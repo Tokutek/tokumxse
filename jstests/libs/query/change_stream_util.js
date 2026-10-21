@@ -1,0 +1,1929 @@
+/*
+ * A class with helper functions which operate on change streams. The class maintains a list of
+ * opened cursors and kills them on cleanup.
+ */
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {indexAccessOpsByName} from "jstests/libs/index_stats_utils.js";
+import {getLocalReadCount} from "jstests/libs/local_reads.js";
+import {getCollectionNameFromFullNamespace} from "jstests/libs/namespace_utils.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
+// The resume-token monotonicity checks in this file assume a consistent v2 change stream
+// implementation. Mixed-version clusters may observe non-monotonic tokens, so the checks are disabled in multiversion tests.
+// TODO SERVER-134853 Enable the check in multiversion tests as well.
+const isMultiversion = Boolean(
+    jsTest.options().useRandomBinVersionsWithinReplicaSet ||
+        (TestData &&
+            (TestData.multiversionBinVersion ||
+                TestData.mixedBinVersions ||
+                TestData.mongosBinVersion)),
+);
+
+/**
+ * Enumeration of the possible types of change streams.
+ */
+export const ChangeStreamWatchMode = Object.freeze({
+    kCollection: 1,
+    kDb: 2,
+    kCluster: 3,
+});
+
+export function watchModeToString(watchMode) {
+    switch (watchMode) {
+        case ChangeStreamWatchMode.kCollection:
+            return "collection";
+        case ChangeStreamWatchMode.kDb:
+            return "db";
+        case ChangeStreamWatchMode.kCluster:
+            return "cluster";
+    }
+}
+
+/**
+ * Returns the value of the first pipeline stage's '$changeStream' key if 'cmdObj' is an
+ * 'aggregate' command with a non-empty pipeline whose first stage has that key, regardless of the
+ * value's type (so a malformed request, e.g. '$changeStream: 1', is still detected). Returns
+ * undefined otherwise.
+ */
+export function getChangeStreamStage(cmdObj) {
+    if (
+        !cmdObj ||
+        !cmdObj.aggregate ||
+        !Array.isArray(cmdObj.pipeline) ||
+        cmdObj.pipeline.length === 0 ||
+        typeof cmdObj.pipeline[0] !== "object" ||
+        cmdObj.pipeline[0] === null ||
+        !("$changeStream" in cmdObj.pipeline[0])
+    ) {
+        return undefined;
+    }
+    return cmdObj.pipeline[0].$changeStream;
+}
+
+/**
+ * Validates if a 'ChangeStreamHistoryLost' exception contains the expected stable message parts,
+ * including the specified timestamp.
+ */
+export function validateChangeStreamHistoryLostException(expectedTimestamp) {
+    return (error) => {
+        assert(error instanceof Error, `Got unexpected error type: ${tojson(error)}`);
+
+        // Validate error message prefix.
+        assert(
+            error.message.includes("Resume of change stream was not possible"),
+            `Got unexpected error message prefix for ChangeStreamHistoryLost exception`,
+            {error},
+        );
+
+        // Validate that expected timestamp is included in the error message.
+        const expectedTimestampString = tojson(expectedTimestamp);
+        assert(
+            error.message.includes(expectedTimestampString),
+            `Got unexpected error message timestamp for ChangeStreamHistoryLost exception`,
+            {error, expectedTimestampString},
+        );
+    };
+}
+
+/**
+ * Returns a truncated json object if the size of 'jsonObj' is greater than 'maxErrorSizeBytes'.
+ */
+export function tojsonMaybeTruncate(jsonObj) {
+    // Maximum size for the json object.
+    const maxErrorSizeBytes = 1024 * 1024;
+
+    return tojson(jsonObj).substring(0, maxErrorSizeBytes);
+}
+
+/**
+ * Helper function used internally by ChangeStreamTest. If no passthrough is active, it is exactly
+ * the same as calling db.runCommand. If a passthrough is active and has defined a function
+ * 'changeStreamPassthroughAwareRunCommand', then this method will be overridden to allow individual
+ * streams to explicitly exempt themselves from being modified by the passthrough.
+ */
+export function isChangeStreamPassthrough() {
+    return typeof changeStreamPassthroughAwareRunCommand != "undefined";
+}
+
+/**
+ * Helper function to retrieve the type of change stream based on the passthrough suite in which the
+ * test is being run. If no passthrough is active, this method returns the kCollection watch mode.
+ */
+export function changeStreamPassthroughType() {
+    return typeof globalThis.ChangeStreamPassthroughHelpers === "undefined"
+        ? ChangeStreamWatchMode.kCollection
+        : globalThis.ChangeStreamPassthroughHelpers.passthroughType();
+}
+
+export function runCommandChangeStreamPassthroughAware(db, cmdObj, noPassthrough) {
+    if (!isChangeStreamPassthrough()) {
+        return db.runCommand(cmdObj);
+    }
+
+    return globalThis.changeStreamPassthroughAwareRunCommand(db, cmdObj, noPassthrough);
+}
+
+/**
+ * Asserts that the given opType triggers an invalidate entry depending on the type of change
+ * stream.
+ *     - single collection streams: drop, rename, and dropDatabase.
+ *     - whole DB streams: dropDatabase.
+ *     - whole cluster streams: none.
+ * Returns the invalidate document if there was one, or null otherwise.
+ */
+/**
+ * Checks if the change event is an invalidate event.
+ */
+export function isInvalidated(change) {
+    return change.operationType === "invalidate";
+}
+
+export function assertInvalidateOp({cursor, opType}) {
+    if (
+        !isChangeStreamPassthrough() ||
+        (changeStreamPassthroughType() == ChangeStreamWatchMode.kDb && opType == "dropDatabase")
+    ) {
+        assert.soon(() => cursor.hasNext());
+        const invalidate = cursor.next();
+        assert.eq(invalidate.operationType, "invalidate");
+        assert(!cursor.hasNext());
+        assert(cursor.isExhausted());
+        assert(cursor.isClosed());
+        return invalidate;
+    }
+    return null;
+}
+
+/**
+ * Checks whether an object has a nested property at the given dot-separated path.
+ * For example, hasAttributeAtPath(obj, 'foo.bar.baz') returns true if obj.foo.bar.baz exists.
+ */
+function hasAttributeAtPath(obj, path) {
+    const parts = path.split(".");
+    let curr = obj;
+    for (const part of parts) {
+        if (!curr || !curr.hasOwnProperty(part)) {
+            return false;
+        }
+        curr = curr[part];
+    }
+    return true;
+}
+
+/**
+ * Deletes a property from an object at a specified dot-separated path.
+ * For example, deleteAttributeAtPath(obj, 'foo.bar.baz') removes obj.foo.bar.baz if it exists.
+ */
+function deleteAttributeAtPath(obj, path) {
+    const parts = path.split(".");
+    let curr = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+        if (!curr || !curr.hasOwnProperty(parts[i])) {
+            return;
+        }
+        curr = curr[parts[i]];
+    }
+    delete curr[parts[parts.length - 1]];
+}
+
+export function canonicalizeEventForTesting(event, expected) {
+    for (let fieldPath of [
+        "_id",
+        "clusterTime",
+        "txnNumber",
+        "lsid",
+        "collectionUUID",
+        "wallTime",
+        "operationDescription",
+        "updateDescription",
+        "commitTimestamp",
+        "nsType",
+        // Exclude "recordIdsReplicated" if not explicitly specified in the expected event. This allows
+        // standard change-stream tests to work with 'replicatedRecordIds'.
+        "operationDescription.recordIdsReplicated",
+        "stateBeforeChange.collectionOptions.recordIdsReplicated",
+        // Exclude "updateDescription.disambiguatedPaths" if not explicitly specified in the expected
+        // event. This is necessary because in v8.2.0, we expose this field unconditionally, but in
+        // versions before or after v8.2.0 the field is only exposed if the change stream is opened with
+        // '{showExpandedEvents: true}'.
+        "updateDescription.disambiguatedPaths",
+    ]) {
+        if (!hasAttributeAtPath(expected, fieldPath)) {
+            deleteAttributeAtPath(event, fieldPath);
+        }
+    }
+    return event;
+}
+
+/**
+ * Helper function that sets a global variable to `true`, runs the callback and then sets back the
+ * global variable to `false`. The global variable can be checked by command overrides to check if
+ * the command was executed from inside the ChangeStreamTest fixture or not.
+ */
+function runInFixture(callback) {
+    globalThis.isInsideChangeStreamTestFixture = true;
+    try {
+        return callback();
+    } finally {
+        globalThis.isInsideChangeStreamTestFixture = false;
+    }
+}
+
+/**
+ * Returns true if a change stream event matches the given expected event, false otherwise. Ignores
+ * the resume token, clusterTime, and other unknowable fields unless they are explicitly listed in
+ * the expected event.
+ */
+function isChangeStreamEventEq(
+    actualEvent,
+    expectedEvent,
+    eventModifier = canonicalizeEventForTesting,
+) {
+    const testEvent = eventModifier(Object.assign({}, actualEvent), expectedEvent);
+    return friendlyEqual(sortDoc(testEvent), sortDoc(expectedEvent));
+}
+
+/**
+ * Helper to check whether a change event matches the given expected event. Throws assertion failure
+ * if change events do not match.
+ */
+export function assertChangeStreamEventEq(actualEvent, expectedEvent, eventModifier) {
+    assert(
+        isChangeStreamEventEq(actualEvent, expectedEvent, eventModifier),
+        () =>
+            "Change events did not match. Expected: " +
+            tojsonMaybeTruncate(expectedEvent) +
+            ", Actual: " +
+            tojsonMaybeTruncate(actualEvent),
+        {
+            expectedEvent,
+            actualEvent,
+        },
+    );
+}
+
+/**
+ * Asserts that 'actualChanges' and 'expectedChanges' contain the same change events, in any order.
+ *
+ * This is a multiset comparison: each actual event must match a distinct expected event (per
+ * assertChangeStreamEventEq semantics), so a duplicate actual event cannot stand in for a missing
+ * expected one. Use it where event order is not guaranteed, e.g. on sharded topologies where
+ * cross-shard event order may not match client issue order.
+ */
+export function assertChangeStreamEventsEqUnordered(actualChanges, expectedChanges, eventModifier) {
+    assert.eq(
+        actualChanges.length,
+        expectedChanges.length,
+        "Change event count mismatch (order ignored)",
+        {actualChanges, expectedChanges},
+    );
+
+    const remaining = [...expectedChanges];
+    for (const actual of actualChanges) {
+        const i = remaining.findIndex((expected) =>
+            isChangeStreamEventEq(actual, expected, eventModifier),
+        );
+        assert.neq(i, -1, "No expected event matched the observed event (order ignored)", {
+            actual,
+            remaining,
+        });
+        remaining.splice(i, 1);
+    }
+}
+
+/**
+ * Asserts that the observed change events equal the expected ones, with deployment awareness:
+ * ordered on replica sets and standalone, unordered on sharded clusters, where cross-shard event
+ * order may not match client issue order.
+ *
+ * The array-based counterpart of ChangeStreamTest.assertNextChangesEqualWithDeploymentAwareness,
+ * for tests that drain their cursor themselves (e.g. via plain cursor.next()) rather than through
+ * ChangeStreamTest's batchSize:1 batches.
+ */
+export function assertChangeStreamEventsEqWithDeploymentAwareness(
+    db,
+    actualChanges,
+    expectedChanges,
+    eventModifier,
+) {
+    assert.eq(actualChanges.length, expectedChanges.length, {actualChanges, expectedChanges});
+    if (FixtureHelpers.isMongos(db)) {
+        assertChangeStreamEventsEqUnordered(actualChanges, expectedChanges, eventModifier);
+    } else {
+        for (let i = 0; i < expectedChanges.length; i++) {
+            assertChangeStreamEventEq(actualChanges[i], expectedChanges[i], eventModifier);
+        }
+    }
+}
+
+/**
+ * Asserts that there are no changes waiting on the change stream cursor.
+ */
+export function assertNoChanges(cursor) {
+    assert(!cursor.hasNext(), () => {
+        return "Unexpected change set: " + tojson(cursor.toArray());
+    });
+}
+
+/**
+ * Helper to check that there are no transaction operations past end of transaction event.
+ */
+export function assertEndOfTransaction(changes) {
+    const finishedTransactions = new Set();
+    for (const change of changes) {
+        assert.eq(
+            change.hasOwnProperty("lsid"),
+            change.hasOwnProperty("txnNumber"),
+            "Found change eventy with inconsistent lsid and txnNumber: " + tojson(change),
+        );
+        if (change.hasOwnProperty("lsid")) {
+            const txnId = tojsononeline({lsid: change.lsid, txnNumber: change.txnNumber});
+            if (change.operationType == "endOfTransaction") {
+                finishedTransactions.add(txnId);
+            } else {
+                assert.eq(
+                    finishedTransactions.has(txnId),
+                    false,
+                    "Found change event past endOfTransaction: " + tojson(change),
+                );
+            }
+        }
+    }
+}
+
+export function isResumableChangeStreamError(error) {
+    return "errorLabels" in error && error.errorLabels.includes("ResumableChangeStreamError");
+}
+
+/**
+ * Polls getMore until it fails with the expected error. Returns the failing getMore response.
+ */
+export function assertGetMoreFailsWithExpectedError({db, cursorId, collName, expectedError, msg}) {
+    let errorResponse;
+    assert.soon(function () {
+        const res = db.runCommand({getMore: cursorId, collection: collName});
+        if (res.ok === 0) {
+            assert(expectedError(res), "Unexpected error: " + tojson(res), {res});
+            errorResponse = res;
+            return true;
+        }
+        return false;
+    }, msg);
+    return errorResponse;
+}
+
+/**
+ * Verify that 'resumeToken' is not a resume token from a control event. Currently only tests for "namespacePlacementChanged" events.
+ */
+export function assertNoControlEventToken(resumeToken) {
+    const decodedPbrt = decodeResumeToken(resumeToken);
+    if (decodedPbrt.tokenType !== highWaterMarkResumeTokenType) {
+        const opType = decodedPbrt.eventIdentifier && decodedPbrt.eventIdentifier.operationType;
+        assert.neq(
+            opType,
+            "namespacePlacementChanged",
+            "postBatchResumeToken is the resume token of an internally swallowed " +
+                "control event and cannot be resumed",
+            {pbrt: resumeToken, decodedPbrt},
+        );
+    }
+}
+
+export function ChangeStreamTest(_db, options) {
+    // Keeps track of cursors opened during the test so that we can be sure to
+    // clean them up before the test completes.
+    let _allCursors = new CursorList();
+    // Map to store cursor-specific data
+    let _cursorData = new Map();
+    let self = this;
+    options = options || {};
+    const eventModifier = options.eventModifier || canonicalizeEventForTesting;
+    const _extraRetryableErrors = options.extraRetryableErrors || [];
+
+    function _isRetryableError(error) {
+        return isResumableChangeStreamError(error) || _extraRetryableErrors.includes(error.code);
+    }
+
+    function _getResumeTokenComparable(token) {
+        assert(token, "Resume token must be present", {token});
+        assert.eq(typeof token, "object", "Resume token must be an object", {token});
+        assert(token.hasOwnProperty("_data"), "Resume token must have _data field", {token});
+        assert.eq(typeof token._data, "string", "Resume token must have string _data field", {
+            token,
+        });
+        return token._data;
+    }
+
+    function updateResumeToken(cursor, changeEvents) {
+        // This isn't fool proof since anyone can just a getMore command on the raw cursor.
+        const cursorId = String(cursor.id);
+        if (!_cursorData.has(cursorId)) {
+            _cursorData.set(cursorId, {});
+        }
+        const cursorInfo = _cursorData.get(cursorId);
+
+        const events = changeEvents && changeEvents.length > 0 ? changeEvents : null;
+
+        const getRequestedResumeToken = () => {
+            const cursorInfo = _cursorData.get(String(cursor.id));
+            if (!cursorInfo || !cursorInfo.pipeline || cursorInfo.pipeline.length === 0) {
+                return null;
+            }
+            const stage = cursorInfo.pipeline[0];
+            const options = stage && stage.$changeStream ? stage.$changeStream : {};
+            return options.resumeAfter || options.startAfter || null;
+        };
+
+        // Verify that 'current' sorts greater-or-equal to 'requested'.
+        const assertNotRegressed = (current, requested, label) => {
+            assert.gte(
+                bsonWoCompare(
+                    _getResumeTokenComparable(current),
+                    _getResumeTokenComparable(requested),
+                ),
+                0,
+                label + " regressed below the preceding token",
+                {requested, current},
+            );
+        };
+
+        // Outside of multiversion tests, the server must never return a resume token that sorts
+        // before the resume/start point requested by the caller.
+        // TODO SERVER-134853 Enable the check in multiversion tests as well.
+        if (!isMultiversion) {
+            const requestedToken = getRequestedResumeToken(cursor);
+            let previousToken = requestedToken || cursorInfo.resumeToken || null;
+
+            // Check every event token in order. They must not regress, but need not be strictly
+            // monotonic: some DDL/resharding events (e.g. reshardBlockingWrites) are emitted once
+            // per shard, and the resume token does not include the recipient shard id, so events
+            // from different shards may produce exactly the same resume token.
+            if (events) {
+                for (let i = 0; i < events.length; i++) {
+                    const eventToken = events[i]._id;
+                    if (previousToken) {
+                        assertNotRegressed(eventToken, previousToken, "event token at index " + i);
+                    }
+                    previousToken = eventToken;
+                }
+            }
+
+            // Check the postBatchResumeToken against the previous token (last event, or
+            // requested/previous if no events). PBRT must not regress.
+            if (cursor.postBatchResumeToken) {
+                if (previousToken) {
+                    assertNotRegressed(
+                        cursor.postBatchResumeToken,
+                        previousToken,
+                        "postBatchResumeToken",
+                    );
+                }
+
+                // A PBRT that is an event token must be a resumable event. The v2 change stream
+                // reader swallows internal control events before they reach
+                // DSCSEnsureResumeTokenPresent, so their event tokens are not resumable and must
+                // never be exposed as a PBRT.
+                assertNoControlEventToken(cursor.postBatchResumeToken);
+                previousToken = cursor.postBatchResumeToken;
+            }
+
+            // Persist the latest seen resume token for the next getMore.
+            cursorInfo.resumeToken = previousToken;
+        } else {
+            // In multiversion mode, just track the latest token without validation.
+            // TODO SERVER-134853 Remove this branch.
+            if (events) {
+                const lastEvent = events[events.length - 1];
+                cursorInfo.resumeToken = lastEvent._id;
+            } else {
+                cursorInfo.resumeToken = cursor.postBatchResumeToken || cursorInfo.resumeToken;
+            }
+        }
+    }
+
+    function addResumeToken(pipeline, resumeToken) {
+        let csStage = pipeline[0]["$changeStream"];
+        // Only one resume option is allowed. Clear any previously set resume
+        // options before setting resumeAfter (mirrors the server-side logic in
+        // change_stream_topology_helpers.cpp::replaceResumeTokenAndVersionInCommand).
+        delete csStage["startAtOperationTime"];
+        delete csStage["startAfter"];
+        csStage["resumeAfter"] = resumeToken;
+        pipeline[0] = {$changeStream: csStage};
+        return pipeline;
+    }
+
+    /**
+     * Starts a change stream cursor with the given pipeline on the given collection. It uses
+     * the 'aggregateOptions' if provided and saves the cursor so that it can be cleaned up later.
+     * If 'doNotModifyInPassthroughs' is 'true' and the test is running in a $changeStream
+     * upconversion passthrough, then this stream will not be modified and will run as though no
+     * passthrough were active.
+     *
+     * Returns the cursor returned by the 'aggregate' command.
+     */
+    self.startWatchingChanges = function ({
+        pipeline,
+        collection,
+        aggregateOptions,
+        doNotModifyInPassthroughs,
+        querySettings,
+    }) {
+        aggregateOptions = aggregateOptions || {};
+        aggregateOptions.cursor = aggregateOptions.cursor || {batchSize: 1};
+
+        // The 'collection' argument may be a collection name, DBCollection object, or '1' which
+        // indicates all collections in _db.
+        assert(
+            collection instanceof DBCollection ||
+                typeof collection === "string" ||
+                collection === 1,
+        );
+        const collName = collection instanceof DBCollection ? collection.getName() : collection;
+
+        return runInFixture(() => {
+            const cmdObj = Object.merge({aggregate: collName, pipeline}, aggregateOptions);
+            if (querySettings) {
+                cmdObj.querySettings = querySettings;
+            }
+
+            // Maximum number of tries, i.e. 1 initial attempt + 3 retries.
+            // If adjusting this value in the future, be sure to constraint the maximum backoff time
+            // below to avoid overly long sleeps.
+            const maxTries = 4;
+            let res;
+            for (let attemptNumber = 1; attemptNumber <= maxTries; attemptNumber++) {
+                const logProgress = (msg, data) => {
+                    jsTest.log.info(msg, Object.assign({attempt: attemptNumber, cmdObj}, data));
+                };
+
+                logProgress("ChangeStreamTest.startWatchingChanges", {});
+                try {
+                    res = assert.commandWorked(
+                        runCommandChangeStreamPassthroughAware(
+                            _db,
+                            cmdObj,
+                            doNotModifyInPassthroughs,
+                        ),
+                    );
+                    break;
+                } catch (e) {
+                    logProgress("ChangeStreamTest.startWatchingChanges: command failed", {
+                        code: e.code,
+                        error: e.message,
+                    });
+
+                    if (attemptNumber === maxTries || !_isRetryableError(e)) {
+                        throw e;
+                    }
+
+                    // Exponential backoff, sleep for 10, 100, 1000ms before retrying.
+                    sleep(Math.pow(10, attemptNumber));
+                }
+            }
+            assert.neq(res.cursor.id, 0);
+
+            const cursorInfo = {
+                pipeline,
+                collName,
+                doNotModifyInPassthroughs,
+                aggregateOptions,
+            };
+            if (querySettings) {
+                cursorInfo.querySettings = querySettings;
+            }
+            _cursorData.set(String(res.cursor.id), cursorInfo);
+            updateResumeToken(res.cursor, res.cursor.firstBatch);
+            _allCursors.push(new DBCommandCursor(_db, res));
+            return {...res.cursor, _changeStreamVersion: res._changeStreamVersion};
+        });
+    };
+
+    /**
+     * Returns a change stream cursor that listens for every change in the cluster. Assumes that the
+     * ChangeStreamTest has been created on the 'admin' db, and will assert if not. It uses the
+     * 'aggregateOptions' if provided and saves the cursor so that it can be cleaned up later.
+     */
+    self.startWatchingAllChangesForCluster = function (
+        aggregateOptions,
+        changeStreamOptions = {},
+        querySettings,
+    ) {
+        assert.eq(_db.getName(), "admin");
+        return self.startWatchingChanges({
+            pipeline: [
+                {$changeStream: Object.assign({allChangesForCluster: true}, changeStreamOptions)},
+            ],
+            collection: 1,
+            aggregateOptions,
+            querySettings,
+        });
+    };
+
+    /**
+     * Restarts the change stream and modify 'cursor' by replacing it's contents thus updating it's
+     * cursor ID.
+     */
+    self.restartChangeStream = function (cursor) {
+        const cursorId = String(cursor.id);
+        const cursorInfo = _cursorData.get(cursorId);
+        if (!cursorInfo || !cursorInfo.resumeToken) {
+            throw new Error("Cannot resume change stream - no resume token available for cursor");
+        }
+
+        const logProgress = (msg, data) => {
+            jsTest.log.info(msg, Object.assign({oldCursorId: cursorId, cursorInfo}, data));
+        };
+
+        logProgress("ChangeStreamTest.restartChangeStream: restarting change stream", {
+            resumeToken: cursorInfo.resumeToken,
+        });
+        const pipeline = addResumeToken(cursorInfo.pipeline, cursorInfo.resumeToken);
+
+        const params = {
+            pipeline,
+            collection: cursorInfo.collName,
+            aggregateOptions: Object.merge(cursorInfo.aggregateOptions || {}, {
+                cursor: {batchSize: 0},
+            }),
+            doNotModifyInPassthroughs: cursorInfo.doNotModifyInPassthroughs,
+        };
+        if (cursorInfo.querySettings) {
+            params.querySettings = cursorInfo.querySettings;
+        }
+        const newCursor = self.startWatchingChanges(params);
+        Object.assign(cursor, newCursor);
+        logProgress("ChangeStreamTest.restartChangeStream: restart complete", {
+            newCursorId: String(cursor.id),
+        });
+        assert.neq(
+            String(cursor.id),
+            cursorId,
+            `Expected cursor ID to change after restart but got the same ID: ${cursorId}. ` +
+                `This may indicate the server reused the cursor ID or Object.assign failed to ` +
+                `update cursor.id.`,
+        );
+        return newCursor;
+    };
+
+    /**
+     * Returns the resume token for the most recent batch returned by the change stream cursor. Throws an error if there is no resume token available for the cursor.
+     */
+    self.getResumeToken = function (cursor) {
+        const cursorId = String(cursor.id);
+        const cursorInfo = _cursorData.get(cursorId);
+        if (!cursorInfo || !cursorInfo.resumeToken) {
+            throw new Error("Cannot get resume token - no resume token available for cursor");
+        }
+        return cursorInfo.resumeToken;
+    };
+
+    /**
+     * Issues a 'getMore' on the provided cursor and returns the cursor returned. The getMore can be
+     * interrupted with a ResumableChangeStreamError. We restart the changeStream pipeline and retry
+     * getMore 3 times.
+     */
+    self.getNextBatch = function (cursor) {
+        const maxRetries = 3;
+
+        for (let attemptNumber = 1; attemptNumber <= maxRetries; attemptNumber++) {
+            const collName = getCollectionNameFromFullNamespace(cursor.ns);
+            const logProgress = (msg, data) => {
+                jsTest.log.info(
+                    msg,
+                    Object.assign(
+                        {
+                            attempt: attemptNumber,
+                            cursorId: cursor.id,
+                            collection: collName,
+                        },
+                        data,
+                    ),
+                );
+            };
+
+            logProgress("ChangeStreamTest.getNextBatch: sending getMore", {});
+            try {
+                const res = assert.commandWorked(
+                    _db.runCommand({getMore: cursor.id, collection: collName, batchSize: 1}),
+                );
+                // Update in-place to preserve the reference chain so that
+                // the caller's cursor object always holds the latest cursor ID.
+                delete cursor.firstBatch;
+                delete cursor.nextBatch;
+                Object.assign(cursor, res.cursor);
+                updateResumeToken(cursor, getBatchFromCursorDocument(cursor));
+                return cursor;
+            } catch (e) {
+                logProgress("ChangeStreamTest.getNextBatch: getMore failed", {
+                    code: e.code,
+                    error: e.message,
+                });
+                if (attemptNumber === maxRetries || !_isRetryableError(e)) {
+                    throw e;
+                }
+                try {
+                    self.restartChangeStream(cursor);
+                } catch (restartError) {
+                    // Restarting the stream can itself fail while the underlying condition that
+                    // made the getMore retryable (e.g. the cluster being unavailable) is still in
+                    // effect. Looping back would retry the getMore against the same (possibly
+                    // already-disposed) cursor, which can throw an unlabeled CursorNotFound and
+                    // mask the original, correctly-labeled error. Throw the original instead.
+                    logProgress("ChangeStreamTest.getNextBatch: restart failed", {
+                        code: restartError.code,
+                        error: restartError.message,
+                    });
+                    throw e;
+                }
+            }
+        }
+        throw new Error("Failed to get next batch after retries");
+    };
+
+    /**
+     * Returns the next batch of documents from the cursor. This encapsulates logic for checking
+     * if it's the first batch or another batch afterwards.
+     */
+    function getBatchFromCursorDocument(cursor) {
+        return cursor.nextBatch === undefined ? cursor.firstBatch : cursor.nextBatch;
+    }
+
+    /**
+     * Returns the next consumed document from a cursor or returns null if there wasn't one.
+     * This does not issue any getMores, instead relying off the batch inside 'cursor'.
+     */
+    function getNextDocFromCursor(cursor) {
+        let nextBatch = getBatchFromCursorDocument(cursor);
+        if (nextBatch.length === 0) {
+            return null;
+        }
+        assert.eq(
+            nextBatch.length,
+            1,
+            "Batch length wasn't 0 or 1: " + tojsonMaybeTruncate(cursor),
+        );
+
+        // Reset the nextBatch, as the document is consumed.
+        delete cursor.firstBatch;
+        cursor.nextBatch = [];
+
+        return nextBatch[0];
+    }
+
+    self.getNextChanges = function (cursor, numChanges, skipFirst) {
+        let changes = [];
+
+        for (let i = 0; i < numChanges; i++) {
+            // Since the first change may be on the original cursor, we need to check for that
+            // change on the cursor before we move the cursor forward.
+            if (i === 0 && !skipFirst) {
+                changes[0] = getNextDocFromCursor(cursor);
+                if (changes[0]) {
+                    continue;
+                }
+            }
+
+            assert.soon(
+                () => {
+                    assert.neq(
+                        cursor.id,
+                        NumberLong(0),
+                        () =>
+                            "Cursor has been closed unexpectedly. Observed change stream events: " +
+                            tojsonMaybeTruncate(changes),
+                    );
+                    cursor = self.getNextBatch(cursor);
+                    changes[i] = getNextDocFromCursor(cursor);
+                    return changes[i] !== null;
+                },
+                () => {
+                    return (
+                        "timed out waiting for another result from the change stream, observed changes: " +
+                        tojsonMaybeTruncate(changes) +
+                        ", expected changes: " +
+                        numChanges
+                    );
+                },
+            );
+        }
+        return changes;
+    };
+
+    /**
+     * Asserts that the last observed change was the change we expect to see. This also asserts
+     * that if we do not expect the cursor to be invalidated, that we do not see the cursor
+     * invalidated. Omits the observed change's resume token and cluster time from the comparison,
+     * unless the expected change explicitly lists an '_id' or 'clusterTime' field to compare
+     * against.
+     */
+    function assertChangeIsExpected(
+        expectedChanges,
+        numChangesSeen,
+        observedChanges,
+        expectInvalidate,
+    ) {
+        if (expectedChanges) {
+            assertChangeStreamEventEq(
+                observedChanges[numChangesSeen],
+                expectedChanges[numChangesSeen],
+                eventModifier,
+            );
+        } else if (!expectInvalidate) {
+            assert(
+                !isInvalidated(observedChanges[numChangesSeen]),
+                "Change was invalidated when it should not have been. Number of changes seen: " +
+                    numChangesSeen +
+                    ", observed changes: " +
+                    tojsonMaybeTruncate(observedChanges) +
+                    ", expected changes: " +
+                    tojsonMaybeTruncate(expectedChanges),
+            );
+        }
+    }
+
+    /**
+     * Iterates through the change stream and asserts that the next changes are the expected ones.
+     * This can be provided with either an expected size or a list of expected changes.
+     * If 'expectInvalidate' is provided, then it will expect the change stream to be invalidated
+     * at the end. The caller is still expected to provide an invalidate entry in 'expectedChanges'.
+     *
+     * Returns a list of the changes seen.
+     */
+    self.assertNextChangesEqual = function ({
+        cursor,
+        expectedChanges,
+        expectedNumChanges,
+        expectInvalidate,
+        skipFirstBatch,
+        ignoreOrder,
+    }) {
+        expectInvalidate = expectInvalidate || false;
+        skipFirstBatch = skipFirstBatch || false;
+
+        // Assert that the expected length matches the length of the expected batch.
+        if (expectedChanges !== undefined && expectedNumChanges !== undefined) {
+            assert.eq(
+                expectedChanges.length,
+                expectedNumChanges,
+                "Expected change's size must match expected number of changes",
+            );
+        }
+
+        // Convert 'expectedChanges' to an array, even if it contains just a single element.
+        if (expectedChanges !== undefined && !(expectedChanges instanceof Array)) {
+            let arrayVersion = new Array();
+            arrayVersion.push(expectedChanges);
+            expectedChanges = arrayVersion;
+        }
+
+        // Set the expected number of changes based on the size of the expected change list.
+        if (expectedNumChanges === undefined) {
+            assert.neq(expectedChanges, undefined);
+            expectedNumChanges = expectedChanges.length;
+        }
+
+        let changes = self.getNextChanges(cursor, expectedNumChanges, skipFirstBatch);
+        if (ignoreOrder) {
+            const lengthMismatchErrMsg = () =>
+                "Change stream event count mismatch (order ignored). " +
+                `Expected ${expectedNumChanges} event(s), observed ${changes.length}. ` +
+                `Expected events: ${tojsonMaybeTruncate(expectedChanges)}. ` +
+                `Observed events: ${tojsonMaybeTruncate(changes)}.`;
+            assert.eq(changes.length, expectedNumChanges, lengthMismatchErrMsg);
+            for (let i = 0; i < changes.length; i++) {
+                const itemMismatchErrMsg = () =>
+                    "Change stream event mismatch (order ignored). " +
+                    `No expected event matched observed event at index ${i}. ` +
+                    `Observed event: ${tojsonMaybeTruncate(changes[i])}. ` +
+                    `Expected events: ${tojsonMaybeTruncate(expectedChanges)}. ` +
+                    `Observed events: ${tojsonMaybeTruncate(changes)}.`;
+                assert(
+                    expectedChanges.some((expectedChange) => {
+                        return isChangeStreamEventEq(changes[i], expectedChange, eventModifier);
+                    }),
+                    itemMismatchErrMsg,
+                );
+            }
+        } else {
+            for (let i = 0; i < changes.length; i++) {
+                assertChangeIsExpected(expectedChanges, i, changes, expectInvalidate);
+            }
+        }
+
+        // If we expect invalidation, the final change should have operation type "invalidate".
+        if (expectInvalidate) {
+            assert(
+                isInvalidated(changes[changes.length - 1]),
+                "Last change was not invalidated when it was expected: " +
+                    tojsonMaybeTruncate(changes),
+            );
+
+            // We make sure that the next batch kills the cursor after an invalidation entry.
+            let finalCursor = self.getNextBatch(cursor);
+            assert.eq(
+                finalCursor.id,
+                0,
+                "Final cursor was not killed: " + tojsonMaybeTruncate(finalCursor),
+            );
+        }
+
+        return changes;
+    };
+
+    /**
+     * Equivalent to the free-standing assertInvalidateOp() for a ChangeStreamTest cursor.
+     * Asserts that the given opType triggers an invalidate entry depending on the type of change
+     * stream ('cursor' must already have been drained up to the invalidating event):
+     *     - single collection streams: drop, rename, and dropDatabase.
+     *     - whole DB streams: dropDatabase.
+     *     - whole cluster streams: none.
+     * Returns the invalidate document if there was one, or null otherwise.
+     */
+    self.assertInvalidateOp = function ({cursor, opType}) {
+        if (
+            !isChangeStreamPassthrough() ||
+            (changeStreamPassthroughType() == ChangeStreamWatchMode.kDb && opType == "dropDatabase")
+        ) {
+            const changes = self.assertNextChangesEqual({
+                cursor,
+                expectedChanges: [{operationType: "invalidate"}],
+                expectInvalidate: true,
+            });
+            return changes[0];
+        }
+        return null;
+    };
+
+    /**
+     * Iterates through the change stream and asserts that the next changes are the expected ones.
+     * The order of the change events from the cursor relative to their order in the list of
+     * expected changes is ignored, however.
+     *
+     * Returns a list of the changes seen.
+     */
+    self.assertNextChangesEqualUnordered = function ({
+        cursor,
+        expectedChanges,
+        expectedNumChanges,
+        expectInvalidate,
+        skipFirstBatch,
+    }) {
+        return self.assertNextChangesEqual({
+            cursor: cursor,
+            expectedChanges: expectedChanges,
+            expectedNumChanges: expectedNumChanges,
+            expectInvalidate: expectInvalidate,
+            skipFirstBatch: skipFirstBatch,
+            ignoreOrder: true,
+        });
+    };
+
+    /**
+     * Iterates through the change stream and asserts that the next changes are the expected ones.
+     *
+     * The method enforces a strict order of events for replica set deployments. In sharded
+     * clusters, due to the possibility of interleaved events across shards, the order is not
+     * strictly enforced, allowing for flexibility in the sequence of events.
+     */
+    self.assertNextChangesEqualWithDeploymentAwareness = function (...args) {
+        const assertEqualFunc = FixtureHelpers.isMongos(db)
+            ? self.assertNextChangesEqualUnordered
+            : self.assertNextChangesEqual;
+        return assertEqualFunc(...args);
+    };
+
+    /**
+     * Retrieves the next batch in the change stream and confirms that it is empty.
+     */
+    self.assertNoChange = function (cursor) {
+        cursor = self.getNextBatch(cursor);
+        assert.eq(
+            0,
+            cursor.nextBatch.length,
+            () => "Cursor had changes: " + tojsonMaybeTruncate(cursor),
+        );
+        return cursor;
+    };
+
+    /**
+     * Gets the next document in the change stream. This always executes a 'getMore' first.
+     * If the current batch has a document in it, that one will be ignored.
+     */
+    self.getOneChange = function (cursor, expectInvalidate = false) {
+        const changes = self.getNextChanges(cursor, 1, true);
+
+        if (expectInvalidate) {
+            assert(
+                isInvalidated(changes[changes.length - 1]),
+                "Last change was not invalidated when it was expected: " +
+                    tojsonMaybeTruncate(changes),
+            );
+
+            // We make sure that the next batch kills the cursor after an invalidation entry.
+            let finalCursor = self.getNextBatch(cursor);
+            assert.eq(
+                finalCursor.id,
+                0,
+                "Final cursor was not killed: " + tojsonMaybeTruncate(finalCursor),
+            );
+        }
+
+        return changes[0];
+    };
+
+    /**
+     * Kills all outstanding cursors.
+     */
+    self.cleanUp = function () {
+        _allCursors.closeAll();
+    };
+
+    /**
+     * Returns the document to be used for the value of a $changeStream stage, given a watchMode
+     * of type ChangeStreamWatchMode and optional resumeAfter value. Any 'extraOptions' (e.g.
+     * {fullDocument: "updateLookup"}) are merged in; the watchMode-derived and resumeAfter fields
+     * take precedence over them.
+     */
+    self.getChangeStreamStage = function (
+        watchMode,
+        resumeAfter,
+        startAtOperationTime,
+        extraOptions = {},
+    ) {
+        if (resumeAfter && startAtOperationTime) {
+            throw new Error("cannot use both resumeAfter and startAtOperationTime");
+        }
+
+        const changeStreamDoc = {...extraOptions};
+        if (resumeAfter) {
+            changeStreamDoc.resumeAfter = resumeAfter;
+        }
+        if (startAtOperationTime) {
+            changeStreamDoc.startAtOperationTime = startAtOperationTime;
+        }
+
+        if (watchMode == ChangeStreamWatchMode.kCluster) {
+            changeStreamDoc.allChangesForCluster = true;
+        }
+        return changeStreamDoc;
+    };
+
+    /**
+     * Create a change stream of the given watch mode (see ChangeStreamWatchMode) on the given
+     * collection. Will resume from a given point if resumeAfter is specified. Any 'options' are
+     * merged into the $changeStream stage (e.g. {fullDocument: "updateLookup"}).
+     */
+    self.getChangeStream = function ({
+        watchMode,
+        coll,
+        resumeAfter,
+        startAtOperationTime,
+        batchSize = 0,
+        options = {},
+    }) {
+        return self.startWatchingChanges({
+            pipeline: [
+                {
+                    $changeStream: self.getChangeStreamStage(
+                        watchMode,
+                        resumeAfter,
+                        startAtOperationTime,
+                        options,
+                    ),
+                },
+            ],
+            collection: watchMode == ChangeStreamWatchMode.kCollection ? coll : 1,
+            // Use a default batch size of 0 to prevent any notifications from being returned in the first
+            // batch. These would be ignored by ChangeStreamTest.getOneChange().
+            aggregateOptions: {cursor: {batchSize}},
+        });
+    };
+
+    /**
+     * Asserts that the change stream cursor given by 'cursor' returns at least one 'dropType'
+     * notification before returning the next notification given by 'expectedNext'. If running in a
+     * sharded passthrough suite, the expectation is to receive a 'dropType' notification from each
+     * shard that has at least one chunk. If the change stream is watching the single collection,
+     * then the first drop will invalidate the stream.
+     *
+     * Returns an array of documents which includes all drop events consumed and the expected change
+     * itself.
+     */
+    self.consumeDropUpTo = function ({cursor, dropType, expectedNext, expectInvalidate}) {
+        expectInvalidate = expectInvalidate || false;
+
+        let results = [];
+        let change = self.getOneChange(cursor, expectInvalidate);
+        while (change.operationType == dropType) {
+            results.push(change);
+            change = self.getOneChange(cursor, expectInvalidate);
+        }
+        results.push(change);
+        assertChangeIsExpected([expectedNext], 0, [change], expectInvalidate);
+
+        return results;
+    };
+
+    /**
+     * Asserts that the notifications from the change stream cursor include 0 or more 'drop'
+     * notifications followed by a 'dropDatabase' notification.
+     *
+     * Returns the list of notifications.
+     */
+    self.assertDatabaseDrop = function ({cursor, db}) {
+        return self.consumeDropUpTo({
+            cursor: cursor,
+            dropType: "drop",
+            expectedNext: {operationType: "dropDatabase", ns: {db: db.getName()}},
+        });
+    };
+}
+
+export function withChangeStreamTest(db, fn) {
+    const cst = new ChangeStreamTest(db);
+    try {
+        fn(cst);
+    } finally {
+        cst.cleanUp();
+    }
+}
+
+/**
+ * Asserts that the given pipeline will eventually return an error with the provided code, either in
+ * the initial aggregate, or a subsequent getMore. Throws an exception if there are any results from
+ * running the pipeline, or if it doesn't throw an error within the window of assert.soon(). If
+ * 'doNotModifyInPassthroughs' is 'true' and the test is running in a $changeStream upconversion
+ * passthrough, then this stream will not be modified and will run as though no passthrough were
+ * active.
+ * The optional `validateExceptionDetails` can be used to verify a caught exception with code equal
+ * to `expectedCode` in more detail. If set, it is expected to be a callback function that receives
+ * the caught exception.
+ */
+ChangeStreamTest.assertChangeStreamThrowsCode = function assertChangeStreamThrowsCode({
+    db,
+    collName,
+    pipeline,
+    expectedCode,
+    validateExceptionDetails,
+    doNotModifyInPassthroughs,
+}) {
+    try {
+        runInFixture(() => {
+            // Run a passthrough-aware initial 'aggregate' command to open the change stream.
+            const res = assert.commandWorked(
+                runCommandChangeStreamPassthroughAware(
+                    db,
+                    {aggregate: collName, pipeline: pipeline, cursor: {batchSize: 1}},
+                    doNotModifyInPassthroughs,
+                ),
+            );
+
+            // Create a cursor using the command response, and begin issuing getMores. We expect
+            // csCursor.hasNext() to throw the expected code before assert.soon() times out.
+            const csCursor = new DBCommandCursor(db, res, 1);
+            assert.soon(() => csCursor.hasNext());
+            assert(false, `Unexpected result from cursor: ${tojsonMaybeTruncate(csCursor.next())}`);
+        });
+    } catch (error) {
+        assert.eq(
+            error.code,
+            expectedCode,
+            `Caught unexpected error: ${tojsonMaybeTruncate(error)}`,
+        );
+        if (typeof validateExceptionDetails === "function") {
+            validateExceptionDetails(error);
+        }
+        return true;
+    }
+    assert(false, "expected this to be unreachable");
+};
+
+/**
+ * Static method for determining which database to run the change stream aggregation on based on
+ * the watchMode.
+ */
+ChangeStreamTest.getDBForChangeStream = function (watchMode, dbObj) {
+    if (watchMode == ChangeStreamWatchMode.kCluster) {
+        return dbObj.getSiblingDB("admin");
+    }
+    return dbObj;
+};
+
+/**
+ * A set of functions to help validate the behaviour of $changeStreams for a given namespace.
+ */
+export function assertChangeStreamNssBehaviour(dbName, collName = "test", options, assertFunc) {
+    const testDb = db.getSiblingDB(dbName);
+    options = options || {};
+    return runInFixture(() => {
+        const res = testDb.runCommand(
+            Object.assign({aggregate: collName, pipeline: [{$changeStream: options}], cursor: {}}),
+        );
+        return assertFunc(res);
+    });
+}
+
+export function assertValidChangeStreamNss(dbName, collName = "test", options) {
+    const res = assertChangeStreamNssBehaviour(dbName, collName, options, assert.commandWorked);
+    assert.commandWorked(
+        db.getSiblingDB(dbName).runCommand({
+            killCursors: collName == 1 ? "$cmd.aggregate" : collName,
+            cursors: [res.cursor.id],
+        }),
+    );
+}
+
+export function assertInvalidChangeStreamNss(dbName, collName = "test", options) {
+    assertChangeStreamNssBehaviour(dbName, collName, options, (res) =>
+        assert.commandFailedWithCode(res, [ErrorCodes.InvalidNamespace, ErrorCodes.InvalidOptions]),
+    );
+}
+
+export const kPreImagesCollectionDatabase = "config";
+export const kPreImagesCollectionName = "system.preimages";
+
+/**
+ * Asserts that 'changeStreamPreAndPostImages' collection option is present and is enabled for
+ * collection.
+ */
+export function assertChangeStreamPreAndPostImagesCollectionOptionIsEnabled(db, collName) {
+    const collectionInfos = db.getCollectionInfos({name: collName});
+    assert(
+        collectionInfos.length === 1 &&
+            collectionInfos[0].hasOwnProperty("options") &&
+            collectionInfos[0].options.hasOwnProperty("changeStreamPreAndPostImages") &&
+            collectionInfos[0].options["changeStreamPreAndPostImages"]["enabled"] === true,
+        collectionInfos,
+    );
+}
+
+/**
+ * Asserts that 'changeStreamPreAndPostImages' collection option is absent in the collection.
+ */
+export function assertChangeStreamPreAndPostImagesCollectionOptionIsAbsent(db, collName) {
+    const collectionInfos = db.getCollectionInfos({name: collName});
+    assert(!collectionInfos[0].options.hasOwnProperty("changeStreamPreAndPostImages"));
+}
+
+export function getPreImagesCollection(connection) {
+    return connection.getDB(kPreImagesCollectionDatabase).getCollection(kPreImagesCollectionName);
+}
+
+// Returns the pre-images written while performing the write operations.
+export function preImagesForOps(db, writeOps) {
+    const preImagesColl = getPreImagesCollection(db.getMongo());
+    const preImagesCollSortSpec = {"_id.ts": 1, "_id.applyOpsIndex": 1};
+
+    // Determine the id of the last pre-image document written to be able to determine the pre-image
+    // documents written by 'writeOps()'. The pre-image purging job may concurrently remove some
+    // pre-image documents while this function is executing.
+    const preImageIdsBefore = preImagesColl
+        .find({}, {})
+        .sort(preImagesCollSortSpec)
+        .allowDiskUse()
+        .toArray();
+    const lastPreImageId =
+        preImageIdsBefore.length > 0
+            ? preImageIdsBefore[preImageIdsBefore.length - 1]._id
+            : undefined;
+
+    // Perform the write operations.
+    writeOps();
+
+    // Return only newly written pre-images.
+    const preImageFilter = lastPreImageId ? {"_id.ts": {$gt: lastPreImageId.ts}} : {};
+    const result = preImagesColl
+        .find(preImageFilter)
+        .sort(preImagesCollSortSpec)
+        .allowDiskUse()
+        .toArray();
+
+    // Verify that the result is correct by checking if the last pre-image still exists. However, if
+    // no pre-image document existed before 'writeOps()' invocation, the result may be incorrect.
+    assert(
+        lastPreImageId === undefined || preImagesColl.find({_id: lastPreImageId}).itcount() == 1,
+        "Last pre-image document has been removed by the pre-image purging job.",
+    );
+    return result;
+}
+
+/**
+ * Returns documents from the pre-images collection from 'connection' ordered by _id.ts,
+ * _id.applyOpsIndex ascending.
+ */
+export function getPreImages(connection) {
+    return getPreImagesCollection(connection)
+        .find()
+        .sort({"_id.ts": 1, "_id.applyOpsIndex": 1})
+        .allowDiskUse()
+        .toArray();
+}
+
+export function findPreImagesCollectionDescriptions(db) {
+    return db.getSiblingDB(kPreImagesCollectionDatabase).runCommand("listCollections", {
+        filter: {name: kPreImagesCollectionName},
+    });
+}
+
+/**
+ * Asserts that pre-images collection is absent in configDB.
+ */
+export function assertPreImagesCollectionIsAbsent(db) {
+    const result = findPreImagesCollectionDescriptions(db);
+    assert.eq(result.cursor.firstBatch.length, 0);
+}
+
+/**
+ * Asserts that pre-images collection is created in the configDB and has clustered index on _id.
+ */
+export function assertPreImagesCollectionExists(db) {
+    const collectionInfos = findPreImagesCollectionDescriptions(db);
+    assert.eq(collectionInfos.cursor.firstBatch.length, 1, collectionInfos);
+    const preImagesCollectionDescription = collectionInfos.cursor.firstBatch[0];
+    assert.eq(preImagesCollectionDescription.name, "system.preimages");
+
+    // Verifies that the pre-images collection is clustered by _id.
+    assert(
+        preImagesCollectionDescription.hasOwnProperty("options"),
+        preImagesCollectionDescription,
+    );
+    assert(
+        preImagesCollectionDescription.options.hasOwnProperty("clusteredIndex"),
+        preImagesCollectionDescription,
+    );
+    const clusteredIndexDescription = preImagesCollectionDescription.options.clusteredIndex;
+    assert(clusteredIndexDescription, preImagesCollectionDescription);
+}
+
+/**
+ * Cross-checks the content of the pre-image document 'preImage' against the associated oplog entry.
+ */
+export function assertValidChangeStreamPreImageDocument(preImage, db) {
+    function assertChangeStreamPreImageDocumentMatchesOplogEntry(oplogEntry, preImage, wallTime) {
+        // Pre-images documents are recorded only for update and delete commands.
+        assert.contains(oplogEntry.op, ["u", "d"], oplogEntry);
+        assert.eq(preImage._id.nsUUID, oplogEntry.ui, oplogEntry);
+        assert.eq(preImage.operationTime, wallTime, oplogEntry);
+        if (oplogEntry.hasOwnProperty("o2")) {
+            assert.eq(preImage.preImage._id, oplogEntry.o2._id, oplogEntry);
+        }
+    }
+    const oplogEntryCursor = db.oplog.rs.find({ts: preImage._id.ts});
+    assert(oplogEntryCursor.hasNext());
+    const oplogEntry = oplogEntryCursor.next();
+    if (oplogEntry.o.hasOwnProperty("applyOps")) {
+        const applyOpsOplogEntry = oplogEntry;
+        assert.lt(preImage._id.applyOpsIndex, applyOpsOplogEntry.o.applyOps.length);
+        const applyOpsEntry = applyOpsOplogEntry.o.applyOps[preImage._id.applyOpsIndex.toNumber()];
+        assertChangeStreamPreImageDocumentMatchesOplogEntry(
+            applyOpsEntry,
+            preImage,
+            applyOpsOplogEntry.wall,
+        );
+    } else {
+        assert.eq(
+            preImage._id.applyOpsIndex,
+            0,
+            "applyOpsIndex value greater than 0 not expected for non-applyOps oplog entries",
+        );
+        assertChangeStreamPreImageDocumentMatchesOplogEntry(oplogEntry, preImage, oplogEntry.wall);
+    }
+}
+
+/**
+ * Advance the cluster time on all primary nodes of the test fixture, even if the no-op oplog writer is disabled.
+ */
+export function advanceClusterTime(db) {
+    const msg =
+        "Advancing oplog time before waiting for changestream. See SERVER-131399 for motivation";
+    for (const primary of FixtureHelpers.getPrimaries(db)) {
+        assert.commandWorked(primary.getDB("admin").runCommand({appendOplogNote: 1, data: {msg}}));
+    }
+}
+
+/**
+ * Advance the cluster time on every primary of the test fixture, including the config server
+ * primary, then ensure every router has observed the advanced cluster time. This covers a
+ * dedicated (non-config-shard) config server as well as multi-router fixtures, where a mongos
+ * that served none of the preceding traffic may still hold an older cluster time.
+ */
+export function advanceClusterTimeIncludingConfigServer(db) {
+    const msg =
+        "Advancing oplog time before waiting for changestream. See SERVER-131399 for motivation";
+    // In transaction passthroughs the override may have left a transaction open on the test's
+    // session. Commit it now via a non-transactional command on that session: the commands below
+    // run on other sessions, and the override would otherwise try to commit the open transaction
+    // with the wrong lsid and fail with "transaction that was not started".
+    assert.commandWorked(db.adminCommand({ping: 1}));
+
+    // The cluster appendOplogNote below only targets shards; write directly to every replica set
+    // first so a dedicated config server is covered too. In config-shard mode the config server
+    // is also listed in config.shards, so it may receive a second (harmless) no-op write.
+    // getAllReplicas() constructs fresh connections that have not observed the cluster time
+    // gossiped to 'db', so propagate it explicitly: otherwise the no-op below could be
+    // timestamped below that time, which would defeat the purpose of this helper.
+    const signedClusterTime = db.getMongo().getClusterTime();
+    for (const replSet of FixtureHelpers.getAllReplicas(db, true /* includeConfigServers */)) {
+        const primary = replSet.getPrimary();
+        if (signedClusterTime) {
+            primary.advanceClusterTime(signedClusterTime);
+        }
+        assert.commandWorked(primary.getDB("admin").runCommand({appendOplogNote: 1, data: {msg}}));
+    }
+
+    // Run appendOplogNote through every router: it writes a no-op on all shards, and the shard
+    // responses advance the issuing router's cluster time before the command returns.
+    // Temporarily disable mongos pinning so the individual router connections behind the
+    // multi-router proxy are reachable; with pinning active the proxy only exposes the pinned
+    // router.
+    const conn = db.getMongo();
+    const pinnedBefore = TestData.pinToSingleMongos;
+    TestData.pinToSingleMongos = false;
+    try {
+        const routers = conn.isMultiRouter ? conn._mongoConnections : [conn];
+        for (const router of routers) {
+            assert.commandWorked(router.adminCommand({appendOplogNote: 1, data: {msg}}));
+        }
+    } finally {
+        TestData.pinToSingleMongos = pinnedBefore;
+    }
+}
+
+/**
+ * Returns the current cluster time by issuing a 'hello' command to the server and extracting
+ * the cluster time from it.
+ */
+export function getClusterTime(db) {
+    return db.hello().$clusterTime.clusterTime;
+}
+
+/**
+ * Returns the configsvr's currently-known configTime (the applied opTime ts on the configsvr
+ * primary).
+ */
+export function getConfigTime(st) {
+    return st.configRS.getPrimary().adminCommand({replSetGetStatus: 1}).optimes.appliedOpTime.ts;
+}
+
+/**
+ * Returns the next cluster time by incrementing the 'inc' field of the provided 'clusterTime'.
+ */
+export function getNextClusterTime(clusterTime) {
+    const UINT32_MAX = 0xffffffff;
+
+    const t = clusterTime.getTime();
+    const i = clusterTime.getInc();
+    if (i === UINT32_MAX) {
+        if (t === UINT32_MAX) {
+            throw new Error("clusterTime overflow: cannot advance Timestamp any further");
+        }
+
+        // Move to the next second and reset increment.
+        return new Timestamp(t + 1, 0);
+    }
+
+    return new Timestamp(t, i + 1);
+}
+
+/**
+ * Records and returns the current time, and waits for the cluster time to advance past it. This
+ * ensures that any change stream opened with startAtOperationTime equal to the recorded time will
+ * have its cluster time observed by the change stream's initialization logic, and thus will not be
+ * considered a future cluster time.
+ * Requires a config server, thus can only be used in sharded cluster tests. Also requires the
+ * no-op oplog writer to be running, as it relies on the cluster time frequently advancing.
+ */
+export function waitForClusterTime(db, conn) {
+    const currentTime = getNextClusterTime(getClusterTime(db));
+
+    // Wait until the current cluster time on the config server passes the initially recorded
+    // cluster time, so that the placement history is actually able to respond for that time.
+    assert.soon(() => {
+        // Return values of the API are:
+        // - OK: 0
+        // - NotAvailable: 1
+        // - FutureClusterTime: 2
+        const res = conn.configRS.getPrimary().getDB("admin").runCommand({
+            _configsvrGetHistoricalPlacement: "",
+            at: currentTime,
+            targetWholeCluster: true,
+            ignoreRemovedShards: false,
+            checkIfPointInTimeIsInFuture: true,
+        }).historicalPlacement.status;
+        return res == 0;
+    }, "Timed out waiting for cluster time to pass current time");
+
+    return currentTime;
+}
+
+/**
+ * Distributes collection data across multiple shards by splitting and moving chunks.
+ *
+ * @param {Object} db - The database object to execute admin commands on
+ * @param {Object} collection - The collection to distribute data for
+ * @param {Object} distributionConfig - Configuration object for data distribution
+ * @param {*} distributionConfig.middle - The split point for creating initial chunks
+ * @param {Array<Object>} distributionConfig.chunks - Array of chunk configurations to move
+ * @param {*} distributionConfig.chunks[].find - Query to identify the chunk to move
+ * @param {string} distributionConfig.chunks[].to - Target shard name to move the chunk to
+ */
+export function distributeCollectionDataOverShards(db, collection, distributionConfig) {
+    assert.commandWorked(
+        db.adminCommand({
+            split: collection.getFullName(),
+            middle: distributionConfig.middle,
+        }),
+    );
+    for (const chunkConfig of distributionConfig.chunks) {
+        assert.commandWorked(
+            db.adminCommand({
+                moveChunk: collection.getFullName(),
+                find: chunkConfig.find,
+                to: chunkConfig.to,
+                _waitForDelete: true,
+            }),
+        );
+    }
+}
+
+/**
+ * If the balancer is not running, starts the balancer, executes the callback and stops the balancer
+ * again. If the balancer is already running, simply executes the callback.
+ */
+export function withBalancerEnabled(conn, cb) {
+    const balancerStatus = assert.commandWorked(
+        conn.adminCommand({
+            balancerStatus: 1,
+        }),
+    );
+    if (balancerStatus.mode == "full") {
+        // If the balancer is already enabled, just run the callback.
+        return cb();
+    } else {
+        // If the balancer is not enabled, start it, run the callback, and then stop it again.
+        assert.commandWorked(conn.adminCommand({balancerStart: 1}));
+        try {
+            return cb();
+        } finally {
+            assert.commandWorked(conn.adminCommand({balancerStop: 1}));
+        }
+    }
+}
+
+/**
+ * Helper function to add a new ReplSetTest shard into the cluster.
+ */
+export function addShardToCluster(st, shardName, numNodes, rsNodeOptions) {
+    const replTest = new ReplSetTest({
+        name: shardName,
+        nodes: numNodes,
+        nodeOptions: rsNodeOptions,
+    });
+    replTest.startSet({shardsvr: ""});
+    replTest.initiate();
+    assert.commandWorked(st.s.adminCommand({addShard: replTest.getURL(), name: shardName}));
+    return replTest;
+}
+
+/**
+ * Removes the specified shard from the cluster (starting the balancer for the removal and stopping
+ * it afterwards).
+ * 'st' must be a ShardingTest instance.
+ */
+export function removeShardFromCluster(st, shardName, before) {
+    withBalancerEnabled(st.s, () => {
+        if (before) {
+            before();
+        }
+        removeShard(st, shardName);
+    });
+}
+
+/**
+ * Build a $currentOp filter that selects cursors originating from a command with the given comment.
+ */
+export function cursorCommentFilter(comment) {
+    return {"cursor.originatingCommand.comment": comment};
+}
+
+/**
+ * Lists idle cursors via $currentOp. Works with both mongos adminDB (for data shard cursors)
+ * and a direct config server connection (for config cursors not visible through mongos).
+ *
+ * When called against mongos, uses idleConnections:true to see data shard cursors.
+ * When called against a config server with localOps:true, sees config-local cursors.
+ *
+ * @param {DB} adminDB - The admin database to query (mongos or direct config server)
+ * @param {Object} filter - Additional $match filter for selecting specific cursors
+ * @param {Object} opts - $currentOp options override (default: {idleConnections: true})
+ */
+export function listIdleCursors(adminDB, filter = {}, opts = {idleConnections: true}) {
+    return adminDB
+        .aggregate([
+            {$currentOp: Object.assign({idleCursors: true, allUsers: true}, opts)},
+            {$match: {type: "idleCursor"}},
+            {$match: filter},
+        ])
+        .toArray();
+}
+
+/**
+ * Assert that open idle cursors exist on exactly the expected data shards and optionally on the
+ * config server.
+ * @param {ShardingTest} st - The sharding test fixture
+ * @param {Array<string>} expectedDataShards - Expected shard names (data shards only)
+ * @param {boolean} expectedConfigCursor - Whether a config server cursor is expected
+ * @param {Object} filter - Filter to select specific cursors (e.g., by comment)
+ */
+export function assertOpenCursors(st, expectedDataShards, expectedConfigCursor, filter = {}) {
+    const adminDB = st.s.getDB("admin");
+    const configAdminDB = st.configRS.getPrimary().getDB("admin");
+
+    assert.soonNoExcept(
+        () => {
+            // Query all open cursors matching the filter via mongos.
+            const dataShardCursors = listIdleCursors(adminDB, filter);
+            jsTest.log.debug("Open shard cursors", {dataShardCursors});
+            const shardsWithOpenCursors = dataShardCursors.map((cursor) => cursor.shard);
+
+            // In config shard mode, the config server is also a data shard (named "config").
+            // Cursors on it are reported as regular data shard cursors via mongos. When the
+            // caller expects a config cursor, attribute any "config" entry to it and strip
+            // it out before comparing against 'expectedDataShards'.
+            const isConfigShard = jsTestOptions().configShard;
+            const shouldRemoveConfigShardFromDataShardList = !isConfigShard || expectedConfigCursor;
+            const dataShardsWithOpenCursors = shouldRemoveConfigShardFromDataShardList
+                ? shardsWithOpenCursors.filter((shard) => shard !== "config")
+                : shardsWithOpenCursors;
+            assert.sameMembers(
+                expectedDataShards,
+                dataShardsWithOpenCursors,
+                `Expected ${expectedDataShards} but got ${dataShardsWithOpenCursors}`,
+            );
+
+            // With a dedicated config server, check for config cursors directly via
+            // localOps since they don't appear in the mongos $currentOp results.
+            if (!isConfigShard) {
+                const configCursors = listIdleCursors(configAdminDB, filter, {localOps: true});
+                jsTest.log.debug("Open config cursors", {configCursors});
+                const configMatch = expectedConfigCursor
+                    ? configCursors.length > 0
+                    : configCursors.length == 0;
+                return configMatch;
+            } else {
+                // In config-shard mode the config server is one of the data shards. When the
+                // caller expects a config cursor, verify "config" was in the data-shard cursor
+                // list reported by mongos before we stripped it out for the sameMembers check.
+                if (expectedConfigCursor && !shardsWithOpenCursors.includes("config")) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        () => {
+            const dataCursors = listIdleCursors(adminDB, filter);
+            const configCursorCount = listIdleCursors(configAdminDB, filter, {
+                localOps: true,
+            }).length;
+            return (
+                `Expected data cursors on ${tojsononeline(expectedDataShards)}, ` +
+                `Actual data shards: ${tojsononeline(dataCursors.map((c) => c.shard))}, ` +
+                `Expected config cursor: ${expectedConfigCursor}. ` +
+                `Actual config cursors: ${configCursorCount}`
+            );
+        },
+    );
+}
+
+// LOGV2 IDs for v2 shard targeter whitebox assertions.
+export const V2TargeterLogCodes = Object.freeze({
+    kTopologyHandlerStageStateTransition: 10657506,
+    kShardTargeterDbPresentPlacementNotAvailableSwitchToV1: 12321700,
+    kShardTargeterDbAbsentPlacementNotAvailableSwitchToV1: 12321703,
+    kClusterShardTargeterPlacementNotAvailableSwitchToV1: 12321704,
+    kCollOrDbPlacementRefresh: 10922912,
+    kCollOrDbShardTargeterInitStrictMode: 11600500,
+    kCollOrDbShardTargeterStartChangeStreamSegment: 10922905,
+    kCollOrDbDbAbsentEventHandling: 12013809,
+    kCollectionHandleMoveChunk: 10917004,
+    kClusterShardTargeterInitStrictMode: 11138104,
+    kClusterShardTargeterStartChangeStreamSegment: 11138108,
+    kClusterSetEventHandler: 11138113,
+    kClusterPlacementRefresh: 11138117,
+});
+
+function tryParseJson(line) {
+    try {
+        return JSON.parse(line);
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Capture logs from `conn` while repeatedly calling `fn`, polling until all `expectedCodes`
+ * appear in order. When `expectedCodes` is empty, `fn` is called once with no polling.
+ *
+ * After all codes are found, optional per-code assertion callbacks in `codeAssertionFnMap`
+ * are invoked with the matching entry's `attr`. Not every code needs a callback.
+ *
+ * @param {Mongo} conn - The connection whose logs to capture
+ * @param {Array<number>} expectedCodes - LOGV2 IDs expected in order (empty = call fn once)
+ * @param {Function} fn - The function to execute (called once or polled repeatedly)
+ * @param {Object} [codeAssertionFnMap] - Optional map of {code: (attr) => {...}} callbacks
+ */
+export function awaitLogMessageCodes(conn, expectedCodes, fn, codeAssertionFnMap = {}) {
+    const offsetBefore = checkLog.getGlobalLog(conn).length;
+    let logs = [];
+
+    assert.soon(
+        () => {
+            fn();
+            logs = checkLog
+                .getGlobalLog(conn)
+                .slice(offsetBefore)
+                .map(tryParseJson)
+                .filter((e) => e !== null);
+            let matchIdx = 0;
+            for (const entry of logs) {
+                if (matchIdx < expectedCodes.length && entry.id === expectedCodes[matchIdx]) {
+                    matchIdx++;
+                }
+            }
+            return matchIdx === expectedCodes.length;
+        },
+        () => {
+            let matchIdx = 0;
+            for (const entry of logs) {
+                if (matchIdx < expectedCodes.length && entry.id === expectedCodes[matchIdx]) {
+                    matchIdx++;
+                }
+            }
+            const missing = expectedCodes.slice(matchIdx);
+            return `Timed out waiting for log codes ${tojsononeline(missing)} in ${logs.length} entries`;
+        },
+    );
+    const matchedLogAttrs = {};
+    for (const log of logs) {
+        if (expectedCodes.includes(log.id) && !(log.id in matchedLogAttrs)) {
+            matchedLogAttrs[log.id] = log.attr || {};
+        }
+    }
+    for (const [code, assertFn] of Object.entries(codeAssertionFnMap)) {
+        const numCode = Number(code);
+        assert(numCode in matchedLogAttrs, `Code ${code} not found in captured logs`);
+        assertFn(matchedLogAttrs[numCode]);
+    }
+}
+
+/**
+ * Returns all state transitions of the 'ChangeStreamHandleTopologyChangeV2Stage' stage logged on
+ * `conn` since log offset `offsetBefore`.
+ */
+function collectV2StageStateTransitions(conn, logOffset) {
+    return checkLog
+        .getGlobalLog(conn)
+        .slice(logOffset)
+        .map(tryParseJson)
+        .filter(
+            (e) => e !== null && e.id === V2TargeterLogCodes.kTopologyHandlerStageStateTransition,
+        )
+        .map((e) => ({from: e.attr.previous, to: e.attr.new}));
+}
+
+/**
+ * Asserts that no transition *from* `state` appears in the logs on `conn` since `offsetBefore`.
+ */
+export function assertNoV2StageStateTransitionFrom(conn, offsetBefore, state) {
+    const transitions = collectV2StageStateTransitions(conn, offsetBefore);
+    assert(
+        !transitions.some((t) => t.from === state),
+        `Expected no transition from state '${state}', found: ${tojsononeline(transitions)}`,
+    );
+}
+
+/**
+ * Polls `fn` until the logs on `conn` contain a subsequence of
+ * 'ChangeStreamHandleTopologyChangeV2Stage' state transitions that matches every element of
+ * `expectedTransitions` (each `{from: string, to: string}`) in order.
+ * Interleaved unrelated transitions are tolerated via subsequence matching.
+ */
+export function awaitV2StageStateTransitions(conn, logOffset, expectedTransitions, fn) {
+    assert.soon(
+        () => {
+            fn();
+            const observed = collectV2StageStateTransitions(conn, logOffset);
+            let idx = 0;
+            for (const t of observed) {
+                if (
+                    idx < expectedTransitions.length &&
+                    t.from === expectedTransitions[idx].from &&
+                    t.to === expectedTransitions[idx].to
+                ) {
+                    idx++;
+                }
+            }
+            return idx === expectedTransitions.length;
+        },
+        () =>
+            `Timed out waiting for transitions ${tojsononeline(expectedTransitions)}, ` +
+            `observed: ${tojsononeline(collectV2StageStateTransitions(conn, logOffset))}`,
+    );
+}
+
+/**
+ * Assert that data in the shards is distributed according to the given expected counts.
+ * @param {DB} db - The database
+ * @param {Collection} coll - The collection
+ * @param {Array<[Mongo, number]>} expectedCounts - Array of [shardConn, expectedDocCount] pairs
+ */
+export function assertCollDataDistribution(db, coll, expectedCounts) {
+    for (const [shardConn, expectedCount] of expectedCounts) {
+        assert.soon(
+            () => {
+                const docs = shardConn.getDB(db.getName())[coll.getName()].find().toArray();
+                return expectedCount == docs.length;
+            },
+            "Expected " + expectedCount + " documents on " + shardConn,
+        );
+    }
+}
+
+/**
+ * Distributes the given collection according to the given configuration and checks the expected
+ * number of documents per shard match the ones given in distributionConfig.expectedCounts.
+ */
+export function ensureShardDistribution(db, coll, distributionConfig) {
+    distributeCollectionDataOverShards(db, coll, distributionConfig);
+    assertCollDataDistribution(db, coll, distributionConfig.expectedCounts);
+}
+
+/**
+ * Runs `fn` once (typically consuming change events that trigger a post-image lookup) and reports,
+ * per node, where the lookup ran. Returns a map of node -> observation:
+ *   - localReadCount: legacy local-read log (id 5837600) scoped to `comment`. Omit `comment` to skip.
+ *   - indexOpsDelta: {indexName: $indexStats accesses.ops delta across `fn`}, i.e. which index the
+ *     lookup used.
+ *   - isRunningOptimizedUpdateLookup: whether *this node* runs the optimized local updateLookup.
+ *     Checked per node, not once globally, since in a multiversion cluster each node's binary (and
+ *     therefore its updateLookup behavior) can differ.
+ */
+export function observePostImageLookup({nodes, ns, comment, fn}) {
+    const opsBefore = nodes.map((node) => indexAccessOpsByName(node.getCollection(ns)));
+    fn();
+    return new Map(
+        nodes.map((node, i) => {
+            const opsAfter = indexAccessOpsByName(node.getCollection(ns));
+            const indexOpsDelta = Object.fromEntries(
+                Object.keys(opsAfter).map((indexName) => {
+                    return [indexName, opsAfter[indexName] - (opsBefore[i][indexName] || 0)];
+                }),
+            );
+            return [
+                node,
+                {
+                    localReadCount:
+                        comment === undefined ? undefined : getLocalReadCount(node, ns, comment),
+                    indexOpsDelta: indexOpsDelta,
+                    isRunningOptimizedUpdateLookup: FeatureFlagUtil.isPresentAndEnabled(
+                        node.getDB("admin"),
+                        "ChangeStreamOptimizedUpdateLookup",
+                    ),
+                },
+            ];
+        }),
+    );
+}
+
+/** Helper class to hold cursors and close them all at once. */
+export class CursorList {
+    constructor() {
+        this._cursors = [];
+    }
+
+    // Adds one or more cursors to the list and returns the first cursor.
+    push(firstCursor, ...additionalCursors) {
+        this._cursors.push(firstCursor, ...additionalCursors);
+        return firstCursor;
+    }
+
+    pop() {
+        return this._cursors.pop();
+    }
+
+    length() {
+        return this._cursors.length;
+    }
+
+    // Closes all closable cursors in the list and empties the list.
+    closeAll() {
+        for (const cursor of this._cursors) {
+            if (cursor instanceof DBCommandCursor && !cursor.isClosed()) {
+                cursor.close();
+            }
+        }
+    }
+}

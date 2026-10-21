@@ -1,0 +1,26 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    shutdown:
+        command_name: shutdown
+        cpp_name: ShutdownRequest
+        description: "Shutdown the database"
+        namespace: ignored
+        api_version: ""
+        strict: true
+        fields:
+            force:
+                description: "True if we want to step down a primary node immediately"
+                type: bool
+                default: false
+            timeoutSecs:
+                description: "Time permitted for stepdown and quiesce mode"
+                type: safeInt64
+                default: 15

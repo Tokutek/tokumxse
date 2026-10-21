@@ -1,0 +1,13 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "generate_fuzz_config",
+    srcs = [
+        "config_fuzzer_limits.py",
+        "config_fuzzer_wt_limits.py",
+        "mongo_fuzzer_configs.py",
+        "plugin.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [],
+)

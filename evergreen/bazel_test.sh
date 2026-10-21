@@ -1,0 +1,96 @@
+# Usage:
+#   bazel_test [arguments]
+#
+# Required environment variables:
+# * ${targets} - Test targets
+# * ${bazel_args} - Extra command line args to pass to "bazel test"
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+. "$DIR/prelude.sh"
+
+set -o errexit
+set -o verbose
+set -o pipefail
+
+. "$DIR/bazel_evergreen_shutils.sh"
+
+bazel_evergreen_shutils::activate_and_cd_src
+bazel_evergreen_shutils::export_ssl_paths_if_needed
+
+# Use `eval` to force evaluation of the environment variables in the echo statement:
+eval echo "Execution environment: Targets: ${targets}"
+
+BAZEL_BINARY="$(bazel_evergreen_shutils::bazel_get_binary_path)"
+export BAZEL_BINARY
+
+# Mode-specific LOCAL_ARG and release flag
+LOCAL_ARG="$(bazel_evergreen_shutils::compute_local_arg test)"
+
+# If we are doing a patch build or we are building a non-push
+# build on the waterfall, then we don't need the --release
+# flag. Otherwise, this is potentially a build that "leaves
+# the building", so we do want that flag.
+LOCAL_ARG="$(bazel_evergreen_shutils::maybe_release_flag "$LOCAL_ARG")"
+
+# Possibly scale test timeout and append to bazel_args
+bazel_evergreen_shutils::maybe_scale_test_timeout_and_append
+
+MONGO_VERSION_ARG="--define=MONGO_VERSION=${version}"
+if [[ -n "${no_mongo_version}" ]]; then
+    MONGO_VERSION_ARG=""
+fi
+
+# Build the shared flags and persist the --config subset
+ALL_FLAGS="--verbose_failures ${LOCAL_ARG} ${MONGO_VERSION_ARG} ${bazel_args:-} ${bazel_compile_flags:-} ${task_compile_flags:-} ${patch_compile_flags:-}"
+echo "${ALL_FLAGS}" >.bazel_build_flags
+
+# to capture exit codes
+set +o errexit
+
+# Build then test with retries. `bazel build` fetches all external dependencies as a
+# prerequisite of compiling, so this retrying phase subsumes a separate `bazel fetch` and also
+# retries genuine build failures. `bazel test` builds and runs in one command, so without a
+# dedicated build phase a build failure would slip into the test phase below, which runs with
+# RETRY_ON_FAIL=0 (so test failures fail fast and are reported faithfully) and would not be
+# retried. The build outputs land in the same output_base, so `bazel test` reuses them from
+# cache and only executes the tests. Keep the flags identical (minus the cache-neutral BEP
+# file) so the test phase does not re-analyze and rebuild. The `test` command runs with
+# --build_tests_only (set under the test: config in .bazelrc), which limits the build to test
+# targets and their deps; pass it explicitly here so this `build` builds the same set rather
+# than every target in the ${targets} pattern (e.g. //src/...). Also force
+# --remote_download_outputs=minimal: this phase only needs to confirm the targets compile, so
+# on a remote build it should leave outputs in the CAS rather than download test binaries to
+# this host. Tests execute remotely, so the test phase consumes them straight from the CAS and
+# downloads only what its own policy requires. The default is "all" outside the remote_test
+# config, hence the explicit override; it is a no-op for local exec (no remote executor).
+export RETRY_ON_FAIL=1
+bazel_evergreen_shutils::retry_bazel_cmd 3 "$BAZEL_BINARY" \
+    build --build_tests_only --remote_download_outputs=minimal ${ALL_FLAGS} ${targets}
+RET=$?
+
+if [[ "$RET" == "0" ]]; then
+    export RETRY_ON_FAIL=0
+    bazel_evergreen_shutils::retry_bazel_cmd 3 "$BAZEL_BINARY" \
+        test ${ALL_FLAGS} --build_event_json_file=build_events.json ${targets}
+    RET=$?
+
+    if [[ "$RET" -eq 124 ]]; then
+        echo "Bazel timed out after ${build_timeout_seconds:-<unspecified>} seconds."
+    elif [[ "$RET" != "0" ]]; then
+        echo "Errors were found during bazel test, failing the execution"
+    fi
+fi
+
+bazel_evergreen_shutils::write_last_engflow_link
+
+set -o errexit
+
+# The --config flag needs to stay consistent between invocations to avoid evicting the previous results.
+# Strip out anything that isn't a --config flag that could interfere with the run command.
+if [[ "$RET" != "0" ]]; then
+    CONFIG_FLAGS="$(bazel_evergreen_shutils::extract_config_flags "${ALL_FLAGS}")"
+    eval ${BAZEL_BINARY} run ${CONFIG_FLAGS} //buildscripts:gather_failed_tests || true
+fi
+
+: "${RET:=1}"
+exit "${RET}"

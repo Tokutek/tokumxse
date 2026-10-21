@@ -1,0 +1,397 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/agg/mock_stage.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/memory_tracking/memory_usage_tracker.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/window_function/partition_iterator.h"
+#include "mongo/db/pipeline/window_function/window_bounds.h"
+#include "mongo/db/pipeline/window_function/window_function.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_removable_document.h"
+#include "mongo/db/pipeline/window_function/window_function_integral.h"
+#include "mongo/db/pipeline/window_function/window_function_min_max.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/compiler/logical_model/sort_pattern/sort_pattern.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
+
+#include <deque>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace {
+
+class WindowFunctionExecRemovableDocumentTest : public AggregationContextFixture {
+public:
+    WindowFunctionExecRemovableDocumentTest() {}
+    WindowFunctionExecRemovableDocument createForFieldPath(
+        std::deque<DocumentSource::GetNextResult> docs,
+        const std::string& inputPath,
+        WindowBounds::DocumentBased bounds) {
+        _docStage = exec::agg::MockStage::createForTest(std::move(docs), getExpCtx());
+        _iter = std::make_unique<PartitionIterator>(
+            getExpCtx().get(), _docStage.get(), &_tracker, boost::none, boost::none);
+        auto input = ExpressionFieldPath::parse(
+            getExpCtx().get(), inputPath, getExpCtx()->variablesParseState);
+        std::unique_ptr<WindowFunctionState> maxFunc =
+            std::make_unique<WindowFunctionMax>(getExpCtx().get());
+        return WindowFunctionExecRemovableDocument(
+            _iter.get(), std::move(input), std::move(maxFunc), bounds, &_tracker["output"]);
+    }
+
+    WindowFunctionExecRemovableDocument createForFieldPath(
+        std::deque<DocumentSource::GetNextResult> docs,
+        const std::string& inputPath,
+        const std::string& sortByPath,
+        WindowBounds::DocumentBased bounds) {
+        _docStage = exec::agg::MockStage::createForTest(std::move(docs), getExpCtx());
+        _iter = std::make_unique<PartitionIterator>(
+            getExpCtx().get(), _docStage.get(), &_tracker, boost::none, boost::none);
+        auto input = ExpressionFieldPath::parse(
+            getExpCtx().get(), inputPath, getExpCtx()->variablesParseState);
+        auto sortBy = ExpressionFieldPath::parse(
+            getExpCtx().get(), sortByPath, getExpCtx()->variablesParseState);
+        std::unique_ptr<WindowFunctionState> integralFunc =
+            std::make_unique<WindowFunctionIntegral>(getExpCtx().get());
+        return WindowFunctionExecRemovableDocument(
+            _iter.get(),
+            ExpressionArray::create(getExpCtx().get(),
+                                    std::vector<boost::intrusive_ptr<Expression>>{sortBy, input}),
+            std::move(integralFunc),
+            bounds,
+            &_tracker["output"]);
+    }
+
+    auto advanceIterator() {
+        return _iter->advance();
+    }
+
+    MemoryUsageTracker _tracker{false,
+                                MemoryUsageLimit{100 * 1024 * 1024} /* default memory limit */};
+
+private:
+    boost::intrusive_ptr<exec::agg::MockStage> _docStage;
+    std::unique_ptr<PartitionIterator> _iter;
+};
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, AccumulateCurrentToInteger) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{
+        Document{{"a", 3}}, Document{{"a", 2}}, Document{{"a", 1}}};
+    {
+        auto mgr = createForFieldPath(docs, "$a", WindowBounds::DocumentBased{0, 2});
+        ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+    }
+
+    {
+        auto mgr = createForFieldPath(
+            std::move(docs), "$a", WindowBounds::DocumentBased{WindowBounds::Current{}, 2});
+        ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+    }
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, AccumulateIntegerToCurrent) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{
+        Document{{"a", 3}}, Document{{"a", 2}}, Document{{"a", 1}}};
+    auto mgr = createForFieldPath(
+        std::move(docs), "$a", WindowBounds::DocumentBased{-1, WindowBounds::Current{}});
+    ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, AccumulateCurrentToCurrent) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{
+        Document{{"a", 3}}, Document{{"a", 2}}, Document{{"a", 1}}};
+    auto mgr = createForFieldPath(
+        std::move(docs),
+        "$a",
+        WindowBounds::DocumentBased{WindowBounds::Current{}, WindowBounds::Current{}});
+    ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, AccumulateIntegerToInteger) {
+    {
+        const auto docsOne = std::deque<DocumentSource::GetNextResult>{
+            Document{{"a", 3}}, Document{{"a", 4}}, Document{{"a", 2}}, Document{{"a", 1}}};
+        auto mgr = createForFieldPath(std::move(docsOne), "$a", WindowBounds::DocumentBased{-1, 1});
+        ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+    }
+
+    {
+        const auto docsTwo = std::deque<DocumentSource::GetNextResult>{
+            Document{{"a", 3}}, Document{{"a", 4}}, Document{{"a", 2}}, Document{{"a", 1}}};
+        auto mgr = createForFieldPath(docsTwo, "$a", WindowBounds::DocumentBased{-3, -1});
+        ASSERT(mgr.getNext().nullish());  // Default value
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+    }
+
+    {
+        const auto docsThree = std::deque<DocumentSource::GetNextResult>{
+            Document{{"a", 5}}, Document{{"a", 4}}, Document{{"a", 2}}, Document{{"a", 1}}};
+        auto mgr =
+            createForFieldPath(std::move(docsThree), "$a", WindowBounds::DocumentBased{1, 3});
+        ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+        advanceIterator();
+        ASSERT(mgr.getNext().nullish());  // Default value
+    }
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, DefaultValueWorksAsExpected) {
+    const auto docsOne =
+        std::deque<DocumentSource::GetNextResult>{Document{{"a", 3}}, Document{{"a", 4}}};
+    {
+        auto mgr = createForFieldPath(docsOne, "$a", WindowBounds::DocumentBased{-3, -2});
+        ASSERT(mgr.getNext().nullish());  // Default value
+        advanceIterator();
+        ASSERT(mgr.getNext().nullish());  // Default value
+    }
+
+    {
+        auto mgr = createForFieldPath(std::move(docsOne), "$a", WindowBounds::DocumentBased{2, 3});
+        ASSERT(mgr.getNext().nullish());  // Default value
+        advanceIterator();
+        ASSERT(mgr.getNext().nullish());  // Default value
+    }
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, RightUnboundedDoesNotAddDocumentsDuringWindow) {
+    {
+        const auto docs = std::deque<DocumentSource::GetNextResult>{
+            Document{{"a", 3}}, Document{{"a", 2}}, Document{{"a", 1}}, Document{{"a", 17}}};
+        auto mgr = createForFieldPath(
+            std::move(docs),
+            "$a",
+            WindowBounds::DocumentBased{WindowBounds::Current{}, WindowBounds::Unbounded{}});
+        ASSERT_VALUE_EQ(Value(17), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(17), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(17), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(17), mgr.getNext());
+        advanceIterator();
+    }
+
+    {
+        const auto docsTwo = std::deque<DocumentSource::GetNextResult>{
+            Document{{"a", 18}}, Document{{"a", 2}}, Document{{"a", 1}}, Document{{"a", 17}}};
+        auto mgr = createForFieldPath(
+            std::move(docsTwo), "$a", WindowBounds::DocumentBased{-1, WindowBounds::Unbounded{}});
+        ASSERT_VALUE_EQ(Value(18), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(18), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(17), mgr.getNext());
+        advanceIterator();
+        ASSERT_VALUE_EQ(Value(17), mgr.getNext());
+        advanceIterator();
+    }
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, EnsureFirstDocumentIsNotRemovedEarly) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{
+        Document{{"a", 4}}, Document{{"a", 1}}, Document{{"a", 2}}};
+    auto mgr = createForFieldPath(std::move(docs), "$a", WindowBounds::DocumentBased{0, 2});
+    ASSERT_VALUE_EQ(Value(4), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, EnsureEarlyDocumentsAreNotIncludedIncorrectly) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{Document{{"a", 6}},
+                                                                Document{{"a", 7}},
+                                                                Document{{"a", 2}},
+                                                                Document{{"a", 1}},
+                                                                Document{{"a", 0}}};
+    auto mgr = createForFieldPath(std::move(docs), "$a", WindowBounds::DocumentBased{2, 5});
+    ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+    advanceIterator();
+    ASSERT_VALUE_EQ(Value(0), mgr.getNext());
+    advanceIterator();
+    ASSERT(mgr.getNext().nullish());  // Default value
+    advanceIterator();
+    ASSERT(mgr.getNext().nullish());  // Default value
+    advanceIterator();
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, CanResetFunction) {
+    {
+        const auto docs = std::deque<DocumentSource::GetNextResult>{Document{{"a", 3}, {"key", 1}},
+                                                                    Document{{"a", 2}, {"key", 1}},
+                                                                    Document{{"a", 2}, {"key", 2}},
+                                                                    Document{{"a", 1}, {"key", 2}},
+                                                                    Document{{"a", 1}, {"key", 3}}};
+        auto mock = exec::agg::MockStage::createForTest(std::move(docs), getExpCtx());
+        auto key = ExpressionFieldPath::createPathFromString(
+            getExpCtx().get(), "key", getExpCtx()->variablesParseState);
+        MemoryUsageTracker tracker{false,
+                                   MemoryUsageLimit{100 * 1024 * 1024} /* default memory limit */};
+        auto iter = PartitionIterator{
+            getExpCtx().get(),
+            mock.get(),
+            &tracker,
+            boost::optional<boost::intrusive_ptr<Expression>>(key),
+            boost::none,
+        };
+        auto input =
+            ExpressionFieldPath::parse(getExpCtx().get(), "$a", getExpCtx()->variablesParseState);
+        CollatorInterfaceMock collator = CollatorInterfaceMock::MockType::kToLowerString;
+        std::unique_ptr<WindowFunctionState> maxFunc =
+            std::make_unique<WindowFunctionMax>(getExpCtx().get());
+        auto mgr = WindowFunctionExecRemovableDocument(&iter,
+                                                       std::move(input),
+                                                       std::move(maxFunc),
+                                                       WindowBounds::DocumentBased{0, 0},
+                                                       &_tracker["output"]);
+        ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+        iter.advance();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+        iter.advance();
+        mgr.reset();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+        iter.advance();
+        ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+        iter.advance();
+        mgr.reset();
+        ASSERT_VALUE_EQ(Value(1), mgr.getNext());
+    }
+
+    {
+        const auto docsTwo =
+            std::deque<DocumentSource::GetNextResult>{Document{{"a", 3}, {"key", 1}},
+                                                      Document{{"a", 2}, {"key", 1}},
+                                                      Document{{"a", 2}, {"key", 2}},
+                                                      Document{{"a", 1}, {"key", 2}}};
+        auto mockTwo = exec::agg::MockStage::createForTest(std::move(docsTwo), getExpCtx());
+        auto keyTwo = ExpressionFieldPath::createPathFromString(
+            getExpCtx().get(), "key", getExpCtx()->variablesParseState);
+        MemoryUsageTracker tracker{false,
+                                   MemoryUsageLimit{100 * 1024 * 1024} /* default memory limit */};
+
+        auto iter = PartitionIterator{
+            getExpCtx().get(),
+            mockTwo.get(),
+            &tracker,
+            boost::optional<boost::intrusive_ptr<Expression>>(keyTwo),
+            boost::none,
+        };
+        auto input =
+            ExpressionFieldPath::parse(getExpCtx().get(), "$a", getExpCtx()->variablesParseState);
+        auto maxFunc = std::make_unique<WindowFunctionMax>(getExpCtx().get());
+        auto mgr = WindowFunctionExecRemovableDocument(&iter,
+                                                       std::move(input),
+                                                       std::move(maxFunc),
+                                                       WindowBounds::DocumentBased{-1, 0},
+                                                       &_tracker["output"]);
+        ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+        iter.advance();
+        ASSERT_VALUE_EQ(Value(3), mgr.getNext());
+        iter.advance();
+        mgr.reset();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+        iter.advance();
+        ASSERT_VALUE_EQ(Value(2), mgr.getNext());
+    }
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, InputExpressionAllowedToCreateVariables) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{
+        Document{{"a", 1}}, Document{{"a", 2}}, Document{{"a", 3}}};
+    auto docStage = exec::agg::MockStage::createForTest(std::move(docs), getExpCtx());
+    auto iter = std::make_unique<PartitionIterator>(
+        getExpCtx().get(), docStage.get(), &_tracker, boost::none, boost::none);
+    auto filterBSON =
+        fromjson("{$filter: {input: [1, 2, 3], as: 'num', cond: {$gte: ['$$num', 2]}}}");
+    auto input = ExpressionFilter::parse(
+        getExpCtx().get(), filterBSON.firstElement(), getExpCtx()->variablesParseState);
+    auto maxFunc = std::make_unique<WindowFunctionMax>(getExpCtx().get());
+    auto mgr = WindowFunctionExecRemovableDocument(iter.get(),
+                                                   std::move(input),
+                                                   std::move(maxFunc),
+                                                   WindowBounds::DocumentBased{-1, 0},
+                                                   &_tracker["output"]);
+    // The input is a constant [2, 3] for each document.
+    ASSERT_VALUE_EQ(Value(std::vector<Value>{Value(2), Value(3)}), mgr.getNext());
+    iter->advance();
+    ASSERT_VALUE_EQ(Value(std::vector<Value>{Value(2), Value(3)}), mgr.getNext());
+    iter->advance();
+    ASSERT_VALUE_EQ(Value(std::vector<Value>{Value(2), Value(3)}), mgr.getNext());
+}
+
+TEST_F(WindowFunctionExecRemovableDocumentTest, CanReceiveSortByExpression) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{Document{{"x", 1}, {"y", 0}},
+                                                                Document{{"x", 3}, {"y", 2}},
+                                                                Document{{"x", 5}, {"y", 4}},
+                                                                Document{{"x", 5}, {"y", 5}},
+                                                                Document{{"x", 6}, {"y", 3}}};
+    // Test 'sortBy'.
+    auto mgr = createForFieldPath(
+        docs, "$y" /* input */, "$x" /* sortBy */, WindowBounds::DocumentBased{-1, 1});
+    double expectedIntegral = 2.0;  // (2 + 0) * (3 - 1) / 2.0 = 2.0
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+    advanceIterator();
+    expectedIntegral += 6.0;  // (4 + 2) * (5 - 3) / 2.0 = 6.0
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+    advanceIterator();
+    expectedIntegral += 0.0 - 2.0;
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+    advanceIterator();
+    expectedIntegral += 4.0 - 6.0;
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+    advanceIterator();
+    expectedIntegral -= 0.0;
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+}
+
+}  // namespace
+}  // namespace mongo

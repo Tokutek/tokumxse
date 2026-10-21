@@ -1,0 +1,74 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/query/client_cursor/cursor_id.h"
+        - "mongo/db/query/client_cursor/release_memory_util.h"
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+types:
+    cursorId:
+        bson_serialization_type: long
+        description: "Uniquely identifies a single cursor on a particular mongoS or mongoD."
+        cpp_type: mongo::CursorId
+        deserializer: "mongo::BSONElement::_numberLong"
+        is_view: false
+
+structs:
+    ReleaseMemoryError:
+        description: >-
+            A structure that holds a cursor id and an error that happened during
+            releasing memory for this cursor.
+        fields:
+            cursorId:
+                type: cursorId
+            status:
+                type: error_status
+                optional: true
+
+    ReleaseMemoryCommandReply:
+        description: "Response from releaseMemory command"
+        strict: false
+        is_command_reply: true
+        fields:
+            cursorsReleased:
+                description: "Cursors that have successfully released memory"
+                type: array<cursorId>
+            cursorsNotFound:
+                description: "Cursors not found"
+                type: array<cursorId>
+            cursorsCurrentlyPinned:
+                description: "Cursors that were already pinned during command execution"
+                type: array<cursorId>
+            cursorsWithErrors:
+                description: "Cursors for which release memory failed with an error."
+                type: array<ReleaseMemoryError>
+
+commands:
+    releaseMemory:
+        description: "Request a specified set of cursors by ID to release memory, if possible."
+        command_name: releaseMemory
+        cpp_name: ReleaseMemoryCommandRequest
+        reply_type: ReleaseMemoryCommandReply
+        api_version: ""
+        access_check:
+            complex:
+                - privilege:
+                      resource_pattern: cluster
+                      action_type: releaseMemoryAnyCursor
+                - privilege:
+                      resource_pattern: database
+                      action_type: releaseMemoryAnyCursor
+                - privilege:
+                      resource_pattern: exact_namespace
+                      action_type: releaseMemoryAnyCursor
+        strict: true
+        namespace: type
+        type: array<cursorId>

@@ -1,0 +1,181 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/router_role/cluster_commands_helpers.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+
+namespace mongo {
+namespace {
+
+/**
+ * Base class for mongos index filter commands. Cluster index filter commands don't do much more
+ * than forwarding the commands to all shards and combining the results.
+ */
+class ClusterIndexFilterCmd : public BasicCommand {
+    ClusterIndexFilterCmd(const ClusterIndexFilterCmd&) = delete;
+    ClusterIndexFilterCmd& operator=(const ClusterIndexFilterCmd&) = delete;
+
+public:
+    /**
+     * Instantiates a command that can be invoked by "name", which will be described by "helpText".
+     */
+    ClusterIndexFilterCmd(std::string_view name, std::string helpText)
+        : BasicCommand(name), _helpText(std::move(helpText)) {}
+
+    std::string help() const override {
+        return _helpText;
+    }
+
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* authzSession = AuthorizationSession::get(opCtx->getClient());
+        ResourcePattern pattern = parseResourcePattern(dbName, cmdObj);
+
+        if (authzSession->isAuthorizedForActionsOnResource(pattern,
+                                                           ActionType::planCacheIndexFilter)) {
+            return Status::OK();
+        }
+
+        return Status(ErrorCodes::Unauthorized, "unauthorized");
+    }
+
+    // Cluster plan cache command entry point.
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbName, cmdObj));
+        const BSONObj query;
+
+        sharding::router::CollectionRouter router(opCtx, nss);
+        return router.routeWithRoutingContext(
+            getName(), [&](OperationContext* opCtx, RoutingContext& routingCtx) {
+                // Clear the result builder since this lambda function may be retried if the router
+                // cache is stale.
+                result.resetToEmpty();
+
+                auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
+                    opCtx,
+                    routingCtx,
+                    nss,
+                    applyReadWriteConcern(
+                        opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+                    ReadPreferenceSetting::get(opCtx),
+                    Shard::RetryPolicy::kIdempotent,
+                    query,
+                    CollationSpec::kSimpleSpec,
+                    boost::none /*letParameters*/,
+                    boost::none /*runtimeConstants*/);
+
+                // Sort shard responses by shard id.
+                std::sort(shardResponses.begin(),
+                          shardResponses.end(),
+                          [](const AsyncRequestsSender::Response& response1,
+                             const AsyncRequestsSender::Response& response2) {
+                              return response1.shardId < response2.shardId;
+                          });
+
+                // Set value of first shard result's "ok" field.
+                bool clusterCmdResult = true;
+
+                for (auto i = shardResponses.begin(); i != shardResponses.end(); ++i) {
+                    const auto& response = *i;
+                    auto status = response.swResponse.getStatus();
+                    uassertStatusOK(
+                        status.withContext(str::stream() << "failed on: " << response.shardId));
+                    const auto& cmdResult = response.swResponse.getValue().data;
+
+                    // XXX: In absence of sensible aggregation strategy,
+                    //      promote first shard's result to top level.
+                    if (i == shardResponses.begin()) {
+                        CommandHelpers::filterCommandReplyForPassthrough(cmdResult, &result);
+                        status = getStatusFromCommandResult(cmdResult);
+                        clusterCmdResult = status.isOK();
+                    }
+
+                    // Append shard result as a sub object.
+                    // Name the field after the shard.
+                    result.append(response.shardId, cmdResult);
+                }
+
+                return clusterCmdResult;
+            });
+    }
+
+private:
+    const std::string _helpText;
+};
+
+class PlanCacheListFiltersCmd : public ClusterIndexFilterCmd {
+public:
+    PlanCacheListFiltersCmd()
+        : ClusterIndexFilterCmd{"planCacheListFilters",
+                                "Displays index filters for all query shapes in a collection."} {}
+};
+
+class PlanCacheClearFiltersCmd : public ClusterIndexFilterCmd {
+public:
+    PlanCacheClearFiltersCmd()
+        : ClusterIndexFilterCmd{"planCacheClearFilters",
+                                "Clears index filter for a single query shape or, "
+                                "if the query shape is omitted, all filters for the collection."} {}
+};
+
+class PlanCacheSetFiltersCmd : public ClusterIndexFilterCmd {
+public:
+    PlanCacheSetFiltersCmd()
+        : ClusterIndexFilterCmd{
+              "planCacheSetFilter",
+              "Sets index filter for a query shape. Overrides existing index filter."} {}
+};
+
+MONGO_REGISTER_COMMAND(PlanCacheListFiltersCmd).forRouter();
+MONGO_REGISTER_COMMAND(PlanCacheClearFiltersCmd).forRouter();
+MONGO_REGISTER_COMMAND(PlanCacheSetFiltersCmd).forRouter();
+
+}  // namespace
+}  // namespace mongo

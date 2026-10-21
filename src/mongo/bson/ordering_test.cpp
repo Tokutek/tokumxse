@@ -1,0 +1,260 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/ordering.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <span>
+#include <string>
+#include <string_view>
+
+#include <fmt/format.h>
+
+namespace mongo {
+namespace {
+
+// Verifies that creating a default all-ascending Ordering behaves as expected.
+TEST(IndexKeyOrderingTest, OrderingAllAscending) {
+    Ordering o = Ordering::allAscending();
+    ASSERT_EQ(0, o.getBits());
+    // We are even checking 10 more bits than actually defined. These all default to ascending too.
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys + 10; ++i) {
+        SCOPED_TRACE(fmt::format("i = {}", i));
+
+        uint32_t mask = i < 32 ? uint32_t{1} << i : 0;
+        ASSERT_EQ(o.get(i), 1);
+        ASSERT_FALSE(o.descending(mask));
+    }
+}
+
+// Verifies that creating an Ordering from BSON with less than max keys behaves as expected.
+TEST(IndexKeyOrderingTest, MakeFromBSON) {
+    BSONObjBuilder bob;
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys / 2; ++i) {
+        bob.append(fmt::format("test{}", i), i % 2 == 0 ? 1 : -1);
+    }
+    BSONObj obj = bob.obj();
+
+    auto o = Ordering::make(obj);
+    ASSERT_EQ(o.getBits(), 0x0000aaaaU);
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys + 10; ++i) {
+        SCOPED_TRACE(fmt::format("i = {}", i));
+
+        uint32_t mask = i < 32 ? uint32_t{1} << i : 0;
+        if (i < Ordering::kMaxCompoundIndexKeys / 2) {
+            // These are the actually defined keys.
+            if (i % 2 == 0) {
+                ASSERT_EQ(o.get(i), 1);
+                ASSERT_FALSE(o.descending(mask));
+            } else {
+                ASSERT_EQ(o.get(i), -1);
+                ASSERT_TRUE(o.descending(mask));
+            }
+        } else {
+            // These are the undefined keys. They default to ascending.
+            ASSERT_EQ(o.get(i), 1);
+            ASSERT_FALSE(o.descending(mask));
+        }
+    }
+}
+
+// Verifies that creating an Ordering from BSON with the maximum number of keys behaves as expected.
+TEST(IndexKeyOrderingTest, MakeFromBSONMaximumNumberOfKeys) {
+    auto build = [](int value) {
+        BSONObjBuilder bob;
+        for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys; ++i) {
+            bob.append(fmt::format("test{}", i), value);
+        }
+        return Ordering::make(bob.obj());
+    };
+
+    // All ascending, using value 0.
+    ASSERT_EQ(0, build(0).getBits());
+
+    // All ascending, using value 1.
+    ASSERT_EQ(0, build(1).getBits());
+
+    // All ascending, using value 123.
+    ASSERT_EQ(0, build(123).getBits());
+
+    // All descending, using value -1.
+    ASSERT_EQ(std::numeric_limits<uint32_t>::max(), build(-1).getBits());
+
+    // All descending, using value -123.
+    ASSERT_EQ(std::numeric_limits<uint32_t>::max(), build(-123).getBits());
+}
+
+// Verifies that creating an Ordering from a BSONObj with too many fields throws an exception.
+TEST(IndexKeyOrderingTest, MakeFromBSONTooManyKeys) {
+    BSONObjBuilder bob;
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys + 1; ++i) {
+        bob.append(fmt::format("test{}", i), 1);
+    }
+    BSONObj obj = bob.obj();
+
+    ASSERT_THROWS_CODE(Ordering::make(obj), DBException, 13103);
+}
+
+// Verifies that creating an Ordering from a span with less than max keys behaves as expected.
+TEST(IndexKeyOrderingTest, MakeFromSpan) {
+    std::vector<int8_t> orders;
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys / 2; ++i) {
+        orders.push_back(i % 2 == 0 ? 1 : -1);
+    }
+
+    auto o = Ordering::make(orders);
+    ASSERT_EQ(o.getBits(), 0x0000aaaaU);
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys + 10; ++i) {
+        SCOPED_TRACE(fmt::format("i = {}", i));
+
+        uint32_t mask = i < 32 ? uint32_t{1} << i : 0;
+        if (i < Ordering::kMaxCompoundIndexKeys / 2) {
+            // These are the actually defined keys.
+            if (i % 2 == 0) {
+                ASSERT_EQ(o.get(i), 1);
+                ASSERT_FALSE(o.descending(mask));
+            } else {
+                ASSERT_EQ(o.get(i), -1);
+                ASSERT_TRUE(o.descending(mask));
+            }
+        } else {
+            // These are the undefined keys. They default to ascending.
+            ASSERT_EQ(o.get(i), 1);
+            ASSERT_FALSE(o.descending(mask));
+        }
+    }
+}
+
+// Verifies that creating an Ordering from a span with the maximum number of keys behaves as
+// expected.
+TEST(IndexKeyOrderingTest, MakeFromSpanMaximumNumberOfKeys) {
+    auto build = [](int value) {
+        std::vector<int8_t> orders(Ordering::kMaxCompoundIndexKeys, value);
+        return Ordering::make(orders);
+    };
+
+    // All ascending, using value 0.
+    ASSERT_EQ(0, build(0).getBits());
+
+    // All ascending, using value 1.
+    ASSERT_EQ(0, build(1).getBits());
+
+    // All ascending, using value 123.
+    ASSERT_EQ(0, build(123).getBits());
+
+    // All descending, using value -1.
+    ASSERT_EQ(std::numeric_limits<uint32_t>::max(), build(-1).getBits());
+
+    // All descending, using value -123.
+    ASSERT_EQ(std::numeric_limits<uint32_t>::max(), build(-123).getBits());
+}
+
+// Verifies that creating an Ordering from a span with too many fields throws an exception.
+TEST(IndexKeyOrderingTest, MakeFromSpanTooManyKeys) {
+    std::vector<int8_t> orders(Ordering::kMaxCompoundIndexKeys + 1, 1);
+    ASSERT_THROWS_CODE(Ordering::make(orders), DBException, 13103);
+}
+
+// Verifies that comparison results are correct.
+TEST(IndexKeyOrderingTest, AllAscendingCompareResults) {
+    Ordering o = Ordering::allAscending();
+
+    auto compare = [&o](std::string_view l, std::string_view r) -> int {
+        return fromjson(l).woCompare(fromjson(r), o);
+    };
+
+    ASSERT_EQ(0, compare("{}", "{}"));
+    ASSERT_EQ(1, compare("{a:1}", "{}"));
+    ASSERT_EQ(-1, compare("{}", "{a:1}"));
+    ASSERT_EQ(0, compare("{a:1}", "{a:1}"));
+    ASSERT_EQ(-1, compare("{a:1}", "{a:2}"));
+    ASSERT_EQ(1, compare("{a:2}", "{a:1}"));
+    ASSERT_EQ(1, compare("{a:1,b:1}", "{a:1}"));
+    ASSERT_EQ(-1, compare("{a:1}", "{a:1,b:1}"));
+    ASSERT_EQ(0, compare("{a:1,b:1}", "{a:1,b:1}"));
+}
+
+// Verifies that comparison results are correct.
+TEST(IndexKeyOrderingTest, AllDescendingCompareResults) {
+    BSONObjBuilder bob;
+    for (size_t i = 0; i < Ordering::kMaxCompoundIndexKeys; ++i) {
+        bob.append(fmt::format("test{}", i), -1);
+    }
+    BSONObj obj = bob.obj();
+    auto o = Ordering::make(obj);
+    ASSERT_EQ(o.getBits(), 0xffffffffU);
+
+    auto compare = [&o](std::string_view l, std::string_view r) -> int {
+        return fromjson(l).woCompare(fromjson(r), o);
+    };
+
+    ASSERT_EQ(0, compare("{}", "{}"));
+    ASSERT_EQ(1, compare("{a:1}", "{}"));
+    ASSERT_EQ(-1, compare("{}", "{a:1}"));
+    ASSERT_EQ(0, compare("{a:1}", "{a:1}"));
+    ASSERT_EQ(1, compare("{a:1}", "{a:2}"));
+    ASSERT_EQ(-1, compare("{a:2}", "{a:1}"));
+    ASSERT_EQ(1, compare("{a:1,b:1}", "{a:1}"));
+    ASSERT_EQ(-1, compare("{a:1}", "{a:1,b:1}"));
+    ASSERT_EQ(0, compare("{a:1,b:1}", "{a:1,b:1}"));
+}
+
+// Verifies that the server treats legacy index key specs the way that we expect them. Namely,
+// anything that is not a number is treated as ascending, and all negative numbers are descending.
+// The exception to this is any form of a negative 0 (-0, -0.0, etc) — these are treated as
+// ascending.
+TEST(IndexKeyOrderingTest, VerifyOlderIndexKeySpecBehavior) {
+    auto generateOrdering = [](const auto& input) {
+        return Ordering::make(BSON("a" << input)).get(0);
+    };
+
+    // Non-negative numbers. Should all be ascending.
+    ASSERT_EQ(generateOrdering(0), 1);
+    ASSERT_EQ(generateOrdering(0.0), 1);
+    ASSERT_EQ(generateOrdering(-0.0), 1);  // Special case - a negative 0 is treated as ascending.
+    ASSERT_EQ(generateOrdering(std::numeric_limits<double>::quiet_NaN()), 1);
+    ASSERT_EQ(generateOrdering(1E-10f), 1);
+    ASSERT_EQ(generateOrdering(FLT_MIN), 1);
+    ASSERT_EQ(generateOrdering(FLT_TRUE_MIN), 1);
+    ASSERT_EQ(generateOrdering(DBL_MIN), 1);
+    ASSERT_EQ(generateOrdering(DBL_TRUE_MIN), 1);
+    ASSERT_EQ(generateOrdering(Decimal128("1E-10")), 1);
+
+    // Negative numbers. Should all be descending.
+    ASSERT_EQ(generateOrdering(-1E-10f), -1);
+    ASSERT_EQ(generateOrdering(-FLT_MIN), -1);
+    ASSERT_EQ(generateOrdering(-FLT_TRUE_MIN), -1);
+    ASSERT_EQ(generateOrdering(-DBL_MIN), -1);
+    ASSERT_EQ(generateOrdering(-DBL_TRUE_MIN), -1);
+    ASSERT_EQ(generateOrdering(-Decimal128("1E-10")), -1);
+
+    // Miscellaneous non-numeric types.
+    ASSERT_EQ(generateOrdering(""), 1);
+    ASSERT_EQ(generateOrdering("xyz"), 1);
+    ASSERT_EQ(generateOrdering(BSON("y" << 1)), 1);
+    ASSERT_EQ(generateOrdering(BSON_ARRAY(1)), 1);
+    ASSERT_EQ(generateOrdering(BSONBinData("", 0, BinDataGeneral)), 1);
+    ASSERT_EQ(generateOrdering(BSONUndefined), 1);
+    ASSERT_EQ(generateOrdering(OID("deadbeefdeadbeefdeadbeef")), 1);
+    ASSERT_EQ(generateOrdering(false), 1);
+    ASSERT_EQ(generateOrdering(true), 1);
+    ASSERT_EQ(generateOrdering(DATENOW), 1);
+    ASSERT_EQ(generateOrdering(BSONNULL), 1);
+    ASSERT_EQ(generateOrdering(BSONRegEx("reg.ex")), 1);
+    ASSERT_EQ(generateOrdering(BSONDBRef("db", OID("dbdbdbdbdbdbdbdbdbdbdbdb"))), 1);
+    ASSERT_EQ(generateOrdering(BSONCode("(function(){})();")), 1);
+    ASSERT_EQ(generateOrdering(BSONSymbol("symbol")), 1);
+    ASSERT_EQ(generateOrdering(BSONCodeWScope("(function(){})();", BSON("a" << 1))), 1);
+    ASSERT_EQ(generateOrdering(Timestamp(1, 2)), 1);
+    ASSERT_EQ(generateOrdering(MINKEY), 1);
+    ASSERT_EQ(generateOrdering(MAXKEY), 1);
+}
+}  // namespace
+}  // namespace mongo

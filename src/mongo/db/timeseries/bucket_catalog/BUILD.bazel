@@ -1,0 +1,100 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "bucket_catalog",
+    srcs = [
+        "bucket.cpp",
+        "bucket_catalog.cpp",
+        "bucket_catalog_helpers.cpp",
+        "bucket_catalog_internal.cpp",
+        "bucket_catalog_server_status.cpp",
+        "bucket_identifiers.cpp",
+        "bucket_metadata.cpp",
+        "bucket_state_registry.cpp",
+        "execution_stats.cpp",
+        "global_bucket_catalog.cpp",
+        "measurement_map.cpp",
+        "reopening.cpp",
+        "rollover.cpp",
+        "write_batch.cpp",
+    ],
+    deps = [
+        ":bucket_catalog_utils",
+        "//src/mongo/bson/column",
+        "//src/mongo/db:dbdirectclient",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/commands/server_status:server_status_core",
+        "//src/mongo/db/shard_role/shard_catalog:collection_catalog",
+        "//src/mongo/db/shard_role/shard_catalog:raw_data_operation",
+        "//src/mongo/db/storage:storage_options",
+        "//src/mongo/db/timeseries:bucket_compression",
+        "//src/mongo/db/timeseries:bucket_compression_failure",
+        "//src/mongo/db/timeseries:timeseries_metadata",
+        "//src/mongo/db/timeseries:timeseries_options",
+    ],
+)
+
+mongo_cc_library(
+    name = "bucket_catalog_utils",
+    srcs = [
+        "flat_bson.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "db_bucket_catalog_test",
+    srcs = [
+        "bucket_catalog_helpers_test.cpp",
+        "bucket_catalog_internal_test.cpp",
+        "bucket_catalog_test.cpp",
+        "bucket_state_registry_test.cpp",
+        "measurement_map_test.cpp",
+        "minmax_test.cpp",
+        "schema_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fourth_group",
+        "server-timeseries-bucket-catalog",
+    ],
+    deps = [
+        ":bucket_catalog",
+        "//src/mongo/db:dbdirectclient",
+        "//src/mongo/db/collection_crud",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/shard_role/shard_catalog:raw_data_operation",
+        "//src/mongo/db/sharding_environment:shard_server_test_fixture",
+        "//src/mongo/db/timeseries:bucket_compression",
+        "//src/mongo/db/timeseries:timeseries_metadata",
+        "//src/mongo/db/timeseries:timeseries_options",
+        "//src/mongo/db/timeseries:timeseries_test_fixture",
+        "//src/mongo/s:common_s",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "timeseries_sizing_test",
+    srcs = [
+        "timeseries_sizing_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_eighth_group",
+        "server-timeseries-bucket-catalog",
+    ],
+    deps = [
+        ":bucket_catalog",
+    ],
+)

@@ -1,0 +1,617 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/client/server_discovery_monitor.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/replica_set_monitor_server_parameters.h"
+#include "mongo/client/sdam/server_description.h"
+#include "mongo/client/sdam/topology_description.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/network_interface_thread_pool.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+
+#include <algorithm>
+#include <iterator>
+#include <ratio>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+namespace mongo::sdam {
+using namespace std::literals::string_view_literals;
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(overrideMaxAwaitTimeMS);
+
+using executor::NetworkInterfaceThreadPool;
+using executor::TaskExecutor;
+using executor::ThreadPoolTaskExecutor;
+
+const Milliseconds kZeroMs = Milliseconds{0};
+
+/**
+ * Given the TopologyVersion corresponding to a remote host, determines if exhaust is enabled.
+ */
+bool exhaustEnabled(boost::optional<TopologyVersion> topologyVersion) {
+    return (topologyVersion &&
+            gReplicaSetMonitorProtocol == ReplicaSetMonitorProtocol::kStreamable);
+}
+
+/**
+ * Returns whether the "ok" field of the specified hello response body indicates success, for a
+ * permissive but not-too-permissive interpretation of success.
+ *
+ * Servers will respond with an "ok" value of `double(1.0)` or `double(0.0)`. Some response handlers
+ * accept the more permissive `BSONElement::trueValue() `, or `BSONElement::numberInt()`, or
+ * `BSONElement::coerce(long long*)`.
+ *
+ * The policy in this function is that `looksOK(...)` is `true` if: the "ok" field is present, and
+ * its value is either a number equal to one or is the boolean `true`.
+ *
+ * Note that this function is called in a context where returning `false` delegates to
+ * `ErrorReply::parse`.
+ */
+bool looksOK(const BSONObj& helloResponseBody) {
+    const BSONElement ok = helloResponseBody["ok"];
+    double value;
+    return (ok.coerce(&value) && value == 1.0) || (ok.isBoolean() && ok.boolean());
+}
+
+}  // namespace
+
+SingleServerDiscoveryMonitor::SingleServerDiscoveryMonitor(
+    const MongoURI& setUri,
+    const HostAndPort& host,
+    boost::optional<TopologyVersion> topologyVersion,
+    const SdamConfiguration& sdamConfig,
+    sdam::TopologyEventsPublisherPtr eventListener,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    std::shared_ptr<ReplicaSetMonitorStats> stats)
+    : _host(host),
+      _stats(stats),
+      _topologyVersion(topologyVersion),
+      _eventListener(eventListener),
+      _executor(executor),
+      _heartbeatFrequency(_overrideRefreshPeriod(sdamConfig.getHeartBeatFrequency())),
+      _connectTimeout(sdamConfig.getConnectionTimeout()),
+      _isExpedited(true),
+      _isShutdown(true),
+      _setUri(setUri) {
+    LOGV2_DEBUG(4333217,
+                kLogLevel + 1,
+                "RSM monitoring host",
+                "host"_attr = host,
+                "replicaSet"_attr = _setUri.getSetName());
+}
+
+void SingleServerDiscoveryMonitor::init() {
+    std::lock_guard lock(_mutex);
+    _isShutdown = false;
+    _scheduleNextHello(lock, Milliseconds(0));
+}
+
+void SingleServerDiscoveryMonitor::requestImmediateCheck() {
+    std::lock_guard lock(_mutex);
+    if (_isShutdown)
+        return;
+
+    // The previous refresh period may or may not have been expedited.
+    // Saving the value here before we change to expedited mode.
+    const auto previousRefreshPeriod = _currentRefreshPeriod(lock, false);
+
+    if (!_isExpedited) {
+        // save some log lines.
+        LOGV2_DEBUG(4333227,
+                    kLogLevel,
+                    "RSM monitoring host in expedited mode until we detect a primary",
+                    "host"_attr = _host,
+                    "replicaSet"_attr = _setUri.getSetName());
+
+        // This will change the _currentRefreshPeriod to the shorter expedited duration.
+        _isExpedited = true;
+    }
+
+    // Get the new expedited refresh period.
+    const auto expeditedRefreshPeriod = _currentRefreshPeriod(lock, false);
+
+    if (_helloOutstanding) {
+        LOGV2_DEBUG(
+            4333216,
+            kLogLevel + 2,
+            "RSM immediate hello check requested, but there is already an outstanding request",
+            "replicaSet"_attr = _setUri.getSetName());
+        return;
+    }
+
+    if (const auto maybeDelayUntilNextCheck = calculateExpeditedDelayUntilNextCheck(
+            _timeSinceLastCheck(), expeditedRefreshPeriod, previousRefreshPeriod)) {
+        _rescheduleNextHello(lock, *maybeDelayUntilNextCheck);
+    }
+}
+
+boost::optional<Milliseconds> SingleServerDiscoveryMonitor::calculateExpeditedDelayUntilNextCheck(
+    const boost::optional<Milliseconds>& maybeTimeSinceLastCheck,
+    const Milliseconds& expeditedRefreshPeriod,
+    const Milliseconds& previousRefreshPeriod) {
+    invariant(expeditedRefreshPeriod.count() <= previousRefreshPeriod.count());
+
+    const auto timeSinceLastCheck =
+        (maybeTimeSinceLastCheck) ? *maybeTimeSinceLastCheck : Milliseconds::max();
+    invariant(timeSinceLastCheck.count() >= 0);
+
+    if (timeSinceLastCheck == previousRefreshPeriod)
+        return boost::none;
+
+    if (timeSinceLastCheck > expeditedRefreshPeriod)
+        return Milliseconds(0);
+
+    const auto delayUntilExistingRequest = previousRefreshPeriod - timeSinceLastCheck;
+
+    // Calculate when the next hello should be scheduled.
+    const Milliseconds delayUntilNextCheck = expeditedRefreshPeriod - timeSinceLastCheck;
+
+    // Do nothing if the time would be greater-than or equal to the existing request.
+    return (delayUntilNextCheck >= delayUntilExistingRequest)
+        ? boost::none
+        : boost::optional<Milliseconds>(delayUntilNextCheck);
+}
+
+boost::optional<Milliseconds> SingleServerDiscoveryMonitor::_timeSinceLastCheck() const {
+    // Since the system clock is not monotonic, the returned value can be negative. In this case we
+    // choose a conservative estimate of 0ms as the time we last checked.
+    return (_lastHelloAt)
+        ? boost::optional<Milliseconds>(std::max(Milliseconds(0), _executor->now() - *_lastHelloAt))
+        : boost::none;
+}
+
+void SingleServerDiscoveryMonitor::_rescheduleNextHello(WithLock lock, Milliseconds delay) {
+    LOGV2_DEBUG(4333218,
+                kLogLevel,
+                "Rescheduling the next replica set monitoring request",
+                "replicaSet"_attr = _setUri.getSetName(),
+                "host"_attr = _host,
+                "delay"_attr = delay);
+    _cancelOutstandingRequest(lock);
+    _scheduleNextHello(lock, delay);
+}
+
+void SingleServerDiscoveryMonitor::_scheduleNextHello(WithLock, Milliseconds delay) {
+    if (_isShutdown)
+        return;
+
+    invariant(!_helloOutstanding);
+
+    auto swCbHandle = _executor->scheduleWorkAt(
+        _executor->now() + delay,
+        [self = shared_from_this()](const executor::TaskExecutor::CallbackArgs& cbData) {
+            if (!cbData.status.isOK()) {
+                return;
+            }
+
+            self->_doRemoteCommand();
+        });
+
+    if (!swCbHandle.isOK()) {
+        _onHelloFailure(swCbHandle.getStatus(), BSONObj());
+        return;
+    }
+
+    _nextHelloHandle = swCbHandle.getValue();
+}
+
+void SingleServerDiscoveryMonitor::_doRemoteCommand() {
+    std::lock_guard lock(_mutex);
+    if (_isShutdown)
+        return;
+
+    StatusWith<executor::TaskExecutor::CallbackHandle> swCbHandle = [&]() {
+        if (exhaustEnabled(_topologyVersion)) {
+            return _scheduleStreamableHello();
+        }
+        return _scheduleSingleHello();
+    }();
+
+    if (!swCbHandle.isOK()) {
+        const auto& error = swCbHandle.getStatus();
+        _onHelloFailure(error, BSONObj());
+        // The attempt to schedule a remote command on the executor is only expected to fail during
+        // shutdown. Otherwise, terminating the process to not risk the cluster availability is the
+        // best action plan. Note that we cannot throw from here (i.e. a scheduled task).
+        invariant(ErrorCodes::isShutdownError(error.code()),
+                  "Encountered non-shutdown error while scheduling remote command");
+        return;
+    }
+
+    _helloOutstanding = true;
+    _remoteCommandHandle = swCbHandle.getValue();
+}
+
+StatusWith<TaskExecutor::CallbackHandle> SingleServerDiscoveryMonitor::_scheduleStreamableHello() {
+    auto maxAwaitTimeMS = durationCount<Milliseconds>(kMaxAwaitTime);
+    overrideMaxAwaitTimeMS.execute([&](const BSONObj& data) {
+        maxAwaitTimeMS =
+            durationCount<Milliseconds>(Milliseconds(data["maxAwaitTimeMS"].numberInt()));
+    });
+
+    BSONObjBuilder bob;
+    bob.append("hello", 1);
+    bob.append("maxAwaitTimeMS", maxAwaitTimeMS);
+    bob.append("topologyVersion", _topologyVersion->toBSON());
+
+    WireSpec::getWireSpec(getGlobalServiceContext()).appendInternalClientWireVersionIfNeeded(&bob);
+
+    const auto timeoutMS = _connectTimeout + kMaxAwaitTime;
+    auto request = executor::RemoteCommandRequest(
+        HostAndPort(_host), DatabaseName::kAdmin, bob.obj(), nullptr, timeoutMS);
+    request.sslMode = _setUri.getSSLMode();
+
+    auto swCbHandle = _executor->scheduleExhaustRemoteCommand(
+        request,
+        [self = shared_from_this(), helloStats = _stats->collectHelloStats()](
+            const executor::TaskExecutor::RemoteCommandCallbackArgs& result) mutable {
+            Milliseconds nextRefreshPeriod;
+            {
+                std::lock_guard lk(self->_mutex);
+
+                if (self->_isShutdown) {
+                    self->_helloOutstanding = false;
+                    LOGV2_DEBUG(4495400,
+                                kLogLevel,
+                                "RSM not processing response",
+                                "error"_attr = result.response.status,
+                                "replicaSet"_attr = self->_setUri.getSetName());
+                    return;
+                }
+
+                auto responseTopologyVersion = result.response.data.getField("topologyVersion");
+                if (responseTopologyVersion) {
+                    self->_topologyVersion = TopologyVersion::parse(
+                        responseTopologyVersion.Obj(), IDLParserContext("TopologyVersion"));
+                } else {
+                    self->_topologyVersion = boost::none;
+                }
+
+                self->_lastHelloAt = self->_executor->now();
+                if (!result.response.isOK() || !result.response.moreToCome) {
+                    self->_helloOutstanding = false;
+                    nextRefreshPeriod = self->_currentRefreshPeriod(lk, result.response.isOK());
+                    self->_scheduleNextHello(lk, nextRefreshPeriod);
+                }
+            }
+
+            self->_onHello(result.response);
+        });
+
+    return swCbHandle;
+}
+
+StatusWith<TaskExecutor::CallbackHandle> SingleServerDiscoveryMonitor::_scheduleSingleHello() {
+    BSONObjBuilder bob;
+    bob.append("hello", 1);
+
+    WireSpec::getWireSpec(getGlobalServiceContext()).appendInternalClientWireVersionIfNeeded(&bob);
+
+    auto request = executor::RemoteCommandRequest(
+        HostAndPort(_host), DatabaseName::kAdmin, bob.obj(), nullptr, _connectTimeout);
+    request.sslMode = _setUri.getSSLMode();
+
+    auto swCbHandle = _executor->scheduleRemoteCommand(
+        request,
+        [self = shared_from_this(), helloStats = _stats->collectHelloStats()](
+            const executor::TaskExecutor::RemoteCommandCallbackArgs& result) mutable {
+            Milliseconds nextRefreshPeriod;
+            {
+                std::lock_guard lk(self->_mutex);
+                self->_helloOutstanding = false;
+
+                if (self->_isShutdown) {
+                    LOGV2_DEBUG(4333219,
+                                kLogLevel,
+                                "RSM not processing response",
+                                "error"_attr = result.response.status,
+                                "replicaSet"_attr = self->_setUri.getSetName());
+                    return;
+                }
+
+                self->_lastHelloAt = self->_executor->now();
+
+                auto responseTopologyVersion = result.response.data.getField("topologyVersion");
+                if (responseTopologyVersion) {
+                    self->_topologyVersion = TopologyVersion::parse(
+                        responseTopologyVersion.Obj(), IDLParserContext("TopologyVersion"));
+                } else {
+                    self->_topologyVersion = boost::none;
+                }
+
+                if (!result.response.isOK() || !result.response.moreToCome) {
+                    self->_helloOutstanding = false;
+
+                    // Prevent immediate rescheduling when exhaust is not supported.
+                    auto scheduleImmediately =
+                        (exhaustEnabled(self->_topologyVersion)) ? result.response.isOK() : false;
+                    nextRefreshPeriod = self->_currentRefreshPeriod(lk, scheduleImmediately);
+                    self->_scheduleNextHello(lk, nextRefreshPeriod);
+                }
+            }
+
+            self->_onHello(result.response);
+        });
+
+    return swCbHandle;
+}
+
+void SingleServerDiscoveryMonitor::shutdown() {
+    std::lock_guard lock(_mutex);
+    if (std::exchange(_isShutdown, true)) {
+        return;
+    }
+
+    LOGV2_DEBUG(4333220,
+                kLogLevel + 1,
+                "RSM closing host",
+                "host"_attr = _host,
+                "replicaSet"_attr = _setUri.getSetName());
+
+    _cancelOutstandingRequest(lock);
+
+    LOGV2_DEBUG(4333229,
+                kLogLevel + 1,
+                "RSM done closing host",
+                "host"_attr = _host,
+                "replicaSet"_attr = _setUri.getSetName());
+}
+
+void SingleServerDiscoveryMonitor::_cancelOutstandingRequest(WithLock) {
+    if (_remoteCommandHandle) {
+        _executor->cancel(_remoteCommandHandle);
+    }
+
+    if (_nextHelloHandle) {
+        _executor->cancel(_nextHelloHandle);
+    }
+
+    _helloOutstanding = false;
+}
+
+void SingleServerDiscoveryMonitor::_onHello(const executor::RemoteCommandResponse& response) {
+    // There are four success/failure cases to consider:
+    //
+    // 1. If `!response.isOK()` (i.e. not ok) then something failed in the sending of the hello
+    //    command or the receiving of the response. In this case, invoke `_onHelloFailure` with the
+    //    `response.status`.
+    // 2. Otherwise, if `response.isOK()` and `response.data` has `ok: 1.0`, then the command
+    //    request/response was transmitted successfully and the resulting hello response was a
+    //    success. In this case, invoke `_onHelloSuccess` with the `response.data`.
+    // 3. Otherwise, if we're able to parse an `ErrorReply` from `response.data`, then the server
+    //    delivered a "not OK" hello response from which we can construct an error `Status`. In this
+    //    case, invoke `_onHelloFailure` with the error status derived from the response body.
+    // 4. Otherwise, if we're unable to parse an `ErrorReply` from `response.data`, then the server
+    //    delivered a "not OK" hello response that did not contain the required error response
+    //    fields. In this case, invoke `_onHelloFailure` with an IDL parse failure status.
+    if (!response.isOK()) {  // (1)
+        _onHelloFailure(response.status, response.data);
+        return;
+    }
+    if (looksOK(response.data)) {  // (2)
+        _onHelloSuccess(response.data);
+        return;
+    }
+    try {  // (3)
+        const auto reply = ErrorReply::parse(response.data);
+        _onHelloFailure(Status(ErrorCodes::Error{reply.getCode()}, reply.getErrmsg()),
+                        response.data);
+    } catch (const DBException& error) {  // (4)
+        _onHelloFailure(error.toStatus("unable to parse ErrorReply from non-OK hello "
+                                       "response in SingleServerDiscoveryMonitor"),
+                        response.data);
+    }
+}
+
+void SingleServerDiscoveryMonitor::_onHelloSuccess(const BSONObj bson) {
+    LOGV2_DEBUG(4333221,
+                kLogLevel + 1,
+                "RSM received successful hello",
+                "host"_attr = _host,
+                "replicaSet"_attr = _setUri.getSetName(),
+                "helloReply"_attr = bson);
+
+    _eventListener->onServerHeartbeatSucceededEvent(_host, bson);
+}
+
+void SingleServerDiscoveryMonitor::_onHelloFailure(const Status& status, const BSONObj bson) {
+    if (auto severity = _rsmErrorLogSeverity();
+        shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, severity)) {
+        LOGV2_DEBUG(4333222,
+                    severity.toInt(),
+                    "RSM received error response",
+                    "host"_attr = _host,
+                    "error"_attr = status.toString(),
+                    "replicaSet"_attr = _setUri.getSetName(),
+                    "response"_attr = bson);
+    }
+
+    _eventListener->onServerHeartbeatFailureEvent(status, _host, bson);
+}
+
+Milliseconds SingleServerDiscoveryMonitor::_overrideRefreshPeriod(Milliseconds original) {
+    Milliseconds r = original;
+    static constexpr auto kPeriodField = "period"sv;
+    if (auto modifyReplicaSetMonitorDefaultRefreshPeriod =
+            globalFailPointRegistry().find("modifyReplicaSetMonitorDefaultRefreshPeriod")) {
+        modifyReplicaSetMonitorDefaultRefreshPeriod->executeIf(
+            [&r](const BSONObj& data) {
+                r = duration_cast<Milliseconds>(Seconds{data.getIntField(kPeriodField)});
+            },
+            [](const BSONObj& data) { return data.hasField(kPeriodField); });
+    }
+    return r;
+}
+
+Milliseconds SingleServerDiscoveryMonitor::_currentRefreshPeriod(WithLock,
+                                                                 bool scheduleImmediately) {
+    if (scheduleImmediately)
+        return Milliseconds(0);
+
+    // The _overrideRefreshPeriod() supports fail injection.
+    return (_isExpedited) ? sdam::SdamConfiguration::kMinHeartbeatFrequency
+                          : _overrideRefreshPeriod(_heartbeatFrequency);
+}
+
+void SingleServerDiscoveryMonitor::disableExpeditedChecking() {
+    std::lock_guard lock(_mutex);
+    _isExpedited = false;
+}
+
+
+ServerDiscoveryMonitor::ServerDiscoveryMonitor(
+    const MongoURI& setUri,
+    const sdam::SdamConfiguration& sdamConfiguration,
+    sdam::TopologyEventsPublisherPtr eventsPublisher,
+    sdam::TopologyDescriptionPtr initialTopologyDescription,
+    std::shared_ptr<ReplicaSetMonitorStats> stats,
+    std::shared_ptr<executor::TaskExecutor> executor)
+    : _stats(stats),
+      _sdamConfiguration(sdamConfiguration),
+      _eventPublisher(eventsPublisher),
+      _executor(_setupExecutor(executor)),
+      _isShutdown(false),
+      _setUri(setUri) {
+    LOGV2_DEBUG(4333223,
+                kLogLevel,
+                "RSM now monitoring replica set",
+                "replicaSet"_attr = _setUri.getSetName(),
+                "nReplicaSetMembers"_attr = initialTopologyDescription->getServers().size());
+    onTopologyDescriptionChangedEvent(nullptr, initialTopologyDescription);
+}
+
+void ServerDiscoveryMonitor::shutdown() {
+    std::lock_guard lock(_mutex);
+    if (_isShutdown)
+        return;
+
+    _isShutdown = true;
+    for (const auto& singleMonitor : _singleMonitors) {
+        singleMonitor.second->shutdown();
+    }
+}
+
+void ServerDiscoveryMonitor::onTopologyDescriptionChangedEvent(
+    sdam::TopologyDescriptionPtr previousDescription, sdam::TopologyDescriptionPtr newDescription) {
+    std::lock_guard lock(_mutex);
+    if (_isShutdown)
+        return;
+
+    const auto newType = newDescription->getType();
+    using sdam::TopologyType;
+
+    if (newType == TopologyType::kSingle || newType == TopologyType::kReplicaSetWithPrimary ||
+        newType == TopologyType::kSharded) {
+        _disableExpeditedChecking(lock);
+    }
+
+    // remove monitors that are missing from the topology
+    auto it = _singleMonitors.begin();
+    while (it != _singleMonitors.end()) {
+        const auto& serverAddress = it->first;
+        if (newDescription->findServerByAddress(serverAddress) == boost::none) {
+            auto& singleMonitor = _singleMonitors[serverAddress];
+            singleMonitor->shutdown();
+            LOGV2_DEBUG(4333225,
+                        kLogLevel,
+                        "RSM host was removed from the topology",
+                        "replicaSet"_attr = _setUri.getSetName(),
+                        "addr"_attr = serverAddress);
+            it = _singleMonitors.erase(it, std::next(it));
+        } else {
+            ++it;
+        }
+    }
+
+    // add new monitors
+    const auto servers = newDescription->getServers();
+    std::for_each(servers.begin(),
+                  servers.end(),
+                  [this](const sdam::ServerDescriptionPtr& serverDescription) {
+                      const auto& serverAddress = serverDescription->getAddress();
+                      bool isMissing = _singleMonitors.find(serverDescription->getAddress()) ==
+                          _singleMonitors.end();
+                      if (isMissing) {
+                          LOGV2_DEBUG(4333226,
+                                      kLogLevel,
+                                      "RSM host was added to the topology",
+                                      "replicaSet"_attr = _setUri.getSetName(),
+                                      "host"_attr = serverAddress);
+                          _singleMonitors[serverAddress] =
+                              std::make_shared<SingleServerDiscoveryMonitor>(
+                                  _setUri,
+                                  serverAddress,
+                                  serverDescription->getTopologyVersion(),
+                                  _sdamConfiguration,
+                                  _eventPublisher,
+                                  _executor,
+                                  _stats);
+                          _singleMonitors[serverAddress]->init();
+                      }
+                  });
+
+    invariant(_singleMonitors.size() == servers.size());
+}
+
+std::shared_ptr<executor::TaskExecutor> ServerDiscoveryMonitor::_setupExecutor(
+    const std::shared_ptr<executor::TaskExecutor>& executor) {
+    if (executor)
+        return executor;
+
+    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+    auto net = executor::makeNetworkInterface("ServerDiscoveryMonitor-TaskExecutor",
+                                              {.metadataHook = std::move(hookList)});
+    auto pool = std::make_unique<executor::NetworkInterfaceThreadPool>(net.get());
+    auto result = ThreadPoolTaskExecutor::create(std::move(pool), std::move(net));
+    result->startup();
+    return result;
+}
+
+void ServerDiscoveryMonitor::requestImmediateCheck() {
+    std::lock_guard lock(_mutex);
+    if (_isShutdown)
+        return;
+
+    for (auto& addressAndMonitor : _singleMonitors) {
+        addressAndMonitor.second->requestImmediateCheck();
+    }
+}
+
+void ServerDiscoveryMonitor::disableExpeditedChecking() {
+    std::lock_guard lock(_mutex);
+    _disableExpeditedChecking(lock);
+}
+
+void ServerDiscoveryMonitor::_disableExpeditedChecking(WithLock) {
+    for (auto& addressAndMonitor : _singleMonitors) {
+        addressAndMonitor.second->disableExpeditedChecking();
+    }
+}
+}  // namespace mongo::sdam

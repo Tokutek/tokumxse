@@ -1,0 +1,27 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library")
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)
+
+mongo_cc_library(
+    name = "sdk_cpp",
+    srcs = [
+        "aggregation_stage.cpp",
+        "host_services.cpp",
+        "logger.cpp",
+        "query_execution_context_handle.cpp",
+        "query_shape_opts_handle.cpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/extension/public:extensions_api_public",
+        "//src/mongo/db/extension/shared",
+        "//src/mongo/db/extension/shared/handle/aggregation_stage:aggregation_stage_handles",
+        "//src/third_party/yaml-cpp:yaml",
+    ],
+)

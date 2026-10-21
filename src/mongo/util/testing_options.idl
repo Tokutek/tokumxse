@@ -1,0 +1,15 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: "public"
+    cpp_namespace: "mongo"
+
+server_parameters:
+    testingDiagnosticsEnabled:
+        description: "Start with test-only diagnostic behavior enabled"
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: gTestingDiagnosticsEnabledAtStartup
+        default: false
+        redact: false

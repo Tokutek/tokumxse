@@ -1,0 +1,397 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+load("//src/mongo/otel:otel_rules.bzl", "OTEL_TARGET_COMPATIBLE_WITH")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)
+
+idl_generator(
+    name = "metrics_settings_gen",
+    src = "metrics_settings.idl",
+)
+
+mongo_cc_library(
+    name = "metrics_initialization",
+    srcs = [
+        "metrics_initialization.cpp",
+        "metrics_settings.cpp",
+        "metrics_settings_gen",
+    ],
+    deps = [
+        ":otel_metrics_service",
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel/utils:bson_to_http_headers",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                ":metrics_prometheus_file_exporter",
+                "//src/mongo/base:system_error",
+                "//src/mongo/db:server_feature_flags",
+                "//src/third_party/opentelemetry-cpp/api",
+                # Consider moving otlp_metric_.*_exporter's into their own standalone libraries
+                "//src/third_party/opentelemetry-cpp/exporters/otlp:otlp_file_exporter",
+                "//src/third_party/opentelemetry-cpp/exporters/otlp:otlp_http_exporter",
+                "//src/third_party/opentelemetry-cpp/sdk/src/metrics",
+                "//src/third_party/opentelemetry-proto:resource_proto_cc",
+                "//src/third_party/opentelemetry-proto:metrics_proto_cc",
+                "@com_google_protobuf//:protobuf",
+            ],
+            "//conditions:default": [],
+        },
+    ) + select(
+        {
+            "//bazel/config:build_grpc_and_otel_enabled": [
+                "@com_github_grpc_grpc//:grpcpp_otel_plugin",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_unit_test(
+    name = "metrics_initialization_test",
+    srcs = [
+        "metrics_initialization_test.cpp",
+    ],
+    tags = ["mongo_unittest_second_group"],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":in_memory_metrics_exporter",
+        ":metrics_initialization",
+        ":metrics_test_util",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "metrics_settings_test",
+    srcs = [
+        "metrics_settings_test.cpp",
+    ],
+    tags = ["mongo_unittest_first_group"],
+    deps = [
+        ":metrics_initialization",
+    ],
+)
+
+mongo_cc_library(
+    name = "otel_metrics_service",
+    srcs = [
+        "metrics_service.cpp",
+        "otel_metric_server_status_adapter.cpp",
+    ],
+    deps = [
+        ":metric_unit",
+        ":metrics_scalar_metric",
+        ":otel_metric_name_validation",
+        ":server_status_metric_name_validation",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/commands/server_status:server_status_metric",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+                "//src/third_party/opentelemetry-cpp/sdk/src/metrics",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_unit_test(
+    name = "metrics_service_test",
+    srcs = [
+        "metrics_service_test.cpp",
+    ],
+    tags = ["mongo_unittest_first_group"],
+    deps = [
+        ":metrics_initialization",
+        ":metrics_test_util",
+        ":otel_metrics_service",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db/commands/server_status:server_status_metric",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+                "//src/third_party/opentelemetry-cpp/sdk/src/metrics",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_unit_test(
+    name = "metric_names_test",
+    srcs = ["metric_names_test.cpp"],
+    tags = ["mongo_unittest_third_group"],
+)
+
+mongo_cc_library(
+    name = "otel_metric_name_validation",
+    srcs = ["otel_metric_name_validation.cpp"],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/util:pcre_wrapper",
+    ],
+)
+
+mongo_cc_library(
+    name = "server_status_metric_name_validation",
+    srcs = ["server_status_metric_name_validation.cpp"],
+    deps = ["//src/mongo:base"],
+)
+
+mongo_cc_unit_test(
+    name = "otel_metric_name_validation_test",
+    srcs = ["otel_metric_name_validation_test.cpp"],
+    tags = ["mongo_unittest_sixth_group"],
+    deps = [":otel_metric_name_validation"],
+)
+
+mongo_cc_unit_test(
+    name = "server_status_metric_name_validation_test",
+    srcs = ["server_status_metric_name_validation_test.cpp"],
+    tags = ["mongo_unittest_first_group"],
+    deps = [":server_status_metric_name_validation"],
+)
+
+mongo_cc_unit_test(
+    name = "otel_metric_server_status_adapter_test",
+    srcs = ["otel_metric_server_status_adapter_test.cpp"],
+    tags = ["mongo_unittest_sixth_group"],
+    deps = [
+        ":metrics_histogram",
+        ":otel_metrics_service",
+        "//src/mongo/db/commands/server_status:server_status_metric",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "metric_unit",
+    srcs = ["metric_unit.cpp"],
+    deps = ["//src/mongo:base"],
+)
+
+mongo_cc_unit_test(
+    name = "metric_unit_test",
+    srcs = ["metric_unit_test.cpp"],
+    tags = ["mongo_unittest_first_group"],
+    deps = [":metric_unit"],
+)
+
+mongo_cc_library(
+    name = "metrics_attributes",
+    srcs = ["metrics_attributes.cpp"],
+    deps = ["//src/mongo:base"] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_unit_test(
+    name = "metrics_attributes_test",
+    srcs = [
+        "metrics_attributes_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        ":metrics_attributes",
+        ":metrics_attributes_test_utils",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "metrics_attributes_test_utils",
+    srcs = ["metrics_attributes_test_utils.cpp"],
+    deps = [
+        ":metrics_attributes",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "metrics_attributes_test_utils_test",
+    srcs = [
+        "metrics_attributes_test_utils_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [":metrics_attributes_test_utils"],
+)
+
+mongo_cc_library(
+    name = "metrics_scalar_metric",
+    deps = [":metrics_attributes"],
+)
+
+mongo_cc_unit_test(
+    name = "metrics_scalar_metric_test",
+    srcs = [
+        "metrics_scalar_metric_test.cpp",
+    ],
+    tags = ["mongo_unittest_first_group"],
+    deps = [
+        ":metrics_attributes_test_utils",
+        ":metrics_scalar_metric",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "metrics_histogram",
+    hdrs = ["metrics_histogram.h"],
+    deps = [
+        ":metric_unit",
+        ":metrics_attributes",
+        "//src/mongo:base",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+                "//src/third_party/opentelemetry-cpp/sdk/src/metrics",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_unit_test(
+    name = "metrics_histogram_test",
+    srcs = [
+        "metrics_histogram_test.cpp",
+    ],
+    tags = ["mongo_unittest_sixth_group"],
+    deps = [
+        ":metrics_histogram",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/third_party/opentelemetry-cpp/api",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "metrics_prometheus_file_exporter",
+    srcs = [
+        "metrics_prometheus_file_exporter.cpp",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":otel_metrics_service",
+        "//src/mongo/db:server_base",
+        "//src/mongo/util:clock_sources",
+        "//src/third_party/opentelemetry-cpp/exporters/prometheus:prometheus_exporter_utils",
+        "//src/third_party/opentelemetry-cpp/sdk/src/metrics",
+        "@com_github_jupp0r_prometheus_cpp//core",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "metrics_prometheus_file_exporter_test",
+    srcs = [
+        "metrics_prometheus_file_exporter_test.cpp",
+    ],
+    tags = ["mongo_unittest_eighth_group"],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":metrics_prometheus_file_exporter",
+        ":metrics_test_util",
+        "//src/mongo/util:clock_source_mock",
+        "//src/third_party/opentelemetry-cpp/sdk/src/metrics",
+        "//src/third_party/opentelemetry-cpp/sdk/src/resource",
+    ],
+)
+
+mongo_cc_library(
+    name = "in_memory_metrics_exporter",
+    testonly = True,
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//src/third_party/opentelemetry-cpp/exporters/memory:in_memory_data",
+        "//src/third_party/opentelemetry-cpp/exporters/memory:in_memory_metric_data",
+        "//src/third_party/opentelemetry-cpp/exporters/memory:in_memory_metric_exporter_factory",
+    ],
+)
+
+mongo_cc_library(
+    name = "metrics_test_util",
+    testonly = True,
+    srcs = [
+        "metrics_test_util.cpp",
+    ],
+    deps = [
+        ":otel_metrics_service",
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/unittest",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                ":in_memory_metrics_exporter",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_unit_test(
+    name = "metrics_test_util_test",
+    srcs = [
+        "metrics_test_util_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        ":metrics_test_util",
+        "//src/mongo/db:service_context_test_fixture",
+    ],
+)
+
+test_suite(
+    name = "otel_tests",
+    tests = [
+        ":metric_names_test",
+        ":metric_unit_test",
+        ":metrics_attributes_test",
+        ":metrics_histogram_test",
+        ":metrics_initialization_test",
+        ":metrics_prometheus_file_exporter_test",
+        ":metrics_scalar_metric_test",
+        ":metrics_service_test",
+        ":metrics_test_util_test",
+        ":otel_metric_name_validation_test",
+        ":otel_metric_server_status_adapter_test",
+        ":server_status_metric_name_validation_test",
+        "//src/mongo/otel/metrics/instrumentation:disk_metrics_test",
+        "//src/mongo/otel/metrics/instrumentation:system_mount_metrics_test",
+    ],
+)

@@ -1,0 +1,95 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/versioning_protocol/database_version.idl"
+
+enums:
+    MultiUpdateCoordinatorPhase:
+        description: The phase of a MultiUpdateCoordinator.
+        type: string
+        values:
+            kUnused: "unused"
+            kAcquireSession: "acquireSession"
+            kBlockMigrations: "blockMigrations"
+            kPerformUpdate: "performUpdate"
+            kSuccess: "success"
+            kFailure: "failure"
+            kDone: "done"
+
+structs:
+    MultiUpdateCoordinatorMetadata:
+        description: Contains immutable fields for a MultiUpdateCoordinator.
+        strict: false
+        fields:
+            _id:
+                type: uuid
+                description: Unique identifier for the operation.
+                cpp_name: id
+            databaseVersion:
+                description: Database version of the original request from mongos.
+                type: DatabaseVersion
+                optional: true
+            updateCommand:
+                type: object_owned
+                description: The original multi update command that triggered the coordinator.
+            ns:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection being updated."
+            isUpsert:
+                type: bool
+                description: "Indicates a multi update with upsert: true."
+                default: false
+            authoritativeMetadataAccessLevel:
+                type: AuthoritativeMetadataAccessLevel
+                description: >-
+                    Authoritative metadata access level granted by the FCV state when this
+                    coordinator was created. Captured once and forwarded to the migration-blocking
+                    begin/end commands so a single operation always uses the same coordinator
+                    version, even if the FCV changes mid-flight.
+                default: kNone
+
+    MultiUpdateCoordinatorMutableFields:
+        description: Contains mutable fields for a MultiUpdateCoordinator.
+        strict: false
+        fields:
+            phase:
+                type: MultiUpdateCoordinatorPhase
+                description: The phase of the MultiUpdateCoordinator.
+                default: kUnused
+            result:
+                type: object_owned
+                description: >-
+                    Stores the result of the underlying update command. By the end of the operation either this field or abortReason will be set.
+                optional: true
+            abortReason:
+                type: error_status
+                description: Stores the abort reason in the case of a failure. By the end of the operation either this field or result will be set.
+                optional: true
+            lsid:
+                type: LogicalSessionId
+                description: "The sessionId to track this update."
+                optional: true
+            txnNumber:
+                type: TxnNumber
+                description: "The txnNumber for the update session."
+                optional: true
+
+    MultiUpdateCoordinatorDocument:
+        description: State document for MultiUpdateCoordinator.
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            MultiUpdateCoordinatorMetadata: metadata
+        fields:
+            mutableFields:
+                type: MultiUpdateCoordinatorMutableFields
+                default: true

@@ -1,0 +1,29 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+commands:
+    dropDatabase:
+        description: "Parser for the dropDatabase command"
+        command_name: dropDatabase
+        namespace: type
+        type: safeInt64
+        cpp_name: DropDatabase
+        strict: true
+        api_version: "1"
+        access_check:
+            simple:
+                privilege:
+                    resource_pattern: exact_namespace
+                    action_type: dropDatabase
+        reply_type: OkReply
+        # TODO (SERVER-115805): Remove this module visibility override once this command’s API and
+        # implementation are part of the same module.
+        mod_visibility: unfortunately_open

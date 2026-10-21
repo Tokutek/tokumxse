@@ -1,0 +1,773 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/stages/ix_scan.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/admission/ticketing/admission_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::sbe {
+using namespace std::literals::string_view_literals;
+IndexScanStageBase::IndexScanStageBase(std::string_view stageType,
+                                       UUID collUuid,
+                                       DatabaseName dbName,
+                                       std::string_view indexName,
+                                       bool forward,
+                                       boost::optional<value::SlotId> indexKeySlot,
+                                       boost::optional<value::SlotId> recordIdSlot,
+                                       boost::optional<value::SlotId> snapshotIdSlot,
+                                       boost::optional<value::SlotId> indexIdentSlot,
+                                       IndexKeysInclusionSet indexKeysToInclude,
+                                       value::SlotVector vars,
+                                       PlanYieldPolicySBE* yieldPolicy,
+                                       PlanNodeId nodeId,
+                                       bool participateInTrialRunTracking)
+    : PlanStage(stageType,
+                yieldPolicy,
+                nodeId,
+                participateInTrialRunTracking,
+                TrialRunTrackingType::TrackReads),
+      _collUuid(collUuid),
+      _dbName(dbName),
+      _indexName(indexName),
+      _forward(forward),
+      _indexKeySlot(indexKeySlot),
+      _recordIdSlot(recordIdSlot),
+      _snapshotIdSlot(snapshotIdSlot),
+      _indexIdentSlot(indexIdentSlot),
+      _indexKeysToInclude(indexKeysToInclude),
+      _vars(std::move(vars)) {
+    tassert(11094724,
+            "Expecting the number of index keys to include to match the number of slots",
+            _indexKeysToInclude.count() == _vars.size());
+}
+
+void IndexScanStageBase::prepareImpl(CompileCtx& ctx) {
+    _accessors.resize(_vars.size());
+    for (size_t idx = 0; idx < _accessors.size(); ++idx) {
+        auto [it, inserted] = _accessorMap.emplace(_vars[idx], &_accessors[idx]);
+        uassert(4822821, str::stream() << "duplicate slot: " << _vars[idx], inserted);
+    }
+
+    tassert(12546100, "MultipleCollectionAccessor must be set on CompileCtx", ctx.mca);
+    _coll = ctx.mca->getCollectionAcquisitionFromUuid(_collUuid);
+
+    auto indexCatalog = _coll->getCollectionPtr()->getIndexCatalog();
+    auto indexEntry = indexCatalog->findIndexByName(_opCtx, _indexName);
+
+    // TODO SERVER-87437: Using a uassert below is a temporary fix. The long term fix will rely on
+    // using <UUID, minValidSnapshot> pair for caching plans on non-standalone deployments.
+    // Currently we use <UUID, collectionVersion> pair to cache plans; collectionVersion is shared
+    // across different versions of the same collection. This can cause invalid cache reads (see
+    // BF-31798).
+    uassert(4938500,
+            str::stream() << "could not find index named '" << _indexName << "' in collection '"
+                          << _coll->getCollectionPtr()->ns().toStringForErrorMsg() << "'",
+            indexEntry);
+
+    _uniqueIndex = indexEntry->descriptor()->unique();
+    _entry = indexEntry;
+    tassert(4938503,
+            str::stream() << "expected IndexCatalogEntry for index named: " << _indexName,
+            static_cast<bool>(_entry));
+
+    _ordering = _entry->ordering();
+
+    auto [identTag, identVal] = value::makeNewString(std::string_view(_entry->getIdent()));
+    _indexIdentAccessor.reset(identTag, identVal);
+
+    if (_indexIdentSlot) {
+        _indexIdentViewAccessor.reset(identTag, identVal);
+    } else {
+        _indexIdentViewAccessor.reset();
+    }
+
+    if (_indexKeySlot) {
+        _recordAccessor.reset(value::TagValueView{
+            value::TypeTags::keyString, value::bitcastFrom<value::KeyStringEntry*>(&_key)});
+    }
+
+    if (_snapshotIdSlot) {
+        _latestSnapshotId = shard_role_details::getRecoveryUnit(_opCtx)->getSnapshotId().toNumber();
+    }
+}
+
+value::SlotAccessor* IndexScanStageBase::getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    if (_indexKeySlot && *_indexKeySlot == slot) {
+        return &_recordAccessor;
+    }
+
+    if (_recordIdSlot && *_recordIdSlot == slot) {
+        return &_recordIdAccessor;
+    }
+
+    if (_snapshotIdSlot && *_snapshotIdSlot == slot) {
+        return &_snapshotIdAccessor;
+    }
+
+    if (_indexIdentSlot && *_indexIdentSlot == slot) {
+        return &_indexIdentViewAccessor;
+    }
+
+    if (auto it = _accessorMap.find(slot); it != _accessorMap.end()) {
+        return it->second;
+    }
+
+    return ctx.getAccessor(slot);
+}
+
+void IndexScanStageBase::doSaveState() {
+    if (_indexKeySlot && !_key.owned() && slotsAccessible()) {
+        _key = std::move(*_key.makeCopy());
+    }
+    if (_recordIdSlot) {
+        prepareForYielding(_recordIdAccessor, slotsAccessible());
+    }
+    for (auto& accessor : _accessors) {
+        prepareForYielding(accessor, slotsAccessible());
+    }
+
+    if (_cursor) {
+        _cursor->save();
+    }
+
+    // Set the index entry to null, since accessing this pointer is illegal during yield.
+    _entry = nullptr;
+}
+
+void IndexScanStageBase::restoreCollectionAndIndex() {
+    tassert(12499900, "Expected collection to be an acquisition", _coll.has_value());
+
+    auto [identTag, identVal] = _indexIdentAccessor.getViewOfValue();
+    tassert(7566700, "Expected ident to be a string", value::isString(identTag));
+
+    auto indexIdent = value::getStringView(identTag, identVal);
+    auto indexEntry =
+        _coll->getCollectionPtr()->getIndexCatalog()->findIndexByIdent(_opCtx, indexIdent);
+    uassert(ErrorCodes::QueryPlanKilled,
+            str::stream() << "query plan killed :: index '" << _indexName << "' dropped",
+            indexEntry);
+
+    // Re-obtain the index entry pointer that was set to null during yield preparation. It is safe
+    // to access the index entry when the query is active, as its validity is protected by at least
+    // MODE_IS collection locks; or, in the case of lock-free reads, its lifetime is managed by the
+    // CollectionCatalog stashed on the RecoveryUnit snapshot, which is kept alive until the query
+    // yields.
+    _entry = indexEntry;
+}
+
+void IndexScanStageBase::doRestoreState() {
+    invariant(_opCtx);
+    tassert(12499901, "Expected collection to be an acquisition", _coll.has_value());
+    restoreCollectionAndIndex();
+    auto& ru = *shard_role_details::getRecoveryUnit(_opCtx);
+    if (_cursor) {
+        _cursor->restore(ru);
+    }
+
+    // Yield is the only time during plan execution that the snapshotId can change. As such, we
+    // update it accordingly as part of yield recovery.
+    if (_snapshotIdSlot) {
+        _latestSnapshotId = ru.getSnapshotId().toNumber();
+    }
+}
+
+void IndexScanStageBase::doDetachFromOperationContext() {
+    if (_cursor) {
+        _cursor->detachFromOperationContext();
+    }
+}
+
+void IndexScanStageBase::doAttachToOperationContext(OperationContext* opCtx) {
+    if (_cursor) {
+        _cursor->reattachToOperationContext(opCtx);
+    }
+}
+
+void IndexScanStageBase::openImpl(bool reOpen) {
+    _commonStats.opens++;
+
+    dassert(_opCtx);
+
+    if (reOpen) {
+        dassert(_open && _coll && _cursor);
+        _scanState = ScanState::kNeedSeek;
+        return;
+    }
+
+    tassert(5071009, "first open to IndexScanStageBase but reOpen=true", !_open);
+    if (!_coll) {
+        // We're being opened for the first time after 'close()', or we're being opened for the
+        // first time ever. We need to re-acquire '_coll' in this case and make some validity
+        // checks (the collection has not been dropped, renamed, etc).
+        tassert(5071010, "IndexScanStageBase is not open but have _cursor", !_cursor);
+    }
+
+    restoreCollectionAndIndex();
+
+    if (!_cursor) {
+        _cursor = _entry->accessMethod()->asSortedData()->newCursor(
+            _opCtx, *shard_role_details::getRecoveryUnit(_opCtx), _forward);
+    }
+
+    _open = true;
+    _scanState = ScanState::kNeedSeek;
+}
+
+template <typename Derived>
+PlanState IndexScanStageBaseImpl<Derived>::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
+    // We are about to get next record from a storage cursor so do not bother saving our internal
+    // state in case it yields as the state will be completely overwritten after the call.
+    disableSlotAccess();
+
+    checkForInterruptAndYield(_opCtx);
+
+    auto& ru = *shard_role_details::getRecoveryUnit(_opCtx);
+    do {
+        switch (_scanState) {
+            case ScanState::kNeedSeek:
+                ++_specificStats.seeks;
+                trackIndexRead();
+                // Seek for key and establish the cursor position.
+                _nextKeyString = self()->seek(ru);
+                break;
+            case ScanState::kScanning:
+                trackIndexRead();
+                _nextKeyString = _cursor->nextKeyValueView(ru);
+                break;
+            case ScanState::kFinished:
+                return trackPlanState(PlanState::IS_EOF);
+        }
+    } while (!self()->validateKey(_nextKeyString));
+
+    if (_indexKeySlot) {
+        _key = value::KeyStringEntry{_nextKeyString};
+    }
+
+    if (_recordIdSlot) {
+        auto nextRid = _nextKeyString.getRecordId();
+        _recordIdAccessor.reset(value::TagValueView{value::TypeTags::RecordId,
+                                                    value::bitcastFrom<const RecordId*>(nextRid)});
+    }
+
+    if (_snapshotIdSlot) {
+        // Copy the latest snapshot ID into the 'snapshotId' slot.
+        _snapshotIdAccessor.reset(value::TypeTags::NumberInt64,
+                                  value::bitcastFrom<uint64_t>(_latestSnapshotId));
+    }
+
+    if (_accessors.size()) {
+        _valuesBuffer.reset();
+        readKeyStringValueIntoAccessors(
+            _nextKeyString, *_ordering, &_valuesBuffer, &_accessors, _indexKeysToInclude);
+    }
+
+    return trackPlanState(PlanState::ADVANCED);
+}
+
+void IndexScanStageBase::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
+    trackClose();
+
+    _cursor.reset();
+    _open = false;
+}
+
+std::unique_ptr<PlanStageStats> IndexScanStageBase::getStats(bool includeDebugInfo) const {
+    auto ret = std::make_unique<PlanStageStats>(_commonStats);
+    ret->specific = std::make_unique<IndexScanStats>(_specificStats);
+
+    if (includeDebugInfo) {
+        BSONObjBuilder bob;
+        bob.append("indexName", _indexName);
+        bob.appendNumber("keysExamined", static_cast<long long>(_specificStats.keysExamined));
+        bob.appendNumber("seeks", static_cast<long long>(_specificStats.seeks));
+        bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
+        if (_specificStats.keyCheckSkipped != 0) {
+            bob.appendNumber("keyCheckSkipped",
+                             static_cast<long long>(_specificStats.keyCheckSkipped));
+        }
+        if (_indexKeySlot) {
+            bob.appendNumber("indexKeySlot", static_cast<long long>(*_indexKeySlot));
+        }
+        if (_recordIdSlot) {
+            bob.appendNumber("recordIdSlot", static_cast<long long>(*_recordIdSlot));
+        }
+        if (_snapshotIdSlot) {
+            bob.appendNumber("snapshotIdSlot", static_cast<long long>(*_snapshotIdSlot));
+        }
+        if (_indexIdentSlot) {
+            bob.appendNumber("indexIdentSlot", static_cast<long long>(*_indexIdentSlot));
+        }
+        bob.append("outputSlots", _vars.begin(), _vars.end());
+        bob.append("indexKeysToInclude", _indexKeysToInclude.to_string());
+        ret->debugInfo = bob.obj();
+    }
+
+    return ret;
+}
+
+const SpecificStats* IndexScanStageBase::getSpecificStats() const {
+    return &_specificStats;
+}
+
+void IndexScanStageBase::debugPrintImpl(std::vector<DebugPrinter::Block>& blocks) const {
+    blocks.emplace_back(DebugPrinter::Block("[`"));
+    bool first = true;
+    if (_indexKeySlot) {
+        DebugPrinter::addIdentifier(blocks, _indexKeySlot.value());
+        blocks.emplace_back("=");
+        DebugPrinter::addKeyword(blocks, "indexKey");
+        first = false;
+    }
+
+    if (_recordIdSlot) {
+        if (!first) {
+            blocks.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(blocks, _recordIdSlot.value());
+        blocks.emplace_back("=");
+        DebugPrinter::addKeyword(blocks, "recordId");
+        first = false;
+    }
+
+    if (_snapshotIdSlot) {
+        if (!first) {
+            blocks.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(blocks, _snapshotIdSlot.value());
+        blocks.emplace_back("=");
+        DebugPrinter::addKeyword(blocks, "snapshotId");
+        first = false;
+    }
+
+    if (_indexIdentSlot) {
+        if (!first) {
+            blocks.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(blocks, _indexIdentSlot.value());
+        blocks.emplace_back("=");
+        DebugPrinter::addKeyword(blocks, "indexIdent");
+        first = false;
+    }
+    blocks.emplace_back(DebugPrinter::Block("`]"));
+
+    blocks.emplace_back(DebugPrinter::Block("[`"));
+    size_t varIndex = 0;
+    for (size_t keyIndex = 0; keyIndex < _indexKeysToInclude.size(); ++keyIndex) {
+        if (!_indexKeysToInclude[keyIndex]) {
+            continue;
+        }
+        if (varIndex) {
+            blocks.emplace_back(DebugPrinter::Block("`,"));
+        }
+        tassert(11093504, "Index out of bounds", varIndex < _vars.size());
+        DebugPrinter::addIdentifier(blocks, _vars[varIndex++]);
+        blocks.emplace_back("=");
+        blocks.emplace_back(std::to_string(keyIndex));
+    }
+    blocks.emplace_back(DebugPrinter::Block("`]"));
+
+    blocks.emplace_back("@\"`");
+    DebugPrinter::addIdentifier(blocks, _collUuid.toString());
+    blocks.emplace_back("`\"");
+
+    blocks.emplace_back("@\"`");
+    DebugPrinter::addIdentifier(blocks, _indexName);
+    blocks.emplace_back("`\"");
+
+    blocks.emplace_back(_forward ? "forward" : "reverse");
+}
+
+size_t IndexScanStageBase::estimateCompileTimeSizeImpl() const {
+    size_t size = size_estimator::estimate(_vars);
+    size += size_estimator::estimate(_indexName);
+    size += size_estimator::estimate(_valuesBuffer);
+    size += size_estimator::estimate(_specificStats);
+    return size;
+}
+
+std::string IndexScanStageBase::getIndexName() const {
+    return _indexName;
+}
+
+template <typename Derived>
+IndexScanStageBaseImpl<Derived>::IndexScanStageBaseImpl(
+    std::string_view stageType,
+    UUID collUuid,
+    DatabaseName dbName,
+    std::string_view indexName,
+    bool forward,
+    boost::optional<value::SlotId> indexKeySlot,
+    boost::optional<value::SlotId> recordIdSlot,
+    boost::optional<value::SlotId> snapshotIdSlot,
+    boost::optional<value::SlotId> indexIdentSlot,
+    IndexKeysInclusionSet indexKeysToInclude,
+    value::SlotVector vars,
+    PlanYieldPolicySBE* yieldPolicy,
+    PlanNodeId nodeId,
+    bool participateInTrialRunTracking)
+    : IndexScanStageBase(stageType,
+                         collUuid,
+                         dbName,
+                         indexName,
+                         forward,
+                         indexKeySlot,
+                         recordIdSlot,
+                         snapshotIdSlot,
+                         indexIdentSlot,
+                         indexKeysToInclude,
+                         vars,
+                         yieldPolicy,
+                         nodeId,
+                         participateInTrialRunTracking){};
+
+SimpleIndexScanStage::SimpleIndexScanStage(UUID collUuid,
+                                           DatabaseName dbName,
+                                           std::string_view indexName,
+                                           bool forward,
+                                           boost::optional<value::SlotId> indexKeySlot,
+                                           boost::optional<value::SlotId> recordIdSlot,
+                                           boost::optional<value::SlotId> snapshotIdSlot,
+                                           boost::optional<value::SlotId> indexIdentSlot,
+                                           IndexKeysInclusionSet indexKeysToInclude,
+                                           value::SlotVector vars,
+                                           std::unique_ptr<EExpression> seekKeyLow,
+                                           std::unique_ptr<EExpression> seekKeyHigh,
+                                           PlanYieldPolicySBE* yieldPolicy,
+                                           PlanNodeId nodeId,
+                                           bool participateInTrialRunTracking)
+    : IndexScanStageBaseImpl(seekKeyLow ? "ixseek"sv : "ixscan"sv,
+                             collUuid,
+                             dbName,
+                             indexName,
+                             forward,
+                             indexKeySlot,
+                             recordIdSlot,
+                             snapshotIdSlot,
+                             indexIdentSlot,
+                             indexKeysToInclude,
+                             std::move(vars),
+                             yieldPolicy,
+                             nodeId,
+                             participateInTrialRunTracking),
+      _seekKeyLow(std::move(seekKeyLow)),
+      _seekKeyHigh(std::move(seekKeyHigh)) {
+    // The valid state is when both boundaries, or none is set, or only low key is set.
+    tassert(11094723,
+            "Expecting neither boundary keys, only low boundary key, or both low and high boundary "
+            "key to be set",
+            (_seekKeyLow && _seekKeyHigh) || (!_seekKeyLow && !_seekKeyHigh) ||
+                (_seekKeyLow && !_seekKeyHigh));
+}
+
+std::unique_ptr<PlanStage> SimpleIndexScanStage::clone() const {
+    return std::make_unique<SimpleIndexScanStage>(_collUuid,
+                                                  _dbName,
+                                                  _indexName,
+                                                  _forward,
+                                                  _indexKeySlot,
+                                                  _recordIdSlot,
+                                                  _snapshotIdSlot,
+                                                  _indexIdentSlot,
+                                                  _indexKeysToInclude,
+                                                  _vars,
+                                                  _seekKeyLow ? _seekKeyLow->clone() : nullptr,
+                                                  _seekKeyHigh ? _seekKeyHigh->clone() : nullptr,
+                                                  _yieldPolicy,
+                                                  _commonStats.nodeId,
+                                                  participateInTrialRunTracking());
+}
+
+void SimpleIndexScanStage::prepare(CompileCtx& ctx) {
+    IndexScanStageBase::prepareImpl(ctx);
+
+    if (_seekKeyLow) {
+        ctx.root = this;
+        _seekKeyLowCode = _seekKeyLow->compile(ctx);
+    }
+    if (_seekKeyHigh) {
+        ctx.root = this;
+        _seekKeyHighCode = _seekKeyHigh->compile(ctx);
+    }
+
+    _seekKeyLowHolder.reset();
+    _seekKeyHighHolder.reset();
+}
+
+void SimpleIndexScanStage::doSaveState() {
+    // Seek points are external to the index scan and must be accessible no matter what as long
+    // as the index scan is opened.
+    if (_open) {
+        if (_seekKeyLow) {
+            prepareForYielding(_seekKeyLowHolder, true);
+        }
+        if (_seekKeyHigh) {
+            prepareForYielding(_seekKeyHighHolder, true);
+        }
+    }
+
+    IndexScanStageBase::doSaveState();
+}
+
+void SimpleIndexScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
+    IndexScanStageBase::openImpl(reOpen);
+
+    if (_seekKeyLow && _seekKeyHigh) {
+        initializeSeekKeyLow();
+        initializeSeekKeyHigh();
+
+        // It is a point bound if the lowKey and highKey are same except discriminator.
+        auto& highKey = getSeekKeyHigh();
+        _pointBound = getSeekKeyLow().compareWithoutDiscriminator(highKey) == 0 &&
+            highKey.computeElementCount(*_ordering) == _entry->descriptor()->getNumFields();
+
+        _cursor->setEndPosition(highKey);
+    } else if (_seekKeyLow) {
+        initializeSeekKeyLow();
+    } else {
+        initializeSeekKeyDefault();
+    }
+}
+
+const key_string::Value& SimpleIndexScanStage::getSeekKeyLow() const {
+    auto [tag, value] = _seekKeyLowHolder.getViewOfValue();
+    return value::getKeyString(value)->getValue();
+}
+
+const key_string::Value& SimpleIndexScanStage::getSeekKeyHigh() const {
+    tassert(8843702, "HighKey must exist", _seekKeyHigh);
+    auto [tag, value] = _seekKeyHighHolder.getViewOfValue();
+    return value::getKeyString(value)->getValue();
+}
+
+std::unique_ptr<PlanStageStats> SimpleIndexScanStage::getStats(bool includeDebugInfo) const {
+    auto stats = IndexScanStageBase::getStats(includeDebugInfo);
+    if (includeDebugInfo && (_seekKeyLow || _seekKeyHigh)) {
+        DebugPrinter printer;
+        BSONObjBuilder bob(stats->debugInfo);
+        if (_seekKeyLow) {
+            bob.append("seekKeyLow", printer.print(_seekKeyLow->debugPrint()));
+        }
+        if (_seekKeyHigh) {
+            bob.append("seekKeyHigh", printer.print(_seekKeyHigh->debugPrint()));
+        }
+        stats->debugInfo = bob.obj();
+    }
+    return stats;
+}
+
+void SimpleIndexScanStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                                        DebugPrintInfo& debugPrintInfo) const {
+    if (_seekKeyLow) {
+        DebugPrinter::addKeyword(ret, "seekKeyLow");
+        ret.emplace_back("=");
+        DebugPrinter::addBlocks(ret, _seekKeyLow->debugPrint());
+        if (_seekKeyHigh) {
+            DebugPrinter::addKeyword(ret, "seekKeyHigh");
+            ret.emplace_back("=");
+            DebugPrinter::addBlocks(ret, _seekKeyHigh->debugPrint());
+        }
+    }
+
+    IndexScanStageBase::debugPrintImpl(ret);
+
+    if (debugPrintInfo.printBytecode) {
+        DebugPrinter::addNewLine(ret);
+        PlanStage::debugPrintBytecode(ret, _seekKeyLowCode, "SEEK_KEY_LOW" /*title*/);
+        PlanStage::debugPrintBytecode(ret, _seekKeyHighCode, "SEEK_KEY_HIGH" /*title*/);
+    }
+}
+
+size_t SimpleIndexScanStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += IndexScanStageBase::estimateCompileTimeSizeImpl();
+    if (_seekKeyLow) {
+        size += size_estimator::estimate(_seekKeyLow);
+    }
+    if (_seekKeyHigh) {
+        size += size_estimator::estimate(_seekKeyHigh);
+    }
+    return size;
+}
+
+GenericIndexScanStage::GenericIndexScanStage(UUID collUuid,
+                                             DatabaseName dbName,
+                                             std::string_view indexName,
+                                             GenericIndexScanStageParams params,
+                                             boost::optional<value::SlotId> indexKeySlot,
+                                             boost::optional<value::SlotId> recordIdSlot,
+                                             boost::optional<value::SlotId> snapshotIdSlot,
+                                             boost::optional<value::SlotId> indexIdentSlot,
+                                             IndexKeysInclusionSet indexKeysToInclude,
+                                             value::SlotVector vars,
+                                             PlanYieldPolicySBE* yieldPolicy,
+                                             PlanNodeId planNodeId,
+                                             bool participateInTrialRunTracking)
+    : IndexScanStageBaseImpl("ixscan_generic"sv,
+                             collUuid,
+                             dbName,
+                             indexName,
+                             params.direction == 1,
+                             indexKeySlot,
+                             recordIdSlot,
+                             snapshotIdSlot,
+                             indexIdentSlot,
+                             indexKeysToInclude,
+                             std::move(vars),
+                             yieldPolicy,
+                             planNodeId,
+                             participateInTrialRunTracking),
+      _params{std::move(params)},
+      _endKey{_params.version} {}
+
+std::unique_ptr<PlanStage> GenericIndexScanStage::clone() const {
+    sbe::GenericIndexScanStageParams params{_params.indexBounds->clone(),
+                                            _params.keyPattern,
+                                            _params.direction,
+                                            _params.version,
+                                            _params.ord};
+    return std::make_unique<GenericIndexScanStage>(_collUuid,
+                                                   _dbName,
+                                                   _indexName,
+                                                   std::move(params),
+                                                   _indexKeySlot,
+                                                   _recordIdSlot,
+                                                   _snapshotIdSlot,
+                                                   _indexIdentSlot,
+                                                   _indexKeysToInclude,
+                                                   _vars,
+                                                   _yieldPolicy,
+                                                   _commonStats.nodeId,
+                                                   participateInTrialRunTracking());
+}
+
+void GenericIndexScanStage::prepare(CompileCtx& ctx) {
+    IndexScanStageBase::prepareImpl(ctx);
+    ctx.root = this;
+    _indexBoundsCode = _params.indexBounds->compile(ctx);
+}
+
+void GenericIndexScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
+    IndexScanStageBase::openImpl(reOpen);
+
+    value::TagValueMaybeOwned bound = _bytecode.run(_indexBoundsCode.get());
+    if (bound.tag() == value::TypeTags::Nothing) {
+        _scanState = ScanState::kFinished;
+        return;
+    }
+
+    tassert(11094722,
+            "indexBounds should be unowned and IndexBounds type",
+            !bound.owned() && bound.tag() == value::TypeTags::indexBounds);
+    _checker.emplace(
+        value::getIndexBoundsView(bound.value()), _params.keyPattern, _params.direction);
+
+    if (!_checker->getStartSeekPoint(&_seekPoint)) {
+        _scanState = ScanState::kFinished;
+    }
+}
+
+void GenericIndexScanStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                                         DebugPrintInfo& debugPrintInfo) const {
+    DebugPrinter::addBlocks(ret, _params.indexBounds->debugPrint());
+    IndexScanStageBase::debugPrintImpl(ret);
+
+    if (debugPrintInfo.printBytecode) {
+        DebugPrinter::addNewLine(ret);
+        PlanStage::debugPrintBytecode(ret, _indexBoundsCode, "INDEX_BOUNDS" /*title*/);
+    }
+}
+
+size_t GenericIndexScanStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += IndexScanStageBase::estimateCompileTimeSizeImpl();
+    size += size_estimator::estimate(_params.keyPattern);
+    size += size_estimator::estimate(_params.indexBounds);
+    size += size_estimator::estimate(_seekPoint);
+    if (_checker) {
+        size += size_estimator::estimate(*_checker);
+    }
+    size += size_estimator::estimate(_keyBuffer);
+    return size;
+}
+
+bool GenericIndexScanStage::validateKey(const SortedDataKeyValueView& key) {
+    if (key.isEmpty()) {
+        _scanState = ScanState::kFinished;
+        return false;
+    }
+    ++_specificStats.keysExamined;
+    auto keyStringData = key.getKeyStringWithoutRecordIdView();
+
+    if (!_endKey.isEmpty()) {
+        auto result = key_string::compare(keyStringData, _endKey.getView());
+        if ((_forward && result <= 0) || (!_forward && result >= 0)) {
+            ++_specificStats.keyCheckSkipped;
+            _scanState = ScanState::kScanning;
+            return true;
+        }
+    }
+
+    if (_checker) {
+        _keyBuffer.reset();
+        BSONObjBuilder keyBuilder(_keyBuffer);
+
+        auto typeBits = key.getTypeBitsView();
+        BufReader typeBitsBr(typeBits.data(), typeBits.size());
+        auto reader = key_string::TypeBits::getReaderFromBuffer(key.getVersion(), &typeBitsBr);
+
+        key_string::toBsonSafe(keyStringData, _params.ord, reader, keyBuilder);
+        auto bsonKey = keyBuilder.done();
+
+        switch (_checker->checkKeyWithEndPosition(
+            bsonKey, &_seekPoint, _endKey, _params.ord, _forward)) {
+            case KeyState::VALID:
+                _scanState = ScanState::kScanning;
+                return true;
+
+            case KeyState::DONE:
+                _scanState = ScanState::kFinished;
+                return false;
+
+            case KeyState::MUST_ADVANCE:
+                _scanState = ScanState::kNeedSeek;
+                return false;
+        }
+    }
+
+    _scanState = ScanState::kFinished;
+    return false;
+}
+// Explicit template instantiations for the template classes
+template class IndexScanStageBaseImpl<SimpleIndexScanStage>;
+template class IndexScanStageBaseImpl<GenericIndexScanStage>;
+
+}  // namespace mongo::sbe

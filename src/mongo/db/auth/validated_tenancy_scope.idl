@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo::auth"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    testOnlyValidatedTenancyScopeKey:
+        description: "HS256 preshared secret for making self-signed security tokens"
+        set_at: startup
+        cpp_vartype: std::string
+        cpp_varname: gTestOnlyValidatedTenancyScopeKey
+        test_only: true
+        redact: false

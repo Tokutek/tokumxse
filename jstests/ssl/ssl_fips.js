@@ -1,26 +1,33 @@
-// Test mongod start with FIPS mode enabled
-ports = allocatePorts(1);
-port1 = ports[0];
-var baseName = "jstests_ssl_ssl_fips";
+(function () {
+    // Test mongod start with FIPS mode enabled
+    const port = allocatePort();
+    let md = undefined;
+    try {
+        md = MongoRunner.runMongod({
+            port: port,
+            tlsMode: "requireTLS",
+            tlsCertificateKeyFile: "jstests/libs/server.pem",
+            tlsCAFile: "jstests/libs/ca.pem",
+            tlsFIPSMode: "",
+        });
+    } catch (e) {
+        print("mongod failed to start, checking for FIPS support");
+        let mongoOutput = rawMongoProgramOutput(".*");
+        assert(
+            mongoOutput.match(/this version of mongodb was not compiled with FIPS support/) ||
+                mongoOutput.match(/OpenSSL was not compiled with FIPS support/) ||
+                mongoOutput.match(/FIPS modes is not enabled on the operating system/) ||
+                mongoOutput.match(/FIPS_mode_set:fips mode not supported/) ||
+                mongoOutput.match(/You can compile Percona Server for MongoDB with FIPS mode yourself/),
+        );
+        return;
+    }
+    assert(md);
 
+    // verify that auth works, SERVER-18051
+    md.getDB("admin").createUser({user: "root", pwd: "root", roles: ["root"]});
+    assert(md.getDB("admin").auth("root", "root"), "auth failed");
 
-var md = startMongod("--port", port1, "--dbpath",
-                     MongoRunner.dataPath + baseName, "--sslMode", "requireSSL",
-                     "--sslPEMKeyFile", "jstests/libs/server.pem",
-                     "--sslFIPSMode");
-
-var mongo = runMongoProgram("mongo", "--port", port1, "--ssl", "--sslAllowInvalidCertificates",
-                            "--sslPEMKeyFile", "jstests/libs/client.pem",
-                            "--sslFIPSMode",
-                            "--eval", ";");
-
-// if mongo shell didn't start/connect properly
-if (mongo != 0) {
-    print("mongod failed to start, checking for FIPS support");
-    assert(rawMongoProgramOutput().match(
-            /this version of mongodb was not compiled with FIPS support/));
-}
-else {
     // kill mongod
-    stopMongod(port1);
-}
+    MongoRunner.stopMongod(md);
+})();

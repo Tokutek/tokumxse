@@ -1,0 +1,300 @@
+"""Unit tests for buildscripts/resmokelib/utils/history.py."""
+
+import json
+import sys
+import unittest
+
+from buildscripts.resmokelib.utils.history import HistoryDict, make_historic, to_plain
+
+
+class TestHistory(unittest.TestCase):
+    """Unit tests for the HistoryDict class."""
+
+    def test_acts_like_dict(self):
+        test_dict = HistoryDict()
+        self.assertRaises(KeyError, lambda: test_dict["nonexistent_key"])
+
+        test_dict["key1"] = "key1value1"
+        self.assertEqual(test_dict["key1"], "key1value1")
+        test_dict["key1"] = "key1value2"
+        self.assertEqual(test_dict["key1"], "key1value2")
+        del test_dict["key1"]
+        self.assertRaises(KeyError, lambda: test_dict["key1"])
+
+    def test_is_iterable(self):
+        test_dict = HistoryDict()
+        test_dict["key1"] = "key1val"
+        test_dict["key2"] = "key2val"
+        test_dict["key3"] = "key3val"
+        test_dict["key4"] = "key4val"
+
+        expected_vals = ["key1val", "key2val", "key3val", "key4val"]
+        actual_vals = []
+        for key in test_dict:
+            actual_vals.append(test_dict[key])
+
+        self.assertCountEqual(actual_vals, expected_vals)
+
+    def test_inner_dict(self):
+        test_dict = HistoryDict()
+        inner_dict = HistoryDict()
+        inner_dict["foo"] = "bar"
+        test_dict["innerDict"] = inner_dict
+        test_dict["innerDict"]["foo"] = "za"
+        another_ref = test_dict["innerDict"]
+        another_ref["another_added"] = "another_val"
+        self.assertEqual(test_dict["innerDict"]["foo"], "za")
+        self.assertEqual(test_dict["innerDict"]["another_added"], "another_val")
+
+        expected_test_dict = """SchemaVersion: "0.1"
+
+
+History:
+
+
+  innerDict:
+  - time: 0
+    type: WRITE
+    value_written: null
+  - time: 1
+    type: WRITE
+    value_written: null
+  - time: 2
+    type: WRITE
+    value_written: null"""
+
+        test_dict_dumped = test_dict.dump_history()
+        self.assertEqual(test_dict_dumped, expected_test_dict)
+        final_dict = HistoryDict(yaml_string=test_dict_dumped)
+        self.assertEqual(expected_test_dict, final_dict.dump_history())
+
+    def test_make_historic(self):
+        actual_dict = {"foo": "bar", "a": "b", "innerdict": {"innerkey": "innerval"}}
+        test_dict = make_historic(actual_dict)
+        test_dict["a"] = "c"
+
+        # Updating actual_dict doesn't affect test_dict (it copied).
+        actual_dict["foo"] = "za"
+        # Similarly, updating the inner dict doesn't either.
+        actual_dict["innerdict"]["innerkey"] = "innerval2"
+
+        # However, updating the inner dict on the test_dict does.
+        test_dict["innerdict"]["innerkey"] = "secondinnerval"
+        expected_test_dict = """SchemaVersion: "0.1"
+
+
+History:
+
+
+  a:
+  - time: 1
+    type: WRITE
+    value_written: b
+  - time: 3
+    type: WRITE
+    value_written: c
+
+
+  foo:
+  - time: 0
+    type: WRITE
+    value_written: bar
+
+
+  innerdict:
+  - time: 2
+    type: WRITE
+    value_written: null
+  - time: 4
+    type: WRITE
+    value_written: null"""
+
+        self.assertEqual(test_dict.dump_history(), expected_test_dict)
+
+    def test_dump_and_load(self):
+        test_dict = HistoryDict()
+
+        test_dict["key1"] = "key1value1"
+        test_dict["key1"] = "key1value2"
+        test_dict["key2"] = "key2value1"
+        del test_dict["key1"]
+
+        # Testing with location would be flaky across machines since it
+        # uses absolute pathing. It's just for human convenience anyway.
+        expected_test_dict = """SchemaVersion: "0.1"
+
+
+History:
+
+
+  key1:
+  - time: 0
+    type: WRITE
+    value_written: key1value1
+  - time: 1
+    type: WRITE
+    value_written: key1value2
+  - time: 3
+    type: DELETE
+    value_written: null
+
+
+  key2:
+  - time: 2
+    type: WRITE
+    value_written: key2value1"""
+
+        self.assertEqual(test_dict.dump_history(), expected_test_dict)
+
+        test_dict["key2"] = "key2value2"
+        second_dict = HistoryDict(yaml_string=expected_test_dict)
+
+        self.assertRaises(KeyError, lambda: second_dict["key1"])
+        self.assertEqual(second_dict["key2"], "key2value1")
+
+        # Include the reads / writes we just did.
+        expected_second_dict = """SchemaVersion: "0.1"
+
+
+History:
+
+
+  key1:
+  - time: 0
+    type: WRITE
+    value_written: key1value1
+  - time: 1
+    type: WRITE
+    value_written: key1value2
+  - time: 3
+    type: DELETE
+    value_written: null
+
+
+  key2:
+  - time: 2
+    type: WRITE
+    value_written: key2value1"""
+
+        self.assertEqual(second_dict.dump_history(), expected_second_dict)
+
+    def test_write_equality(self):
+        test_dict = HistoryDict()
+        test_dict["foo"] = "bar"
+        test_dict["myint"] = 1
+        test_dict["foo"] = "za"
+        test_dict["innerdict"] = make_historic({"a": "b"})
+
+        second_dict = HistoryDict()
+        second_dict["foo"] = "bar"
+        second_dict["myint"] = 1
+        second_dict["foo"] = "za"
+        second_dict["innerdict"] = make_historic({"a": "b"})
+
+        self.assertTrue(test_dict.write_equals(second_dict))
+
+        second_dict["another"] = "write"
+        self.assertFalse(test_dict.write_equals(second_dict))
+        test_dict["another"] = "write"
+        self.assertTrue(test_dict.write_equals(second_dict))
+
+        # Reads aren't counted
+        _ = second_dict["foo"]
+        self.assertTrue(test_dict.write_equals(second_dict))
+
+    def test_copy_does_not_record_writes(self):
+        """copy() should not record writes — verify the history is unchanged."""
+        parent = HistoryDict()
+        parent["key"] = "value"
+        parent["nested"] = make_historic({"inner": 1})
+        expected_history = parent.dump_history()
+
+        copied = parent.copy()
+
+        # The copy must have identical history — no extra entries from the copy operation itself.
+        self.assertEqual(expected_history, copied.dump_history())
+        self.assertEqual(copied["key"], "value")
+        self.assertEqual(copied["nested"]["inner"], 1)
+
+    def test_copy_does_not_fire_notify_during_construction(self):
+        """copy() using __setitem__ fires notify_subscriber_write() on the partially-constructed
+        copy for every key assigned. In the real fixture stack this can lead to re-entrancy:
+        __setitem__  -> notify -> accept_write -> (subscriber calls copy() again).
+        Verify that copy() produces zero notify calls on the new dict."""
+        parent = HistoryDict()
+        parent["a"] = 1
+        parent["b"] = make_historic({"c": 2})
+
+        notify_calls = []
+        original_notify = HistoryDict.notify_subscriber_write
+
+        def tracking_notify(self_inner):
+            # Walk the call stack to detect if we're anywhere inside copy()
+            frame = sys._getframe(1)
+            while frame is not None:
+                if frame.f_code.co_name == "copy" and frame.f_code.co_filename.endswith(
+                    "history.py"
+                ):
+                    notify_calls.append("notified during copy")
+                    break
+                frame = frame.f_back
+            return original_notify(self_inner)
+
+        try:
+            HistoryDict.notify_subscriber_write = tracking_notify
+            parent.copy()
+        finally:
+            HistoryDict.notify_subscriber_write = original_notify
+
+        self.assertEqual(
+            [],
+            notify_calls,
+            "copy() must not call notify_subscriber_write() during construction",
+        )
+
+    def test_to_plain_converts_nested_historic(self):
+        """to_plain() should recursively return plain, json-serializable python objects.
+
+        This mirrors the DisaggReplicaSetFixture case: a plain dict/list tree (built in
+        the fixture) that embeds a nested HistoryDict pulled from replset_config_options.
+        """
+        # 'settings' comes out of a HistoryDict config store; the rest is built plainly.
+        settings = make_historic({"electionTimeoutMillis": 86400000, "chainingAllowed": False})
+        config = {
+            "version": 1,
+            "members": [{"_id": 0, "priority": 1}, {"_id": 1, "priority": 1}],
+            "settings": settings,
+        }
+
+        # The embedded HistoryDict makes the whole structure not directly json-serializable.
+        self.assertRaises(TypeError, lambda: json.dumps(config))
+
+        plain = to_plain(config)
+
+        # The result is made of plain builtin types, with no serialization envelope.
+        self.assertIsInstance(plain, dict)
+        self.assertIsInstance(plain["settings"], dict)
+        self.assertNotIsInstance(plain["settings"], HistoryDict)
+        self.assertIsInstance(plain["members"], list)
+        self.assertIsInstance(plain["members"][0], dict)
+        self.assertEqual(
+            plain,
+            {
+                "version": 1,
+                "members": [{"_id": 0, "priority": 1}, {"_id": 1, "priority": 1}],
+                "settings": {"electionTimeoutMillis": 86400000, "chainingAllowed": False},
+            },
+        )
+
+        # It round-trips through json without error.
+        self.assertEqual(json.loads(json.dumps(plain)), plain)
+
+    def test_to_plain_passes_through_scalars(self):
+        self.assertEqual(to_plain(5), 5)
+        self.assertEqual(to_plain("foo"), "foo")
+        self.assertEqual(to_plain(None), None)
+        self.assertEqual(to_plain({"a": 1}), {"a": 1})
+
+
+if __name__ == "__main__":
+    unittest.main()

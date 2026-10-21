@@ -1,0 +1,76 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/modifier_node.h"
+#include "mongo/db/update/update_node.h"
+#include "mongo/db/update/update_node_visitor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+/**
+ * Represents the application of $inc or $mul to the value at the end of a path.
+ */
+class ArithmeticNode : public ModifierNode {
+public:
+    enum class ArithmeticOp { kAdd, kMultiply };
+
+    explicit ArithmeticNode(ArithmeticOp op) : _op(op) {}
+
+    Status init(BSONElement modExpr, const boost::intrusive_ptr<ExpressionContext>& expCtx) final;
+
+    std::unique_ptr<UpdateNode> clone() const final {
+        return std::make_unique<ArithmeticNode>(*this);
+    }
+
+    void setCollator(const CollatorInterface* collator) final {}
+
+    void acceptVisitor(UpdateNodeVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+protected:
+    ModifyResult updateExistingElement(mutablebson::Element* element,
+                                       const FieldRef& elementPath) const final;
+    void setValueForNewElement(mutablebson::Element* element) const final;
+
+    bool allowCreation() const final {
+        return true;
+    }
+
+private:
+    std::string_view operatorName() const final {
+        switch (_op) {
+            case ArithmeticNode::ArithmeticOp::kAdd:
+                return "$inc";
+            case ArithmeticNode::ArithmeticOp::kMultiply:
+                return "$mul";
+        }
+        MONGO_UNREACHABLE;
+    }
+
+    BSONObj operatorValue(const query_shape::SerializationOptions& opts) const final {
+        return BSON("" << opts.serializeLiteral(_val));
+    }
+
+    ArithmeticOp _op;
+    BSONElement _val;
+};
+
+}  // namespace mongo

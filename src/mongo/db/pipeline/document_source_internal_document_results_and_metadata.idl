@@ -1,0 +1,88 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    MetadataBindSpec:
+        description: >-
+            Binds the metadata stream from the source stage to a pipeline variable. 'as' must name a
+            known built-in pipeline variable (e.g., "SEARCH_META" for $$SEARCH_META).
+        strict: true
+        query_shape_component: true
+        fields:
+            as:
+                description: Pipeline variable name to bind the metadata stream to.
+                type: string
+                stability: internal
+                query_shape: anonymize
+
+    ShardedPlanSpec:
+        description: >-
+            Merge-sort pattern and optional metadata merge pipeline cached by the router when
+            serializing $_internalDocumentResultsAndMetadata into a subpipeline. The shard uses
+            this to reconstruct distributedPlanLogic() when the live callback is unavailable after
+            a BSON round-trip.
+        strict: true
+        query_shape_component: true
+        fields:
+            resultsSortPattern:
+                description: Merge-sort pattern for the document results stream.
+                type: object_owned
+                stability: internal
+                query_shape: parameter
+            metaMergePipeline:
+                description: >-
+                    Merge pipeline for the metadata stream; absent when no metadata binding is
+                    configured.
+                type: array<object_owned>
+                optional: true
+                stability: internal
+                query_shape: parameter
+
+    DocumentSourceResultsAndMetadataSpec:
+        description: >-
+            Internal specification for $_internalDocumentResultsAndMetadata, a container
+            stage that wraps an aggregation source stage which emits document results
+            and metadata and routes them into separate consumers via DocumentSourceExchange.
+        strict: true
+        query_shape_component: true
+        fields:
+            source:
+                description: >-
+                    The source stage that emits both document results and metadata as two separate streams.
+                type: object_owned
+                stability: internal
+                query_shape: parameter
+            metadata:
+                description: >-
+                    Binds the metadata stream from the source stage to a pipeline variable. Optionally
+                    cleared by optimizeAt() when no downstream stage
+                    references the variable.
+                type: MetadataBindSpec
+                optional: true
+                stability: internal
+                query_shape: literal
+            returnCursor:
+                description: >-
+                    When true, the metadata stream is returned as a separate
+                    cursor rather than being bound inline via
+                    $setVar. Only the router sets this during pipeline serialization
+                    to shards.
+                type: bool
+                default: false
+                stability: internal
+                query_shape: parameter
+            shardedPlanSpec:
+                description: >-
+                    Merge plan cached by the router when serializing this stage into a subpipeline;
+                    used by the shard when the DPL callback is unavailable after re-parse.
+                type: ShardedPlanSpec
+                optional: true
+                stability: internal
+                query_shape: literal

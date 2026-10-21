@@ -1,0 +1,425 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/shell/proxyscope.h"
+
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/mozjs/shell/implscope.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/interruptible.h"
+
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <thread>
+#include <utility>
+
+#include <boost/none.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+
+namespace mongo {
+namespace mozjs {
+
+MozJSProxyScope::MozJSProxyScope(MozJSScriptEngine* engine)
+    : _engine(engine),
+      _implScope(nullptr),
+      _mutex(),
+      _state(State::Idle),
+      _status(Status::OK()),
+      _thread(implThread, this) {
+    // Test the child on startup to make sure it's awake and that the
+    // implementation scope sucessfully constructed.
+    try {
+        run([] {});
+    } catch (...) {
+        shutdownThread();
+        throw;
+    }
+}
+
+MozJSProxyScope::~MozJSProxyScope() {
+    try {
+        kill();
+        shutdownThread();
+    } catch (...) {
+        reportFailedDestructor(MONGO_SOURCE_LOCATION());
+    }
+}
+
+void MozJSProxyScope::init(const BSONObj* data) {
+    run([&] { _implScope->init(data); });
+}
+
+void MozJSProxyScope::reset() {
+    unregisterOperation();
+    runWithoutInterruptionExceptAtGlobalShutdown([&] { _implScope->reset(); });
+}
+
+bool MozJSProxyScope::isKillPending() const {
+    return _implScope->isKillPending();
+}
+
+void MozJSProxyScope::registerOperation(OperationContext* opCtx) {
+    _opCtx = opCtx;
+}
+
+void MozJSProxyScope::unregisterOperation() {
+    _opCtx = nullptr;
+}
+
+void MozJSProxyScope::externalSetup() {
+    run([&] { _implScope->externalSetup(); });
+}
+
+std::string MozJSProxyScope::getError() {
+    std::string out;
+    runWithoutInterruptionExceptAtGlobalShutdown([&] { out = _implScope->getError(); });
+    return out;
+}
+
+std::string MozJSProxyScope::getBaseURL() const {
+    return _implScope->getBaseURL();
+}
+
+bool MozJSProxyScope::hasOutOfMemoryException() {
+    bool out = false;
+    runWithoutInterruptionExceptAtGlobalShutdown(
+        [&] { out = _implScope->hasOutOfMemoryException(); });
+    return out;
+}
+
+void MozJSProxyScope::gc() {
+    _implScope->gc();
+}
+
+void MozJSProxyScope::advanceGeneration() {
+    runWithoutInterruptionExceptAtGlobalShutdown([&] { _implScope->advanceGeneration(); });
+}
+
+void MozJSProxyScope::requireOwnedObjects() {
+    runWithoutInterruptionExceptAtGlobalShutdown([&] { _implScope->requireOwnedObjects(); });
+}
+
+double MozJSProxyScope::getNumber(const char* field) {
+    double out = 0.0;
+    run([&] { out = _implScope->getNumber(field); });
+    return out;
+}
+
+int MozJSProxyScope::getNumberInt(const char* field) {
+    int out = 0;
+    run([&] { out = _implScope->getNumberInt(field); });
+    return out;
+}
+
+long long MozJSProxyScope::getNumberLongLong(const char* field) {
+    long long out = 0;
+    run([&] { out = _implScope->getNumberLongLong(field); });
+    return out;
+}
+
+Decimal128 MozJSProxyScope::getNumberDecimal(const char* field) {
+    Decimal128 out;
+    run([&] { out = _implScope->getNumberDecimal(field); });
+    return out;
+}
+
+std::string MozJSProxyScope::getString(const char* field) {
+    std::string out;
+    run([&] { out = _implScope->getString(field); });
+    return out;
+}
+
+bool MozJSProxyScope::getBoolean(const char* field) {
+    bool out = false;
+    run([&] { out = _implScope->getBoolean(field); });
+    return out;
+}
+
+BSONObj MozJSProxyScope::getObject(const char* field) {
+    BSONObj out;
+    run([&] { out = _implScope->getObject(field); });
+    return out;
+}
+
+OID MozJSProxyScope::getOID(const char* field) {
+    OID out;
+    run([&] { out = _implScope->getOID(field); });
+    return out;
+}
+
+void MozJSProxyScope::getBinData(const char* field,
+                                 std::function<void(const BSONBinData&)> withBinData) {
+    run([&] { _implScope->getBinData(field, std::move(withBinData)); });
+}
+
+Timestamp MozJSProxyScope::getTimestamp(const char* field) {
+    Timestamp out;
+    run([&] { out = _implScope->getTimestamp(field); });
+    return out;
+}
+
+JSRegEx MozJSProxyScope::getRegEx(const char* field) {
+    JSRegEx out;
+    run([&] { out = _implScope->getRegEx(field); });
+    return out;
+}
+
+void MozJSProxyScope::setNumber(const char* field, double val) {
+    run([&] { _implScope->setNumber(field, val); });
+}
+
+void MozJSProxyScope::setString(const char* field, std::string_view val) {
+    run([&] { _implScope->setString(field, val); });
+}
+
+void MozJSProxyScope::setBoolean(const char* field, bool val) {
+    run([&] { _implScope->setBoolean(field, val); });
+}
+
+void MozJSProxyScope::setElement(const char* field, const BSONElement& e, const BSONObj& parent) {
+    run([&] { _implScope->setElement(field, e, parent); });
+}
+
+void MozJSProxyScope::setObject(const char* field, const BSONObj& obj, bool readOnly) {
+    run([&] { _implScope->setObject(field, obj, readOnly); });
+}
+
+void MozJSProxyScope::setFunction(const char* field, const char* code) {
+    run([&] { _implScope->setFunction(field, code); });
+}
+
+void MozJSProxyScope::deleteGlobal(std::string_view name) {
+    run([&] { _implScope->deleteGlobal(name); });
+}
+
+int MozJSProxyScope::type(const char* field) {
+    int out = 0;
+    run([&] { out = _implScope->type(field); });
+    return out;
+}
+
+void MozJSProxyScope::rename(const char* from, const char* to) {
+    run([&] { _implScope->rename(from, to); });
+}
+
+int MozJSProxyScope::invoke(ScriptingFunction func,
+                            const BSONObj* argsObject,
+                            const BSONObj* recv,
+                            int timeoutMs,
+                            bool ignoreReturn,
+                            bool readOnlyArgs,
+                            bool readOnlyRecv) {
+    int out = 0;
+    run([&] {
+        out = _implScope->invoke(
+            func, argsObject, recv, timeoutMs, ignoreReturn, readOnlyArgs, readOnlyRecv);
+    });
+
+    return out;
+}
+
+bool MozJSProxyScope::exec(std::string_view code,
+                           const std::string& name,
+                           bool printResult,
+                           bool reportError,
+                           bool assertOnError,
+                           int timeoutMs) {
+    bool out = false;
+    run([&] {
+        out = _implScope->exec(code, name, printResult, reportError, assertOnError, timeoutMs);
+    });
+    return out;
+}
+
+void MozJSProxyScope::injectNative(const char* field, NativeFunction func, void* data) {
+    run([&] { _implScope->injectNative(field, func, data); });
+}
+
+ScriptingFunction MozJSProxyScope::_createFunction(const char* raw) {
+    ScriptingFunction out = 0;
+    run([&] { out = _implScope->_createFunction(raw); });
+    return out;
+}
+
+void MozJSProxyScope::kill() {
+    _implScope->kill();
+}
+
+void MozJSProxyScope::interrupt() {
+    _implScope->interrupt();
+}
+
+/**
+ * Invokes a function on the implementation thread
+ *
+ * It does this by serializing the invocation through a unique_function and
+ * capturing any exceptions through _status.
+ *
+ * We transition:
+ *
+ * Idle -> ProxyRequest -> ImplResponse -> Idle
+ */
+template <typename Closure>
+void MozJSProxyScope::run(Closure&& closure) {
+    // We can end up calling functions on the proxy scope from the impl thread
+    // when callbacks from javascript have a handle to the proxy scope and call
+    // methods on it from there. If we're on the same thread, it's safe to
+    // simply call back in, so let's do that.
+
+    if (_thread.get_id() == std::this_thread::get_id()) {
+        return closure();
+    }
+
+    runOnImplThread(std::move(closure));
+}
+
+template <typename Closure>
+void MozJSProxyScope::runWithoutInterruptionExceptAtGlobalShutdown(Closure&& closure) {
+    auto toRun = [&] {
+        run(std::forward<Closure>(closure));
+    };
+
+    if (_opCtx) {
+        return _opCtx->runWithoutInterruptionExceptAtGlobalShutdown(toRun);
+    } else {
+        return toRun();
+    }
+}
+
+void MozJSProxyScope::runOnImplThread(unique_function<void()> f) {
+    {
+        std::unique_lock<std::mutex> lk(_mutex);
+        _function = std::move(f);
+
+        invariant(_state == State::Idle);
+        _state = State::ProxyRequest;
+    }
+    _implCondvar.notify_one();
+
+    Status status = Status::OK();
+    {
+        std::unique_lock<std::mutex> lk(_mutex);
+
+        Interruptible* interruptible = _opCtx ? _opCtx : Interruptible::notInterruptible();
+
+        auto pred = [&] {
+            return _state == State::ImplResponse;
+        };
+
+        try {
+            interruptible->waitForConditionOrInterrupt(_proxyCondvar, lk, pred);
+        } catch (const DBException& ex) {
+            _implScope->kill();
+            _proxyCondvar.wait(lk, pred);
+
+            // update _status after the wait, otherwise it would get overwritten in implThread
+            _status = ex.toStatus();
+        }
+
+        _state = State::Idle;
+
+        // Clear the _status state and throw it if necessary
+        status = std::move(_status);
+    }
+
+    uassertStatusOK(status);
+}
+
+void MozJSProxyScope::shutdownThread() {
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+
+        invariant(_state == State::Idle);
+
+        _state = State::Shutdown;
+    }
+
+    _implCondvar.notify_one();
+
+    _thread.join();
+}
+
+/**
+ * The main loop for the implementation thread
+ *
+ * This owns the actual implementation scope (which needs to be created on this
+ * child thread) and has essentially two transition paths:
+ *
+ * Standard: ProxyRequest -> ImplResponse
+ *   Invoke _function. Serialize exceptions to _status.
+ *
+ * Shutdown: Shutdown -> _
+ *   break out of the loop and return.
+ */
+void MozJSProxyScope::implThread(MozJSProxyScope* proxy) {
+    if (hasGlobalServiceContext()) {
+        Client::initThread("js", getGlobalServiceContext()->getService());
+    }
+
+    std::unique_ptr<MozJSImplScope> scope;
+
+    // This will leave _status set for the first noop runOnImplThread(), which
+    // captures the startup exception that way
+    try {
+        scope.reset(new MozJSImplScope(proxy->_engine,
+                                       boost::none /* Don't override global jsHeapLimitMB */));
+        proxy->_implScope = scope.get();
+    } catch (...) {
+        proxy->_status = exceptionToStatus();
+    }
+
+    // This is mostly to silence coverity, so that it sees that the
+    // ProxyScope doesn't hold a reference to the ImplScope after it
+    // is deleted by the unique_ptr.
+    const ScopeGuard unbindImplScope([&proxy] { proxy->_implScope = nullptr; });
+
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(proxy->_mutex);
+            {
+                MONGO_IDLE_THREAD_BLOCK;
+                proxy->_implCondvar.wait(lk, [proxy] {
+                    return proxy->_state == State::ProxyRequest || proxy->_state == State::Shutdown;
+                });
+            }
+
+            if (proxy->_state == State::Shutdown)
+                break;
+        }
+
+        Status capturedStatus = Status::OK();
+        bool hadException = false;
+        try {
+            // Safe without _mutex: runOnImplThread transfers ownership under the lock
+            // and blocks callers until _state == ImplResponse, so only this thread
+            // can observe or mutate _function during execution. Holding _mutex while
+            // running the closure would deadlock re-entrant callbacks, since the closure
+            // may call back into run(), which first grabs _mutex before queueing work.
+            // coverity[missing_lock]
+            proxy->_function();
+        } catch (...) {
+            capturedStatus = exceptionToStatus();
+            hadException = true;
+        }
+
+        {
+            std::unique_lock<std::mutex> lk(proxy->_mutex);
+
+            if (hadException) {
+                proxy->_status = std::move(capturedStatus);
+            }
+
+            proxy->_state = State::ImplResponse;
+        }
+        proxy->_proxyCondvar.notify_one();
+    }
+}
+
+}  // namespace mozjs
+}  // namespace mongo

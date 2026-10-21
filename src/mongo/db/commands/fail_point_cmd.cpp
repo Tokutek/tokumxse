@@ -1,177 +1,168 @@
-/*
- *    Copyright (C) 2012 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include <vector>
-
-#include "mongo/base/init.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/request_types/wait_for_fail_point_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+
+#include <memory>
+#include <string>
 
 namespace mongo {
 
-    using std::string;
-    using std::stringstream;
+/**
+ * Test-only command for modifying installed fail points.
+ *
+ * Requires the 'enableTestCommands' server parameter to be set. See docs/test_commands.md.
+ *
+ * Format
+ * {
+ *    configureFailPoint: <string>, // name of the fail point.
+ *
+ *    mode: <string|Object>, // the new mode to set. Can have one of the following format:
+ *
+ *        - 'off' - disable fail point.
+ *
+ *        - 'alwaysOn' - fail point is always active.
+ *
+ *        - { activationProbability: <n> } - double n. [0 <= n <= 1]
+ *          n: the probability that the fail point will fire.  0=never, 1=always.
+ *
+ *        - { times: <n> } - int32 n. n > 0. n: # of passes the fail point remains active.
+ *
+ *        - { skip: <n> } - int32 n. n > 0. n: # of passes before the fail point activates
+ *          and remains active.
+ *
+ *    data: <Object> // optional arbitrary object to inject into the failpoint.
+ *        When activated, the FailPoint can read this data and it can be used to inform
+ *        the specific action taken by the code under test.
+ * }
+ */
+class FaultInjectCmd : public BasicCommand {
+public:
+    FaultInjectCmd() : BasicCommand("configureFailPoint") {}
 
-    /**
-     * Command for modifying installed fail points.
-     *
-     * Format
-     * {
-     *    configureFailPoint: <string>, // name of the fail point.
-     *    mode: <string|Object>, // the new mode to set. Can have one of the
-     *        following format:
-     *
-     *        1. 'off' - disable fail point.
-     *        2. 'alwaysOn' - fail point is always active.
-     *        3. { activationProbability: <n> } - n should be a double between 0 and 1,
-     *           representing the probability that the fail point will fire.  0 means never,
-     *           1 means (nearly) always.
-     *        4. { times: <n> } - n should be positive and within the range of a 32 bit
-     *            signed integer and this is the number of passes on the fail point will
-     *            remain activated.
-     *
-     *    data: <Object> // optional arbitrary object to store.
-     * }
-     */
-    class FaultInjectCmd: public Command {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
+
+    // No auth needed because it only works when enabled via command line.
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        return Status::OK();
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    std::string help() const override {
+        return "modifies the settings of a fail point";
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const std::string failPointName(cmdObj.firstElement().str());
+        const auto timesEntered = setGlobalFailPoint(failPointName, cmdObj);
+        result.appendNumber("count", timesEntered);
+        return true;
+    }
+};
+
+/**
+ * Command for waiting for installed fail points.
+ *
+ * For number of additional times entered > 1, this command is only guaranteed to work
+ * correctly if the code that enters the fail point uses the FailPoint API correctly.
+ * That is, the code can only use one of shouldFail, pauseWhileSet, scopedIf, scoped,
+ * executeIf, and execute to enter the fail point (as all of these functions have side
+ * effects on the counter for times entered).
+ */
+class WaitForFailPointCommand : public TypedCommand<WaitForFailPointCommand> {
+public:
+    using Request = WaitForFailPoint;
+    class Invocation final : public InvocationBase {
     public:
-        FaultInjectCmd(): Command("configureFailPoint") {}
+        using InvocationBase::InvocationBase;
 
-        virtual bool slaveOk() const {
-            return true;
+        void typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::FailedToParse,
+                    "Missing maxTimeMS",
+                    request().getGenericArguments().getMaxTimeMS());
+            const std::string failPointName = std::string{request().getCommandParameter()};
+            FailPoint* failPoint = globalFailPointRegistry().find(failPointName);
+            if (failPoint == nullptr)
+                uasserted(ErrorCodes::FailPointSetFailed, failPointName + " not found");
+            failPoint->waitForTimesEntered(opCtx, request().getTimesEntered());
         }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+    private:
+        bool supportsWriteConcern() const override {
+            return false;
+        }
 
-        virtual bool adminOnly() const {
-            return true;
+        // The command parameter happens to be string so it's historically been interpreted
+        // by parseNs as a collection. Continuing to do so here for unexamined compatibility.
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
         }
 
         // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-
-        virtual void help(stringstream& h) const {
-            h << "modifies the settings of a fail point";
-        }
-
-        bool run(OperationContext* txn, const string& dbname,
-                BSONObj& cmdObj,
-                int,
-                string& errmsg,
-                BSONObjBuilder& result,
-                bool fromRepl) {
-            const string failPointName(cmdObj.firstElement().str());
-            FailPointRegistry* registry = getGlobalFailPointRegistry();
-            FailPoint* failPoint = registry->getFailPoint(failPointName);
-
-            if (failPoint == NULL) {
-                errmsg = failPointName + " not found";
-                return false;
-            }
-
-            FailPoint::Mode mode = FailPoint::alwaysOn;
-            FailPoint::ValType val = 0;
-
-            const BSONElement modeElem(cmdObj["mode"]);
-            if (modeElem.eoo()) {
-                result.appendElements(failPoint->toBSON());
-                return true;
-            }
-            else if (modeElem.type() == String) {
-                const string modeStr(modeElem.valuestr());
-
-                if (modeStr == "off") {
-                    mode = FailPoint::off;
-                }
-                else if (modeStr == "alwaysOn") {
-                    mode = FailPoint::alwaysOn;
-                }
-                else {
-                    errmsg = "unknown mode: " + modeStr;
-                    return false;
-                }
-            }
-            else if (modeElem.type() == Object) {
-                const BSONObj modeObj(modeElem.Obj());
-
-                if (modeObj.hasField("times")) {
-                    mode = FailPoint::nTimes;
-                    const int intVal = modeObj["times"].numberInt();
-
-                    if (intVal < 0) {
-                        errmsg = "times should be positive";
-                        return false;
-                    }
-
-                    val = intVal;
-                }
-                else if (modeObj.hasField("activationProbability")) {
-                    mode = FailPoint::random;
-                    const double activationProbability =
-                        modeObj["activationProbability"].numberDouble();
-                    if (activationProbability < 0 || activationProbability > 1) {
-                        errmsg = str::stream() <<
-                            "activationProbability must be between 0.0 and 1.0; found " <<
-                            activationProbability;
-                        return false;
-                    }
-                    val = static_cast<int32_t>(
-                            std::numeric_limits<int32_t>::max() * activationProbability);
-                }
-                else {
-                    errmsg = "invalid mode object";
-                    return false;
-                }
-            }
-            else {
-                errmsg = "invalid mode format";
-                return false;
-            }
-
-            BSONObj dataObj;
-            if (cmdObj.hasField("data")) {
-                dataObj = cmdObj["data"].Obj();
-            }
-
-            failPoint->setMode(mode, val, dataObj);
-            return true;
-        }
+        void doCheckAuthorization(OperationContext* opCtx) const override {}
     };
-    MONGO_INITIALIZER(RegisterFaultInjectCmd)(InitializerContext* context) {
-        if (Command::testCommandsEnabled) {
-            // Leaked intentionally: a Command registers itself when constructed.
-            new FaultInjectCmd();
-        }
-        return Status::OK();
+
+    std::string help() const override {
+        return "wait for a fail point to be entered a certain number of times";
     }
-}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
+};
+
+MONGO_REGISTER_COMMAND(WaitForFailPointCommand).testOnly().forRouter().forShard();
+MONGO_REGISTER_COMMAND(FaultInjectCmd).testOnly().forRouter().forShard();
+}  // namespace mongo

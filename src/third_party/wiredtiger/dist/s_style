@@ -1,196 +1,246 @@
-#! /bin/sh
+#!/bin/bash
 
 # General style correction and cleanup.
-t=__wt.$$
-trap 'rm -f $t; exit 0' 0 1 2 3 13 15
+. `dirname -- ${BASH_SOURCE[0]}`/common_functions.sh
+setup_trap
+cd_top
+check_fast_mode_flag
 
-cd ..
-
-# Turn a C file into a line per function so we can use grep on it.
-file_parse()
-{
-	sed -n \
-	    -e '/^{$/,/^}$/{=;p;}' $1 |
-	sed 'N;s/\n/:/' |
-	sed -e '/./{H;/^[0-9][0-9]*:}$/!d;}' \
-	    -e x \
-	    -e 's/\n/ /g' \
-	    -e p \
-	    -e '{s/.*//;x;}'
-}
-
-# Returns in functions after a jump to the error label, or an infinite loop
-# where there's a jump to the error label after the error label.
-for f in `find bench examples ext src test -name '*.[ci]'`; do
-	file_parse $f |
-	egrep '(WT_ERR|WT_ERR_MSG|WT_ERR_NOTFOUND_OK|WT_ERR_TEST|WT_ILLEGAL_VALUE_ERR)\(.*(WT_ASSERT_RET|WT_ILLEGAL_VALUE|WT_RET|WT_RET_MSG|WT_RET_NOTFOUND_OK|WT_RET_TEST|WT_VERBOSE_RET|WT_VERBOSE_RETVAL)\(.*err:|[^a-z_]err:.*(WT_ERR|WT_ERR_MSG|WT_ERR_NOTFOUND_OK|WT_ERR_TEST|WT_ILLEGAL_VALUE_ERR)\(' |
-	sed 's/:.*//' > $t
-
-	test -s $t && {
-		echo "$f: return after a jump to the error label or a jump to the error label after the error label"
-		sed 's/^/function @ line:/' < $t
-	}
-done
-
-# Return of 0 in functions after a jump to the error label.
-for f in `find bench examples ext src test -name '*.[ci]'`; do
-	file_parse $f |
-	egrep -v '[^a-z_]err:.*return \(ret|[^a-z_]err:.*WT_RET' |
-	egrep '[^a-z_]err:.*return \(0\);' |
-	sed 's/:.*//' > $t
-
-	test -s $t && {
-		echo "$f: error label followed by a return of 0"
-		sed 's/^/function @ line:/' < $t
-	}
-done
-
-for f in \
-    `find bench examples ext src test -name '*.[chisy]' -o -name '*.in' |
+# Parallel execution: if it's the main onvocation of the script, collect the file names
+# to process and run them in subprocesses.
+is_main_run && {
+    find bench dist examples ext src test tools/checksum_bitflip -name '*.[ch]' -o -name '*.in' \
+            -o -name '*.dox' -o -name '*.cxx' -o -name '*.cpp' -o -name '*.py' -o -name '*.cmake' \
+            -o -name '*.i' -o -name '*.yml' | \
     sed -e '/Makefile.in/d' \
-	-e '/build_win\/wiredtiger_config.h/d'`; do
-	if grep "^[^}]*while (0);" $f > $t; then
-		echo "$f: while (0) has trailing semi-colon"
-		cat $t
-	fi
+        -e '/test\/3rdparty/d' \
+        -e '/test\/checksum\/power8/d' \
+        -e '/bench\/workgen\/workgen_wrap.cxx/d' \
+        -e '/checksum\/zseries/d' | \
+    do_in_parallel
+    exit $?
+}
 
-	if grep "(unsigned)" $f > $t; then
-		echo "$f: (unsigned) cast is wrong"
-		cat $t
-	fi
+# A list of files provided: process them one by one.
 
-	if grep WT_DEADLOCK $f | grep -v '#define.WT_DEADLOCK' > $t; then
-		echo "$f: WT_DEADLOCK deprecated in favor of WT_ROLLBACK"
-		cat $t
-	fi
+for f in "$@"; do
+    # General style correction and cleanup for a single file
+    fname="${f##*/}"
+    rm -f "$t"
+    t=__wt_s_style.$fname.$$
 
-	if ! expr "$f" : 'src/os_posix/.*' > /dev/null &&
-	   ! expr "$f" : 'src/os_win/.*' > /dev/null &&
-	   ! expr "$f" : 'src/include/extern.h' > /dev/null &&
-	   ! expr "$f" : 'src/include/os.h' > /dev/null &&
-	   grep '__wt_errno' $f > $t; then
-		echo "$f: upper-level code should not call __wt_errno"
-		cat $t
-	fi
+    if [ ! -e $f ]; then
+        echo "$0 error $f does not exist"
+        exit 1;
+    fi
 
-	if ! expr "$f" : 'examples/c/.*' > /dev/null &&
-	   ! expr "$f" : 'ext/datasources/helium/helium.c' > /dev/null &&
-	   ! expr "$f" : 'src/include/os.h' > /dev/null &&
-	    grep "%zu" $f | grep -v 'SIZET_FMT' > $t; then
-		echo "$f: %zu needs to be fixed for Windows"
-		cat $t
-	fi
+    # Ignore styling errors of external libraries.
+    if [[ "$f" == src/* ]] &&
+      [[ "$f" != src/os_win/* ]] &&
+      [[ "$f" != src/docs/* ]] &&
+      [[ "$f" != src/tags* ]] &&
+      [[ "$f" != src/*/hash_city* ]] &&
+      [[ "$f" != src/checksum* ]]; then
 
-	egrep -w 'off_t' $f > $t
-	test -s $t && {
-		echo "$f: off_t type declaration, use wt_off_t"
-		cat $t
-	}
+        # Camel case style is not allowed.
+        if grep -E -n '\b[a-z]+[A-Z]' $f | grep -E -v ':[     ]+\*|"|UNCHECKED_STRING'; then
+            echo "$f: Styling requires variables that use underscores to separate parts of a name instead of camel casing.";
+        fi
 
-	# Direct calls to functions we're not supposed to use in the library.
-	# We don't check for all of them, just a few of the common ones.
-	if ! expr "$f" : 'bench/.*' > /dev/null &&
-	   ! expr "$f" : 'examples/.*' > /dev/null &&
-	   ! expr "$f" : 'ext/.*' > /dev/null &&
-	   ! expr "$f" : 'test/.*' > /dev/null &&
-	   ! expr "$f" : '.*/utilities/.*' > /dev/null; then
-		if ! expr "$f" : '.*/os_alloc.c' > /dev/null &&
-		     egrep '[[:space:]]free[(]|[[:space:]]strdup[(]|[[:space:]]strndup[(]|[[:space:]]malloc[(]|[[:space:]]calloc[(]|[[:space:]]realloc[(]' $f > $t; then
-			test -s $t && {
-				echo "$f: call to illegal function"
-				cat $t
-			}
-		fi
-		if ! expr "$f" : '.*/os_strtouq.c' > /dev/null &&
-		     egrep '[[:space:]]strtouq[(]' $f > $t; then
-			test -s $t && {
-				echo "$f: call to illegal function"
-				cat $t
-			}
-		fi
-		if egrep '[[:space:]]exit[(]' $f > $t; then
-			test -s $t && {
-				echo "$f: call to illegal function"
-				cat $t
-			}
-		fi
-	fi
+        # Return values should be wrapped in parentheses.
+        grep -E -n '^[^*/"]*[[:space:]]*return [^(]' $f > $t;
+        test -s $t && {
+            echo "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-="
+            echo 'Add parentheses to return values indicated below in file '"$f"
+            echo "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-="
+            cat $t
+        }
+    fi
 
-	# Declaration of an integer return variable.
-	if ! expr "$f" : 'bench/.*' > /dev/null &&
-	   ! expr "$f" : 'examples/.*' > /dev/null &&
-	   ! expr "$f" : 'test/.*' > /dev/null &&
-	   ! expr "$f" : 'ext/.*' > /dev/null; then
-		egrep -w ret $f | egrep 'int.*[, ]ret[,;]' > $t
-		test -s $t && {
-			echo "$f: explicit declaration of \"ret\""
-			cat $t
-		}
-	fi
+    # C++ files must use .cpp as a file extension
+    if [ "${fname##*.}" = "cxx" ]; then
+        echo "$f: C++ files must use .cpp as an extension."
+    fi
 
-	# Early exits from critical loops
-	sed -n -e '/API_CALL.*;$/,/API_END.*;/{=;p;}' \
-	       -e '/LSM_.*ENTER*;$/,/LSM_.*LEAVE*;/{=;p;}' \
-	       -e '/va_start/,/va_end/{=;p;}' $f | \
-		sed 'N;s/\n/:/' | \
-		egrep -w 'return|WT_RET' | \
-		sed -e "s,^,$f:," -e 's/$/ [return skips API_END call]/'
+    # Remove non-ascii characters and substitute some expressions with accepted version.
+    if grep -Eq 'EOPNOTSUPP|\(unsigned\)|hazard reference|;;' $f 2>/dev/null; then
+        tr -cd '[:alnum:][:space:][:punct:]' < $f |
+        sed -e '/for /!s/;;$/;/' \
+            -e 's/(EOPNOTSUPP)/(ENOTSUP)/' \
+            -e 's/(unsigned)/(u_int)/' \
+            -e 's/hazard reference/hazard pointer/' >$t
+        cmp $t $f > /dev/null 2>&1 || (echo "modifying $f" && cp $t $f)
+    fi
 
-	tr -cd '[:alnum:][:space:][:punct:]' < $f |
-	unexpand |
-	sed -e 's/){/) {/' \
-	    -e 's/\([	 ]\)for(/\1for (/' \
-	    -e 's/\([	 ]\)if(/\1if (/' \
-	    -e 's/\([	 ]\)index(/\1strchr(/' \
-	    -e 's/\([	 ]\)return(/\1return (/' \
-	    -e 's/\([	 ]\)return \([^()]*\);/\1return (\2);/' \
-	    -e 's/\([	 ]\)rindex(/\1strrchr(/' \
-	    -e 's/\([	 ]\)sizeof (/\1sizeof(/g' \
-	    -e 's/\([	 ]\)switch(/\1switch (/' \
-	    -e 's/\([	 ]\)while(/\1while (/' \
-	    -e 's/\([	 ,]\)uint\([	 ,]\)/\1u_int\2/g' \
-	    -e 's/\([	 ,]\)u_int8_t\([	 ,]\)/\1uint8_t\2/g' \
-	    -e 's/\([	 ,]\)u_int16_t\([	 ,]\)/\1uint16_t\2/g' \
-	    -e 's/\([	 ,]\)u_int32_t\([	 ,]\)/\1uint32_t\2/g' \
-	    -e 's/\([	 ,]\)u_int64_t\([	 ,]\)/\1uint64_t\2/g' \
-	    -e 's/\([	 ,]\)u_quad\([	 ,]\)/\1uint64_t\2/g' \
-	    -e 's/\([|&=+-]\)  *\([^*]\)/\1 \2/' \
-	    -e 's/(void) \([a-zA-Z_]\)/(void)\1/' \
-	    -e '/for /!s/;;$/;/' \
-	    -e 's/(EOPNOTSUPP)/(ENOTSUP)/' \
-	    -e 's/(unsigned)/(u_int)/' \
-	    -e 's/hazard reference/hazard pointer/' \
-	    -e 's/^#define /#define	/' >$t
+    # Finding paired typos in the comments of different file types and excluding invalid edge cases.
+    if [ "${fname##*.}" = "py" ]; then
+        grep -E '#.*[[:space:]]\b([a-zA-Z]+)[[:space:]]\b\1[[:space:]\.]' $f | grep -E -v -e "long long"> $t
+    elif [ "${fname##*.}" = "c" ] || [ "${fname##*.}" = "cpp" ] || [ "${fname##*.}" = "h" ]; then
+        grep -E '/?\*.*[[:space:]]\b([a-zA-Z]+)[[:space:]]\b\1[[:space:]\.]' $f | grep -E -v -e "@" -e "long long" > $t
+    else
+        grep -E '[[:space:]]\b([a-zA-Z]+)[[:space:]]\b\1[[:space:]\.]' $f | grep -E -v -e "@" -e "^\(" > $t
+    fi
 
-	cmp $t $f > /dev/null 2>&1 || (echo "modifying $f" && cp $t $f)
+    test -s $t && {
+        echo "paired typo"
+        echo "============================"
+        echo $f
+        cat $t
+    }
+
+    extension="${fname##*.}"
+    if [ "x$extension" = "xdox" ]; then
+        exit 0;
+    fi
+
+    if grep "^[^}]*while (0);" $f > $t; then
+        echo "$f: while (0) has trailing semi-colon"
+        cat $t
+    fi
+
+    if grep WT_DEADLOCK $f | grep -v '#define.WT_DEADLOCK' > $t; then
+        echo "$f: WT_DEADLOCK deprecated in favor of WT_ROLLBACK"
+        cat $t
+    fi
+
+    # A static assert in verify_build.h requires using sizeof explicitly.
+    if [[ "$f" != src/include/verify_build.h ]] &&
+        grep 'sizeof(WT_UPDATE)' $f > $t; then
+        echo "$f: Use WT_UPDATE_SIZE rather than sizeof(WT_UPDATE)"
+        cat $t
+
+    fi
+
+    if [[ "$f" != examples/c/* ]] &&
+       [[ "$f" != ext/* ]] &&
+       [[ "$f" != src/include/wiredtiger_ext.h ]] &&
+       [[ "$f" != src/txn/txn_ext.c ]] &&
+       grep WT_TXN_ISO_ $f; then
+        echo "$f: WT_TXN_ISO_XXX constants only for the extension API"
+    fi
+
+    if [[ "$f" != src/include/queue.h ]] &&
+        grep -E 'STAILQ_|SLIST_' $f ; then
+        echo "$f: use TAILQ or LIST, not a singly-linked list"
+    fi
+
+    if [[ "$f" != src/include/extern.h ]] &&
+       [[ "$f" != src/include/extern_posix.h ]] &&
+       [[ "$f" != src/include/extern_win.h ]] &&
+       [[ "$f" != src/include/os.h ]] &&
+       [[ "$f" != src/os_common/* ]] &&
+       [[ "$f" != src/os_posix/* ]] &&
+       [[ "$f" != src/os_win/* ]] &&
+        grep '__wt_errno' $f > $t; then
+        echo "$f: upper-level code should not call __wt_errno"
+        cat $t
+    fi
+
+    if [[ "$f" != examples/c/* ]] &&
+       [[ "$f" != src/include/os.h ]] &&
+        grep -E "%[0-9]*zu" $f | grep -v 'SIZET_FMT' > $t; then
+        echo "$f: %zu needs to be fixed for Windows"
+        cat $t
+    fi
+
+    grep -E -w 'off_t' $f > $t
+    test -s $t && {
+        echo "$f: off_t type declaration, use wt_off_t"
+        cat $t
+    }
+
+    if [[ "$f" != src/include/misc.h ]] &&
+        grep '[[:space:]]qsort(' $f > $t; then
+        echo "$f: qsort call, use WiredTiger __wt_qsort instead"
+        cat $t
+    fi
+
+    if [[ "$f" != src/*/os_setvbuf.c ]] &&
+        grep -E -w 'setvbuf' $f > $t; then
+        echo "$f: setvbuf call, use WiredTiger library replacements"
+        cat $t
+    fi
+
+    if [[ "$f" != examples/c/* ]] &&
+       [[ "$f" != bench/* ]] &&
+       [[ "$f" != *.cxx ]] &&
+       [[ "$f" != *.cpp ]] &&
+       [[ "$f" != ext/* ]] &&
+       [[ "$f" != src/os_posix/os_snprintf.c ]] &&
+        grep -E '[^a-z_]snprintf\(|[^a-z_]vsnprintf\(' $f > $t; then
+        echo "$f: snprintf call, use WiredTiger library replacements"
+        cat $t
+    fi
+
+    # If we don't have matching pack-begin and pack-end calls, we don't get
+    # an error, we just get a Windows performance regression.
+    grep -E WT_PACKED_STRUCT $f > $t
+    cnt=$(grep -c -E WT_PACKED_STRUCT $t)
+    (( cnt % 2 )) && {
+        echo "$f: mismatched WT_PACKED_STRUCT_BEGIN/END lines"
+        cat $t
+    }
+
+    # Direct calls to functions we're not supposed to use in the library.
+    # We don't check for all of them, just a few of the common ones.
+    if [[ "$f" != bench/* ]] &&
+       [[ "$f" != dist/* ]] &&
+       [[ "$f" != examples/* ]] &&
+       [[ "$f" != ext/* ]] &&
+       [[ "$f" != test/* ]]; then
+        if [[ "$f" != */os_alloc.c ]] &&
+           [[ "$f" != */util_misc.c ]] &&
+             grep -E '[[:space:]]free[(]|[[:space:]]strdup[(]|[[:space:]]strndup[(]|[[:space:]]malloc[(]|[[:space:]]calloc[(]|[[:space:]]realloc[(]|[[:space:]]sprintf[(]' $f > $t; then
+            test -s $t && {
+                echo "$f: call to illegal function"
+                cat $t
+            }
+        fi
+        if [[ "$f" != */os_strtouq.c ]] &&
+             grep -E '[[:space:]]strtouq[(]' $f > $t; then
+            test -s $t && {
+                echo "$f: call to illegal function"
+                cat $t
+            }
+        fi
+        if grep -E '[[:space:]]exit[(]' $f > $t; then
+            test -s $t && {
+                echo "$f: call to illegal function"
+                cat $t
+            }
+        fi
+    fi
+
+    # Declaration of an integer return variable.
+    if [[ "$f" != bench/* ]] &&
+       [[ "$f" != examples/* ]] &&
+       [[ "$f" != test/* ]] &&
+       [[ "$f" != ext/* ]]; then
+       # This regex can return false positives on functions that take ret as
+       # an argument. Filter out matches that contain brackets.
+        grep -E -w ret $f | grep -E 'int.*[, ]ret[,;]' | grep -E -v '[()]' > $t
+        test -s $t && {
+            echo "$f: explicit declaration of \"ret\""
+            cat $t
+        }
+    fi
+
+    # Use of ctype functions that sign extend their arguments.
+    if [[ "$f" != bench/* ]] &&
+       [[ "$f" != test/csuite/* ]] &&
+       [[ "$f" != examples/* ]] &&
+       [[ "$f" != ext/* ]] &&
+       [[ "$f" != *.py ]] &&
+       [[ "$f" != *.cpp ]] &&
+       [[ "$f" != src/include/ctype.i ]] &&
+       [[ "$f" != src/include/ctype_inline.h ]]; then
+        if grep -E '(#include.*["</]ctype.h[">]|\b(is(alnum|alpha|cntrl|digit|graph|lower|print|punct|space|upper|xdigit)|to(lower|toupper))\()' $f > $t; then
+            test -s $t && {
+                echo "$f: direct use of ctype.h functions, instead of ctype.i equivalents"
+                cat $t
+            }
+        fi
+    fi
 done
 
-# Check Python coding standards: check for tab characters.
-egrep '	' `find . -name '*.py'` |
-    sed -e 's/:.*//' \
-	-e '/__init__.py/d' \
-	-e '/src\/docs\/tools\/doxypy.py/d' |
-    sort -u |
-    sed 's/^/	/' > $t
-test -s $t && {
-	echo '[tab] characters appear in Python scripts:'
-	cat $t
-}
-# Check Python coding standards: check for trailing semi-colons.
-# Don't check too widely, there are third-party tools that fail this test as
-# well as scripts in this directory that output C code, and so fail the test.
-egrep ';$' `find lang test -name '*.py'`> $t
-test -s $t && {
-	echo 'trailing semi-colons in selected Python code:'
-	cat $t
-}
-
-# Check for common typos (Wikipedia's list).
-find bench examples ext src test \
-    -name '*.[chisy]' -o -name '*.in' -o -name '*.dox' |
-xargs egrep -w 'a a|an an|and and|are are|be be|by by|for for|from from|if if|in in|is is|it it|of of|the the|this this|to to|was was|were were|when when|with with|a an|an a|a the|the a' > $t
-	test -s $t && {
-		echo "paired typo"
-		echo "============================"
-		cat $t
-	}
+exit 0

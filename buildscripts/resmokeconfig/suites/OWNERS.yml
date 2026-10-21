@@ -1,0 +1,293 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "README.md":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "aggregation*":
+    approvers:
+      - 10gen/query
+  - "aggregation_dependency_graph_validation_passthrough.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_disabled_optimization.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_repeat_queries_multiplan_single_solutions.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_unsplittable_collections_on_random_shard_passthrough*":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_facet_unwind_passthrough.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "*join_optimization*":
+    approvers:
+      - 10gen/query-optimization
+  - "*join_plan_cache*":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_sharded_collections_causally_consistent_passthrough.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "aggregation_secondary_reads.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "backup_restore.yml":
+    approvers:
+      - 10gen/server-backup-restore
+  - "benchmarks_abt_lowering.yml":
+    approvers:
+      - 10gen/query-execution-sbe
+  - "benchmarks_expression.yml":
+    approvers:
+      - 10gen/query-execution-classic
+  - "benchmarks_expression_sbe.yml":
+    approvers:
+      - 10gen/query-execution-sbe
+  - "benchmarks_query.yml":
+    approvers:
+      - 10gen/query
+  - "benchmarks_sorter.yml":
+    approvers:
+      - 10gen/server-external-sorter
+  - "buildscripts_test.yml":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "bulk_write*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "bulk_write_multi_op_sharded_collections_jscore_passthrough.yml":
+    approvers:
+      - 10gen/query-execution-router
+  - "clustered_collection_passthrough.yml":
+    approvers:
+      - 10gen/query-execution
+  - "pbt_clustered_experiment_coll.yml":
+    approvers:
+      - 10gen/query-property-based-testing
+  - "concurrency_compute_mode.yml":
+    approvers:
+      - 10gen/query-integration-features
+  - "core_wildcard_indexes.yml":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "decimal.yml":
+    approvers:
+      - 10gen/server-programmability
+  - "disk_wiredtiger.yml":
+    approvers:
+      - 10gen/server-storage-engine-integration
+  - "extensions*":
+    approvers:
+      - 10gen/query-integration-extensions-api
+  - "failpoints*":
+    approvers:
+      - 10gen/server-programmability
+  - "fle*":
+    approvers:
+      - 10gen/query-integration-features
+  - "*high_yielding*":
+    approvers:
+      - 10gen/query-execution-yielding
+  - "json_schema.yml":
+    approvers:
+      - 10gen/query-execution
+  - "query_tester_self_test.yml":
+    approvers:
+      - 10gen/query-optimization-correctness
+  - "search*":
+    approvers:
+      - 10gen/query-integration-search
+  - "sharding_clustered_collections.yml":
+    approvers:
+      - 10gen/query-execution-router
+  - "unittests_query.yml":
+    approvers:
+      - 10gen/query
+  - "update_fuzzer*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "vector_search*":
+    approvers:
+      - 10gen/query-integration-search
+  - "query_golden*":
+    approvers:
+      - 10gen/query-optimization
+  - "queryable_wt*":
+    approvers:
+      - 10gen/server-backup-restore
+  - "read_only*":
+    approvers:
+      - 10gen/server-storage-engine-integration
+  - "no_passthrough_network*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "integration_tests_replset_tls.yml":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "cwrwc*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "fcv*":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "feature_flag_multiversion*":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "jstestfuzz_replication*":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "libunwind.yml":
+    approvers:
+      - 10gen/server-programmability
+  - "magic_restore*":
+    approvers:
+      - 10gen/server-recovery
+  - "mongot*":
+    approvers:
+      - 10gen/query-integration-search
+  - "concurrency_with_mongot_extension*":
+    approvers:
+      - 10gen/query-integration-extensions-api
+  - "multiversion*":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "replica_sets*":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "read_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "resmoke_end2end_tests.yml":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "retryable_writes*":
+    approvers:
+      - 10gen/server-transactions
+  - "rollback*":
+    approvers:
+      - 10gen/server-recovery
+  - "*txn*":
+    approvers:
+      - 10gen/server-transactions
+  - "write_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "*config_transitions_and_add_remove_shard.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "*config_transitions.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "query_correctness_query_shape_hash_stability_generated_test.yml":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "timeseries_crud_jscore_passthrough.yml":
+    approvers:
+      - 10gen/query-timeseries
+  - "sharding_auth.yml":
+    approvers:
+      - 10gen/server-security
+  - "concurrency_replication_maintenance.yml":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "identity_views_passthrough.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "replica_sets_transition_to_csrs_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "*cbr*":
+    approvers:
+      - 10gen/query-optimization
+  - "sharding_config_shard.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "concurrency_sharded_initial_sync.yml":
+    approvers:
+      - 10gen/server-initial-sync
+  - "concurrency_sharded_with_balancer_and_config_shard.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "concurrency_sharded_with_config_shard.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "sharding_jscore_passthrough_with_balancer.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "sharding_jscore_passthrough_with_config_shard.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "sharded_collections_jscore_passthrough_with_config_shard.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "unsplittable_collections_created_on_any_shard_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "concurrency_simultaneous_replication.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "*change_streams*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "*rseq_kernel_check*":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "replica_sets_with_priority_ports.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_jscore_passthrough_priority_ports.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "sharding_jscore_passthrough_base.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "sharded_collections_jscore_passthrough_base.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "sharding_uninitialized_fcv_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "sharded_collections_uninitialized_fcv_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "sharding_api_version_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "ssl*.yml":
+    approvers:
+      - 10gen/server-security
+  - "analyze_shard_key_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "timeseries_write_pbt*":
+    approvers:
+      - 10gen/server-timeseries-testing
+  - "sharding_csrs_continuous_config_stepdown.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "v1index_jscore_passthrough.yml":
+    approvers:
+      - 10gen/query
+  - "core_ese.yml":
+    approvers:
+      - 10gen/server-security
+  - "core_heap_profiling.yml":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "session_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-transactions
+  - "product_limits.yml":
+    approvers:
+      - 10gen/query-optimization-correctness
+  - "concurrency_resharding_with_lightweight_stepdowns.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "core_explain_v3_passthrough.yml":
+    approvers:
+      - 10gen/query-optimization

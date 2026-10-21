@@ -1,0 +1,620 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/vote_requester.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/repl/repl_set_request_votes_args.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace mongo {
+namespace repl {
+namespace {
+
+using executor::RemoteCommandRequest;
+using executor::RemoteCommandResponse;
+
+bool stringContains(const std::string& haystack, const std::string& needle) {
+    return haystack.find(needle) != std::string::npos;
+}
+
+TEST(ReplSetRequestVotes, ArgsAcceptsUnknownField) {
+    ReplSetRequestVotesArgs requestVoteArgs;
+    BSONObjBuilder bob;
+    requestVoteArgs.addToBSON(&bob);
+    bob.append("unknownField", 1);  // append an unknown field.
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(requestVoteArgs.initialize(cmdObj));
+
+    // The serialized object should be the same as the original except for the unknown field.
+    BSONObjBuilder bob2;
+    requestVoteArgs.addToBSON(&bob2);
+    bob2.append("unknownField", 1);
+    ASSERT_BSONOBJ_EQ(bob2.obj(), cmdObj);
+}
+
+TEST(ReplSetRequestVotes, ResponseAcceptsUnknownField) {
+    ReplSetRequestVotesResponse requestVoteRes;
+    BSONObjBuilder bob;
+    requestVoteRes.addToBSON(&bob);
+    bob.append("unknownField", 1);  // append an unknown field.
+    BSONObj cmdObj = bob.obj();
+    ASSERT_OK(requestVoteRes.initialize(cmdObj));
+
+    // The serialized object should be the same as the original except for the unknown field.
+    BSONObjBuilder bob2;
+    requestVoteRes.addToBSON(&bob2);
+    bob2.append("unknownField", 1);
+    ASSERT_BSONOBJ_EQ(bob2.obj(), cmdObj);
+}
+
+
+class VoteRequesterTest : public mongo::unittest::Test {
+public:
+    void setUp() override {
+        ReplSetConfig config(ReplSetConfig::parse(
+            BSON("_id" << "rs0"
+                       << "version" << 2 << "protocolVersion" << 1 << "members"
+                       << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                << "host0")
+                                     << BSON("_id" << 1 << "host"
+                                                   << "host1")
+                                     << BSON("_id" << 2 << "host"
+                                                   << "host2")
+                                     << BSON("_id" << 3 << "host"
+                                                   << "host3"
+                                                   << "votes" << 0 << "priority" << 0)
+                                     << BSON("_id" << 4 << "host"
+                                                   << "host4"
+                                                   << "votes" << 0 << "priority" << 0)))));
+        ASSERT_OK(config.validate());
+        long long candidateId = 0;
+        long long term = 2;
+        OpTime lastOplogEntry = OpTime(Timestamp(999, 0), 1);
+
+        _requester.reset(new VoteRequester::Algorithm(config,
+                                                      candidateId,
+                                                      term,
+                                                      false,  // not a dryRun
+                                                      lastOplogEntry,
+                                                      lastOplogEntry,
+                                                      -1));
+    }
+
+    void tearDown() override {
+        _requester.reset(nullptr);
+    }
+
+protected:
+    bool hasReceivedSufficientResponses() {
+        return _requester->hasReceivedSufficientResponses();
+    }
+
+    void processResponse(const RemoteCommandRequest& request,
+                         const RemoteCommandResponse& response) {
+        if (!response.isOK()) {
+            _requester->processResponse(request, response);
+            return;
+        }
+        BSONObjBuilder builder(response.data);
+        // Appends ok:1.0 (status ok) to response data if 'ok' field is missing.
+        CommandHelpers::appendCommandStatusNoThrow(builder, Status::OK());
+        RemoteCommandResponse responseWithCmdStatus = response;
+        responseWithCmdStatus.data = builder.obj();
+        _requester->processResponse(request, responseWithCmdStatus);
+    }
+
+    int getNumResponders() {
+        return _requester->getResponders().size();
+    }
+
+    VoteRequester::Result getResult() {
+        return _requester->getResult();
+    }
+
+    RemoteCommandRequest requestFrom(std::string hostname) {
+        return RemoteCommandRequest(HostAndPort(hostname),
+                                    DatabaseName::kEmpty,  // fields do not matter in VoteRequester
+                                    BSONObj(),
+                                    nullptr,
+                                    Milliseconds(0));
+    }
+
+    RemoteCommandResponse badRemoteCommandResponse() {
+        return RemoteCommandResponse::make_forTest(
+            Status(ErrorCodes::NodeNotFound, "not on my watch"));
+    }
+
+    RemoteCommandResponse callbackCanceledCommandResponse() {
+        return RemoteCommandResponse::make_forTest(
+            Status(ErrorCodes::CallbackCanceled, "Testing canceled callback"));
+    }
+
+    RemoteCommandResponse votedYes() {
+        ReplSetRequestVotesResponse response;
+        response.setVoteGranted(true);
+        response.setTerm(1);
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedYesStatusNotOkBecauseFailedToStoreLastVote() {
+        ReplSetRequestVotesResponse response;
+        BSONObjBuilder result;
+        response.setVoteGranted(true);
+        response.setTerm(1);
+        response.addToBSON(&result);
+        auto status =
+            Status(ErrorCodes::InterruptedDueToReplStateChange, "operation was interrupted");
+        CommandHelpers::appendCommandStatusNoThrow(result, status);
+        return RemoteCommandResponse::make_forTest(result.obj(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedNoBecauseConfigVersionDoesNotMatch() {
+        ReplSetRequestVotesResponse response;
+        response.setVoteGranted(false);
+        response.setTerm(1);
+        response.setReason("candidate's config version differs from mine");
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedNoBecauseSetNameDiffers() {
+        ReplSetRequestVotesResponse response;
+        response.setVoteGranted(false);
+        response.setTerm(1);
+        response.setReason("candidate's set name differs from mine");
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedNoBecauseLastOpTimeIsGreater() {
+        ReplSetRequestVotesResponse response;
+        response.setVoteGranted(false);
+        response.setTerm(1);
+        response.setReason("candidate's data is staler than mine");
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedNoBecauseTermIsGreater() {
+        ReplSetRequestVotesResponse response;
+        response.setVoteGranted(false);
+        response.setTerm(3);
+        response.setReason("candidate's term is lower than mine");
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedNoBecauseAlreadyVoted() {
+        ReplSetRequestVotesResponse response;
+        response.setVoteGranted(false);
+        response.setTerm(2);
+        response.setReason("already voted for another candidate this term");
+        return RemoteCommandResponse::make_forTest(response.toBSON(), Milliseconds(10));
+    }
+
+    std::unique_ptr<VoteRequester::Algorithm> _requester;
+};
+
+class VoteRequesterDryRunTest : public VoteRequesterTest {
+public:
+    void setUp() override {
+        ReplSetConfig config(ReplSetConfig::parse(
+            BSON("_id" << "rs0"
+                       << "version" << 2 << "protocolVersion" << 1 << "members"
+                       << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                << "host0")
+                                     << BSON("_id" << 1 << "host"
+                                                   << "host1")
+                                     << BSON("_id" << 2 << "host"
+                                                   << "host2")
+                                     << BSON("_id" << 3 << "host"
+                                                   << "host3"
+                                                   << "votes" << 0 << "priority" << 0)
+                                     << BSON("_id" << 4 << "host"
+                                                   << "host4"
+                                                   << "votes" << 0 << "priority" << 0)))));
+        ASSERT_OK(config.validate());
+        long long candidateId = 0;
+        long long term = 2;
+        OpTime lastOplogEntry = OpTime(Timestamp(999, 0), 1);
+
+        _requester.reset(new VoteRequester::Algorithm(config,
+                                                      candidateId,
+                                                      term,
+                                                      true,  // dryRun
+                                                      lastOplogEntry,
+                                                      lastOplogEntry,
+                                                      -1));
+    }
+};
+
+class VoteRequesterCatchupTakeoverDryRunTest : public VoteRequesterTest {
+public:
+    void setUp() override {
+        ReplSetConfig config(
+            ReplSetConfig::parse(BSON("_id" << "rs0"
+                                            << "version" << 2 << "protocolVersion" << 1 << "members"
+                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                     << "host0")
+                                                          << BSON("_id" << 1 << "host"
+                                                                        << "host1")
+                                                          << BSON("_id" << 2 << "host"
+                                                                        << "host2")
+                                                          << BSON("_id" << 3 << "host"
+                                                                        << "host3")
+                                                          << BSON("_id" << 4 << "host"
+                                                                        << "host4")))));
+        ASSERT_OK(config.validate());
+        long long candidateId = 0;
+        long long term = 2;
+        int primaryIndex = 1;
+        OpTime lastOplogEntry = OpTime(Timestamp(999, 0), 1);
+
+        _requester.reset(new VoteRequester::Algorithm(config,
+                                                      candidateId,
+                                                      term,
+                                                      true,  // dryRun
+                                                      lastOplogEntry,
+                                                      lastOplogEntry,
+                                                      primaryIndex));
+    }
+};
+
+TEST_F(VoteRequesterTest, ImmediateGoodResponseWinElection) {
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, VoterFailedToStoreLastVote) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYesStatusNotOkBecauseFailedToStoreLastVote());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("failReason" << "received an invalid response"
+                                                       << "from"
+                                                       << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, BadConfigVersionWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseConfigVersionDoesNotMatch());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, SetNameDiffersWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseSetNameDiffers());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, LastOpTimeIsGreaterWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseLastOpTimeIsGreater());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, FailedToContactWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), badRemoteCommandResponse());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("failReason" << "failed to receive response"
+                                                       << "from"
+                                                       << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, AlreadyVotedWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseAlreadyVoted());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, StaleTermLoseElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseTermIsGreater());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kStaleTerm == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, NotEnoughVotesLoseElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseSetNameDiffers());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), badRemoteCommandResponse());
+
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("failReason" << "failed to receive response"
+                                                       << "from"
+                                                       << "host2:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, CallbackCanceledNotEnoughVotesLoseElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseAlreadyVoted());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), callbackCanceledCommandResponse());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("failReason" << "failed to receive response"
+                                                       << "from"
+                                                       << "host2:27017"))));
+    // Make sure processing the callbackCanceled Response was necessary to get sufficient responses.
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    // Because of the CallbackCanceled Response, host2 doesn't count as a responder.
+    ASSERT_EQUALS(1, getNumResponders());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+}
+
+TEST_F(VoteRequesterDryRunTest, ImmediateGoodResponseWinElection) {
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, BadConfigVersionWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseConfigVersionDoesNotMatch());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, SetNameDiffersWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseSetNameDiffers());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, LastOpTimeIsGreaterWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseLastOpTimeIsGreater());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, FailedToContactWinElection) {
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), badRemoteCommandResponse());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, AlreadyVotedWinElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseAlreadyVoted());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, StaleTermLoseElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseTermIsGreater());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kStaleTerm == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterDryRunTest, NotEnoughVotesLoseElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseSetNameDiffers());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    processResponse(requestFrom("host2"), badRemoteCommandResponse());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("failReason" << "failed to receive response"
+                                                       << "from"
+                                                       << "host2:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+    ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterCatchupTakeoverDryRunTest, CatchupTakeoverPrimarySaysYesWinElection) {
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYes());
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+}
+
+TEST_F(VoteRequesterCatchupTakeoverDryRunTest, CatchupTakeoverPrimarySaysYesButNotEnoughVotes) {
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYes());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+    processResponse(requestFrom("host2"), votedNoBecauseLastOpTimeIsGreater());
+    processResponse(requestFrom("host3"), votedNoBecauseLastOpTimeIsGreater());
+    processResponse(requestFrom("host4"), votedNoBecauseLastOpTimeIsGreater());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
+    ASSERT_EQUALS(4, getNumResponders());
+}
+
+TEST_F(VoteRequesterCatchupTakeoverDryRunTest, CatchupTakeoverPrimarySaysNoLoseElection) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host2"), votedYes());
+    processResponse(requestFrom("host3"), votedYes());
+
+    // This covers the case that the Vote Requester is cancelled partway through
+    // the dry run before the primary responded.
+    ASSERT(VoteRequester::Result::kPrimaryRespondedNo == getResult());
+
+    // It also tests that even if a majority of yes votes have already been received,
+    // it still needs to wait for a yes response from the primary.
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    processResponse(requestFrom("host1"), votedNoBecauseLastOpTimeIsGreater());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(BSON("attr" << BSON("vote" << "no"
+                                                                            << "from"
+                                                                            << "host1:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kPrimaryRespondedNo == getResult());
+    ASSERT_EQUALS(3, getNumResponders());
+}
+
+TEST_F(VoteRequesterCatchupTakeoverDryRunTest,
+       CatchupTakeoverAllNodesRespondedMeansSufficientResponses) {
+    unittest::LogCaptureGuard logs;
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    // Getting a good response from the other secondaries is insufficient.
+    processResponse(requestFrom("host2"), votedYes());
+    processResponse(requestFrom("host3"), votedYes());
+    processResponse(requestFrom("host4"), votedYes());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+
+    // Getting a bad response from the primary means all targets have responded, and so we have
+    // received sufficient responses.
+    processResponse(requestFrom("host1"), badRemoteCommandResponse());
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("failReason" << "failed to receive response"
+                                                       << "from"
+                                                       << "host1:27017"))));
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+
+    // A bad response from the primary is equivalent to it saying NO.
+    ASSERT(VoteRequester::Result::kPrimaryRespondedNo == getResult());
+
+    // Only the secondaries are counted; the primary is excluded from the responders since it gave a
+    // bad response.
+    ASSERT_EQUALS(3, getNumResponders());
+}
+
+}  // namespace
+}  // namespace repl
+}  // namespace mongo

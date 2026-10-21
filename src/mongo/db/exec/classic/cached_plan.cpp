@@ -1,0 +1,237 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/exec/classic/cached_plan.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/exec/classic/multi_plan.h"
+#include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/db/exec/trial_period_utils.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_explainer_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/replanning_required_info.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/exceptions.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <memory>
+#include <utility>
+#include <vector>
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+MONGO_FAIL_POINT_DEFINE(planCacheAlwaysReplanClassic);
+
+namespace mongo {
+
+
+CachedPlanStage::CachedPlanStage(ExpressionContext* expCtx,
+                                 CollectionAcquisition collection,
+                                 WorkingSet* ws,
+                                 const CanonicalQuery* cq,
+                                 size_t decisionWorks,
+                                 std::unique_ptr<PlanStage> root,
+                                 const size_t cachedPlanHash)
+    : RequiresAllIndicesStage(kStageType, expCtx, collection),
+      _ws(ws),
+      _canonicalQuery(cq),
+      _decisionWorks(decisionWorks),
+      _cachedPlanHash(cachedPlanHash) {
+    _children.emplace_back(std::move(root));
+}
+
+Status CachedPlanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
+                                     PlanYieldPolicy* yieldPolicy) {
+    // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of execution
+    // work that happens here, so this is needed for the time accounting to make sense.
+    auto optTimer = getOptTimer();
+
+    // During plan selection, the list of indices we are using to plan must remain stable, so the
+    // query will die during yield recovery if any index has been dropped. However, once plan
+    // selection completes successfully, we no longer need all indices to stick around. The selected
+    // plan should safely die on yield recovery if it is using the dropped index.
+    //
+    // Dismiss the requirement that no indices can be dropped when this method returns.
+    ON_BLOCK_EXIT([this] { releaseAllIndicesRequirement(); });
+
+    // If we work this many times during the trial period, then we will replan the
+    // query from scratch.
+    size_t maxWorksBeforeReplan =
+        static_cast<size_t>(internalQueryCacheEvictionRatio.load() * _decisionWorks);
+
+    // When the failpoint is active, force the cached plan to always be replanned by setting the
+    // threshold to zero.
+    if (MONGO_unlikely(planCacheAlwaysReplanClassic.shouldFail())) {
+        maxWorksBeforeReplan = 0;
+    }
+
+    // The trial period ends without replanning if the cached plan produces this many results.
+    size_t numResults = trial_period::getTrialPeriodNumToReturn(*_canonicalQuery);
+
+    for (size_t i = 0; i < maxWorksBeforeReplan; ++i) {
+        // Might need to yield between calls to work due to the timer elapsing.
+        Status yieldStatus = tryYield(yieldPolicy);
+        if (!yieldStatus.isOK()) {
+            return yieldStatus;
+        }
+
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState state;
+        try {
+            state = child()->work(&id);
+        } catch (const ExceptionFor<ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed>& ex) {
+            // The plan failed by hitting the limit we impose on memory consumption. It's possible
+            // that a different plan is less resource-intensive, so we fall back to replanning the
+            // whole query. We neither evict the existing cache entry nor cache the result of
+            // replanning.
+            auto explainer = plan_explainer_factory::make(child().get());
+            LOGV2_DEBUG(20579,
+                        1,
+                        "Execution of cached plan failed, falling back to replan",
+                        "query"_attr = redact(_canonicalQuery->toStringShort()),
+                        "planSummary"_attr = explainer->getPlanSummary(),
+                        "status"_attr = redact(ex.toStatus()));
+
+            const bool shouldCache = false;
+            return replan(shouldCache, str::stream() << "cached plan returned: " << ex.toStatus());
+        }
+
+        if (PlanStage::ADVANCED == state) {
+            // Save result for later.
+            WorkingSetMember* member = _ws->get(id);
+            // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+            member->makeObjOwnedIfNeeded();
+            _results.push(id);
+
+            if (_results.size() >= numResults) {
+                // Once a plan returns enough results, stop working. There is no need to replan.
+                _bestPlanChosen = true;
+                return Status::OK();
+            }
+        } else if (PlanStage::IS_EOF == state) {
+            // Cached plan hit EOF quickly enough. No need to replan.
+            _bestPlanChosen = true;
+            return Status::OK();
+        } else if (PlanStage::NEED_YIELD == state) {
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
+            if (!yieldPolicy->canAutoYield()) {
+                throwWriteConflictException("Write conflict during best plan selection period.");
+            }
+
+            if (yieldPolicy->canAutoYield()) {
+                yieldPolicy->forceYield();
+            }
+
+            Status yieldStatus = tryYield(yieldPolicy);
+            if (!yieldStatus.isOK()) {
+                return yieldStatus;
+            }
+        }
+    }
+
+    // If we're here, the trial period took more than 'maxWorksBeforeReplan' work cycles. This
+    // plan is taking too long, so we replan from scratch.
+    auto explainer = plan_explainer_factory::make(child().get());
+    LOGV2_DEBUG(20580,
+                1,
+                "Evicting cache entry and replanning query",
+                "maxWorksBeforeReplan"_attr = maxWorksBeforeReplan,
+                "decisionWorks"_attr = _decisionWorks,
+                "query"_attr = redact(_canonicalQuery->toStringShort()),
+                "planSummary"_attr = explainer->getPlanSummary());
+
+    const bool shouldCache = true;
+    return replan(
+        shouldCache,
+        str::stream()
+            << "cached plan was less efficient than expected: expected trial execution to take "
+            << _decisionWorks << " works but it took at least " << maxWorksBeforeReplan
+            << " works");
+}
+
+Status CachedPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
+    // These are the conditions which can cause us to yield:
+    //   1) The yield policy's timer elapsed, or
+    //   2) some stage requested a yield, or
+    //   3) we need to yield and retry due to a WriteConflictException.
+    // In all cases, the actual yielding happens here.
+    if (yieldPolicy->shouldYieldOrInterrupt(expCtx()->getOperationContext())) {
+        // Here's where we yield.
+        return yieldPolicy->yieldOrInterrupt(
+            expCtx()->getOperationContext(), nullptr, RestoreContext::RestoreType::kYield);
+    }
+
+    return Status::OK();
+}
+
+Status CachedPlanStage::replan(bool shouldCache, std::string reason) {
+    planCacheCounters.incrementClassicReplannedCounter();
+
+    if (shouldCache) {
+        // Deactivate the current cache entry.
+        auto cache = CollectionQueryInfo::get(collectionPtr()).getPlanCache();
+        size_t evictedCount = cache->deactivate(
+            plan_cache_key_factory::make<PlanCacheKey>(*_canonicalQuery, collection()));
+        planCacheCounters.incrementClassicCachedPlansEvictedCounter(evictedCount);
+    }
+
+    return Status(
+        ReplanningRequiredInfo(
+            plan_cache_util::ConditionalClassicPlanCacheWriter::alwaysOrNeverCacheMode(shouldCache),
+            _cachedPlanHash),
+        std::move(reason));
+}
+
+bool CachedPlanStage::isEOF() const {
+    return _results.empty() && child()->isEOF();
+}
+
+PlanStage::StageState CachedPlanStage::doWork(WorkingSetID* out) {
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
+    }
+
+    // First exhaust any results buffered during the trial period.
+    if (!_results.empty()) {
+        *out = _results.front();
+        _results.pop();
+        return PlanStage::ADVANCED;
+    }
+
+    // Nothing left in trial period buffer.
+    return child()->work(out);
+}
+
+std::unique_ptr<PlanStageStats> CachedPlanStage::getStats() {
+    _commonStats.isEOF = isEOF();
+
+    std::unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_CACHED_PLAN);
+    ret->specific = std::make_unique<CachedPlanStats>(_specificStats);
+    ret->children.emplace_back(child()->getStats());
+
+    return ret;
+}
+
+const SpecificStats* CachedPlanStage::getSpecificStats() const {
+    return &_specificStats;
+}
+}  // namespace mongo

@@ -1,0 +1,152 @@
+/*! @page upgrading Upgrading WiredTiger applications
+
+@section version_develop Upgrading to Version 12.0.0
+<dl>
+<dt>Chunk cache is deprecated</dt>
+<dd>
+The chunk cache feature has been deprecated and is no longer supported. Opening a connection with
+<code>chunk_cache=(enabled=true)</code> will now result in an error. If \c chunk_cache configuration is
+present but disabled, a deprecation warning will be issued and the configuration will be ignored.
+Existing databases that have chunk cache settings persisted in their \c WiredTiger.basecfg file
+will continue to open successfully as long as chunk cache is not enabled. The \c WiredTigerCC.wt
+metadata file, if present, will be automatically removed on startup.
+</dd>
+
+<dt>Fixed-length column-store is removed</dt>
+<dd>
+The storage format fixed-length column-store is no longer supported. This means that if you have a
+fixed-length column-store table it will not be readable as of 12.0.0, opening the database will
+return an error. In order to upgrade to this release you must re-write the table as either
+variable-length column-store, or row-store. However we will also be removing support for
+variable-length column-store so it is recommended to re-write the table as row-store.
+
+The steps are as follows:
+-# Create a row store table with integer keys (key_format=i), and fixed-length bit values.
+-# Open a cursor on your FLCS table.
+-# For every key in the FLCS table read it in, and write it back to the row store table.
+-# Finally drop the FLCS table.
+
+</dd>
+
+<dt>Tiered storage is removed</dt>
+<dd>
+Tiered storage is no longer supported. Checkpoint configuration
+<code>flush_tier</code> is an unknown configuration key. Connection
+reconfigure <code>tiered_storage</code> is an unknown configuration key. The
+<code>WT_STORAGE_SOURCE</code> interface,
+<code>WT_CONNECTION.add_storage_source</code>, and
+<code>WT_CONNECTION.get_storage_source</code> have been removed.
+Opening a <code>tiered:</code>, <code>object:</code>, or <code>tier:</code>
+URI is refused. The connection verbose choice \c tiered is no longer
+recognized. The \c dir_store extension is no longer provided.
+
+<code>wiredtiger_open</code> and table or file <code>tiered_storage</code>
+configuration, and the file <code>tiered_object</code> setting, still parse,
+so leftover keys in existing metadata do not cause an error. New table and
+file creates do not persist these keys.
+</dd>
+</dl> <hr>
+@section version_1131 Upgrading to Version 11.3.1
+<dl>
+
+<dt>Per-file configuration "huffman_value"</dt>
+<dd>
+Huffman encoding is no longer supported for values or keys (support for keys was removed
+in a previous release).
+</dd>
+
+<dt>Connection configuration "checkpoint_cleanup"</dt>
+<dd>
+The checkpoint_cleanup configuration now uses a sub-configuration "method" to control
+how aggressively obsolete content is removed when creating checkpoints:
+"checkpoint_cleanup=[method=[none|reclaim_space]]"
+</dd>
+
+<dt>Connection configuration "verbose"</dt>
+<dd>
+Three eviction-related verbose config values ('evict', 'evict_stuck', and 'evictserver')
+have been merged into the 'eviction' config.
+</dd>
+
+<dt>WT_SESSION.verify configuration "dump_app_data"</dt>
+<dd>
+The 'dump_app_data' configuration of the WT_SESSION.verify command has been renamed to
+'dump_all_data'.
+</dd>
+
+<dt>WT_SESSION.set_timestamp configuration "oldest_timestamp" and "stable_timestamp"</dt>
+<dd>
+An invalid oldest_timestamp or stable_timestamp value is no longer silently ignored, and now
+returns an error. The stable timestamp should always be greater than the oldest timestamp and
+neither can be set to a value older than the current one.
+</dd>
+
+</dl> <hr>
+@section version_1120 Upgrading to Version 11.2.0
+<dl>
+
+<dt>Connection configuration "operation_timeout_ms"</dt>
+<dd>
+The connection configuration "operation_timeout_ms" is now deprecated. The option is
+still accepted in this version but will have no effect when set.
+</dd>
+
+<dt>Connection configuration "failpoint_eviction_fail_after_reconciliation"</dt>
+<dd>
+The connection configuration "failpoint_eviction_fail_after_reconciliation" has been
+replaced by "failpoint_eviction_split".
+</dd>
+
+<dt>Cursor configuration "prefix_search"</dt>
+<dd>
+The cursor configuration "prefix_search" is now deprecated. The option is still accepted
+in this version but will have no effect when set. Users should look into the new bound
+cursor interface.
+</dd>
+
+<dt>Session API "flush_tier" function</dt>
+<dd>
+The session API "flush_tier" function is removed. Users of this function should move to
+calling "checkpoint" with the "flush_tier" configuration specified.
+</dd>
+
+</dl> <hr>
+@section version_1110 Upgrading to Version 11.1.0
+<dl>
+
+<dt>Connection configuration "debug mode"</dt>
+<dd>
+The connection configuration "debug_mode" (only used for testing) has had its
+"flush_checkpoint" option removed.
+</dd>
+
+<dt>Connection configuration "timing_stress_for_test"</dt>
+<dd>
+The connection configuration "timing_stress_for_test" (only used for testing) has had
+its "checkpoint_evict_page" option removed.
+</dd>
+
+<dt>Connection configuration "verbose"</dt>
+<dd>
+The verbose messaging system has had its range of debug options extended. The previous
+"DEBUG" level now maps to "DEBUG_1", and will output significantly fewer messages. If you
+want all of the same messages as the old "DEBUG" level, you'll need to use "DEBUG_5".
+</dd>
+
+</dl> <hr>
+@section version_1100 Upgrading to Version 11.0.0
+
+The WiredTiger 11.0 release is a complete refresh of the WiredTiger storage engine.
+Applications written to earlier versions of the WiredTiger API will require review
+(although the API structure is substantially the same as previous releases). Applications
+using row-store data objects can use those objects without change. Applications using
+fixed- or variable-length column-store data objects will require a dump and reload cycle
+to import those objects into a 11.0 release environment.
+
+</dl> <hr>
+@section pre_1100 Upgrading to Version older than 11.0.0
+
+Please refer to the following link for upgrade suggestions for version older than 11.0.0.
+https://source.wiredtiger.com/10.0.0/upgrading.html
+
+*/

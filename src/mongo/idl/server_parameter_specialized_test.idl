@@ -1,0 +1,120 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::test"
+    cpp_includes:
+        - "mongo/idl/server_parameter_specialized_test.h"
+        - "mongo/platform/atomic.h"
+
+server_parameters:
+    specializedDummy:
+        description: "Specialized server parameter with dummy value."
+        set_at: [startup, runtime]
+        cpp_class: SpecializedDummyServerParameter
+        redact: false
+
+    specializedDeprecated:
+        description: "Specialized server parameter marked deprecated."
+        set_at: [startup, runtime]
+        cpp_class: SpecializedDeprecatedServerParameter
+        redact: false
+        is_deprecated: true
+
+    specializedWithCtor:
+        description: "Provide a custom constructor implementation."
+        set_at: startup
+        cpp_class:
+            name: SpecializedConstructorServerParameter
+            override_ctor: true
+        redact: false
+
+    specializedWithValue:
+        description: "Attach a simple value."
+        set_at: startup
+        cpp_class:
+            name: SpecializedWithValueServerParameter
+            data: std::int32_t
+        default: 43
+        redact: false
+
+    specializedWithStringValue:
+        description: "Attach a string."
+        set_at: startup
+        cpp_class:
+            name: SpecializedWithStringValueServerParameter
+            data: std::string
+        default: "Hello World"
+        redact: false
+
+    specializedWithAtomicValue:
+        description: "Attach a thread safe value."
+        set_at: [startup, runtime]
+        cpp_class:
+            name: SpecializedWithAtomicValueServerParameter
+            data: Atomic<std::int32_t>
+        default: 42
+        redact: false
+
+    specializedWithMultiValue:
+        description: "Attach a struct."
+        set_at: startup
+        cpp_class:
+            name: SpecializedMultiValueServerParameter
+            data: ExtraDataForServerParameter
+            override_set: true
+        redact: false
+
+    specializedWithCtorAndValue:
+        description: "Attach a simple value and a constum constructor."
+        set_at: startup
+        cpp_class:
+            name: SpecializedWithCtorAndValueServerParameter
+            data: std::int32_t
+            override_ctor: true
+        default: 44
+        redact: false
+
+    specializedWithOptions:
+        description: "Use optional attributes."
+        set_at: startup
+        cpp_class: SpecializedWithOptions
+        redact: true
+        test_only: false
+        condition: {expr: true}
+        deprecated_name: deprecatedWithOptions
+
+    specializedRuntimeOnly:
+        description: "Only settable at runtime."
+        set_at: runtime
+        cpp_class: SpecializedRuntimeOnly
+        redact: false
+
+    specializedRedactedSettable:
+        description: "Redacted and runtime-settable."
+        set_at: runtime
+        cpp_class:
+            name: SpecializedRedactedSettable
+            data: std::string
+        redact: true
+        test_only: false
+
+    specializedWithValidate:
+        description: "Has custom validation method"
+        set_at: runtime
+        cpp_class:
+            name: SpecializedWithValidateServerParameter
+            override_validate: true
+            data: std::int32_t
+        redact: false
+
+    specializedCluster:
+        description: "Specialized cluster server parameter"
+        set_at: cluster
+        cpp_class:
+            name: SpecializedClusterServerParameter
+            override_set: true
+            override_validate: true
+            data: SpecializedClusterServerParameterData
+        redact: false
+        omit_in_ftdc: false

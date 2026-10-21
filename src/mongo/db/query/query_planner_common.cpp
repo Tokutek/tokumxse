@@ -1,87 +1,126 @@
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/query/query_planner_common.h"
+
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/compiler/metadata/index_entry.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_options_gen.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/str.h"
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
-    void QueryPlannerCommon::reverseScans(QuerySolutionNode* node) {
-        StageType type = node->getType();
+bool QueryPlannerCommon::scanDirectionsEqual(QuerySolutionNode* node, int direction) {
+    StageType type = node->getType();
 
-        if (STAGE_IXSCAN == type) {
-            IndexScanNode* isn = static_cast<IndexScanNode*>(node);
-            isn->direction *= -1;
+    boost::optional<int> scanDir;
+    if (STAGE_IXSCAN == type) {
+        IndexScanNode* isn = static_cast<IndexScanNode*>(node);
+        scanDir = isn->direction;
+    } else if (STAGE_DISTINCT_SCAN == type) {
+        DistinctNode* dn = static_cast<DistinctNode*>(node);
+        scanDir = dn->direction;
+    } else if (STAGE_COLLSCAN == type) {
+        CollectionScanNode* collScan = static_cast<CollectionScanNode*>(node);
+        scanDir = collScan->direction;
+    } else {
+        // We shouldn't encounter a sort stage.
+        tassert(11321046,
+                fmt::format("Encountered unexpected sort stage {}", nodeStageTypeToString(node)),
+                !isSortStageType(type));
+    }
 
-            if (isn->bounds.isSimpleRange) {
-                std::swap(isn->bounds.startKey, isn->bounds.endKey);
-                // XXX: Not having a startKeyInclusive means that if we reverse a max/min query
-                // we have different results with and without the reverse...
-                isn->bounds.endKeyInclusive = true;
-            }
-            else {
-                for (size_t i = 0; i < isn->bounds.fields.size(); ++i) {
-                    std::vector<Interval>& iv = isn->bounds.fields[i].intervals;
-                    // Step 1: reverse the list.
-                    std::reverse(iv.begin(), iv.end());
-                    // Step 2: reverse each interval.
-                    for (size_t j = 0; j < iv.size(); ++j) {
-                        iv[j].reverse();
-                    }
-                }
-            }
+    // If we found something with a direction, and the direction doesn't match, we return false.
+    if (scanDir && scanDir != direction) {
+        return false;
+    }
 
-            if (!isn->bounds.isValidFor(isn->indexKeyPattern, isn->direction)) {
-                LOG(5) << "Invalid bounds: " << isn->bounds.toString() << std::endl;
-                invariant(0);
-            }
-
-            // TODO: we can just negate every value in the already computed properties.
-            isn->computeProperties();
-        }
-        else if (STAGE_SORT_MERGE == type) {
-            // reverse direction of comparison for merge
-            MergeSortNode* msn = static_cast<MergeSortNode*>(node);
-            msn->sort = reverseSortObj(msn->sort);
-        }
-        else {
-            invariant(STAGE_SORT != type);
-            // This shouldn't be here...
-        }
-
-        for (size_t i = 0; i < node->children.size(); ++i) {
-            reverseScans(node->children[i]);
+    for (size_t i = 0; i < node->children.size(); ++i) {
+        if (!scanDirectionsEqual(node->children[i].get(), direction)) {
+            return false;
         }
     }
+    return true;
+}
+
+void QueryPlannerCommon::reverseScans(QuerySolutionNode* node, bool reverseCollScans) {
+    StageType type = node->getType();
+
+    if (STAGE_IXSCAN == type) {
+        IndexScanNode* isn = static_cast<IndexScanNode*>(node);
+        isn->direction *= -1;
+
+        isn->bounds = isn->bounds.reverse();
+
+        invariant(isn->bounds.isValidFor(
+                      isn->index.keyPattern, isn->direction, isn->index.collator != nullptr),
+                  str::stream() << "Invalid bounds: "
+                                << redact(isn->bounds.toString(isn->index.collator != nullptr)));
+
+        // TODO: we can just negate every value in the already computed properties.
+        isn->computeProperties();
+    } else if (STAGE_DISTINCT_SCAN == type) {
+        DistinctNode* dn = static_cast<DistinctNode*>(node);
+        dn->direction *= -1;
+
+        dn->bounds = dn->bounds.reverse();
+
+        invariant(dn->bounds.isValidFor(
+                      dn->index.keyPattern, dn->direction, dn->index.collator != nullptr),
+                  str::stream() << "Invalid bounds: "
+                                << redact(dn->bounds.toString(dn->index.collator != nullptr)));
+
+        dn->computeProperties();
+    } else if (STAGE_SORT_MERGE == type) {
+        // reverse direction of comparison for merge
+        MergeSortNode* msn = static_cast<MergeSortNode*>(node);
+        msn->sort = reverseSortObj(msn->sort);
+    } else if (reverseCollScans && STAGE_COLLSCAN == type) {
+        CollectionScanNode* collScan = static_cast<CollectionScanNode*>(node);
+        collScan->direction *= -1;
+    } else {
+        // Reversing scans is done in order to determine whether or not we need to add an explicit
+        // SORT stage. There shouldn't already be one present in the plan.
+        tassert(11321047,
+                fmt::format("Encountered unexpected sort stage {}", nodeStageTypeToString(node)),
+                !isSortStageType(type));
+    }
+
+    for (size_t i = 0; i < node->children.size(); ++i) {
+        reverseScans(node->children[i].get(), reverseCollScans);
+    }
+}
+
+boost::optional<int> QueryPlannerCommon::determineClusteredScanDirection(
+    const CanonicalQuery& query,
+    const boost::optional<ClusteredCollectionInfo>& clusteredInfo,
+    const CollatorInterface* clusteredCollectionCollator) {
+    if (clusteredInfo && query.getSortPattern() &&
+        CollatorInterface::collatorsMatch(clusteredCollectionCollator, query.getCollator())) {
+        BSONObj kp = clustered_util::getSortPattern(clusteredInfo->getIndexSpec());
+        if (QueryPlannerCommon::providesSort(query, kp)) {
+            return 1;
+        } else if (QueryPlannerCommon::providesSort(query,
+                                                    QueryPlannerCommon::reverseSortObj(kp))) {
+            return -1;
+        }
+    }
+
+    return boost::none;
+}
 
 }  // namespace mongo

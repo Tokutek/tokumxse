@@ -1,0 +1,15 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+imports:
+    - "mongo/db/basic_types.idl"
+enums:
+    PercentileMethod:
+        description: "Describes the type of calculation used by a percentile accumulator."
+        type: string
+        values:
+            kApproximate: "approximate"
+            kDiscrete: "discrete"
+            kContinuous: "continuous"

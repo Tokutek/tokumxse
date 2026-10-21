@@ -1,0 +1,377 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/values/util.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/random_utils.h"
+#include "mongo/util/str.h"
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+value::TagValueMaybeOwned ByteCode::builtinAbs(ArityType arity) {
+    tassert(11080079, "Unexpected arity value", arity == 1);
+    return genericAbs(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinCeil(ArityType arity) {
+    tassert(11080078, "Unexpected arity value", arity == 1);
+    return genericCeil(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinFloor(ArityType arity) {
+    tassert(11080077, "Unexpected arity value", arity == 1);
+    return genericFloor(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinExp(ArityType arity) {
+    tassert(11080076, "Unexpected arity value", arity == 1);
+    return genericExp(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinLn(ArityType arity) {
+    tassert(11080075, "Unexpected arity value", arity == 1);
+    return genericLn(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinLog10(ArityType arity) {
+    tassert(11080074, "Unexpected arity value", arity == 1);
+    return genericLog10(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinSqrt(ArityType arity) {
+    tassert(11080073, "Unexpected arity value", arity == 1);
+    return genericSqrt(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinPow(ArityType arity) {
+    tassert(11080072, "Unexpected arity value", arity == 2);
+    return genericPow(viewFromStack(0), viewFromStack(1));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAcos(ArityType arity) {
+    tassert(12603700, "Unexpected arity value", arity == 1);
+    return genericAcos(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAcosh(ArityType arity) {
+    tassert(12603701, "Unexpected arity value", arity == 1);
+    return genericAcosh(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAsin(ArityType arity) {
+    tassert(12603702, "Unexpected arity value", arity == 1);
+    return genericAsin(viewFromStack(0));
+}
+value::TagValueMaybeOwned ByteCode::builtinAsinh(ArityType arity) {
+    tassert(12603703, "Unexpected arity value", arity == 1);
+    return genericAsinh(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAtan(ArityType arity) {
+    tassert(12603704, "Unexpected arity value", arity == 1);
+    return genericAtan(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAtanh(ArityType arity) {
+    tassert(12603705, "Unexpected arity value", arity == 1);
+    return genericAtanh(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAtan2(ArityType arity) {
+    tassert(12603706, "Unexpected arity value", arity == 2);
+    return genericAtan2(viewFromStack(0), viewFromStack(1));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinCos(ArityType arity) {
+    tassert(12603707, "Unexpected arity value", arity == 1);
+    return genericCos(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinCosh(ArityType arity) {
+    tassert(12603708, "Unexpected arity value", arity == 1);
+    return genericCosh(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinDegreesToRadians(ArityType arity) {
+    tassert(12603709, "Unexpected arity value", arity == 1);
+    return genericDegreesToRadians(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinRadiansToDegrees(ArityType arity) {
+    tassert(12603710, "Unexpected arity value", arity == 1);
+    return genericRadiansToDegrees(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinSin(ArityType arity) {
+    tassert(12603711, "Unexpected arity value", arity == 1);
+    return genericSin(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinSinh(ArityType arity) {
+    tassert(12603712, "Unexpected arity value", arity == 1);
+    return genericSinh(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinTan(ArityType arity) {
+    tassert(12603713, "Unexpected arity value", arity == 1);
+    return genericTan(viewFromStack(0));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinTanh(ArityType arity) {
+    tassert(12603714, "Unexpected arity value", arity == 1);
+    return genericTanh(viewFromStack(0));
+}
+
+/**
+ * Converts a number to int32 assuming the input fits the range. This is used for $round "place"
+ * argument, which is checked to be a whole number between -20 and 100, but could still be a
+ * non-int32 type.
+ */
+int32_t ByteCode::convertNumericToInt32(const value::TagValueView v) {
+    switch (v.tag) {
+        case value::TypeTags::NumberInt32: {
+            return value::bitcastTo<int32_t>(v.value);
+        }
+        case value::TypeTags::NumberInt64: {
+            return static_cast<int32_t>(value::bitcastTo<int64_t>(v.value));
+        }
+        case value::TypeTags::NumberDouble: {
+            return static_cast<int32_t>(value::bitcastTo<double>(v.value));
+        }
+        case value::TypeTags::NumberDecimal: {
+            Decimal128 dec = value::bitcastTo<Decimal128>(v.value);
+            return dec.toInt(Decimal128::kRoundTiesToEven);
+        }
+        default:
+            MONGO_UNREACHABLE_TASSERT(11122940);
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::genericRoundTrunc(std::string_view funcName,
+                                                      Decimal128::RoundingMode roundingMode,
+                                                      int32_t place,
+                                                      value::TypeTags numTag,
+                                                      value::Value numVal) {
+
+    // Construct 10^-precisionValue, which will be used as the quantize reference. This is passed to
+    // decimal.quantize() to indicate the precision of our rounding.
+    const auto quantum = Decimal128(0LL, Decimal128::kExponentBias - place, 0LL, 1LL);
+
+    switch (numTag) {
+        case value::TypeTags::NumberDecimal: {
+            auto dec = value::bitcastTo<Decimal128>(numVal);
+            if (!dec.isInfinite()) {
+                dec = dec.quantize(quantum, roundingMode);
+            }
+            auto [resultTag, resultValue] = value::makeCopyDecimal(dec);
+            return {true, resultTag, resultValue};
+        }
+        case value::TypeTags::NumberDouble: {
+            auto asDec = Decimal128(value::bitcastTo<double>(numVal), Decimal128::kRoundTo34Digits);
+            if (!asDec.isInfinite()) {
+                asDec = asDec.quantize(quantum, roundingMode);
+            }
+            return value::TagValueMaybeOwned::numberDouble(asDec.toDouble());
+        }
+        case value::TypeTags::NumberInt32:
+        case value::TypeTags::NumberInt64: {
+            if (place >= 0) {
+                return {false, numTag, numVal};
+            }
+            auto numericArgll = numTag == value::TypeTags::NumberInt32
+                ? static_cast<int64_t>(value::bitcastTo<int32_t>(numVal))
+                : value::bitcastTo<int64_t>(numVal);
+            auto out = Decimal128(numericArgll).quantize(quantum, roundingMode);
+            uint32_t flags = 0;
+            auto outll = out.toLong(&flags);
+            uassert(5155302,
+                    str::stream() << "Invalid conversion to long during " << funcName << ".",
+                    !Decimal128::hasFlag(flags, Decimal128::kInvalid));
+            if (numTag == value::TypeTags::NumberInt64 ||
+                outll > std::numeric_limits<int32_t>::max()) {
+                // Even if the original was an int to begin with - it has to be a long now.
+                return value::TagValueMaybeOwned::numberInt64(outll);
+            }
+            return value::TagValueMaybeOwned::numberInt32(static_cast<int32_t>(outll));
+        }
+        default:
+            return value::TagValueMaybeOwned::nothing();
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::scalarRoundTrunc(std::string_view funcName,
+                                                     Decimal128::RoundingMode roundingMode,
+                                                     ArityType arity) {
+    tassert(11080071, "Unexpected arity value", arity == 1 || arity == 2);
+    int32_t place = 0;
+    auto num = viewFromStack(0);
+    if (arity == 2) {
+        auto placeArg = viewFromStack(1);
+        if (!value::isNumber(placeArg.tag)) {
+            return value::TagValueMaybeOwned::nothing();
+        }
+        place = convertNumericToInt32(placeArg);
+    }
+
+    return genericRoundTrunc(funcName, roundingMode, place, num.tag, num.value);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinTrunc(ArityType arity) {
+    return scalarRoundTrunc("$trunc", Decimal128::kRoundTowardZero, arity);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinRand(ArityType arity) {
+    double num = random_utils::getRNG().nextCanonicalDouble();
+    return {true, value::TypeTags::NumberDouble, value::bitcastFrom<double>(num)};
+}
+
+value::TagValueMaybeOwned ByteCode::builtinRound(ArityType arity) {
+    return scalarRoundTrunc("$round", Decimal128::kRoundTiesToEven, arity);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinDoubleDoubleSum(ArityType arity) {
+    tassert(11080070, "Unexpected arity value", arity >= 1);
+
+    value::TypeTags resultTag = value::TypeTags::NumberInt32;
+    bool haveDate = false;
+
+    // Sweep across all tags and pick the result type.
+    for (ArityType idx = 0; idx < arity; ++idx) {
+        auto arg = viewFromStack(idx);
+        if (arg.tag == value::TypeTags::Date) {
+            if (haveDate) {
+                uassert(4848404, "only one date allowed in an $add expression", !haveDate);
+            }
+            // Date is a simple 64 bit integer.
+            haveDate = true;
+            resultTag = value::getWidestNumericalType(resultTag, value::TypeTags::NumberInt64);
+        } else if (value::isNumber(arg.tag)) {
+            resultTag = value::getWidestNumericalType(resultTag, arg.tag);
+        } else if (arg.tag == value::TypeTags::Nothing || arg.tag == value::TypeTags::Null) {
+            // What to do about null and nothing?
+            return value::TagValueMaybeOwned::nothing();
+        } else {
+            // What to do about non-numeric types like arrays and objects?
+            return value::TagValueMaybeOwned::nothing();
+        }
+    }
+
+    if (resultTag == value::TypeTags::NumberDecimal) {
+        Decimal128 sum;
+        for (ArityType idx = 0; idx < arity; ++idx) {
+            auto arg = viewFromStack(idx);
+            if (arg.tag == value::TypeTags::Date) {
+                sum = sum.add(Decimal128(value::bitcastTo<int64_t>(arg.value)));
+            } else {
+                sum = sum.add(value::numericCast<Decimal128>(arg));
+            }
+        }
+        if (haveDate) {
+            return value::TagValueMaybeOwned::date(sum.toLong());
+        } else {
+            auto [tag, val] = value::makeCopyDecimal(sum);
+            return {true, tag, val};
+        }
+    } else {
+        DoubleDoubleSummation sum;
+        for (ArityType idx = 0; idx < arity; ++idx) {
+            auto arg = viewFromStack(idx);
+            if (arg.tag == value::TypeTags::NumberInt32) {
+                sum.addInt(value::numericCast<int32_t>(arg));
+            } else if (arg.tag == value::TypeTags::NumberInt64) {
+                sum.addLong(value::numericCast<int64_t>(arg));
+            } else if (arg.tag == value::TypeTags::NumberDouble) {
+                sum.addDouble(value::numericCast<double>(arg));
+            } else if (arg.tag == value::TypeTags::Date) {
+                sum.addLong(value::bitcastTo<int64_t>(arg.value));
+            }
+        }
+        if (haveDate) {
+            uassert(ErrorCodes::Overflow, "date overflow in $add", sum.fitsLong());
+            return value::TagValueMaybeOwned::date(sum.getLong());
+        } else {
+            switch (resultTag) {
+                case value::TypeTags::NumberInt32: {
+                    auto result = sum.getLong();
+                    if (sum.fitsLong() && result >= std::numeric_limits<int32_t>::min() &&
+                        result <= std::numeric_limits<int32_t>::max()) {
+                        return value::TagValueMaybeOwned::numberInt32(static_cast<int32_t>(result));
+                    }
+                    [[fallthrough]];  // To the larger type
+                }
+                case value::TypeTags::NumberInt64: {
+                    if (sum.fitsLong()) {
+                        return value::TagValueMaybeOwned::numberInt64(sum.getLong());
+                    }
+                    [[fallthrough]];  // To the larger type.
+                }
+                case value::TypeTags::NumberDouble: {
+                    return value::TagValueMaybeOwned::numberDouble(sum.getDouble());
+                }
+                default:
+                    MONGO_UNREACHABLE_TASSERT(11122941);
+            }
+        }
+    }
+    return value::TagValueMaybeOwned::nothing();
+}  // ByteCode::builtinDoubleDoubleSum
+
+value::TagValueMaybeOwned ByteCode::builtinConvertSimpleSumToDoubleDoubleSum(ArityType arity) {
+    tassert(11080069, "Unexpected arity value", arity == 1);
+    auto simpleSum = viewFromStack(0);
+    return builtinConvertSimpleSumToDoubleDoubleSumImpl(simpleSum.tag, simpleSum.value);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinConvertSimpleSumToDoubleDoubleSumImpl(
+    value::TypeTags simpleSumTag, value::Value simpleSumVal) {
+    auto accTagVal = value::TagValueOwned::fromRaw(genericInitializeDoubleDoubleSumState());
+
+    value::Array* accumulator = value::getArrayView(accTagVal.value());
+
+    aggDoubleDoubleSumImpl(accumulator, simpleSumTag, simpleSumVal);
+
+    return accTagVal;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinDoubleDoubleSumFromAcc(ArityType arity) {
+    // Reuse the same DoubleDouble accumulator state and helpers as the $sum
+    auto accTagVal = value::TagValueOwned::fromRaw(genericInitializeDoubleDoubleSumState());
+    value::Array* accumulator = value::getArrayView(accTagVal.value());
+
+    auto processOne = [&](value::TypeTags tag, value::Value val) {
+        aggDoubleDoubleSumImpl(accumulator, tag, val);
+    };
+
+    // A single array argument is summed element-wise, while a single non-array argument
+    // or multiple arguments are each processed directly. Non-numeric values are ignored.
+    processStackRange(0, arity, processOne);
+
+    return aggDoubleDoubleSumFinalizeImpl(accumulator);
+}
+
+template <bool isSamp>
+value::TagValueMaybeOwned ByteCode::builtinStdDevFromAcc(ArityType arity) {
+    auto accTagVal = value::TagValueOwned::fromRaw(value::makeNewArray());
+    value::Array* accumulator = value::getArrayView(accTagVal.value());
+    accumulator->reserve(AggStdDevValueElems::kSizeOfArray);
+
+    accumulator->push_back_raw(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(0));
+    accumulator->push_back_raw(value::TypeTags::NumberDouble, value::bitcastFrom<double>(0.0));
+    accumulator->push_back_raw(value::TypeTags::NumberDouble, value::bitcastFrom<double>(0.0));
+
+    auto processOne = [&](value::TypeTags tag, value::Value val) {
+        aggStdDevImpl(accumulator, {tag, val});
+    };
+
+    processStackRange(0, arity, processOne);
+
+    return aggStdDevFinalizeImpl(accTagVal.value(), isSamp);
+}
+template value::TagValueMaybeOwned ByteCode::builtinStdDevFromAcc<false>(ArityType arity);
+template value::TagValueMaybeOwned ByteCode::builtinStdDevFromAcc<true>(ArityType arity);
+
+
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

@@ -1,0 +1,152 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    featuresReplyJS:
+        description: "JS information for features command reply"
+        fields:
+            utf8:
+                # In practice this is always true and exists for BC.
+                description: "Scripting engine supports utf8"
+                type: bool
+
+    featuresReply:
+        description: "Reply to the features command"
+        is_command_reply: true
+        fields:
+            js:
+                description: "Status of the scription engine"
+                type: featuresReplyJS
+                optional: true
+            oidMachineOld:
+                description: "The previous per-machine nonce, before applying oidReset"
+                type: long
+                optional: true
+            oidMachine:
+                description: "The per-machine nonce used in generating ObjectId values"
+                type: long
+
+    hostInfoSystemReply:
+        description: "hostInfo.system reply fields"
+        fields:
+            currentTime: date
+            hostname: string
+            cpuAddrSize: int
+            memSizeMB: long
+            memLimitMB: long
+            numCores: int
+            numCoresAvailableToProcess:
+                type: int
+                optional: true
+            numPhysicalCores:
+                type: int
+                optional: true
+            numCpuSockets:
+                type: int
+                optional: true
+            cpuArch:
+                type: string
+                optional: true
+            numaEnabled:
+                type: bool
+                optional: true
+            numNumaNodes:
+                type: int
+                optional: true
+
+    hostInfoOsReply:
+        description: "hostInfo.os reply fields"
+        fields:
+            type: string
+            name: string
+            version: string
+
+    hostInfoReply:
+        description: "Reply to hostInfo command"
+        is_command_reply: true
+        fields:
+            system: hostInfoSystemReply
+            os:
+                type: hostInfoOsReply
+                optional: true
+
+            # extra is operating system specific
+            extra:
+                description: "Extra system information from ProcessInfo"
+                type: object
+                optional: true
+
+    getCmdLineOptsReply:
+        description: "Command line options as passed to the server executable on startup"
+        is_command_reply: true
+        fields:
+            argv:
+                type: array
+                optional: true
+            parsed: object
+
+commands:
+    features:
+        description: "Returns build level feature settings"
+        api_version: ""
+        command_name: features
+        namespace: ignored
+        cpp_name: FeaturesCommand
+        reply_type: featuresReply
+        fields:
+            oidReset:
+                description: "Regenerate the per-machine nonce used in generating ObjectId values"
+                type: safeBool
+                optional: true
+
+    hostInfo:
+        description: "Returns information about the server's host"
+        api_version: ""
+        command_name: hostInfo
+        namespace: ignored
+        cpp_name: HostInfoCommand
+        reply_type: hostInfoReply
+
+    getCmdLineOpts:
+        description: "Return the command line options used to launch the server"
+        api_version: ""
+        command_name: getCmdLineOpts
+        namespace: ignored
+        cpp_name: GetCmdLineOptsCommand
+        reply_type: getCmdLineOptsReply
+
+    logRotate:
+        description: "Rotate log file(s)"
+        api_version: ""
+        command_name: logRotate
+        namespace: type
+        type:
+            # Strictly speaking, this should be `string or ignored`,
+            # but since we must have a type, we'll assume a non-string value
+            # will be of the basic form {logRotate: 1}.
+            variant: [safeBool, string]
+        cpp_name: LogRotateCommand
+        reply_type: OkReply
+
+    getLog:
+        description: "Returns most recent log lines from log spooler"
+        api_version: ""
+        command_name: getLog
+        namespace: type
+        type: string
+        cpp_name: GetLogCommand
+
+    clearLog:
+        # Test Only
+        description: "Clear the log contents"
+        api_version: ""
+        command_name: clearLog
+        namespace: type
+        type: string
+        cpp_name: ClearLogCommand
+        reply_type: OkReply

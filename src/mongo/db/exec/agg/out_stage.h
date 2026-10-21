@@ -1,0 +1,172 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/agg/writer_stage.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <string_view>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo::exec::agg {
+
+/**
+ * This class handles the execution part of the single document transformation aggregation stage
+ * and is part of the execution pipeline. Its construction is based on
+ * DocumentSourceSingleDocumentTransformation, which handles the optimization part.
+ */
+class OutStage final : public WriterStage<BSONObj> {
+public:
+    OutStage(std::string_view stageName,
+             const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+             NamespaceString outputNs,
+             const std::shared_ptr<TimeseriesOptions>& timeseries)
+        : WriterStage<BSONObj>(stageName, pExpCtx, std::move(outputNs)),
+          _writeConcern(pExpCtx->getOperationContext()->getWriteConcern()),
+          _timeseries(timeseries) {}
+
+private:
+    void doDispose() override;
+
+    /**
+     * Used to track the $out state for the destructor. $out should clean up different namespaces
+     * depending on when the stage was interrupted or failed.
+     */
+    enum class OutCleanUpProgress {
+        kTmpCollExists,
+        kRenameComplete,
+        kViewCreatedIfNeeded,
+        kComplete
+    };
+
+    /**
+     * Runs a createCollection command on the temporary namespace. Returns
+     * nothing, but if the function returns, we assume the temporary collection is created.
+     */
+    void createTemporaryCollection();
+
+    /**
+     * Retrieves the UUID of the temporary collection and populates the _tempNsUUID field.
+     */
+    void retrieveTemporaryCollectionUUID();
+
+    /**
+     * Checks that the temporary collection has not been changed during execution of $out.
+     *
+     * Throws InterruptedDueToTimeseriesUpgradeDowngrade if the temporary collection is timeseries
+     * and has been upgraded/downgraded during execution of $out.
+     *
+     * Throws NamespaceNotFound if the temporary collection has been removed.
+     */
+    void checkTemporaryCollectionUUIDNotChanged();
+
+
+    /**
+     * Runs a renameCollection from the temporary namespace to the user requested namespace.
+     * Returns nothing, but if the function returns, we assume the rename has succeeded and the
+     * temporary namespace no longer exists.
+     */
+    void renameTemporaryCollection();
+
+    /**
+     * Runs a createCollection command to create the view backing the time-series buckets
+     * collection. This should only be called if $out is writing to a legacy time-series collection.
+     * If the function returns, we assume the view is created.
+     */
+    void createTimeseriesView();
+
+    /**
+     * Retrieves and stores the original output collection's options, indexes, and UUID. Must be
+     * called before validateTimeseries() since it populates '_originalOutCollInfo'.
+     */
+    void retrieveOriginalOutCollInfo();
+
+    void initialize() override;
+
+    void finalize() override;
+
+    void flush(BatchedCommandRequest bcr, BatchedObjects batch) override;
+
+    std::pair<BSONObj, int> makeBatchObject(Document doc) const override {
+        auto obj = doc.toBson();
+        tassert(6628900, "_writeSizeEstimator should be initialized", _writeSizeEstimator);
+        return {obj, _writeSizeEstimator->estimateInsertSizeBytes(obj)};
+    }
+
+    BatchedCommandRequest makeBatchedWriteRequest() const override;
+
+    void waitWhileFailPointEnabled() override;
+
+    NamespaceString makeBucketNsIfLegacyTimeseries(const NamespaceString& ns);
+
+    /**
+     * Determines if an error exists with the user input and existing collections. This function
+     * sets the '_timeseries' member variable and must be run before referencing '_timeseries'
+     * variable. The function will error if:
+     * 1. The user provides the 'timeseries' field, but a non time-series collection or view exists
+     * in that namespace.
+     * 2. The user provides the 'timeseries' field with a specification that does not match an
+     * existing time-series collection. The function will replace the value of '_timeseries' if the
+     * user does not provide the 'timeseries' field, but a time-series collection exists.
+     */
+    std::shared_ptr<TimeseriesOptions> validateTimeseries();
+
+    static constexpr int kMaxCatalogRetryAttempts = 5;
+
+    // Stash the writeConcern of the original command as the operation context may change by the
+    // time we start to flush writes. This is because certain aggregations (e.g. $exchange)
+    // establish cursors with batchSize 0 then run subsequent getMore's which use a new operation
+    // context. The getMore's will not have an attached writeConcern however we still want to
+    // respect the writeConcern of the original command.
+    WriteConcernOptions _writeConcern;
+
+    // Holds on to the original collection options and index specs so we can check they
+    // didn't change during computation. For time-series collections these values will be
+    // translated for the raw buckets.
+    struct OriginalCollectionInfo {
+        BSONObj options;
+        std::vector<BSONObj> indexes;
+        // TODO SERVER-111600: remove this once 9.0 becomes last LTS
+        bool isLegacyTimeseries;
+    };
+    boost::optional<OriginalCollectionInfo> _originalOutCollInfo;
+
+    // The temporary namespace for the $out writes.
+    NamespaceString _tempNs;
+
+    // Set if $out is writing to a time-series collection. This is how $out determines if it is
+    // writing to a time-series collection or not. Any reference to this variable **must** be after
+    // 'validateTimeseries', since 'validateTimeseries' sets this value.
+    std::shared_ptr<TimeseriesOptions> _timeseries;
+
+    // Tracks the current state of the temporary collection, and is used for cleanup.
+    OutCleanUpProgress _tmpCleanUpState = OutCleanUpProgress::kComplete;
+
+    // The UUID of the temporary output collection, used to detect if the temp collection UUID
+    // changed during execution, which can cause incomplete results. This can happen if the primary
+    // steps down during execution.
+    boost::optional<UUID> _tempNsUUID = boost::none;
+
+    // True when the temporary and final out collection must be created
+    // as legacy timeseries collections.
+    //
+    // TODO SERVER-111600: Remove this variable and all references to it once
+    // 9.0 becomes last LTS and all timeseries collections are viewless
+    bool _outIsLegacyTimeseries = false;
+};
+
+}  // namespace mongo::exec::agg

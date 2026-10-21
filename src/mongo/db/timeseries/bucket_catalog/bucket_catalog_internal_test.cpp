@@ -1,0 +1,400 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/timeseries/bucket_catalog/bucket_catalog_internal.h"
+
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/sharding_environment/shard_server_test_fixture.h"
+#include "mongo/db/timeseries/bucket_catalog/bucket_catalog.h"
+#include "mongo/db/timeseries/bucket_catalog/rollover.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/timeseries/timeseries_test_fixture.h"
+#include "mongo/db/timeseries/timeseries_test_util.h"
+#include "mongo/db/timeseries/write_ops/internal/timeseries_write_ops_internal.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
+
+#include <string_view>
+
+
+namespace mongo::timeseries::bucket_catalog {
+namespace {
+using namespace std::literals::string_view_literals;
+constexpr std::string_view kNumClosedDueToCount = "numBucketsClosedDueToCount"sv;
+constexpr std::string_view kNumClosedDueToTimeForward = "numBucketsClosedDueToTimeForward"sv;
+constexpr std::string_view kNumClosedDueToSchemaChanges = "numBucketsClosedDueToSchemaChange"sv;
+constexpr std::string_view kNumClosedDueToSize = "numBucketsClosedDueToSize"sv;
+constexpr std::string_view kNumClosedDuetoCachePressure = "numBucketsClosedDueToCachePressure"sv;
+
+class BucketCatalogInternalTest : public TimeseriesTestFixture {
+protected:
+    TrackingContexts _trackingContexts;
+    ExecutionStats _globalStats;
+
+    void _rolloverWithRolloverReason(RolloverReason reason);
+    void _testRolloverWithRolloverReasonUpdatesStats(RolloverReason reason, std::string_view stat);
+};
+
+void BucketCatalogInternalTest::_rolloverWithRolloverReason(RolloverReason reason) {
+    auto timeseriesOptions = _getTimeseriesOptions(_ns1);
+    std::vector<bucket_catalog::WriteStageErrorAndIndex> errorsAndIndices;
+    auto batchedInsertContexts = bucket_catalog::buildBatchedInsertContexts(*_bucketCatalog,
+                                                                            _uuid1,
+                                                                            timeseriesOptions,
+                                                                            {_measurement},
+                                                                            /*startIndex=*/0,
+                                                                            /*numDocsToStage=*/1,
+                                                                            /*docsToRetry=*/{},
+                                                                            errorsAndIndices);
+    ASSERT(errorsAndIndices.empty());
+
+    auto batchedInsertCtx = batchedInsertContexts[0];
+    auto measurementTimestamp = std::get<1>(batchedInsertCtx.measurementsTimesAndIndices[0]);
+
+    Bucket& bucket =
+        internal::allocateBucket(*_bucketCatalog,
+                                 *_bucketCatalog->stripes[batchedInsertCtx.stripeNumber],
+                                 WithLock::withoutLock(),
+                                 batchedInsertCtx.key,
+                                 batchedInsertCtx.options,
+                                 measurementTimestamp,
+                                 nullptr,
+                                 batchedInsertCtx.stats);
+
+    bucket.rolloverReason = reason;
+    ASSERT(allCommitted(bucket));
+    internal::rollover(*_bucketCatalog,
+                       *_bucketCatalog->stripes[batchedInsertCtx.stripeNumber],
+                       WithLock::withoutLock(),
+                       bucket,
+                       bucket.rolloverReason);
+}
+
+void BucketCatalogInternalTest::_testRolloverWithRolloverReasonUpdatesStats(RolloverReason reason,
+                                                                            std::string_view stat) {
+    EXPECT_EQ(0, _getExecutionStat(_uuid1, stat));
+    _rolloverWithRolloverReason(reason);
+    EXPECT_EQ(1, _getExecutionStat(_uuid1, stat));
+}
+
+TEST_F(BucketCatalogInternalTest, UpdateRolloverStats) {
+    auto _collectionStats = std::make_shared<ExecutionStats>();
+    ExecutionStatsController stats(_collectionStats, _globalStats);
+
+    // Ensure that both the globalStats and collectionStats are initially all set to 0.
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToTimeForward.load(), 0);
+    EXPECT_EQ(_globalStats.numBucketsArchivedDueToTimeBackward.load(), 0);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToCount.load(), 0);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToCachePressure.load(), 0);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToSize.load(), 0);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToSchemaChange.load(), 0);
+
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToTimeForward.load(), 0);
+    EXPECT_EQ(_collectionStats->numBucketsArchivedDueToTimeBackward.load(), 0);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToCount.load(), 0);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToCachePressure.load(), 0);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToSize.load(), 0);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToSchemaChange.load(), 0);
+
+    internal::updateRolloverStats(stats, RolloverReason::kTimeForward);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToTimeForward.load(), 1);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToTimeForward.load(), 1);
+
+    internal::updateRolloverStats(stats, RolloverReason::kTimeBackward);
+    EXPECT_EQ(_globalStats.numBucketsArchivedDueToTimeBackward.load(), 1);
+    EXPECT_EQ(_collectionStats->numBucketsArchivedDueToTimeBackward.load(), 1);
+
+    internal::updateRolloverStats(stats, RolloverReason::kCount);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToCount.load(), 1);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToCount.load(), 1);
+
+    internal::updateRolloverStats(stats, RolloverReason::kCachePressure);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToCachePressure.load(), 1);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToCachePressure.load(), 1);
+
+    internal::updateRolloverStats(stats, RolloverReason::kSize);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToSize.load(), 1);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToSize.load(), 1);
+
+    internal::updateRolloverStats(stats, RolloverReason::kSchemaChange);
+    EXPECT_EQ(_globalStats.numBucketsClosedDueToSchemaChange.load(), 1);
+    EXPECT_EQ(_collectionStats->numBucketsClosedDueToSchemaChange.load(), 1);
+}
+
+TEST_F(BucketCatalogInternalTest, RolloverUpdatesRolloverStats) {
+    std::vector<std::tuple<RolloverReason, std::string_view>> rolloverReasonAndMetricPairs = {
+        std::make_tuple(RolloverReason::kCount, kNumClosedDueToCount),
+        std::make_tuple(RolloverReason::kTimeForward, kNumClosedDueToTimeForward),
+        std::make_tuple(RolloverReason::kSchemaChange, kNumClosedDueToSchemaChanges),
+        std::make_tuple(RolloverReason::kSize, kNumClosedDueToSize),
+        std::make_tuple(RolloverReason::kCachePressure, kNumClosedDuetoCachePressure),
+    };
+    for (const auto& [reason, metric] : rolloverReasonAndMetricPairs) {
+        _testRolloverWithRolloverReasonUpdatesStats(reason, metric);
+    }
+}
+
+TEST_F(BucketCatalogInternalTest, ReopenFetchedBucketPreservesIsRawDataOperationFlag) {
+    AutoGetCollection autoColl(_opCtx, _resolveTimeseriesNss(_ns1), MODE_IS);
+    const Collection* bucketsColl = (*autoColl).get();
+
+    auto collectionStats = std::make_shared<ExecutionStats>();
+    ExecutionStatsController stats(collectionStats, _globalStats);
+
+    isRawDataOperation(_opCtx) = false;
+
+    internal::reopenFetchedBucket(_opCtx, bucketsColl, OID::gen(), stats);
+
+    ASSERT_FALSE(isRawDataOperation(_opCtx));
+}
+
+TEST_F(BucketCatalogInternalTest, ReopenQueriedBucketPreservesIsRawDataOperationFlag) {
+    {
+        DBDirectClient client{_opCtx};
+        BSONObj cmdResult;
+        client.runCommand(
+            _ns1.dbName(),
+            BSON("createIndexes"
+                 << _resolveTimeseriesNss(_ns1).coll() << "indexes"
+                 << BSON_ARRAY(BSON("key" << BSON("meta" << 1 << "control.min.time" << 1) << "name"
+                                          << "meta_1_control.min.time_1"))),
+            cmdResult);
+        ASSERT(cmdResult["ok"].trueValue()) << cmdResult;
+    }
+
+    AutoGetCollection autoColl(_opCtx, _resolveTimeseriesNss(_ns1), MODE_IS);
+    const Collection* bucketsColl = (*autoColl).get();
+    const auto tsOptions = _getTimeseriesOptions(_ns1);
+
+    auto collectionStats = std::make_shared<ExecutionStats>();
+    ExecutionStatsController stats(collectionStats, _globalStats);
+
+    isRawDataOperation(_opCtx) = false;
+
+    internal::reopenQueriedBucket(_opCtx, bucketsColl, tsOptions, /*pipeline=*/{}, stats);
+
+    ASSERT_FALSE(isRawDataOperation(_opCtx));
+}
+class BucketCatalogInternalShardServerTest : public ShardServerTestFixture {
+protected:
+    void setUp() override {
+        ShardServerTestFixture::setUp();
+        createTestCollection(operationContext(),
+                             _ns,
+                             BSON("create" << _ns.coll() << "timeseries"
+                                           << BSON("timeField" << "time" << "metaField" << "tag")));
+    }
+
+    NamespaceString _ns = NamespaceString::createNamespaceString_forTest(
+        "bucket_catalog_internal_shard_server_test", "ts");
+    ExecutionStats _globalStats;
+};
+
+TEST_F(BucketCatalogInternalShardServerTest, StaleConfigWhenReopeningArchivedBucketDoesNotThrow) {
+    auto* opCtx = operationContext();
+    const auto bucketsNss = timeseries::test_util::resolveTimeseriesNss(_ns);
+
+    // Acquire the buckets collection before attaching a shard version, so obtaining the handle
+    // itself doesn't trip the version check.
+    AutoGetCollection autoColl(opCtx, bucketsNss, MODE_IS);
+    const Collection* bucketsColl = (*autoColl).get();
+
+    auto collectionStats = std::make_shared<ExecutionStats>();
+    ExecutionStatsController stats(collectionStats, _globalStats);
+
+    const ShardVersion staleVersion =
+        ShardVersionFactory::make(ChunkVersion({OID::gen(), Timestamp(1, 1)}, {1, 0}));
+    ScopedSetShardRole scopedShardRole{
+        opCtx, bucketsNss, staleVersion, boost::none /* dbVersion */};
+
+    // Ensure that reopenFetchedBucket returns an empty BSONObj instead of throwing when the fetch
+    // encounters a StaleConfig exception.
+    BSONObj reopenedBucketDoc;
+    ASSERT_DOES_NOT_THROW(reopenedBucketDoc =
+                              internal::reopenFetchedBucket(opCtx, bucketsColl, OID::gen(), stats));
+    ASSERT_TRUE(reopenedBucketDoc.isEmpty());
+}
+
+struct GenerateBucketOIDExtendedRangeParam {
+    static GenerateBucketOIDExtendedRangeParam create(int64_t millisSinceEpoch, bool setsFlag) {
+        return {.date = Date_t::fromMillisSinceEpoch(millisSinceEpoch), .setsFlag = setsFlag};
+    }
+
+    Date_t date;
+    bool setsFlag{false};
+};
+
+std::ostream& operator<<(std::ostream& os, const GenerateBucketOIDExtendedRangeParam& param) {
+    os << std::format("date: {}, setsFlag: {}", param.date.toString(), param.setsFlag);
+    return os;
+}
+
+class GenerateBucketOIDExtendedRangeTest
+    : public testing::TestWithParam<GenerateBucketOIDExtendedRangeParam> {};
+
+TEST_P(GenerateBucketOIDExtendedRangeTest, ExtendedRangeFlagIsSetCorrectly) {
+    const auto [date, expectExtendedRange] = GetParam();
+    const auto options = std::invoke([] {
+        TimeseriesOptions opts("time");
+        opts.setGranularity(BucketGranularityEnum::Seconds);
+        return opts;
+    });
+
+    const auto [oid, roundedTime] = internal::generateBucketOID(date, options);
+    EXPECT_EQ(expectExtendedRange, timeseries::oidHasExtendedRangeTime(oid)) << fmt::format(
+        "Input timestamp: {0:d}.{1:d}s ({2:#018x}), OID timestamp: {3:d} ({3:#010x})",
+        date.toMillisSinceEpoch() / 1000,
+        date.toMillisSinceEpoch() % 1000,
+        date.toMillisSinceEpoch(),
+        oid.getTimestamp());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    GenerateBucketOIDExtendedRange,
+    GenerateBucketOIDExtendedRangeTest,
+    testing::Values(
+        // Standard range: epoch
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0000'0000'0000LL * 1000, false),
+        // Standard range: 2021-01-01T00:00:00Z
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0000'5FEE'6600LL * 1000, false),
+
+        // Standard range: just under INT32_MAX (2038-01-19T03:13:00Z, multiple of 60)
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0000'7FFF'FFCBLL * 1000, false),
+
+        // Extended: 1 minute before epoch (negative timestamp)
+        GenerateBucketOIDExtendedRangeParam::create(-0x3CLL * 1000, true),
+
+        // Extended: well before epoch (~1958)
+        GenerateBucketOIDExtendedRangeParam::create(-0x0000'0000'167F'0934LL * 1000, true),
+
+        // Extended: just past INT32_MAX (0x8000'0044), truncation naturally has high bit
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0000'8000'0044LL * 1000, true),
+
+        // Extended: ~2106, truncation wraps to 0x2C — flag required to distinguish from epoch
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0001'0000'002CLL * 1000, true),
+
+        // Extended: ~2174, truncation wraps to 0x8000'0004 — high bit naturally present
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0001'8000'0024LL * 1000, true),
+
+        // Extended: ~2242, double wrap to 0x2C — flag required again
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0002'0000'001CLL * 1000, true),
+
+        // Extended: ~2242, double wrap to 0x2C — no flag
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0000'7FFF'FFFFLL * 1000, false),
+
+        // Extended: ~just past INT32_MAX, using milliseconds
+        // This is floored to integer seconds based on timeseries options and the min cannot be
+        // higher resolution than seconds, the flag should not be set as the control.min[timeField]
+        // on the bucket will be within the standard range.
+        GenerateBucketOIDExtendedRangeParam::create(0x0000'0000'7FFF'FFFFLL * 1000 + 1LL, false)));
+
+TEST_F(BucketCatalogInternalTest, PredictNextBucketOIDMatchesActualNextOID) {
+    TimeseriesOptions options;
+    const Date_t timestamp = Date_t::now();
+
+    [[maybe_unused]] auto [oid1, unusedTs1] = internal::generateBucketOID(timestamp, options);
+    auto predicted2 = predictNextBucketOID(oid1);
+    [[maybe_unused]] auto [oid2, unusedTs2] = internal::generateBucketOID(timestamp, options);
+    ASSERT_EQ(predicted2, oid2);
+
+    auto predicted3 = predictNextBucketOID(oid2);
+    [[maybe_unused]] auto [oid3, unusedTs3] = internal::generateBucketOID(timestamp, options);
+    ASSERT_EQ(predicted3, oid3);
+}
+
+TEST_F(BucketCatalogInternalTest, OIDCollisionDoesNotRemoveExistingBucketId) {
+    // For simplicity, use only one stripe.
+    FailPointEnableBlock failPoint("alwaysUseSameBucketCatalogStripe");
+
+    auto key = BucketKey(_uuid1,
+                         BucketMetadata(getTrackingContext(_bucketCatalog->trackingContexts,
+                                                           TrackingScope::kOpenBucketsByKey),
+                                        BSONElement{},
+                                        boost::none));
+    TimeseriesOptions options;
+    auto collectionStats = std::make_shared<ExecutionStats>();
+    ExecutionStatsController stats(collectionStats, _globalStats);
+    const Date_t timestamp = Date_t::now();
+
+    auto [currentOID, roundedTime] = internal::generateBucketOID(timestamp, options);
+    auto collidingOID = predictNextBucketOID(currentOID);
+    BucketId collidingBucketId{key.collectionUUID, collidingOID, key.signature()};
+
+    // Manually insert a bucket at collidingBucketId to simulate a pre-existing entry.
+    auto [it, inserted] = _bucketCatalog->stripes[0]->openBucketsById.try_emplace(
+        collidingBucketId,
+        tracking::make_unique<Bucket>(
+            getTrackingContext(_bucketCatalog->trackingContexts, TrackingScope::kOpenBucketsById),
+            _bucketCatalog->trackingContexts,
+            collidingBucketId,
+            key,
+            options.getTimeField(),
+            roundedTime,
+            _bucketCatalog->bucketStateRegistry));
+    ASSERT_TRUE(inserted);
+    ASSERT_OK(initializeBucketState(_bucketCatalog->bucketStateRegistry, collidingBucketId));
+
+    ASSERT(_bucketCatalog->stripes[0]->openBucketsById.contains(collidingBucketId));
+
+    // Allocate a bucket. The first attempt collides with collidingBucketId, after which we reset
+    // the counter and then successfully retry with a new OID.
+    Bucket& newBucket = internal::allocateBucket(*_bucketCatalog,
+                                                 *_bucketCatalog->stripes[0],
+                                                 WithLock::withoutLock(),
+                                                 key,
+                                                 options,
+                                                 timestamp,
+                                                 nullptr,
+                                                 stats);
+
+    EXPECT_NE(collidingBucketId, newBucket.bucketId);
+    // The existing entry should still exist.
+    ASSERT(_bucketCatalog->stripes[0]->openBucketsById.contains(collidingBucketId));
+}
+
+TEST_F(BucketCatalogInternalTest,
+       OIDCollisionInBucketStateRegistryDoesNotLeaveDanglingEntryInOpenBucketsById) {
+    // For simplicity, use only one stripe.
+    FailPointEnableBlock failPoint("alwaysUseSameBucketCatalogStripe");
+
+    auto key = BucketKey(_uuid1,
+                         BucketMetadata(getTrackingContext(_bucketCatalog->trackingContexts,
+                                                           TrackingScope::kOpenBucketsByKey),
+                                        BSONElement{},
+                                        boost::none));
+    TimeseriesOptions options;
+    auto collectionStats = std::make_shared<ExecutionStats>();
+    ExecutionStatsController stats(collectionStats, _globalStats);
+    const Date_t timestamp = Date_t::now();
+
+    auto [currentOID, unused] = internal::generateBucketOID(timestamp, options);
+    auto frozenOID = predictNextBucketOID(currentOID);
+    BucketId frozenBucketId{key.collectionUUID, frozenOID, key.signature()};
+
+    // Freeze the bucket state so initializeBucketState will fail for this ID. There should be an
+    // entry for this bucketId in the bucket state registry but none in the openBucketsById map.
+    freezeBucket(_bucketCatalog->bucketStateRegistry, frozenBucketId);
+    ASSERT_FALSE(_bucketCatalog->stripes[0]->openBucketsById.contains(frozenBucketId));
+
+    Bucket& newBucket = internal::allocateBucket(*_bucketCatalog,
+                                                 *_bucketCatalog->stripes[0],
+                                                 WithLock::withoutLock(),
+                                                 key,
+                                                 options,
+                                                 timestamp,
+                                                 nullptr,
+                                                 stats);
+
+    EXPECT_NE(frozenBucketId, newBucket.bucketId);
+    ASSERT_FALSE(_bucketCatalog->stripes[0]->openBucketsById.contains(frozenBucketId));
+}
+
+}  // namespace
+}  // namespace mongo::timeseries::bucket_catalog

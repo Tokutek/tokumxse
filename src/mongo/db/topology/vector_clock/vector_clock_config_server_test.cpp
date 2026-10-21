@@ -1,0 +1,368 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/authorization_session_impl.h"
+#include "mongo/db/auth/authz_session_external_state_mock.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/keys_collection_client_sharded.h"
+#include "mongo/db/keys_collection_manager.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/logical_time_validator.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/sharding_environment/config_server_test_fixture.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/topology/vector_clock/vector_clock.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/transport/session.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace mongo {
+namespace {
+
+class VectorClockConfigServerTest : public ConfigServerTestFixture {
+protected:
+    VectorClockConfigServerTest()
+        : ConfigServerTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
+
+    void setUp() override {
+        ConfigServerTestFixture::setUp();
+
+        auto keysCollectionClient = std::make_unique<KeysCollectionClientSharded>(
+            Grid::get(operationContext())->catalogClient());
+
+        VectorClockMutable::get(getServiceContext())
+            ->tickClusterTimeTo(LogicalTime(Timestamp(1, 0)));
+
+        _keyManager = std::make_shared<KeysCollectionManager>(
+            "dummy", std::move(keysCollectionClient), Seconds(1000));
+        auto validator = std::make_unique<LogicalTimeValidator>(_keyManager);
+        validator->init(getServiceContext());
+        LogicalTimeValidator::set(getServiceContext(), std::move(validator));
+    }
+
+    void tearDown() override {
+        LogicalTimeValidator::get(getServiceContext())->shutDown();
+
+        ConfigServerTestFixture::tearDown();
+    }
+
+    void makeClientUnauthorizedToAdvanceTime(Client* client) {
+        auto sessionState = std::make_unique<AuthzSessionExternalStateMock>(client);
+        auto authSession =
+            std::make_unique<AuthorizationSessionImpl>(std::move(sessionState), client);
+        AuthorizationSession::set(client, std::move(authSession));
+    }
+
+    void makeClusterTimeToBeSigned() {
+        // The timestamp is only signed if the client is not authorized to advance time.
+        makeClientUnauthorizedToAdvanceTime(operationContext()->getClient());
+
+        // Create a dummy key to be able to sign timestamps.
+        // Note that it's not possible to automatically generate new keys since the
+        // `setupMajorityReads` has been explicitly disabled for this test suite.
+        // Insert before enabling the key generator to avoid a race where the background thread
+        // runs before the insert and populates the cache with auto-generated keys, which then
+        // shadow this key due to the newerThanThis optimization in _refreshInternalKeys.
+        KeysCollectionDocument keyDoc(_kKeyId);
+        keyDoc.setKeysCollectionDocumentBase(
+            {"dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0))});
+        ASSERT_OK(insertToConfigCollection(
+            operationContext(), NamespaceString::kKeysCollectionNamespace, keyDoc.toBSON()));
+
+        LogicalTimeValidator::get(getServiceContext())
+            ->enableKeyGenerator(operationContext(), true);
+
+        _keyManager->refreshNow(operationContext());
+        _keyManager->stopMonitoring();
+    }
+
+    int _kKeyId = 1;
+
+private:
+    std::shared_ptr<KeysCollectionManager> _keyManager;
+};
+
+
+TEST_F(VectorClockConfigServerTest, TickClusterTime) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    const auto t0 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(1, 0)), t0.clusterTime());
+
+    const auto r1 = vc->tickClusterTime(1);
+    const auto t1 = vc->getTime();
+    ASSERT_EQ(r1, t1.clusterTime());
+    ASSERT_GT(r1, t0.clusterTime());
+
+    const auto r2 = vc->tickClusterTime(2);
+    const auto t2 = vc->getTime();
+    ASSERT_GT(r2, r1);
+    ASSERT_GT(t2.clusterTime(), r1);
+}
+
+TEST_F(VectorClockConfigServerTest, TickToClusterTime) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    const auto t0 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(1, 0)), t0.clusterTime());
+
+    vc->tickClusterTimeTo(LogicalTime(Timestamp(1, 1)));
+    const auto t1 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(1, 1)), t1.clusterTime());
+
+    vc->tickClusterTimeTo(LogicalTime(Timestamp(3, 3)));
+    const auto t2 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(3, 3)), t2.clusterTime());
+
+    vc->tickClusterTimeTo(LogicalTime(Timestamp(2, 2)));
+    const auto t3 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(3, 3)), t3.clusterTime());
+}
+
+using VectorClockConfigServerTestDeathTest = VectorClockConfigServerTest;
+DEATH_TEST_F(VectorClockConfigServerTestDeathTest, CannotTickConfigTime, "invariant") {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+    vc->tickConfigTime(1);
+}
+
+TEST_F(VectorClockConfigServerTest, TickToConfigTime) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    const auto t0 = vc->getTime();
+    ASSERT_EQ(VectorClock::kInitialComponentTime, t0.configTime());
+
+    vc->tickConfigTimeTo(LogicalTime(Timestamp(1, 1)));
+    const auto t1 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(1, 1)), t1.configTime());
+
+    vc->tickConfigTimeTo(LogicalTime(Timestamp(3, 3)));
+    const auto t2 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(3, 3)), t2.configTime());
+
+    vc->tickConfigTimeTo(LogicalTime(Timestamp(2, 2)));
+    const auto t3 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(3, 3)), t3.configTime());
+}
+
+DEATH_TEST_F(VectorClockConfigServerTestDeathTest, CannotTickTopologyTime, "invariant") {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+    vc->tickTopologyTime(1);
+}
+
+TEST_F(VectorClockConfigServerTest, TickToTopologyTime) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    const auto t0 = vc->getTime();
+    ASSERT_EQ(VectorClock::kInitialComponentTime, t0.topologyTime());
+
+    vc->tickTopologyTimeTo(LogicalTime(Timestamp(1, 1)));
+    const auto t1 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(1, 1)), t1.topologyTime());
+
+    vc->tickTopologyTimeTo(LogicalTime(Timestamp(3, 3)));
+    const auto t2 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(3, 3)), t2.topologyTime());
+
+    vc->tickTopologyTimeTo(LogicalTime(Timestamp(2, 2)));
+    const auto t3 = vc->getTime();
+    ASSERT_EQ(LogicalTime(Timestamp(3, 3)), t3.topologyTime());
+}
+
+TEST_F(VectorClockConfigServerTest, GossipOutInternal) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    vc->tickClusterTime(1);                           // (1, 1)
+    const auto clusterTime = vc->tickClusterTime(1);  // (1, 2)
+    const auto configTime = LogicalTime(Timestamp(1, 1));
+    vc->tickConfigTimeTo(configTime);
+    const auto topologyTime = LogicalTime(Timestamp(1, 0));
+    vc->tickTopologyTimeTo(topologyTime);
+
+    BSONObjBuilder bob;
+    vc->gossipOut(operationContext(), &bob, true /*force internal*/);
+    auto obj = bob.obj();
+
+    // On config servers, gossip out to internal clients should have $clusterTime, $configTime, and
+    // $topologyTime.
+    ASSERT_TRUE(obj.hasField("$clusterTime"));
+    ASSERT_EQ(obj["$clusterTime"].Obj()["clusterTime"].timestamp(), clusterTime.asTimestamp());
+    // No signature is attached for internal clients.
+    ASSERT_FALSE(obj["$clusterTime"].Obj().hasField("signature"));
+    ASSERT_TRUE(obj.hasField("$configTime"));
+    ASSERT_EQ(obj["$configTime"].timestamp(), configTime.asTimestamp());
+    ASSERT_TRUE(obj.hasField("$topologyTime"));
+    ASSERT_EQ(obj["$topologyTime"].timestamp(), topologyTime.asTimestamp());
+}
+
+TEST_F(VectorClockConfigServerTest, GossipOutExternal) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    vc->tickClusterTime(1);                           // (1, 1)
+    const auto clusterTime = vc->tickClusterTime(1);  // (1, 2)
+    const auto configTime = LogicalTime(Timestamp(1, 1));
+    vc->tickConfigTimeTo(configTime);
+    const auto topologyTime = LogicalTime(Timestamp(1, 0));
+    vc->tickTopologyTimeTo(topologyTime);
+
+    BSONObjBuilder bob;
+    vc->gossipOut(operationContext(), &bob);
+    auto obj = bob.obj();
+
+    // On config servers, gossip out to external clients should have $clusterTime, but not
+    // $configTime or $topologyTime.
+    ASSERT_TRUE(obj.hasField("$clusterTime"));
+    ASSERT_EQ(obj["$clusterTime"].Obj()["clusterTime"].timestamp(), clusterTime.asTimestamp());
+    // A signature is always attached for external clients. Client is authed, so it receives a dummy
+    // signature.
+    ASSERT_TRUE(obj["$clusterTime"].Obj().hasField("signature"));
+    ASSERT_EQ(obj["$clusterTime"].Obj()["signature"].Obj()["keyId"].Long(), 0);
+    ASSERT_FALSE(obj.hasField("$configTime"));
+    ASSERT_FALSE(obj.hasField("$topologyTime"));
+}
+
+TEST_F(VectorClockConfigServerTest, GossipOutExternalWithSignedClusterTime) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    makeClusterTimeToBeSigned();
+
+    vc->tickClusterTime(1);                           // (1, 1)
+    const auto clusterTime = vc->tickClusterTime(1);  // (1, 2)
+    const auto configTime = LogicalTime(Timestamp(1, 1));
+    vc->tickConfigTimeTo(configTime);
+    const auto topologyTime = LogicalTime(Timestamp(1, 0));
+    vc->tickTopologyTimeTo(topologyTime);
+
+
+    BSONObjBuilder bob;
+    vc->gossipOut(operationContext(), &bob);
+    auto obj = bob.obj();
+
+    // On config servers, gossip out to external clients should have $clusterTime, but not
+    // $configTime or $topologyTime.
+    ASSERT_TRUE(obj.hasField("$clusterTime"));
+    ASSERT_EQ(obj["$clusterTime"].Obj()["clusterTime"].timestamp(), clusterTime.asTimestamp());
+    // A signature is always attached for external clients. Client is not authed, so it receives a
+    // valid signature.
+    ASSERT_TRUE(obj["$clusterTime"].Obj().hasField("signature"));
+    ASSERT_EQ(obj["$clusterTime"].Obj()["signature"].Obj()["keyId"].Long(), _kKeyId);
+    ASSERT_FALSE(obj.hasField("$configTime"));
+    ASSERT_FALSE(obj.hasField("$topologyTime"));
+}
+
+TEST_F(VectorClockConfigServerTest, GossipInInternal) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    vc->tickClusterTime(2);  // (1, 2)
+    const auto configTime = LogicalTime(Timestamp(1, 1));
+    vc->tickConfigTimeTo(configTime);
+    const auto topologyTime = LogicalTime(Timestamp(1, 0));
+    vc->tickTopologyTimeTo(topologyTime);
+
+    auto dummySignature =
+        BSON("hash" << BSONBinData("\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1", 20, BinDataGeneral)
+                    << "keyId" << 0);
+    auto timepointsObj = BSON(
+        "$clusterTime" << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
+                       << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2));
+    auto timepoints = GossipedVectorClockComponents::parse(
+        timepointsObj, IDLParserContext("VectorClockComponents"));
+    vc->gossipIn(operationContext(), timepoints, false, true);
+
+    // On config servers, gossip in from internal clients should update $clusterTime, $configTime,
+    // and $topologyTime.
+    auto afterTime = vc->getTime();
+    ASSERT_EQ(afterTime.clusterTime().asTimestamp(), Timestamp(2, 2));
+    ASSERT_EQ(afterTime.configTime().asTimestamp(), Timestamp(2, 2));
+    ASSERT_EQ(afterTime.topologyTime().asTimestamp(), Timestamp(2, 2));
+
+    // Can gossip in from an internal client without a dummy signature.
+    timepointsObj = BSON("$clusterTime" << BSON("clusterTime" << Timestamp(1, 2)) << "$configTime"
+                                        << Timestamp(1, 2) << "$topologyTime" << Timestamp(1, 2)),
+    timepoints = GossipedVectorClockComponents::parse(timepointsObj,
+                                                      IDLParserContext("VectorClockComponents"));
+    vc->gossipIn(operationContext(), timepoints, false, true);
+
+    auto afterTime2 = vc->getTime();
+    ASSERT_EQ(afterTime2.clusterTime().asTimestamp(), Timestamp(2, 2));
+    ASSERT_EQ(afterTime2.configTime().asTimestamp(), Timestamp(2, 2));
+    ASSERT_EQ(afterTime2.topologyTime().asTimestamp(), Timestamp(2, 2));
+
+    // Can gossip in from an internal client with a dummy signature.
+    timepointsObj = BSON("$clusterTime" << BSON("clusterTime" << Timestamp(3, 3)) << "$configTime"
+                                        << Timestamp(3, 3) << "$topologyTime" << Timestamp(3, 3)),
+    timepoints = GossipedVectorClockComponents::parse(timepointsObj,
+                                                      IDLParserContext("VectorClockComponents"));
+    vc->gossipIn(operationContext(), timepoints, false, true);
+
+    auto afterTime3 = vc->getTime();
+    ASSERT_EQ(afterTime3.clusterTime().asTimestamp(), Timestamp(3, 3));
+    ASSERT_EQ(afterTime3.configTime().asTimestamp(), Timestamp(3, 3));
+    ASSERT_EQ(afterTime3.topologyTime().asTimestamp(), Timestamp(3, 3));
+}
+
+TEST_F(VectorClockConfigServerTest, GossipInExternal) {
+    auto sc = getServiceContext();
+    auto vc = VectorClockMutable::get(sc);
+
+    vc->tickClusterTime(2);  // (1, 2)
+    const auto configTime = LogicalTime(Timestamp(1, 1));
+    vc->tickConfigTimeTo(configTime);
+    const auto topologyTime = LogicalTime(Timestamp(1, 0));
+    vc->tickTopologyTimeTo(topologyTime);
+
+    auto dummySignature =
+        BSON("hash" << BSONBinData("\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1\1", 20, BinDataGeneral)
+                    << "keyId" << 0);
+    auto timepointsObj = BSON(
+        "$clusterTime" << BSON("clusterTime" << Timestamp(2, 2) << "signature" << dummySignature)
+                       << "$configTime" << Timestamp(2, 2) << "$topologyTime" << Timestamp(2, 2));
+    auto timepoints = GossipedVectorClockComponents::parse(
+        timepointsObj, IDLParserContext("VectorClockComponents"));
+    vc->gossipIn(operationContext(), timepoints, false);
+
+    // On config servers, gossip in from external clients should update $clusterTime, but not
+    // $configTime or $topologyTime.
+    auto afterTime = vc->getTime();
+    ASSERT_EQ(afterTime.clusterTime().asTimestamp(), Timestamp(2, 2));
+    ASSERT_EQ(afterTime.configTime().asTimestamp(), configTime.asTimestamp());
+    ASSERT_EQ(afterTime.topologyTime().asTimestamp(), topologyTime.asTimestamp());
+
+    // Gossiping works without a signature, since it's treated as a dummy signature and the test's
+    // client is authorized to advance the clock.
+    timepointsObj = BSON("$clusterTime" << BSON("clusterTime" << Timestamp(3, 3)) << "$configTime"
+                                        << Timestamp(1, 1) << "$topologyTime" << Timestamp(1, 1)),
+    timepoints = GossipedVectorClockComponents::parse(timepointsObj,
+                                                      IDLParserContext("VectorClockComponents"));
+    vc->gossipIn(nullptr, timepoints, false);
+
+    auto afterTime2 = vc->getTime();
+    ASSERT_EQ(afterTime2.clusterTime().asTimestamp(), Timestamp(3, 3));
+    ASSERT_EQ(afterTime2.configTime().asTimestamp(), configTime.asTimestamp());
+    ASSERT_EQ(afterTime2.topologyTime().asTimestamp(), topologyTime.asTimestamp());
+}
+
+}  // namespace
+}  // namespace mongo

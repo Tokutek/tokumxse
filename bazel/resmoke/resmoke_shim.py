@@ -1,0 +1,408 @@
+import json
+import os
+import pathlib
+import random
+import shutil
+import signal
+import string
+import sys
+import tempfile
+from functools import cache
+
+import psutil
+import yaml
+
+REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
+sys.path.append(str(REPO_ROOT))
+from bazel.resmoke.resource_monitor import ResourceMonitor
+from buildscripts.bazel_local_resources import acquire_local_resource
+from buildscripts.resmokelib import cli
+from buildscripts.resmokelib.hang_analyzer.process import signal_python
+from buildscripts.resmokelib.logging.loggers import new_resmoke_logger
+
+
+@cache
+def get_volatile_status() -> dict:
+    volatile_status = {}
+    with open(os.path.join("bazel", "resmoke", "volatile-status.txt"), "rt") as f:
+        for line in f:
+            key, val = line.strip().split(" ", 1)[:2]
+            volatile_status[key] = val
+    return volatile_status
+
+
+def get_from_volatile_status(key):
+    volatile_status = get_volatile_status()
+    return volatile_status.get(key)
+
+
+def add_volatile_arg(args, flag, key):
+    val = get_from_volatile_status(key)
+    if val:
+        args.append(flag + val)
+
+
+def add_multiversion_exclude_tags(args):
+    """Read the multiversion config and add --excludeWithAnyTags for multiversion tests."""
+    config_file = os.environ.get("MULTIVERSION_CONFIG_FILE")
+    if not config_file or not os.path.exists(config_file):
+        return
+
+    with open(config_file) as f:
+        config = yaml.safe_load(f)
+
+    # Map multiversion_setup version names to multiversion-config fields.
+    versions = os.environ.get("MULTIVERSION_VERSIONS", "").split(",")
+    fcv_tags = set()
+    for version in versions:
+        if version == "last-lts":
+            tag_field = "requires_fcv_tag_lts"
+        elif version == "last-continuous":
+            tag_field = "requires_fcv_tag_continuous"
+        elif version == "last-patch":
+            # A last-patch binary is in the same series as the version under test, so
+            # its FCV matches and the default tag set applies. This mirrors
+            # mongo-task-generator's get_fcv_tags_for_patch().
+            tag_field = "requires_fcv_tag"
+        else:
+            continue
+        tags_str = config.get(tag_field, "")
+        if tags_str:
+            fcv_tags.update(tags_str.split(","))
+
+    exclude = "multiversion_incompatible,backport_required_multiversion"
+    if fcv_tags:
+        exclude += "," + ",".join(sorted(fcv_tags))
+    args.append("--excludeWithAnyTags=" + exclude)
+
+
+def add_evergreen_build_info(args):
+    add_volatile_arg(args, "--buildId=", "build_id")
+    add_volatile_arg(args, "--distroId=", "distro_id")
+    add_volatile_arg(args, "--executionNumber=", "execution")
+    add_volatile_arg(args, "--gitRevision=", "revision")
+    add_volatile_arg(args, "--otelParentId=", "otel_parent_id")
+    add_volatile_arg(args, "--otelTraceId=", "otel_trace_id")
+    add_volatile_arg(args, "--projectName=", "project")
+    add_volatile_arg(args, "--requester=", "requester")
+    add_volatile_arg(args, "--revisionOrderId=", "revision_order_id")
+    add_volatile_arg(args, "--taskId=", "task_id")
+    add_volatile_arg(args, "--taskName=", "task_name")
+    add_volatile_arg(args, "--variantName=", "build_variant")
+    add_volatile_arg(args, "--versionId=", "version_id")
+
+
+def copy_jstestfuzz_metadata_to_undeclared_outputs():
+    """Copy jstestfuzz_generate metadata files from runfiles into the test outputs."""
+    test_srcdir = os.environ.get("TEST_SRCDIR")
+    out_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+    if not test_srcdir or not out_dir:
+        return
+    base = os.path.join(test_srcdir, "_main")
+    if not os.path.isdir(base):
+        return
+    metadata = {
+        ".jstestfuzz_seed": "jstestfuzz_seed.txt",
+        ".jstestfuzz_commit_sha": "jstestfuzz_commit_sha.txt",
+    }
+    for root, dirs, _ in os.walk(base, followlinks=False):
+        for d in dirs:
+            candidate = os.path.join(root, d)
+            if not os.path.isfile(os.path.join(candidate, ".jstestfuzz_seed")):
+                continue
+            for src_name, dst_name in metadata.items():
+                src = os.path.join(candidate, src_name)
+                if os.path.exists(src):
+                    shutil.copyfile(src, os.path.join(out_dir, dst_name))
+            return
+
+
+def inject_config_fuzz_seed(resmoke_args):
+    """Read the pre-generated config fuzz seed file and inject --configFuzzSeed into resmoke args.
+
+    Also copies the seed to TEST_UNDECLARED_OUTPUTS_DIR so fetch_remote_test_results.sh
+    can include it in the reproduction command.
+    """
+    seed_file = os.environ.get("CONFIG_FUZZ_SEED_FILE")
+    if not seed_file or not os.path.exists(seed_file):
+        return
+
+    with open(seed_file) as f:
+        seed = f.read().strip()
+
+    if not seed:
+        return
+
+    if not any(arg.startswith("--configFuzzSeed") for arg in resmoke_args):
+        resmoke_args.append(f"--configFuzzSeed={seed}")
+
+    out_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+    if out_dir:
+        shutil.copy(seed_file, os.path.join(out_dir, "config_fuzz_seed.txt"))
+
+
+def setup_pythonpath():
+    """Setup PYTHONPATH and executable location for jstests that call python"""
+
+    os.environ["RESMOKE_PYTHON"] = sys.executable
+
+    # Export sys.path to PYTHONPATH so that Python subprocesses spawned from JS tests
+    # (via runNonMongoProgram) can import the same packages as this process. Bazel sets up
+    # sys.path for the test process but not for child subprocesses.
+    # Exclude empty-string entries (they mean "cwd" which varies per subprocess).
+    new_paths = [p for p in sys.path if p]
+
+    # Prepend any additional import paths declared via data deps that provide PyInfo.
+    python_imports_file = os.environ.get("PYTHON_IMPORTS_FILE")
+    if python_imports_file and os.path.exists(python_imports_file):
+        test_srcdir = os.environ.get("TEST_SRCDIR")
+        if test_srcdir:
+            with open(python_imports_file, "r") as f:
+                imports = [line.strip() for line in f if line.strip()]
+            if imports:
+                new_paths = [os.path.join(test_srcdir, imp) for imp in imports] + new_paths
+
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    new_pythonpath = os.pathsep.join(new_paths)
+    if existing_pythonpath:
+        new_pythonpath = new_pythonpath + os.pathsep + existing_pythonpath
+    os.environ["PYTHONPATH"] = new_pythonpath
+
+
+def resolve_deps_path() -> str | None:
+    """Return the binary dependency path list for this resmoke test."""
+
+    deps_path_map_file = os.environ.get("DEPS_PATH_MAP_FILE")
+    test_target = os.environ.get("TEST_TARGET")
+    if deps_path_map_file and test_target:
+        with open(deps_path_map_file, "r", encoding="utf-8") as file:
+            deps_path_map = json.load(file)
+        deps_path = deps_path_map.get(test_target)
+        if deps_path:
+            return deps_path
+
+    return os.environ.get("DEPS_PATH")
+
+
+def add_deps_path_to_path():
+    deps_path = resolve_deps_path()
+    if not deps_path:
+        return
+
+    os.environ["DEPS_PATH"] = deps_path
+    os.environ["PATH"] += os.pathsep + os.pathsep.join(
+        [os.path.dirname(os.path.abspath(path)) for path in deps_path.split(":")]
+    )
+
+
+class ResmokeShimContext:
+    def __init__(self):
+        self.links = []
+        self.tmpdir_symlink = None
+        self.outputs_symlink = None
+        self.resource_monitor = None
+
+    @staticmethod
+    def _make_short_symlink(target, prefix, short_root):
+        """Create a short symlink in short_root pointing to target, retrying on collision."""
+        chars = string.ascii_lowercase + string.digits
+        while True:
+            suffix = "".join(random.choices(chars, k=6))
+            link_path = os.path.join(short_root, prefix + suffix)
+            try:
+                os.symlink(target, link_path)
+                return link_path
+            except FileExistsError:
+                continue
+
+    def create_short_symlinks(self):
+        """Create short symlinks in /tmp to avoid long path issues."""
+        if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK):
+            short_root = "/tmp"
+        else:
+            short_root = tempfile.gettempdir()
+
+        test_tempdir = os.environ.get("TEST_TMPDIR")
+        if test_tempdir:
+            self.tmpdir_symlink = self._make_short_symlink(test_tempdir, "rt", short_root)
+            self.links.append(self.tmpdir_symlink)
+
+        undeclared_outputs_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+        if undeclared_outputs_dir:
+            self.outputs_symlink = self._make_short_symlink(
+                undeclared_outputs_dir, "ro", short_root
+            )
+            self.links.append(self.outputs_symlink)
+
+    def __enter__(self):
+        # Use the Bazel provided TEST_TMPDIR. Note this must occur after uses of acquire_local_resource
+        # which relies on a shared temporary directory among all test shards.
+        if self.tmpdir_symlink:
+            os.environ["TMPDIR"] = self.tmpdir_symlink
+            os.environ["TMP"] = self.tmpdir_symlink
+            os.environ["TEMP"] = self.tmpdir_symlink
+
+        # JVM-based test dependencies (mongot) write their perf data to a shared memory file
+        # at /tmp/hsperfdata_<user>/<pid>. HotSpot hardcodes /tmp on Linux, so this ignores the
+        # TMPDIR isolation above. Because each shard runs in its own PID namespace, concurrent
+        # shards produce identical pids and collide on the same file, which makes the JVM emit a
+        # "Cannot use file ... because it is locked by another process" warning on stdout.
+        # Keep perf data in private memory instead so there is no file to contend over.
+        java_tool_options = os.environ.get("JAVA_TOOL_OPTIONS", "")
+        os.environ["JAVA_TOOL_OPTIONS"] = (java_tool_options + " -XX:+PerfDisableSharedMem").strip()
+
+        # Bazel will send SIGTERM on a test timeout. If all processes haven't terminated
+        # after –-local_termination_grace_seconds (default 15s), Bazel will SIGKILL them instead.
+        signal.signal(signal.SIGTERM, self._handle_interrupt)
+
+        # Symlink source directories because resmoke uses relative paths profusely.
+        base_dir = os.path.join(os.environ.get("TEST_SRCDIR"), "_main")
+        working_dir = os.getcwd()
+        for entry in os.scandir(base_dir):
+            link = os.path.join(working_dir, entry.name)
+            self.links.append(link)
+            os.symlink(entry.path, link)
+
+        # If mongot binaries were provided via a mongot_setup, link them where
+        # resmoke's default mongot path (mongot-localdev/mongot) expects them.
+        mongot_dir = os.path.join(base_dir, "bazel", "resmoke", "mongot", "mongot-localdev")
+        mongot_link = os.path.join(working_dir, "mongot-localdev")
+        if os.path.isdir(mongot_dir) and not os.path.exists(mongot_link):
+            self.links.append(mongot_link)
+            os.symlink(mongot_dir, mongot_link)
+
+        try:
+            output_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+            if output_dir:
+                output_file = os.path.join(output_dir, "resource_usage.txt")
+                self.resource_monitor = ResourceMonitor(
+                    output_file=output_file, root_pid=os.getpid()
+                )
+                self.resource_monitor.write_snapshot(self.resource_monitor.collect_snapshot())
+                self.resource_monitor.start_periodic_monitoring()
+        except Exception as e:
+            # Log but don't fail - monitoring is non-critical
+            print(f"Warning: Failed to initialize resource monitoring: {e}", file=sys.stderr)
+            self.resource_monitor = None
+
+        return self
+
+    def __exit__(self, exception_type, exception_value, exception_traceback):
+        if self.resource_monitor:
+            try:
+                self.resource_monitor.stop_periodic_monitoring()
+                final_snapshot = self.resource_monitor.collect_snapshot()
+                self.resource_monitor.write_snapshot(final_snapshot)
+            except Exception as e:
+                print(f"Warning: Error during resource monitoring cleanup: {e}", file=sys.stderr)
+
+        for link in self.links:
+            os.unlink(link)
+
+    def _handle_interrupt(self, signum, frame):
+        # Attempt a clean shutdown, producing python stacktraces and generating core dumps for
+        # any still running process. It is likely that most programs will have terminated before
+        # core dumps can be produced, since Bazel sends SIGTERM to all processes, not just this one.
+        # Individual timeouts per test are depended upon for useful core dumps of test processes.
+        pid = os.getpid()
+        p = psutil.Process(pid)
+        signal_python(new_resmoke_logger(), p.name, pid)
+
+
+if __name__ == "__main__":
+    copy_jstestfuzz_metadata_to_undeclared_outputs()
+    setup_pythonpath()
+
+    sys.argv[0] = os.path.join(
+        "buildscripts", "resmoke.py"
+    )  # Ensure resmoke's local invocation is printed using resmoke.py directly
+    resmoke_args = sys.argv
+
+    # If there was an extra --suites argument added as a --test_arg in the bazel invocation, rewrite
+    # the original as --originSuite. Intentionally 'suite', sinces it is a common partial match for the actual
+    # argument 'suites'
+    suite_args = [i for i, arg in enumerate(resmoke_args) if arg.startswith("--suite")]
+    if len(suite_args) > 1:
+        resmoke_args[suite_args[0]] = resmoke_args[suite_args[0]].replace(
+            "--suites", "--originSuite"
+        )
+
+    # Reduce the storage engine's cache size (if not already set) to reduce the likelihood
+    # of a mongod process being killed by the OOM killer. The configuration of the
+    # cache size is duplicated in evergreen/resmoke_tests_execute.sh, please update both.
+    storage_engine_in_memory = "--storageEngine=inMemory" in resmoke_args
+    storage_engine_cache_arg = [
+        arg for arg in resmoke_args if arg.startswith("--storageEngineCacheSizeGB")
+    ]
+    if not storage_engine_cache_arg:
+        if storage_engine_in_memory:
+            resmoke_args.append("--storageEngineCacheSizeGB=4")
+        else:
+            resmoke_args.append("--storageEngineCacheSizeGB=1")
+
+    add_evergreen_build_info(resmoke_args)
+    add_multiversion_exclude_tags(resmoke_args)
+    inject_config_fuzz_seed(resmoke_args)
+
+    add_deps_path_to_path()
+
+    ctx = ResmokeShimContext()
+    ctx.create_short_symlinks()
+
+    undeclared_output_dir = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+
+    outputs_dir = ctx.outputs_symlink if ctx.outputs_symlink else undeclared_output_dir
+
+    # Use the real path (not the symlink) so OTEL writes remain valid after __exit__ removes symlinks.
+    # The TracerProvider shuts down via atexit, which runs after ctx.__exit__ removes the symlinks.
+    otel_dir = os.path.join(undeclared_output_dir or outputs_dir, "build", "metrics")
+    os.makedirs(otel_dir, exist_ok=True)
+    resmoke_args.append(f"--otelCollectorDir={otel_dir}")
+    resmoke_args.append(f"--taskWorkDir={outputs_dir}")
+    resmoke_args.append(f"--reportFile={os.path.join(outputs_dir, 'report.json')}")
+    os.chdir(outputs_dir)
+
+    # Locally, it is nice for the data directory to preserved in the test output. However, we
+    # don't want to save it in CI since we explicitly archive the data directory for failed
+    # tests already. It will add to the output tree size in remote execution which is wasteful.
+    if "--log=evg" in resmoke_args:
+        dbpath = ctx.tmpdir_symlink if ctx.tmpdir_symlink else os.environ.get("TEST_TMPDIR")
+    else:
+        dbpath = os.path.join(outputs_dir, "data")
+    resmoke_args.append(f"--dbpathPrefix={dbpath}")
+
+    if os.environ.get("TEST_SHARD_INDEX") and os.environ.get("TEST_TOTAL_SHARDS"):
+        shard_count = os.environ.get("TEST_TOTAL_SHARDS")
+        shard_index = os.environ.get("TEST_SHARD_INDEX")
+
+        resmoke_args.append(f"--shardIndex={shard_index}")
+        resmoke_args.append(f"--shardCount={shard_count}")
+        if os.environ.get("TEST_SHARD_STATUS_FILE"):
+            open(os.environ["TEST_SHARD_STATUS_FILE"], "w").close()
+
+        report = f"report_shard_{shard_index}_of_{shard_count}.json"
+    else:
+        resmoke_args.append("--shardIndex=0")
+        resmoke_args.append("--shardCount=1")
+
+        report = "report.json"
+    resmoke_args.append(f"--reportFile={os.path.join(outputs_dir, report)}")
+
+    lock, base_port = acquire_local_resource("port_block")
+    resmoke_args.append(f"--basePort={base_port}")
+
+    resmoke_args.append(f"--archiveDirectory={os.path.join(outputs_dir, 'data_archives')}")
+
+    with ctx:
+        if undeclared_output_dir:
+            for arg in resmoke_args:
+                if arg.startswith("--multiversionDir="):
+                    mv_dir = os.path.abspath(arg.split("=", 1)[1])
+                    src = os.path.join(mv_dir, "multiversion-downloads.json")
+                    if os.path.exists(src):
+                        dest = "multiversion-downloads-" + os.path.basename(mv_dir) + ".json"
+                        shutil.copy(src, os.path.join(undeclared_output_dir, dest))
+
+        cli.main(resmoke_args)
+
+    lock.release()

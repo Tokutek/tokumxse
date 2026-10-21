@@ -1,0 +1,34 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: mongo
+    cpp_includes:
+        - "mongo/db/sharding_environment/shard_shared_state_cache.h"
+
+server_parameters:
+    shardRetryTokenBucketCapacity:
+        description: Maximum amount of retry tokens available to a shard.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<std::int32_t>
+        cpp_varname: gShardRetryTokenBucketCapacity
+        default: 1000
+        validator:
+            gt: 0
+        redact: false
+        on_update: ShardSharedStateCache::updateRetryBudgetCapacity
+
+    shardRetryTokenReturnRate:
+        description: >-
+            Return rate for shard retry tokens on successful requests.
+            Allows the amount of available retry tokens to increase over time as requests are being
+            performed.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<double>
+        cpp_varname: gShardRetryTokenReturnRate
+        default: 0.1
+        validator:
+            gt: 0
+        redact: false
+        on_update: ShardSharedStateCache::updateRetryBudgetReturnRate

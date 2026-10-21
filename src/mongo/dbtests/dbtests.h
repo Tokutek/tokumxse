@@ -1,66 +1,49 @@
-// dbtests.h : Test suite generator headers.
-//
-
-/**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/util/modules.h"
 
-#include "mongo/db/instance.h"
-#include "mongo/unittest/unittest.h"
+#include <string_view>
 
-using namespace mongo;
-using namespace mongo::unittest;
-using boost::shared_ptr;
+#include <boost/optional/optional.hpp>
 
-namespace mongo {
-    class BSONObj;
-    class OperationContext;
-    class Status;
-    class StringData;
+[[MONGO_MOD_PUBLIC]];
+namespace mongo::dbtests {
 
-namespace dbtests {
-    // This specifies default dbpath for our testing framework
-    extern const std::string default_test_dbpath;
+/**
+ * Combines AutoGetDb and AutoStatsTracker. If the requested 'ns' exists, the constructed
+ * object will have both the database and the collection locked in MODE_IX. Otherwise, the database
+ * will be locked in MODE_IX and will be created, while the collection will be locked in MODE_X, but
+ * not created.
+ */
+class WriteContextForTests {
+    WriteContextForTests(const WriteContextForTests&) = delete;
+    WriteContextForTests& operator=(const WriteContextForTests&) = delete;
 
-    /**
-     * Creates an index if it does not already exist.
-     */
-    Status createIndex(OperationContext* txn,
-                       StringData ns,
-                       const BSONObj& keys,
-                       bool unique = false);
+public:
+    WriteContextForTests(OperationContext* opCtx, std::string_view ns);
 
-    /**
-     * Creates an index from a BSON spec, if it does not already exist.
-     */
-    Status createIndexFromSpec(OperationContext* txn, StringData ns, const BSONObj& spec);
-}  // namespace dbtests
-}  // namespace mongo
+    Database* db() const {
+        return _autoDb->getDb();
+    }
+
+    CollectionAcquisition getOrCreateCollection(LockMode mode = MODE_IX);
+    CollectionAcquisition getCollection(LockMode mode = MODE_IX) const;
+
+private:
+    OperationContext* const _opCtx;
+    const NamespaceString _nss;
+
+    boost::optional<AutoGetDb> _autoDb;
+    boost::optional<AutoStatsTracker> _tracker;
+};
+
+}  // namespace mongo::dbtests

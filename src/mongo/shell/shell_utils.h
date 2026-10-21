@@ -1,90 +1,154 @@
-// mongo/shell/shell_utils.h
-/*
- *    Copyright 2010 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/thread/mutex.hpp>
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/util/modules.h"
 
-#include "mongo/db/jsobj.h"
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
+
+#include <boost/filesystem.hpp>
+#include <boost/filesystem/path.hpp>
 
 namespace mongo {
 
-    class Scope;
-    class DBClientWithCommands;
-    
-    namespace shell_utils {
+class Scope;
+class DBClientBase;
 
-        extern std::string _dbConnect;
-        extern std::string _dbAuth;
-        extern bool _nokillop;
+namespace shell_utils {
 
-        void RecordMyLocation( const char *_argv0 );
-        void installShellUtils( Scope& scope );
+bool isBalanced(const std::string& code);
 
-        void initScope( Scope &scope );
-        void onConnect( DBClientWithCommands &c );
+extern std::string dbConnect;
+using EnterpriseShellCallback = void(Scope&);
 
-        const char* getUserDir();
-        
-        BSONElement singleArg(const BSONObj& args);
-        extern const BSONObj undefinedReturn;
-        
-        /** Prompt for confirmation from cin. */
-        class Prompter {
-        public:
-            Prompter( const std::string &prompt );
-            /** @return prompted confirmation or cached confirmation. */
-            bool confirm();
-        private:
-            const std::string _prompt;
-            bool _confirmed;
-        };
+void RecordMyLocation(const char* _argv0);
+void installShellUtils(Scope& scope);
 
-        /** Registry of server connections. */
-        class ConnectionRegistry {
-        public:
-            ConnectionRegistry();
-            void registerConnection( DBClientWithCommands &client );
-            void killOperationsOnAllConnections( bool withPrompt ) const;
-        private:
-            std::map<std::string,std::set<std::string> > _connectionUris;
-            mutable mongo::mutex _mutex;
-        };
-        
-        extern ConnectionRegistry connectionRegistry;
+void initScope(Scope& scope);
+void onConnect(DBClientBase& c, std::string_view uri);
 
-        // This mutex helps the shell serialize output on exit, to avoid deadlocks at shutdown. So
-        // it also protects the global dbexitCalled.
-        extern boost::mutex &mongoProgramOutputMutex;
+boost::filesystem::path getHistoryFilePath();
+void setEnterpriseShellCallback(EnterpriseShellCallback* callback);
 
-        // Helper to tell if a file exists cross platform
-        // TODO: Remove this when we have a cross platform file utility library
-        bool fileExists(const std::string& file);
-    }
+
+BSONElement singleArg(const BSONObj& args);
+extern const BSONObj undefinedReturn;
+
+/** Prompt for confirmation from cin. */
+class Prompter {
+public:
+    Prompter(const std::string& prompt);
+    /** @return prompted confirmation or cached confirmation. */
+    bool confirm();
+
+private:
+    const std::string _prompt;
+    bool _confirmed;
+};
+
+/** Registry of server connections. */
+class ConnectionRegistry {
+public:
+    ConnectionRegistry();
+    void registerConnection(DBClientBase& client, std::string_view uri);
+    void killOperationsOnAllConnections(bool withPrompt) const;
+
+private:
+    std::map<std::string, std::set<std::string>> _connectionUris;
+    mutable std::mutex _mutex;
+};
+
+extern ConnectionRegistry connectionRegistry;
+
+// Helper to tell if a file exists cross platform
+// TODO: Remove this when we have a cross platform file utility library
+bool fileExists(const std::string& file);
+
+// If the test began a GoldenTestContext, end it and compare actual/expected results.
+void closeGoldenTestContext();
+
+/**
+ * Thrown when a GoldenTestContextShell test fails.
+ */
+struct GoldenTestContextShellFailure {
+    std::string message;
+    std::string actualOutputFile;
+    std::string expectedOutputFile;
+
+    std::string toString() const;
+    void diff() const;
+};
+
+void closeMochaStyleTestContext(Scope& scope);
+
+std::string getURIFromArgs(const std::string& arg,
+                           const std::string& host,
+                           const std::string& port);
+
+}  // namespace shell_utils
+
+// Specifically scoped namespace for usages that are "unfortunately public"
+namespace [[MONGO_MOD_NEEDS_REPLACEMENT]] shell_utils {
+
+enum class NormalizationOpts : uint32_t {
+    kResults = 0,
+    // Set this bit to sort an array of results. Used in QueryTester.
+    kSortResults = 1 << 0,
+    // Set this bit to sort fields in the BSONObj.
+    kSortBSON = 1 << 1,
+    // Set this bit to sort arrays in the BSONObj.
+    kSortArrays = 1 << 2,
+    // Set this bit to normalize numerics.
+    kNormalizeNumerics = 1 << 3,
+    // Set this bit to treat null and missing as the same value.
+    kConflateNullAndMissing = 1 << 4,
+    // Set this bit to round floating points to 15 digits of precision.
+    kRoundFloatingPointNumerics = 1 << 5,
+    // Set this bit to run explain of the original query instead.
+    kExplain = 1 << 6,
+    // Set this bit to compare only the 'queryShapeHash' results.
+    kQueryShapeHash = 1 << 7,
+};
+using NormalizationOptsSet = NormalizationOpts;
+
+inline NormalizationOpts operator&(NormalizationOpts lhs, NormalizationOpts rhs) {
+    return static_cast<NormalizationOpts>(static_cast<uint32_t>(lhs) & static_cast<uint32_t>(rhs));
 }
+
+inline NormalizationOpts operator|(NormalizationOpts lhs, NormalizationOpts rhs) {
+    return static_cast<NormalizationOpts>(static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
+}
+
+inline bool isSet(NormalizationOpts opts, NormalizationOpts flag) {
+    return (opts & flag) != NormalizationOpts::kResults;
+}
+
+// Sorts a vector of BSON objects by their fields as they appear in the BSON.
+void sortQueryResults(std::vector<BSONObj>& input);
+
+/**
+ * Normalizes a BSONObj for more flexible results comparison. By default, this will return the
+ * BSONObj with no changes.
+ *
+ * If the kSortBSON bit, this method will return a new BSON with the same field/value
+ * pairings, but recursively sorted by the fields. If the kSortArrays bit is set, this method will
+ * also recursively sort the BSONObj's arrays. If the kNormalizeNumerics bit is set, this method
+ * will normalize numerics by casting them to the widest type, Decimal128, and normalizing them to
+ * the maximum precision. If the kConflateNullAndMissing bit is set, this method will treat null,
+ * undefined, and missing fields as the same by removing null and undefined values.
+ */
+BSONObj normalizeBSONObj(const BSONObj& input,
+                         NormalizationOptsSet opts = NormalizationOpts::kResults);
+
+
+}  // namespace shell_utils
+}  // namespace mongo

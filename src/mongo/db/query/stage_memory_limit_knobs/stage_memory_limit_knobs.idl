@@ -1,0 +1,397 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/platform/atomic.h"
+    # Knob server parameters are implementation details of the query.knobs module: read
+    # them via QueryKnobConfiguration. Only the enums are part of the public API.
+    mod_visibility: private
+
+server_parameters:
+    internalDocumentSourceLookupCacheSizeBytes:
+        description: >-
+            Maximum amount of non-correlated foreign-collection data that the $lookup stage
+            will cache before abandoning the cache and executing the full pipeline on each iteration."
+        set_at: [startup, runtime]
+        cpp_varname: "internalDocumentSourceLookupCacheSizeBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gte: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: documentSourceLookupCacheSizeBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalDocumentSourceGraphLookupMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the $graphLookup aggregation stage will cache
+            in-memory before spilling.
+        set_at: [startup, runtime]
+        cpp_varname: "internalDocumentSourceGraphLookupMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: documentSourceGraphLookupMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalDocumentSourceGroupMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the $group aggregation stage will cache in-memory
+            before spilling to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalDocumentSourceGroupMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: documentSourceGroupMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalDocumentSourceSetWindowFieldsMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the $setWindowFields aggregation stage will cache
+            in-memory before throwing an error.
+        set_at: [startup, runtime]
+        cpp_varname: "internalDocumentSourceSetWindowFieldsMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: documentSourceSetWindowFieldsMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalDocumentSourceBucketAutoMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the $bucketAuto aggregation stage will cache in-memory
+            before spilling to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalDocumentSourceBucketAutoMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: documentSourceBucketAutoMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalDocumentSourceDensifyMaxMemoryBytes:
+        description: "Limits the number of bytes densification can use to store partition information."
+        set_at: [startup, runtime]
+        cpp_varname: "internalDocumentSourceDensifyMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: documentSourceDensifyMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalQueryFacetBufferSizeBytes:
+        description: "The number of bytes to buffer at once during a $facet stage."
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryFacetBufferSizeBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: queryFacetBufferSizeBytes
+
+    internalTextOrStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the TextOrStage stage will cache in-memory before
+            spilling to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalTextOrStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: textOrStageMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalQuerySlotBasedExecutionHashLookupApproxMemoryUseInBytesBeforeSpill:
+        description: >-
+            The max size in bytes that the hash table in a HashLookup stage can be estimated to
+            be before we spill to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: sbeHashLookupApproxMemoryUseInBytesBeforeSpill
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill:
+        description: >-
+            The max size in bytes that the hash table in a HashAgg stage can be estimated to
+            be before we spill to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQuerySBEAggApproxMemoryUseInBytesBeforeSpill"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: sbeHashAggApproxMemoryUseInBytesBeforeSpill
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalQueryMaxSpoolMemoryUsageBytes:
+        description: >-
+            The maximum amount of memory a query or command is willing to use to execute a
+            spool, measured in bytes. If disk use is allowed, then it may be possible to spool more data,
+            but this limit will still constrain the memory consumption.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryMaxSpoolMemoryUsageBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: queryMaxSpoolMemoryUsageBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalQueryMaxBlockingSortMemoryUsageBytes:
+        description: >-
+            The maximum amount of memory a query (e.g. a find or aggregate command) is willing
+            to use to execute a blocking sort, measured in bytes. If disk use is allowed, then it may be
+            possible to sort more data, but this limit will still constrain the memory consumption.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryMaxBlockingSortMemoryUsageBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gte: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: queryMaxBlockingSortMemoryUsageBytes
+
+    internalOrStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the classic OrStage stage will cache in-memory before
+            failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalOrStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: orStageMaxMemoryBytes
+
+    internalNearStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the NearStage stage will cache in-memory before
+            spilling to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalNearStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: nearStageMaxMemoryBytes
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalMergeSortStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the classic MergeSortStage stage will cache in-memory
+            before failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalMergeSortStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: mergeSortStageMaxMemoryBytes
+
+    internalIndexScanStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the classic IndexScan stage will cache in-memory before
+            failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalIndexScanStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: indexScanStageMaxMemoryBytes
+
+    internalSlotBasedExecutionUniqueStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the SBE Unique and UniqueRoaring stages will cache
+            in-memory before failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalSBEUniqueStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: sbeUniqueStageMaxMemoryBytes
+
+    internalSlotBasedExecutionMergeJoinStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the SBE MergeJoin stages will cache
+            in-memory before failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalSBEMergeJoinStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: sbeMergeJoinStageMaxMemoryBytes
+
+    internalSlotBasedExecutionAndHashStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the hash table that the SBE AndHash stage will build
+            in-memory before failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalSBEAndHashStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: sbeAndHashStageMaxMemoryBytes
+
+    internalQuerySlotBasedExecutionHashJoinApproxMemoryUseInBytesBeforeSpill:
+        description: >-
+            The max size in bytes that the hash table in a HashJoin stage can be estimated to
+            be before we spill to disk.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQuerySBEHashJoinApproxMemoryUseInBytesBeforeSpill"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: sbeHashJoinApproxMemoryUseInBytesBeforeSpill
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
+
+    internalUpdateStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the classic UpdateStage stage will cache in-memory
+            before failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalUpdateStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: updateStageMaxMemoryBytes
+
+    internalCountScanStageMaxMemoryBytes:
+        description: >-
+            Maximum size of the data that the classic CountScan stage will cache in-memory before
+            failing the query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalCountScanStageMaxMemoryBytes"
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: std::numeric_limits<long long>::max()
+        validator:
+            gt: 0
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: countScanStageMaxMemoryBytes

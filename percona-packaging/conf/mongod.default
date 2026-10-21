@@ -1,0 +1,3 @@
+OPTIONS="-f /etc/mongod.conf"
+STDOUT="/var/log/@@LOGDIR@@/mongod.stdout"
+STDERR="/var/log/@@LOGDIR@@/mongod.stderr"

@@ -1,0 +1,184 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/inclusion_projection_executor.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/compiler/logical_model/projection/projection_policies.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/string_map.h"
+
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo::projection_executor {
+/**
+ * A AddFieldsProjectionExecutor represents a projection execution tree for the $addFields stage.
+ *
+ * This class is mostly a wrapper around an InclusionNode tree. It contains logic to parse a
+ * specification object into the corresponding InclusionNode tree, but defers most execution logic
+ * to the underlying tree. In this way it is similar to InclusionProjectionExecutor, but it differs
+ * by not applying inclusions before adding computed fields, thus keeping all existing fields.
+ */
+class AddFieldsProjectionExecutor : public ProjectionExecutor {
+public:
+    /**
+     * TODO SERVER-25510: The ProjectionExecutor _id and array-recursion policies are not
+     * applicable to the $addFields "projection" stage. We make them non-configurable here.
+     */
+    AddFieldsProjectionExecutor(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : ProjectionExecutor(expCtx,
+                             {ProjectionPolicies::DefaultIdPolicy::kIncludeId,
+                              ProjectionPolicies::ArrayRecursionPolicy::kRecurseNestedArrays,
+                              ProjectionPolicies::ComputedFieldsPolicy::kAllowComputedFields}),
+          _root(new InclusionNode(_policies)) {}
+
+    AddFieldsProjectionExecutor(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                std::unique_ptr<InclusionNode> root)
+        : ProjectionExecutor(expCtx,
+                             {ProjectionPolicies::DefaultIdPolicy::kIncludeId,
+                              ProjectionPolicies::ArrayRecursionPolicy::kRecurseNestedArrays,
+                              ProjectionPolicies::ComputedFieldsPolicy::kAllowComputedFields}),
+          _root(std::move(root)) {}
+    /**
+     * Creates the data needed to perform an AddFields.
+     * Verifies that there are no conflicting paths in the specification.
+     */
+    static std::unique_ptr<AddFieldsProjectionExecutor> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& spec);
+
+    /**
+     * Create a projection that binds an expression to a top-level field.
+     *
+     * 'fieldPath' must be a top-level field name (exactly one element; no dots).
+     */
+    static std::unique_ptr<AddFieldsProjectionExecutor> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const FieldPath& fieldPath,
+        const boost::intrusive_ptr<Expression>& expr);
+
+    TransformerType getType() const final {
+        return TransformerType::kComputedProjection;
+    }
+
+    const InclusionNode& getRoot() const {
+        return *_root;
+    }
+
+    /**
+     * Parses the addFields specification given by 'spec', populating internal data structures.
+     */
+    void parse(const BSONObj& spec);
+
+    Document serializeTransformation(
+        const query_shape::SerializationOptions& options = {}) const final {
+        return _root->serialize(options);
+    }
+
+    /**
+     * Optimizes any computed expressions.
+     */
+    void optimize() final {
+        _root->optimize();
+    }
+
+    /**
+     * Checks whether the projection is a noop.
+     */
+    bool isNoop() const final {
+        // The $addFields projection is noop if no fields are going to be added.
+        return _root->isAdditionSetEmpty();
+    }
+
+    DepsTracker::State addDependencies(DepsTracker* deps) const final {
+        _root->reportDependencies(deps);
+        return DepsTracker::State::SEE_NEXT;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        _root->addVariableRefs(refs);
+    }
+
+    DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        OrderedPathSet computedPaths;
+        StringMap<std::string> renamedPaths;
+        StringMap<std::string> complexRenamedPaths;
+        _root->reportComputedPaths(&computedPaths, &renamedPaths, &complexRenamedPaths);
+        return {DocumentSource::GetModPathsReturn::Type::kFiniteSet,
+                std::move(computedPaths),
+                std::move(renamedPaths),
+                std::move(complexRenamedPaths)};
+    }
+
+    void describeTransformation(
+        document_transformation::DocumentOperationVisitor& visitor) const override;
+
+    /**
+     * Add the specified fields to 'inputDoc'.
+     *
+     * Replaced fields will remain in their original place in the document, while new added fields
+     * will be added to the end of the document in the order in which they were specified to the
+     * $addFields stage.
+     *
+     * Arrays will be traversed, with any dotted/nested computed fields applied to each element in
+     * the array. For example, setting "a.0": "hello" will add a field "0" to every object
+     * in the array "a". If there is an element in "a" that is not an object, it will be replaced
+     * with {"0": "hello"}. See SERVER-25200 for more details.
+     */
+    Document applyProjection(const Document& inputDoc, const EvaluationContext& ctx) const final;
+
+    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const override {
+        return boost::none;
+    }
+
+    std::pair<BSONObj, bool> extractComputedProjections(
+        std::string_view oldName,
+        std::string_view newName,
+        const std::set<std::string_view>& reservedNames) final {
+        return _root->extractComputedProjectionsInAddFields(oldName, newName, reservedNames);
+    }
+
+private:
+    /**
+     * Attempts to parse 'objSpec' as an expression like {$add: [...]}. Adds a computed field to
+     * '_root' and returns true if it was successfully parsed as an expression. Returns false if it
+     * was not an expression specification.
+     *
+     * Throws an error if it was determined to be an expression specification, but failed to parse
+     * as a valid expression.
+     */
+    bool parseObjectAsExpression(const FieldPath& pathToObject,
+                                 const BSONObj& objSpec,
+                                 const VariablesParseState& variablesParseState);
+
+    /**
+     * Traverses 'subObj' and parses each field. Creates nodes along the 'pathToObj' when an
+     * expression/terminal path is found.
+     */
+    void parseSubObject(const BSONObj& subObj,
+                        const VariablesParseState& variablesParseState,
+                        const FieldPath& pathToObj);
+
+    // The InclusionNode tree does most of the execution work once constructed.
+    std::unique_ptr<InclusionNode> _root;
+};
+}  // namespace mongo::projection_executor

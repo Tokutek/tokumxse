@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Feature flag for gRPC.
+
+global:
+    cpp_namespace: "mongo::feature_flags"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+feature_flags:
+    featureFlagGRPC:
+        description: "Feature flag to enable listening for ingress gRPC connections"
+        cpp_varname: gFeatureFlagGRPC
+        default: false
+        fcv_gated: false
+    featureFlagEgressGrpcForSearch:
+        mod_visibility: public
+        description: "Feature flag to use egress gRPC for search communication"
+        cpp_varname: gEgressGrpcForSearch
+        default: true
+        fcv_gated: false

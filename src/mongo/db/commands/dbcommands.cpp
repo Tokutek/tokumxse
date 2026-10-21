@@ -1,0 +1,553 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_checks.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/buildinfo_common.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbcommands_gen.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/global_catalog/ddl/shard_key_index_util.h"
+#include "mongo/db/global_catalog/sharding_catalog_client.h"
+#include "mongo/db/global_catalog/type_collection.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/metrics_filtering_util.h"
+#include "mongo/db/metrics_policy_manager.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/query/explain_verbosity_gen.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/request_execution_context.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/ddl/coll_mod_gen.h"
+#include "mongo/db/shard_role/ddl/drop_database_gen.h"
+#include "mongo/db/shard_role/ddl/drop_gen.h"
+#include "mongo/db/shard_role/ddl/replica_set_ddl_tracker.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/coll_mod.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/drop_collection.h"
+#include "mongo/db/shard_role/shard_catalog/drop_database.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/stats/storage_stats.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/timeseries/timeseries_collmod.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/buildinfo.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
+#include "mongo/util/timer.h"
+
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+// Will cause 'CmdDatasize' to hang as it starts executing.
+MONGO_FAIL_POINT_DEFINE(hangBeforeDatasizeCount);
+
+class CmdDataSize final : public TypedCommand<CmdDataSize> {
+public:
+    using Request = DataSizeCommand;
+    using Reply = typename Request::Reply;
+
+    CmdDataSize() : TypedCommand(Request::kCommandName, Request::kCommandAlias) {}
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        bool supportsWriteConcern() const final {
+            return false;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auto as = AuthorizationSession::get(opCtx->getClient());
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    as->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns()),
+                                                         ActionType::find));
+        }
+
+        NamespaceString ns() const final {
+            return request().getCommandParameter();
+        }
+
+        Reply typedRun(OperationContext* opCtx) {
+            const auto& cmd = request();
+
+            const bool hasMin = cmd.getMin() != boost::none;
+            const bool hasMax = cmd.getMax() != boost::none;
+
+            const std::string_view negation = hasMin ? ""sv : "not "sv;
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Max must " << negation << "be set if min is " << negation
+                                  << "set.",
+                    hasMin == hasMax);
+
+            Timer timer;
+            NamespaceString nss = ns();
+            auto min = cmd.getMin().get_value_or({});
+            auto max = cmd.getMax().get_value_or({});
+            auto keyPattern = cmd.getKeyPattern().get_value_or({});
+            const bool estimate = cmd.getEstimate();
+
+            Reply reply;
+
+            const auto collection =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest::fromOpCtx(
+                                      opCtx, nss, AcquisitionPrerequisites::kRead),
+                                  MODE_IS);
+
+            if (!collection.exists()) {
+                // Collection does not exist
+                reply.setNumObjects(0);
+                reply.setSize(0);
+                reply.setMillis(timer.millis());
+                return reply;
+            }
+
+            const auto& collectionShardingDescription = collection.getShardingDescription();
+            if (collectionShardingDescription.isSharded()) {
+                const auto& shardKeyPattern = collectionShardingDescription.getShardKeyPattern();
+                uassert(ErrorCodes::BadValue,
+                        "keyPattern must be empty or must be an object that equals the shard key",
+                        keyPattern.isEmpty() ||
+                            (SimpleBSONObjComparator::kInstance.evaluate(shardKeyPattern.toBSON() ==
+                                                                         keyPattern)));
+
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << "min value " << min << " does not have shard key",
+                        min.isEmpty() || shardKeyPattern.isShardKey(min));
+                min = shardKeyPattern.normalizeShardKey(min);
+
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << "max value " << max << " does not have shard key",
+                        max.isEmpty() || shardKeyPattern.isShardKey(max));
+                max = shardKeyPattern.normalizeShardKey(max);
+            }
+
+            const auto [dataSize, numRecords] =
+                collection.getCollectionPtr()->latestSizeCount(opCtx);
+            reply.setNumObjects(numRecords);
+
+            if (numRecords == 0) {
+                reply.setSize(0);
+                reply.setMillis(timer.millis());
+                return reply;
+            }
+            reply.setEstimate(estimate);
+
+            // hasMin/hasMax check above matches presense of params,
+            // This test matches presence of significant param values.
+            uassert(ErrorCodes::BadValue,
+                    "Only one of min or max specified",
+                    min.isEmpty() == max.isEmpty());
+
+            std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
+            if (min.isEmpty() && max.isEmpty()) {
+                if (estimate) {
+                    reply.setSize(dataSize);
+                    reply.setMillis(timer.millis());
+                    return reply;
+                }
+                exec = InternalPlanner::collectionScan(
+                    opCtx, collection, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            } else {
+                if (keyPattern.isEmpty()) {
+                    // if keyPattern not provided, try to infer it from the fields in 'min'
+                    keyPattern = Helpers::inferKeyPattern(min);
+                }
+
+                const auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
+                                                                   collection.getCollectionPtr(),
+                                                                   keyPattern,
+                                                                   /*requireSingleKey=*/true);
+
+                uassert(ErrorCodes::OperationFailed,
+                        "Couldn't find valid index containing key pattern",
+                        shardKeyIdx);
+
+                // Use inclusive upper bound when max is all-MaxKey.
+                KeyPattern kp(shardKeyIdx->keyPattern());
+                const bool isMaxGlobal = kp.isGlobalMax(max);
+                min = Helpers::toKeyFormat(kp.extendRangeBound(min, false));
+                max = Helpers::toKeyFormat(kp.extendRangeBound(max, isMaxGlobal));
+                const auto boundInclusion = isMaxGlobal
+                    ? BoundInclusion::kIncludeBothStartAndEndKeys
+                    : BoundInclusion::kIncludeStartKeyOnly;
+
+                exec = InternalPlanner::shardKeyIndexScan(opCtx,
+                                                          collection,
+                                                          *shardKeyIdx,
+                                                          min,
+                                                          max,
+                                                          boundInclusion,
+                                                          PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            }
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &hangBeforeDatasizeCount, opCtx, "hangBeforeDatasizeCount", []() {});
+
+
+            const auto maxSize = cmd.getMaxSize();
+            const auto maxObjects = cmd.getMaxObjects();
+
+            std::remove_const_t<decltype(maxSize)> size = 0;
+            std::remove_const_t<decltype(size)> avgObjSize = dataSize / numRecords;
+            std::remove_const_t<decltype(maxObjects)> numObjects = 0;
+
+            try {
+                RecordId loc;
+                while (PlanExecutor::ADVANCED ==
+                       exec->getNext(static_cast<BSONObj*>(nullptr), &loc)) {
+                    if (estimate) {
+                        size += avgObjSize;
+                    } else {
+                        size +=
+                            collection.getCollectionPtr()
+                                ->getRecordStore()
+                                ->dataFor(opCtx, *shard_role_details::getRecoveryUnit(opCtx), loc)
+                                .size();
+                    }
+
+                    ++numObjects;
+
+                    if ((maxSize && (size > maxSize)) ||
+                        (maxObjects && (numObjects > maxObjects))) {
+                        reply.setMaxReached(true);
+                        break;
+                    }
+                }
+            } catch (DBException& ex) {
+                LOGV2_WARNING(23801,
+                              "Internal error while reading",
+                              logAttrs(nss),
+                              "error"_attr = ex.toStatus());
+                ex.addContext("Executor error while reading during dataSize command");
+                throw;
+            }
+
+            reply.setSize(size);
+            reply.setNumObjects(numObjects);
+            reply.setMillis(timer.millis());
+            return reply;
+        }
+    };
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    std::string help() const final {
+        return std::string{Request::kCommandDescription};
+    }
+};
+MONGO_REGISTER_COMMAND(CmdDataSize).forShard();
+
+Rarely _collStatsSampler;
+
+class CmdCollStats final : public TypedCommand<CmdCollStats> {
+public:
+    using Request = CollStatsCommand;
+
+    CmdCollStats() : TypedCommand(Request::kCommandName, Request::kCommandAlias) {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const final {
+        return false;
+    }
+
+    std::string help() const final {
+        return std::string{Request::kCommandDescription};
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    class Invocation final : public MinimalInvocationBase {
+    public:
+        using MinimalInvocationBase::MinimalInvocationBase;
+
+    private:
+        bool supportsWriteConcern() const override {
+            return false;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            auto as = AuthorizationSession::get(opCtx->getClient());
+            uassert(ErrorCodes::Unauthorized,
+                    "unauthorized",
+                    as->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns()),
+                                                         ActionType::collStats));
+        }
+
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) final {
+            // Critical to monitoring and observability, categorize the command as immediate
+            // priority.
+            ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+                opCtx, AdmissionContext::Priority::kExempt);
+
+            if (_collStatsSampler.tick())
+                LOGV2_WARNING(7024600,
+                              "The collStats command is deprecated. For more information, see "
+                              "https://dochub.mongodb.org/core/collStats-deprecated");
+
+            const auto nss = ns();
+            uassert(
+                ErrorCodes::OperationFailed, "No collection name specified", !nss.coll().empty());
+
+            auto inputResultBuilder = reply->getBodyBuilder();
+            // If filtering is required by the metrics policy, append the metrics to a temporary
+            // result builder and filter them at the end. Otherwise, append directly to the input
+            // result builder to avoid additional costs in the non-filtering case.
+            auto& metricsPolicyManager = MetricsPolicyManager::get(opCtx);
+            bool requireFiltering = metricsPolicyManager.requiresFiltering(
+                opCtx, MetricsCategoryEnum::kCollStats, /*forceFiltered=*/false);
+
+            auto serializationCtx =
+                SerializationContext::stateCommandReply(request().getSerializationContext());
+
+            boost::optional<BSONObjBuilder> tmpResultBuilder;
+            if (requireFiltering) {
+                tmpResultBuilder.emplace();
+            }
+            BSONObjBuilder& result = requireFiltering ? *tmpResultBuilder : inputResultBuilder;
+
+            result.append("ns", NamespaceStringUtil::serialize(nss, serializationCtx));
+
+            const auto& spec = request().getStorageStatsSpec();
+            Status status =
+                appendCollectionStorageStats(opCtx, nss, spec, serializationCtx, &result);
+            if (!status.isOK() && (status.code() != ErrorCodes::NamespaceNotFound)) {
+                uassertStatusOK(status);  // throws
+            }
+
+            // If filtering is required, we appended the metrics in a temporary result builder.
+            // Now extract and append only the ones matching the allowlist to the input result
+            // builder.
+            if (requireFiltering) {
+                const auto& matcher =
+                    metricsPolicyManager.getAllowlistMatcher(MetricsCategoryEnum::kCollStats);
+                metrics_filtering_util::appendPaths(
+                    inputResultBuilder, tmpResultBuilder->obj(), matcher);
+            }
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(CmdCollStats).forShard();
+
+class CmdDbStats final : public TypedCommand<CmdDbStats> {
+public:
+    using Request = DBStatsCommand;
+    using Reply = typename Request::Reply;
+
+    CmdDbStats() : TypedCommand(Request::kCommandName, Request::kCommandAlias) {}
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        bool supportsWriteConcern() const final {
+            return false;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auto as = AuthorizationSession::get(opCtx->getClient());
+            uassert(
+                ErrorCodes::Unauthorized,
+                "Unauthorized",
+                as->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forDatabaseName(request().getDbName()), ActionType::dbStats));
+        }
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
+
+        Reply typedRun(OperationContext* opCtx) {
+            // Critical to monitoring and observability, categorize the command as immediate
+            // priority.
+            ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+                opCtx, AdmissionContext::Priority::kExempt);
+
+            const auto& cmd = request();
+            const auto& dbname = cmd.getDbName();
+
+            // Scale factors valid range (0...2^50] (up to a petabyte)
+            uassert(ErrorCodes::BadValue,
+                    "Scale factor must be greater than zero and less than or equal to 2^50",
+                    cmd.getScale() > 0 && cmd.getScale() <= (1ll << 50));
+
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid db name: " << dbname.toStringForErrorMsg(),
+                    DatabaseName::isValid(dbname, DatabaseName::DollarInDbNameBehavior::Allow));
+
+            {
+                CurOp::get(opCtx)->ensureStarted();
+                std::lock_guard<Client> lk(*opCtx->getClient());
+                CurOp::get(opCtx)->setNS(lk, dbname);
+            }
+
+            AutoGetDb autoDb(opCtx, dbname, MODE_IS);
+            Database* db = autoDb.getDb();
+
+            // We need to copy the serialization context from the request to the reply object
+            Reply reply(SerializationContext::stateCommandReply(cmd.getSerializationContext()));
+            reply.setDB(DatabaseNameUtil::serialize(dbname, reply.getSerializationContext()));
+
+            if (!db) {
+                // This preserves old behavior where we used to create an empty database even when
+                // the database was accessed for a read. Changing this behavior would impact users
+                // that have learned to depend on it, so we continue to support it. Ensure that
+                // these fields match exactly the fields in `DatabaseImpl::getStats`.
+                reply.setCollections(0);
+                reply.setViews(0);
+                reply.setObjects(0);
+                reply.setAvgObjSize(0);
+                reply.setDataSize(0);
+                reply.setStorageSize(0);
+                reply.setIndexes(0);
+                reply.setIndexSize(0);
+                reply.setTotalSize(0);
+                reply.setScaleFactor(cmd.getScale());
+
+                if (cmd.getFreeStorage()) {
+                    reply.setFreeStorageSize(0);
+                    reply.setIndexFreeStorageSize(0);
+                    reply.setTotalFreeStorageSize(0);
+                }
+
+                if (!getGlobalServiceContext()->getStorageEngine()->isEphemeral()) {
+                    reply.setFsUsedSize(0);
+                    reply.setFsTotalSize(0);
+                }
+
+            } else {
+                {
+                    std::lock_guard<Client> lk(*opCtx->getClient());
+                    CurOp::get(opCtx)->enter(
+                        lk,
+                        dbname,
+                        DatabaseProfileSettings::get(opCtx->getServiceContext())
+                            .getDatabaseProfileLevel(dbname));
+                }
+
+                db->getStats(opCtx, &reply, cmd.getFreeStorage(), cmd.getScale());
+            }
+
+            // If filtering is required by the metrics policy, filter the reply before returning.
+            auto& metricsPolicyManager = MetricsPolicyManager::get(opCtx);
+            if (metricsPolicyManager.requiresFiltering(
+                    opCtx, MetricsCategoryEnum::kDbStats, /*forceFiltered=*/false)) {
+                BSONObj replyBSON = reply.toBSON();
+                BSONObjBuilder filteredBuilder;
+                const auto& matcher =
+                    metricsPolicyManager.getAllowlistMatcher(MetricsCategoryEnum::kDbStats);
+                metrics_filtering_util::appendPaths(filteredBuilder, replyBSON, matcher);
+                reply = Reply::parseOwned(filteredBuilder.obj());
+            }
+
+            return reply;
+        }
+    };
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const final {
+        return false;
+    }
+
+    std::string help() const final {
+        return std::string{Request::kCommandDescription};
+    }
+};
+MONGO_REGISTER_COMMAND(CmdDbStats).forShard();
+
+BuildInfo getShardBuildInfo(OperationContext* opCtx) {
+    // Critical to observability and diagnosability, categorize as immediate priority.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+        opCtx, AdmissionContext::Priority::kExempt);
+
+    auto reply = getBuildInfo();
+    reply.setStorageEngines(getStorageEngineNames(opCtx->getServiceContext()));
+    return reply;
+}
+
+class CmdBuildInfoShard : public CmdBuildInfoCommon {
+public:
+    using CmdBuildInfoCommon::CmdBuildInfoCommon;
+
+    BuildInfo generateBuildInfo(OperationContext* opCtx) const final {
+        return getShardBuildInfo(opCtx);
+    }
+};
+MONGO_REGISTER_COMMAND(CmdBuildInfoShard).forShard();
+
+}  // namespace
+}  // namespace mongo

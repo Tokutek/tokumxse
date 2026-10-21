@@ -1,0 +1,45 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _flushRoutingTableCacheUpdates:
+        description: >-
+            An internal command to wait for the last routing table cache refresh for a
+            particular namespace to be persisted to disk.
+        command_name: _flushRoutingTableCacheUpdates
+        cpp_name: FlushRoutingTableCacheUpdates
+        strict: true
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        fields:
+            syncFromConfig:
+                type: bool
+                description: >-
+                    If true, forces a refresh of the cache entry from the config server
+                    before waiting for updates to be persist.
+                default: true
+    _flushRoutingTableCacheUpdatesWithWriteConcern:
+        description: >-
+            The same behavior as _flushRoutingTableCacheUpdates but accepts writeConcern.
+        command_name: _flushRoutingTableCacheUpdatesWithWriteConcern
+        cpp_name: FlushRoutingTableCacheUpdatesWithWriteConcern
+        strict: true
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        reply_type: OkReply
+        fields:
+            syncFromConfig:
+                type: bool
+                description: >-
+                    If true, forces a refresh of the cache entry from the config server
+                    before waiting for updates to be persist.
+                default: true

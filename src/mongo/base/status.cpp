@@ -1,100 +1,129 @@
-/*    Copyright 2012 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
 
 #include "mongo/base/status.h"
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/str.h"
+
+#include <exception>
 #include <ostream>
-#include <sstream>
+#include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
-    Status::ErrorInfo::ErrorInfo(ErrorCodes::Error aCode, StringData aReason, int aLocation)
-        : code(aCode), reason(aReason.toString()), location(aLocation) {
+Status& Status::addContext(std::string_view reasonPrefix) {
+    if (!isOK()) {
+        boost::intrusive_ptr oldInfo = std::move(_error);
+        const Status::ErrorInfo& e = *oldInfo;
+        _error = _createErrorInfo(
+            e.code, fmt::format("{}{}", reasonPrefix, causedBy(e.reason)), e.extra);
     }
+    return *this;
+}
 
-    Status::ErrorInfo* Status::ErrorInfo::create(ErrorCodes::Error c, StringData r, int l) {
-        const bool needRep = ((c != ErrorCodes::OK) ||
-                              !r.empty() ||
-                              (l != 0));
-        return needRep ? new ErrorInfo(c, r, l) : NULL;
+std::string Status::toString() const {
+    StringBuilder sb;
+    sb << *this;
+    return sb.str();
+}
+
+void Status::serialize(BSONObjBuilder* builder) const {
+    builder->append("code", code());
+    builder->append("codeName", ErrorCodes::errorString(code()));
+    if (!isOK()) {
+        builder->append("errmsg", reason());
+        if (const auto& ei = extraInfo())
+            ei->serialize(builder);
     }
+}
 
-    Status::Status(ErrorCodes::Error code, const std::string& reason, int location)
-        : _error(ErrorInfo::create(code, reason, location)) {
-        ref(_error);
+boost::intrusive_ptr<const Status::ErrorInfo> Status::_createErrorInfo(
+    ErrorCodes::Error code, std::string reason, std::shared_ptr<const ErrorExtraInfo> extra) {
+    if (code == ErrorCodes::OK)
+        return nullptr;
+    if (extra) {
+        // The public API prevents getting into this state.
+        invariant(ErrorCodes::canHaveExtraInfo(code));
+    } else if (ErrorCodes::mustHaveExtraInfo(code)) {
+        // If an ErrorExtraInfo class is non-optional, return an error.
+
+        // This is possible if code calls a 2-argument Status constructor with a code that should
+        // have extra info.
+        if (kDebugBuild) {
+            // Make it easier to find this issue by fatally failing in debug builds.
+            LOGV2_FATAL(40680, "Code {code} is supposed to have extra info", "code"_attr = code);
+        }
+
+        // In release builds, replace the error code. This maintains the invariant that all Statuses
+        // for a code that is supposed to hold extra info hold correctly-typed extra info, without
+        // crashing the server.
+        return make_intrusive<ErrorInfo>(
+            ErrorCodes::Error(40671),
+            str::stream() << "Missing required extra info for error code " << code,
+            std::move(extra));
     }
+    return make_intrusive<ErrorInfo>(code, std::move(reason), std::move(extra));
+}
 
-    Status::Status(ErrorCodes::Error code, const char* reason, int location)
-        : _error(ErrorInfo::create(code, reason, location)) {
-        ref(_error);
+boost::intrusive_ptr<const Status::ErrorInfo> Status::_parseErrorInfo(ErrorCodes::Error code,
+                                                                      std::string reason,
+                                                                      const BSONObj& extraObj) {
+    std::shared_ptr<const ErrorExtraInfo> extra;
+    if (auto parser = ErrorExtraInfo::parserFor(code)) {
+        try {
+            extra = parser(extraObj);
+        } catch (const DBException& ex) {
+            if (ErrorCodes::mustHaveExtraInfo(code)) {
+                return ex.toStatus(str::stream() << "Error parsing extra info for " << code)._error;
+            }
+        }
     }
+    return _createErrorInfo(code, std::move(reason), std::move(extra));
+}
 
-    bool Status::compare(const Status& other) const {
-        return
-            code() == other.code() &&
-            location() == other.location();
+std::ostream& Status::_streamTo(std::ostream& os) const {
+    os << codeString();
+    if (!isOK())
+        os << " " << reason();
+    return os;
+}
+
+StringBuilder& Status::_streamTo(StringBuilder& sb) const {
+    sb << codeString();
+    if (!isOK()) {
+        try {
+            if (const auto& extra = extraInfo()) {
+                BSONObjBuilder bob;
+                extra->serialize(&bob);
+                sb << bob.done();
+            }
+        } catch (const DBException&) {
+            // This really shouldn't happen but it would be really annoying if it broke error
+            // logging in production.
+            if (kDebugBuild) {
+                LOGV2_FATAL_CONTINUE(
+                    23806,
+                    "Error serializing extra info for {status_code} in Status::toString()",
+                    "status_code"_attr = code());
+                std::terminate();
+            }
+        }
+        sb << ": " << reason();
     }
+    return sb;
+}
 
-    bool Status::operator==(const Status& other) const {
-        return compare(other);
-    }
-
-    bool Status::operator!=(const Status& other) const {
-        return ! compare(other);
-    }
-
-    bool Status::compareCode(const ErrorCodes::Error other) const {
-        return code() == other;
-    }
-
-    bool Status::operator==(const ErrorCodes::Error other) const {
-        return compareCode(other);
-    }
-
-    bool Status::operator!=(const ErrorCodes::Error other) const {
-        return ! compareCode(other);
-    }
-
-    std::ostream& operator<<(std::ostream& os, const Status& status) {
-        return os << status.codeString() << " " << status.reason();
-    }
-
-    std::ostream& operator<<(std::ostream& os, ErrorCodes::Error code) {
-        return os << ErrorCodes::errorString(code);
-    }
-
-    std::string Status::toString() const {
-        std::ostringstream ss;
-        ss << codeString();
-        if ( !isOK() )
-            ss << " " << reason();
-        if ( location() != 0 )
-            ss << " @ " << location();
-        return ss.str();
-    }
-
-} // namespace mongo
+}  // namespace mongo

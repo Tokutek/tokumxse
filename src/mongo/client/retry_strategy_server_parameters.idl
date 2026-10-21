@@ -1,0 +1,45 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/client/retry_strategy.h"
+        - "mongo/db/server_options.h"
+
+server_parameters:
+    defaultClientBaseBackoffMillis:
+        description: >-
+            Controls the default base backoff for the default retry strategy. When performing
+            retries, the server will use this base backoff as a factor for the exponential delay.
+            If this value is larger than defaultClientMaxBackoffMillis, the server will use
+            defaultClientMaxBackoffMillis as the default base backoff instead.
+        set_at: [startup, runtime]
+        cpp_varname: gDefaultClientBaseBackoffMillis
+        cpp_vartype: Atomic<int32_t>
+        default: 100
+        validator: {gte: 0}
+        redact: false
+
+    defaultClientMaxBackoffMillis:
+        description: >-
+            Controls the default max backoff for the default retry strategy. Ensures clients don't
+            wait longer than this amount of time.
+        set_at: [startup, runtime]
+        cpp_varname: gDefaultClientMaxBackoffMillis
+        cpp_vartype: Atomic<int32_t>
+        default: 10000
+        validator: {gte: 0}
+        redact: false
+
+    defaultClientMaxRetryAttempts:
+        description: >-
+            The maximum amount of retries the server will attempt when encountering retryable
+            errors.
+        mod_visibility: public
+        set_at: [startup, runtime]
+        cpp_varname: gDefaultClientMaxRetryAttempts
+        cpp_vartype: Atomic<int32_t>
+        default: 3
+        validator: {gte: 0}
+        redact: false

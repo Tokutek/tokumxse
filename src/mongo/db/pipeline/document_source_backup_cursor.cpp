@@ -1,0 +1,174 @@
+/*======
+This file is part of Percona Server for MongoDB.
+
+Copyright (C) 2021-present Percona and/or its affiliates. All rights reserved.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the Server Side Public License, version 1,
+    as published by MongoDB, Inc.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    Server Side Public License for more details.
+
+    You should have received a copy of the Server Side Public License
+    along with this program. If not, see
+    <http://www.mongodb.com/licensing/server-side-public-license>.
+
+    As a special exception, the copyright holders give permission to link the
+    code of portions of this program with the OpenSSL library under certain
+    conditions as described in each individual source file and distribute
+    linked combinations including the program with the OpenSSL library. You
+    must comply with the Server Side Public License in all respects for
+    all of the code used other than as permitted herein. If you modify file(s)
+    with this exception, you may extend this exception to your version of the
+    file(s), but you are not obligated to do so. If you do not wish to do so,
+    delete this exception statement from your version. If you delete this
+    exception statement from all source files in the program, then also delete
+    it in the license file.
+======= */
+
+
+#include "mongo/db/pipeline/document_source_backup_cursor.h"
+
+#include "mongo/logv2/log.h"
+#include "mongo/platform/basic.h"
+
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+// We only link this file into mongod so this stage doesn't exist in mongos
+namespace mongo {
+
+using namespace std::literals::string_view_literals;
+
+namespace {
+constexpr std::string_view kDisableIncrementalBackup = "disableIncrementalBackup"sv;
+constexpr std::string_view kIncrementalBackup = "incrementalBackup"sv;
+constexpr std::string_view kBlockSize = "blockSize"sv;
+constexpr std::string_view kThisBackupName = "thisBackupName"sv;
+constexpr std::string_view kSrcBackupName = "srcBackupName"sv;
+}  // namespace
+
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE(backupCursor,
+                                     DocumentSourceBackupCursor::LiteParsed::parse,
+                                     AllowedWithApiStrict::kAlways);
+
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(backupCursor,
+                                                   DocumentSourceBackupCursor,
+                                                   BackupCursorStageParams);
+
+ALLOCATE_DOCUMENT_SOURCE_ID(backupCursor, DocumentSourceBackupCursor::id)
+
+using boost::intrusive_ptr;
+
+std::unique_ptr<DocumentSourceBackupCursor::LiteParsed>
+DocumentSourceBackupCursor::LiteParsed::parse(const NamespaceString& nss,
+                                              const BSONElement& spec,
+                                              const LiteParserOptions& options) {
+
+    return std::make_unique<DocumentSourceBackupCursor::LiteParsed>(spec);
+}
+
+std::string_view DocumentSourceBackupCursor::getSourceName() const {
+    return kStageName;
+}
+
+Value DocumentSourceBackupCursor::serialize(const query_shape::SerializationOptions& opts) const {
+    return Value(Document{
+        {getSourceName(),
+         Document{
+             {kDisableIncrementalBackup,
+              _backupOptions.disableIncrementalBackup ? Value(true) : Value()},
+             {kIncrementalBackup, _backupOptions.incrementalBackup ? Value(true) : Value()},
+             {kBlockSize, Value(_backupOptions.blockSizeMB)},
+             {kThisBackupName,
+              _backupOptions.thisBackupName ? Value(*_backupOptions.thisBackupName) : Value()},
+             {kSrcBackupName,
+              _backupOptions.srcBackupName ? Value(*_backupOptions.srcBackupName) : Value()}}}});
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceBackupCursor::createFromBson(
+    BSONElement spec, const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    // The anticipated usage of a backup cursor: open the backup cursor, consume the results, copy
+    // data off disk, close the backup cursor. The backup cursor must be successfully closed for
+    // the data copied to be valid. Hence, the caller needs a way to keep the cursor open after
+    // consuming the results, as well as the ability to send "heartbeats" to prevent the client
+    // cursor manager from timing out the backup cursor. A backup cursor does consume resources;
+    // in the event the calling process crashes, the cursors should eventually be timed out.
+    pExpCtx->setTailableMode(TailableModeEnum::kTailable);
+
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << kStageName << " parameters must be specified in an object, but found: "
+                          << typeName(spec.type()),
+            spec.type() == BSONType::object);
+
+    StorageEngine::BackupOptions options;
+
+    for (auto&& elem : spec.embeddedObject()) {
+        const auto fieldName = elem.fieldNameStringData();
+
+        if (fieldName == kDisableIncrementalBackup) {
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "The '" << fieldName << "' parameter of the " << kStageName
+                                  << " stage must be a boolean value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::boolean);
+            options.disableIncrementalBackup = elem.boolean();
+        } else if (fieldName == kIncrementalBackup) {
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "The '" << fieldName << "' parameter of the " << kStageName
+                                  << " stage must be a boolean value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::boolean);
+            options.incrementalBackup = elem.boolean();
+        } else if (fieldName == kBlockSize) {
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "The '" << fieldName << "' parameter of the " << kStageName
+                                  << " stage must be an integer value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::numberInt);
+            options.blockSizeMB = elem.Int();
+        } else if (fieldName == kThisBackupName) {
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "The '" << fieldName << "' parameter of the " << kStageName
+                                  << " stage must be a string value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::string);
+            options.thisBackupName = elem.String();
+        } else if (fieldName == kSrcBackupName) {
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "The '" << fieldName << "' parameter of the " << kStageName
+                                  << " stage must be a string value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::string);
+            options.srcBackupName = elem.String();
+        } else {
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << "Unrecognized option '" << fieldName << "' in " << kStageName
+                                    << " stage");
+        }
+    }
+
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream() << "'" << kIncrementalBackup << "' and '" << kDisableIncrementalBackup
+                          << "' parameters are mutually exclusive. Cannot enable both",
+            !(options.incrementalBackup && options.disableIncrementalBackup));
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream() << "'" << kThisBackupName << "' and '" << kSrcBackupName
+                          << "' parameters are only allowed when '" << kIncrementalBackup
+                          << "' is true",
+            options.incrementalBackup || !(options.thisBackupName || options.srcBackupName));
+
+    return new DocumentSourceBackupCursor(std::move(options), pExpCtx);
+}
+
+DocumentSourceBackupCursor::DocumentSourceBackupCursor(
+    StorageEngine::BackupOptions&& options, const intrusive_ptr<ExpressionContext>& expCtx)
+    : DocumentSource(kStageName, expCtx), _backupOptions(std::move(options)) {}
+
+DocumentSourceBackupCursor::~DocumentSourceBackupCursor() = default;
+}  // namespace mongo

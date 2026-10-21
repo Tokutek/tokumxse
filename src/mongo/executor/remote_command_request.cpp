@@ -1,0 +1,184 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/executor/remote_command_request.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+namespace executor {
+namespace {
+
+// Used to generate unique identifiers for requests so they can be traced throughout the
+// asynchronous networking logs
+Atomic<unsigned long long> requestIdCounter(0);
+
+}  // namespace
+
+constexpr Milliseconds RemoteCommandRequest::kNoTimeout;
+
+RemoteCommandRequest::RemoteCommandRequest()
+    : id(requestIdCounter.addAndFetch(1)), operationKey(UUID::gen()) {}
+
+RemoteCommandRequest::RemoteCommandRequest(const HostAndPort& target_,
+                                           const DatabaseName& dbName_,
+                                           const BSONObj& cmdObj_,
+                                           const BSONObj& metadata_,
+                                           OperationContext* opCtx_,
+                                           const RemoteCommandRequest::Options& options_)
+    : id(requestIdCounter.addAndFetch(1)),
+      target(target_),
+      dbname(dbName_),
+      cmdObj(cmdObj_),
+      metadata(metadata_),
+      opCtx(opCtx_),
+      timeout(options_.timeout),
+      fireAndForget(options_.fireAndForget),
+      isKillOp(options_.isKillOp),
+      operationKey(options_.operationKey),
+      telemetryContext(options_.telemetryContext) {
+
+    // If there is a comment associated with the current operation, append it to the command that we
+    // are about to dispatch to the shards.
+    if (opCtx && opCtx->getComment() && !cmdObj["comment"]) {
+        cmdObj = cmdObj.addField(*opCtx->getComment());
+    }
+
+    if (cmdObj.hasField("maxTimeMSOpOnly")) {
+        int maxTimeField = cmdObj["maxTimeMSOpOnly"].Number();
+        if (auto maxTimeMSOpOnly = Milliseconds(maxTimeField);
+            timeout == executor::RemoteCommandRequest::kNoTimeout || maxTimeMSOpOnly < timeout) {
+            timeout = maxTimeMSOpOnly;
+            auto now = MONGO_likely(hasGlobalServiceContext())
+                ? getGlobalServiceContext()->getFastClockSource()->now()
+                : Date_t::now();
+            deadline = now + maxTimeMSOpOnly;
+        }
+    }
+
+    if (opCtx && APIParameters::get(opCtx).getParamsPassed()) {
+        BSONObjBuilder bob(std::move(cmdObj));
+        APIParameters::get(opCtx).appendInfo(&bob);
+        cmdObj = bob.obj();
+    }
+
+    _updateTimeoutFromOpCtxDeadline(opCtx);
+
+    // If we have a timeout but _updateTimeoutFromOpCtxDeadline didn't set a deadline,
+    // derive one from the timeout duration.
+    if (timeout != kNoTimeout && deadline == kNoDeadline) {
+        auto now = MONGO_likely(hasGlobalServiceContext())
+            ? getGlobalServiceContext()->getFastClockSource()->now()
+            : Date_t::now();
+        deadline = now + timeout;
+    }
+}
+
+RemoteCommandRequest::RemoteCommandRequest(const HostAndPort& target_,
+                                           const DatabaseName& dbName_,
+                                           const BSONObj& cmdObj_,
+                                           OperationContext* opCtx_,
+                                           const RemoteCommandRequest::Options& options_)
+    : RemoteCommandRequest(target_, dbName_, cmdObj_, rpc::makeEmptyMetadata(), opCtx_, options_) {}
+
+RemoteCommandRequest::RemoteCommandRequest(const HostAndPort& target_,
+                                           const DatabaseName& dbName_,
+                                           const BSONObj& cmdObj_,
+                                           const BSONObj& metadataObj_,
+                                           OperationContext* opCtx_,
+                                           Milliseconds timeoutMillis_,
+                                           bool fireAndForget_,
+                                           boost::optional<UUID> operationKey_)
+    : RemoteCommandRequest(target_,
+                           dbName_,
+                           cmdObj_,
+                           metadataObj_,
+                           opCtx_,
+                           {.timeout = timeoutMillis_,
+                            .fireAndForget = fireAndForget_,
+                            .operationKey = operationKey_}) {}
+
+RemoteCommandRequest::operator OpMsgRequest() const {
+    const auto& tenantId = this->dbname.tenantId();
+    const auto vts = tenantId
+        ? auth::ValidatedTenancyScopeFactory::create(
+              *tenantId, auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{})
+        : auth::ValidatedTenancyScope::kNotRequired;
+
+    return OpMsgRequestBuilder::create(vts, this->dbname, std::move(this->cmdObj), this->metadata);
+}
+
+void RemoteCommandRequest::_updateTimeoutFromOpCtxDeadline(const OperationContext* opCtx) {
+    if (!opCtx || !opCtx->hasDeadline()) {
+        return;
+    }
+
+    const auto opCtxTimeout = opCtx->getRemainingMaxTimeMillis();
+    if (timeout == kNoTimeout || opCtxTimeout <= timeout) {
+        timeout = opCtxTimeout;
+        deadline = opCtx->getDeadline();
+        timeoutCode = opCtx->getTimeoutError();
+
+        if (MONGO_unlikely(maxTimeNeverTimeOut.shouldFail())) {
+            // If a mongod or mongos receives a request with a 'maxTimeMS', but the
+            // 'maxTimeNeverTimeOut' failpoint is enabled, that server process should not enforce
+            // the deadline locally, but should still pass the remaining deadline on to any other
+            // servers it contacts as 'maxTimeMSOpOnly'.
+            enforceLocalTimeout = false;
+        }
+    }
+}
+
+std::string RemoteCommandRequest::toString() const {
+    str::stream out;
+    out << "RemoteCommand " << id << " -- target:";
+    out << target.toString();
+    out << " db:" << toStringForLogging(dbname);
+    out << " fireAndForget:" << fireAndForget;
+
+    if (dateScheduled && timeout != kNoTimeout) {
+        out << " expDate:" << (*dateScheduled + timeout).toString();
+    }
+
+    if (operationKey) {
+        out << " operationKey:" << *operationKey;
+    }
+
+    out << " cmd:" << cmdObj.toString();
+    return out;
+}
+
+bool RemoteCommandRequest::operator==(const RemoteCommandRequest& rhs) const {
+    if (this == &rhs) {
+        return true;
+    }
+    return target == rhs.target && dbname == rhs.dbname &&
+        SimpleBSONObjComparator::kInstance.evaluate(cmdObj == rhs.cmdObj) &&
+        SimpleBSONObjComparator::kInstance.evaluate(metadata == rhs.metadata) &&
+        timeout == rhs.timeout;
+}
+
+bool RemoteCommandRequest::operator!=(const RemoteCommandRequest& rhs) const {
+    return !(*this == rhs);
+}
+}  // namespace executor
+}  // namespace mongo

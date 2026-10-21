@@ -1,0 +1,166 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+"""Check out previous releases' IDL files, in preparation for checking backwards compatibility."""
+
+import argparse
+import logging
+import os
+import shutil
+import sys
+from subprocess import CalledProcessError, check_output
+
+from packaging.version import Version
+from retry import retry
+
+# Get relative imports to work when the package is not installed on the PYTHONPATH.
+if __name__ == "__main__" and __package__ is None:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from buildscripts.resmokelib.multiversionconstants import (
+    LAST_CONTINUOUS_FCV,
+    LAST_LTS_FCV,
+    LATEST_FCV,
+)
+
+LOGGER_NAME = "checkout-idl"
+LOGGER = logging.getLogger(LOGGER_NAME)
+
+
+def get_tags() -> list[str]:
+    """Get a list of git tags that the IDL compatibility script should check against."""
+
+    def gen_versions_and_tags():
+        for tag in check_output(["git", "tag"]).decode().split():
+            # Releases are like "r5.6.7". Older ones aren't r-prefixed but we don't care about them.
+            if not tag.startswith("r"):
+                continue
+
+            try:
+                yield Version(tag[1:]), tag
+            except ValueError:
+                # Not a release tag.
+                pass
+
+    def gen_tags():
+        """
+        Get the latest released tag for LATEST, LAST_CONTINUOUS and LAST_LTS versions.
+
+        If the version is not yet released, get the latest unreleased tag for that version.
+        """
+
+        fcvs = [Version(x) for x in [LAST_LTS_FCV, LAST_CONTINUOUS_FCV, LATEST_FCV]]
+        # Remove duplicates from our generic FCVs list. The potential duplicates are when last
+        # LTS is the same as last continuous.
+        fcvs = [*set(fcvs)]
+
+        # Initialize a results dict that points each FCV to a tuple of
+        # (candidate_tag, is_prerelease_version).
+        results = {fcv: (None, True) for fcv in fcvs}
+
+        # For each generic FCV, this algorithm fetches the latest released tag for that version. If
+        # there are no released versions for a FCV, this algorithm fetches the tag for the latest
+        # unreleased version.
+        for version, tag in sorted(gen_versions_and_tags(), reverse=True):
+            major_minor_version = Version(f"{version.major}.{version.minor}")
+            if major_minor_version in results:
+                candidate_tag, candidate_is_prerelease_version = results[major_minor_version]
+                if candidate_tag is None:
+                    # This is the first tag we have seen for this version. Set our first
+                    # candidate tag and if this tag is a prerelease version.
+                    results[major_minor_version] = (tag, version.is_prerelease)
+                elif candidate_is_prerelease_version and not version.is_prerelease:
+                    # This version is the first released version we have seen and our previous
+                    # candidate tag is not a released version. Set the tag to point to this
+                    # version instead.
+                    results[major_minor_version] = (tag, version.is_prerelease)
+
+        for fcv, (tag, _) in results.items():
+            if tag is None:
+                # No release tag exists locally for this FCV. This happens when a new latest FCV
+                # is introduced before its first tag is visible to this clone. For example, when
+                # LATEST_FCV became 9.1, tasks running on that revision saw no r9.1.* tag until
+                # r9.1.0-alpha0 had propagated. Skip such an FCV rather than yielding None, which
+                # would fail deep inside a subprocess call.
+                LOGGER.warning("No release tag found for FCV %s; skipping it", fcv)
+                continue
+
+            yield tag
+
+    return list(gen_tags())
+
+
+# Partial clones can have a commit-graph that references commits not in the
+# local object database (e.g. old WiredTiger commits reachable only via tags
+# whose full ancestry wasn't fetched). Passing core.commitGraph=false tells
+# git to ignore this optional cache, avoiding "in the commit graph file but
+# not in the object database" errors.
+_GIT = ["git", "-c", "core.commitGraph=false"]
+
+
+@retry(tries=3, delay=5)
+def _show_with_retry(tag: str, path: str) -> bytes:
+    return check_output([*_GIT, "show", f"{tag}:{path}"])
+
+
+@retry(tries=3, delay=5)
+def _fetch_with_retry(tags: list[str]) -> bytes:
+    return check_output([*_GIT, "fetch", "origin", *tags])
+
+
+@retry(tries=3, delay=5)
+def _ls_tree_with_retry(tag: str) -> bytes:
+    return check_output([*_GIT, "ls-tree", "--name-only", "-r", tag])
+
+
+def make_idl_directories(tags: list[str], destination: str) -> None:
+    """For each tag, construct a source tree containing only its IDL files."""
+    LOGGER.info("Clearing destination directory '%s'", destination)
+    shutil.rmtree(destination, ignore_errors=True)
+
+    # Prefetch all tags we will use up front to avoid `git show` failures later.
+    LOGGER.info("Fetching tags: %s", tags)
+    _fetch_with_retry(tags)
+
+    for tag in tags:
+        LOGGER.info("Checking out IDL files in %s", tag)
+        directory = os.path.join(destination, tag)
+        for path in _ls_tree_with_retry(tag).decode().split():
+            if not path.endswith(".idl"):
+                continue
+
+            try:
+                contents = _show_with_retry(tag, path).decode()
+            except CalledProcessError as e:
+                LOGGER.error("Failed to run git show command after multiple retries: %s", str(e))
+                raise e
+
+            output_path = os.path.join(directory, path)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "w+") as fd:
+                fd.write(contents)
+
+
+def main():
+    """Run the script."""
+    arg_parser = argparse.ArgumentParser(description=__doc__)
+    arg_parser.add_argument("-v", "--verbose", action="count", help="Enable verbose logging")
+    arg_parser.add_argument(
+        "destination", metavar="DESTINATION", help="Directory to check out past IDL file versions"
+    )
+    args = arg_parser.parse_args()
+
+    logging.basicConfig(level=logging.WARNING)
+    logging.getLogger(LOGGER_NAME).setLevel(logging.DEBUG if args.verbose else logging.INFO)
+
+    tags = get_tags()
+    LOGGER.info("Fetching IDL files for past tags: %s", tags)
+    assert len(tags) >= 2, (
+        f"we must always have at least two tags to check, but only found {tags}; a release tag for "
+        "one of the generic FCVs is missing from this clone"
+    )
+
+    make_idl_directories(tags, args.destination)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,57 @@
+version: 1.0.0
+filters:
+  - "storage_stats*":
+    approvers:
+      - 10gen/server-storage-engine-integration
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "counters*":
+    approvers:
+      - 10gen/query-execution
+  - "opcounters*":
+    approvers:
+      - 10gen/query-integration-observability
+  - "top*":
+    approvers:
+      - 10gen/query-integration-observability
+  - "latency_server_status_section.cpp":
+    approvers:
+      - 10gen/query-integration-observability
+  - "operation_latency_histogram*":
+    approvers:
+      - 10gen/query-integration-observability
+  - "read_preference*":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "external_client_on_router*":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "server_read_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "server_write_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "api_version_metrics*":
+    approvers:
+      - 10gen/query-optimization
+  - "change_stream*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "system_buckets_metrics*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "direct_system_buckets_access*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "timer_stats*":
+    approvers:
+      - 10gen/server-programmability
+  - "counter_ops.h":
+    approvers:
+      - 10gen/server-programmability
+  - "lock_server_status_section*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "global_lock_stats*":
+    approvers:
+      - 10gen/server-catalog-and-routing

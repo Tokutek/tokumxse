@@ -1,0 +1,248 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/repl/local_oplog_info.h"
+
+#include "mongo/db/admission/flow_control.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
+#include "mongo/db/repl/intent_registry.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/scopeguard.h"
+
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+namespace mongo {
+namespace {
+
+const auto oplogSlotTimeContext = OperationContext::declareDecoration<OplogSlotTimeContext>();
+const auto localOplogInfo = ServiceContext::declareDecoration<LocalOplogInfo>();
+
+}  // namespace
+
+// static
+LocalOplogInfo* LocalOplogInfo::get(ServiceContext& service) {
+    return get(&service);
+}
+
+// static
+LocalOplogInfo* LocalOplogInfo::get(ServiceContext* service) {
+    return &localOplogInfo(service);
+}
+
+// static
+LocalOplogInfo* LocalOplogInfo::get(OperationContext* opCtx) {
+    return get(opCtx->getServiceContext());
+}
+
+// static
+OplogSlotTimeContext& LocalOplogInfo::getOplogSlotTimeContext(OperationContext* opCtx) {
+    return oplogSlotTimeContext(opCtx);
+}
+
+RecordStore* LocalOplogInfo::getRecordStore() const {
+    std::lock_guard<std::mutex> lk(_rsMutex);
+    return _rs;
+}
+
+void LocalOplogInfo::setRecordStore(OperationContext* opCtx, RecordStore* rs) {
+    invariant(rs);
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+    Timestamp lastAppliedOpTime;
+    if (repl::feature_flags::gFeatureFlagOplogVisibility.isEnabled()) {
+        lastAppliedOpTime = replCoord->getMyLastAppliedOpTime().getTimestamp();
+    }
+
+    std::lock_guard<std::mutex> lk(_rsMutex);
+    if (_oplogManager) {
+        invariant(_rs);
+        _oplogManager->stop(_rs);
+    }
+    _rs = rs;
+    // If the server was started in read-only mode, or we are restoring the node, don't truncate.
+    // If async marker generation is enabled, skip calculating the oplog truncate markers here.
+    auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+    bool needsTruncateMarkers = opCtx->getServiceContext()->userWritesAllowed() &&
+        !storageGlobalParams.repair && !repl::ReplSettings::shouldSkipOplogSampling() &&
+        !provider.supportsAsyncOplogMarkerGeneration();
+    if (needsTruncateMarkers) {
+        _truncateMarkers = OplogTruncateMarkers::createOplogTruncateMarkers(opCtx, *rs);
+    }
+
+    if (repl::feature_flags::gFeatureFlagOplogVisibility.isEnabled()) {
+        _oplogVisibilityManager.reInit(_rs, lastAppliedOpTime);
+    }
+    auto& engine = *opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    if ((_oplogManager = engine.getOplogManager())) {
+        _oplogManager->start(opCtx, engine, *_rs);
+    }
+}
+
+void LocalOplogInfo::resetRecordStore() {
+    std::lock_guard<std::mutex> lk(_rsMutex);
+    if (_oplogManager) {
+        _oplogManager->stop(_rs);
+        _oplogManager = nullptr;
+    }
+    _rs = nullptr;
+
+    if (repl::feature_flags::gFeatureFlagOplogVisibility.isEnabled()) {
+        // It's possible for the oplog visibility manager to be uninitialized because
+        // resetRecordStore may be called before setRecordStore in repair/standalone mode.
+        _oplogVisibilityManager.clear();
+    }
+}
+
+std::shared_ptr<OplogTruncateMarkers> LocalOplogInfo::getTruncateMarkers() const {
+    std::lock_guard<std::mutex> lk(_rsMutex);
+    return _truncateMarkers;
+}
+
+void LocalOplogInfo::setTruncateMarkers(std::shared_ptr<OplogTruncateMarkers> markers) {
+    std::lock_guard<std::mutex> lk(_rsMutex);
+    _truncateMarkers = std::move(markers);
+    // Re-adjust in case the max size changed while sampling.
+    if (_truncateMarkers) {
+        _truncateMarkers->adjust(*_rs);
+    }
+}
+
+void LocalOplogInfo::setNewTimestamp(ServiceContext* service, const Timestamp& newTime) {
+    VectorClockMutable::get(service)->tickClusterTimeTo(LogicalTime(newTime));
+}
+
+std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx,
+                                                      std::size_t count,
+                                                      std::size_t opTimeOffset,
+                                                      OnReserveOpTimesFn onReserveWithMutexHeld) {
+    auto& intentRegistry = rss::consensus::IntentRegistry::get(opCtx->getServiceContext());
+    if (gFeatureFlagIntentRegistration.isEnabled() && intentRegistry.isPrimaryEnforcementActive() &&
+        !intentRegistry.hasWriteIntentDeclared(opCtx) && !repl::alwaysAllowNonLocalWrites(opCtx)) {
+        LOGV2_FATAL(12436504,
+                    "Attempted to reserve optime without a declared write intent",
+                    "opCtx"_attr = opCtx->getOpID());
+    }
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    long long term = repl::OpTime::kUninitializedTerm;
+
+    // Fetch term out of the newOpMutex.
+    if (replCoord->getSettings().isReplSet()) {
+        // Current term. If we're not a replset of pv=1, it remains kOldProtocolVersionTerm.
+        term = replCoord->getTerm();
+    }
+
+    Timestamp ts;
+    // Provide a sample to FlowControl after the `oplogInfo.newOpMutex` is released.
+    ON_BLOCK_EXIT([opCtx, &ts, count] {
+        auto& rss = rss::ReplicatedStorageService::get(opCtx);
+        if (!rss.getPersistenceProvider().shouldUseOplogWritesForFlowControlSampling())
+            return;
+
+        auto flowControl = FlowControl::get(opCtx);
+        if (flowControl) {
+            flowControl->sample(ts, count);
+        }
+    });
+
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
+    const bool isFirstOpTime = !shard_role_details::getRecoveryUnit(opCtx)->isTimestamped();
+
+    // Allow the storage engine to start the transaction outside the critical section.
+    shard_role_details::getRecoveryUnit(opCtx)->preallocateSnapshot();
+    {
+        std::lock_guard<std::mutex> lk(_newOpMutex);
+
+        ts = VectorClockMutable::get(opCtx)->tickClusterTime(count).asTimestamp();
+        const bool orderedCommit = false;
+
+        // The local oplog record store pointer must already be established by this point.
+        // We can't establish it here because that would require locking the local database, which
+        // would be a lock order violation.
+        invariant(_rs);
+        invariant(opTimeOffset < count);
+        Timestamp registerTs(ts.asULL() + opTimeOffset);
+        fassert(28560, storageEngine->oplogDiskLocRegister(opCtx, _rs, registerTs, orderedCommit));
+
+        // Run any caller-supplied action that must be strictly ordered against every other
+        // reservation, while _newOpMutex is still held (e.g. recording the step-down timestamp).
+        if (onReserveWithMutexHeld) {
+            onReserveWithMutexHeld(ts);
+        }
+    }
+
+    const auto prevAssertOnLockAttempt =
+        shard_role_details::getLocker(opCtx)->getAssertOnLockAttempt();
+    const auto prevRuBlockingAllowed =
+        shard_role_details::getRecoveryUnit(opCtx)->getBlockingAllowed();
+    if (isFirstOpTime) {
+        // This transaction has begun holding a resource in the form of an oplog slot. Committed
+        // transactions that get a later oplog slot will be unable to replicate until this resource
+        // is released (in the form of this transaction committing or aborting). We choose to fail
+        // the operation if it blocks on a lock or a storage engine operation, like a prepared
+        // update. Both scenarios could stall the system and stop replication.
+        shard_role_details::getLocker(opCtx)->setAssertOnLockAttempt(true);
+        shard_role_details::getRecoveryUnit(opCtx)->setBlockingAllowed(false);
+    }
+    oplogSlotTimeContext(opCtx).incBatchCount();
+    std::vector<OplogSlot> oplogSlots(count);
+    for (std::size_t i = 0; i < count; i++) {
+        oplogSlots[i] = {Timestamp(ts.asULL() + i), term};
+    }
+
+    // If we abort a transaction that has reserved an optime, we should make sure to update the
+    // stable timestamp if necessary, since this oplog hole may have been holding back the stable
+    // timestamp.
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback([replCoord,
+                                                            isFirstOpTime,
+                                                            prevAssertOnLockAttempt,
+                                                            prevRuBlockingAllowed](
+                                                               OperationContext* opCtx) {
+        replCoord->attemptToAdvanceStableTimestamp();
+        oplogSlotTimeContext(opCtx).decBatchCount();
+
+        // Only reset these properties when the first slot is released.
+        if (isFirstOpTime) {
+            shard_role_details::getLocker(opCtx)->setAssertOnLockAttempt(prevAssertOnLockAttempt);
+            shard_role_details::getRecoveryUnit(opCtx)->setBlockingAllowed(prevRuBlockingAllowed);
+        }
+    });
+
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit([isFirstOpTime,
+                                                          prevAssertOnLockAttempt,
+                                                          prevRuBlockingAllowed](
+                                                             OperationContext* opCtx,
+                                                             boost::optional<Timestamp>) {
+        oplogSlotTimeContext(opCtx).decBatchCount();
+
+        // Only reset these properties when the first slot is released.
+        if (isFirstOpTime) {
+            shard_role_details::getLocker(opCtx)->setAssertOnLockAttempt(prevAssertOnLockAttempt);
+            shard_role_details::getRecoveryUnit(opCtx)->setBlockingAllowed(prevRuBlockingAllowed);
+        }
+    });
+
+    return oplogSlots;
+}
+
+}  // namespace mongo

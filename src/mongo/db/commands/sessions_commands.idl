@@ -1,0 +1,40 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
+
+commands:
+    endSessionsFromClient:
+        description: "Parser for the endSessions command"
+        command_name: endSessions
+        namespace: type
+        type: array<LogicalSessionFromClient>
+        cpp_name: EndSessionsFromClient
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        access_check:
+            complex:
+                - check: get_authenticated_user
+                - check: lookup_user
+
+    refreshSessionsFromClient:
+        description: "Parser for the refreshSessions command"
+        command_name: refreshSessions
+        namespace: type
+        type: array<LogicalSessionFromClient>
+        cpp_name: RefreshSessionsFromClient
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        access_check:
+            complex:
+                - check: get_authenticated_user
+                - check: lookup_user

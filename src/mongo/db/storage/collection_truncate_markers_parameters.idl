@@ -1,0 +1,15 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+server_parameters:
+    useSlowCollectionTruncateMarkerScanning:
+        description: "Uses and slows down collection truncate markers scanning"
+        set_at: [startup]
+        cpp_vartype: "bool"
+        cpp_varname: gUseSlowCollectionTruncateMarkerScanning
+        default: false
+        redact: false

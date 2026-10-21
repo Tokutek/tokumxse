@@ -1,0 +1,1586 @@
+"""Test hook that periodically adds and removes a shard. That shard may be the config server, in
+which case it is transitioned in/out of config shard mode.
+"""
+
+import enum
+import logging
+import os.path
+import random
+import re
+import threading
+import time
+
+import bson
+import pymongo.errors
+from tenacity import (
+    RetryError,
+    Retrying,
+    before_sleep_log,
+    retry_any,
+    retry_if_exception,
+    retry_if_result,
+    stop_after_delay,
+    wait_exponential,
+)
+
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.hang_analyzer.hang_analyzer import HangAnalyzer
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib.testing.fixtures import shardedcluster
+from buildscripts.resmokelib.testing.hooks import interface
+from buildscripts.resmokelib.testing.hooks import lifecycle as lifecycle_interface
+from buildscripts.resmokelib.testing.retry import is_retryable_error
+from buildscripts.resmokelib.testing.retry import (
+    retryable_code_names as retryable_network_err_names,
+)
+from buildscripts.resmokelib.testing.retry import retryable_codes as retryable_network_errs
+from buildscripts.resmokelib.utils import version_comparison
+
+# The possible number of seconds to wait before initiating a transition.
+TRANSITION_INTERVALS = [10]
+
+
+class IdleRequestReceived(errors.ResmokeError):
+    """Exception raised when idle request was sent from resmoke runner.
+    Should lead to shutdown of the hook."""
+
+    pass
+
+
+class ContinuousAddRemoveShard(interface.Hook):
+    DESCRIPTION = (
+        "Continuously adds and removes shards at regular intervals. If running with configsvr "
+        + "transitions, will transition in/out of config shard mode."
+    )
+
+    IS_BACKGROUND = True
+
+    STOPS_FIXTURE = False
+
+    def __init__(
+        self,
+        hook_logger,
+        fixture,
+        is_fsm_workload=False,
+        auth_options=None,
+        random_balancer_on=True,
+        transition_configsvr=False,
+        add_remove_random_shards=False,
+        move_primary_comment=None,
+        move_sessions_collection=False,
+        transition_intervals=TRANSITION_INTERVALS,
+    ):
+        interface.Hook.__init__(self, hook_logger, fixture, ContinuousAddRemoveShard.DESCRIPTION)
+        self._fixture = fixture
+        self._add_remove_thread = None
+        self._auth_options = auth_options
+        self._random_balancer_on = random_balancer_on
+        self._transition_configsvr = transition_configsvr
+        self._add_remove_random_shards = add_remove_random_shards
+        self._move_primary_comment = move_primary_comment
+        self._move_sessions_collection = move_sessions_collection
+        self._transition_intervals = transition_intervals
+
+        # The action file names need to match the same construction as found in
+        # jstests/concurrency/fsm_libs/resmoke_runner.js.
+        dbpath_prefix = fixture.get_dbpath_prefix()
+
+        # When running an FSM workload, we use the file-based lifecycle protocol
+        # in which a file is used as a form of communication between the hook and
+        # the FSM workload to decided when the hook is allowed to run.
+        if is_fsm_workload:
+            # Each hook uses a unique set of action files - the uniqueness is brought
+            # about by using the hook's name as a suffix.
+            self.__action_files = lifecycle_interface.ActionFiles._make(
+                [
+                    os.path.join(dbpath_prefix, field + "_" + self.__class__.__name__)
+                    for field in lifecycle_interface.ActionFiles._fields
+                ]
+            )
+        else:
+            self.__action_files = None
+
+    def before_suite(self, test_report):
+        """Before suite."""
+
+        if self.__action_files is not None:
+            lifecycle = lifecycle_interface.FileBasedThreadLifecycle(self.__action_files)
+        else:
+            lifecycle = lifecycle_interface.FlagBasedThreadLifecycle()
+
+        if not isinstance(self._fixture, shardedcluster.ShardedClusterFixture):
+            msg = "Can only add and remove shards for sharded cluster fixtures."
+            self.logger.error(msg)
+            raise errors.ServerFailure(msg)
+
+        if not self._transition_configsvr and not self._add_remove_random_shards:
+            msg = "Continuous add and remove shard hook must run with either or both of "
+            "transition_configsvr: true or add_remove_random_shards: true."
+            self.logger.error(msg)
+            raise errors.ServerFailure(msg)
+
+        self._add_remove_thread = _AddRemoveShardThread(
+            self.logger,
+            lifecycle,
+            self._fixture,
+            self._auth_options,
+            self._random_balancer_on,
+            self._transition_configsvr,
+            self._add_remove_random_shards,
+            self._move_primary_comment,
+            self._move_sessions_collection,
+            self._transition_intervals,
+        )
+        self.logger.info("Starting the add/remove shard thread.")
+        self._add_remove_thread.start()
+
+    def after_suite(self, test_report, teardown_flag=None):
+        """After suite."""
+        self.logger.info("Stopping the add/remove shard thread.")
+        self._add_remove_thread.stop()
+        self.logger.info("Add/remove shard thread stopped.")
+
+    def before_test(self, test, test_report):
+        """Before test."""
+        self.logger.info("Resuming the add/remove shard thread.")
+        self._add_remove_thread.pause()
+        self._add_remove_thread.resume()
+
+    def after_test(self, test, test_report):
+        """After test."""
+        self.logger.info("Pausing the add/remove shard thread.")
+        self._add_remove_thread.pause()
+        self.logger.info("Paused the add/remove shard thread.")
+
+
+class _ShardRemovalNewApiState(enum.Enum):
+    """States of the new-API 3-phase shard-removal protocol.
+
+    See `_AddRemoveShardThread._transition_to_dedicated_or_remove_shard_new_api`
+    for the transition table and the tenacity-driven control flow.
+    """
+
+    NOT_STARTED = enum.auto()
+    DRAINING = enum.auto()
+    DRAIN_COMPLETE = enum.auto()
+    HANDLE_SHARD_NOT_FOUND = enum.auto()
+    DONE = enum.auto()
+
+
+class _ShardRemovalOldApiState(enum.Enum):
+    """States of the old-API single-command shard-removal protocol.
+
+    See `_AddRemoveShardThread._transition_to_dedicated_or_remove_shard_old_api`
+    for the transition table and the tenacity-driven control flow.
+    """
+
+    POLL_AND_DRAIN = enum.auto()
+    HANDLE_SHARD_NOT_FOUND = enum.auto()
+    DONE = enum.auto()
+
+
+class _AddRemoveShardThread(threading.Thread):
+    CONFIG_SHARD = "config shard mode"
+    DEDICATED = "dedicated config server mode"
+    TRANSITION_TIMEOUT_SECS = float(900)  # 15 minutes
+    # Error codes, taken from mongo/base/error_codes.yml.
+    _NAMESPACE_NOT_FOUND = 26
+    _INTERRUPTED = 11601
+    _CONFLICTING_OPERATION_IN_PROGRESS = 117
+    _DATABASE_DROP_PENDING = 215
+    _BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE = 12587
+    _ILLEGAL_OPERATION = 20
+    _SHARD_NOT_FOUND = 70
+    _OPERATION_FAILED = 96
+    _RESHARD_COLLECTION_ABORTED = 341
+    _RESHARD_COLLECTION_IN_PROGRESS = 338
+    _LOCK_BUSY = 46
+    _FAILED_TO_SATISFY_READ_PREFERENCE = 133
+    _OPLOG_OPERATION_UNSUPPORTED = 62
+    _RANGE_NOT_IN_SINGLE_CHUNK = 11089203
+    _STALLED_DRAINING_THRESHOLD = 10
+
+    _CONFIG_DATABASE_NAME = "config"
+    _LOGICAL_SESSIONS_COLLECTION_NAME = "system.sessions"
+    _LOGICAL_SESSIONS_NAMESPACE = _CONFIG_DATABASE_NAME + "." + _LOGICAL_SESSIONS_COLLECTION_NAME
+    _UNMOVABLE_NAMESPACE_REGEXES = [
+        r"\.system\.",
+        r"enxcol_\..*\.esc",
+        r"enxcol_\..*\.ecc",
+        r"enxcol_\..*\.ecoc",
+    ]
+
+    def __init__(
+        self,
+        logger,
+        life_cycle,
+        fixture,
+        auth_options,
+        random_balancer_on,
+        transition_configsvr,
+        add_remove_random_shards,
+        move_primary_comment,
+        move_sessions_collection,
+        transition_intervals,
+    ):
+        threading.Thread.__init__(self, name="AddRemoveShardThread")
+        self.logger = logger
+        self.__lifecycle = life_cycle
+        self._fixture = fixture
+        self._auth_options = auth_options
+        self._random_balancer_on = random_balancer_on
+        self._transition_configsvr = transition_configsvr
+        self._add_remove_random_shards = add_remove_random_shards
+        self._move_primary_comment = move_primary_comment
+        self._move_sessions_collection = move_sessions_collection
+        self._transition_intervals = transition_intervals
+        self._client = fixture_interface.build_client(self._fixture, self._auth_options)
+        self._current_config_mode = self._current_fixture_mode()
+        self._shard_name_suffix = 0
+        self._prev_sharded_coll_state = None
+        self._sharded_colls_unchanged_rounds = 0
+
+        # Event set when the thread has been stopped using the 'stop()' method.
+        self._is_stopped_evt = threading.Event()
+        # Event set when the thread is not performing stepdowns.
+        self._is_idle_evt = threading.Event()
+        self._is_idle_evt.set()
+
+    def _current_fixture_mode(self):
+        res = self._client.admin.command({"listShards": 1})
+
+        for shard_info in res["shards"]:
+            if shard_info["_id"] == "config":
+                return self.CONFIG_SHARD
+
+        return self.DEDICATED
+
+    def _get_fcv_version(self):
+        """Return the cluster FCV string from admin.system.version, or None if not found."""
+        try:
+            doc = self._client.admin["system.version"].find_one(
+                {"_id": "featureCompatibilityVersion"}
+            )
+            return doc["version"] if doc else None
+        except Exception as e:
+            self.logger.debug(f"Could not read FCV: {e}")
+            return None
+
+    def _is_fcv_at_least(self, min_version):
+        """
+        Return True if the cluster FCV is >= min_version (same semantics as MongoRunner.compareBinVersions).
+        Returns False if FCV cannot be read.
+        """
+        fcv = self._get_fcv_version()
+        if fcv is None:
+            return False
+        return version_comparison.compare_bin_versions(fcv, min_version) >= 0
+
+    def _pick_shard_to_add_remove(self):
+        if not self._add_remove_random_shards:
+            return "config", None
+
+        # If the previous round was interrupted mid-drain by an idle request, pick the same shard for draining
+        draining_shard = self._find_draining_shard()
+        if draining_shard is not None:
+            return draining_shard["_id"], draining_shard["host"]
+
+        # If running with both config transitions and random shard add/removals, pick any shard
+        # including the config shard. Otherwise, pick any shard that is not the config shard.
+        shard_to_remove_and_add = (
+            self._get_other_shard_info(None)
+            if self._transition_configsvr and self._current_config_mode is self.CONFIG_SHARD
+            else self._get_other_shard_info("config")
+        )
+        return shard_to_remove_and_add["_id"], shard_to_remove_and_add["host"]
+
+    def _find_draining_shard(self):
+        res = self._client.admin.command({"listShards": 1})
+        for shard in res["shards"]:
+            if shard.get("draining", False):
+                return shard
+        return None
+
+    def run(self):
+        try:
+            while True:
+                self._is_idle_evt.set()
+
+                permitted = self.__lifecycle.wait_for_action_permitted()
+                if not permitted:
+                    break
+
+                self._is_idle_evt.clear()
+
+                # Pick the shard to add/remove this round
+                shard_id, shard_host = self._pick_shard_to_add_remove()
+
+                wait_secs = random.choice(self._transition_intervals)
+                msg = (
+                    "transition to dedicated."
+                    if shard_id == "config"
+                    else "removing shard " + shard_id + "."
+                )
+                self.logger.info(f"Waiting {wait_secs} seconds before " + msg)
+                self.__lifecycle.wait_for_action_interval(wait_secs)
+
+                # If the transitioning was interrupted by idle request, finish the run immediately
+                # skipping decommissioning the shard and post remove shard checks
+                try:
+                    self._transition_to_dedicated_or_remove_shard(shard_id)
+                except IdleRequestReceived:
+                    continue
+
+                shard_obj = None
+                removed_shard_fixture = None
+                if shard_id == "config":
+                    self._current_config_mode = self.DEDICATED
+                    removed_shard_fixture = self._fixture.configsvr
+                else:
+                    self.logger.info("Decommissioning removed shard " + shard_id + ".")
+                    shard_obj = self._fixture.get_shard_object(shard_host)
+                    removed_shard_fixture = shard_obj
+                    self._decommission_removed_shard(shard_obj)
+
+                self._run_post_remove_shard_checks(removed_shard_fixture, shard_id)
+
+                wait_secs = random.choice(self._transition_intervals)
+                msg = (
+                    "transition to config shard."
+                    if shard_id == "config"
+                    else "adding shard " + shard_id + "."
+                )
+                self.logger.info(f"Waiting {wait_secs} seconds before " + msg)
+                self.__lifecycle.wait_for_action_interval(wait_secs)
+
+                # Always end with with same shard list at the test end as at startup.
+
+                # If we decommissioned the shard, restart it before adding it back.
+                if shard_id != "config":
+                    self.logger.info("Restarting decommissioned shard " + shard_id + ".")
+                    shard_obj.setup()
+
+                self._transition_to_config_shard_or_add_shard(shard_id, shard_host)
+                if shard_id == "config":
+                    self._current_config_mode = self.CONFIG_SHARD
+
+                if self.__lifecycle.poll_for_idle_request():
+                    self.__lifecycle.send_idle_acknowledgement()
+
+        except Exception:
+            # Proactively log the exception when it happens so it will be
+            # flushed immediately.
+            self.logger.exception("Add/Remove Shard Thread threw exception")
+            # The event should be signaled whenever the thread is not performing stepdowns.
+            self._is_idle_evt.set()
+
+    def stop(self):
+        """Stop the thread."""
+        self.__lifecycle.stop()
+        self._is_stopped_evt.set()
+        # Unpause to allow the thread to finish.
+        self.resume()
+        self.join()
+
+    def pause(self):
+        """Pause the thread."""
+        self.__lifecycle.mark_test_finished()
+
+        # Wait until we are no longer executing transitions.
+        self._is_idle_evt.wait()
+        # Check if the thread is alive in case it has thrown an exception while running.
+        self._check_thread()
+
+    def resume(self):
+        """Resume the thread."""
+        self.__lifecycle.mark_test_started()
+
+    def _dump_stacks_on_timeout(self, reason):
+        """Run the hang analyzer to capture stacks before raising on a transition timeout.
+
+        This ensures we get diagnostics from the live processes before the subsequent
+        fixture teardown (SIGABRT) destroys the evidence.
+        """
+        pids = self._fixture.pids()
+        if not pids:
+            self.logger.warning("No fixture pids found; skipping hang analysis.")
+            return
+
+        self.logger.info("Running hang analyzer on fixture pids %s due to: %s", pids, reason)
+        try:
+            options = {
+                "dump_core": True,
+                "process_ids": ",".join([str(p) for p in pids]),
+                "kill_processes": False,
+                "debugger_output": None,
+                "process_match": "exact",
+                "max_disk_usage_percent": 90,
+                "go_process_names": "",
+                "process_names": "",
+            }
+            HangAnalyzer(options, task_id=None, logger=self.logger).execute()
+        except Exception:
+            self.logger.exception("Hang analyzer failed during transition timeout.")
+
+    def _check_thread(self):
+        if not self.is_alive():
+            msg = "The add/remove shard thread is not running."
+            self.logger.error(msg)
+            raise errors.ServerFailure(msg)
+
+    def _is_common_expected_move_error_code(self, code):
+        """Errors common to moveCollection, moveRange, and movePrimary during shard draining."""
+        if code == self._NAMESPACE_NOT_FOUND:
+            # A concurrent dropDatabase or dropCollection could have removed the namespace.
+            return True
+        if code == self._DATABASE_DROP_PENDING:
+            # A concurrent dropDatabase can prevent migrations.
+            return True
+        if code == self._LOCK_BUSY:
+            # The concurrent CheckMetadataConsistencyInBackground hook or another DDL operation
+            # may hold the DDL lock, preventing the move operation from acquiring it.
+            return True
+        return False
+
+    def _is_expected_move_collection_error(self, err, namespace):
+        """
+        Checks both errors common to all move operations during shard draining (e.g.
+        NamespaceNotFound, DatabaseDropPending) and errors specific to moveCollection
+        (e.g. BackgroundOperationInProgressForNamespace, ReshardCollectionAborted).
+        """
+        if self._is_common_expected_move_error_code(err.code):
+            return True
+
+        if err.code == self._BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE:
+            # Ongoing background operations (e.g. index builds) will prevent moveCollection until
+            # they complete.
+            return True
+
+        if err.code == self._RESHARD_COLLECTION_ABORTED:
+            # Tests with interruptions may interrupt moveCollection operation, causing it to get
+            # aborted.
+            return True
+
+        if err.code == self._RESHARD_COLLECTION_IN_PROGRESS:
+            # Tests with interruptions may interrupt the transition thread while running
+            # moveCollection, leading the thread to retry and hit ReshardCollectionInProgress.
+            # Also, if random balancing is on, the balancer will also move unsharded collections
+            # (both tracked and untracked). So the moveCollection operation initiated by the
+            # balancer may conflict with the moveCollection operation initiated by this hook.
+            return True
+
+        if err.code == self._ILLEGAL_OPERATION:
+            if "Can't move an internal resharding collection" in str(err):
+                return True
+            if "Can't register a temporary collection" in str(err):
+                return True
+            for regex in self._UNMOVABLE_NAMESPACE_REGEXES:
+                if re.search(regex, namespace):
+                    return True
+
+        if err.code == self._OPLOG_OPERATION_UNSUPPORTED:
+            # If the collection is untracked and the balancer is off, the moveCollection operation
+            # is attempted by the hook but the coordinator cannot proceed because operations are not
+            # supported for untracked collections.
+            return True
+
+        return False
+
+    def _is_expected_move_range_error(self, err):
+        """
+        Checks both errors common to all move operations during shard draining (e.g.
+        NamespaceNotFound, DatabaseDropPending) and errors specific to moveRange (e.g.
+        ReshardCollectionInProgress, ConflictingOperationInProgress, RangeNotInSingleChunk).
+        """
+        if self._is_common_expected_move_error_code(err.code):
+            return True
+        if err.code == self._RESHARD_COLLECTION_IN_PROGRESS:
+            # A concurrent reshardCollection or unshardCollection could have started before we
+            # run moveRange.
+            return True
+        if err.code == self._CONFLICTING_OPERATION_IN_PROGRESS:
+            # This error is expected when balancing is blocked, e.g. via 'setAllowMigrations'.
+            return True
+        if err.code == self._RANGE_NOT_IN_SINGLE_CHUNK:
+            # The chunk boundaries read from config.chunks may have been split by the balancer
+            # or a concurrent operation before the moveRange command executes, so the original
+            # [min, max) range no longer fits inside a single chunk.
+            return True
+        return False
+
+    def _is_expected_move_primary_error_code(self, code):
+        """
+        Checks both error codes common to all move operations during shard draining (e.g.
+        NamespaceNotFound, DatabaseDropPending) and codes specific to movePrimary (e.g.
+        ConflictingOperationInProgress, non-idempotent cloning phase errors).
+        """
+        if self._is_common_expected_move_error_code(code):
+            return True
+
+        if code == self._CONFLICTING_OPERATION_IN_PROGRESS:
+            # Tests with interruptions may interrupt the add/remove shard thread while running
+            # movePrimary, leading the thread to retry and hit ConflictingOperationInProgress.
+            return True
+
+        if code == 7120202:
+            # Tests with stepdowns might interrupt the movePrimary during the cloning phase,
+            # but the _shardsvrClongCatalogData command is not idempotent so the coordinator
+            # will fail the request if cloning has started.
+            return True
+
+        if code == 9046501:
+            # This is an error thrown by a failpoint inside movePrimary when there are still user
+            # collections to clone.
+            return True
+
+        if code == self._BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE:
+            # This is an error thrown if there is an index build in the background during some ddl
+            # operation (eg the movePrimary)
+            return True
+
+        return False
+
+    def _is_expected_transition_error_code(self, code):
+        if code == self._INTERRUPTED:
+            # Some workloads kill sessions which may interrupt the transition.
+            return True
+
+        if code == self._CONFLICTING_OPERATION_IN_PROGRESS:
+            # Trying to update the cluster cardinality parameter in addShard or
+            # removeShard will fail with this error if there is another
+            # setClusterParameter command already running.
+            return True
+
+        if code == 8955101:
+            # If there is a failover during _shardsvrJoinMigrations, removeShard will fail with
+            # anonymous error 8955101.
+            # TODO SERVER-90212 remove this exception for 8955101.
+            return True
+
+        return False
+
+    def _retry_with_timeout(self, func, *, retry_predicate, step_name, shard_id=None):
+        """Run `func` with `retry_predicate` until it succeeds or `TRANSITION_TIMEOUT_SECS` elapse.
+
+        On timeout, dumps process stacks via the hang analyzer and raises ServerFailure.
+        On success, logs a completion message with elapsed time.
+        """
+        start_time = time.monotonic()
+        step_label = step_name + (
+            f" for shard '{shard_id}'" if shard_id and shard_id != "config" else ""
+        )
+        try:
+            result = Retrying(
+                retry=retry_predicate,
+                wait=wait_exponential(multiplier=0.1, min=0.1, max=1),
+                stop=stop_after_delay(self.TRANSITION_TIMEOUT_SECS),
+                before_sleep=before_sleep_log(self.logger, logging.INFO),
+            )(func)
+        except RetryError as err:
+            last = err.last_attempt
+            reason = (
+                f"last exception: {last.exception()}"
+                if last.failed
+                else f"last result: {last.result()}"
+            )
+            elapsed = time.monotonic() - start_time
+            msg = (
+                f"Timed out during {step_label} after {last.attempt_number} attempts "
+                f"in {elapsed:.1f}s "
+                f"(configured timeout {self.TRANSITION_TIMEOUT_SECS:.0f}s, {reason})"
+            )
+            self.logger.error(msg)
+            self._dump_stacks_on_timeout(msg)
+            raise errors.ServerFailure(msg) from err
+        self.logger.info(
+            "Completed %s in %0d ms", step_label, (time.monotonic() - start_time) * 1000
+        )
+        return result
+
+    def _decommission_removed_shard(self, shard_obj):
+        direct_shard_conn = pymongo.MongoClient(shard_obj.get_driver_connection_url())
+
+        with shard_obj.removeshard_teardown_mutex:
+
+            def attempt():
+                # Wait until any DDL, resharding, transactions, and migration ops are cleaned up.
+                # TODO SERVER-90782 Change these to be assertions, rather than waiting for the collections
+                # to be empty
+                if len(list(direct_shard_conn.config.system.sharding_ddl_coordinators.find())) != 0:
+                    self.logger.info(
+                        "Waiting for config.system.sharding_ddl_coordinators to be empty before decommissioning."
+                    )
+                    return False
+
+                if (
+                    len(list(direct_shard_conn.config.localReshardingOperations.recipient.find()))
+                    != 0
+                ):
+                    self.logger.info(
+                        "Waiting for config.localReshardingOperations.recipient to be empty before decommissioning."
+                    )
+                    return False
+
+                if len(list(direct_shard_conn.config.transaction_coordinators.find())) != 0:
+                    self.logger.info(
+                        "Waiting for config.transaction_coordinators to be empty before decommissioning."
+                    )
+                    return False
+
+                # TODO SERVER-91474 Wait for ongoing transactions to finish on participants
+                if self._get_number_of_ongoing_transactions(direct_shard_conn) != 0:
+                    self.logger.info(
+                        "Waiting for ongoing transactions to commit or abort before decommissioning."
+                    )
+                    return False
+
+                # TODO SERVER-50144 Wait for config.rangeDeletions to be empty before decommissioning
+
+                all_dbs = direct_shard_conn.admin.command({"listDatabases": 1})
+                for db in all_dbs["databases"]:
+                    if db["name"] not in ["admin", "config", "local"] and db["empty"] is False:
+                        all_collections = direct_shard_conn.db_name.command({"listCollections": 1})
+                        for coll in all_collections:
+                            if len(list(direct_shard_conn.db_name.coll.find())) != 0:
+                                msg = "Found non-empty collection after removing shard: " + coll
+                                self.logger.error(msg)
+                                raise errors.ServerFailure(msg)
+
+                return True
+
+            self._retry_with_timeout(
+                attempt,
+                retry_predicate=retry_if_result(lambda done: not done),
+                step_name="decommissioning of removed shard",
+            )
+
+            teardown_handler = fixture_interface.FixtureTeardownHandler(self.logger)
+            shard_obj.removeshard_teardown_marker = True
+            teardown_handler.teardown(shard_obj, "shard")
+            if not teardown_handler.was_successful():
+                msg = "Error when decommissioning shard."
+                self.logger.error(msg)
+                raise errors.ServerFailure(teardown_handler.get_error_message())
+
+    def _get_tracked_collections_on_shard(self, shard_id):
+        return list(
+            self._client.config.collections.aggregate(
+                [
+                    {
+                        "$lookup": {
+                            "from": "chunks",
+                            "localField": "uuid",
+                            "foreignField": "uuid",
+                            "as": "chunksOnRemovedShard",
+                            "pipeline": [
+                                {"$match": {"shard": shard_id}},
+                                # History can be very large because we randomize migrations, so
+                                # exclude it to reduce log spam.
+                                {"$project": {"history": 0}},
+                            ],
+                        }
+                    },
+                    {"$match": {"chunksOnRemovedShard": {"$ne": []}}},
+                ]
+            )
+        )
+
+    def _get_untracked_collections_on_shard(self, source):
+        untracked_collections = []
+        databases = list(
+            self._client.config.databases.aggregate(
+                [
+                    {
+                        "$match": {"primary": source},
+                    }
+                ]
+            )
+        )
+        for database in databases:
+            # listCollections will return the bucket collection and the timeseries views and
+            # adding them both to the list of untracked collections to move will trigger two
+            # moveCollections for the same bucket collection. We can exclude the bucket collections
+            # from the list of collections to move since it doesn't give us any extra test coverage.
+            for collection in self._client.get_database(database["_id"]).list_collections(
+                filter={"name": {"$not": {"$regex": r".*system\.buckets.*"}}}
+            ):
+                namespace = database["_id"] + "." + collection["name"]
+                coll_doc = self._client.config.collections.find_one({"_id": namespace})
+                if not coll_doc:
+                    collection["_id"] = namespace
+                    untracked_collections.append(collection)
+        return untracked_collections
+
+    def _get_collection_uuid(self, namespace):
+        collection_entry = self._client.config.collections.find_one({"_id": namespace})
+        if collection_entry and "uuid" in collection_entry:
+            return collection_entry["uuid"]
+        msg = "Could not find the collection uuid for " + namespace
+        self.logger.warning(msg)
+        return None
+
+    def _move_all_unsharded_collections_from_shard(self, collections, source):
+        for collection in collections:
+            namespace = collection["_id"]
+            destination = self._get_other_shard_id(source)
+            self.logger.info("Running moveCollection for " + namespace + " to " + destination)
+            try:
+                self._client.admin.command(
+                    {
+                        "moveCollection": namespace,
+                        "toShard": destination,
+                    }
+                )
+            except pymongo.errors.OperationFailure as err:
+                if not self._is_expected_move_collection_error(err, namespace):
+                    raise err
+                self.logger.info(
+                    "Ignoring error when moving the collection '" + namespace + "': " + str(err)
+                )
+                if err.code == self._RESHARD_COLLECTION_IN_PROGRESS:
+                    self.logger.info(
+                        "Skip moving the other collections since there is already a resharding "
+                        + "operation in progress"
+                    )
+                    return
+
+    def _move_sessions_collection_from_shard(self, source):
+        namespace = self._LOGICAL_SESSIONS_NAMESPACE
+        collection_uuid = self._get_collection_uuid(namespace)
+        if collection_uuid is None:
+            return
+        chunks_on_source = [
+            doc
+            for doc in self._client["config"]["chunks"].find(
+                {"shard": source, "uuid": collection_uuid}
+            )
+        ]
+
+        for chunk in chunks_on_source:
+            destination = self._get_other_shard_id(source)
+            self.logger.info(
+                "Running moveRange for "
+                + namespace
+                + " to move the chunk "
+                + str(chunk)
+                + " to "
+                + destination
+            )
+            try:
+                # Explicitly specifying a wc as a jsfuzztest might changed the default to something unsatisfiable
+                self._client.admin.command(
+                    {
+                        "moveRange": namespace,
+                        "min": chunk["min"],
+                        "max": chunk["max"],
+                        "toShard": destination,
+                        "writeConcern": {"w": "majority"},
+                    }
+                )
+            except pymongo.errors.OperationFailure as err:
+                if not self._is_expected_move_range_error(err):
+                    raise err
+                self.logger.info(
+                    "Ignoring error when moving the chunk "
+                    + str(chunk)
+                    + " for the collection '"
+                    + namespace
+                    + "': "
+                    + str(err)
+                )
+
+    def _move_all_primaries_from_shard(self, databases, source):
+        for database in databases:
+            destination = self._get_other_shard_id(source)
+            try:
+                self.logger.info("Running movePrimary for " + database + " to " + destination)
+                # Explicitly specifying a wc as a jsfuzztest might changed the default to something unsatisfiable
+                cmd_obj = {
+                    "movePrimary": database,
+                    "to": destination,
+                    "writeConcern": {"w": "majority"},
+                }
+                if self._move_primary_comment:
+                    cmd_obj["comment"] = self._move_primary_comment
+                self._client.admin.command(cmd_obj)
+            except pymongo.errors.OperationFailure as err:
+                if not self._is_expected_move_primary_error_code(err.code):
+                    raise err
+                self.logger.info(
+                    "Ignoring error when moving the database '" + database + "': " + str(err)
+                )
+
+    def _drain_shard_for_ongoing_transition(self, num_rounds, transition_result, source):
+        tracked_colls = self._get_tracked_collections_on_shard(source)
+        sharded_colls = []
+        tracked_unsharded_colls = []
+        for coll in tracked_colls:
+            if "unsplittable" in coll:
+                tracked_unsharded_colls.append(coll)
+            else:
+                sharded_colls.append(coll)
+        untracked_unsharded_colls = self._get_untracked_collections_on_shard(source)
+
+        if num_rounds % 10 == 0:
+            self.logger.info("Draining shard " + source + ": " + str({"num_rounds": num_rounds}))
+            self.logger.info(
+                "Sharded collections on "
+                + source
+                + ": "
+                + str({"count": len(sharded_colls), "collections": sharded_colls})
+            )
+            self.logger.info(
+                "Tracked unsharded collections on "
+                + source
+                + ": "
+                + str(
+                    {"count": len(tracked_unsharded_colls), "collections": tracked_unsharded_colls}
+                )
+            )
+            self.logger.info(
+                "Untracked unsharded collections on "
+                + source
+                + ": "
+                + str(
+                    {
+                        "count": len(untracked_unsharded_colls),
+                        "collections": untracked_unsharded_colls,
+                    }
+                )
+            )
+            self.logger.info(
+                "Databases on "
+                + source
+                + ": "
+                + str(
+                    {
+                        "count": len(transition_result["dbsToMove"]),
+                        "collections": transition_result["dbsToMove"],
+                    }
+                )
+            )
+
+        # If resmoke runner has requested the hook to go idle while draining or moving,
+        # the hook needs to send acknowledgement immediately and shut down.
+        if self.__lifecycle.poll_for_idle_request():
+            self.__lifecycle.send_idle_acknowledgement()
+            raise IdleRequestReceived()
+
+        self._handle_stalled_sharded_collections(sharded_colls, source)
+
+        # If random balancing is on, the balancer will also move unsharded collections (both tracked
+        # and untracked). However, random balancing is a test-only setting. In production, users are
+        # expected to move unsharded collections manually. So even when random balancing is on,
+        # still move collections half of the time.
+        should_move = not self._random_balancer_on or random.random() < 0.5
+        if should_move:
+            self._move_all_unsharded_collections_from_shard(
+                tracked_unsharded_colls + untracked_unsharded_colls, source
+            )
+        if self._move_sessions_collection:
+            self._move_sessions_collection_from_shard(source)
+        self._move_all_primaries_from_shard(transition_result["dbsToMove"], source)
+
+    def _is_state_stalled(self, current_state):
+        if not current_state:
+            self._prev_sharded_coll_state = current_state
+            self._sharded_colls_unchanged_rounds = 0
+            return False
+
+        if current_state == self._prev_sharded_coll_state:
+            self._sharded_colls_unchanged_rounds += 1
+        else:
+            self._prev_sharded_coll_state = current_state
+            self._sharded_colls_unchanged_rounds = 0
+            return False
+
+        if self._sharded_colls_unchanged_rounds % self._STALLED_DRAINING_THRESHOLD != 0:
+            return False
+
+        return True
+
+    def _handle_stalled_sharded_collections(self, sharded_colls, source):
+        """Track whether sharded-collection draining is making progress.
+
+        If the set of sharded collections with chunks on `source` has not changed for
+        _STALLED_DRAINING_THRESHOLD consecutive rounds, check each collection for index
+        inconsistencies (SERVER-99357). If any are found, reshard the collection off the
+        shard so that draining can complete.
+        """
+        current_state = frozenset(
+            (coll["_id"], len(coll.get("chunksOnRemovedShard", []))) for coll in sharded_colls
+        )
+
+        if not self._is_state_stalled(current_state):
+            return
+
+        self.logger.info(
+            f"Sharded collection draining on {source} appears stalled for "
+            f"{self._sharded_colls_unchanged_rounds} consecutive rounds. "
+            f"Checking for index inconsistencies."
+        )
+        coll_info = {coll["_id"]: coll.get("key", {}) for coll in sharded_colls}
+        for namespace, shard_key in coll_info.items():
+            self._check_and_reshard_if_index_inconsistent(namespace, shard_key, source)
+
+    def _check_and_reshard_if_index_inconsistent(self, namespace, shard_key, source):
+        """Run checkMetadataConsistency with checkIndexes for `namespace`.
+
+        If InconsistentIndex inconsistencies are found, reshard the collection off `source`
+        to unblock draining.
+        """
+        db_name, coll_name = namespace.split(".", 1)
+        try:
+            result = self._client[db_name].command(
+                {
+                    "checkMetadataConsistency": coll_name,
+                    "checkIndexes": True,
+                    "cursor": {},
+                }
+            )
+        except (pymongo.errors.ConnectionFailure, pymongo.errors.OperationFailure) as err:
+            self.logger.warning(f"checkMetadataConsistency failed for {namespace}: {err}")
+            return
+
+        cursor_data = result.get("cursor", {})
+        inconsistencies = list(cursor_data.get("firstBatch", []))
+        while cursor_id := cursor_data.get("id", 0):
+            try:
+                more = self._client[db_name].command(
+                    {"getMore": cursor_id, "collection": coll_name}
+                )
+            except (pymongo.errors.ConnectionFailure, pymongo.errors.OperationFailure) as err:
+                self.logger.warning(f"getMore failed for {namespace} cursor {cursor_id}: {err}")
+                return
+            cursor_data = more.get("cursor", {})
+            inconsistencies.extend(cursor_data.get("nextBatch", []))
+
+        index_inconsistencies = [i for i in inconsistencies if i.get("type") == "InconsistentIndex"]
+
+        if not index_inconsistencies:
+            self.logger.info(f"No index inconsistencies found for {namespace}")
+            return
+
+        self._reshard_collection_off_shard(namespace, shard_key, source)
+
+    def _reshard_collection_off_shard(self, namespace, shard_key, source):
+        """Reshard `namespace` to work around an index inconsistency blocking chunk migrations.
+
+        We don't use shardDistribution here because it isn't supported for hashed shard keys, and
+        using `forceRedistribution` alone will fix the index inconsistencies.
+        """
+        self.logger.info(
+            f"Resharding {namespace} (key {shard_key}) off {source} to work around index "
+            f"inconsistency blocking chunk migrations."
+        )
+        try:
+            self._client.admin.command(
+                {
+                    "reshardCollection": namespace,
+                    "key": shard_key,
+                    "forceRedistribution": True,
+                }
+            )
+            self.logger.info(f"Successfully resharded {namespace}.")
+        except pymongo.errors.OperationFailure as err:
+            if not self._is_expected_move_collection_error(err, namespace):
+                raise
+            self.logger.info(f"Ignoring expected error when resharding {namespace}: {err}")
+
+    def _shard_removal_is_last_shard_error(self, err):
+        """True if `err` is the cluster's 'last shard' guard.
+
+        Two server-side messages are matched for multiversion compatibility:
+          - "would drain the last shard" (server 8.3+, renamed in SERVER-106558)
+          - "would remove the last shard" (older server versions)
+        """
+        if err.code != self._ILLEGAL_OPERATION:
+            return False
+        return "would drain the last shard" in str(err) or "would remove the last shard" in str(err)
+
+    def _is_retryable_add_remove_shard_error(self, exc, state_name):
+        """True if `exc` is a transient that should be retried without changing state.
+
+        Shared by the shard-removal FSMs (old-API and new-API) and by the shard-add logic.
+
+        Retryable errors:
+          - any `ConnectionFailure` (covers `AutoReconnect`, `ServerSelectionTimeoutError`, ...)
+          - any exception carrying the `RetryableWriteError` label
+          - `OperationFailure` with a retryable network error code
+          - `OperationFailure` with `FailedToSatisfyReadPreference`
+          - `OperationFailure` with an expected transition error code (`INTERRUPTED`,
+            `CONFLICTING_OPERATION_IN_PROGRESS`, anonymous 8955101)
+        """
+        retryable_error_codes = set(retryable_network_errs)
+        retryable_error_codes.add(self._FAILED_TO_SATISFY_READ_PREFERENCE)
+        retryable_error_codes.add(self._INTERRUPTED)
+        retryable_error_codes.add(self._CONFLICTING_OPERATION_IN_PROGRESS)
+        # If there is a failover during _shardsvrJoinMigrations, removeShard will fail with
+        # anonymous error 8955101.
+        # TODO(SERVER-90212): Remove this once failure on shardsvrJoinMigrations propagates
+        # retryable errors.
+        retryable_error_codes.add(8955101)
+        if is_retryable_error(exc, retryable_error_codes):
+            self.logger.info(f"Retryable error in state {state_name}, will retry. err: {exc!r}")
+            return True
+        return False
+
+    def _shard_removal_old_api_advance_state(self, shard_id, state, command, msg, start_time):
+        """Advance the old-API shard-removal FSM by one step and return the next state."""
+        match state:
+            case _ShardRemovalOldApiState.POLL_AND_DRAIN:
+                return self._shard_removal_old_api_poll_and_drain(
+                    shard_id, command, msg, start_time
+                )
+            case _ShardRemovalOldApiState.HANDLE_SHARD_NOT_FOUND:
+                return self._shard_removal_old_api_handle_shard_not_found(shard_id, msg)
+            case _ShardRemovalOldApiState.DONE:
+                # Defensive: should be unreachable. The retry predicate stops once
+                # the FSM reaches DONE, so this function shouldn't be called while in DONE.
+                raise AssertionError("DONE should not be advanced")
+            case _:
+                raise AssertionError(f"Unhandled old-API state: {state!r}")
+
+    def _shard_removal_old_api_poll_and_drain(self, shard_id, command, msg, start_time):
+        """POLL_AND_DRAIN handler: issue the removal command.
+
+        Retryable errors (AutoReconnect / FailedToSatisfyReadPreference /
+        retryable_network_errs / expected transition error codes) are handled
+        by the outer tenacity retry via `_is_retryable_add_remove_shard_error`,
+        so they don't appear here.
+        """
+        try:
+            res = self._client.admin.command(command)
+        except pymongo.errors.OperationFailure as err:
+            # Some workloads add and remove shards so removing the config shard
+            # may fail transiently when only one data shard is left.
+            if self._shard_removal_is_last_shard_error(err):
+                self.logger.info(
+                    f"Cannot remove {shard_id} right now (would remove last shard); will retry"
+                )
+                return _ShardRemovalOldApiState.POLL_AND_DRAIN
+            # If there was a failover or interrupt finishing the removal, this
+            # thread may have missed the success reply. The next removeShard
+            # call returns SHARD_NOT_FOUND because the operation actually
+            # completed. HANDLE_SHARD_NOT_FOUND confirms via listShards.
+            if err.code == self._SHARD_NOT_FOUND:
+                return _ShardRemovalOldApiState.HANDLE_SHARD_NOT_FOUND
+            raise
+
+        if res["state"] == "completed":
+            self.logger.info(
+                "Completed " + msg + " in %0d ms",
+                (time.monotonic() - start_time) * 1000,
+            )
+            return _ShardRemovalOldApiState.DONE
+
+        if res["state"] == "ongoing":
+            self._old_api_num_draining_rounds += 1
+            self._drain_shard_for_ongoing_transition(
+                self._old_api_num_draining_rounds, res, shard_id
+            )
+        return _ShardRemovalOldApiState.POLL_AND_DRAIN
+
+    def _shard_removal_old_api_handle_shard_not_found(self, shard_id, msg):
+        """HANDLE_SHARD_NOT_FOUND handler: query listShards to confirm silent completion.
+
+        Reached from POLL_AND_DRAIN when removeShard returns SHARD_NOT_FOUND.
+
+        We issue a `listShards` request and check its results:
+        - If listShards confirms the shard is absent, we assume a prior remove/drain attempt already
+          completed and declare DONE.
+        - If listShards still shows the shard, we treat it as transient rather than failing loudly:
+          listShards is not guaranteed to observe the same topology state as a prior remove/drain
+          command from the same client across a configsvr primary change, so this case can be a
+          transient failover artifact rather than a genuine inconsistency. We go back to
+          POLL_AND_DRAIN and retry; the outer tenacity timeout is the backstop that will catch a
+          real inconsistency.
+        """
+        res = self._client.admin.command({"listShards": 1})
+        if not any(s["_id"] == shard_id for s in res["shards"]):
+            self.logger.info(
+                f"Did not find entry for {shard_id} in config.shards. "
+                f"Assuming {msg} finished on previous transition request."
+            )
+            return _ShardRemovalOldApiState.DONE
+
+        self.logger.info(
+            f"{shard_id} returned ShardNotFound during {msg} but listShards still shows it. "
+            "This may be a transient failover artifact rather than a genuine inconsistency; "
+            "retrying."
+        )
+        return _ShardRemovalOldApiState.POLL_AND_DRAIN
+
+    def _transition_to_dedicated_or_remove_shard_old_api(self, shard_id):
+        """Old removeShard API (single-command polling protocol).
+
+        Drives a 3-state FSM (see `_ShardRemovalOldApiState`) via tenacity. The main state is
+        `POLL_AND_DRAIN` in which the FSM repeatedly executes `removeShard` /
+        `transitionToDedicatedConfigServer` until the shard is removed.
+
+        Transition table:
+
+            From                    Event                                   To
+            ---------------------------------------------------------------------------------------
+            POLL_AND_DRAIN          remove command OK + state="completed"   DONE
+            POLL_AND_DRAIN          remove command OK + state="ongoing"     POLL_AND_DRAIN
+            POLL_AND_DRAIN          is_last_shard_error (would remove last) POLL_AND_DRAIN (retry; tenacity backs off)
+            POLL_AND_DRAIN          SHARD_NOT_FOUND                         HANDLE_SHARD_NOT_FOUND
+            HANDLE_SHARD_NOT_FOUND  listShards confirms shard absent        DONE
+            HANDLE_SHARD_NOT_FOUND  listShards shows shard still present    POLL_AND_DRAIN (retry; possible failover artifact)
+            any                     receive idle request                    throws an IdleRequestReceived exception (and shuts down the hook immediately)
+            any                     unrecognized error                      propagates
+
+        Retryable errors (classified by `_is_retryable_add_remove_shard_error()`) do not change
+        the state — tenacity retries the same state. Unrecognized errors propagate out of the FSM.
+        """
+        if shard_id == "config":
+            self.logger.info("Starting transition from " + self._current_config_mode)
+        else:
+            self.logger.info("Starting removal of " + shard_id)
+
+        msg = "transition to dedicated" if shard_id == "config" else "removing shard"
+        command = (
+            {"transitionToDedicatedConfigServer": 1}
+            if shard_id == "config"
+            else {"removeShard": shard_id}
+        )
+
+        # Initial state.
+        start_time = time.monotonic()
+        self._old_api_num_draining_rounds = -1
+        state = _ShardRemovalOldApiState.POLL_AND_DRAIN
+
+        # Perform a single FSM step.
+        def do_fsm_step():
+            # `state` is captured via `nonlocal` so it persists across invocations.
+            nonlocal state
+            # NOTE: On a retryable exception, the `state = ...` assignment never runs, i.e., the
+            # current state doesn't change.
+            state = self._shard_removal_old_api_advance_state(
+                shard_id, state, command, msg, start_time
+            )
+            return state
+
+        self._retry_with_timeout(
+            do_fsm_step,
+            retry_predicate=retry_any(
+                # Drive forward progress: retry until the FSM reaches DONE.
+                retry_if_result(lambda s: s is not _ShardRemovalOldApiState.DONE),
+                # Retry on transient errors.
+                # NOTE: `state` is the current FSM state, used below for logging purposes.
+                retry_if_exception(
+                    lambda e: self._is_retryable_add_remove_shard_error(e, state.name)
+                ),
+            ),
+            step_name="remove/transition shard (old API)",
+            shard_id=shard_id,
+        )
+
+    def _shard_removal_new_api_is_retryable_error(self, exc, state_name, shard_id):
+        """True if `exc` is a transient failure and FSM step should be retried.
+
+        Extends `_is_retryable_add_remove_shard_error` with one new-API-specific retryable case:
+          - `ILLEGAL_OPERATION` "isn't completely drained": the commit phase can race with a new
+            unsplittable collection landing on the draining shard (e.g. via the
+            `createUnshardedCollectionRandomizeDataShard` failpoint).
+        """
+        if self._is_retryable_add_remove_shard_error(exc, state_name):
+            return True
+        if not isinstance(exc, pymongo.errors.OperationFailure):
+            return False
+        err = exc
+        subject = "Config shard" if shard_id == "config" else f"Shard {shard_id}"
+        if err.code == self._ILLEGAL_OPERATION and "isn't completely drained" in str(err):
+            self.logger.info(
+                f"{subject} not fully drained in state {state_name}, will retry. err: {err}"
+            )
+            return True
+        return False
+
+    def _shard_removal_new_api_advance_state(self, shard_id, state, commands):
+        """Advance the new-API shard-removal FSM by one step and return the next state."""
+        match state:
+            case _ShardRemovalNewApiState.NOT_STARTED:
+                return self._shard_removal_new_api_start(shard_id, commands)
+            case _ShardRemovalNewApiState.DRAINING:
+                return self._shard_removal_new_api_poll(shard_id, commands)
+            case _ShardRemovalNewApiState.DRAIN_COMPLETE:
+                return self._shard_removal_new_api_commit(shard_id, commands)
+            case _ShardRemovalNewApiState.HANDLE_SHARD_NOT_FOUND:
+                return self._shard_removal_new_api_handle_shard_not_found(shard_id)
+            case _ShardRemovalNewApiState.DONE:
+                # Defensive: should be unreachable. The retry predicate stops once
+                # the FSM reaches DONE, so this function shouldn't be called while in DONE.
+                raise AssertionError("DONE should not be advanced")
+            case _:
+                raise AssertionError(f"Unhandled new-API state: {state!r}")
+
+    def _shard_removal_new_api_start(self, shard_id, commands):
+        """NOT_STARTED handler: issue start command; transition to DRAINING on success."""
+        try:
+            self._client.admin.command(commands["start"])
+        except pymongo.errors.OperationFailure as err:
+            if err.code == self._SHARD_NOT_FOUND:
+                return _ShardRemovalNewApiState.HANDLE_SHARD_NOT_FOUND
+            # Only the start phase checks for "would remove the last shard". By
+            # the time we reach DRAINING / DRAIN_COMPLETE the server has already
+            # accepted the removal, so this error cannot legitimately arise later.
+            if self._shard_removal_is_last_shard_error(err):
+                self.logger.info(
+                    f"Cannot remove {shard_id} right now (would remove last shard); "
+                    "will retry from NOT_STARTED"
+                )
+                return _ShardRemovalNewApiState.NOT_STARTED
+            raise
+        self.logger.info(f"Successfully started draining {shard_id}")
+        return _ShardRemovalNewApiState.DRAINING
+
+    def _shard_removal_new_api_poll(self, shard_id, commands):
+        """DRAINING handler: poll status; transition to DRAIN_COMPLETE on drainingComplete."""
+        try:
+            res = self._client.admin.command(commands["status"])
+        except pymongo.errors.OperationFailure as err:
+            if err.code == self._SHARD_NOT_FOUND:
+                return _ShardRemovalNewApiState.HANDLE_SHARD_NOT_FOUND
+            raise
+
+        if res.get("state") == "drainingComplete":
+            self.logger.info(f"Draining complete for shard {shard_id}")
+            return _ShardRemovalNewApiState.DRAIN_COMPLETE
+
+        self._num_draining_rounds += 1
+        if "dbsToMove" in res:
+            self._drain_shard_for_ongoing_transition(self._num_draining_rounds, res, shard_id)
+        return _ShardRemovalNewApiState.DRAINING
+
+    def _shard_removal_new_api_commit(self, shard_id, commands):
+        """DRAIN_COMPLETE handler: issue commit command; transition to DONE on success."""
+        try:
+            self._client.admin.command(commands["commit"])
+        except pymongo.errors.OperationFailure as err:
+            if err.code == self._SHARD_NOT_FOUND:
+                return _ShardRemovalNewApiState.HANDLE_SHARD_NOT_FOUND
+            raise
+        self.logger.info(f"Successfully committed shard removal {shard_id}")
+        return _ShardRemovalNewApiState.DONE
+
+    def _shard_removal_new_api_handle_shard_not_found(self, shard_id):
+        """HANDLE_SHARD_NOT_FOUND handler: query listShards to confirm silent completion.
+
+        Reached from any of the three command-issuing states (NOT_STARTED, DRAINING, DRAIN_COMPLETE)
+        when start / status / commit return SHARD_NOT_FOUND.
+
+        We issue a `listShards` request and check its results:
+        - If listShards confirms the shard is absent, we assume a prior remove/drain attempt already
+          completed and declare DONE.
+        - If listShards still shows the shard, we treat it as transient rather than failing loudly:
+          listShards is not guaranteed to observe the same topology state as a prior start/status/
+          commit command from the same client across a configsvr primary change, so this case can be
+          a transient failover artifact rather than a genuine inconsistency. We go back to
+          NOT_STARTED and retry; re-issuing the start command is a no-op if the shard is already
+          draining (or already gone), so this is safe regardless of which state originally observed
+          SHARD_NOT_FOUND. The outer tenacity timeout is the backstop that will catch a real
+          inconsistency.
+        """
+        res = self._client.admin.command({"listShards": 1})
+        subject = "Config shard" if shard_id == "config" else f"Shard {shard_id}"
+        if not any(s["_id"] == shard_id for s in res["shards"]):
+            self.logger.info(
+                f"{subject} not found and confirmed absent from listShards, "
+                "assuming already removed/transitioned"
+            )
+            return _ShardRemovalNewApiState.DONE
+
+        self.logger.info(
+            f"{subject} returned ShardNotFound but listShards still shows it. This may be a "
+            "transient failover artifact rather than a genuine inconsistency; retrying from "
+            "NOT_STARTED."
+        )
+        return _ShardRemovalNewApiState.NOT_STARTED
+
+    def _transition_to_dedicated_or_remove_shard_new_api(self, shard_id):
+        """New removeShard API (8.3+) using three-phase protocol: start -> status -> commit.
+
+        Drives a 5-state FSM (see `_ShardRemovalNewApiState`) via tenacity. Each non-terminal state
+        handler issues exactly one server command (`startShardDraining`, `shardDrainingStatus`,
+        `commitShardRemoval`, or `listShards`; or corresponding
+        `*TransitionToDedicatedConfigServer` commands for the transition to dedicated config server
+        case).
+
+        Transition table:
+
+            From                    Event                                   To
+            ---------------------------------------------------------------------------------------
+            NOT_STARTED             start command OK                        DRAINING
+            NOT_STARTED             SHARD_NOT_FOUND                         HANDLE_SHARD_NOT_FOUND
+            NOT_STARTED             is_last_shard_error (would remove last) NOT_STARTED (*)
+            DRAINING                status == drainingComplete              DRAIN_COMPLETE
+            DRAINING                status still draining                   DRAINING
+            DRAINING                SHARD_NOT_FOUND                         HANDLE_SHARD_NOT_FOUND
+            DRAIN_COMPLETE          commit command OK                       DONE
+            DRAIN_COMPLETE          SHARD_NOT_FOUND                         HANDLE_SHARD_NOT_FOUND
+            HANDLE_SHARD_NOT_FOUND  listShards confirms shard absent        DONE
+            HANDLE_SHARD_NOT_FOUND  listShards shows shard still present    NOT_STARTED (retry; possible failover artifact)
+            any                     receive idle request                    throws an IdleRequestReceived exception (and shuts down the hook immediately)
+            any                     unrecognized error                      propagates
+
+        (*) Re-enters the same state; tenacity's exponential back-off gives the cluster time to
+            change before the next attempt.
+
+        Retryable errors (classified by `_shard_removal_new_api_is_retryable_error`) do not change
+        the state — tenacity retries the same state. Unrecognized errors propagate out of the FSM.
+        """
+        is_config = shard_id == "config"
+
+        commands = {
+            "start": {"startTransitionToDedicatedConfigServer": 1}
+            if is_config
+            else {"startShardDraining": shard_id},
+            "status": {"getTransitionToDedicatedConfigServerStatus": 1}
+            if is_config
+            else {"shardDrainingStatus": shard_id},
+            "commit": {"commitTransitionToDedicatedConfigServer": 1}
+            if is_config
+            else {"commitShardRemoval": shard_id},
+        }
+
+        if is_config:
+            self.logger.info("Starting transition from " + self._current_config_mode + " (new API)")
+        else:
+            self.logger.info("Starting removal of " + shard_id + " (new API)")
+
+        self._num_draining_rounds = 0
+        state = _ShardRemovalNewApiState.NOT_STARTED
+
+        # Perform a single FSM step.
+        def do_fsm_step():
+            # `state` is captured via `nonlocal` so it persists across invocations.
+            nonlocal state
+            # NOTE: On a retryable exception, the `state = ...` assignment never runs, i.e., the
+            # current state doesn't change.
+            state = self._shard_removal_new_api_advance_state(shard_id, state, commands)
+            return state
+
+        self._retry_with_timeout(
+            do_fsm_step,
+            retry_predicate=retry_any(
+                # Drive forward progress: retry until the FSM reaches DONE.
+                retry_if_result(lambda s: s is not _ShardRemovalNewApiState.DONE),
+                # Retry on transient errors.
+                # NOTE: `state` is the current FSM state, used below for logging purposes.
+                retry_if_exception(
+                    lambda e: self._shard_removal_new_api_is_retryable_error(
+                        e, state.name, shard_id
+                    )
+                ),
+            ),
+            step_name="shard removal new API transition",
+            shard_id=shard_id,
+        )
+
+    def _transition_to_dedicated_or_remove_shard(self, shard_id):
+        """Transition to dedicated config server / remove shard, using either old or new API.
+
+        The new API requires FCV >= 8.3; when eligible, it is picked randomly
+        about half the time so both APIs get exercised.
+        """
+        self._prev_sharded_coll_state = None
+        self._sharded_colls_unchanged_rounds = 0
+        # Pick the API once for this transition attempt so we don't switch mid-retry.
+        use_new_api = self._is_fcv_at_least("8.3") and random.random() > 0.5
+
+        if use_new_api:
+            self._transition_to_dedicated_or_remove_shard_new_api(shard_id)
+        else:
+            self._transition_to_dedicated_or_remove_shard_old_api(shard_id)
+
+    def _is_retryable_config_shard_error(self, err, state_name):
+        """Retry predicate for _transition_to_config_shard_or_add_shard.
+
+        Delegates the shared checks to `_is_retryable_add_remove_shard_error`, then adds one
+        more: a message-based fallback for `OPERATION_FAILED`, since a node killed just before
+        the attempt causes a connection failure that isn't tagged with a retryable code.
+        """
+        if self._is_retryable_add_remove_shard_error(err, state_name):
+            return True
+        if isinstance(err, pymongo.errors.OperationFailure):
+            # If one of the nodes in the shard is killed just before the attempt to
+            # transition/addShard, addShard will fail because it will not be able to connect.
+            # The error code returned is not retryable (it is OperationFailed), so we check
+            # the specific error message as well.
+            if err.code == self._OPERATION_FAILED:
+                s = str(err)
+                if (
+                    "Connection refused" in s
+                    or "does not belong to replica set" in s
+                    or any(n in s for n in retryable_network_err_names)
+                ):
+                    return True
+        return False
+
+    def _transition_to_config_shard_or_add_shard(self, shard_id, shard_host):
+        if shard_id == "config":
+            self.logger.info("Starting transition from " + self._current_config_mode)
+        else:
+            self.logger.info("Starting to add shard " + shard_id)
+
+        msg = "transitioning from dedicated" if shard_id == "config" else "adding shard"
+
+        def attempt():
+            if shard_id == "config":
+                self._client.admin.command({"transitionFromDedicatedConfigServer": 1})
+            else:
+                original_shard_id = (
+                    shard_id if self._shard_name_suffix == 0 else shard_id.split("_")[0]
+                )
+                shard_name = original_shard_id + "_" + str(self._shard_name_suffix)
+                self.logger.info("Adding shard with new shardId: " + shard_name)
+                self._client.admin.command({"addShard": shard_host, "name": shard_name})
+                self._shard_name_suffix = self._shard_name_suffix + 1
+
+        self._retry_with_timeout(
+            attempt,
+            retry_predicate=retry_if_exception(
+                lambda e: self._is_retryable_config_shard_error(e, msg)
+            ),
+            step_name=msg,
+            shard_id=shard_id,
+        )
+
+    def _get_other_shard_info(self, shard_id):
+        res = self._client.admin.command({"listShards": 1})
+
+        if len(res["shards"]) < 2:
+            msg = (
+                "Did not find a shard different from " + shard_id
+                if shard_id is not None
+                else "Did not find enough shards (need at least 2)"
+            )
+            self.logger.error(msg)
+            raise errors.ServerFailure(msg)
+
+        possible_choices = []
+        if shard_id is not None:
+            possible_choices = [
+                shard_info for shard_info in res["shards"] if shard_info["_id"] != shard_id
+            ]
+        else:
+            possible_choices = [shard_info for shard_info in res["shards"]]
+
+        return random.choice(possible_choices)
+
+    def _get_other_shard_id(self, shard_id):
+        return self._get_other_shard_info(shard_id)["_id"]
+
+    def _get_number_of_ongoing_transactions(self, shard_conn):
+        res = list(
+            shard_conn.admin.aggregate(
+                [
+                    {
+                        "$currentOp": {
+                            "allUsers": True,
+                            "idleConnections": True,
+                            "idleSessions": True,
+                        }
+                    },
+                    {"$match": {"transaction": {"$exists": True}}},
+                    {"$count": "num_ongoing_txns"},
+                ]
+            )
+        )
+        return res[0]["num_ongoing_txns"] if res else 0
+
+    def _is_retryable_post_checks_error(self, err):
+        """Retry predicate for _run_post_remove_shard_checks."""
+        # The checks run directly on shard nodes, so they may fail getting a connection if the
+        # shard node is killed (AutoReconnect, NotPrimaryError — both ConnectionFailure
+        # subclasses handled by is_retryable_error).
+        # Retry on retryable errors that might be thrown in suites with forced failovers.
+        retryable_error_codes = set(retryable_network_errs)
+        # Some workloads kill sessions which may interrupt the transition.
+        retryable_error_codes.add(self._INTERRUPTED)
+        return is_retryable_error(err, retryable_error_codes)
+
+    def _run_post_remove_shard_checks(self, removed_shard_fixture, removed_shard_name):
+        def attempt():
+            # Configsvr metadata checks:
+            ## Check that the removed shard no longer exists on config.shards.
+            assert (
+                self._client["config"]["shards"].count_documents({"_id": removed_shard_name}) == 0
+            ), f"Removed shard still exists on config.shards: {removed_shard_name}"
+
+            ## Check that no database has the removed shard as its primary shard.
+            databasesPointingToRemovedShard = [
+                doc
+                for doc in self._client["config"]["databases"].find({"primary": removed_shard_name})
+            ]
+            assert not databasesPointingToRemovedShard, f"Found databases whose primary shard is a removed shard: {databasesPointingToRemovedShard}"
+
+            ## Check that no chunk has the removed shard as its owner.
+            chunksPointingToRemovedShard = [
+                doc for doc in self._client["config"]["chunks"].find({"shard": removed_shard_name})
+            ]
+            assert (
+                not chunksPointingToRemovedShard
+            ), f"Found chunks whose owner is a removed shard: {chunksPointingToRemovedShard}"
+
+            ## Check that all tag in config.tags refer to at least one existing shard.
+            tagsWithoutShardPipeline = [
+                {
+                    "$lookup": {
+                        "from": "shards",
+                        "localField": "tag",
+                        "foreignField": "tags",
+                        "as": "shards",
+                    }
+                },
+                {"$match": {"shards": []}},
+            ]
+            tagsWithoutShardPipelineResultCursor = self._client["config"]["tags"].aggregate(
+                tagsWithoutShardPipeline
+            )
+            tagsWithoutShardPipelineResult = [doc for doc in tagsWithoutShardPipelineResultCursor]
+            assert not tagsWithoutShardPipelineResult, f"Found tags in config.tags that are not owned by any shard: {tagsWithoutShardPipelineResult}"
+
+            if removed_shard_name != "config":
+                return
+
+            # Check that there is no user data left on the removed shard. (Note: This can only be
+            # checked on transitionToDedicatedConfigServer)
+            removed_shard_primary_client = removed_shard_fixture.get_primary().mongo_client()
+            dbs = removed_shard_primary_client.list_database_names()
+            assert all(
+                databaseName in {"local", "admin", "config"} for databaseName in dbs
+            ), f"Expected to not have any user database on removed shard: {dbs}"
+
+            # Check the filtering metadata on removed shard. Expect that the shard knows that it does
+            # not own any chunk anymore. Check on all replica set nodes.
+            # First, await secondaries to replicate the last optime
+            removed_shard_fixture.await_last_op_committed(
+                removed_shard_fixture.AWAIT_REPL_TIMEOUT_FOREVER_MINS * 60
+            )
+            for removed_shard_node in [
+                removed_shard_fixture.get_primary()
+            ] + removed_shard_fixture.get_secondaries():
+                sharding_state_response = removed_shard_node.mongo_client().admin.command(
+                    {"shardingState": 1}
+                )
+                for nss, metadata in sharding_state_response["versions"].items():
+                    # placementVersion == Timestamp(0, 0) means that this shard owns no chunk for the
+                    # collection.
+
+                    # TODO (SERVER-130196): Re-enable this check for resharding temporary collections.
+                    if "system.resharding" in nss or "system.buckets.resharding" in nss:
+                        continue
+
+                    assert (
+                        metadata["placementVersion"] == bson.Timestamp(0, 0)
+                    ), f"Expected remove shard's filtering information to reflect that the shard does not own any chunk for collection {nss}, but found {metadata} on node {removed_shard_node.get_driver_connection_url()}"
+
+        self._retry_with_timeout(
+            attempt,
+            retry_predicate=retry_if_exception(self._is_retryable_post_checks_error),
+            step_name="post-remove-shard checks",
+            shard_id=removed_shard_name,
+        )

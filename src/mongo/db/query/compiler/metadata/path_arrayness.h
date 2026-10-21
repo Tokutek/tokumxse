@@ -1,0 +1,214 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/util/modules.h"
+
+#include <set>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class ExpressionContext;
+class NamespaceString;
+class PathArrayness;
+
+/**
+ * A monotonically-increasing set of FieldPaths. Supports insertion and iteration but not removal.
+ */
+class MonotonicallyIncreasingFieldPathSet {
+public:
+    void insert(const FieldPath& path) {
+        _paths.insert(path);
+    }
+
+    bool empty() const {
+        return _paths.empty();
+    }
+
+    auto begin() const {
+        return _paths.begin();
+    }
+
+    auto end() const {
+        return _paths.end();
+    }
+
+private:
+    std::set<FieldPath> _paths;
+};
+
+struct PathArraynessChecker {
+    const MonotonicallyIncreasingFieldPathSet nonArrayPaths;
+    boost::optional<uint64_t> prevEpoch;
+
+    void uassertIfInvalidatedAndSyncEpoch(const PathArrayness& current, const NamespaceString& ns);
+};
+
+/**
+ * Data structure representing arrayness of field paths.
+ */
+class PathArrayness {
+
+    class TrieNode;
+
+public:
+    explicit PathArrayness(uint64_t epoch = 0) : _epoch(epoch) {}
+
+    ~PathArrayness() = default;
+
+    uint64_t epoch() const {
+        return _epoch;
+    }
+
+    void incrementEpoch() {
+        ++_epoch;
+    }
+
+    /**
+     * Returns the first path in 'nonArrayPaths' that is now possibly-array in 'current', or
+     * boost::none if no paths are invalidated.
+     */
+    static boost::optional<FieldPath> getFirstInvalidatedPath(
+        const MonotonicallyIncreasingFieldPathSet& nonArrayPaths,
+        const PathArrayness& current,
+        const NamespaceString& ns);
+
+    /**
+     * Returns a reference to an empty PathArrayness instance. This represents the conservative
+     * case: all field paths are treated as potentially containing arrays. This empty case may be
+     * encountered when no Collection acquisition is possible (e.g. when running on a 'mongos').
+     *
+     * The returned reference is backed by a function-local static instance of PathArrayness.
+     */
+    static const PathArrayness& emptyPathArrayness();
+
+    /**
+     * Insert a path into the trie.
+     */
+    void addPath(const FieldPath& path, const MultikeyComponents& multikeyPath, bool isFullRebuild);
+
+    /**
+     * Insert all paths from an index into the trie. This method assumes 'multikeyPaths' is not
+     * empty.
+     * The parameter 'isFullRebuild' should be set by the caller if we are building the whole trie
+     * from the full set of indexes.
+     */
+    void addPathsFromIndexKeyPattern(const BSONObj& indexKeyPattern,
+                                     const MultikeyPaths& multikeyPaths,
+                                     bool isFullRebuild);
+
+    /**
+     * Given a path return whether any component of it could be an array.
+     * For field paths that are not included in any index, assumes that the path has an array.
+     */
+    bool canPathBeArray(const FieldPath& path, const ExpressionContext* expCtx) const;
+    bool canPathBeArray(const FieldRef& path, const ExpressionContext* expCtx) const;
+
+    /**
+     * Debugging helper to visualize trie.
+     */
+    void visualizeTrie_forTest() const {
+        _root.visualizeTrie_forTest("");
+    }
+
+    /**
+     * Export the trie data structure to a mapping of field path prefixes to a boolean that
+     * specifies whether or not that field path prefix is an array component.
+     */
+    stdx::unordered_map<std::string, bool> exportToMap_forTest();
+
+    /**
+     * Static helper to determine if an index is suitable for tracking array pathness.
+     * Only BTREE indexes are eligible because other index types (wildcard, text, hashed, geo,
+     * column store, etc.) either have unbounded multikey paths, do not expose meaningful array path
+     * semantics, or are not used by the query planner in a way that benefits from this structure.
+     * Among BTREE indexes, partial indexes (don't cover the full document set) and hidden indexes
+     * (invisible to the query optimizer) are also excluded. Indexes whose key pattern contains a
+     * numeric path component (e.g. {"a.0.x": 1}) are also excluded, because positional array access
+     * means the multikey metadata does not reliably reflect whether the parent path is an array.
+     */
+    static bool isIndexEligibleToAddToPathArrayness(const IndexDescriptor& descriptor);
+
+private:
+    /**
+     * Data structure representing the inner nodes of the trie.
+     */
+    class TrieNode {
+    public:
+        TrieNode(bool canBeArray = true) : _canBeArray(canBeArray) {}
+
+        ~TrieNode() = default;
+
+        /**
+         * Insert a path with specific MultikeyComponents information.
+         * The function is recursive and the "depth" parameter represents the specific component
+         * inserted during a specific invocation.
+         * e.g., path a.b.c, for depth 0 will insert 'a' for depth 1 will insert 'b' under 'a' and
+         * depth 2 will insert 'c' under 'a.b'.
+         */
+        void insertPath(const FieldPath& path,
+                        const MultikeyComponents& multikeyPath,
+                        size_t depth,
+                        bool isFullRebuild);
+
+        bool hasChildren() const {
+            return _children.size();
+        }
+
+        bool canBeArray() const {
+            return _canBeArray;
+        }
+
+        /**
+         * Helper function to determine whether any component of a given path could be an array.
+         */
+        bool canPathBeArray(const FieldPath& path) const;
+
+        /**
+         * Debugging helper to visualize trie.
+         */
+        void visualizeTrie_forTest(std::string fieldName, int depth = 0) const;
+
+        /**
+         * Return the next components of this specific field path along with the corresponding
+         * `TrieNodes`. This is used only for debugging/testing purposes.
+         */
+        std::vector<std::pair<std::string, TrieNode>> getChildren() const {
+            std::vector<std::pair<std::string, TrieNode>> childrenVector;
+            std::copy(_children.begin(), _children.end(), std::back_inserter(childrenVector));
+            return childrenVector;
+        }
+
+    private:
+        /**
+         * Child nodes representing further segments of the path.
+         */
+        // NOLINT is included to permit usage of std:: instead of stdx::. This is necessary due to
+        // stricter compilation requirements on Windows variants.
+        std::unordered_map<std::string, TrieNode> _children;  // NOLINT
+
+        /**
+         * Represents whether the current node (i.e. path segment) may contain array values.
+         * "true" indicates the path segment *may* contain array values.
+         * "false" indicates that the path segment *definitely* does not contain array values.
+         *
+         * By default assume a field contains array value.
+         */
+        bool _canBeArray = true;
+    };
+
+    uint64_t _epoch = 0;
+
+    /**
+     * The root to the trie.
+     */
+    TrieNode _root;
+};
+}  // namespace mongo

@@ -1,0 +1,42 @@
+- name: non_enterprise_root
+  value:
+    selector:
+      roots:
+        - jstests/replsets/*.js
+
+- name: running_as_shardsvr_exclusions
+  value:
+    selector:
+      exclude_with_any_tags:
+        - assumes_sharding_initialized
+        - transitioning_replicaset_incompatible
+
+- name: running_as_shardsvr_cli_params
+  value:
+    executor:
+      fixture:
+        mongod_options:
+          set_parameters:
+            enableTestCommands: 1
+          shardsvr: ""
+
+# TODO SERVER-118900: Remove this override once 9.0 becomes last LTS
+- name: jscore_passthrough_with_system_buckets_hook
+  value:
+    executor:
+      hooks:
+        # CheckSystemBucketsMetrics must run before ValidateCollections
+        - class: CheckSystemBucketsMetrics
+        - class: RunQueryStats
+          skip_tags:
+            # Running $queryStats will increment these counters which can screw up some test assertions.
+            - inspects_command_opcounters
+            - known_query_shape_computation_problem
+        - class: RunDBCheckInBackground
+        - class: CheckReplDBHashInBackground
+        - class: ValidateCollectionsInBackground
+        - class: CheckReplOplogs
+        - class: CheckReplDBHash
+        - class: ValidateCollections
+        - class: CleanEveryN
+          n: 20

@@ -1,0 +1,128 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+"""Configuration for Join Cost Model Calibration.
+
+Two collections (join_coll_1, join_coll_2) with identical schema:
+    - unique:        Sequential unique integers in [1, COLLECTION_CARDINALITY]
+    - random:        Random unique integers in [1, COLLECTION_CARDINALITY]
+    - uniform_16:    Uniform random integers in [1, 16]
+    - uniform_256:   Uniform random integers in [1, 256]
+    - uniform_4k:    Uniform random integers in [1, 4096]
+    - uniform_64k:   Uniform random integers in [1, 65536]
+    - string_filler: Random string to increase document size
+
+Indexes (on join_coll_2 only, enabling INLJ plans):
+    {unique: 1}, {uniform_16: 1}, {uniform_256: 1}, {uniform_4k: 1}, {uniform_64k: 1}
+"""
+
+from __future__ import annotations
+
+import os
+
+import config
+from random_generator import DataType, RandomDistribution, RangeGenerator, StringRandomDistribution
+
+COLLECTION_CARDINALITY = 100_000
+DEFAULT_STRING_FILLER_LENGTH = 900
+LARGE_STRING_FILLER_LENGTH = 3_000
+
+
+def create_join_collection_template(
+    name: str,
+    string_filler_length: int = DEFAULT_STRING_FILLER_LENGTH,
+    create_indexes: bool = False,
+) -> config.CollectionTemplate:
+    """Create a collection template for join calibration."""
+    return config.CollectionTemplate(
+        name=name,
+        fields=[
+            config.FieldTemplate(
+                name="unique",
+                data_type=DataType.INTEGER,
+                distribution=RandomDistribution.sequential(
+                    RangeGenerator(DataType.INTEGER, 1, COLLECTION_CARDINALITY + 1)
+                ),
+                indexed=create_indexes,
+            ),
+            config.FieldTemplate(
+                name="random",
+                data_type=DataType.INTEGER,
+                distribution=RandomDistribution.permutation(
+                    RangeGenerator(DataType.INTEGER, 1, COLLECTION_CARDINALITY + 1)
+                ),
+                indexed=False,
+            ),
+            config.FieldTemplate(
+                name="uniform_16",
+                data_type=DataType.INTEGER,
+                distribution=RandomDistribution.uniform(RangeGenerator(DataType.INTEGER, 1, 17)),
+                indexed=create_indexes,
+            ),
+            config.FieldTemplate(
+                name="uniform_256",
+                data_type=DataType.INTEGER,
+                distribution=RandomDistribution.uniform(RangeGenerator(DataType.INTEGER, 1, 257)),
+                indexed=create_indexes,
+            ),
+            config.FieldTemplate(
+                name="uniform_4k",
+                data_type=DataType.INTEGER,
+                distribution=RandomDistribution.uniform(RangeGenerator(DataType.INTEGER, 1, 4097)),
+                indexed=create_indexes,
+            ),
+            config.FieldTemplate(
+                name="uniform_64k",
+                data_type=DataType.INTEGER,
+                distribution=RandomDistribution.uniform(RangeGenerator(DataType.INTEGER, 1, 65537)),
+                indexed=create_indexes,
+            ),
+            config.FieldTemplate(
+                name="string_filler",
+                data_type=DataType.STRING,
+                distribution=StringRandomDistribution(string_filler_length, pool_size=1000),
+                indexed=False,
+            ),
+        ],
+        # Need an index for multikeyness info
+        compound_indexes=[
+            ["dummy", "unique", "random", "uniform_16", "uniform_256", "uniform_4k", "uniform_64k"]
+        ],
+        cardinalities=[COLLECTION_CARDINALITY],
+    )
+
+
+join_coll_1 = create_join_collection_template(
+    name="join_coll_1",
+    create_indexes=False,
+)
+join_coll_1_large = create_join_collection_template(
+    name="join_coll_1_large",
+    string_filler_length=LARGE_STRING_FILLER_LENGTH,
+    create_indexes=False,
+)
+join_coll_2 = create_join_collection_template(
+    name="join_coll_2",
+    create_indexes=True,
+)
+join_coll_2_large = create_join_collection_template(
+    name="join_coll_2_large",
+    string_filler_length=LARGE_STRING_FILLER_LENGTH,
+    create_indexes=True,
+)
+
+join_database = config.DatabaseConfig(
+    connection_string=os.getenv("MONGODB_URI", "mongodb://localhost"),
+    database_name="join_calibration",
+    dump_path="~/mongo/buildscripts/cost_model",
+    restore_from_dump=config.RestoreMode.NEVER,
+    dump_on_exit=False,
+)
+
+join_data_generator = config.DataGeneratorConfig(
+    enabled=True,
+    create_indexes=True,
+    batch_size=COLLECTION_CARDINALITY,
+    collection_templates=[join_coll_1, join_coll_1_large, join_coll_2, join_coll_2_large],
+    write_mode=config.WriteMode.REPLACE,
+    collection_name_with_card=False,
+)

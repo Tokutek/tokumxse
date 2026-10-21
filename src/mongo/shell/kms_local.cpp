@@ -1,0 +1,130 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/secure_allocator.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/crypto/aead_encryption.h"
+#include "mongo/crypto/fle_data_frames.h"
+#include "mongo/crypto/symmetric_crypto.h"
+#include "mongo/crypto/symmetric_key.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/shell/kms.h"
+#include "mongo/shell/kms_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <cstdint>
+#include <memory>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+constexpr auto kLocalKms = "local"sv;
+
+/**
+ * Manages Local KMS Information
+ */
+class LocalKMSService final : public KMSService {
+public:
+    LocalKMSService(SymmetricKey key) : _key(std::move(key)) {}
+
+    std::string_view name() const override {
+        return kLocalKms;
+    }
+
+    static std::unique_ptr<KMSService> create(const LocalKMS& config);
+
+    SecureVector<uint8_t> decrypt(ConstDataRange cdr, BSONObj masterKey) final;
+
+    BSONObj encryptDataKeyByString(ConstDataRange cdr, std::string_view keyId) final;
+
+    SymmetricKey& getMasterKey() final {
+        return _key;
+    }
+
+private:
+    std::vector<uint8_t> encrypt(ConstDataRange cdr, std::string_view kmsKeyId);
+
+private:
+    // Key that wraps all KMS encrypted data
+    SymmetricKey _key;
+};
+
+std::vector<uint8_t> LocalKMSService::encrypt(ConstDataRange cdr, std::string_view kmsKeyId) {
+    std::vector<std::uint8_t> ciphertext(crypto::aeadCipherOutputLength(cdr.length()));
+
+    uassertStatusOK(crypto::aeadEncryptLocalKMS(_key, cdr, {ciphertext}));
+
+    return ciphertext;
+}
+
+BSONObj LocalKMSService::encryptDataKeyByString(ConstDataRange cdr, std::string_view keyId) {
+    auto dataKey = encrypt(cdr, keyId);
+
+    LocalMasterKey masterKey;
+
+    LocalMasterKeyAndMaterial keyAndMaterial;
+    keyAndMaterial.setKeyMaterial(dataKey);
+    keyAndMaterial.setMasterKey(masterKey);
+
+    return keyAndMaterial.toBSON();
+}
+
+SecureVector<uint8_t> LocalKMSService::decrypt(ConstDataRange cdr, BSONObj masterKey) {
+    SecureVector<uint8_t> plaintext(uassertStatusOK(aeadGetMaximumPlainTextLength(cdr.length())));
+
+    plaintext->resize(uassertStatusOK(crypto::aeadDecryptLocalKMS(_key, cdr, {*plaintext})));
+
+    return plaintext;
+}
+
+std::unique_ptr<KMSService> LocalKMSService::create(const LocalKMS& config) {
+    uassert(51237,
+            str::stream() << "Local KMS key must be 96 bytes, found " << config.getKey().length()
+                          << " bytes instead",
+            config.getKey().length() == crypto::kFieldLevelEncryptionKeySize);
+
+    SecureVector<uint8_t> aesVector = SecureVector<uint8_t>(
+        config.getKey().data(), config.getKey().data() + config.getKey().length());
+    SymmetricKey key = SymmetricKey(aesVector, crypto::aesAlgorithm, "local");
+
+    auto localKMS = std::make_unique<LocalKMSService>(std::move(key));
+
+    return localKMS;
+}
+
+/**
+ * Factory for LocalKMSService if user specifies local config to mongo() JS constructor.
+ */
+class LocalKMSServiceFactory final : public KMSServiceFactory {
+public:
+    LocalKMSServiceFactory() = default;
+    ~LocalKMSServiceFactory() override = default;
+
+    std::unique_ptr<KMSService> create(const BSONObj& config) final {
+        auto field = config[KmsProviders::kLocalFieldName];
+        if (field.eoo()) {
+            return nullptr;
+        }
+
+        auto obj = field.Obj();
+        return LocalKMSService::create(LocalKMS::parse(obj, IDLParserContext("root")));
+    }
+};
+
+}  // namespace
+
+MONGO_INITIALIZER(LocalKMSRegister)(::mongo::InitializerContext* context) {
+    KMSServiceController::registerFactory(KMSProviderEnum::local,
+                                          std::make_unique<LocalKMSServiceFactory>());
+}
+
+}  // namespace mongo

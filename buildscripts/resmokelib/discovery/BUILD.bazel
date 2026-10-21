@@ -1,0 +1,21 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "discovery",
+    srcs = [
+        "__init__.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib/multiversion",
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+        dependency(
+            "pydantic",
+            group = "evergreen",
+        ),
+    ],
+)

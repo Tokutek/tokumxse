@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_test(
+    name = "test_discovery",
+    srcs = [
+        "__init__.py",
+        "test_discovery.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/logging",
+    ],
+)

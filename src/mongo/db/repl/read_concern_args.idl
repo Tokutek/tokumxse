@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/repl/read_concern_args.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+types:
+    ReadConcern:
+        description: "An object representing a read concern."
+        bson_serialization_type: object
+        cpp_type: "mongo::repl::ReadConcernArgs"
+        serializer: "mongo::repl::ReadConcernArgs::toBSONInner"
+        deserializer: "mongo::repl::ReadConcernArgs::fromBSONThrows"
+        # repl::ReadConcernArgs has only non view members.
+        is_view: false

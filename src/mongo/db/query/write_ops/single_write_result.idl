@@ -1,0 +1,32 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Write op single results IDL
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/query/write_ops/query_stats_metrics.idl"
+
+structs:
+    singleWriteResult:
+        description: "A document that contains basic statistics for an executed write."
+        fields:
+            n:
+                type: long
+                description: "For insert: number of documents inserted.
+                    For update: number of documents that matched the query predicate.
+                    For delete: number of documents deleted."
+            nModified:
+                type: long
+                description: "The number of documents modified by an update operation."
+            upsertedId:
+                type: object
+                description: "The _id value of the object that was upserted."
+            queryStatsMetrics:
+                type: QueryStatsMetrics
+                optional: true
+                description: "Metrics if requested for this single write"

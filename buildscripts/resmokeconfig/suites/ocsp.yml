@@ -1,0 +1,15 @@
+test_kind: js_test
+
+selector:
+  roots:
+    - jstests/ocsp/*.js
+
+executor:
+  config:
+    shell_options:
+      nodb: ""
+      tls: ""
+      tlsCAFile: ${x509ObjDir}/ca_ocsp.pem
+      tlsCertificateKeyFile: ${x509ObjDir}/client_ocsp.pem
+      tlsAllowInvalidHostnames: ""
+      setShellParameter: ocspEnabled=true

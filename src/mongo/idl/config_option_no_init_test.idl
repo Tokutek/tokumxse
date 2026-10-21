@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::test"
+    configs:
+        source: [cli, ini, yaml]
+        initializer:
+            register: addIDLTestConfigs
+            store: storeIDLTestConfigs
+
+configs:
+    "test.config.noInit.opt1":
+        description: "Basic option using explicit call register/store"
+        short_name: testConfigNoInitOpt1
+        arg_vartype: String
+        cpp_vartype: std::string
+        cpp_varname: gTestConfigNoInitOpt1

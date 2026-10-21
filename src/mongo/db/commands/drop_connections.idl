@@ -1,0 +1,22 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# dropConnections IDL File.
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/util/net/hostandport.idl"
+
+commands:
+    dropConnections:
+        description: "An administrative command which takes a list of host and ports and drops pooled connections to them"
+        command_name: dropConnections
+        namespace: ignored
+        api_version: ""
+        fields:
+            hostAndPort:
+                description: "List of host and ports"
+                type: array<HostAndPort>

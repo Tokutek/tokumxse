@@ -1,0 +1,344 @@
+notifications:
+  - scopes:
+      - name: "master branch"
+        jira_queries:
+          hot: "filter = 53085 AND filter = 53200"
+          cold: "filter = 53085 AND filter != 53200"
+    thresholds:
+      overall:
+        hot:
+          count: 60
+          grace_period_days: 5
+        cold:
+          count: 40
+          grace_period_days: 5
+      group:
+        hot:
+          count: 10
+          grace_period_days: 5
+        cold:
+          count: 7
+          grace_period_days: 5
+      team:
+        hot:
+          count: 3
+          grace_period_days: 2
+        cold:
+          count: 3
+          grace_period_days: 2
+    slack:
+      overall_scope_tags:
+        - "<!subteam^S0ANBEJA4TH>" # database-leads+
+        - "<@U0WM3PSMV>" # mira.carey@mongodb.com - SVP
+        - "<@U03J9P66LRW>" # tyler.brock@mongodb.com - VP
+        - "<@U032DKCUWQ4>" # mick.graham@mongodb.com - VP
+        - "<@U0VB7SB7D>" # bernie@mongodb.com - VP
+        - "<@U03F4KZUYP5>" # tara.hernandez@mongodb.com - VP
+        - "<@U0V9XLF8R>" # kelsey.schubert@mongodb.com - Director
+      message_footer: |
+        Refer to our playbook at <http://go/blockonred> for details.
+        Drill into the data using the <https://jira.mongodb.org/secure/Dashboard.jspa?selectPageId=33310|Jira Dashboard>.
+
+  # - scopes:
+  #     - name: "v7.0 version"
+  #       jira_queries:
+  #         hot: 'filter = 56041 and filter = 56042 and "Evergreen Project" in (mongodb-mongo-v7.0, mongodb-mongo-v7.0-staging, sys-perf-7.0)'
+  #         cold: 'filter = 56041 AND filter != 56042 and "Evergreen Project" in (mongodb-mongo-v7.0, mongodb-mongo-v7.0-staging, sys-perf-7.0)'
+  #     - name: "v8.0 version"
+  #       jira_queries:
+  #         hot: 'filter = 56041 and filter = 56042 and "Evergreen Project" in (mongodb-mongo-v8.0, mongodb-mongo-v8.0-staging, sys-perf-8.0)'
+  #         cold: 'filter = 56041 AND filter != 56042 and "Evergreen Project" in (mongodb-mongo-v8.0, mongodb-mongo-v8.0-staging, sys-perf-8.0)'
+  #     - name: "v8.2 version"
+  #       jira_queries:
+  #         hot: 'filter = 56041 and filter = 56042 and "Evergreen Project" in (mongodb-mongo-v8.2, mongodb-mongo-v8.2-staging, sys-perf-8.2)'
+  #         cold: 'filter = 56041 AND filter != 56042 and "Evergreen Project" in (mongodb-mongo-v8.2, mongodb-mongo-v8.2-staging, sys-perf-8.2)'
+  #   thresholds:
+  #     overall:
+  #       hot:
+  #         count: 50
+  #         grace_period_days: 0
+  #       cold:
+  #         count: 100
+  #         grace_period_days: 0
+  #     group:
+  #       hot:
+  #         count: 16
+  #         grace_period_days: 0
+  #       cold:
+  #         count: 32
+  #         grace_period_days: 0
+  #     team:
+  #       hot:
+  #         count: 6
+  #         grace_period_days: 0
+  #       cold:
+  #         count: 10
+  #         grace_period_days: 0
+  #   slack:
+  #     overall_scope_tags:
+  #       - "<!here>"
+  #     message_footer: |
+  #       Drill into the data using the <https://jira.mongodb.org/secure/Dashboard.jspa?selectPageId=33950|Jira Dashboard> (apply the Version filter as quotas are version-specific).
+  #     short_issue_data_table: True
+
+groups:
+  #######################################################################
+  #                     Group configuration example                     #
+  #######################################################################
+  # - name: "Group Name"
+  #   teams:
+  #     - "Team Name 1"  # Should exactly match "Assigned Teams" Jira BF field value
+  #     - "Team Name 2"
+  #     - "Team Name 3"
+  #   slack_tags:  # Optional, group default slack_tags will be used if absent
+  #     - "<!here>" # This is equivalent to "@here"
+  #     - "<@{slack-member-id}>" # How to find Slack member ID: https://forums.slackcommunity.com/s/question/0D5Hq00009mZfnuKAC/hello-i-am-a-slack-newbie-how-do-i-find-my-slack-id?language=en_US
+  #######################################################################
+
+  # Core Server Team VP orgs as described on https://wiki.corp.mongodb.com/pages/viewpage.action?spaceKey=KERNEL&title=Server+Home
+  - name: "Durability and Availability"
+    thresholds:
+      hot: 50
+      cold: 25
+    teams:
+      - "Workload Resilience"
+      - "Replication"
+      - "Storage Engines"
+      - "Storage Engines - Server Integration"
+      - "Storage Engines - Foundations"
+      - "Storage Engines - Transactions"
+      - "Storage Engines - Persistence"
+      - "Storage Layer Services"
+      - "SLS - CIS"
+      - "SLS - Control Services"
+      - "SLS - Log Service"
+      - "SLS - Page Services"
+      - "Backup - DS"
+    slack_tags:
+      - "<@U032DKCUWQ4>" # mick.graham@mongodb.com - VP
+      - "<@U0V2RMB1N>" # judah.schvimer@mongodb.com - Director
+      - "<@U06QP4BJRD2>" # jonas.bergler@mongodb.com - Director
+      - "<@U0AJK68RVGT>" # mark.hunter@mongodb.com - Director
+      - "<@UDWBB4ZQV>" # xiang.gao@mongodb.com - Director
+  - name: "Online Transaction Processing"
+    teams:
+      - "Storage Execution"
+      - "Query Execution"
+      - "Query Optimization"
+      - "Catalog and Routing"
+      - "Cluster Scalability"
+    slack_tags:
+      - "<@U03J9P66LRW>" # tyler.brock@mongodb.com - VP
+      - "<@U0XPWJ72R>" # geert.bosch@mongodb.com - Director
+      - "<@U0X6DK154>" # bernard.gorman@mongodb.com - Director
+      - "<@U0B71RRMBN1>" # andrey.gorelov@mongodb.com - Director
+      - "<@U01ALSK50HH>" # sergi.mateo-bellido@mongodb.com - Director
+  - name: "Database Interfaces and Architecture"
+    teams:
+      - "DB Integration & Observability"
+      - "Networking & Observability"
+      - "Server Programmability"
+      - "Server Security"
+    slack_tags:
+      - "<@U0VB7SB7D>" # bernie@mongodb.com - VP
+      - "<@U0294T002>" # james.wahlin@mongodb.com - Director
+      - "<@U23L5FVFH>" # ryan.chipman@mongodb.com - Director
+  - name: "Developer Productivity"
+    teams:
+      - "DevProd AXIS"
+      - "DevProd Build"
+      - "DevProd Evergreen"
+      - "DevProd Performance Infrastructure"
+      - "DevProd Release Infrastructure"
+      - "DevProd Services & Integrations"
+      - "DevProd Test Infrastructure"
+    slack_tags:
+      - "<@U03F4KZUYP5>" # tara.hernandez@mongodb.com - VP
+      - "<@U03JWS27799>" # john.daniels@mongodb.com
+      - "<@U03D3JHNB1C>" # alex.neben@mongodb.com - Director
+      - "<@U0V5GV746>" # david.golden@mongodb.com
+
+teams:
+  #######################################################################
+  #                     Team configuration example                      #
+  #######################################################################
+  # - name: "Team Name"  # Should exactly match "Assigned Teams" Jira BF field value
+  #   slack_tags:  # Optional, team default slack_tags will be used if absent
+  #     - "<!here>" # This is equivalent to "@here"
+  #     - "<@{slack-member-id}>" # How to find Slack member ID: https://forums.slackcommunity.com/s/question/0D5Hq00009mZfnuKAC/hello-i-am-a-slack-newbie-how-do-i-find-my-slack-id?language=en_US
+  #######################################################################
+
+  # Core Server Teams as described on https://wiki.corp.mongodb.com/pages/viewpage.action?spaceKey=KERNEL&title=Server+Home
+
+  # Durability and Availability teams
+  - name: "Workload Resilience"
+    slack_tags:
+      - "<@U0V2RMB1N>" # judah.schvimer@mongodb.com - Director
+      - "<@UCAV3DERW>" # jason.chan@mongodb.com
+  - name: "Replication"
+    slack_tags:
+      - "<@U0V2RMB1N>" # judah.schvimer@mongodb.com - Director
+      - "<!subteam^S0AK685U9TK>" # @rss-repl-triage - Leads + triagers
+    thresholds: # this accounts for the combination of RSSD and Replication
+      hot: 6
+      cold: 6
+  - name: "Storage Engines"
+    slack_tags:
+      - "<!subteam^S05UGLCB76U>" # @leads-storage-engines - Leads
+      - "<!subteam^S08DQ4QBP6K>" # @storage-engines-wiredtiger-primary - Triager
+    thresholds: # triage should route these elsewhere quickly (ie faster than the cooldown)
+      hot: 0
+      cold: 0
+  - name: "Storage Engines - Server Integration"
+    slack_tags:
+      - "<@U0AJK68RVGT>" # mark.hunter@mongodb.com - Director
+      - "<@U09EG3B1MR6>" # nick.beckenham@mongodb.com - Lead
+  - name: "Storage Engines - Foundations"
+    slack_tags:
+      - "<@U0AJK68RVGT>" # mark.hunter@mongodb.com - Director
+      - "<@U094DFQ4JGL>" # radoslav.kardum@mongodb.com - Lead
+  - name: "Storage Engines - Transactions"
+    slack_tags:
+      - "<@U0AJK68RVGT>" # mark.hunter@mongodb.com - Director
+      - "<@UKGR8F9C7>" # haribabu.kommi@mongodb.com - Lead
+  - name: "Storage Engines - Persistence"
+    slack_tags:
+      - "<@U0AJK68RVGT>" # mark.hunter@mongodb.com - Director
+      - "<@U01JK626XEY>" # etienne.petrel@mongodb.com - Lead
+  - name: "Storage Layer Services"
+    slack_tags:
+      - "<@U06QP4BJRD2>" # jonas.bergler@mongodb.com - Director
+      - "<!subteam^S08RZGCJWT0>" # @sls-leaders - Leads
+    thresholds: # triage should route these elsewhere quickly (ie faster than the cooldown)
+      hot: 0
+      cold: 0
+  - name: "SLS - CIS"
+    slack_tags:
+      - "<@U06QP4BJRD2>" # jonas.bergler@mongodb.com - Director
+      - "<@UK30W5J75>" # lamont.nelson@mongodb.com - Lead
+    thresholds: # Reduced Quotas for SLS
+      hot: 3
+      cold: 3
+  - name: "SLS - Control Services"
+    slack_tags:
+      - "<@U06QP4BJRD2>" # jonas.bergler@mongodb.com - Director
+      - "<@UAX8EUQ3A>" # thomas.zembowicz@mongodb.com - Lead
+    thresholds: # Reduced Quotas for SLS
+      hot: 3
+      cold: 3
+  - name: "SLS - Log Service"
+    slack_tags:
+      - "<@U06QP4BJRD2>" # jonas.bergler@mongodb.com - Director
+      - "<@UH210P78V>" # lingzhi.deng@mongodb.com - Lead
+    thresholds: # Reduced Quotas for SLS
+      hot: 3
+      cold: 3
+  - name: "SLS - Page Services"
+    slack_tags:
+      - "<@U06QP4BJRD2>" # jonas.bergler@mongodb.com - Director
+      - "<@U0Z7JD2G4>" # siyuan.zhou@mongodb.com - Lead
+    thresholds: # Reduced Quotas for SLS
+      hot: 3
+      cold: 3
+  - name: "Backup - DS"
+    slack_tags:
+      - "<@UDWBB4ZQV>" # xiang.gao@mongodb.com - Director
+      - "<@U09M548NXL4>" # bahy.morgan@mongodb.com - Lead
+      - "<!subteam^S09TA7LBTNX>" # @backup-ds-oncall
+    thresholds:
+      hot: 1
+      cold: 3
+
+  # Online Transaction Processing teams
+  - name: "Storage Execution"
+    slack_tags:
+      - "<@U0XPWJ72R>" # geert.bosch@mongodb.com - Director
+      - "<!subteam^S02P8DH4XNH>" # @leads-storage-execution - Leads
+  - name: "Catalog and Routing"
+    slack_tags:
+      - "<@U01ALSK50HH>" # sergi.mateo-bellido@mongodb.com - Director
+      - "<@U01QVSEJZBM>" # antonio.fuschetto@mongodb.com - Manager
+      - "<@U5VNCT8UA>" # josef.ahmad@mongodb.com - Manager
+  - name: "Cluster Scalability"
+    slack_tags:
+      - "<@U01ALSK50HH>" # sergi.mateo-bellido@mongodb.com - Director
+      - "<@U02PN9DPVK9>" # rachita.dhawan@mongodb.com - Lead
+  - name: "Query Execution"
+    slack_tags:
+      - "<@U0X6DK154>" # bernard.gorman@mongodb.com - Director
+      - "<!subteam^S088MANHJCW>" # @leads-query-execution - Leads
+  - name: "Query Optimization"
+    slack_tags:
+      - "<@U0B71RRMBN1>" # andrey.gorelov@mongodb.com - Director
+      - "<!subteam^S08K9JHA36C>" # @leads-query-optimization
+
+  # Database Interfaces and Architecture teams
+  - name: "DB Integration & Observability"
+    slack_tags:
+      - "<@U0294T002>" # james.wahlin@mongodb.com - Director
+      - "<!subteam^S080PEJEYUW>" # @leads-staff-dino - Leads + Staff
+    thresholds:
+      hot: 3
+      cold: 5
+  - name: "Networking & Observability"
+    slack_tags:
+      - "<@U23L5FVFH>" # ryan.chipman@mongodb.com - Director
+      - "<@U02H776RRH8>" # didier.nadeau@mongodb.com
+  - name: "Server Programmability"
+    slack_tags:
+      - "<@U23L5FVFH>" # ryan.chipman@mongodb.com - Director
+      - "<@U0AMLD1C9J7>" # gabriel.spil@mongodb.com - Lead
+  - name: "Server Security"
+    slack_tags:
+      - "<@U23L5FVFH>" # ryan.chipman@mongodb.com - Director
+      - "<@U02HWKGMAQL>" # adam.rayner@mongodb.com - Lead
+
+  # Release Quality teams
+  - name: "Build Baron"
+    slack_tags:
+      - "<@U0V9XLF8R>" # kelsey.schubert@mongodb.com - Director
+  - name: "~ Unassigned"
+    slack_tags:
+      - "<!subteam^S0AHTLRQLJD>" # @buildbaronteam for routing to appropriate team
+  - name: "Product Performance"
+    slack_tags:
+      - "<@U0V9XLF8R>" # kelsey.schubert@mongodb.com - Director
+  - name: "Server Release"
+    slack_tags:
+      - "<@U0V9XLF8R>" # kelsey.schubert@mongodb.com - Director
+  - name: "Server Triage"
+    slack_tags:
+      - "<@U0V9XLF8R>" # kelsey.schubert@mongodb.com - Director
+
+  # Other teams
+  - name: "Atlas Streams"
+    slack_tags:
+      - "<!subteam^S07M9UNSX5J>" # @streams-engine-team
+
+  # DevProd Teams as described on https://wiki.corp.mongodb.com/pages/viewpage.action?pageId=88587938
+  - name: "DevProd AXIS"
+    slack_tags:
+      - "<@U03F4KZUYP5>" # tara.hernandez@mongodb.com
+  - name: "DevProd Build"
+    slack_tags:
+      - "<@U03JWS27799>" # john.daniels@mongodb.com
+  - name: "DevProd Evergreen"
+    slack_tags:
+      - "<@U03F4KZUYP5>" # tara.hernandez@mongodb.com
+      - "<@UCBGNB7JP>" # annie.black@mongodb.com
+  - name: "DevProd Performance Infrastructure"
+    slack_tags:
+      - "<@U03D3JHNB1C>" # alex.neben@mongodb.com - Director
+      - "<@U04V70K9ZU5>" # james.littlejohn@mongodb.com - Lead
+  - name: "DevProd Release Infrastructure"
+    slack_tags:
+      - "<@U03F4KZUYP5>" # tara.hernandez@mongodb.com
+      - "<@U0VSD7XNX>" # zakhar.kleyman@mongodb.com
+  - name: "DevProd Services & Integrations"
+    slack_tags:
+      - "<@U03D3JHNB1C>" # alex.neben@mongodb.com - Director
+      - "<@U7KJZBDFE>" # geoff.mishkin@mongodb.com
+  - name: "DevProd Test Infrastructure"
+    slack_tags:
+      - "<@U03D3JHNB1C>" # alex.neben@mongodb.com - Director
+      - "<@U06RQRMS2SE>" # steve.mcclure@mongodb.com - Lead

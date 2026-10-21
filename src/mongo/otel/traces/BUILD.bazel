@@ -1,0 +1,441 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+load("//src/mongo/otel:otel_rules.bzl", "OTEL_TARGET_COMPATIBLE_WITH")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)
+
+GRPC_TARGET_COMPATIBLE_WITH = select({
+    "//bazel/config:build_grpc_enabled": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+mongo_cc_library(
+    name = "traceparent",
+    srcs = [
+        "traceparent.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "traceparent_test",
+    srcs = [
+        "traceparent_test.cpp",
+    ],
+    tags = ["mongo_unittest_fifth_group"],
+    deps = [
+        ":traceparent",
+    ],
+)
+
+idl_generator(
+    name = "trace_settings_gen",
+    src = "trace_settings.idl",
+)
+
+idl_generator(
+    name = "tracing_feature_flags_gen",
+    src = "tracing_feature_flags.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+idl_generator(
+    name = "trace_sampling_parameters_gen",
+    src = "trace_sampling_parameters.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "trace_settings",
+    srcs = [
+        "trace_settings.cpp",
+        ":trace_settings_gen",
+    ],
+    deps = [
+        ":trace_sampling_parameters",
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel/utils:bson_to_http_headers",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "trace_settings_test",
+    srcs = [
+        "trace_settings_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "tracing_test",
+    ],
+    deps = [
+        ":trace_settings",
+        "//src/mongo/db:server_parameter",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+mongo_cc_library(
+    name = "tracer_provider_service",
+    srcs = [
+        "tracer_provider_service.cpp",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel:otel_base",
+        "//src/third_party/opentelemetry-cpp/api",
+        "//src/third_party/opentelemetry-cpp/sdk/src/trace",
+    ],
+)
+
+# Kept separate from ":tracer_provider_service" so that consumers that only need to observe/use an
+# already-created service (e.g. span.cpp) don't need to depend on the OTLP exporters and other
+# heavyweight initialization dependencies.
+mongo_cc_library(
+    name = "tracer_provider_service_factory",
+    srcs = [
+        "tracer_provider_service_factory.cpp",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":trace_settings",
+        ":tracer_provider_service",
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel:otel_base",
+        "//src/third_party/opentelemetry-cpp/api",
+        "//src/third_party/opentelemetry-cpp/exporters/otlp:otlp_file_exporter",
+        "//src/third_party/opentelemetry-cpp/exporters/otlp:otlp_http_exporter",
+        "//src/third_party/opentelemetry-cpp/sdk/src/trace",
+    ],
+)
+
+mongo_cc_library(
+    name = "tracing_feature_flags",
+    srcs = [
+        ":tracing_feature_flags_gen",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_library(
+    name = "trace_sampling_parameters",
+    srcs = [
+        "trace_sampling_parameters.cpp",
+        ":trace_sampling_parameters_gen",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel/traces/sampler",
+        "//src/mongo/otel/traces/sampler:sampling_config",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "trace_sampling_parameters_test",
+    srcs = [
+        "trace_sampling_parameters_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fourth_group",
+        "tracing_test",
+    ],
+    deps = [
+        ":trace_sampling_parameters",
+        "//src/mongo/otel/traces/sampler",
+        "//src/mongo/otel/traces/sampler:sampling_config",
+    ],
+)
+
+mongo_cc_library(
+    name = "tracing_enablement",
+    srcs = [
+        "tracing_enablement.cpp",
+    ],
+    hdrs = [
+        "tracing_enablement.h",
+    ],
+    deps = [
+        ":tracing_feature_flags",
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_library(
+    name = "tracing_utils",
+    srcs = [
+        "tracing_utils.cpp",
+    ],
+    hdrs = [
+        "tracing_utils.h",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/third_party/opentelemetry-cpp/api",
+    ],
+)
+
+mongo_cc_library(
+    name = "tracing_initialization",
+    deps = [
+        ":trace_settings",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                ":tracing_initialization_impl",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "tracing_initialization_base",
+    hdrs = [
+        "trace_initialization.h",
+    ],
+    deps = [
+        ":trace_settings",
+        "//src/mongo/db:server_base",
+        "//src/mongo/stdx",
+    ],
+)
+
+mongo_cc_library(
+    name = "tracing_initialization_impl",
+    srcs = [
+        "trace_initialization.cpp",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":tracer_provider_service",
+        ":tracer_provider_service_factory",
+        ":tracing_initialization_base",
+        "//src/mongo/otel/traces/sampler",
+        "//src/third_party/opentelemetry-proto:resource_proto_cc",
+        "//src/third_party/opentelemetry-proto:trace_proto_cc",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
+
+mongo_cc_library(
+    name = "telemetry_context_serialization",
+    deps = [
+        ":telemetry_context_serialization_header",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                ":telemetry_context_serialization_impl",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "telemetry_context_serialization_header",
+    hdrs = [
+        "telemetry_context_serialization.h",
+    ],
+    deps = [
+        "//src/mongo/otel:otel_base",
+        "//src/mongo/rpc:telemetry_context_section",
+    ],
+)
+
+mongo_cc_library(
+    name = "telemetry_context_serialization_impl",
+    srcs = [
+        "bson_text_map_carrier.cpp",
+        "telemetry_context_serialization.cpp",
+    ],
+    hdrs = [
+        "bson_text_map_carrier.h",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel/traces:telemetry_context_serialization_header",
+        "//src/mongo/otel/traces/span:span_telemetry_context",
+        "//src/mongo/rpc:telemetry_context_section",
+        "//src/third_party/opentelemetry-cpp/api",
+    ],
+)
+
+# Library for public facing tracing API used by the larger codebase.
+mongo_cc_library(
+    name = "tracing",
+    deps = [
+        "//src/mongo/base:system_error",
+        "//src/mongo/db:server_base",
+        "//src/mongo/otel:otel_base",
+        "//src/mongo/otel/traces/span:span_names",
+    ] + select(
+        {
+            "@//bazel/config:build_otel_enabled": [
+                "//src/mongo/otel/traces/span",
+            ],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+mongo_cc_library(
+    name = "tracing_test_util",
+    srcs = [
+        "mock_exporter.cpp",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/third_party/opentelemetry-cpp/api",
+        "//src/third_party/opentelemetry-cpp/sdk/src/trace",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "tracer_provider_service_factory_test",
+    srcs = [
+        "tracer_provider_service_factory_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_second_group",
+        "tracing_test",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":trace_settings",
+        ":tracer_provider_service",
+        ":tracer_provider_service_factory",
+        "//src/mongo/db:server_base",
+        "//src/mongo/unittest:server_parameter_guard",
+        "//src/third_party/opentelemetry-cpp/api",
+        "//src/third_party/opentelemetry-cpp/sdk/src/trace",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "tracer_provider_service_test",
+    srcs = [
+        "tracer_provider_service_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fourth_group",
+        "tracing_test",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":tracer_provider_service",
+        ":tracer_provider_service_factory",
+        "//src/mongo/db:server_base",
+        "//src/mongo/unittest",
+        "//src/third_party/opentelemetry-cpp/api",
+        "//src/third_party/opentelemetry-cpp/sdk/src/trace",
+    ],
+)
+
+mongo_cc_library(
+    name = "traces_test_util",
+    srcs = [
+        "traces_test_util.cpp",
+    ],
+    hdrs = [
+        "traces_test_util.h",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/otel:otel_base",
+        "//src/mongo/otel/traces/span",
+        "//src/mongo/otel/traces/span:span_names",
+        "//src/mongo/unittest",
+    ] + select({
+        "@//bazel/config:build_otel_enabled": [
+            ":tracer_provider_service",
+            ":tracer_provider_service_factory",
+            ":tracing_test_util",
+            "//src/mongo/otel/traces/sampler",
+            "//src/third_party/opentelemetry-cpp/sdk/src/trace",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+mongo_cc_unit_test(
+    name = "traces_test_util_test",
+    srcs = [
+        "traces_test_util_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fourth_group",
+        "tracing_test",
+    ],
+    deps = [
+        ":telemetry_context_serialization",
+        ":traces_test_util",
+        ":tracing",
+        "//src/mongo/otel/traces/span:span_names",
+        "//src/mongo/unittest",
+        "//src/mongo/unittest:server_parameter_guard",
+    ] + select({
+        "@//bazel/config:build_otel_enabled": [
+            ":tracer_provider_service",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+mongo_cc_unit_test(
+    name = "tracing_test",
+    srcs = [
+        "bson_text_map_carrier_test.cpp",
+        "telemetry_context_serialization_test.cpp",
+        "trace_initialization_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fourth_group",
+        "tracing_test",
+    ],
+    target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":tracer_provider_service_factory",
+        ":tracing",
+        ":tracing_initialization",
+        ":tracing_test_util",
+        ":tracing_utils",
+        "//src/mongo/otel",
+        "//src/mongo/otel/traces/sampler",
+        "//src/mongo/unittest:server_parameter_guard",
+        "//src/third_party/opentelemetry-cpp/api",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "grpc_tracing_test",
+    srcs = [
+        "grpc_tracing_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fourth_group",
+        "tracing_test",
+    ],
+    target_compatible_with = GRPC_TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":tracer_provider_service",
+        ":tracer_provider_service_factory",
+        ":tracing",
+        "//src/third_party/opentelemetry-cpp/exporters/otlp:otlp_grpc_exporter",
+    ],
+)

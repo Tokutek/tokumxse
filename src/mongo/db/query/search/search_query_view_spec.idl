@@ -1,0 +1,28 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    SearchQueryViewSpec:
+        description: >-
+            If the query is on a sharded view, mongos will use this struct to serialize the view information before sending the requests to the shards. 
+            The document sources specific to mongot stages also hold this struct to retain the view information necessary to perform mongot-indexed view logic during query execution.
+        strict: true
+        fields:
+            name:
+                description: >-
+                    The name of the view.
+                type: string
+                optional: false
+            effectivePipeline:
+                description: >-
+                    An array of agg stages gathered from the current and associated views. This field is only required for createSearchIndexes commands, 
+                    though it is being added to all search index command requests for easier debugability.
+                type: array<object>
+                optional: false

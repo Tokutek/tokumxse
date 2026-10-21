@@ -1,0 +1,59 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# _configsvrConfigureCollectionBalancing and configureCollectionBalancing IDL File
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    configure_coll_balancing_params:
+        description: "Parameters for configureCollectionBalancing command"
+        fields:
+            chunkSize:
+                type: safeInt
+                cpp_name: chunkSizeMB
+                description: "New default chunk size in MiB, 0 will unset the collection specific chunk size."
+                optional: true
+            enableAutoMerger:
+                type: bool
+                description: "Specifies whether the auto-merger should be running or not for this collection."
+                optional: true
+            defragmentCollection:
+                type: bool
+                description: "Tell the balancer to defragment the collection"
+                optional: true
+            enableBalancing:
+                type: bool
+                description: "Specifies whether the balancer should be enabled or not for this collection."
+                optional: true
+
+commands:
+    configureCollectionBalancing:
+        command_name: configureCollectionBalancing
+        cpp_name: ConfigureCollectionBalancing
+        description: "Public configureCollectionBalancing command on mongos"
+        strict: true
+        namespace: type
+        api_version: ""
+        reply_type: OkReply
+        type: namespacestring
+        chained_structs:
+            configure_coll_balancing_params:
+                cpp_name: CollBalancingParams
+
+    _configsvrConfigureCollectionBalancing:
+        command_name: _configsvrConfigureCollectionBalancing
+        cpp_name: ConfigsvrConfigureCollectionBalancing
+        description: "Internal configureCollectionBalancing command on the config server"
+        strict: false
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        chained_structs:
+            configure_coll_balancing_params:
+                cpp_name: CollBalancingParams

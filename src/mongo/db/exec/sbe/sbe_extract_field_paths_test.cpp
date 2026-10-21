@@ -1,0 +1,418 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
+#include "mongo/db/exec/sbe/stages/extract_field_paths.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+
+#include <vector>
+
+#include <fmt/format.h>
+
+namespace mongo::sbe {
+
+namespace {
+using Path = value::Path;
+using Get = value::Get;
+using Traverse = value::Traverse;
+using Id = value::Id;
+}  // namespace
+
+class ExtractFieldPathsStageTest : public PlanStageTestFixture {
+public:
+    const std::string expectedFieldName = "expected";
+
+    std::string makeExpectedArr(std::string expectedArr) {
+        auto tempObj = fmt::format("{{{}: {}}}", expectedFieldName, expectedArr);
+        return tempObj;
+    }
+
+    std::vector<Path> makePathReqs(std::vector<FieldPath> pathReqFieldPaths) {
+        std::vector<Path> pathReqs;
+        for (const auto& fieldPath : pathReqFieldPaths) {
+            Path path;
+            for (size_t i = 0; i < fieldPath.getPathLength() - 1; ++i) {
+                path.emplace_back(Get{.field = std::string(fieldPath.getFieldName(i))});
+                path.emplace_back(Traverse{});
+            }
+            // Omit the Traverse for the last path component.
+            if (fieldPath.getPathLength() != 0) {
+                path.emplace_back(Get{
+                    .field = std::string(fieldPath.getFieldName(fieldPath.getPathLength() - 1))});
+            }
+            path.emplace_back(Id{});
+            pathReqs.push_back(std::move(path));
+        }
+        return pathReqs;
+    }
+
+    /**
+     * @param paths: A vector of FieldPath's that we want to read from the input documents.
+     * @param input: A vector of size n, containing string representations of BSON documents
+     * that we want to read from.
+     * @param outputs: A vector of size n, containing string representations of BSON arrays that
+     * correspond to the expected output for each input document. The size of each sub array is
+     * equal to the number of paths that exist in the corresponding input document.
+     *
+     * @note Since missing paths map to TypeTags::Nothing which can't easily be represented in
+     * BSON, the lack of an array entry corresponds to a missing path. This also means that if
+     * we are looking for paths "a" and "b", the expected outputs for {a: 1} and {b: 1} will
+     * both be [1] even though the values in each specific slot will be different depending on
+     * which path they correspond to.
+     *
+     * @note See the function comment for runTestMulti for an explanation of the array nesting
+     * of the inputs and expected outputs.
+     */
+    void runExtractFieldPathsTest(std::vector<FieldPath> paths,
+                                  std::vector<std::string> inputs,
+                                  std::vector<std::string> outputs,
+                                  bool includeCellBlockTraverse = true) {
+        tassert(
+            10757501, "expected inputs and outputs size to match", inputs.size() == outputs.size());
+
+        BSONArrayBuilder inputBab;
+        BSONArrayBuilder outputBab;
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            inputBab << BSON_ARRAY(fromjson(inputs[i]));
+            outputBab << fromjson(makeExpectedArr(outputs[i]))[expectedFieldName];
+        }
+        value::TagValueOwned input =
+            value::TagValueOwned::fromRaw(stage_builder::makeValue(inputBab.arr()));
+        value::TagValueOwned expected =
+            value::TagValueOwned::fromRaw(stage_builder::makeValue(outputBab.arr()));
+
+        auto makeStageFn = [&, this](value::SlotVector scanSlots,
+                                     std::unique_ptr<PlanStage> scanStage) {
+            auto pathReqs = makePathReqs(paths);
+            value::SlotVector outputSlots = generateMultipleSlotIds(pathReqs.size());
+
+            // A single input slot that holds the entire object.
+            std::vector<PathSlot> inputs = {{{Id{}}, scanSlots[0]}};
+            std::vector<PathSlot> outputs;
+            outputs.reserve(pathReqs.size());
+            tassert(11163704,
+                    "expected an output slot for each path req",
+                    pathReqs.size() == outputSlots.size());
+            for (size_t i = 0; i < pathReqs.size(); ++i) {
+                outputs.emplace_back(std::make_pair(pathReqs[i], outputSlots[i]));
+            }
+
+            auto extractFieldPathsStage = makeS<ExtractFieldPathsStage>(
+                std::move(scanStage), inputs, outputs, kEmptyPlanNodeId);
+
+            return std::make_pair(outputSlots, std::move(extractFieldPathsStage));
+        };
+
+        auto [inputTag, inputVal] = input.releaseToRaw();
+        auto [expectedTag, expectedVal] = expected.releaseToRaw();
+        runTestMulti(1, inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+    }
+};
+
+// Tests where all paths can be found in the input documents.
+TEST_F(ExtractFieldPathsStageTest, SinglePathNonNestedNonArrayTest) {
+    std::vector<FieldPath> paths{"a"};
+    std::vector<std::string> inputs{"{a: 1}", "{a: 2}"};
+    std::vector<std::string> outputs{"[1]", "[2]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathNonNestedNonArrayToplevelFieldSlotTest) {
+    // `inputBab` is an array of subarrays. Each subarray has an element for each input slot.
+    BSONArrayBuilder inputBab;
+    inputBab << BSON_ARRAY(1) << BSON_ARRAY(2);
+    value::TagValueOwned input =
+        value::TagValueOwned::fromRaw(stage_builder::makeValue(inputBab.arr()));
+    // `outputBab` is an array of subarrays. Each subarray has an element for each output slot.
+    BSONArrayBuilder outputBab;
+    outputBab << BSON_ARRAY(1) << BSON_ARRAY(2);
+    value::TagValueOwned expected =
+        value::TagValueOwned::fromRaw(stage_builder::makeValue(outputBab.arr()));
+    auto makeStageFn = [&, this](value::SlotVector scanSlots,
+                                 std::unique_ptr<PlanStage> scanStage) {
+        std::vector<FieldPath> paths{"a"};
+        auto pathReqs = makePathReqs(paths);
+        value::SlotVector outputSlots = generateMultipleSlotIds(pathReqs.size());
+        std::vector<PathSlot> inputs;
+        for (size_t i = 0; i < scanSlots.size(); ++i) {
+            // Associate each input slot with its corresponding toplevel field path.
+            tassert(11163708, "input path not toplevel", pathReqs[i].size() == 2);
+            inputs.emplace_back(pathReqs[i], scanSlots[i]);
+        }
+        std::vector<PathSlot> outputs;
+        outputs.reserve(pathReqs.size());
+        for (size_t i = 0; i < pathReqs.size(); ++i) {
+            // Associate each output slot with its corresponding path.
+            outputs.emplace_back(std::make_pair(pathReqs[i], outputSlots[i]));
+        }
+        auto extractFieldPathsStage =
+            makeS<ExtractFieldPathsStage>(std::move(scanStage), inputs, outputs, kEmptyPlanNodeId);
+        return std::make_pair(outputSlots, std::move(extractFieldPathsStage));
+    };
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTestMulti(1, inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SingleToplevelFieldSlotNestedPathTest) {
+    // `inputBab` is an array of subarrays. Each subarray has an element for each input slot.
+    BSONArrayBuilder inputBab;
+    inputBab << BSON_ARRAY(BSON("b" << 1)) << BSON_ARRAY(BSON("b" << 2));
+    value::TagValueOwned input =
+        value::TagValueOwned::fromRaw(stage_builder::makeValue(inputBab.arr()));
+    // `outputBab` is an array of subarrays. Each subarray has an element for each output slot.
+    BSONArrayBuilder outputBab;
+    outputBab << BSON_ARRAY(1) << BSON_ARRAY(2);
+    value::TagValueOwned expected =
+        value::TagValueOwned::fromRaw(stage_builder::makeValue(outputBab.arr()));
+    auto makeStageFn = [&, this](value::SlotVector scanSlots,
+                                 std::unique_ptr<PlanStage> scanStage) {
+        std::vector<FieldPath> paths{"a.b"};
+        auto pathReqs = makePathReqs(paths);
+        value::SlotVector outputSlots = generateMultipleSlotIds(pathReqs.size());
+        std::vector<PathSlot> inputs;
+        for (size_t i = 0; i < scanSlots.size(); ++i) {
+            // Associate each input slot with its corresponding toplevel field path.
+            Path p = {pathReqs[i][0], Id{}};
+            inputs.emplace_back(p, scanSlots[i]);
+        }
+        std::vector<PathSlot> outputs;
+        outputs.reserve(pathReqs.size());
+        for (size_t i = 0; i < pathReqs.size(); ++i) {
+            // Associate each output slot with its corresponding path.
+            outputs.emplace_back(pathReqs[i], outputSlots[i]);
+        }
+        auto extractFieldPathsStage =
+            makeS<ExtractFieldPathsStage>(std::move(scanStage), inputs, outputs, kEmptyPlanNodeId);
+        return std::make_pair(outputSlots, std::move(extractFieldPathsStage));
+    };
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTestMulti(1, inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(ExtractFieldPathsStageTest, MultiPathNonNestedNonArrayTest) {
+    std::vector<FieldPath> paths{"a", "b"};
+    std::vector<std::string> inputs{"{a: 1, b: 3}", "{b: 4, a: 2}"};
+    std::vector<std::string> outputs{"[1, 3]", "[2, 4]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathNestedNonArrayTest) {
+    std::vector<FieldPath> paths{"a.b"};
+    std::vector<std::string> inputs{"{a: {b: 1}}", "{a: {b: 2}}"};
+    std::vector<std::string> outputs{"[1]", "[2]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, MultiPathNestedNonArrayTest) {
+    std::vector<FieldPath> paths{"a.b", "a.c", "d"};
+    std::vector<std::string> inputs{"{a: {b: 1, c: 3}, d: 5}", "{d :6, a: {c: 4, b: 2}}"};
+    std::vector<std::string> outputs{"[1, 3, 5]", "[2, 4, 6]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathNonNestedNonArrayDeepValueTest) {
+    std::vector<FieldPath> paths{"a"};
+    std::vector<std::string> inputs{"{a: \"not a StringSmall\"}", "{a: \"is a StringBig\"}"};
+    std::vector<std::string> outputs{"[ \"not a StringSmall\"]", "[\"is a StringBig\"]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathArrayTest) {
+    std::vector<FieldPath> paths{"a.b"};
+    std::vector<std::string> inputs{"{a: [{b: 1}]}", "{a: [{b: 2}]}"};
+    std::vector<std::string> outputs{"[[1]]", "[[2]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathArrayLength2Test) {
+    std::vector<FieldPath> paths{"a.b"};
+    std::vector<std::string> inputs{"{a: [{b: 1}, {b: 2}]}"};
+    std::vector<std::string> outputs{"[[1, 2]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, TwoPathsArrayLength2Test) {
+    std::vector<FieldPath> paths{"a.b", "a.c"};
+    std::vector<std::string> inputs{"{a: [{b: 1, c: 2}, {b: 3, c: 4}]}"};
+    std::vector<std::string> outputs{"[[1, 3], [2, 4]]"};
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, ThreePathsArrayLength2Test) {
+    std::vector<FieldPath> paths{"a.b", "a.c", "a.d"};
+    std::vector<std::string> inputs{"{a: [{b: 1, c: 2, d: 3}, {b: 4, c: 5, d: 6}]}"};
+    std::vector<std::string> outputs{"[[1, 4], [2, 5], [3, 6]]"};
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, TenPathsArrayLength2Test) {
+    std::vector<FieldPath> paths{
+        "a.b", "a.c", "a.d", "a.e", "a.f", "a.g", "a.h", "a.i", "a.j", "a.k"};
+    std::vector<std::string> inputs{
+        "{a: [{b: 1, c: 2, d: 3, e: 4, f: 5, g: 6, h: 7, i: 8, j: 9, k: 10}, {b: 11, c: 12, d: 13, "
+        "e: 14, f: 15, g: 16, h: 17, i: 18, j: 19, k: 20}]}"};
+    std::vector<std::string> outputs{
+        "[[1, 11], [2, 12], [3, 13], [4, 14], [5, 15], [6, 16], [7, 17], [8, 18], [9, 19], [10, "
+        "20]]"};
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathNestedArrayTest) {
+    std::vector<FieldPath> paths{"a.b.c"};
+    std::vector<std::string> inputs{"{a: [{b: [{c: 1}, {c: 2}]}]}",
+                                    "{a: [{b: [{c: 3}]}, {b: [{c: 4}]}]}"};
+    std::vector<std::string> outputs{"[[[1, 2]]]", "[[[3], [4]]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathNestedArrayDeepValueTest) {
+    std::vector<FieldPath> paths{"a.b.c"};
+    std::vector<std::string> inputs{
+        "{a: [{b: [{c: \"not a StringSmall\"}, {c: {d: \"is a StringBig\"}}]}]}",
+        "{a: [{b: [{c: [1, 2, 3, 4]}]}, {b: [{c: \"Hello World!\"}]}]}"};
+    std::vector<std::string> outputs{"[[[\"not a StringSmall\", {d: \"is a StringBig\"}]]]",
+                                     "[[[[1, 2, 3, 4]], [\"Hello World!\"]]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, TwoPathsNestedArrayTest) {
+    std::vector<FieldPath> paths{"a.b.c", "a.d.e"};
+    std::vector<std::string> inputs{"{a: [{b: [{c: 1}]}, {d: [{e: 2}]}]}"};
+    std::vector<std::string> outputs{"[[[1]], [[2]]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, TwoPathsVariedArrayNestingTest) {
+    std::vector<FieldPath> paths{"a.b.c", "a.b.d"};
+    std::vector<std::string> inputs{
+        "{a: [{b: [{c: 1}, {c: 2}, {d: 3}]}, {b: {d: 4, c: 5}}, {b: [{d: 6}, {c: 7}, {d: "
+        "8}]}]}"};
+    std::vector<std::string> outputs{"[[[1, 2], 5, [7]], [[3], 4, [6, 8]]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, ParentAndChildPathTest) {
+    std::vector<FieldPath> paths{"a", "a.b"};
+    std::vector<std::string> inputs{"{a: {b: 1}}", "{a: {b: 2}}"};
+    std::vector<std::string> outputs{"[{b: 1}, 1]", "[{b: 2}, 2]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+// Tests where some or all of the paths are not present in one or more of the input documents.
+TEST_F(ExtractFieldPathsStageTest, PathDoesNotExistTest) {
+    std::vector<FieldPath> paths{"b"};
+    std::vector<std::string> inputs{"{a: 1}", "{a: 2}"};
+    std::vector<std::string> outputs{"[]", "[]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, NestedPathDoesNotExistTest) {
+    std::vector<FieldPath> paths{"a.c"};
+    std::vector<std::string> inputs{"{a: 1}", "{a: 2}", "{a: {b: 3}}"};
+    std::vector<std::string> outputs{"[]", "[]", "[]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, OnePathExistsOneDoesntTest) {
+    std::vector<FieldPath> paths{"a", "a.c"};
+    std::vector<std::string> inputs{"{a: 1}", "{a: 2}", "{a: {b: 3}}"};
+    std::vector<std::string> outputs{"[1]", "[2]", "[{b: 3}]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, NinePathsExistOneDoesntTest) {
+    std::vector<FieldPath> paths{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
+    std::vector<std::string> inputs{
+        "{a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9}",
+        "{a: 10, b: 11, c: 12, d: 13, e: 14, f: 15, g: 16, h: 17, i: 18}",
+        "{a: 19, b: 20, c: 21, d: 22, e: 23, f: 24, g: 25, h: 26, i: 27}"};
+    std::vector<std::string> outputs{"[1, 2, 3, 4, 5, 6, 7, 8, 9]",
+                                     "[10, 11, 12, 13, 14, 15, 16, 17, 18]",
+                                     "[19, 20, 21, 22, 23, 24, 25, 26, 27]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, PathsExistInSomeDocumentsTest) {
+    std::vector<FieldPath> paths{"a", "b", "c"};
+    std::vector<std::string> inputs{"{a: 1, c: 2}", "{b: 2, a: 3}", "{c: {a: 4}, b: 5}"};
+    std::vector<std::string> outputs{"[1, 2]", "[3, 2]", "[5, {a: 4}]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, PathInArrayDoesNotExistTest) {
+    std::vector<FieldPath> paths{"a.c"};
+    std::vector<std::string> inputs{"{a: [{b: 1}]}", "{a: [{b: 2}]}"};
+    std::vector<std::string> outputs{"[[]]", "[[]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, OnlyTraverseOneArrayPerPathComponentTest) {
+    std::vector<FieldPath> paths{"a.b"};
+    std::vector<std::string> inputs{"{a: [{b: 1}]}", "{a: [[{b: 2}]]}", "{a: [[{b: 3}], {b: 4}]}"};
+    std::vector<std::string> outputs{"[[1]]", "[[]]", "[[4]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, SinglePathLeafArray) {
+    std::vector<FieldPath> paths{"a"};
+    std::vector<std::string> inputs{"{a: [1, 2]}", "{a: [{b: 3}]}", "{a: []}"};
+    std::vector<std::string> outputs{"[[1, 2]]", "[[{b: 3}]]", "[[]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, MultiPathLeafArrays) {
+    std::vector<FieldPath> paths{"a", "b.c"};
+    std::vector<std::string> inputs{"{a: [1, 2], b: [{c: [3, 4]}]}"};
+    std::vector<std::string> outputs{"[[1, 2], [[3, 4]]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, MixedTypesDeepFirst) {
+    std::vector<FieldPath> paths{"a", "b.c", "b"};
+    std::vector<std::string> inputs{"{a: [1, 2], b: [{c: [3, \"stringBig\"]}]}",
+                                    "{a: 4, b: {c: 5}}"};
+    std::vector<std::string> outputs{"[[1, 2], [[3, \"stringBig\"]], [{c: [3, \"stringBig\"]}]]",
+                                     "[4, 5, {c: 5}]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+TEST_F(ExtractFieldPathsStageTest, MixedTypesShallowFirst) {
+    std::vector<FieldPath> paths{"a", "b.c", "b"};
+    std::vector<std::string> inputs{"{a: 1, b: {c: 2}}",
+                                    "{a: \"non-shallow value\", b: [{c: [3, 4]}]}"};
+    std::vector<std::string> outputs{"[1, 2, {c: 2}]",
+                                     "[\"non-shallow value\", [[3, 4]], [{c: [3, 4]}]]"};
+
+    runExtractFieldPathsTest(paths, inputs, outputs);
+}
+
+}  // namespace mongo::sbe

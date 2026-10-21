@@ -1,196 +1,374 @@
-// expression_tree.h
-
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/util/make_data_structure.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
 
-#include <boost/scoped_ptr.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/optional.hpp>
 
 /**
- * this contains all Expessions that define the structure of the tree
+ * this contains all Expressions that define the structure of the tree
  * they do not look at the structure of the documents themselves, just combine other things
  */
 namespace mongo {
+using namespace std::literals::string_view_literals;
 
-    class ListOfMatchExpression : public MatchExpression {
-    public:
-        ListOfMatchExpression( MatchType type ) : MatchExpression( type ){}
-        virtual ~ListOfMatchExpression();
+class ListOfMatchExpression : public MatchExpression {
+public:
+    using Expressions = std::vector<std::unique_ptr<MatchExpression>>;
 
-        /**
-         * @param e - I take ownership
-         */
-        void add( MatchExpression* e );
+    /**
+     * Number of short-circuits recorded across this node's children after which the children are
+     * reordered and their counters reset.
+     */
+    static constexpr std::uint32_t kReorderIterations = 4096;
 
-        /**
-         * clears all the thingsd we own, and does NOT delete
-         * someone else has taken ownership
-         */
-        void clearAndRelease() { _expressions.clear(); }
+    ListOfMatchExpression(MatchType type,
+                          clonable_ptr<ErrorAnnotation> annotation,
+                          Expressions expressions)
+        : MatchExpression(type, std::move(annotation)), _expressions(std::move(expressions)) {}
 
-        virtual size_t numChildren() const { return _expressions.size(); }
+    void add(std::unique_ptr<MatchExpression> e) {
+        _expressions.push_back(std::move(e));
+    }
 
-        virtual MatchExpression* getChild( size_t i ) const { return _expressions[i]; }
+    void reserve(size_t n) {
+        _expressions.reserve(n);
+    }
 
-        virtual std::vector<MatchExpression*>* getChildVector() { return &_expressions; }
+    void clear() {
+        _expressions.clear();
+    }
 
-        bool equivalent( const MatchExpression* other ) const;
+    size_t numChildren() const override {
+        return _expressions.size();
+    }
 
-    protected:
-        void _debugList( StringBuilder& debug, int level ) const;
+    /**
+     * Returns the unmodifiable vector of the children of the current node.
+     */
+    const Expressions& getChildren() const {
+        return _expressions;
+    }
 
-        void _listToBSON(BSONArrayBuilder* out) const;
+    MatchExpression* getChild(size_t i) const final {
+        tassert(6400201, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+        return _expressions[i].get();
+    }
 
-    private:
-        std::vector< MatchExpression* > _expressions;
-    };
+    void resetChild(size_t i, MatchExpression* other) override {
+        tassert(6329404, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+        _expressions[i].reset(other);
+    }
 
-    class AndMatchExpression : public ListOfMatchExpression {
-    public:
-        AndMatchExpression() : ListOfMatchExpression( AND ){}
-        virtual ~AndMatchExpression(){}
+    /*
+     * Replaces the ith child with nullptr, and releases ownership of the child.
+     */
+    std::unique_ptr<MatchExpression> releaseChild(size_t i) {
+        return std::move(_expressions[i]);
+    }
 
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
+    /*
+     * Removes the ith child, and releases ownership of the child.
+     */
+    virtual std::unique_ptr<MatchExpression> removeChild(size_t i) {
+        auto child = std::move(_expressions[i]);
+        _expressions.erase(_expressions.begin() + i);
+        return child;
+    }
 
-        virtual MatchExpression* shallowClone() const {
-            AndMatchExpression* self = new AndMatchExpression();
-            for (size_t i = 0; i < numChildren(); ++i) {
-                self->add(getChild(i)->shallowClone());
+    Expressions* getChildVector() final {
+        return &_expressions;
+    }
+
+    const Expressions& getChildVector() const {
+        return _expressions;
+    }
+
+    bool equivalent(const MatchExpression* other) const final;
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLogical;
+    }
+
+    /**
+     * Enables dynamic reordering of this node's child predicates based on their observed
+     * selectivity.
+     * Has no effect for nodes with fewer than two children, where there is nothing to reorder.
+     */
+    void allowReordering();
+
+    /**
+     * Records that the child pointed to by 'it' short-circuited the evaluation of this node, and
+     * reorders the children once 'kReorderIterations' short-circuits have accumulated.
+     *
+     * Called from the match expression evaluator on the hot path. No-op unless reordering was
+     * enabled via 'allowReordering()'.
+     *
+     * The reorder mutates the child vector that the caller is currently iterating over,
+     * which invalidates 'it' and the caller's loop iterators. This is safe only because every
+     * caller in 'exec/matcher/matcher.h' returns immediately after calling this function. Any
+     * caller that wants to keep iterating afterwards must re-obtain its iterators.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE void recordMatch(Expressions::const_iterator it) const {
+        if (_reorderingEnabled) {
+            (*it)->incrementShortCircuitCounter();
+            if (++_reorderHits >= kReorderIterations) {
+                _reorderPredicates();
             }
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
         }
+    }
 
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+protected:
+    void _debugList(StringBuilder& debug, int indentationLevel) const;
 
-        virtual void toBSON(BSONObjBuilder* out) const;
-    };
+    void _listToBSON(BSONArrayBuilder* out,
+                     const query_shape::SerializationOptions& opts = {},
+                     bool includePath = true) const;
 
-    class OrMatchExpression : public ListOfMatchExpression {
-    public:
-        OrMatchExpression() : ListOfMatchExpression( OR ){}
-        virtual ~OrMatchExpression(){}
+    bool _isReorderingEnabled() const {
+        return _reorderingEnabled;
+    }
 
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
+    /**
+     * Reorders the child predicates by observed short-circuit frequency, so that the child most
+     * likely to terminate evaluation early is evaluated first, then clears the counters to start a
+     * fresh measurement window.
+     */
+    void _reorderPredicates() const;
 
-        virtual MatchExpression* shallowClone() const {
-            OrMatchExpression* self = new OrMatchExpression();
-            for (size_t i = 0; i < numChildren(); ++i) {
-                self->add(getChild(i)->shallowClone());
-            }
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+private:
+    // Mutable because both statistics gathering and reordering operate on a const expression tree.
+    mutable Expressions _expressions;
+
+    // Short-circuits recorded across all children since the last reorder.
+    mutable std::uint32_t _reorderHits = 0;
+
+    bool _reorderingEnabled = false;
+};
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] AndMatchExpression : public ListOfMatchExpression {
+public:
+    static constexpr std::string_view kName = "$and"sv;
+
+    AndMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(AND, std::move(annotation), {}) {}
+    AndMatchExpression(std::vector<std::unique_ptr<MatchExpression>> expressions,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(AND, std::move(annotation), std::move(expressions)) {}
+    AndMatchExpression(std::unique_ptr<MatchExpression> expression,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(AND, std::move(annotation), makeVector(std::move(expression))) {}
+
+    std::unique_ptr<MatchExpression> clone() const override {
+        std::unique_ptr<AndMatchExpression> self =
+            std::make_unique<AndMatchExpression>(_errorAnnotation);
+        self->reserve(numChildren());
+        for (size_t i = 0; i < numChildren(); ++i) {
+            self->add(getChild(i)->clone());
         }
-
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
-
-        virtual void toBSON(BSONObjBuilder* out) const;
-    };
-
-    class NorMatchExpression : public ListOfMatchExpression {
-    public:
-        NorMatchExpression() : ListOfMatchExpression( NOR ){}
-        virtual ~NorMatchExpression(){}
-
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
-
-        virtual MatchExpression* shallowClone() const {
-            NorMatchExpression* self = new NorMatchExpression();
-            for (size_t i = 0; i < numChildren(); ++i) {
-                self->add(getChild(i)->shallowClone());
-            }
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+        if (getTag()) {
+            self->setTag(getTag()->clone());
         }
-
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
-
-        virtual void toBSON(BSONObjBuilder* out) const;
-    };
-
-    class NotMatchExpression : public MatchExpression {
-    public:
-        NotMatchExpression() : MatchExpression( NOT ){}
-        NotMatchExpression( MatchExpression* e ) : MatchExpression( NOT ), _exp( e ){}
-        /**
-         * @param exp - I own it, and will delete
-         */
-        virtual Status init( MatchExpression* exp ) {
-            _exp.reset( exp );
-            return Status::OK();
+        if (_isReorderingEnabled()) {
+            self->allowReordering();
         }
+        return self;
+    }
 
-        virtual MatchExpression* shallowClone() const {
-            NotMatchExpression* self = new NotMatchExpression();
-            MatchExpression* child = _exp->shallowClone();
-            self->init(child);
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
+
+    void serialize(BSONObjBuilder* out,
+                   const query_shape::SerializationOptions& opts = {},
+                   bool includePath = true) const override;
+
+    bool isTriviallyTrue() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+};
+
+class OrMatchExpression : public ListOfMatchExpression {
+public:
+    static constexpr std::string_view kName = "$or"sv;
+
+    OrMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(OR, std::move(annotation), {}) {}
+    OrMatchExpression(std::vector<std::unique_ptr<MatchExpression>> expressions,
+                      clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(OR, std::move(annotation), std::move(expressions)) {}
+    OrMatchExpression(std::unique_ptr<MatchExpression> expression,
+                      clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(OR, std::move(annotation), makeVector(std::move(expression))) {}
+
+    std::unique_ptr<MatchExpression> clone() const override {
+        std::unique_ptr<OrMatchExpression> self =
+            std::make_unique<OrMatchExpression>(_errorAnnotation);
+        self->reserve(numChildren());
+        for (size_t i = 0; i < numChildren(); ++i) {
+            self->add(getChild(i)->clone());
         }
-
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const {
-            return !_exp->matches( doc, NULL );
+        if (getTag()) {
+            self->setTag(getTag()->clone());
         }
-
-        virtual bool matchesSingleElement( const BSONElement& e ) const {
-            return !_exp->matchesSingleElement( e );
+        if (_isReorderingEnabled()) {
+            self->allowReordering();
         }
+        return self;
+    }
 
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
 
-        virtual void toBSON(BSONObjBuilder* out) const;
+    void serialize(BSONObjBuilder* out,
+                   const query_shape::SerializationOptions& opts = {},
+                   bool includePath = true) const override;
 
-        bool equivalent( const MatchExpression* other ) const;
+    bool isTriviallyFalse() const final;
 
-        virtual size_t numChildren() const { return 1; }
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
 
-        virtual MatchExpression* getChild( size_t i ) const { return _exp.get(); }
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+};
 
-        MatchExpression* releaseChild(void) { return _exp.release(); }
+class NorMatchExpression : public ListOfMatchExpression {
+public:
+    static constexpr std::string_view kName = "$nor"sv;
 
-        void resetChild( MatchExpression* newChild) { _exp.reset(newChild); }
+    NorMatchExpression(clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(NOR, std::move(annotation), {}) {}
+    NorMatchExpression(std::vector<std::unique_ptr<MatchExpression>> expressions,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(NOR, std::move(annotation), std::move(expressions)) {}
+    NorMatchExpression(std::unique_ptr<MatchExpression> expression,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ListOfMatchExpression(NOR, std::move(annotation), makeVector(std::move(expression))) {}
 
-    private:
-        std::auto_ptr<MatchExpression> _exp;
-    };
+    std::unique_ptr<MatchExpression> clone() const override {
+        std::unique_ptr<NorMatchExpression> self =
+            std::make_unique<NorMatchExpression>(_errorAnnotation);
+        self->reserve(numChildren());
+        for (size_t i = 0; i < numChildren(); ++i) {
+            self->add(getChild(i)->clone());
+        }
+        if (getTag()) {
+            self->setTag(getTag()->clone());
+        }
+        if (_isReorderingEnabled()) {
+            self->allowReordering();
+        }
+        return self;
+    }
 
-}
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
+
+    void serialize(BSONObjBuilder* out,
+                   const query_shape::SerializationOptions& opts = {},
+                   bool includePath = true) const override;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+};
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] NotMatchExpression final : public MatchExpression {
+public:
+    static constexpr int kNumChildren = 1;
+    explicit NotMatchExpression(MatchExpression* e,
+                                clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(NOT, std::move(annotation)), _exp(e) {}
+
+    explicit NotMatchExpression(std::unique_ptr<MatchExpression> expr,
+                                clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(NOT, std::move(annotation)), _exp(std::move(expr)) {}
+
+    std::unique_ptr<MatchExpression> clone() const override {
+        std::unique_ptr<NotMatchExpression> self =
+            std::make_unique<NotMatchExpression>(_exp->clone(), _errorAnnotation);
+        if (getTag()) {
+            self->setTag(getTag()->clone());
+        }
+        return self;
+    }
+
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
+
+    void serialize(BSONObjBuilder* out,
+                   const query_shape::SerializationOptions& opts = {},
+                   bool includePath = true) const override;
+
+    bool equivalent(const MatchExpression* other) const final;
+
+    size_t numChildren() const final {
+        return kNumChildren;
+    }
+
+    MatchExpression* getChild(size_t i) const final {
+        tassert(6400210, "Out-of-bounds access to child of MatchExpression.", i < kNumChildren);
+        return _exp.get();
+    }
+
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
+        return nullptr;
+    }
+
+    MatchExpression* releaseChild() {
+        return _exp.release();
+    }
+
+    void resetChild(size_t i, MatchExpression* newChild) override {
+        tassert(6329405, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+        _exp.reset(newChild);
+    }
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLogical;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+private:
+    static void serializeNotExpressionToNor(MatchExpression* exp,
+                                            BSONObjBuilder* out,
+                                            const query_shape::SerializationOptions& opts = {},
+                                            bool includePath = true);
+
+    std::unique_ptr<MatchExpression> _exp;
+};
+}  // namespace mongo

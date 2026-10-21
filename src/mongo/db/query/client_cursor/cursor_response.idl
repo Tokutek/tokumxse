@@ -1,0 +1,470 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file describes the BSON format for cursor response object.
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/namespace_string.h"
+        - "mongo/db/query/client_cursor/cursor_idl_validator.h"
+        - "mongo/db/query/query_stats/plan_shape_counters/plan_shape_counts.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+types:
+    PlanShapeCounts:
+        description: >-
+            Counts of winning plan shapes observed by query stats, in the form of
+            '{patterns: {[counterName]: [count]}, nodes: {...}, accessPaths: {...}}'.
+            Counters with a zero count and empty counter categories are omitted.
+        bson_serialization_type: object
+        cpp_type: "mongo::plan_shape_counters::PlanShapeCounts"
+        serializer: "mongo::plan_shape_counters::PlanShapeCounts::toBSON"
+        deserializer: "mongo::plan_shape_counters::PlanShapeCounts::fromBSON"
+        is_view: false
+
+enums:
+    CursorType:
+        description: "The type of a single cursor if a response has multiple cursors"
+        type: string
+        values:
+            SearchMetaResult: "meta"
+            DocumentResult: "results"
+
+structs:
+    IncludeMetrics:
+        description: "Specifies which metrics to include in the cursor response."
+        strict: false
+        fields:
+            queryStats:
+                description: "If true, include query stats metrics in the response."
+                type: bool
+                default: false
+                stability: internal
+
+    ChangeStreamCursorMetrics:
+        description: "Change stream metrics reported in a cursor response."
+        strict: false
+        fields:
+            optime:
+                description: "The oplog timestamp of the latest event processed by the change stream cursor."
+                type: timestamp
+                optional: true
+                stability: unstable
+
+    CardinalityEstimationMethods:
+        description: "Counts of cardinality estimation methods used by the cost-based ranker."
+        strict: false
+        fields:
+            Histogram:
+                description: "Count of estimates computed via histogram CE."
+                type: long
+                optional: true
+                stability: unstable
+            Sampling:
+                description: "Count of estimates computed via sampling CE."
+                type: long
+                optional: true
+                stability: unstable
+            Heuristics:
+                description: "Count of estimates computed via heuristic CE."
+                type: long
+                optional: true
+                stability: unstable
+            Mixed:
+                description: "Count of estimates from computations mixing different estimation types."
+                type: long
+                optional: true
+                stability: unstable
+            Metadata:
+                description: "Count of estimates from database metadata like collection cardinality."
+                type: long
+                optional: true
+                stability: unstable
+            Code:
+                description: "Count of estimates computed directly in C++, e.g. constants or exactCE."
+                type: long
+                optional: true
+                stability: unstable
+
+    CursorMetrics:
+        description: "A struct representing all of the metrics a cursor response can return."
+        strict: false
+        fields:
+            keysExamined:
+                description: "Number of index keys examined by the query."
+                type: long
+                stability: unstable
+            docsExamined:
+                description: "Number of documents examined by the query."
+                type: long
+                stability: unstable
+            bytesRead:
+                description: "Number of bytes of storage read by the query."
+                type: long
+                stability: unstable
+            readingTimeMicros:
+                description: "Amount of time spent reading data from storage."
+                type: long
+                stability: unstable
+            workingTimeMillis:
+                description: "Amount of time spent executing the query, not including time spent blocked."
+                type: long
+                stability: unstable
+            hasSortStage:
+                description: "Boolean value that is true if the query plan involves an in-memory sort."
+                type: bool
+                stability: unstable
+            usedDisk:
+                description: "Boolean value that is if the given query used disk."
+                type: bool
+                stability: unstable
+            fromMultiPlanner:
+                description: "Boolean value that is true if the plan came from the multi-planner."
+                type: bool
+                stability: unstable
+            fromPlanCache:
+                description: "Boolean value that is true if the plan came from the plan cache."
+                type: bool
+                stability: unstable
+            planningTimeMicros:
+                description: "Time from the moment a planning request is received to the moment the winning plan is finalized"
+                type: long
+                stability: unstable
+                default: 0
+            cardinalityEstimationMethods:
+                description: "Counts of cardinality estimation methods used by the cost-based ranker."
+                type: CardinalityEstimationMethods
+                default: true
+                stability: unstable
+            nDocsSampled:
+                description: "Number of documents sampled by the query by the cost-based ranker."
+                type: long
+                stability: unstable
+                default: 0
+            planShapeCounts:
+                description: "Counts of winning plan shapes observed by query stats."
+                type: PlanShapeCounts
+                optional: true
+                stability: unstable
+            cpuNanos:
+                description: "Amount of CPU time spent by a query operation."
+                type: long
+                stability: unstable
+                default: 0
+            delinquentAcquisitions:
+                description: "Number of times that execution ticket acquisition was overdue by a query operation."
+                type: long
+                stability: unstable
+                default: 0
+            totalAcquisitionDelinquencyMillis:
+                description: "Total time in milliseconds that execution ticket acquisition was overdue by a query operation."
+                type: long
+                stability: unstable
+                default: 0
+            maxAcquisitionDelinquencyMillis:
+                description: "Maximum time in milliseconds that execution ticket acquisition was overdue by a query operation."
+                type: long
+                stability: unstable
+                default: 0
+            numInterruptChecks:
+                description: "Number of checkForInterrupt is call by a query operation."
+                type: long
+                stability: unstable
+                default: 0
+            overdueInterruptApproxMaxMillis:
+                description: "Maximum time in milliseconds that checkForInterrupt was delayed for a sampled query operation."
+                type: long
+                stability: unstable
+                default: 0
+            nMatched:
+                description: "The number of documents selected for update."
+                type: long
+                stability: unstable
+                default: 0
+            nUpserted:
+                description: "The number of documents inserted by an upsert."
+                type: long
+                stability: unstable
+                default: 0
+            nModified:
+                description: "The number of existing documents updated."
+                type: long
+                stability: unstable
+                default: 0
+            nDeleted:
+                description: "The number of documents deleted."
+                type: long
+                stability: unstable
+                default: 0
+            nInserted:
+                description: "The number of documents inserted (excluding upserts)."
+                type: long
+                stability: unstable
+                default: 0
+            keysInserted:
+                description: "The number of index keys inserted."
+                type: long
+                stability: unstable
+                default: 0
+            keysDeleted:
+                description: "The number of index keys deleted."
+                type: long
+                stability: unstable
+                default: 0
+            totalTimeQueuedMicros:
+                description: "Total time spent waiting for a ticket."
+                type: long
+                stability: unstable
+                default: 0
+            totalAdmissions:
+                description: "Total number of admissions during the operation."
+                type: long
+                stability: unstable
+                default: 0
+            totalNormalPriorityAdmissions:
+                description: "Total number of normal priority admissions during the operation."
+                type: long
+                stability: unstable
+                default: 0
+            totalLowPriorityAdmissions:
+                description: "Total number of low priority admissions during the operation."
+                type: long
+                stability: unstable
+                default: 0
+            wasLoadShed:
+                description: "If true, the operation was load shed."
+                type: bool
+                stability: unstable
+                default: false
+            wasDeprioritized:
+                description: "If true, the operation was deprioritized at some point."
+                type: bool
+                stability: unstable
+                default: false
+            wasMarkedNonDeprioritizable:
+                description: "If true, the operation was marked non-deprioritizable at some point."
+                type: bool
+                stability: unstable
+                default: false
+            clusterPeakTrackedMemBytes:
+                description: "Sum of local peak tracked memory and peak tracked memory from all remote shards contacted during query execution."
+                type: long
+                stability: unstable
+                default: 0
+
+    ResponseCursorBase:
+        description: "Common fields of initial and subsequent cursor responses."
+        fields:
+            id:
+                cpp_name: "cursorId"
+                description: "The cursor id of the cursor."
+                type: long
+                stability: stable
+            ns:
+                description: "The namespace of the cursor."
+                type: namespacestring
+                stability: stable
+            postBatchResumeToken:
+                description: "An optional resume token object."
+                type: object
+                optional: true
+                stability: stable
+            atClusterTime:
+                description: "The time stamp at which the response is being returned."
+                type: timestamp
+                optional: true
+                stability: stable
+            partialResultsReturned:
+                description: "Boolean represents whether partial results are being returned."
+                type: optionalBool
+                stability: stable
+            invalidated:
+                description: "Boolean represents if the cursor has been invalidated."
+                type: optionalBool
+                stability: stable
+            $_wasStatementExecuted:
+                description:
+                    "An optional field set to true if a write without shard key had already
+                    applied the write. To provide some context, this internal field is
+                    used by the two phase write without shard key protocol introduced in
+                    PM-1632 to support retryable writes for updateOne without shard key,
+                    deleteOne without shard key, and findAndModify without shard key."
+                type: optionalBool
+                cpp_name: wasStatementExecuted
+                stability: internal
+
+    InitialResponseCursor:
+        description: "A struct representing an initial response cursor."
+        inline_chained_structs: true
+        chained_structs:
+            ResponseCursorBase: ResponseCursorBase
+        fields:
+            firstBatch:
+                description: "The first batch of the cursor."
+                type: array<object>
+                stability: stable
+            metrics:
+                description: "An optional field containing metrics about the query's execution."
+                type: CursorMetrics
+                optional: true
+                stability: unstable
+
+    MultiResponseInitialResponseCursor:
+        description: "A struct representing an initial response cursor if multiple cursors are returned."
+        inline_chained_structs: true
+        chained_structs:
+            ResponseCursorBase: ResponseCursorBase
+        fields:
+            firstBatch:
+                description: "The first batch of the cursor."
+                type: array<object>
+                stability: stable
+            type:
+                description: "Optional disambiguation string of a cursor."
+                type: CursorType
+                cpp_name: cursorType
+                stability: unstable
+                optional: true
+            metrics:
+                description: "An optional field containing metrics about the query's execution."
+                type: CursorMetrics
+                optional: true
+                stability: unstable
+
+    MultiResponseCursor:
+        description: "A struct representing a cursor object inside an array of cursors"
+        fields:
+            cursor:
+                description: "The actual cursor object."
+                type: MultiResponseInitialResponseCursor
+                stability: unstable
+            ok:
+                type: bool
+                stability: unstable
+
+    CursorInitialReply:
+        description: "A struct representing a initial cursor reply."
+        cpp_validator_func: "validateIDLParsedCursorResponse"
+        is_command_reply: true
+        fields:
+            cursor:
+                description: "A response cursor object."
+                type: InitialResponseCursor
+                stability: stable
+                optional: true
+            cursors:
+                description: "An array of cursor objects."
+                type: array<MultiResponseCursor>
+                stability: unstable
+                optional: true
+            vars:
+                description: "An optional field containing additional response information for the query."
+                type: object
+                optional: true
+                stability: unstable
+            type:
+                description: "An optional field containing disambiguation information if a reply contains multiple cursors."
+                type: CursorType
+                cpp_name: cursorType
+                optional: true
+                stability: unstable
+            explain:
+                description: "An optional field containing explain info."
+                type: object
+                optional: true
+                stability: unstable
+
+    GetMoreResponseCursor:
+        description: "A struct representing a subsequent response cursor."
+        inline_chained_structs: true
+        chained_structs:
+            ResponseCursorBase: ResponseCursorBase
+        fields:
+            nextBatch:
+                description: "The subsequent batch of the cursor."
+                type: array<object>
+                stability: stable
+            metrics:
+                description: "An optional field containing metrics about the query's execution."
+                type: CursorMetrics
+                optional: true
+                stability: unstable
+
+    CursorGetMoreReply:
+        description: "A struct representing a getMore cursor reply."
+        is_command_reply: true
+        fields:
+            cursor:
+                description: "A response cursor object."
+                type: GetMoreResponseCursor
+                stability: stable
+            explain:
+                description: "An optional field containing updated explain info."
+                type: object
+                optional: true
+                stability: unstable
+
+    # This type could be naturally expressed as a variant of InitialResponseCursor and
+    # GetMoreResponseCursor, but the IDL parser can't handle multi-struct variants in general.
+    # It needs to be able to identify the type of the struct based on the first element of the
+    # BSON object, which imposes a constraint on the order of fields in the BSON.
+    AnyCursor:
+        description: "A struct representing either an initial or subsequent cursor"
+        inline_chained_structs: true
+        cpp_validator_func: "validateIDLParsedAnyCursor"
+        chained_structs:
+            ResponseCursorBase: ResponseCursorBase
+        fields:
+            firstBatch:
+                description: "The first batch of the cursor."
+                type: array<object>
+                stability: stable
+                optional: true
+                # Non-const getter is needed here so we can avoid copying the batch of BSONObjs in the batch.
+                non_const_getter: true
+            nextBatch:
+                description: "The subsequent batch of the cursor."
+                type: array<object>
+                stability: stable
+                optional: true
+                # Non-const getter is needed here so we can avoid copying the batch of BSONObjs in the batch.
+                non_const_getter: true
+            type:
+                description: "An optional field containing disambiguation information if a reply contains multiple cursors."
+                type: CursorType
+                cpp_name: cursorType
+                optional: true
+                stability: unstable
+            metrics:
+                description: "An optional field containing metrics about the query's execution."
+                type: CursorMetrics
+                optional: true
+                stability: unstable
+
+    AnyCursorResponse:
+        description: "A struct representing a cursor response, which can contain either an initial or a subsequent cursor."
+        strict: false
+        fields:
+            writeConcernError:
+                description: "An optional field containing any write concern errors returned when the command was run."
+                type: object
+                optional: true
+                stability: unstable
+            vars:
+                description: "An optional field containing additional response information for the query."
+                type: object
+                optional: true
+                stability: unstable
+            cursor:
+                description: "A response cursor object."
+                type: AnyCursor
+                stability: unstable
+            explain:
+                description: "An optional field containing initial or updated explain info."
+                type: object
+                optional: true
+                stability: unstable

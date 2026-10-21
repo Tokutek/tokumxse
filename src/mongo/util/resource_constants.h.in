@@ -1,0 +1,45 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+// This file is only constants used by resource compiler. It is not to be used in C or C++ files.
+
+#ifndef RC_INVOKED
+#error "Cannot include mongo/util/resource_constants.h by non resource compiler files."
+#endif
+
+#include <sdkddkver.h>
+
+// This is a single number, not a string
+#define MONGO_VERSION_MAJOR @mongo_version_major@
+
+// This is a single number, not a string
+#define MONGO_VERSION_MINOR @mongo_version_minor@
+
+// This is a single number, not a string
+#define MONGO_VERSION_PATCH @mongo_version_patch@
+
+// This is a string, it should be the product version
+#define MONGO_FILE_VERSION_STR "@mongo_version@"
+
+// This is a string, it should be the file version. We use the product version.
+#define MONGO_PRODUCT_VERSION_STR "@mongo_version@"
+
+#if (NTDDI_VERSION >= NTDDI_WIN7)
+    #define MONGO_PRODUCT_WINDOWS_VERSION "Windows 7/Windows Server 2008 R2";
+#else
+    #error This targeted Windows version is not supported
+#endif  // NTDDI_VERSION
+
+#ifdef MONGO_ENTERPRISE_VERSION
+#define MONGO_PRODUCT_EDITION_STR @buildinfo_modules@
+#elif MONGO_CONFIG_SSL
+#define MONGO_PRODUCT_EDITION_STR "SSL"
+#else
+#define MONGO_PRODUCT_EDITION_STR "Legacy"
+#endif
+
+#define MONGO_PRODUCT_NAME_STR "MongoDB " MONGO_PRODUCT_EDITION_STR " " MONGO_PRODUCT_WINDOWS_VERSION
+
+#define MONGO_VERSION_COMMENT_STR "Git @mongo_git_hash@"
+
+

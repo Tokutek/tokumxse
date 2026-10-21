@@ -1,0 +1,605 @@
+import difflib
+import os
+import pathlib
+import platform
+import shutil
+import subprocess
+import sys
+import time
+
+REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
+WRAPPER_CONFIG_MODE_FILE = f"{REPO_ROOT}/.tmp/mongo_wrapper_config_mode"
+
+sys.path.append(str(REPO_ROOT))
+
+from bazel.wrapper_hook.compiledb import (
+    clear_compiledb_posthook_state,
+    generate_compiledb,
+    prepare_compiledb_posthook_args,
+)
+from bazel.wrapper_hook.hermetic_container.env import (
+    CROSS_HOST_FLAGS_WITH_SEPARATE_VALUE,
+)
+from bazel.wrapper_hook.wrapper_debug import wrapper_debug
+
+
+class BinAndSourceIncompatible(Exception):
+    pass
+
+
+class DuplicateSourceNames(Exception):
+    pass
+
+
+COMPILEDB_FLAGS_WITH_SEPARATE_VALUE = CROSS_HOST_FLAGS_WITH_SEPARATE_VALUE | frozenset(
+    {
+        "-c",
+        "--aspects",
+        "--build_tag_filters",
+        "--compiler",
+        "--conlyopt",
+        "--copt",
+        "--cxxopt",
+        "--features",
+        "--host_cpu",
+        "--host_conlyopt",
+        "--host_copt",
+        "--host_cxxopt",
+        "--host_linkopt",
+        "--javacopt",
+        "--java_language_version",
+        "--java_runtime_version",
+        "--linkopt",
+        "--output_filter",
+        "--profile",
+        "--run_under",
+        "--strategy",
+        "--test_arg",
+        "--test_env",
+        "--test_filter",
+        "--test_output",
+        "--test_tag_filters",
+        "--test_timeout",
+    }
+)
+
+
+def get_buildozer_output(autocomplete_query):
+    from buildscripts.install_bazel import install_bazel
+
+    buildozer_name = "buildozer" if not platform.system() == "Windows" else "buildozer.exe"
+    buildozer = shutil.which(buildozer_name)
+    if not buildozer:
+        buildozer = str(pathlib.Path(f"~/.local/bin/{buildozer_name}").expanduser())
+        if not os.path.exists(buildozer):
+            bazel_bin_dir = str(pathlib.Path("~/.local/bin").expanduser())
+            if not os.path.exists(bazel_bin_dir):
+                os.makedirs(bazel_bin_dir)
+            install_bazel(bazel_bin_dir)
+
+    p = subprocess.run(
+        [
+            buildozer,
+            "print label srcs",
+            "//src/...:%mongo_cc_unit_test",
+            "//src/...:%mongo_cc_fuzztest",
+            "//src/...:%mongo_cc_benchmark",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if not autocomplete_query and p.returncode != 0:
+        print("buildozer test target query failed:")
+        print(p.args)
+        print(p.stdout)
+        print(p.stderr)
+        sys.exit(1)
+
+    # Rust test targets are created inside the mongo_rust_shared_library macro and
+    # are invisible to buildozer. Query the library targets by macro name and derive
+    # the test label by appending _test, then format as "label []" so the parser's
+    # empty-srcs fallback adds them to sources_to_bin.
+    rust = subprocess.run(
+        [buildozer, "print label", "//src/...:%mongo_rust_shared_library"],
+        capture_output=True,
+        text=True,
+    )
+
+    if not autocomplete_query and rust.returncode != 0:
+        print("buildozer rust test target query failed:")
+        print(rust.args)
+        print(rust.stdout)
+        print(rust.stderr)
+        sys.exit(1)
+
+    rust_lines = "".join(
+        f"{label.strip()}_test []\n"
+        for label in rust.stdout.splitlines()
+        if label.strip().startswith("//")
+    )
+
+    return p.stdout + rust_lines
+
+
+def check_bazel_command_type(args):
+    with open(pathlib.Path(__file__).parent / "bazel_commands.commands") as f:
+        bazel_commands = [line.strip() for line in f.readlines()]
+
+    for arg in args:
+        if arg in bazel_commands:
+            return arg
+
+
+def _read_target_pattern_file(path):
+    with open(path, "r", encoding="utf-8") as target_file:
+        return [
+            line.strip()
+            for line in target_file
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+
+def _parse_targets_and_flags(args, replacements, compiledb_targets, compiledb_only_targets):
+    build_flags = []
+    build_targets = []
+    build_args = []
+    target_pattern_file = None
+    parsing_targets = True
+    expected_value_option = None
+    separate_value_options = COMPILEDB_FLAGS_WITH_SEPARATE_VALUE
+
+    for arg in args:
+        if expected_value_option is not None:
+            build_flags.append(arg)
+            build_args.append(arg)
+            if expected_value_option == "--target_pattern_file":
+                target_pattern_file = arg
+            expected_value_option = None
+            continue
+        if arg == "--":
+            parsing_targets = False
+            continue
+        if arg in replacements:
+            continue
+        if parsing_targets and arg.startswith("-"):
+            if arg in separate_value_options:
+                build_flags.append(arg)
+                build_args.append(arg)
+                expected_value_option = arg
+                continue
+            if arg.startswith("--target_pattern_file="):
+                target_pattern_file = arg.split("=", 1)[1]
+            if arg == "--config=compiledb-aspect":
+                arg = "--config=compiledb"
+            build_flags.append(arg)
+            build_args.append(arg)
+        elif parsing_targets:
+            if arg in compiledb_targets or arg in compiledb_only_targets:
+                continue
+            build_targets.append(arg)
+            build_args.append(arg)
+
+    return build_flags, build_targets, target_pattern_file, build_args
+
+
+def swap_default_config(
+    args, command, config_mode, compiledb_target, clang_tidy, user_specified_config
+):
+    # Remember the user's last specified config mode to prevent invalidating cache on run or lint commands.
+    if os.path.exists(f"{REPO_ROOT}/.bazelrc.local"):
+        return config_mode
+
+    try:
+        if config_mode is None:
+            if user_specified_config:
+                return config_mode
+            if os.path.exists(WRAPPER_CONFIG_MODE_FILE):
+                # Reset to fastbuild if it's been more than 2 days since the file was written,
+                # since we don't want users to stay locked on dbg/opt if they forgot to change it back
+                two_days_since_last_command = (
+                    os.path.getmtime(WRAPPER_CONFIG_MODE_FILE) < time.time() - 60 * 60 * 24 * 2
+                )
+                invalidating_invocation = (
+                    command == "build" and not compiledb_target and not clang_tidy
+                )
+                if two_days_since_last_command or invalidating_invocation:
+                    os.remove(WRAPPER_CONFIG_MODE_FILE)
+                else:
+                    with open(WRAPPER_CONFIG_MODE_FILE, "r", encoding="utf-8") as f:
+                        config_mode = f.read().strip()
+                        args.insert(3, f"--config={config_mode}")
+                        green = "\033[0;32m"
+                        no_color = "\033[0m"
+                        print("=====")
+                        print(
+                            f"{green}INFO:{no_color} No config mode specified, using last specified config option: --config={config_mode}"
+                        )
+                        print("=====")
+        else:
+            if not os.path.exists(os.path.dirname(WRAPPER_CONFIG_MODE_FILE)):
+                os.makedirs(os.path.dirname(WRAPPER_CONFIG_MODE_FILE))
+            with open(WRAPPER_CONFIG_MODE_FILE, "w", encoding="utf-8") as f:
+                f.write(config_mode)
+    except Exception as _:
+        print(f"Failed to read/write config mode file at {WRAPPER_CONFIG_MODE_FILE}")
+    return config_mode
+
+
+def test_runner_interface(
+    args, autocomplete_query, get_buildozer_output=get_buildozer_output, enterprise=True, atlas=True
+):
+    start = time.time()
+
+    plus_autocomplete_query = False
+    plus_starts = ("+", ":+", "//:+")
+    skip_plus_interface = True
+    compiledb_target = False
+    compiledb_config = False
+    setup_clang_tidy = False
+    clang_tidy = False
+    persistent_compdb = True
+    compiledb_targets = ["//:compiledb", ":compiledb", "compiledb"]
+    compiledb_only_targets = ["//:compiledb_only", ":compiledb_only", "compiledb_only"]
+    compiledb_target_scope = None
+    sources_to_bin = {}
+    duplicate_sources = {}
+    select_sources = {}
+    current_select = None
+    in_select = False
+    c_exts = (".c", ".cc", ".cpp")
+    replacements = {}
+    fileNameFilter = []
+    bin_targets = []
+    catch_all_target = False
+    source_targets = {}
+    rust_bin_targets = {}
+
+    current_bazel_command = check_bazel_command_type(args)
+    command_index = next(
+        (i for i, arg in enumerate(args) if arg == current_bazel_command),
+        1,
+    )
+    startup_args = args[1:command_index]
+
+    if autocomplete_query:
+        str_args = " ".join(args)
+        if "'//:*'" in str_args or "':*'" in str_args or "//:all" in str_args or ":all" in str_args:
+            plus_autocomplete_query = True
+
+    if os.environ.get("CI") is not None:
+        persistent_compdb = False
+
+    config_mode = None
+    user_specified_config = False
+    for index, arg in enumerate(args):
+        if index > 0 and args[index - 1] in ("--config", "-c"):
+            continue
+        if arg in compiledb_targets:
+            compiledb_target = True
+            setup_clang_tidy = True
+            replacements[arg] = []
+            skip_plus_interface = False
+        if arg in compiledb_only_targets:
+            compiledb_target = True
+            replacements[arg] = []
+            skip_plus_interface = False
+        if arg.startswith("--compiledb-target-scope="):
+            compiledb_target_scope = arg.split("=", 1)[1]
+            replacements[arg] = []
+            skip_plus_interface = False
+        if arg.startswith("--compiledb_target_scope="):
+            compiledb_target_scope = arg.split("=", 1)[1]
+            replacements[arg] = []
+            skip_plus_interface = False
+        if arg == "--intree_compdb":
+            replacements[arg] = []
+            persistent_compdb = False
+            skip_plus_interface = False
+        config_value = None
+        if arg.startswith("--config="):
+            config_value = arg.split("=", 1)[1]
+        elif arg.startswith("-c="):
+            config_value = arg.split("=", 1)[1]
+        elif arg in ("--config", "-c") and index + 1 < len(args):
+            config_value = args[index + 1]
+        if config_value is not None:
+            user_specified_config = True
+            val = config_value
+            if val in {"opt", "dbg", "fastbuild", "dbg_aubsan", "dbg_tsan"}:
+                config_mode = val
+            if val in ("compiledb", "compiledb-aspect"):
+                compiledb_config = True
+            if val == "clang-tidy":
+                clang_tidy = True
+        if arg.startswith(plus_starts):
+            skip_plus_interface = False
+        if arg.endswith("..."):
+            catch_all_target = True
+
+    config_mode = swap_default_config(
+        args,
+        current_bazel_command,
+        config_mode,
+        compiledb_target,
+        clang_tidy,
+        user_specified_config,
+    )
+    clear_compiledb_posthook_state()
+
+    if platform.system() == "Windows":
+        setup_clang_tidy = False
+
+    for arg in args:
+        if arg.startswith("--runs_per_test=") and catch_all_target:
+            try:
+                runs_per_test_value = int(arg.split("=")[1])
+                if runs_per_test_value > 10:
+                    print(
+                        f"WARNING: --runs_per_test={runs_per_test_value} is set above 10. "
+                        "This may cause excessive resource usage. Please only use this option when a single test is selected."
+                    )
+                    sys.exit(1)
+            except ValueError:
+                pass  # Non-integer value, let bazel handle the error
+
+    parsed_build_flags = None
+    parsed_build_targets = None
+    parsed_target_pattern_file = None
+    if current_bazel_command == "build" and compiledb_target:
+        (
+            parsed_build_flags,
+            parsed_build_targets,
+            parsed_target_pattern_file,
+            parsed_build_args,
+        ) = _parse_targets_and_flags(
+            args[command_index + 1 :], replacements, compiledb_targets, compiledb_only_targets
+        )
+
+    if compiledb_target:
+        if current_bazel_command == "build":
+            compiledb_requested_targets = list(parsed_build_targets or [])
+            if parsed_target_pattern_file and os.path.isfile(parsed_target_pattern_file):
+                compiledb_requested_targets.extend(
+                    _read_target_pattern_file(parsed_target_pattern_file)
+                )
+
+            if compiledb_target_scope:
+                original_build_targets = set(parsed_build_targets)
+                parsed_build_targets = [compiledb_target_scope]
+                compiledb_requested_targets = [compiledb_target_scope]
+                scoped_build_args = []
+                scope_inserted = False
+                for arg in parsed_build_args:
+                    if arg in original_build_targets:
+                        if not scope_inserted:
+                            scoped_build_args.append(compiledb_target_scope)
+                            scope_inserted = True
+                        continue
+                    scoped_build_args.append(arg)
+                if not scope_inserted:
+                    scoped_build_args.append(compiledb_target_scope)
+                parsed_build_args = scoped_build_args
+            elif not parsed_build_targets and not parsed_target_pattern_file:
+                parsed_build_targets = [os.environ.get("MONGO_COMPILEDB_TARGET_SCOPE", "//src/...")]
+                parsed_build_args.append(parsed_build_targets[0])
+
+            return prepare_compiledb_posthook_args(
+                bazel_bin=args[0],
+                startup_args=startup_args,
+                command=current_bazel_command,
+                build_flags=parsed_build_flags or [],
+                build_targets=parsed_build_targets,
+                build_args=parsed_build_args,
+                persistent_compdb=persistent_compdb,
+                enterprise=enterprise,
+                atlas=atlas,
+                compiledb_targets=compiledb_requested_targets,
+                setup_clang_tidy=setup_clang_tidy,
+            )
+
+        generate_compiledb(
+            args[0],
+            persistent_compdb,
+            enterprise,
+            atlas,
+            target_scope_override=compiledb_target_scope,
+            setup_clang_tidy=setup_clang_tidy,
+            startup_args=startup_args,
+        )
+
+    if compiledb_config and not compiledb_target and current_bazel_command == "build":
+        (
+            parsed_build_flags,
+            parsed_build_targets,
+            parsed_target_pattern_file,
+            parsed_build_args,
+        ) = _parse_targets_and_flags(args[command_index + 1 :], {}, [], [])
+
+        posthook_targets = list(parsed_build_targets)
+        if parsed_target_pattern_file and os.path.isfile(parsed_target_pattern_file):
+            with open(parsed_target_pattern_file, "r", encoding="utf-8") as f:
+                posthook_targets.extend(line.strip() for line in f if line.strip())
+
+        return prepare_compiledb_posthook_args(
+            bazel_bin=args[0],
+            startup_args=startup_args,
+            command=current_bazel_command,
+            build_flags=parsed_build_flags,
+            build_targets=parsed_build_targets,
+            build_args=parsed_build_args,
+            persistent_compdb=persistent_compdb,
+            enterprise=enterprise,
+            atlas=atlas,
+            compiledb_targets=posthook_targets or None,
+            setup_clang_tidy=False,
+        )
+
+    if skip_plus_interface and not autocomplete_query:
+        return args[1:]
+
+    def add_source_test(source_file, bin_file, sources_to_bin):
+        src_key = pathlib.Path(
+            pathlib.Path(source_file.replace("//", "").replace(":", "/")).name
+        ).stem
+        if src_key in sources_to_bin:
+            # Don't fail eagerly: a collision on one source name shouldn't break
+            # unrelated `+` invocations. Record the conflicting binaries and only
+            # raise if the ambiguous name is actually the one being resolved.
+            duplicate_sources.setdefault(src_key, [sources_to_bin[src_key]]).append(bin_file)
+            return
+        if src_key == pathlib.Path(bin_file.replace("//", "").replace(":", "/")).name:
+            src_key = f"{src_key}-{src_key}"
+        sources_to_bin[src_key] = bin_file
+
+    # this naively gets all possible source file targets
+    for line in get_buildozer_output(autocomplete_query).splitlines():
+        # non select case
+        if line.startswith("//") and line.endswith("]"):
+            in_select = False
+            current_select = None
+            tokens = line.split("[")
+            binfile = tokens[0].strip()
+            srcs = tokens[1][:-1].split(" ")
+            added_any = False
+            for src in srcs:
+                if src.endswith(c_exts):
+                    add_source_test(src, binfile, sources_to_bin)
+                    added_any = True
+            if not added_any:
+                target_name = pathlib.Path(binfile.replace("//", "").replace(":", "/")).name
+                if target_name and target_name.endswith("_test"):
+                    rust_bin_targets[target_name] = binfile
+                    rust_bin_targets[target_name[:-5]] = binfile
+        else:
+            if not in_select:
+                current_select = line.split(" ")[0]
+                select_sources[current_select] = []
+                in_select = True
+            for token in line.split('"'):
+                if token.strip().endswith(c_exts):
+                    add_source_test(token.strip(), current_select, sources_to_bin)
+
+    if plus_autocomplete_query:
+        autocomplete_target = [
+            "//:+" + test for test in sources_to_bin.keys() if test not in duplicate_sources
+        ]
+        autocomplete_target += [
+            "//:+" + pathlib.Path(test.replace("//", "").replace(":", "/")).name
+            for test in set(sources_to_bin.values())
+        ]
+        autocomplete_target += ["//:compiledb"]
+        with open("/tmp/mongo_autocomplete_plus_targets", "w") as f:
+            f.write(" ".join(autocomplete_target))
+    elif autocomplete_query:
+        with open("/tmp/mongo_autocomplete_plus_targets", "w") as f:
+            f.write("")
+
+    if autocomplete_query or plus_autocomplete_query:
+        return args[1:]
+
+    for arg in args[1:]:
+        if arg.startswith(plus_starts):
+            test_name = arg[arg.find("+") + 1 :]
+            if test_name in duplicate_sources:
+                bins = "\n  ".join(
+                    f"{bin_file}->{test_name}" for bin_file in duplicate_sources[test_name]
+                )
+                raise DuplicateSourceNames(
+                    f"Ambiguous test name '+{test_name}': multiple test files share this name:\n  {bins}\n"
+                    "Use the full bazel target instead (e.g. //path/to:target)."
+                )
+            if test_name in rust_bin_targets:
+                real_target = rust_bin_targets[test_name]
+                bin_targets.append(real_target)
+                replacements[arg] = [real_target]
+                continue
+            real_target = sources_to_bin.get(test_name)
+
+            if not real_target:
+                for bin_target in set(sources_to_bin.values()):
+                    if (
+                        pathlib.Path(bin_target.replace("//", "").replace(":", "/")).name
+                        == test_name
+                    ):
+                        bin_targets.append(bin_target)
+                        real_target = bin_target
+                if not real_target:
+                    # Target not found - suggest similar ones and pass through
+                    suggestions = difflib.get_close_matches(test_name, sources_to_bin.keys(), n=5)
+                    error_msg = f"WARNING: Target '{arg}' not found"
+                    if suggestions:
+                        error_msg += "\n\nDid you mean one of these?\n"
+                        for suggestion in suggestions:
+                            error_msg += f"  +{suggestion}\n"
+                    else:
+                        error_msg += " and no similar targets."
+                    print(error_msg, file=sys.stderr)
+                    # Pass through the argument unchanged: it might be an important argument
+                else:
+                    replacements[arg] = [real_target]
+            else:
+                # defer source targets to see if we can skip redundant tests
+                source_targets[test_name] = [arg, real_target]
+
+    source_targets_without_bin_targets = []
+    bins_from_source_added = []
+    for test_name, values in source_targets.items():
+        arg, real_target = values
+
+        if real_target not in bin_targets:
+            if real_target not in bins_from_source_added:
+                replacements[arg] = [real_target]
+                bins_from_source_added.append(real_target)
+            else:
+                replacements[arg] = []
+            if test_name not in fileNameFilter:
+                fileNameFilter += [test_name]
+            source_targets_without_bin_targets.append(test_name)
+        else:
+            replacements[arg] = []
+
+    if bin_targets and source_targets_without_bin_targets:
+        raise BinAndSourceIncompatible(
+            "Cannot mix source file test targets with different test binary targets.\n"
+            + "Conflicting source targets:\n    "
+            + "\n    ".join(source_targets_without_bin_targets)
+            + "\n"
+            + "Conflicting binary targets:\n    "
+            + "\n    ".join(
+                [
+                    pathlib.Path(bin_target.replace("//", "").replace(":", "/")).name
+                    for bin_target in bin_targets
+                ]
+            )
+        )
+
+    new_args = []
+    replaced_already = []
+    for arg in args[1:]:
+        replaced = False
+        for k, v in replacements.items():
+            if v and v[0] is None:
+                pass
+            elif arg == k:
+                if k not in replaced_already:
+                    new_args.extend(v)
+                    replaced_already.append(k)
+                replaced = True
+                break
+        if not replaced:
+            new_args.append(arg)
+
+    if fileNameFilter:
+        if current_bazel_command == "test":
+            new_args.append("--test_arg=--fileNameFilter")
+            new_args.append(f"--test_arg={'|'.join(fileNameFilter)}")
+        if current_bazel_command == "run":
+            if "--" not in args:
+                new_args.append("--")
+            new_args.append("--fileNameFilter")
+            new_args.append(f"{'|'.join(fileNameFilter)}")
+
+    wrapper_debug(f"plus interface time: {time.time() - start}")
+
+    return new_args

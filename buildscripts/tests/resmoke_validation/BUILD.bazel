@@ -1,0 +1,65 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_suites_configurations",
+    srcs = ["test_suites_configurations.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)
+
+py_test(
+    name = "test_find_suites",
+    srcs = ["test_find_suites.py"],
+    data = [
+        "//buildscripts/resmokeconfig:all_files",
+        "//jstests/core/testing:all_subpackage_javascript_files",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts:resmoke",
+    ],
+)
+
+py_test(
+    name = "test_generated_matrix_suites",
+    srcs = ["test_generated_matrix_suites.py"],
+    data = [
+        "//buildscripts/resmokeconfig:all_files",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/logging",
+    ],
+)
+
+py_test(
+    name = "test_jstest_tags",
+    srcs = ["test_jstest_tags.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/idl",
+        "//buildscripts/resmokelib",
+    ],
+)
+
+py_test(
+    name = "test_matrix_suite_generation",
+    srcs = ["test_matrix_suite_generation.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/logging",
+    ],
+)
+
+py_test(
+    name = "test_derive_suite_selectors",
+    srcs = ["test_derive_suite_selectors.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//bazel/resmoke:derive_suite_selectors",
+    ],
+)

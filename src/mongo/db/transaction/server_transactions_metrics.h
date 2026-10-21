@@ -1,0 +1,145 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/transaction/transactions_stats_gen.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <mutex>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * Container for server-wide multi-document transaction statistics.
+ */
+class ServerTransactionsMetrics {
+    ServerTransactionsMetrics(const ServerTransactionsMetrics&) = delete;
+    ServerTransactionsMetrics& operator=(const ServerTransactionsMetrics&) = delete;
+
+public:
+    ServerTransactionsMetrics() = default;
+
+    static ServerTransactionsMetrics* get(ServiceContext* service);
+    static ServerTransactionsMetrics* get(OperationContext* opCtx);
+
+    unsigned long long getCurrentActive() const;
+    void decrementCurrentActive();
+    void incrementCurrentActive();
+
+    unsigned long long getCurrentInactive() const;
+    void decrementCurrentInactive();
+    void incrementCurrentInactive();
+
+    unsigned long long getCurrentOpen() const;
+    void decrementCurrentOpen();
+    void incrementCurrentOpen();
+
+    unsigned long long getTotalStarted() const;
+    unsigned long long getTotalStartedInternal() const;
+    unsigned long long getTotalStartedExternal() const;
+    void incrementTotalStarted(bool isServerInitiated);
+
+    unsigned long long getTotalAborted() const;
+    unsigned long long getTotalAbortedInternal() const;
+    unsigned long long getTotalAbortedExternal() const;
+    void incrementTotalAborted(bool isServerInitiated);
+
+    unsigned long long getTotalCommitted() const;
+    unsigned long long getTotalCommittedInternal() const;
+    unsigned long long getTotalCommittedExternal() const;
+    void incrementTotalCommitted(bool isServerInitiated);
+
+    unsigned long long getTotalPrepared() const;
+    unsigned long long getTotalPreparedInternal() const;
+    unsigned long long getTotalPreparedExternal() const;
+    void incrementTotalPrepared(bool isServerInitiated);
+
+    unsigned long long getTotalPreparedThenCommitted() const;
+    unsigned long long getTotalPreparedThenCommittedInternal() const;
+    unsigned long long getTotalPreparedThenCommittedExternal() const;
+    void incrementTotalPreparedThenCommitted(bool isServerInitiated);
+
+    unsigned long long getTotalPreparedThenAborted() const;
+    unsigned long long getTotalPreparedThenAbortedInternal() const;
+    unsigned long long getTotalPreparedThenAbortedExternal() const;
+    void incrementTotalPreparedThenAborted(bool isServerInitiated);
+
+    unsigned long long getCurrentPrepared() const;
+    void incrementCurrentPrepared();
+    void decrementCurrentPrepared();
+
+    void updateLastTransaction(size_t operationCount,
+                               size_t oplogOperationBytes,
+                               BSONObj writeConcern);
+
+    void incrementReclaimedPreparedTxnsCommitted();
+    long long getReclaimedPreparedTxnsCommitted() const;
+
+    void incrementReclaimedPreparedTxnsAborted();
+    long long getReclaimedPreparedTxnsAborted() const;
+
+    /**
+     * Appends the accumulated stats to a transactions stats object.
+     * Include the 'lastCommittedTransactions' field if 'includeLastCommitted' is true.
+     */
+    void updateStats(TransactionsStats* stats, bool includeLastCommitted);
+
+private:
+    // The number of multi-document transactions currently active.
+    Atomic<unsigned long long> _currentActive{0};
+
+    // The number of multi-document transactions currently inactive.
+    Atomic<unsigned long long> _currentInactive{0};
+
+    // The total number of open transactions.
+    Atomic<unsigned long long> _currentOpen{0};
+
+    // Total counts are classified as "external" if the transactions were started explicitly
+    // by a user and "internal" if they were server-initiated.
+
+    // The total number of multi-document transactions started since the last server startup.
+    Atomic<unsigned long long> _totalStartedInternal{0};
+    Atomic<unsigned long long> _totalStartedExternal{0};
+
+    // The total number of multi-document transaction aborts.
+    Atomic<unsigned long long> _totalAbortedInternal{0};
+    Atomic<unsigned long long> _totalAbortedExternal{0};
+
+    // The total number of multi-document transaction commits.
+    Atomic<unsigned long long> _totalCommittedInternal{0};
+    Atomic<unsigned long long> _totalCommittedExternal{0};
+
+    // The total number of prepared transactions since the last server startup.
+    Atomic<unsigned long long> _totalPreparedInternal{0};
+    Atomic<unsigned long long> _totalPreparedExternal{0};
+
+    // The total number of prepared transaction commits.
+    Atomic<unsigned long long> _totalPreparedThenCommittedInternal{0};
+    Atomic<unsigned long long> _totalPreparedThenCommittedExternal{0};
+
+    // The total number of prepared transaction aborts.
+    Atomic<unsigned long long> _totalPreparedThenAbortedInternal{0};
+    Atomic<unsigned long long> _totalPreparedThenAbortedExternal{0};
+
+    // The current number of transactions in the prepared state.
+    Atomic<unsigned long long> _currentPrepared{0};
+
+    Atomic<long long> _reclaimedPreparedTxnsCommitted{0};
+    Atomic<long long> _reclaimedPreparedTxnsAborted{0};
+
+    // Protects member variables below.
+    mutable std::mutex _mutex;
+
+    boost::optional<LastCommittedTransaction> _lastCommittedTransaction;
+};
+
+}  // namespace mongo

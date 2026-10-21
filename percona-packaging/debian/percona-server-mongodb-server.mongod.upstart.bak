@@ -1,0 +1,56 @@
+# Ubuntu upstart file at /etc/init/mongod.conf
+
+# Recommended ulimit values for mongod or mongos
+# See http://docs.mongodb.org/manual/reference/ulimit/#recommended-settings
+#
+limit fsize unlimited unlimited
+limit cpu unlimited unlimited
+limit as unlimited unlimited
+limit nofile 64000 64000
+limit rss unlimited unlimited
+limit nproc 32000 32000
+
+kill timeout 300 # wait 300s between SIGTERM and SIGKILL.
+
+pre-start script
+  DAEMONUSER=${DAEMONUSER:-mongod}
+  if [ ! -d /var/lib/mongodb ]; then
+    mkdir -p /var/lib/mongodb && chown mongod:mongod /var/lib/mongodb
+  fi
+  mkdir -p /var/run
+  touch /var/run/mongod.pid
+  chown $DAEMONUSER /var/run/mongod.pid
+  /usr/bin/percona-server-mongodb-helper.sh
+#
+end script
+
+start on runlevel [2345]
+stop on runlevel [06]
+
+script
+  ENABLE_MONGOD=yes
+  DAEMON=/usr/bin/mongod
+  DAEMONUSER=${DAEMONUSER:-mongod}
+
+  if [ -f /etc/default/mongod ]; then . /etc/default/mongod; fi
+  # Handle NUMA access to CPUs (SERVER-3574)
+  # This verifies the existence of numactl as well as testing that the command works
+  NUMACTL_ARGS="--interleave=all"
+  if which numactl >/dev/null 2>/dev/null && numactl $NUMACTL_ARGS ls / >/dev/null 2>/dev/null
+  then
+    NUMACTL="$(which numactl) -- $NUMACTL_ARGS"
+    DAEMON_OPTS="${OPTIONS:-}"
+  else
+    NUMACTL=""
+    DAEMON_OPTS="-- ${OPTIONS:-}"
+  fi
+
+  if [ "x$ENABLE_MONGOD" = "xyes" ]
+  then
+    exec start-stop-daemon --start \
+        --chuid $DAEMONUSER \
+        --pidfile /var/run/mongod.pid \
+        --make-pidfile \
+        --exec $NUMACTL $DAEMON $DAEMON_OPTS
+  fi
+end script

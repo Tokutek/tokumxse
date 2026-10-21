@@ -1,0 +1,215 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/default_baton.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+
+#include <algorithm>
+#include <mutex>
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+namespace mongo {
+
+namespace {
+
+const auto kDetached = Status(ErrorCodes::ShutdownInProgress, "Baton detached");
+
+}  // namespace
+
+DefaultBaton::DefaultBaton(OperationContext* opCtx) : _opCtx(opCtx) {}
+
+DefaultBaton::~DefaultBaton() {
+    invariant(!_opCtx);
+    invariant(_scheduled.empty());
+}
+
+void DefaultBaton::detachImpl() {
+    decltype(_scheduled) scheduled;
+    decltype(_timers) timers;
+
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+
+        invariant(_opCtx->getBaton().get() == this);
+        _opCtx->setBaton(nullptr);
+
+        _opCtx = nullptr;
+
+        using std::swap;
+        swap(_scheduled, scheduled);
+        swap(_timers, timers);
+        _timersById.clear();
+    }
+
+    for (auto& timer : timers) {
+        timer.second.promise.setError(kDetached);
+    }
+
+    for (auto& job : scheduled) {
+        job(kDetached);
+    }
+}
+
+void DefaultBaton::schedule(Task func) {
+    std::unique_lock<std::mutex> lk(_mutex);
+
+    if (!_opCtx) {
+        lk.unlock();
+        func(kDetached);
+
+        return;
+    }
+
+    _scheduled.push_back(std::move(func));
+
+    if (_sleeping && !_notified) {
+        _notified = true;
+        _cv.notify_one();
+    }
+}
+
+void DefaultBaton::_notify(std::unique_lock<std::mutex> lk) noexcept {
+    dassert(lk.mutex() == &_mutex);
+
+    _notified = true;
+    _cv.notify_one();
+}
+
+void DefaultBaton::notify() noexcept {
+    _notify(std::unique_lock<std::mutex>(_mutex));
+}
+
+Waitable::TimeoutState DefaultBaton::run_until(ClockSource* clkSource,
+                                               Date_t oldDeadline) noexcept {
+    // We'll fulfill promises and run jobs on the way out, ensuring we don't hold any locks
+    const ScopeGuard guard([&] {
+        std::unique_lock<std::mutex> lk(_mutex);
+
+        // Fire expired timers
+        std::vector<Timer> expiredTimers;
+        const auto now = clkSource->now();
+        for (auto it = _timers.begin(); it != _timers.end() && it->first <= now;
+             it = _timers.erase(it)) {
+            _timersById.erase(it->second.id);
+            expiredTimers.push_back(std::move(it->second));
+        }
+
+        lk.unlock();
+        for (auto& timer : expiredTimers) {
+            timer.promise.emplaceValue();
+        }
+        lk.lock();
+
+        // While we have scheduled work, keep running jobs
+        while (_scheduled.size()) {
+            auto toRun = std::exchange(_scheduled, {});
+
+            lk.unlock();
+            for (auto& job : toRun) {
+                job(Status::OK());
+            }
+            lk.lock();
+        }
+    });
+
+    std::unique_lock<std::mutex> lk(_mutex);
+
+    // If anything was scheduled, run it now.
+    if (_scheduled.size()) {
+        return Waitable::TimeoutState::NoTimeout;
+    }
+
+    auto newDeadline = oldDeadline;
+
+    if (!_timers.empty()) {
+        newDeadline = std::min(oldDeadline, _timers.begin()->first);
+    }
+
+    // we mark sleeping, so that we receive notifications
+    _sleeping = true;
+
+    // while we're not notified
+    auto notified =
+        clkSource->waitForConditionUntil(_cv, lk, newDeadline, [&] { return _notified; });
+
+    _sleeping = false;
+    _notified = false;
+
+    // If we've been notified, or we haven't timed out yet, return as if by spurious wakeup.
+    // Otherwise call it a timeout.
+    return (notified || (clkSource->now() < oldDeadline)) ? Waitable::TimeoutState::NoTimeout
+                                                          : Waitable::TimeoutState::Timeout;
+}
+
+void DefaultBaton::run(ClockSource* clkSource) noexcept {
+    run_until(clkSource, Date_t::max());
+}
+
+void DefaultBaton::_safeExecute(std::unique_lock<std::mutex> lk, Job job) {
+    dassert(lk.mutex() == &_mutex);
+
+    if (!_opCtx) {
+        // If we're detached, no job can safely execute.
+        iasserted(kDetached);
+    }
+
+    if (_sleeping) {
+        _scheduled.push_back([this, job = std::move(job)](auto status) mutable {
+            if (status.isOK()) {
+                job(std::unique_lock<std::mutex>(_mutex));
+            }
+        });
+        _notify(std::move(lk));
+    } else {
+        job(std::move(lk));
+    }
+}
+
+Future<void> DefaultBaton::waitUntil(Date_t expiration, const CancellationToken& token) try {
+    auto pf = makePromiseFuture<void>();
+    auto id = _nextTimerId.fetchAndAdd(1);
+    _safeExecute(std::unique_lock(_mutex),
+                 [this, id, expiration, promise = std::move(pf.promise)](auto lk) mutable {
+                     auto iter = _timers.emplace(expiration, Timer{id, std::move(promise)});
+                     _timersById[iter->second.id] = iter;
+                 });
+
+    token.onCancel().thenRunOn(shared_from_this()).getAsync([this, id](Status s) {
+        if (s.isOK()) {
+            std::unique_lock lk(_mutex);
+            if (_timersById.find(id) == _timersById.end()) {
+                return;
+            }
+
+            _safeExecute(std::move(lk), [this, id](auto lk) {
+                auto it = _timersById.find(id);
+                if (it == _timersById.end()) {
+                    return;
+                }
+                auto timer = std::exchange(it->second->second, {});
+                _timers.erase(it->second);
+                _timersById.erase(it);
+                lk.unlock();
+
+                timer.promise.setError(
+                    Status(ErrorCodes::CallbackCanceled, "Baton wait cancelled"));
+            });
+        }
+    });
+    return std::move(pf.future);
+} catch (const DBException& e) {
+    return e.toStatus();
+}
+
+}  // namespace mongo

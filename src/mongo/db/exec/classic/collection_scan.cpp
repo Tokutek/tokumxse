@@ -1,0 +1,588 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/collection_scan.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/admission/ticketing/admission_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/exec/classic/filter.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/query/record_id_range.h"
+#include "mongo/db/query/record_id_range_list.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/resharding/resume_token_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <memory>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+MONGO_FAIL_POINT_DEFINE(hangCollScanDoWork);
+
+namespace mongo {
+
+namespace {
+bool shouldIncludeStartRecord(const CollectionScanParams& params) {
+    return params.boundInclusion ==
+        CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords ||
+        params.boundInclusion == CollectionScanParams::ScanBoundInclusion::kIncludeStartRecordOnly;
+}
+
+const char* getStageName(const CollectionAcquisition& coll, const CollectionScanParams& params) {
+    return (!coll.getCollectionPtr()->ns().isOplog() && (params.minRecord || params.maxRecord))
+        ? "CLUSTERED_IXSCAN"
+        : "COLLSCAN";
+}
+
+void handleCollScanDoWorkFailpoint() {
+    if (auto fp = hangCollScanDoWork.scoped(); MONGO_unlikely(fp.isActive())) {
+        const BSONObj& data = fp.getData();
+        if (auto delay = data.getField("delay"); delay.isNumber()) {
+            sleepFor(Milliseconds(delay.numberInt()));
+        } else {
+            hangCollScanDoWork.pauseWhileSet();
+        }
+    }
+}
+
+}  // namespace
+
+
+CollectionScan::CollectionScan(ExpressionContext* expCtx,
+                               CollectionAcquisition collection,
+                               const CollectionScanParams& params,
+                               WorkingSet* workingSet,
+                               const MatchExpression* filter)
+    : RequiresCollectionStage(getStageName(collection, params), expCtx, collection),
+      _workingSet(workingSet),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
+      _params(params) {
+    const auto& collPtr = collection.getCollectionPtr();
+    // Explain reports the direction of the collection scan.
+    _specificStats.direction = params.direction;
+    _specificStats.tailable = params.tailable;
+    // Mirror the bounds as a single-range RecordIdRangeList so explain output is uniform with
+    // MultiRangeClusteredScan. Inclusivity is expressed in min/max (value) order; for BACKWARD
+    // scans, the user-facing "start" is the max and "end" is the min, so the inclusivity flags
+    // get swapped accordingly.
+    if (params.minRecord || params.maxRecord) {
+        const bool startInclusive =
+            (params.boundInclusion ==
+                 CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords ||
+             params.boundInclusion ==
+                 CollectionScanParams::ScanBoundInclusion::kIncludeStartRecordOnly);
+        const bool endInclusive =
+            (params.boundInclusion ==
+                 CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords ||
+             params.boundInclusion ==
+                 CollectionScanParams::ScanBoundInclusion::kIncludeEndRecordOnly);
+        const bool minInclusive =
+            (params.direction == CollectionScanParams::FORWARD) ? startInclusive : endInclusive;
+        const bool maxInclusive =
+            (params.direction == CollectionScanParams::FORWARD) ? endInclusive : startInclusive;
+        RecordIdRange range;
+        range.intersectRange(params.minRecord, params.maxRecord, minInclusive, maxInclusive);
+        _specificStats.rangeList = RecordIdRangeList(std::move(range));
+    }
+    if (params.minRecord || params.maxRecord) {
+        // The 'minRecord' and 'maxRecord' parameters are used for a special optimization that
+        // applies only to forwards scans of the oplog and scans on clustered collections.
+        tassert(9049500,
+                "Cannot resume using '$_resumeAfter'/ '$_startAt' if 'minRecord' or 'maxRecord' is "
+                "used",
+                !params.resumeScanPoint);
+        if (collPtr->ns().isOplog()) {
+            tassert(11051659,
+                    "Expecting forward Oplog scan direction",
+                    params.direction == CollectionScanParams::FORWARD);
+        } else {
+            tassert(11051658, "Expecting clustered collection", collPtr->isClustered());
+        }
+    }
+
+    if (params.boundInclusion !=
+        CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords) {
+        // A collection must be clustered if the bounds aren't both included by default.
+        tassert(6125000,
+                "Only collection scans on clustered collections may specify recordId "
+                "BoundInclusion policies",
+                collPtr->isClustered());
+
+        if (filter) {
+            // The filter is applied after the ScanBoundInclusion is considered.
+            LOGV2_DEBUG(6125007,
+                        5,
+                        "Running a bounded collection scan with a ScanInclusionBound may cause "
+                        "the filter to be overriden");
+        }
+    }
+
+    LOGV2_DEBUG(5400802,
+                5,
+                "collection scan bounds",
+                "min"_attr = (!_params.minRecord) ? "none" : redact(_params.minRecord->toString()),
+                "max"_attr = (!_params.maxRecord) ? "none" : redact(_params.maxRecord->toString()));
+    tassert(6521000,
+            "Expected oplog scan with 'shouldTrackLatestOplogTimestamp'",
+            !_params.shouldTrackLatestOplogTimestamp || collPtr->ns().isOplog());
+
+    if (params.assertTsHasNotFallenOff) {
+        tassert(6521001,
+                "Expected 'shouldTrackLatestOplogTimestamp' with 'assertTsHasNotFallenOff'",
+                params.shouldTrackLatestOplogTimestamp);
+        tassert(6521002,
+                "Expected forward collection scan with 'assertTsHasNotFallenOff'",
+                params.direction == CollectionScanParams::FORWARD);
+    }
+
+    if (params.resumeScanPoint) {
+        // The 'resumeScanPoint' parameter is used for resumable collection scans, which we
+        // only support in the forward direction.
+        tassert(6521003,
+                "Expected forward collection scan with 'resumeScanPoint'",
+                params.direction == CollectionScanParams::FORWARD);
+    }
+
+    // Set up 'OplogWaitConfig' if we are scanning the oplog.
+    if (collPtr && collPtr->ns().isOplog()) {
+        _oplogWaitConfig = OplogWaitConfig();
+    }
+}
+
+namespace {
+
+/**
+ * Returns the first document (owned) in the collection using the cursor 'newCursor' assuming that
+ * the cursor has not been used and is unpositioned.
+ */
+BSONObj getFirstEntry(RecoveryUnit& ru, SeekableRecordCursor* newCursor) {
+    auto firstRecord = newCursor->next();
+    uassert(ErrorCodes::CollectionIsEmpty,
+            "Found collection empty when checking that the first record has not rolled over",
+            firstRecord);
+    auto entry = firstRecord->data.toBson().getOwned();
+
+    // If we use the cursor, unposition it so that it is ready for use by future callers.
+    newCursor->saveUnpositioned();
+    newCursor->restore(ru);
+    return entry;
+}
+
+/**
+ * Asserts that the timestamp has not already fallen off the oplog and then returns an unpositioned
+ * cursor.
+ *
+ * Throws OplogQueryMinTsMissing if tsToCheck no longer exists in the oplog.
+ * Throws CollectionIsEmpty if the collection has no documents.
+ */
+std::unique_ptr<SeekableRecordCursor> initCursorAndAssertTsHasNotFallenOff(
+    OperationContext* opCtx, const CollectionPtr& coll, Timestamp tsToCheck) {
+    auto cursor = coll->getCursor(opCtx);
+    const auto firstEntry =
+        getFirstEntry(*shard_role_details::getRecoveryUnit(opCtx), cursor.get());
+    const repl::OplogEntryParserNonStrict oplogEntryParser{firstEntry};
+
+    // Indicates that 'firstEntry' means initialization of a replica set.
+    bool isNewRS{false};
+    try {
+        // Verify that the timestamp of the first observed oplog entry is earlier than or equal to
+        // timestamp that should not have fallen off the oplog.
+        if (oplogEntryParser.getOpTime().getTimestamp() <= tsToCheck) {
+            return cursor;
+        }
+
+        // If the first entry we see in the oplog is the replset initialization, then it doesn't
+        // matter if its timestamp is later than the timestamp that should not have fallen off the
+        // oplog; no events earlier can have fallen off this oplog.
+        isNewRS = !rss::ReplicatedStorageService::get(opCtx)
+                       .getPersistenceProvider()
+                       .oplogHasBeenTruncated(firstEntry);
+    } catch (const AssertionException& exception) {
+        uasserted(8881102,
+                  str::stream() << "Failed to parse the oldest oplog entry" << causedBy(exception));
+    }
+    uassert(ErrorCodes::OplogQueryMinTsMissing,
+            str::stream()
+                << "Specified timestamp has already fallen off the oplog for the input timestamp: "
+                << tsToCheck << ", first oplog entry: " << firstEntry.toString(),
+            isNewRS);
+    return cursor;
+}
+}  // namespace
+
+void CollectionScan::initCursor(OperationContext* opCtx,
+                                const CollectionPtr& collPtr,
+                                bool forward) {
+    if (_params.assertTsHasNotFallenOff) {
+        tassert(11051657, "Expect forward scan if scanning the oplog", forward);
+        _cursor =
+            initCursorAndAssertTsHasNotFallenOff(opCtx, collPtr, *_params.assertTsHasNotFallenOff);
+
+        // We don't need to check this assertion again after we've confirmed the first oplog event.
+        _params.assertTsHasNotFallenOff = boost::none;
+    } else {
+        _cursor = collPtr->getCursor(opCtx, forward);
+    }
+}
+
+PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
+    handleCollScanDoWorkFailpoint();
+
+    if (_commonStats.isEOF) {
+        _priority.reset();
+        return PlanStage::IS_EOF;
+    }
+
+    boost::optional<Record> record;
+    const bool needToMakeCursor = !_cursor;
+    const auto& collPtr = collectionPtr();
+
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "CollectionScan",
+        [&] {
+            if (needToMakeCursor) {
+                const bool forward = _params.direction == CollectionScanParams::FORWARD;
+                if (forward && _params.shouldWaitForOplogVisibility) {
+                    tassert(9478714, "Must have oplog wait config configured", _oplogWaitConfig);
+                    if (_oplogWaitConfig->shouldWaitForOplogVisibility()) {
+                        tassert(9478701,
+                                "We should only request yield for a tailable oplog scan",
+                                !_params.tailable && collPtr->ns().isOplog());
+
+                        // Perform wait during yield. Note that we mark this as having waited before
+                        // actually waiting so that we can distinguish waiting for oplog visiblity
+                        // from a WriteConflictException when handling this yield.
+                        _oplogWaitConfig->setWaitedForOplogVisibility();
+                        LOGV2_DEBUG(
+                            9478711, 2, "Oplog scan triggering yield to wait for visibility");
+                        return NEED_YIELD;
+                    }
+                }
+
+                try {
+                    initCursor(opCtx(), collPtr, forward);
+                } catch (const ExceptionFor<ErrorCodes::CollectionIsEmpty>&) {
+                    _commonStats.isEOF = true;
+                    return PlanStage::IS_EOF;
+                }
+
+                if (!_lastSeenId.isNull()) {
+                    tassert(11051656, "Expecting tailable scan", _params.tailable);
+                    // Seek to where we were last time. If it no longer exists, mark us as dead
+                    // since we want to signal an error rather than silently dropping data from the
+                    // stream.
+                    //
+                    // Note that we want to return the record *after* this one since we have already
+                    // returned this one. This is possible in the tailing case. Notably, tailing is
+                    // the only time we'd need to create a cursor after already getting a record out
+                    // of it and updating our _lastSeenId.
+                    if (!_cursor->seekExact(_lastSeenId)) {
+                        uasserted(ErrorCodes::CappedPositionLost,
+                                  str::stream() << "CollectionScan died due to failure to restore "
+                                                << "tailable cursor position. "
+                                                << "Last seen record id: " << _lastSeenId);
+                    }
+                    ++_specificStats.seeks;
+                }
+
+                if (_params.resumeScanPoint) {
+                    tassert(11051655, "Expecting non-tailable scan", !_params.tailable);
+                    tassert(11051654,
+                            "Expecting nothing to be returned from the cursor yet",
+                            _lastSeenId.isNull());
+                    // Seek to where we are trying to resume the scan from. Signal a KeyNotFound
+                    // error if the recordId is null.
+                    //
+                    // Note that we want to return the record *after* this one since we have already
+                    // returned this one prior to the resume *unless* we are resuming from a deleted
+                    // record id in which case the cursor is already positioned on the next record
+                    // id.
+                    auto& resumeScanPoint = *_params.resumeScanPoint;
+                    auto& recordIdToSeek = resumeScanPoint.recordId;
+                    if (recordIdToSeek.isNull()) {
+                        uasserted(
+                            ErrorCodes::KeyNotFound,
+                            "Failed to resume collection scan: cannot resume from null recordId");
+                    }
+
+                    // Attempt to seek to the exact recordId. If it doesn't exist and we're using
+                    // '$_startAt' (tolerateKeyNotFound = true), we'll use seek() instead to find
+                    // the next highest recordId and return. In this case the cursor is already
+                    // positioned on the recordId we want to return so we don't need to advance it
+                    // again below. If tolerateKeyNotFound = false, we throw.
+                    auto testRecord = _cursor->seekExact(recordIdToSeek);
+                    ++_specificStats.seeks;
+                    if (!testRecord) {
+                        if (resumeScanPoint.tolerateKeyNotFound) {
+                            record = _cursor->seek(recordIdToSeek,
+                                                   SeekableRecordCursor::BoundInclusion::kInclude);
+                            ++_specificStats.seeks;
+                            return PlanStage::ADVANCED;
+                        } else {
+                            uasserted(
+                                ErrorCodes::KeyNotFound,
+                                str::stream()
+                                    << "Failed to resume collection scan: the recordId from "
+                                    << "which we are attempting to resume no longer exists in "
+                                    << "the collection: " << recordIdToSeek);
+                        }
+                    }
+                }
+
+                if (_lastSeenId.isNull() && _params.direction == CollectionScanParams::FORWARD &&
+                    _params.minRecord) {
+                    // Seek to the start location and return it.
+                    record = _cursor->seek(_params.minRecord->recordId(),
+                                           shouldIncludeStartRecord(_params)
+                                               ? SeekableRecordCursor::BoundInclusion::kInclude
+                                               : SeekableRecordCursor::BoundInclusion::kExclude);
+                    ++_specificStats.seeks;
+                    return PlanStage::ADVANCED;
+                } else if (_lastSeenId.isNull() &&
+                           _params.direction == CollectionScanParams::BACKWARD &&
+                           _params.maxRecord) {
+                    // Seek to the start location and return it.
+                    record = _cursor->seek(_params.maxRecord->recordId(),
+                                           shouldIncludeStartRecord(_params)
+                                               ? SeekableRecordCursor::BoundInclusion::kInclude
+                                               : SeekableRecordCursor::BoundInclusion::kExclude);
+                    ++_specificStats.seeks;
+                    return PlanStage::ADVANCED;
+                }
+            }
+
+            record = _cursor->next();
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            // Leave us in a state to try again next time.
+            if (needToMakeCursor)
+                _cursor.reset();
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
+    }
+
+    if (!record) {
+        // We hit EOF. If we are tailable, leave us in a state to pick up where we left off on the
+        // next call to work(). Otherwise, the EOF is permanent.
+        if (_params.tailable) {
+            _cursor.reset();
+        } else {
+            _lastSeenId = RecordId();
+            _commonStats.isEOF = true;
+        }
+
+        _priority.reset();
+        return PlanStage::IS_EOF;
+    }
+
+    _lastSeenId = record->id;
+    if (_params.shouldTrackLatestOplogTimestamp) {
+        setLatestOplogEntryTimestamp(*record);
+    }
+
+    WorkingSetID id = _workingSet->allocate();
+    WorkingSetMember* member = _workingSet->get(id);
+    member->recordId = std::move(record->id);
+    member->resetDocument(shard_role_details::getRecoveryUnit(opCtx())->getSnapshotId(),
+                          record->data.releaseToBson());
+    _workingSet->transitionToRecordIdAndObj(id);
+
+    return returnIfMatches(member, id, out);
+}
+
+void CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
+    auto extractTimestampFromTsField = [&]() {
+        auto tsElem = record.data.toBson()[repl::OpTime::kTimestampFieldName];
+        uassert(ErrorCodes::Error(4382100),
+                str::stream() << "CollectionScan was asked to track latest operation time, "
+                                 "but found a result without a valid 'ts' field: "
+                              << record.data.toBson().toString(),
+                tsElem.type() == BSONType::timestamp);
+        return tsElem.timestamp();
+    };
+
+    const Timestamp ts = [&]() {
+        // For oplog records, the RecordId is the timestamp key, so the scan can avoid reparsing
+        // BSON just to read the 'ts' field.
+        if (record.id.isLong()) {
+            Timestamp tsFromId = Timestamp(static_cast<unsigned long long>(record.id.getLong()));
+            dassert(tsFromId == extractTimestampFromTsField());
+            return tsFromId;
+        }
+
+        // Fallback: extract timestamp from "ts" field of BSON record.
+        return extractTimestampFromTsField();
+    }();
+
+    LOGV2_DEBUG(550450,
+                5,
+                "Setting _latestOplogEntryTimestamp to the max of the timestamp of the current "
+                "latest oplog entry and the timestamp of the current record",
+                "latestOplogEntryTimestamp"_attr = _latestOplogEntryTimestamp,
+                "currentRecordTimestamp"_attr = ts);
+    _latestOplogEntryTimestamp = std::max(_latestOplogEntryTimestamp, ts);
+}
+
+BSONObj CollectionScan::getPostBatchResumeToken() const {
+    // Return a resume token compatible with resumable initial sync.
+    if (_params.requestResumeToken) {
+        BSONObjBuilder builder;
+        _lastSeenId.serializeToken("$recordId", &builder);
+        auto initialSyncId = repl::ReplicationCoordinator::get(opCtx())->getInitialSyncId(opCtx());
+        if (initialSyncId) {
+            initialSyncId.value().appendToBuilder(&builder, "$initialSyncId");
+        }
+        return builder.obj();
+    }
+    // Return a resume token compatible with resharding oplog sync.
+    if (_params.shouldTrackLatestOplogTimestamp) {
+        return ResumeTokenOplogTimestamp{_latestOplogEntryTimestamp}.toBSON();
+    }
+
+    return {};
+}
+
+namespace {
+bool shouldIncludeEndRecord(const CollectionScanParams& params) {
+    return params.boundInclusion ==
+        CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords ||
+        params.boundInclusion == CollectionScanParams::ScanBoundInclusion::kIncludeEndRecordOnly;
+}
+
+bool pastEndOfRange(const CollectionScanParams& params, const WorkingSetMember& member) {
+    if (params.direction == CollectionScanParams::FORWARD) {
+        // A forward scan ends with the maxRecord when it is specified.
+        if (!params.maxRecord) {
+            return false;
+        }
+
+        const auto& endRecord = params.maxRecord->recordId();
+        return member.recordId > endRecord ||
+            (member.recordId == endRecord && !shouldIncludeEndRecord(params));
+    } else {
+        // A backward scan ends with the minRecord when it is specified.
+        if (!params.minRecord) {
+            return false;
+        }
+        const auto& endRecord = params.minRecord->recordId();
+
+        return member.recordId < endRecord ||
+            (member.recordId == endRecord && !shouldIncludeEndRecord(params));
+    }
+}
+
+}  // namespace
+
+PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
+                                                      WorkingSetID memberID,
+                                                      WorkingSetID* out) {
+    ++_specificStats.docsTested;
+
+    // The 'maxRecord' bound is always inclusive, even if the query predicate is
+    // an exclusive inequality like $lt. In such cases, we rely on '_filter' to either
+    // exclude or include the endpoints as required by the user's query.
+    if (pastEndOfRange(_params, *member)) {
+        _workingSet->free(memberID);
+        _commonStats.isEOF = true;
+        return PlanStage::IS_EOF;
+    }
+
+    if (!Filter::passes(member, _filter)) {
+        _workingSet->free(memberID);
+        if (_params.shouldReturnEofOnFilterMismatch) {
+            _commonStats.isEOF = true;
+            return PlanStage::IS_EOF;
+        }
+        return PlanStage::NEED_TIME;
+    }
+    if (_params.stopApplyingFilterAfterFirstMatch) {
+        _filter = nullptr;
+    }
+    *out = memberID;
+    return PlanStage::ADVANCED;
+}
+
+bool CollectionScan::isEOF() const {
+    return _commonStats.isEOF;
+}
+
+void CollectionScan::doSaveStateRequiresCollection() {
+    if (_cursor) {
+        _cursor->save();
+    }
+}
+
+void CollectionScan::doRestoreStateRequiresCollection() {
+    if (_cursor) {
+        // If this collection scan serves a read operation on a capped collection, only restore the
+        // cursor if it can be repositioned exactly where it was, so that consumers don't silently
+        // get 'holes' when scanning capped collections. If this collection scan serves a write
+        // operation on a capped collection like a clustered TTL deletion, exempt this operation
+        // from the guarantees above.
+        const auto tolerateCappedCursorRepositioning = expCtx()->getIsCappedDelete();
+        const bool couldRestore = _cursor->restore(*shard_role_details::getRecoveryUnit(opCtx()),
+                                                   tolerateCappedCursorRepositioning);
+        uassert(ErrorCodes::CappedPositionLost,
+                str::stream()
+                    << "CollectionScan died due to position in capped collection being deleted. "
+                    << "Last seen record id: " << _lastSeenId,
+                couldRestore);
+    }
+}
+
+void CollectionScan::doDetachFromOperationContext() {
+    if (_cursor)
+        _cursor->detachFromOperationContext();
+
+    _priority.reset();
+}
+
+void CollectionScan::doReattachToOperationContext() {
+    if (_cursor)
+        _cursor->reattachToOperationContext(opCtx());
+}
+
+std::unique_ptr<PlanStageStats> CollectionScan::getStats() {
+    // Add a BSON representation of the filter to the stats tree, if there is one.
+    if (nullptr != _filter) {
+        _commonStats.filter = _filter->serialize();
+    }
+
+    std::unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_COLLSCAN);
+    ret->specific = std::make_unique<CollectionScanStats>(_specificStats);
+    return ret;
+}
+
+const SpecificStats* CollectionScan::getSpecificStats() const {
+    return &_specificStats;
+}
+
+}  // namespace mongo

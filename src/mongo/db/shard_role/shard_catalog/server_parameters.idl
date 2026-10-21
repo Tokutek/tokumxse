@@ -1,0 +1,39 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: mongo
+
+server_parameters:
+    durableRecoveryForCollectionCatalogEntryChance:
+        description: >-
+            Sets the probability to perform a durable metadata recovery for any given collection catalog request
+        set_at:
+            - startup
+            - runtime
+        cpp_varname: gChanceForDurableCollectionMetadataRecovery
+        cpp_vartype: Atomic<double>
+        test_only: true
+        default: 1
+        validator:
+            gte: 0
+            lte: 1
+        redact: false
+
+    enableBackgroundCleanupOfShardCatalog:
+        description: Enables background cleanup of the authoritative shard catalog
+        set_at:
+            - startup
+            - runtime
+        cpp_varname: gEnableBackgroundCleanupOfShardCatalog
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+feature_flags:
+    featureFlagPerformDeepCopyOfCollections:
+        description: Forces the CollectionCatalog to always do a deep copy of collections
+        cpp_varname: gFeatureFlagPerformDeepCopyOfCollections
+        default: false
+        fcv_gated: false

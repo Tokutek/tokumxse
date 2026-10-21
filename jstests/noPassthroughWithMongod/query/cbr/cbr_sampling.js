@@ -1,0 +1,372 @@
+/**
+ * Test that cost-based ranking can use sampling to estimate filters.
+ *
+ * @tags: [
+ *   requires_fcv_90,
+ * ]
+ */
+
+import {
+    assertChosenRanker,
+    ChosenRanker,
+    getRejectedPlans,
+    getWinningPlanFromExplain,
+    isCollscan,
+    PlanRankerReason,
+} from "jstests/libs/query/analyze_plan.js";
+import {getPlanRankerConfig, setPlanRankerConfig} from "jstests/libs/query/cbr_utils.js";
+import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
+
+// TODO SERVER-92589: Remove this exemption
+if (checkSbeFullyEnabled(db)) {
+    jsTestLog(`Skipping ${jsTestName()} as SBE executor is not supported yet`);
+    quit();
+}
+
+const collName = jsTestName();
+const coll = db[collName];
+coll.drop();
+
+let docs = [];
+for (let i = 0; i < 1000; i++) {
+    let doc = {a: i % 100 === 0 ? 0 : i, b: [i - 1, i, i + 1]};
+    if (i % 2 === 0) {
+        doc.c = i;
+        doc.e = 0;
+    }
+    if (i % 100 === 0) {
+        doc.d = "hello";
+    }
+    docs.push(doc);
+}
+
+assert.commandWorked(coll.insert(docs));
+
+function assertCollscanUsesSampling(query) {
+    const explain = coll.find(query).explain();
+    const plan = getWinningPlanFromExplain(explain);
+    assert(isCollscan(db, plan));
+    assert.eq(plan.estimatesMetadata.ceSource, "Sampling", plan);
+}
+
+function assertAllPlansUseSampling(query, ce, allowedSources = ["Sampling"]) {
+    const explain = coll.find(query).explain();
+    [getWinningPlanFromExplain(explain), ...getRejectedPlans(explain)].forEach((plan) => {
+        assert(
+            allowedSources.includes(plan.estimatesMetadata.ceSource),
+            `expected ceSource in ${tojson(allowedSources)}, got ${plan.estimatesMetadata.ceSource}: ${tojson(plan)}`,
+        );
+        if (ce === undefined) {
+            assert.gt(plan.cardinalityEstimate, 0, plan);
+        } else {
+            assert.close(plan.cardinalityEstimate, ce, plan, 1);
+        }
+        if (plan.stage !== "COLLSCAN") {
+            if (ce > 0) {
+                assert.gt(plan.inputStage.cardinalityEstimate, 0, plan);
+                assert.gt(plan.inputStage.numKeysEstimate, 0, plan);
+            } else {
+                assert.gte(plan.inputStage.cardinalityEstimate, 0, plan);
+                assert.gte(plan.inputStage.numKeysEstimate, 0, plan);
+            }
+        }
+    });
+}
+
+const prevPlanRankerConfig = getPlanRankerConfig(db);
+const prevSamplingConfig = assert.commandWorked(
+    db.adminCommand({
+        getParameter: 1,
+        internalQueryDisablePlanCache: 1,
+        internalQuerySamplingCEMethod: 1,
+        internalQuerySamplingBySequentialScan: 1,
+        samplingMarginOfError: 1,
+    }),
+);
+
+try {
+    assert.commandWorked(
+        db.adminCommand({
+            setParameter: 1,
+            featureFlagCostBasedRanker: true,
+            internalQueryPlanRanker: "costBased",
+            internalQueryCBRCEMode: "samplingCE",
+        }),
+    );
+    assert.commandWorked(db.adminCommand({setParameter: 1, internalQueryDisablePlanCache: 1}));
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingCEMethod: "random"}),
+    );
+    assertCollscanUsesSampling({a: {$lt: 100}});
+    assertCollscanUsesSampling({b: {$elemMatch: {$gt: 100, $lt: 200}}});
+    // Test the chunk-based sampling method.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingCEMethod: "chunk"}),
+    );
+    assertCollscanUsesSampling({a: {$lt: 1000}});
+
+    // Switch back to the random sampling method because the CE could be 0 for some of the filters
+    // below, for example, the ce of 'b: {$lt: 500}' is 0 if all the chunks picked happen to fall
+    // into the first half of the collection.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingCEMethod: "random"}),
+    );
+
+    // TODO SERVER-97790: Enable rooted $or test
+    // assertCollscanUsesSampling({$or: [{a: {$lt: 100}}, {b: {$gt: 900}}]});
+
+    assert.commandWorked(coll.createIndex({a: 1}));
+    assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+    assert.commandWorked(coll.createIndex({b: 1}));
+    assert.commandWorked(coll.createIndex({c: 1}));
+    assertAllPlansUseSampling({a: {$lt: 100}});
+    assertAllPlansUseSampling({b: {$lt: 100}});
+    assertAllPlansUseSampling({a: {$lt: 100}, b: {$lt: 500}});
+    assertAllPlansUseSampling({a: {$lt: 100}, b: {$lt: 500}, c: {$exists: true}});
+
+    // Test that invalid query does not error during Sampling CE. Every sampled document throws
+    // during evaluation, so the effective sample size is 0 and the estimate is reported with
+    // source Code (an authoritative zero — see SamplingEstimatorImpl::makeScaledEstimate). After
+    // merging with the Metadata-sourced collection cardinality during CE propagation the plan's
+    // ceSource surfaces as Metadata. Authoritative zeros are preserved by
+    // CardinalityEstimator::clampZeroEstimates.
+    assertAllPlansUseSampling({$expr: {$divide: ["$a", 0]}}, 0, ["Metadata"]);
+
+    // Test that an expression that causes an exception during evaluation is handled correctly when
+    // evaluated during Sampling CE. Correct handling means that instead of throwing an exception
+    // during CE, the exception is caught, the document is skipped, and the estimate is scaled
+    // according to the number of successfully evaluated documents.
+    // The test case is crafted so that there is a plan with an IndexScanNode that also has a
+    // filter, and that filter contains an expression that would throw an excetion during
+    // evaluation. The goal is to call SamplingEstimatorImpl::estimateRIDs with the IndexBounds of
+    // this index scan, and trigger an exception. AND short-circuits so $expr is only evaluated
+    // for docs where b==3 AND a==0, which no document satisfies — so the effective sample size
+    // is positive, no match is observed, and the resulting zero on the scan nodes makes CBR
+    // fall back to the multi-planner (ZeroCEEstimate). Sampling CE must not throw, but the
+    // multi-planner's trial execution evaluates the $expr and does surface the division by zero.
+    //
+    // Sample deterministically for the two queries below. CBR keeps the estimates it gathered
+    // before aborting, and those estimates size the multi-planner's trial phase - so with a random
+    // sample it would vary from run to run whether a scan is estimated at zero at all, and whether
+    // the trial reaches a document that makes the $expr throw.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingBySequentialScan: true}),
+    );
+
+    const constantDivByZeroError = assert.throws(() =>
+        coll.find({b: {$eq: 3}, a: {$eq: 0}, $expr: {$divide: ["$a", 0]}}).explain(),
+    );
+    assert.eq(constantDivByZeroError.code, ErrorCodes.BadValue, constantDivByZeroError);
+
+    // Similar to above, but division by a field value that is zero for some documents (every 100th
+    // document has a=0), causing an exception during evaluation. Not every sampled document
+    // throws, so the effective sample size is positive and matches are observed: the scans are
+    // estimated above zero, CBR costs every plan itself, and the estimate is scaled by the
+    // effective sample size.
+    assertAllPlansUseSampling({c: {$eq: 200}, a: {$eq: 0}, $expr: {$divide: [42, "$a"]}}, 1);
+
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingBySequentialScan: false}),
+    );
+
+    db.adminCommand({setParameter: 1, samplingMarginOfError: 1.0});
+    db.adminCommand({setParameter: 1, samplingConfidenceInterval: "99"});
+
+    // Variant of the above: the expression errors only for some documents (those with a=0), while
+    // others are evaluated successfully. The estimate is computed from non-error documents and
+    // scaled by the effective sample size, producing a non-zero result.
+    assertAllPlansUseSampling(
+        {b: {$gte: 0}, c: {$exists: true}, $expr: {$divide: [42, "$a"]}},
+        494.949494949495,
+    );
+
+    // Test that error-document scaling produces a correct estimate. The $expr throws for documents
+    // with a=0 (10 documents at i=0,100,...,900). Of the remaining 990 evaluable documents,
+    // 495 match {a: {$lt: 500}}, giving CE = 495 * 1000 / 990 = 500.
+    assertAllPlansUseSampling({a: {$lt: 500}, $expr: {$divide: [42, "$a"]}}, 500);
+
+    db.adminCommand({setParameter: 1, samplingMarginOfError: 5.0});
+    db.adminCommand({setParameter: 1, samplingConfidenceInterval: "95"});
+
+    // This valid query should get a positive ce.
+    assertAllPlansUseSampling({$expr: {$divide: ["$a", 1]}});
+
+    // Test the sequential scan sampling method that generates the sample by scanning the first N
+    // documents of the collection. The sample generated by this method is repeatable as long as
+    // the collection was populated in the same way.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingBySequentialScan: true}),
+    );
+    // Run the same query multiple times to ensure the sample is repeatable.
+    assertAllPlansUseSampling({a: {$lt: 100}}, 268.2291666666667);
+    assertAllPlansUseSampling({a: {$lt: 100}}, 268.2291666666667);
+    assertAllPlansUseSampling({a: {$lt: 100}}, 268.2291666666667);
+
+    // Test that internalSamplingSizeOverride directly controls the sample size, bypassing
+    // samplingConfidenceInterval and samplingMarginOfError. The sequential scan is still active
+    // here so the sample is deterministic; we verify that the explain metadata reflects the
+    // exact count requested via the override.
+    {
+        const overrideSize = 50;
+        setPlanRankerConfig(db, {
+            featureFlagCostBasedRanker: true,
+            internalQueryPlanRanker: "costBased",
+            internalQueryCBRCEMode: "samplingCE",
+            internalSamplingSizeOverride: overrideSize,
+        });
+        const explain = coll.find({a: {$lt: 100}}).explain();
+        const ns = coll.getFullName();
+        const meta = explain.queryPlanner.ceSamplingMetadata[ns];
+        assert(meta, "expected ceSamplingMetadata in explain", {explain});
+        assert.eq(
+            meta.sampleRequestedDocCount,
+            overrideSize,
+            "sampleRequestedDocCount should match internalSamplingSizeOverride",
+            {meta},
+        );
+        setPlanRankerConfig(db, {
+            featureFlagCostBasedRanker: true,
+            internalQueryPlanRanker: "costBased",
+            internalQueryCBRCEMode: "samplingCE",
+            internalSamplingSizeOverride: 0,
+        });
+    }
+
+    // Require a sample larger than the collection and test that a full scan of the collection was
+    // done to collect the sample. With the effective sample covering every document,
+    // SamplingEstimatorImpl::makeScaledEstimate tags the CE as 'Code' (authoritative),
+    // so 'CardinalityEstimator::clampZeroEstimates' leaves any zero unchanged. COLLSCAN plans
+    // multiply a Code-sourced selectivity by the Metadata-sourced collection cardinality, which
+    // merges to 'Metadata'; index plans stay 'Code', so both are accepted below.
+    assert.commandWorked(db.adminCommand({setParameter: 1, samplingMarginOfError: 1.0}));
+    const authoritative = ["Code", "Metadata"];
+    // Since the sample was actually generated from all the documents in the collection. The 'ce' of
+    // this predicate should include all documents, which is 1000.
+    assertAllPlansUseSampling({a: {$lt: 1000}}, 1000, authoritative);
+
+    // SERVER-109891 Check that $type, $ne, $regex works
+    assertAllPlansUseSampling({a: {$type: "double"}}, 1000, authoritative);
+    assertAllPlansUseSampling({a: {$ne: "test"}}, 1000, authoritative);
+    assertAllPlansUseSampling({b: {$type: "double"}}, 1000, authoritative);
+    assertAllPlansUseSampling({c: {$type: "double"}}, 500, authoritative);
+    assertAllPlansUseSampling({e: {$ne: 0}}, 500, authoritative);
+
+    // A query that matches no documents gets a CE of 0, since the sampler observed every
+    // document and found none matching. That zero on the index scan makes CBR fall back to
+    // multi-planning.
+    assertChosenRanker(
+        coll.find({a: {$type: "string"}}).explain(),
+        ChosenRanker.kMultiPlanning,
+        PlanRankerReason.kCBRInestimableNode,
+    );
+    assertAllPlansUseSampling({d: {$type: "string"}}, 10, authoritative);
+    assertAllPlansUseSampling({d: /^h/}, 10, authoritative);
+    assertAllPlansUseSampling({d: /^e/}, 0, authoritative);
+
+    // When sampling CE returns zero cardinality for every candidate index plan (because the
+    // queried value is absent from the sample), CBR must not rank the plans and instead treat them
+    // as non estimable.
+    {
+        // Reset sampling state to defaults so this test doesn't depend on prior test state. A
+        // 5% margin of error keeps the sample size smaller than the collection populated below.
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalQuerySamplingBySequentialScan: false}),
+        );
+        assert.commandWorked(db.adminCommand({setParameter: 1, samplingMarginOfError: 5.0}));
+
+        // A collection with no 'a' or 'b' fields forces sampling CE to return 0 for every
+        // candidate index plan. Populate with enough documents that the sample is strictly
+        // smaller than the collection - otherwise the sampler observes every document and the
+        // zero is reported as an authoritative 'Code' source instead.
+        const zeroCEColl = db[collName + "_zero_ce"];
+        const numDocs = 500;
+        const docs = Array.from({length: numDocs}, (_, i) => ({c: i}));
+
+        function assertFallsBackToMultiplanning(query, projection) {
+            const cursor = projection ? zeroCEColl.find(query, projection) : zeroCEColl.find(query);
+            assertChosenRanker(
+                cursor.explain(),
+                ChosenRanker.kMultiPlanning,
+                PlanRankerReason.kCBRInestimableNode,
+            );
+        }
+
+        function runZeroCEScenarios() {
+            // Covered query on {a:1, b:1}.
+            assertFallsBackToMultiplanning({a: 1, b: 1}, {_id: 0, a: 1, b: 1});
+
+            // Same predicate without a projection forcing a covered plan.
+            assertFallsBackToMultiplanning({a: 1, b: 1});
+
+            // Predicate uses only the leading field; both indexes are candidates.
+            assertFallsBackToMultiplanning({a: 1});
+        }
+
+        for (const indexes of [
+            [{a: 1}, {a: 1, b: 1}],
+            [{a: 1, b: 1}, {a: 1}],
+        ]) {
+            zeroCEColl.drop();
+            assert.commandWorked(zeroCEColl.insertMany(docs));
+            for (const idx of indexes) {
+                assert.commandWorked(zeroCEColl.createIndex(idx));
+            }
+            runZeroCEScenarios();
+        }
+        zeroCEColl.drop();
+    }
+
+    // A zero scan estimate aborts CBR even when the source is authoritative ('Code', from the
+    // sampler observing the entire collection and finding no matches - see
+    // SamplingEstimatorImpl::makeScaledEstimate). Verify the fallback to the multi-planner
+    // happens regardless of index creation order.
+    {
+        // Drive the sampler to cover the whole collection so zero observations are tagged
+        // as Code rather than Sampling.
+        assert.commandWorked(db.adminCommand({setParameter: 1, samplingMarginOfError: 1.0}));
+
+        const exactZeroColl = db[collName + "_exact_zero_ce"];
+        const numDocs = 50;
+        const exactDocs = Array.from({length: numDocs}, (_, i) => ({c: i}));
+
+        function assertExactZeroFallsBackToMultiplanning() {
+            const explain = exactZeroColl.find({a: 1, b: 1}, {_id: 0, a: 1, b: 1}).explain();
+            assertChosenRanker(
+                explain,
+                ChosenRanker.kMultiPlanning,
+                PlanRankerReason.kCBRInestimableNode,
+            );
+            [getWinningPlanFromExplain(explain), ...getRejectedPlans(explain)].forEach((plan) => {
+                assert(!plan.hasOwnProperty("costEstimate"), plan);
+            });
+        }
+
+        // Order 1: {a:1} created first.
+        exactZeroColl.drop();
+        assert.commandWorked(exactZeroColl.insertMany(exactDocs));
+        assert.commandWorked(exactZeroColl.createIndex({a: 1}));
+        assert.commandWorked(exactZeroColl.createIndex({a: 1, b: 1}));
+        assertExactZeroFallsBackToMultiplanning();
+
+        // Order 2: {a:1, b:1} created first.
+        exactZeroColl.drop();
+        assert.commandWorked(exactZeroColl.insertMany(exactDocs));
+        assert.commandWorked(exactZeroColl.createIndex({a: 1, b: 1}));
+        assert.commandWorked(exactZeroColl.createIndex({a: 1}));
+        assertExactZeroFallsBackToMultiplanning();
+
+        exactZeroColl.drop();
+    }
+} finally {
+    setPlanRankerConfig(db, prevPlanRankerConfig);
+    assert.commandWorked(
+        db.adminCommand({
+            setParameter: 1,
+            internalQueryDisablePlanCache: prevSamplingConfig.internalQueryDisablePlanCache,
+            internalQuerySamplingCEMethod: prevSamplingConfig.internalQuerySamplingCEMethod,
+            internalQuerySamplingBySequentialScan:
+                prevSamplingConfig.internalQuerySamplingBySequentialScan,
+            samplingMarginOfError: prevSamplingConfig.samplingMarginOfError,
+        }),
+    );
+}

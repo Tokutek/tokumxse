@@ -1,0 +1,135 @@
+VARIATION InclusionProjection
+input: {
+    "pipeline": [
+        {
+            "$set": {
+                "a": {
+                    "$const": "foo"
+                }
+            }
+        },
+        {
+            "$set": {
+                "b": {
+                    "$const": "bar"
+                }
+            }
+        },
+        {
+            "$set": {
+                "c": {
+                    "$const": "baz"
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": true,
+                "b": true,
+                "c": true
+            }
+        },
+        {
+            "$match": {
+                "a": "foo",
+                "b": "bar"
+            }
+        }
+    ]
+}
+output: {
+    "$set:0": {
+        "scope:0": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:0": {
+                    "declaringScope": "scope:0",
+                    "dependencies": []
+                },
+                "a:1": {
+                    "declaringScope": "scope:0",
+                    "metadata": {
+                        "array": false,
+                        "constant": "foo"
+                    },
+                    "dependencies": []
+                }
+            }
+        },
+        "dependencies": []
+    },
+    "$set:1": {
+        "scope:1": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:2": {
+                    "declaringScope": "scope:1",
+                    "dependencies": []
+                },
+                "a:1": "a:1",
+                "b:3": {
+                    "declaringScope": "scope:1",
+                    "metadata": {
+                        "array": false,
+                        "constant": "bar"
+                    },
+                    "dependencies": []
+                }
+            }
+        },
+        "dependencies": []
+    },
+    "$set:2": {
+        "scope:2": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:4": {
+                    "declaringScope": "scope:2",
+                    "dependencies": []
+                },
+                "a:1": "a:1",
+                "b:3": "b:3",
+                "c:5": {
+                    "declaringScope": "scope:2",
+                    "metadata": {
+                        "array": false,
+                        "constant": "baz"
+                    },
+                    "dependencies": []
+                }
+            }
+        },
+        "dependencies": []
+    },
+    "$project:3": {
+        "scope:3": {
+            "exhaustiveScope": "scope:3",
+            "fields": {
+                "<missing>:6": {
+                    "declaringScope": "scope:3",
+                    "metadata": {
+                        "array": false,
+                        "missing": true
+                    },
+                    "dependencies": []
+                },
+                "_id:-1": "_id:-1",
+                "b:3": "b:3",
+                "c:5": "c:5"
+            }
+        },
+        "dependencies": [
+            "<base document>:-1",
+            "b:3",
+            "c:5"
+        ]
+    },
+    "$match:4": {
+        "scope:3": "scope:3",
+        "dependencies": [
+            "<missing>:6",
+            "b:3"
+        ]
+    }
+}
+

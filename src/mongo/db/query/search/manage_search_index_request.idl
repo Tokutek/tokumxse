@@ -1,0 +1,32 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: mongo
+imports:
+    - mongo/db/basic_types.idl
+    - "mongo/db/query/search/search_query_view_spec.idl"
+structs:
+    ManageSearchIndexRequest:
+        description: Command request for search index management host
+        strict: false
+        fields:
+            manageSearchIndex:
+                description: Command name field that holds the collection name value
+                type: string
+                optional: false
+            collectionUUID:
+                description: The collection UUID
+                type: uuid
+                optional: false
+            userCommand:
+                description: The original user search index command request
+                type: object
+                optional: false
+            view:
+                description: >-
+                    If the command is being run on a view namespace, this field must be
+                    set to SearchQueryViewSpec
+                type: SearchQueryViewSpec
+                optional: true

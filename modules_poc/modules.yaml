@@ -1,0 +1,1255 @@
+# This file defines the modules for the MongoDB project.
+#
+# Top-level keys are modules names. Dots can be used to create submodules.
+# Each module has a meta section with information about the module and a files section
+# with a list of globs that belong to the module. Any metadata missing from submodules
+# will be inherited from their parent.
+#
+# How metadata is used:
+#   slack:
+#     Slack channel for questions about the the module. This will be included in
+#     error messages about accessing private APIs, so that developers know where
+#     to go to ask what they should do instead. Because # starts comments in YAML,
+#     you should just write server-foo instead of #server-foo.
+#
+#   jira:
+#     Jira "Assigned Team" that should be used when filing tickets for the module.
+#
+#   fully_marked:
+#     If present and true, behaves as if all headers in the module have been fully
+#     marked, meaning that any unmarked APIs will be treated as private, regardless
+#     of whether they have included modules.h. This lets us lock-in the progress of
+#     marking that module so that it stays fully marked even as new files are added.
+#     Unlike other metadata, this is not inherited by submodules so that it is
+#     possible to have a fully_marked parent module before marking all submodules.
+#
+#   If unsure about these, or if multiple teams are involved, please pick a good place
+#   to send questions/tickets to initially, understanding that we can always send them
+#   somewhere else if needed.
+
+core:
+  description: TODO
+  meta:
+    slack: server-programmability
+    jira: Server Programmability
+    fully_marked: true
+  files:
+    - src/mongo/base/
+    - src/mongo/platform/
+    - src/mongo/stdx/
+    - src/mongo/util/
+    - src/mongo/db/partitioned*
+    - src/mongo/db/crud_bm.cpp
+    - src/mongo/db/field_parser[._]*
+    - src/mongo/db/generic_argument_util.*
+    - src/mongo/db/nesting_depth_test.cpp
+    - src/mongo/db/operation_killer.*
+    - src/mongo/db/operation_time_tracker[._]*
+    - src/mongo/db/request_execution_context.h
+    - src/mongo/db/server_lifecycle_monitor[._]*
+    - src/mongo/db/service_entry_point_bm_fixture.h
+    - src/mongo/db/startup_warnings*
+    - src/mongo/db/thread_client_test.cpp
+    - src/mongo/db/throw_hook_impl[._]*
+    - src/mongo/db/throw_hook_options.idl
+    - src/mongo/dbtests/threadedtests.cpp
+    - src/mongo/dbtests/basictests.cpp
+    - src/mongo/executor/cancelable_executor[._]*
+    - src/mongo/executor/inline_executor[._]*
+    - src/mongo/executor/scoped_task_executor[._]*
+    - src/mongo/executor/task_executor[._]*
+    - src/mongo/executor/thread_pool[._]*
+    - src/mongo/db/exec/scoped_timer*
+    - src/mongo/db/stats/counter_ops.h
+
+core.bson:
+  meta:
+    fully_marked: true
+  files:
+    - src/mongo/bson/
+    # Unsure about the next one but putting here for now:
+    - src/mongo/db/query/util/jparse_util* # needs to be same module as bson/json.h
+    - src/mongo/dbtests/jsobjtests.cpp
+    - src/mongo/dbtests/jsontests.cpp
+
+core.idl:
+  meta:
+    fully_marked: true
+  files:
+    - src/mongo/idl/
+    - src/mongo/db/basic_types.*
+
+# stuff that is part of a generic mongo service
+core.service:
+  meta:
+    fully_marked: true
+  files:
+    - src/mongo/db/commands[._]* # not the commands directory
+    - src/mongo/db/*operation_context*
+    - src/mongo/db/client*
+    - src/mongo/db/service_context*
+    - src/mongo/db/dbdirectclient[._]*
+    - src/mongo/dbtests/directclienttests.cpp
+    - src/mongo/db/feature_flag*
+    - src/mongo/db/ifr_context_decoration*
+    - src/mongo/db/ifr_flag_retry_info*
+    - src/mongo/db/error_labels*
+    - src/mongo/db/server_feature_flags.idl
+    - src/mongo/db/windows_options.idl
+    - src/mongo/db/initialize_server_global_state.*
+    - src/mongo/db/default_max_time_ms_cluster_parameter*
+    - src/mongo/db/commands/test_deprecation_command.cpp
+    - src/mongo/db/s/forwardable_operation_metadata*
+    - src/mongo/embedded
+    - src/mongo/db/logical_time.*
+
+# stuff that is part of a *specific* mongo server (eg mongos, mongod)
+core.servers:
+  meta:
+    fully_marked: true
+  files:
+    - src/mongo/db/mongod.cpp
+    - src/mongo/db/mongod_main.*
+    - src/mongo/db/mongod_options.*
+    - src/mongo/db/mongod_options_init.cpp
+    - src/mongo/db/mongod_initializers.cpp
+    - src/mongo/db/mongod_options_general.*
+    - src/mongo/db/mongod_options_legacy.idl
+    - src/mongo/db/mongod_options_test.cpp
+    - src/mongo/db/service_context_d_test_fixture.*
+    - src/mongo/db/global_settings*
+    - src/mongo/db/mongod_options_sharding*
+    - src/mongo/s/mongos.cpp
+    - src/mongo/s/mongos_main.*
+    - src/mongo/s/mongos_options*
+    - src/mongo/db/startup_check_rseq*
+
+core.commands:
+  meta:
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/buildinfo_common.*
+    - src/mongo/db/commands/cpuload.cpp
+    - src/mongo/db/commands/db_command_test_fixture.h
+    - src/mongo/db/commands/fail_point_cmd.cpp
+    - src/mongo/db/commands/kill_op.cpp
+    - src/mongo/db/commands/kill_op_cmd_base.*
+    - src/mongo/db/commands/kill_operations.idl
+    - src/mongo/db/commands/killoperations_cmd.cpp
+    - src/mongo/db/commands/killoperations_common.h
+    - src/mongo/db/commands/shutdown.*
+    - src/mongo/db/commands/shutdown_d.cpp
+    - src/mongo/db/commands/sleep_command.cpp
+    - src/mongo/db/commands/test_commands_enabled*
+    - src/mongo/db/commands/generic.*
+    - src/mongo/db/commands/generic_servers.*
+    - src/mongo/db/commands/parameters.*
+    - src/mongo/s/request_types/wait_for_fail_point.idl
+    - src/mongo/s/commands/cluster_build_info.cpp
+    - src/mongo/s/commands/cluster_kill_op.cpp
+    - src/mongo/s/commands/cluster_killoperations_cmd.cpp
+    - src/mongo/s/commands/cluster_shutdown_cmd.cpp
+
+core.unittest:
+  meta:
+    fully_marked: true
+  files:
+    - src/mongo/unittest/
+    - src/mongo/dbtests/framework[._]*
+
+clang_tidy_checks:
+  meta:
+    slack: server-programmability
+    jira: Server Programmability
+    fully_marked: true
+  files:
+    - src/mongo/tools/mongo_tidy_checks/
+
+shell:
+  meta:
+    slack: ask-devprod-test-infrastructure
+    jira: DevProd Test Infrastructure
+    fully_marked: true
+  files:
+    - src/mongo/shell/
+    - src/mongo/db/modules/enterprise/src/fle/shell
+
+query:
+  meta:
+    slack: TODO
+    jira: TODO
+    fully_marked: true
+  files:
+    - src/mongo/db/aggregated_index_usage_tracker*
+    - src/mongo/db/api_parameters*
+    - src/mongo/db/field_ref*
+    - src/mongo/db/traffic_*
+    - src/mongo/db/validate_api_parameters*
+    - src/mongo/db/bulk_write_shard_test.cpp
+    - src/mongo/db/collection_index_usage_tracker*
+    - src/mongo/db/commands/filemd5_cmd.cpp # TODO SERVER-88071: Deprecate/remove this command.
+    - src/mongo/db/commands/profile*
+    - src/mongo/db/commands/sysprofile*
+    - src/mongo/db/commands/query_cmd/
+    - src/mongo/db/commands/set_profiling_*
+    - src/mongo/db/commands/shardsvr_resolve_view_command*
+    - src/mongo/db/commands/top_command*
+    - src/mongo/db/exec/
+    - src/mongo/db/extension/
+    - src/mongo/db/change_stream*
+    - src/mongo/db/op_observer/change_stream_pre_images_op_observer*
+    - src/mongo/db/curop*
+    - src/mongo/db/cursor*
+    - src/mongo/db/fts/
+    - src/mongo/db/geo/
+    - src/mongo/db/hasher*
+    - src/mongo/db/ifr_unrecognized_flag_info*
+    - src/mongo/db/index_names*
+    - src/mongo/db/index/ # mostly query, except index_access_method owned by storex
+    - src/mongo/db/matcher/
+    - src/mongo/db/memory_tracking/
+    - src/mongo/db/multi_key_path_tracker*
+    - src/mongo/db/modules/enterprise/src/fle/query_analysis
+    - src/mongo/db/op_debug*
+    - src/mongo/db/pipeline/
+    - src/mongo/db/profile_*
+    - src/mongo/db/query/
+    - src/mongo/db/s/query_analysis* # note the filename pattern
+    - src/mongo/db/s/*query*analyzer* # note the filename pattern
+    - src/mongo/db/s/document_source_visitor_docs_needed_bounds.cpp
+    - src/mongo/db/s/query_cmd
+    - src/mongo/db/stats/
+    - src/mongo/db/update/
+    - src/mongo/db/update_index_data*
+    - src/mongo/db/views/
+    - src/mongo/db/yieldable.h
+    - src/mongo/dbtests/counttests.cpp
+    - src/mongo/dbtests/documentsourcetests.cpp
+    - src/mongo/dbtests/extensions_callback_real_test.cpp
+    - src/mongo/dbtests/insert_test.cpp
+    - src/mongo/dbtests/plan_ranking.cpp
+    - src/mongo/dbtests/jstests.cpp
+    - src/mongo/dbtests/matchertests.cpp
+    - src/mongo/dbtests/plan_executor_invalidation_test.cpp
+    - src/mongo/dbtests/query*
+    - src/mongo/dbtests/updatetests.cpp
+    - src/mongo/s/cluster_cursor_stats.cpp
+    - src/mongo/s/cluster_write*
+    - src/mongo/s/commands/cluster_query_settings_cmds.cpp
+    - src/mongo/s/commands/cluster_query_without_shard_key_cmd.cpp
+    - src/mongo/s/commands/cluster_write_without_shard_key_cmd.cpp
+    - src/mongo/s/query/
+    - src/mongo/s/request_types/cluster_commands_without_shard_key.idl
+    - src/mongo/s/write_ops/
+    - src/mongo/replay
+    - src/mongo/scripting/
+    - src/mongo/s/commands/query_cmd
+    - src/mongo/s/query/planner
+    - src/mongo/s/query/shard_key_pattern_query_util*
+    - src/mongo/s/query/shard_targeting_collation_helpers*
+    - src/mongo/s/query/shard_targeting_helpers*
+    - src/mongo/db/namespace_spec.idl # only used by query
+    - src/mongo/s/commands/*document_shard_key_*
+    - src/mongo/db/s/*analyze_shard_key*
+    - src/mongo/s/*analyze_shard_key*
+    - src/mongo/s/*query_analyze*
+    - src/mongo/s/commands/*analyze_shard_key*
+    - src/mongo/s/commands/*query_analyze*
+    - src/mongo/db/s/migration_blocking_operation/*multi_update*
+    - src/mongo/s/request_types/*multi_update*
+    - src/mongo/dbtests/pdfiletests.cpp
+    - src/mongo/dbtests/wildcard*
+    - src/mongo/s/query_analysis*
+    - src/mongo/s/commands/cluster_filemd5_cmd.cpp
+    - src/mongo/db/diagnostic_printers_test.cpp
+    - src/mongo/db/keypattern*
+    - src/mongo/db/commands/shardsvr_run_search_index_command*
+    - src/mongo/db/s/shardsvr_resolve_view_command_test.cpp
+    - src/mongo/dbtests/commandtests.cpp
+    - src/mongo/s/would_change_owning_shard_exception*
+
+query.knobs:
+  meta:
+    description: >-
+      The query knob framework. Knob server parameters are implementation details: all per-query
+      knob reads must go through QueryKnobConfiguration so that QuerySettings overrides are
+      applied and the values stay stable for the operation's lifetime.
+    fully_marked: true
+  files:
+    - src/mongo/db/query/query_knobs/
+    - src/mongo/db/query/query_execution_knobs*
+    - src/mongo/db/query/query_optimization_knobs*
+    - src/mongo/db/query/query_knob_descriptors_*
+    - src/mongo/db/query/stage_memory_limit_knobs/
+
+catalog_and_routing:
+  meta:
+    description: >-
+      Core catalog and routing machinery, shared among shard_role, router_role, global_catalog and
+      topology modules.
+    slack: server-catalog-and-routing
+    jira: Catalog and Routing
+    fully_marked: true
+  files:
+    - src/mongo/db/sharding_environment/**
+    - src/mongo/db/versioning_protocol/**
+    - src/mongo/db/persistent_task_store*
+    - src/mongo/db/local_executor*
+    - src/mongo/db/rs_local_client*
+    - src/mongo/db/database_name[._]*
+    - src/mongo/db/namespace_string[._]*
+    - src/mongo/db/stats/system_buckets_metrics*
+    - src/mongo/db/stats/direct_system_buckets_access.h
+
+catalog_and_routing.shard_role:
+  meta:
+    description: >-
+      This module represents the logical parts of a database/collection that are constrained to a
+      single replica set, or to an individual shard in the context of a sharded cluster. They
+      provide APIs that higher-order modules use, for instance, to build distributed DDL operations,
+      but the module only concerns itself with the local (replica-set or shard) view and has no
+      bearing on the global catalog.
+    slack: server-catalog-and-routing
+    jira: Catalog and Routing
+    fully_marked: true
+  files:
+    - src/mongo/db/shard_role/**
+    - src/mongo/db/service_entry_point_shard_role[._]*
+
+catalog_and_routing.global_catalog:
+  meta:
+    description: >-
+      This module contains the parts of the distributed catalog from the Config Server, the commands
+      exposed to external users and the interfaces exposed to internal users (other modules) to run
+      sharded DDL operations. For sharded clusters, the DDL module contains everything, including
+      the cluster commit protocol.
+    slack: server-catalog-and-routing
+    jira: Catalog and Routing
+    fully_marked: true
+  files:
+    - src/mongo/db/global_catalog/**
+
+catalog_and_routing.router_role:
+  meta:
+    description: >-
+      This module contains protocols and interfaces that ensure queries are routed to the correct
+      subset of shards and that the entire distributed operation executes with the correct
+      consistency level.
+    slack: server-catalog-and-routing
+    jira: Catalog and Routing
+    fully_marked: true
+  files:
+    - src/mongo/db/router_role/
+    - src/mongo/s/service_entry_point_router_role[._]*
+    - src/mongo/s/commands/strategy*
+
+catalog_and_routing.topology:
+  meta:
+    description: >-
+      This module contains the topology of the cluster, including the operations to promote a
+      replica set to sharded cluster, demote a sharded cluster to replica set, to add/remove a shard
+      to a sharded cluster and protocol for ensuring distributed operation executes with the correct
+      consistency level.
+    slack: server-catalog-and-routing
+    jira: Catalog and Routing
+    fully_marked: true
+  files:
+    - src/mongo/db/topology/**
+
+    # FCV:
+    - src/mongo/db/version_context*
+    - src/mongo/s/commands/cluster_set_feature_compatibility_version_cmd.cpp
+
+    # cluster-wide r/w concern:
+    - src/mongo/db/commands/*rwc_defaults*
+    - src/mongo/s/commands/cluster_rwc_defaults_commands.cpp
+    - src/mongo/s/commands/s_read_write_concern_defaults_server_status.cpp
+    - src/mongo/s/read_write_concern_defaults_cache_lookup_mongos*
+
+    # change streams:
+    - src/mongo/s/change_streams*
+
+    # standby clusters:
+    - src/mongo/tools/mongosentry_tool/
+
+transactions:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/cluster_command_translations.h
+    - src/mongo/db/commands/*transaction*
+    - src/mongo/db/commands/*txn*
+    - src/mongo/db/transaction/
+    - src/mongo/db/cluster_transaction_api.*
+    - src/mongo/db/internal_transactions_feature_flag.idl
+    - src/mongo/db/periodic_runner_job_abort_expired_transactions.*
+    - src/mongo/db/transaction_validation.*
+    - src/mongo/db/*txn*
+    - src/mongo/db/s/*transaction*
+    - src/mongo/db/s/*txn*
+    - src/mongo/s/commands/*transaction*
+    - src/mongo/s/commands/*txn*
+    - src/mongo/s/*transaction*
+    - src/mongo/db/session/
+    - src/mongo/s/session_catalog_router*
+    - src/mongo/db/service_liaison_mock.*
+    - src/mongo/db/logical_session*
+    - src/mongo/db/initialize_operation_session_info*
+    - src/mongo/db/commands/*session*
+    - src/mongo/dbtests/logical_sessions_tests.cpp
+    - src/mongo/s/client_transport_observer_mongos*
+    - src/mongo/db/stats/read_preference_metrics*
+    - src/mongo/db/stats/single_transaction_stats*
+
+fcv:
+  meta:
+    slack: server-fcv
+    jira: Catalog and Routing
+    fully_marked: true
+  files:
+    - src/mongo/db/feature_compatibility*
+    - src/mongo/db/commands/feature_compatibility*
+    - src/mongo/db/commands/set_feature_compatibility_version*
+    - src/mongo/db/op_observer/fcv_op_observer*
+    - src/mongo/unittest/ensure_fcv.h
+    - src/mongo/db/commands/set_feature_compatibility_version_steps/fcv_step.*
+    - src/mongo/db/commands/set_feature_compatibility_version_steps/fcv_step_test.*
+    - src/mongo/db/commands/set_feature_compatibility_version_steps/legacy_fcv_step.*
+
+access_control:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/client/native_sasl_client_session*
+    - src/mongo/client/sasl_*
+    - src/mongo/client/scram_client_cache*
+    - src/mongo/db/auth/
+    - src/mongo/db/commands/authentication*
+    - src/mongo/db/commands/user_management*
+    - src/mongo/db/modules/enterprise/src/kerberos
+    - src/mongo/db/modules/enterprise/src/ldap
+    - src/mongo/db/modules/enterprise/src/sasl
+    - src/mongo/db/modules/enterprise/src/util/gssapi*
+    - src/mongo/db/modules/enterprise/src/util/report.*
+    - src/mongo/s/commands/cluster_user_management_commands.cpp
+
+admission:
+  meta:
+    slack: server-workload-resilience
+    jira: Workload Scheduling
+    fully_marked: true
+  files:
+    - src/mongo/db/admission/
+    - src/mongo/db/flow_control_ticketholder*
+
+workload_simulation:
+  meta:
+    slack: server-workload-resilience
+    jira: Workload Scheduling
+    fully_marked: true
+  files:
+    - src/mongo/tools/workload_simulation/
+
+native_tenant_data_isolation:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/tenant_id*
+    - src/mongo/db/multitenancy*
+    - src/mongo/db/auth/validated_tenancy_scope*
+    - src/mongo/s/initialize_tenant_to_shard_cache*
+
+crypto:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/crypto
+
+audit:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/audit*
+    - src/mongo/db/modules/enterprise/src/audit
+    - src/mongo/rpc/metadata/audit*
+    - src/mongo/s/client_metadata_propagation_egress_hook*
+
+storage_engine_api.encrypted_storage_engine:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/modules/enterprise/src/encryptdb
+
+security:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/commands/connection_status.*
+    - src/mongo/db/commands/hashcmd.cpp
+    - src/mongo/db/commands/rotate_certificates*
+    - src/mongo/db/landlock*
+    - src/mongo/db/modules/enterprise/src/fips
+    - src/mongo/db/modules/enterprise/src/kmip
+    - src/mongo/db/modules/enterprise/src/landlock
+    - src/mongo/db/system_index*
+    - src/mongo/util/landlock
+
+field_level_encryption:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/commands/fle2_*
+    - src/mongo/db/fle_*
+    - src/mongo/db/*_structured_encryption_*
+    - src/mongo/s/commands/*fle2*
+    - src/mongo/db/commands/fle_compact_test.cpp
+
+field_level_encryption.cryptd:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/modules/enterprise/src/fle/commands
+    - src/mongo/util/cryptd
+
+field_level_encryption.crypt_shared:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/modules/enterprise/src/fle/lib
+
+catalog_and_routing.topology.causal_consistency:
+  meta:
+    slack: server-sharding
+    jira: Cluster Scalability
+    fully_marked: true
+  files:
+    - src/mongo/db/keys_collection*
+    - src/mongo/db/key_generator*
+    - src/mongo/db/logical_time_*
+    - src/mongo/db/time_proof_service*
+    - src/mongo/db/signed_logical_time*
+
+data_movement:
+  meta:
+    slack: server-sharding
+    jira: Cluster Scalability
+  files:
+    # data movement commands on mongos
+    - src/mongo/s/commands/data_movement/*
+
+    # resharding
+    - src/mongo/db/s/*reshard*
+    - src/mongo/db/s/config/*reshard*
+    - src/mongo/db/s/config/sampling_based_initial_split_policy_test.cpp
+    - src/mongo/s/*reshard*
+    - src/mongo/db/s/metrics/**
+    - src/mongo/s/request_types/*reshard*
+    - src/mongo/s/commands/*reshard*
+    - src/mongo/db/s/resharding/sharding_write_router*
+
+    # chunk operations
+    - src/mongo/db/s/migration_chunk*
+    - src/mongo/db/s/migration_batch*
+    - src/mongo/db/s/migration*manager*
+    - src/mongo/db/s/migration*session*
+    - src/mongo/db/s/session*migration*
+    - src/mongo/db/s/migration_recipient*
+    - src/mongo/db/s/migration_coordinator*
+    - src/mongo/db/s/migration_util*
+    - src/mongo/db/s/migration_chunk*
+    - src/mongo/db/s/active_migrations*
+    - src/mongo/db/s/random_migration_testing_utils*
+    - src/mongo/db/s/*range_delet*
+    - src/mongo/db/s/max_key_orphan*
+    - src/mongo/db/s/max_key_zone*
+    - src/mongo/db/s/chunk*
+    - src/mongo/db/s/start_chunk*
+    - src/mongo/db/s/*move_range*
+    - src/mongo/db/s/move_timing*
+    - src/mongo/db/s/config/initial_split_policy*
+    - src/mongo/db/s/config/*move_range*
+    - src/mongo/db/s/*split_vector*
+    - src/mongo/db/s/cleanup_orphaned_cmd.cpp
+    - src/mongo/db/s/max_key*
+    - src/mongo/s/commands/*move_range*
+    - src/mongo/s/request_types/move_range_request.idl
+    - src/mongo/s/commands/*split_vector*
+    - src/mongo/s/commands/*split_cmd*
+    - src/mongo/s/commands/*move_chunk*
+    - src/mongo/s/request_types/auto_split_vector.idl
+    - src/mongo/s/request_types/migration_secondary_throttle*
+    - src/mongo/s/request_types/cleanup_orphaned.idl
+    - src/mongo/s/migration_blocking_operation/migration_blocking_operation*
+
+    # jumbo flag
+    # TODO SERVER-105531: consider restructuring the sharding catalog manager
+    # to clearly divide data movement and DDL primitives.
+    - src/mongo/db/s/config/configsvr_clear_jumbo_flag_command.cpp
+    - src/mongo/s/commands/*jumbo*
+
+    # balancer
+    - src/mongo/db/s/*balanc*
+    - src/mongo/db/s/config/configsvr_*balanc*
+    - src/mongo/s/balanc*
+    - src/mongo/s/commands/*balanc*
+    - src/mongo/s/request_types/*balanc*
+
+    - src/mongo/db/cloner*
+
+    # zones
+    - src/mongo/db/s/remove_tags.idl
+    - src/mongo/db/s/config/configsvr_remove_tags_command.cpp
+    - src/mongo/db/s/config/configsvr_update_zone_key_range_command.cpp
+    - src/mongo/s/commands/cluster_update_zone_key_range_cmd.cpp
+    - src/mongo/s/request_types/update_zone*
+
+observability:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/server_status*
+    - src/mongo/db/connection_health_metrics_parameter.idl
+    - src/mongo/db/not_primary_error_tracker*
+    - src/mongo/db/operation_cpu_timer*
+    - src/mongo/db/process_health/
+    - src/mongo/executor/split_timer*
+    - src/mongo/util/observable_mutex*
+    - src/mongo/watchdog/
+    - src/mongo/otel/
+
+observability.logging:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/log_process_details*
+    - src/mongo/logv2/
+    - src/mongo/util/log_and_backoff*
+
+observability.tracing:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/otel/traces/
+    - src/mongo/util/tracing_support*
+
+observability.metrics:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/metrics_*
+    - src/mongo/otel/metrics/
+
+observability.ftdc:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/ftdc/
+
+observability.commands:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/get_metrics_filtering_allowlist*
+    - src/mongo/db/commands/parse_log_component_settings*
+    - src/mongo/db/commands/update_metrics_filtering_allowlist*
+    - src/mongo/db/commands/xray_commands*
+    - src/mongo/s/commands/cluster_ftdc_commands.cpp
+    - src/mongo/s/commands/cluster_netstat_cmd.cpp
+
+networking:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/client/
+    - src/mongo/dbtests/clienttests.cpp
+    - src/mongo/dbtests/mock_dbclient_conn_test.cpp
+    - src/mongo/dbtests/mock/mock_conn_registry*
+    - src/mongo/dbtests/mock/mock_dbclient_connection*
+    - src/mongo/dbtests/mock/mock_remote_db_server*
+    - src/mongo/dbtests/socktests.cpp
+    - src/mongo/executor/async_rpc*
+    - src/mongo/executor/async_client*
+    - src/mongo/executor/connection_pool*
+    - src/mongo/executor/connection_metrics.h
+    - src/mongo/executor/network*
+    - src/mongo/executor/remote_command*
+    - src/mongo/executor/rpc_local_timing*
+    - src/mongo/executor/test_network*
+    - src/mongo/executor/mock_network*
+    - src/mongo/executor/mock_async_rpc*
+    - src/mongo/executor/mock_async_client_factory*
+    - src/mongo/executor/pooled_async_client_factory.h
+    - src/mongo/executor/egress_*
+
+networking.core:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/dbmessage*
+    - src/mongo/db/op_msg*
+    - src/mongo/db/operation_id*
+    - src/mongo/db/operation_key_manager*
+    - src/mongo/db/session_manager_mongod.h
+    - src/mongo/db/shutdown_in_progress_quiesce_info*
+    - src/mongo/db/wire_version*
+    - src/mongo/rpc/
+    - src/mongo/transport/
+    - src/mongo/util/net/
+    - src/mongo/s/load_balancer_support*
+    - src/mongo/db/modules/enterprise/src/mfp
+
+networking.commands:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/command_mirroring_test.cpp
+    - src/mongo/db/commands/conn_pool_stats.cpp
+    - src/mongo/db/commands/conn_pool_sync.cpp
+    - src/mongo/db/commands/drop_connections*
+    - src/mongo/db/commands/http_client.cpp
+    - src/mongo/db/commands/http_client.idl
+    - src/mongo/db/commands/isself.cpp
+    - src/mongo/db/commands/traffic_recording_cmds.cpp
+    - src/mongo/db/commands/whats_my_sni_command.cpp
+    - src/mongo/db/commands/whats_my_uri_cmd.cpp
+    - src/mongo/s/commands/cluster_hello_cmd.cpp
+    - src/mongo/s/commands/cluster_whats_my_uri_cmd.cpp
+
+networking.execution:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/baton*
+    - src/mongo/db/default_baton*
+    - src/mongo/executor/async_multicaster*
+    - src/mongo/executor/async_timer_*
+    - src/mongo/executor/async_transaction_rpc.h
+    - src/mongo/executor/executor_integration_test_*
+    - src/mongo/executor/exhaust_response_reader_*
+    - src/mongo/executor/pinned_connection_task_executor*
+    - src/mongo/s/append_raw_responses_test.cpp
+    - src/mongo/s/async_requests_sender*
+    - src/mongo/s/async_rpc_shard_targeter*
+    - src/mongo/s/sharding_task_executor*
+
+networking.mirrored_reads:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/db/mirror*
+
+networking.mongo_bridge:
+  meta:
+    slack: server-networking-observability
+    jira: Networking & Observability
+    fully_marked: true
+  files:
+    - src/mongo/tools/mongobridge_tool/
+
+timeseries: # authoritative: @10gen/server-collection-write-path
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/timeseries # excluding ./bucket_catalog
+    - src/mongo/db/op_observer/should_set_is_timeseries_field_test*
+
+timeseries.bucket_catalog: # authoritative: @10gen/server-timeseries-bucket-catalog
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/timeseries/bucket_catalog
+
+collection_write_path: # authoritative: @10gen/server-collection-write-path
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/collection_crud
+    - src/mongo/db/commands/collection_to_capped*
+    - src/mongo/db/replicated_fast_count
+
+bsoncolumn: # authoritative: @10gen/server-bsoncolumn
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/bson/column
+
+external_sorter: # authoritative: @10gen/server-external-sorter
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/sorter
+
+index_builds: # authoritative: @10gen/server-index-builds
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/index_builds
+    - src/mongo/db/index/index_access_method*
+    - src/mongo/db/index/index_bulk_builder_metrics*
+    - src/mongo/db/index/preallocated_container_pool*
+    - src/mongo/db/index_key_validate*
+    - src/mongo/db/index_spec_validate*
+    - src/mongo/db/commands/set_index_commit_quorum*
+    - src/mongo/db/commands/vote*index_build*
+    - src/mongo/dbtests/indexupdatetests.cpp
+    - src/mongo/s/commands/commit_quorum/cluster_set_index_commit_quorum_cmd.cpp
+
+key_string: # authoritative: @10gen/server-key-string
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/storage/key_string
+
+disagg_storage:
+  meta:
+    slack: disaggregated-storage-mongod
+    jira: RSSD
+    fully_marked: true
+  files:
+    - src/mongo/db/modules/atlas/src/disagg_storage
+    - src/mongo/db/modules/atlas/src/disagg_storage/replication_coordinator_disagg_magic_restore*
+
+disagg_storage.encryption:
+  meta:
+    slack: disagg-security-data-encryption
+    jira: Server Security
+    fully_marked: true
+  files:
+    - src/mongo/db/modules/atlas/src/disagg_storage/encryption
+
+storage_engine_api:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/repair*
+    - src/mongo/db/storage/wiredtiger
+    - src/mongo/db/storage/kv/kv_engine*
+    - src/mongo/db/storage/devnull
+    - src/mongo/db/storage/storage_engine*
+    - src/mongo/db/storage/record_store*
+    - src/mongo/db/storage/recovery_unit*
+    - src/mongo/db/storage/sorted_data_interface*
+    - src/mongo/db/storage/container*
+    - src/mongo/db/startup_recovery*
+    - src/mongo/db/modules/enterprise/src/inmemory
+    - src/mongo/db/modules/enterprise/src/queryable
+
+storage_engine_integration:
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/storage # excluding ./key_string, ./wiredtiger, ./devnull, some of ./kv
+    - src/mongo/db/action_duration_metrics*
+    - src/mongo/db/record_id*
+    - src/mongo/db/server_recovery*
+    - src/mongo/db/mongod_options_storage*
+    - src/mongo/db/dbhelpers*
+    - src/mongo/db/dbcommands.idl
+    - src/mongo/db/import*
+    - src/mongo/db/index_repair*
+    - src/mongo/db/commands/fsync*
+    - src/mongo/db/commands/dbcommands*
+    - src/mongo/db/commands/test_commands.*
+    - src/mongo/db/commands/resize_oplog*
+    - src/mongo/db/op_observer/batched_write*
+    - src/mongo/db/stats/storage_stats*
+    - src/mongo/db/storage/mdb_catalog*
+    - src/mongo/dbtests/dbhelper_tests.cpp
+    - src/mongo/dbtests/dbtests*
+    - src/mongo/dbtests/storage_debug_util*
+    - src/mongo/s/commands/storage_engine
+    - src/mongo/s/commands/*fsync*
+
+validate:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/throttle_cursor*
+    - src/mongo/db/commands/validate.cpp
+    - src/mongo/db/validate
+    - src/mongo/dbtests/validate_tests.cpp
+    - src/mongo/dbtests/extended_validate_tests.cpp
+    - src/mongo/s/commands/cluster_validate_cmd.cpp
+
+dbhash:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/dbhash*
+
+compact:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/collection_compact*
+    - src/mongo/db/commands/auto_compact*
+    - src/mongo/db/commands/compact*
+    - src/mongo/db/storage/compact_options*
+    - src/mongo/s/commands/cluster_compact_cmd.cpp
+
+dbcheck:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/dbcheck*
+    - src/mongo/dbtests/deferred_writer.cpp
+    - src/mongo/db/repl/dbcheck*
+
+server_backup_restore:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/modules/enterprise/src/hot_backups
+    - src/mongo/db/modules/enterprise/src/live_import
+    - src/mongo/db/storage/backup*
+
+cache_pressure:
+  meta:
+    slack: storage-engines-server-integration
+    jira: Server Integration
+    fully_marked: true
+  files:
+    - src/mongo/db/periodic_runner_cache_pressure_rollback*
+
+ttl: # authoritative: @10gen/server-ttl
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/db/ttl
+
+tracking_allocators: # authoritative: @10gen/server-tracking-allocators
+  meta:
+    slack: server-storage-execution
+    jira: Storage Execution
+    fully_marked: true
+  files:
+    - src/mongo/util/tracking
+
+atlas_streams:
+  meta:
+    slack: streams-engine
+    jira: Atlas Streams
+    fully_marked: true
+  files:
+    - src/mongo/db/modules/enterprise/src/streams
+
+server_parameters:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/server_parameter*
+
+server_options:
+  meta:
+    slack: server-security
+    jira: Server Security
+  files:
+    - src/mongo/db/server_options*
+    - src/mongo/unittest/integration_test_main.cpp
+    - src/mongo/db/cluster_auth_mode_option.idl
+    - src/mongo/db/keyfile_option.idl
+
+# This module doesn't really exist. It's files are only compiled on windows, and we don't
+# run the mod_scanner on a windows build. However, it is needed to ensure that all first-party
+# C++ files are assigned to a module. It should be a dependency island anyway.
+installer:
+  files:
+    - src/mongo/installer/
+
+replicated_storage_service:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/rss
+
+replication.clang_checked:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/clang_checked/*
+
+replication.hello:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/hello/
+    - src/mongo/db/repl/replication_info.cpp
+    - src/mongo/db/repl/replication_info_test.cpp
+
+replication.initial_sync:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/modules/enterprise/src/fcbis/
+    - src/mongo/db/repl/initial_sync/
+    - src/mongo/db/repl/*multiapplier*
+    - src/mongo/db/repl/*storage_interface*
+    - src/mongo/db/repl/*collection_bulk_loader*
+    - src/mongo/db/repl/clean_shutdown.idl
+
+replication.configs:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*repl_set_config*
+    - src/mongo/db/repl/*member_config*
+    - src/mongo/db/repl/*member_data*
+    - src/mongo/db/repl/*member_id*
+    - src/mongo/db/repl/repl_*server_parameters.idl
+    - src/mongo/db/repl/*member_state*
+    - src/mongo/db/repl/*repl_settings*
+    - src/mongo/db/repl/*repl_set_tag*
+    - src/mongo/db/repl/*repl_set_config*
+
+replication.oplog:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/apply_ops*
+    - src/mongo/db/commands/oplog*
+    - src/mongo/db/op_observer/op_observer*
+    - src/mongo/db/op_observer/fallback_op_observer*
+    - src/mongo/db/op_observer/operation_logger*
+    - src/mongo/db/repl/*apply_ops*
+    - src/mongo/db/repl/*bgsync*
+    - src/mongo/db/repl/*consistency_markers*
+    - src/mongo/db/repl/*internode_validation*
+    - src/mongo/db/repl/*get_next_optimes_test*
+    - src/mongo/db/repl/*idempotency_test_fixture*
+    - src/mongo/db/repl/*insert_group*
+    - src/mongo/db/repl/*noop_writer*
+    - src/mongo/db/repl/*oplog*
+    - src/mongo/db/repl/*pipelined*
+    - src/mongo/db/repl/*oplog_visibility_manager*
+    - src/mongo/db/repl/*optime*
+    - src/mongo/db/repl/*reporter*
+    - src/mongo/db/repl/*session_update_tracker*
+    - src/mongo/db/repl/*slotted_timestamp_list*
+    - src/mongo/db/repl/*sync_source*
+    - src/mongo/db/repl/apply_container_ops_test.cpp
+    - src/mongo/db/repl/local_oplog_info*
+    - src/mongo/db/repl/repl_network_traffic_stats*
+    - src/mongo/db/repl/repl_worker_pool_thread_count*
+    - src/mongo/s/commands/cluster_oplog_note_cmd.cpp
+    - src/mongo/s/commands/cluster_repl_set_get_status_cmd.cpp
+
+replication.server_rw_concerns:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/commands/server_status/read_write_concern_defaults_server_status.cpp
+    - src/mongo/db/*read_concern*
+    - src/mongo/db/read_write_concern*
+    - src/mongo/db/repl/*read_concern*
+    - src/mongo/db/repl/*write_concern*
+    - src/mongo/db/repl/*speculative_majority_read_info*
+    - src/mongo/db/stats/server_write_concern*
+    - src/mongo/db/stats/server_read_concern*
+    - src/mongo/db/stats/read_concern_stats.idl
+    - src/mongo/db/write_concern*
+
+replication.rs_aware_service:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*primary_only_service*
+    - src/mongo/db/repl/*replica_set_aware_service*
+    - src/mongo/db/s/primary_only_service_helpers
+
+replication.recovery:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*replication_recovery*
+    - src/mongo/db/repl/*rollback*
+    - src/mongo/db/modules/enterprise/src/magic_restore
+    - src/mongo/dbtests/rollbacktests.cpp
+    - src/mongo/db/repl/*roll_back_local_operations*
+    - src/mongo/db/repl/*timestamp_block*
+
+replication.replication_coordinator:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*optime_observer*
+    - src/mongo/db/repl/*replication_coordinator*
+    - src/mongo/db/repl/*write_concern_waiter_list*
+    - src/mongo/db/repl/*lock_guard_with_deferred_task*
+    - src/mongo/db/repl/*external_state*
+    - src/mongo/db/repl/*heartbeat*
+    - src/mongo/db/repl/*topology_coordinator*
+    - src/mongo/db/repl/*check_quorum_for_config_change*
+    - src/mongo/db/repl/*auto_get_rstl_for_stepup_stepdown*
+    - src/mongo/db/repl/*repl_set_heartbeat*
+    - src/mongo/db/repl/*vote_requester*
+    - src/mongo/db/repl/*last_vote*
+    - src/mongo/db/repl/*scatter_gather*
+    - src/mongo/db/repl/*split_prepare_session_manager*
+    - src/mongo/db/repl/*replication_metrics*
+    - src/mongo/db/repl/*election_reason*
+    - src/mongo/db/repl/*repl_set_request_votes*
+    - src/mongo/db/command_can_run_here*
+    - src/mongo/db/repl/*always_allow_non_local_writes*
+    - src/mongo/db/repl/*isself*
+    - src/mongo/db/repl/replication_waiter_list_bm.cpp
+    - src/mongo/db/modules/atlas/src/disagg_storage/replication_coordinator*
+
+replication.utils:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*parsing_utils*
+    - src/mongo/db/repl/*delayable_timeout_callback*
+    - src/mongo/db/repl/*abstract_async_component*
+    - src/mongo/db/repl/*wait_for_majority_service*
+    - src/mongo/db/repl/*idempotency*
+    - src/mongo/db/repl/*task_runner*
+    - src/mongo/db/repl/*task_executor_mock*
+    - src/mongo/db/repl/*replication_auth*
+    - src/mongo/db/repl/*replication_process*
+    - src/mongo/db/repl/*collection_utils*
+    - src/mongo/db/repl/*replication_types*
+    - src/mongo/db/repl/*temp_collections_cleanup_mongod*
+    - src/mongo/db/*mongod_options_replication*
+    - src/mongo/db/op_observer/find_and_modify_images_op_observer*
+    - src/mongo/db/incremental_rollout_metrics.cpp
+
+replication.repl_client_info:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*repl_client_info*
+    - src/mongo/db/repl/*repl_set_member_in_standalone_mode*
+
+replication.commands:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*repl_set_command*
+    - src/mongo/db/repl/*repl_set_commands*
+    - src/mongo/db/repl/*update_position_args*
+    - src/mongo/db/commands/snapshot_management.cpp
+    - src/mongo/db/commands/test_api_version_2_commands.cpp
+    - src/mongo/db/repl/repl_set_get_status_cmd.cpp
+
+replication.testing:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*mock_repl_coord*
+    - src/mongo/db/repl/*repl_set_test_egress*
+    - src/mongo/db/repl/*storage_timestamp_test*
+    - src/mongo/db/repl/image_collection_entry.idl
+    - src/mongo/dbtests/mock/mock_replica_set*
+    - src/mongo/dbtests/mock_replica_set_test.cpp
+    - src/mongo/dbtests/replica_set_tests.cpp
+    - src/mongo/dbtests/repltests.cpp
+
+replication.split_horizon:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/split_horizon/
+
+replication.intent:
+  meta:
+    slack: server-replication
+    jira: Replication
+    fully_marked: true
+  files:
+    - src/mongo/db/repl/*intent*
+    - src/mongo/db/replication_state_transition_lock_guard*

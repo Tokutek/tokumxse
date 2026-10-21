@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::extension"
+    mod_visibility: public
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ExtensionExceptionInformation:
+        description: "Information about an extension exception"
+        fields:
+            message:
+                type: string
+                optional: false
+            errorCode:
+                type: int
+                optional: false

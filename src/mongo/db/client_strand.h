@@ -1,0 +1,207 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/db/client.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/out_of_line_executor.h"
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+
+/**
+ * ClientStrand is a reference counted type for loaning Clients to threads.
+ *
+ * ClientStrand maintains the lifetime of its wrapped Client object and provides functionality to
+ * "bind" that Client to one and only one thread at a time. Its functions are synchronized.
+ */
+class ClientStrand final : public RefCountable {
+    static constexpr auto kDiagnosticLogLevel = 3;
+
+public:
+    static constexpr auto kUnableToRecoverClient = "Unable to recover Client for ClientStrand";
+
+    /**
+     * A simple RAII guard to set and release Clients.
+     */
+    class Guard {
+    public:
+        Guard() = default;
+        Guard(Guard&&) = default;
+        Guard& operator=(Guard&&) = default;
+
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+
+        Guard(ClientStrand* strand) : _strand(strand) {
+            // Hold the lock for as long as the Guard is around. This forces other consumers to
+            // queue behind the Guard.
+            _strand->_mutex.lock();
+            MONGO_COMPILER_DIAGNOSTIC_PUSH
+            MONGO_COMPILER_DIAGNOSTIC_WORKAROUND_ATOMIC_WRITE
+            _strand->_isBound.store(true);
+            MONGO_COMPILER_DIAGNOSTIC_POP
+
+            _strand->_setCurrent();
+        }
+
+        ~Guard() {
+            dismiss();
+        }
+
+        void dismiss() noexcept {
+            auto strand = std::exchange(_strand, {});
+            if (!strand) {
+                return;
+            }
+
+            strand->_releaseCurrent();
+            strand->_isBound.store(false);
+            strand->_mutex.unlock();
+        }
+
+        Client* get() noexcept {
+            return _strand->getClientPointer();
+        }
+
+        Client* operator->() noexcept {
+            return get();
+        }
+
+        Client& operator*() noexcept {
+            return *get();
+        }
+
+    private:
+        boost::intrusive_ptr<ClientStrand> _strand;
+    };
+
+    /**
+     * A simple wrapping executor to run tasks while a Client is bound.
+     */
+    class Executor final : public OutOfLineExecutor {
+    public:
+        Executor(ClientStrand* strand, ExecutorPtr exec)
+            : _strand(strand), _exec(std::move(exec)) {}
+        void schedule(Task task) override;
+
+    private:
+        boost::intrusive_ptr<ClientStrand> _strand;
+        ExecutorPtr _exec;
+    };
+
+    /**
+     * Make a new ClientStrand from a UniqueClient.
+     */
+    static boost::intrusive_ptr<ClientStrand> make(ServiceContext::UniqueClient client);
+
+    /**
+     * Acquire an owning ClientStrand given a client.
+     *
+     * This will return nullptr if the Client does not belong to a ClientStrand.
+     */
+    static boost::intrusive_ptr<ClientStrand> get(Client* client);
+
+    ClientStrand(ServiceContext::UniqueClient client)
+        : _clientPtr(client.get()),
+          _client(std::move(client)),
+          _threadName(ThreadNameRef{_client->desc()}) {}
+
+    /**
+     * Get a pointer to the underlying Client.
+     */
+    Client* getClientPointer() noexcept {
+        return _clientPtr;
+    }
+
+    /**
+     * Set the current Client for this thread and return a RAII guard to release it eventually.
+     *
+     * If the Client is currently bound, this function will block until the Client is available.
+     */
+    auto bind() {
+        return Guard(this);
+    }
+
+    /**
+     * Run a Task with the Client bound to the current thread.
+     *
+     * This function runs the task inline and assumes that the Client is not already bound to the
+     * current thread. If the Client is currently bound, this function will block until it is
+     * released.
+     */
+    template <typename Task, typename... Args>
+    void run(Task task, Args&&... args) {
+        auto guard = bind();
+
+        return task(std::forward<Args>(args)...);
+    }
+
+    /**
+     * Make a wrapped executor around another.
+     */
+    ExecutorPtr makeExecutor(ExecutorPtr exec) {
+        return std::make_shared<Executor>(this, std::move(exec));
+    }
+
+    /**
+     * Return if the strand is currently bound to a Client.
+     */
+    bool isBound() const noexcept {
+        return _isBound.load();
+    }
+
+private:
+    /**
+     * Bind the Client to the current thread.
+     *
+     * This is only valid to call if no other thread has the Client bound.
+     */
+    void _setCurrent();
+
+    /**
+     * Release the Client from the current thread.
+     *
+     * This is valid to call multiple times on the same thread. It is not valid to mix this with
+     * Client::releaseCurrent().
+     */
+    void _releaseCurrent();
+
+    Client* const _clientPtr;
+
+    std::mutex _mutex;
+
+    // Once we have stdx::atomic::wait(), we can get rid of the mutex in favor of this variable.
+    Atomic<bool> _isBound{false};
+
+    ServiceContext::UniqueClient _client;
+
+    ThreadNameRef _threadName;
+    ThreadNameRef _oldThreadName;
+};
+
+inline void ClientStrand::Executor::schedule(Task task) {
+    _exec->schedule([task = std::forward<Task>(task), strand = _strand](Status status) mutable {
+        strand->run(std::move(task), std::move(status));
+    });
+}
+
+using ClientStrandPtr = boost::intrusive_ptr<ClientStrand>;
+
+}  // namespace mongo

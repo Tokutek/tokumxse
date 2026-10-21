@@ -1,0 +1,46 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_types.idl"
+    - "mongo/db/query/client_cursor/cursor_response.idl"
+
+commands:
+    checkMetadataConsistency:
+        description: "The public checkMetadataConsistency command on mongos."
+        command_name: checkMetadataConsistency
+        cpp_name: CheckMetadataConsistency
+        namespace: concatenate_with_db
+        allow_global_collection_name: true
+        api_version: ""
+        reply_type: CursorInitialReply
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            CommonCheckMetadataRequestFields: commonFields
+        fields:
+            cursor:
+                type: SimpleCursorOptions
+                optional: true
+
+server_parameters:
+    probabilityTriggerShardFilteringRecoveryDuringCheckMetadataConsistency:
+        description: >
+            A test-only parameter that enables random filtering metadata recovery during the execution of
+            checkMetadataConsistency
+        set_at:
+            - startup
+            - runtime
+        cpp_vartype: Atomic<double>
+        cpp_varname: gProbabilityOfFilteringMetadataRecovery
+        default: 0.5
+        validator:
+            gte: 0.0
+            lte: 1.0
+        redact: false
+        test_only: true

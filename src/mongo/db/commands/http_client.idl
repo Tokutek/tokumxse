@@ -1,0 +1,39 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    httpClientReply:
+        description: "Result of an HTTP(S) GET request"
+        is_command_reply: true
+        fields:
+            code:
+                description: "Status code returned by server"
+                type: int
+            header:
+                description: "Headers returned by server"
+                type: string
+            body:
+                description: "Content returned by server"
+                type: string
+
+commands:
+    httpClientRequest:
+        description: "Fetch an HTTP(S) resource via GET"
+        command_name: httpClientRequest
+        namespace: ignored
+        api_version: ""
+        fields:
+            uri:
+                description: "Document location to fetch"
+                type: string
+            timeoutSecs:
+                description: "Maximum amount of time to wait for response (seconds)"
+                type: int
+                optional: true
+                validator:
+                    gt: 0

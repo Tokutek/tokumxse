@@ -1,0 +1,21 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::auth"
+    cpp_includes: []
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    X509MechanismClientStep1:
+        description: Client's opening request
+        strict: false
+        fields:
+            u:
+                description: "Principal name of client"
+                cpp_name: principalName
+                type: string
+                optional: true

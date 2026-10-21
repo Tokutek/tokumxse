@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ResumeTokenOplogTimestamp:
+        description: "Token format which facilitates resuming from the most recently-observed timestamp in the oplog"
+        strict: true
+        mod_visibility: public
+        fields:
+            ts:
+                type: timestamp
+                description: "The latest oplog timestamp."
+                optional: false

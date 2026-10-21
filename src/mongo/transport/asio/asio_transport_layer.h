@@ -1,0 +1,468 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/config.h"
+#include "mongo/db/ftdc/rolling_stats.h"
+#include "mongo/db/server_options.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/transport/session_manager.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_types.h"
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+
+#include <asio/basic_socket_acceptor.hpp>
+#include <asio/generic/stream_protocol.hpp>
+
+namespace mongo {
+
+class ServiceContext;
+class ServiceEntryPoint;
+
+namespace transport {
+using namespace std::literals::string_view_literals;
+
+// Simulates reads and writes that always return 1 byte and fail with EAGAIN
+extern FailPoint asioTransportLayerShortOpportunisticReadWrite;
+
+// Causes an asyncConnect to timeout after it's successfully connected to the remote peer
+extern FailPoint asioTransportLayerAsyncConnectTimesOut;
+
+extern FailPoint asioTransportLayerHangBeforeAcceptCallback;
+
+extern FailPoint asioTransportLayerHangDuringAcceptCallback;
+
+// Causes the listener thread to immediately hang when it is entered.
+extern FailPoint asioTransportLayerHangAtListenerStart;
+
+class AsioNetworkingBaton;
+class AsioReactor;
+class AsioSession;
+class WrappedEndpoint;
+
+/**
+ * A TransportLayer implementation based on ASIO networking primitives.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] AsioTransportLayer final : public TransportLayer {
+    AsioTransportLayer(const AsioTransportLayer&) = delete;
+    AsioTransportLayer& operator=(const AsioTransportLayer&) = delete;
+
+public:
+    using GenericAcceptor = asio::basic_socket_acceptor<asio::generic::stream_protocol>;
+
+    constexpr static auto kSlowOperationThreshold = Seconds(1);
+
+    struct Options {
+        constexpr static auto kIngress = 0x1;
+        constexpr static auto kEgress = 0x10;
+
+        Options() = default;
+        explicit Options(const ServerGlobalParams* params);
+
+        int mode = kIngress | kEgress;
+
+        bool isIngress() const {
+            return mode & kIngress;
+        }
+
+        bool isEgress() const {
+            return mode & kEgress;
+        }
+
+        int port = ServerGlobalParams::DefaultDBPort;  // port to bind to
+        boost::optional<int> loadBalancerPort;         // accepts load balancer connections
+        boost::optional<int> priorityPort;             // accepts priority connections
+        boost::optional<int> secondaryPort;            // accepts secondary connections
+        std::vector<std::string> ipList;               // addresses to bind to
+#ifndef _WIN32
+        bool useUnixSockets = true;         // whether to allow UNIX sockets in ipList
+        std::string unixProxySocketPrefix;  // empty means disabled
+#endif
+        bool enableIPv6 = false;             // whether to allow IPv6 sockets in ipList
+        size_t maxConns = DEFAULT_MAX_CONN;  // maximum number of active connections
+    };
+
+    /**
+     * A service, internal to `AsioTransportLayer`, that allows creating timers and running `Future`
+     * continuations when a timeout occurs. This allows setting up timeouts for synchronous
+     * operations, such as a synchronous SSL handshake. A separate thread is assigned to run these
+     * timers to:
+     * - Ensure there is always a thread running the timers, regardless of using a synchronous or
+     *   asynchronous listener.
+     * - Avoid any performance implications on other reactors (e.g., the `egressReactor`).
+     * The public visibility is only for testing purposes and this service is not intended to be
+     * used outside `AsioTransportLayer`.
+     */
+    class TimerService {
+    public:
+        using Spawn = std::function<stdx::thread(std::function<void()>)>;
+        struct Options {
+            Spawn spawn;
+        };
+        explicit TimerService(Options opt);
+        TimerService() : TimerService(Options{}) {}
+        ~TimerService();
+
+        /**
+         * Spawns a thread to run the reactor.
+         * Immediately returns if the service has already started.
+         * May be called more than once, and concurrently.
+         */
+        void start();
+
+        /**
+         * Stops the reactor and joins the thread.
+         * Immediately returns if the service is not started, or already stopped.
+         * May be called more than once, and concurrently.
+         */
+        void stop();
+
+        std::unique_ptr<ReactorTimer> makeTimer();
+
+        Date_t now();
+
+    private:
+        Reactor* _getReactor();
+
+        const std::shared_ptr<Reactor> _reactor;
+
+        // Serializes invocations of `start()` and `stop()`, and allows updating `_state` and
+        // `_thread` as a single atomic operation.
+        std::mutex _mutex;
+
+        // State transitions: `kInitialized` --> `kStarted` --> `kStopped`
+        //                          |_______________________________^
+        enum class State { kInitialized, kStarted, kStopped };
+        Atomic<State> _state;
+
+        Spawn _spawn = [](std::function<void()> f) {
+            return stdx::thread{std::move(f)};
+        };
+        stdx::thread _thread;
+    };
+
+    // Note that passing `nullptr` for {sessionManager} will disallow ingress usage.
+    AsioTransportLayer(const Options& opts, std::unique_ptr<SessionManager> sessionManager);
+
+    ~AsioTransportLayer() override;
+
+    StatusWith<std::shared_ptr<Session>> connect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        Milliseconds timeout,
+        const boost::optional<TransientSSLParams>& transientSSLParams) final;
+
+    Future<std::shared_ptr<Session>> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<ConnectionMetrics> connectionMetrics,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext = nullptr) final;
+
+    Status setup() final;
+
+    ReactorHandle getReactor(WhichReactor which) final;
+
+    Status start() final;
+
+    void shutdown() final;
+
+    void stopAcceptingSessions() final;
+
+    void appendStatsForServerStatus(BSONObjBuilder* bob) const override;
+
+    void appendStatsForFTDC(BSONObjBuilder& bob) const override;
+
+    std::string_view getNameForLogging() const override {
+        return "asio"sv;
+    }
+
+    TransportProtocol getTransportProtocol() const override {
+        return TransportProtocol::MongoRPC;
+    }
+
+    int listenerMainPort() const {
+        return _listenerInterfaceMainPort->getListenerPort();
+    }
+
+    boost::optional<int> loadBalancerPort() const {
+        return _listenerOptions.loadBalancerPort;
+    }
+
+    boost::optional<int> priorityPort() const {
+        return _listenerOptions.priorityPort;
+    }
+
+#ifndef _WIN32
+    bool isProxyUnixDomainSocket(const std::string& path) const;
+#endif
+
+    SessionManager* getSessionManager() const override {
+        return _sessionManager.get();
+    }
+
+    std::shared_ptr<SessionManager> getSharedSessionManager() const override {
+        return _sessionManager;
+    }
+
+    bool isIngress() const override {
+        return _listenerOptions.isIngress();
+    }
+
+    bool isEgress() const override {
+        return _listenerOptions.isEgress();
+    }
+
+    std::vector<std::pair<SockAddr, int>> getListenerSocketBacklogQueueDepths() const;
+
+    ExecutorPtr tlsHandshakePool() const;
+
+    SessionStatsResult collectReplicationSessionStats() override;
+    void registerReplicationSession(std::shared_ptr<Session>) override;
+#ifdef __linux__
+    BatonHandle makeBaton(OperationContext* opCtx) const override;
+#endif
+
+#ifdef MONGO_CONFIG_SSL
+    SSLParams::SSLModes sslMode() const;
+
+    std::shared_ptr<const SSLConnectionContext> sslContext() const {
+        return _sslContext.get();
+    }
+
+    Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                              bool asyncOCSPStaple) override;
+
+    /**
+     * Creates a transient SSL context using targeted (non default) SSL params.
+     * @param transientSSLParams overrides any value in stored SSLConnectionContext.
+     * @param optionalManager provides an optional SSL manager, otherwise the default one will be
+     * used.
+     */
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> createTransientSSLContext(
+        const TransientSSLParams& transientSSLParams) override;
+#endif
+
+private:
+    // Tokens help with tracking the number of pending proxy sessions.
+    using TokenType = ScopeGuard<std::function<void()>>;
+
+    void _acceptConnection(GenericAcceptor& acceptor);
+
+    template <typename Endpoint>
+    StatusWith<std::shared_ptr<AsioSession>> _doSyncConnect(
+        Endpoint endpoint,
+        const HostAndPort& peer,
+        const Milliseconds& timeout,
+        boost::optional<TransientSSLParams> transientSSLParams);
+
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> _createSSLContext(
+        std::shared_ptr<SSLManagerInterface>& manager,
+        SSLParams::SSLModes sslMode,
+        bool asyncOCSPStaple) const;
+
+    // Returns a token to track the number of connections pending the proxy protocol header. If the
+    // server has already accepted too many of such connections, returns `nullptr`.
+    std::unique_ptr<TokenType> _makeParseProxyTokenIfPossible();
+
+    void _trySetListenerSocketBacklogQueueDepth(GenericAcceptor& acceptor);
+
+    std::mutex _mutex;
+    void stopAcceptingSessionsWithLock(std::unique_lock<std::mutex> lk);
+
+    // AsioTransportLayer uses three reactor roles:
+    //  - Ingress reactor (`_ingressReactor`): provides the I/O context used to create accepted
+    //    client sockets. It is intentionally not run (see reason in below paragraph) and we instead
+    //    perform read/write work synchronously on session threads.
+    //  - Acceptor reactor(s): owned by each `ListenerInterface` (`_acceptorReactor`) and used only
+    //    for listening sockets and async_accept processing on the listener thread(s).
+    //  - Egress reactor (`_egressReactor`): owns outbound client sockets for egress connections.
+    //
+    // AsioTransportLayer should never call run() on `_ingressReactor`.
+    // In synchronous mode, this will cause a massive performance degradation due to
+    // unnecessary wakeups on the asio thread for sockets we don't intend to interact
+    // with asynchronously. The additional IO context avoids registering those sockets
+    // with the acceptors epoll set, thus avoiding those wakeups.  Calling run will
+    // undo that benefit.
+    //
+    // The underlying problem that caused this is here:
+    // https://github.com/chriskohlhoff/asio/issues/240
+    //
+    // It is important that the reactors be declared before the vector of acceptors (or any other
+    // state that is associated with the reactors), so that we destroy any existing acceptors or
+    // other reactor associated state before we drop the refcount on the reactor, which may destroy
+    // it.
+    std::shared_ptr<AsioReactor> _ingressReactor;
+    std::shared_ptr<AsioReactor> _egressReactor;
+    std::shared_ptr<ThreadPool> _tlsHandshakePool;
+
+#ifdef MONGO_CONFIG_SSL
+    synchronized_value<std::shared_ptr<const SSLConnectionContext>> _sslContext;
+#endif
+
+    struct AcceptorRecord;
+
+    // Only used if _listenerOptions.async is false.
+    struct Listener {
+        /**
+         * During {kActive}, we are actively accepting new connections and processing existing one.
+         * When we transition to {kShuttingDown}, no new connections will be accepted,
+         * and once all listening sockets have been cancelled,
+         * the running thread will transition to {kShutdown}.
+         */
+        enum class State {
+            kNew,
+            kActive,
+            kShuttingDown,
+            kShutdown,
+        };
+
+        stdx::thread thread;
+        stdx::condition_variable cv;
+        State state{State::kNew};
+    };
+
+    class ListenerInterface {
+    public:
+        ListenerInterface(std::mutex& sharedMutex,
+                          std::shared_ptr<AsioReactor> reactor,
+                          AsioTransportLayer* layer);
+
+        ~ListenerInterface();
+
+        Status setup(const std::vector<int>& ports,
+                     const std::vector<std::string>& listenIPAddrs,
+                     const std::vector<std::string>& listenUnixSocketsAddrs,
+                     const std::vector<std::string>& listenProxyUnixSocketsAddrs,
+                     Options& listenerOptions);
+
+        void stopListenerWithLock(std::unique_lock<std::mutex>& lk);
+
+        AsioTransportLayer::Listener::State getListenerState() const;
+
+        std::shared_ptr<AsioReactor> getReactor() const;
+
+        void startListener(std::string threadName);
+
+        bool isListenerStarted() const;
+
+        int getListenerPort() const {
+            return _listenerPort;
+        }
+
+        void waitUntilListenerStarted(std::unique_lock<std::mutex>& lk);
+
+        void waitListenerThreadJoin();
+
+        void setAcceptorRecords(
+            std::vector<std::unique_ptr<AsioTransportLayer::AcceptorRecord>>&& records);
+
+        const std::vector<std::unique_ptr<AsioTransportLayer::AcceptorRecord>>&
+        getAcceptorRecords();
+
+    private:
+        void _runListener(std::string threadName);
+
+        /** Unconditionally starts listening on all acceptors. */
+        void _startListening(WithLock lk);
+
+        void _waitForConnections(std::unique_lock<std::mutex>& lk);
+
+        void _stopAcceptors(WithLock lk);
+
+        StatusWith<std::vector<std::unique_ptr<AsioTransportLayer::AcceptorRecord>>>
+        _createAcceptorRecords(const std::vector<int>& ports,
+                               const std::set<WrappedEndpoint>& endpoints,
+                               const Options& listenerOptions,
+                               bool isProxyUnixDomainSocket);
+
+        // The lock is not necessary for this method since there are no concurrent operations
+        // accessing the shared state.
+        StatusWith<std::vector<std::unique_ptr<AsioTransportLayer::AcceptorRecord>>>
+        _retrieveAllAcceptorRecords(const std::vector<int>& ports,
+                                    const std::vector<std::string>& listenIPAddrs,
+                                    const std::vector<std::string>& listenUnixSocketsAddrs,
+                                    const std::vector<std::string>& listenProxyUnixSocketsAddrs,
+                                    const Options& listenerOptions);
+
+        // The real incoming port in case of the corresponding listener option port is 0
+        // (ephemeral).
+        int _listenerPort = 0;
+
+        std::mutex& _sharedMutex;
+
+        // The _acceptorReactor contains all the sockets in _acceptors.
+        std::shared_ptr<AsioReactor> _acceptorReactor;
+
+        std::vector<std::unique_ptr<AsioTransportLayer::AcceptorRecord>> _acceptorRecords;
+
+        Listener _listener;
+
+        AsioTransportLayer* _asioTransportLayer;
+    };
+
+    // AsioTransportLayer should run its own thread that calls run() on _listenerInterfaceMainPort's
+    // _acceptorReactor to process calls to async_accept on the main port - this is the equivalent
+    // of the "listener" thread in other TransportLayers. If the priority port is specified,
+    // AsioTransportLayer should run a second thread that calls run() on
+    // _listenerInterfacePriorityPort's _acceptorReactor to process calls to async_accept on the
+    // priority port.
+    const std::unique_ptr<ListenerInterface> _listenerInterfaceMainPort;
+    const std::unique_ptr<ListenerInterface> _listenerInterfacePriorityPort;
+
+    stdx::unordered_set<std::string> _proxyUnixSocketAddrs;
+
+    std::shared_ptr<SessionManager> _sessionManager;
+
+    Options _listenerOptions;
+
+    Atomic<bool> _isShutdown{false};
+
+    const std::unique_ptr<TimerService> _timerService;
+
+    // Tracks the cumulative time the listener spends between accepting incoming connections to
+    // handing them off to dedicated connection threads. We use an int64 since Microseconds is not
+    // an arithmetic type for atomic operations.
+    Atomic<std::int64_t> _listenerProcessingTotalMicros;
+
+    // Tracks the number of connections that are initiated to itself, where the remote and local
+    // addresses are the same. This excludes connections over Unix Domain Sockets.
+    Counter64 _numNonUDSSelfConnections;
+
+    // Tracks the number of connections that are dropped by the client before the server gets to
+    // process them (e.g. perform TLS handshake).
+    Counter64 _discardedDueToClientDisconnect;
+
+    // Tracks the current number of sessions that were accepted from the proxy port and are pending
+    // the proxy protocol header.
+    int64_t _numConnectionsPendingProxyHeader{0};
+
+    // Counts the aggregate number of proxy connections that were dropped due to the server reaching
+    // the maximum number of proxy connections pending proxy protocol header.
+    Counter64 _discardedDueToMaximumPendingOnProxyHeader;
+
+    // Statistics on dns resolution latency in milliseconds.
+    RollingStats _dnsResolveStatsMillis;
+
+    // Guards vector of replication sessions
+    std::mutex _replicationSessionLock;
+    std::vector<std::weak_ptr<AsioSession>> _replicationSessions;
+};
+
+}  // namespace transport
+}  // namespace mongo

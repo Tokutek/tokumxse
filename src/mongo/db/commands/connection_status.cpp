@@ -1,134 +1,128 @@
-/*
- *    Copyright (C) 2010 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/auth_name.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/parsed_privilege_gen.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/connection_status_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/read_through_cache.h"
+
+#include <algorithm>
+#include <iterator>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    using std::string;
-    using std::stringstream;
+class CmdConnectionStatus : public TypedCommand<CmdConnectionStatus> {
+public:
+    using Request = ConnectionStatusCommand;
+    using Reply = typename ConnectionStatusCommand::Reply;
 
-    class CmdConnectionStatus : public Command {
+    class Invocation final : public InvocationBase {
     public:
-        CmdConnectionStatus() : Command("connectionStatus") {}
-        virtual bool slaveOk() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {} // No auth required
+        using InvocationBase::InvocationBase;
 
-        void help(stringstream& h) const {
-            h << "Returns connection-specific information such as logged-in users and their roles";
+        Reply typedRun(OperationContext* opCtx) {
+            auto* as = AuthorizationSession::get(opCtx->getClient());
+
+            ConnectionStatusReplyAuthInfo info;
+            std::vector<UserName> userNames;
+            if (auto userName = as->getAuthenticatedUserName()) {
+                userNames.push_back(std::move(userName.value()));
+            }
+            info.setAuthenticatedUsers(std::move(userNames));
+            info.setAuthenticatedUserRoles(
+                iteratorToVector<RoleName>(as->getAuthenticatedRoleNames()));
+            if (request().getShowPrivileges()) {
+                info.setAuthenticatedUserPrivileges(expandPrivileges(as));
+            }
+
+            Reply reply;
+            reply.setAuthInfo(std::move(info));
+            reply.setUuid(opCtx->getClient()->getUUID());
+            return reply;
         }
 
-        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
-                 BSONObjBuilder& result, bool fromRepl) {
-            AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
-
-            bool showPrivileges;
-            Status status = bsonExtractBooleanFieldWithDefault(cmdObj,
-                                                               "showPrivileges",
-                                                               false,
-                                                               &showPrivileges);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
+    private:
+        template <typename T>
+        static std::vector<T> iteratorToVector(AuthNameIterator<T> it) {
+            std::vector<T> ret;
+            for (; it.more(); it.next()) {
+                ret.push_back(*it);
             }
+            return ret;
+        }
 
-            BSONObjBuilder authInfo(result.subobjStart("authInfo"));
-            {
-                BSONArrayBuilder authenticatedUsers(authInfo.subarrayStart("authenticatedUsers"));
-                UserNameIterator nameIter = authSession->getAuthenticatedUserNames();
+        static std::vector<auth::ParsedPrivilege> expandPrivileges(AuthorizationSession* as) {
+            // Create a unified map of resources to privileges, to avoid duplicate
+            // entries in the connection status output.
+            User::ResourcePrivilegeMap unified;
 
-                for ( ; nameIter.more(); nameIter.next()) {
-                    BSONObjBuilder userInfoBuilder(authenticatedUsers.subobjStart());
-                    userInfoBuilder.append(AuthorizationManager::USER_NAME_FIELD_NAME,
-                                           nameIter->getUser());
-                    userInfoBuilder.append(AuthorizationManager::USER_DB_FIELD_NAME,
-                                           nameIter->getDB());
-                }
-            }
-            {
-                BSONArrayBuilder authenticatedRoles(
-                        authInfo.subarrayStart("authenticatedUserRoles"));
-                RoleNameIterator roleIter = authSession->getAuthenticatedRoleNames();
-
-                for ( ; roleIter.more(); roleIter.next()) {
-                    BSONObjBuilder roleInfoBuilder(authenticatedRoles.subobjStart());
-                    roleInfoBuilder.append(AuthorizationManager::ROLE_NAME_FIELD_NAME,
-                                           roleIter->getRole());
-                    roleInfoBuilder.append(AuthorizationManager::ROLE_DB_FIELD_NAME,
-                                           roleIter->getDB());
-                }
-            }
-            if (showPrivileges) {
-                BSONArrayBuilder authenticatedPrivileges(
-                        authInfo.subarrayStart("authenticatedUserPrivileges"));
-
-                // Create a unified map of resources to privileges, to avoid duplicate
-                // entries in the connection status output.
-                User::ResourcePrivilegeMap unifiedResourcePrivilegeMap;
-                UserNameIterator nameIter = authSession->getAuthenticatedUserNames();
-
-                for ( ; nameIter.more(); nameIter.next()) {
-                    User* authUser = authSession->lookupUser(*nameIter);
-                    const User::ResourcePrivilegeMap& resourcePrivilegeMap =
-                        authUser->getPrivileges();
-                    for (User::ResourcePrivilegeMap::const_iterator it =
-                            resourcePrivilegeMap.begin();
-                            it != resourcePrivilegeMap.end();
-                            ++it) {
-                        if (unifiedResourcePrivilegeMap.find(it->first) ==
-                                unifiedResourcePrivilegeMap.end()) {
-                            unifiedResourcePrivilegeMap[it->first] = it->second;
-                        } else {
-                            unifiedResourcePrivilegeMap[it->first].addActions(
-                                    it->second.getActions());
-                        }
+            if (auto authUser = as->getAuthenticatedUser()) {
+                for (const auto& privIter : authUser.value()->getPrivileges()) {
+                    auto it = unified.find(privIter.first);
+                    if (it == unified.end()) {
+                        unified[privIter.first] = privIter.second;
+                    } else {
+                        it->second.addActions(privIter.second.getActions());
                     }
                 }
-
-                for (User::ResourcePrivilegeMap::const_iterator it =
-                        unifiedResourcePrivilegeMap.begin();
-                        it != unifiedResourcePrivilegeMap.end();
-                        ++it) {
-                    authenticatedPrivileges << it->second.toBSON();
-                }
             }
 
-            authInfo.doneFast();
-
-            return true;
+            std::vector<auth::ParsedPrivilege> ret;
+            std::transform(unified.cbegin(),
+                           unified.cend(),
+                           std::back_inserter(ret),
+                           [](const auto& it) { return it.second.toParsedPrivilege(); });
+            return ret;
         }
-    } cmdConnectionStatus;
-}
+
+        bool supportsWriteConcern() const final {
+            return false;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            // No auth required
+        }
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
+    };
+
+    bool requiresAuth() const final {
+        return false;
+    }
+
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+};
+MONGO_REGISTER_COMMAND(CmdConnectionStatus).forRouter().forShard();
+
+}  // namespace mongo

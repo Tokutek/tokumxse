@@ -1,0 +1,163 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/util/modules.h"
+
+#include <shared_mutex>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * Interface for handling stale shard metadata errors.
+ * Implementations perform recovery or refresh actions for sharding metadata for a given database
+ * when stale metadata exceptions are encountered.
+ */
+class [[MONGO_MOD_PRIVATE]] StaleShardDatabaseMetadataHandler {
+public:
+    /**
+     * Handles a StaleDbVersion error by recovering the sharding metadata for the specified
+     * database.
+     */
+    virtual boost::optional<DatabaseVersion> handleStaleDatabaseVersionException(
+        OperationContext* opCtx, const StaleDbRoutingVersion& staleDbException) const = 0;
+};
+
+/**
+ * Each shard node process (primary or secondary) has one instance of this object for each database
+ * whose primary is placed on, or is currently being movePrimary'd to, the current shard. It sits on
+ * the second level of the hierarchy of the Shard Role runtime-authoritative caches (along with
+ * CollectionShardingState) and contains sharding-related information about the database, such as
+ * its database version.
+ *
+ * SYNCHRONIZATION: Some methods might require holding a database level lock, so be sure to check
+ * the function-level comments for details.
+ */
+class [[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]] DatabaseShardingState {
+    DatabaseShardingState(const DatabaseShardingState&) = delete;
+    DatabaseShardingState& operator=(const DatabaseShardingState&) = delete;
+
+public:
+    DatabaseShardingState() = default;
+    virtual ~DatabaseShardingState() = default;
+
+    /**
+     * Obtains the sharding state for the specified database along with a lock in shared mode, which
+     * will be held until the object goes out of scope.
+     */
+    class ScopedDatabaseShardingState {
+        using LockType = std::variant<std::shared_lock<std::shared_mutex>,   // NOLINT
+                                      std::unique_lock<std::shared_mutex>>;  // NOLINT
+
+    public:
+        ScopedDatabaseShardingState(ScopedDatabaseShardingState&&);
+
+        ~ScopedDatabaseShardingState();
+
+        DatabaseShardingState* operator->() const {
+            return _dss;
+        }
+
+        DatabaseShardingState& operator*() const {
+            return *_dss;
+        }
+
+    private:
+        friend class DatabaseShardingState;
+        friend class DatabaseShardingRuntime;
+        friend class DatabaseShardingStateMock;
+
+        ScopedDatabaseShardingState(LockType lock, DatabaseShardingState* dss);
+
+        static ScopedDatabaseShardingState acquireScopedDatabaseShardingState(
+            OperationContext* opCtx, const DatabaseName& dbName, LockMode mode);
+
+        LockType _lock;
+        DatabaseShardingState* _dss;
+    };
+
+    static ScopedDatabaseShardingState acquire(OperationContext* opCtx, const DatabaseName& dbName);
+
+    static ScopedDatabaseShardingState assertDbLockedAndAcquire(OperationContext* opCtx,
+                                                                const DatabaseName& dbName);
+
+    /**
+     * Returns the names of the databases that have a DatabaseShardingState.
+     */
+    static std::vector<DatabaseName> getDatabaseNames(OperationContext* opCtx);
+
+    /**
+     * Returns StaleShardDatabaseMetadataHandler object that can be used to react to Stale Shard
+     * exceptions.
+     */
+    static const StaleShardDatabaseMetadataHandler& getStaleShardExceptionHandler(
+        OperationContext* opCtx);
+
+    /**
+     * Checks that the cached database version matches the one attached to the operation, which
+     * means that the operation is routed to the right shard (database owner).
+     *
+     * Throws `StaleDbRoutingVersion` exception when the critical section is taken, there is no
+     * cached database version, or the cached database version does not match the one sent by the
+     * client.
+     */
+    virtual void checkDbVersionOrThrow(OperationContext* opCtx) const = 0;
+
+    virtual void checkDbVersionOrThrow(OperationContext* opCtx,
+                                       const DatabaseVersion& receivedVersion) const = 0;
+
+    /**
+     * Checks that the current shard server is the primary for the given database, throwing
+     * `IllegalOperation` if not.
+     */
+    virtual void assertIsPrimaryShardForDb(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns `true` whether a `movePrimary` operation on this database is in progress, `false`
+     * otherwise.
+     */
+    virtual bool isMovePrimaryInProgress() const = 0;
+};
+
+
+/**
+ * Singleton factory to instantiate DatabaseShardingState objects specific to the type of instance
+ * which is running.
+ */
+class [[MONGO_MOD_PUBLIC]] DatabaseShardingStateFactory {
+    DatabaseShardingStateFactory(const DatabaseShardingStateFactory&) = delete;
+    DatabaseShardingStateFactory& operator=(const DatabaseShardingStateFactory&) = delete;
+
+public:
+    static void set(ServiceContext* service, std::unique_ptr<DatabaseShardingStateFactory> factory);
+    static void clear(ServiceContext* service);
+
+    virtual ~DatabaseShardingStateFactory() = default;
+
+    /**
+     * Called by the DatabaseShardingState::acquire method once per newly cached database. It is
+     * invoked under a mutex and must not acquire any locks or do blocking work.
+     *
+     * Implementations must be thread-safe when called from multiple threads.
+     */
+    virtual std::unique_ptr<DatabaseShardingState> make(const DatabaseName& dbName) = 0;
+
+    /**
+     * Called by the DatabaseShardingState::getStaleShardExceptionHandler. Constructs a
+     * StaleShardExceptionHandler object that can be used to react to Stale Shard exceptions.
+     */
+    virtual const StaleShardDatabaseMetadataHandler& getStaleShardExceptionHandler() const = 0;
+
+protected:
+    DatabaseShardingStateFactory() = default;
+};
+
+}  // namespace mongo

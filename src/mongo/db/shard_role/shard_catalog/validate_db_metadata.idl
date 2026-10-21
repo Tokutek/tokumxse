@@ -1,0 +1,60 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/util/uuid.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ErrorReplyElement:
+        description: "Error reply element of validateDBMetadata command's reply."
+        fields:
+            shard:
+                type: string
+                optional: true
+            ns: namespacestring
+            code: int
+            codeName: string
+            errmsg: string
+
+    ValidateDBMetadataCommandReply:
+        description: "The validateDBMetadata command's reply."
+        is_command_reply: true
+        fields:
+            apiVersionErrors:
+                type: array<ErrorReplyElement>
+                optional: true
+            hasMoreErrors:
+                type: optionalBool
+    APIParamsForCmd:
+        description: "Structure defining the API parameters for validateDBMetadata."
+        fields:
+            version:
+                type: string
+            strict:
+                type: optionalBool
+            deprecationErrors:
+                type: optionalBool
+
+commands:
+    validateDBMetadata:
+        description: "Input request for validateDBMetadata command."
+        command_name: validateDBMetadata
+        cpp_name: ValidateDBMetadataCommandRequest
+        namespace: ignored
+        api_version: ""
+        reply_type: ValidateDBMetadataCommandReply
+        fields:
+            db:
+                type: string
+                optional: true
+            collection:
+                type: string
+                optional: true
+            apiParameters:
+                type: APIParamsForCmd

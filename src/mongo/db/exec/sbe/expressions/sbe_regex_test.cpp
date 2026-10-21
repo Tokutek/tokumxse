@@ -1,0 +1,231 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/expression_test_base.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
+#include "mongo/db/exec/sbe/util/pcre.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/pcre_util.h"
+#include "mongo/util/str.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <tuple>
+
+namespace mongo::sbe {
+class SBERegexTest : public EExpressionTestFixture {
+protected:
+    void runAndAssertRegexCompile(const vm::CodeFragment* compiledExpr,
+                                  std::string_view regexString) {
+        value::TagValueOwned result =
+            value::TagValueOwned::fromRaw(runCompiledExpression(compiledExpr));
+
+        ASSERT_EQUALS(value::TypeTags::pcreRegex, result.tag());
+
+        auto regex = value::getPcreRegexView(result.value());
+        std::string res = str::stream()
+            << "/" << regex->pattern() << "/" << pcre_util::optionsToFlags(regex->options());
+        ASSERT_EQUALS(res, regexString);
+    }
+
+    void runAndAssertMatchExpression(const vm::CodeFragment* compiledExpr, bool expected) {
+        value::TagValueOwned result =
+            value::TagValueOwned::fromRaw(runCompiledExpression(compiledExpr));
+
+        ASSERT(result.tag() == value::TypeTags::Boolean);
+        ASSERT_EQUALS(value::bitcastTo<bool>(result.value()), expected);
+    }
+
+    void runAndAssertFindExpression(const vm::CodeFragment* compiledExpr,
+                                    std::string_view expectedMatch,
+                                    int idx) {
+        value::TagValueOwned result =
+            value::TagValueOwned::fromRaw(runCompiledExpression(compiledExpr));
+
+        ASSERT(result.tag() == value::TypeTags::Object);
+        auto obj = value::getObjectView(result.value());
+
+        auto match = obj->getField("match");
+        ASSERT(value::isString(match.tag));
+        ASSERT_EQUALS(value::getStringView(match.tag, match.value), expectedMatch);
+
+        auto fieldIdx = obj->getField("idx");
+        ASSERT_EQUALS(fieldIdx.tag, value::TypeTags::NumberInt32);
+        ASSERT_EQUALS(value::numericCast<int32_t>(fieldIdx.tag, fieldIdx.value), idx);
+    }
+
+    void addMatchResult(value::Array* arrayPtr, std::string_view matchStr, int32_t idx) {
+        value::TagValueOwned ownedObj = value::TagValueOwned::fromRaw(value::makeNewObject());
+        auto obj = value::getObjectView(ownedObj.value());
+
+        auto [matchStrTag, matchStrVal] = value::makeNewString(matchStr);
+        auto [capturesTag, capturesVal] = value::makeNewArray();
+        obj->push_back_raw("match", matchStrTag, matchStrVal);
+        obj->push_back_raw("idx", value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(idx));
+        obj->push_back_raw("captures", capturesTag, capturesVal);
+        arrayPtr->push_back(std::move(ownedObj));
+    }
+
+    void runAndAssertFindAllExpression(const vm::CodeFragment* compiledExpr,
+                                       value::Array* expected) {
+        value::TagValueOwned result =
+            value::TagValueOwned::fromRaw(runCompiledExpression(compiledExpr));
+
+        ASSERT(result.tag() == value::TypeTags::Array);
+        auto arr = value::getArrayView(result.value());
+
+        ASSERT_EQUALS(arr->size(), expected->size());
+
+        for (size_t idx = 0; idx < arr->size(); ++idx) {
+            auto [objTag, objVal] = arr->getAt(idx);
+            ASSERT(objTag == value::TypeTags::Object);
+            auto [expObjTag, expObjVal] = expected->getAt(idx);
+            ASSERT(expObjTag == value::TypeTags::Object);
+
+            auto [matchTag, matchVal] = value::getObjectView(objVal)->getField("match");
+            auto [expMatchTag, expMatchVal] = value::getObjectView(expObjVal)->getField("match");
+            ASSERT_EQUALS(matchTag, expMatchTag);
+            ASSERT_EQUALS(value::getStringView(matchTag, matchVal),
+                          value::getStringView(expMatchTag, expMatchVal));
+
+            auto [idxTag, idxVal] = value::getObjectView(objVal)->getField("idx");
+            auto [expIdxTag, expIdxVal] = value::getObjectView(expObjVal)->getField("idx");
+            ASSERT_EQUALS(idxTag, expIdxTag);
+            ASSERT_EQUALS(value::numericCast<int64_t>(idxTag, idxVal),
+                          value::numericCast<int64_t>(expIdxTag, expIdxVal));
+        }
+    }
+};
+
+TEST_F(SBERegexTest, ComputesRegexCompile) {
+    value::OwnedValueAccessor slotAccessor1;
+    value::OwnedValueAccessor slotAccessor2;
+    auto patternSlot = bindAccessor(&slotAccessor1);
+    auto optionsSlot = bindAccessor(&slotAccessor2);
+    auto regexExpr = sbe::makeE<sbe::EFunction>(
+        EFn::kRegexCompile,
+        sbe::makeEs(makeE<EVariable>(patternSlot), makeE<EVariable>(optionsSlot)));
+    auto compiledExpr = compileExpression(*regexExpr);
+
+    auto [patternTag, patternVal] = value::makeNewString("^Many");
+    auto [optionsTag, optionsVal] = value::makeNewString("i");
+    slotAccessor1.reset(patternTag, patternVal);
+    slotAccessor2.reset(optionsTag, optionsVal);
+    runAndAssertRegexCompile(compiledExpr.get(), "/^Many/i");
+}
+
+TEST_F(SBERegexTest, ComputesRegexMatch) {
+    value::OwnedValueAccessor slotAccessor1;
+    value::OwnedValueAccessor slotAccessor2;
+    auto regexSlot = bindAccessor(&slotAccessor1);
+    auto inputSlot = bindAccessor(&slotAccessor2);
+    auto regexExpr = sbe::makeE<sbe::EFunction>(
+        EFn::kRegexMatch, sbe::makeEs(makeE<EVariable>(regexSlot), makeE<EVariable>(inputSlot)));
+    auto compiledExpr = compileExpression(*regexExpr);
+
+    auto [regexTag, regexVal] = makeNewPcreRegex("line", "").releaseToRaw();
+    auto [inputTag, inputVal] = value::makeNewString("Many lines of code");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertMatchExpression(compiledExpr.get(), true);
+
+    std::tie(regexTag, regexVal) = makeNewPcreRegex("link", "").releaseToRaw();
+    std::tie(inputTag, inputVal) = value::makeNewString("Example text");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertMatchExpression(compiledExpr.get(), false);
+}
+
+TEST_F(SBERegexTest, ComputesRegexFind) {
+    value::OwnedValueAccessor slotAccessor1;
+    value::OwnedValueAccessor slotAccessor2;
+    auto regexSlot = bindAccessor(&slotAccessor1);
+    auto inputSlot = bindAccessor(&slotAccessor2);
+    auto regexExpr = sbe::makeE<sbe::EFunction>(
+        EFn::kRegexFind, sbe::makeEs(makeE<EVariable>(regexSlot), makeE<EVariable>(inputSlot)));
+    auto compiledExpr = compileExpression(*regexExpr);
+
+    auto [regexTag, regexVal] = makeNewPcreRegex("line", "").releaseToRaw();
+    auto [inputTag, inputVal] = value::makeNewString("Many lines of code");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertFindExpression(compiledExpr.get(), "line", 5);
+
+    std::tie(regexTag, regexVal) = makeNewPcreRegex("line", "i").releaseToRaw();
+    std::tie(inputTag, inputVal) = value::makeNewString("Many LINES of code");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertFindExpression(compiledExpr.get(), "LINE", 5);
+}
+
+TEST_F(SBERegexTest, ComputesRegexFindAll) {
+    value::OwnedValueAccessor slotAccessor1;
+    value::OwnedValueAccessor slotAccessor2;
+    auto regexSlot = bindAccessor(&slotAccessor1);
+    auto inputSlot = bindAccessor(&slotAccessor2);
+    auto regexExpr = sbe::makeE<sbe::EFunction>(
+        EFn::kRegexFindAll, sbe::makeEs(makeE<EVariable>(regexSlot), makeE<EVariable>(inputSlot)));
+    auto compiledExpr = compileExpression(*regexExpr);
+
+    auto expectedArr = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arrayView = value::getArrayView(expectedArr.value());
+
+    addMatchResult(arrayView, "line", 4);
+    addMatchResult(arrayView, "line", 16);
+
+    auto [regexTag, regexVal] = makeNewPcreRegex("line", "").releaseToRaw();
+    auto [inputTag, inputVal] = value::makeNewString("One line or two lines of code");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertFindAllExpression(compiledExpr.get(), arrayView);
+}
+
+TEST_F(SBERegexTest, RegexFindAllEmptyMatchOnEmptyInput) {
+    value::OwnedValueAccessor slotAccessor1;
+    value::OwnedValueAccessor slotAccessor2;
+    auto regexSlot = bindAccessor(&slotAccessor1);
+    auto inputSlot = bindAccessor(&slotAccessor2);
+    auto regexExpr = sbe::makeE<sbe::EFunction>(
+        EFn::kRegexFindAll, sbe::makeEs(makeE<EVariable>(regexSlot), makeE<EVariable>(inputSlot)));
+    auto compiledExpr = compileExpression(*regexExpr);
+
+    auto expectedArr = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arrayView = value::getArrayView(expectedArr.value());
+    addMatchResult(arrayView, /*matchStr*/ "", /*idx*/ 0);
+
+    auto [regexTag, regexVal] = makeNewPcreRegex("a*", "").releaseToRaw();
+    auto [inputTag, inputVal] = value::makeNewString("");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertFindAllExpression(compiledExpr.get(), arrayView);
+}
+
+TEST_F(SBERegexTest, RegexFindAllEndAnchorOnNonEmptyInput) {
+    value::OwnedValueAccessor slotAccessor1;
+    value::OwnedValueAccessor slotAccessor2;
+    auto regexSlot = bindAccessor(&slotAccessor1);
+    auto inputSlot = bindAccessor(&slotAccessor2);
+    auto regexExpr = sbe::makeE<sbe::EFunction>(
+        EFn::kRegexFindAll, sbe::makeEs(makeE<EVariable>(regexSlot), makeE<EVariable>(inputSlot)));
+    auto compiledExpr = compileExpression(*regexExpr);
+
+    auto expectedArr = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arrayView = value::getArrayView(expectedArr.value());
+    addMatchResult(arrayView, /*matchStr*/ "", /*idx*/ 5);
+
+    auto [regexTag, regexVal] = makeNewPcreRegex("$", "").releaseToRaw();
+    auto [inputTag, inputVal] = value::makeNewString("hello");
+    slotAccessor1.reset(regexTag, regexVal);
+    slotAccessor2.reset(inputTag, inputVal);
+    runAndAssertFindAllExpression(compiledExpr.get(), arrayView);
+}
+
+}  // namespace mongo::sbe

@@ -1,0 +1,82 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "util",
+    srcs = [
+        "__init__.py",
+        "buildozer_utils.py",
+        "cedar_report.py",
+        "cmdutils.py",
+        "codeowners_utils.py",
+        "evergreen_retry.py",
+        "expansions.py",
+        "fileops.py",
+        "generate_co_jira_map.py",
+        "golden_test_config.py",
+        "oauth.py",
+        "read_config.py",
+        "runcommand.py",
+        "taskname.py",
+        "testname.py",
+        "teststats.py",
+        "time.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "oauthlib",
+            group = "testing",
+        ),
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+        dependency(
+            "structlog",
+            group = "evergreen",
+        ),
+        dependency(
+            "pkce",
+            group = "testing",
+        ),
+        dependency(
+            "pydantic",
+            group = "evergreen",
+        ),
+        dependency(
+            "requests-oauthlib",
+            group = "testing",
+        ),
+        dependency(
+            "evergreen-py",
+            group = "testing",
+        ),
+        dependency(
+            "urllib3",
+            group = "testing",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+    ],
+)
+
+py_library(
+    name = "download_utils",
+    srcs = [
+        "download_utils.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "boto3",
+            group = "aws",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+    ],
+)

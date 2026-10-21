@@ -1,0 +1,329 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#include "mongo/db/commands/oplog_application_checks.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_checks.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/builtin_roles.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/validated_tenancy_scope_factory.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/database_name_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/document_validation.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+void checkBSONType(BSONType type, const BSONElement& elem) {
+    uassert(elem.type() == BSONType::eoo ? ErrorCodes::NoSuchKey : ErrorCodes::TypeMismatch,
+            fmt::format("Wrong type for {:?}. Expected a {}, got a {}.",
+                        elem.fieldNameStringData(),
+                        typeName(type),
+                        typeName(elem.type())),
+            elem.type() == type);
+}
+
+UUID OplogApplicationChecks::getUUIDFromOplogEntry(const BSONObj& oplogEntry) {
+    BSONElement uiElem = oplogEntry["ui"];
+    return uassertStatusOK(UUID::parse(uiElem));
+}
+
+Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opCtx,
+                                                           const DatabaseName& dbName,
+                                                           const BSONObj& oplogEntry,
+                                                           AuthorizationSession* authSession) {
+    BSONElement opTypeElem = oplogEntry["op"];
+    checkBSONType(BSONType::string, opTypeElem);
+    const std::string_view opType = opTypeElem.checkAndGetStringData();
+
+    if (opType == "n"sv) {
+        // oplog notes require cluster permissions, and may not have a ns
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()),
+                ActionType::appendOplogNote)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    }
+
+    const BSONElement nsElem = oplogEntry["ns"];
+    checkBSONType(BSONType::string, nsElem);
+    const auto tid = repl::OplogEntry::parseTid(oplogEntry);
+    NamespaceString nss = NamespaceStringUtil::deserialize(
+        tid, nsElem.checkAndGetStringData(), SerializationContext::stateDefault());
+
+    // The database named in the 'ns' field, before the UUID override below. dropDatabase ignores
+    // any 'ui' at execution time and drops this database, so it must be authorized against it.
+    const DatabaseName nsFieldDbName = nss.dbName();
+
+    if (oplogEntry.hasField("ui"sv)) {
+        // ns by UUID overrides the ns specified if they are different.
+        auto catalog = CollectionCatalog::get(opCtx);
+        boost::optional<NamespaceString> uuidCollNS =
+            shard_role_nocheck::lookupNssWithoutAcquisition(opCtx,
+                                                            getUUIDFromOplogEntry(oplogEntry));
+        if (uuidCollNS && *uuidCollNS != nss)
+            nss = *uuidCollNS;
+    }
+
+    BSONElement oElem = oplogEntry["o"];
+    checkBSONType(BSONType::object, oElem);
+    BSONObj o = oElem.Obj();
+
+    if (opType == "c"sv) {
+        std::string_view commandName = o.firstElement().fieldNameStringData();
+        Command* commandInOplogEntry = CommandHelpers::findCommand(opCtx, commandName);
+        if (!commandInOplogEntry) {
+            // Some oplog entries are internal-only and not registered in the global command
+            // registry. Allow them through if the user has ActionType::internal (e.g. __system).
+            // TODO(SERVER-114573): Remove upgradeDowngradeViewlessTimeseries from this list once
+            // 9.0 becomes last-lts, as the oplog entry will no longer exist.
+            static const StringDataSet kInternalOplogCommands{
+                "upgradeDowngradeViewlessTimeseries"sv,
+            };
+            if (kInternalOplogCommands.contains(commandName)) {
+                if (!authSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forClusterResource(dbName.tenantId()),
+                        ActionType::internal)) {
+                    return Status(ErrorCodes::Unauthorized, "Unauthorized");
+                }
+                return Status::OK();
+            }
+            return Status(ErrorCodes::FailedToParse, "Unrecognized command in op");
+        }
+
+        auto dbNameForAuthCheck = nss.dbName();
+        if (commandName == "renameCollection"sv) {
+            // renameCollection commands must be run on the 'admin' database. Its arguments are
+            // fully qualified namespaces. Catalog internals don't know the op produced by running
+            // renameCollection was originally run on 'admin', so we must restore this.
+            dbNameForAuthCheck = DatabaseNameUtil::deserialize(
+                nss.tenantId(), "admin", SerializationContext::stateDefault());
+        } else if (commandName == "dropDatabase"sv) {
+            // dropDatabase ignores any 'ui' at execution time and drops the database named in the
+            // 'ns' field, so authorize that database rather than the UUID-resolved one.
+            dbNameForAuthCheck = nsFieldDbName;
+        }
+
+        // TODO SERVER-123371 reuse the parse result for when we run() later. Note that when
+        // running, we must use a potentially different dbname.
+        return [&] {
+            try {
+                boost::optional<auth::ValidatedTenancyScope> vts;
+                if (dbNameForAuthCheck.tenantId()) {
+                    vts = boost::optional<auth::ValidatedTenancyScope>(
+                        auth::ValidatedTenancyScopeFactory::create(
+                            dbNameForAuthCheck.tenantId().value(),
+                            auth::ValidatedTenancyScopeFactory::TrustedForInnerOpMsgRequestTag{}));
+                }
+
+                auto request = OpMsgRequestBuilder::create(vts, dbNameForAuthCheck, o);
+                commandInOplogEntry->parse(opCtx, request)->checkAuthorization(opCtx, request);
+                return Status::OK();
+            } catch (const DBException& e) {
+                return e.toStatus();
+            }
+        }();
+    }
+
+    if (opType == "i"sv) {
+        return auth::checkAuthForInsert(authSession, opCtx, nss);
+    } else if (opType == "u"sv) {
+        BSONElement o2Elem = oplogEntry["o2"];
+        checkBSONType(BSONType::object, o2Elem);
+        BSONObj o2 = o2Elem.Obj();
+
+        BSONElement bElem = oplogEntry["b"];
+        if (!bElem.eoo()) {
+            checkBSONType(BSONType::boolean, bElem);
+        }
+        bool b = bElem.trueValue();
+
+        const bool upsert = b;
+
+        return auth::checkAuthForUpdate(authSession,
+                                        opCtx,
+                                        nss,
+                                        o2,
+                                        write_ops::UpdateModification::parseFromOplogEntry(
+                                            o, write_ops::UpdateModification::DiffOptions{}),
+                                        upsert);
+    } else if (opType == "d"sv) {
+        return auth::checkAuthForDelete(authSession, opCtx, nss, o);
+    } else if (opType == "db"sv) {
+        // It seems that 'db' isn't used anymore. Require all actions to prevent casual use.
+        ActionSet allActions;
+        allActions.addAllActions();
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forAnyResource(nss.tenantId()), allActions)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    } else if (opType == "ci"sv) {
+        // Container ops write to the storage ident named by the op's "container" field, not to
+        // "nss" -- the two are unrelated, so this cannot be scoped to nss like the other ops
+        // above. Require the action on any resource instead.
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forAnyResource(nss.tenantId()), ActionType::containerInsert)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    } else if (opType == "cd"sv) {
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forAnyResource(nss.tenantId()), ActionType::containerDelete)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    } else if (opType == "cu"sv) {
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forAnyResource(nss.tenantId()), ActionType::containerUpdate)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    }
+
+    return Status(ErrorCodes::FailedToParse, "Unrecognized opType");
+}
+
+Status OplogApplicationChecks::checkOperationArray(const BSONElement& opsElement) {
+    if (opsElement.type() != BSONType::array) {
+        return {ErrorCodes::FailedToParse, "ops has to be an array"};
+    }
+    const auto& ops = opsElement.Obj();
+    // check input
+    BSONObjIterator i(ops);
+    while (i.more()) {
+        BSONElement e = i.next();
+        auto status = checkOperation(e);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+    return Status::OK();
+}
+
+Status OplogApplicationChecks::checkOperation(const BSONElement& e) {
+    if (e.type() != BSONType::object) {
+        return {ErrorCodes::FailedToParse, str::stream() << "op not an object: " << e.fieldName()};
+    }
+    BSONObj obj = e.Obj();
+    // op - operation type
+    BSONElement opElement = obj.getField("op");
+    if (opElement.eoo()) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "op does not contain required \"op\" field: " << e.fieldName()};
+    }
+    if (opElement.type() != BSONType::string) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "\"op\" field is not a string: " << e.fieldName()};
+    }
+    // operation type -- see logOp() comments for types
+    std::string_view opType = opElement.valueStringDataSafe();
+    if (opType.empty()) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "\"op\" field value cannot be empty: " << e.fieldName()};
+    }
+
+    // ns - namespace
+    // Only operations of type 'n' are allowed to have an empty namespace.
+    BSONElement nsElement = obj.getField("ns");
+    if (nsElement.eoo()) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "op does not contain required \"ns\" field: " << e.fieldName()};
+    }
+    if (nsElement.type() != BSONType::string) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "\"ns\" field is not a string: " << e.fieldName()};
+    }
+    if (nsElement.String().find('\0') != std::string::npos) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "namespaces cannot have embedded null characters"};
+    }
+    if (opType != "n"sv && nsElement.String().empty()) {
+        return {ErrorCodes::IllegalOperation,
+                str::stream() << "\"ns\" field value cannot be empty when op type is not 'n': "
+                              << e.fieldName()};
+    }
+    return Status::OK();
+}
+
+Status OplogApplicationChecks::checkAuthForOperation(OperationContext* opCtx,
+                                                     const DatabaseName& dbName,
+                                                     const BSONObj& cmdObj,
+                                                     OplogApplicationValidity validity) {
+    AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+    if (!authSession->isAuthorizedForActionsOnResource(
+            ResourcePattern::forClusterResource(dbName.tenantId()), ActionType::applyOps)) {
+        return Status(ErrorCodes::Unauthorized, "Unauthorized");
+    }
+
+    if (validity == OplogApplicationValidity::kNeedsSuperuser) {
+        std::vector<Privilege> universalPrivileges;
+        auth::generateUniversalPrivileges(&universalPrivileges, dbName.tenantId());
+        if (!authSession->isAuthorizedForPrivileges(universalPrivileges)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    }
+    if (validity == OplogApplicationValidity::kNeedsForceAndUseUUID) {
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()),
+                {ActionType::forceUUID, ActionType::useUUID})) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        validity = OplogApplicationValidity::kOk;
+    }
+    if (validity == OplogApplicationValidity::kNeedsUseUUID) {
+        if (!authSession->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()), ActionType::useUUID)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        validity = OplogApplicationValidity::kOk;
+    }
+    fassert(40314, validity == OplogApplicationValidity::kOk);
+
+    boost::optional<DisableDocumentValidationForInternalOp> maybeDisableValidation;
+    if (shouldBypassDocumentValidationForCommand(cmdObj))
+        maybeDisableValidation.emplace(opCtx);
+
+    checkBSONType(BSONType::array, cmdObj.firstElement());
+    for (const BSONElement& e : cmdObj.firstElement().Array()) {
+        checkBSONType(BSONType::object, e);
+        Status status = OplogApplicationChecks::checkOperationAuthorization(
+            opCtx, dbName, e.Obj(), authSession);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    return Status::OK();
+}
+
+}  // namespace mongo

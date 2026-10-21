@@ -1,0 +1,1191 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/rpc/op_msg_test.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_client_handle_shard.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
+#include "mongo/db/auth/authorization_manager_impl.h"
+#include "mongo/db/auth/authorization_router_impl.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authorization_session_impl.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/telemetry_context_section_gen.h"
+#include "mongo/unittest/log_capture.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/serialization_context.h"
+
+#include <algorithm>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+namespace rpc {
+namespace test {
+namespace {
+
+// Fixture class to raise log verbosity so that invalid messages are printed by the parser.
+class OpMsgParser : public unittest::Test {
+    unittest::MinimumLoggedSeverityGuard _severityGuard{logv2::LogComponent::kNetwork,
+                                                        logv2::LogSeverity::Debug(1)};
+};
+
+// Flags
+constexpr uint32_t kNoFlags = 0;
+constexpr uint32_t kHaveChecksum = OpMsg::kChecksumPresent;
+
+TEST_F(OpMsgParser, SucceedsWithJustBody) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 0u);
+}
+
+TEST_F(OpMsgParser, SucceedsWithChecksum) {
+    auto msg = OpMsgBytes{kHaveChecksum,  //
+                          kBodySection,
+                          fromjson("{ping: 1}")}
+                   .appendChecksum()
+                   .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 0u);
+}
+
+TEST_F(OpMsgParser, SucceedsWithBodyThenSequence) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+                fromjson("{a: 2}"),
+            },
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 1u);
+    ASSERT_EQ(msg.sequences[0].name, "docs");
+    ASSERT_EQ(msg.sequences[0].objs.size(), 2u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[0].objs[0], fromjson("{a: 1}"));
+    ASSERT_BSONOBJ_EQ(msg.sequences[0].objs[1], fromjson("{a: 2}"));
+}
+
+TEST_F(OpMsgParser, SucceedsWithSequenceThenBody) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 1u);
+    ASSERT_EQ(msg.sequences[0].name, "docs");
+    ASSERT_EQ(msg.sequences[0].objs.size(), 1u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[0].objs[0], fromjson("{a: 1}"));
+}
+
+TEST_F(OpMsgParser, SucceedsWithSequenceThenBodyThenSequence) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kDocSequenceSection,
+            Sized{
+                "empty",  //
+            },
+
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 2u);
+    ASSERT_EQ(msg.sequences[0].name, "empty");
+    ASSERT_EQ(msg.sequences[0].objs.size(), 0u);
+    ASSERT_EQ(msg.sequences[1].name, "docs");
+    ASSERT_EQ(msg.sequences[1].objs.size(), 1u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[1].objs[0], fromjson("{a: 1}"));
+}
+
+TEST_F(OpMsgParser, SucceedsWithSequenceThenSequenceThenBody) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kDocSequenceSection,
+            Sized{
+                "empty",  //
+            },
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 2u);
+    ASSERT_EQ(msg.sequences[0].name, "empty");
+    ASSERT_EQ(msg.sequences[0].objs.size(), 0u);
+    ASSERT_EQ(msg.sequences[1].name, "docs");
+    ASSERT_EQ(msg.sequences[1].objs.size(), 1u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[1].objs[0], fromjson("{a: 1}"));
+}
+
+TEST_F(OpMsgParser, SucceedsWithBodyThenSequenceThenSequence) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+
+            kDocSequenceSection,
+            Sized{
+                "empty",  //
+            },
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 2u);
+    ASSERT_EQ(msg.sequences[0].name, "docs");
+    ASSERT_EQ(msg.sequences[0].objs.size(), 1u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[0].objs[0], fromjson("{a: 1}"));
+    ASSERT_EQ(msg.sequences[1].name, "empty");
+    ASSERT_EQ(msg.sequences[1].objs.size(), 0u);
+}
+
+TEST_F(OpMsgParser, FailsIfNoBody) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::MissingOpMsgBodySection);
+}
+
+TEST_F(OpMsgParser, FailsIfNoBodyAndEmitsMsgParseLog) {
+    // The parse-failure log (id 22632) is rate-limited by a process-global SeveritySuppressor.
+    // Raise the component to Debug(2) so the single failure below is always emitted (and captured)
+    // regardless of the order in which the tests run.
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kNetwork,
+                                                       logv2::LogSeverity::Debug(2)};
+
+    unittest::LogCaptureGuard logs;
+
+    auto msg = OpMsgBytes{
+        kNoFlags,
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::MissingOpMsgBodySection);
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("c" << "OP_MSG" << "id" << 22632)), 1);
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("c" << "NETWORK" << "id" << 22632)), 0);
+}
+
+TEST_F(OpMsgParser, RateLimitsParseFailureLog) {
+    // Ensure that OP_MSG parsing failure logs (id 22632) can only emit one log at Debug(1)
+    // verbosity per suppression period. Every subsequent log should be Debug(2), so in this
+    // test, we should see 1 log in the capture guard even though 5 errors happened.
+    unittest::LogCaptureGuard logs;
+
+    for (int i = 0; i < 5; ++i) {
+        auto msg = OpMsgBytes{
+            kNoFlags,
+        };
+
+        ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::MissingOpMsgBodySection);
+    }
+
+    ASSERT_LTE(logs.countBSONContainingSubset(BSON("c" << "OP_MSG" << "id" << 22632)), 1);
+}
+
+TEST_F(OpMsgParser, FailsIfNoBodyEvenWithSequence) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+
+        kDocSequenceSection,
+        Sized{"docs"},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::MissingOpMsgBodySection);
+}
+
+TEST_F(OpMsgParser, FailsIfTwoBodies) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kBodySection,
+        fromjson("{pong: 1}"),
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::MultipleOpMsgBodySections);
+}
+
+TEST_F(OpMsgParser, FailsIfDuplicateSequences) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{"docs"},
+
+        kDocSequenceSection,
+        Sized{"docs"},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::DuplicateOpMsgDocumentSequence);
+}
+
+TEST_F(OpMsgParser, FailsIfDuplicateSequenceWithBody) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1, 'docs': []}"),
+
+        kDocSequenceSection,
+        Sized{"docs"},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::DuplicateOpMsgField);
+}
+
+TEST_F(OpMsgParser, FailsIfDuplicateSequenceWithBodyNested) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1, a: {b:[]}}"),
+
+        kDocSequenceSection,
+        Sized{"a.b"},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::DuplicateOpMsgField);
+}
+
+TEST_F(OpMsgParser, SucceedsIfSequenceAndBodyHaveCommonPrefix) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{cursor: {ns: 'foo.bar', id: 1}}"),
+
+            kDocSequenceSection,
+            Sized{
+                "cursor.firstBatch",  //
+                fromjson("{_id: 1}"),
+            },
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{cursor: {ns: 'foo.bar', id: 1}}"));
+    ASSERT_EQ(msg.sequences.size(), 1u);
+    ASSERT_EQ(msg.sequences[0].name, "cursor.firstBatch");
+    ASSERT_EQ(msg.sequences[0].objs.size(), 1u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[0].objs[0], fromjson("{_id: 1}"));
+}
+
+TEST_F(OpMsgParser, FailsIfUnknownSectionKind) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        '\x99',    // This is where a section kind would go
+        Sized{},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::UnknownOpMsgSectionKind);
+}
+
+TEST_F(OpMsgParser, FailsIfBodyTooBig) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .addToSize(-1);  // Shrink message so body extends past end.
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParser, FailsIfBodyTooBigIntoChecksum) {
+    auto msg =
+        OpMsgBytes{
+            kHaveChecksum,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .appendChecksum()
+            .addToSize(-1);  // Shrink message so body extends past end.
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParser, FailsIfDocumentSequenceTooBig) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+        }
+            .addToSize(-1);  // Shrink message so body extends past end.
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::Overflow);
+}
+
+TEST_F(OpMsgParser, FailsIfDocumentSequenceTooBigIntoChecksum) {
+    auto msg =
+        OpMsgBytes{
+            kHaveChecksum,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+        }
+            .appendChecksum()
+            .addToSize(-1);  // Shrink message so body extends past end.
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::Overflow);
+}
+
+TEST_F(OpMsgParser, FailsIfDocumentInSequenceTooBig) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{
+            "docs",  //
+            fromjson("{a: 1}"),
+        }
+            .addToSize(-1),  // Shrink sequence so document extends past end.
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParser, FailsIfNameOfDocumentSequenceTooBig) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{
+            "foo",
+        }
+            .addToSize(-1),  // Shrink sequence so document extends past end.
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::Overflow);
+}
+
+TEST_F(OpMsgParser, FailsIfNameOfDocumentSequenceHasNoNulTerminator) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{'f', 'o', 'o'},
+        // No '\0' at end of document. ASAN should complain if we keep looking for one.
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::Overflow);
+}
+
+TEST_F(OpMsgParser, FailsIfTooManyDocumentSequences) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{"foo"},
+
+        kDocSequenceSection,
+        Sized{"bar"},
+
+        kDocSequenceSection,
+        Sized{"baz"},
+    };
+
+    ASSERT_THROWS_WITH_CHECK(
+        msg.parse(), ExceptionFor<ErrorCodes::TooManyDocumentSequences>, [](const DBException& ex) {
+            ASSERT(ErrorCodes::isConnectionFatalMessageParseError(ex));
+        });
+}
+
+TEST_F(OpMsgParser, FailsIfNoRoomForFlags) {
+    // Flags are 4 bytes. Try 0-3 bytes.
+    ASSERT_THROWS_CODE(OpMsgBytes{}.parse(), AssertionException, ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE(OpMsgBytes{'\0'}.parse(), AssertionException, ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE((OpMsgBytes{'\0', '\0'}.parse()), AssertionException, ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE(
+        (OpMsgBytes{'\0', '\0', '\0'}.parse()), AssertionException, ErrorCodes::Overflow);
+
+    ASSERT_THROWS_CODE(OpMsg::flags(OpMsgBytes{}.done()), AssertionException, ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE(
+        OpMsg::flags(OpMsgBytes{'\0'}.done()), AssertionException, ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE(
+        OpMsg::flags(OpMsgBytes{'\0', '\0'}.done()), AssertionException, ErrorCodes::Overflow);
+    ASSERT_THROWS_CODE(OpMsg::flags(OpMsgBytes{'\0', '\0', '\0'}.done()),
+                       AssertionException,
+                       ErrorCodes::Overflow);
+}
+
+TEST_F(OpMsgParser, FlagExtractionWorks) {
+    ASSERT_EQ(OpMsg::flags(OpMsgBytes{0u}.done()), 0u);    // All clear.
+    ASSERT_EQ(OpMsg::flags(OpMsgBytes{~0u}.done()), ~0u);  // All set.
+
+    for (auto i = uint32_t(0); i < 32u; i++) {
+        const auto flags = uint32_t(1) << i;
+        ASSERT_EQ(OpMsg::flags(OpMsgBytes{flags}.done()), flags) << flags;
+        ASSERT(OpMsg::isFlagSet(OpMsgBytes{flags}.done(), flags)) << flags;
+        ASSERT(!OpMsg::isFlagSet(OpMsgBytes{~flags}.done(), flags)) << flags;
+        ASSERT(!OpMsg::isFlagSet(OpMsgBytes{0u}.done(), flags)) << flags;
+        ASSERT(OpMsg::isFlagSet(OpMsgBytes{~0u}.done(), flags)) << flags;
+    }
+}
+
+TEST_F(OpMsgParser, FailsWithUnknownRequiredFlags) {
+    // Bits 0 and 1 are known, and bits >= 16 are optional.
+    for (auto i = uint32_t(2); i < 16u; i++) {
+        auto flags = uint32_t(1) << i;
+        auto msg = OpMsgBytes{
+            flags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        };
+
+        ASSERT_THROWS_WITH_CHECK(msg.parse(), AssertionException, [](const DBException& ex) {
+            ASSERT_EQ(ex.toStatus().code(), ErrorCodes::IllegalOpMsgFlag);
+            ASSERT(ErrorCodes::isConnectionFatalMessageParseError(ex.toStatus().code()));
+        });
+    }
+}
+
+TEST_F(OpMsgParser, SucceedsWithUnknownOptionalFlags) {
+    // bits >= 16 are optional.
+    for (auto i = uint32_t(16); i < 32u; i++) {
+        auto flags = uint32_t(1) << i;
+        OpMsgBytes{
+            flags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+    }
+}
+
+TEST_F(OpMsgParser, FailsWithChecksumMismatch) {
+    auto msg = OpMsgBytes{kHaveChecksum,  //
+                          kBodySection,
+                          fromjson("{ping: 1}")}
+                   .appendChecksum(123);
+
+    ASSERT_THROWS_WITH_CHECK(msg.parse(), AssertionException, [](const DBException& ex) {
+        ASSERT_EQ(ex.toStatus().code(), ErrorCodes::ChecksumMismatch);
+        ASSERT(ErrorCodes::isConnectionFatalMessageParseError(ex.toStatus().code()));
+    });
+}
+
+void testSerializer(const Message& fromSerializer, OpMsgBytes&& expected) {
+    const auto expectedMsg = expected.done();
+    ASSERT_EQ(fromSerializer.operation(), dbMsg);
+    // Ignoring request and reply ids since they aren't handled by OP_MSG code.
+
+    auto gotSD = std::string_view(fromSerializer.singleData().data(), fromSerializer.dataSize());
+    auto expectedSD = std::string_view(expectedMsg.singleData().data(), expectedMsg.dataSize());
+    if (gotSD == expectedSD)
+        return;
+
+    size_t commonLength =
+        std::mismatch(gotSD.begin(), gotSD.end(), expectedSD.begin(), expectedSD.end()).first -
+        gotSD.begin();
+
+    LOGV2(22636, "Mismatch after {commonLength} bytes.", "commonLength"_attr = commonLength);
+    LOGV2(22637,
+          "Common prefix: {hexdump_gotSD_rawData_commonLength}",
+          "hexdump_gotSD_rawData_commonLength"_attr = hexdump(gotSD.substr(0, commonLength)));
+    LOGV2(22638,
+          "Got suffix     : {hexdump_gotSD_rawData_commonLength_gotSD_size_commonLength}",
+          "hexdump_gotSD_rawData_commonLength_gotSD_size_commonLength"_attr =
+              hexdump(gotSD.substr(commonLength)));
+    LOGV2(22639,
+          "Expected suffix: {hexdump_expectedSD_rawData_commonLength_expectedSD_size_commonLength}",
+          "hexdump_expectedSD_rawData_commonLength_expectedSD_size_commonLength"_attr =
+              hexdump(expectedSD.substr(commonLength)));
+    FAIL("Serialization didn't match expected data. See above for details.");
+}
+
+TEST(OpMsgSerializer, JustBody) {
+    OpMsg msg;
+    msg.body = fromjson("{ping: 1}");
+
+    testSerializer(msg.serialize(),
+                   OpMsgBytes{
+                       kNoFlags,  //
+                       kBodySection,
+                       fromjson("{ping: 1}"),
+                   });
+}
+
+TEST(OpMsgSerializer, BodyAndSequence) {
+    OpMsg msg;
+    msg.body = fromjson("{ping: 1}");
+    msg.sequences = {{"docs", {fromjson("{a:1}"), fromjson("{a:2}")}}};
+
+    testSerializer(msg.serialize(),
+                   OpMsgBytes{
+                       kNoFlags,  //
+                       kDocSequenceSection,
+                       Sized{
+                           "docs",  //
+                           fromjson("{a: 1}"),
+                           fromjson("{a: 2}"),
+                       },
+
+                       kBodySection,
+                       fromjson("{ping: 1}"),
+                   });
+}
+
+TEST(OpMsgSerializer, BodyAndEmptySequence) {
+    OpMsg msg;
+    msg.body = fromjson("{ping: 1}");
+    msg.sequences = {{"docs", {}}};
+
+    testSerializer(msg.serialize(),
+                   OpMsgBytes{
+                       kNoFlags,  //
+                       kDocSequenceSection,
+                       Sized{
+                           "docs",  //
+                       },
+
+                       kBodySection,
+                       fromjson("{ping: 1}"),
+                   });
+}
+
+TEST(OpMsgSerializer, BodyAndTwoSequences) {
+    OpMsg msg;
+    msg.body = fromjson("{ping: 1}");
+    msg.sequences = {
+        {"a", {fromjson("{a: 1}")}},  //
+        {"b", {fromjson("{b: 1}")}},
+    };
+
+    testSerializer(msg.serialize(),
+                   OpMsgBytes{
+                       kNoFlags,  //
+                       kDocSequenceSection,
+                       Sized{
+                           "a",  //
+                           fromjson("{a: 1}"),
+                       },
+
+                       kDocSequenceSection,
+                       Sized{
+                           "b",  //
+                           fromjson("{b: 1}"),
+                       },
+
+                       kBodySection,
+                       fromjson("{ping: 1}"),
+                   });
+}
+
+namespace {
+constexpr auto kValidTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+BSONObj makeTelemetryBson(std::string_view traceparent) {
+    return BSON("otel" << BSON("traceparent" << traceparent));
+}
+
+BSONObj makeTelemetryBsonOfSize(std::string_view traceparent, int targetSize) {
+    auto base = BSON("otel" << BSON("traceparent" << traceparent) << "padding" << "");
+    const int padding = std::max(0, targetSize - base.objsize());
+    return BSON("otel" << BSON("traceparent" << traceparent) << "padding"
+                       << std::string(padding, 'x'));
+}
+}  // namespace
+
+TEST(OpMsgSerializer, OtelTelemetryContext) {
+    auto msg = OpMsg{};
+    msg.body = fromjson("{ping: 1}");
+    msg.telemetryContext = TelemetryContextSection::parse(makeTelemetryBson(kValidTraceparent));
+
+    testSerializer(msg.serialize(),
+                   OpMsgBytes{
+                       kNoFlags,
+                       kTelemetrySection,
+                       makeTelemetryBson(kValidTraceparent),
+                       kBodySection,
+                       fromjson("{ping: 1}"),
+                   });
+}
+
+TEST_F(OpMsgParser, SucceedsWithTelemetryContext) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,
+            kTelemetrySection,
+            makeTelemetryBson(kValidTraceparent),
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT(msg.telemetryContext);
+    ASSERT_EQ(msg.telemetryContext->getOtel().getTraceparent(), kValidTraceparent);
+}
+
+TEST_F(OpMsgParser, SucceedsWithBodyThenTelemetryContext) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,
+            kBodySection,
+            fromjson("{ping: 1}"),
+            kTelemetrySection,
+            makeTelemetryBson(kValidTraceparent),
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT(msg.telemetryContext);
+    ASSERT_EQ(msg.telemetryContext->getOtel().getTraceparent(), kValidTraceparent);
+}
+
+TEST_F(OpMsgParser, NoTelemetryContextWhenAbsent) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+
+    ASSERT_FALSE(msg.telemetryContext);
+}
+
+TEST_F(OpMsgParser, FailsWithInvalidTraceparent) {
+    auto msg = OpMsgBytes{
+        kNoFlags,
+        kTelemetrySection,
+        makeTelemetryBson("not-a-valid-traceparent"),
+        kBodySection,
+        fromjson("{ping: 1}"),
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::BadValue);
+}
+
+TEST_F(OpMsgParser, FailsWhenTelemetryContextExceedsMaxSize) {
+    auto msg = OpMsgBytes{
+        kNoFlags,
+        kTelemetrySection,
+        makeTelemetryBsonOfSize(kValidTraceparent, 8 * 1024),
+        kBodySection,
+        fromjson("{ping: 1}"),
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::BSONObjectTooLarge);
+}
+
+TEST_F(OpMsgParser, SucceedsWithTelemetryContextNearMaxSize) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,
+            kTelemetrySection,
+            makeTelemetryBsonOfSize(kValidTraceparent, 2 * 1024),
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT(msg.telemetryContext);
+    EXPECT_EQ(msg.telemetryContext->getOtel().getTraceparent(), kValidTraceparent);
+}
+
+TEST_F(OpMsgParser, FailsWithMultipleTelemetryContexts) {
+    auto msg = OpMsgBytes{
+        kNoFlags,
+        kTelemetrySection,
+        makeTelemetryBson(kValidTraceparent),
+        kTelemetrySection,
+        makeTelemetryBson(kValidTraceparent),
+        kBodySection,
+        fromjson("{ping: 1}"),
+    };
+
+    ASSERT_THROWS_WITH_CHECK(msg.parse(), AssertionException, [](const AssertionException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_STRING_CONTAINS(ex.reason(), "Multiple telemetry context sections in message");
+    });
+}
+
+TEST_F(OpMsgParser, FailsWithMalformedTelemetryBson) {
+    auto msg = OpMsgBytes{
+        kNoFlags,
+        kTelemetrySection,
+        int32_t{5},  // BSON object size: 4-byte length + 1-byte terminator.
+        '\x01',      // Not the required 0x00 EOO terminator, so this is not valid BSON.
+        kBodySection,
+        fromjson("{ping: 1}"),
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST(OpMsgSerializer, BodyAndSequenceInPlace) {
+    OpMsgBuilder builder;
+
+    auto emptySeq = builder.beginDocSequence("empty");
+    emptySeq.done();
+
+    {
+        auto seq = builder.beginDocSequence("docs");
+        seq.append(fromjson("{a: 1}"));
+        seq.appendBuilder().append("a", 2);
+    }
+
+    builder.beginBody().append("ping", 1);
+    builder.resumeBody().append("$db", "foo");
+
+    testSerializer(builder.finish(),
+                   OpMsgBytes{
+                       kNoFlags,  //
+                       kDocSequenceSection,
+                       Sized{
+                           "empty",
+                       },
+
+                       kDocSequenceSection,
+                       Sized{
+                           "docs",  //
+                           fromjson("{a: 1}"),
+                           fromjson("{a: 2}"),
+                       },
+
+                       kBodySection,
+                       fromjson("{ping: 1, $db: 'foo'}"),
+                   });
+}
+
+TEST(OpMsgSerializer, BodyAndInPlaceSequenceInPlaceWithReset) {
+    OpMsgBuilder builder;
+
+    auto emptySeq = builder.beginDocSequence("empty");
+    emptySeq.done();
+
+    {
+        auto seq = builder.beginDocSequence("docs");
+        seq.append(fromjson("{a: 1}"));
+        seq.appendBuilder().append("a", 2);
+    }
+
+    builder.beginBody().append("ping", 1);
+    builder.resumeBody().append("$db", "foo");
+
+    builder.reset();
+
+    // Everything above shouldn't matter.
+
+    {
+        auto seq = builder.beginDocSequence("docs2");
+        seq.append(fromjson("{b: 1}"));
+        seq.appendBuilder().append("b", 2);
+    }
+
+    builder.beginBody().append("pong", 1);
+
+    testSerializer(builder.finish(),
+                   OpMsgBytes{
+                       kNoFlags,  //
+                       kDocSequenceSection,
+                       Sized{
+                           "docs2",  //
+                           fromjson("{b: 1}"),
+                           fromjson("{b: 2}"),
+                       },
+
+                       kBodySection,
+                       fromjson("{pong: 1}"),
+                   });
+}
+
+TEST(OpMsgSerializer, ReplaceFlagsWorks) {
+    {
+        auto msg = OpMsgBytes{~0u}.done();
+        OpMsg::replaceFlags(&msg, 0u);
+        ASSERT_EQ(OpMsg::flags(msg), 0u);
+    }
+    {
+        auto msg = OpMsgBytes{0u}.done();
+        OpMsg::replaceFlags(&msg, ~0u);
+        ASSERT_EQ(OpMsg::flags(msg), ~0u);
+    }
+
+    for (auto i = uint32_t(0); i < 32u; i++) {
+        auto flags = uint32_t(1) << i;
+        {
+            auto msg = OpMsgBytes{0u}.done();
+            OpMsg::replaceFlags(&msg, flags);
+            ASSERT_EQ(OpMsg::flags(msg), flags) << flags;
+        }
+        {
+            auto msg = OpMsgBytes{~0u}.done();
+            OpMsg::replaceFlags(&msg, flags);
+            ASSERT_EQ(OpMsg::flags(msg), flags) << flags;
+        }
+        {
+            auto msg = OpMsgBytes{~flags}.done();
+            OpMsg::replaceFlags(&msg, flags);
+            ASSERT_EQ(OpMsg::flags(msg), flags) << flags;
+        }
+    }
+}
+
+TEST(OpMsgSerializer, SetFlagWorks) {
+    for (auto i = uint32_t(0); i < 32u; i++) {
+        auto flags = uint32_t(1) << i;
+        {
+            auto msg = OpMsgBytes{0u}.done();
+            OpMsg::setFlag(&msg, flags);
+            ASSERT_EQ(OpMsg::flags(msg), flags) << flags;
+        }
+        {
+            auto msg = OpMsgBytes{~0u}.done();
+            OpMsg::setFlag(&msg, flags);
+            ASSERT_EQ(OpMsg::flags(msg), ~0u) << flags;
+        }
+        {
+            auto msg = OpMsgBytes{~flags}.done();
+            OpMsg::setFlag(&msg, flags);
+            ASSERT_EQ(OpMsg::flags(msg), ~0u) << flags;
+        }
+    }
+}
+
+class OpMsgWithAuth : public mongo::ScopedGlobalServiceContextForTest, public unittest::Test {
+protected:
+    void setUp() final {
+        auto globalAuthzManagerFactory = std::make_unique<AuthorizationManagerFactoryMock>();
+        AuthorizationManager::set(getService(),
+                                  globalAuthzManagerFactory->createShard(getService()));
+        AuthorizationManager::get(getService())->setAuthEnabled(true);
+
+        auth::AuthorizationBackendInterface::set(
+            getService(), globalAuthzManagerFactory->createBackendInterface(getService()));
+
+        client = getServiceContext()->getService()->makeClient("test");
+    }
+
+    ServiceContext::UniqueClient client;
+};
+
+TEST(OpMsgRequest, GetDatabaseWorks) {
+    OpMsgRequest msg;
+    msg.body = fromjson("{$db: 'foo'}");
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), "foo");
+
+    msg.body = fromjson("{before: 1, $db: 'foo'}");
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), "foo");
+
+    msg.body = fromjson("{before: 1, $db: 'foo', after: 1}");
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), "foo");
+}
+
+TEST(OpMsgRequest, GetDatabaseThrowsWrongType) {
+    OpMsgRequest msg;
+    msg.body = fromjson("{$db: 1}");
+    ASSERT_THROWS(msg.parseDbName().toString_forTest(), DBException);
+}
+
+TEST(OpMsgRequest, GetDatabaseThrowsMissing) {
+    OpMsgRequest msg;
+    msg.body = fromjson("{}");
+    ASSERT_THROWS(msg.parseDbName().toString_forTest(), AssertionException);
+
+    msg.body = fromjson("{$notdb: 'foo'}");
+    ASSERT_THROWS(msg.parseDbName().toString_forTest(), AssertionException);
+}
+
+TEST(OpMsgRequestBuilder, WithVTS) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+    const TenantId tenantId(OID::gen());
+    const auto vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"sv,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
+    const std::string_view dbString = "testDb";
+    auto const body = fromjson("{ping: 1}");
+
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), dbString);
+}
+
+TEST(OpMsgRequestBuilder, WithVTSAndSerializationContextExpPrefixDefault) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+    const TenantId tenantId(OID::gen());
+    const std::string_view dbString = "testDb";
+    const std::string dbStringWithTid = str::stream() << tenantId.toString() << "_" << dbString;
+    auto const body = fromjson("{ping: 1}");
+
+    using Prefix = SerializationContext::Prefix;
+
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"sv,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), dbString);
+}
+
+void CheckCommandMsgIdlParsingForOpMsgRequest(bool simulateAtlasProxyTenantProtocol) {
+    const TenantId tenantId(OID::gen());
+    const std::string dbString =
+        simulateAtlasProxyTenantProtocol ? (tenantId.toString() + "_testDb") : "testDb";
+    auto cmd = BSON("insert" << "bar"
+                             << "$db" << dbString << "documents" << BSON_ARRAY(BSONObj()));
+    OpMsgRequest msg;
+    msg.body = cmd;
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        tenantId,
+        simulateAtlasProxyTenantProtocol ? auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy
+                                         : auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TenantForTestingTag{});
+    msg.validatedTenancyScope = vts;
+    auto op = InsertOp::parse(msg);
+    ASSERT_EQ(op.getSerializationContext().getPrefix(),
+              simulateAtlasProxyTenantProtocol ? SerializationContext::Prefix::IncludePrefix
+                                               : SerializationContext::Prefix::ExcludePrefix);
+}
+
+TEST_F(OpMsgWithAuth, TestExpectPrefixTrueParsedInMsg) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+    CheckCommandMsgIdlParsingForOpMsgRequest(true);
+}
+
+TEST_F(OpMsgWithAuth, TestExpectPrefixFalseParsedInMsg) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+    CheckCommandMsgIdlParsingForOpMsgRequest(false);
+}
+
+TEST(OpMsgRequestBuilder, WithVTSAndSerializationContextExpPrefixFalse) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+    const TenantId tenantId(OID::gen());
+    const std::string_view dbString = "testDb";
+    const std::string dbStringWithTid = str::stream() << tenantId.toString() << "_" << dbString;
+    auto const body = fromjson("{ping: 1}");
+
+    using Prefix = SerializationContext::Prefix;
+
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"sv,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
+    ASSERT_EQ(msg.parseDbName().toString_forTest(), dbString);
+}
+
+TEST(OpMsgRequestBuilder, WithVTSAndSerializationContextExpPrefixTrue) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+    const TenantId tenantId(OID::gen());
+    const std::string_view dbString = "testDb";
+    const std::string dbStringWithTid = str::stream() << tenantId.toString() << "_" << dbString;
+    auto const body = fromjson("{ping: 1}");
+
+    using Prefix = SerializationContext::Prefix;
+
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"sv,
+        auth::ValidatedTenancyScope::TenantProtocol::kAtlasProxy,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
+    OpMsgRequest msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, dbString), body);
+    ASSERT(msg.validatedTenancyScope);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), tenantId);
+    ASSERT_EQ(msg.parseDbName().toStringWithTenantId_forTest(), dbStringWithTid);
+}
+
+TEST(OpMsgRequestBuilder, CreateDoesNotCopy) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+    unittest::ServerParameterGuard requireTenantIdController("featureFlagRequireTenantID", true);
+    unittest::ServerParameterGuard securityTokenController("featureFlagSecurityToken", true);
+    unittest::ServerParameterGuard secretController("testOnlyValidatedTenancyScopeKey", "secret");
+
+
+    const TenantId tenantId(OID::gen());
+
+    auth::ValidatedTenancyScope vts = auth::ValidatedTenancyScopeFactory::create(
+        UserName("user", "admin", tenantId),
+        "secret"sv,
+        auth::ValidatedTenancyScope::TenantProtocol::kDefault,
+        auth::ValidatedTenancyScopeFactory::TokenForTestingTag{});
+
+    auto body = fromjson("{ping: 1}");
+    const void* const bodyPtr = body.objdata();
+    auto msg = OpMsgRequestBuilder::create(
+        vts, DatabaseName::createDatabaseName_forTest(tenantId, "db"), std::move(body));
+
+    auto const newBody = BSON("ping" << 1 << "$db"
+                                     << "db");
+    ASSERT_BSONOBJ_EQ(msg.body, newBody);
+    ASSERT_EQ(static_cast<const void*>(msg.body.objdata()), bodyPtr);
+}
+
+TEST(OpMsgTest, ChecksumResizesMessage) {
+    auto msg = OpMsgBytes{kNoFlags,  //
+                          kBodySection,
+                          fromjson("{ping: 1}")}
+                   .done();
+
+    // Test that appendChecksum() resizes the buffer if necessary.
+    const auto capacity = msg.sharedBuffer().capacity();
+    OpMsg::appendChecksum(&msg);
+    ASSERT_EQ(msg.sharedBuffer().capacity(), capacity + 4);
+    // The checksum is correct.
+    OpMsg::parse(msg);
+}
+
+TEST(OpMsgTest, EmptyMessageWithChecksumFlag) {
+    // Checks that an empty message that would normally be invalid because it's
+    // missing a body, is invalid because a checksum was specified in the flag
+    // but no checksum was included.
+    auto msg = OpMsgBytes{OpMsg::kChecksumPresent};
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidOpMsgSize);
+}
+
+}  // namespace
+}  // namespace test
+}  // namespace rpc
+}  // namespace mongo

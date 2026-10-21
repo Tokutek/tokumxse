@@ -1,58 +1,38 @@
-// Test the --sslMode parameter
-// This tests runs through the 8 possible combinations of sslMode values
+// Test the --tlsMode parameter
+// This tests runs through the 8 possible combinations of tlsMode values
 // and SSL-enabled and disabled shell respectively. For each combination
-// expected behavior is verified. 
+// expected behavior is verified.
+import {TLSTest} from "jstests/libs/ssl_test.js";
+function testCombination(tlsMode, sslShell, shouldSucceed) {
+    jsTest.log(
+        "TESTING: tlsMode = " +
+            tlsMode +
+            ", sslShell = " +
+            (sslShell
+                ? "true"
+                : "false" + " (should " + (shouldSucceed ? "" : "not ") + "succeed)"),
+    );
 
-var SERVER_CERT = "jstests/libs/server.pem"
-var CA_CERT = "jstests/libs/ca.pem" 
-var CLIENT_CERT = "jstests/libs/client.pem"
+    let serverOptionOverrides = {tlsMode: tlsMode};
 
-var baseName = "jstests_mixed_mode_ssl"
-port = allocatePorts(1)[0];
+    let clientOptions = sslShell
+        ? TLSTest.prototype.defaultTLSClientOptions
+        : TLSTest.prototype.noTLSClientOptions;
 
-function testCombination(sslMode, sslShell, shouldSucceed) {
-    if (sslMode == "disabled") {
-        MongoRunner.runMongod({port: port});
-    }
-    else {
-        MongoRunner.runMongod({port: port,
-                               sslMode: sslMode, 
-                               sslAllowInvalidCertificates: "",
-                               sslPEMKeyFile: SERVER_CERT,
-                               sslCAFile: CA_CERT});
-    }
-
-    var mongo;
-    if (sslShell) {
-        mongo = runMongoProgram("mongo", "--port", port, "--ssl", 
-                                "--sslPEMKeyFile", CLIENT_CERT,
-                                "--sslAllowInvalidCertificates",
-                                "--eval", ";");
-    }
-    else {
-        mongo = runMongoProgram("mongo", "--port", port,
-                                "--eval", ";");
-    }
+    let fixture = new TLSTest(serverOptionOverrides, clientOptions);
 
     if (shouldSucceed) {
-        // runMongoProgram returns 0 on success
-        assert.eq(0, mongo, "Connection attempt failed when it should succeed sslMode:" + 
-                  sslMode + " SSL-shell:" + sslShell);
+        assert(fixture.connectWorked());
+    } else {
+        assert(fixture.connectFails());
     }
-    else {
-        // runMongoProgram returns 1 on failure
-        assert.eq(1, mongo, "Connection attempt succeeded when it should fail sslMode:" + 
-                  sslMode + " SSL-shell:" + sslShell);
-    }
-    stopMongod(port);
 }
 
 testCombination("disabled", false, true);
-testCombination("allowSSL", false, true);
-testCombination("preferSSL", false, true);
-testCombination("requireSSL", false, false);
+testCombination("allowTLS", false, true);
+testCombination("preferTLS", false, true);
+testCombination("requireTLS", false, false);
 testCombination("disabled", true, false);
-testCombination("allowSSL", true, true);
-testCombination("preferSSL", true, true);
-testCombination("requireSSL", true, true);
-
+testCombination("allowTLS", true, true);
+testCombination("preferTLS", true, true);
+testCombination("requireTLS", true, true);

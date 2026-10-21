@@ -1,0 +1,125 @@
+/**
+ * Test that DocumentSourceSetWindowFields errors when using more than the perscribed amount of
+ * data. Memory checks are per node, so only test when the data is all in one place.
+ *
+ * @tags: [
+ *   not_allowed_with_signed_security_token,
+ *   # This test sets a server parameter via setParameterOnAllNonConfigNodes. To keep the host list
+ *   # consistent, no add/remove shard operations should occur during the test.
+ *   assumes_stable_shard_list,
+ * ]
+ */
+
+import "jstests/libs/query/sbe_assert_error_override.js";
+
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {setParameterOnAllNonConfigNodes} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
+
+const coll = db[jsTestName()];
+coll.drop();
+
+const origMemoryLimit = assert.commandWorked(
+    db.adminCommand({getParameter: 1, internalDocumentSourceSetWindowFieldsMaxMemoryBytes: 1}),
+).internalDocumentSourceSetWindowFieldsMaxMemoryBytes;
+
+try {
+    // Test that we can set the memory limit.
+    setParameterOnAllNonConfigNodes(
+        db.getMongo(),
+        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+        1200,
+    );
+    // Create a collection with enough documents in a single partition to go over the memory limit.
+    const docsPerPartition = 10;
+    for (let i = 0; i < docsPerPartition; i++) {
+        assert.commandWorked(
+            coll.insert({_id: i, partitionKey: 1, largeStr: Array(1025).toString()}),
+        );
+    }
+
+    assert.commandFailedWithCode(
+        coll.runCommand({
+            aggregate: coll.getName(),
+            pipeline: [
+                {$setWindowFields: {sortBy: {partitionKey: 1}, output: {val: {$sum: "$_id"}}}},
+            ],
+            cursor: {},
+            allowDiskUse: false,
+        }),
+        5643011,
+    );
+
+    // The same query passes with a higher memory limit. Note that the amount of memory consumed by the
+    // stage is roughly double the size of the documents since each document has an internal cache.
+    const perDocSize = 1200;
+    setParameterOnAllNonConfigNodes(
+        db.getMongo(),
+        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+        perDocSize * docsPerPartition * 3 + 1024,
+    );
+    assert.commandWorked(
+        coll.runCommand({
+            aggregate: coll.getName(),
+            pipeline: [
+                {$setWindowFields: {sortBy: {partitionKey: 1}, output: {val: {$sum: "$largeStr"}}}},
+            ],
+            cursor: {},
+            allowDiskUse: false,
+        }),
+    );
+
+    // The query passes with multiple partitions of the same size.
+    for (let i = docsPerPartition; i < docsPerPartition * 2; i++) {
+        assert.commandWorked(
+            coll.insert({_id: i, partitionKey: 2, largeStr: Array(1025).toString()}),
+        );
+    }
+    assert.commandWorked(
+        coll.runCommand({
+            aggregate: coll.getName(),
+            pipeline: [
+                {
+                    $setWindowFields: {
+                        sortBy: {partitionKey: 1},
+                        partitionBy: "$partitionKey",
+                        output: {val: {$sum: "$largeStr"}},
+                    },
+                },
+            ],
+            cursor: {},
+            allowDiskUse: false,
+        }),
+    );
+
+    setParameterOnAllNonConfigNodes(
+        db.getMongo(),
+        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+        perDocSize * docsPerPartition + 1024,
+    );
+
+    // Test that the query fails with a window function that stores documents.
+    assert.commandFailedWithCode(
+        coll.runCommand({
+            aggregate: coll.getName(),
+            pipeline: [
+                {
+                    $setWindowFields: {
+                        sortBy: {partitionKey: 1},
+                        partitionBy: "$partitionKey",
+                        output: {val: {$max: "$largeStr", window: {documents: [-9, 9]}}},
+                    },
+                },
+            ],
+            cursor: {},
+            allowDiskUse: false,
+        }),
+        [5643011, 5414201],
+    );
+} finally {
+    // Reset limit for other tests.
+    setParameterOnAllNonConfigNodes(
+        db.getMongo(),
+        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+        origMemoryLimit,
+    );
+}

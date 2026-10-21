@@ -1,0 +1,458 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/session/kill_sessions_local.h"
+
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/client_cursor/cursor_manager.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/kill_sessions_common.h"
+#include "mongo/db/session/kill_sessions_gen.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+namespace {
+
+/** Helper method to determine deadline for an individual session checkout. Some reapers enforce a
+ * per session time limit, while others enforce a deadline for checking out/killing all matching
+ * sessions, so this helper determines which to use for the deadline on a per session level. */
+Date_t getSessionCheckoutDeadline(Milliseconds* timeout, Date_t deadline) {
+    if (!timeout) {
+        return deadline;
+    } else {
+        return std::min(Date_t::now() + *timeout, deadline);
+    }
+}
+
+/**
+ * Shortcut method shared by the various forms of session kill below. Every session kill operation
+ * consists of the following stages:
+ *  1) Select the sessions to kill, based on their lsid or owning user account (achieved through the
+ *     'matcher') and further refining that list through the 'filterFn'.
+ *  2) If any of the selected sessions are currently checked out, interrupt the owning operation
+ *     context with 'reason' as the code.
+ *  3) Finish killing the selected and interrupted sessions through the 'killSessionFn'.
+ */
+void killSessionsAction(
+    OperationContext* opCtx,
+    const SessionKiller::Matcher& matcher,
+    const std::function<bool(const ObservableSession&)>& filterFn,
+    const std::function<void(OperationContext*, const SessionToKill&)>& killSessionFn,
+    ErrorCodes::Error reason = ErrorCodes::Interrupted,
+    Milliseconds* perSessionTimeout = nullptr,
+    int64_t* numTimeOuts = nullptr,
+    Date_t killSessionsDeadline = Date_t::max()) {
+    const auto catalog = SessionCatalog::get(opCtx);
+
+    std::vector<SessionCatalog::KillToken> sessionKillTokens;
+    sessionKillTokens = catalog->killSessions(matcher, reason, filterFn);
+
+    for (auto& sessionKillToken : sessionKillTokens) {
+        // Kept separately because the token is handed off to 'checkOutSessionForKill' below.
+        const auto lsidToKill = sessionKillToken.lsidToKill();
+
+        Date_t checkoutStartTime = Date_t::now();
+        try {
+            auto session = catalog->checkOutSessionForKill(
+                opCtx,
+                std::move(sessionKillToken),
+                getSessionCheckoutDeadline(perSessionTimeout, killSessionsDeadline));
+            Milliseconds checkoutDuration = Date_t::now() - checkoutStartTime;
+
+            if (checkoutDuration > Milliseconds(gTransactionLifetimeLimitSeconds.load())) {
+                auto participant = TransactionParticipant::get(session);
+                LOGV2(11790800,
+                      "Slow session checkout",
+                      "session"_attr = session.getSessionId().toBSON(),
+                      "txnNumberAndRetryCounter"_attr =
+                          participant.getActiveTxnNumberAndRetryCounter().toBSON(),
+                      "duration"_attr = checkoutDuration);
+            }
+
+            // TODO (SERVER-33850): Rename KillAllSessionsByPattern and
+            // ScopedKillAllSessionsByPatternImpersonator to not refer to session kill
+            const KillAllSessionsByPattern* pattern = matcher.match(session.getSessionId());
+            invariant(pattern);
+
+            ScopedKillAllSessionsByPatternImpersonator impersonator(opCtx, *pattern);
+            killSessionFn(opCtx, session);
+        } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+            // If we exceed the time limit while checking out sessions for step up or step down,
+            // then we crash the node and dump info on the session.
+            LOGV2(11790801,
+                  "Exceeded time limit while checking out session",
+                  "lsidToKill"_attr = lsidToKill,
+                  "duration"_attr = Date_t::now() - checkoutStartTime);
+            if (reason == ErrorCodes::InterruptedDueToReplStateChange) {
+                LOGV2_FATAL(11790802,
+                            "Failed to check out session for kill",
+                            "lsidToKill"_attr = lsidToKill);
+            }
+            // Failed to check out the session for kill, continue with the next sessionKillToken.
+            if (numTimeOuts)
+                (*numTimeOuts)++;
+            continue;
+        }
+    }
+}
+
+}  // namespace
+
+void killSessionsAbortUnpreparedTransactions(OperationContext* opCtx,
+                                             const SessionKiller::Matcher& matcher,
+                                             ErrorCodes::Error reason,
+                                             Date_t killSessionsDeadline) {
+    killSessionsAction(
+        opCtx,
+        matcher,
+        [](const ObservableSession& session) {
+            auto participant = TransactionParticipant::get(session);
+            return participant.transactionIsInProgress();
+        },
+        [reason](OperationContext* opCtx, const SessionToKill& session) {
+            auto participant = TransactionParticipant::get(session);
+            // This is the same test as in the filter, but we must check again now
+            // that the session is checked out.
+            if (participant.transactionIsInProgress()) {
+                LOGV2(11101700,
+                      "Aborting unprepared transaction",
+                      "session"_attr = session.getSessionId().toBSON(),
+                      "txnNumberAndRetryCounter"_attr =
+                          participant.getActiveTxnNumberAndRetryCounter().toBSON(),
+                      "reason"_attr = reason);
+                participant.abortTransaction(opCtx);
+            }
+        },
+        reason,
+        /*perSessionTimeout*/ nullptr,
+        /*numTimeouts*/ 0,
+        killSessionsDeadline);
+}
+
+void killSessionsAbortUnpreparedTransactionsForLockerIds(OperationContext* opCtx,
+                                                         const std::vector<LockerId>& lockerIds,
+                                                         ErrorCodes::Error reason,
+                                                         Date_t killSessionsDeadline) {
+    if (lockerIds.empty()) {
+        return;
+    }
+
+    // Build a set for O(1) lookup.
+    stdx::unordered_set<LockerId> lockerIdSet(lockerIds.begin(), lockerIds.end());
+    KillAllSessionsByPatternSet patterns;
+
+    // Scan the session catalog to find in-progress transactions whose locker IDs match.
+    // This covers both stashed transactions, where the Locker lives in TxnResources) and active
+    // checked-out transactions (where the Locker is on the OperationContext).
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    const auto catalog = SessionCatalog::get(opCtx);
+    catalog->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+        auto participant = TransactionParticipant::get(session);
+        if (!participant.transactionIsInProgress()) {
+            return;
+        }
+
+        // Check the stashed locker.
+        auto stashedLockerId = participant.getStashedLockerId();
+        if (stashedLockerId && lockerIdSet.count(*stashedLockerId) > 0) {
+            patterns.emplace(makeKillAllSessionsByPattern(opCtx, session.getSessionId()));
+            return;
+        }
+
+        // Check the active locker on the currently checked-out OperationContext.
+        if (auto* checkedOutOpCtx = session.currentOperationContext()) {
+            auto lockerId = shard_role_details::getLocker(checkedOutOpCtx)->getId();
+            if (lockerIdSet.count(lockerId) > 0) {
+                patterns.emplace(makeKillAllSessionsByPattern(opCtx, session.getSessionId()));
+            }
+        }
+    });
+
+    if (patterns.empty()) {
+        return;
+    }
+
+    SessionKiller::Matcher matcher(std::move(patterns));
+    killSessionsAction(
+        opCtx,
+        matcher,
+        [](const ObservableSession& session) {
+            auto participant = TransactionParticipant::get(session);
+            return participant.transactionIsInProgress();
+        },
+        [reason](OperationContext* opCtx, const SessionToKill& session) {
+            auto participant = TransactionParticipant::get(session);
+            if (participant.transactionIsInProgress()) {
+                LOGV2(10698901,
+                      "Aborting unprepared transaction for conflicting locker",
+                      "session"_attr = session.getSessionId().toBSON(),
+                      "txnNumberAndRetryCounter"_attr =
+                          participant.getActiveTxnNumberAndRetryCounter().toBSON(),
+                      "reason"_attr = reason);
+                participant.abortTransaction(opCtx);
+            }
+        },
+        reason,
+        /*perSessionTimeout*/ nullptr,
+        /*numTimeouts*/ 0,
+        killSessionsDeadline);
+}
+
+SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
+                                        const SessionKiller::Matcher& matcher,
+                                        SessionKiller::UniformRandomBitGenerator* urbg) {
+    killSessionsAbortUnpreparedTransactions(opCtx, matcher);
+    uassertStatusOK(killSessionsLocalKillOps(opCtx, matcher));
+
+    auto res = CursorManager::get(opCtx)->killCursorsWithMatchingSessions(opCtx, matcher);
+    uassertStatusOK(res.first);
+
+    return {std::vector<HostAndPort>{}};
+}
+
+void killAllExpiredTransactions(OperationContext* opCtx,
+                                Milliseconds perSessionTimeout,
+                                int64_t* numKills,
+                                int64_t* numTimeOuts) {
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    killSessionsAction(
+        opCtx,
+        matcherAllSessions,
+        [when = opCtx->getServiceContext()->getPreciseClockSource()->now()](
+            const ObservableSession& session) {
+            return TransactionParticipant::get(session).expiredAsOf(when);
+        },
+        [&numKills](OperationContext* opCtx, const SessionToKill& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            // If the transaction is aborted here, it means it was aborted after
+            // the filter.  The most likely reason for this is that the transaction
+            // was active and the session kill aborted it.  We still want to log
+            // that as aborted due to transactionLifetimeLimitSessions.
+            if (txnParticipant.transactionIsInProgress() || txnParticipant.transactionIsAborted()) {
+                LOGV2(20707,
+                      "Aborting transaction because it has been running for longer than "
+                      "'transactionLifetimeLimitSeconds'",
+                      "sessionId"_attr = session.getSessionId().getId(),
+                      "txnNumberAndRetryCounter"_attr =
+                          txnParticipant.getActiveTxnNumberAndRetryCounter());
+                if (txnParticipant.transactionIsInProgress()) {
+                    txnParticipant.abortTransaction(opCtx);
+                }
+                (*numKills)++;
+            }
+        },
+        ErrorCodes::TransactionExceededLifetimeLimitSeconds,
+        &perSessionTimeout,
+        numTimeOuts);
+}
+
+void killOldestTransaction(OperationContext* opCtx,
+                           Milliseconds perSessionTimeout,
+                           int64_t* numKills,
+                           int64_t* numSkips,
+                           int64_t* numTimeOuts) {
+    SessionKiller::Matcher matcher(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    boost::optional<LogicalSessionId> oldest;
+    Microseconds oldestDuration;
+    const auto sessionCatalog = SessionCatalog::get(opCtx);
+    sessionCatalog->scanSessions(matcher, [&](const ObservableSession& session) {
+        TransactionParticipant::Observer txnParticipant = TransactionParticipant::get(session);
+        ScopeGuard updateSkipStats([&numSkips] { (*numSkips)++; });
+
+        // Filter out internal sessions.
+        if (session.getSessionId().getTxnUUID()) {
+            return;
+        }
+
+        // Filtering out prepared transactions as we are unable to abort a prepared transaction.
+        if (txnParticipant.transactionIsPrepared()) {
+            return;
+        }
+
+        // Transaction aborted, or we have a session without a transaction yet.
+        if (!txnParticipant.transactionIsInProgress() || txnParticipant.transactionIsAborted()) {
+            return;
+        }
+
+        updateSkipStats.dismiss();
+
+        auto currentDuration =
+            txnParticipant.getDuration(opCtx->getServiceContext()->getTickSource());
+
+        if (!oldest || currentDuration > oldestDuration) {
+            oldestDuration = currentDuration;
+            oldest = session.getSessionId();
+        }
+    });
+    if (!oldest) {
+        LOGV2_DEBUG(10036706, 1, "Oldest transaction was not found");
+        return;
+    }
+
+    try {
+        auto killToken =
+            SessionCatalog::get(opCtx)->killSession(*oldest, ErrorCodes::TemporarilyUnavailable);
+
+        auto session = sessionCatalog->checkOutSessionForKill(
+            opCtx,
+            std::move(killToken),
+            getSessionCheckoutDeadline(&perSessionTimeout, /*killSessionsDeadline*/ Date_t::max()));
+
+        // TODO (SERVER-33850): Rename KillAllSessionsByPattern and
+        // ScopedKillAllSessionsByPatternImpersonator to not refer to session kill
+        const KillAllSessionsByPattern* pattern = matcher.match(session.getSessionId());
+        invariant(pattern);
+
+        ScopedKillAllSessionsByPatternImpersonator impersonator(opCtx, *pattern);
+        auto txnParticipant = TransactionParticipant::get(session);
+        if (txnParticipant.transactionIsInProgress() || txnParticipant.transactionIsAborted()) {
+            LOGV2(10036704,
+                  "Aborting oldest transaction",
+                  "sessionId"_attr = session.getSessionId().getId(),
+                  "txnNumberAndRetryCounter"_attr =
+                      txnParticipant.getActiveTxnNumberAndRetryCounter());
+            if (txnParticipant.transactionIsInProgress()) {
+                txnParticipant.abortTransaction(
+                    opCtx,
+                    Status(ErrorCodes::TemporarilyUnavailable,
+                           "Transaction aborted due to cache pressure."));
+            }
+            (*numKills)++;
+        }
+    } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+        // Failed to check out the session for kill.
+        if (numTimeOuts) {
+            (*numTimeOuts)++;
+        }
+    } catch (const ExceptionFor<ErrorCodes::NoSuchSession>&) {
+        LOGV2_DEBUG(10036708, 1, "Aborting session error - session not found.");
+    }
+}
+void killSessionsLocalShutdownAllTransactions(OperationContext* opCtx) {
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    killSessionsAction(
+        opCtx,
+        matcherAllSessions,
+        [](const ObservableSession& session) {
+            return TransactionParticipant::get(session).transactionIsOpen();
+        },
+        [](OperationContext* opCtx, const SessionToKill& session) {
+            TransactionParticipant::get(session).shutdown(opCtx);
+        },
+        ErrorCodes::InterruptedAtShutdown);
+}
+
+void killSessionsAbortAllPreparedTransactions(OperationContext* opCtx) {
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    killSessionsAction(
+        opCtx,
+        matcherAllSessions,
+        [](const ObservableSession& session) {
+            // Filter for sessions that have a prepared transaction.
+            return TransactionParticipant::get(session).transactionIsPrepared();
+        },
+        [](OperationContext* opCtx, const SessionToKill& session) {
+            // We're holding the RSTL, so the transaction shouldn't be otherwise
+            // affected.
+            invariant(TransactionParticipant::get(session).transactionIsPrepared());
+            // Abort the prepared transaction and invalidate the session it is
+            // associated with.
+            TransactionParticipant::get(session).abortTransaction(opCtx);
+            TransactionParticipant::get(session).invalidate(opCtx);
+        });
+}
+
+void yieldLocksForPreparedTransactions(OperationContext* opCtx) {
+    // Create a new opCtx because we need an empty locker to refresh the locks.
+    //
+    // When checking out sessions below, the opCtx can hold the global lock acquired by the
+    // prepared transaction, making it a target by the repl killOp thread. The input opCtx is
+    // already unkillable so we just mark this one also unkillable to avoid crash.
+    auto newClient = opCtx->getServiceContext()->getService()->makeClient(
+        "prepared-txns-yield-locks", Client::noSession(), ClientOperationKillableByStepdown{false});
+
+
+    AlternativeClientRegion acr(newClient);
+    auto newOpCtx = cc().makeOperationContext();
+
+    // Scan the sessions again to get the list of all sessions with prepared transaction
+    // to yield their locks.
+    LOGV2(6015318, "Yielding locks for prepared transactions.");
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(newOpCtx.get())});
+    killSessionsAction(
+        newOpCtx.get(),
+        matcherAllSessions,
+        [](const ObservableSession& session) {
+            return TransactionParticipant::get(session).transactionIsPrepared();
+        },
+        [](OperationContext* killerOpCtx, const SessionToKill& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            // Yield locks for prepared transactions. When scanning and killing
+            // operations, all prepared transactions are included in the list. Even
+            // though new sessions may be created after the scan, none of them can
+            // become prepared during stepdown, since the RSTL has been enqueued,
+            // preventing any new writes.
+            if (txnParticipant.transactionIsPrepared()) {
+                LOGV2_DEBUG(20708,
+                            3,
+                            "Yielding locks of prepared transaction",
+                            "sessionId"_attr = session.getSessionId().getId(),
+                            "txnNumberAndRetryCounter"_attr =
+                                txnParticipant.getActiveTxnNumberAndRetryCounter());
+                txnParticipant.refreshLocksForPreparedTransaction(killerOpCtx, true);
+            }
+        },
+        ErrorCodes::InterruptedDueToReplStateChange);
+}
+
+void invalidateSessionsForStepdown(OperationContext* opCtx) {
+    // It is illegal to invalidate the sessions if the operation has a session checked out.
+    invariant(!OperationContextSession::get(opCtx));
+
+    LOGV2(6015319, "Invalidating sessions for stepdown.");
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    killSessionsAction(
+        opCtx,
+        matcherAllSessions,
+        [](const ObservableSession& session) {
+            return !TransactionParticipant::get(session).transactionIsPrepared();
+        },
+        [](OperationContext* killerOpCtx, const SessionToKill& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            if (!txnParticipant.transactionIsPrepared()) {
+                txnParticipant.invalidate(killerOpCtx);
+            }
+        },
+        ErrorCodes::InterruptedDueToReplStateChange);
+}
+
+}  // namespace mongo

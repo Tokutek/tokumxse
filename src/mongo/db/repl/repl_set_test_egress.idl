@@ -1,0 +1,35 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    replSetTestEgressReply:
+        description: "Result of attempting to connect to cluster member"
+        is_command_reply: true
+        fields:
+            target:
+                description: "Actual member connected to"
+                type: string
+
+commands:
+    replSetTestEgress:
+        description: "Attempt to connect to a cluster member"
+        command_name: replSetTestEgress
+        namespace: ignored
+        api_version: ""
+        fields:
+            target:
+                description: "Member address to connect and authenticate to, empty to select random member"
+                type: string
+                optional: true
+            timeoutSecs:
+                description: "Maximum amount of time to wait for connection (seconds)"
+                type: int
+                default: 5
+                validator:
+                    gt: 0

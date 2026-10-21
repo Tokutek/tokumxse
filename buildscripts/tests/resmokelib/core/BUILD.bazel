@@ -1,0 +1,42 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_pipe",
+    srcs = [
+        "__init__.py",
+        "test_pipe.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_programs",
+    srcs = [
+        "__init__.py",
+        "test_programs.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)
+
+py_test(
+    name = "test_redirect",
+    srcs = [
+        "__init__.py",
+        "test_redirect.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)

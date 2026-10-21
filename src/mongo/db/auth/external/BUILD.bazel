@@ -1,0 +1,51 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "externalsaslauth",
+    srcs = [
+        "awsiam_server_mechanism.cpp",
+        "cyrus_sasl_server_session.cpp",
+        "external_sasl_authentication_session.cpp",
+        "gssapi_server_mechanism.cpp",
+        "sasl_oidc_server_mechanism.cpp",
+    ],
+    linkopts = [
+        "-lgssapi_krb5",
+        "-lldap",
+        "-lsasl2",
+    ],
+    deps = [
+        "//src/mongo/db:ldap_options",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/auth:saslauth",
+        "//src/mongo/db/auth/oidc",
+        "//src/mongo/db/ldap:ldap_manager",
+        "//src/mongo/util/net:http_client",
+    ] + select({
+        "//bazel/config:ssl_enabled": [
+            "//src/mongo/client:sasl_aws_common",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+mongo_cc_unit_test(
+    name = "sasl_oidc_test",
+    srcs = [
+        "sasl_oidc_server_mechanism_test.cpp",
+    ],
+    tags = ["mongo_unittest_second_group"],
+    deps = [
+        ":externalsaslauth",
+        "//src/mongo/db/auth/oidc:oidc_test_fixture",
+    ],
+)

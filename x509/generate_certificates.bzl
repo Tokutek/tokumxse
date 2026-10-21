@@ -1,0 +1,143 @@
+load("@rules_python//python:py_info.bzl", "PyInfo")
+load("//bazel/uv:defs.bzl", "dependency")
+load("//bazel/config:py_action_env.bzl", "py_exec_import_paths")
+load("//bazel/config:render_template.bzl", "render_template")
+load("@internal_platforms_do_not_use//host:constraints.bzl", "HOST_CONSTRAINTS")
+
+def _generate_certificates(ctx):
+    python = ctx.toolchains["@rules_python//python:toolchain_type"].py3_runtime
+    python_libs = [py_dep[PyInfo].transitive_sources for py_dep in ctx.attr.py_libs]
+
+    # py_libs is `cfg = "exec"`: this action runs the exec-platform
+    # interpreter as a build tool, so its wheels must be selected for the
+    # exec platform too. Under cross-compilation (e.g. macos-cross on a
+    # linux remote worker), target-config wheels are for the wrong OS —
+    # cryptography's native _rust.abi3.so fails with "invalid ELF header".
+    python_path = py_exec_import_paths(ctx, ctx.attr.py_libs)
+
+    # Materialize the cert definitions as a public output so tests and other consumers can use the
+    # exact input passed to mkcert.py.
+    certfile = ctx.actions.declare_file(ctx.attr.certs_json_name)
+    ctx.actions.write(
+        output = certfile,
+        content = ctx.attr.certs_def,
+    )
+    certs_def = json.decode(ctx.attr.certs_def)
+    out_set = {}
+
+    # Statically compute output files from cert definitions
+    for cert in certs_def["certs"]:
+        # Each cert def generates cert.name and a SHA-256 and SHA-1 digest of cert.name.
+        out_set[cert["name"]] = None
+        out_set[cert["name"] + ".digest.sha256"] = None
+        out_set[cert["name"] + ".digest.sha1"] = None
+        if cert.get("split_cert_and_key", False):
+            # Split certs additionally generate .crt and .key files.
+            crt_name = cert["name"][:-len(".pem")] + ".crt"
+            key_name = cert["name"][:-len(".pem")] + ".key"
+            out_set[crt_name] = None
+            out_set[key_name] = None
+        if cert.get("pkcs12", None) != None:
+            # PKCS12 certs generate a separate cert bundle at cert.pkcs12.name.
+            pkcs12_name = cert["pkcs12"].get("name", cert["name"])
+            out_set[pkcs12_name] = None
+    should_gen_crls = False
+    if "crls" in certs_def:
+        for crl in certs_def["crls"]:
+            # Each CRL def generates crl and the two digests.
+            out_set[crl] = None
+            out_set[crl + ".digest.sha256"] = None
+            out_set[crl + ".digest.sha1"] = None
+            should_gen_crls = True
+
+    outputs = [ctx.actions.declare_file(out) for out in out_set]
+
+    # Isolate certificate generation from unrelated stable workspace status changes. This action
+    # reruns whenever stable status changes, but its output changes only when the year changes.
+    certificate_generation_year = ctx.actions.declare_file("." + ctx.label.name + ".certificate_generation_year")
+    ctx.actions.run(
+        executable = python.interpreter.path,
+        inputs = depset(direct = [ctx.info_file, ctx.file.year_extractor], transitive = [python.files]),
+        outputs = [certificate_generation_year],
+        arguments = [
+            ctx.file.year_extractor.path,
+            ctx.info_file.path,
+            certificate_generation_year.path,
+        ],
+        mnemonic = "ExtractCertificateGenerationYear",
+    )
+
+    # Run the Python script to generate the certificates, sending stdout to /dev/null to avoid
+    # cluttering the build log.
+    args = ctx.actions.args()
+    args.add(ctx.expand_location(ctx.attr.main))
+    args.add("--certificate-generation-year-file", certificate_generation_year.path)
+    args.add(certfile.path)
+    args.add("--mkcrl" if should_gen_crls else "--no-mkcrl")
+    args.add("--quiet")
+    args.add("--output", outputs[0].dirname)
+
+    ctx.actions.run(
+        executable = python.interpreter.path,
+        outputs = outputs,
+        inputs = depset(
+            direct = [certfile, certificate_generation_year] + ctx.files.static_inputs,
+            transitive = [python.files, depset([arg.files.to_list()[0] for arg in ctx.attr.srcs])] + python_libs,
+        ),
+        arguments = [args],
+        env = {"PYTHONPATH": ctx.configuration.host_path_separator.join(python_path)},
+        mnemonic = "CertificateGenerator",
+    )
+
+    return [DefaultInfo(files = depset(outputs + [certfile]))]
+
+generate_certificates = rule(
+    implementation = _generate_certificates,
+    attrs = {
+        "static_inputs": attr.label_list(mandatory = True, allow_files = True, doc = "Static input files required to generate certificates."),
+        "certs_def": attr.string(mandatory = True, doc = "Definitions for all certificates."),
+        "certs_json_name": attr.string(mandatory = True, doc = "Name of the materialized certificate definitions JSON output."),
+        "srcs": attr.label_list(
+            doc = "The input files of this rule.",
+            allow_files = True,
+            default = [
+                Label("//x509:mkcert.py"),
+            ],
+        ),
+        "main": attr.string(
+            doc = "The main Python file to execute.",
+            default = "$(location //x509:mkcert.py)",
+        ),
+        "year_extractor": attr.label(
+            doc = "Extracts the certificate generation year from stable workspace status.",
+            allow_single_file = True,
+            default = Label("//x509:extract_certificate_generation_year.py"),
+        ),
+        "py_libs": attr.label_list(
+            cfg = "exec",
+            default = [
+                dependency(
+                    "ecdsa",
+                    group = "testing",
+                ),
+                dependency(
+                    "asn1crypto",
+                    group = "testing",
+                ),
+                dependency(
+                    "pyyaml",
+                    group = "core",
+                ),
+                dependency(
+                    "cryptography",
+                    group = "platform",
+                ),
+            ],
+        ),
+    },
+    toolchains = ["@rules_python//python:toolchain_type"],
+    # Certificate generation is a host-local provenance input.  Keep its Python
+    # interpreter native even when the surrounding build uses a foreign RBE
+    # execution platform for cross compilation.
+    exec_compatible_with = HOST_CONSTRAINTS,
+)

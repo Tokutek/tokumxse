@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Feature flags for balancer functionality.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo::feature_flags"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+feature_flags:
+    featureFlagBalancerWindowDOW:
+        description: "Feature flag for enabling day-of-week specific balancing windows."
+        cpp_varname: gFeatureFlagBalancerWindowDOW
+        default: true
+        fcv_gated: true
+        version: 8.3

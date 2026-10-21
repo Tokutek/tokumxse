@@ -1,0 +1,383 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/counter.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/synchronized_value.h"
+
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <variant>
+
+#include <boost/optional.hpp>
+
+namespace mongo {
+class Service;
+
+namespace status_metric_detail {
+
+template <typename M>
+using HasValueFnOp = decltype(std::declval<M>().value());
+
+template <typename M>
+constexpr inline bool hasValueFn = stdx::is_detected_v<HasValueFnOp, M>;
+
+template <typename M>
+auto& voidlessValue(M& m) {
+    if constexpr (hasValueFn<M>) {
+        return m.value();
+    } else {
+        struct Dummy {};
+        static constexpr Dummy dummy;
+        return dummy;
+    }
+}
+}  // namespace status_metric_detail
+
+/**
+ * Polymorphic interface for a metric to be published in the payload of serverStatus.
+ */
+class ServerStatusMetric {
+public:
+    virtual ~ServerStatusMetric() = default;
+
+    /**
+     * Appends this metric to the current `b` as name `leafName`.
+     * Metrics do not know the name to appear under: `leafName` tells them.
+     */
+    virtual void appendTo(BSONObjBuilder& b, std::string_view leafName) const = 0;
+
+    /**
+     * If the predicate has been set, is is consulted when appending the metric.
+     * If it evaluates to false, the metric is not appended.
+     */
+    void setEnabledPredicate(std::function<bool()> enabled) {
+        _enabled = std::move(enabled);
+    }
+
+    bool isEnabled() const {
+        return !_enabled || _enabled();
+    }
+
+private:
+    std::function<bool()> _enabled;
+};
+
+/**
+ * A generic `ServerStatusMetric` controlled by a policy to handle a common use
+ * case. `ValuePolicy` configures the `BasicServerStatusMetric` template.
+ *
+ * Has a `ValuePolicy` data member. Calls the policy's `doAppend` member
+ * function to perform serialization.
+ *
+ * For `ValuePolicy p`, require:
+ *
+ *     p.appendTo(bob, leafName)
+ *         A customization point, whereby this metric specifies how it will
+ *         append itself as a field `std::string_view leafName` to the
+ *         `BSONObjBuilder& bob`.
+ *
+ *     T& p.value()
+ *         [Optional]
+ *         Returns a reference to some object through which user code can
+ *         manipulate the metric. For example, a `Counter64&`.  This reference
+ *         is returned to the user by a metric builder's call operator.
+ *
+ *         If `ValuePolicy` has no `value()` member function, the builder will
+ *         return an empty placeholder value. This is the case for metrics that
+ *         don't need any input calls.
+ */
+template <typename ValuePolicy>
+class BasicServerStatusMetric : public ServerStatusMetric {
+public:
+    /** All ctor args are forwarded to the policy. */
+    template <typename... As,
+              std::enable_if_t<std::is_constructible_v<ValuePolicy, As...>, int> = 0>
+    explicit BasicServerStatusMetric(As&&... args) : _policy{std::forward<As>(args)...} {}
+
+    /** Returns the reference returned by the builder, for the user to retain. */
+    auto& value() {
+        return status_metric_detail::voidlessValue(_policy);
+    }
+
+    void appendTo(BSONObjBuilder& b, std::string_view leafName) const override {
+        if (!isEnabled())
+            return;
+        _policy.appendTo(b, leafName);
+    }
+
+private:
+    MONGO_COMPILER_NO_UNIQUE_ADDRESS ValuePolicy _policy;
+};
+
+/**
+ * Metrics are organized as a tree by dot-delimited paths.
+ * If path starts with `.`, it will be stripped and the path will be treated
+ * as being directly under the root.
+ * Otherwise, it will appear under the "metrics" subtree.
+ * Examples:
+ *     tree.add(".foo.m1", m1);  // m1 appears as "foo.m1"
+ *     tree.add("foo.m2", m2);   // m2 appears as "metrics.foo.m2"
+ *
+ * The `role` is used to disambiguate collisions.
+ */
+class MetricTree {
+public:
+    /** Can hold either a subtree or a metric. */
+    struct TreeNode {
+    public:
+        explicit TreeNode(std::unique_ptr<MetricTree> v) : _v{std::move(v)} {}
+        explicit TreeNode(std::unique_ptr<ServerStatusMetric> v) : _v{std::move(v)} {}
+
+        bool isSubtree() const {
+            return _v.index() == 0;
+        }
+
+        const std::unique_ptr<MetricTree>& getSubtree() const {
+            return get<0>(_v);
+        }
+
+        const std::unique_ptr<ServerStatusMetric>& getMetric() const {
+            return get<1>(_v);
+        }
+
+    private:
+        std::variant<std::unique_ptr<MetricTree>, std::unique_ptr<ServerStatusMetric>> _v;
+    };
+
+    using ChildMap = std::map<std::string, TreeNode, std::less<>>;
+
+    void add(std::string_view path, std::unique_ptr<ServerStatusMetric> metric);
+
+    void appendTo(BSONObjBuilder& b, const BSONObj& excludePaths = {}) const;
+
+    const ChildMap& children() const {
+        return _children;
+    }
+
+    /**
+     * Removes the metric at `path` from the tree, then prunes any intermediate subtrees that
+     * become empty as a result. The path follows the same leading-dot convention as `add`: a
+     * leading '.' means the path is absolute (relative to the root of the tree), while a path
+     * without a leading '.' is implicitly rooted under "metrics.". Does nothing if `path` is
+     * empty or does not exist in the tree. Intended for use in tests only.
+     */
+    void removeForTests(std::string_view path);
+
+    void freeze() {
+        _frozen = true;
+    }
+
+private:
+    void _add(std::string_view path, std::unique_ptr<ServerStatusMetric> metric);
+
+    /**
+     * The helper for `removeForTests`. Removes the node at `path` (a dot-separated absolute path
+     * with no leading dot) and bottom-up prunes any intermediate subtrees that become empty after
+     * after the removal. Silently returns without modifying the tree when any component of
+     * `path` is missing or when an intermediate component is a leaf metric rather than a subtree.
+     */
+    void _removeForTests(std::string_view path);
+
+    ChildMap _children;
+    bool _frozen = false;
+};
+
+class [[MONGO_MOD_PUBLIC]] MetricTreeSet {
+public:
+    /**
+     * Returns the metric tree for the specified ClusterRole.
+     * The `role` must be exactly one of None, ShardServer, or RouterServer.
+     */
+    MetricTree& operator[](ClusterRole role);
+
+    /**
+     * Freezes all metric trees, preventing any further metric additions.
+     * Any subsequent call to MetricTree::add() on a frozen tree will result in an error.
+     */
+    void freeze();
+
+private:
+    MetricTree _none;
+    MetricTree _shard;
+    MetricTree _router;
+};
+
+[[MONGO_MOD_PUBLIC]] MetricTreeSet& globalMetricTreeSet();
+
+
+/**
+ * Write a merger of the `trees` to `b`, under field `name`. `excludePaths` is a
+ * BSON tree of Bool, specifying `false` for subtrees that are to be omitted
+ * from the results.
+ */
+void appendMergedTrees(std::vector<const MetricTree*> trees,
+                       BSONObjBuilder& b,
+                       const BSONObj& excludePaths = {});
+
+template <typename Policy>
+class [[MONGO_MOD_PUBLIC]] CustomMetricBuilder {
+public:
+    using Metric = BasicServerStatusMetric<Policy>;
+
+    explicit CustomMetricBuilder(std::string name) : _name{std::move(name)} {}
+
+    /** Execute the builder, creating a reference to the registered metric */
+    auto& operator*() && {
+        std::unique_ptr<Metric> ptr;
+        if (_construct)
+            ptr = _construct();
+        else if constexpr (std::is_constructible_v<Metric>)
+            ptr = std::make_unique<Metric>();
+        else
+            invariant(_construct, "No suitable constructor");
+        if (_pred)
+            ptr->setEnabledPredicate(std::move(_pred));
+        auto& reference = *ptr;
+        MetricTreeSet* trees = _trees ? _trees : &globalMetricTreeSet();
+        MetricTree* tree = &(*trees)[_role];
+        if (!tree)
+            tree = &globalMetricTreeSet()[ClusterRole::None];
+        tree->add(_name, std::move(ptr));
+        return status_metric_detail::voidlessValue(reference);
+    }
+
+    CustomMetricBuilder setTreeSet(MetricTreeSet* trees) && {
+        _trees = trees;
+        return std::move(*this);
+    }
+
+    CustomMetricBuilder setRole(ClusterRole role) && {
+        _role = role;
+        return std::move(*this);
+    }
+
+    CustomMetricBuilder setPredicate(std::function<bool()> pred) && {
+        _pred = std::move(pred);
+        return std::move(*this);
+    }
+
+    /* Sets constructor arguments for the built product. */
+    template <typename... Args>
+    CustomMetricBuilder bind(Args... args) && {
+        _construct = [args...] {
+            return std::make_unique<Metric>(args...);
+        };
+        return std::move(*this);
+    }
+
+private:
+    std::string _name;
+    std::function<bool()> _pred;
+    std::function<std::unique_ptr<Metric>()> _construct;
+    MetricTreeSet* _trees = nullptr;
+    ClusterRole _role{};
+};
+
+/** The ValuePolicy to be used for the simple case of BSON-appendable types. */
+template <typename T>
+class DefaultStatusMetricValuePolicy {
+public:
+    template <typename... As, std::enable_if_t<std::is_constructible_v<T, As...>, int> = 0>
+    explicit DefaultStatusMetricValuePolicy(As&&... args) : _v{std::forward<As>(args)...} {}
+
+    auto& value() {
+        return _v;
+    }
+
+    void appendTo(BSONObjBuilder& b, std::string_view leafName) const {
+        b.append(leafName, _v);
+    }
+
+private:
+    T _v;
+};
+
+/** Trait for choosing a policy for a metric. */
+template <typename T>
+struct [[MONGO_MOD_PUBLIC]] ServerStatusMetricPolicySelection {
+    using type = DefaultStatusMetricValuePolicy<T>;
+};
+template <typename T>
+using ServerStatusMetricPolicySelectionT = typename ServerStatusMetricPolicySelection<T>::type;
+
+/**
+ * A CustomMetricBuilder, using a policy chosen by the ServerStatusMetricValuePolicy trait.
+ *
+ * Example (note the auto& reference):
+ *   auto& myMetric = *MetricBuilder<Counter64>("network.myMetric")
+ *                         .setPredicate(someNullaryPredicate);
+ *
+ * NOTE: By default, MetricBuilder is NOT thread-safe. You must either use an atomic type (e.g.
+ * Counter64, Atomic64Metric, etc.) or use MetricBuilder<synchronized_value<T>> instead to guarantee
+ * thread-safety.
+ */
+template <typename T>
+using MetricBuilder [[MONGO_MOD_PUBLIC]] =
+    CustomMetricBuilder<ServerStatusMetricPolicySelectionT<T>>;
+
+/**
+ * Leverage `synchronized_value<T>` to make a thread-safe `T` metric, for `T`
+ * that are not intrinsically thread-safe (e.g. string, int).
+ * T must be usable as an argument to `BSONObjBuilder::append`.
+ */
+template <typename T>
+struct ServerStatusMetricPolicySelection<synchronized_value<T>> {
+    class Policy {
+    public:
+        template <typename... As, std::enable_if_t<std::is_constructible_v<T, As...>, int> = 0>
+        explicit Policy(As&&... args) : _v{std::forward<As>(args)...} {}
+
+        auto& value() {
+            return _v;
+        }
+
+        void appendTo(BSONObjBuilder& b, std::string_view leafName) const {
+            b.append(leafName, **_v);
+        }
+
+    private:
+        synchronized_value<T> _v;
+    };
+    using type = Policy;
+};
+
+template <typename T>
+struct CounterMetricPolicy {
+public:
+    T& value() {
+        return _v;
+    }
+
+    void appendTo(BSONObjBuilder& b, std::string_view leafName) const {
+        b.append(leafName, static_cast<long long>(_v.get()));
+    }
+
+private:
+    T _v;
+};
+
+template <>
+struct ServerStatusMetricPolicySelection<Counter64> {
+    using type = CounterMetricPolicy<Counter64>;
+};
+
+template <>
+struct ServerStatusMetricPolicySelection<Atomic64Metric> {
+    using type = CounterMetricPolicy<Atomic64Metric>;
+};
+
+}  // namespace mongo

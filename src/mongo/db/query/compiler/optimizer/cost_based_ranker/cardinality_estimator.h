@@ -1,0 +1,279 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_cond.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_match_array_index.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_estimator.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/ce_cache.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/ce_utils.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates_storage.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/util/modules.h"
+
+#include <string_view>
+
+namespace mongo::cost_based_ranker {
+
+using CEResult = StatusWith<CardinalityEstimate>;
+
+template <typename T>
+concept IntersectionType = std::same_as<T, AndHashNode> || std::same_as<T, AndSortedNode>;
+
+template <typename T>
+concept UnionType = std::same_as<T, OrNode> || std::same_as<T, MergeSortNode>;
+
+// Above this interval count building and hashing a MatchExpression cache key from the bounds costs
+// more than the CE computation itself, in which case we skip caching and call estimateRIDs
+// directly.
+constexpr size_t kMaxNumIntervalsCached = 1000;
+
+/**
+ * This class implements bottom-up cardinality estimation of QuerySolutionNode plans that consist of
+ * QSN nodes, MatchExpression filter nodes, and Intervals. This estimator may use different CE
+ * methods for different nodes.
+ *
+ * Estimation is performed recursively bottom-up, where child estimates are combined via
+ * exponential backoff. In order to take into account implicit conjunctions where sequences of QSN
+ * nodes encode a conjunction, the estimator employs a stack of selectivities that includes the
+ * combined selectivities of filter conjunctions and QSN-sequence conjunctions.
+ */
+class CardinalityEstimator {
+public:
+    CardinalityEstimator(const CollectionInfo& collInfo,
+                         const ce::SamplingEstimator* samplingEstimator,
+                         EstimateMap& qsnEstimates,
+                         QueryCBRCEModeEnum rankerMode,
+                         bool failOnZeroIxscanCE = true);
+
+    // Delete the copy and move constructors and assignment operator
+    CardinalityEstimator(const CardinalityEstimator&) = delete;
+    CardinalityEstimator(CardinalityEstimator&&) = delete;
+    CardinalityEstimator& operator=(const CardinalityEstimator&) = delete;
+    CardinalityEstimator& operator=(CardinalityEstimator&&) = delete;
+
+    CEResult estimatePlan(const QuerySolution& plan);
+    /**
+     * Estimate the cardinality of a standalone filter (no QuerySolution), scaled to the
+     * collection cardinality. Resets per-estimation state, so the estimator may be reused.
+     * Applies the same zero-clamping policy as estimatePlan(): an approximate-source zero
+     * ("not observed in the sample") is floored to kMinCE.
+     */
+    CEResult estimateFilter(const MatchExpression* filter);
+
+protected:
+    // QuerySolutionNodes
+    CEResult estimate(const QuerySolutionNode* node);
+    CEResult estimate(const CollectionScanNode* node);
+    CEResult estimate(const VirtualScanNode* node);
+    CEResult estimate(const IndexScanNode* node);
+    CEResult estimate(const FetchNode* node);
+    CEResult estimate(const AndHashNode* node);
+    CEResult estimate(const AndSortedNode* node);
+    CEResult estimate(const OrNode* node);
+    CEResult estimate(const MergeSortNode* node);
+    CEResult estimate(const SortNode* node);
+    CEResult estimate(const LimitNode* node);
+    CEResult estimate(const SkipNode* node);
+
+    // MatchExpressions
+    CEResult estimate(const MatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const NotMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const AndMatchExpression* node);
+    CEResult estimate(const OrMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const NorMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const ElemMatchValueMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const InternalSchemaXorMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const InternalSchemaAllElemMatchFromIndexMatchExpression* node,
+                      bool isFilterRoot);
+    CEResult estimate(const InternalSchemaCondMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const InternalSchemaMatchArrayIndexMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const InternalSchemaObjectMatchExpression* node, bool isFilterRoot);
+    CEResult estimate(const InternalSchemaAllowedPropertiesMatchExpression* node);
+
+    // Intervals
+    CEResult estimate(const IndexBounds* node);
+    CEResult estimate(const OrderedIntervalList* node, bool forceHistogram = false);
+
+    /**
+     * Attempt to push a limit down to child stages, potentially scaling by the selectivity
+     * of the child.
+     */
+    void propagateLimit(const QuerySolutionNode* node, size_t limit);
+
+    /**
+     * "At least one row" floor used by 'clampZeroEstimates' for approximate-source zeros.
+     */
+    static constexpr double kMinCE = 1.0;
+
+    /**
+     * Walk '_qsnEstimates' and replace zero-valued approximate-source cardinality estimates
+     * (Sampling / Histogram / Heuristics / Mixed) with a non-zero inferred value. A zero from
+     * an approximate source means "not observed" rather than "truly zero"; letting it reach
+     * the cost model causes structurally different plans to tie at the per-node minCost.
+     *
+     * Policy:
+     *   - Sampling, Histogram, Heuristics, Mixed -> kMinCE ("at least one row")
+     *   - Metadata, Code -> untouched (authoritative zeros)
+     *
+     * Authoritative zeros are deliberately preserved; the 'CostEstimator' handles them via an
+     * additive per-stage minimum so structurally different plans still receive distinct costs.
+     */
+    void clampZeroEstimates();
+
+    /**
+     * Apply the "at least one row" floor to a single estimate: zero-valued approximate-source
+     * (Sampling / Histogram / Heuristics / Mixed) estimates become 'kMinCE'; authoritative
+     * (Metadata / Code) zeros are returned untouched.
+     */
+    CardinalityEstimate clampZeroEstimate(CardinalityEstimate ce);
+
+    CEResult estimateIndexSeeks(const IndexBounds& bounds, bool multiKey);
+
+    // Internal helper functions
+
+    /**
+     * Attempt to use histograms to estimate all predicates of the given AndMatchExpression. If
+     * estimatation of any of the children is unable to be done with histograms (non-sargable
+     * predicate, missing histogram, etc.), returns a non-OK status.
+     */
+    CEResult tryHistogramAnd(const AndMatchExpression* node);
+
+    /**
+     * Estimate the conjunction of MatchExpressions in 'nodes', which are all predicates over
+     * 'path', using the histogram over 'path'. This is done by converting each expression in
+     * 'nodes' to an Interval, intersecting all the intervals and finally invoking histogram
+     * estimation. This function assumes that 'path' is non-multikey.
+     */
+    CEResult estimateConjWithHistogram(std::string_view path,
+                                       const std::vector<const MatchExpression*>& nodes);
+
+    CEResult scanCard(const QuerySolutionNode* node, const CardinalityEstimate& card);
+
+    template <IntersectionType T>
+    CEResult indexIntersectionCard(const T* node);
+
+    template <UnionType T>
+    CEResult indexUnionCard(const T* node);
+
+    // Cardinality of nodes that do not affect the number of documents - their output cardinality
+    // is the same as their input unless the node has a limit.
+    CEResult passThroughNodeCard(const QuerySolutionNode* node);
+    CEResult limitNodeCard(const QuerySolutionNode* node, size_t limit);
+
+    CardinalityEstimate conjCard(size_t offset, CardinalityEstimate inputCard) {
+        std::span selsToEstimate(std::span(_conjSels.begin() + offset, _conjSels.end()));
+        if (selsToEstimate.size() == 0) {
+            return inputCard;
+        }
+        SelectivityEstimate conjSel = conjExponentialBackoff(selsToEstimate);
+        CardinalityEstimate resultCard = conjSel * inputCard;
+        return resultCard;
+    }
+
+    CardinalityEstimate disjCard(CardinalityEstimate inputCard,
+                                 std::vector<SelectivityEstimate>& disjSels) {
+        SelectivityEstimate disjSel = disjExponentialBackoff(disjSels);
+        CardinalityEstimate resultCard = disjSel * inputCard;
+        return resultCard;
+    }
+
+    /**
+     * Estimate the cardinality of the given vector of MatchExpressions as if they were a
+     * conjunction.
+     */
+    CEResult estimateConjunction(const MatchExpression* conjunction);
+    /**
+     * Estimate the cardinality of the given vector of MatchExpressions as if they were a
+     * disjunction. This is a helper for the implementations of estimation of $or and $nor.
+     */
+    CEResult estimateDisjunction(const std::vector<std::unique_ptr<MatchExpression>>& disjuncts);
+
+    /**
+     * Leaf nodes and ORs that are the root of a QSN's filter are atomic from conjunction
+     * estimation's perspective, therefore conjunction estimation will not add such nodes
+     * to the _conjSels stack. This function adds the selectivity of such root nodes to _conjSels
+     * so that they participate in implicit conjunction selectivity calculation.
+     * For instance a plan of an IndexScanNode with a filter (a < 5) OR (a > 10), and a subsequent
+     * FetchNode with a filter (b > 'abc') express the conjunction
+     * ((a < 5) OR (a > 10)) AND (b > 'abc')
+     * All conjuncts' selectivities are combined when computing the total cardinality of the
+     * FetchNode.
+     */
+    void addRootNodeSel(const CEResult& ceRes) {
+        SelectivityEstimate sel = ceRes.getValue() / _inputCard;
+        _conjSels.emplace_back(sel);
+    }
+
+    // Pop all selectivities from '_conjSels' after the first 'count' elements.
+    void popSelectivities(size_t count = 0) {
+        tassert(9586700, "Cannot pop more elements than total size.", count <= _conjSels.size());
+        size_t oldSize = _conjSels.size() - count;
+        _conjSels.erase(_conjSels.end() - oldSize, _conjSels.end());
+    }
+
+    // Get the path of the given node. This function consults the '_elemMatchPathStack' to check if
+    // this node is under an $elemMatch, if so it will return that path.
+    std::string_view getPath(const MatchExpression* node);
+
+    CardinalityEstimate _collCard;
+
+    // The input cardinality of the last complete conjunction. This conjunction may consist of a
+    // chain of QSN nodes (an implicit conjunction) including all intervals and filter expressions
+    // in those nodes.
+    CardinalityEstimate _inputCard;
+
+    // A stack of the selectivities of all nodes that belong to one conjunction - both from explicit
+    // and implicit conjunctions. The stack is cleared by any conjunction-breaker node - that is,
+    // any parent node of a conjunction that is not part of the conjunction itself.
+    // A subsequent conjunction will push again onto this stack.
+    std::vector<SelectivityEstimate> _conjSels;
+
+    // Catalog information about the collection including index metadata and cached histograms.
+    const CollectionInfo& _collInfo;
+
+    // Sampling estimator used to estimate cardinality using a cache of documents randomly sampled
+    // from the collection. We don't own this pointer and it may be null in the case that a sampling
+    // method which never uses sampling is requested.
+    const ce::SamplingEstimator* _samplingEstimator;
+
+    // A map from QSN to QSNEstimate that stores the final CE result for each QSN node.
+    // Not owned by this class - it is passed by the user of this class, and is filled in with
+    // entries during the estimation process.
+    EstimateMap& _qsnEstimates;
+
+    // The cardinality estimate mode we are using for estimates.
+    const QueryCBRCEModeEnum _ceMode;
+
+    // Whether a zero index scan estimate fails the plan with ErrorCodes::ZeroCEEstimate.
+    const bool _failOnZeroIxscanCE;
+
+    // Set with the paths we know are multikey which is deduced from the catalog. Note that a field
+    // may be multikey but not reflected in this set because there may not be an index over the
+    // field.
+    StringDataSet _multikeyPaths;
+
+    // Set with the paths we know are non-multikey deduced from the catalog. Like '_multikeyPaths',
+    // a field may be non-multikey but not reflected in this set because there are no indexes over
+    // the field.
+    StringDataSet _nonMultikeyPaths;
+
+    // Keep track of the path associated with the current node in $elemMatch contexts. For example,
+    // ElemMatchValueMatchExpression may have a child which looks like GTMatchExpression with an
+    // empty path.
+    std::stack<std::string_view> _elemMatchPathStack;
+
+    // Cache cardinality estimates of logically equivalent MatchExpressions and IndexBounds.
+    CECache<false /* disable logging */> _ceCache;
+};
+
+}  // namespace mongo::cost_based_ranker

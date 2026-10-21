@@ -1,0 +1,1064 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/external_data_source_option_gen.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role/ddl/create_gen.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/virtual_collection_impl.h"
+#include "mongo/db/shard_role/shard_catalog/virtual_collection_options.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/timeseries/timeseries_test_util.h"
+#include "mongo/stdx/utility.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <ostream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+using namespace std::string_literals;
+
+class CreateCollectionTest : public ServiceContextMongoDTest {
+protected:
+    void setUp() override;
+    void tearDown() override;
+
+    void validateValidator(const std::string& validatorStr, int expectedError);
+
+    // Use StorageInterface to access storage features below catalog interface.
+    std::unique_ptr<repl::StorageInterface> _storage;
+};
+
+void CreateCollectionTest::setUp() {
+    // Set up mongod.
+    ServiceContextMongoDTest::setUp();
+
+    auto service = getServiceContext();
+
+    // Set up ReplicationCoordinator and ensure that we are primary.
+    auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
+    ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+    repl::ReplicationCoordinator::set(service, std::move(replCoord));
+
+    _storage = std::make_unique<repl::StorageInterfaceImpl>();
+}
+
+void CreateCollectionTest::tearDown() {
+    _storage = {};
+
+    // Tear down mongod.
+    ServiceContextMongoDTest::tearDown();
+}
+
+class CreateVirtualCollectionTest : public CreateCollectionTest {
+private:
+    void setUp() override {
+        CreateCollectionTest::setUp();
+        computeModeEnabled = true;
+    }
+    void tearDown() override {
+        computeModeEnabled = false;
+        CreateCollectionTest::tearDown();
+    }
+};
+
+/**
+ * Creates an OperationContext.
+ */
+ServiceContext::UniqueOperationContext makeOpCtx() {
+    auto opCtx = cc().makeOperationContext();
+    repl::createOplog(opCtx.get());
+    return opCtx;
+}
+
+void CreateCollectionTest::validateValidator(const std::string& validatorStr,
+                                             const int expectedError) {
+    NamespaceString newNss =
+        NamespaceString::createNamespaceString_forTest("test.newCollWithValidation");
+
+    auto opCtx = makeOpCtx();
+
+    CollectionOptions options;
+    options.validator = fromjson(validatorStr);
+    options.uuid = UUID::gen();
+
+    return writeConflictRetry(opCtx.get(), "create", newNss, [&] {
+        auto acq = acquireCollection(opCtx.get(),
+                                     CollectionAcquisitionRequest::fromOpCtx(
+                                         opCtx.get(), newNss, AcquisitionPrerequisites::kWrite),
+                                     MODE_IX);
+        auto db = DatabaseHolder::get(opCtx.get())->openDb(opCtx.get(), newNss.dbName());
+        ASSERT_TRUE(db) << "Cannot create collection " << newNss.toStringForErrorMsg()
+                        << " because database " << newNss.dbName().toStringForErrorMsg()
+                        << " does not exist.";
+
+        WriteUnitOfWork wuow(opCtx.get());
+        const auto status =
+            db->userCreateNS(opCtx.get(), newNss, options, false /*createDefaultIndexes*/);
+        ASSERT_EQ(expectedError, status.code()) << status;
+    });
+}
+
+CollectionAcquisition acquireCollForRead(OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+}
+
+/**
+ * Returns true if collection exists.
+ */
+bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollForRead(opCtx, nss).exists();
+}
+
+/**
+ * Returns collection options.
+ */
+CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) {
+    const auto collection = acquireCollForRead(opCtx, nss);
+    ASSERT_TRUE(collection.exists())
+        << "Unable to get collections options for " << nss.toStringForErrorMsg()
+        << " because collection does not exist.";
+    return collection.getCollectionPtr()->getCollectionOptions();
+}
+
+/**
+ * Returns a VirtualCollectionImpl if the underlying implementation object is a virtual collection.
+ */
+const VirtualCollectionImpl* getVirtualCollection(OperationContext* opCtx,
+                                                  const NamespaceString& nss) {
+    const auto collection = acquireCollForRead(opCtx, nss);
+    return dynamic_cast<const VirtualCollectionImpl*>(collection.getCollectionPtr().get());
+}
+
+/**
+ * Returns virtual collection options.
+ */
+VirtualCollectionOptions getVirtualCollectionOptions(OperationContext* opCtx,
+                                                     const NamespaceString& nss) {
+    auto vcollPtr = getVirtualCollection(opCtx, nss);
+    ASSERT_TRUE(vcollPtr) << "Collection must be a virtual collection";
+
+    return vcollPtr->getVirtualCollectionOptions();
+}
+
+/**
+ * Returns UUID of collection.
+ */
+UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
+    auto options = getCollectionOptions(opCtx, nss);
+    ASSERT_TRUE(options.uuid);
+    return *(options.uuid);
+}
+
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsWithSpecificUuidNoExistingCollection) {
+    NamespaceString newNss = NamespaceString::createNamespaceString_forTest("test.newColl");
+
+    auto opCtx = makeOpCtx();
+    ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
+
+    auto uuid = UUID::gen();
+    Lock::DBLock lock(opCtx.get(), newNss.dbName(), MODE_IX);
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          newNss.dbName(),
+                                          uuid,
+                                          BSON("create" << newNss.coll()),
+                                          /*allowRenameOutOfTheWay*/ false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+}
+
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsWithSpecificUuidNestedInObject) {
+    // Documents the behavior where 'uuid' is retrieved from the 'o' field when not provided  in
+    // 'ui'. This differs from create oplog entries generated by a primary node - where 'uuid' is
+    // omitted from the 'o' field and instead stored in the 'ui' field of the oplog entry.
+    //
+    // The test ensures that future code changes do not break any downstream tools that rely on the
+    // pre-existing behavior.
+    NamespaceString newNss = NamespaceString::createNamespaceString_forTest("test.newColl");
+
+    auto opCtx = makeOpCtx();
+    ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
+
+    auto uuid = UUID::gen();
+    Lock::DBLock lock(opCtx.get(), newNss.dbName(), MODE_IX);
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          newNss.dbName(),
+                                          boost::none,
+                                          BSON("create" << newNss.coll() << "uuid" << uuid),
+                                          /*allowRenameOutOfTheWay*/ false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+    ASSERT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
+}
+
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsWithSpecificUuidNonDropPendingCurrentCollectionHasSameUuid) {
+    NamespaceString curNss = NamespaceString::createNamespaceString_forTest("test.curColl");
+    NamespaceString newNss = NamespaceString::createNamespaceString_forTest("test.newColl");
+
+    auto opCtx = makeOpCtx();
+    auto uuid = UUID::gen();
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+
+    // Create existing collection using StorageInterface.
+    {
+        CollectionOptions options;
+        options.uuid = uuid;
+        ASSERT_OK(_storage->createCollection(opCtx.get(), curNss, options));
+    }
+    ASSERT_TRUE(collectionExists(opCtx.get(), curNss));
+    ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
+
+    // This should rename the existing collection 'curNss' to the collection 'newNss' we are trying
+    // to create.
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          newNss.dbName(),
+                                          uuid,
+                                          BSON("create" << newNss.coll()),
+                                          /*allowRenameOutOfTheWay*/ true));
+
+    ASSERT_FALSE(collectionExists(opCtx.get(), curNss));
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+}
+
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsWithSpecificUuidRenamesExistingCollectionWithSameNameOutOfWay) {
+    NamespaceString newNss = NamespaceString::createNamespaceString_forTest("test.newColl");
+
+    auto opCtx = makeOpCtx();
+    auto uuid = UUID::gen();
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+
+    // Create existing collection with same name but different UUID using StorageInterface.
+    auto existingCollectionUuid = UUID::gen();
+    {
+        CollectionOptions options;
+        options.uuid = existingCollectionUuid;
+        ASSERT_OK(_storage->createCollection(opCtx.get(), newNss, options));
+    }
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+    ASSERT_NOT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
+
+    // This should rename the existing collection 'newNss' to a randomly generated collection name.
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          newNss.dbName(),
+                                          uuid,
+                                          BSON("create" << newNss.coll()),
+                                          /*allowRenameOutOfTheWay*/ true));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+    ASSERT_EQUALS(uuid, getCollectionUuid(opCtx.get(), newNss));
+
+    // Check that old collection that was renamed out of the way still exists.
+    auto catalog = CollectionCatalog::get(opCtx.get());
+    auto renamedCollectionNss = catalog->lookupNSSByUUID(opCtx.get(), existingCollectionUuid);
+    ASSERT(renamedCollectionNss);
+    ASSERT_TRUE(collectionExists(opCtx.get(), *renamedCollectionNss))
+        << "old renamed collection with UUID " << existingCollectionUuid
+        << " missing: " << (*renamedCollectionNss).toStringForErrorMsg();
+}
+
+/**
+ * Testing an oplog sequence that can cause inconsistent data being read:
+ * 1. [TS1: Create timeseries coll "test.curColl", together with a system bucket
+ *          "test.system.buckets.curColl" with UUID2]
+ * 2. [TS2: Drop timeseries coll "test.curColl"]
+ * 3. [TS3: Create timeseries coll "test.curColl" together with a system bucket
+ *          "test.system.buckets.curColl" with UUID1]
+ *
+ * After initial sync, TS1 is applied and renames UUID1 away due to name conflict.
+ * Renaming needs to respect the system.buckets collection prefix when collections are listed.
+ */
+// TODO SERVER-123350: Remove this test once 9.0 is last LTS.
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsRespectsTimeseriesBucketsCollectionPrefix) {
+    // This test validates system.buckets.* prefix handling during applyOps rename,
+    // which only applies to legacy timeseries collections.
+    unittest::ServerParameterGuard viewlessController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    NamespaceString curNss = NamespaceString::createNamespaceString_forTest("test.curColl");
+    auto bucketsColl =
+        NamespaceString::createNamespaceString_forTest("test.system.buckets.curColl");
+    auto opCtx = makeOpCtx();
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+
+    // Create a time series collection
+    const auto tsOptions = TimeseriesOptions("t");
+    CreateCommand cmd = CreateCommand(curNss);
+    cmd.getCreateCollectionRequest().setTimeseries(tsOptions);
+    uassertStatusOK(createCollection(opCtx.get(), cmd));
+    ASSERT_TRUE(collectionExists(opCtx.get(), bucketsColl));
+
+    // The system.buckets collection was created with uuid1.
+    auto uuid1 = getCollectionUuid(opCtx.get(), bucketsColl);
+    // Now call createCollectionForApplyOps with the same name but a different uuid2.
+    auto uuid2 = UUID::gen();
+    ASSERT_NOT_EQUALS(uuid1, uuid2);
+    // This should rename the old collection to a randomly generated collection name.
+    cmd = CreateCommand(bucketsColl);
+    cmd.getCreateCollectionRequest().setTimeseries(tsOptions);
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          bucketsColl.dbName(),
+                                          uuid2,
+                                          cmd.toBSON(),
+                                          /*allowRenameOutOfTheWay*/ true));
+    ASSERT_TRUE(collectionExists(opCtx.get(), bucketsColl));
+    ASSERT_EQUALS(uuid2, getCollectionUuid(opCtx.get(), bucketsColl));
+
+    // Check that old collection that was renamed out of the way still exists.
+    auto catalog = CollectionCatalog::get(opCtx.get());
+    auto renamedCollectionNss = catalog->lookupNSSByUUID(opCtx.get(), uuid1);
+    ASSERT(renamedCollectionNss);
+    ASSERT_TRUE(collectionExists(opCtx.get(), *renamedCollectionNss))
+        << "old renamed collection with UUID " << uuid1
+        << " missing: " << (*renamedCollectionNss).toStringForErrorMsg();
+    // The renamed collection should still have the system.buckets prefix.
+    ASSERT(renamedCollectionNss->isTimeseriesBucketsCollection());
+
+    // Drop the new collection (with uuid2).
+    {
+        repl::UnreplicatedWritesBlock uwb(opCtx.get());  // Do not use oplog.
+        ASSERT_OK(_storage->dropCollection(opCtx.get(), bucketsColl));
+    }
+    ASSERT_FALSE(collectionExists(opCtx.get(), bucketsColl));
+
+    // Now call createCollectionForApplyOps with uuid1.
+    cmd = CreateCommand(bucketsColl);
+    cmd.getCreateCollectionRequest().setTimeseries(tsOptions);
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          bucketsColl.dbName(),
+                                          uuid1,
+                                          cmd.toBSON(),
+                                          /*allowRenameOutOfTheWay*/ false));
+    // This should rename the old collection back to its original name.
+    ASSERT_FALSE(collectionExists(opCtx.get(), *renamedCollectionNss));
+    ASSERT_TRUE(collectionExists(opCtx.get(), bucketsColl));
+    ASSERT_EQUALS(uuid1, getCollectionUuid(opCtx.get(), bucketsColl));
+}
+
+TEST_F(CreateCollectionTest, ValidationOptions) {
+    // Try a valid validator before trying invalid validators.
+    validateValidator("", static_cast<int>(ErrorCodes::Error::OK));
+    validateValidator("{a: {$exists: false}}", static_cast<int>(ErrorCodes::Error::OK));
+
+    // Invalid validators.
+    validateValidator(
+        "{$expr: {$function: {body: 'function(age) { return age >= 21; }', args: ['$age'], lang: "
+        "'js'}}}",
+        4660800);
+    validateValidator("{$expr: {$_internalJsEmit: {eval: 'function() {}', this: {}}}}", 4660801);
+    validateValidator("{$where: 'this.a == this.b'}", static_cast<int>(ErrorCodes::BadValue));
+}
+
+// Tests that validator validation is disabled when inserting a document into a
+// <database>.system.resharding.* collection. The primary donor is responsible for validating
+// documents before they are inserted into the recipient's temporary resharding collection.
+TEST_F(CreateCollectionTest, ValidationDisabledForTemporaryReshardingCollection) {
+    NamespaceString reshardingNss =
+        NamespaceString::createNamespaceString_forTest("myDb", "system.resharding.yay");
+    auto opCtx = makeOpCtx();
+
+    {
+        Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+        BSONObj createCmdObj =
+            BSON("create" << reshardingNss.coll() << "validator" << BSON("a" << 5));
+        ASSERT_OK(createCollection(opCtx.get(), reshardingNss.dbName(), createCmdObj));
+        ASSERT_TRUE(collectionExists(opCtx.get(), reshardingNss));
+    }
+
+    const auto collection = acquireCollection(
+        opCtx.get(),
+        CollectionAcquisitionRequest(reshardingNss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx.get()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+
+    WriteUnitOfWork wuow(opCtx.get());
+    // Ensure a document that violates validator criteria can be inserted into the temporary
+    // resharding collection.
+    auto insertObj = fromjson("{'_id':2, a:1}");
+    auto status = Helpers::insert(opCtx.get(), collection.getCollectionPtr(), insertObj);
+    ASSERT_OK(status);
+}
+
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsDoesNotCreateIdIndexOnClusteredCollection) {
+    auto opCtx = makeOpCtx();
+    auto nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    auto uuid = UUID::gen();
+
+    {
+        Lock::GlobalLock lk(opCtx.get(), MODE_X);
+        ASSERT_OK(createCollectionForApplyOps(
+            opCtx.get(),
+            nss.dbName(),
+            uuid,
+            BSON("create" << nss.coll() << "clusteredIndex"
+                          << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                                      << "clustered_index"
+                                      << "unique" << true)),
+            /*allowRenameOutOfTheWay*/ false));
+    }
+
+    auto coll = acquireCollForRead(opCtx.get(), nss);
+    auto indexCatalog = coll.getCollectionPtr()->getIndexCatalog();
+    ASSERT_FALSE(indexCatalog->haveAnyIndexes());
+}
+
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsUsesDefaultIdIndexSpecIfEmpty) {
+    auto opCtx = makeOpCtx();
+    auto noIdNss = NamespaceString::createNamespaceString_forTest("test.noId");
+    auto emptySpecNss = NamespaceString::createNamespaceString_forTest("test.emptyIdSpec");
+
+
+    {
+        Lock::GlobalLock lk(opCtx.get(), MODE_X);
+        ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                              noIdNss.dbName(),
+                                              UUID::gen(),
+                                              BSON("create" << noIdNss.coll()),
+                                              false,
+                                              boost::none));
+        ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                              emptySpecNss.dbName(),
+                                              UUID::gen(),
+                                              BSON("create" << emptySpecNss.coll()),
+                                              false,
+                                              BSONObj()));
+    }
+
+    auto noIdIndex = acquireCollForRead(opCtx.get(), noIdNss);
+    ASSERT_FALSE(noIdIndex.getCollectionPtr()->isIndexPresent("_id_"));
+    auto emptySpec = acquireCollForRead(opCtx.get(), emptySpecNss);
+    ASSERT(emptySpec.getCollectionPtr()->isIndexPresent("_id_"));
+}
+
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsUsesIdIndexIdentIfSupplied) {
+    auto opCtx = makeOpCtx();
+    auto noIdNss = NamespaceString::createNamespaceString_forTest("test.noId");
+    auto explicitIdNss = NamespaceString::createNamespaceString_forTest("test.explicitId");
+    auto implicitIdNss = NamespaceString::createNamespaceString_forTest("test.implicitId");
+
+    // Internal collections have id indexes and we need to filter out the idents for those later
+    auto originalIdents = opCtx->getServiceContext()->getStorageEngine()->getEngine()->getAllIdents(
+        *shard_role_details::getRecoveryUnit(opCtx.get()));
+
+    {
+        // Create three collections: one with no id index (but an ident specified), one with an id
+        // index and an ident specified, and one with an id index but no ident specified
+        Lock::GlobalLock lk(opCtx.get(), MODE_X);
+        const auto idIndexSpec = BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                                          << "_id_");
+        ASSERT_OK(createCollectionForApplyOps(
+            opCtx.get(),
+            noIdNss.dbName(),
+            UUID::gen(),
+            BSON("create" << noIdNss.coll()),
+            false,
+            boost::none,
+            CreateCollCatalogIdentifier{.ident = "collection-1", .idIndexIdent = "index-1"s}));
+        ASSERT_OK(createCollectionForApplyOps(
+            opCtx.get(),
+            explicitIdNss.dbName(),
+            UUID::gen(),
+            BSON("create" << explicitIdNss.coll()),
+            false,
+            idIndexSpec,
+            CreateCollCatalogIdentifier{.ident = "collection-2", .idIndexIdent = "index-2"s}));
+        ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                              implicitIdNss.dbName(),
+                                              UUID::gen(),
+                                              BSON("create" << implicitIdNss.coll()),
+                                              false,
+                                              idIndexSpec,
+                                              boost::none));
+    }
+
+    auto noIdIndex = acquireCollForRead(opCtx.get(), noIdNss);
+    ASSERT_FALSE(noIdIndex.getCollectionPtr()->isIndexPresent("_id_"));
+
+    auto explicitIdent = acquireCollForRead(opCtx.get(), explicitIdNss);
+    ASSERT(explicitIdent.getCollectionPtr()->isIndexPresent("_id_"));
+    ASSERT(explicitIdent.getCollectionPtr()->getIndexCatalog()->findIndexByIdent(opCtx.get(),
+                                                                                 "index-2"));
+    auto implicitIdent = acquireCollForRead(opCtx.get(), implicitIdNss);
+    ASSERT(explicitIdent.getCollectionPtr()->isIndexPresent("_id_"));
+
+    // There should be exactly two new idents starting with index- once we exclude the idents which
+    // existed before we created out collections. One should be "index-2" and one should be a newly
+    // generated ident. "ident-1" should *not* be present as that collection doesn't have an id
+    // index.
+    auto newIdents = opCtx->getServiceContext()->getStorageEngine()->getEngine()->getAllIdents(
+        *shard_role_details::getRecoveryUnit(opCtx.get()));
+    std::set<std::string_view> indexIdents;
+    for (auto& ident : newIdents) {
+        if (ident.starts_with("index-"))
+            indexIdents.insert(ident);
+    }
+    for (auto& ident : originalIdents) {
+        indexIdents.erase(ident);
+    }
+    ASSERT_FALSE(indexIdents.contains("index-1"));
+    ASSERT(indexIdents.contains("index-2"));
+    ASSERT_EQ(indexIdents.size(), 2);
+}
+
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsUsesRecordIdsReplicatedIfSuppliedWhenItIsFalse) {
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+
+    auto opCtx = makeOpCtx();
+    auto nss = NamespaceString::createNamespaceString_forTest("test.recordIdsReplicated");
+    ASSERT_FALSE(collectionExists(opCtx.get(), nss));
+
+    CollectionOptions options;
+    CreateCommand cmd = CreateCommand(nss);
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);
+
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          nss.dbName(),
+                                          UUID::gen(),
+                                          cmd.toBSON(),
+                                          false,
+                                          boost::none,
+                                          boost::none,
+                                          /*recordIdsReplicated=*/false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), nss));
+    auto coll = acquireCollForRead(opCtx.get(), nss);
+    ASSERT_FALSE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsUsesRecordIdsReplicatedIfSuppliedWhenItIsTrue) {
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+
+    auto opCtx = makeOpCtx();
+    auto nss = NamespaceString::createNamespaceString_forTest("test.recordIdsReplicated");
+    ASSERT_FALSE(collectionExists(opCtx.get(), nss));
+
+    CollectionOptions options;
+    CreateCommand cmd = CreateCommand(nss);
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);
+
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          nss.dbName(),
+                                          UUID::gen(),
+                                          cmd.toBSON(),
+                                          false,
+                                          boost::none,
+                                          boost::none,
+                                          /*recordIdsReplicated=*/true));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), nss));
+    auto coll = acquireCollForRead(opCtx.get(), nss);
+    ASSERT_TRUE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsUsesRecordIdsReplicatedWhenNotSuppliedAndFeatureFlagIsOn) {
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+
+    auto opCtx = makeOpCtx();
+    auto nss = NamespaceString::createNamespaceString_forTest("test.recordIdsReplicated");
+    ASSERT_FALSE(collectionExists(opCtx.get(), nss));
+
+    CollectionOptions options;
+    CreateCommand cmd = CreateCommand(nss);
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);
+
+    ASSERT_OK(
+        createCollectionForApplyOps(opCtx.get(), nss.dbName(), UUID::gen(), cmd.toBSON(), false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), nss));
+    auto coll = acquireCollForRead(opCtx.get(), nss);
+    ASSERT_TRUE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsDoesNotUseRecordIdsReplicatedWhenFeatureFlagIsOff) {
+    auto opCtx = makeOpCtx();
+    auto nss = NamespaceString::createNamespaceString_forTest("test.recordIdsReplicated");
+    ASSERT_FALSE(collectionExists(opCtx.get(), nss));
+
+    CollectionOptions options;
+    CreateCommand cmd = CreateCommand(nss);
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);
+
+    ASSERT_OK(
+        createCollectionForApplyOps(opCtx.get(), nss.dbName(), UUID::gen(), cmd.toBSON(), false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), nss));
+    auto coll = acquireCollForRead(opCtx.get(), nss);
+    ASSERT_FALSE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+const auto kValidUrl1 = std::string(ExternalDataSourceMetadata::kUrlProtocolFile) + "named_pipe1"s;
+const auto kValidUrl2 = std::string(ExternalDataSourceMetadata::kUrlProtocolFile) + "named_pipe2"s;
+
+TEST_F(CreateVirtualCollectionTest, VirtualCollectionOptionsWithOneSource) {
+    NamespaceString vcollNss = NamespaceString::createNamespaceString_forTest("myDb", "vcoll.name");
+    auto opCtx = makeOpCtx();
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+    VirtualCollectionOptions reqVcollOpts;
+    reqVcollOpts.dataSources.emplace_back(kValidUrl1, StorageTypeEnum::pipe, FileTypeEnum::bson);
+    ASSERT_OK(createVirtualCollection(opCtx.get(), vcollNss, reqVcollOpts));
+    ASSERT_TRUE(getVirtualCollection(opCtx.get(), vcollNss));
+
+    ASSERT_EQ(stdx::to_underlying(getCollectionOptions(opCtx.get(), vcollNss).autoIndexId),
+              stdx::to_underlying(CollectionOptions::NO));
+
+    auto vcollOpts = getVirtualCollectionOptions(opCtx.get(), vcollNss);
+    ASSERT_EQ(vcollOpts.dataSources.size(), 1);
+    ASSERT_EQ(vcollOpts.dataSources[0].url, kValidUrl1);
+    ASSERT_EQ(stdx::to_underlying(vcollOpts.dataSources[0].storageType),
+              stdx::to_underlying(StorageTypeEnum::pipe));
+    ASSERT_EQ(stdx::to_underlying(vcollOpts.dataSources[0].fileType),
+              stdx::to_underlying(FileTypeEnum::bson));
+}
+
+TEST_F(CreateVirtualCollectionTest, VirtualCollectionOptionsWithMultiSource) {
+    NamespaceString vcollNss = NamespaceString::createNamespaceString_forTest("myDb", "vcoll.name");
+    auto opCtx = makeOpCtx();
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+    VirtualCollectionOptions reqVcollOpts;
+    reqVcollOpts.dataSources.emplace_back(kValidUrl1, StorageTypeEnum::pipe, FileTypeEnum::bson);
+    reqVcollOpts.dataSources.emplace_back(kValidUrl2, StorageTypeEnum::pipe, FileTypeEnum::bson);
+
+    ASSERT_OK(createVirtualCollection(opCtx.get(), vcollNss, reqVcollOpts));
+    ASSERT_TRUE(getVirtualCollection(opCtx.get(), vcollNss));
+
+    ASSERT_EQ(stdx::to_underlying(getCollectionOptions(opCtx.get(), vcollNss).autoIndexId),
+              stdx::to_underlying(CollectionOptions::NO));
+
+    auto vcollOpts = getVirtualCollectionOptions(opCtx.get(), vcollNss);
+    ASSERT_EQ(vcollOpts.dataSources.size(), 2);
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_EQ(vcollOpts.dataSources[i].url, reqVcollOpts.dataSources[i].url);
+        ASSERT_EQ(stdx::to_underlying(vcollOpts.dataSources[i].storageType),
+                  stdx::to_underlying(StorageTypeEnum::pipe));
+        ASSERT_EQ(stdx::to_underlying(vcollOpts.dataSources[i].fileType),
+                  stdx::to_underlying(FileTypeEnum::bson));
+    }
+}
+
+TEST_F(CreateVirtualCollectionTest, InvalidVirtualCollectionOptions) {
+    NamespaceString vcollNss = NamespaceString::createNamespaceString_forTest("myDb", "vcoll.name");
+    auto opCtx = makeOpCtx();
+
+    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
+
+    {
+        bool exceptionOccurred = false;
+        VirtualCollectionOptions reqVcollOpts;
+        constexpr auto kInvalidUrl = "fff://abc/named_pipe"sv;
+        try {
+            reqVcollOpts.dataSources.emplace_back(
+                kInvalidUrl, StorageTypeEnum::pipe, FileTypeEnum::bson);
+        } catch (const DBException&) {
+            exceptionOccurred = true;
+        }
+
+        ASSERT_TRUE(exceptionOccurred)
+            << fmt::format("Invalid 'url': {} must fail but succeeded", kInvalidUrl);
+    }
+
+    {
+        bool exceptionOccurred = false;
+        VirtualCollectionOptions reqVcollOpts;
+        constexpr auto kInvalidStorageTypeEnum = StorageTypeEnum(2);
+        try {
+            reqVcollOpts.dataSources.emplace_back(
+                kValidUrl1, kInvalidStorageTypeEnum, FileTypeEnum::bson);
+        } catch (const DBException&) {
+            exceptionOccurred = true;
+        }
+
+        ASSERT_TRUE(exceptionOccurred)
+            << fmt::format("Unknown 'storageType': {} must fail but succeeded",
+                           stdx::to_underlying(kInvalidStorageTypeEnum));
+    }
+
+    {
+        bool exceptionOccurred = false;
+        VirtualCollectionOptions reqVcollOpts;
+        constexpr auto kInvalidFileTypeEnum = FileTypeEnum(2);
+        try {
+            reqVcollOpts.dataSources.emplace_back(
+                kValidUrl1, StorageTypeEnum::pipe, kInvalidFileTypeEnum);
+        } catch (const DBException&) {
+            exceptionOccurred = true;
+        }
+
+        ASSERT_TRUE(exceptionOccurred)
+            << fmt::format("Unknown 'fileType': {} must fail but succeeded",
+                           stdx::to_underlying(kInvalidFileTypeEnum));
+    }
+}
+TEST_F(CreateCollectionTest,
+       CreateCollectionForApplyOpsCannotCreateViewWithSpecifiedCatalogIdentifiers) {
+    NamespaceString newNss = NamespaceString::createNamespaceString_forTest("test.coll");
+
+    auto opCtx = makeOpCtx();
+    auto uuid = UUID::gen();
+    Lock::DBLock lock(opCtx.get(), newNss.dbName(), MODE_IX);
+    ASSERT_THROWS_CODE(
+        createCollectionForApplyOps(
+            opCtx.get(),
+            newNss.dbName(),
+            uuid,
+            fromjson("{create: 'view', viewOn: 'coll', pipeline: []}"),
+            /*allowRenameOutOfTheWay*/ false,
+            /*idIndex=*/boost::none,
+            CreateCollCatalogIdentifier{.ident = "collection-1", .idIndexIdent = "index-1"s}),
+        DBException,
+        ErrorCodes::InvalidOptions);
+}
+
+TEST_F(CreateCollectionTest, TestCollectionCreationChecks) {
+    auto createCollectionTestCase = [&](OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        const CollectionOptions& options,
+                                        ErrorCodes::Error expectedErrorCode) {
+        ASSERT(!collectionExists(opCtx, nss));
+        // createCollection reports failures inconsistently (thrown DBException vs returned Status),
+        // so normalize both into a Status before checking the error code.
+        const Status status = [&] {
+            try {
+                return createCollection(opCtx, nss, options, /*idIndex=*/boost::none);
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }();
+        ASSERT_EQ(status.code(), expectedErrorCode) << status;
+    };
+
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+
+    // CollectionOptions cannot have validator set when creating a viewless timeseries collection.
+    {
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", true);
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        options.validator = fromjson("{ts: {$type: 'date'}}");
+        createCollectionTestCase(opCtx.get(), nss, options, ErrorCodes::InvalidOptions);
+    }
+    // Cannot create a time-series collection within a multi-document transaction.
+    {
+        auto opCtx = makeOpCtx();
+        opCtx->setInMultiDocumentTransaction();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        createCollectionTestCase(
+            opCtx.get(), nss, options, ErrorCodes::OperationNotSupportedInTransaction);
+    };
+    // Cannot create the system.profile collection as a time-series collection.
+    {
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        NamespaceString profileNss =
+            NamespaceString::createNamespaceString_forTest("test.system.profile");
+        createCollectionTestCase(opCtx.get(), profileNss, options, ErrorCodes::IllegalOperation);
+    };
+    // Cannot create a system collection within a transaction.
+    {
+        auto opCtx = makeOpCtx();
+        opCtx->setInMultiDocumentTransaction();
+        CollectionOptions options;
+        NamespaceString systemNss =
+            NamespaceString::createNamespaceString_forTest("test.system.profile");
+        createCollectionTestCase(
+            opCtx.get(), systemNss, options, ErrorCodes::OperationNotSupportedInTransaction);
+    }
+
+    // Cannot create a timeseries collection with $-prefixed metafield
+    {
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        options.timeseries->setMetaField("$meta"sv);
+        createCollectionTestCase(opCtx.get(), nss, options, ErrorCodes::BadValue);
+    }
+
+    // Cannot create a timeseries collection with $-prefixed timefield
+    {
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("$time");
+        createCollectionTestCase(opCtx.get(), nss, options, ErrorCodes::BadValue);
+    }
+
+    // Cannot set fixedBucketing when featureFlagFixedBucketingCatalog is disabled.
+    {
+        unittest::ServerParameterGuard flagController("featureFlagFixedBucketingCatalog", false);
+        unittest::ServerParameterGuard viewlessController(
+            "featureFlagCreateViewlessTimeseriesCollections", true);
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        options.timeseries->setFixedBucketing(true);
+        createCollectionTestCase(opCtx.get(), nss, options, ErrorCodes::InvalidOptions);
+    }
+
+    // Cannot set fixedBucketing on a non-viewless (legacy) timeseries collection.
+    {
+        unittest::ServerParameterGuard flagController("featureFlagFixedBucketingCatalog", true);
+        unittest::ServerParameterGuard viewlessController(
+            "featureFlagCreateViewlessTimeseriesCollections", false);
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        options.timeseries->setFixedBucketing(true);
+        createCollectionTestCase(opCtx.get(), nss, options, ErrorCodes::InvalidOptions);
+    }
+}
+
+// Verifies that fixedBucketing is stored correctly at creation time: explicit values are persisted
+// unchanged, an omitted value defaults to true when the flag is enabled, and stays unset when
+// the flag is disabled.
+TEST_F(CreateCollectionTest, FixedBucketingValuePersisted) {
+    unittest::ServerParameterGuard viewlessController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    auto checkPersisted = [&](std::string_view collName,
+                              boost::optional<bool> createValue,
+                              boost::optional<bool> expectedStored) {
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", collName);
+        auto opCtx = makeOpCtx();
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        if (createValue.has_value()) {
+            options.timeseries->setFixedBucketing(*createValue);
+        }
+
+        ASSERT_OK(createCollection(opCtx.get(), nss, options, /*idIndex=*/boost::none));
+
+        const auto storedOptions = getCollectionOptions(opCtx.get(), nss);
+        ASSERT_TRUE(storedOptions.timeseries.has_value());
+        const auto storedFixedBucketing = storedOptions.timeseries->getFixedBucketing();
+        ASSERT_EQ(storedFixedBucketing.has_value(), expectedStored.has_value());
+        if (expectedStored.has_value()) {
+            ASSERT_EQ(static_cast<bool>(storedFixedBucketing), *expectedStored);
+        }
+    };
+
+    {
+        unittest::ServerParameterGuard flagController("featureFlagFixedBucketingCatalog", true);
+        checkPersisted("fixedBucketingTrue", true, true);
+        checkPersisted("fixedBucketingFalse", false, false);
+        checkPersisted("fixedBucketingOmitted", boost::none, true);
+    }
+    {
+        unittest::ServerParameterGuard flagController("featureFlagFixedBucketingCatalog", false);
+        checkPersisted("fixedBucketingOmittedFlagOff", boost::none, boost::none);
+    }
+}
+
+// Verifies that an idempotent re-create that omits fixedBucketing inherits the stored value and
+// succeeds regardless of what was originally stored (true or false).
+TEST_F(CreateCollectionTest, FixedBucketingIdempotentRecreateOmittedInheritsStored) {
+    unittest::ServerParameterGuard flagController("featureFlagFixedBucketingCatalog", true);
+    unittest::ServerParameterGuard viewlessController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    // firstCreateValue: value passed on first create (boost::none = omit, defaults to true).
+    // expectedStored: value expected after both creates.
+    auto checkIdempotentRecreate = [&](std::string_view collName,
+                                       boost::optional<bool> firstCreateValue,
+                                       bool expectedStored) {
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", collName);
+        auto opCtx = makeOpCtx();
+
+        CollectionOptions options;
+        options.timeseries = TimeseriesOptions("ts");
+        if (firstCreateValue.has_value()) {
+            options.timeseries->setFixedBucketing(*firstCreateValue);
+        }
+        ASSERT_OK(createCollection(opCtx.get(), nss, options, /*idIndex=*/boost::none));
+
+        // Re-create omitting fixedBucketing: must succeed and leave stored value unchanged.
+        CollectionOptions optionsAgain;
+        optionsAgain.timeseries = TimeseriesOptions("ts");
+        ASSERT_OK(createCollection(opCtx.get(), nss, optionsAgain, /*idIndex=*/boost::none));
+
+        const auto storedOptions = getCollectionOptions(opCtx.get(), nss);
+        ASSERT_TRUE(storedOptions.timeseries.has_value());
+        const auto storedFixedBucketing = storedOptions.timeseries->getFixedBucketing();
+        ASSERT_TRUE(storedFixedBucketing.has_value());
+        ASSERT_EQ(static_cast<bool>(storedFixedBucketing), expectedStored);
+    };
+
+    // omit first create (defaults to true), omit re-create => stays true
+    checkIdempotentRecreate("fixedBucketingRecreateOmitOmit", boost::none, true);
+    // explicit true, omit re-create => stays true
+    checkIdempotentRecreate("fixedBucketingRecreateTrueOmit", true, true);
+    // explicit false, omit re-create => stays false
+    checkIdempotentRecreate("fixedBucketingRecreateFalseOmit", false, false);
+}
+
+// Verifies that a re-create with an explicit fixedBucketing value that differs from the stored
+// value fails with NamespaceExists.
+TEST_F(CreateCollectionTest, FixedBucketingExplicitMismatchOnRecreateFails) {
+    unittest::ServerParameterGuard flagController("featureFlagFixedBucketingCatalog", true);
+    unittest::ServerParameterGuard viewlessController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("test", "fixedBucketingMismatch");
+    auto opCtx = makeOpCtx();
+
+    // First create: explicit false.
+    CollectionOptions options;
+    options.timeseries = TimeseriesOptions("ts");
+    options.timeseries->setFixedBucketing(false);
+    ASSERT_OK(createCollection(opCtx.get(), nss, options, /*idIndex=*/boost::none));
+
+    // Re-create with explicit true: must fail because it conflicts with the stored false.
+    // createCollection returns the incompatibility as a non-OK Status rather than throwing.
+    CollectionOptions conflictingOptions;
+    conflictingOptions.timeseries = TimeseriesOptions("ts");
+    conflictingOptions.timeseries->setFixedBucketing(true);
+    const auto status =
+        createCollection(opCtx.get(), nss, conflictingOptions, /*idIndex=*/boost::none);
+    ASSERT_EQ(status.code(), ErrorCodes::NamespaceExists);
+}
+
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsTimeseries) {
+    NamespaceString newNss = timeseries::test_util::resolveTimeseriesNss(
+        NamespaceString::createNamespaceString_forTest("test.newColl"));
+
+    auto opCtx = makeOpCtx();
+    ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
+
+    auto uuid = UUID::gen();
+    Lock::DBLock lock(opCtx.get(), newNss.dbName(), MODE_IX);
+
+    const auto tsOptions = TimeseriesOptions("t");
+    CreateCommand cmd = CreateCommand(newNss);
+    cmd.getCreateCollectionRequest().setTimeseries(tsOptions);
+
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          newNss.dbName(),
+                                          uuid,
+                                          cmd.toBSON(),
+                                          /*allowRenameOutOfTheWay*/ false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+}
+
+// In the ApplyOps path, $-prefixed timeField or metaField should be allowed
+TEST_F(CreateCollectionTest, CreateCollectionForApplyOpsTimeseriesDollarPrefix) {
+    NamespaceString newNss = timeseries::test_util::resolveTimeseriesNss(
+        NamespaceString::createNamespaceString_forTest("test.newColl"));
+
+    auto opCtx = makeOpCtx();
+    ASSERT_FALSE(collectionExists(opCtx.get(), newNss));
+
+    auto uuid = UUID::gen();
+    Lock::DBLock lock(opCtx.get(), newNss.dbName(), MODE_IX);
+
+    auto tsOptions = TimeseriesOptions("$ts");
+    tsOptions.setMetaField("$meta"sv);
+    CreateCommand cmd = CreateCommand(newNss);
+    cmd.getCreateCollectionRequest().setTimeseries(tsOptions);
+
+    ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                          newNss.dbName(),
+                                          uuid,
+                                          cmd.toBSON(),
+                                          /*allowRenameOutOfTheWay*/ false));
+
+    ASSERT_TRUE(collectionExists(opCtx.get(), newNss));
+}
+
+TEST_F(CreateCollectionTest, RejectClusteredIndexNameWithEmbeddedNullByte) {
+    auto opCtx = makeOpCtx();
+
+    // Creates a clustered collection whose implicit index carries 'indexName'.
+    const auto createClusteredCollection = [&](std::string_view indexName) {
+        const NamespaceString nss =
+            NamespaceString::createNamespaceString_forTest("test.BadClusteredIndexName");
+        ASSERT_FALSE(collectionExists(opCtx.get(), nss));
+
+        ClusteredIndexSpec indexSpec;
+        indexSpec.setKey(BSON("_id" << 1));
+        indexSpec.setUnique(true);
+        indexSpec.setName(std::string{indexName});
+
+        CollectionOptions options;
+        options.clusteredIndex =
+            ClusteredCollectionInfo(std::move(indexSpec), /*legacyFormat=*/false);
+        return createCollection(opCtx.get(), nss, options, /*idIndex=*/boost::none);
+    };
+
+    ASSERT_EQ(createClusteredCollection("\0"sv), ErrorCodes::CannotCreateIndex);
+    ASSERT_EQ(createClusteredCollection("\0\0"sv), ErrorCodes::CannotCreateIndex);
+    ASSERT_EQ(createClusteredCollection("\0trailing"sv), ErrorCodes::CannotCreateIndex);
+    ASSERT_EQ(createClusteredCollection("leading\0"sv), ErrorCodes::CannotCreateIndex);
+    ASSERT_EQ(createClusteredCollection("embedded\0null"sv), ErrorCodes::CannotCreateIndex);
+
+    // An empty name is likewise rejected, while an ordinary name succeeds.
+    ASSERT_EQ(createClusteredCollection(""sv), ErrorCodes::CannotCreateIndex);
+    ASSERT_OK(createClusteredCollection("myClusteredIndex"sv));
+}
+
+}  // namespace
+}  // namespace mongo

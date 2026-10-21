@@ -1,0 +1,260 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/shard_role/shard_catalog/durable_catalog_entry_metadata.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <mutex>
+#include <string>
+#include <string_view>
+
+#include <boost/container/flat_set.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+namespace mongo {
+
+namespace {
+
+const std::string kTimeseriesBucketsMayHaveMixedSchemaDataFieldName =
+    "timeseriesBucketsMayHaveMixedSchemaData";
+
+// TODO(SERVER-101423): Remove once 9.0 becomes last LTS.
+const std::string kTimeseriesBucketingParametersHaveChanged_DO_NOT_USE =
+    "timeseriesBucketingParametersHaveChanged";
+
+const std::string kRecordIdsReplicated = "recordIdsReplicated";
+}  // namespace
+
+namespace durable_catalog {
+void CatalogEntryMetaData::IndexMetaData::updateTTLSetting(long long newExpireSeconds) {
+    BSONObjBuilder b;
+    for (BSONObjIterator bi(spec); bi.more();) {
+        BSONElement e = bi.next();
+        if (e.fieldNameStringData() == "expireAfterSeconds") {
+            continue;
+        }
+        b.append(e);
+    }
+
+    b.append("expireAfterSeconds", newExpireSeconds);
+    spec = b.obj();
+}
+
+
+void CatalogEntryMetaData::IndexMetaData::updateHiddenSetting(bool hidden) {
+    // If hidden == false, we remove this field from catalog rather than add a field with false.
+    // or else, the old binary can't startup due to the unknown field.
+    BSONObjBuilder b;
+    for (BSONObjIterator bi(spec); bi.more();) {
+        BSONElement e = bi.next();
+        if (e.fieldNameStringData() == "hidden") {
+            continue;
+        }
+        b.append(e);
+    }
+
+    if (hidden) {
+        b.append("hidden", hidden);
+    }
+    spec = b.obj();
+}
+
+void CatalogEntryMetaData::IndexMetaData::updateUniqueSetting(bool unique) {
+    // If unique == false, we remove this field from catalog rather than add a field with false.
+    BSONObjBuilder b;
+    for (BSONObjIterator bi(spec); bi.more();) {
+        BSONElement e = bi.next();
+        if (e.fieldNameStringData() != "unique") {
+            b.append(e);
+        }
+    }
+
+    if (unique) {
+        b.append("unique", unique);
+    }
+    spec = b.obj();
+}
+
+void CatalogEntryMetaData::IndexMetaData::updatePrepareUniqueSetting(bool prepareUnique) {
+    // If prepareUnique == false, we remove this field from catalog rather than add a
+    // field with false.
+    BSONObjBuilder b;
+    for (BSONObjIterator bi(spec); bi.more();) {
+        BSONElement e = bi.next();
+        if (e.fieldNameStringData() != "prepareUnique") {
+            b.append(e);
+        }
+    }
+
+    if (prepareUnique) {
+        b.append("prepareUnique", prepareUnique);
+    }
+    spec = b.obj();
+}
+
+int CatalogEntryMetaData::getTotalIndexCount() const {
+    return std::count_if(
+        indexes.cbegin(), indexes.cend(), [](const auto& index) { return index.isPresent(); });
+}
+
+int CatalogEntryMetaData::findIndexOffset(std::string_view name) const {
+    for (unsigned i = 0; i < indexes.size(); i++)
+        if (indexes[i].nameStringData() == name)
+            return i;
+    return -1;
+}
+
+void CatalogEntryMetaData::insertIndex(IndexMetaData indexMetaData) {
+    int indexOffset = findIndexOffset(indexMetaData.nameStringData());
+
+    if (indexOffset < 0) {
+        indexes.push_back(std::move(indexMetaData));
+        return;
+    }
+
+    // We have an unused element, was invalidated due to an index drop, that can be reused
+    // for this new index.
+    indexes[indexOffset] = std::move(indexMetaData);
+}
+
+bool CatalogEntryMetaData::eraseIndex(std::string_view name) {
+    int indexOffset = findIndexOffset(name);
+
+    if (indexOffset < 0) {
+        return false;
+    }
+
+    // Zero out the index metadata to be reused later and to keep the indexes of other indexes
+    // stable.
+    indexes[indexOffset] = {};
+
+    return true;
+}
+
+BSONObj CatalogEntryMetaData::toBSON(bool hasExclusiveAccess) const {
+    BSONObjBuilder b;
+    b.append("ns", NamespaceStringUtil::serializeForCatalog(nss));
+    b.append("options", options.toBSON());
+    {
+        BSONArrayBuilder arr(b.subarrayStart("indexes"));
+        for (unsigned i = 0; i < indexes.size(); i++) {
+            if (!indexes[i].isPresent()) {
+                continue;
+            }
+
+            BSONObjBuilder sub(arr.subobjStart());
+            sub.append("spec", indexes[i].spec);
+            sub.appendBool("ready", indexes[i].ready);
+            {
+                std::unique_lock lock(indexes[i].multikeyMutex, std::defer_lock_t{});
+                if (!hasExclusiveAccess) {
+                    lock.lock();
+                }
+                sub.appendBool("multikey", indexes[i].multikey);
+
+                if (!indexes[i].multikeyPaths.empty()) {
+                    BSONObjBuilder subMultikeyPaths(sub.subobjStart("multikeyPaths"));
+                    multikey_paths::serialize(indexes[i].spec.getObjectField("key"),
+                                              indexes[i].multikeyPaths,
+                                              subMultikeyPaths);
+                    subMultikeyPaths.doneFast();
+                }
+            }
+
+            if (indexes[i].buildUUID) {
+                indexes[i].buildUUID->appendToBuilder(&sub, "buildUUID");
+            }
+            sub.doneFast();
+        }
+        arr.doneFast();
+    }
+
+    if (timeseriesBucketsMayHaveMixedSchemaData) {
+        b.append(kTimeseriesBucketsMayHaveMixedSchemaDataFieldName,
+                 *timeseriesBucketsMayHaveMixedSchemaData);
+    }
+
+    if (timeseriesBucketingParametersHaveChanged_DO_NOT_USE) {
+        b.append(kTimeseriesBucketingParametersHaveChanged_DO_NOT_USE,
+                 *timeseriesBucketingParametersHaveChanged_DO_NOT_USE);
+    }
+
+    if (recordIdsReplicated) {
+        b.appendBool(kRecordIdsReplicated, recordIdsReplicated);
+    }
+    return b.obj();
+}
+
+void CatalogEntryMetaData::parse(const BSONObj& obj) {
+    nss = NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(
+        std::string{obj.getStringField("ns")});
+
+    if (obj["options"].isABSONObj()) {
+        options = uassertStatusOK(
+            CollectionOptions::parse(obj["options"].Obj(), CollectionOptions::parseForStorage));
+    }
+
+    BSONElement indexList = obj["indexes"];
+
+    if (indexList.isABSONObj()) {
+        for (BSONElement elt : indexList.Obj()) {
+            BSONObj idx = elt.Obj();
+            IndexMetaData imd;
+            imd.spec = idx["spec"].Obj().getOwned();
+            imd.ready = idx["ready"].trueValue();
+            imd.multikey = idx["multikey"].trueValue();
+
+            if (auto multikeyPathsElem = idx["multikeyPaths"]) {
+                imd.multikeyPaths = uassertStatusOK(multikey_paths::parse(multikeyPathsElem.Obj()));
+            }
+
+            if (idx["buildUUID"]) {
+                imd.buildUUID = fassert(31353, UUID::parse(idx["buildUUID"]));
+            }
+
+            if (!imd.isPresent()) {
+                fassertFailedWithStatus(
+                    5738500,
+                    Status(ErrorCodes::FailedToParse,
+                           str::stream() << "invalid index in collection metadata: " << obj));
+            }
+
+            indexes.push_back(imd);
+        }
+    }
+
+    BSONElement timeseriesMixedSchemaElem = obj[kTimeseriesBucketsMayHaveMixedSchemaDataFieldName];
+    if (!timeseriesMixedSchemaElem.eoo() && timeseriesMixedSchemaElem.isBoolean()) {
+        timeseriesBucketsMayHaveMixedSchemaData = timeseriesMixedSchemaElem.Bool();
+    }
+
+    BSONElement tsBucketingParametersChangedElem =
+        obj[kTimeseriesBucketingParametersHaveChanged_DO_NOT_USE];
+    if (!tsBucketingParametersChangedElem.eoo() && tsBucketingParametersChangedElem.isBoolean()) {
+        timeseriesBucketingParametersHaveChanged_DO_NOT_USE =
+            tsBucketingParametersChangedElem.Bool();
+    }
+
+    if (BSONElement value = obj[kRecordIdsReplicated]; value.isBoolean()) {
+        recordIdsReplicated = value.Bool();
+    }
+}
+
+}  // namespace durable_catalog
+
+}  // namespace mongo

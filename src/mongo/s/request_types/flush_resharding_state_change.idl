@@ -1,0 +1,26 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# _flushReshardingStateChange IDL File
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _flushReshardingStateChange:
+        description: "An internal command to flush resharding state changes to shards."
+        command_name: _flushReshardingStateChange
+        strict: true
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        reply_type: OkReply
+        fields:
+            reshardingUUID:
+                type: uuid
+                optional: false
+                description: "The UUID for this resharding operation"

@@ -1,0 +1,237 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/client/sdam/topology_listener.h"
+
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+
+#include <algorithm>
+#include <iterator>
+#include <mutex>
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+namespace mongo::sdam {
+
+void TopologyEventsPublisher::registerListener(TopologyListenerPtr listener) {
+    auto locked_listener = listener.lock();
+    if (!locked_listener) {
+        LOGV2_WARNING(5148001, "Trying to register an empty listener with TopologyEventsPublisher");
+        return;
+    }
+    std::lock_guard lock(_mutex);
+    // Make sure we're not re-registering a listener. This is a linear scan of a vector, but there
+    // are only a few calls to registerListener in the codebase so this shouldn't be a problem.
+    if (std::find_if(_listeners.begin(),
+                     _listeners.end(),
+                     [&locked_listener](const TopologyListenerPtr& ptr) {
+                         return ptr.lock() == locked_listener;
+                     }) == std::end(_listeners)) {
+        _listeners.push_back(listener);
+    }
+}
+
+void TopologyEventsPublisher::removeListener(TopologyListenerPtr listener) {
+    auto locked_listener = listener.lock();
+    if (!locked_listener) {
+        LOGV2_WARNING(6142505, "Trying to remove an empty listener with TopologyEventsPublisher");
+        return;
+    }
+
+    std::lock_guard lock(_mutex);
+    _listeners.erase(std::remove_if(_listeners.begin(),
+                                    _listeners.end(),
+                                    [&locked_listener](const TopologyListenerPtr& ptr) {
+                                        return ptr.lock() == locked_listener;
+                                    }),
+                     _listeners.end());
+}
+
+void TopologyEventsPublisher::close() {
+    std::lock_guard lock(_mutex);
+    _listeners.clear();
+    _isClosed = true;
+}
+
+void TopologyEventsPublisher::onTopologyDescriptionChangedEvent(
+    TopologyDescriptionPtr previousDescription, TopologyDescriptionPtr newDescription) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::TOPOLOGY_DESCRIPTION_CHANGED;
+    event->previousDescription = previousDescription;
+    event->newDescription = newDescription;
+    {
+        std::lock_guard lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::onServerHandshakeCompleteEvent(HelloRTT duration,
+                                                             const HostAndPort& address,
+                                                             const BSONObj reply) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::HANDSHAKE_COMPLETE;
+    event->duration = duration;
+    event->hostAndPort = address;
+    event->reply = reply;
+    {
+        std::lock_guard<std::mutex> lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::onServerHandshakeFailedEvent(const HostAndPort& address,
+                                                           const Status& status,
+                                                           const BSONObj reply) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::HANDSHAKE_FAILURE;
+    event->hostAndPort = address;
+    event->reply = reply;
+    event->status = status;
+    {
+        std::lock_guard<std::mutex> lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
+                                                              const BSONObj reply) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::HEARTBEAT_SUCCESS;
+    event->hostAndPort = hostAndPort;
+    event->reply = reply;
+    {
+        std::lock_guard lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::onServerHeartbeatFailureEvent(Status errorStatus,
+                                                            const HostAndPort& hostAndPort,
+                                                            const BSONObj reply) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::HEARTBEAT_FAILURE;
+    event->hostAndPort = hostAndPort;
+    event->reply = reply;
+    event->status = errorStatus;
+    {
+        std::lock_guard lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::_scheduleNextDelivery() {
+    // run nextDelivery async
+    _executor->schedule(
+        [self = shared_from_this()](const Status& status) { self->_nextDelivery(); });
+}
+
+void TopologyEventsPublisher::onServerPingFailedEvent(const HostAndPort& hostAndPort,
+                                                      const Status& status) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::PING_FAILURE;
+    event->hostAndPort = hostAndPort;
+    event->status = status;
+    {
+        std::lock_guard lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+void TopologyEventsPublisher::onServerPingSucceededEvent(HelloRTT duration,
+                                                         const HostAndPort& hostAndPort) {
+    EventPtr event = std::make_unique<Event>();
+    event->type = EventType::PING_SUCCESS;
+    event->duration = duration;
+    event->hostAndPort = hostAndPort;
+    {
+        std::lock_guard lock(_eventQueueMutex);
+        _eventQueue.push_back(std::move(event));
+    }
+    _scheduleNextDelivery();
+}
+
+// note that this could be done in batches if it is a bottleneck.
+void TopologyEventsPublisher::_nextDelivery() {
+    // get the next event to send
+    EventPtr nextEvent;
+    {
+        std::lock_guard lock(_eventQueueMutex);
+        if (!_eventQueue.size()) {
+            return;
+        }
+        nextEvent = std::move(_eventQueue.front());
+        _eventQueue.pop_front();
+    }
+
+    // release the lock before sending to avoid deadlock in the case there
+    // are events generated by sending the current one.
+    std::vector<std::shared_ptr<TopologyListener>> listeners;
+    {
+        std::lock_guard lock(_mutex);
+        if (_isClosed) {
+            return;
+        }
+        listeners.reserve(_listeners.size());
+        // Helps to purge empty elements when a weak_ptr points to an element removed elsewhere.
+        // We take advantage of the fact that we are scanning the container anyway.
+        _listeners.erase(std::remove_if(_listeners.begin(),
+                                        _listeners.end(),
+                                        [this, &listeners](const TopologyListenerPtr& ptr) {
+                                            auto p = ptr.lock();
+                                            if (p) {
+                                                // Makes a copy of non-empty elements in
+                                                // 'listeners'.
+                                                listeners.push_back(p);
+                                                return false;
+                                            }
+                                            return true;
+                                        }),
+                         _listeners.end());
+    }
+
+    // send to the listeners outside of the lock.
+    for (const auto& listener : listeners) {
+        // The copy logic above guaranteed that only non-empty elements are in the vector.
+        _sendEvent(listener.get(), *nextEvent);
+    }
+}
+
+void TopologyEventsPublisher::_sendEvent(TopologyListener* listener, const Event& event) {
+    switch (event.type) {
+        case EventType::HEARTBEAT_SUCCESS:
+            listener->onServerHeartbeatSucceededEvent(event.hostAndPort, event.reply);
+            break;
+        case EventType::HEARTBEAT_FAILURE:
+            listener->onServerHeartbeatFailureEvent(event.status, event.hostAndPort, event.reply);
+            break;
+        case EventType::TOPOLOGY_DESCRIPTION_CHANGED:
+            listener->onTopologyDescriptionChangedEvent(event.previousDescription,
+                                                        event.newDescription);
+            break;
+        case EventType::HANDSHAKE_COMPLETE:
+            listener->onServerHandshakeCompleteEvent(
+                event.duration, event.hostAndPort, event.reply);
+            break;
+        case EventType::PING_SUCCESS:
+            listener->onServerPingSucceededEvent(event.duration, event.hostAndPort);
+            break;
+        case EventType::PING_FAILURE:
+            listener->onServerPingFailedEvent(event.hostAndPort, event.status);
+            break;
+        case EventType::HANDSHAKE_FAILURE:
+            listener->onServerHandshakeFailedEvent(event.hostAndPort, event.status, event.reply);
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+};  // namespace mongo::sdam

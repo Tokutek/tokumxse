@@ -1,0 +1,88 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/agg/search/search_meta_stage.h"
+
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/extension/host/extension_search_server_status.h"
+#include "mongo/db/pipeline/search/document_source_search_meta.h"
+
+namespace mongo {
+
+boost::intrusive_ptr<exec::agg::Stage> documentSourceSearchMetaToStageFn(
+    const boost::intrusive_ptr<DocumentSource>& source) {
+    auto documentSource = dynamic_cast<DocumentSourceSearchMeta*>(source.get());
+
+    tassert(10807801, "expected 'DocumentSourceSearchMeta' type", documentSource);
+
+    // Increment legacySearchQueryCount when legacy $searchMeta is converted to executable stage.
+    search_metrics::legacySearchQueryCount.increment(1);
+
+    return make_intrusive<exec::agg::SearchMetaStage>(documentSource->kStageName,
+                                                      documentSource->_spec,
+                                                      documentSource->getExpCtx(),
+                                                      documentSource->_taskExecutor,
+                                                      documentSource->getSearchIdLookupMetrics(),
+                                                      documentSource->_sharedState);
+}
+
+namespace exec::agg {
+
+REGISTER_AGG_STAGE_MAPPING(searchMetaStage,
+                           DocumentSourceSearchMeta::id,
+                           documentSourceSearchMetaToStageFn);
+
+GetNextResult SearchMetaStage::getNextAfterSetup() {
+    if (pExpCtx->getNeedsMerge()) {
+        // When we are merging $searchMeta we have established a cursor which only returns metadata
+        // results (see 'establishCursor()'). So just iterate that cursor normally.
+        return InternalSearchMongotRemoteStage::getNextAfterSetup();
+    }
+
+    if (!_returnedAlready) {
+        tryToSetSearchMetaVar();
+        auto& vars = pExpCtx->variables;
+
+        tassert(6448005,
+                "Expected SEARCH_META to be set for $searchMeta stage",
+                vars.hasConstantValue(Variables::kSearchMetaId) &&
+                    vars.getValue(Variables::kSearchMetaId).isObject());
+        _returnedAlready = true;
+        return {vars.getValue(Variables::kSearchMetaId).getDocument()};
+    }
+    return GetNextResult::makeEOF();
+}
+
+std::unique_ptr<executor::TaskExecutorCursor> SearchMetaStage::establishCursor() {
+    // TODO SERVER-94875 We should be able to remove any cursor establishment logic from
+    // DocumentSourceSearchMeta if we establish the cursors during search_helper
+    // pipeline preparation instead.
+    auto cursors =
+        mongot_cursor::establishCursorsForSearchMetaStage(pExpCtx,
+                                                          getSearchQuery(),
+                                                          getTaskExecutor(),
+                                                          getIntermediateResultsProtocolVersion(),
+                                                          nullptr,
+                                                          getView());
+
+    if (cursors.size() == 1) {
+        const auto& cursor = *cursors.begin();
+        tassert(6448010,
+                "If there's one cursor we expect to get SEARCH_META from the attached vars",
+                !getIntermediateResultsProtocolVersion() && !cursor->getType() &&
+                    cursor->getCursorVars());
+        return std::move(*cursors.begin());
+    }
+    for (auto&& cursor : cursors) {
+        auto maybeCursorType = cursor->getType();
+        tassert(6448008, "Expected every mongot cursor to come back with a type", maybeCursorType);
+        if (*maybeCursorType == CursorTypeEnum::SearchMetaResult) {
+            // Note this may leak the other cursor(s). Should look into whether we can
+            // killCursors.
+            return std::move(cursor);
+        }
+    }
+    tasserted(6448009, "Expected to get a metadata cursor back from mongot, found none");
+}
+}  // namespace exec::agg
+}  // namespace mongo

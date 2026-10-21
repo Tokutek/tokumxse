@@ -1,0 +1,8 @@
+version: 1.0.0
+filters:
+  - "capped/*":
+    approvers:
+      - 10gen/server-collection-write-path
+  - "clustered/*":
+    approvers:
+      - 10gen/server-collection-write-path

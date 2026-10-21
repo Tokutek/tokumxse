@@ -1,0 +1,511 @@
+"""Generator functions for all parameters that we fuzz when invoked with --fuzzMongodConfigs."""
+
+import json
+import os
+import random
+import stat
+
+from buildscripts.resmokelib import config, utils
+
+
+def is_enterprise_param_available(param_config: dict) -> bool:
+    """
+    Check if a parameter is available for fuzzing.
+
+    Returns True if the parameter is available (either not enterprise-only, or the
+    enterprise module is loaded). This handles the case where config.MODULES is empty
+    (e.g., when generate-fuzz-config is run standalone without module initialization).
+    """
+    return not param_config.get("enterprise_only", False) or "enterprise" in (config.MODULES or [])
+
+
+# Parameter sets with different behaviors.
+flow_control_params = [
+    "flowControlTicketAdderConstant",
+    "flowControlDecayConstant",
+    "flowControlFudgeFactor",
+    "flowControlMaxSamples",
+    "flowControlMinTicketsPerSecond",
+    "flowControlTicketMultiplierConstant",
+    "flowControlSamplePeriod",
+    "flowControlTargetLagSeconds",
+    "flowControlThresholdLagPercentage",
+    "flowControlWarnThresholdSeconds",
+]
+
+
+def safe_randint(rng, min_val, max_val, param_name=None):
+    """Wrapper for randint() that validates integer arguments and provides context on failure."""
+    if not isinstance(min_val, int) or not isinstance(max_val, int):
+        context = f" (parameter: {param_name})" if param_name else ""
+        raise TypeError(
+            f"randint() requires integer arguments{context}. "
+            f"Got min={min_val} (type={type(min_val).__name__}), max={max_val} (type={type(max_val).__name__}). "
+            f"Fix: use int() in config file or add 'isUniform': True for float ranges."
+        )
+    return rng.randint(min_val, max_val)
+
+
+def generate_normal_wt_parameters(rng, value, param_name=None):
+    """Returns the value assigned the WiredTiger parameters (both eviction or table) based on the fields of the parameters in the config_fuzzer_wt_limits.py."""
+    if "choices" in value:
+        ret = rng.choice(value["choices"])
+        if "multiplier" in value:
+            ret *= value["multiplier"]
+    elif "min" in value and "max" in value:
+        ret = safe_randint(rng, value["min"], value["max"], param_name)
+    return ret
+
+
+def generate_special_eviction_configs(rng, ret, params):
+    """Returns the value assigned the WiredTiger eviction parameters based on the fields of the parameters in config_fuzzer_wt_limits.py for special parameters (parameters with different assignment behaviors)."""
+    from buildscripts.resmokelib.generate_fuzz_config.config_fuzzer_wt_limits import (
+        min_trigger_bytes,
+    )
+
+    # eviction_trigger is relative to eviction_target, so you have to leave them excluded to ensure
+    # eviction_trigger is fuzzed first.
+    ret["eviction_target"] = rng.randint(
+        params["eviction_target"]["min"], params["eviction_target"]["max"]
+    )
+    ret["eviction_trigger"] = rng.randint(
+        ret["eviction_target"] + params["eviction_trigger"]["lower_bound"],
+        params["eviction_trigger"]["upper_bound"],
+    )
+
+    # Fuzz eviction_dirty_target and trigger as absolute values.
+    ret["eviction_dirty_target"] = rng.randint(
+        params["eviction_dirty_target"]["min"], params["eviction_dirty_target"]["max"]
+    )
+
+    ret["trigger_max"] = params["trigger_max"]["default"]
+    ret["eviction_dirty_trigger"] = rng.randint(
+        max(ret["eviction_dirty_target"] + 1, min_trigger_bytes), ret["trigger_max"]
+    )
+
+    assert ret["eviction_dirty_trigger"] > ret["eviction_dirty_target"]
+    assert ret["eviction_dirty_trigger"] <= ret["trigger_max"]
+
+    ret["updates_target_min"] = params["updates_target_min"]["default"]
+
+    ret["eviction_updates_target"] = rng.randint(
+        ret["updates_target_min"], ret["eviction_dirty_target"] - 1
+    )
+
+    ret["eviction_updates_trigger"] = rng.randint(
+        max(ret["eviction_updates_target"] + 1, min_trigger_bytes),
+        ret["eviction_dirty_trigger"] - 1,
+    )
+
+    # dbg_rollback_error rolls back every Nth transaction.
+    # The values have been tuned after looking at how many WiredTiger transactions happen per second for the config-fuzzed jstests.
+    # The setting is triggering bugs, disabled until they get resolved.
+    ret["dbg_rollback_error"] = 0
+    # choices = params["dbg_rollback_error"]["choices"]
+    # choices.append(rng.randint(params["dbg_rollback_error"]["lower_bound"], params["dbg_rollback_error"]["upper_bound"]))
+    # ret["dbg_rollback_error"] = rng.choice(choices)
+
+    return ret
+
+
+def generate_eviction_configs(rng):
+    """Returns a string with random configurations for wiredTigerEngineConfigString parameter."""
+    from buildscripts.resmokelib.generate_fuzz_config.config_fuzzer_wt_limits import (
+        config_fuzzer_params,
+    )
+
+    params = config_fuzzer_params["wt"]
+
+    ret = {}
+    excluded_normal_params = [
+        "dbg_rollback_error",
+        "eviction_dirty_target",
+        "eviction_dirty_target_1",
+        "eviction_dirty_target_2",
+        "eviction_dirty_trigger",
+        "eviction_target",
+        "eviction_trigger",
+        "eviction_updates_target",
+        "eviction_updates_trigger",
+        "trigger_max",
+        "updates_target_min",
+    ]
+
+    ret = generate_special_eviction_configs(rng, ret, params)
+    ret.update(
+        {
+            key: generate_normal_wt_parameters(rng, value, key)
+            for key, value in params.items()
+            if key not in excluded_normal_params
+        }
+    )
+
+    return (
+        "debug_mode=(eviction={0},realloc_exact={1},rollback_error={2}),"
+        "eviction_checkpoint_target={3},eviction_dirty_target={4},eviction_dirty_trigger={5},"
+        "eviction_target={6},eviction_trigger={7},eviction_updates_target={8},"
+        "eviction_updates_trigger={9},file_manager=(close_handle_minimum={10},"
+        "close_idle_time={11},close_scan_interval={12})".format(
+            ret["dbg_eviction"],
+            ret["dbg_realloc_exact"],
+            ret["dbg_rollback_error"],
+            ret["eviction_checkpoint_target"],
+            ret["eviction_dirty_target"],
+            ret["eviction_dirty_trigger"],
+            ret["eviction_target"],
+            ret["eviction_trigger"],
+            ret["eviction_updates_target"],
+            ret["eviction_updates_trigger"],
+            ret["close_handle_minimum"],
+            ret["close_idle_time_secs"],
+            ret["close_scan_interval"],
+        )
+    )
+
+
+def generate_special_table_configs(rng, ret, params):
+    """Returns the value assigned the WiredTiger table parameters based on the fields of the parameters in config_fuzzer_wt_limits.py for special parameters (parameters with different assignment behaviors)."""
+
+    ret["memory_page_max_lower_bound"] = ret["leaf_page_max"]
+    # Assume WT cache size of 1GB as most MDB tests specify this as the cache size.
+    ret["memory_page_max_upper_bound"] = round(
+        (
+            rng.randint(
+                params["memory_page_max_upper_bound"]["lower_bound"],
+                params["memory_page_max_upper_bound"]["upper_bound"],
+            )
+            * params["memory_page_max_upper_bound"]["multiplier"]
+        )
+        / 10
+    )  # cache_size / 10
+    ret["memory_page_max"] = rng.randint(
+        ret["memory_page_max_lower_bound"], ret["memory_page_max_upper_bound"]
+    )
+    return ret
+
+
+def generate_table_configs(rng):
+    """Returns a string with random configurations for WiredTiger tables."""
+    from buildscripts.resmokelib.generate_fuzz_config.config_fuzzer_wt_limits import (
+        config_fuzzer_params,
+    )
+
+    params = config_fuzzer_params["wt_table"]
+
+    ret = {}
+    # excluded_normal_params are a list of params that we want to exclude from the for-loop because they have some different assignment behavior
+    # e.g. depending on other parameters' values, having rounding, having a different distribution.
+    excluded_normal_params = [
+        "memory_page_max_lower_bound",
+        "memory_page_max_upper_bound",
+        "memory_page_max",
+    ]
+
+    ret.update(
+        {
+            key: generate_normal_wt_parameters(rng, value, key)
+            for key, value in params.items()
+            if key not in excluded_normal_params
+        }
+    )
+    ret = generate_special_table_configs(rng, ret, params)
+
+    return (
+        "block_compressor={0},internal_page_max={1},leaf_page_max={2},leaf_value_max={3},"
+        "memory_page_max={4},prefix_compression={5},split_pct={6}".format(
+            ret["block_compressor"],
+            ret["internal_page_max"],
+            ret["leaf_page_max"],
+            ret["leaf_value_max"],
+            ret["memory_page_max"],
+            ret["prefix_compression"],
+            ret["split_pct"],
+        )
+    )
+
+
+def generate_encryption_config(rng: random.Random):
+    ret = {}
+    # encryption requires the wiredtiger storage engine.
+    # encryption also required an enterprise binary.
+    if (
+        config.STORAGE_ENGINE != "wiredTiger"
+        or "enterprise" not in (config.MODULES or [])
+        or config.DISABLE_ENCRYPTION_FUZZING
+    ):
+        return ret
+    chance_to_encrypt = 0.33
+    if rng.random() < chance_to_encrypt:
+        ret["enableEncryption"] = ""
+        encryption_key_file = "src/mongo/db/modules/enterprise/jstests/encryptdb/libs/ekf2"
+
+        # Antithesis runs mongo processes in a docker container separate from the resmoke process.
+        # It cannot use the absolute path from the machine that resmoke running on.
+        # Other applications, such as Jepsen, can be run in a different directory than the root
+        # of the mongo directory so we use the absolute path.
+        if not config.NOOP_MONGO_D_S_PROCESSES:
+            encryption_key_file = os.path.abspath(encryption_key_file)
+
+        # Set file permissions to avoid "too open" error.
+        # MongoDB requires keyfiles to have restricted permissions.
+        # Since git doesn't preserve file permissions across clones,
+        # we need to explicitly set them to a state Mongo accepts.
+        os.chmod(encryption_key_file, stat.S_IRUSR | stat.S_IWUSR)
+        ret["encryptionKeyFile"] = encryption_key_file
+
+        chance_to_use_gcm = 0.50
+        if rng.random() < chance_to_use_gcm:
+            ret["encryptionCipherMode"] = "AES256-GCM"
+
+    return ret
+
+
+def generate_normal_mongo_parameters(rng, value, param_name=None):
+    """Returns the value assigned the mongod or mongos parameter based on the fields of the parameters in the config_fuzzer_limits.py."""
+
+    if "document" in value:
+        ret = {}
+        for doc_key, doc_value in value["document"].items():
+            if "exclude_prob" in doc_value and rng.random() < doc_value["exclude_prob"]:
+                # Exclude this key from the document
+                continue
+            ret[doc_key] = generate_normal_mongo_parameters(rng, doc_value, doc_key)
+    elif "isUniform" in value:
+        ret = rng.uniform(value["min"], value["max"])
+    elif "isRandomizedChoice" in value:
+        choices = value["choices"]
+        choices.append(rng.randint(value["lower_bound"], value["upper_bound"]))
+        ret = rng.choice(choices)
+    elif "choices" in value:
+        ret = rng.choice(value["choices"])
+    elif "min" in value and "max" in value:
+        ret = safe_randint(rng, value["min"], value["max"], param_name)
+        if "multiplier" in value:
+            ret *= value["multiplier"]
+    elif "default" in value:
+        ret = value["default"]
+    return ret
+
+
+def generate_special_runtime_parameters(rng, param_name, value):
+    """Returns the runtime value assigned the mongod or mongos parameter based on the fields of the parameters in config_fuzzer_limits.py for special parameters (parameters with different assignment behaviors)."""
+
+    if param_name == "flowControlThresholdLagPercentage":
+        return rng.random()
+
+    raise ValueError(
+        f"Parameter '{param_name}' has custom_fuzz_value_assignment=True but is not handled in "
+        f"generate_special_runtime_parameters(). Add handling or remove the flag."
+    )
+
+
+def generate_special_mongod_startup_parameters(rng, ret, params):
+    """Returns the runtime value assigned the mongod parameter based on the fields of the parameters in config_fuzzer_limits.py for special parameters (parameters with different assignment behaviors)."""
+
+    # throughputProbingConcurrencyMovingAverageWeight is the only parameter that uses rng.random().
+    ret["throughputProbingConcurrencyMovingAverageWeight"] = 1 - rng.random()
+
+    # We assign throughputProbingInitialConcurrency first, then derive min/max to satisfy:
+    # 2 * minConcurrency <= initialConcurrency <= 2 * maxConcurrency
+    # (initialConcurrency is TOTAL while min/maxConcurrency are PER-POOL)
+    ret["throughputProbingInitialConcurrency"] = rng.randint(
+        params["throughputProbingInitialConcurrency"]["min"],
+        params["throughputProbingInitialConcurrency"]["max"],
+    )
+    ret["throughputProbingMinConcurrency"] = rng.randint(
+        params["throughputProbingMinConcurrency"]["min"],
+        ret["throughputProbingInitialConcurrency"] // 2,
+    )
+    ret["throughputProbingMaxConcurrency"] = rng.randint(
+        ret["throughputProbingInitialConcurrency"] // 2,
+        params["throughputProbingMaxConcurrency"]["max"],
+    )
+
+    # mirrorReads sets a nested samplingRate field.
+    ret["mirrorReads"] = {"samplingRate": rng.choice(params["mirrorReads"]["choices"])}
+
+    # Deal with other special cases of parameters (having to add other sources of randomization, depending on another variable, etc.).
+    ret["internalQueryExecYieldIterations"] = rng.choices(
+        [
+            1,
+            rng.randint(
+                params["internalQueryExecYieldIterations"]["lower_bound"],
+                params["internalQueryExecYieldIterations"]["upper_bound"],
+            ),
+        ],
+        weights=[1, 10],
+    )[0]
+    ret["maxNumberOfTransactionOperationsInSingleOplogEntry"] = rng.randint(1, 10) * rng.choice(
+        params["maxNumberOfTransactionOperationsInSingleOplogEntry"]["choices"]
+    )
+
+    ret["disableLogicalSessionCacheRefresh"] = rng.choice(
+        params["disableLogicalSessionCacheRefresh"]["choices"]
+    )
+    if not ret["disableLogicalSessionCacheRefresh"]:
+        ret["logicalSessionRefreshMillis"] = rng.choice(
+            params["logicalSessionRefreshMillis"]["choices"]
+        )
+    if rng.random() >= 0.1:
+        ret["failpoint.hangAfterPreCommittingCatalogUpdates"] = {"mode": "off"}
+        ret["failpoint.hangBeforePublishingCatalogUpdates"] = {"mode": "off"}
+    else:
+        waitMillisMax = params["failpoint.hangAfterPreCommittingCatalogUpdates"][
+            "pauseEntireCommitMillis"
+        ]["max"]
+        waitMillisMin = params["failpoint.hangAfterPreCommittingCatalogUpdates"][
+            "pauseEntireCommitMillis"
+        ]["min"]
+        ret["failpoint.hangAfterPreCommittingCatalogUpdates"] = {
+            "mode": {"activationProbability": random.uniform(0, 0.5)},
+            "data": {"pauseEntireCommitMillis": rng.randint(waitMillisMin, waitMillisMax)},
+        }
+        waitMillisMax = params["failpoint.hangBeforePublishingCatalogUpdates"][
+            "pauseEntireCommitMillis"
+        ]["max"]
+        waitMillisMin = params["failpoint.hangBeforePublishingCatalogUpdates"][
+            "pauseEntireCommitMillis"
+        ]["min"]
+        ret["failpoint.hangBeforePublishingCatalogUpdates"] = {
+            "mode": {"activationProbability": random.uniform(0, 0.5)},
+            "data": {"pauseEntireCommitMillis": rng.randint(waitMillisMin, waitMillisMax)},
+        }
+
+    # enableFlowControl gates the entire set of flow control parameters. Generate it here,
+    # alongside other interdependent params, so the normal loop cannot regenerate it and
+    # produce an inconsistent value (it is marked custom_fuzz_value_assignment in the limits).
+    ret["enableFlowControl"] = rng.choice(params["enableFlowControl"]["choices"])
+    if not ret["enableFlowControl"]:
+        # Flow control params are always generated by the normal loop (they are not marked
+        # custom_fuzz_value_assignment), so they always consume RNG regardless of whether
+        # flow control is enabled. Remove them from the output here when disabled rather
+        # than skipping them in the loop, which keeps the RNG sequence stable across seeds
+        # and avoids the inconsistency that arises from conditionally deleting them before
+        # the loop runs.
+        for key in flow_control_params:
+            ret.pop(key, None)
+    else:
+        # flowControlThresholdLagPercentage requires rng.random() rather than randint.
+        ret["flowControlThresholdLagPercentage"] = rng.random()
+
+    return ret
+
+
+def generate_mongod_parameters(rng):
+    """Return a dictionary with values for each mongod parameter."""
+    from buildscripts.resmokelib.generate_fuzz_config.config_fuzzer_limits import (
+        config_fuzzer_params,
+    )
+
+    # Get only the mongod parameters that have "startup" in the "fuzz_at" param value.
+    params = {
+        param: val
+        for param, val in config_fuzzer_params["mongod"].items()
+        if "startup" in val.get("fuzz_at", []) and is_enterprise_param_available(val)
+    }
+
+    # TODO (SERVER-75632): Remove/comment out the below line to enable passthrough testing.
+    params["lockCodeSegmentsInMemory"]["custom_fuzz_value_assignment"] = True
+
+    ret = {}
+
+    # Range through all parameters and assign the parameters based on the keys that are available or the parameter set lists defined above.
+    ret.update(
+        {
+            key: generate_normal_mongo_parameters(rng, value, key)
+            for key, value in params.items()
+            if not value.get("custom_fuzz_value_assignment", False)
+        }
+    )
+
+    ret = generate_special_mongod_startup_parameters(rng, ret, params)
+    return ret
+
+
+def generate_mongod_extra_configs(rng):
+    """Return a dictionary with values for each additional (i.e. not setParameter) mongod config."""
+    from buildscripts.resmokelib.generate_fuzz_config.config_fuzzer_limits import (
+        config_fuzzer_extra_configs,
+    )
+
+    generated_config = {
+        key: generate_normal_mongo_parameters(rng, value, key)
+        for key, value in config_fuzzer_extra_configs["mongod"].items()
+        if is_enterprise_param_available(value)
+    }
+
+    # This is needed for our antithesis setup
+    # Our antithesis setup runs twice, once for setup and once at runtime
+    # If this option is different between the two runs, the hook can fail
+    if config.NOOP_MONGO_D_S_PROCESSES:
+        generated_config["auditRuntimeConfiguration"] = "on"
+
+    return generated_config
+
+
+def generate_mongos_parameters(rng):
+    """Return a dictionary with values for each mongos parameter."""
+    from buildscripts.resmokelib.generate_fuzz_config.config_fuzzer_limits import (
+        config_fuzzer_params,
+    )
+
+    # Get only the mongos parameters that have "startup" in the "fuzz_at" param value.
+    params = {
+        param: val
+        for param, val in config_fuzzer_params["mongos"].items()
+        if "startup" in val.get("fuzz_at", []) and is_enterprise_param_available(val)
+    }
+
+    return {key: generate_normal_mongo_parameters(rng, value, key) for key, value in params.items()}
+
+
+def fuzz_mongod_set_parameters(seed, user_provided_params):
+    """Randomly generate mongod configurations and wiredTigerConnectionString."""
+    rng = random.Random(seed)
+
+    ret = {}
+    mongod_params = generate_mongod_parameters(rng)
+
+    for key, value in mongod_params.items():
+        ret[key] = value
+
+    for key, value in utils.load_yaml(user_provided_params).items():
+        ret[key] = value
+
+    for key, value in ret.items():
+        # We may at times contain a dictionary for the parameter value, in order to pass them via
+        # setParameter we must dump them as a JSON.
+        if isinstance(value, dict):
+            value = json.dumps(value)
+        ret[key] = value
+
+    return (
+        utils.dump_yaml(ret),
+        generate_mongod_extra_configs(rng),
+        generate_eviction_configs(rng),
+        generate_table_configs(rng),
+        generate_table_configs(rng),
+        generate_encryption_config(rng),
+    )
+
+
+def fuzz_mongos_set_parameters(seed, user_provided_params):
+    """Randomly generate mongos configurations."""
+    rng = random.Random(seed)
+
+    ret = {}
+    params = generate_mongos_parameters(rng)
+    for key, value in params.items():
+        ret[key] = value
+
+    for key, value in utils.load_yaml(user_provided_params).items():
+        ret[key] = value
+
+    for key, value in ret.items():
+        # We may at times contain a dictionary for the parameter value, in order to pass them
+        # via setParameter we must dump them as a JSON.
+        if isinstance(value, dict):
+            value = json.dumps(value)
+        ret[key] = value
+
+    return utils.dump_yaml(ret)

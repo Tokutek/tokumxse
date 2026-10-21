@@ -1,0 +1,148 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/**
+ * Unit tests of the builtin roles psuedo-collection.
+ */
+
+#include "mongo/db/auth/builtin_roles.h"
+
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/database_name_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string_view>
+#include <vector>
+
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+const auto kAdminDB = DatabaseName::kAdmin;
+const auto kAdminRsrc = ResourcePattern::forDatabaseName(kAdminDB);
+const auto kAdminSystemJSNSS =
+    NamespaceString::createNamespaceString_forTest(kAdminDB, "system.js"sv);
+const auto kAdminSystemJSRsrc = ResourcePattern::forExactNamespace(kAdminSystemJSNSS);
+
+TEST(BuiltinRoles, BuiltinRolesOnlyOnAppropriateDatabases) {
+    ASSERT(auth::isBuiltinRole(RoleName("read", "test")));
+    ASSERT(auth::isBuiltinRole(RoleName("readWrite", "test")));
+    ASSERT(auth::isBuiltinRole(RoleName("userAdmin", "test")));
+    ASSERT(auth::isBuiltinRole(RoleName("dbAdmin", "test")));
+    ASSERT(auth::isBuiltinRole(RoleName("dbOwner", "test")));
+    ASSERT(auth::isBuiltinRole(RoleName("enableSharding", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("readAnyDatabase", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("readWriteAnyDatabase", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("userAdminAnyDatabase", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("dbAdminAnyDatabase", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("clusterAdmin", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("root", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("__system", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("MyRole", "test")));
+    ASSERT(!auth::isBuiltinRole(RoleName("searchCoordinator", "test")));
+
+    ASSERT(auth::isBuiltinRole(RoleName("read", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("readWrite", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("userAdmin", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("dbAdmin", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("dbOwner", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("enableSharding", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("readAnyDatabase", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("readWriteAnyDatabase", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("userAdminAnyDatabase", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("dbAdminAnyDatabase", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("clusterAdmin", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("root", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("__system", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("directShardOperations", "admin")));
+    ASSERT(!auth::isBuiltinRole(RoleName("MyRole", "admin")));
+    ASSERT(auth::isBuiltinRole(RoleName("searchCoordinator", "admin")));
+}
+
+TEST(BuiltinRoles, getBuiltinRolesForDB) {
+    auto adminRoles = auth::getBuiltinRoleNamesForDB(DatabaseName::kAdmin);
+    ASSERT(adminRoles.contains(RoleName("read", "admin")));
+    ASSERT(adminRoles.contains(RoleName("readAnyDatabase", "admin")));
+    for (const auto& role : adminRoles) {
+        ASSERT_EQ(role.getDB(), "admin");
+        ASSERT(auth::isBuiltinRole(role));
+    }
+
+    auto testRoles = auth::getBuiltinRoleNamesForDB(
+        DatabaseName::createDatabaseName_forTest(boost::none, "test"));
+    ASSERT(testRoles.contains(RoleName("read", "test")));
+    ASSERT(!testRoles.contains(RoleName("readAnyDatabase", "test")));
+    for (const auto& role : testRoles) {
+        ASSERT_EQ(role.getDB(), "test");
+        ASSERT(auth::isBuiltinRole(role));
+    }
+    ASSERT_GTE(adminRoles.size(), testRoles.size());
+}
+
+TEST(BuiltinRoles, addPrivilegesForBuiltinRole) {
+    PrivilegeVector privs;
+    ASSERT(auth::addPrivilegesForBuiltinRole(RoleName("read", "admin"), &privs));
+    ASSERT_EQ(privs.size(), 2);
+
+    // The "read" role should have these actions on the admin DB and admin.system.js collections.
+    const ActionSet expSet({
+        ActionType::changeStream,
+        ActionType::collStats,
+        ActionType::dbHash,
+        ActionType::dbStats,
+        ActionType::find,
+        ActionType::killCursors,
+        ActionType::listCollections,
+        ActionType::listIndexes,
+        ActionType::listSearchIndexes,
+        ActionType::performRawDataOperations,
+        ActionType::planCacheRead,
+    });
+
+    for (const auto& priv : privs) {
+        auto resource = priv.getResourcePattern();
+        ASSERT((resource == kAdminRsrc) || (resource == kAdminSystemJSRsrc));
+        ASSERT(priv.getActions() == expSet);
+    }
+}
+
+TEST(BuiltinRoles, addSystemBucketsPrivilegesForBuiltinRoleClusterManager) {
+    PrivilegeVector privs;
+    ASSERT(auth::addPrivilegesForBuiltinRole(RoleName("clusterManager", "admin"), &privs));
+    ASSERT_EQ(privs.size(), 11);
+
+    const auto systemBucketsResourcePattern = ResourcePattern::forAnySystemBuckets(boost::none);
+
+    const ActionSet clusterManagerRoleDatabaseActionSet({
+        ActionType::clearJumboFlag,
+        ActionType::splitChunk,
+        ActionType::moveChunk,
+        ActionType::moveCollection,
+        ActionType::enableSharding,
+        ActionType::splitVector,
+        ActionType::refineCollectionShardKey,
+        ActionType::reshardCollection,
+        ActionType::rewriteCollection,
+        ActionType::analyzeShardKey,
+        ActionType::configureQueryAnalyzer,
+        ActionType::unshardCollection,
+    });
+
+    for (const auto& priv : privs) {
+        auto resourcePattern = priv.getResourcePattern();
+        if (resourcePattern == systemBucketsResourcePattern) {
+            ASSERT(priv.getActions() == clusterManagerRoleDatabaseActionSet);
+        }
+    }
+}
+}  // namespace
+}  // namespace mongo

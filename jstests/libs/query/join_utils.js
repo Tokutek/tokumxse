@@ -1,0 +1,312 @@
+/**
+ * Utility functions for join optimization tests.
+ */
+import {
+    getQueryPlanner,
+    getAllPlanStages,
+    getWinningPlanFromExplain,
+} from "jstests/libs/query/analyze_plan.js";
+import {runWithParamsAllNonConfigNodes} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
+import {getLatestProfilerEntry} from "jstests/libs/profiler.js";
+
+/**
+ * Returns {hits, misses, invalidations} from serverStatus.metrics.query.planCache.join.
+ */
+export function joinPlanCacheStats(db) {
+    const planCache = db.serverStatus().metrics.query.planCache;
+    assert(planCache.hasOwnProperty("join"), "missing metrics.query.planCache.join", {planCache});
+    const join = planCache.join;
+    return {hits: join.hits, misses: join.misses, invalidations: join.invalidations};
+}
+
+/**
+ * Runs 'fn' and returns the change in the join plan cache counters during its execution:
+ * {hitDelta, missDelta, invalidationDelta}.
+ */
+export function joinPlanCacheStatsDelta(db, fn) {
+    const before = joinPlanCacheStats(db);
+    fn();
+    const after = joinPlanCacheStats(db);
+    return {
+        hitDelta: after.hits - before.hits,
+        missDelta: after.misses - before.misses,
+        invalidationDelta: after.invalidations - before.invalidations,
+    };
+}
+
+/**
+ * Returns {numEntries, estimatedSizeBytes} from serverStatus.metrics.query.planCache.join.
+ */
+export function joinPlanCacheOccupancy(db) {
+    const entries = db
+        .getSiblingDB("admin")
+        .aggregate([{$joinPlanCacheStats: {}}])
+        .toArray();
+    let estimatedSizeBytes = 0;
+    for (const entry of entries) {
+        estimatedSizeBytes += Number(entry.estimatedSizeBytes);
+    }
+    return {numEntries: entries.length, estimatedSizeBytes};
+}
+
+/**
+ * Asserts that the join plan cache stats change by the expected amounts during the execution of 'fn'.
+ */
+export function assertJoinPlanCacheStats({
+    db,
+    fn,
+    expectedHits,
+    expectedMisses,
+    expectedInvalidations = 0,
+}) {
+    const {hitDelta, missDelta, invalidationDelta} = joinPlanCacheStatsDelta(db, fn);
+    assert.eq(hitDelta, expectedHits, "unexpected join plan cache hits", {
+        expectedHits,
+        hitDelta,
+    });
+    assert.eq(missDelta, expectedMisses, "unexpected join plan cache misses", {
+        expectedMisses,
+        missDelta,
+    });
+    assert.eq(
+        invalidationDelta,
+        expectedInvalidations,
+        "unexpected join plan cache invalidations",
+        {expectedInvalidations, invalidationDelta},
+    );
+}
+
+// Runs the given test case with join optimization enabled and disabled, verifies that the results
+// match expectedResults with UNORDERED comparison, and checks whether the join optimizer was used as expected.
+export function runTestWithUnorderedComparison({
+    db,
+    description,
+    coll,
+    pipeline,
+    expectedResults,
+    expectedUsedJoinOptimization,
+    additionalJoinParams = {},
+    expectedNumJoinStages = -1,
+}) {
+    print(`Running test: ${description} with additional join params ${additionalJoinParams}`);
+
+    const originalResults = runWithParamsAllNonConfigNodes(
+        db,
+        {internalEnableJoinOptimization: false},
+        () => {
+            return coll.aggregate(pipeline).toArray();
+        },
+    );
+    assert.sameMembers(originalResults, expectedResults);
+
+    const joinParams = {internalEnableJoinOptimization: true, ...additionalJoinParams};
+    const joinOptResults = runWithParamsAllNonConfigNodes(db, joinParams, () => {
+        return coll.aggregate(pipeline).toArray();
+    });
+    assert.sameMembers(joinOptResults, expectedResults);
+
+    const explain = runWithParamsAllNonConfigNodes(db, joinParams, () => {
+        return coll.explain().aggregate(pipeline);
+    });
+    print(`Explain: ${tojson(explain)}`);
+    const winningPlan = getQueryPlanner(explain).winningPlan;
+
+    const usedJoinOptimization = winningPlan.hasOwnProperty("usedJoinOptimization")
+        ? winningPlan.usedJoinOptimization
+        : false;
+    assert.eq(expectedUsedJoinOptimization, usedJoinOptimization, winningPlan);
+
+    const joinStages = getAllPlanStages(getWinningPlanFromExplain(explain)).filter(
+        plannerStageIsJoinOptNode,
+    );
+    if (expectedUsedJoinOptimization) {
+        assert.gt(
+            joinStages.length,
+            0,
+            `Expected to find some join opt stages, found none: ` + tojson(explain),
+        );
+        if (expectedNumJoinStages > 0) {
+            assert.eq(
+                joinStages.length,
+                expectedNumJoinStages,
+                `Expected ${expectedNumJoinStages} join opt stages: ` + tojson(explain),
+            );
+        }
+    } else {
+        assert.eq(joinStages.length, 0, `Expected no join opt stages: ` + tojson(explain));
+    }
+}
+
+/**
+ * Ensures the winning query plan used a hash join.
+ */
+export function usedHashJoinEmbedding(explain) {
+    const stages = getAllPlanStages(getWinningPlanFromExplain(explain)).map((stage) => stage.stage);
+    return stages.includes("HASH_JOIN_EMBEDDING");
+}
+/**
+ * Ensures the winning query plan used a indexed nested loop join.
+ */
+export function usedIndexedNestLoopJoinEmbedding(explain) {
+    const stages = getAllPlanStages(getWinningPlanFromExplain(explain)).map((stage) => stage.stage);
+    return stages.includes("INDEXED_NESTED_LOOP_JOIN_EMBEDDING");
+}
+/**
+ * Ensures the winning query plan used a nested loop join.
+ */
+export function usedNestedLoopJoinEmbedding(explain) {
+    const stages = getAllPlanStages(getWinningPlanFromExplain(explain)).map((stage) => stage.stage);
+    return stages.includes("NESTED_LOOP_JOIN_EMBEDDING");
+}
+
+/**
+ * Returns an abbreviation for a join embedding stage name, or the original name
+ * if it is not a join stage.
+ */
+export function joinStageAbbreviation(stageName) {
+    switch (stageName) {
+        case "HASH_JOIN_EMBEDDING":
+            return "HJ";
+        case "NESTED_LOOP_JOIN_EMBEDDING":
+            return "NLJ";
+        case "INDEXED_NESTED_LOOP_JOIN_EMBEDDING":
+            return "INLJ";
+        default:
+            return stageName;
+    }
+}
+
+export function plannerStageIsJoinOptNode(stageObj) {
+    return (
+        stageObj.stage.includes("NESTED_LOOP_JOIN_EMBEDDING") ||
+        stageObj.stage.includes("INDEXED_NESTED_LOOP_JOIN_EMBEDDING") ||
+        stageObj.stage.includes("HASH_JOIN_EMBEDDING")
+    );
+}
+
+/**
+ * Returns a boolean that indicates if the explain showed that join optimization was used.
+ */
+export function joinOptUsed(explain) {
+    const winningPlanStats = getQueryPlanner(explain).winningPlan;
+
+    if (winningPlanStats.usedJoinOptimization === false) {
+        return false;
+    }
+
+    return (
+        winningPlanStats.usedJoinOptimization &&
+        (usedHashJoinEmbedding(explain) ||
+            usedIndexedNestLoopJoinEmbedding(explain) ||
+            usedNestedLoopJoinEmbedding(explain))
+    );
+}
+
+/**
+ * Asserts that the join optimizer was used and every join node uses the expected method.
+ */
+export function assertAllJoinsUseMethod(explain, expectedMethod) {
+    assert(joinOptUsed(explain), "Expected join optimization to be used: " + tojson(explain));
+
+    const joinStages = getAllPlanStages(getWinningPlanFromExplain(explain)).filter(
+        plannerStageIsJoinOptNode,
+    );
+    assert.gt(joinStages.length, 0, "Expected at least one join stage: " + tojson(explain));
+
+    for (const stage of joinStages) {
+        assert.eq(
+            joinStageAbbreviation(stage.stage),
+            expectedMethod,
+            `Expected all joins to be ${expectedMethod}, but found ${stage.stage}`,
+        );
+    }
+}
+
+/**
+ * Hooks 'actionFun' to run before the body of 'prototype[funName]'.
+ * 'actionFun' receives the same args as the wrapped function.
+ * Returns a cleanup function which restores the original 'funName'.
+ */
+function insertBeforeHook(prototype, funName, actionFun) {
+    const originalFun = prototype[funName];
+    assert.eq(typeof originalFun, "function");
+    prototype[funName] = function (...args) {
+        actionFun.call(this, ...args);
+        return originalFun.call(this, ...args);
+    };
+    return () => {
+        prototype[funName] = originalFun;
+    };
+}
+
+/**
+ * Hooks fsync before relevant commands run, ensuring stable on-disk size when join-opt runs.
+ * Returns a cleanup function which removes the hooks.
+ */
+function hookFsyncForJoinOpt() {
+    const fsync = function () {
+        assert.commandWorked(this.getDB().adminCommand({fsync: 1}));
+    };
+    const unhookAggregate = insertBeforeHook(DBCollection.prototype, "aggregate", fsync);
+    const unhookExplain = insertBeforeHook(DBCollection.prototype, "explain", fsync);
+
+    return () => {
+        unhookAggregate();
+        unhookExplain();
+    };
+}
+
+/**
+ * Runs 'pipeline' on 'coll' and returns its results along with the plan summary the server recorded
+ * for the execution, as reported in the slow query log and the profiler.
+ */
+export function runPipelineAndGetPlanSummary(coll, pipeline) {
+    const db = coll.getDB();
+    const previousProfilingLevel = assert.commandWorked(db.setProfilingLevel(2)).was;
+    try {
+        const results = coll.aggregate(pipeline).toArray();
+        const entry = getLatestProfilerEntry(db, {
+            op: "command",
+            ns: coll.getFullName(),
+            "command.aggregate": coll.getName(),
+            "command.pipeline": {$exists: true},
+        });
+        assert(entry.hasOwnProperty("planSummary"), "no planSummary was profiled", {entry});
+        return {results, planSummary: entry.planSummary};
+    } finally {
+        assert.commandWorked(db.setProfilingLevel(previousProfilingLevel));
+    }
+}
+
+/**
+ * Restores join-opt parameters to state before test.
+ */
+export function joinTestWrapper(db, testFun) {
+    const params = assert.commandWorked(
+        db.adminCommand({
+            getParameter: 1,
+            internalEnableJoinOptimization: 1,
+            internalJoinReorderMode: 1,
+            internalJoinPlanTreeShape: 1,
+            internalMaxNodesInJoinGraph: 1,
+            internalMaxEdgesInJoinGraph: 1,
+            internalMaxNumberNodesConsideredForImplicitEdges: 1,
+            internalJoinPlanSamplingSize: 1,
+            internalJoinEnumerateCollScanPlans: 1,
+            internalMinAllPlansEnumerationSubsetLevel: 1,
+            internalMaxAllPlansEnumerationSubsetLevel: 1,
+            internalJoinOptimizationSamplingCEMethod: 1,
+            internalJoinMethod: 1,
+        }),
+    );
+    delete params.ok;
+    delete params.operationTime;
+
+    const unhookFsync = hookFsyncForJoinOpt();
+    try {
+        testFun();
+    } finally {
+        unhookFsync();
+        assert.commandWorked(db.adminCommand({setParameter: 1, ...params}));
+    }
+}

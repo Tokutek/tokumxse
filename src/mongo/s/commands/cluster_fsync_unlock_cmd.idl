@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    fsyncUnlock:
+        description: "The command for calling fsync unlock on all shards of a cluster."
+        command_name: fsyncUnlock
+        cpp_name: clusterFsyncUnlock
+        strict: false
+        namespace: ignored
+        api_version: ""
+        mod_visibility: private

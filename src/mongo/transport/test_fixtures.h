@@ -1,0 +1,348 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/logv2/log.h"
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_mock.h"
+#include "mongo/unittest/join_thread.h"
+#include "mongo/unittest/temp_dir.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/ssl_options.h"
+
+#include <functional>
+#include <memory>
+#include <queue>
+#include <string_view>
+
+#include <boost/filesystem.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::transport::test {
+
+constexpr auto kLetKernelChoosePort = 0;
+
+template <typename T>
+class BlockingQueue {
+public:
+    void push(T t) {
+        std::unique_lock lk(_mu);
+        _q.push(std::move(t));
+        lk.unlock();
+        _cv.notify_one();
+    }
+
+    T pop() {
+        std::unique_lock lk(_mu);
+        _cv.wait(lk, [&] { return !_q.empty(); });
+        T r = std::move(_q.front());
+        _q.pop();
+        return r;
+    }
+
+private:
+    mutable std::mutex _mu;
+    mutable stdx::condition_variable _cv;
+    std::queue<T> _q;
+};
+
+using unittest::JoinThread;
+
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] SessionThread {
+    struct StopException {};
+
+    explicit SessionThread(std::shared_ptr<transport::Session> s)
+        : _session{std::move(s)}, _thread{[this] {
+              _run();
+          }} {}
+
+    ~SessionThread() {
+        if (!_thread.joinable())
+            return;
+        schedule([](auto&&) { throw StopException{}; });
+    }
+
+    void schedule(std::function<void(transport::Session&)> task) {
+        _tasks.push(std::move(task));
+    }
+
+    std::shared_ptr<transport::Session> session() const {
+        return _session;
+    }
+
+private:
+    void _run() {
+        while (true) {
+            try {
+                LOGV2(6109508, "SessionThread: pop and execute a task");
+                _tasks.pop()(*_session);
+            } catch (const StopException&) {
+                LOGV2(6109509, "SessionThread: stopping");
+                return;
+            }
+        }
+    }
+
+    std::shared_ptr<transport::Session> _session;
+    BlockingQueue<std::function<void(transport::Session&)>> _tasks;
+    JoinThread _thread;  // Appears after the members _run uses.
+};
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] InlineReactor : public Reactor {
+public:
+    void run() override {}
+    void stop() override {}
+
+    void drain() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void schedule(Task t) override {
+        t(Status::OK());
+    }
+
+    std::unique_ptr<ReactorTimer> makeTimer() override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::chrono::system_clock::time_point systemTime() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void appendStats(BSONObjBuilder&, bool) const override {
+        MONGO_UNREACHABLE;
+    }
+};
+
+class NoopReactor : public Reactor {
+public:
+    void run() override {}
+    void stop() override {}
+
+    void drain() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void schedule(Task) override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::unique_ptr<ReactorTimer> makeTimer() override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::chrono::system_clock::time_point systemTime() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void appendStats(BSONObjBuilder&, bool) const override {
+        MONGO_UNREACHABLE;
+    }
+};
+
+class TransportLayerMockWithReactor : public TransportLayerMock {
+public:
+    using TransportLayerMock::TransportLayerMock;
+
+    ReactorHandle getReactor(WhichReactor) override {
+        return _mockReactor;
+    }
+
+private:
+    ReactorHandle _mockReactor = std::make_unique<NoopReactor>();
+};
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] MockSessionManager : public SessionManager {
+public:
+    MockSessionManager() = default;
+    explicit MockSessionManager(std::function<void(SessionThread&)> onStartSession)
+        : _onStartSession(std::move(onStartSession)) {}
+
+    ~MockSessionManager() override {
+        _join();
+    }
+
+    void startSession(std::shared_ptr<transport::Session> session) override {
+        LOGV2(6109510, "Accepted connection", "remote"_attr = session->remote());
+        auto& newSession = [&]() -> SessionThread& {
+            auto vec = *_sessions;
+            vec->push_back(std::make_unique<SessionThread>(std::move(session)));
+            return *vec->back();
+        }();
+        if (_onStartSession)
+            _onStartSession(newSession);
+        LOGV2(6109511, "started session");
+    }
+
+    void endSessionByClient(Client* client) override {}
+
+    void endAllSessions(Client::TagMask tags) override {
+        _join();
+    }
+
+    bool shutdown(Milliseconds timeout) override {
+        _join();
+        return true;
+    }
+
+    std::size_t numOpenSessions() const override {
+        return _sessions->size();
+    }
+
+    std::vector<std::pair<SessionId, std::string>> getOpenSessionIDs() const override {
+        return {};
+    }
+
+    void setOnStartSession(std::function<void(SessionThread&)> cb) {
+        _onStartSession = std::move(cb);
+    }
+
+    void onLoadBalancerPeerSet(bool) override {}
+
+private:
+    void _join() {
+        LOGV2(6109513, "Joining all session threads");
+        _sessions->clear();
+    }
+
+    std::function<void(SessionThread&)> _onStartSession;
+    synchronized_value<std::vector<std::unique_ptr<SessionThread>>> _sessions;
+};
+
+class ServiceEntryPointUnimplemented : public ServiceEntryPoint {
+public:
+    ServiceEntryPointUnimplemented() = default;
+
+    Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                     const Message& request,
+                                     Date_t started) override {
+        MONGO_UNREACHABLE;
+    }
+};
+
+class TempCertificatesDir {
+public:
+    TempCertificatesDir(std::string directoryPrefix) {
+        _dir = std::make_unique<unittest::TempDir>(directoryPrefix + "_certs_test");
+        boost::filesystem::path directoryPath(_dir->path());
+        boost::filesystem::path filePathCA(directoryPath / "ca.pem");
+        boost::filesystem::path filePathPEM(directoryPath / "server_pem.pem");
+        _filePathCA = filePathCA.string();
+        _filePathPEM = filePathPEM.string();
+        _filePathClientPEM = boost::filesystem::path(directoryPath / "client.pem").string();
+    }
+
+    std::string_view getCAFile() const {
+        return _filePathCA;
+    }
+
+    std::string_view getPEMKeyFile() const {
+        return _filePathPEM;
+    }
+
+    std::string_view getClientPEMKeyFile() const {
+        return _filePathClientPEM;
+    }
+
+private:
+    std::unique_ptr<unittest::TempDir> _dir;
+    std::string _filePathCA;
+    std::string _filePathPEM;
+    std::string _filePathClientPEM;
+};
+
+/**
+ * Creates a temporary directory and copies the certificates at the provided filepaths into two new
+ * files in the temporary directory, which the caller can access through TempCertificatesDir. Allows
+ * tests to modify certificate contents mid-test to mimic the actions taken by a user when they call
+ * rotateCertificates.
+ */
+inline std::unique_ptr<TempCertificatesDir> copyCertsToTempDir(std::string caFile,
+                                                               std::string pemFile,
+                                                               std::string clientPemFile,
+                                                               std::string directoryPrefix) {
+    auto tempDir = std::make_unique<TempCertificatesDir>(directoryPrefix);
+
+    boost::filesystem::copy_file(caFile, std::string{tempDir->getCAFile()});
+    boost::filesystem::copy_file(pemFile, std::string{tempDir->getPEMKeyFile()});
+    boost::filesystem::copy_file(clientPemFile, std::string{tempDir->getClientPEMKeyFile()});
+
+    return tempDir;
+};
+
+/**
+ * RAII type that caches the included sslGlobalParams on construction,
+ * and restores them to the cached values on destruction.
+ */
+class SSLGlobalParamsGuard {
+public:
+    SSLGlobalParamsGuard() {
+        _sslCAFile = sslGlobalParams.sslCAFile;
+        _sslPEMKeyFile = sslGlobalParams.sslPEMKeyFile;
+        _sslPEMKeyPassword = sslGlobalParams.sslPEMKeyPassword;
+        _sslClusterFile = sslGlobalParams.sslClusterFile;
+        _sslClusterPassword = sslGlobalParams.sslClusterPassword;
+        _sslMode = sslGlobalParams.sslMode.load();
+    }
+
+    ~SSLGlobalParamsGuard() {
+        sslGlobalParams.sslCAFile = _sslCAFile;
+        sslGlobalParams.sslPEMKeyFile = _sslPEMKeyFile;
+        sslGlobalParams.sslPEMKeyPassword = _sslPEMKeyPassword;
+        sslGlobalParams.sslClusterFile = _sslClusterFile;
+        sslGlobalParams.sslClusterPassword = _sslClusterPassword;
+        sslGlobalParams.sslMode.store(_sslMode);
+    }
+
+private:
+    std::string _sslCAFile;
+    std::string _sslPEMKeyFile;
+    std::string _sslPEMKeyPassword;
+    std::string _sslClusterFile;
+    std::string _sslClusterPassword;
+    int _sslMode;
+};
+
+struct NetworkConnectionStats {
+    int logicalBytesIn;
+    int logicalBytesOut;
+    int physicalBytesIn;
+    int physicalBytesOut;
+    int numRequests;
+
+    static NetworkConnectionStats get(NetworkCounter::ConnectionType type) {
+        BSONObjBuilder bob;
+        globalNetworkCounter().append(bob);
+        BSONObj metrics = bob.obj();
+        if (type == NetworkCounter::ConnectionType::kEgress) {
+            metrics = metrics.getField("egress").Obj().getOwned();
+        }
+
+        NetworkConnectionStats stats;
+        stats.logicalBytesIn = metrics["bytesIn"].numberInt();
+        stats.logicalBytesOut = metrics["bytesOut"].numberInt();
+        stats.physicalBytesIn = metrics["physicalBytesIn"].numberInt();
+        stats.physicalBytesOut = metrics["physicalBytesOut"].numberInt();
+        stats.numRequests = metrics["numRequests"].numberInt();
+        return stats;
+    }
+
+    NetworkConnectionStats getDifference(NetworkConnectionStats other) {
+        NetworkConnectionStats diff;
+        diff.logicalBytesIn = logicalBytesIn - other.logicalBytesIn;
+        diff.logicalBytesOut = logicalBytesOut - other.logicalBytesOut;
+        diff.physicalBytesIn = physicalBytesIn - other.physicalBytesIn;
+        diff.physicalBytesOut = physicalBytesOut - other.physicalBytesOut;
+        diff.numRequests = numRequests - other.numRequests;
+        return diff;
+    }
+};
+
+}  // namespace mongo::transport::test
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

@@ -1,0 +1,183 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#include "mongo/db/pipeline/search/vector_search_helper.h"
+
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/search/search_helper.h"
+#include "mongo/db/pipeline/skip_and_limit.h"
+#include "mongo/db/query/search/mongot_cursor.h"
+#include "mongo/db/transaction/internal_transaction_metrics.h"
+
+namespace mongo {
+namespace {
+executor::RemoteCommandRequest getRemoteCommandRequestForVectorSearchQuery(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& request) {
+    BSONObjBuilder cmdBob;
+    cmdBob.append(mongot_cursor::kVectorSearchCmd, expCtx->getNamespaceString().coll());
+    uassert(7828001,
+            str::stream()
+                << "A uuid is required for a vector search query, but was missing. Got namespace "
+                << expCtx->getNamespaceString().toStringForErrorMsg(),
+            expCtx->getUUID());
+    expCtx->getUUID().value().appendToBuilder(&cmdBob, mongot_cursor::kCollectionUuidField);
+    if (expCtx->getExplain()) {
+        // mongod owns the "explain" field when the aggregate is being explained. A user-supplied
+        // "explain" in the stage spec would collide with the field appended here and produce a
+        // mongot command with duplicate top-level keys, so reject it. Outside of explain a
+        // user-supplied "explain" is intentionally passed through untouched.
+        uassert(10804601,
+                "Cannot specify the 'explain' field in a $vectorSearch stage when the aggregate "
+                "command is run with explain",
+                !request.hasField(mongot_cursor::kExplainField));
+        cmdBob.append(mongot_cursor::kExplainField,
+                      BSON("verbosity" << ExplainOptions::verbosityString(*expCtx->getExplain())));
+    }
+
+    // Attempt to get the view from the request.
+    boost::optional<SearchQueryViewSpec> view = search_helpers::getViewFromBSONObj(request);
+    if (view) {
+        // mongot only expects the view's name but request currently holds the entire view object.
+        // Set the view name and remove the view object from the request.
+        cmdBob.append(mongot_cursor::kViewNameField, view->getName());
+        request.removeField(search_helpers::kViewFieldName);
+    }
+
+    // Pass through remaining user-supplied fields from the request.
+    cmdBob.appendElements(request);
+
+    return mongot_cursor::getRemoteCommandRequest(
+        expCtx->getOperationContext(), expCtx->getNamespaceString(), cmdBob.obj());
+}
+}  // namespace
+
+namespace search_helpers {
+std::unique_ptr<executor::TaskExecutorCursor> establishVectorSearchCursor(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const BSONObj& request,
+    std::shared_ptr<executor::TaskExecutor> taskExecutor) {
+    // Note that we always pre-fetch the next batch here. This is because we generally expect
+    // everything to fit into one batch, since we give mongot the exact upper bound initially - we
+    // will only see multiple batches if this upper bound doesn't fit in 16MB. This should be a rare
+    // enough case that it shouldn't overwhelm mongot to pre-fetch.
+    auto getMoreStrategy = std::make_unique<executor::DefaultTaskExecutorCursorGetMoreStrategy>(
+        /*batchSize*/ boost::none,
+        /*preFetchNextBatch*/ true);
+    auto cursors = mongot_cursor::establishCursors(
+        expCtx,
+        getRemoteCommandRequestForVectorSearchQuery(expCtx, request),
+        taskExecutor,
+        std::move(getMoreStrategy));
+    // Should always have one results cursor.
+    tassert(7828000, "Expected exactly one cursor from mongot", cursors.size() == 1);
+    return std::move(cursors.front());
+}
+
+BSONObj getVectorSearchExplainResponse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       const BSONObj& spec,
+                                       executor::TaskExecutor* taskExecutor) {
+    auto request = getRemoteCommandRequestForVectorSearchQuery(expCtx, spec);
+    return mongot_cursor::getExplainResponse(expCtx.get(), request, taskExecutor);
+}
+
+bool findAndRemoveSortStage(DocumentSourceContainer::iterator idLookupReplaceRootItr,
+                            DocumentSourceContainer* container) {
+    auto isSortOnVectorSearchMeta = [](const SortPattern& sortPattern) -> bool {
+        return isSortOnSingleMetaField(sortPattern,
+                                       (1 << DocumentMetadataFields::MetaType::kVectorSearchScore));
+    };
+
+    auto sortItr = std::next(idLookupReplaceRootItr);
+    if (sortItr == container->end()) {
+        return false;
+    }
+
+    auto sortStage = dynamic_cast<DocumentSourceSort*>(sortItr->get());
+    if (!sortStage) {
+        return false;
+    }
+
+    // A $sort stage has been found directly after the desugared
+    // vectorSearch pipeline. $vectorSearch results are always sorted by
+    // 'vectorSearchScore', so if the $sort stage is also sorted by
+    // 'vectorSearchScore', the $sort stage is redundant and can safely be
+    // removed.
+    if (!(isSortOnVectorSearchMeta(sortStage->getSortPattern()))) {
+        return false;
+    }
+    // Optimization successful.
+    container->remove(*sortItr);
+    return true;
+}
+
+bool findIdLookupOrReplaceRootStage(DocumentSource* currStage) {
+    if (currStage->isInstanceOf<DocumentSourceInternalSearchIdLookUp>()) {
+        return true;
+    }
+    if (auto replaceRootStage =
+            dynamic_cast<DocumentSourceSingleDocumentTransformation*>(currStage);
+        replaceRootStage &&
+        replaceRootStage->getTransformerType() ==
+            TransformerInterface::TransformerType::kReplaceRoot) {
+        return true;
+    }
+    return false;
+}
+
+boost::optional<DocumentSourceContainer::iterator> applyVectorSearchSortOptimization(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
+    // Attempt to remove a $sort stage that sorts by 'vectorSearchScore' directly after the
+    // $vectorSearch stage.
+    if (findAndRemoveSortStage(itr, container)) {
+        return itr;  // Return the same pointer in case there are other optimizations to still be
+                     // applied.
+    }
+
+    auto nextStageItr =
+        std::next(itr);  // The iterator `itr` is pointed at the $vectorSearch extension stage so
+    // when it is advanced, the returned iterator will point at the next
+    // stage (most likely either an idLookup or replaceRoot stage).
+
+    if (nextStageItr == container->end()) {
+        return boost::none;
+    }
+
+    // Attempt to remove a $sort stage that sorts by 'vectorSearchScore' directly after the
+    // desugared $vectorSearch stage.
+    if (findIdLookupOrReplaceRootStage(nextStageItr->get()) &&
+        findAndRemoveSortStage(nextStageItr, container)) {
+        return itr;  // Return the same pointer in case there are other optimizations to still be
+                     // applied.
+    }
+
+    return boost::none;
+}
+
+boost::optional<long long> setVectorSearchLimitForOptimization(
+    DocumentSourceContainer::iterator itr,
+    DocumentSourceContainer* container,
+    boost::optional<long long> currentLimit) {
+    auto nextStageItr =
+        std::next(itr);  // The iterator `itr` is pointed at the $vectorSearch extension stage
+                         // so when it is advanced, the returned iterator will point at the next
+                         // stage (most likely either an idLookup or replaceRoot stage).
+
+    // Only attempt to get the limit from the query if there are further stages in the pipeline.
+    if (nextStageItr == container->end()) {
+        return boost::none;
+    }
+
+    // Move past the $internalSearchIdLookup/$replaceRoot stage, if it is next.
+    if (findIdLookupOrReplaceRootStage(nextStageItr->get())) {
+        ++nextStageItr;
+    }
+
+    // Calculate the extracted limit without modifying the rest of the pipeline.
+    if (auto userLimit = getUserLimit(nextStageItr, container)) {
+        return currentLimit ? std::min(*currentLimit, *userLimit) : *userLimit;
+    }
+    return currentLimit;
+}
+}  // namespace search_helpers
+}  // namespace mongo

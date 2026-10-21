@@ -1,0 +1,201 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/shell/countdownlatch.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/scripting/mozjs/common/objectwrapper.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
+
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#include <jsapi.h>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <js/CallArgs.h>
+#include <js/PropertySpec.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+// IWYU pragma: no_include "cxxabi.h"
+
+namespace mongo {
+namespace mozjs {
+
+const char* const CountDownLatchInfo::className = "CountDownLatch";
+
+const JSFunctionSpec CountDownLatchInfo::methods[5] = {
+    MONGO_ATTACH_JS_FUNCTION(_new),
+    MONGO_ATTACH_JS_FUNCTION(_await),
+    MONGO_ATTACH_JS_FUNCTION(_countDown),
+    MONGO_ATTACH_JS_FUNCTION(_getCount),
+    JS_FS_END,
+};
+
+/**
+ * The global CountDownLatch holder.
+ *
+ * Provides an interface for communicating between JSThread's
+ */
+class CountDownLatchHolder {
+public:
+    CountDownLatchHolder() : _counter(0) {}
+
+    int32_t make(int32_t count) {
+        uassert(ErrorCodes::JSInterpreterFailure, "argument must be >= 0", count >= 0);
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        int32_t desc = ++_counter;
+        _latches.insert(std::make_pair(desc, std::make_shared<CountDownLatch>(count)));
+
+        return desc;
+    }
+
+    void await(int32_t desc) {
+        auto latch = get(desc);
+        std::unique_lock<std::mutex> lock(latch->mutex);
+
+        while (latch->count != 0) {
+            latch->cv.wait(lock);
+        }
+    }
+
+    void countDown(int32_t desc) {
+        auto latch = get(desc);
+        std::unique_lock<std::mutex> lock(latch->mutex);
+
+        if (latch->count > 0)
+            latch->count--;
+
+        if (latch->count == 0)
+            latch->cv.notify_all();
+    }
+
+    int32_t getCount(int32_t desc) {
+        auto latch = get(desc);
+        std::unique_lock<std::mutex> lock(latch->mutex);
+
+        return latch->count;
+    }
+
+private:
+    /**
+     * Latches for communication between threads
+     */
+    struct CountDownLatch {
+        CountDownLatch(int32_t count) : count(count) {}
+
+        std::mutex mutex;
+        stdx::condition_variable cv;
+        int32_t count;
+    };
+
+    std::shared_ptr<CountDownLatch> get(int32_t desc) {
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        auto iter = _latches.find(desc);
+        uassert(ErrorCodes::JSInterpreterFailure,
+                "not a valid CountDownLatch descriptor",
+                iter != _latches.end());
+
+        return iter->second;
+    }
+
+    using Map = stdx::unordered_map<int32_t, std::shared_ptr<CountDownLatch>>;
+
+    std::mutex _mutex;
+    Map _latches;
+    int32_t _counter;
+};
+
+namespace {
+CountDownLatchHolder globalCountDownLatchHolder;
+}  // namespace
+
+/**
+ * The argument for _new is a count value. We restrict it to be a 32 bit integer.
+ *
+ * The argument for _await/_countDown/_getCount is an id for CountDownLatch instance returned from
+ * _new call. It must be a 32 bit integer.
+ */
+auto uassertGet(JS::CallArgs args, unsigned int i) {
+    uassert(ErrorCodes::JSInterpreterFailure, "need exactly one argument", args.length() == 1);
+
+    auto int32Arg = args.get(i);
+    if (int32Arg.isDouble()) {
+        uassert(ErrorCodes::JSInterpreterFailure,
+                "argument must not be an NaN",
+                !int32Arg.isDouble() || !std::isnan(int32Arg.toDouble()));
+        auto val = int32Arg.toDouble();
+        uassert(ErrorCodes::JSInterpreterFailure,
+                "argument must be a 32 bit integer",
+                INT_MIN <= val && val <= INT_MAX);
+
+        return static_cast<int32_t>(val);
+    }
+
+    uassert(
+        ErrorCodes::JSInterpreterFailure, "argument must be a 32 bit integer", int32Arg.isInt32());
+
+    return int32Arg.toInt32();
+}
+
+void CountDownLatchInfo::Functions::_new::call(JSContext* cx, JS::CallArgs args) {
+    args.rval().setInt32(globalCountDownLatchHolder.make(uassertGet(args, 0)));
+}
+
+void CountDownLatchInfo::Functions::_await::call(JSContext* cx, JS::CallArgs args) {
+    globalCountDownLatchHolder.await(uassertGet(args, 0));
+
+    args.rval().setUndefined();
+}
+
+void CountDownLatchInfo::Functions::_countDown::call(JSContext* cx, JS::CallArgs args) {
+    globalCountDownLatchHolder.countDown(uassertGet(args, 0));
+
+    args.rval().setUndefined();
+}
+
+void CountDownLatchInfo::Functions::_getCount::call(JSContext* cx, JS::CallArgs args) {
+    args.rval().setInt32(globalCountDownLatchHolder.getCount(uassertGet(args, 0)));
+}
+
+/**
+ * We have to do this odd dance here because we need the methods from
+ * CountDownLatch to be installed in a plain object as enumerable properties.
+ * This is due to the way CountDownLatch is invoked, specifically after being
+ * transmitted across our js fork(). So we can't inherit and can't rely on the
+ * type. Practically, we also end up wrapping up all of these functions in pure
+ * js variants that call down, which makes them bson <-> js safe.
+ */
+void CountDownLatchInfo::postInstall(JSContext* cx,
+                                     JS::HandleObject global,
+                                     JS::HandleObject proto) {
+    auto objPtr = JS_NewPlainObject(cx);
+    uassert(ErrorCodes::JSInterpreterFailure, "Failed to JS_NewPlainObject", objPtr);
+
+    JS::RootedObject obj(cx, objPtr);
+    ObjectWrapper objWrapper(cx, obj);
+    ObjectWrapper protoWrapper(cx, proto);
+
+    JS::RootedValue val(cx);
+    for (auto iter = methods; iter->name; ++iter) {
+        invariant(!iter->name.isSymbol());
+        ObjectWrapper::Key key(iter->name.string());
+        protoWrapper.getValue(key, &val);
+        objWrapper.setValue(key, val);
+    }
+
+    val.setObjectOrNull(obj);
+    ObjectWrapper(cx, global).setValue(CountDownLatchInfo::className, val);
+}
+
+}  // namespace mozjs
+}  // namespace mongo

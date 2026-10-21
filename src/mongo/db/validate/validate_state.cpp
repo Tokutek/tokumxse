@@ -1,0 +1,412 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/validate/validate_state.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/intent_registry.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_enabled.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/timeseries/catalog_helper.h"
+#include "mongo/db/validate/validate_gen.h"
+#include "mongo/db/views/view.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+#include <utility>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
+namespace mongo {
+
+namespace {
+/*
+ * Oplog Batch Applier takes this lock in exclusive mode when applying the
+ * batch. Foreground validation waits on this lock to begin validation.
+ * We must synchronise these operations as foreground validation involves opening a snapshot of the
+ * most recent data and during oplog application, CRUD operations on the document are performed in a
+ * transaction separate from the fast count updates. This could potentially lead to validation
+ * opening a snapshot between these two transactions and result in an incorrectly reported fast
+ * count discrepancy.
+ */
+ResourceMutex validateLock("validateLock");
+}  // namespace
+
+MONGO_FAIL_POINT_DEFINE(hangDuringValidationInitialization);
+MONGO_FAIL_POINT_DEFINE(skipEnforcingFastSizeAndCount);
+
+namespace collection_validation {
+
+std::string_view toString(FastCountType fastCountType) {
+    switch (fastCountType) {
+        case FastCountType::legacySizeStorer:
+            return "legacySizeStorer";
+        case FastCountType::replicated:
+            return "replicated";
+        case FastCountType::both:
+            return "both";
+        case FastCountType::neither:
+            return "neither";
+    }
+    LOGV2_FATAL(
+        11853100, "Unknown fastCountType value", "value"_attr = static_cast<int>(fastCountType));
+}
+
+Lock::ExclusiveLock obtainExclusiveValidationLock(OperationContext* opCtx) {
+    return Lock::ExclusiveLock(opCtx, validateLock);
+}
+
+ValidateState::ValidateState(OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             ValidationOptions options)
+    : ValidationOptions(std::move(options)),
+      _validateLock(isBackground() ? boost::none
+                                   : boost::optional<Lock::SharedLock>{{opCtx, validateLock}}),
+      _globalLock(opCtx,
+                  isBackground() ? MODE_IS : MODE_IX,
+                  {false,
+                   false,
+                   false,
+                   getRepairMode() != RepairMode::kNone
+                       ? rss::consensus::IntentRegistry::Intent::LocalWrite
+                       : rss::consensus::IntentRegistry::Intent::Read}),
+      _nss(nss),
+      _dataThrottle(opCtx->fastClockSource().now().toMillisSinceEpoch(),
+                    [&]() { return gMaxValidateMBperSec.load(); }) {
+
+    // RepairMode is incompatible with the ValidateModes kBackground and
+    // kForegroundFullEnforceFast[Count|Size|CountAndSize].
+    if (fixErrors()) {
+        uassert(11950900,
+                "Cannot fix errors when validation is run in the background",
+                !isBackground());
+        // If the persistence provider does use replicated fast count, we enforce
+        // fast count unconditionally and do not fix the value up when performing validation, so it
+        // is not incompatible with fixErrors.
+        uassert(11950901,
+                "Cannot enforce fast count when fixErrors is enabled",
+                !shouldEnforceFastCount(opCtx, getDetectedFastCountType(opCtx)) ||
+                    rss::ReplicatedStorageService::get(opCtx)
+                        .getPersistenceProvider()
+                        .shouldUseReplicatedFastCount());
+    }
+
+    if (adjustMultikey()) {
+        uassert(11950902,
+                "Cannot run adjust multikey repair when validation is run in the background",
+                !isBackground());
+    }
+}
+
+Status ValidateState::_checkReplicatedFastCountContainer(OperationContext* opCtx) const {
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    auto* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto* engine = storageEngine->getEngine();
+
+    if (!engine->hasIdent(ru, ident::kFastCountMetadataStore)) {
+        return Status(ErrorCodes::Error{12231705},
+                      str::stream()
+                          << "Internal FastCount container ident '"
+                          << ident::kFastCountMetadataStore
+                          << "' does not exist to validate. Required for enforcing fast count.");
+    }
+    return Status::OK();
+}
+
+Status ValidateState::_checkUnreplicatedFastCountCollectionExists(OperationContext* opCtx) const {
+    const StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    const bool tableExists = storageEngine->getEngine()->hasIdent(
+        *shard_role_details::getRecoveryUnit(opCtx), ident::kSizeStorer);
+    if (!tableExists) {
+        return Status(ErrorCodes::NonExistentPath, "SizeStorer doesn't exist");
+    }
+    return Status::OK();
+}
+
+bool ValidateState::_isNSEligibleForSizeStorerValidation() const {
+    if (isConcurrentlyWritable()) {
+        // Writes racing with validation can cause validate to incorrectly report an incorrect fast
+        // count when run in enforceFastCount mode.
+        return false;
+    } else if (_nss == NamespaceString::kIndexBuildEntryNamespace) {
+        // Do not enforce fast count on the 'config.system.indexBuilds' collection. This is an
+        // internal collection that should not be queried and is empty most of the time.
+        return false;
+    } else if (_nss == NamespaceString::kSessionTransactionsTableNamespace) {
+        // The 'config.transactions' collection is an implicitly replicated collection used for
+        // internal bookkeeping for retryable writes and multi-statement transactions.
+        // Replication rollback won't adjust the size storer counts for the
+        // 'config.transactions' collection. We therefore do not enforce fast count on it.
+        return false;
+    } else if (_nss == NamespaceString::kConfigImagesNamespace) {
+        // The 'config.image_collection' collection is an implicitly replicated collection used
+        // for internal bookkeeping for retryable writes. Replication rollback won't adjust the
+        // size storer counts for the 'config.image_collection' collection. We therefore do not
+        // enforce fast count on it.
+        return false;
+    }
+    return true;
+}
+
+bool ValidateState::shouldEnforceFastCount(OperationContext* opCtx, FastCountType type) const {
+    if (MONGO_unlikely(skipEnforcingFastSizeAndCount.shouldFail())) {
+        return false;
+    }
+    if (isBackground()) {
+        return false;
+    }
+    if (getReadTimestamp()) {
+        return false;
+    }
+    if (rss::ReplicatedStorageService::get(opCtx)
+            .getPersistenceProvider()
+            .shouldUseReplicatedFastCount()) {
+        // Oplog writers only take a global IX lock, so the oplog can still be written to even
+        // during full validation despite validation taking the collection X lock.
+        return !_nss.isOplog() && isReplicatedFastCountEligible(_nss);
+    } else {
+        // TODO SERVER-128302: Re-enable validation when the fast count type is both.
+        return type != FastCountType::both && _isNSEligibleForSizeStorerValidation() &&
+            enforceFastCountRequested();
+    }
+}
+
+bool ValidateState::shouldEnforceFastSize(OperationContext* opCtx, FastCountType type) const {
+    if (MONGO_unlikely(skipEnforcingFastSizeAndCount.shouldFail())) {
+        return false;
+    }
+    if (isBackground()) {
+        return false;
+    }
+    if (getReadTimestamp()) {
+        return false;
+    }
+    if (rss::ReplicatedStorageService::get(opCtx)
+            .getPersistenceProvider()
+            .shouldUseReplicatedFastCount()) {
+        // Oplog writers only take a global IX lock, so the oplog can still be written to even
+        // during full validation despite validation taking the collection X lock.
+        return !_nss.isOplog() && isReplicatedFastCountEligible(_nss);
+    } else {
+        // TODO SERVER-128302: Re-enable validation when the fast count type is both.
+        return type != FastCountType::both && _isNSEligibleForSizeStorerValidation() &&
+            enforceFastSizeRequested();
+    }
+}
+
+FastCountType ValidateState::getDetectedFastCountType(OperationContext* opCtx) const {
+    const Status replicatedFastCountStatus = _checkReplicatedFastCountContainer(opCtx);
+    const Status legacyFastCountStatus = _checkUnreplicatedFastCountCollectionExists(opCtx);
+    if (replicatedFastCountStatus.isOK() && legacyFastCountStatus.isOK()) {
+        return FastCountType::both;
+    } else if (replicatedFastCountStatus.isOK()) {
+        return FastCountType::replicated;
+    } else if (legacyFastCountStatus.isOK()) {
+        return FastCountType::legacySizeStorer;
+    } else {
+        return FastCountType::neither;
+    }
+}
+
+FastCountType ValidateState::getExpectedFastCountType(OperationContext* opCtx) const {
+    const bool persistenceProviderUsesRFC = rss::ReplicatedStorageService::get(opCtx)
+                                                .getPersistenceProvider()
+                                                .shouldUseReplicatedFastCount();
+    const bool featureFlagEnabled =
+        gFeatureFlagReplicatedFastCount.isEnabledUseLatestFCVWhenUninitialized(
+            VersionContext::getDecoration(opCtx),
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+    const bool isOplogPresent = static_cast<bool>(LocalOplogInfo::get(opCtx)->getRecordStore());
+
+    if (persistenceProviderUsesRFC) {
+        return FastCountType::replicated;
+    }
+
+    return (featureFlagEnabled && isOplogPresent) ? FastCountType::both
+                                                  : FastCountType::legacySizeStorer;
+}
+
+void ValidateState::yieldCursors(OperationContext* opCtx) {
+    // Save all the cursors.
+    for (const auto& indexCursor : _indexCursors) {
+        indexCursor.second->save();
+    }
+
+    _traverseRecordStoreCursor->save();
+    _seekRecordStoreCursor->save();
+
+    // Restore all the cursors.
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    for (const auto& indexCursor : _indexCursors) {
+        indexCursor.second->restore(ru);
+    }
+
+    uassert(ErrorCodes::Interrupted,
+            "Interrupted due to: failure to restore yielded traverse cursor",
+            _traverseRecordStoreCursor->restore(ru));
+    uassert(ErrorCodes::Interrupted,
+            "Interrupted due to: failure to restore yielded seek cursor",
+            _seekRecordStoreCursor->restore(ru));
+}
+
+Status ValidateState::initializeCollection(OperationContext* opCtx) {
+    if (getReadTimestamp()) {
+        shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, *getReadTimestamp());
+
+        invariant(!shard_role_details::getRecoveryUnit(opCtx)->isActive());
+    }
+    try {
+        // MODE_IS converts to "MaybeLockFree" for background validation when using this API.
+        auto [acquisition, wasRenamed] = timeseries::acquireCollectionWithBucketsLookup(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(
+                opCtx,
+                _nss,
+                !isBackground() && getRepairMode() != RepairMode::kNone
+                    ? AcquisitionPrerequisites::OperationType::kUnreplicatedWrite
+                    : AcquisitionPrerequisites::OperationType::kRead),
+            isBackground() ? LockMode::MODE_IS : LockMode::MODE_X);
+        if (wasRenamed) {
+            _nss = acquisition.nss();
+        }
+
+        if (!acquisition.exists()) {
+            return Status(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "Collection '" << _nss.toStringForErrorMsg()
+                                        << "' does not exist to validate.");
+        }
+
+        _collection = std::move(acquisition);
+    } catch (const ExceptionFor<ErrorCodes::SnapshotTooOld>&) {
+        if (isBackground()) {
+            // This will throw SnapshotTooOld to indicate we cannot find an available snapshot at
+            // the provided timestamp. This is likely because minSnapshotHistoryWindowInSeconds has
+            // been changed to a lower value from the default of 5 minutes.
+            return Status(
+                ErrorCodes::NamespaceNotFound,
+                fmt::format("Cannot run background validation on collection {} because the "
+                            "snapshot history is no longer available",
+                            _nss.toStringForErrorMsg()));
+        }
+        throw;
+    }
+
+    if (MONGO_unlikely(hangDuringValidationInitialization.shouldFail())) {
+        LOGV2(7490901, "Hanging on fail point 'hangDuringValidationInitialization'");
+        hangDuringValidationInitialization.pauseWhileSet();
+    }
+
+    _uuid = _collection->uuid();
+
+    // We want to share the same data throttle instance across all the cursors used during this
+    // validation. Validations started on other collections will not share the same data
+    // throttle instance.
+    if (!isBackground()) {
+        _dataThrottle.turnThrottlingOff();
+    }
+
+    // We can release the validate lock here as we now have exclusive access to the collection and
+    // no CRUD operations or fast count changes will occur.
+    _validateLock.reset();
+    return Status::OK();
+}
+
+void ValidateState::initializeCursors(OperationContext* opCtx) {
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+
+    // Accumulate a size summary only on the full-scan cursors (the record-store traverse cursor
+    // and each index cursor). Opening a size-stats cursor resets its counters, so the flag is
+    // left off for the seek cursor and every other cursor. Opt-in only; results are logged after
+    // the scans complete.
+    const bool collectSizeStats = isCollHashValidation() && sizeStats();
+
+    {
+        if (collectSizeStats) {
+            ru.setSizeStatsCursor(true);
+        }
+        // Clear on any exit so the flag can't leak onto later cursors on this recovery unit.
+        ScopeGuard resetSizeStats([&] {
+            if (collectSizeStats) {
+                ru.setSizeStatsCursor(false);
+            }
+        });
+        _traverseRecordStoreCursor = std::make_shared<SeekableRecordThrottleCursor>(
+            opCtx, getCollection()->getRecordStore(), &_dataThrottle);
+    }
+    _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
+        opCtx, getCollection()->getRecordStore(), &_dataThrottle);
+
+    const IndexCatalog* indexCatalog = getCollection()->getIndexCatalog();
+    // The index iterator for ready indexes is timestamp-aware and will only return indexes that
+    // are visible at our read time.
+    const auto it = indexCatalog->getIndexIterator(IndexCatalog::InclusionPolicy::kReady);
+    while (it->more()) {
+        const IndexCatalogEntry* entry = it->next();
+        const IndexDescriptor* desc = entry->descriptor();
+        const auto iam = entry->accessMethod()->asSortedData();
+        std::unique_ptr<SortedDataInterfaceThrottleCursor> indexCursor;
+        {
+            if (collectSizeStats) {
+                ru.setSizeStatsCursor(true);
+            }
+            // Clear on any exit so the flag can't leak onto later cursors on this recovery unit.
+            ScopeGuard resetSizeStats([&] {
+                if (collectSizeStats) {
+                    ru.setSizeStatsCursor(false);
+                }
+            });
+            indexCursor =
+                std::make_unique<SortedDataInterfaceThrottleCursor>(opCtx, iam, &_dataThrottle);
+        }
+        if (collectSizeStats) {
+            // A direct seek doesn't drive the size-summary accumulation, so probe once from an
+            // unpositioned cursor to measure the parts of the index that the scan's initial seek
+            // would otherwise skip. The scan re-seeks to the start afterwards, so consuming this
+            // key is harmless.
+            indexCursor->nextKeyString(opCtx);
+        }
+        _indexCursors.emplace(desc->indexName(), std::move(indexCursor));
+        _indexIdents.push_back(entry->getIdent());
+    }
+
+    // Because SeekableRecordCursors don't have a method to reset to the start, we save and then
+    // use a seek to the first RecordId to reset the cursor (and reuse it) as needed. When
+    // iterating through a Record Store cursor, we initialize the loop (and obtain the first
+    // Record) with a seek to the first Record (using firstRecordId). Subsequent loop iterations
+    // use cursor->next() to get subsequent Records. However, if the Record Store is empty,
+    // there is no first record. In this case, we set the first Record Id to an invalid RecordId
+    // (RecordId()), which will halt iteration at the initialization step.
+    auto record = _traverseRecordStoreCursor->next(opCtx);
+    _firstRecordId = record ? std::move(record->id) : RecordId();
+}
+
+}  // namespace collection_validation
+}  // namespace mongo

@@ -1,0 +1,98 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/topology/remove_shard_gen.h"
+#include "mongo/db/topology/shard_registry.h"
+#include "mongo/db/topology/transition_to_dedicated_config_server_gen.h"
+#include "mongo/util/assert_util.h"
+
+#include <string>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+namespace {
+
+const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
+
+class StopTransitionToDedicatedConfigServerCmd
+    : public TypedCommand<StopTransitionToDedicatedConfigServerCmd> {
+public:
+    using Request = StopTransitionToDedicatedConfigServer;
+
+    StopTransitionToDedicatedConfigServerCmd() : TypedCommand(Request::kCommandName) {}
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+            ConfigSvrStopShardDraining configsvrRequest{ShardId::kConfigServerId};
+            mongo::RemoveShardRequestBase request;
+            configsvrRequest.setRemoveShardRequestBase(request);
+            configsvrRequest.setDbName(DatabaseName::kAdmin);
+            configsvrRequest.setIsTransitionToDedicatedCS(true);
+
+            const auto cmdResponseWithStatus =
+                Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommand(
+                    opCtx,
+                    kPrimaryOnlyReadPreference,
+                    DatabaseName::kAdmin,
+                    // TODO SERVER-91373: Remove appendMajorityWriteConcern
+                    CommandHelpers::appendMajorityWriteConcern(
+                        CommandHelpers::filterCommandRequestForPassthrough(
+                            configsvrRequest.toBSON()),
+                        opCtx->getWriteConcern()),
+                    Shard::RetryPolicy::kIdempotent);
+
+            uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(cmdResponseWithStatus));
+        }
+
+
+    private:
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        NamespaceString ns() const override {
+            return {};
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::transitionToDedicatedConfigServer));
+        }
+    };
+    std::string help() const override {
+        return "Command to stop transitioning from an embedded config server to a dedicated config "
+               "server";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+};
+MONGO_REGISTER_COMMAND(StopTransitionToDedicatedConfigServerCmd).forRouter();
+
+}  // namespace
+}  // namespace mongo

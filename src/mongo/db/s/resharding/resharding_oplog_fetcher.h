@@ -1,0 +1,240 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/hierarchical_cancelable_operation_context_factory.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
+#include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/util/background.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+
+namespace mongo {
+
+class ReshardingMetrics;
+
+class ReshardingOplogFetcher : public resharding::OnInsertAwaitable {
+public:
+    class Env {
+    public:
+        Env(ServiceContext* service, ReshardingMetrics* metrics)
+            : _service(service), _metrics(metrics) {}
+        ServiceContext* service() const {
+            return _service;
+        }
+
+        ReshardingMetrics* metrics() const {
+            return _metrics;
+        }
+
+    private:
+        ServiceContext* _service;
+        ReshardingMetrics* _metrics;
+    };
+
+    // Special value to use for startAt to indicate there are no more oplog entries needing to be
+    // fetched.
+    static const ReshardingDonorOplogId kFinalOpAlreadyFetched;
+
+    ReshardingOplogFetcher(
+        std::unique_ptr<Env> env,
+        UUID reshardingUUID,
+        UUID collUUID,
+        ReshardingDonorOplogId startAt,
+        ShardId donorShard,
+        ShardId recipientShard,
+        NamespaceString oplogBufferNss,
+        bool storeProgress,
+        boost::optional<ForwardableOperationMetadata> forwardableOpMetadata = boost::none);
+
+    ~ReshardingOplogFetcher() override;
+
+    Future<void> awaitInsert(const ReshardingDonorOplogId& lastSeen) override;
+
+    void awaitBatchProcessed(int numBatchesProcessed);
+
+    /**
+     * Schedules a task that will do the following:
+     *
+     * - Find a valid connection to fetch oplog entries from.
+     * - Send an aggregation request + getMores until either:
+     * -- The "final resharding" oplog entry is found.
+     * -- An interruption occurs.
+     * -- The fetcher concludes it's fallen off the oplog.
+     * -- A different error occurs.
+     *
+     * In the first two circumstances, the task will terminate. If the fetcher has fallen off the
+     * oplog, this is thrown as a fatal resharding exception.  In the last circumstance, the task
+     * will be rescheduled in a way that resumes where it had left off from.
+     */
+    ExecutorFuture<void> schedule(std::shared_ptr<executor::TaskExecutor> executor,
+                                  const CancellationToken& cancelToken);
+
+    /**
+     * Given a shard, fetches and copies oplog entries until
+     *  - reaching an error,
+     *  - coming across a sentinel finish oplog entry, or
+     *  - hitting the end of the donor's oplog.
+     *
+     * Returns true if there are more oplog entries to be copied, and returns false if the sentinel
+     * finish oplog entry has been copied.
+     */
+    bool consume(Client* client,
+                 std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory,
+                 Shard* shard);
+
+    bool iterate(Client* client,
+                 std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory);
+
+    /**
+     * Notifies the fetcher that oplog application has started.
+     */
+    void onStartingOplogApplication();
+
+    /**
+     * Makes the oplog fetcher prepare for the critical section. Currently, this makes the fetcher
+     * start doing the following to reduce the likelihood of not finishing oplog fetching within the
+     * critical section timeout:
+     * - Start fetching oplog entries from the primary node instead of the "nearest" node which
+     *   could be a lagged secondary.
+     * - Sleep for reshardingOplogFetcherSleepMillisDuringCriticalSection instead of
+     *   reshardingOplogFetcherSleepMillisBeforeCriticalSection after exhausting the oplog entries
+     *   returned by the previous cursor.
+     */
+    void prepareForCriticalSection();
+
+    int getNumOplogEntriesCopied() const {
+        return _numOplogEntriesCopied;
+    }
+
+    ReshardingDonorOplogId getLastSeenTimestamp() const {
+        return _startAt;
+    }
+
+    void setInitialBatchSizeForTest(int size) {
+        _initialBatchSize = size;
+    }
+
+    void useReadConcernForTest(bool use) {
+        _useReadConcern = use;
+    }
+
+    void setMaxBatchesForTest(int maxBatches) {
+        _maxBatches = maxBatches;
+    }
+
+private:
+    /**
+     * Helper to construct an opCtx and set non-deprioritizable state if needed.
+     */
+    CancelableOperationContext _makeOperationContext(
+        std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory) const;
+
+    /**
+     * Returns true if there's more work to do and the task should be rescheduled.
+     */
+    void _ensureCollection(Client* client,
+                           std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory,
+                           NamespaceString nss);
+
+    AggregateCommandRequest _makeAggregateCommandRequest(
+        Client* client, std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory);
+
+    ExecutorFuture<void> _reschedule(std::shared_ptr<executor::TaskExecutor> executor,
+                                     const CancellationToken& cancelToken);
+
+    /**
+     * Returns true if the recipient has been configured to estimate the remaining time based on
+     * the exponential moving average of the time it takes to fetch and apply oplog entries.
+     */
+    bool _needToEstimateRemainingTimeBasedOnMovingAverage(OperationContext* opCtx);
+
+    /**
+     * Returns true if the average for time to apply oplog entries needs to be updated, i.e. if the
+     * recipient is in the 'apply' state and it has been more than
+     * 'reshardingExponentialMovingAverageTimeToFetchAndApplyIntervalMillis' since the last update
+     * which is when the last progress mark oplog entry was inserted.
+     */
+    bool _needToUpdateAverageTimeToApply(WithLock, OperationContext* opCtx) const;
+
+    /**
+     * If a progress mark oplog entry with the given timestamp needs to be inserted, returns an
+     * oplog id for it. Otherwise, returns none.
+     */
+    boost::optional<ReshardingDonorOplogId> _makeProgressMarkOplogIdIfNeedToInsert(
+        OperationContext* opCtx, const Timestamp& currBatchLastOplogTs);
+
+    /**
+     * Returns a progress mark noop oplog entry with the given oplog id.
+     */
+    repl::MutableOplogEntry _makeProgressMarkOplog(OperationContext* opCtx,
+                                                   const ReshardingDonorOplogId& oplogId) const;
+
+    ServiceContext* _service() const {
+        return _env->service();
+    }
+
+    std::unique_ptr<Env> _env;
+
+    const UUID _reshardingUUID;
+    const UUID _collUUID;
+    const ShardId _donorShard;
+    const ShardId _recipientShard;
+    const NamespaceString _oplogBufferNss;
+    const bool _storeProgress;
+    const boost::optional<ForwardableOperationMetadata> _forwardableOpMetadata;
+    boost::optional<bool> _supportEstimatingRemainingTimeBasedOnMovingAverage;
+
+    int _numOplogEntriesCopied = 0;
+    Atomic<bool> _oplogApplicationStarted{false};
+
+    // The mutex that protects all the members below.
+    mutable std::mutex _mutex;
+
+    ReshardingDonorOplogId _startAt;
+    boost::optional<Date_t> _lastUpdatedProgressMarkAt;
+
+    Promise<void> _onInsertPromise;
+    Future<void> _onInsertFuture;
+
+    stdx::condition_variable _batchProcessedCV;
+    int _totalNumBatchesProcessed = 0;
+
+    Atomic<bool> _isPreparingForCriticalSection;
+    // The cancellation source for the current aggregation.
+    boost::optional<CancellationSource> _aggCancelSource;
+
+    // For testing to control behavior.
+
+    // The aggregation batch size. This only affects the original call and not `getmore`s.
+    int _initialBatchSize = 0;
+    // Setting to false will omit the `afterClusterTime` and `majority` read concern.
+    bool _useReadConcern = true;
+    // Dictates how many batches get processed before returning control from a call to `consume`.
+    int _maxBatches = -1;
+};
+}  // namespace mongo

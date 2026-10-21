@@ -1,0 +1,301 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/platform/rwmutex.h"
+
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager.h"
+#include "mongo/platform/waitable_atomic.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/processinfo.h"
+
+#include <array>
+#include <mutex>
+#include <shared_mutex>
+#include <vector>
+
+#include <benchmark/benchmark.h>
+
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#define MONGO_SANITIZER_BENCHMARK_BUILD
+#endif
+
+// Only run `ResourceMutex` benchmarks locally since they cause timeouts and other issues in CI.
+#define REGISTER_RESOURCE_MUTEX_BENCHMARKS false
+
+namespace mongo {
+namespace {
+
+template <typename DataType>
+class WriteRarelyRWMutexController {
+public:
+    explicit WriteRarelyRWMutexController(DataType value) {
+        auto lk = _rwMutex.writeLock();
+        _data = value;
+    }
+
+    auto read() const {
+        auto lk = _rwMutex.readLock();
+        return _data;
+    }
+
+private:
+    mutable WriteRarelyRWMutex _rwMutex;
+    DataType _data;
+};
+
+template <typename DataType>
+class SharedMutexController {
+public:
+    explicit SharedMutexController(DataType value) {
+        std::unique_lock lk(_mutex);
+        _data = value;
+    }
+
+    auto read() const {
+        std::shared_lock lk(_mutex);  // NOLINT
+        return _data;
+    }
+
+private:
+    mutable std::shared_mutex _mutex;  // NOLINT
+    DataType _data;
+};
+
+template <typename DataType>
+class MutexController {
+public:
+    explicit MutexController(DataType value) {
+        std::unique_lock lk(_mutex);
+        _data = value;
+    }
+
+    auto read() const {
+        std::unique_lock lk(_mutex);
+        return _data;
+    }
+
+private:
+    mutable std::mutex _mutex;
+    DataType _data;
+};
+
+template <typename DataType>
+class RWMutexController {
+public:
+    explicit RWMutexController(DataType value) {
+        std::unique_lock lk(_mutex);
+        _data = value;
+    }
+
+    auto read() const {
+        std::shared_lock lk(_mutex);  // NOLINT
+        return _data;
+    }
+
+private:
+    mutable RWMutex _mutex;
+    DataType _data;
+};
+
+template <template <class> class ControllerType>
+class RWMutexBm : public benchmark::Fixture {
+public:
+    void run(benchmark::State& state) {
+        for (auto _ : state) {
+            benchmark::DoNotOptimize(_controller.read());
+        }
+    }
+
+private:
+    using DataType = uint64_t;
+    static constexpr DataType kInitialValue = 0xABCDEF;
+    ControllerType<DataType> _controller{kInitialValue};
+};
+
+BENCHMARK_TEMPLATE_DEFINE_F(RWMutexBm, WriteRarelyRWMutex, WriteRarelyRWMutexController)
+(benchmark::State& s) {
+    run(s);
+}
+BENCHMARK_TEMPLATE_DEFINE_F(RWMutexBm, SharedMutex, SharedMutexController)(benchmark::State& s) {
+    run(s);
+}
+BENCHMARK_TEMPLATE_DEFINE_F(RWMutexBm, Mutex, MutexController)(benchmark::State& s) {
+    run(s);
+}
+BENCHMARK_TEMPLATE_DEFINE_F(RWMutexBm, RWMutex, RWMutexController)(benchmark::State& s) {
+    run(s);
+}
+
+const auto kMaxThreads = ProcessInfo::getNumLogicalCores() * 2;
+BENCHMARK_REGISTER_F(RWMutexBm, WriteRarelyRWMutex)->ThreadRange(1, kMaxThreads);
+BENCHMARK_REGISTER_F(RWMutexBm, SharedMutex)->ThreadRange(1, kMaxThreads);
+BENCHMARK_REGISTER_F(RWMutexBm, Mutex)->ThreadRange(1, kMaxThreads);
+BENCHMARK_REGISTER_F(RWMutexBm, RWMutex)->ThreadRange(1, kMaxThreads);
+
+class ResourceMutexBm : public benchmark::Fixture {
+    using DataType = uint64_t;
+    struct ThreadState {
+        ServiceContext::UniqueClient client;
+        ServiceContext::UniqueOperationContext opCtx;
+    };
+
+public:
+    void SetUp(benchmark::State& state) override {
+        std::unique_lock lk(_initializationMutex);
+        if (state.thread_index == 0) {
+            _svcCtx = ServiceContext::make();
+            _locker = std::make_unique<Locker>(_svcCtx.get());
+            _threadStates.reserve(state.threads);
+            for (int i = 0; i < state.threads; i++) {
+                auto client = _svcCtx->getService()->makeClient("ResourceMutexBm");
+                auto opCtx = client->makeOperationContext();
+                _threadStates.emplace_back(std::move(client), std::move(opCtx));
+            }
+            _initializationCv.notify_all();
+        } else {
+            _initializationCv.wait(lk, [&] { return _svcCtx.get() != nullptr; });
+        }
+    }
+
+    void TearDown(benchmark::State& state) override {
+        std::unique_lock lk(_initializationMutex);
+        if (state.thread_index == 0) {
+            _threadStates.clear();
+            _locker.reset();
+            _svcCtx.reset();
+            _initializationCv.notify_all();
+        } else {
+            _initializationCv.wait(lk, [&] { return _svcCtx.get() == nullptr; });
+        }
+    }
+
+    auto read(benchmark::State& state) {
+        auto opCtx = _threadStates[state.thread_index].opCtx.get();
+        LockRequest request;
+        request.initNew(_locker.get(),
+                        nullptr /* No need for a notifier since this won't block. */);
+        Lock::ResourceLock lk(opCtx, _mutex.getRid(), MODE_IS);
+        auto data = _data;
+        return data;
+    }
+
+    void run(benchmark::State& state) {
+        for (auto _ : state) {
+            benchmark::DoNotOptimize(read(state));
+        }
+    }
+
+private:
+    ServiceContext::UniqueServiceContext _svcCtx;
+    std::unique_ptr<Locker> _locker;
+    std::vector<ThreadState> _threadStates;
+
+    ResourceMutex _mutex{"BM_ResourceMutexController"};
+    DataType _data = 0xABCDEF;
+
+    std::mutex _initializationMutex;
+    stdx::condition_variable _initializationCv;
+};
+
+BENCHMARK_DEFINE_F(ResourceMutexBm, ResourceMutex)(benchmark::State& s) {
+    run(s);
+}
+
+#if REGISTER_RESOURCE_MUTEX_BENCHMARKS
+BENCHMARK_REGISTER_F(ResourceMutexBm, ResourceMutex)->ThreadRange(1, kMaxThreads);
+#endif
+
+class RWMutexStressBm : public benchmark::Fixture {
+public:
+    void SetUp(benchmark::State& state) override {
+        auto threads = state.range(0);
+        auto readers = state.range(1);
+
+        _stopped.store(false);
+        _pendingThreads.store(threads);
+        while (threads--) {
+            _threads.emplace_back([&] { _workerBody(threads <= readers); });
+        }
+
+        auto pending = _pendingThreads.load();
+        while (pending > 0) {
+            pending = _pendingThreads.wait(pending);
+        }
+    }
+
+    void TearDown(benchmark::State&) override {
+        _stopped.store(true);
+        _stopped.notifyAll();
+        for (auto& thread : _threads) {
+            thread.join();
+        }
+        _threads.clear();
+    }
+
+    void run(benchmark::State& state) {
+        for (auto _ : state) {
+            auto lk = _rwMutex.writeLock();
+        }
+    }
+
+private:
+    void _workerBody(bool isReader) {
+        // Initialize thread-local state for all worker threads, regardless of what they do next.
+        {
+            auto readLock = _rwMutex.readLock();
+        }
+
+        if (_pendingThreads.subtractAndFetch(1) == 0) {
+            _pendingThreads.notifyAll();
+        }
+
+        if (isReader) {
+            while (!_stopped.load()) {
+                // This is one of the readers, who will keep acquiring and releasing a read lock.
+                auto readLock = _rwMutex.readLock();
+            }
+        } else {
+            _stopped.wait(false);
+        }
+    }
+
+    WaitableAtomic<bool> _stopped;
+    WaitableAtomic<uint32_t> _pendingThreads;
+
+    std::vector<stdx::thread> _threads;
+
+    WriteRarelyRWMutex _rwMutex;
+};
+
+BENCHMARK_DEFINE_F(RWMutexStressBm, Write)(benchmark::State& state) {
+    run(state);
+}
+BENCHMARK_REGISTER_F(RWMutexStressBm, Write)->Apply([](auto* b) {
+/**
+ * Run this in a diminished "correctness check" mode with sanitizers since they do not support a
+ * large number of threads.
+ */
+#ifdef MONGO_SANITIZER_BENCHMARK_BUILD
+    constexpr std::array threadCounts{1};
+    constexpr std::array readerCounts{0, 1};
+#else
+    constexpr std::array threadCounts{1, 10, 100, 1000, 10000, 20000};
+    constexpr std::array readerCounts{0, 1, 2, 4, 8, 16, 32, 64};
+#endif
+
+    b->ArgNames({"Threads", "Readers"});
+
+    for (auto tc : threadCounts) {
+        for (auto rc : readerCounts) {
+            if (rc > tc)
+                break;
+            b->Args({tc, rc});
+        }
+    }
+});
+
+}  // namespace
+}  // namespace mongo

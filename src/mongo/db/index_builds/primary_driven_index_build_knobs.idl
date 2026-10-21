@@ -1,0 +1,62 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::index_builds::primary_driven"
+    mod_visibility: private
+
+server_parameters:
+    primaryDrivenIndexBuildPrefetching:
+        description: "Whether primary-driven index builds use prefetching."
+        set_at:
+            - runtime
+            - startup
+        cpp_varname: prefetching
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+    primaryDrivenIndexBuildScanPhaseContainerWriteMBperSec:
+        description:
+            "Max MB per second that the collection scan phase of a primary-driven index build will
+            spill into the sorter's container. Those spills are replicated container writes, so on
+            disaggregated storage they compete with the foreground workload. Setting it to 0 turns
+            off throttling. The limit applies to the build as a whole, not to each index being
+            built. Spills are paced one container write at a time, so the longest run of
+            unthrottled writes is bounded by
+            'primaryDrivenIndexBuildSorterInsertionBatchBytes'."
+        set_at: [startup, runtime]
+        cpp_varname: scanPhaseContainerWriteMBperSec
+        cpp_vartype: Atomic<int>
+        default: 0
+        validator:
+            gte: 0
+        redact: false
+
+    primaryDrivenIndexBuildIndexTableCleanupBatchBytes:
+        description:
+            "The maximum number of bytes per batch when cleaning up index entries before
+            resuming a primary-driven index build."
+        set_at: [startup, runtime]
+        cpp_varname: indexTableCleanupBatchBytes
+        cpp_vartype: Atomic<long long>
+        default:
+            expr: 4 * 1024 * 1024
+        validator:
+            gte: 1
+        redact: false
+
+    primaryDrivenIndexBuildBulkLoadPhaseContainerWriteMBperSec:
+        description:
+            "Max MB per second that the bulk load phase of a primary-driven index build will write
+            from the sorter into the index table. Setting it to 0 turns off throttling. The
+            limit applies to the index build as a whole, not to each index being built. The limit is
+            charged when the build yields, so the longest run of unthrottled writes is bounded by
+            'internalIndexBuildBulkLoadYieldIterations' keys."
+        set_at: [startup, runtime]
+        cpp_varname: bulkLoadPhaseContainerWriteMBperSec
+        cpp_vartype: Atomic<int>
+        default: 0
+        validator:
+            gte: 0
+        redact: false

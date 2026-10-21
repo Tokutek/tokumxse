@@ -1,0 +1,574 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/common/valuewriter.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/js_regex.h"
+#include "mongo/scripting/mozjs/common/exception.h"
+#include "mongo/scripting/mozjs/common/internedstring.h"
+#include "mongo/scripting/mozjs/common/jsstringwrapper.h"
+#include "mongo/scripting/mozjs/common/objectwrapper.h"
+#include "mongo/scripting/mozjs/common/runtime.h"
+#include "mongo/scripting/mozjs/common/types/bindata.h"
+#include "mongo/scripting/mozjs/common/types/code.h"
+#include "mongo/scripting/mozjs/common/types/dbpointer.h"
+#include "mongo/scripting/mozjs/common/types/maxkey.h"
+#include "mongo/scripting/mozjs/common/types/minkey.h"
+#include "mongo/scripting/mozjs/common/types/nativefunction.h"
+#include "mongo/scripting/mozjs/common/types/numberdecimal.h"
+#include "mongo/scripting/mozjs/common/types/numberint.h"
+#include "mongo/scripting/mozjs/common/types/numberlong.h"
+#include "mongo/scripting/mozjs/common/types/oid.h"
+#include "mongo/scripting/mozjs/common/types/timestamp.h"
+#include "mongo/scripting/mozjs/common/wraptype.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/represent_as.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <new>
+#include <string_view>
+
+#include <jsapi.h>
+#include <jsfriendapi.h>
+#include <jspubtd.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/numeric/conversion/converter_policies.hpp>
+#include <boost/optional/optional.hpp>
+#include <js/Array.h>
+#include <js/ComparisonOperators.h>
+#include <js/Conversions.h>
+#include <js/Date.h>
+#include <js/Object.h>
+#include <js/RegExp.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+
+namespace mongo {
+namespace mozjs {
+
+ValueWriter::ValueWriter(JSContext* cx, JS::HandleValue value)
+    : _context(cx), _value(value), _originalParent(nullptr) {}
+
+void ValueWriter::setOriginalBSON(BSONObj* obj) {
+    _originalParent = obj;
+}
+
+int ValueWriter::type() {
+    if (_value.isNull())
+        return stdx::to_underlying(BSONType::null);
+    if (_value.isUndefined())
+        return stdx::to_underlying(BSONType::undefined);
+    if (_value.isString())
+        return stdx::to_underlying(BSONType::string);
+
+    bool isArray;
+
+    if (!JS::IsArrayObject(_context, _value, &isArray)) {
+        uasserted(ErrorCodes::BadValue, "unable to check if type is an array");
+    }
+    if (isArray) {
+        return stdx::to_underlying(BSONType::array);
+    }
+
+    if (_value.isBoolean()) {
+        return stdx::to_underlying(BSONType::boolean);
+    }
+
+    // We could do something more sophisticated here by checking to see if we
+    // round trip through int32_t, int64_t and double and picking a type that
+    // way, for now just always come back as double for numbers though (it's
+    // what we did for v8)
+    if (_value.isNumber()) {
+        return stdx::to_underlying(BSONType::numberDouble);
+    }
+
+    if (_value.isObject()) {
+        JS::RootedObject obj(_context, _value.toObjectOrNull());
+
+        bool isDate;
+        if (!JS::ObjectIsDate(_context, obj, &isDate)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is a date");
+        }
+        if (isDate) {
+            return stdx::to_underlying(BSONType::date);
+        }
+
+        bool isRegExp;
+        if (!JS::ObjectIsRegExp(_context, obj, &isRegExp)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is a regexp");
+        }
+        if (isRegExp) {
+            return stdx::to_underlying(BSONType::regEx);
+        }
+
+        if (js::IsFunctionObject(obj)) {
+            return stdx::to_underlying(BSONType::code);
+        }
+
+        if (auto jsClass = JS::GetClass(obj)) {
+            auto runtime = getCommonRuntime(_context);
+            if (runtime->numberIntProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::numberInt);
+            } else if (runtime->numberLongProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::numberLong);
+            } else if (runtime->numberDecimalProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::numberDecimal);
+            } else if (runtime->oidProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::oid);
+            } else if (runtime->binDataProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::binData);
+            } else if (runtime->timestampProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::timestamp);
+            } else if (runtime->minKeyProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::minKey);
+            } else if (runtime->maxKeyProto().getJSClass() == jsClass) {
+                return stdx::to_underlying(BSONType::maxKey);
+            }
+        }
+
+        return stdx::to_underlying(BSONType::object);
+    }
+
+    uasserted(ErrorCodes::BadValue, "unable to get type");
+}
+
+std::string ValueWriter::typeAsString() {
+    if (_value.isNull())
+        return "null";
+    if (_value.isUndefined())
+        return "undefined";
+    if (_value.isString())
+        return "string";
+
+    bool isArray;
+
+    if (!JS::IsArrayObject(_context, _value, &isArray)) {
+        uasserted(ErrorCodes::BadValue, "unable to check if type is an array");
+    }
+
+    if (isArray)
+        return "array";
+    if (_value.isBoolean())
+        return "boolean";
+    if (_value.isNumber())
+        return "number";
+
+    if (_value.isObject()) {
+        JS::RootedObject obj(_context, _value.toObjectOrNull());
+
+        if (!JS::IsArrayObject(_context, obj, &isArray)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is an array");
+        }
+        if (isArray)
+            return "array";
+
+        bool isDate;
+
+        if (!JS::ObjectIsDate(_context, obj, &isDate)) {
+            uasserted(ErrorCodes::BadValue, "unable to check if type is a date");
+        }
+        if (isDate)
+            return "date";
+
+        if (js::IsFunctionObject(obj))
+            return "function";
+
+        return ObjectWrapper(_context, _value).getClassName();
+    }
+
+    uasserted(ErrorCodes::BadValue, "unable to get type");
+}
+
+BSONObj ValueWriter::toBSON() {
+    if (!_value.isObject())
+        return BSONObj();
+
+    JS::RootedObject obj(_context, _value.toObjectOrNull());
+
+    return ObjectWrapper(_context, obj).toBSON();
+}
+
+std::string ValueWriter::toString() {
+    JSStringWrapper jsstr;
+    return std::string{toStringData(&jsstr)};
+}
+
+std::string_view ValueWriter::toStringData(JSStringWrapper* jsstr) {
+    *jsstr = JSStringWrapper(_context, JS::ToString(_context, _value));
+    return jsstr->toStringData();
+}
+
+double ValueWriter::toNumber() {
+    double out;
+    if (JS::ToNumber(_context, _value, &out))
+        return out;
+
+    throwCurrentJSException(_context, ErrorCodes::BadValue, "Failure to convert value to number");
+}
+
+bool ValueWriter::toBoolean() {
+    return JS::ToBoolean(_value);
+}
+
+int32_t ValueWriter::toInt32() {
+    int32_t out;
+    if (JS::ToInt32(_context, _value, &out))
+        return out;
+
+    throwCurrentJSException(_context, ErrorCodes::BadValue, "Failure to convert value to number");
+}
+
+int64_t ValueWriter::toInt64() {
+    int64_t out;
+    if (getCommonRuntime(_context)->numberLongProto().instanceOf(_value))
+        return NumberLongInfo::ToNumberLong(_context, _value);
+
+    if (JS::ToInt64(_context, _value, &out))
+        return out;
+
+    throwCurrentJSException(_context, ErrorCodes::BadValue, "Failure to convert value to number");
+}
+
+Decimal128 ValueWriter::toDecimal128() {
+    std::uint32_t signalingFlags = 0;
+    if (_value.isNumber()) {
+        return Decimal128(toNumber(), Decimal128::kRoundTo15Digits);
+    }
+    if (getCommonRuntime(_context)->numberIntProto().instanceOf(_value))
+        return Decimal128(NumberIntInfo::ToNumberInt(_context, _value));
+
+    if (getCommonRuntime(_context)->numberLongProto().instanceOf(_value))
+        return Decimal128(static_cast<int64_t>(NumberLongInfo::ToNumberLong(_context, _value)));
+
+    if (getCommonRuntime(_context)->numberDecimalProto().instanceOf(_value))
+        return NumberDecimalInfo::ToNumberDecimal(_context, _value);
+
+    if (_value.isString()) {
+        std::string input = toString();
+        Decimal128 decimal = Decimal128(input, &signalingFlags);
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Input is not a valid Decimal128 value.",
+                !Decimal128::hasFlag(signalingFlags, Decimal128::SignalingFlag::kInvalid));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Input out of range of Decimal128 value (inexact).",
+                !Decimal128::hasFlag(signalingFlags, Decimal128::SignalingFlag::kInexact));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Input out of range of Decimal128 value (underflow).",
+                !Decimal128::hasFlag(signalingFlags, Decimal128::SignalingFlag::kUnderflow));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Input out of range of Decimal128 value (overflow).",
+                !Decimal128::hasFlag(signalingFlags, Decimal128::SignalingFlag::kOverflow));
+
+        return decimal;
+    }
+    uasserted(ErrorCodes::BadValue, str::stream() << "Unable to write Decimal128 value.");
+}
+
+OID ValueWriter::toOID() {
+    if (getCommonRuntime(_context)->oidProto().instanceOf(_value)) {
+        return OIDInfo::getOID(
+            _context, _value, getCommonRuntime(_context)->oidProto().getJSClass());
+    }
+
+    throwCurrentJSException(_context, ErrorCodes::BadValue, "Unable to write ObjectId value.");
+}
+
+void ValueWriter::toBinData(std::function<void(const BSONBinData&)> withBinData) {
+    if (!getCommonRuntime(_context)->binDataProto().instanceOf(_value)) {
+        throwCurrentJSException(_context, ErrorCodes::BadValue, "Unable to write BinData value.");
+    }
+
+    JS::RootedObject obj(_context, _value.toObjectOrNull());
+    ObjectWrapper wrapper(_context, obj);
+    auto subType = wrapper.getNumber(InternedString::type);
+    uassert(6123400, "BinData sub type must be between 0 and 255", subType >= 0 && subType <= 255);
+
+    auto binDataStr =
+        JS::GetMaybePtrFromReservedSlot<std::string>(obj, BinDataInfo::BinDataStringSlot);
+    uassert(ErrorCodes::BadValue, "Cannot call getter on BinData prototype", binDataStr);
+
+    auto binData = base64::decode(*binDataStr);
+    withBinData(BSONBinData(
+        binData.c_str(), binData.size(), static_cast<BinDataType>(static_cast<int>(subType))));
+}
+
+Timestamp ValueWriter::toTimestamp() {
+    JS::RootedObject obj(_context, _value.toObjectOrNull());
+
+    uassert(ErrorCodes::BadValue,
+            "Unable to write Timestamp value.",
+            getCommonRuntime(_context)->timestampProto().getJSClass() == JS::GetClass(obj));
+
+    return TimestampInfo::getValidatedValue(_context, obj);
+}
+
+JSRegEx ValueWriter::toRegEx() {
+    JS::RootedObject regExpObj(_context, _value.toObjectOrNull());
+    uassert(12748201, "Invalid regular expression", regExpObj);
+    JS::RootedString regExpSource(_context, JS::GetRegExpSource(_context, regExpObj));
+    uassert(12748202, "Failed to get regex source", regExpSource);
+    JSStringWrapper regExpSourceWrapper(_context, regExpSource);
+    JS::RegExpFlags regExpFlags = JS::GetRegExpFlags(_context, regExpObj);
+    std::string flags;
+    if (regExpFlags.global())
+        flags += 'g';
+    if (regExpFlags.ignoreCase())
+        flags += 'i';
+    if (regExpFlags.multiline())
+        flags += 'm';
+    if (regExpFlags.dotAll())
+        flags += 's';
+    if (regExpFlags.unicode())
+        flags += 'u';
+    if (regExpFlags.sticky())
+        flags += 'y';
+    return JSRegEx(regExpSourceWrapper.toString(), flags);
+}
+
+void ValueWriter::writeThis(BSONObjBuilder* b,
+                            std::string_view sd,
+                            ObjectWrapper::WriteFieldRecursionFrames* frames) {
+    uassert(17279,
+            str::stream() << "Exceeded depth limit of " << ObjectWrapper::kMaxWriteFieldDepth
+                          << " when converting js object to BSON. Do you have a cycle?",
+            frames->size() < ObjectWrapper::kMaxWriteFieldDepth);
+
+    // Null char should be at the end, not in the string
+    uassert(16985,
+            str::stream() << "JavaScript property (name) contains a null char "
+                          << "which is not allowed in BSON. "
+                          << (_originalParent ? _originalParent->jsonString() : ""),
+            (std::string::npos == sd.find('\0')));
+
+    if (_value.isString()) {
+        JSStringWrapper jsstr;
+        b->append(sd, toStringData(&jsstr));
+    } else if (_value.isNumber()) {
+        double val = toNumber();
+
+        // if previous type was integer, attempt to represent 'val' as an integer
+        auto intval = representAs<int>(val);
+
+        if (intval && _originalParent) {
+            // This makes copying an object of numbers O(n**2) :(
+            BSONElement elmt = _originalParent->getField(sd);
+            if (elmt.type() == BSONType::numberInt) {
+                b->append(sd, *intval);
+                return;
+            }
+        }
+
+        b->append(sd, val);
+    } else if (_value.isObject()) {
+        _writeObject(b, sd, frames);
+    } else if (_value.isBoolean()) {
+        b->appendBool(sd, _value.toBoolean());
+    } else if (_value.isUndefined()) {
+        b->appendUndefined(sd);
+    } else if (_value.isNull()) {
+        b->appendNull(sd);
+    } else {
+        uasserted(16662,
+                  str::stream() << "unable to convert JavaScript property to mongo element " << sd);
+    }
+}
+
+void ValueWriter::_writeObject(BSONObjBuilder* b,
+                               std::string_view sd,
+                               ObjectWrapper::WriteFieldRecursionFrames* frames) {
+    auto runtime = getCommonRuntime(_context);
+
+    // We open a block here because it's important that the two rooting types
+    // we need (obj and o) go out of scope before we actually open a
+    // new WriteFieldFrame (in the emplace at the bottom of the function). If
+    // we don't do this, we'll destroy the local roots in this function body
+    // before the frame we added, which will break the gc rooting list.
+    {
+        JS::RootedObject obj(_context, _value.toObjectOrNull());
+        ObjectWrapper o(_context, obj);
+
+        auto jsclass = JS::GetClass(obj);
+
+        if (jsclass) {
+            if (runtime->oidProto().getJSClass() == jsclass) {
+                b->append(sd, OIDInfo::getOID(_context, obj, runtime->oidProto().getJSClass()));
+
+                return;
+            }
+
+            if (runtime->numberLongProto().getJSClass() == jsclass) {
+                long long out = NumberLongInfo::ToNumberLong(_context, obj);
+                b->append(sd, out);
+
+                return;
+            }
+
+            if (runtime->numberIntProto().getJSClass() == jsclass) {
+                b->append(sd, NumberIntInfo::ToNumberInt(_context, obj));
+
+                return;
+            }
+
+            if (runtime->codeProto().getJSClass() == jsclass) {
+                if (o.hasOwnField(InternedString::scope)  // CodeWScope
+                    && o.type(InternedString::scope) == stdx::to_underlying(BSONType::object)) {
+                    if (o.type(InternedString::code) != stdx::to_underlying(BSONType::string)) {
+                        uasserted(ErrorCodes::BadValue, "code must be a string");
+                    }
+
+                    b->appendCodeWScope(
+                        sd, o.getString(InternedString::code), o.getObject(InternedString::scope));
+                } else {  // Code
+                    if (o.type(InternedString::code) != stdx::to_underlying(BSONType::string)) {
+                        uasserted(ErrorCodes::BadValue, "code must be a string");
+                    }
+
+                    b->appendCode(sd, o.getString(InternedString::code));
+                }
+                return;
+            }
+
+            if (runtime->numberDecimalProto().getJSClass() == jsclass) {
+                b->append(sd, NumberDecimalInfo::ToNumberDecimal(_context, obj));
+
+                return;
+            }
+
+            if (runtime->dbPointerProto().getJSClass() == jsclass) {
+                uassert(ErrorCodes::BadValue,
+                        "can't serialize DBPointer prototype",
+                        runtime->dbPointerProto().getProto() != obj);
+
+                JS::RootedValue id(_context);
+                o.getValue("id", &id);
+
+                uassert(
+                    ErrorCodes::BadValue, "DBPointer ObjectID must be and object", id.isObject());
+
+                b->appendDBRef(sd,
+                               o.getString("ns"),
+                               OIDInfo::getOID(_context, id, runtime->oidProto().getJSClass()));
+
+                return;
+            }
+
+            if (runtime->binDataProto().getJSClass() == jsclass) {
+                auto str = JS::GetMaybePtrFromReservedSlot<std::string>(
+                    obj, BinDataInfo::BinDataStringSlot);
+
+                uassert(ErrorCodes::BadValue, "Cannot call getter on BinData prototype", str);
+
+                auto binData = base64::decode(*str);
+
+                auto subType = o.getNumber(InternedString::type);
+                uassert(5677700,
+                        "BinData sub type must be between 0 and 255",
+                        subType >= 0 && subType <= 255);
+
+                b->appendBinData(sd,
+                                 binData.size(),
+                                 static_cast<BinDataType>(static_cast<int>(subType)),
+                                 binData.c_str());
+
+                return;
+            }
+
+            if (runtime->timestampProto().getJSClass() == jsclass) {
+                Timestamp ot = TimestampInfo::getValidatedValue(_context, obj);
+                b->append(sd, ot);
+
+                return;
+            }
+
+            if (runtime->minKeyProto().getJSClass() == jsclass) {
+                b->appendMinKey(sd);
+
+                return;
+            }
+
+            if (runtime->maxKeyProto().getJSClass() == jsclass) {
+                b->appendMaxKey(sd);
+
+                return;
+            }
+        }
+
+        auto protoKey = JS::IdentifyStandardInstanceOrPrototype(obj);
+
+        switch (protoKey) {
+            case JSProto_Function: {
+                uassert(16716,
+                        "cannot convert native function to BSON",
+                        !runtime->nativeFunctionProto().instanceOf(obj));
+                JSStringWrapper jsstr;
+                b->appendCode(sd, ValueWriter(_context, _value).toStringData(&jsstr));
+                return;
+            }
+            case JSProto_RegExp: {
+                if (JS::IdentifyStandardPrototype(obj) == JSProto_RegExp) {
+                    b->appendRegex(sd, "(?:)", "");
+                    return;
+                }
+                JS::RootedObject reObj(_context, obj);
+                JS::RootedString src(_context, JS::GetRegExpSource(_context, reObj));
+                uassert(ErrorCodes::BadValue, "failed to get RegExp source", src);
+                JSStringWrapper srcWrapper(_context, src);
+                std::string r(srcWrapper.toStringData());
+                JS::RegExpFlags jsFlags = JS::GetRegExpFlags(_context, reObj);
+                std::string o;
+                if (jsFlags.global())
+                    o += 'g';
+                if (jsFlags.ignoreCase())
+                    o += 'i';
+                if (jsFlags.multiline())
+                    o += 'm';
+                if (jsFlags.dotAll())
+                    o += 's';
+                if (jsFlags.unicode())
+                    o += 'u';
+                if (jsFlags.sticky())
+                    o += 'y';
+                b->appendRegex(sd, r, o);
+                return;
+            }
+            case JSProto_Date: {
+                Date_t d;
+                if (JS::IdentifyStandardPrototype(obj) == JSProto_Date) {
+                    d = Date_t::fromMillisSinceEpoch(0);
+                } else {
+                    JS::RootedValue dateval(_context);
+                    o.callMethod("getTime", &dateval);
+                    // getTime() returns NaN for invalid Date objects (constructed from
+                    // out-of-range values or non-parseable strings). JS::ToInt64(NaN) = 0
+                    // per ECMAScript spec, so invalid dates silently become epoch 0 in BSON.
+                    // TODO SERVER-126786: investigate whether to throw instead, consistent with
+                    // NumberLong which already rejects NaN via representAs<int64_t>().
+                    d = Date_t::fromMillisSinceEpoch(ValueWriter(_context, dateval).toInt64());
+                }
+
+                b->appendDate(sd, d);
+
+                return;
+            }
+            default:
+                break;
+        }
+    }
+
+    // nested object or array
+
+    // This emplace is effectively a recursive function call, as this code path
+    // unwinds back to ObjectWrapper::toBSON. In that function we'll actually
+    // write the child we've just pushed onto the frames stack.
+    frames->emplace(_context, _value.toObjectOrNull(), b, sd);
+}
+
+}  // namespace mozjs
+}  // namespace mongo

@@ -1,0 +1,346 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_stats/aggregated_metric.h"
+#include "mongo/db/query/query_stats/key.h"
+#include "mongo/db/query/query_stats/plan_shape_counters/plan_shape_counts.h"
+#include "mongo/db/query/query_stats/supplemental_metrics_stats.h"
+#include "mongo/util/lru_cache.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+
+#include <cstdint>
+#include <memory>
+
+namespace mongo::query_stats {
+
+/**
+ * Value stored for one error code recently seen for a query shape.
+ */
+struct QueryStatsErrorEntry {
+    uint64_t count = 0;
+    Date_t latestSeenTimestamp;
+};
+
+struct CursorEntry {
+    void toBSON(BSONObjBuilder& queryStatsBuilder, bool buildAsSubsection) const;
+
+    /**
+     * Aggregates the time for execution for first batch only.
+     */
+    AggregatedMetric<uint64_t> firstResponseExecMicros;
+};
+
+struct QueryExecEntry {
+    void toBSON(BSONObjBuilder& queryStatsBuilder, bool buildAsSubsection) const;
+
+    /**
+     * Aggregates the number of documents returned for the query including getMore requests.
+     */
+    AggregatedMetric<uint64_t> docsReturned;
+
+    /**
+     * Aggregates the number of keys examined including getMore requests.
+     */
+    AggregatedMetric<uint64_t> keysExamined;
+
+    /**
+     * Aggregates the number of documents examined including getMore requests.
+     */
+    AggregatedMetric<uint64_t> docsExamined;
+
+    /**
+     * Aggregates the number of bytes read including getMore requests.
+     */
+    AggregatedMetric<uint64_t> bytesRead;
+
+    /**
+     * Aggregates the amount of time spent reading from storage including getMore requests.
+     */
+    AggregatedMetric<int64_t> readTimeMicros;
+
+    /**
+     * Aggregates the delinquent acquisitions stats including getMore requests.
+     */
+    AggregatedMetric<uint64_t> delinquentAcquisitions;
+    AggregatedMetric<int64_t> totalAcquisitionDelinquencyMillis;
+    AggregatedMetric<int64_t> maxAcquisitionDelinquencyMillis;
+
+    /**
+     * Aggregates the execution control stats.
+     */
+    AggregatedMetric<int64_t> totalTimeQueuedMicros;
+    AggregatedMetric<uint64_t> totalAdmissions;
+    AggregatedBool wasLoadShed;
+    AggregatedBool wasDeprioritized;
+    AggregatedBool wasMarkedNonDeprioritizable;
+
+    /**
+     * Aggregates the checkForInterrupt stats including getMore requests.
+     */
+    AggregatedMetric<uint64_t> numInterruptChecksPerSec;
+    AggregatedMetric<int64_t> overdueInterruptApproxMaxMillis;
+
+    /**
+     * Aggregates the local peak tracked memory usage in bytes.
+     */
+    AggregatedMetric<uint64_t> peakTrackedMemBytes;
+
+    /**
+     * Aggregates the total peak tracked memory usage in bytes (sum of local
+     * peak + per-shard peak when node is acting as a router).
+     */
+    AggregatedMetric<uint64_t> clusterPeakTrackedMemBytes;
+};
+
+struct CostBasedRankerEntry {
+    void toBSON(BSONObjBuilder& queryStatsBuilder) const;
+
+    /**
+     * Aggregates the cardinality estimation methods used across all executions.
+     * Each method maps to a count of how many times it was used.
+     */
+    AggregatedCardinalityEstimationMethods cardinalityEstimationMethods;
+
+    /**
+     * Aggregates the number of documents sampled by the cost-based ranker.
+     */
+    AggregatedMetric<uint64_t> nDocsSampled;
+};
+
+struct QueryPlannerEntry {
+    void toBSON(BSONObjBuilder& queryStatsBuilder,
+                bool buildAsSubsection,
+                bool includeCBRMetrics) const;
+
+    /**
+     * Aggregates the number of queries that used a sort stage including getMore requests.
+     */
+    AggregatedBool hasSortStage;
+
+    /**
+     * Aggregates the number of queries that used disk including getMore requests.
+     */
+    AggregatedBool usedDisk;
+
+    /**
+     * Aggregates the number of queries that used the multi-planner including getMore requests.
+     */
+    AggregatedBool fromMultiPlanner;
+
+    /**
+     * Aggregates the number of queries that used the plan cache including getMore requests.
+     */
+    AggregatedBool fromPlanCache;
+
+    /**
+     * Aggregates the planning time in microseconds including getMore requests.
+     */
+    AggregatedMetric<int64_t> planningTimeMicros;
+
+    /**
+     * Query stats relevant to the cost based ranker. This is only
+     * collected if includeCBRMetrics is true.
+     */
+    CostBasedRankerEntry costBasedRankerStats;
+
+    /**
+     * Aggregates the winning plan shapes observed across all executions of this query shape.
+     */
+    plan_shape_counters::PlanShapeCounts planShapeCounters;
+};
+
+struct WritesEntry {
+    void toBSON(BSONObjBuilder& queryStatsBuilder) const;
+
+    /**
+     * Aggregates the number of documents selected by an update command.
+     */
+    AggregatedMetric<uint64_t> nMatched;
+
+    /**
+     * Aggregates the number of documents inserted by an upsert.
+     */
+    AggregatedMetric<uint64_t> nUpserted;
+
+    /**
+     * Aggregates the number of existing documents updated.
+     */
+    AggregatedMetric<uint64_t> nModified;
+
+    /**
+     * Aggregates the number of documents deleted.
+     */
+    AggregatedMetric<uint64_t> nDeleted;
+
+    /**
+     * Aggregates the number of documents inserted (excluding upserts).
+     */
+    AggregatedMetric<uint64_t> nInserted;
+
+    /**
+     * Aggregates the total number of update operations in the update request.
+     */
+    AggregatedMetric<uint64_t> nUpdateOps;
+
+    /**
+     * Aggregates the total number of delete operations in the delete request.
+     */
+    AggregatedMetric<uint64_t> nDeleteOps;
+
+    /**
+     * Aggregates the number of index keys inserted as part of index maintenance for the write.
+     * Sourced from the OpDebug additive metrics.
+     */
+    AggregatedMetric<uint64_t> keysInserted;
+
+    /**
+     * Aggregates the number of index keys deleted as part of index maintenance for the write.
+     * Sourced from the OpDebug additive metrics.
+     */
+    AggregatedMetric<uint64_t> keysDeleted;
+};
+
+/**
+ * The value stored in the query stats store. It contains a Key representing this "kind" of
+ * query, and some metrics about that shape. This class is responsible for knowing its size and
+ * updating our server status metrics about the size of the query stats store accordingly. At the
+ * time of this writing, the LRUCache utility does not easily expose its size in a way we could use
+ * as server status metrics.
+ */
+struct QueryStatsEntry {
+    QueryStatsEntry(std::unique_ptr<const Key> key_)
+        : firstSeenTimestamp(Date_t::now()),
+          // 'internalQueryStatsMaxErrorCodesPerShape' is a startup-only knob, so the bound is fixed
+          // for the lifetime of the process and can be handed to the cache to enforce itself.
+          recentErrors(static_cast<size_t>(internalQueryStatsMaxErrorCodesPerShape.load())),
+          reservedErrorBudgetBytes(
+              feature_flags::gFeatureFlagQueryStatsErrors.checkEnabled()
+                  ? static_cast<size_t>(internalQueryStatsMaxErrorCodesPerShape.load()) *
+                      kApproxBytesPerRecentError
+                  : 0),
+          key(std::move(key_)) {}
+
+    BSONObj toBSON(bool buildSubsections = false,
+                   bool includeWriteMetrics = false,
+                   bool includeCBRMetrics = false,
+                   bool includeErrorMetrics = false) const;
+
+    /**
+     * Timestamp for when this query shape was added to the store. Set on construction.
+     */
+    const Date_t firstSeenTimestamp;
+
+    /**
+     * Timestamp for when the latest time this query shape was seen.
+     */
+    Date_t latestSeenTimestamp;
+
+    /**
+     * Last execution time in microseconds.
+     */
+    uint64_t lastExecutionMicros = 0;
+
+    /**
+     * Number of successful query executions.
+     */
+    uint64_t execCount = 0;
+
+    /**
+     * Number of executions that completed with an error.
+     */
+    uint64_t execCountErrored = 0;
+
+    /**
+     * Records in 'recentErrors' that an execution of this shape failed with error code 'code',
+     * bumping 'execCountErrored'. The number of distinct codes retained is bounded by the
+     * 'internalQueryStatsMaxErrorCodesPerShape' startup parameter: once the cache is full, the
+     * least-recently-seen code is evicted.
+     */
+    void recordErrorCode(ErrorCodes::Error code);
+
+    /**
+     * The most recent distinct error codes seen for this shape, keyed by error code, ordered
+     * most-recently-seen first. Bounded to 'internalQueryStatsMaxErrorCodesPerShape' entries.
+     */
+    LRUCache<ErrorCodes::Error, QueryStatsErrorEntry> recentErrors;
+
+    /**
+     * Approximate heap cost of a single 'recentErrors' cache entry. LRUCache stores each entry in a
+     * std::list and additionally indexes it by key in an unordered_map, so each entry costs:
+     * - one std::list node holding the {code, {count, timestamp}} pair + the list link pointers.
+     * - one unordered_map node holding the key and an iterator into the list.
+     * - that element's share of the map's table. The table is open-addressed rather than chained,
+     *   costing one slot pointer plus one control byte per slot. Capacity is 2^k - 1 held to 7/8
+     *   load, so an element accounts for at most two slots.
+     */
+    static constexpr size_t kApproxBytesPerRecentError =
+        sizeof(std::pair<ErrorCodes::Error, QueryStatsErrorEntry>) + 2 * sizeof(void*) +  // list
+        sizeof(std::pair<const ErrorCodes::Error, void*>) +  // map node
+        2 * (sizeof(void*) + 1);                             // map slots
+
+    /**
+     * Worst-case memory reserved for 'recentErrors' in the store budget. Non-zero only if
+     'featureFlagQueryStatsErrors' was enabled when this entry was created.
+     */
+    const size_t reservedErrorBudgetBytes;
+
+    /**
+     * Aggregates the total time for execution including getMore requests.
+     */
+    AggregatedMetric<uint64_t> totalExecMicros;
+
+    /**
+     * Aggregates the executing time (excluding time spent blocked) including getMore requests.
+     */
+    AggregatedMetric<int64_t> workingTimeMillis;
+
+    /**
+     * Aggregates the executing time including getMore requests.
+     */
+    AggregatedMetric<int64_t> cpuNanos;
+
+    /**
+     * Metrics relevant to the cursor and batching protocol
+     */
+    CursorEntry cursorStats;
+
+    /**
+     * Metrics related to query execution.
+     */
+    QueryExecEntry queryExecStats;
+
+    /**
+     * Metrics related to query planner.
+     */
+    QueryPlannerEntry queryPlannerStats;
+
+    /**
+     * The Key that can generate the query stats key for this request.
+     */
+    std::shared_ptr<const Key> key;
+
+    /**
+     * Adds supplemental metric to supplementalStatsMap.
+     */
+    void addSupplementalStats(std::unique_ptr<SupplementalStatsEntry> metric);
+
+    /**
+     * Supplemental metrics. The data structure is not allocated and the pointer is null if
+     * optional metrics are not collected.
+     */
+    clonable_ptr<SupplementalStatsMap> supplementalStatsMap;
+
+    /**
+     * Metrics related to writes.
+     */
+    WritesEntry writesStats;
+};
+
+}  // namespace mongo::query_stats

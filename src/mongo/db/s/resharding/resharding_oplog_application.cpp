@@ -1,0 +1,596 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/s/resharding/resharding_oplog_application.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/batched_write_context.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/write_ops/canonical_delete.h"
+#include "mongo/db/query/write_ops/delete.h"
+#include "mongo/db/query/write_ops/delete_request_gen.h"
+#include "mongo/db/query/write_ops/update.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/s/resharding/resharding_data_copy_util.h"
+#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/exceptions.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/transaction_operations.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
+namespace mongo {
+namespace {
+Date_t getDeadline(OperationContext* opCtx) {
+    return opCtx->getServiceContext()->getPreciseClockSource()->now() +
+        Milliseconds(resharding::gReshardingOplogApplierMaxLockRequestTimeoutMillis.load());
+}
+
+CollectionAcquisition acquireCollectionAndAssertExists(OperationContext* opCtx,
+                                                       const NamespaceString& collNss) {
+    auto acquiredColl =
+        acquireCollection(opCtx,
+                          CollectionAcquisitionRequest::fromOpCtx(
+                              opCtx, collNss, AcquisitionPrerequisites::kWrite, getDeadline(opCtx)),
+                          MODE_IX);
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Failed to apply op during resharding due to missing collection "
+                          << collNss.toStringForErrorMsg(),
+            acquiredColl.exists());
+
+    return acquiredColl;
+}
+
+}  // namespace
+
+ReshardingOplogApplicationRules::ReshardingOplogApplicationRules(
+    NamespaceString outputNss,
+    std::vector<NamespaceString> allStashNss,
+    size_t myStashIdx,
+    ShardId donorShardId,
+    ChunkManager sourceChunkMgr,
+    ReshardingOplogApplierMetrics* applierMetrics,
+    bool isCapped)
+    : _outputNss(std::move(outputNss)),
+      _allStashNss(std::move(allStashNss)),
+      _myStashIdx(myStashIdx),
+      _myStashNss(_allStashNss.at(_myStashIdx)),
+      _donorShardId(std::move(donorShardId)),
+      _sourceChunkMgr(std::move(sourceChunkMgr)),
+      _applierMetrics(applierMetrics),
+      _isCapped(isCapped) {}
+
+Status ReshardingOplogApplicationRules::applyOperation(OperationContext* opCtx,
+                                                       const repl::OplogEntry& op) const {
+    LOGV2_DEBUG(49901, 3, "Applying op for resharding", "op"_attr = redact(op.toBSONForLogging()));
+
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
+    invariant(opCtx->writesAreReplicated());
+
+    return writeConflictRetry(opCtx, "applyOplogEntryCRUDOpResharding", op.getNss(), [&] {
+        try {
+            auto opType = op.getOpType();
+            switch (opType) {
+                case repl::OpTypeEnum::kInsert:
+                case repl::OpTypeEnum::kUpdate:
+                    _applyInsertOrUpdate(opCtx, op);
+                    break;
+                case repl::OpTypeEnum::kDelete: {
+                    _applyDelete(opCtx, op);
+                    _applierMetrics->onDeleteApplied();
+                    break;
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            }
+            return Status::OK();
+        } catch (const DBException& ex) {
+            if (ex.code() == ErrorCodes::WriteConflict) {
+                throwWriteConflictException("Conflict when applying an oplog entry.");
+            }
+
+            if (ex.code() == ErrorCodes::LockTimeout) {
+                throwWriteConflictException("Timeout when applying an oplog entry.");
+            }
+
+            return ex.toStatus();
+        }
+    });
+}
+
+bool canBatchedWritesCommit(OperationContext* opCtx) {
+    auto& batchedWriteContext = BatchedWriteContext::get(opCtx);
+    return batchedWriteContext.writesAreBatched() &&
+        !batchedWriteContext.getBatchedOperations(opCtx)->isEmpty();
+}
+
+void ReshardingOplogApplicationRules::_applyInsertOrUpdate(OperationContext* opCtx,
+                                                           const repl::OplogEntry& op) const {
+
+    WriteUnitOfWork wuow(opCtx);
+
+    auto outputColl = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _outputNss, AcquisitionPrerequisites::kWrite, getDeadline(opCtx)),
+        MODE_IX);
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Failed to apply op during resharding due to missing collection "
+                          << _outputNss.toStringForErrorMsg(),
+            outputColl.exists());
+    auto stashColl = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _myStashNss, AcquisitionPrerequisites::kWrite, getDeadline(opCtx)),
+        MODE_IX);
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Failed to apply op during resharding due to missing collection "
+                          << _myStashNss.toStringForErrorMsg(),
+            stashColl.exists());
+
+    auto opType = op.getOpType();
+    switch (opType) {
+        case repl::OpTypeEnum::kInsert:
+            _applyInsert_inlock(opCtx, outputColl, stashColl, op);
+            _applierMetrics->onInsertApplied();
+            break;
+        case repl::OpTypeEnum::kUpdate:
+            _applyUpdate_inlock(opCtx, outputColl, stashColl, op);
+            _applierMetrics->onUpdateApplied();
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    bool allowBatchedWritesToCommit = canBatchedWritesCommit(opCtx);
+
+    // Batched writes are assigned their timestamp upon committing, unlike regular writes. In the
+    // Primary Driven Index Builds mode, write operations are combined into batches instead of being
+    // processed individually.
+    if (shard_role_details::getRecoveryUnit(opCtx)->isTimestamped() || allowBatchedWritesToCommit) {
+        // Resharding oplog application does two kinds of writes:
+        //
+        // 1) The (obvious) write for applying oplog entries to documents being resharded.
+        // 2) A find on document in the output collection transformed into an unreplicated no-op
+        // write on the same document to ensure serialization of concurrent oplog appliers reading
+        // on the same doc.
+        //
+        // Some of the code paths can end up where only the second kind of write is made. In
+        // that case, there is no timestamp associated with the write. This results in a
+        // mixed-mode update chain within WT that is problematic with durable history. We
+        // roll back those transactions by only committing the `WriteUnitOfWork` when there
+        // is a timestamp set.
+        wuow.commit();
+    }
+}
+
+void ReshardingOplogApplicationRules::_applyInsert_inlock(OperationContext* opCtx,
+                                                          CollectionAcquisition& outputColl,
+                                                          CollectionAcquisition& stashColl,
+                                                          const repl::OplogEntry& op) const {
+    /**
+     * The rules to apply ordinary insert operations are as follows:
+     *
+     * Note that [op _id] refers to the value of op["o"]["_id"].
+     *
+     * 1. If there exists a document with _id == [op _id] in the conflict stash collection, replace
+     * the contents of the doc in the conflict stash collection for this donor shard with the
+     * contents of 'op'.
+     * 2. If there does NOT exist a document with _id == [op _id] in the output collection, insert
+     * the contents of 'op' into the output collection.
+     * 3. If there exists a document with _id == [op _id] in the output collection and it is owned
+     * by this donor shard, replace the contents of the doc in the output collection with the
+     * contents of 'op'.
+     * 4. If there exists a document with _id == [op _id] in the output collection and it is NOT
+     * owned by this donor shard, insert the contents of 'op' into the conflict stash collection.
+     */
+
+    BSONObj oField = op.getObject();
+
+    // If the 'o' field does not have an _id, the oplog entry is corrupted.
+    auto idField = oField["_id"];
+    uassert(ErrorCodes::NoSuchKey,
+            str::stream() << "Failed to apply insert due to missing _id: "
+                          << redact(op.toBSONForLogging()),
+            !idField.eoo());
+
+    BSONObj idQuery = idField.wrap();
+    auto updateMod = write_ops::UpdateModification::parseFromClassicUpdate(oField);
+
+    // First, query the conflict stash collection using [op _id] as the query. If a doc exists,
+    // apply rule #1 and run a replacement update on the stash collection.
+    auto stashCollDoc = _queryStashCollById(opCtx, stashColl.getCollectionPtr(), idQuery);
+    if (!stashCollDoc.isEmpty()) {
+        auto request = UpdateRequest();
+        request.setNamespaceString(_myStashNss);
+        request.setQuery(idQuery);
+        request.setUpdateModification(std::move(updateMod));
+        request.setUpsert(false);
+        request.setFromOplogApplication(true);
+        request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+        UpdateResult ur = doUpdate(opCtx, stashColl, request);
+        invariant(ur.numMatched != 0);
+
+        _applierMetrics->onWriteToStashCollections();
+
+        return;
+    }
+
+    // Query the output collection for a doc with _id == [op _id]. If a doc does not exist, apply
+    // rule #2 and insert this doc into the output collection.
+    BSONObj outputCollDoc;
+    auto foundDoc = Helpers::findByIdAndNoopUpdate(
+        opCtx, outputColl.getCollectionPtr(), idQuery, outputCollDoc);
+
+    if (!foundDoc) {
+        uassertStatusOK(Helpers::insert(opCtx, outputColl.getCollectionPtr(), oField));
+
+        return;
+    }
+
+    invariant(!outputCollDoc.isEmpty());
+
+    // A doc with [op _id] already exists in the output collection. Check whether this doc belongs
+    // to '_donorShardId' under the original shard key. If it does, apply rule #3 and run a
+    // replacement update on the output collection.
+    if (_sourceChunkMgr.keyBelongsToShard(
+            _sourceChunkMgr.getShardKeyPattern().extractShardKeyFromDoc(outputCollDoc),
+            _donorShardId)) {
+        auto request = UpdateRequest();
+        request.setNamespaceString(_outputNss);
+        request.setQuery(idQuery);
+        request.setUpdateModification(std::move(updateMod));
+        request.setUpsert(false);
+        request.setFromOplogApplication(true);
+        request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+        UpdateResult ur = doUpdate(opCtx, outputColl, request);
+        invariant(ur.numMatched != 0);
+
+        return;
+    }
+
+    // The doc does not belong to '_donorShardId' under the original shard key, so apply rule #4
+    // and insert the contents of 'op' to the stash collection.
+    uassertStatusOK(Helpers::insert(opCtx, stashColl.getCollectionPtr(), oField));
+
+    _applierMetrics->onWriteToStashCollections();
+}
+
+void ReshardingOplogApplicationRules::_applyUpdate_inlock(OperationContext* opCtx,
+                                                          CollectionAcquisition& outputColl,
+                                                          CollectionAcquisition& stashColl,
+                                                          const repl::OplogEntry& op) const {
+    /**
+     * The rules to apply ordinary update operations are as follows:
+     *
+     * Note that [op _id] refers to the value of op["o"]["_id"].
+     *
+     * 1. If there exists a document with _id == [op _id] in the conflict stash collection, update
+     * the document from this collection.
+     * 2. If there does NOT exist a document with _id == [op _id] in the output collection, do
+     * nothing.
+     * 3. If there exists a document with _id == [op _id] in the output collection but it is NOT
+     * owned by this donor shard, do nothing.
+     * 4. If there exists a document with _id == [op _id] in the output collection and it is owned
+     * by this donor shard, update the document from this collection.
+     */
+
+    BSONObj oField = op.getObject();
+    BSONObj o2Field;
+    if (op.getObject2())
+        o2Field = op.getObject2().value();
+
+    // If the 'o2' field does not have an _id, the oplog entry is corrupted.
+    auto idField = o2Field["_id"];
+    uassert(ErrorCodes::NoSuchKey,
+            str::stream() << "Failed to apply update due to missing _id: "
+                          << redact(op.toBSONForLogging()),
+            !idField.eoo());
+
+    BSONObj idQuery = idField.wrap();
+    auto updateMod = write_ops::UpdateModification::parseFromOplogEntry(
+        oField, write_ops::UpdateModification::DiffOptions{});
+
+    // First, query the conflict stash collection using [op _id] as the query. If a doc exists,
+    // apply rule #1 and update the doc from the stash collection.
+    auto stashCollDoc = _queryStashCollById(opCtx, stashColl.getCollectionPtr(), idQuery);
+    if (!stashCollDoc.isEmpty()) {
+        auto request = UpdateRequest();
+        request.setNamespaceString(_myStashNss);
+        request.setQuery(idQuery);
+        request.setUpdateModification(std::move(updateMod));
+        request.setUpsert(false);
+        request.setFromOplogApplication(true);
+        request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+        UpdateResult ur = doUpdate(opCtx, stashColl, request);
+
+        invariant(ur.numMatched != 0);
+
+        _applierMetrics->onWriteToStashCollections();
+
+        return;
+    }
+
+    // Query the output collection for a doc with _id == [op _id].
+    BSONObj outputCollDoc;
+    auto foundDoc = Helpers::findByIdAndNoopUpdate(
+        opCtx, outputColl.getCollectionPtr(), idQuery, outputCollDoc);
+
+    if (!foundDoc ||
+        !_sourceChunkMgr.keyBelongsToShard(
+            _sourceChunkMgr.getShardKeyPattern().extractShardKeyFromDoc(outputCollDoc),
+            _donorShardId)) {
+        // Either a doc with _id == [op _id] does not exist in the output collection (rule
+        // #2) or a doc does exist, but it does not belong to '_donorShardId' under the
+        // original shard key (rule #3). In either case, do nothing.
+        return;
+    }
+
+    invariant(!outputCollDoc.isEmpty());
+
+    // A doc with _id == [op _id] exists and is owned by '_donorShardId'. Apply rule #4 and update
+    // the doc in the ouput collection.
+    auto request = UpdateRequest();
+    request.setNamespaceString(_outputNss);
+    request.setQuery(idQuery);
+    request.setUpdateModification(std::move(updateMod));
+    request.setUpsert(false);
+    request.setFromOplogApplication(true);
+    request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    UpdateResult ur = doUpdate(opCtx, outputColl, request);
+
+    invariant(ur.numMatched != 0);
+}
+
+void ReshardingOplogApplicationRules::_applyDelete(OperationContext* opCtx,
+                                                   const repl::OplogEntry& op) const {
+    /**
+     * The rules to apply ordinary delete operations are as follows:
+     *
+     * Note that [op _id] refers to the value of op["o"]["_id"].
+     *
+     * 1. If there exists a document with _id == [op _id] in the conflict stash collection, delete
+     * the document from this collection.
+     * 2. If there does NOT exist a document with _id == [op _id] in the output collection, do
+     * nothing.
+     * 3. If there exists a document with _id == [op _id] in the output collection but it is NOT
+     * owned by this donor shard, do nothing.
+     * 4. If there exists a document with _id == [op _id] in the output collection and it is owned
+     * by this donor shard, atomically delete the doc from the output collection, choose a doc with
+     * _id == [op _id] arbitrarily from among all resharding conflict stash collections to delete
+     * from that resharding conflict stash collection and insert into the output collection.
+     */
+
+    BSONObj oField = op.getObject();
+
+    // If the 'o' field does not have an _id, the oplog entry is corrupted.
+    auto idField = oField["_id"];
+    uassert(ErrorCodes::NoSuchKey,
+            str::stream() << "Failed to apply delete due to missing _id: "
+                          << redact(op.toBSONForLogging()),
+            !idField.eoo());
+
+    BSONObj idQuery = idField.wrap();
+    const NamespaceString outputNss = op.getNss();
+
+    /*
+     * Capped collections are unsplittable collections which exist on a single shard, so stash
+     * collections are redundant for them since they can't have duplicate _id values.
+     * TODO (SERVER-90821): Use this for all unsplittable collections.
+     */
+    if (_isCapped) {
+        WriteUnitOfWork wuow(opCtx);
+        const auto outputCappedColl = acquireCollectionAndAssertExists(opCtx, _outputNss);
+
+        BSONObj outputCollDoc;
+        auto foundDoc = Helpers::findByIdAndNoopUpdate(
+            opCtx, outputCappedColl.getCollectionPtr(), idQuery, outputCollDoc);
+
+        if (!foundDoc) {
+            return;
+        }
+
+        // Delete from the output collection
+        invariant(!outputCollDoc.isEmpty());
+        auto nDeleted = deleteObjects(opCtx, outputCappedColl, idQuery, true /* justOne */);
+        invariant(nDeleted != 0);
+
+        // Batched writes are assigned their timestamp upon committing, unlike regular writes. In
+        // the Primary Driven Index Builds mode, write operations are combined into batches instead
+        // of being processed individually.
+        bool allowBatchedWritesToCommit = canBatchedWritesCommit(opCtx);
+
+        invariant(allowBatchedWritesToCommit ||
+                  shard_role_details::getRecoveryUnit(opCtx)->isTimestamped());
+        wuow.commit();
+
+        return;
+    }
+
+    {
+        // First, query the conflict stash collection using [op _id] as the query. If a doc exists,
+        // apply rule #1 and delete the doc from the stash collection.
+        WriteUnitOfWork wuow(opCtx);
+        const auto stashColl = acquireCollectionAndAssertExists(opCtx, _myStashNss);
+        auto stashCollDoc = _queryStashCollById(opCtx, stashColl.getCollectionPtr(), idQuery);
+        if (!stashCollDoc.isEmpty()) {
+            auto nDeleted = deleteObjects(opCtx, stashColl, idQuery, true /* justOne */);
+            invariant(nDeleted != 0);
+
+            _applierMetrics->onWriteToStashCollections();
+            // Batched writes are assigned their timestamp upon committing, unlike regular writes.
+            // In the Primary Driven Index Builds mode, write operations are combined into batches
+            // instead of being processed individually.
+            bool allowBatchedWritesToCommit = canBatchedWritesCommit(opCtx);
+            invariant(allowBatchedWritesToCommit ||
+                      shard_role_details::getRecoveryUnit(opCtx)->isTimestamped());
+            wuow.commit();
+
+            return;
+        }
+    }
+
+    // Now run 'findByIdAndNoopUpdate' to figure out which of rules #2, #3, and #4 we must apply.
+    // We must run 'findByIdAndNoopUpdate' in the same storage transaction as the ops run in the
+    // single replica set transaction that is executed if we apply rule #4, so we therefore must run
+    // 'findByIdAndNoopUpdate' as a part of the single replica set transaction.
+    {
+        WriteUnitOfWork wuow(opCtx, WriteUnitOfWork::atomicGroup);
+        const auto outputColl = acquireCollectionAndAssertExists(opCtx, _outputNss);
+
+        // Query the output collection for a doc with _id == [op _id].
+        BSONObj outputCollDoc;
+        auto foundDoc = Helpers::findByIdAndNoopUpdate(
+            opCtx, outputColl.getCollectionPtr(), idQuery, outputCollDoc);
+
+        if (!foundDoc ||
+            !_sourceChunkMgr.keyBelongsToShard(
+                _sourceChunkMgr.getShardKeyPattern().extractShardKeyFromDoc(outputCollDoc),
+                _donorShardId)) {
+            // Either a doc with _id == [op _id] does not exist in the output collection (rule
+            // #2) or a doc does exist, but it does not belong to '_donorShardId' under the
+            // original shard key (rule #3). In either case, do nothing.
+            return;
+        }
+
+        invariant(!outputCollDoc.isEmpty());
+
+        // A doc with _id == [op _id] exists and is owned by '_donorShardId'. Apply rule #4 and
+        // atomically:
+        // 1. Delete the doc from '_outputNss'
+        // 2. Choose a document with _id == [op _id] arbitrarily from among all resharding
+        // conflict stash collections to delete from that resharding conflict stash collection
+        // 3. Insert the doc just deleted into the output collection
+
+        // Delete from the output collection
+        auto nDeleted = deleteObjects(opCtx, outputColl, idQuery, true /* justOne */);
+        invariant(nDeleted != 0);
+
+        // Attempt to delete a doc from one of the stash collections. Once we've matched a doc
+        // in one collection, we'll break.
+        BSONObj doc;
+        size_t i = 0;
+        for (const auto& coll : _allStashNss) {
+            if (i == _myStashIdx) {
+                ++i;
+                continue;
+            }
+
+            const auto stashColl =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest::fromOpCtx(
+                                      opCtx,
+                                      coll,
+                                      AcquisitionPrerequisites::OperationType::kWrite,
+                                      getDeadline(opCtx)),
+                                  MODE_IX);
+
+            uassert(
+                ErrorCodes::NamespaceNotFound,
+                str::stream() << "Failed to apply op during resharding due to missing collection "
+                              << coll.toStringForErrorMsg(),
+                stashColl.exists());
+
+            auto request = DeleteRequest{};
+            request.setNsString(coll);
+            request.setQuery(idQuery);
+            request.setMulti(false);
+            request.setReturnDeleted(true);
+
+            auto canonicalDelete = uassertStatusOK(
+                CanonicalDelete::makeFromRequest(opCtx, stashColl.getCollectionPtr(), request));
+
+            auto exec = uassertStatusOK(getExecutorDelete(&CurOp::get(opCtx)->debug(),
+                                                          stashColl,
+                                                          canonicalDelete,
+                                                          boost::none /* verbosity */));
+            BSONObj res;
+            auto state = exec->getNext(&res, nullptr);
+
+            _applierMetrics->onWriteToStashCollections();
+
+            if (PlanExecutor::ADVANCED == state) {
+                // We matched a document and deleted it, so break.
+                doc = std::move(res);
+                break;
+            }
+
+            invariant(state == PlanExecutor::IS_EOF);
+            ++i;
+        }
+
+        // Insert the doc we just deleted from one of the stash collections into the output
+        // collection.
+        if (!doc.isEmpty()) {
+            uassertStatusOK(Helpers::insert(opCtx, outputColl.getCollectionPtr(), doc));
+        }
+
+        // Because we called findByIdAndNoopUpdate in this wuow, we have to ensure that this wuow
+        // contains some replicated writes.
+        invariant(!BatchedWriteContext::get(opCtx).getBatchedOperations(opCtx)->isEmpty());
+        wuow.commit();
+    }
+}
+
+BSONObj ReshardingOplogApplicationRules::_queryStashCollById(OperationContext* opCtx,
+                                                             const CollectionPtr& coll,
+                                                             const BSONObj& idQuery) const {
+    const IndexCatalog* indexCatalog = coll->getIndexCatalog();
+    uassert(4990100,
+            str::stream() << "Missing _id index for collection "
+                          << _myStashNss.toStringForErrorMsg(),
+            indexCatalog->haveIdIndex(opCtx));
+
+    BSONObj result;
+    Helpers::findById(opCtx, _myStashNss, idQuery, result);
+    return result;
+}
+}  // namespace mongo

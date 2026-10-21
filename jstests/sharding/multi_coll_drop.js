@@ -1,45 +1,42 @@
 // Tests the dropping and re-adding of a collection
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var st = new ShardingTest( name = "multidrop", shards = 1, verbose = 0, mongos = 2 )
+let st = new ShardingTest({name: "multidrop", shards: 1, mongos: 2});
 
-var mA = st.s0
-var mB = st.s1
+let mA = st.s0;
+let mB = st.s1;
 
-var coll = mA.getCollection( name + ".coll" )
-var collB = mB.getCollection( coll + "" )
+let coll = mA.getCollection("multidrop.coll");
+let collB = mB.getCollection("multidrop.coll");
 
-jsTestLog( "Shard and split collection..." )
+jsTestLog("Shard and split collection...");
 
-var admin = mA.getDB( "admin" )
-admin.runCommand({ enableSharding : coll.getDB() + "" })
-admin.runCommand({ shardCollection : coll + "", key : { _id : 1 } })
+let admin = mA.getDB("admin");
+assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
+assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
-for( var i = -100; i < 100; i++ ){
-    admin.runCommand({ split : coll + "", middle : { _id : i } })
+for (let i = -100; i < 100; i++) {
+    assert.commandWorked(admin.runCommand({split: coll + "", middle: {_id: i}}));
 }
 
-jsTestLog( "Create versioned connection for each mongos..." )
+jsTestLog("Create versioned connection for each mongos...");
 
-coll.find().itcount()
-collB.find().itcount()
+assert.eq(0, coll.find().itcount());
+assert.eq(0, collB.find().itcount());
 
-jsTestLog( "Dropping sharded collection..." )
-coll.drop()
+jsTestLog("Dropping sharded collection...");
+assert(coll.drop());
 
-jsTestLog( "Recreating collection..." )
+jsTestLog("Recreating collection...");
 
-admin.runCommand({ shardCollection : coll + "", key : { _id : 1 } })
-for( var i = -10; i < 10; i++ ){
-    admin.runCommand({ split : coll + "", middle : { _id : i } })
+assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
+for (let i = -10; i < 10; i++) {
+    assert.commandWorked(admin.runCommand({split: coll + "", middle: {_id: i}}));
 }
 
-jsTestLog( "Retrying connections..." )
+jsTestLog("Retrying connections...");
 
-coll.find().itcount()
-collB.find().itcount() 
+assert.eq(0, coll.find().itcount());
+assert.eq(0, collB.find().itcount());
 
-jsTestLog( "Done." )
-
-st.stop()
-
-
+st.stop();

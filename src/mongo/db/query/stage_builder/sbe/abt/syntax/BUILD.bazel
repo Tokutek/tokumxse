@@ -1,0 +1,22 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "syntax_expr",
+    srcs = [
+        "expr.cpp",
+    ],
+    deps = [
+        "//src/mongo/db/exec/sbe:query_sbe_makeobj_spec",  # needed to register extended type destruction for MakeObjSpec :(
+        "//src/mongo/db/exec/sbe:sbe_fn_names",
+        "//src/mongo/stdx",
+    ],
+)

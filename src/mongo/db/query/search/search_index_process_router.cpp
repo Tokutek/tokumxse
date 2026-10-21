@@ -1,0 +1,133 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/search/search_index_process_router.h"
+
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/router_role/cluster_commands_helpers.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/ddl/list_collections_gen.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/views/view_graph.h"
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+ServiceContext::ConstructorActionRegisterer SearchIndexProcessRouterImplementation{
+    "SearchIndexProcessRouter-registration", [](ServiceContext* serviceContext) {
+        invariant(serviceContext);
+        // Only register the router implementation if this server has a router service.
+        if (auto service = serviceContext->getService();
+            service && service->role().hasExclusively(ClusterRole::RouterServer)) {
+            SearchIndexProcessInterface::set(service, std::make_unique<SearchIndexProcessRouter>());
+        }
+    }};
+
+namespace {
+// Currently, the views catalog lives on the primary shard. However, in Atlas search, the router
+// handles sharded search index commands. Therefore to support search index commands on sharded
+// views, the router must descend the view graph by recursively calling listCollections on the
+// primary shard until we reach the storage collection. The risk in this approach is that the views
+// catalog might change in between each listCollections invocation (eg the user drops one of the
+// ancestor views, modifies an ancestor's view definition, etc). Though not ideal, the current work
+// solution is that if a user changes the view graph and invalidates their correspondent mongot
+// index, said index will be silently killed and queries using that index will return no results.
+// When future work is completed to cache the views catalog on the router aware, we will be able to
+// eliminate this race condition and get a single/locked instance of the view graph for each search
+// index command.
+StatusWith<std::pair<boost::optional<UUID>, boost::optional<ResolvedNamespace>>> resolveViewHelper(
+    OperationContext* opCtx, const CachedDatabaseInfo& cdb, NamespaceString nss) {
+
+    BSONObjBuilder bob;
+    bob.append("_shardsvrResolveView", 1);
+    bob.append("nss", NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+
+    // _shardsvrResolveView is an internal command that does not participate in API versioning.
+    // Strip any API parameters so they are not forwarded with the command, which would cause it
+    // to fail if the client set apiStrict: true.
+    IgnoreAPIParametersBlock ignoreAPIParams(opCtx);
+    auto response = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+        opCtx,
+        nss.dbName(),
+        cdb,
+        bob.obj(),
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        Shard::RetryPolicy::kIdempotent);
+    boost::optional<ResolvedNamespace> resolvedView;
+    boost::optional<UUID> uuid;
+    auto data = uassertStatusOK(response.swResponse).data;
+
+    if (data.hasField("resolvedView")) {
+        resolvedView = boost::make_optional(ResolvedNamespace::parseFromBSON(data["resolvedView"]));
+    }
+    if (data.hasField("collectionUUID")) {
+        uuid = boost::make_optional(uassertStatusOK(UUID::parse(data["collectionUUID"])));
+    }
+    return std::make_pair(uuid, resolvedView);
+}
+}  // namespace
+
+std::pair<boost::optional<UUID>, boost::optional<ResolvedNamespace>>
+SearchIndexProcessRouter::fetchCollectionUUIDAndResolveView(OperationContext* opCtx,
+                                                            const NamespaceString& nss,
+                                                            bool failOnTsColl) {
+    sharding::router::DBPrimaryRouter router(opCtx, nss.dbName());
+    auto uuidAndPossibleCollName = router.route(
+        "get collection UUID",
+        [&](OperationContext* opCtx, const CachedDatabaseInfo& cdb)
+            -> std::pair<boost::optional<UUID>, boost::optional<ResolvedNamespace>> {
+            ListCollections listCollections;
+            listCollections.setDbName(nss.dbName());
+            listCollections.setFilter(BSON("name" << nss.coll()));
+
+            auto response = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+                opCtx,
+                nss.dbName(),
+                cdb,
+                listCollections.toBSON(),
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                Shard::RetryPolicy::kIdempotent);
+
+            // We consider an empty response to mean that the collection doesn't exist.
+            auto batch = uassertStatusOK(response.swResponse).data["cursor"]["firstBatch"].Array();
+            if (batch.empty()) {
+                return std::make_pair(boost::none, boost::none);
+            }
+            const auto& bsonDoc = batch.front();
+
+            // Search index related commands should fail when attempted on a ts collection.
+            // Except '$listSearchIndexes' should return empty results.
+            uassert(10840700,
+                    "search index commands are not allowed on timeseries collections",
+                    !(failOnTsColl && bsonDoc["type"].String() == "timeseries"));
+
+            if (bsonDoc["type"].String() == "view") {
+                auto sourceCollection = bsonDoc["options"]["viewOn"].String();
+                auto status = resolveViewHelper(opCtx, cdb, nss);
+                return uassertStatusOK(status);
+            }
+
+            auto uuid = UUID::parse(bsonDoc["info"]["uuid"]);
+            if (!uuid.isOK()) {
+                return std::make_pair(boost::none, boost::none);
+            }
+            // The search index command is being ran on a normal source collection eg not a view.
+            return std::make_pair(boost::make_optional(uuid.getValue()), boost::none);
+        });
+    return uuidAndPossibleCollName;
+}
+
+std::pair<UUID, boost::optional<ResolvedNamespace>>
+SearchIndexProcessRouter::fetchCollectionUUIDAndResolveViewOrThrow(OperationContext* opCtx,
+                                                                   const NamespaceString& nss) {
+    auto uuidResolvdNssPair = fetchCollectionUUIDAndResolveView(opCtx, nss);
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Collection '" << nss.toStringForErrorMsg() << "' does not exist.",
+            uuidResolvdNssPair.first);
+
+    return std::make_pair(*uuidResolvdNssPair.first, uuidResolvdNssPair.second);
+}
+
+}  // namespace mongo

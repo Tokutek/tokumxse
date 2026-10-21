@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# cloneCatalogData IDL File
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    cloneCatalogData:
+        description: "The internal cloneCatalogData command on a shard"
+        command_name: cloneCatalogData
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        fields:
+            from:
+                type: string
+                description: "The connection string of the database to clone from."

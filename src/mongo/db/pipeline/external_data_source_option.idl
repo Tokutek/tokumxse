@@ -1,0 +1,56 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    StorageType:
+        description: "Storage type for external data source."
+        type: string
+        values:
+            pipe: pipe
+    FileType:
+        description: "File type for external data source."
+        type: string
+        values:
+            bson: bson
+
+structs:
+    ExternalDataSourceInfo:
+        description: "Metadata for external data source."
+        strict: true
+        fields:
+            url:
+                description: "Url for an external data source"
+                type: string
+                optional: false
+                stability: unstable
+            storageType:
+                description: "Storage type for an external data source"
+                type: StorageType
+                optional: false
+                stability: unstable
+            fileType:
+                description: "File type for an external data source"
+                type: FileType
+                optional: false
+                stability: unstable
+    ExternalDataSourceOption:
+        description: "Option for a virtual collection."
+        strict: true
+        fields:
+            collName:
+                description: "Virtual collection name."
+                type: string
+                optional: false
+                stability: unstable
+            dataSources:
+                description: "Specification for external data sources."
+                type: array<ExternalDataSourceInfo>
+                optional: false
+                stability: unstable

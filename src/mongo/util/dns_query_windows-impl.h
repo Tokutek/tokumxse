@@ -1,0 +1,273 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#ifndef MONGO_ALLOW_INCLUDE_UTIL_DNS_QUERY_PLATFORM
+#error Do not include the DNS Query platform implementation headers.  Please use "mongo/util/dns_query.h" instead.
+#endif
+
+#include "mongo/util/duration.h"
+#include "mongo/util/errno_util.h"
+
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <windns.h>
+
+#include <boost/noncopyable.hpp>
+
+using std::begin;
+using std::end;
+using namespace std::literals::string_literals;
+
+namespace mongo {
+namespace dns {
+// The anonymous namespace is safe, in this header, as it is not really a header.  It is only used
+// in the `dns_query.cpp` TU.
+namespace {
+enum class DNSQueryClass { kInternet };
+
+enum class DNSQueryType {
+    kSRV = DNS_TYPE_SRV,
+    kTXT = DNS_TYPE_TEXT,
+    kAddress = DNS_TYPE_A,
+    kCNAME = DNS_TYPE_CNAME
+};
+
+/**
+ * A `ResourceRecord` represents a single DNS entry as parsed by the resolver API.
+ * It can be viewed as one of various record types, using the member functions.
+ * It roughly corresponds to the DNS RR data structure
+ */
+class ResourceRecord {
+public:
+    explicit ResourceRecord(std::string service, std::shared_ptr<DNS_RECORDA> initialRecord)
+        : _service(std::move(service)), _record(std::move(initialRecord)) {}
+    explicit ResourceRecord() = default;
+
+    /**
+     * View this record as a DNS TXT record.
+     */
+    std::vector<std::string> txtEntry() const {
+        if (this->_record->wType != DNS_TYPE_TEXT) {
+            StringBuilder oss;
+            oss << "Incorrect record format for \"" << this->_service
+                << "\": expected TXT record, found a record of type " << this->_record->wType
+                << " instead";
+            uasserted(ErrorCodes::DNSRecordTypeMismatch, oss.str());
+        }
+
+        std::vector<std::string> rv;
+
+        const auto start = this->_record->Data.TXT.pStringArray;
+        const auto count = this->_record->Data.TXT.dwStringCount;
+        std::copy(start, start + count, back_inserter(rv));
+        return rv;
+    }
+
+    /**
+     * View this record as a DNS A record.
+     */
+    std::string addressEntry() const {
+        if (this->_record->wType != DNS_TYPE_A) {
+            StringBuilder oss;
+            oss << "Incorrect record format for \"" << this->_service
+                << "\": expected A record, found a record of type " << this->_record->wType
+                << " instead";
+            uasserted(ErrorCodes::DNSRecordTypeMismatch, oss.str());
+        }
+
+        std::string rv;
+        const auto& data = this->_record->Data.A.IpAddress;
+
+        for (int i = 0; i < 4; ++i) {
+            std::ostringstream oss;
+            oss << int(data >> (i * CHAR_BIT) & 0xFF);
+            rv += oss.str() + ".";
+        }
+        rv.pop_back();
+
+        return rv;
+    }
+
+    /**
+     * View this record as a DNS SRV record.
+     */
+    SRVHostEntry srvHostEntry() const {
+        if (this->_record->wType != DNS_TYPE_SRV) {
+            StringBuilder oss;
+            oss << "Incorrect record format for \"" << this->_service
+                << "\": expected SRV record, found a record of type " << this->_record->wType
+                << " instead";
+            uasserted(ErrorCodes::DNSRecordTypeMismatch, oss.str());
+        }
+
+        const auto& data = this->_record->Data.SRV;
+        return {data.pNameTarget + "."s, data.wPort};
+    }
+
+    /**
+     * View this record as a DNS CName record
+     */
+    std::string cnameEntry() const {
+        if (getType() != DNSQueryType::kCNAME) {
+            StringBuilder oss;
+            oss << "Incorrect record format for \"" << this->_service
+                << "\": expected CNAME record, found a record of type " << this->_record->wType
+                << " instead";
+            uasserted(ErrorCodes::DNSRecordTypeMismatch, oss.str());
+        }
+
+        return std::string(this->_record->Data.CNAME.pNameHost);
+    }
+
+    DNSQueryType getType() const {
+        return static_cast<DNSQueryType>(this->_record->wType);
+    }
+
+    Seconds getTtl() const {
+        return Seconds(this->_record->dwTtl);
+    }
+
+
+private:
+    std::string _service;
+    std::shared_ptr<DNS_RECORDA> _record;
+};
+
+void freeDnsRecord(PDNS_RECORDA record) {
+    DnsRecordListFree(record, DnsFreeRecordList);
+}
+
+/**
+ * The `DNSResponse` class represents a response to a DNS query.
+ * It has STL-compatible iterators to view individual DNS Resource Records within a response.
+ */
+class DNSResponse {
+public:
+    explicit DNSResponse(std::string service, PDNS_RECORDA initialResults)
+        : _service(std::move(service)), _results(initialResults, freeDnsRecord) {}
+
+    class iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = ResourceRecord;
+        using difference_type = std::ptrdiff_t;
+        using pointer = value_type*;
+        using reference = value_type&;
+
+        const ResourceRecord& operator*() {
+            this->_populate();
+            return this->_storage;
+        }
+
+        const ResourceRecord* operator->() {
+            this->_populate();
+            return &this->_storage;
+        }
+
+        iterator& operator++() {
+            this->_advance();
+            return *this;
+        }
+
+        iterator operator++(int) {
+            iterator tmp = *this;
+            this->_advance();
+            return tmp;
+        }
+
+        auto makeRelopsLens() const {
+            return this->_record.get();
+        }
+
+        inline friend bool operator==(const iterator& lhs, const iterator& rhs) {
+            return lhs.makeRelopsLens() == rhs.makeRelopsLens();
+        }
+
+        inline friend bool operator<(const iterator& lhs, const iterator& rhs) {
+            return lhs.makeRelopsLens() < rhs.makeRelopsLens();
+        }
+
+        inline friend bool operator!=(const iterator& lhs, const iterator& rhs) {
+            return !(lhs == rhs);
+        }
+
+    private:
+        friend DNSResponse;
+
+        explicit iterator(std::string service, std::shared_ptr<DNS_RECORDA> initialRecord)
+            : _service(std::move(service)), _record(std::move(initialRecord)) {}
+
+        void _advance() {
+            this->_record = {this->_record, this->_record->pNext};
+            this->_ready = false;
+        }
+
+        void _populate() {
+            if (this->_ready) {
+                return;
+            }
+            this->_storage = ResourceRecord{this->_service, this->_record};
+            this->_ready = true;
+        }
+
+        std::shared_ptr<DNS_RECORDA> _record;
+        std::string _service;
+        ResourceRecord _storage;
+        bool _ready = false;
+    };
+
+    iterator begin() const {
+        return iterator{this->_service, this->_results};
+    }
+
+    iterator end() const {
+        return iterator{this->_service, nullptr};
+    }
+
+    std::size_t size() const {
+        return std::distance(this->begin(), this->end());
+    }
+
+private:
+    std::string _service;
+    std::shared_ptr<std::remove_pointer<PDNS_RECORDA>::type> _results;
+};
+
+/**
+ * The `DNSQueryState` object represents the state of a DNS query interface, on Windows systems.
+ */
+class DNSQueryState {
+public:
+    DNSResponse lookup(const std::string& service,
+                       const DNSQueryClass class_,
+                       const DNSQueryType type) {
+        PDNS_RECORDA queryResults;
+        auto e = DnsQuery_UTF8(service.c_str(),
+                               WORD(type),
+                               DNS_QUERY_BYPASS_CACHE,
+                               nullptr,
+                               reinterpret_cast<PDNS_RECORD*>(&queryResults),
+                               nullptr);
+        if (e) {
+            auto ec = systemError(e);
+            uasserted(ErrorCodes::DNSHostNotFound,
+                      "Failed to look up service \""s + "\":"s + errorMessage(ec));
+        }
+        return DNSResponse{service, queryResults};
+    }
+};
+}  // namespace
+}  // namespace dns
+}  // namespace mongo

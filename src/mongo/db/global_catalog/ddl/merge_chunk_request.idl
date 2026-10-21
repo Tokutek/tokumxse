@@ -1,0 +1,261 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/global_catalog/ddl/merge_chunk_request_valid.h"
+        - "mongo/util/uuid.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/chunk_range.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+types:
+    # Non-IDL response used UUIDtoBSON instead of UUID::toCDR
+    my_uuid:
+        bson_serialization_type: object
+        description: "A UUID for some reason not generic uuid type."
+        cpp_type: UUID
+        deserializer: UUID::parse
+        serializer: UUID::toBSON
+        is_view: false
+
+structs:
+    ShardsvrMergeChunksRequest:
+        description: "mergeChunks command parameters"
+        strict: false
+        fields:
+            bounds:
+                description: "Chunk bounds to merge."
+                type: array<object_owned>
+            epoch:
+                description: "The expected epoch of the collection for the chunks being merged."
+                type: objectid
+            timestamp:
+                description: "The expected timestamp of the collection that is being committed."
+                type: timestamp
+                optional: true
+
+    ShardsvrMergeAllChunksOnShardRequest:
+        description: "mergeAllChunksOnShard command parameters"
+        strict: false
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            maxNumberOfChunksToMerge:
+                description: "The maximum number of chunks to merge."
+                type: int
+                default: 2147483647 # INT_MAX
+            maxTimeProcessingChunksMS:
+                description: >-
+                    "The maximum time in milliseconds spent looking for mergeable chunks."
+                type: int
+                default: 2147483647 # INT_MAX
+
+    ConfigSvrMergeResponse:
+        description: "Response of the _configsvrCommitChunksMerge command"
+        strict: false
+        is_command_reply: true
+        fields:
+            shardVersion:
+                type: ChunkVersion
+                description: "Latest data placement of the shard."
+
+    MergeAllChunksOnShardResponse:
+        description: "Response of the _configsvrCommitMergeAllChunksOnShard and _shardsvrMergeAllChunksOnShard commands."
+        strict: false
+        is_command_reply: true
+        fields:
+            shardVersion:
+                type: ChunkVersion
+                description: "Latest data placement of the shard."
+            numMergedChunks:
+                type: int
+                description: "Number of chunks that were merged"
+
+    ConfigsvrMergeAllPrecomputedChunksOnShardResponse:
+        description: "Response of the _configsvrCommitMergeAllPrecomputedChunksOnShard command."
+        strict: false
+        is_command_reply: true
+        fields:
+            shardVersion:
+                type: ChunkVersion
+                description: "Latest data placement of the shard."
+                optional: false
+            changedChunks:
+                type: array<object_owned>
+                description: "The list of the chunks changed by the merge commit, in config BSON format."
+
+    ConfigSvrCommitMergeChunksResponse:
+        description: "Response of the _configsvrCommitMergeChunks command."
+        strict: false
+        is_command_reply: true
+        fields:
+            changedChunks:
+                type: array<object>
+                description: "The list of the chunks changed by the merge commit, in config BSON format."
+
+commands:
+    # TODO (SERVER-127253) Remove this command once v9.0 branches out)
+    _configsvrCommitChunksMerge:
+        command_name: _configsvrCommitChunksMerge
+        cpp_name: ConfigSvrMergeChunks
+        description: "The internal _configsvrCommitChunksMerge command on the config server."
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        reply_type: ConfigSvrMergeResponse
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+            collUUID:
+                type: my_uuid
+                cpp_name: "collectionUUID"
+                description: "The UUID of the collection that the chunk belongs to."
+            chunkRange:
+                type: chunk_range
+                cpp_name: "chunkRange"
+                description: "Chunk bounds to merge."
+            epoch:
+                description: "The expected epoch of the collection that is being committed."
+                type: objectid
+                optional: true
+            timestamp:
+                description: "The expected timestamp of the collection that is being committed."
+                type: timestamp
+                optional: true
+
+    _configsvrCommitMergeChunks:
+        command_name: _configsvrCommitMergeChunks
+        cpp_name: ConfigSvrCommitMergeChunksRequest
+        description:
+            "Internal command that commits a chunk merge to the global catalog and returns the
+            chunks it changed."
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        reply_type: ConfigSvrCommitMergeChunksResponse
+        fields:
+            shard:
+                type: shard_id
+                description: "Shard that owns the chunks being merged."
+            chunkRange:
+                type: chunk_range
+                description: "Bounds of the contiguous chunks to merge."
+            shardVersionPreMerge:
+                type: ChunkVersion
+                description: "Shard version captured before the merge."
+
+    clusterMergeChunks:
+        command_name: mergeChunks
+        cpp_name: ClusterMergeChunks
+        description: "The public mergeChunks command to merge chunks in a collection on mongos."
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: true
+        fields:
+            bounds:
+                description: "Chunk bounds to merge."
+                type: array<object_owned>
+
+    _shardsvrMergeChunks:
+        command_name: _shardsvrMergeChunks
+        command_alias: mergeChunks
+        cpp_name: ShardsvrMergeChunks
+        description: "The internal _shardsvrMergeChunks command on a shard."
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        chained_structs:
+            ShardsvrMergeChunksRequest: ShardsvrMergeChunksRequest
+
+    clusterMergeAllChunksOnShard:
+        command_name: mergeAllChunksOnShard
+        cpp_name: ClusterMergeAllChunksOnShard
+        description: "Definition of the mergeAllChunksOnShard command called on routers."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            maxNumberOfChunksToMerge:
+                description: "The maximum number of chunks to merge"
+                type: int
+                default: 2147483647 # INT_MAX
+            maxTimeProcessingChunksMS:
+                description: >-
+                    "The maximum time in milliseconds spent looking for mergeable chunks."
+                type: int
+                default: 2147483647 # INT_MAX
+
+    _shardsvrMergeAllChunksOnShard:
+        command_name: _shardsvrMergeAllChunksOnShard
+        cpp_name: ShardSvrMergeAllChunksOnShard
+        description: "Definition of the mergeAllChunksOnShard command called on the shards."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        chained_structs:
+            ShardsvrMergeAllChunksOnShardRequest: ShardsvrMergeAllChunksOnShardRequest
+
+    _configsvrCommitMergeAllChunksOnShard:
+        command_name: _configsvrCommitMergeAllChunksOnShard
+        cpp_name: ConfigSvrCommitMergeAllChunksOnShard
+        description: "Definition of the mergeAllChunksOnShard command called on the config server."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        reply_type: MergeAllChunksOnShardResponse
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            maxNumberOfChunksToMerge:
+                description: "The maximum number of chunks to merge."
+                type: int
+                default: 2147483647 # INT_MAX
+            maxTimeProcessingChunksMS:
+                description: >-
+                    "The maximum time in milliseconds spent looking for mergeable chunks."
+                type: int
+                default: 2147483647 # INT_MAX
+
+    _configsvrCommitMergeAllPrecomputedChunksOnShard:
+        command_name: _configsvrCommitMergeAllPrecomputedChunksOnShard
+        cpp_name: ConfigSvrCommitMergeAllPrecomputedChunksOnShard
+        description: "Definition of the mergeAllChunksOnShardV2 command called on the config server."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        reply_type: ConfigsvrMergeAllPrecomputedChunksOnShardResponse
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            newChunks:
+                description: "A precomputed list with the new chunks to commit."
+                type: array<object_owned>

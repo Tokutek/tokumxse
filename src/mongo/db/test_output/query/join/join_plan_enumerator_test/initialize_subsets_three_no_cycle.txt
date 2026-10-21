@@ -1,0 +1,50 @@
+LEFT DEEP, 3 Nodes
+HJ order pruning enabled: 0
+numHashJoins: 3
+numNestedLoopJoins: 0
+numIndexedNestedLoopJoins: 0
+numRejectedNodes: 9
+numNodes: 6
+Level 0:
+001, 010, 100
+Level 1:
+011, 101, 110
+Level 2:
+111
+
+Output plans (best plan 0):
+0.(130.805)[111] HJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+RIGHT DEEP, 3 Nodes
+HJ order pruning enabled: 0
+numHashJoins: 3
+numNestedLoopJoins: 0
+numIndexedNestedLoopJoins: 0
+numRejectedNodes: 7
+numNodes: 6
+Level 0:
+001, 010, 100
+Level 1:
+011, 101, 110
+Level 2:
+111
+
+Output plans (best plan 0):
+0.(130.805)[111] HJ
+ -> left:
+    (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+

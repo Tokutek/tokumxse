@@ -1,0 +1,210 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/rewrites/boolean_simplification/quine_mccluskey.h"
+
+#include "mongo/unittest/unittest.h"
+
+namespace mongo::boolean_simplification {
+TEST(FindPrimeImplicantsTest, Test1) {
+    // AB | ~AB = B
+    Bitset mask{"11"_b};
+    Maxterm maxterm{{
+        Minterm{"10"_b, mask},
+        Minterm{"11"_b, mask},
+    }};
+    Maxterm expectedMaxterm{Minterm{"10", "10"}};
+    std::vector<CoveredOriginalMinterms> expectedCoveredMinterms{CoveredOriginalMinterms{"11"}};
+
+    auto [actualMaxterm, actualCoveredMinterms] = findPrimeImplicants(maxterm);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    ASSERT_EQ(expectedCoveredMinterms, actualCoveredMinterms);
+}
+
+TEST(FindPrimeImplicantsTest, Test2) {
+    // "ABC | A~BC = AC"
+    Bitset mask{"111"_b};
+    Maxterm maxterm{
+        Minterm{"111"_b, mask},
+        Minterm{"101"_b, mask},
+    };
+    Maxterm expectedMaxterm{Minterm{"101", "101"}};
+    std::vector<CoveredOriginalMinterms> expectedCoveredMinterms{CoveredOriginalMinterms{"11"}};
+
+    auto [actualMaxterm, actualCoveredMinterms] = findPrimeImplicants(maxterm);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    ASSERT_EQ(expectedCoveredMinterms, actualCoveredMinterms);
+}
+
+TEST(FindPrimeImplicantsTest, Test3) {
+    // ABC | A~BC | AB~C = AC | AB
+    Bitset mask{"111"_b};
+    Maxterm maxterm{
+        Minterm{"111"_b, mask},
+        Minterm{"101"_b, mask},
+        Minterm{"110"_b, mask},
+    };
+
+    Maxterm expectedMaxterm{
+        Minterm{"101", "101"},
+        Minterm{"110", "110"},
+    };
+
+    std::vector<CoveredOriginalMinterms> expectedCoveredMinterms{CoveredOriginalMinterms{"011"},
+                                                                 CoveredOriginalMinterms{"101"}};
+
+    auto [actualMaxterm, actualCoveredMinterms] = findPrimeImplicants(maxterm);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    ASSERT_EQ(expectedCoveredMinterms, actualCoveredMinterms);
+}
+
+TEST(FindPrimeImplicantsTest, Test4) {
+    // ~A~B~C~D | ~A~B~CD | ~AB~C~D | ~AB~CD = ~A~C
+    Bitset mask{"1111"_b};
+    Maxterm maxterm{
+        Minterm{"0000"_b, mask},
+        Minterm{"0001"_b, mask},
+        Minterm{"0100"_b, mask},
+        Minterm{"0101"_b, mask},
+    };
+
+    Maxterm expectedMaxterm{
+        Minterm{"0000", "1010"},
+    };
+
+    std::vector<CoveredOriginalMinterms> expectedCoveredMinterms{CoveredOriginalMinterms{"1111"}};
+
+    auto [actualMaxterm, actualCoveredMinterms] = findPrimeImplicants(maxterm);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    ASSERT_EQ(expectedCoveredMinterms, actualCoveredMinterms);
+}
+
+TEST(FindPrimeImplicantsTest, Test5) {
+    // ~A~B~C~D | ~A~B~CD | ~AB~C~D | ~AB~CD |~ABCD | A~BCD = A~BCD | ~ABD | ~A~C
+    Bitset mask{"1111"_b};
+    Maxterm maxterm{{"0000"_b, mask},
+                    Minterm{"0001"_b, mask},
+                    Minterm{"0100"_b, mask},
+                    Minterm{"0101"_b, mask},
+                    Minterm{"0111"_b, mask},
+                    Minterm{"1011"_b, mask}};
+
+    Maxterm expectedMaxterm{
+        Minterm{"1011", "1111"},
+        Minterm{"0101", "1101"},
+        Minterm{"0000", "1010"},
+    };
+
+    std::vector<CoveredOriginalMinterms> expectedCoveredMinterms{
+        CoveredOriginalMinterms{"100000"},
+        CoveredOriginalMinterms{"011000"},
+        CoveredOriginalMinterms{"001111"},
+    };
+
+    auto [actualMaxterm, actualCoveredMinterms] = findPrimeImplicants(maxterm);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    ASSERT_EQ(expectedCoveredMinterms, actualCoveredMinterms);
+}
+
+TEST(FindPrimeImplicantsTest, Test6) {
+    // ~A~B~C | ~AB~C | A~B~C | ~ABC | A~BC | ABC = ~A~C | ~B~C | ~AB | A~B | BC | AC
+    Bitset mask{"111"_b};
+    Maxterm maxterm{
+        Minterm{"000"_b, mask},
+        Minterm{"010"_b, mask},
+        Minterm{"100"_b, mask},
+        Minterm{"011"_b, mask},
+        Minterm{"101"_b, mask},
+        Minterm{"111"_b, mask},
+    };
+
+    Maxterm expectedMaxterm{
+        Minterm{"000", "011"},
+        Minterm{"000", "101"},
+        Minterm{"010", "110"},
+        Minterm{"100", "110"},
+        Minterm{"011", "011"},
+        Minterm{"101", "101"},
+    };
+
+    std::vector<CoveredOriginalMinterms> expectedCoveredMinterms{
+        CoveredOriginalMinterms{"000101"},
+        CoveredOriginalMinterms{"000011"},
+        CoveredOriginalMinterms{"001010"},
+        CoveredOriginalMinterms{"010100"},
+        CoveredOriginalMinterms{"101000"},
+        CoveredOriginalMinterms{"110000"},
+    };
+
+    auto [actualMaxterm, actualCoveredMinterms] = findPrimeImplicants(maxterm);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    ASSERT_EQ(expectedCoveredMinterms, actualCoveredMinterms);
+}
+
+TEST(QuineMcCluskeyTest, Test5) {
+    // ~A~B~C~D | ~A~B~CD | ~AB~C~D | ~AB~CD |~ABCD | A~BCD = A~BCD | ~ABD | ~A~C
+    Bitset mask{"1111"_b};
+    Maxterm maxterm{{"0000"_b, mask},
+                    Minterm{"0001"_b, mask},
+                    Minterm{"0100"_b, mask},
+                    Minterm{"0101"_b, mask},
+                    Minterm{"0111"_b, mask},
+                    Minterm{"1011"_b, mask}};
+
+    Maxterm expectedMaxterm{
+        Minterm{"1011", "1111"},
+        Minterm{"0101", "1101"},
+        Minterm{"0000", "1010"},
+    };
+
+    auto actualMaxterm = quineMcCluskey(maxterm, 1000);
+    ASSERT_EQ(expectedMaxterm, actualMaxterm);
+}
+
+/**
+ * This test simplifies the same expression as FindPrimeImplicantsTest::Test6 but because it employs
+ * Petricks's method for further optimization the resulting expression is much smaller.
+ */
+TEST(QuineMcCluskeyTest, Test6) {
+    // ~A~B~C | ~AB~C | A~B~C | ~ABC | A~BC | ABC = ~A~C | A~B | BC
+    Bitset mask{"111"_b};
+    Maxterm maxterm{
+        Minterm{"000"_b, mask},
+        Minterm{"010"_b, mask},
+        Minterm{"100"_b, mask},
+        Minterm{"011"_b, mask},
+        Minterm{"101"_b, mask},
+        Minterm{"111"_b, mask},
+    };
+
+    {
+        // This is the expected output of findPrimeImplicants().
+        Maxterm expectedMaxterm{
+            Minterm{"000", "011"},
+            Minterm{"000", "101"},
+            Minterm{"010", "110"},
+            Minterm{"100", "110"},
+            Minterm{"011", "011"},
+            Minterm{"101", "101"},
+        };
+        auto actualMaxterm = quineMcCluskey(maxterm, 2);
+        // Validate that with a very low setting for the number of prime implicants generated by
+        // Petrick's, we bail out of Petrick's gracefully.
+        ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    }
+
+    {
+        Maxterm expectedMaxterm{
+            Minterm{"000", "101"},
+            Minterm{"100", "110"},
+            Minterm{"011", "011"},
+        };
+        auto actualMaxterm = quineMcCluskey(maxterm, 1000);
+        // This test asserts on one possible output: ~A~C | A~B | BC, another possible output is
+        // ~A~C | ~AB | AC. See the coverage output in FindPrimeImplicantsTest::Test6, the last
+        // uncovered minterm #5 can be covered by BC or AC. It just happens that we select the
+        // first optimal coverage, if we change quineMcCluskey the second one can be picked up.
+        ASSERT_EQ(expectedMaxterm, actualMaxterm);
+    }
+}
+}  // namespace mongo::boolean_simplification

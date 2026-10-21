@@ -1,0 +1,222 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
+#include "mongo/db/global_catalog/ddl/sharded_rename_collection_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+struct RenameCollectionOptions;
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] RenameCollectionParticipantService final
+    : public repl::PrimaryOnlyService {
+public:
+    static constexpr std::string_view kServiceName = "RenameCollectionParticipantService"sv;
+
+    explicit RenameCollectionParticipantService(ServiceContext* serviceContext)
+        : PrimaryOnlyService(serviceContext) {}
+
+    ~RenameCollectionParticipantService() override = default;
+
+    static RenameCollectionParticipantService* getService(OperationContext* opCtx);
+
+    std::string_view getServiceName() const override {
+        return kServiceName;
+    }
+
+    NamespaceString getStateDocumentsNS() const override {
+        return NamespaceString::kShardingRenameParticipantsNamespace;
+    }
+
+    // The service implemented its own conflict check before this method was added.
+    void checkIfConflictsWithOtherInstances(
+        OperationContext* opCtx,
+        BSONObj initialState,
+        const std::vector<const PrimaryOnlyService::Instance*>& existingInstances) override {};
+
+    std::shared_ptr<Instance> constructInstance(BSONObj initialState) override;
+};
+
+/*
+ * POS instance managing a rename operation on a single node.
+ *
+ * At a higher level, a rename operation corresponds to 2 steps.
+ * - STEP 1 (upon receiving `ShardsvrRenameCollectionParticipantCommand`):
+ * -- Block CRUD operations, drop target and rename source collection.
+ *
+ * - STEP 2 (Upon receiving `ShardsvrRenameCollectionUnblockParticipantCommand`):
+ * --  Unblock CRUD operations.
+ *
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] RenameParticipantInstance
+    : public repl::PrimaryOnlyService::TypedInstance<RenameParticipantInstance> {
+public:
+    using StateDoc = RenameCollectionParticipantDocument;
+    using Phase = RenameCollectionParticipantPhaseEnum;
+
+    explicit RenameParticipantInstance(const BSONObj& participantDoc)
+        : _doc(RenameCollectionParticipantDocument::parseOwned(
+              participantDoc.getOwned(), IDLParserContext("RenameCollectionParticipantDocument"))),
+          _request(_doc.getRenameCollectionRequest()) {}
+
+    ~RenameParticipantInstance() override;
+
+    /*
+     * Check if the given participant document has the same options as the current instance.
+     * If it does, the participant can be joined.
+     */
+    bool hasSameOptions(const BSONObj& participantDoc);
+
+    BSONObj doc() const {
+        return _doc.toBSON();
+    }
+
+    const boost::optional<UUID>& getTargetUUID() const {
+        return _doc.getTargetUUID();
+    }
+
+    /*
+     * Returns a future that will be ready when the local rename is completed.
+     */
+    SharedSemiFuture<void> getBlockCRUDAndRenameCompletionFuture() {
+        return _blockCRUDAndRenameCompletionPromise.getFuture();
+    }
+
+    /*
+     * Flags CRUD operations as ready to be served and returns a future that will be ready right
+     * after releasing the critical section on source and target collection.
+     */
+    boost::optional<SharedSemiFuture<void>> getUnblockCrudFutureFor(const UUID& sourceUUID) {
+        std::lock_guard<std::mutex> lg(_stateMutex);
+        if (sourceUUID != _doc.getSourceUUID()) {
+            return boost::none;
+        }
+        if (!_canUnblockCRUDPromise.getFuture().isReady()) {
+            _canUnblockCRUDPromise.setFrom(Status::OK());
+        }
+
+        return _unblockCRUDPromise.getFuture();
+    }
+
+    boost::optional<BSONObj> reportForCurrentOp(
+        MongoProcessInterface::CurrentOpConnectionsMode connMode,
+        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const override {}
+
+private:
+    friend class RenameCollectionParticipantServiceTest;
+
+    static void _renameOrDropTarget(OperationContext* opCtx,
+                                    const NamespaceString& fromNss,
+                                    const NamespaceString& toNss,
+                                    const RenameCollectionOptions& options,
+                                    const UUID& sourceUUID,
+                                    const boost::optional<UUID>& targetUUID,
+                                    bool isNonAuthoritative);
+
+    RenameCollectionParticipantDocument _doc;
+    const RenameCollectionRequest _request;
+
+    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                         const CancellationToken& token) noexcept final;
+
+    SemiFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                              const CancellationToken& token) noexcept;
+
+    void interrupt(Status status) noexcept final;
+
+    template <typename Func>
+    auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
+        return [=, this] {
+            const auto& currPhase = _doc.getPhase();
+
+            if (currPhase > newPhase) {
+                // Do not execute this phase if we already reached a subsequent one.
+                return;
+            }
+            if (currPhase < newPhase) {
+                // Persist the new phase if this is the first time we are executing it.
+                _enterPhase(newPhase);
+            }
+
+            const auto inCritSec = _isInCriticalSection(newPhase);
+            auto opCtxHolder = makeOperationContext(!inCritSec);
+            auto* opCtx = opCtxHolder.get();
+
+            return handlerFn(opCtx);
+        };
+    }
+
+    /**
+     * Create an `OperationContext` with the `ForwardableOperationMetadata` from the participant
+     * document set on it. Use this instead of `cc().makeOperationContext()`.
+     */
+    ServiceContext::UniqueOperationContext makeOperationContext(bool deprioritizable) {
+        auto opCtxHolder = cc().makeOperationContext();
+        _doc.getForwardableOpMetadata().setOn(opCtxHolder.get());
+        if (!deprioritizable) {
+            ExecutionAdmissionContext::get(opCtxHolder.get())
+                .setTaskType(opCtxHolder.get(),
+                             ExecutionAdmissionContext::TaskType::NonDeprioritizable);
+        }
+        return opCtxHolder;
+    }
+
+    ServiceContext::UniqueOperationContext makeOperationContext() {
+        const auto inCritSec = _isInCriticalSection(_doc.getPhase());
+        return makeOperationContext(!inCritSec);
+    }
+
+    void _removeStateDocument(OperationContext* opCtx);
+    void _enterPhase(Phase newPhase);
+    void _invalidateFutures(const Status& errStatus, WithLock);
+
+    bool _isInCriticalSection(Phase phase) const;
+
+    // Protects the state of the service object (the recovery doc and the promise fields).
+    std::mutex _stateMutex;
+
+    // Ready when step 1 (drop target && rename source) has been completed: once set, a successful
+    // response to `ShardsvrRenameCollectionParticipantCommand` can be returned to the coordinator.
+    SharedPromise<void> _blockCRUDAndRenameCompletionPromise;
+
+    // Ready when the "unblock CRUD" command has been received: once set, the participant POS can
+    // proceed to unblock CRUD operations.
+    SharedPromise<void> _canUnblockCRUDPromise;
+
+    // Ready when step 2 (unblock CRUD operations) have been completed: once set, a successful
+    // response to `ShardsvrRenameCollectionUnblockParticipantCommand` can be returned to the
+    // coordinator.
+    SharedPromise<void> _unblockCRUDPromise;
+};
+
+}  // namespace mongo

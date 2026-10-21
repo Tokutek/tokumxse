@@ -1,0 +1,75 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+structs:
+    DropIndexesReply:
+        description: Reply to the dropIndexes command
+        strict: false
+        is_command_reply: true
+        fields:
+            nIndexesWas:
+                description:
+                    Number of indexes on the collection at start of dropIndexes command
+                    (mongod only)
+                type: int
+                optional: true
+                stability: stable
+            msg:
+                description: Optional message (mongod only)
+                type: string
+                optional: true
+                stability: stable
+
+    DropIndexesRequest:
+        description: dropIndexes command request
+        strict: false
+        fields:
+            index:
+                description:
+                    An index name, or array of names, or "*" for all indexes, or an index
+                    spec (an object).
+                type:
+                    variant:
+                        - string
+                        - array<string>
+                        - object
+                stability: stable
+            isTimeseriesNamespace:
+                description:
+                    "This flag is set to true when the command was originally sent to
+                    mongos on the time-series view, but got rewritten to target
+                    time-series buckets namespace before being sent to shards."
+                type: optionalBool
+                stability: internal
+            collectionUUID:
+                type: uuid
+                description: "The expected UUID of the collection."
+                optional: true
+                stability: unstable
+
+commands:
+    dropIndexes:
+        description: "Parser for the dropIndexes command"
+        command_name: dropIndexes
+        command_alias: deleteIndexes
+        namespace: concatenate_with_db
+        cpp_name: dropIndexes
+        strict: true
+        api_version: "1"
+        access_check:
+            simple:
+                privilege:
+                    resource_pattern: exact_namespace
+                    action_type: dropIndex
+        inline_chained_structs: true
+        chained_structs:
+            DropIndexesRequest: DropIndexesRequest
+        reply_type: DropIndexesReply

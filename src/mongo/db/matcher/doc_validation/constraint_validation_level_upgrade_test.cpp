@@ -1,0 +1,221 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/matcher/doc_validation/constraint_validation_level_upgrade.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options_gen.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/uuid.h"
+
+#include <boost/none.hpp>
+
+// All tests use localOnly=true (local aggregate) since CatalogTestFixture does not spin up a
+// sharding environment.
+
+namespace mongo {
+namespace {
+
+CollectionAcquisition acquireForWrite(OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+}
+
+class ConstraintValidationLevelUpgradeTest : public CatalogTestFixture {};
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ReturnsOKForNonExistentCollection) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+    ASSERT_OK(noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true));
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ReturnsOKForCollectionWithNoValidator) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+
+    ASSERT_OK(noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true));
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ReturnsOKForEmptyCollectionWithValidator) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.validator = fromjson("{a: {$exists: true}}");
+    options.uuid = UUID::gen();
+
+    ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+
+    ASSERT_OK(noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true));
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ReturnsErrorWhenDocumentViolatesValidator) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.validator = fromjson("{a: {$exists: true}}");
+    options.validationAction = ValidationActionEnum::warn;
+    options.validationLevel = ValidationLevelEnum::moderate;
+    options.uuid = UUID::gen();
+
+    {
+        ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+        auto coll = acquireForWrite(opCtx, nss);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), BSON("_id" << 1 << "b" << 1)));
+        wuow.commit();
+    }
+
+    ASSERT_EQ(
+        noDocumentsViolatingValidator(opCtx,
+                                      nss,
+                                      PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                      /*localOnly=*/true)
+            .code(),
+        12370902);
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ReturnsOKWhenAllDocumentsConformToValidator) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.validator = fromjson("{a: {$exists: true}}");
+    options.validationAction = ValidationActionEnum::warn;
+    options.validationLevel = ValidationLevelEnum::moderate;
+    options.uuid = UUID::gen();
+
+    {
+        ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+        auto coll = acquireForWrite(opCtx, nss);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), BSON("_id" << 1 << "a" << 1)));
+        wuow.commit();
+    }
+
+    ASSERT_OK(noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true));
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ReturnsErrorWhenDocumentViolatesJsonSchemaValidator) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.validator = fromjson("{$jsonSchema: {required: [\"a\"]}}");
+    options.validationAction = ValidationActionEnum::warn;
+    options.validationLevel = ValidationLevelEnum::moderate;
+    options.uuid = UUID::gen();
+
+    ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+    {
+        auto coll = acquireForWrite(opCtx, nss);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), BSON("_id" << 1 << "b" << 1)));
+        wuow.commit();
+    }
+
+    ASSERT_EQ(
+        noDocumentsViolatingValidator(opCtx,
+                                      nss,
+                                      PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                      /*localOnly=*/true)
+            .code(),
+        12370902);
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ErrorMessageTruncatesLargeValidator) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    // Build a validator whose JSON serialization exceeds 10KB via a long schema title.
+    std::string longTitle(15000, 'x');
+    CollectionOptions options;
+    options.validator =
+        BSON("$jsonSchema" << BSON("title" << longTitle << "required" << BSON_ARRAY("a")));
+    options.validationAction = ValidationActionEnum::warn;
+    options.validationLevel = ValidationLevelEnum::moderate;
+    options.uuid = UUID::gen();
+
+    ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+    {
+        auto coll = acquireForWrite(opCtx, nss);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), BSON("_id" << 1 << "b" << 1)));
+        wuow.commit();
+    }
+
+    auto status = noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true);
+    ASSERT_EQ(status.code(), 12370902);
+    ASSERT_STRING_CONTAINS(status.reason(), "First offending document _id: 1");
+    ASSERT_STRING_CONTAINS(status.reason(), "<your collection's validator>");
+    ASSERT_STRING_OMITS(status.reason(), longTitle);
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, SkipsScanWhenCollectionAlreadyAtConstraintLevel) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.validator = fromjson("{a: {$exists: true}}");
+    options.validationLevel = ValidationLevelEnum::constraint;
+    options.uuid = UUID::gen();
+    ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+
+    // The aggregate must not be dispatched when the collection is already at constraint level.
+    ASSERT_OK(noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true));
+}
+
+TEST_F(ConstraintValidationLevelUpgradeTest, ErrorMessageContainsValidatorAndCollectionHint) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("testdb", "testcoll");
+    auto* opCtx = operationContext();
+
+    CollectionOptions options;
+    options.validator = fromjson("{a: {$exists: true}}");
+    options.validationAction = ValidationActionEnum::warn;
+    options.validationLevel = ValidationLevelEnum::moderate;
+    options.uuid = UUID::gen();
+
+    ASSERT_OK(createCollection(opCtx, nss, options, boost::none));
+    {
+        auto coll = acquireForWrite(opCtx, nss);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), BSON("_id" << 1 << "b" << 1)));
+        wuow.commit();
+    }
+
+    auto status = noDocumentsViolatingValidator(
+        opCtx, nss, PlacementConcern(boost::none, ShardVersion::UNTRACKED()), /*localOnly=*/true);
+    ASSERT_EQ(status.code(), 12370902);
+    ASSERT_STRING_CONTAINS(status.reason(), "First offending document _id: 1");
+    ASSERT_STRING_CONTAINS(status.reason(), "Run db.testcoll.find({\"$nor\": [");
+    StringBuilder validatorStr;
+    options.validator.toString(validatorStr, /*isArray=*/false, /*full=*/true);
+    ASSERT_STRING_CONTAINS(status.reason(), validatorStr.str());
+    ASSERT_STRING_CONTAINS(status.reason(), "]}) to find non-compliant documents.");
+}
+
+}  // namespace
+}  // namespace mongo

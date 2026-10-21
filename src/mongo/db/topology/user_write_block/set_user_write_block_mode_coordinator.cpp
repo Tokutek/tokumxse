@@ -1,0 +1,197 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/topology/user_write_block/set_user_write_block_mode_coordinator.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/database_name_util.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
+#include "mongo/db/global_catalog/ddl/sharding_catalog_manager.h"
+#include "mongo/db/global_catalog/ddl/sharding_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/topology/shard_registry.h"
+#include "mongo/db/topology/user_write_block/set_user_write_block_mode_gen.h"
+#include "mongo/db/topology/user_write_block/writes_recoverable_critical_section_service.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future_impl.h"
+
+#include <tuple>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
+namespace mongo {
+
+namespace {
+
+ShardsvrSetUserWriteBlockMode makeShardsvrSetUserWriteBlockModeCommand(
+    bool block, ShardsvrSetUserWriteBlockModePhaseEnum phase) {
+    ShardsvrSetUserWriteBlockMode shardsvrSetUserWriteBlockModeCmd;
+    shardsvrSetUserWriteBlockModeCmd.setDbName(DatabaseName::kAdmin);
+    SetUserWriteBlockModeRequest setUserWriteBlockModeRequest(block /* global */);
+    shardsvrSetUserWriteBlockModeCmd.setSetUserWriteBlockModeRequest(
+        std::move(setUserWriteBlockModeRequest));
+    shardsvrSetUserWriteBlockModeCmd.setPhase(phase);
+
+    return shardsvrSetUserWriteBlockModeCmd;
+}
+
+void sendSetUserWriteBlockModeCmdToAllShards(OperationContext* opCtx,
+                                             std::shared_ptr<executor::TaskExecutor> executor,
+                                             bool block,
+                                             ShardsvrSetUserWriteBlockModePhaseEnum phase,
+                                             const OperationSessionInfo& osi) {
+    const auto allShards = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+
+    auto shardsvrSetUserWriteBlockModeCmd = makeShardsvrSetUserWriteBlockModeCommand(block, phase);
+
+    generic_argument_util::setOperationSessionInfo(shardsvrSetUserWriteBlockModeCmd, osi);
+    generic_argument_util::setMajorityWriteConcern(shardsvrSetUserWriteBlockModeCmd);
+
+    sharding_util::sendCommandToShards(opCtx,
+                                       shardsvrSetUserWriteBlockModeCmd.getDbName(),
+                                       shardsvrSetUserWriteBlockModeCmd.toBSON(),
+                                       allShards,
+                                       executor);
+}
+
+}  // namespace
+
+bool SetUserWriteBlockModeCoordinator::hasSameOptions(const BSONObj& otherDocBSON) const {
+    const auto otherDoc =
+        StateDoc::parse(otherDocBSON, IDLParserContext("SetUserWriteBlockModeCoordinatorDocument"));
+    return _evalStateDocumentThreadSafe(
+        [&](const StateDoc& doc) { return doc.getBlock() == otherDoc.getBlock(); });
+}
+
+boost::optional<BSONObj> SetUserWriteBlockModeCoordinator::reportForCurrentOp(
+    MongoProcessInterface::CurrentOpConnectionsMode connMode,
+    MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept {
+
+    const auto phase =
+        _evalStateDocumentThreadSafe([](const StateDoc& doc) { return doc.getPhase(); });
+
+    BSONObjBuilder bob;
+    bob.append("type", "op");
+    bob.append("desc", "SetUserWriteBlockModeCoordinator");
+    bob.append("op", "command");
+    bob.append("currentPhase", phase);
+    bob.append("active", true);
+    return bob.obj();
+}
+
+const ConfigsvrCoordinatorMetadata& SetUserWriteBlockModeCoordinator::metadata() const {
+    return _doc.getConfigsvrCoordinatorMetadata();
+}
+
+ExecutorFuture<void> SetUserWriteBlockModeCoordinator::_runImpl(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token) noexcept {
+    return ExecutorFuture<void>(**executor)
+        .then(_buildPhaseHandler(
+            Phase::kPrepare,
+            [this, anchor = shared_from_this()](auto* opCtx) {
+                auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+                const auto session = _getNewSession(opCtx);
+
+                // Ensure the topology is stable so we don't miss propagating the write blocking
+                // state to any concurrently added shard. Keep it stable until we have persisted the
+                // user write blocking state on the configsvr so that new shards that get added will
+                // see the new state.
+                Lock::SharedLock stableTopologyRegion =
+                    ShardingCatalogManager::get(opCtx)->enterStableTopologyRegion(opCtx);
+
+                // Propagate the state to the shards.
+                sendSetUserWriteBlockModeCmdToAllShards(
+                    opCtx,
+                    executor,
+                    _doc.getBlock(),
+                    ShardsvrSetUserWriteBlockModePhaseEnum::kPrepare,
+                    session);
+
+                // Durably store the state on the configsvr.
+                if (_doc.getBlock()) {
+                    UserWritesRecoverableCriticalSectionService::get(opCtx)
+                        ->acquireRecoverableCriticalSectionBlockNewShardedDDL(
+                            opCtx,
+                            UserWritesRecoverableCriticalSectionService::
+                                kGlobalUserWritesNamespace);
+                } else {
+                    UserWritesRecoverableCriticalSectionService::get(opCtx)
+                        ->demoteRecoverableCriticalSectionToNoLongerBlockUserWrites(
+                            opCtx,
+                            UserWritesRecoverableCriticalSectionService::
+                                kGlobalUserWritesNamespace);
+                }
+
+                // Wait for majority write concern.
+                WriteConcernResult ignoreResult;
+                auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+                uassertStatusOK(waitForWriteConcern(
+                    opCtx, latestOpTime, defaultMajorityWriteConcern(), &ignoreResult));
+            }))
+        .then(
+            _buildPhaseHandler(Phase::kComplete, [this, anchor = shared_from_this()](auto* opCtx) {
+                auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+                auto session = _getNewSession(opCtx);
+
+                // Ensure the topology is stable so we don't miss propagating the write blocking
+                // state to any concurrently added shard. Keep it stable until we have persisted the
+                // user write blocking state on the configsvr so that new shards that get added will
+                // e see the new state.
+                Lock::SharedLock stableTopologyRegion =
+                    ShardingCatalogManager::get(opCtx)->enterStableTopologyRegion(opCtx);
+
+                // Propagate the state to the shards.
+                sendSetUserWriteBlockModeCmdToAllShards(
+                    opCtx,
+                    executor,
+                    _doc.getBlock(),
+                    ShardsvrSetUserWriteBlockModePhaseEnum::kComplete,
+                    session);
+
+                // Durably store the state on the configsvr.
+                if (_doc.getBlock()) {
+                    UserWritesRecoverableCriticalSectionService::get(opCtx)
+                        ->promoteRecoverableCriticalSectionToBlockUserWrites(
+                            opCtx,
+                            UserWritesRecoverableCriticalSectionService::
+                                kGlobalUserWritesNamespace);
+                } else {
+                    UserWritesRecoverableCriticalSectionService::get(opCtx)
+                        ->releaseRecoverableCriticalSectionBlockingUserWrites(
+                            opCtx,
+                            UserWritesRecoverableCriticalSectionService::
+                                kGlobalUserWritesNamespace);
+                }
+
+                // Wait for majority write concern.
+                WriteConcernResult ignoreResult;
+                auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+                uassertStatusOK(waitForWriteConcern(
+                    opCtx, latestOpTime, defaultMajorityWriteConcern(), &ignoreResult));
+            }));
+}
+
+}  // namespace mongo

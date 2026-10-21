@@ -1,0 +1,229 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/memory_tracking/memory_usage_tracker.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/util/modules.h"
+
+#include <utility>
+
+namespace mongo {
+
+/**
+ * Base class of all GroupProcessor implementations. This class is used by the aggregation framework
+ * and streams enterprise module to perform the document processing needed for $group.
+ */
+class [[MONGO_MOD_OPEN]] GroupProcessorBase {
+public:
+    using Accumulators = std::vector<boost::intrusive_ptr<AccumulatorState>>;
+    using GroupsMap = ValueUnorderedMap<Accumulators>;
+
+    GroupProcessorBase(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                       MemoryUsageLimit maxMemoryUsageBytes);
+
+    GroupProcessorBase(GroupProcessorBase&& other) = default;
+    GroupProcessorBase(const GroupProcessorBase& other) = delete;
+
+    /**
+     * Returns a new GroupProcessorBase with only the configuration fields copied from this
+     * instance. The returned object has fresh (empty) state: no accumulated groups, no stats, and
+     * execution has not started. Use this instead of copy construction to avoid unintentionally
+     * copying potentially large group maps or stale accumulated state.
+     */
+    GroupProcessorBase makeFreshGroupProcessorBase() const;
+
+    /**
+     * Sets the expression to use to determine the group id of each document.
+     * This must be called before setExecutionStarted().
+     */
+    void setIdExpression(boost::intrusive_ptr<Expression> idExpression);
+
+    /**
+     * Add an AccumulationStatement, which will become a field in each Document that results from
+     * grouping. This must be called before setExecutionStarted().
+     */
+    void addAccumulationStatement(AccumulationStatement accumulationStatement);
+
+    /**
+     * This must be called before the very first accumulate() call to indicate that the processor
+     * object has been fully initialized.
+     */
+    void setExecutionStarted();
+
+    /**
+     * Returns the group key for the given document.
+     */
+    Value computeGroupKey(const Document& root) const;
+
+    /**
+     * Finds the group for the given key. Note that this method does not insert a new group when
+     * the group does not already exist.
+     */
+    inline GroupsMap::iterator findGroup(const Value& key) {
+        return _groups.find(key);
+    }
+
+    /**
+     * Finds the group for the given key. Insert a new group when the group does not already exist.
+     */
+    std::pair<GroupsMap::iterator, bool> findOrCreateGroup(const Value& key);
+
+    /**
+     * Computes the argument for the accumulator at the given index for the given document.
+     */
+    inline Value computeAccumulatorArg(const Document& root, size_t accumulatorIdx) const {
+        return _accumulatedFields.at(accumulatorIdx)
+            .expr.argument->evaluate(root, &_expCtx->variables);
+    }
+
+    /**
+     * Adds the given argument to the accumulator at the given index for the given group.
+     */
+    void accumulate(GroupsMap::iterator groupIter, size_t accumulatorIdx, Value accumulatorArg);
+
+    /**
+     * Resets the internal state to match the initial state.
+     */
+    void reset();
+
+    /**
+     * Returns the field names, if any, used to determine the group id of each document.
+     * This vector is non-empty only when the expression sent to setIdExpression() is an
+     * ExpressionObject. This vector then contains the field names of fields used to construct this
+     * object.
+     */
+    const std::vector<std::string>& getIdFieldNames() const {
+        return _idFieldNames;
+    }
+
+    /**
+     * Returns the expression used to determine the group id of each document.
+     * When the expression sent to setIdExpression() is an ExpressionObject, the returned vector
+     * contains the expressions used to compute the individual values in this object.
+     */
+    const std::vector<boost::intrusive_ptr<Expression>>& getIdExpressions() const {
+        return _idExpressions;
+    }
+
+    /**
+     * Similar to above, but can be used to change or swap out individual id expressions.
+     * Should not be used once execution has begun.
+     */
+    std::vector<boost::intrusive_ptr<Expression>>& getMutableIdExpressions() {
+        return _idExpressions;
+    }
+
+    /**
+     * Returns all the AccumulationStatements added via addAccumulationStatement().
+     */
+    const std::vector<AccumulationStatement>& getAccumulationStatements() const {
+        return _accumulatedFields;
+    }
+
+    /**
+     * Similar to above, but can be used to change or swap out individual accumulated fields.
+     * Should not be used once execution has begun.
+     */
+    std::vector<AccumulationStatement>& getMutableAccumulationStatements() {
+        return _accumulatedFields;
+    }
+
+    /**
+     * Returns the expression to use to determine the group id of each document.
+     */
+    boost::intrusive_ptr<Expression> getIdExpression() const;
+
+    /**
+     * Returns true if this GroupProcessor is used by a 'global' $group which is merging together
+     * results from earlier partial groups.
+     */
+    bool doingMerge() const {
+        return _doingMerge;
+    }
+
+    /**
+     * Tell this object if it is doing a merge from shards. Defaults to false.
+     */
+    void setDoingMerge(bool doingMerge) {
+        _doingMerge = doingMerge;
+    }
+
+    /**
+     * Returns true if this GroupProcessor is used by the shard part of a split $group which will be
+     * merged together later.
+     */
+    bool willBeMerged() const {
+        return _willBeMerged;
+    }
+
+    /**
+     * Tell this object that it is the shard part of a split group, and the results will
+     * be merged later.
+     */
+    void setWillBeMerged(bool willBeMerged) {
+        _willBeMerged = willBeMerged;
+    }
+
+    const GroupStats& getStats() const {
+        return _stats;
+    }
+
+    const MemoryUsageTracker& getMemoryTracker() const {
+        return _memoryTracker;
+    }
+
+    /**
+     * If we ran out of memory, finish all the pending operations so that some memory
+     * can be freed.
+     */
+    void freeMemory();
+
+protected:
+    Document makeDocument(const Value& id, const Accumulators& accums);
+
+    // Converts the internal representation of the group key to the _id shape specified by the
+    // user.
+    Value expandId(const Value& val);
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+    // If the expression for the '_id' field represents a non-empty object, we track its fields'
+    // names in '_idFieldNames'.
+    std::vector<std::string> _idFieldNames;
+    // Expressions for the individual fields when '_id' produces a document in the order of
+    // '_idFieldNames' or the whole expression otherwise.
+    std::vector<boost::intrusive_ptr<Expression>> _idExpressions;
+
+    std::vector<AccumulationStatement> _accumulatedFields;
+    // Per-field memory trackers corresponding to each AccumulationStatement in _accumulatedFields.
+    // Caching these helps avoid lookups in the map in MemoryUsageTracker for every input document.
+    std::vector<SimpleMemoryUsageTracker*> _accumulatedFieldMemoryTrackers;
+
+    // Only set to true for a merging $group when a $group is split by distributedPlanLogic().
+    bool _doingMerge{false};
+
+    // Only set to true when a $group is split by distributedPlanLogic(), and only for the $group
+    // pushed down to shards.
+    bool _willBeMerged{false};
+
+    MemoryUsageTracker _memoryTracker;
+
+    // This flag should be set before the very first call to accumulate() to assert that accessor
+    // methods that provide access to mutable member variables are not called during runtime.
+    bool _executionStarted{false};
+
+    GroupsMap _groups;
+    GroupStats _stats;
+
+private:
+    // Constructor used by makeFreshGroupProcessorBase() to create a GroupProcessorBase with a
+    // pre-constructed MemoryUsageTracker (e.g. one created via makeFreshMemoryUsageTracker()).
+    GroupProcessorBase(boost::intrusive_ptr<ExpressionContext> expCtx,
+                       MemoryUsageTracker memoryTracker);
+};
+
+}  // namespace mongo

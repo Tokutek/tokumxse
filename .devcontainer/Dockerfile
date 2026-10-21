@@ -1,0 +1,151 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE=quay.io/mongodb/bazel-remote-execution:ubuntu24-2026_03_26-16_42_59
+FROM $BASE_IMAGE
+ARG BASE_IMAGE
+
+ARG USERNAME=mongo-dev
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+# Create the user
+RUN groupadd $USERNAME && useradd -s /bin/bash --gid $USER_GID -m $USERNAME
+
+RUN apt-get update \
+    && apt-get install -y \
+        sudo \
+        curl \
+        ca-certificates \
+        xdg-utils \
+        wget \
+        less \
+        jq \
+        vim-tiny \
+        procps \
+        lsof \
+        zip \
+        unzip \
+        openssh-client \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install xdg-open wrapper for browser integration
+COPY .devcontainer/xdg-open-wrapper.sh /usr/local/bin/xdg-open-wrapper.sh
+RUN chmod +x /usr/local/bin/xdg-open-wrapper.sh && \
+  if [ -f /usr/bin/xdg-open ]; then \
+    mv /usr/bin/xdg-open /usr/bin/xdg-open.real; \
+  fi && \
+  ln -s /usr/local/bin/xdg-open-wrapper.sh /usr/bin/xdg-open
+
+# Give user sudo access (common-utils feature will enhance this)
+RUN echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devcontaineruser && \
+    chmod 0440 /etc/sudoers.d/devcontaineruser
+
+# Toolchain installation with SHA256 verification
+# Run "python3 toolchain.py" to update toolchain_config.env
+ARG TARGETPLATFORM
+COPY .devcontainer/toolchain_config.env /tmp/toolchain_config.env
+RUN set -e; \
+  . /tmp/toolchain_config.env; \
+  if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+    TOOLCHAIN_URL="$TOOLCHAIN_ARM64_URL"; \
+    TOOLCHAIN_SHA256="$TOOLCHAIN_ARM64_SHA256"; \
+    ARCH="arm64"; \
+  elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+    TOOLCHAIN_URL="$TOOLCHAIN_AMD64_URL"; \
+    TOOLCHAIN_SHA256="$TOOLCHAIN_AMD64_SHA256"; \
+    ARCH="amd64"; \
+  else \
+    echo "Unsupported platform: $TARGETPLATFORM"; \
+    exit 1; \
+  fi; \
+  echo "Target platform: $TARGETPLATFORM"; \
+  echo "Architecture: $ARCH"; \
+  echo "Installing toolchain from: $TOOLCHAIN_URL"; \
+  echo "Expected SHA256: $TOOLCHAIN_SHA256"; \
+  curl -fSL "$TOOLCHAIN_URL" -o /tmp/toolchain.tar.gz; \
+  echo "Verifying checksum..."; \
+  echo "$TOOLCHAIN_SHA256  /tmp/toolchain.tar.gz" | sha256sum -c -;
+RUN echo "Extracting toolchain..."; \
+  mkdir -p /opt/mongodbtoolchain/revisions && tar -xzf /tmp/toolchain.tar.gz -C /opt/mongodbtoolchain/revisions; \
+  rm /tmp/toolchain.tar.gz; \
+  chown -R ${USERNAME} /opt/mongodbtoolchain;
+
+# Evergreen CLI installation with SHA256 verification
+# Run "python3 evergreen_cli.py" to update evergreen_cli_config.env
+COPY .devcontainer/evergreen_cli_config.env /tmp/evergreen_cli_config.env
+RUN set -e; \
+  . /tmp/evergreen_cli_config.env; \
+  if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+    EVERGREEN_CLI_URL="$EVERGREEN_CLI_ARM64_URL"; \
+    EVERGREEN_CLI_SHA256="$EVERGREEN_CLI_ARM64_SHA256"; \
+    ARCH="arm64"; \
+  elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+    EVERGREEN_CLI_URL="$EVERGREEN_CLI_AMD64_URL"; \
+    EVERGREEN_CLI_SHA256="$EVERGREEN_CLI_AMD64_SHA256"; \
+    ARCH="amd64"; \
+  else \
+    echo "Unsupported platform for Evergreen CLI: $TARGETPLATFORM"; \
+    exit 1; \
+  fi; \
+  echo "Installing Evergreen CLI for: $ARCH"; \
+  echo "URL: $EVERGREEN_CLI_URL"; \
+  echo "Expected SHA256: $EVERGREEN_CLI_SHA256"; \
+  curl -fSL "$EVERGREEN_CLI_URL" -o /tmp/evergreen; \
+  echo "Verifying checksum..."; \
+  echo "$EVERGREEN_CLI_SHA256  /tmp/evergreen" | sha256sum -c -; \
+  echo "Installing to /usr/local/bin/evergreen..."; \
+  mv /tmp/evergreen /usr/local/bin/evergreen; \
+  chmod +x /usr/local/bin/evergreen; \
+  echo "Evergreen CLI installation complete"
+
+USER $USERNAME
+ENV USER=${USERNAME}
+RUN /opt/mongodbtoolchain/revisions/*/scripts/install.sh; echo "Toolchain installation complete"
+
+# Add MongoDB toolchain to PATH via system-wide profile
+USER root
+RUN echo 'export PATH="/opt/mongodbtoolchain/v5/bin:${PATH}"' > /etc/profile.d/02-mongodbtoolchain.sh \
+  && chmod +x /etc/profile.d/02-mongodbtoolchain.sh
+USER $USERNAME
+
+# Create MongoDB data directory
+USER root
+RUN mkdir -p /data/db && chown -R ${USERNAME}:${USERNAME} /data/db
+USER $USERNAME
+
+# Bazel telemetry - configure system-wide defaults
+# These will be imported by user's .bazelrc in post-create script
+USER root
+RUN mkdir -p /etc/devcontainer && \
+  echo "# MongoDB Devcontainer Bazel Configuration" > /etc/devcontainer/bazelrc && \
+  echo "common --bes_keywords=devcontainer:use=true" >> /etc/devcontainer/bazelrc && \
+  echo "common --bes_keywords=devcontainer:image=$BASE_IMAGE" >> /etc/devcontainer/bazelrc && \
+  chmod 644 /etc/devcontainer/bazelrc
+USER $USERNAME
+
+# Install pipx (Python package manager for tools)
+# Add ~/.local/bin to PATH for pipx-installed tools
+USER root
+RUN echo 'export PATH="$HOME/.local/bin:${PATH}"' > /etc/profile.d/03-local-bin.sh \
+  && chmod +x /etc/profile.d/03-local-bin.sh
+USER $USERNAME
+
+ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
+RUN /opt/mongodbtoolchain/v5/bin/python3.13 -m venv /tmp/pipx-venv && \
+  /tmp/pipx-venv/bin/python -m pip install --upgrade "pip==25.3" && \
+  /tmp/pipx-venv/bin/python -m pip install pipx && \
+  /tmp/pipx-venv/bin/pipx install pipx --python /opt/mongodbtoolchain/v5/bin/python3.13 --force && \
+  rm -rf /tmp/pipx-venv
+# Note: PATH is configured via /etc/profile.d, not ~/.bashrc, to avoid modifying home volume
+
+# Install db-contrib-tool using pipx
+RUN /home/${USERNAME}/.local/bin/pipx install db-contrib-tool
+
+# Install uv (pinned). uv is the dependency manager for the top-level
+# Python deps; version comes from buildscripts/uv_version.txt so all
+# uv installers in the repo (venv_setup.sh, uv_sync.sh, this Dockerfile,
+# antithesis workload Dockerfile, powercycle bootstrap) resolve to the
+# same pin. `--mount=type=bind` reads the version file at build time
+# without leaving it in the final image layer.
+RUN --mount=type=bind,source=buildscripts/uv_version.txt,target=/tmp/uv_version.txt \
+    /home/${USERNAME}/.local/bin/pipx install "uv==$(cat /tmp/uv_version.txt)"

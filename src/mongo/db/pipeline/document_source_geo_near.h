@@ -1,0 +1,231 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/matcher.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/str.h"
+
+#include <list>
+#include <memory>
+#include <set>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+DECLARE_STAGE_PARAMS_DERIVED_DEFAULT(GeoNear);
+class GeoNearLiteParsed final : public LiteParsedDocumentSourceDefault<GeoNearLiteParsed> {
+public:
+    GeoNearLiteParsed(const BSONElement& originalBson)
+        : LiteParsedDocumentSourceDefault<GeoNearLiteParsed>(originalBson) {}
+
+    static std::unique_ptr<GeoNearLiteParsed> parse(const NamespaceString& nss,
+                                                    const BSONElement& spec,
+                                                    const LiteParserOptions& options) {
+        return std::make_unique<GeoNearLiteParsed>(spec);
+    }
+
+    std::unique_ptr<StageParams> getStageParams() const final {
+        return std::make_unique<GeoNearStageParams>(_originalBson);
+    }
+
+    // $geoNear produces sorted output by distance, so it is a ranked stage.
+    bool isRankedStage() const final {
+        return true;
+    }
+
+    // $geoNear is a selection stage unless distanceField or includeLocs is specified,
+    // which add new fields to output documents.
+    bool isSelectionStage() const final {
+        if (_originalBson.type() == BSONType::object) {
+            auto specObj = _originalBson.Obj();
+            if (specObj.hasField("distanceField"sv) || specObj.hasField("includeLocs"sv)) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+class DocumentSourceGeoNear : public DocumentSource {
+public:
+    static constexpr std::string_view kKeyFieldName = "key"sv;
+    static constexpr std::string_view kStageName = "$geoNear"sv;
+    static constexpr std::string_view kDistanceFieldFieldName = "distanceField"sv;
+    static constexpr std::string_view kIncludeLocsFieldName = "includeLocs"sv;
+    static constexpr std::string_view kNearFieldName = "near"sv;
+
+    /**
+     * Only exposed for testing.
+     */
+    static boost::intrusive_ptr<DocumentSourceGeoNear> create(
+        const boost::intrusive_ptr<ExpressionContext>&);
+
+    std::string_view getSourceName() const final {
+        return DocumentSourceGeoNear::kStageName;
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    StageConstraints constraints(PipelineSplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kCustom,
+                                     HostTypeRequirement::kTargetedShards,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
+        constraints.outputDependsOnSingleInput = true;
+        return constraints;
+    }
+
+    void validatePipelinePosition(bool alreadyOptimized,
+                                  DocumentSourceContainer::const_iterator pos,
+                                  const DocumentSourceContainer& container) const final {
+        // This stage must be in the first position in the pipeline after optimization.
+        uassert(40603,
+                str::stream() << getSourceName()
+                              << " was not the first stage in the pipeline after optimization. Is "
+                                 "optimization disabled or inhibited?",
+                !alreadyOptimized || pos == container.cbegin());
+    }
+
+    Value serialize(const query_shape::SerializationOptions& opts =
+                        query_shape::SerializationOptions{}) const final;
+
+    boost::intrusive_ptr<DocumentSource> optimize();
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+
+
+    bool hasQuery() const override;
+
+    /**
+     * A query predicate to apply to the documents in addition to the "near" predicate.
+     */
+    BSONObj getQuery() const override {
+        return query ? *query->getQuery() : BSONObj();
+    };
+
+    /**
+     * Set the query predicate to apply to the documents in addition to the "near" predicate.
+     */
+    void setQuery(BSONObj newQuery) {
+        query = std::make_unique<Matcher>(newQuery.getOwned(), getExpCtx());
+    };
+
+    /**
+     * The field in which the computed distance will be stored.
+     */
+    boost::optional<FieldPath> getDistanceField() const {
+        return distanceField;
+    }
+
+    /**
+     * The field in which the matching point will be stored, if requested.
+     */
+    boost::optional<FieldPath> getLocationField() const {
+        return includeLocs;
+    }
+
+    /**
+     * The field over which to apply the "near" predicate, if specified.
+     */
+    boost::optional<FieldPath> getKeyField() const {
+        return keyFieldPath;
+    }
+
+    /**
+     * Set the field over which to apply the "near" predicate.
+     */
+    void setKeyField(const FieldPath& newPath) {
+        keyFieldPath = newPath;
+    }
+
+    /**
+     * A scaling factor to apply to the distance, if specified by the user.
+     */
+    boost::optional<double> getDistanceMultiplier() const {
+        return distanceMultiplier;
+    }
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
+    /**
+     * Returns true if the $geoNear specification requires the geoNear point metadata.
+     */
+    bool needsGeoNearPoint() const;
+
+    /**
+     * Converts this $geoNear aggregation stage into an equivalent $near or $nearSphere query on
+     * 'nearFieldName'.
+     */
+    BSONObj asNearQuery(std::string_view nearFieldName);
+
+    /**
+     * In a sharded cluster, this becomes a merge sort by distance, from nearest to furthest.
+     */
+    boost::optional<DistributedPlanLogic> distributedPlanLogic(
+        const DistributedPlanContext* ctx) final;
+
+    DocumentSourceContainer::iterator optimizeAt(DocumentSourceContainer::iterator itr,
+                                                 DocumentSourceContainer* container);
+
+private:
+    explicit DocumentSourceGeoNear(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * If this stage immediately follows an $_internalUnpackBucket, split it up into several stages
+     * including an explicit $sort.
+     *
+     * Does nothing if not immediately following an $_internalUnpackBucket.
+     */
+    DocumentSourceContainer::iterator splitForTimeseries(DocumentSourceContainer::iterator itr,
+                                                         DocumentSourceContainer* container);
+
+
+    /**
+     * Parses the fields in the object 'options', throwing if an error occurs.
+     */
+    void parseOptions(BSONObj options, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+
+    // These fields describe the command to run.
+    // 'near' is required; the rest are optional.
+    boost::intrusive_ptr<Expression> _nearGeometry;
+
+    boost::optional<FieldPath> distanceField;
+    std::unique_ptr<Matcher> query;
+    bool spherical;
+    boost::intrusive_ptr<Expression> maxDistance;
+    boost::intrusive_ptr<Expression> minDistance;
+    boost::optional<double> distanceMultiplier;
+    boost::optional<FieldPath> includeLocs;
+    boost::optional<FieldPath> keyFieldPath;
+};
+}  // namespace mongo

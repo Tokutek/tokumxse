@@ -1,0 +1,176 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/addtoset_node.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <set>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+Status AddToSetNode::init(BSONElement modExpr,
+                          const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    invariant(modExpr.ok());
+
+    _useEachElem = false;
+
+    // If the value of 'modExpr' is an object whose first field is '$each', treat it as an $each.
+    if (modExpr.type() == BSONType::object) {
+        auto firstElement = modExpr.Obj().firstElement();
+        if (firstElement && firstElement.fieldNameStringData() == "$each") {
+            _useEachElem = true;
+            if (firstElement.type() != BSONType::array) {
+                return Status(
+                    ErrorCodes::TypeMismatch,
+                    str::stream()
+                        << "The argument to $each in $addToSet must be an array but it was of type "
+                        << typeName(firstElement.type()));
+            }
+            if (modExpr.Obj().nFields() > 1) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "Found unexpected fields after $each in $addToSet: "
+                                            << modExpr.Obj());
+            }
+            _elements = firstElement.Array();
+        }
+    }
+
+    // If the value of 'modExpr' was not an $each, we append the entire element.
+    if (!_useEachElem) {
+        _elements.push_back(modExpr);
+    }
+
+    setCollator(expCtx->getCollator());
+    return Status::OK();
+}
+
+void AddToSetNode::setCollator(const CollatorInterface* collator) {
+    tassert(11739500,
+            "Trying to set collator when it is already set",
+            !_elementsSet.key_comp().collator());
+    _elementsSet = absl::btree_set<BSONElementAndIndex, BSONElementAndIndexComparator>(
+        BSONElementAndIndexComparator{collator});
+
+    _deduplicateElements();
+}
+
+void AddToSetNode::_deduplicateElements() {
+    _elementsSet.clear();
+    std::vector<BSONElement> deduplicatedElements;
+    for (size_t i = 0; i < _elements.size(); ++i) {
+        if (_elementsSet.emplace(_elements[i], i).second) {
+            deduplicatedElements.push_back(_elements[i]);
+        }
+    }
+    _elements = deduplicatedElements;
+}
+
+std::vector<AddToSetNode::BSONElementAndIndex> AddToSetNode::_getElementsToAdd(
+    mutablebson::Element* element) const {
+    // Find the set of elements that do not already exist in the array 'element'.
+    auto elementsToAdd = _elementsSet;
+    for (auto existingElem = element->leftChild(); existingElem.ok();
+         existingElem = existingElem.rightSibling()) {
+        elementsToAdd.erase(existingElem);
+        if (elementsToAdd.size() == 0) {
+            break;
+        }
+    }
+
+    // Sort elements by original index to preserve the order.
+    std::vector<BSONElementAndIndex> elementsToAddVector{elementsToAdd.begin(),
+                                                         elementsToAdd.end()};
+    std::sort(elementsToAddVector.begin(),
+              elementsToAddVector.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.index < rhs.index; });
+    return elementsToAddVector;
+}
+
+ModifierNode::ModifyResult AddToSetNode::updateExistingElement(mutablebson::Element* element,
+                                                               const FieldRef& elementPath) const {
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "Cannot apply $addToSet to non-array field. Field named '"
+                          << element->getFieldName() << "' has non-array type "
+                          << typeName(element->getType()),
+            element->getType() == BSONType::array);
+
+    auto elementsToAdd = _getElementsToAdd(element);
+    if (elementsToAdd.empty()) {
+        return ModifyResult::kNoOp;
+    }
+    for (auto&& [elem, _] : elementsToAdd) {
+        auto toAdd = element->getDocument().makeElement(elem);
+        invariant(element->pushBack(toAdd));
+    }
+
+    ModifyResult result(ModifyResult::kArrayAppendUpdate);
+    result.description = ModifyResult::ArrayAppendUpdateDescription{elementsToAdd.size()};
+    return result;
+}
+
+void AddToSetNode::setValueForNewElement(mutablebson::Element* element) const {
+    BSONObj emptyArray;
+    invariant(element->setValueArray(emptyArray));
+    for (auto&& elem : _elements) {
+        auto toAdd = element->getDocument().makeElement(elem);
+        invariant(element->pushBack(toAdd));
+    }
+}
+
+void AddToSetNode::logUpdate(LogBuilderInterface* logBuilder,
+                             const RuntimeUpdatePath& pathTaken,
+                             mutablebson::Element element,
+                             ModifyResult modifyResult,
+                             boost::optional<int> createdFieldIdx) const {
+    invariant(logBuilder);
+
+    if (modifyResult.type == ModifyResult::kNormalUpdate ||
+        modifyResult.type == ModifyResult::kCreated) {
+        ModifierNode::logUpdate(logBuilder, pathTaken, element, modifyResult, createdFieldIdx);
+    } else if (modifyResult.type == ModifyResult::kArrayAppendUpdate) {
+        // This update only modified the array by appending entries to the end. Rather than writing
+        // out the entire contents of the array, we create oplog entries for the newly appended
+        // elements.
+        invariant(holds_alternative<ModifyResult::ArrayAppendUpdateDescription>(
+            modifyResult.description));
+        const auto numAppended =
+            get<ModifyResult::ArrayAppendUpdateDescription>(modifyResult.description).inserted;
+        const auto arraySize = countChildren(element);
+
+        std::vector<mutablebson::Element> added;
+        added.reserve(numAppended);
+        auto child = element.findNthChild(arraySize - numAppended);
+        for (size_t i = 0; i < numAppended; i++) {
+            added.push_back(child);
+            child = child.rightSibling();
+        }
+
+        // We have to copy the field ref provided in order to use RuntimeUpdatePathTempAppend.
+        RuntimeUpdatePath pathTakenCopy = pathTaken;
+        invariant(arraySize >= numAppended);
+        auto position = arraySize - numAppended;
+        for (const auto& elementToLog : added) {
+            const std::string positionAsString = std::to_string(position);
+
+            RuntimeUpdatePathTempAppend tempAppend(
+                pathTakenCopy, positionAsString, RuntimeUpdatePath::ComponentType::kArrayIndex);
+            uassertStatusOK(
+                logBuilder->logCreatedField(pathTakenCopy, pathTakenCopy.size() - 1, elementToLog));
+
+            ++position;
+        }
+    } else {
+        MONGO_UNREACHABLE;
+    }
+}
+
+}  // namespace mongo

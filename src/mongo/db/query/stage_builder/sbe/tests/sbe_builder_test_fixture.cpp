@@ -1,0 +1,262 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/stage_builder/sbe/tests/sbe_builder_test_fixture.h"
+
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
+#include "mongo/db/exec/sbe/sbe_unittest_assert.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/stage_builder/sbe/builder.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_mock.h"
+#include "mongo/db/shard_role/shard_role_mock.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+unittest::GoldenTestConfig goldenTestConfigSbe{"src/mongo/db/test_output/query/stage_builder/sbe"};
+
+std::unique_ptr<QuerySolution> SbeStageBuilderTestFixture::makeQuerySolution(
+    std::unique_ptr<QuerySolutionNode> root) {
+    auto querySoln = std::make_unique<QuerySolution>();
+    querySoln->setRoot(std::move(root));
+    return querySoln;
+}
+
+std::tuple<sbe::value::SlotVector,
+           std::unique_ptr<sbe::PlanStage>,
+           stage_builder::PlanStageData,
+           boost::intrusive_ptr<ExpressionContext>>
+SbeStageBuilderTestFixture::buildPlanStage(std::unique_ptr<QuerySolution> querySolution,
+                                           MultipleCollectionAccessor& colls,
+                                           bool hasRecordId,
+                                           BuildPlanStageParam param) {
+    auto findCommand = param.makeFindCmdReq(_nss);
+
+    boost::intrusive_ptr<ExpressionContext> expCtx = param.expCtx
+        ? *param.expCtx
+        : new ExpressionContextForTest(operationContext(), _nss, std::move(param.collator));
+
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = expCtx, .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    if (hasRecordId) {
+        // Force the builder to generate the RecordId output even if it isn't needed by the plan.
+        cq->setForceGenerateRecordId(true);
+    }
+
+    CollectionMock coll(_nss);
+    // CollectionPtr_UNSAFE is intentional here: 'coll' is a stack-allocated mock with no catalog
+    // entry, so establishConsistentCollection cannot be used. This code path is test-only and
+    // never yields, so the Collection* cannot go stale within this scope.
+    CollectionPtr collPtr = CollectionPtr::CollectionPtr_UNSAFE(&coll);
+    if (param.shardFilterInterface) {
+        auto shardFilterer = param.shardFilterInterface->makeShardFilterer(operationContext());
+        collPtr.setShardKeyPattern(shardFilterer->getKeyPattern().toBSON());
+        colls = MultipleCollectionAccessor(
+            shard_role_mock::acquireCollectionMocked(operationContext(), _nss, std::move(collPtr)));
+    }
+
+    stage_builder::SlotBasedStageBuilder builder{
+        operationContext(), colls, *cq, *querySolution, getYieldPolicy()};
+
+    auto [stage, data] = builder.build(querySolution->root());
+
+    // Reset "shardFilterer".
+    if (auto shardFiltererSlot = data.env->getSlotIfExists("shardFilterer"sv);
+        shardFiltererSlot && param.shardFilterInterface) {
+        auto shardFilterer = param.shardFilterInterface->makeShardFilterer(operationContext());
+        data.env->resetSlot(*shardFiltererSlot,
+                            sbe::value::TypeTags::shardFilterer,
+                            sbe::value::bitcastFrom<ShardFilterer*>(shardFilterer.release()),
+                            true);
+    }
+
+    auto slots = sbe::makeSV();
+    if (hasRecordId) {
+        slots.push_back(*data.staticData->recordIdSlot);
+    }
+    slots.push_back(*data.staticData->resultSlot);
+
+    // 'expCtx' owns the collator and a collator slot is registered into the runtime environment
+    // while creating 'builder'. So, the caller should retain the 'expCtx' until the execution is
+    // done. Otherwise, the collator slot becomes invalid at runtime because the canonical query
+    // which is created here owns the 'expCtx' which is deleted with the canonical query at the end
+    // of this function.
+    return {slots, std::move(stage), std::move(data), expCtx};
+}
+
+void SbeStageBuilderTestFixture::insertDocuments(const NamespaceString& nss,
+                                                 const std::vector<BSONObj>& docs) {
+    auto coll = acquireCollection(
+        operationContext(),
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(operationContext()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    WriteUnitOfWork wuow{operationContext()};
+    ASSERT_OK(Helpers::insert(operationContext(), coll.getCollectionPtr(), docs));
+    wuow.commit();
+}
+
+void GoldenSbeStageBuilderTestFixture::createCollection(const std::vector<BSONObj>& docs,
+                                                        boost::optional<BSONObj> indexKeyPattern,
+                                                        CollectionOptions options) {
+    ASSERT_FALSE(_collInitialized) << "collection has been initialized";
+    _collInitialized = true;
+    // Create collection and index
+    ASSERT_OK(storageInterface()->createCollection(operationContext(), _nss, CollectionOptions()));
+    if (indexKeyPattern) {
+        ASSERT_OK(storageInterface()->createIndexesOnEmptyCollection(
+            operationContext(),
+            _nss,
+            {BSON("v" << 2 << "name" << DBClientBase::genIndexName(*indexKeyPattern) << "key"
+                      << *indexKeyPattern)}));
+    }
+    insertDocuments(_nss, docs);
+}
+
+IndexEntry SbeStageBuilderTestFixture::makeIndexEntry(const NamespaceString& nss,
+                                                      BSONObj keyPattern) {
+    auto acquisition =
+        acquireCollectionOrView(operationContext(),
+                                CollectionOrViewAcquisitionRequest::fromOpCtx(
+                                    operationContext(), nss, AcquisitionPrerequisites::kRead),
+                                MODE_IS);
+    const auto& collPtr = acquisition.getCollection().getCollectionPtr();
+    const auto indexName = DBClientBase::genIndexName(keyPattern);
+    for (auto&& ice :
+         collPtr->getIndexCatalog()->getEntriesShared(IndexCatalog::InclusionPolicy::kReady)) {
+        if (ice->descriptor()->indexName() == indexName) {
+            return {keyPattern,
+                    IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                    IndexConfig::kLatestIndexVersion,
+                    false /* multiKey */,
+                    {{}, {}} /* multiKeyPaths */,
+                    {} /* multikeyPathSet */,
+                    false /* sp */,
+                    false /* unq */,
+                    CoreIndexInfo::Identifier(indexName),
+                    {} /* io */,
+                    nullptr /* wildcardProjection */,
+                    ice};
+        }
+    }
+    FAIL("Could not find index with keyPattern " + keyPattern.toString() + " in collection");
+    MONGO_UNREACHABLE;
+}
+
+void GoldenSbeStageBuilderTestFixture::runTest(std::unique_ptr<QuerySolutionNode> root,
+                                               const mongo::BSONArray& expectedValue,
+                                               BuildPlanStageParam param) {
+    auto querySolution = makeQuerySolution(std::move(root));
+
+    // Translate the QuerySolution tree to an sbe::PlanStage.
+    boost::optional<CollectionOrViewAcquisition> localColl;
+    MultipleCollectionAccessor colls;
+    if (_collInitialized) {
+        localColl.emplace(
+            acquireCollectionOrView(operationContext(),
+                                    CollectionOrViewAcquisitionRequest::fromOpCtx(
+                                        operationContext(), _nss, AcquisitionPrerequisites::kRead),
+                                    MODE_IS));
+        colls = MultipleCollectionAccessor(*localColl);
+    }
+    attachCollectionAcquisition(colls);
+
+    auto [resultSlots, stage, data, _] =
+        buildPlanStage(std::move(querySolution), colls, false /*hasRecordId*/, std::move(param));
+    auto resultAccessors = prepareTree(&data.env.ctx, stage.get(), resultSlots);
+    ASSERT_EQ(resultAccessors.size(), 1u);
+
+    // Print the stage explain output and verify.
+    _gctx->printTestHeader(unittest::GoldenTestContext::HeaderFormat::Text);
+    sbe::DebugPrintInfo debugPrintInfo{};
+    auto explain = sbe::DebugPrinter().print(*stage.get(), debugPrintInfo);
+    _gctx->outStream() << (localColl ? replaceUuid(explain, localColl->getCollection().uuid())
+                                     : explain);
+    _gctx->outStream() << std::endl;
+    _gctx->verifyOutput();
+
+    // Execute the plan to verify explain output is correct.
+    sbe::value::TagValueOwned results =
+        sbe::value::TagValueOwned::fromRaw(getAllResults(stage.get(), resultAccessors[0]));
+
+    sbe::value::TagValueOwned expectedResult =
+        sbe::value::TagValueOwned::fromRaw(stage_builder::makeValue(expectedValue));
+
+    ASSERT_SBE_VALUE_EQ(
+        results.tag(), results.value(), expectedResult.tag(), expectedResult.value());
+}
+
+std::string GoldenSbeStageBuilderTestFixture::replaceUuid(std::string input, UUID uuid) {
+    auto uuidStr = uuid.toString();
+    std::string replace_by = "UUID";
+    // Find the first occurrence of the uuid
+    size_t pos = input.find(uuidStr);
+
+    // Iterate through the string and replace all occurrences
+    while (pos != std::string::npos) {
+        // Replace the uuid with the constant string
+        input.replace(pos, uuidStr.size(), replace_by);
+
+        // Find the next occurrence of the uuid
+        pos = input.find(uuidStr, pos + replace_by.size());
+    }
+
+    return input;
+}
+
+void GoldenSbeExprBuilderTestFixture::setUp() {
+    SbeStageBuilderTestFixture::setUp();
+    _expCtx = new ExpressionContextForTest();
+    _planStageData = std::make_unique<stage_builder::PlanStageStaticData>();
+    _state.emplace(operationContext(),
+                   _env,
+                   _planStageData.get(),
+                   _variables,
+                   nullptr /* yieldPolicy */,
+                   &_slotIdGenerator,
+                   &_frameIdGenerator,
+                   &_spoolIdGenerator,
+                   &_inListsMap,
+                   &_collatorsMap,
+                   &_sortSpecMap,
+                   _expCtx,
+                   false /* needsMerge */,
+                   false /* allowDiskUse */,
+                   *_expCtx->getIfrContext());
+}
+
+void GoldenSbeExprBuilderTestFixture::runTest(stage_builder::SbExpr sbExpr,
+                                              sbe::value::TypeTags expectedTag,
+                                              sbe::value::Value expectedVal,
+                                              std::string_view test) {
+    auto sbeEExpr = sbExpr.lower(*_state);
+    // Print the stage explain output and verify.
+    _gctx->printTestHeader(unittest::GoldenTestContext::HeaderFormat::Text);
+    _gctx->outStream() << test << std::endl;
+    _gctx->outStream() << sbe::DebugPrinter().print(sbeEExpr->debugPrint());
+    _gctx->outStream() << std::endl;
+
+    sbe::CompileCtx _compileCtx(std::make_unique<sbe::RuntimeEnvironment>());
+    sbe::vm::CodeFragment code = sbeEExpr->compileDirect(_env.ctx);
+    sbe::vm::ByteCode vm;
+    auto results = vm.run(&code);
+
+
+    ASSERT_SBE_VALUE_EQ(results.tag(), results.value(), expectedTag, expectedVal);
+}
+}  // namespace mongo

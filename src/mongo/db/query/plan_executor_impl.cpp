@@ -1,0 +1,1010 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/query/plan_executor_impl.h"
+
+#include "mongo/base/counter.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/classic/cached_plan.h"
+#include "mongo/db/exec/classic/collection_scan.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/subplan.h"
+#include "mongo/db/exec/classic/timeseries_modify.h"
+#include "mongo/db/exec/classic/update_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/plan_explainer_factory.h"
+#include "mongo/db/query/plan_explainer_impl.h"
+#include "mongo/db/query/plan_insert_listener.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
+#include "mongo/db/query/plan_yield_policy_impl.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/write_conflict_backoff.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/shard_filtering_util.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/exceptions.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+namespace {
+const BSONObj kEmptyPBRT;
+const std::vector<NamespaceStringOrUUID> kEmptyNssVector;
+
+// Avoid logging the same message about long-running collection scans from different queries too
+// frequently.
+logv2::SeveritySuppressor longCollectionScanLogSeveritySuppressor{
+    Seconds(300), logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(3)};
+
+}  // namespace
+
+
+const OperationContext::Decoration<boost::optional<repl::OpTime>> clientsLastKnownCommittedOpTime =
+    OperationContext::declareDecoration<boost::optional<repl::OpTime>>();
+
+// This failpoint is also accessed by the SBE executor so we define it outside of an anonymous
+// namespace.
+MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeShouldWaitForInserts);
+
+MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeLogAndBackoff);
+
+PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
+                                   std::unique_ptr<WorkingSet> ws,
+                                   std::unique_ptr<PlanStage> rt,
+                                   std::unique_ptr<QuerySolution> qs,
+                                   std::unique_ptr<CanonicalQuery> cq,
+                                   const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   const boost::optional<CollectionAcquisition>& collection,
+                                   bool returnOwnedBson,
+                                   NamespaceString nss,
+                                   PlanYieldPolicy::YieldPolicy yieldPolicy,
+                                   boost::optional<size_t> cachedPlanHash,
+                                   boost::optional<std::string> replanReason,
+                                   boost::optional<PlanExplainerData> maybeExplainData,
+                                   boost::optional<PlanSelectionStrategy> planSelectionStrategy)
+    : _opCtx(opCtx),
+      _cq(std::move(cq)),
+      _expCtx(_cq ? _cq->getExpCtx() : expCtx),
+      _workingSet(std::move(ws)),
+      _qs(std::move(qs)),
+      _root(std::move(rt)),
+      _planExplainer(
+          plan_explainer_factory::make(_root.get(),
+                                       cachedPlanHash,
+                                       std::move(replanReason),
+                                       std::move(maybeExplainData),
+                                       _cq && _cq->getExplain().has_value() /* isExplain */,
+                                       planSelectionStrategy)),
+      _mustReturnOwnedBson(returnOwnedBson),
+      _mustSetRecordIdMetadata(_cq && _cq->metadataDeps()[DocumentMetadataFields::kRecordId]),
+      // Read value of 'operationResponseMaxMS' query knob once, here at construction, where the
+      // knob configuration is resolved and available. The knob is fixed for the query's lifetime,
+      // so the value is cached and reused rather than re-read on every reattach (see header).
+      _operationResponseMaxMS(QueryKnobConfiguration::get(opCtx).getOperationResponseMaxMS()),
+      _responseDeadlineType([&]() -> ResponseDeadlineType {
+          // Determine response deadline type for change stream queries.
+          if (_expCtx && _expCtx->getChangeStreamSpec().has_value()) {
+              if (_operationResponseMaxMS > 0) {
+                  // Use the response deadline to periodically interrupt the executor after a
+                  // user-configurable time period of performing work. This allows us to return
+                  // an updated PBRT to the consumer and check for interrupts more frequently during
+                  // long-running operations.
+                  return ResponseDeadlineType::kInterruptWork;
+              }
+              // Use the response deadline to log an info message about long-running operations that
+              // exceed 'kLongOperationResponseLogInfoDeadline'.
+              // This allows end users to discover that long-running operations can be interrupted
+              // via configuration. Currently only used for change stream queries.
+              return ResponseDeadlineType::kLogInfoMessage;
+          }
+
+          // No response deadline.
+          return ResponseDeadlineType::kNone;
+      }()),
+      _responseDeadlineValue(_calculateResponseDeadlineValue()),
+      _nss(std::move(nss)) {
+    invariant(!_expCtx || _expCtx->getOperationContext() == _opCtx);
+    invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
+
+    const bool collectionExists = collection.is_initialized() && collection->exists();
+
+    // Storing an acquisition that doesn't exists will cause the restore procedure to throw if the
+    // collection appears. There is no need to unnecessarily fail a query that is not planning to
+    // access the collection.
+    if (collectionExists) {
+        _collection = collection;
+    }
+
+    // If we don't yet have a namespace string, then initialize it from either 'collection' or
+    // '_cq'.
+    if (_nss.isEmpty()) {
+        if (collectionExists) {
+            _nss = collection->nss();
+        } else {
+            tassert(11321318, "canonicalQuery must not be null", _cq);
+            if (_cq->getFindCommandRequest().getNamespaceOrUUID().isNamespaceString()) {
+                _nss = _cq->getFindCommandRequest().getNamespaceOrUUID().nss();
+            }
+        }
+    }
+
+    _yieldPolicy = makeClassicYieldPolicy(
+        _opCtx,
+        _nss,
+        this,
+        collectionExists ? yieldPolicy : PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    if (_qs) {
+        _planExplainer->setQuerySolution(_qs.get());
+        _planExplainer->updateEnumeratorExplainInfo(_qs->_enumeratorExplainInfo);
+    } else if (const MultiPlanStage* mps = getMultiPlanStage()) {
+        const QuerySolution* soln = mps->bestSolution();
+        _planExplainer->setQuerySolution(soln);
+        _planExplainer->updateEnumeratorExplainInfo(soln->_enumeratorExplainInfo);
+    } else if (auto subplan = getStageByType(_root.get(), STAGE_SUBPLAN)) {
+        auto subplanStage = static_cast<SubplanStage*>(subplan);
+        _planExplainer->updateEnumeratorExplainInfo(
+            subplanStage->compositeSolution()->_enumeratorExplainInfo);
+    }
+
+    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN
+    // stage. This is used for change streams in order to keep the the latest oplog timestamp
+    // and post batch resume token up to date as the oplog scan progresses. Similarly, this is
+    // used for oplog scans to coordinate waiting for oplog visiblity.
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
+        _collScanStage = static_cast<CollectionScan*>(collectionScan);
+
+        if (_nss.isOplog()) {
+            _oplogWaitConfig = _collScanStage->getOplogWaitConfig();
+            tassert(9478713,
+                    "Should have '_oplogWaitConfig' if we are scanning the oplog",
+                    _oplogWaitConfig);
+
+            // Allow waiting for oplog visiblity if our yield policy supports auto yielding.
+            if (_yieldPolicy->canAutoYield() &&
+                _collScanStage->params().shouldWaitForOplogVisibility) {
+                _oplogWaitConfig->enableWaitingForOplogVisibility();
+                _afterSnapshotAbandonFn = [&]() {
+                    _waitForAllEarlierOplogWritesToBeVisible();
+                };
+            }
+        }
+    }
+}
+
+PlanExecutorImpl::~PlanExecutorImpl() {
+    invariant(_currentState == kDisposed);
+}
+
+PlanStage* PlanExecutorImpl::getRootStage() const {
+    return _root.get();
+}
+
+CanonicalQuery* PlanExecutorImpl::getCanonicalQuery() const {
+    return _cq.get();
+}
+
+const NamespaceString& PlanExecutorImpl::nss() const {
+    return _nss;
+}
+
+const std::vector<NamespaceStringOrUUID>& PlanExecutorImpl::getSecondaryNamespaces() const {
+    // Return a reference to an empty static array. This array will never contain any elements
+    // because a PlanExecutorImpl is only capable of executing against a single namespace. As
+    // such, it will never lock more than one namespace.
+    return kEmptyNssVector;
+}
+
+OperationContext* PlanExecutorImpl::getOpCtx() const {
+    return _opCtx;
+}
+
+void PlanExecutorImpl::saveState() {
+    invariant(_currentState == kUsable || _currentState == kSaved);
+
+    if (!isMarkedAsKilled()) {
+        // The following call can throw, leaving '_currentState' unchanged.
+        _root->saveState();
+    }
+
+    _currentState = kSaved;
+}
+
+void PlanExecutorImpl::restoreState(const RestoreContext& context) {
+    try {
+        restoreStateWithoutRetrying(context);
+    } catch (const StorageUnavailableException&) {
+        if (!_yieldPolicy->canAutoYield()) {
+            throw;
+        }
+
+        // Handles retries by calling restoreStateWithoutRetrying() in a loop.
+        uassertStatusOK(_yieldPolicy->yieldOrInterrupt(
+            getOpCtx(), nullptr /* whileYieldingFn */, context.type()));
+    }
+}
+
+void PlanExecutorImpl::restoreStateWithoutRetrying(const RestoreContext& context) {
+    invariant(_currentState == kSaved);
+
+    if (!isMarkedAsKilled()) {
+        _root->restoreState(context);
+    }
+
+    _currentState = kUsable;
+    uassertStatusOK(_killStatus);
+}
+
+void PlanExecutorImpl::detachFromOperationContext() {
+    invariant(_currentState == kSaved);
+
+    // Reset response deadline because the request is over.
+    _responseDeadlineValue.reset();
+
+    _opCtx = nullptr;
+    _root->detachFromOperationContext();
+    if (_expCtx) {
+        _expCtx->setOperationContext(nullptr);
+    }
+    _currentState = kDetached;
+}
+
+void PlanExecutorImpl::reattachToOperationContext(OperationContext* opCtx) {
+    invariant(_currentState == kDetached);
+    invariant(_opCtx == nullptr);
+
+    // We're reattaching for a getMore now.  Reset the yield timer in order to prevent from
+    // yielding again right away.
+    _yieldPolicy->resetTimer();
+
+    _opCtx = opCtx;
+    _root->reattachToOperationContext(opCtx);
+    if (_expCtx) {
+        _expCtx->setOperationContext(opCtx);
+    }
+
+    // The response deadline value needs to be (re)computed here on every invocation, because
+    // the same plan executor instance can be used to service multiple getMore requests.
+    _responseDeadlineValue = _calculateResponseDeadlineValue();
+    _interrupted = false;
+
+    _currentState = kSaved;
+}
+
+namespace {
+/**
+ * Helper function used to determine if we need to hang before inserts.
+ */
+void hangBeforeShouldWaitForInsertsIfFailpointEnabled(PlanExecutorImpl* exec) {
+    if (MONGO_unlikely(
+            planExecutorHangBeforeShouldWaitForInserts.shouldFail([exec](const BSONObj& data) {
+                auto fpNss = NamespaceStringUtil::parseFailPointData(data, "namespace"sv);
+                return fpNss.isEmpty() || fpNss == exec->nss();
+            }))) {
+        LOGV2(20946,
+              "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
+              "enabled. Blocking until fail point is disabled");
+        planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
+    }
+}
+}  // namespace
+
+
+/**
+ * Logs and sleeps, if necessary, after a write conflict.
+ */
+void PlanExecutorImpl::logWriteConflictAndBackoff(size_t numAttempts) {
+    if (MONGO_unlikely(planExecutorHangBeforeLogAndBackoff.shouldFail())) {
+        planExecutorHangBeforeLogAndBackoff.pauseWhileSet(_opCtx);
+    }
+    write_conflict_backoff::logAndBackoff(
+        _opCtx, numAttempts, "plan execution", ""sv, NamespaceStringOrUUID(_nss));
+}
+
+/**
+ * Does all waiting during yield if needed.
+ */
+void PlanExecutorImpl::doWaitDuringYield() {
+    // If we yielded because we encountered a sharding critical section, wait for the critical
+    // section to end before continuing. By waiting for the critical section to be exited we avoid
+    // busy spinning immediately and encountering the same critical section again. It is important
+    // that this wait happens after having released the lock hierarchy - otherwise deadlocks could
+    // happen, or the very least, locks would be unnecessarily held while waiting.
+    const auto& shardingCriticalSection = planExecutorShardingState(_opCtx).criticalSectionFuture;
+    if (shardingCriticalSection) {
+        refresh_util::waitForCriticalSectionToComplete(_opCtx, *shardingCriticalSection).ignore();
+        planExecutorShardingState(_opCtx).criticalSectionFuture.reset();
+    }
+
+    if (_writeConflictsInARowToLog) {
+        logWriteConflictAndBackoff(*_writeConflictsInARowToLog);
+        _writeConflictsInARowToLog = boost::none;
+    }
+}
+
+/**
+ * This function waits for all oplog entries before the read to become visible. This must be done
+ * before initializing a cursor to perform an oplog scan as that is when we establish the endpoint
+ * for the cursor. Note that this function can only be called for forward, non-tailable scans.
+ */
+void PlanExecutorImpl::_waitForAllEarlierOplogWritesToBeVisible() {
+    tassert(9478702, "This function should not be called outside of oplog scans", nss().isOplog());
+    tassert(9478703, "This function should not be called outside of oplog scans", _collScanStage);
+    const auto& params = _collScanStage->params();
+    if (!(params.direction == CollectionScanParams::FORWARD &&
+          params.shouldWaitForOplogVisibility)) {
+        return;
+    }
+
+    if (_collScanStage->initializedCursor()) {
+        return;
+    }
+
+    tassert(9478704, "This function should not be called on tailable cursors", !params.tailable);
+
+    // If we do not have an oplog, we do not wait.
+    LocalOplogInfo* oplogInfo = LocalOplogInfo::get(_opCtx);
+    if (!oplogInfo) {
+        return;
+    }
+
+    RecordStore* oplogRecordStore = oplogInfo->getRecordStore();
+    if (!oplogRecordStore) {
+        return;
+    }
+
+    auto storageEngine = _opCtx->getServiceContext()->getStorageEngine();
+    storageEngine->waitForAllEarlierOplogWritesToBeVisible(_opCtx, oplogRecordStore);
+}
+
+PlanExecutor::ExecState PlanExecutorImpl::getNext(BSONObj* objOut, RecordId* dlOut) {
+    auto* docOut = objOut ? &_docOutput : nullptr;
+    ExecState state = _getNextImpl(docOut, dlOut);
+
+    if (objOut && state == ExecState::ADVANCED) {
+        const bool includeMetadata = _expCtx && _expCtx->getNeedsMerge();
+        *objOut = includeMetadata ? _docOutput.toBsonWithMetaData() : _docOutput.toBson();
+    }
+    return state;
+}
+
+PlanExecutor::ExecState PlanExecutorImpl::getNextDocument(Document& objOut) {
+    return _getNextImpl(&objOut, nullptr);
+}
+
+PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Document* objOut, RecordId* dlOut) {
+    checkFailPointPlanExecAlwaysFails(nss());
+
+    invariant(_currentState == kUsable);
+    if (isMarkedAsKilled()) {
+        uassertStatusOK(_killStatus);
+    }
+
+    if (!_stash.empty()) {
+        tassert(11321319, "objOut must not be null", objOut);
+        tassert(11321320, "dlOut must be null", !dlOut);
+        *objOut = std::move(_stash.front());
+        _stash.pop_front();
+        return PlanExecutor::ADVANCED;
+    }
+
+    // Per-call retry state: streak counters incremented on every WriteConflict or
+    // TemporarilyUnavailable error accordingly, and reset to 0 on any successful call to
+    // _root->work.
+    WriteConflictRetryState retryState;
+
+    // Capped insert notifier; declared outside the loop so that it (and thus the capped-insert
+    // version tracking) persists across the two-EOF wait handshake in _handleEOFAndExit(). It is
+    // created lazily on the first EOF that actually needs to wait, rather than on every call, to
+    // avoid allocating a notifier on the common path where _getNextImpl returns a document without
+    // ever waiting. Holding the shared pointer while we wait is what allows the notifier version
+    // to advance; that requirement is only relevant once we are blocking.
+    std::unique_ptr<insert_listener::Notifier> notifier;
+
+    // This callback is used by the yielding code once all storage resources are released.
+    const auto afterSnapshotAndLocksRelinquishedCb = [&]() {
+        doWaitDuringYield();
+
+        if (_responseDeadlineType != ResponseDeadlineType::kNone) {
+            // May set '_interrupted' to true if the response deadline is reached.
+            _handleResponseDeadline();
+        }
+    };
+
+    for (;;) {
+        // These are the conditions which can cause us to yield:
+        //   1) The yield policy's timer elapsed, or
+        //   2) some stage requested a yield, or
+        //   3) we need to yield and retry due to a WriteConflictException.
+        // In all cases, the actual yielding happens here.
+        if (_yieldPolicy->shouldYieldOrInterrupt(_opCtx)) {
+            uassertStatusOK(_yieldPolicy->yieldOrInterrupt(_opCtx,
+                                                           afterSnapshotAndLocksRelinquishedCb,
+                                                           RestoreContext::RestoreType::kYield,
+                                                           _afterSnapshotAbandonFn));
+            if (_interrupted) {
+                return PlanExecutor::IS_EOF;
+            }
+        }
+
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState code = _root->work(&id);
+
+        if (code != PlanStage::NEED_YIELD) {
+            retryState.writeConflictsInARow = 0;
+            retryState.tempUnavailErrorsInARow = 0;
+        }
+
+        if (PlanStage::ADVANCED == code) {
+            WorkingSetMember* member = _workingSet->get(id);
+            if (_mustSetRecordIdMetadata) {
+                member->metadata().setRecordId(member->recordId);
+            }
+            bool hasRequestedData = true;
+
+            if (nullptr != objOut) {
+                if (WorkingSetMember::RID_AND_IDX == member->getState()) {
+                    if (1 != member->keyData.size()) {
+                        _workingSet->free(id);
+                        hasRequestedData = false;
+                    } else {
+                        *objOut = Document{member->keyData[0].keyData};
+                    }
+                } else if (member->hasObj()) {
+                    using std::swap;
+                    swap(*objOut, member->doc.value());
+                } else {
+                    _workingSet->free(id);
+                    hasRequestedData = false;
+                }
+            }
+
+            if (nullptr != dlOut) {
+                tassert(6297500, "Working set member has no record ID", member->hasRecordId());
+                *dlOut = std::move(member->recordId);
+            }
+
+            if (hasRequestedData) {
+                // transfer the metadata from the WSM to Document.
+                if (objOut) {
+                    if (_mustReturnOwnedBson && !objOut->isOwned()) {
+                        *objOut = std::move(*objOut).getOwned();
+                    }
+
+                    if (member->metadata()) {
+                        MutableDocument md(std::move(*objOut));
+                        md.setMetadata(member->releaseMetadata());
+                        *objOut = md.freeze();
+                    }
+                }
+                _workingSet->free(id);
+                return PlanExecutor::ADVANCED;
+            }
+            // This result didn't have the data the caller wanted, try again.
+
+        } else if (PlanStage::NEED_YIELD == code) {
+            _handleNeedYield(retryState);
+
+        } else if (PlanStage::NEED_TIME == code) {
+            // Fall through to yield check at end of large conditional.
+
+        } else if (_handleEOFAndExit(code, notifier)) {
+            return PlanExecutor::IS_EOF;
+        }
+    }
+}
+
+namespace {
+BSONObj makeBsonWithMetadata(Document& doc, WorkingSetMember* member) {
+    if (member->metadata()) {
+        MutableDocument md(std::move(doc));
+        md.setMetadata(member->releaseMetadata());
+        return md.freeze().toBsonWithMetaData();
+    }
+
+    return doc.toBsonWithMetaData();
+}
+}  // namespace
+
+boost::optional<Date_t> PlanExecutorImpl::_calculateResponseDeadlineValue() const {
+    if (_responseDeadlineType == ResponseDeadlineType::kNone || !_opCtx) {
+        // No response deadline configured, or no operation to compute one against (e.g. recomputed
+        // during disposal, which reattaches the executor to a foreign or null opCtx).
+        return boost::none;
+    }
+
+    auto now = _opCtx->getServiceContext()->getPreciseClockSource()->now();
+    if (_responseDeadlineType == ResponseDeadlineType::kInterruptWork) {
+        tassert(
+            10290002,
+            "Expected 'operationResponseMaxMS' to be set to a value > 0 if response deadline type "
+            "is 'kInterruptWork'",
+            _operationResponseMaxMS > 0);
+
+        // Use configured operation response timeout as the response deadline. If the
+        // response deadline is reached, the executor will return whatever results it has
+        // accumulated plus an updated PBRT to the consumer.
+        return now + Milliseconds(_operationResponseMaxMS);
+    }
+
+    // Use hard-coded response deadline to inform the user about a long-running oplog scan at
+    // most once per change stream query.
+    tassert(10290003,
+            "Expected response deadline type to be 'kLogInfoMessage'",
+            _responseDeadlineType == ResponseDeadlineType::kLogInfoMessage);
+    return now + kLongOperationResponseLogInfoDeadline;
+}
+
+void PlanExecutorImpl::_handleResponseDeadline() {
+    tassert(10290004,
+            "expecting response deadline type to be set",
+            _responseDeadlineType != ResponseDeadlineType::kNone);
+    tassert(10290005,
+            "expecting response deadline value to be set",
+            _responseDeadlineValue.has_value());
+
+    if (auto now = _opCtx->getServiceContext()->getPreciseClockSource()->now();
+        now < *_responseDeadlineValue) {
+        // There is a response deadline, but it has not been reached.
+        return;
+    }
+
+    if (_responseDeadlineType == ResponseDeadlineType::kInterruptWork) {
+        // Mark as softly interrupted so we exit the work loop directly after yielding. Also cancel
+        // any outstanding awaitData waits.
+        _interrupted = true;
+        awaitDataState(_opCtx).shouldWaitForInserts = false;
+
+        LOGV2_DEBUG(
+            10290000, 3, "Interrupting long-running collection scan after configured deadline");
+    } else if (_responseDeadlineType == ResponseDeadlineType::kLogInfoMessage) {
+        // Avoid logging the same message again for this executor.
+        _responseDeadlineType = ResponseDeadlineType::kNone;
+        _responseDeadlineValue.reset();
+        LOGV2_DEBUG(10290001,
+                    longCollectionScanLogSeveritySuppressor().toInt(),
+                    "Long-running collection scan detected for query. This message will only be "
+                    "logged once per query. Set the value of the 'operationResponseMaxMS' "
+                    "server parameter to periodically return updates from long-running operations "
+                    "and prevent timeouts. See the documentation for more details: "
+                    "https://docs.mongodb.com/manual/reference/parameters/"
+                    "#param.operationResponseMaxMS");
+    }
+}
+
+void PlanExecutorImpl::_handleNeedYield(WriteConflictRetryState& retryState) {
+    invariant(shard_role_details::getRecoveryUnit(_opCtx));
+
+    if (_expCtx->getTemporarilyUnavailableException()) {
+        _expCtx->setTemporarilyUnavailableException(false);
+
+        if (!_yieldPolicy->canAutoYield()) {
+            throwTemporarilyUnavailableException(
+                "got TemporarilyUnavailable exception on a plan that "
+                "cannot "
+                "auto-yield");
+        }
+
+        retryState.tempUnavailErrorsInARow++;
+        handleTemporarilyUnavailableException(
+            _opCtx,
+            retryState.tempUnavailErrorsInARow,
+            "plan executor",
+            NamespaceStringOrUUID(_nss),
+            Status(ErrorCodes::TemporarilyUnavailable, "temporarily unavailable"),
+            retryState.writeConflictsInARow);
+    } else if (!_oplogWaitConfig || !_oplogWaitConfig->waitedForOplogVisiblity()) {
+        // If we didn't wait for oplog visibility, then we must be yielding because of a
+        // WriteConflictException.
+        if (!_yieldPolicy->canAutoYield() ||
+            MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
+            throwWriteConflictException(
+                "Write conflict during plan execution and yielding is "
+                "disabled.");
+        }
+
+        retryState.writeConflictsInARow++;
+
+        if (internalQueryEnableWriteConflictBackoffWithoutTicket.loadRelaxed()) {
+            // Defer the logAndBackoff() call to the yield handler.
+            _writeConflictsInARowToLog = retryState.writeConflictsInARow;
+        } else {
+            // Log and backoff immediately, while holding the ticket. Use the legacy stepped
+            // schedule here: the exponential ramp sleeps up to ~2x capMs, far too long to
+            // hold a ticket through.
+            if (MONGO_unlikely(planExecutorHangBeforeLogAndBackoff.shouldFail())) {
+                planExecutorHangBeforeLogAndBackoff.pauseWhileSet(_opCtx);
+            }
+            mongo::logWriteConflictAndBackoff(retryState.writeConflictsInARow,
+                                              "plan execution",
+                                              ""sv,
+                                              NamespaceStringOrUUID(_nss));
+        }
+    }
+
+    // Yield next time through the loop.
+    tassert(
+        11321321,
+        fmt::format(
+            "Invalid call to PlanExecutorImpl::_handleNeedYield() without auto-yielding policy {}",
+            PlanYieldPolicy::serializeYieldPolicy(_yieldPolicy->getPolicy())),
+        _yieldPolicy->canAutoYield());
+    _yieldPolicy->forceYield();
+}
+
+bool PlanExecutorImpl::_handleEOFAndExit(PlanStage::StageState code,
+                                         std::unique_ptr<insert_listener::Notifier>& notifier) {
+    tassert(11321322,
+            fmt::format("Expected code to be IS_EOF, but found {}", PlanStage::stateStr(code)),
+            PlanStage::IS_EOF == code);
+    hangBeforeShouldWaitForInsertsIfFailpointEnabled(this);
+
+    if (!insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
+        return true;
+    }
+
+    if (!insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
+        // Time to exit.
+        return true;
+    }
+
+    // Create the notifier lazily the first time we are about to wait, and reuse it on subsequent
+    // EOFs within this call so the two-EOF version comparison works. Because shouldWaitForInserts
+    // implies shouldListenForInserts, makeNotifier() is guaranteed to return a non-null notifier
+    // here, so the previous separate !notifier guard (which existed only to handle construction
+    // and the wait-decision happening at different times) is no longer needed.
+    if (!notifier) {
+        notifier =
+            insert_listener::getCappedInsertNotifier(_opCtx, _collection, _yieldPolicy.get());
+    }
+
+    invariant(notifier);
+    insert_listener::waitForInserts(_opCtx, _yieldPolicy.get(), notifier);
+    return false;
+}
+
+size_t PlanExecutorImpl::getNextBatch(size_t batchSize, AppendBSONObjFn append) {
+    if (batchSize == 0) {
+        return 0;
+    }
+
+    checkFailPointPlanExecAlwaysFails(nss());
+    _checkIfKilled();
+
+    const bool includeMetadata = _expCtx && _expCtx->getNeedsMerge();
+    const bool hasAppendFn = static_cast<bool>(append);
+
+    const auto whileYieldingFn = [this]() {
+        return doWaitDuringYield();
+    };
+
+    // Capped insert notifier; created lazily in _handleEOFAndExit() the first time we actually
+    // need to wait, rather than on every call. See the comment in _getNextImpl().
+    std::unique_ptr<insert_listener::Notifier> notifier;
+
+    WorkingSetID id = WorkingSet::INVALID_ID;
+
+    // Per-call retry state: streak counters incremented on every WriteConflict or
+    // TemporarilyUnavailable error accordingly, and reset to 0 on any successful call to
+    // _root->work.
+    WriteConflictRetryState retryState;
+
+    size_t numResults = 0;
+    BSONObj objOut;
+
+    // Handle case where previous execution stashed a result.
+    if (!_stash.empty()) {
+        objOut = _stash.front().toBson();
+        _stash.pop_front();
+        if (hasAppendFn) {
+            append(objOut, getPostBatchResumeToken(), numResults);
+        }
+        numResults++;
+    }
+
+    for (;;) {
+        _checkIfMustYield(whileYieldingFn);
+
+        PlanStage::StageState code = _root->work(&id);
+
+        if (code != PlanStage::NEED_YIELD) {
+            retryState.writeConflictsInARow = 0;
+            retryState.tempUnavailErrorsInARow = 0;
+        }
+
+        if (code == PlanStage::ADVANCED) {
+            // Process working set member.
+            WorkingSetMember* member = _workingSet->get(id);
+
+            if (MONGO_likely(member->hasObj())) {
+                if (includeMetadata) {
+                    objOut = makeBsonWithMetadata(member->doc.value(), member);
+                } else {
+                    objOut = member->doc.value().toBson();
+                }
+
+            } else if (member->keyData.size() >= 1) {
+                if (includeMetadata) {
+                    _docOutput = Document{member->keyData[0].keyData};
+                    objOut = makeBsonWithMetadata(_docOutput, member);
+                } else {
+                    objOut = member->keyData[0].keyData;
+                }
+
+            } else {
+                _workingSet->free(id);
+                continue;  // Try to call work() again- we didn't get what we needed.
+            }
+
+            _workingSet->free(id);
+
+            if (MONGO_unlikely(hasAppendFn &&
+                               !append(objOut, getPostBatchResumeToken(), numResults))) {
+                stashResult(objOut);
+                break;
+            }
+            numResults++;
+
+            // Only check if the query has been killed or if we've filled up the batch once a result
+            // has been produced. Doing these checks every loop can impact the performance of
+            // queries that repeatedly return NEED_TIME.
+            if (MONGO_unlikely(numResults >= batchSize)) {
+                break;
+            }
+
+            _checkIfKilled();
+
+        } else if (code == PlanStage::NEED_YIELD) {
+            _handleNeedYield(retryState);
+
+        } else if (code == PlanStage::NEED_TIME) {
+            // Do nothing except reset counters; need more time.
+
+        } else if (_handleEOFAndExit(code, notifier)) {
+            break;
+        }
+    }
+    return numResults;
+}
+
+bool PlanExecutorImpl::isEOF() const {
+    invariant(_currentState == kUsable);
+    return isMarkedAsKilled() || (_stash.empty() && _root->isEOF());
+}
+
+void PlanExecutorImpl::markAsKilled(Status killStatus) {
+    invariant(!killStatus.isOK());
+    // If killed multiple times, only retain the first status.
+    if (_killStatus.isOK()) {
+        _killStatus = killStatus;
+    }
+}
+
+void PlanExecutorImpl::dispose(OperationContext* opCtx) {
+    _currentState = kDisposed;
+}
+
+long long PlanExecutorImpl::executeCount() {
+    tassert(
+        11321323,
+        fmt::format("Invalid call to PlanExecutorImpl::executeCount() on non-countlike stage {}",
+                    static_cast<int>(_root->stageType())),
+        _root->stageType() == StageType::STAGE_COUNT ||
+            _root->stageType() == StageType::STAGE_RECORD_STORE_FAST_COUNT);
+
+    // Iterate until EOF, returning no data.
+    int numResults = getNextBatch(std::numeric_limits<int64_t>::max(), nullptr);
+    tassert(
+        9212603, "PlanExecutorImpl expects count plans to return no documents", numResults == 0);
+
+    auto countStats = static_cast<const CountStats*>(_root->getSpecificStats());
+    return countStats->nCounted;
+}
+
+UpdateResult PlanExecutorImpl::getUpdateResult() const {
+    auto updateStatsToResult = [](const UpdateStats& updateStats,
+                                  bool containsDotsAndDollarsField) -> UpdateResult {
+        return UpdateResult(updateStats.nMatched > 0 /* Did we update at least one obj? */,
+                            updateStats.isModUpdate /* Is this a $mod update? */,
+                            updateStats.nModified /* number of modified docs, no no-ops */,
+                            updateStats.nMatched /* # of docs matched/updated, even no-ops */,
+                            updateStats.objInserted,
+                            containsDotsAndDollarsField);
+    };
+
+    // If we're updating a non-existent collection, then the delete plan may have an EOF as the
+    // root stage.
+    if (_root->stageType() == STAGE_EOF) {
+        const auto stats = std::make_unique<UpdateStats>();
+        return updateStatsToResult(static_cast<const UpdateStats&>(*stats), false);
+    }
+
+    // If the collection exists, then we expect the root of the plan tree to either be an update
+    // stage, or (for findAndModify) a projection stage wrapping an update / TS_MODIFY stage.
+    const auto updateStage = [&] {
+        switch (_root->stageType()) {
+            case StageType::STAGE_PROJECTION_DEFAULT:
+            case StageType::STAGE_PROJECTION_COVERED:
+            case StageType::STAGE_PROJECTION_SIMPLE: {
+                tassert(
+                    7314604,
+                    fmt::format("Unexpected number of children: {}", _root->getChildren().size()),
+                    _root->getChildren().size() == 1U);
+                auto childStage = _root->child().get();
+                tassert(7314605,
+                        fmt::format("Unexpected child stage type: {}",
+                                    fmt::underlying(childStage->stageType())),
+                        StageType::STAGE_UPDATE == childStage->stageType() ||
+                            StageType::STAGE_TIMESERIES_MODIFY == childStage->stageType());
+                return childStage;
+            }
+            default:
+                return _root.get();
+        }
+    }();
+    switch (updateStage->stageType()) {
+        case StageType::STAGE_TIMESERIES_MODIFY: {
+            const auto& stats =
+                static_cast<const TimeseriesModifyStats&>(*updateStage->getSpecificStats());
+            return UpdateResult(
+                stats.nMeasurementsModified > 0 /* Did we update at least one obj? */,
+                stats.isModUpdate /* Is this a $mod update? */,
+                stats.nMeasurementsModified /* number of modified docs, no no-ops */,
+                stats.nMeasurementsMatched /* # of docs matched/updated, even no-ops */,
+                stats.objInserted /* objInserted */,
+                static_cast<TimeseriesModifyStage*>(updateStage)->containsDotsAndDollarsField());
+        }
+        case StageType::STAGE_UPDATE: {
+            const auto& stats = static_cast<const UpdateStats&>(*updateStage->getSpecificStats());
+            return updateStatsToResult(
+                stats, static_cast<UpdateStage*>(updateStage)->containsDotsAndDollarsField());
+        }
+        default:
+            MONGO_UNREACHABLE_TASSERT(7314606);
+    }
+}
+
+long long PlanExecutorImpl::getDeleteResult() const {
+    // If we're deleting from a non-existent collection, then the delete plan may have an EOF as
+    // the root stage.
+    if (_root->stageType() == STAGE_EOF) {
+        return 0LL;
+    }
+
+    // If the collection exists, the delete plan may either have a delete stage at the root, or
+    // (for findAndModify) a projection stage wrapping a delete / TS_MODIFY stage.
+    const auto deleteStage = [&] {
+        switch (_root->stageType()) {
+            case StageType::STAGE_PROJECTION_DEFAULT:
+            case StageType::STAGE_PROJECTION_COVERED:
+            case StageType::STAGE_PROJECTION_SIMPLE: {
+                tassert(
+                    7308302,
+                    fmt::format("Unexpected number of children: {}", _root->getChildren().size()),
+                    _root->getChildren().size() == 1U);
+                auto childStage = _root->child().get();
+                tassert(7308303,
+                        fmt::format("Unexpected child stage type: {}",
+                                    fmt::underlying(childStage->stageType())),
+                        StageType::STAGE_DELETE == childStage->stageType() ||
+                            StageType::STAGE_TIMESERIES_MODIFY == childStage->stageType());
+                return childStage;
+            }
+            default:
+                return _root.get();
+        }
+    }();
+    switch (deleteStage->stageType()) {
+        case StageType::STAGE_TIMESERIES_MODIFY: {
+            const auto& tsModifyStats =
+                static_cast<const TimeseriesModifyStats&>(*deleteStage->getSpecificStats());
+            return tsModifyStats.nMeasurementsModified;
+        }
+        case StageType::STAGE_DELETE:
+        case StageType::STAGE_BATCHED_DELETE: {
+            const auto& deleteStats =
+                static_cast<const DeleteStats&>(*deleteStage->getSpecificStats());
+            return deleteStats.docsDeleted;
+        }
+        default:
+            MONGO_UNREACHABLE_TASSERT(7308306);
+    }
+}
+
+BatchedDeleteStats PlanExecutorImpl::getBatchedDeleteStats() {
+    // If we're deleting on a non-existent collection, then the delete plan may have an EOF as the
+    // root stage.
+    if (_root->stageType() == STAGE_EOF) {
+        return BatchedDeleteStats();
+    }
+
+    tassert(11321324,
+            fmt::format("Invalid call to PlanExecutorImpl::getBatchedDeleteStats() on an executor "
+                        "with the root stage {}",
+                        static_cast<int>(_root->stageType())),
+            _root->stageType() == StageType::STAGE_BATCHED_DELETE);
+
+    // If the collection exists, we expect the root of the plan tree to be a batched delete stage.
+    // Note: findAndModify is incompatible with the batched delete stage so no need to handle
+    // projection stage wrapping.
+    const auto stats = _root->getSpecificStats();
+    auto batchedStats = static_cast<const BatchedDeleteStats*>(stats);
+    return *batchedStats;
+}
+
+void PlanExecutorImpl::stashResult(const BSONObj& obj) {
+    _stash.push_front(Document{obj.getOwned()});
+}
+
+Status PlanExecutorImpl::getKillStatus() const {
+    invariant(isMarkedAsKilled());
+    return _killStatus;
+}
+
+bool PlanExecutorImpl::isDisposed() const {
+    return _currentState == kDisposed;
+}
+
+Timestamp PlanExecutorImpl::getLatestOplogTimestamp() const {
+    return _collScanStage ? _collScanStage->getLatestOplogTimestamp() : Timestamp{};
+}
+
+BSONObj PlanExecutorImpl::getPostBatchResumeToken() const {
+    return _collScanStage ? _collScanStage->getPostBatchResumeToken() : kEmptyPBRT;
+}
+
+PlanExecutor::LockPolicy PlanExecutorImpl::lockPolicy() const {
+    // If this PlanExecutor is simply unspooling queued data, then there is no need to acquire
+    // locks.
+    if (_root->stageType() == StageType::STAGE_QUEUED_DATA) {
+        return LockPolicy::kLocksInternally;
+    }
+
+    return LockPolicy::kLockExternally;
+}
+
+const PlanExplainer& PlanExecutorImpl::getPlanExplainer() const {
+    tassert(11321325,
+            "Invalid call PlanExecutorImpl::getPlanExplainer() with null _planExplainer",
+            _planExplainer);
+    return *_planExplainer;
+}
+
+MultiPlanStage* PlanExecutorImpl::getMultiPlanStage() const {
+    if (PlanStage* ps = getStageByType(_root.get(), StageType::STAGE_MULTI_PLAN)) {
+        auto* mps = dynamic_cast<MultiPlanStage*>(ps);
+        tassert(11321326, "PlanStage* could not be converted to a MultiPlanStage*", mps);
+        return mps;
+    }
+    return nullptr;
+}
+
+}  // namespace mongo

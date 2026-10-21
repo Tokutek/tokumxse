@@ -1,108 +1,164 @@
-/*
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/auth/sasl_plain_server_conversation.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/secure_allocator.h"
+#include "mongo/base/status.h"
 #include "mongo/crypto/mechanism_scram.h"
-#include "mongo/db/auth/sasl_authentication_session.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/password_digest.h"
-#include "mongo/util/text.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
+
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
-
-    SaslPLAINServerConversation::SaslPLAINServerConversation(
-                                                    SaslAuthenticationSession* saslAuthSession) :
-        SaslServerConversation(saslAuthSession) {
+namespace {
+template <typename HashBlock>
+StatusWith<bool> trySCRAM(const User::CredentialData& credentials, std::string_view pwd) {
+    const auto scram = credentials.scram<HashBlock>();
+    if (!scram.isValid()) {
+        // No stored credentials available.
+        return false;
     }
 
-    SaslPLAINServerConversation::~SaslPLAINServerConversation() {};
-
-    StatusWith<bool> SaslPLAINServerConversation::step(StringData inputData,
-                                                       std::string* outputData) {
-        // Expecting user input on the form: user\0user\0pwd
-        std::string input = inputData.toString();
-        std::string pwd = "";
-
-        try {
-            _user = input.substr(0, inputData.find('\0'));
-            pwd = input.substr(inputData.find('\0', _user.size()+1)+1);
-        }
-        catch (std::out_of_range& exception) {
-            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
-                mongoutils::str::stream() << "Incorrectly formatted PLAIN client message");
-        }
-
-        User* userObj;
-        // The authentication database is also the source database for the user.
-        Status status = _saslAuthSession->getAuthorizationSession()->getAuthorizationManager().
-                acquireUser(_saslAuthSession->getOpCtxt(),
-                            UserName(_user, _saslAuthSession->getAuthenticationDatabase()),
-                            &userObj);
-
-        if (!status.isOK()) {
-            return StatusWith<bool>(status);
-        }
-
-        const User::CredentialData creds = userObj->getCredentials();
-        _saslAuthSession->getAuthorizationSession()->getAuthorizationManager().
-                releaseUser(userObj);
-
-        std::string authDigest = createPasswordDigest(_user, pwd);
-
-        if (!creds.password.empty()) {
-            // Handle schemaVersion26Final (MONGODB-CR/SCRAM mixed mode)
-            if (authDigest != creds.password) {
-                return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
-                    mongoutils::str::stream() << "Incorrect user name or password");
-            }
-        }
-        else {
-            // Handle schemaVersion28SCRAM (SCRAM only mode)
-            unsigned char storedKey[scram::hashSize];
-            unsigned char serverKey[scram::hashSize];
-
-            scram::generateSecrets(authDigest,
-                reinterpret_cast<const unsigned char*>(base64::decode(creds.scram.salt).c_str()),
-                16,
-                creds.scram.iterationCount,
-                storedKey,
-                serverKey);
-            if (creds.scram.storedKey != base64::encode(reinterpret_cast<const char*>(storedKey),
-                                                        scram::hashSize)){
-                return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
-                    mongoutils::str::stream() << "Incorrect user name or password");
-            }
-        }
-
-        *outputData = "";
-
-        return StatusWith<bool>(true);
+    const auto decodedSalt = base64::decode(scram.salt);
+    scram::Secrets<HashBlock, scram::UnlockedSecretsPolicy> secrets(scram::Presecrets<HashBlock>(
+        std::string{pwd},
+        std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()),
+                                  reinterpret_cast<const std::uint8_t*>(decodedSalt.c_str()) +
+                                      decodedSalt.size()),
+        scram.iterationCount));
+    if (scram.storedKey !=
+        base64::encode(std::string_view(reinterpret_cast<const char*>(secrets.storedKey().data()),
+                                        secrets.storedKey().size()))) {
+        return Status(ErrorCodes::AuthenticationFailed,
+                      str::stream() << "Incorrect user name or password");
     }
 
+    return true;
+}
+}  // namespace
+
+StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
+    OperationContext* opCtx, std::string_view inputData) {
+    if (_authenticationDatabase == "$external") {
+        return Status(ErrorCodes::AuthenticationFailed,
+                      "PLAIN mechanism must be used with internal users");
+    }
+
+    AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getService());
+
+    // Expecting user input on the form: [authz-id]\0authn-id\0pwd
+    std::string input = std::string{inputData};
+
+    SecureAllocatorAuthDomain::SecureString pwd = "";
+    try {
+        size_t firstNull = inputData.find('\0');
+        if (firstNull == std::string::npos) {
+            return Status(
+                ErrorCodes::AuthenticationFailed,
+                str::stream()
+                    << "Incorrectly formatted PLAIN client message, missing first NULL delimiter");
+        }
+        size_t secondNull = inputData.find('\0', firstNull + 1);
+        if (secondNull == std::string::npos) {
+            return Status(
+                ErrorCodes::AuthenticationFailed,
+                str::stream()
+                    << "Incorrectly formatted PLAIN client message, missing second NULL delimiter");
+        }
+
+        std::string authorizationIdentity = input.substr(0, firstNull);
+        ServerMechanismBase::_principalName =
+            input.substr(firstNull + 1, (secondNull - firstNull) - 1);
+        if (ServerMechanismBase::_principalName.empty()) {
+            return Status(ErrorCodes::AuthenticationFailed,
+                          str::stream()
+                              << "Incorrectly formatted PLAIN client message, empty username");
+        } else if (!authorizationIdentity.empty() &&
+                   authorizationIdentity != ServerMechanismBase::_principalName) {
+            return Status(ErrorCodes::AuthenticationFailed,
+                          str::stream()
+                              << "SASL authorization identity must match authentication identity");
+        }
+        pwd = SecureAllocatorAuthDomain::SecureString(input.substr(secondNull + 1).c_str());
+        if (pwd->empty()) {
+            return Status(ErrorCodes::AuthenticationFailed,
+                          str::stream()
+                              << "Incorrectly formatted PLAIN client message, empty password");
+        }
+    } catch (std::out_of_range&) {
+        return Status(ErrorCodes::AuthenticationFailed,
+                      str::stream() << "Incorrectly formatted PLAIN client message");
+    }
+
+    // The authentication database is also the source database for the user.
+    auto swUser = [&]() -> StatusWith<UserHandle> {
+        ScopedCallbackTimer timer([&](Microseconds elapsed) {
+            if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
+                LOGV2(6788606,
+                      "Auth metrics report",
+                      "metric"_attr = "plain_acquireUser",
+                      "micros"_attr = elapsed.count());
+            }
+        });
+
+        auto swRequest = makeUserRequest(opCtx);
+        if (!swRequest.isOK()) {
+            return swRequest.getStatus();
+        }
+
+        return authManager->acquireUser(opCtx, std::move(swRequest.getValue()));
+    }();
+
+    if (!swUser.isOK()) {
+        return swUser.getStatus();
+    }
+
+    auto userObj = std::move(swUser.getValue());
+    const auto creds = userObj->getCredentials();
+
+    const auto sha256Status = trySCRAM<SHA256Block>(creds, pwd->c_str());
+    if (!sha256Status.isOK()) {
+        return sha256Status.getStatus();
+    }
+    if (sha256Status.getValue()) {
+        return std::make_tuple(true, std::string());
+    }
+
+    const auto authDigest = createPasswordDigest(ServerMechanismBase::_principalName, pwd->c_str());
+    const auto sha1Status = trySCRAM<SHA1Block>(creds, authDigest);
+    if (!sha1Status.isOK()) {
+        return sha1Status.getStatus();
+    }
+    if (sha1Status.getValue()) {
+        return std::make_tuple(true, std::string());
+    }
+
+    return Status(ErrorCodes::AuthenticationFailed, str::stream() << "No credentials available.");
+}
+
+namespace {
+GlobalSASLMechanismRegisterer<PLAINServerFactory> plainRegisterer;
+}  // namespace
 }  // namespace mongo

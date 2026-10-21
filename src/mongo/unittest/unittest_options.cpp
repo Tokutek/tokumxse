@@ -1,0 +1,288 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#include "mongo/unittest/unittest_options.h"
+
+#include "mongo/base/parse_number.h"
+#include "mongo/base/status.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
+
+#include <any>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#include <stdio.h>
+#else
+#include <unistd.h>
+#endif
+
+#include <variant>
+
+#include <boost/filesystem.hpp>
+#include <boost/optional.hpp>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::unittest {
+namespace {
+
+int strToInt(std::string_view s) {
+    int i;
+    if (auto st = NumberParser{}(s, &i); !st.isOK())
+        iasserted(st);
+    return i;
+}
+
+bool strToBool(std::string_view s) {
+    if (s == "1" || s == "true")
+        return true;
+    if (s == "0" || s == "false")
+        return false;
+    iasserted(Status{ErrorCodes::BadValue, "Expected a bool"});
+}
+
+enum Kind {
+    switchBool,
+    optBool,
+    str,
+    strArray,
+    integer,
+};
+
+using Arg = std::variant<std::monostate, bool, int, std::string, std::vector<std::string>>;
+
+struct OptSpec {
+    std::string name;
+    std::string description;
+    Kind kind;
+    Arg defaultValue;
+    Arg implicitValue;  // value used if no arg is given
+    Arg value;
+};
+
+class TestOptionParser {
+public:
+    explicit TestOptionParser(std::vector<OptSpec>* opts) : _opts{opts} {}
+
+    void run(std::vector<std::string>& argVec) {
+        auto ai = argVec.begin();
+        if (ai == argVec.end())
+            return;
+        ++ai;  // Skip argv[0]
+        for (; ai != argVec.end();) {
+            if (*ai == "--")
+                return;  // A "--" that terminates the options.
+            bool found = false;
+            for (auto&& o : *_opts) {
+                std::string_view a = *ai;
+                if (!(_consumePrefix(a, "--") && _consumePrefix(a, o.name)))
+                    continue;
+                if (_consumePrefix(a, "=")) {  // Matches name, has embedded argument.
+                    iassert(ErrorCodes::BadValue,
+                            fmt::format("Option {:?} cannot accept argument", o.name),
+                            o.kind != Kind::switchBool);
+                    _acceptArg(o, a);
+                    ai = argVec.erase(ai);
+                    found = true;
+                    break;
+                }
+                if (!a.empty()) {  // not a match
+                    continue;
+                }
+
+                found = true;
+                if (o.kind == Kind::switchBool) {
+                    o.value = true;
+                    ai = argVec.erase(ai);
+                    break;
+                }
+
+                if (!holds_alternative<std::monostate>(o.implicitValue)) {
+                    o.value = o.implicitValue;
+                    ai = argVec.erase(ai);
+                    break;
+                }
+
+                // Consider next token as arg.
+                ai = argVec.erase(ai);
+                iassert(ErrorCodes::BadValue,
+                        fmt::format("Option {:?} requires an argument", o.name),
+                        ai != argVec.end());
+                _acceptArg(o, *ai);
+                ai = argVec.erase(ai);
+                break;
+            }
+            // Didn't match any opt spec.
+            if (!found)
+                ++ai;
+        }
+    }
+
+private:
+    bool _consumePrefix(std::string_view& s, std::string_view pat) {
+        if (!s.starts_with(pat))
+            return false;
+        s.remove_prefix(pat.size());
+        return true;
+    }
+
+    void _acceptArg(OptSpec& o, std::string_view a) {
+        switch (o.kind) {
+            case Kind::switchBool:
+                MONGO_UNREACHABLE;
+            case Kind::optBool:
+                o.value = strToBool(a);
+                break;
+            case Kind::integer:
+                o.value = strToInt(a);
+                break;
+            case Kind::str:
+                o.value = std::string{a};
+                break;
+            case Kind::strArray:
+                if (holds_alternative<std::monostate>(o.value))
+                    o.value = std::vector<std::string>{};
+                get<std::vector<std::string>>(o.value).push_back(std::string{a});
+                break;
+        }
+    }
+
+    std::vector<OptSpec>* _opts;
+};
+
+
+std::vector<OptSpec> allOptions() {
+    return std::vector<OptSpec>{
+        {
+            "help",
+            "describe all options",
+            Kind::switchBool,
+            false,
+        },
+        {
+            "list",
+            "List all test suites in this unit test.",
+            Kind::switchBool,
+            false,
+        },
+        {
+            "suite",
+            "Test suite name. Specify --suite more than once to run multiple suites.",
+            Kind::strArray,
+        },
+        {
+            "filter",
+            "Test case name filter. Specify a regex partial-matching the test names.",
+            Kind::str,
+        },
+        {
+            "fileNameFilter",
+            "Filter test cases by source file name by partial-matching regex.",
+            Kind::str,
+        },
+        {
+            "repeat",
+            "Specifies the number of runs for each test.",
+            Kind::integer,
+            1,
+        },
+        {
+            "verbose",
+            "Log more verbose output.  Specify one or more 'v's to increase verbosity.",
+            Kind::str,
+            {},
+            std::string{"v"},
+        },
+        {
+            "tempPath",
+            "Directory to place mongo::TempDir subdirectories",
+            Kind::str,
+        },
+        {
+            "autoUpdateAsserts",
+            "Auto-update expected output for asserts in unit tests which support "
+            "auto-updating.",
+            Kind::switchBool,
+            false,
+        },
+        {
+            "rewriteAllAutoAsserts",
+            "Rewrite all auto-updating assertions for self-testing purposes.",
+            Kind::switchBool,
+            false,
+        },
+        {
+            "enhancedReporter",
+            "Use the enhanced test result reporter.",
+            Kind::optBool,
+            true,
+        },
+        {
+            "showEachTest",
+            "Use with --enhancedReporter. Show all test results, not just failing ones.",
+            Kind::switchBool,
+            false,
+        },
+    };
+}
+
+}  // namespace
+
+UnitTestOptions parseUnitTestOptions(std::vector<std::string>& argVec) {
+    std::vector<OptSpec> opts = allOptions();
+    TestOptionParser parser{&opts};
+    parser.run(argVec);
+
+    auto load = [&]<typename T>(boost::optional<T>* out, std::string_view key) {
+        for (const auto& o : opts) {
+            if (o.name != key)
+                continue;
+            if (holds_alternative<T>(o.value)) {
+                out->emplace(get<T>(o.value));
+                return;
+            }
+        }
+    };
+    UnitTestOptions uto;
+    load(&uto.help, "help");
+    load(&uto.list, "list");
+    load(&uto.suites, "suite");
+    load(&uto.filter, "filter");
+    load(&uto.fileNameFilter, "fileNameFilter");
+    load(&uto.repeat, "repeat");
+    load(&uto.verbose, "verbose");
+    load(&uto.tempPath, "tempPath");
+    load(&uto.autoUpdateAsserts, "autoUpdateAsserts");
+    load(&uto.rewriteAllAutoAsserts, "rewriteAllAutoAsserts");
+    load(&uto.enhancedReporter, "enhancedReporter");
+    load(&uto.showEachTest, "showEachTest");
+    return uto;
+}
+
+std::string getUnitTestOptionsHelpString(std::vector<std::string>& argVec) {
+    std::string s;
+    s += fmt::format("Supported MongoDB unit test options:\n");
+    for (auto&& o : allOptions()) {
+        s += fmt::format(" --{}", o.name);
+        if (o.kind == Kind::optBool)
+            s += "=<bool>";
+        else if (o.kind == Kind::integer)
+            s += "=<int>";
+        else if (o.kind == Kind::str)
+            s += "=<string>";
+        else if (o.kind == Kind::strArray)
+            s += "=<string> (repeatable)";
+        s += fmt::format("\n    {}\n", o.description);
+    }
+    return s;
+}
+
+}  // namespace mongo::unittest

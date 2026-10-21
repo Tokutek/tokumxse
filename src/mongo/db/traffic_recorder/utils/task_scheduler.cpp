@@ -1,0 +1,158 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/traffic_recorder/utils/task_scheduler.h"
+
+#include "mongo/db/query/util/stop_token.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/time_support.h"
+
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+
+namespace mongo {
+
+namespace detail {
+// Differs from std/boost impl in that it allows taking ownership of the popped value.
+// std/boost provide only const access via top().
+template <class Value, class Comparator = std::less<>>
+class priority_queue {
+public:
+    bool empty() const {
+        return _data.empty();
+    }
+
+    void push(Value v) {
+        _data.push_back(std::move(v));
+        std::push_heap(_data.begin(), _data.end(), _comp);
+    }
+
+    const Value& top() const {
+        return _data.at(0);
+    }
+
+    Value take_top() {
+        std::pop_heap(_data.begin(), _data.end(), _comp);
+        auto result = std::move(_data.back());
+        _data.pop_back();
+        return result;
+    }
+
+    void clear() {
+        _data.clear();
+    }
+
+private:
+    std::vector<Value> _data;
+    Comparator _comp;
+};
+}  // namespace detail
+
+class TaskSchedulerImpl final : public TaskScheduler {
+public:
+    TaskSchedulerImpl(std::string name) {
+        _worker = stdx::thread([this, token = _stop.get_token(), name = std::move(name)]() {
+            setThreadName(std::move(name));
+            _doWork(token);
+        });
+    }
+
+    void runAt(Date_t timepoint, unique_function<void()> work) final {
+        {
+            auto ul = std::unique_lock(_mutex);
+            _tasks.push({timepoint, std::move(work)});
+        }
+        _cv.notify_one();
+    }
+
+    void cancelAll() final {
+        {
+            auto ul = std::unique_lock(_mutex);
+            _tasks.clear();
+        }
+        _cv.notify_one();
+    }
+
+    // This function must stay final as long as it is called from the destructor.
+    void stop() final {
+        _stop.request_stop();
+        _cv.notify_one();
+        if (_worker.joinable()) {
+            _worker.join();
+        }
+        stopped.store(true);
+    }
+
+    ~TaskSchedulerImpl() final {
+        if (!stopped.load()) {
+            stop();
+        }
+    }
+
+private:
+    void _doWork(stop_token token) {
+        auto ul = std::unique_lock(_mutex);
+        while (!token.stop_requested()) {
+            _cv.wait(ul, [&] { return token.stop_requested() || !_tasks.empty(); });
+            if (_tasks.empty()) {
+                // No work; check the stop token or wait again.
+                continue;
+            }
+            const auto& [timepoint, work] = _tasks.top();
+            auto now = Date_t::now();
+
+            if (timepoint > now) {
+                auto expectedTimepoint = timepoint;
+                _cv.wait_for(ul, (timepoint - now).toSystemDuration(), [&] {
+                    return token.stop_requested() || _tasks.empty() ||
+                        std::get<0>(_tasks.top()) != expectedTimepoint;
+                });
+                // We woke - either:
+                // * Stop has been requested, no further work should be done
+                // * It is time to run the task observed previously
+                // * A _new_ task with an earlier time has been enqueued
+                // * Tasks have been cancelled
+                //
+                // Check the stop token and the top of the queue again.
+                continue;
+            }
+
+            // Take ownership of the top piece of work; the queue may be modified
+            // while unlocked.
+            auto currentTask = _tasks.take_top().second;
+
+
+            ul.unlock();
+            // There is a task, and it is time to run it.
+            currentTask();
+            ul.lock();
+        }
+    }
+
+    std::atomic<bool> stopped = false;  // NOLINT
+
+    stop_source _stop;
+    stdx::thread _worker;
+
+    std::mutex _mutex;
+    std::condition_variable _cv;  // NOLINT
+
+    struct TimeOrdered {
+        bool operator()(const auto& a, const auto& b) {
+            // Ignore the task itself, just sort by time.
+            // The _smaller_ element should be top, so
+            // sort greater than, rather than less than.
+            return std::get<0>(a) > std::get<0>(b);
+        }
+    };
+
+    using QueueElement = std::pair<Date_t, unique_function<void()>>;
+    detail::priority_queue<QueueElement, TimeOrdered> _tasks;
+};
+
+std::unique_ptr<TaskScheduler> makeTaskScheduler(std::string name) {
+    return std::make_unique<TaskSchedulerImpl>(std::move(name));
+}
+}  // namespace mongo

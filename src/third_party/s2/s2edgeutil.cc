@@ -51,7 +51,13 @@ bool S2EdgeUtil::VertexCrossing(S2Point const& a, S2Point const& b,
   if (a == c) return S2::OrderedCCW(S2::Ortho(a), d, b, a);
   if (b == d) return S2::OrderedCCW(S2::Ortho(b), c, a, b);
 
-  S2LOG(DFATAL) << "VertexCrossing called with 4 distinct vertices";
+  // Changing the following to a warning is a workaround fix for SERVER-19674.
+  //
+  // Because ExpensiveCCW is subject to numerical errors there are some
+  // edge cases where this function will be called with 4 distinct
+  // (but with two extremely close) vertices
+  //
+  S2LOG(WARN) << "VertexCrossing called with 4 distinct vertices";
   return false;
 }
 
@@ -398,6 +404,24 @@ int S2EdgeUtil::EdgeCrosser::RobustCrossingInternal(S2Point const* d) {
 
   int dac = S2::RobustCCW(*c_, *d, *a_, c_cross_d);
   return (dac == acb_) ? 1 : -1;
+}
+
+// MongoDB addition: see the declaration in s2edgeutil.h for rationale.
+const double S2EdgeUtil::EdgeCrosser::kDegenerateDetError = 0.2e-16;
+
+int S2EdgeUtil::EdgeCrosser::TriageOrExpensiveCCW(S2Point const& a, S2Point const& b,
+                                                   S2Point const& c,
+                                                   S2Point const& a_cross_b) {
+  int ccw = S2::TriageCCW(a, b, c, a_cross_b);
+  // case 1: |det| > kMaxDetError, conclusive, return ccw
+  // case 2: |det| < kDegenerateDetError, treat it as degenerate case and return 0   
+  // case 3: kDegenerateDetError <= |det| <= kMaxDetError, call ExpensiveCCW
+  if (ccw != 0) return ccw;  
+  double det = a_cross_b.DotProd(c);
+  if (fabs(det) < kDegenerateDetError) {
+    return 0;  // Genuinely degenerate: give up rather than trust ExpensiveCCW.
+  }
+  return S2::ExpensiveCCW(a, b, c);
 }
 
 void S2EdgeUtil::RectBounder::AddPoint(S2Point const* b) {

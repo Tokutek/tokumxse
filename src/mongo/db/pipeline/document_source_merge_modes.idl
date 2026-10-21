@@ -1,0 +1,36 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Merge modes for the document source merge stage.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    MergeWhenMatchedMode:
+        description: "Possible merge mode values for $merge's 'whenMatched' field."
+        type: string
+        values:
+            kFail: "fail"
+            kKeepExisting: "keepExisting"
+            kMerge: "merge"
+            # Technically, we don't need this item, as the 'pipeline' value, as a string, is not
+            # supported by the 'whenMatched' field. Instead, a pipeline definition, as an array of
+            # objects, should be used. However, to avoid special casing logic in
+            # DocumentSourceMerge, and to keep all merge strategy definitions in a single
+            # descriptors map, which keys are pairs of whenMatched/whenNotMatched values, this
+            # 'kPipeline' element is added for internal use only.
+            kPipeline: "pipeline"
+            kReplace: "replace"
+
+    MergeWhenNotMatchedMode:
+        description: "Possible merge mode values for $merge's 'whenNotMatched'. field"
+        type: string
+        values:
+            kDiscard: "discard"
+            kFail: "fail"
+            kInsert: "insert"

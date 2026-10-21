@@ -1,0 +1,334 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/platform/rwmutex.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/modules.h"
+
+#include <chrono>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <shared_mutex>
+#include <vector>
+
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+namespace rss {
+namespace consensus {
+
+/**
+ * Implementation of the Intent Registration system, used by operations to declare intents which are
+ * required for access into the Storage layer.
+ */
+
+class ReplicationStateTransitionGuard {
+    friend class IntentRegistry;
+    std::function<void()> _releaseCallback;
+    ReplicationStateTransitionGuard(std::function<void()> cb) : _releaseCallback(cb) {}
+
+public:
+    ReplicationStateTransitionGuard() = default;
+    ReplicationStateTransitionGuard(const ReplicationStateTransitionGuard&) = delete;
+    ReplicationStateTransitionGuard(ReplicationStateTransitionGuard&& other) noexcept
+        : _releaseCallback(std::move(other._releaseCallback)) {
+        other._releaseCallback = nullptr;
+    };
+    ReplicationStateTransitionGuard& operator=(const ReplicationStateTransitionGuard&) = delete;
+    ReplicationStateTransitionGuard& operator=(ReplicationStateTransitionGuard&& other) noexcept {
+        _releaseCallback = std::move(other._releaseCallback);
+        other._releaseCallback = nullptr;
+        return *this;
+    }
+
+    void release() {
+        if (_releaseCallback) {
+            _releaseCallback();
+            _releaseCallback = nullptr;
+        }
+    }
+    ~ReplicationStateTransitionGuard() {
+        release();
+    }
+};
+
+// Defined in intent_registry.cpp. Removes the per-opCtx write-intent counter from IntentRegistry
+// when an OperationContext is destroyed so deferred deregistrations cannot corrupt a new opCtx
+// that has been allocated at the same memory address.
+class WriteIntentCleanup;
+
+// Defined in intent_registry.cpp. Deregisters all tokens for a Client when that Client is
+// destroyed while a stashed WUOW still holds write-intent tokens, preventing
+// _killOperationsByIntent from dereferencing the freed client pointer.
+class ClientIntentCleanup;
+
+class IntentRegistry {
+    friend class IntentRegistryTest;
+    friend class WriteIntentCleanup;
+    friend class ClientIntentCleanup;
+
+public:
+    enum class Intent {
+        Read,
+        Write,
+        LocalWrite,
+        BlockingWrite,
+        _NumDistinctIntents_,
+    };
+
+    enum class InterruptionType {
+        StepUp,
+        StepDown,
+        Rollback,
+        Shutdown,
+        None,
+    };
+
+    /**
+     * Class used to represent a unique Intent for a specific operation.
+     */
+    class [[MONGO_MOD_PRIVATE]] IntentToken {
+        friend class IntentRegistry;
+        using idType = uint64_t;
+
+    public:
+        IntentToken(Intent intent);
+        idType id() const;
+        Intent intent() const;
+
+    private:
+        IntentToken(Intent intent, idType id) : _intent(intent), _id(id) {}
+        static inline Atomic<idType> _currentTokenId = {};
+        Intent _intent;
+        idType _id;
+    };
+
+    /**
+     * Creates the IntentRegistry to hold and manage all IntentTokens.
+     */
+    IntentRegistry();
+
+    static IntentRegistry& get(ServiceContext* serviceContext);
+    static IntentRegistry& get(OperationContext* opCtx);
+
+    /**
+     * Validates that the intent is compatible with the current system state and
+     * registers intent in IntentRegistry, or rejects the request if it is
+     * incompatible. This function can throw an exception if the intent cannot
+     * be registered.
+     */
+    IntentToken registerIntent(Intent intent, OperationContext* opCtx);
+
+    /**
+     * Removes the intent from the IntentRegistry. This function can throw an
+     * exception if the intent cannot be deregistered.
+     */
+    void deregisterIntent(IntentToken token);
+
+    /**
+     * Checks if the requested intent can be declared, returns true if it can and false if it
+     * cannot. Note that there is no guarantee that calling canDeclareIntent followed by
+     * registerIntent will be successful. This function should be used if you are declaring intent
+     * to temporarily check the state of the system to avoid exception handling.
+     */
+    bool canDeclareIntent(Intent intent, OperationContext* opCtx);
+
+    /**
+     * Returns true if there is an active Replication state transition ongoing, false otherwise.
+     */
+    bool activeStateTransition() {
+        std::shared_lock lock(_stateMutex);
+        return _interruptionCtx != nullptr;
+    }
+
+    /**
+     * Returns _interruptionContext if there is an active Replication state transition ongoing,
+     * boost::none otherwise.
+     */
+    boost::optional<OperationContext*> replicationStateTransitionInterruptionCtx() {
+        std::shared_lock lock(_stateMutex);
+        if (_interruptionCtx != nullptr) {
+            return _interruptionCtx;
+        } else {
+            return boost::none;
+        }
+    }
+
+    struct ActiveStateTransition {
+        OperationContext* opCtx;
+        InterruptionType type;
+
+        // Whether this transition acquires the global lock in MODE_X before changing storage, so
+        // that the change is ordered after any operation already holding the global lock.
+        //
+        // TODO(SERVER-122542): Remove once step up no longer takes the global lock in MODE_X.
+        bool orderedByGlobalLock;
+
+        bool operator==(const ActiveStateTransition&) const = default;
+    };
+
+    /**
+     * Returns the opCtx driving the active replication state transition along with its type, or
+     * boost::none if there is no active transition.
+     */
+    boost::optional<ActiveStateTransition> activeStateTransitionInfo() {
+        std::shared_lock lock(_stateMutex);
+        if (!_interruptionCtx) {
+            return boost::none;
+        }
+        return ActiveStateTransition{
+            _interruptionCtx, _lastInterruption, _interruptionOrderedByGlobalLock};
+    }
+
+    /**
+     * Returns true when the active state transition is draining an intent held by this opCtx,
+     * meaning the operation should call checkForInterrupt() so the drain can complete.
+     */
+    bool isOpBlockedByActiveTransitionDrain(OperationContext* opCtx) {
+        InterruptionType interruption;
+        {
+            std::shared_lock lock(_stateMutex);
+            if (!_interruptionCtx) {
+                return false;
+            }
+            interruption = _lastInterruption;
+        }
+        switch (interruption) {
+            case InterruptionType::Rollback:
+            case InterruptionType::Shutdown:
+                return true;
+            case InterruptionType::StepDown:
+            case InterruptionType::StepUp:
+                return hasWriteIntentDeclared(opCtx);
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Provides a way for transition threads to kill operations with intents
+     * which conflict with the state transition, and wait for all of those
+     * operations to deregister. While active, it will also prevent operations
+     * that conflict with the ongoing state transtion from registering their
+     * intent, except those that originate from the same OperationContext to allow transition
+     * threads to perform necessary work.
+     *
+     * postInterruptionCallback, if provided, is invoked on the async drain thread after active
+     * conflicting operations are killed, before waiting for the drain to complete.
+     */
+    std::future<ReplicationStateTransitionGuard> killConflictingOperations(
+        InterruptionType interruption,
+        OperationContext* opCtx,
+        std::function<void()> postInterruptionCallback = nullptr,
+        boost::optional<uint32_t> timeout_sec = boost::none,
+        bool orderedByGlobalLock = false);
+
+    /**
+     * Updates metrics around user ops when a state transition that kills operations occurs (i.e.
+     * step up, step down, rollback, or shutdown). Also logs the metrics.
+     */
+    void updateAndLogStateTransitionMetrics(IntentRegistry::InterruptionType interrupt,
+                                            size_t numOpsKilled) const;
+
+    bool hasWriteIntentDeclared(const OperationContext* opCtx);
+
+    bool isPrimaryEnforcementActive();
+
+    /**
+     * Activates the "must be primary" check for write intent registration. Called once during
+     * replica set startup. This flag exists to allow unit tests to not have to be concerned with
+     * properly declaring intents.
+     */
+    void activatePrimaryEnforcement();
+
+    /**
+     * Marks the IntentRegistry enabled and resets the active and last interruption.
+     */
+    void enable();
+
+    /**
+     * Marks the IntentRegistry disabled.
+     */
+    void disable();
+
+    static std::string intentToString(Intent intent);
+
+    static std::string interruptionToString(InterruptionType interrupt);
+
+    size_t getTotalOpsKilled() const;
+
+    std::vector<size_t> getTotalIntentsDeclared() const;
+
+    /**
+     * Deregisters all intent tokens registered by the given client.
+     */
+    void deregisterTokensForClient(Client* client);
+
+    // Deregisters all intent tokens associated with the given session. Called from
+    // prepareTransaction so prepared transactions don't block the stepdown/shutdown drain.
+    void deregisterTokensForSession(OperationContext* opCtx, const LogicalSessionId& lsid);
+
+private:
+    struct TokenMapEntry {
+        OperationContext* opCtx;
+        Client* client;
+        ServiceContext* svcCtx;
+        uint64_t opId;
+        boost::optional<LogicalSessionId> lsid;
+        // Captured at registration time so _killOperationsByIntent and _waitForDrain can log
+        // the client description without dereferencing the Client pointer after its _desc member
+        // may have been freed (Client data members are destroyed before Decorable<Client> base
+        // runs ClientIntentCleanup, leaving a window where the token is still in the map but
+        // client->desc() would access freed memory).
+        std::string clientDesc;
+    };
+
+    struct tokenMap {
+        mutable std::mutex lock;
+        stdx::condition_variable cv;
+        absl::flat_hash_map<IntentToken::idType, TokenMapEntry> map;
+    };
+
+    bool _validIntent(Intent intent) const;
+    void _killOperationsByIntent(Intent intent, InterruptionType interruption);
+    void _waitForDrain(Intent intent,
+                       std::chrono::milliseconds timeout,
+                       InterruptionType interruption);
+
+    // Called by WriteIntentCleanup when an opCtx with active write intents is destroyed.
+    // Removes the mapping so deferred deregistration callbacks skip the decrement.
+    void _unregisterWriteCountForOpId(uint64_t opId);
+
+    bool _enabled = true;
+    // Controls if we reject write intents based on if a node is primary or not. Starts false so
+    // that unit tests do not need to set up a primary in order to register intents.
+    bool _primaryEnforcementActive = false;
+    RWMutex _stateMutex;
+    stdx::condition_variable _activeInterruptionCV;
+    InterruptionType _lastInterruption = InterruptionType::None;
+    // TODO(SERVER-122542): Remove once step up no longer takes the global lock in MODE_X.
+    bool _interruptionOrderedByGlobalLock = false;
+    OperationContext* _interruptionCtx = nullptr;
+    std::vector<tokenMap> _tokenMaps;
+    Atomic<int> _pendingStateChange = 0;
+    stdx::condition_variable _pendingStateChangeCV;
+
+    // Maps opCtx opId -> write intent counter pointer. Removed when the opCtx is destroyed
+    // (via WriteIntentCleanup) so deferred callbacks don't corrupt a new opCtx's counter.
+    mutable std::mutex _opIdMutex;
+    absl::flat_hash_map<uint64_t, Atomic<int32_t>*> _opIdToWriteCountPtr;
+
+    // Tracks number of operations killed on state transition.
+    size_t _totalOpsKilled = 0;
+};
+}  // namespace consensus
+}  // namespace rss
+}  // namespace mongo

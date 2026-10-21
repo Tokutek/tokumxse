@@ -1,0 +1,691 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/oplog.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/oplog_interface.h"
+#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/rss/stub_persistence_provider.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/storage/checkpointer.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/barrier.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/decorable.h"
+
+#include <algorithm>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <ostream>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+namespace repl {
+namespace {
+
+class OplogTest : public ServiceContextMongoDTest {
+protected:
+    void setUp() override;
+};
+
+void OplogTest::setUp() {
+    // Set up mongod.
+    ServiceContextMongoDTest::setUp();
+
+    auto service = getServiceContext();
+    auto opCtx = cc().makeOperationContext();
+
+    // Set up ReplicationCoordinator and create oplog.
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
+    createOplog(opCtx.get());
+
+    // Ensure that we are primary.
+    auto replCoord = ReplicationCoordinator::get(opCtx.get());
+    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
+}
+
+/**
+ * Assert that oplog only has a single entry and return that oplog entry.
+ */
+OplogEntry _getSingleOplogEntry(OperationContext* opCtx) {
+    OplogInterfaceLocal oplogInterface(opCtx);
+    auto oplogIter = oplogInterface.makeIterator();
+    auto opEntry = unittest::assertGet(oplogIter->next());
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus())
+        << "Expected only 1 document in the oplog collection "
+        << NamespaceString::kRsOplogNamespace.toStringForErrorMsg()
+        << " but found more than 1 document instead";
+    return unittest::assertGet(OplogEntry::parse(opEntry.first));
+}
+
+TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    auto msgObj = BSON("msg" << "hello, world!");
+
+    // Write to the oplog.
+    OpTime opTime;
+    {
+        MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+        oplogEntry.setNss(nss);
+        oplogEntry.setObject(msgObj);
+        oplogEntry.setWallClockTime(Date_t::now());
+        auto acq = acquireCollection(opCtx.get(),
+                                     CollectionAcquisitionRequest::fromOpCtx(
+                                         opCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                                     MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opTime = logOp(opCtx.get(), &oplogEntry);
+        ASSERT_FALSE(opTime.isNull());
+        wunit.commit();
+    }
+
+    OplogEntry oplogEntry = _getSingleOplogEntry(opCtx.get());
+
+    // Ensure that msg fields were properly added to the oplog entry.
+    ASSERT_EQUALS(opTime, oplogEntry.getOpTime())
+        << "OpTime returned from logOp() did not match that in the oplog entry written to the "
+           "oplog: "
+        << oplogEntry.toBSONForLogging();
+    ASSERT(OpTypeEnum::kNoop == oplogEntry.getOpType())
+        << "Expected 'n' op type but found '" << idl::serialize(oplogEntry.getOpType())
+        << "' instead: " << oplogEntry.toBSONForLogging();
+    ASSERT_BSONOBJ_EQ(msgObj, oplogEntry.getObject());
+
+    // Ensure that the msg optime returned is the same as the last optime in the ReplClientInfo.
+    ASSERT_EQUALS(ReplClientInfo::forClient(&cc()).getLastOp(), opTime);
+}
+
+TEST_F(OplogTest, HashSingleOpRoundTrip) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    const std::int64_t hash = 8622950721748590592LL;
+    SingleOpSizeMetadata expectedMetadata;
+    expectedMetadata.setH(hash);
+
+    MutableOplogEntry op;
+    op.setOpType(repl::OpTypeEnum::kInsert);
+    op.setNss(nss);
+    op.setUuid(UUID::gen());
+    op.setObject(BSON("_id" << 0 << "x" << 10));
+    op.setWallClockTime(Date_t::now());
+    op.setSizeMetadata(OplogEntrySizeMetadata{expectedMetadata});
+
+    {
+        auto acq = acquireCollection(opCtx.get(),
+                                     CollectionAcquisitionRequest::fromOpCtx(
+                                         opCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                                     MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        logOp(opCtx.get(), &op);
+        wunit.commit();
+    }
+
+    const OplogEntry entry = _getSingleOplogEntry(opCtx.get());
+    const auto& sizeMetadata = entry.getSizeMetadata();
+    ASSERT_TRUE(sizeMetadata.has_value());
+    ASSERT_TRUE(std::holds_alternative<SingleOpSizeMetadata>(*sizeMetadata));
+    const boost::optional<std::int64_t> parsedDocHash =
+        std::get<SingleOpSizeMetadata>(*sizeMetadata).getH();
+    ASSERT_TRUE(parsedDocHash.has_value());
+    EXPECT_EQ(hash, *parsedDocHash);
+}
+
+/**
+ * Checks optime and namespace in oplog entry.
+ */
+void _checkOplogEntry(const OplogEntry& oplogEntry,
+                      const OpTime& expectedOpTime,
+                      const NamespaceString& expectedNss) {
+    ASSERT_EQUALS(expectedOpTime, oplogEntry.getOpTime()) << oplogEntry.toBSONForLogging();
+    ASSERT_EQUALS(expectedNss, oplogEntry.getNss()) << oplogEntry.toBSONForLogging();
+}
+void _checkOplogEntry(const OplogEntry& oplogEntry,
+                      const std::pair<OpTime, NamespaceString>& expectedOpTimeAndNss) {
+    _checkOplogEntry(oplogEntry, expectedOpTimeAndNss.first, expectedOpTimeAndNss.second);
+}
+
+/**
+ * Test function that schedules two concurrent logOp() tasks using a thread pool.
+ * Checks the state of the oplog collection against the optimes returned from logOp().
+ * Before returning, updates 'opTimeNssMap' with the optimes from logOp() and 'oplogEntries' with
+ * the contents of the oplog collection.
+ */
+using OpTimeNamespaceStringMap = std::map<OpTime, NamespaceString>;
+template <typename F>
+void _testConcurrentLogOp(const F& makeTaskFunction,
+                          OpTimeNamespaceStringMap* opTimeNssMap,
+                          std::vector<OplogEntry>* oplogEntries,
+                          std::size_t expectedNumOplogEntries) {
+    ASSERT_LESS_THAN_OR_EQUALS(expectedNumOplogEntries, 2U);
+
+    // Run 2 concurrent logOp() requests using the thread pool.
+    ThreadPool::Options options;
+    options.maxThreads = 2U;
+    options.onCreateThread = [](const std::string& name) {
+        Client::initThread(name, getGlobalServiceContext()->getService());
+    };
+    ThreadPool pool(options);
+    pool.startup();
+
+    // Run 2 concurrent logOp() requests using the thread pool.
+    // Use a barrier with a thread count of 3 to ensure both logOp() tasks are complete before this
+    // test thread can proceed with shutting the thread pool down.
+    std::mutex mtx;
+    ;
+    unittest::Barrier barrier(3U);
+    const NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("test1.coll");
+    const NamespaceString nss2 = NamespaceString::createNamespaceString_forTest("test2.coll");
+    pool.schedule([&](auto status) mutable {
+        ASSERT_OK(status) << "Failed to schedule logOp() task for namespace "
+                          << nss1.toStringForErrorMsg();
+        makeTaskFunction(nss1, &mtx, opTimeNssMap, &barrier)();
+    });
+    pool.schedule([&](auto status) mutable {
+        ASSERT_OK(status) << "Failed to schedule logOp() task for namespace "
+                          << nss2.toStringForErrorMsg();
+        makeTaskFunction(nss2, &mtx, opTimeNssMap, &barrier)();
+    });
+    barrier.countDownAndWait();
+
+    // Shut thread pool down.
+    pool.shutdown();
+    pool.join();
+
+    // Read oplog entries from the oplog collection starting with the entry with the most recent
+    // optime.
+    auto opCtx = cc().makeOperationContext();
+    OplogInterfaceLocal oplogInterface(opCtx.get());
+    auto oplogIter = oplogInterface.makeIterator();
+    auto nextValue = oplogIter->next();
+    while (nextValue.isOK()) {
+        const auto& doc = nextValue.getValue().first;
+        oplogEntries->emplace_back(unittest::assertGet(OplogEntry::parse(doc)));
+        nextValue = oplogIter->next();
+    }
+    ASSERT_EQUALS(expectedNumOplogEntries, oplogEntries->size());
+
+    // Reverse 'oplogEntries' because we inserted the oplog entries in descending order by optime.
+    std::reverse(oplogEntries->begin(), oplogEntries->end());
+
+    // Look up namespaces and their respective optimes (returned by logOp()) in the map.
+    std::lock_guard<std::mutex> lock(mtx);
+    ASSERT_EQUALS(2U, opTimeNssMap->size());
+}
+
+/**
+ * Inserts noop oplog entry with embedded namespace string.
+ * Inserts optime/namespace pair into map while holding a lock on the mutex.
+ * Returns optime of generated oplog entry.
+ */
+OpTime _logOpNoopWithMsg(OperationContext* opCtx,
+                         std::mutex* mtx,
+                         OpTimeNamespaceStringMap* opTimeNssMap,
+                         const NamespaceString& nss) {
+    MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+    oplogEntry.setNss(nss);
+    oplogEntry.setObject(BSON("msg" << nss.ns_forTest()));
+    oplogEntry.setWallClockTime(Date_t::now());
+    auto opTime = logOp(opCtx, &oplogEntry);
+    ASSERT_FALSE(opTime.isNull());
+
+    std::lock_guard<std::mutex> lock(*mtx);
+    ASSERT(opTimeNssMap->find(opTime) == opTimeNssMap->end())
+        << "Unable to add namespace " << nss.toStringForErrorMsg()
+        << " to map - map contains duplicate entry for optime " << opTime;
+    opTimeNssMap->insert(std::make_pair(opTime, nss));
+
+    return opTime;
+}
+
+TEST_F(OplogTest, ConcurrentLogOp) {
+    OpTimeNamespaceStringMap opTimeNssMap;
+    std::vector<OplogEntry> oplogEntries;
+
+    _testConcurrentLogOp(
+        [](const NamespaceString& nss,
+           std::mutex* mtx,
+           OpTimeNamespaceStringMap* opTimeNssMap,
+           unittest::Barrier* barrier) {
+            return [=] {
+                auto opCtx = cc().makeOperationContext();
+                auto acq =
+                    acquireCollection(opCtx.get(),
+                                      CollectionAcquisitionRequest::fromOpCtx(
+                                          opCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                                      MODE_X);
+                WriteUnitOfWork wunit(opCtx.get());
+
+                _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
+
+                // It is okay for multiple threads to maintain uncommitted WUOWs upon returning from
+                // logOp() because each thread will hold an implicit MODE_IX lock on the oplog
+                // collection.
+                barrier->countDownAndWait();
+                wunit.commit();
+            };
+        },
+        &opTimeNssMap,
+        &oplogEntries,
+        2U);
+
+    _checkOplogEntry(oplogEntries[0], *(opTimeNssMap.begin()));
+    _checkOplogEntry(oplogEntries[1], *(opTimeNssMap.rbegin()));
+}
+
+TEST_F(OplogTest, ConcurrentLogOpRevertFirstOplogEntry) {
+    OpTimeNamespaceStringMap opTimeNssMap;
+    std::vector<OplogEntry> oplogEntries;
+
+    _testConcurrentLogOp(
+        [](const NamespaceString& nss,
+           std::mutex* mtx,
+           OpTimeNamespaceStringMap* opTimeNssMap,
+           unittest::Barrier* barrier) {
+            return [=] {
+                auto opCtx = cc().makeOperationContext();
+                auto acq =
+                    acquireCollection(opCtx.get(),
+                                      CollectionAcquisitionRequest::fromOpCtx(
+                                          opCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                                      MODE_X);
+                WriteUnitOfWork wunit(opCtx.get());
+
+                auto opTime = _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
+
+                // It is okay for multiple threads to maintain uncommitted WUOWs upon returning from
+                // logOp() because each thread will hold an implicit MODE_IX lock on the oplog
+                // collection.
+                barrier->countDownAndWait();
+
+                // Revert the first logOp() call and confirm that there are no holes in the
+                // oplog after committing the oplog entry with the more recent optime.
+                {
+                    std::lock_guard<std::mutex> lock(*mtx);
+                    auto firstOpTimeAndNss = *(opTimeNssMap->cbegin());
+                    if (opTime == firstOpTimeAndNss.first) {
+                        ASSERT_EQUALS(nss, firstOpTimeAndNss.second)
+                            << "optime matches entry in optime->nss map but namespace in map  is "
+                               "different.";
+                        // Abort WUOW by returning early. The oplog entry for this task should not
+                        // be present in the oplog.
+                        return;
+                    }
+                }
+
+                wunit.commit();
+            };
+        },
+        &opTimeNssMap,
+        &oplogEntries,
+        1U);
+
+    _checkOplogEntry(oplogEntries[0], *(opTimeNssMap.crbegin()));
+}
+
+TEST_F(OplogTest, ConcurrentLogOpRevertLastOplogEntry) {
+    OpTimeNamespaceStringMap opTimeNssMap;
+    std::vector<OplogEntry> oplogEntries;
+
+    _testConcurrentLogOp(
+        [](const NamespaceString& nss,
+           std::mutex* mtx,
+           OpTimeNamespaceStringMap* opTimeNssMap,
+           unittest::Barrier* barrier) {
+            return [=] {
+                auto opCtx = cc().makeOperationContext();
+                auto acq =
+                    acquireCollection(opCtx.get(),
+                                      CollectionAcquisitionRequest::fromOpCtx(
+                                          opCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                                      MODE_X);
+                WriteUnitOfWork wunit(opCtx.get());
+
+                auto opTime = _logOpNoopWithMsg(opCtx.get(), mtx, opTimeNssMap, nss);
+
+                // It is okay for multiple threads to maintain uncommitted WUOWs upon returning from
+                // logOp() because each thread will hold an implicit MODE_IX lock on the oplog
+                // collection.
+                barrier->countDownAndWait();
+
+                // Revert the last logOp() call and confirm that there are no holes in the
+                // oplog after committing the oplog entry with the earlier optime.
+                {
+                    std::lock_guard<std::mutex> lock(*mtx);
+                    auto lastOpTimeAndNss = *(opTimeNssMap->crbegin());
+                    if (opTime == lastOpTimeAndNss.first) {
+                        ASSERT_EQUALS(nss, lastOpTimeAndNss.second)
+                            << "optime matches entry in optime->nss map but namespace in map is "
+                               "different.";
+                        // Abort WUOW by returning early. The oplog entry for this task should not
+                        // be present in the oplog.
+                        return;
+                    }
+                }
+
+                wunit.commit();
+            };
+        },
+        &opTimeNssMap,
+        &oplogEntries,
+        1U);
+
+    _checkOplogEntry(oplogEntries[0], *(opTimeNssMap.cbegin()));
+}
+
+class CreateIndexForApplyOpsTest : public OplogTest {
+public:
+    void setUp() override {
+        OplogTest::setUp();
+
+        auto opCtx = cc().makeOperationContext();
+
+        auto uuid = UUID::gen();
+        auto acq = acquireCollection(opCtx.get(),
+                                     CollectionAcquisitionRequest::fromOpCtx(
+                                         opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                     MODE_X);
+        ASSERT_OK(createCollectionForApplyOps(opCtx.get(),
+                                              _nss.dbName(),
+                                              boost::none,
+                                              BSON("create" << _nss.coll() << "uuid" << uuid),
+                                              /*allowRenameOutOfTheWay*/ false));
+
+        auto replCoord = ReplicationCoordinator::get(opCtx.get());
+        ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
+    }
+
+    NamespaceString _nss = NamespaceString::createNamespaceString_forTest("test.coll");
+};
+
+TEST_F(CreateIndexForApplyOpsTest, GeneratesNewIdentIfNone) {
+    auto opCtx = cc().makeOperationContext();
+    {
+        auto acq = acquireCollection(opCtx.get(),
+                                     CollectionAcquisitionRequest::fromOpCtx(
+                                         opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                     MODE_X);
+        createIndexForApplyOps(opCtx.get(),
+                               BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                                        << "a_1"),
+                               boost::none,
+                               _nss,
+                               OplogApplication::Mode::kSecondary);
+    }
+
+    auto collection = acquireCollection(
+        opCtx.get(),
+        CollectionAcquisitionRequest::fromOpCtx(opCtx.get(), _nss, AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    auto index =
+        collection.getCollectionPtr()->getIndexCatalog()->findIndexByName(opCtx.get(), "a_1");
+    ASSERT(index);
+    ASSERT(index->getIdent().starts_with("index-"));
+}
+
+TEST_F(CreateIndexForApplyOpsTest, UsesIdentIfSpecified) {
+    auto opCtx = cc().makeOperationContext();
+
+    const std::string ident = "index-test-ident";
+    const std::string identUniqueTag = "test-ident";
+    {
+        auto acq = acquireCollection(opCtx.get(),
+                                     CollectionAcquisitionRequest::fromOpCtx(
+                                         opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                     MODE_X);
+        createIndexForApplyOps(opCtx.get(),
+                               BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                                        << "a_1"),
+                               BSON("indexIdent" << identUniqueTag),
+                               _nss,
+                               OplogApplication::Mode::kSecondary);
+    }
+
+    auto collection = acquireCollection(
+        opCtx.get(),
+        CollectionAcquisitionRequest::fromOpCtx(opCtx.get(), _nss, AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    auto catalog = collection.getCollectionPtr()->getIndexCatalog();
+    ASSERT(catalog->findIndexByIdent(opCtx.get(), ident));
+    auto index = catalog->findIndexByName(opCtx.get(), "a_1");
+    ASSERT(index);
+    ASSERT_EQ(index->getIdent(), ident);
+}
+
+TEST_F(CreateIndexForApplyOpsTest, MetadataValidation) {
+    auto opCtx = cc().makeOperationContext();
+    auto acq = acquireCollection(opCtx.get(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                 MODE_X);
+    auto spec = BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                         << "a_1");
+    ASSERT_THROWS_CODE(createIndexForApplyOps(
+                           opCtx.get(), spec, BSONObj(), _nss, OplogApplication::Mode::kSecondary),
+                       AssertionException,
+                       ErrorCodes::IDLFailedToParse);
+    ASSERT_THROWS_CODE(
+        createIndexForApplyOps(
+            opCtx.get(), spec, BSON("indexIdent" << 1), _nss, OplogApplication::Mode::kSecondary),
+        AssertionException,
+        ErrorCodes::TypeMismatch);
+    ASSERT_THROWS_CODE(
+        createIndexForApplyOps(
+            opCtx.get(), spec, BSON("indexIdent" << ""), _nss, OplogApplication::Mode::kSecondary),
+        AssertionException,
+        ErrorCodes::BadValue);
+    ASSERT_THROWS_CODE(createIndexForApplyOps(opCtx.get(),
+                                              spec,
+                                              BSON("ident" << "malformed-ident"),
+                                              _nss,
+                                              OplogApplication::Mode::kSecondary),
+                       AssertionException,
+                       ErrorCodes::IDLFailedToParse);
+}
+
+// --- Tests for the recordIdsReplicated guard in the applyOps "create" path ---
+
+// Minimal stub provider that mandates replicated RecordIds.
+class StubProviderRequiringReplicatedRecordIds : public rss::StubPersistenceProvider {
+public:
+    std::string name() const override {
+        return "StubProviderRequiringReplicatedRecordIds";
+    }
+    bool shouldUseReplicatedRecordIds() const override {
+        return true;
+    }
+    bool shouldUseReplicatedCatalogIdentifiers() const override {
+        return false;
+    }
+    bool supportsTableLogging() const override {
+        return true;
+    }
+    const char* getWTMemoryPageMaxForOplogStrValue() const override {
+        return "10m";
+    }
+    bool supportsUnstableCheckpoints() const override {
+        return true;
+    }
+    bool shouldUseOplogWritesForFlowControlSampling() const override {
+        return true;
+    }
+    bool shouldUseReplicatedFastCount() const override {
+        return false;
+    }
+    std::string getMainWiredTigerTableSettings() const override {
+        return "";
+    }
+};
+
+class ApplyCreateWithRecordIdsReplicatedTest : public OplogTest {
+protected:
+    // Build a minimal oplog-entry BSON for a "create" command.
+    BSONObj makeCreateOplogEntry(const NamespaceString& nss, bool recordIdsReplicated) {
+        return BSON(
+            "op" << "c" << "ns" << nss.getCommandNS().ns_forTest() << "ui" << UUID::gen() << "o"
+                 << BSON("create" << nss.coll() << "recordIdsReplicated" << recordIdsReplicated)
+                 << "ts" << Timestamp(2, 1) << "t" << 1LL << "v" << 2LL << "wall" << Date_t::now());
+    }
+
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("test.applyOpsRids");
+};
+
+// applyOps with recordIdsReplicated must throw CommandNotSupported when neither the persistence
+// provider nor the feature flag enables the feature.
+TEST_F(ApplyCreateWithRecordIdsReplicatedTest,
+       ApplyOpsCreate_ThrowsCommandNotSupported_WhenNeitherProviderNorFlagEnabled) {
+    auto opCtx = cc().makeOperationContext();
+    auto entry = unittest::assertGet(OplogEntry::parse(makeCreateOplogEntry(_nss, true)));
+
+    auto acq = acquireCollection(opCtx.get(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                 MODE_X);
+    auto status = applyCommand_inlock(
+        opCtx.get(), ApplierOperation{&entry}, OplogApplication::Mode::kApplyOpsCmd);
+    ASSERT_EQ(ErrorCodes::CommandNotSupported, status.code());
+}
+
+// applyOps with recordIdsReplicated must be allowed when the persistence provider requires it,
+// even when the feature flag is disabled.
+TEST_F(ApplyCreateWithRecordIdsReplicatedTest,
+       ApplyOpsCreate_Allowed_WhenProviderRequiresItWithoutFeatureFlag) {
+    auto opCtx = cc().makeOperationContext();
+
+    rss::ReplicatedStorageService::get(opCtx->getServiceContext())
+        .setPersistenceProvider(std::make_unique<StubProviderRequiringReplicatedRecordIds>());
+
+    auto entry = unittest::assertGet(OplogEntry::parse(makeCreateOplogEntry(_nss, true)));
+
+    auto acq = acquireCollection(opCtx.get(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                 MODE_X);
+    ASSERT_OK(applyCommand_inlock(
+        opCtx.get(), ApplierOperation{&entry}, OplogApplication::Mode::kApplyOpsCmd));
+}
+
+// applyOps with recordIdsReplicated must be allowed when the feature flag is enabled, even
+// when the persistence provider does not mandate it.
+TEST_F(ApplyCreateWithRecordIdsReplicatedTest,
+       ApplyOpsCreate_Allowed_WhenFeatureFlagEnabledWithoutProvider) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagRecordIdsReplicated", true);
+    auto opCtx = cc().makeOperationContext();
+    auto entry = unittest::assertGet(OplogEntry::parse(makeCreateOplogEntry(_nss, true)));
+
+    auto acq = acquireCollection(opCtx.get(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                 MODE_X);
+    ASSERT_OK(applyCommand_inlock(
+        opCtx.get(), ApplierOperation{&entry}, OplogApplication::Mode::kApplyOpsCmd));
+}
+
+// The guard must not fire for non-applyOps modes (e.g. secondary replication), even when
+// neither the provider nor the feature flag is enabled.
+TEST_F(ApplyCreateWithRecordIdsReplicatedTest,
+       ApplyOpsCreate_NotBlocked_InSecondaryMode_WhenNeitherProviderNorFlagEnabled) {
+    auto opCtx = cc().makeOperationContext();
+    auto entry = unittest::assertGet(OplogEntry::parse(makeCreateOplogEntry(_nss, true)));
+
+    auto acq = acquireCollection(opCtx.get(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     opCtx.get(), _nss, AcquisitionPrerequisites::kWrite),
+                                 MODE_X);
+    ASSERT_OK(applyCommand_inlock(
+        opCtx.get(), ApplierOperation{&entry}, OplogApplication::Mode::kSecondary));
+}
+
+// ------------------------------------------------------------------
+// Test: oplog writes notify the injected CheckpointSchedulePolicy
+// ------------------------------------------------------------------
+
+class MockCheckpointPolicy : public CheckpointSchedulePolicy {
+public:
+    void waitUntilReady(std::unique_lock<std::mutex>&,
+                        stdx::condition_variable&,
+                        std::function<bool()>) override {}
+    bool accumulateOplogBytes(int64_t bytes) override {
+        _accumulated.fetchAndAdd(bytes);
+        return false;
+    }
+    int64_t accumulated() const {
+        return _accumulated.load();
+    }
+
+private:
+    AtomicWord<int64_t> _accumulated{0};
+};
+
+// Fixture that installs a spy checkpointer and removes it before teardown.
+// The checkpointer is never started, so stopStorageControls must not see it.
+class OplogCheckpointNotificationTest : public OplogTest {
+protected:
+    void tearDown() override {
+        Checkpointer::set(getServiceContext(), nullptr);
+        OplogTest::tearDown();
+    }
+};
+
+TEST_F(OplogCheckpointNotificationTest, OplogWriteNotifiesCheckpointPolicy) {
+    auto opCtx = cc().makeOperationContext();
+
+    MockCheckpointPolicy* mock = nullptr;
+    {
+        auto owned = std::make_unique<MockCheckpointPolicy>();
+        mock = owned.get();
+        Checkpointer::set(getServiceContext(), std::make_unique<Checkpointer>(std::move(owned)));
+    }
+
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    int64_t expectedBytes = 0;
+    {
+        MutableOplogEntry entry;
+        entry.setOpType(repl::OpTypeEnum::kNoop);
+        entry.setNss(nss);
+        entry.setObject(BSON("msg" << "test"));
+        entry.setWallClockTime(Date_t::now());
+        AutoGetDb autoDb(opCtx.get(), nss.dbName(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        logOp(opCtx.get(), &entry);
+        wunit.commit();
+        // logOp fills in all oplog fields (ts, t, v, op, ns, …); toBSON() reflects the full
+        // serialized size that notifyOplogWrite accumulates.
+        expectedBytes = entry.toBSON().objsize();
+    }
+
+    ASSERT_GTE(mock->accumulated(), expectedBytes);
+}
+
+}  // namespace
+}  // namespace repl
+}  // namespace mongo

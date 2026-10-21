@@ -1,0 +1,767 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+    - "mongo/util/net/hostandport.idl"
+
+enums:
+    MetadataInconsistencyType:
+        description: "Type of metadata inconsistency."
+        type: string
+        values:
+            kCollectionOptionsMismatch: "CollectionOptionsMismatch"
+            kCollectionAuxiliaryMetadataMismatch: "CollectionAuxiliaryMetadataMismatch"
+            kCollectionUUIDMismatch: "CollectionUUIDMismatch"
+            kCorruptedChunkHistory: "CorruptedChunkHistory"
+            kCorruptedChunkShardKey: "CorruptedChunkShardKey"
+            kCorruptedZoneShardKey: "CorruptedZoneShardKey"
+            kHiddenShardedCollection: "HiddenShardedCollection"
+            kInconsistentIndex: "InconsistentIndex"
+            kMisplacedCollection: "MisplacedCollection"
+            kMissingLocalCollection: "MissingLocalCollection"
+            kMissingRoutingTable: "MissingRoutingTable"
+            kMissingShardKeyIndex: "MissingShardKeyIndex"
+            kRangeDeletionMissingShardKeyIndex: "RangeDeletionMissingShardKeyIndex"
+            kRoutingTableMissingMaxKey: "RoutingTableMissingMaxKey"
+            kRoutingTableMissingMinKey: "RoutingTableMissingMinKey"
+            kRoutingTableRangeGap: "RoutingTableRangeGap"
+            kRoutingTableRangeOverlap: "RoutingTableRangeOverlap"
+            kZonesRangeOverlap: "ZonesRangeOverlap"
+            kTrackedUnshardedCollectionHasMultipleChunks: "TrackedUnshardedCollectionHasMultipleChunks"
+            kTrackedUnshardedCollectionHasInvalidKey: "TrackedUnshardedCollectionHasInvalidKey"
+            kInconsistentDatabaseVersionInShardCatalog: "InconsistentDatabaseVersionInShardCatalog"
+            kInconsistentDatabaseVersionInShardCatalogCache: "InconsistentDatabaseVersionInShardCatalogCache"
+            kMissingDatabaseMetadataInShardCatalog: "MissingDatabaseMetadataInShardCatalog"
+            kMissingDatabaseMetadataInShardCatalogCache: "MissingDatabaseMetadataInShardCatalogCache"
+            kMisplacedDatabaseMetadataInShardCatalog: "MisplacedDatabaseMetadataInShardCatalog"
+            kMisplacedDatabaseMetadataInShardCatalogCache: "MisplacedDatabaseMetadataInShardCatalogCache"
+            kDatabaseMetadataForNonExistingDatabaseInShardCatalog: "DatabaseMetadataForNonExistingDatabaseInShardCatalog"
+            kDatabaseMetadataForNonExistingDatabaseInShardCatalogCache: "DatabaseMetadataForNonExistingDatabaseInShardCatalogCache"
+            kCollectionMetadataForNonExistingDatabaseInShardCatalog: "CollectionMetadataForNonExistingDatabaseInShardCatalog"
+            kCollectionMetadataForNonExistingDatabaseInShardCatalogCache: "CollectionMetadataForNonExistingDatabaseInShardCatalogCache"
+            kMalformedTimeseriesBucketsCollection: "MalformedTimeseriesBucketsCollection"
+            kUnparsableShardCatalogEntry: "UnparsableShardCatalogEntry"
+            kInconsistentShardCatalogCollectionMetadata: "InconsistentShardCatalogCollectionMetadata"
+            kIncompatibleUniqueIndexOnShardedCollection: "IncompatibleUniqueIndexOnShardedCollection"
+            kLegacyShardCacheCollectionsPresent: "LegacyShardCacheCollectionsPresent"
+            # TODO(SERVER-98118): remove this inconsistency once 9.0 is last LTS
+            kAuthoritativeShardCatalogCollectionsPresent: "AuthoritativeShardCatalogCollectionsPresent"
+
+    MetadataInconsistencyDescription:
+        description: "Description of each metadata inconsistency."
+        type: string
+        values:
+            kCollectionOptionsMismatch: "Found collection with mismatching options across shards and/or config server"
+            kCollectionAuxiliaryMetadataMismatch: "Found collection with mismatching auxiliary metadata across shards and/or config server"
+            kCollectionUUIDMismatch: "Found collection on non primary shard with mismatching UUID"
+            kCorruptedChunkHistory: "Found chunk with an invalid history field"
+            kCorruptedChunkShardKey: "Found chunk with a shard key pattern violation"
+            kCorruptedZoneShardKey: "Found zone with a shard key pattern violation"
+            kHiddenShardedCollection: "Found sharded collection but relative database does not exist"
+            kInconsistentIndex: "Found an index of a sharded collection that is inconsistent between different shards"
+            kMisplacedCollection: "Found unsharded collection without the appropriate metadata on a shard different from the database primary shard"
+            kMissingLocalCollection: "Collection registered on the sharding catalog not found on the given shards"
+            kMissingRoutingTable: "Found sharded collection without any chunk"
+            kMissingShardKeyIndex: "Found sharded collection without a shard key index"
+            kRangeDeletionMissingShardKeyIndex: "Found sharded collection with an outstanding range deletion task without a shard key index"
+            kRoutingTableMissingMaxKey: "Routing table has a gap because last chunk boundary does not reach MaxKey"
+            kRoutingTableMissingMinKey: "Routing table has a gap because first chunk does not start from MinKey"
+            kRoutingTableRangeGap: "Found a gap between two consecutive chunks"
+            kRoutingTableRangeOverlap: "Found two overlapping consecutive chunks"
+            kZonesRangeOverlap: "Found two overlapping zones"
+            kTrackedUnshardedCollectionHasMultipleChunks: "Found tracked unsharded collection with more than one chunks"
+            kTrackedUnshardedCollectionHasInvalidKey: "Found tracked unsharded collection with invalid shard-key"
+            kInconsistentDatabaseVersionInShardCatalog: "Found database metadata in the shard catalog that is not aligned with one in global catalog"
+            kInconsistentDatabaseVersionInShardCatalogCache: "Found database metadata in the shard catalog cache that is not aligned with one in the global or shard catalog"
+            kMissingDatabaseMetadataInShardCatalog: "Found database metadata in the global catalog but not in the shard catalog or not in a consistent state"
+            kMissingDatabaseMetadataInShardCatalogCache: "Found database metadata in the global catalog but not in shard catalog cache"
+            kMisplacedDatabaseMetadataInShardCatalog: "Found some database metadata in the shard catalog that is not owned by this shard"
+            kMisplacedDatabaseMetadataInShardCatalogCache: "Found database metadata in the shard catalog cache of a shard that is not the database's primary shard"
+            kDatabaseMetadataForNonExistingDatabaseInShardCatalog: "Found database metadata in the shard catalog for a database absent from the global catalog"
+            kDatabaseMetadataForNonExistingDatabaseInShardCatalogCache: "Found database metadata in the shard catalog cache for a database absent from the global catalog"
+            kCollectionMetadataForNonExistingDatabaseInShardCatalog: "Found collection metadata in the shard catalog for a database absent from the global catalog"
+            kCollectionMetadataForNonExistingDatabaseInShardCatalogCache: "Found collection metadata in the shard catalog cache for a database absent from the global catalog"
+            kMalformedTimeseriesBucketsCollection: "Found malformed timeseries collection"
+            kUnparsableShardCatalogEntry: "Found an unparsable entry in the shard catalog"
+            kInconsistentShardCatalogCollectionMetadata: "Found inconsistencies between collection metadata in the global catalog and the shard catalog"
+            kIncompatibleUniqueIndexOnShardedCollection: "Found incompatible index options with uniqueness in a sharded collection"
+            kLegacyShardCacheCollectionsPresent: "Found legacy non-authoritative shard catalog cache collections on a shard that is fully upgraded"
+            kAuthoritativeShardCatalogCollectionsPresent: "Found authoritative shard catalog collections on a shard that is fully downgraded"
+
+    MetadataInconsistencySeverity:
+        description: "Severity level of a metadata inconsistency."
+        type: string
+        values:
+            kHigh: "high"
+            kMedium: "medium"
+            kLow: "low"
+
+    MetadataConsistencyCommandLevel:
+        description: "Level mode of the metadata consistency command."
+        type: string
+        values:
+            kClusterLevel: "ClusterLevel"
+            kDatabaseLevel: "DatabaseLevel"
+            kCollectionLevel: "CollectionLevel"
+
+    CheckMetadataConsistencySecondaryMode:
+        description: "How is metadata checked on secondaries"
+        type: string
+        values:
+            kNoSecondaryCheck: "noSecondaryCheck"
+            kCheckAtPrimaryTimestamp: "checkAtPrimaryTimestamp"
+            kCheckAtSecondaryTimestamp: "checkAtSecondaryTimestamp"
+
+structs:
+    MisplacedCollectionDetails:
+        description: "Details about a misplaced collection inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that is misplaced."
+            shard:
+                type: shard_id
+                description: "The shard where the collection is placed."
+            localUUID:
+                type: uuid
+                description: "The UUID of the collection that is misplaced."
+            numDocs:
+                type: long
+                description: "The number of documents in the collection that is misplaced."
+
+    MissingLocalCollectionDetails:
+        description: "Details about a local collection not found inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that has not been found on any shard."
+            uuid:
+                type: uuid
+                description: "The UUID of the collection registered on the sharding catalog."
+            shard:
+                type: shard_id
+                description: "The shard where the collection is missing."
+
+    CollectionOptionsMismatchDetails:
+        description: "Details about a collection options mismatch inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that has a collection options mismatch."
+            options:
+                type: array<object>
+                description: "A list of the different options found per shard and/or config server."
+
+    CollectionAuxiliaryMetadataMismatchDetails:
+        description: "Details about a collection auxiliary metadata mismatch inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that has a collection auxiliary metadata mismatch."
+            collectionMetadata:
+                type: array<object>
+                description: "A list of the different auxiliary metadata found per shard and/or config server."
+
+    CollectionUUIDMismatchDetails:
+        description: "Details about a UUID mismatch inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that has a UUID mismatch."
+            shard:
+                type: shard_id
+                description: "The shard where the UUID mismatch inconsistency has been found."
+            localUUID:
+                type: uuid
+                description: "The UUID of the collection found on the shard."
+            uuid:
+                type: uuid
+                description: "The UUID of the collection found on the config server."
+            numDocs:
+                type: long
+                description: "The number of documents in the collection found on the shard."
+
+    MissingShardKeyIndexDetails:
+        description: "Details about a missing shard key index inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that is missing a shard key index."
+            shard:
+                type: shard_id
+                description: "The shard where the missing shard key index inconsistency has been found."
+            shardKey:
+                type: object
+                description: "The shard key of the collection."
+
+    RangeDeletionMissingShardKeyIndexDetails:
+        description: "Details about a range deletion with missing shard key index inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that has an outstanding range deletion without a supporting shard key index."
+            shard:
+                type: shard_id
+                description: "The shard where the range deletion with missing shard key index inconsistency has been found."
+            shardKey:
+                type: object
+                description: "The shard key of the collection."
+
+    RoutingTableRangeOverlapDetails:
+        description: "Details about a routing table range overlap inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            chunkA:
+                type: object
+                description: "The first chunk that overlaps with the second chunk."
+            chunkB:
+                type: object
+                description: "The second chunk that overlaps with the first chunk."
+
+    RoutingTableRangeGapDetails:
+        description: "Details about a routing table range gap inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            chunkA:
+                type: object
+                description: "The first chunk that has a gap with the second chunk."
+            chunkB:
+                type: object
+                description: "The second chunk that has a gap with the first chunk."
+
+    RoutingTableMissingMinKeyDetails:
+        description: "Details about a routing table missing min key inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            minKeyObj:
+                type: object
+                description: "The min key of the collection."
+            globalMin:
+                type: object
+                description: "The expected min key of the collection."
+
+    RoutingTableMissingMaxKeyDetails:
+        description: "Details about a routing table missing max key inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            maxKeyObj:
+                type: object
+                description: "The max key of the collection."
+            globalMax:
+                type: object
+                description: "The expected max key of the collection."
+
+    CorruptedChunkHistoryDetails:
+        description: "Details about a corrupted chunk history field."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            chunk:
+                type: object
+                description: "The chunk with a corrupted history."
+            issue:
+                type: string
+                description: "The type of corruption."
+
+    CorruptedChunkShardKeyDetails:
+        description: "Details about a corrupted chunk shard key inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            chunk:
+                type: object
+                description: "The chunk with a corrupted shard key."
+            shardKeyPattern:
+                type: object
+                description: "The shard key pattern of the collection."
+
+    CorruptedZoneShardKeyDetails:
+        description: "Details about a corrupted zone shard key inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            zone:
+                type: object
+                description: "The zone with a corrupted shard key."
+            shardKeyPattern:
+                type: object
+                description: "The shard key pattern of the collection."
+
+    UnexpectedShardCatalogCollectionDetails:
+        description: "Details about a shard catalog collection unexpectedly found on a shard given the cluster's current FCV."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection found."
+            shard:
+                type: shard_id
+                description: "The shard on which the collection was found."
+
+    HiddenShardedCollectionDetails:
+        description: "Details about a hidden sharded collection inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that is hidden."
+            collection:
+                type: object
+                description: "Information about the collection."
+
+    InconsistentIndexDetails:
+        description: "Details about index inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the affected collection."
+            info:
+                type: object
+                description: "Object containing infos about the inconsistent index."
+
+    MissingRoutingTableDetails:
+        description: "Details about a missing routing table inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection that has no routing table."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+
+    ZonesRangeOverlapDetails:
+        description: "Details about a zones range overlap inconsistency."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                description: "The UUID of the collection."
+            zoneA:
+                type: object
+                description: "The first zone that overlaps with the second zone."
+            zoneB:
+                type: object
+                description: "The second zone that overlaps with the first zone."
+
+    TrackedUnshardedCollectionHasMultipleChunksDetails:
+        description: "Details about tracked unsharded collection with more then one chunks"
+        strict: false
+        fields:
+            namespace:
+                description: "The namespace of the collection."
+                cpp_name: nss
+                type: namespacestring
+            uuid:
+                description: "The UUID of the collection."
+                type: uuid
+            numChunks:
+                description: "The number of chunks found for the collection"
+                type: int
+
+    TrackedUnshardedCollectionHasInvalidKeyDetails:
+        description: "Details about tracked unsharded collection with an invalid shard key"
+        strict: false
+        fields:
+            namespace:
+                description: "The namespace of the collection."
+                cpp_name: nss
+                type: namespacestring
+            uuid:
+                description: "The UUID of the collection."
+                type: uuid
+            shardKey:
+                description: "The shard key of the collection."
+                type: object
+
+    TrackedUnshardedCollectionIsMissingLocally:
+        description: "Details about unsharded collection tracked on the csrs but not present locally on any shard"
+        strict: false
+        fields:
+            namespace:
+                description: "The namespace of the collection."
+                cpp_name: nss
+                type: namespacestring
+            uuid:
+                description: "The UUID of the collection."
+                type: uuid
+            shard:
+                description: "The shard where the collection was supposed to be found"
+                type: shard_id
+
+    InconsistentDatabaseVersionInShardCatalogDetails:
+        description: "Details about an inconsistent database metadata from the shard catalog compared to the one in the global catalog"
+        strict: false
+        fields:
+            dbName:
+                description: "The database name."
+                type: database_name
+            shardId:
+                description: "The shard where this database metadata has been found."
+                type: shard_id
+            dbVersionInGlobalCatalog:
+                description: "The database version of the global catalog."
+                type: database_version
+            dbVersionInShardCatalog:
+                description: "The database version of the shard catalog."
+                type: database_version
+
+    InconsistentDatabaseVersionInShardCatalogCacheDetails:
+        description: "Details about an inconsistent database metadata from the shard catalog cache compared to the one in the global or shard catalog"
+        strict: false
+        fields:
+            dbName:
+                description: "The database name."
+                type: database_name
+            shardId:
+                description: "The shard where this database metadata has been found."
+                type: shard_id
+            dbVersionInGlobalCatalog:
+                description: "The database version of the global catalog."
+                type: database_version
+            dbVersionInShardCatalogCache:
+                description: "The database version of the shard catalog cache."
+                type: database_version
+            primaryShardIdInShardCatalogCache:
+                description: "The primary shard reported by the shard catalog cache."
+                type: shard_id
+                optional: true
+
+    MissingDatabaseMetadataInShardCatalogDetails:
+        description: "Details about a missing database metadata entry in the shard catalog compared to the one in the global catalog"
+        strict: false
+        fields:
+            dbName:
+                description: "The database name."
+                type: database_name
+            shardId:
+                description: "The shard where this database metadata has been found."
+                type: shard_id
+            dbVersionInGlobalCatalog:
+                description: "The database version of the global catalog."
+                type: database_version
+            reason:
+                description: "The reason why the entry is considered missing or corrupted."
+                type: string
+                optional: true
+
+    MissingDatabaseMetadataInShardCatalogCacheDetails:
+        description: "Details about a missing database metadata entry in the shard catalog cache compared to the one in global catalog"
+        strict: false
+        fields:
+            dbName:
+                description: "The database name."
+                type: database_name
+            shardId:
+                description: "The shard where this database metadata has been found."
+                type: shard_id
+            dbVersionInGlobalCatalog:
+                description: "The database version of the global catalog."
+                type: database_version
+
+    MisplacedDatabaseMetadataInShardCatalogDetails:
+        description: "Details about an inconsistent database metadata placed in the wrong shard"
+        strict: false
+        fields:
+            dbName:
+                description: "The database name."
+                type: database_name
+            shardId:
+                description: "The shard where this database metadata has been found."
+                type: shard_id
+            shardIdInShardCatalog:
+                description: "The shard that the shard catalog thinks is the primary shard for the database."
+                type: shard_id
+
+    MisplacedDatabaseMetadataInShardCatalogCacheDetails:
+        description: "Details about database metadata in the shard catalog cache of the wrong shard"
+        strict: false
+        fields:
+            dbName:
+                description: "The database name."
+                type: database_name
+            shardId:
+                description: "The shard where this database metadata has been found."
+                type: shard_id
+            shardIdInShardCatalogCache:
+                description: "The shard that the shard catalog cache thinks is the primary shard for the database."
+                type: shard_id
+
+    InconsistentShardCatalogCollectionMetadataDetails:
+        description: "Details about mismatched collection metadata between the shard catalog and the global catalog"
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the collection."
+            collectionUUID:
+                type: uuid
+                optional: true
+                description: "The UUID of the collection."
+            details:
+                type: object
+                description: >-
+                    Specific details about the mismatch, such as the differing field and its values
+                    in both catalogs, or the reason for the inconsistency.
+
+    MalformedTimeseriesBucketsCollectionDetails:
+        description: "Details about a malformed timeseries collection."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace of the buckets collection."
+            issue:
+                type: string
+                description: "The type of corruption."
+            options:
+                type: object
+                description: "Collection options not matching the expeced format."
+
+    DatabaseMetadataForNonExistingDatabaseInShardCatalogDetails:
+        description: "Details about durable database metadata for a database absent from the global catalog."
+        strict: false
+        fields:
+            dbName:
+                type: database_name
+                description: "The database name."
+            shardId:
+                type: shard_id
+                description: "The shard where the metadata was found."
+            primary:
+                type: shard_id
+                description: "The primary shard recorded in the metadata."
+            version:
+                type: database_version
+                description: "The database version recorded in the metadata."
+
+    DatabaseMetadataForNonExistingDatabaseInShardCatalogCacheDetails:
+        description: "Details about cached database metadata for a database absent from the global catalog."
+        strict: false
+        fields:
+            dbName:
+                type: database_name
+                description: "The database name."
+            shardId:
+                type: shard_id
+                description: "The shard where the metadata was found."
+            primary:
+                type: shard_id
+                description: "The cached primary shard."
+            version:
+                type: database_version
+                description: "The cached database version."
+
+    CollectionMetadataForNonExistingDatabaseInShardCatalogDetails:
+        description: "Details about durable collection metadata for a database absent from the global catalog."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The collection namespace."
+            shardId:
+                type: shard_id
+                description: "The shard where the metadata was found."
+            collectionTimestamp:
+                type: timestamp
+                description: "The timestamp of the collection metadata recorded in the shard catalog."
+
+    CollectionMetadataForNonExistingDatabaseInShardCatalogCacheDetails:
+        description: "Details about cached collection metadata for a database absent from the global catalog."
+        strict: false
+        fields:
+            namespace:
+                cpp_name: nss
+                type: namespacestring
+                description: "The collection namespace."
+            shardId:
+                type: shard_id
+                description: "The shard where the metadata was found."
+            placementVersion:
+                type: shard_version
+                description: "The collection placement version recorded in the cache."
+
+    UnparsableShardCatalogEntryDetails:
+        description: "Details about an unparsable entry found in the shard catalog."
+        strict: false
+        fields:
+            shardId:
+                type: shard_id
+                description: "The shard where the unparsable entry was found."
+            reason:
+                type: string
+                description: "The reason the entry could not be parsed."
+
+    Provenance:
+        description: "A shardId/HostAndPort combination identifying the exact node that created an inconsistency item"
+        strict: false
+        fields:
+            shardId:
+                type: shard_id
+                description: "The ShardId"
+            hostAndPort:
+                type: HostAndPort
+                description: "Replica set member identification"
+            timestamp:
+                type: timestamp
+                description: "Timestamp at which the check was performed"
+                optional: true
+
+    MetadataInconsistencyItem:
+        description: "Object representing a single metadata inconsistency found in a specific shard"
+        strict: false
+        fields:
+            type:
+                type: MetadataInconsistencyType
+                description: "Type of the inconsistency."
+            description:
+                type: string
+                description: "Description about the inconsistency."
+            details:
+                type: object
+                description: "Details about the inconsistency."
+            severity:
+                type: MetadataInconsistencySeverity
+                description: "Severity level of the inconsistency."
+                optional: true
+            provenance:
+                type: Provenance
+                description: "Node from which this item originated"
+                optional: true
+
+    CommonCheckMetadataRequestFields:
+        description: "Common fields for all checkMetdataConsistency commands"
+        strict: false
+        fields:
+            # TODO SERVER-75675 remove this field and always perform index consistency checks
+            checkIndexes:
+                description: "Enable index consistency checks"
+                type: safeBool
+                default: false
+            dbMetadataLockMaxTimeMS:
+                description:
+                    "Max time in milliseconds that the operation is allowed to block other
+                    DDL operations on a database"
+                type: exactInt64
+                validator: {gte: 0, lte: 2147483647} # [0, 2^31 - 1]
+                optional: true
+            checkRangeDeletionIndexes:
+                description: "Check that in the presence of outstanding range deletion tasks a shard key index must exists"
+                type: safeBool
+                default: false
+            # _checkSecondariesMode is an internal, test-only parameter. It has no effect with the
+            # test proctor disabled, hence the leading underscore. If not set,
+            # checkMetadataConsistency will internally choose randomly between
+            # `checkAtPrimaryTimestamp` and `checkAtSecondaryTimestamp` (again, only when the
+            # testing proctor is enabled).
+            # TODO (SERVER-131058): consider exposing it publicly and remove the underscore.
+            _checkSecondariesMode:
+                description: "How metadata is checked on secondaries"
+                type: CheckMetadataConsistencySecondaryMode
+                optional: true
+            performStrictChunkChecksIfBelowThreshold:
+                type: safeInt64
+                description: >
+                    Enables full chunk checks whenever the number of chunks that the receiving shard owns
+                    is below a certain threshold. Otherwise the command will only do a subset of checks
+                    based on the aggregate. Defaults to always running strict checks.
+                default: 1152921504606846975 # = 2^60 - 1
+                validator:
+                    gte: 0
+                    lt: 1152921504606846976 # = 2^60
+
+    UniqueIndexInconsistencyInfo:
+        description: "Details about unique index misconfiguration."
+        strict: false
+        fields:
+            index:
+                type: object
+                description: "Index with the issue."
+            shard:
+                type: shard_id
+                description: "Shard id where the issue was found."
+            issue:
+                type: string
+                description: "Uniqueness issue found."
+            shardKey:
+                type: object
+                description: "Collection shard key."
+                optional: true

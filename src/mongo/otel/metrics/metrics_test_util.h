@@ -1,0 +1,421 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/otel/metrics/metrics_service.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/modules.h"
+
+#ifdef MONGO_CONFIG_OTEL
+#include <string_view>
+
+#include <opentelemetry/exporters/memory/in_memory_data.h>
+#include <opentelemetry/exporters/memory/in_memory_metric_data.h>
+#include <opentelemetry/exporters/memory/in_memory_metric_exporter_factory.h>
+#include <opentelemetry/metrics/noop.h>
+#include <opentelemetry/metrics/provider.h>
+#include <opentelemetry/sdk/metrics/data/metric_data.h>
+#include <opentelemetry/sdk/metrics/export/periodic_exporting_metric_reader_factory.h>
+#include <opentelemetry/sdk/metrics/export/periodic_exporting_metric_reader_options.h>
+#include <opentelemetry/sdk/metrics/meter_provider.h>
+#include <opentelemetry/sdk/metrics/meter_provider_factory.h>
+#include <opentelemetry/sdk/metrics/metric_reader.h>
+#endif  // MONGO_CONFIG_OTEL
+
+namespace mongo::otel::metrics {
+#ifdef MONGO_CONFIG_OTEL
+namespace test_util_detail {
+/**
+ * The MetricReader is the OTel component that connects the exporter with each registered
+ * Instrument. This implementation allows callers to trigger collection on-demand so that unit tests
+ * can collect metrics in a predictable fashion.
+ */
+class OnDemandMetricReader : public opentelemetry::sdk::metrics::MetricReader {
+public:
+    OnDemandMetricReader(std::unique_ptr<opentelemetry::sdk::metrics::PushMetricExporter> exporter)
+        : _exporter{std::move(exporter)} {}
+
+    opentelemetry::sdk::metrics::AggregationTemporality GetAggregationTemporality(
+        opentelemetry::sdk::metrics::InstrumentType instrument_type) const noexcept override {
+        return _exporter->GetAggregationTemporality(instrument_type);
+    }
+
+    void triggerMetricExport() {
+        this->Collect([this](opentelemetry::sdk::metrics::ResourceMetrics& metric_data) {
+            this->_exporter->Export(metric_data);
+            return true;
+        });
+    }
+
+private:
+    bool OnForceFlush(std::chrono::microseconds) noexcept override {
+        return true;
+    }
+
+    bool OnShutDown(std::chrono::microseconds) noexcept override {
+        return true;
+    }
+
+    std::unique_ptr<opentelemetry::sdk::metrics::PushMetricExporter> _exporter;
+};
+}  // namespace test_util_detail
+
+inline bool isNoopMeter(opentelemetry::metrics::Meter* provider) {
+    return !!dynamic_cast<opentelemetry::metrics::NoopMeter*>(provider);
+}
+
+inline bool isNoopMeterProvider(opentelemetry::metrics::MeterProvider* provider) {
+    return !!dynamic_cast<opentelemetry::metrics::NoopMeterProvider*>(provider);
+}
+#endif  // MONGO_CONFIG_OTEL
+
+/**
+ * Class used for reading the data of an OpenTelemtry histogram.
+ */
+template <typename T>
+class HistogramData {
+public:
+#ifdef MONGO_CONFIG_OTEL
+    HistogramData(opentelemetry::sdk::metrics::HistogramPointData data);
+#endif  // MONGO_CONFIG_OTEL
+
+    // See the documentation for MetricsService::createInt64Histogram in metrics_service.h for an
+    // explanation of this boundaries member variable.
+    std::vector<double> boundaries;
+    T sum;
+    T min;
+    T max;
+    std::vector<uint64_t> counts;
+    uint64_t count;
+
+#ifdef MONGO_CONFIG_OTEL
+private:
+    /**
+     * Gets the underlying value of the provided ValueType, either int64_t or double.
+     */
+    T getValue(opentelemetry::sdk::metrics::ValueType valueType) {
+        massert(ErrorCodes::TypeMismatch,
+                "The internal type of the histogram and the requested type do not match",
+                std::holds_alternative<T>(valueType));
+        return std::get<T>(valueType);
+    }
+#endif  // MONGO_CONFIG_OTEL
+};
+#ifdef MONGO_CONFIG_OTEL
+template <typename T>
+HistogramData<T>::HistogramData(opentelemetry::sdk::metrics::HistogramPointData data)
+    : boundaries(data.boundaries_), counts(data.counts_), count(data.count_) {
+    sum = getValue(data.sum_);
+    min = getValue(data.min_);
+    max = getValue(data.max_);
+};
+#endif  // MONGO_CONFIG_OTEL
+
+/** Pretty printing histogram data for gtest failure messages */
+template <typename T>
+void PrintTo(const HistogramData<T>& h, std::ostream* os) {
+    *os << "{sum: " << h.sum << ", count: " << h.count << ", min: " << h.min << ", max: " << h.max
+        << "}";
+}
+/** Matches a histogram reading against a sum value */
+MATCHER_P(HasSum,
+          sumMatcher,
+          "has sum that " + testing::DescribeMatcher<int64_t>(sumMatcher, negation)) {
+    return testing::ExplainMatchResult(sumMatcher, arg.sum, result_listener);
+}
+/** Matches a histogram reading against a count value */
+MATCHER_P(HasCount,
+          countMatcher,
+          "has count that " + testing::DescribeMatcher<int64_t>(countMatcher, negation)) {
+    return testing::ExplainMatchResult(countMatcher, arg.count, result_listener);
+}
+
+/**
+ * Sets up a MetricProvider with an in-memory exporter so tests can create and inspect metrics. This
+ * must be constructed before creating any metrics in order to capture them.
+ *
+ * NOTE: Not all platforms support exporting OpenTelemetry metrics (e.g., Windows), and on those
+ * platforms it is not possible to read the metrics in tests via readInt64Counter(),
+ * readDoubleCounter(), etc. You can use canReadMetrics() in tests to check whether the platform
+ * supports OpenTelemetry metrics.
+ *
+ * WARNING: On platforms that do not support OpenTelemetry metrics, the OtelMetricsCapturer does not
+ * call MetricsService::initialize(), so metric values recorded before initialization are not reset
+ * when creating the OtelMetricsCapturer. Do not record metrics before creating the
+ * OtelMetricsCapturer, otherwise the values will vary depending on the platform. On
+ * non-OpenTelemetry platforms, it is only possible to read metrics via serverStatus.
+ */
+class [[MONGO_MOD_PUBLIC]] OtelMetricsCapturer {
+public:
+    /**
+     * Default constructor which uses the static MetricsService object.
+     */
+    OtelMetricsCapturer();
+
+    /**
+     * Constructor that allows specifying the MetricsService object to initialize.
+     *
+     * This constructor should be used directly in limited circumstances. Specifically, this
+     * constructor allows unit testing the MetricsService, but tests in server code should use the
+     * static instance.
+     */
+    [[MONGO_MOD_PRIVATE]] OtelMetricsCapturer(MetricsService& metricsService);
+
+#ifdef MONGO_CONFIG_OTEL
+    ~OtelMetricsCapturer();
+#endif  // MONGO_CONFIG_OTEL
+
+    /**
+     * Gets the value of an int64_t counter for the given attribute combination and throws an
+     * exception if it is not found. Works with both Counter and UpdownCounter.
+     */
+    template <AttributeType... AttributeTs>
+    int64_t readInt64Counter(MetricName name, const std::tuple<AttributeTs...>& attributes);
+
+    /** Overload of the above for when there are no attributes. */
+    int64_t readInt64Counter(MetricName name);
+
+    /**
+     * Gets the value of a double counter for the given attribute combination and throws an
+     * exception if it is not found. Works with both Counter and UpdownCounter.
+     */
+    template <AttributeType... AttributeTs>
+    double readDoubleCounter(MetricName name, const std::tuple<AttributeTs...>& attributes);
+
+    /** Overload of the above for when there are no attributes. */
+    double readDoubleCounter(MetricName name);
+
+    /**
+     * Gets the value of an int64_t gauge for the given attribute combination and throws an
+     * exception if it is not found.
+     */
+    template <AttributeType... AttributeTs>
+    int64_t readInt64Gauge(MetricName name, const std::tuple<AttributeTs...>& attributes);
+
+    /** Overload of the above for when there are no attributes. */
+    int64_t readInt64Gauge(MetricName name);
+
+    /**
+     * Gets the value of a double gauge for the given attribute combination and throws an
+     * exception if it is not found.
+     */
+    template <AttributeType... AttributeTs>
+    double readDoubleGauge(MetricName name, const std::tuple<AttributeTs...>& attributes);
+
+    /** Overload of the above for when there are no attributes. */
+    double readDoubleGauge(MetricName name);
+
+    /**
+     * Gets the data of an int64_t histogram for the given attribute combination and throws an
+     * exception if it is not found.
+     */
+    template <AttributeType... AttributeTs>
+    HistogramData<int64_t> readInt64Histogram(MetricName name,
+                                              const std::tuple<AttributeTs...>& attributes);
+
+    /** Overload of the above for when there are no attributes. */
+    HistogramData<int64_t> readInt64Histogram(MetricName name);
+
+    /**
+     * Gets the data of a double histogram for the given attribute combination and throws an
+     * exception if it is not found.
+     */
+    template <AttributeType... AttributeTs>
+    HistogramData<double> readDoubleHistogram(MetricName name,
+                                              const std::tuple<AttributeTs...>& attributes);
+
+    /** Overload of the above for when there are no attributes. */
+    HistogramData<double> readDoubleHistogram(MetricName name);
+
+    /**
+     * Returns whether it is safe to use the above "read" methods in the current environment. This
+     * is required for tests that should also run on Windows because metrics can be recorded but
+     * cannot be exported or read on Windows, and attempting to read them will crash.
+     */
+    static bool canReadMetrics();
+
+private:
+    static constexpr std::string_view kUsingOtelOnWindows =
+        "You're trying to read metrics in an environment that doesn't have otel enabled (likely "
+        "Windows). In tests this can be avoided by checking OtelMetricsCapturer::canReadMetrics()";
+
+    MetricsService& _metricsService;
+
+#ifdef MONGO_CONFIG_OTEL
+    // Stash the reader so that callers can trigger on-demand metric collection.
+    test_util_detail::OnDemandMetricReader* _reader;
+    // This is the in-memory data structure that holds the collected metrics. The exporter writes to
+    // this DS, and the get() function will read from it.
+    opentelemetry::exporter::memory::SimpleAggregateInMemoryMetricData* _metrics;
+#endif  // MONGO_CONFIG_OTEL
+};
+
+class DynamicMetricNameTestPasskeyMaker {
+public:
+    static DynamicMetricNameMaker::Passkey make() {
+        return DynamicMetricNameMaker::Passkey{};
+    }
+};
+
+////////////////////////////////////////////////////////////
+// Implementation details
+////////////////////////////////////////////////////////////
+
+#ifdef MONGO_CONFIG_OTEL
+namespace test_util_detail {
+
+/**
+ * Builds an OrderedAttributeMap for looking up a specific attribute combination in the exported
+ * metric data. Attribute names are fetched from the MetricsService registration and paired with the
+ * positionally-provided values. OrderedAttributeMap then sorts the pairs by name, producing the
+ * canonical representation that OTel uses to key each metric data point. Throws if the number of
+ * provided values does not match the number of registered attributes for the metric.
+ */
+template <AttributeType... AttributeTs>
+opentelemetry::sdk::common::OrderedAttributeMap buildAttrMap(
+    MetricsService& metricsService, MetricName name, const std::tuple<AttributeTs...>& attributes) {
+    std::vector<std::string> attrNames = metricsService.getAttributeNamesForTests(name);
+    massert(ErrorCodes::BadValue,
+            fmt::format("Provided {} attribute value(s) but metric '{}' has {} attribute(s)",
+                        sizeof...(AttributeTs),
+                        name.getName(),
+                        attrNames.size()),
+            attrNames.size() == sizeof...(AttributeTs));
+
+    std::vector<AttributeNameAndValue> nameAndValues;
+    nameAndValues.reserve(sizeof...(AttributeTs));
+    std::apply(
+        [&attrNames, &nameAndValues](const auto&... vals) {
+            size_t i = 0;
+            (nameAndValues.push_back(
+                 {.name = std::string_view(attrNames[i++]), .value = AnyAttributeType(vals)}),
+             ...);
+        },
+        attributes);
+    return opentelemetry::sdk::common::OrderedAttributeMap(
+        AttributesKeyValueIterable(std::move(nameAndValues)));
+}
+
+/**
+ * Gets a specific opentelemetry Instrument type based on the instrument's name and attribute
+ * combination. The DataType must be a PointType as defined in the opentelemetry library:
+ * https://github.com/open-telemetry/opentelemetry-cpp/blob/f0a1da286f3b130df1eb3db79ffc1ae427c9532b/sdk/include/opentelemetry/sdk/metrics/data/metric_data.h#L21
+ */
+template <typename DataType, AttributeType... AttributeTs>
+DataType getMetricData(opentelemetry::exporter::memory::SimpleAggregateInMemoryMetricData& metrics,
+                       OnDemandMetricReader& reader,
+                       MetricsService& metricsService,
+                       MetricName name,
+                       const std::tuple<AttributeTs...>& attributes) {
+    metrics.Clear();
+    reader.triggerMetricExport();
+
+    const opentelemetry::exporter::memory::SimpleAggregateInMemoryMetricData::AttributeToPoint&
+        attributeToPoint =
+            metrics.Get(std::string(MetricsService::kMeterName), std::string(name.getName()));
+
+    opentelemetry::sdk::common::OrderedAttributeMap attrMap =
+        buildAttrMap(metricsService, name, attributes);
+    auto it = attributeToPoint.find(attrMap);
+    massert(ErrorCodes::KeyNotFound,
+            fmt::format("No metric with name {} and the given attributes exists", name.getName()),
+            it != attributeToPoint.end());
+
+    massert(ErrorCodes::TypeMismatch,
+            fmt::format("Metric {} does not have matching metric type", name.getName()),
+            std::holds_alternative<DataType>(it->second));
+    return std::get<DataType>(it->second);
+}
+}  // namespace test_util_detail
+#endif  // MONGO_CONFIG_OTEL
+
+template <AttributeType... AttributeTs>
+int64_t OtelMetricsCapturer::readInt64Counter(MetricName name,
+                                              const std::tuple<AttributeTs...>& attributes) {
+#ifdef MONGO_CONFIG_OTEL
+    auto data = test_util_detail::getMetricData<opentelemetry::sdk::metrics::SumPointData>(
+        *_metrics, *_reader, _metricsService, name, attributes);
+    massert(ErrorCodes::TypeMismatch,
+            fmt::format("Metric {} does not have matching value type", name.getName()),
+            std::holds_alternative<int64_t>(data.value_));
+    return std::get<int64_t>(data.value_);
+#else
+    invariant(false, kUsingOtelOnWindows);
+    return {};
+#endif
+}
+
+template <AttributeType... AttributeTs>
+double OtelMetricsCapturer::readDoubleCounter(MetricName name,
+                                              const std::tuple<AttributeTs...>& attributes) {
+#ifdef MONGO_CONFIG_OTEL
+    auto data = test_util_detail::getMetricData<opentelemetry::sdk::metrics::SumPointData>(
+        *_metrics, *_reader, _metricsService, name, attributes);
+    massert(ErrorCodes::TypeMismatch,
+            fmt::format("Metric {} does not have matching value type", name.getName()),
+            std::holds_alternative<double>(data.value_));
+    return std::get<double>(data.value_);
+#else
+    invariant(false, kUsingOtelOnWindows);
+    return {};
+#endif
+}
+
+template <AttributeType... AttributeTs>
+int64_t OtelMetricsCapturer::readInt64Gauge(MetricName name,
+                                            const std::tuple<AttributeTs...>& attributes) {
+#ifdef MONGO_CONFIG_OTEL
+    auto data = test_util_detail::getMetricData<opentelemetry::sdk::metrics::LastValuePointData>(
+        *_metrics, *_reader, _metricsService, name, attributes);
+    massert(ErrorCodes::TypeMismatch,
+            fmt::format("Metric {} does not have matching value type", name.getName()),
+            std::holds_alternative<int64_t>(data.value_));
+    return std::get<int64_t>(data.value_);
+#else
+    invariant(false, kUsingOtelOnWindows);
+    return {};
+#endif
+}
+
+template <AttributeType... AttributeTs>
+double OtelMetricsCapturer::readDoubleGauge(MetricName name,
+                                            const std::tuple<AttributeTs...>& attributes) {
+#ifdef MONGO_CONFIG_OTEL
+    auto data = test_util_detail::getMetricData<opentelemetry::sdk::metrics::LastValuePointData>(
+        *_metrics, *_reader, _metricsService, name, attributes);
+    massert(ErrorCodes::TypeMismatch,
+            fmt::format("Metric {} does not have matching value type", name.getName()),
+            std::holds_alternative<double>(data.value_));
+    return std::get<double>(data.value_);
+#else
+    invariant(false, kUsingOtelOnWindows);
+    return {};
+#endif
+}
+
+template <AttributeType... AttributeTs>
+HistogramData<int64_t> OtelMetricsCapturer::readInt64Histogram(
+    MetricName name, const std::tuple<AttributeTs...>& attributes) {
+#ifdef MONGO_CONFIG_OTEL
+    return test_util_detail::getMetricData<opentelemetry::sdk::metrics::HistogramPointData>(
+        *_metrics, *_reader, _metricsService, name, attributes);
+#else
+    invariant(false, kUsingOtelOnWindows);
+    return {};
+#endif
+}
+
+template <AttributeType... AttributeTs>
+HistogramData<double> OtelMetricsCapturer::readDoubleHistogram(
+    MetricName name, const std::tuple<AttributeTs...>& attributes) {
+#ifdef MONGO_CONFIG_OTEL
+    return test_util_detail::getMetricData<opentelemetry::sdk::metrics::HistogramPointData>(
+        *_metrics, *_reader, _metricsService, name, attributes);
+#else
+    invariant(false, kUsingOtelOnWindows);
+    return {};
+#endif
+}
+
+}  // namespace mongo::otel::metrics

@@ -1,0 +1,23 @@
+load("@rules_python//python:defs.bzl", "py_library")
+load("//bazel/uv:defs.bzl", "dependency")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "mock_ocsp_responder",
+    srcs = ["mock_ocsp_responder.py"],
+    deps = [
+        dependency(
+            "asn1crypto",
+            group = "testing",
+        ),
+        dependency(
+            "oscrypto",
+            group = "testing",
+        ),
+        dependency(
+            "flask",
+            group = "testing",
+        ),
+    ],
+)

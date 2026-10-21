@@ -1,0 +1,39 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Server parameters for configuring the refresh of the session colelction.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    sessionWriteConcernTimeoutSystemMillis:
+        description: Controls the write concern timeout (in milliseconds) for the refresh or removal of items from the session collection.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gSessionWriteConcernTimeoutSystemMillis
+        default: 60000
+        validator:
+            gte: 0
+        redact: false
+
+    sessionMaxBatchSize:
+        description: >-
+            Controls the maximum batch size (number of elements) for the sessions' refresh. 
+            This batch size is chosen to ensure that we don't form requests larger than the 16mb limit. 
+            Especially for refreshes, the updates we send include the full user name (user@db), and user
+            names can be quite large (we enforce a max 10k limit for usernames used with sessions).
+            At a default of 1000 elements, a 16mb payload gives us a budget of 16000 bytes per user, which we should
+            comfortably be able to stay under, even with 10k user names. so we do not form requests larger than the 16mb limit.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gSessionMaxBatchSize
+        default: 1000
+        validator:
+            gte: 100
+            lte: 10000
+        redact: false

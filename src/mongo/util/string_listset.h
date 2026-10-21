@@ -1,0 +1,194 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/platform/compiler.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/string_map.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+class StringListSet {
+public:
+    static constexpr size_t npos = std::numeric_limits<size_t>::max();
+
+private:
+    inline static size_t getLowestNBits(size_t val, size_t n) {
+        return val & ((1u << n) - 1u);
+    }
+
+    inline static size_t computeFastHash1(std::string_view s) {
+        size_t len = s.size();
+        if (MONGO_unlikely(len == 0)) {
+            return 126;
+        }
+        // The lowest 5 bits of 'str[len - 1]' and the lowest 2 bits of 'len' are decent sources
+        // of entropy. Combine them to generate a pseudo-random number 'h' where 0 <= h <= 127.
+        size_t h = getLowestNBits(size_t(s[len - 1]) + (len << 5u), 7);
+        return h;
+    }
+
+    inline static size_t computeFastHash2(std::string_view s, size_t fastHash1) {
+        if (MONGO_unlikely(s.empty())) {
+            return 38;
+        }
+        // The lowest 5 bits of 's[0]' are a decent source of entropy. Using 's[0]' and
+        // 'fastHash1', generate a pseudo-random number 'h' where 0 <= h <= 127 and where
+        // h != fastHash1.
+        uint8_t b0 = s[0];
+        size_t h = getLowestNBits(fastHash1 + b0 + getLowestNBits(~b0 >> 4u, 1), 7);
+        return h;
+    }
+
+public:
+    explicit StringListSet(std::vector<std::string> strings)
+        : _strings(std::move(strings)), _stringToIndexMap(), _fastHt(buildFastHash()) {}
+
+    StringListSet(const StringListSet& other)
+        : _strings(other._strings), _stringToIndexMap(), _fastHt(buildFastHash()) {}
+
+    StringListSet(StringListSet&& other)
+        : _strings(std::move(other._strings)), _stringToIndexMap(), _fastHt(buildFastHash()) {}
+
+    StringListSet& operator=(const StringListSet& other) {
+        if (&other != this) {
+            _strings = other._strings;
+            _fastHt = buildFastHash();
+        }
+        return *this;
+    }
+
+    StringListSet& operator=(StringListSet&& other) {
+        if (&other != this) {
+            _strings = std::move(other._strings);
+            _fastHt = buildFastHash();
+        }
+        return *this;
+    }
+
+    bool operator==(const StringListSet& other) const {
+        if (this == &other) {
+            return true;
+        }
+        return _strings == other._strings;
+    }
+
+    inline bool empty() const {
+        return _strings.empty();
+    }
+    inline size_t size() const {
+        return _strings.size();
+    }
+
+    inline std::vector<std::string>::const_iterator begin() const {
+        return _strings.cbegin();
+    }
+    inline std::vector<std::string>::const_iterator cbegin() const {
+        return _strings.cbegin();
+    }
+    inline std::vector<std::string>::const_iterator end() const {
+        return _strings.cend();
+    }
+    inline std::vector<std::string>::const_iterator cend() const {
+        return _strings.cend();
+    }
+
+    inline const std::string& operator[](size_t idx) const {
+        return _strings[idx];
+    }
+    inline const std::string& at(size_t idx) const {
+        return _strings.at(idx);
+    }
+
+    inline size_t findPos(std::string_view str) const {
+        size_t len = str.size();
+        size_t fastHash = computeFastHash1(str);
+        size_t encodedIdx = 0;
+
+        if (useFastHash()) {
+            size_t numAttempts = 0;
+
+            // This 'for' loop will iterate at most two times. There is logic near the end of
+            // the loop body that breaks out of the loop once 'numAttempts' reaches 2.
+            for (;;) {
+                encodedIdx = _fastHt[fastHash];
+
+                if (encodedIdx > 1) {
+                    // If encodedIdx >= 2, then there is a single string in _strings to compare
+                    // with. Compare 'str' with this single string.
+                    if (len != _strings[encodedIdx - 2].size() ||
+                        memcmp(str.data(), _strings[encodedIdx - 2].data(), len) != 0) {
+                        return npos;
+                    }
+
+                    return encodedIdx - 2;
+                } else if (MONGO_likely(encodedIdx < 1)) {
+                    // If encodedIdx == 0, then we know 'str' is not present in _strings.
+                    return npos;
+                }
+
+                ++numAttempts;
+
+                if (numAttempts >= 2) {
+                    // If this was our second attempt, we give up and search for 'str' in
+                    // 'stringToIndexMap'. We break out of the loop early to avoid calling
+                    // computeFastHash2() again.
+                    break;
+                }
+
+                // If this was our first attempt, try again using computeFastHash2().
+                fastHash = computeFastHash2(str, fastHash);
+            }
+        }
+
+        return findInMapImpl(str);
+    }
+
+    inline std::vector<std::string>::const_iterator find(std::string_view str) const {
+        auto pos = findPos(str);
+        return pos != npos ? _strings.cbegin() + pos : _strings.cend();
+    }
+
+    inline size_t count(std::string_view str) const {
+        auto pos = findPos(str);
+        return pos != npos ? 1 : 0;
+    }
+
+    std::string toString() const;
+
+    const auto& getUnderlyingVector() const {
+        return _strings;
+    }
+
+    const auto& getUnderlyingMap() const {
+        return _stringToIndexMap;
+    }
+
+private:
+    bool useFastHash() const {
+        // If there are more than 64 strings in '_strings', don't bother with '_fastHt'.
+        return _strings.size() <= 64;
+    }
+
+    std::array<uint8_t, 128> buildFastHash();
+
+    size_t findInMapImpl(std::string_view str) const;
+
+    std::vector<std::string> _strings;
+    StringDataMap<size_t> _stringToIndexMap;
+    std::array<uint8_t, 128> _fastHt;
+};
+}  // namespace mongo

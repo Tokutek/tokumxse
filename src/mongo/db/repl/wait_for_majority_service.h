@@ -1,0 +1,194 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/db/client_strand.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/modules.h"
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/utility/in_place_factory.hpp>  // IWYU pragma: keep
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+namespace detail {
+
+class AsyncConditionVariable {
+public:
+    AsyncConditionVariable() : _current(boost::in_place()) {}
+
+    SemiFuture<void> onNotify() {
+        std::lock_guard lk(_mutex);
+        return _current->getFuture().semi();
+    }
+
+    void notifyAllAndReset() {
+        std::lock_guard lk(_mutex);
+        if (_inShutdown) {
+            return;
+        }
+        _current->emplaceValue();
+        _current = boost::in_place();
+    }
+
+    void notifyAllAndClose() {
+        std::lock_guard lk(_mutex);
+        if (_inShutdown) {
+            return;
+        }
+        _inShutdown = true;
+        _current->emplaceValue();
+    }
+
+private:
+    mutable std::mutex _mutex;
+    boost::optional<SharedPromise<void>> _current;
+    bool _inShutdown{false};
+};
+}  // namespace detail
+
+
+class WaitForMajorityServiceImplBase {
+public:
+    virtual ~WaitForMajorityServiceImplBase();
+    void startup(ServiceContext* ctx);
+    void shutDown();
+    SemiFuture<void> waitUntilMajority(const repl::OpTime& opTime,
+                                       const CancellationToken& cancelToken);
+
+private:
+    enum class State { kNotStarted, kRunning, kShutdown };
+    // State is kNotStarted on construction, kRunning after WaitForMajorityService::startup() has
+    // been called, and kShutdown after WaitForMajorityService::shutdown() has been called. It is
+    // illegal to call WaitForMajorityService::waitUntilMajority before calling startup.
+    State _state{State::kNotStarted};
+    /**
+     * Internal representation of an individual request to wait on some particular optime.
+     */
+    struct Request {
+        explicit Request(Promise<void> promise)
+            : hasBeenProcessed{false}, result(std::move(promise)) {}
+        Atomic<bool> hasBeenProcessed;
+        Promise<void> result;
+    };
+
+    using OpTimeWaitingMap = std::multimap<repl::OpTime, std::shared_ptr<Request>>;
+
+    /**
+     * Periodically checks the list of opTimes to wait for majority committed.
+     */
+    SemiFuture<void> _periodicallyWaitForMajority();
+
+    virtual Status _waitForOpTime(OperationContext* opCtx, const repl::OpTime& opTime) = 0;
+
+    virtual std::string_view _getReadOrWrite() const = 0;
+
+    // The pool of threads available to wait on opTimes and cancel existing requests.
+    std::shared_ptr<ThreadPool> _pool;
+
+    // This future is completed when the service has finished all of its work and is ready for
+    // shutdown.
+    boost::optional<SemiFuture<void>> _backgroundWorkComplete;
+
+    // Manages the Client responsible for the thread that waits on opTimes.
+    ClientStrandPtr _waitForMajorityClient;
+
+    // Manages the Client responsible for the thread that cancels existing requests to wait on
+    // opTimes.
+    ClientStrandPtr _waitForMajorityCancellationClient;
+
+    // This mutex synchronizes access to the members declared below.
+    std::mutex _mutex;
+
+    // Contains an ordered list of opTimes to wait to be majority comitted.
+    OpTimeWaitingMap _queuedOpTimes;
+
+    // Contains the last opTime that the background thread was able to successfully wait to be
+    // majority comitted.
+    repl::OpTime _lastOpTimeWaited;
+
+    // Use for signalling new opTime requests being queued.
+    detail::AsyncConditionVariable _hasNewOpTimeCV;
+};
+
+class WaitForMajorityServiceForReadImpl : public WaitForMajorityServiceImplBase {
+private:
+    Status _waitForOpTime(OperationContext* opCtx, const repl::OpTime& opTime) final;
+    std::string_view _getReadOrWrite() const final {
+        return "Read"sv;
+    }
+};
+
+class WaitForMajorityServiceForWriteImpl : public WaitForMajorityServiceImplBase {
+private:
+    Status _waitForOpTime(OperationContext* opCtx, const repl::OpTime& opTime) final;
+    std::string_view _getReadOrWrite() const final {
+        return "Write"sv;
+    }
+};
+/**
+ * Provides a facility for asynchronously waiting a local opTime to be majority committed.
+ */
+
+class [[MONGO_MOD_PUBLIC]] WaitForMajorityService {
+public:
+    ~WaitForMajorityService();
+
+    static WaitForMajorityService& get(ServiceContext* service);
+
+    static Status waitUntilMajorityCanceledStatus() {
+        return Status{ErrorCodes::CallbackCanceled,
+                      "WaitForMajorityService::waitUntilMajority canceled"};
+    }
+
+    /**
+     * Sets up the background thread pool responsible for waiting for opTimes to be majority
+     * committed.
+     */
+    void startup(ServiceContext* ctx);
+
+    /**
+     * Blocking method, which shuts down and joins the background thread.
+     */
+    void shutDown();
+
+    /**
+     * Enqueue a request to wait for the given opTime to be majority committed.
+     */
+    SemiFuture<void> waitUntilMajorityForRead(const repl::OpTime& opTime,
+                                              const CancellationToken& cancelToken);
+    /**
+     * Enqueue a request to wait for the given opTime to be majority committed on this primary.
+     * Returns a PrimarySteppedDown error if the primary steps down while waiting or if this is
+     * a secondary.
+     */
+    SemiFuture<void> waitUntilMajorityForWrite(const repl::OpTime& opTime,
+                                               const CancellationToken& cancelToken);
+
+private:
+    WaitForMajorityServiceForReadImpl _readService;
+    WaitForMajorityServiceForWriteImpl _writeService;
+};
+
+}  // namespace mongo

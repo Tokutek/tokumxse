@@ -1,0 +1,176 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/util/modules.h"
+
+#include <string>
+#include <string_view>
+
+namespace mongo {
+class [[MONGO_MOD_FILE_PRIVATE]] MDBCatalogTest;
+
+/**
+ * A wrapper around the '_mdb_catalog' storage table. Each row in the table is indexed with a
+ * 'RecordId', referred to as the 'Catalog ID', and contains a BSON document that describes a
+ * collection's properties, indexes, and the idents which map to its storage resources.
+ *
+ * The 'MDBCatalog' is aware of top-level fields and idents described in each '_mdb_catalog' entry.
+ * Meaningful parsing of additional 'Collection' and 'Index' properties are beyond the scope of the
+ * class.
+ *
+ * Top-level structure of an entry in the '_mdb_catalog' catalog.
+ *    {
+ *      // Uniquely identifies a collection's main storage table on disk (tied to a 'RecordStore' in
+ *      // the sever)
+ *      'ident': <std::string>,
+ *
+ *      // Maps each of the collection's indexes to an ident.
+ *      //      <indexName : indexIdent>
+ *      // where both 'indexName' and 'indexIdent' are of type 'string'
+ *      'idxIdent': <BSONObj>,
+ *
+ *      // Metadata field which specifies 'Collection' and 'Index' properties.
+ *      'md': <BSONObj>,
+ *
+ *      // The namespace of the collection.
+ *      'ns': <std::string>
+ *    }
+ */
+class [[MONGO_MOD_PUBLIC]] MDBCatalog final {
+public:
+    /**
+     * `Entry` ties together the common identifiers of a single `_mdb_catalog` document.
+     */
+    struct EntryIdentifier {
+        RecordId catalogId;
+        std::string ident;
+        NamespaceString nss;
+    };
+
+    MDBCatalog(RecordStore* rs, KVEngine* engine);
+
+    static MDBCatalog* get(OperationContext* opCtx) {
+        return opCtx->getServiceContext()->getStorageEngine()->getMDBCatalog();
+    }
+
+    void init(OperationContext* opCtx);
+
+    /**
+     * Reserves a 'catalogId' to use when creating a new catalog entry.
+     */
+    RecordId reserveCatalogId(OperationContext* opCtx);
+
+    std::vector<MDBCatalog::EntryIdentifier> getAllCatalogEntries(OperationContext* opCtx) const;
+
+    EntryIdentifier getEntry(const RecordId& catalogId) const;
+
+    BSONObj getRawCatalogEntry(OperationContext* opCtx, const RecordId& catalogId) const;
+
+    RecordStore::Options getParsedRecordStoreOptions(OperationContext* opCtx,
+                                                     const RecordId& catalogId,
+                                                     const NamespaceString& nss) const;
+
+    void putUpdatedEntry(OperationContext* opCtx,
+                         const RecordId& catalogId,
+                         const BSONObj& catalogEntry);
+
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
+
+    std::string getIndexIdent(OperationContext* opCtx,
+                              const RecordId& catalogId,
+                              std::string_view idxName) const;
+
+    std::vector<std::string> getIndexIdents(OperationContext* opCtx, const RecordId& catalogId);
+
+    /**
+     * Checks if any collection tracked in the catalog is using the given ident.
+     */
+    bool hasCollectionIdent(OperationContext* opCtx, std::string_view ident) const;
+
+    /**
+     * Checks if any index tracked in the catalog is using the given ident.
+     */
+    bool hasIndexIdent(OperationContext* opCtx, std::string_view ident) const;
+
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
+                                                    bool forward = true) const;
+
+    /*
+     * Adds a new 'catalogEntry' at 'catalogId' to the _mdb_catalog, but does not attempt to create
+     * a backing 'RecordStore'.
+     */
+    StatusWith<MDBCatalog::EntryIdentifier> addEntry(OperationContext* opCtx,
+                                                     const std::string& ident,
+                                                     const NamespaceString& nss,
+                                                     const BSONObj& catalogEntryObj,
+                                                     const RecordId& catalogId);
+
+    StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> importCatalogEntry(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const UUID& uuid,
+        const RecordStore::Options& recordStoreOptions,
+        const BSONObj& catalogEntry,
+        const BSONObj& storageMetadata,
+        bool panicOnCorruptWtMetadata,
+        bool repair);
+
+    Status removeEntry(OperationContext* opCtx, const RecordId& catalogId);
+
+    Status putRenamedEntry(OperationContext* opCtx,
+                           const RecordId& catalogId,
+                           const NamespaceString& toNss,
+                           const BSONObj& renamedEntry);
+
+    /**
+     * First tries to return the in-memory entry. If not found, e.g. when collection is dropped
+     * after the provided timestamp, loads the entry from the persisted catalog at the provided
+     * timestamp.
+     */
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx, const RecordId& catalogId) const;
+
+    StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx,
+                                             const std::string& ident,
+                                             bool isClustered);
+
+    [[MONGO_MOD_PUBLIC]]
+    boost::optional<EntryIdentifier> getEntry_forTest(const RecordId& catalogId) const;
+
+private:
+    class AddIdentChange;
+    friend class MDBCatalogTest;
+
+    BSONObj _findRawEntry(SeekableRecordCursor& cursor, const RecordId& catalogId) const;
+
+    StatusWith<EntryIdentifier> _importEntry(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             const BSONObj& catalogEntry);
+
+    std::vector<std::string> _getIndexIdents(const BSONObj& rawCatalogEntry);
+
+    // TODO SERVER-105451 refactor to avoid the need for direct bson parsing
+    static RecordStore::Options _parseRecordStoreOptions(const NamespaceString& nss,
+                                                         const BSONObj& obj);
+
+    static BSONObj _buildOrphanedCatalogEntryObjAndNs(const std::string& ident,
+                                                      bool isClustered,
+                                                      NamespaceString* nss,
+                                                      std::string* ns,
+                                                      UUID uuid = UUID::gen());
+
+    RecordStore* _rs;  // not owned
+
+    absl::flat_hash_map<RecordId, EntryIdentifier, RecordId::Hasher> _catalogIdToEntryMap;
+    mutable std::mutex _catalogIdToEntryMapLock;
+
+    KVEngine* const _engine;
+};
+}  // namespace mongo

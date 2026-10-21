@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "logging",
+    srcs = [
+        "__init__.py",
+        "flush.py",
+        "formatters.py",
+        "handlers.py",
+        "loggers.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [],
+)

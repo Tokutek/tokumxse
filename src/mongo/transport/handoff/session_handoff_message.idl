@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::transport"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    SessionHandoffMessage:
+        description: >-
+            The BSON body of an OP_HANDOFF wire protocol message. Carries the serialized s2n TLS
+            connection state that the secure pre-auth process passes to mongod/s as part of session
+            handoff.
+        strict: false
+        fields:
+            s2nState:
+                type: bindata_generic
+                description: "Serialized s2n connection state produced by s2n_connection_serialize."
+            extraCleartext:
+                type: bindata_generic
+                optional: true
+                description: "Data received and decrypted from the client following the last pre-auth message."

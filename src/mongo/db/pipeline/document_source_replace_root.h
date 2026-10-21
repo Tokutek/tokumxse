@@ -1,0 +1,210 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/compiler/dependency_analysis/expression_dependencies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/modules.h"
+
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+DEFINE_LITE_PARSED_STAGE_DEFAULT_DERIVED(ReplaceRoot);
+
+/**
+ * This class implements the transformation logic for the $replaceRoot and $replaceWith stages.
+ */
+class ReplaceRootTransformation final : public TransformerInterface {
+public:
+    enum class UserSpecifiedName { kReplaceRoot, kReplaceWith };
+
+    ReplaceRootTransformation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              boost::intrusive_ptr<Expression> newRootExpression,
+                              std::string errMsgContextForNonObject,
+                              SbeCompatibility sbeCompatibility)
+        : _expCtx(expCtx),
+          _newRoot(std::move(newRootExpression)),
+          _errMsgContextForNonObject(std::move(errMsgContextForNonObject)) {
+        _sbeCompatibility = sbeCompatibility;
+    }
+
+    TransformerType getType() const final {
+        return TransformerType::kReplaceRoot;
+    }
+
+    Document applyTransformation(const Document& input, const EvaluationContext& ctx) const final;
+
+    // Optimize the newRoot expression.
+    void optimize() final {
+        // Optimization can sometimes modify a previously compatible expression so that it can no
+        // longer be executed in SBE. When that happens, the expression optimizer updates the
+        // 'sbeCompatibility' value in the ExpressionContext, which we can use to update the
+        // '_sbeCompatibility' value for this $replaceRoot operation.
+        TemporarySbeCompatibilityGuard guard(_expCtx.get(), _sbeCompatibility);
+
+        _newRoot = _newRoot->optimize();
+
+        _sbeCompatibility = _expCtx->getSbeCompatibility();
+    }
+
+    // Used by optimize() to optimize out the $replaceRoot stage if it is a no-op.
+    // In particular, the stage {$replaceRoot: {newRoot: '$$ROOT'}} would get optimized out.
+    // Since $$ROOT is a reference to the top-level document currently being processed in
+    // the pipeline, the root would remain the same.
+    bool isNoop() const final {
+        auto fieldPath = dynamic_cast<ExpressionFieldPath*>(_newRoot.get());
+        return fieldPath && fieldPath->isROOT();
+    }
+
+    Document serializeTransformation(
+        const query_shape::SerializationOptions& options = {}) const final {
+        return Document{{"newRoot", _newRoot->serialize(options)}};
+    }
+
+    DepsTracker::State addDependencies(DepsTracker* deps) const final {
+        expression::addDependencies(_newRoot.get(), deps);
+        // This stage will replace the entire document with a new document, so any existing fields
+        // will be replaced and cannot be required as dependencies.
+        return DepsTracker::State::EXHAUSTIVE_FIELDS;
+    }
+
+    DocumentSource::GetModPathsReturn getModifiedPaths() const final {
+        // Replaces the entire root, so all paths are modified.
+        return {DocumentSource::GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
+    }
+
+    void describeTransformation(
+        document_transformation::DocumentOperationVisitor& visitor) const final {
+        visitor(document_transformation::ReplaceRoot{});
+    }
+
+    const boost::intrusive_ptr<Expression>& getExpression() const {
+        return _newRoot;
+    }
+
+    /**
+     * Detects if 'replaceRootTransform' represents the unnesting of a field path. If it does,
+     * returns the name of that field path. For example, if 'replaceRootTransform' represents the
+     * transformation associated with {$replaceWith: "$x"} or {$replaceRoot: {newRoot: "$x"}},
+     * returns "x".
+     */
+    boost::optional<std::string> unnestsPath() const;
+
+    /**
+     * This whole block adds
+     * {$or: [{"subDocument": {$type: "array"}}, {"subDocument": {$not: {$type: "object"}}}]}
+     * in order to match on documents which, when evaluated at $expression, don't resolve to
+     * objects. "array" is separately included because for MatchExpressions, arrays are evaluated as
+     * "object" types.
+     */
+    static boost::intrusive_ptr<DocumentSourceMatch> createTypeNEObjectPredicate(
+        const std::string& expression, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Report renames from this stage to a MatchExpression. We only report a rename for a top-level
+     * field in a path to ensure that we only have at max one applicable rename per path in the ME.
+     */
+    void reportRenames(const MatchExpression* expr,
+                       const std::string& prefixPath,
+                       StringMap<std::string>& renames);
+
+    /**
+     * This optimization pushes a match stage before a replaceRoot stage to improve performance.
+     *
+     * Ex: [{$replaceWith: {"$subDocument"}}, {$match: {x: 2}}]
+     * ->
+     * [{$match: {"subDocument.x": 2}}, {$replaceWith: {"$subDocument"}}]
+     *
+     * We also append {$expr: {$ne: [{$type: "$expression"}, {$const: "object"}]}} to the pushed
+     * forward match stage to ensure that after we swap a $match stage before a $replaceRoot stage,
+     * we can still check that the structure of all documents in the collection can resolve to a
+     * document after `newRoot` is applied.
+     *
+     * Note: this optimization will not rename and push forward a match stage if there are
+     * dependencies between different paths contained in the match expression.
+     */
+    bool pushDotRenamedMatchBefore(DocumentSourceContainer::iterator itr,
+                                   DocumentSourceContainer* container);
+
+    DocumentSourceContainer::iterator doOptimizeAt(DocumentSourceContainer::iterator itr,
+                                                   DocumentSourceContainer* container) final;
+
+    boost::intrusive_ptr<Expression>& getExpressionToModify() {
+        return _newRoot;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        expression::addVariableRefs(_newRoot.get(), refs);
+    }
+
+    SbeCompatibility sbeCompatibility() const {
+        return _sbeCompatibility;
+    }
+
+private:
+    const boost::intrusive_ptr<ExpressionContext> _expCtx;
+    boost::intrusive_ptr<Expression> _newRoot;
+
+    // A string for additional context for the user about where/why we were expecting an object.
+    // This can be helpful if you are using $replaceRoot as part of an alias expansion as we do in
+    // $documents for example. Goes first in the template error message below.
+    std::string _errMsgContextForNonObject;
+    static constexpr std::string_view kErrorTemplate =
+        "{} must evaluate to an object, but resulting value was: {}. Type of resulting value: "
+        "'{}'. Input document: {}"sv;
+
+    SbeCompatibility _sbeCompatibility = SbeCompatibility::notCompatible;
+};
+
+/*
+ * $replaceRoot takes an object containing only an expression in the newRoot field, and replaces
+ * each incoming document with the result of evaluating that expression. Throws an error if the
+ * given expression is not an object or if the expression evaluates to the "missing" Value. This
+ * is implemented as an extension of DocumentSourceSingleDocumentTransformation.
+ *
+ * There is a shorthand $replaceWith alias which takes a direct single argument containing the
+ * expression which will become the new root: {$replaceWith: <expression>} aliases to {$replaceRoot:
+ * {newRoot: <expression>}}.
+ */
+class DocumentSourceReplaceRoot final {
+public:
+    static constexpr std::string_view kStageName = "$replaceRoot"sv;
+    static constexpr std::string_view kAliasNameReplaceWith = "$replaceWith"sv;
+    /**
+     * Creates a new replaceRoot DocumentSource from the BSON specification of the $replaceRoot
+     * stage.
+     */
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    static boost::intrusive_ptr<DocumentSource> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const boost::intrusive_ptr<Expression>& newRootExpression,
+        std::string errMsgContextForNonObjects,
+        SbeCompatibility sbeCompatibility);
+
+private:
+    // It is illegal to construct a DocumentSourceReplaceRoot directly, use createFromBson()
+    // instead.
+    DocumentSourceReplaceRoot() = default;
+};
+
+}  // namespace mongo

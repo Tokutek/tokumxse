@@ -1,0 +1,30 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/query/explain_verbosity.idl"
+
+commands:
+    explain:
+        description: "Parser for the explain command"
+        command_name: explain
+        cpp_name: ExplainCommandRequest
+        namespace: type
+        type: object
+        strict: true
+        api_version: "1"
+        access_check:
+            ignore: true
+        fields:
+            verbosity:
+                description: "The verbosity for explain command."
+                type: Verbosity
+                default: kExecAllPlans
+                stability: stable
+        # Dummy reply type as we won't use it to parse explain reply.
+        reply_type: OkReply

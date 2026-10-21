@@ -1,0 +1,185 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/matcher/matcher.h"
+
+#include "mongo/bson/dotted_path/dotted_path_support.h"
+#include "mongo/db/matcher/expression_expr.h"
+#include "mongo/db/matcher/expression_internal_eq_hashed_key.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_max_properties.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_min_properties.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
+#include "mongo/db/memory_tracking/memory_usage_tracker.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_knob_descriptors_execution.h"
+#include "mongo/util/fail_point.h"
+
+namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(ExprMatchExpressionMatchesReturnsFalseOnException);
+
+namespace exec::matcher {
+
+Value evaluateExpression(const ExprMatchExpression* expr,
+                         const MatchableDocument* doc,
+                         const EvaluationContext& ctx) {
+    // 'Variables' is not thread safe, and ExprMatchExpression may be used in a validator which
+    // processes documents from multiple threads simultaneously. Hence we make a copy of the
+    // 'Variables' object per-caller.
+    Variables variables = expr->getExpressionContext()->variables;
+
+    auto eval = [&](const Document& document) {
+        // We must be careful which memory tracker charges this evaluation, because an
+        // ExpressionContext may be shared across threads (e.g. a collection validator evaluates
+        // $expr from multiple writer threads). A caller-supplied tracker is used as-is (it is
+        // assumed to be owned by this thread's operation). Otherwise, choose based on the
+        // OperationContext:
+        //  - Bound to an OperationContext: the ExpressionContext belongs to a single operation
+        //  running
+        //    on one thread, so its shared fallback tracker is safe to use here.
+        //  - No OperationContext: the ExpressionContext may be shared across threads, so charging
+        //  its
+        //    shared fallback tracker would race. Use a per-call standalone tracker instead.
+        if (!ctx.tracker && !expr->getExpressionContext()->getOperationContext()) {
+            SimpleMemoryUsageTracker perCallFallbackTracker{
+                MemoryUsageLimit{query_knobs::kMaxSingleExpressionMemoryUsageBytes}};
+            EvaluationContext localCtx = ctx;
+            localCtx.tracker = &perCallFallbackTracker;
+            return expr->getExpression()->evaluate(document, &variables, localCtx);
+        }
+        return expr->getExpression()->evaluate(document, &variables, ctx);
+    };
+
+    const boost::optional<const Document&> maybeSource = doc->getSourceDocument();
+    if (maybeSource.has_value()) {
+        return eval(maybeSource.value());
+    } else {
+        return eval(Document(doc->toBSON()));
+    }
+}
+
+void MatchExpressionEvaluator::visit(const ExprMatchExpression* expr) {
+    if (expr->getRewriteResult() && expr->getRewriteResult()->matchExpression() &&
+        !matches(expr->getRewriteResult()->matchExpression(), _doc, _details, _ctx)) {
+        _result = false;
+        return;
+    }
+    try {
+        _result = evaluateExpression(expr, _doc, _ctx).coerceToBool();
+    } catch (const DBException&) {
+        if (MONGO_unlikely(ExprMatchExpressionMatchesReturnsFalseOnException.shouldFail())) {
+            _result = false;
+            return;
+        }
+
+        throw;
+    }
+}
+
+void MatchExpressionEvaluator::visit(const InternalEqHashedKey* expr) {
+    // Sadly, we need to match EOO elements to null index keys, as a special case.
+    if (!bson::extractElementAtDottedPath(_doc->toBSON(), expr->path())) {
+        _result = BSONElementHasher::hash64(BSON("" << BSONNULL).firstElement(),
+                                            BSONElementHasher::DEFAULT_HASH_SEED) ==
+            expr->getData().numberLong();
+        return;
+    }
+
+    // Otherwise, we let this traversal work for us.
+    visitPathExpression(expr);
+}
+
+void MatchExpressionEvaluator::visit(const InternalSchemaCondMatchExpression* expr) {
+    _result = matches(expr->condition(), _doc, _details, _ctx)
+        ? matches(expr->thenBranch(), _doc, _details, _ctx)
+        : matches(expr->elseBranch(), _doc, _details, _ctx);
+}
+
+void MatchExpressionEvaluator::visit(const InternalSchemaMaxPropertiesMatchExpression* expr) {
+    BSONObj obj = _doc->toBSON();
+    _result = (obj.nFields() <= expr->numProperties());
+}
+
+void MatchExpressionEvaluator::visit(const InternalSchemaMinPropertiesMatchExpression* expr) {
+    BSONObj obj = _doc->toBSON();
+    _result = (obj.nFields() >= expr->numProperties());
+}
+
+void MatchExpressionEvaluator::visit(const InternalSchemaXorMatchExpression* expr) {
+    MatchExpressionEvaluator childVisitor(_doc, nullptr, _ctx);
+    bool found = false;
+    for (auto&& child : expr->getChildren()) {
+        child->acceptVisitor(&childVisitor);
+        if (childVisitor.getResult()) {
+            if (found) {
+                _result = false;
+                return;
+            }
+            found = true;
+        }
+    }
+    _result = found;
+}
+
+void MatchExpressionEvaluator::visit(const NotMatchExpression* expr) {
+    _result = !matches(expr->getChild(0), _doc, nullptr, _ctx);
+}
+
+void MatchExpressionEvaluator::visitPathExpression(const PathMatchExpression* expr) {
+    tassert(9714100, "Access to incomplete PathMatchExpression.", expr->elementPath());
+    MatchableDocument::IteratorHolder cursor(_doc, &*expr->elementPath());
+    while (cursor->more()) {
+        ElementIterator::Context e = cursor->next();
+        if (!exec::matcher::matchesSingleElement(expr, e.element(), _details)) {
+            continue;
+        }
+        if (_details && _details->needRecord() && !e.arrayOffset().eoo()) {
+            _details->setElemMatchKey(e.arrayOffset().fieldNameStringData());
+        }
+        _result = true;
+        return;
+    }
+    // There was no match
+    _result = false;
+}
+
+/**
+ * The input BSONObj matches if:
+ *  - each field that matches a regular expression in 'expr->getPatternProperties()' also matches
+ *    the corresponding match expression; and
+ *  - any field not contained in 'expr->getProperties()' nor matching a pattern in
+ *    'expr->getPatternProperties()' matches the 'expr->getOtherwise()' match expression.
+ */
+bool matchesBSONObj(const InternalSchemaAllowedPropertiesMatchExpression* expr,
+                    const BSONObj& obj) {
+    for (auto&& property : obj) {
+        bool checkOtherwise = true;
+        for (auto&& constraint : expr->getPatternProperties()) {
+            if (constraint.first.regex->matchView(property.fieldName())) {
+                checkOtherwise = false;
+                if (!matchesBSONElement(constraint.second->getFilter(), property)) {
+                    return false;
+                }
+            }
+        }
+
+        if (checkOtherwise &&
+            expr->getProperties().find(property.fieldNameStringData()) !=
+                expr->getProperties().end()) {
+            checkOtherwise = false;
+        }
+
+        if (checkOtherwise && !matchesBSONElement(expr->getOtherwise()->getFilter(), property)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MatchExpressionEvaluator::visit(const InternalSchemaAllowedPropertiesMatchExpression* expr) {
+    _result = matchesBSONObj(expr, _doc->toBSON());
+}
+
+}  // namespace exec::matcher
+}  // namespace mongo

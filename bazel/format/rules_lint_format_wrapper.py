@@ -1,0 +1,319 @@
+import argparse
+import os
+import pathlib
+import subprocess
+from typing import Union
+
+from git import Repo
+from utils.evergreen_git import get_default_origin_branch
+
+from bazel.toolchains.cc.mongo_linux.gdb_python_version_check import (
+    check_gdb_wrapper_python_version,
+)
+from buildscripts.sort_backport_multiversion import sort_backport_multiversion
+
+
+def _git_distance(args: list) -> int:
+    command = ["git", "rev-list", "--count"] + args
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running git command: {' '.join(command)}")
+        print(f"stderr: {e.stderr.strip()}")
+        print(f"stdout: {e.stdout.strip()}")
+        raise
+    return int(result.stdout.strip())
+
+
+def _get_merge_base(args: list) -> str:
+    command = ["git", "merge-base"] + args
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def _git_diff(args: list) -> str:
+    command = ["git", "diff"] + args
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    return result.stdout.strip() + os.linesep
+
+
+def _git_unstaged_files() -> str:
+    command = ["git", "ls-files", "--others", "--exclude-standard"]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    return result.stdout.strip() + os.linesep
+
+
+def _get_files_changed_since_fork_point(origin_branch: str) -> list[str]:
+    """Query git to get a list of files in the repo from a diff."""
+    # There are 3 diffs we run:
+    # 1. List of commits between the origin branch and HEAD of current branch
+    # 2. Cached/Staged files (--cached)
+    # 3. Working Tree files git tracks
+
+    fork_point = _get_merge_base(["HEAD", origin_branch])
+
+    diff_files = _git_diff(["--name-only", f"{fork_point}..HEAD"])
+    diff_files += _git_diff(["--name-only", "--cached"])
+    diff_files += _git_diff(["--name-only"])
+    diff_files += _git_unstaged_files()
+
+    file_set = {
+        os.path.normpath(os.path.join(os.curdir, line.rstrip()))
+        for line in diff_files.splitlines()
+        if line
+    }
+
+    return list(file_set)
+
+
+def _split_file_args(file_args: list[str]) -> list[str]:
+    """Flatten --file values, each of which may be a comma or newline separated list."""
+    files = []
+    for file_arg in file_args:
+        for line in file_arg.splitlines():
+            for entry in line.split(","):
+                entry = entry.strip()
+                if entry and entry not in files:
+                    files.append(entry)
+    return files
+
+
+def run_rules_lint(
+    rules_lint_format_path: pathlib.Path,
+    rules_lint_format_check_path: pathlib.Path,
+    check: bool,
+    files_to_format: Union[list[str], str] = "all",
+) -> bool:
+    try:
+        if check:
+            command = [str(rules_lint_format_check_path)]
+            print("Running rules_lint formatter in check mode")
+        else:
+            command = [str(rules_lint_format_path)]
+            print("Running rules_lint formatter")
+        if files_to_format != "all":
+            command += files_to_format
+        repo_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        subprocess.run(command, check=True, env=os.environ, cwd=repo_path)
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def run_prettier(
+    prettier: pathlib.Path, check: bool, files_to_format: Union[list[str], str] = "all"
+) -> bool:
+    # Explicitly ignore anything in the output directories or any symlinks in the root of the repository
+    # to prevent bad symlinks from failing the run, see https://github.com/prettier/prettier/issues/11568 as
+    # to why it the paths being present in .prettierignore isn't sufficient
+    force_exclude_dirs = {
+        "!./build",
+        "!./bazel-bin",
+        "!./bazel-out",
+        "!./bazel-mongo",
+        "!./external",
+        "!./.compiledb",
+        "!./monguard",
+    }
+    for path in pathlib.Path(".").iterdir():
+        if path.is_symlink():
+            force_exclude_dirs.add(f"!./{path}")
+    try:
+        command = [
+            str(prettier),
+            "--log-level",
+            "warn",
+            # Changed-files mode may include extensions prettier does not parse (for example .py, .sky).
+            # Ignore unknown files so formatter routing can continue instead of failing early.
+            "--ignore-unknown",
+        ]
+        if files_to_format == "all":
+            command += ["."]
+        elif len(files_to_format) == 0:
+            print("Skipping prettier due to having no files to format.")
+            return True
+        else:
+            command += files_to_format
+        command += list(force_exclude_dirs)
+        write_command = command + ["--no-cache", "--write"]
+        check_command = command + ["--no-cache", "--check"]
+        if check:
+            print("Running prettier")
+            subprocess.run(check_command, check=True)
+        else:  # write mode
+            # Run without --cache and loop until prettier converges. Prettier is not always
+            # idempotent: a single pass may produce output that a second pass would reformat
+            # differently. Looping ensures write mode always reaches the fixed point.
+
+            for _ in range(
+                3  # this should only take 2 runs at most, but cap it at 3 to be flexible (and not infinite if something goes wrong)
+            ):
+                print("Running prettier")
+                subprocess.run(write_command, check=True)
+                result = subprocess.run(check_command, capture_output=True)
+                if result.returncode == 0:
+                    break
+            else:
+                raise subprocess.CalledProcessError(
+                    result.returncode, check_command, result.stdout, result.stderr
+                )
+    except subprocess.CalledProcessError as e:
+        if e.stdout:
+            print(e.stdout.decode())
+        if e.stderr:
+            print(e.stderr.decode())
+        print("Found formatting errors. Run 'bazel run format' to fix")
+        print("*** IF BAZEL IS NOT INSTALLED, RUN THE FOLLOWING: ***\n")
+        print("python buildscripts/install_bazel.py")
+
+        if os.path.exists("external"):
+            print(
+                "\nexternal exists which may be causing issues in the linter, please try running:\n"
+            )
+            print("\tunlink external")
+        return False
+
+    if check:
+        print("No formatting errors")
+    return True
+
+
+def main() -> int:
+    # If we are running in bazel, default the directory to the workspace
+    default_dir = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
+    if not default_dir:
+        # The formatter needs Bazel's workspace environment to locate the
+        # checkout and its runfiles; direct Python execution is unsupported.
+        print("This script must be run through Bazel. Please run 'bazel run format' instead")
+        print("*** IF BAZEL IS NOT INSTALLED, RUN THE FOLLOWING: ***\n")
+        print("python buildscripts/install_bazel.py")
+        return 1
+
+    # aspect_rules_js js_binary launcher expects RUNFILES and Bazel on Linux sets RUNFILES_DIR.
+    if "RUNFILES_DIR" in os.environ and "RUNFILES" not in os.environ:
+        os.environ["RUNFILES"] = os.environ["RUNFILES_DIR"]
+
+    parser = argparse.ArgumentParser(
+        prog="Format", description="This script formats code in mongodb"
+    )
+
+    parser.add_argument("--check", help="Run in check mode", default=False, action="store_true")
+    parser.add_argument(
+        "--prettier", help="Set the path to prettier", required=True, type=pathlib.Path
+    )
+    parser.add_argument(
+        "--rules-lint-format",
+        help="Set the path to rules_lint's formatter",
+        required=True,
+        type=pathlib.Path,
+    )
+    parser.add_argument(
+        "--rules-lint-format-check",
+        help="Set the path to rules_lint's formatter check script",
+        required=True,
+        type=pathlib.Path,
+    )
+    parser.add_argument(
+        "--all",
+        help="Format all files instead of just formatting files that have changed since the fork point",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--origin-branch",
+        help="The branch to use as the fork point for changed files (example: origin/<branch>)",
+        default="auto",
+    )
+    parser.add_argument(
+        "--file",
+        help="A file to format. May be repeated, and each value may be a comma or newline "
+        "separated list of files.",
+        action="append",
+        default=[],
+    )
+
+    args = parser.parse_args()
+    prettier_path: pathlib.Path = args.prettier.resolve()
+
+    os.chdir(default_dir)
+
+    gdb_python_version_errors = check_gdb_wrapper_python_version(
+        pathlib.Path("bazel/toolchains/cc/mongo_linux/mongo_gdb.bzl")
+    )
+    if gdb_python_version_errors:
+        print("GDB wrapper Python version check failed:")
+        for error in gdb_python_version_errors:
+            print(f"- {error}")
+        return 1
+
+    origin_branch = args.origin_branch
+    if origin_branch == "auto":
+        origin_branch = get_default_origin_branch(Repo())
+
+    files_to_format = "all"
+    explicit_files = _split_file_args(args.file)
+    if explicit_files:
+        files_to_format = explicit_files
+    elif not args.all:
+        max_distance = 100
+        distance = _git_distance([f"{origin_branch}..HEAD"])
+        if distance > max_distance:
+            print(
+                f"The number of commits between current branch and origin branch ({origin_branch}) is too large: {distance} commits (> {max_distance} commits)."
+            )
+            print("WARNING!!! Defaulting to formatting all files, this may take a while.")
+            print(
+                "Please update your local branch with the latest changes from origin, or use "
+                "`bazel run format --origin-branch=other_branch` to select a different origin "
+                "branch. The legacy `bazel run format -- --origin-branch other_branch` form "
+                "is also supported."
+            )
+            args.all = True
+        else:
+            files_to_format = _get_files_changed_since_fork_point(origin_branch)
+
+    # If the total size of all file paths exceeds 128 KiB, the argument list
+    # may blow past the OS ARG_MAX limit (typically 2 MiB on Linux) once the
+    # base command, environment variables, and exclude flags are added.
+    # Fall back to formatting all files to avoid an OSError.
+    max_arg_bytes = 128 * 1024
+    if files_to_format != "all":
+        total_bytes = sum(len(f.encode("utf-8")) + 1 for f in files_to_format)
+        if total_bytes > max_arg_bytes:
+            print(
+                f"WARNING: Too many changed files ({len(files_to_format)} files, {total_bytes} bytes of paths). "
+                "Defaulting to formatting all files to avoid 'Argument list too long' errors."
+            )
+            files_to_format = "all"
+
+    if files_to_format != "all":
+        files_to_format = [str(file) for file in files_to_format if os.path.isfile(file)]
+        print(f"Formatting {len(files_to_format)} file(s)")
+
+    def files_to_format_contain_backports(files: Union[list[str], str]) -> bool:
+        if files == "all":
+            return True
+        return any("backports_required_for_multiversion_tests" in f for f in files)
+
+    backports_ok = True
+    if files_to_format_contain_backports(files_to_format):
+        print("Sorting etc/backports_required_for_multiversion_tests.yml")
+        backports_ok = sort_backport_multiversion(
+            check=args.check,
+            path=pathlib.Path(default_dir)
+            / "etc"
+            / "backports_required_for_multiversion_tests.yml",
+        )
+
+    return (
+        0
+        if backports_ok
+        and run_prettier(prettier_path, args.check, files_to_format)
+        and run_rules_lint(
+            args.rules_lint_format, args.rules_lint_format_check, args.check, files_to_format
+        )
+        else 1
+    )
+
+
+if __name__ == "__main__":
+    exit(main())

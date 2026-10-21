@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/bson/bson_depth.h"
+
+server_parameters:
+    maxBSONDepth:
+        description: "Maximum nesting depth of BSON objects"
+        set_at: startup
+        cpp_varname: "BSONDepth::maxAllowableDepth"
+        validator:
+            gte: {expr: "BSONDepth::kBSONDepthParameterFloor"}
+            lte: {expr: "BSONDepth::kBSONDepthParameterCeiling"}
+        redact: false

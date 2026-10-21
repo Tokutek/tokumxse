@@ -1,0 +1,141 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/platform/atomic.h"
+#include "mongo/util/modules.h"
+
+#include <string>
+
+#include <boost/filesystem/path.hpp>
+#include <boost/optional/optional.hpp>
+
+/*
+ * This file defines the storage for options that come from the command line related to data file
+ * persistence.  Many executables that can access data files directly such as mongod and certain
+ * tools use these variables, but each executable may have a different set of command line flags
+ * that allow the user to change a different subset of these options.
+ */
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+struct StorageGlobalParams {
+    StorageGlobalParams();
+    [[MONGO_MOD_PUBLIC]] void reset_forTest();
+
+    // Returns the directory path used by the spill storage engine to store spilled data.
+    boost::filesystem::path getSpillDbPath() const;
+
+    // Default data directory for mongod when running in non-config server mode.
+    static const char* kDefaultDbPath;
+
+    // Default data directory for mongod when running as the config database of
+    // a sharded cluster.
+    static const char* kDefaultConfigDbPath;
+
+    // --storageEngine
+    // storage engine for this instance of mongod.
+    std::string engine;
+
+    // True if --storageEngine was passed on the command line, and false otherwise.
+    bool engineSetByUser;
+
+    // The directory where the mongod instance stores its data.
+    std::string dbpath;
+
+    // --upgrade
+    // Upgrades the on-disk data format of the files specified by the --dbpath to the
+    // latest version, if needed.
+    bool upgrade;
+
+    // --repair
+    // Runs a repair routine on all databases.
+    bool repair;
+
+    // --validate
+    // Runs validation on all collections.
+    bool validate;
+
+    // --restore
+    // This should only be used when restoring from a backup. Mongod will behave differently by
+    // handling collections with missing data files, allowing database renames, skipping oplog
+    // entries for collections not restored and more.
+    bool restore;
+
+    // --magicRestore
+    bool magicRestore;
+
+    // Whether the Storage Engine selected should be in-memory in nature or not.
+    bool inMemory = false;
+
+    // --journalCommitInterval
+    // This parameter is both a server parameter and a configuration parameter, and to resolve
+    // conflicts between the two, the default must be set here.
+    static constexpr int kMaxJournalCommitIntervalMs = 500;
+    Atomic<int> journalCommitIntervalMs{100};
+
+    // --notablescan
+    // no table scans allowed
+    Atomic<bool> noTableScan;
+
+    // --directoryperdb
+    // Stores each database’s files in its own folder in the data directory.
+    // When applied to an existing system, the directoryPerDB option alters
+    // the storage pattern of the data directory.
+    bool directoryperdb;
+
+    // --syncdelay
+    // Delay in seconds between triggering the next checkpoint after the completion of the previous
+    // one. A value of 0 indicates that checkpointing will be skipped.
+    // Do not set this value on production systems.
+    // In almost every situation, you should use the default setting.
+    // This parameter is both a server parameter and a configuration parameter, and to resolve
+    // conflicts between the two, the default must be set here.
+    static constexpr double kDefaultSyncDelaySecs = 60.0;
+    static constexpr double kMaxSyncdelaySecs = 60 * 60;  // 1hr
+    Atomic<double> syncdelay{kDefaultSyncDelaySecs};      // seconds between checkpoints
+
+    // --queryableBackupMode
+    // Prevents user-originating operations from performing writes to the server. Internally
+    // generated writes are still permitted.
+    bool queryableBackupMode;
+
+    // --groupCollections
+    // Dictate to the storage engine that it should attempt to create new MongoDB collections from
+    // an existing underlying MongoDB database level resource if possible. This can improve
+    // workloads that rely heavily on creating many collections within a database.
+    bool groupCollections;
+
+    // --oplogMinRetentionHours
+    // Controls what size the oplog should be in addition to oplogSize. If set, the oplog will only
+    // be truncated if it is over the capped size, and if the bucket of oldest oplog entries fall
+    // outside of the retention window which is set by this option.
+    //
+    // If the value isn't explicitly set during configuration, a default value of 0 is used. This
+    // default may be overridden depending on architecture.
+    Atomic<double> oplogMinRetentionHours{0.0};
+    bool oplogMinRetentionInitializedUsingDefault{true};
+
+    // Controls whether we allow the OplogTruncateMarkers mechanism to delete oplog history on WT.
+    bool allowOplogTruncation;
+
+    // Test-only option. Disables table logging.
+    bool forceDisableTableLogging = false;
+
+    // Test-only flag which allows disabling the spill WiredTiger instance. Tests that exercise
+    // spill-to-disk behavior must opt in explicitly (e.g. via Options{}.enableSpillEngine()).
+    bool enableSpillEngine = true;
+
+private:
+    void _reset();
+};
+
+/**
+ * Help test user for storage.dbPath config option.
+ */
+std::string storageDBPathDescription();
+
+extern StorageGlobalParams storageGlobalParams;
+
+}  // namespace mongo

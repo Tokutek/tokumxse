@@ -1,0 +1,76 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/matcher/schema/encrypt_schema_types.h"
+        - "mongo/db/query/compiler/parsers/matcher/schema/encrypt_schema_types_parser.h"
+    mod_visibility: public
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/crypto/encryption_fields.idl"
+
+types:
+    encryptSchemaKeyId:
+        bson_serialization_type: any
+        description: "A string pointing to the key id or an array UUIDs identifying a set of keys."
+        cpp_type: "mongo::EncryptSchemaKeyId"
+        serializer: mongo::EncryptSchemaKeyId::serializeToBSON
+        deserializer: mongo::parsers::matcher::schema::parseEncryptSchemaKeyId
+        # EncryptSchemaKeyId has only non view members.
+        is_view: false
+
+    bsonTypeSet:
+        bson_serialization_type: any
+        description: "A string or array of strings representing BSONType names."
+        cpp_type: "mongo::BSONTypeSet"
+        serializer: mongo::BSONTypeSet::serializeToBSON
+        deserializer: mongo::parsers::matcher::schema::parseBSONTypeSet
+        # BSONTypeSet initialized with non view objects.
+        is_view: false
+
+enums:
+    FleAlgorithm:
+        description: "The algorithm used to encrypt fields for field level encryption."
+        type: string
+        values:
+            kDeterministic: "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
+            kRandom: "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
+
+structs:
+    # Maps to the encrypt keyword in JSON Schema.
+    EncryptionInfo:
+        description:
+            "Represents the fields that users can specify within the encryptMetadata
+            subobject in a JSON Schema."
+        strict: true
+        fields:
+            bsonType:
+                description: "Specifies the type of the to-be-encrypted value."
+                type: bsonTypeSet
+                optional: true
+            algorithm:
+                description: "The encryption algorithm to be used."
+                type: FleAlgorithm
+                optional: true
+            keyId:
+                description: "A JSONPointer to a key or an array of UUIDs identifying a set of keys."
+                type: encryptSchemaKeyId
+                optional: true
+
+    # Maps to "encryptMetadata" in JSON Schema.
+    EncryptionMetadata:
+        description: "The fields that can be applied to children in the schema
+            with the encrypt keyword."
+        strict: true
+        generate_comparison_operators: true
+        fields:
+            algorithm:
+                description: "The encryption algorithm to be used."
+                type: FleAlgorithm
+                optional: true
+            keyId:
+                description: "A JSONPointer to a key or an array of UUIDs identifying a set of keys."
+                type: encryptSchemaKeyId
+                optional: true

@@ -1,0 +1,21 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_setup_multiversion",
+    srcs = [
+        "__init__.py",
+        "test_setup_multiversion.py",
+    ],
+    data = [
+        "//buildscripts/resmokeconfig:setup_multiversion/setup_multiversion_config.yml",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)

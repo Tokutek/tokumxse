@@ -1,0 +1,62 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ShardDrainingState:
+        description: "State of shard draining on the shard being removed."
+        type: string
+        values:
+            kStarted: "started"
+            kOngoing: "ongoing"
+            kPendingDataCleanup: "pendingDataCleanup"
+            kDrainingComplete: "drainingComplete"
+            kCompleted: "completed"
+
+structs:
+    RemainingCounts:
+        description: "Remaining count of chunks, unsharded collections, dbs, and jumbo chunks on the shard being removed."
+        strict: false
+        fields:
+            chunks:
+                description: "Number of chunks remaining on the shard being removed."
+                type: long
+            collectionsToMove:
+                description: "Number of unsharded collections remaining on the shard being removed."
+                type: long
+            dbs:
+                description: "Number of databases remaining on the shard being removed."
+                type: long
+            jumboChunks:
+                description: "Number of jumbo chunks remaining on the shard being removed."
+                type: long
+            estimatedRemainingBytes:
+                description: "Estimated number of bytes remaining to be drained on the shard being removed."
+                type: long
+                optional: true
+
+    RemoveShardProgress:
+        description: "Remove shard draining progress"
+        strict: false
+        fields:
+            state:
+                type: ShardDrainingState
+                description: "State of shard draining on the shard being removed."
+            remaining:
+                type: RemainingCounts
+                description: "Number of chunks, unsharded collections, dbs, and jumbo chunks remaining on the shard being removed."
+                optional: true
+            pendingRangeDeletions:
+                type: long
+                description: "Number of pending range deletions remaining on the shard being removed."
+                optional: true
+            firstNonEmptyCollection:
+                type: namespacestring
+                description: "First non empty collection found on the shard being removed."
+                optional: true

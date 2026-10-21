@@ -1,0 +1,234 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/exec/expression/evaluate.h"
+#include "mongo/util/elapsed_tracker.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(mapReduceFilterPauseBeforeLoop);
+
+namespace exec::expression {
+
+namespace {
+
+void mapReduceFilterWaitBeforeLoop(OperationContext* opCtx) {
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &mapReduceFilterPauseBeforeLoop, opCtx, "mapReduceFilterPauseBeforeLoop", []() {
+            LOGV2(9006800, "waiting due to 'mapReduceFilterPauseBeforeLoop' failpoint");
+        });
+}
+
+std::function<void()> getExpressionInterruptChecker(OperationContext* opCtx) {
+    if (opCtx) {
+        ElapsedTracker et(&opCtx->fastClockSource(),
+                          internalQueryExpressionInterruptIterations.load(),
+                          Milliseconds{internalQueryExpressionInterruptPeriodMS.load()});
+        return [=]() mutable {
+            if (MONGO_unlikely(et.intervalHasElapsed())) {
+                opCtx->checkForInterrupt();
+            }
+        };
+    } else {
+        return []() {
+        };
+    }
+}
+
+}  // namespace
+
+
+Value evaluate(const ExpressionMap& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    // guaranteed at parse time that this isn't using our _varId
+    Value inputVal = expr.getInput()->evaluate(root, variables, ctx);
+    if (inputVal.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(16883,
+            str::stream() << "input to $map must be an array not " << typeName(inputVal.getType()),
+            inputVal.isArray());
+
+    const std::vector<Value>& input = inputVal.getArray();
+
+    if (input.empty()) {
+        return inputVal;
+    }
+
+    auto checkForInterrupt =
+        getExpressionInterruptChecker(expr.getExpressionContext()->getOperationContext());
+    mapReduceFilterWaitBeforeLoop(expr.getExpressionContext()->getOperationContext());
+
+    size_t memUsed = 0;
+    std::vector<Value> output;
+    output.reserve(input.size());
+    const size_t memLimit = internalQueryMaxMapFilterReduceBytes.load();
+    for (size_t i = 0; i < input.size(); i++) {
+        checkForInterrupt();
+        variables->setValue(expr.getVarId(), input[i]);
+        if (expr.getIndexVariableId()) {
+            variables->setValue(*expr.getIndexVariableId(), Value(static_cast<int>(i)));
+        }
+
+        Value toInsert = expr.getEach()->evaluate(root, variables, ctx);
+        if (toInsert.missing()) {
+            toInsert = Value(BSONNULL);  // can't insert missing values into array
+        }
+
+        output.push_back(toInsert);
+        memUsed += toInsert.getApproximateSize();
+        if (MONGO_unlikely(memUsed > memLimit)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      "$map would use too much memory and cannot spill");
+        }
+    }
+
+    return Value(std::move(output));
+}
+
+Value evaluate(const ExpressionReduce& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    Value inputVal = expr.getInput()->evaluate(root, variables, ctx);
+
+    if (inputVal.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40080,
+            str::stream() << "$reduce requires that 'input' be an array, found: "
+                          << inputVal.toString(),
+            inputVal.isArray());
+
+    auto checkForInterrupt =
+        getExpressionInterruptChecker(expr.getExpressionContext()->getOperationContext());
+    mapReduceFilterWaitBeforeLoop(expr.getExpressionContext()->getOperationContext());
+
+    size_t memLimit = internalQueryMaxMapFilterReduceBytes.load();
+    Value accumulatedValue = expr.getInitial()->evaluate(root, variables, ctx);
+
+    int32_t prevDepth = -1;
+    size_t interval = expr.getAccumulatedValueDepthCheckInterval();
+    const auto& input = inputVal.getArray();
+    for (size_t i = 0; i < input.size(); ++i) {
+        checkForInterrupt();
+
+        variables->setValue(expr.getThisVar(), input[i]);
+        variables->setValue(expr.getValueVar(), accumulatedValue);
+        if (expr.getIndexVariableId()) {
+            variables->setValue(*expr.getIndexVariableId(), Value(static_cast<int>(i)));
+        }
+
+        accumulatedValue = expr.getIn()->evaluate(root, variables, ctx);
+        if ((interval > 0) && (i % interval) == 0 &&
+            (accumulatedValue.isObject() || accumulatedValue.isArray())) {
+            int32_t depth =
+                accumulatedValue.depth(2 * BSONDepth::getMaxAllowableDepth() /*maxDepth*/);
+            if (MONGO_unlikely(depth == -1)) {
+                uasserted(ErrorCodes::Overflow,
+                          "$reduce accumulated value exceeded max allowable BSON depth");
+            }
+            // Exponential backoff if depth has not increased.
+            if (depth == prevDepth) {
+                tassert(10236400,
+                        "unexpected control flow in $reduce object/array depth verification",
+                        prevDepth != -1);
+                interval *= 2;
+            }
+            prevDepth = depth;
+        }
+        if (MONGO_unlikely(accumulatedValue.getApproximateSize() > memLimit)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      "$reduce would use too much memory and cannot spill");
+        }
+    }
+
+    return accumulatedValue;
+}
+
+Value evaluate(const ExpressionFilter& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    // We are guaranteed at parse time that this isn't using our _varId.
+    Value inputVal = expr.getInput()->evaluate(root, variables, ctx);
+
+    if (inputVal.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(28651,
+            str::stream() << "input to $filter must be an array not "
+                          << typeName(inputVal.getType()),
+            inputVal.isArray());
+
+    const std::vector<Value>& input = inputVal.getArray();
+
+    if (input.empty()) {
+        return inputVal;
+    }
+
+    // This counter ensures we don't return more array elements than our limit arg has specified.
+    // For example, given the query, {$project: {b: {$filter: {input: '$a', as: 'x', cond: {$gt:
+    // ['$$x', 1]}, limit: {$literal: 3}}}}} remainingLimitCounter would be 3 and we would return up
+    // to the first 3 elements matching our condition, per doc.
+    auto approximateOutputSize = input.size();
+    boost::optional<int> remainingLimitCounter;
+    if (expr.hasLimit()) {
+        auto limitValue = (expr.getChildren()[*expr.getLimit()])->evaluate(root, variables, ctx);
+        // If the $filter query contains limit: null, we interpret the query as being "limit-less"
+        // and therefore return all matching elements per doc.
+        if (!limitValue.nullish()) {
+            uassert(
+                327391,
+                str::stream() << "$filter: limit must be represented as a 32-bit integral value: "
+                              << limitValue.toString(),
+                limitValue.integral());
+            int coercedLimitValue = limitValue.coerceToInt();
+            uassert(327392,
+                    str::stream() << "$filter: limit must be greater than 0: "
+                                  << limitValue.toString(),
+                    coercedLimitValue > 0);
+            remainingLimitCounter = coercedLimitValue;
+            approximateOutputSize =
+                std::min(approximateOutputSize, static_cast<size_t>(coercedLimitValue));
+        }
+    }
+
+    auto checkForInterrupt =
+        getExpressionInterruptChecker(expr.getExpressionContext()->getOperationContext());
+    mapReduceFilterWaitBeforeLoop(expr.getExpressionContext()->getOperationContext());
+
+    std::vector<Value> output;
+    output.reserve(approximateOutputSize);
+    for (size_t i = 0; i < input.size(); ++i) {
+        checkForInterrupt();
+
+        variables->setValue(expr.getVariableId(), input[i]);
+        if (expr.getIndexVariableId()) {
+            variables->setValue(*expr.getIndexVariableId(), Value(static_cast<int>(i)));
+        }
+
+        if (expr.getCond()->evaluate(root, variables, ctx).coerceToBool()) {
+            output.push_back(input[i]);
+            if (remainingLimitCounter && --*remainingLimitCounter == 0) {
+                return Value(std::move(output));
+            }
+        }
+    }
+
+    return Value(std::move(output));
+}
+
+}  // namespace exec::expression
+
+}  // namespace mongo

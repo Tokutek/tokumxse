@@ -1,0 +1,14 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: mongo
+
+server_parameters:
+    skipCorruptDocumentsWhenCloning:
+        description: "Skip corrupt documents when cloning"
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gSkipCorruptDocumentsWhenCloning
+        set_at: [startup, runtime]
+        redact: false

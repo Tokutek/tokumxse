@@ -1,0 +1,281 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/sbe/expression_test_base.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
+#include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
+#include "mongo/db/exec/sbe/stages/co_scan.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/time_support.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <queue>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace mongo::sbe {
+using namespace std::literals::string_view_literals;
+
+namespace {
+using SBEKeyStringTest = EExpressionTestFixture;
+
+std::string valueDebugString(std::pair<value::TypeTags, value::Value> value) {
+    std::stringstream stream;
+    stream << value;
+    return stream.str();
+};
+
+std::string valueDebugString(value::TagValueView value) {
+    std::stringstream stream;
+    stream << value;
+    return stream.str();
+};
+}  // namespace
+
+#define APPEND_TWICE(BOB, NAME, VALUE)         \
+    do {                                       \
+        BOB.append(NAME "-ascending", VALUE);  \
+        BOB.append(NAME "-descending", VALUE); \
+    } while (false);
+
+TEST_F(SBEKeyStringTest, Basic) {
+    // Add interesting values to a BSON object. Note that we add each value twice: one will have an
+    // "ascending" ordering, and the other will have a "descending" ordering.
+    BSONObjBuilder bob;
+    APPEND_TWICE(bob, "zeroInt", 0);
+    APPEND_TWICE(bob, "oneByteInt", 0x10);
+    APPEND_TWICE(bob, "twoByteInt", 0x1010);
+    APPEND_TWICE(bob, "threeByteInt", 0x101010);
+    APPEND_TWICE(bob, "fourByteInt", 0x10101010);
+    APPEND_TWICE(bob, "fiveByteInt", int64_t{0x1010101010});
+    APPEND_TWICE(bob, "sixByteInt", int64_t{0x101010101010});
+    APPEND_TWICE(bob, "sevenByteInt", int64_t{0x10101010101010});
+    APPEND_TWICE(bob, "eightByteInt", int64_t{0x1010101010101010});
+    APPEND_TWICE(bob, "negativeZeroInt", 0);
+    APPEND_TWICE(bob, "negativeOneByteInt", -0x10);
+    APPEND_TWICE(bob, "negativeTwoByteInt", -0x1010);
+    APPEND_TWICE(bob, "negativeThreeByteInt", -0x101010);
+    APPEND_TWICE(bob, "negativeFourByteInt", -0x10101010);
+    APPEND_TWICE(bob, "negativeFiveByteInt", int64_t{-0x1010101010});
+    APPEND_TWICE(bob, "negativeSixByteInt", int64_t{-0x101010101010});
+    APPEND_TWICE(bob, "negativeSevenByteInt", int64_t{-0x10101010101010});
+    APPEND_TWICE(bob, "negativeEightByteInt", int64_t{-0x1010101010101010});
+    APPEND_TWICE(bob, "boolFalse", false);
+    APPEND_TWICE(bob, "boolTrue", true);
+    APPEND_TWICE(bob, "doubleVal", 123.45);
+    APPEND_TWICE(bob, "doubleInfinity", std::numeric_limits<double>::infinity());
+    APPEND_TWICE(bob, "negativeDoubleInfinity", -std::numeric_limits<double>::infinity());
+    APPEND_TWICE(bob, "decimalValue", Decimal128("01189998819991197253"));
+    APPEND_TWICE(bob, "decimalInfinity", Decimal128::kPositiveInfinity);
+    APPEND_TWICE(bob, "decimalNegativeInfinity", Decimal128::kNegativeInfinity);
+    APPEND_TWICE(bob, "shortString", "str");
+    APPEND_TWICE(bob, "longString", "I am the very model of a modern major general.");
+    APPEND_TWICE(bob, "symbol", BSONSymbol("I am the very model of a modern major general."));
+    APPEND_TWICE(bob, "date", Date_t::fromMillisSinceEpoch(123));
+    APPEND_TWICE(bob, "timestamp", Timestamp(123));
+    APPEND_TWICE(bob, "binData", BSONBinData("\xde\xad\xbe\xef", 4, BinDataGeneral));
+    APPEND_TWICE(bob, "code", BSONCode("function test() { return 'Hello world!'; }"));
+    APPEND_TWICE(bob, "dbref", BSONDBRef("db.c", OID("010203040506070809101112")));
+    APPEND_TWICE(
+        bob, "cws", BSONCodeWScope("function test() { return 'Hello world!'; }", BSONObj()));
+
+    bob.appendNull("null-ascending");
+    bob.appendNull("null-descending");
+    auto testValues = bob.done();
+
+    // Copy each element from 'testValues' into a key_string::Value. Each key_string::Value has a
+    // maximum number of components, so we have to break the elements up into groups.
+    std::queue<std::tuple<key_string::Value, Ordering, size_t>> keyStringQueue;
+    std::vector<BSONElement> elements;
+    testValues.elems(elements);
+
+    for (size_t i = 0; i < elements.size(); i += Ordering::kMaxCompoundIndexKeys) {
+        auto endBound = std::min(i + Ordering::kMaxCompoundIndexKeys, elements.size());
+
+        BSONObjBuilder patternBob;
+        for (auto j = i; j < endBound; ++j) {
+            patternBob.append(elements[j].fieldNameStringData(), (j % 2 == 0) ? 1 : -1);
+        }
+        auto ordering = Ordering::make(patternBob.done());
+
+        key_string::Builder keyStringBuilder(key_string::Version::V1, ordering);
+        for (auto j = i; j < endBound; ++j) {
+            keyStringBuilder.appendBSONElement(elements[j]);
+        }
+        keyStringBuilder.appendRecordId(RecordId{0});
+        keyStringQueue.emplace(keyStringBuilder.getValueCopy(), ordering, endBound - i);
+    }
+
+    // Set up an SBE expression that will compare one element in the 'testValues' BSON object with
+    // one of the KeyString components.
+    CompileCtx ctx{std::make_unique<RuntimeEnvironment>()};
+    CoScanStage emptyStage{kEmptyPlanNodeId};
+    ctx.root = &emptyStage;
+
+    // The expression takes three inputs:
+    //   1) the BSON object,
+    value::ViewOfValueAccessor bsonObjAccessor;
+    auto bsonObjSlot = bindAccessor(&bsonObjAccessor);
+
+    //  2) the field name corresponding to the BSON element,
+    value::OwnedValueAccessor fieldNameAccessor;
+    auto fieldNameSlot = bindAccessor(&fieldNameAccessor);
+
+    //  3) and the KeyString component.
+    value::ViewOfValueAccessor keyStringComponentAccessor;
+    auto keyStringComponentSlot = bindAccessor(&keyStringComponentAccessor);
+
+    auto comparisonExpr = makeE<EPrimBinary>(
+        EPrimBinary::eq,
+        makeE<EVariable>(keyStringComponentSlot),
+        makeE<EFunction>(EFn::kGetField,
+                         makeEs(makeE<EVariable>(bsonObjSlot), makeE<EVariable>(fieldNameSlot))));
+    auto compiledExpr = compileExpression(*comparisonExpr);
+
+    bsonObjAccessor.reset(value::TypeTags::bsonObject,
+                          value::bitcastFrom<const char*>(testValues.objdata()));
+    std::vector<sbe::value::OwnedValueAccessor> keyStringValues;
+    BufBuilder builder;
+    for (auto&& element : testValues) {
+        while (keyStringValues.empty()) {
+            ASSERT(!keyStringQueue.empty());
+
+            auto [keyString, ordering, size] = keyStringQueue.front();
+            keyStringQueue.pop();
+
+            builder.reset();
+            keyStringValues.resize(size);
+            SortedDataKeyValueView view{keyString.getView(),
+                                        keyString.getRecordIdView(),
+                                        keyString.getTypeBitsView(),
+                                        keyString.getVersion(),
+                                        true};
+            readKeyStringValueIntoAccessors(view, ordering, &builder, &keyStringValues);
+        }
+
+        auto [componentTag, componentVal] = keyStringValues.front().getViewOfValue();
+        keyStringComponentAccessor.reset(componentTag, componentVal);
+        keyStringValues.erase(keyStringValues.begin());
+
+        auto [fieldNameTag, fieldNameVal] = value::makeNewString(element.fieldName());
+        fieldNameAccessor.reset(fieldNameTag, fieldNameVal);
+
+        auto result = runCompiledExpressionPredicate(compiledExpr.get());
+        ASSERT(result) << "BSONElement (" << element << ") failed to match KeyString component ("
+                       << valueDebugString(std::make_pair(componentTag, componentVal)) << ")";
+    }
+
+    ASSERT(keyStringValues.empty());
+    ASSERT(keyStringQueue.empty());
+}
+
+TEST(SimpleSBEKeyStringTest, KeyComponentInclusion) {
+    key_string::Builder keyStringBuilder(key_string::Version::V1, key_string::ALL_ASCENDING);
+    keyStringBuilder.appendNumberLong(12345);  // Included
+    keyStringBuilder.appendString("I've information vegetable, animal, and mineral"sv);
+    keyStringBuilder.appendString(
+        "I know the kings of England, and I quote the fights historical"sv);  // Included
+    keyStringBuilder.appendString("From Marathon to Waterloo, in order categorical");
+    keyStringBuilder.appendRecordId(RecordId{0});
+
+    IndexKeysInclusionSet indexKeysToInclude;
+    indexKeysToInclude.set(0);
+    indexKeysToInclude.set(2);
+
+    std::vector<value::OwnedValueAccessor> accessors;
+    accessors.resize(2);
+
+    auto keySize = key_string::getKeySize(
+        keyStringBuilder.getView(), key_string::ALL_ASCENDING, keyStringBuilder.version);
+    SortedDataKeyValueView view{keyStringBuilder.getView(),
+                                keyStringBuilder.getView().subspan(keySize),
+                                keyStringBuilder.getTypeBits().getView(),
+                                keyStringBuilder.version,
+                                true};
+    BufBuilder builder;
+    readKeyStringValueIntoAccessors(
+        view, key_string::ALL_ASCENDING, &builder, &accessors, indexKeysToInclude);
+
+    auto value = accessors[0].getViewOfValue();
+    ASSERT(value::TypeTags::NumberInt64 == value.tag &&
+           12345 == value::bitcastTo<int64_t>(value.value))
+        << "Incorrect value from accessor: " << valueDebugString(value);
+
+    value = accessors[1].getViewOfValue();
+    ASSERT(value::isString(value.tag) &&
+           ("I know the kings of England, and I quote the fights historical" ==
+            value::getStringView(value.tag, value.value)))
+        << "Incorrect value from accessor: " << valueDebugString(value);
+}
+
+// Regression test for SERVER-134335: outstanding accessors have to be reset (and thus contain
+// Nothing) when keys contain different component counts.
+TEST(SimpleSBEKeyStringTest, KeyComponentSizeVariance) {
+    // Key with 2 components.
+    key_string::Builder longKeyBuilder(key_string::Version::V1, key_string::ALL_ASCENDING);
+    longKeyBuilder.appendString(std::string(200, 'A'));
+    longKeyBuilder.appendString(std::string(75, 'B'));
+    longKeyBuilder.appendRecordId(RecordId{0});
+    auto longKey = longKeyBuilder.getValueCopy();
+
+    // Key with 1 component.
+    key_string::Builder shortKeyBuilder(key_string::Version::V1, key_string::ALL_ASCENDING);
+    shortKeyBuilder.appendString(std::string(60, 'C'));
+    shortKeyBuilder.appendRecordId(RecordId{0});
+    auto shortKey = shortKeyBuilder.getValueCopy();
+
+    std::vector<SortedDataKeyValueView> keyViews;
+    for (const auto& ks : {longKey, shortKey}) {
+        auto keySize =
+            key_string::getKeySize(ks.getView(), key_string::ALL_ASCENDING, ks.getVersion());
+        keyViews.emplace_back(ks.getView(),
+                              ks.getView().subspan(keySize),
+                              ks.getTypeBitsView(),
+                              ks.getVersion(),
+                              true);
+    }
+
+    std::vector<value::OwnedValueAccessor> accessors(2);
+    BufBuilder builder;
+
+    // As in ixscan.cpp, create accessors to read the components from each compound index.
+    readKeyStringValueIntoAccessors(keyViews[0], key_string::ALL_ASCENDING, &builder, &accessors);
+    ASSERT_EQ(accessors.size(), 2);
+
+    // Reset buffer.
+    builder.reset();
+    readKeyStringValueIntoAccessors(keyViews[1], key_string::ALL_ASCENDING, &builder, &accessors);
+    ASSERT_EQ(accessors.size(), 2);
+
+    auto [firstTag, firstVal] = accessors[0].getViewOfValue();
+    ASSERT(value::isString(firstTag));
+    ASSERT_EQ(value::getStringView(firstTag, firstVal), std::string(60, 'C'));
+
+    auto [secondTag, secondVal] = accessors[1].getViewOfValue();
+    ASSERT_EQ(value::TypeTags::Nothing, secondTag);
+}
+
+}  // namespace mongo::sbe

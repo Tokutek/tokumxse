@@ -1,0 +1,74 @@
+version: 2.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "/bazel*":
+    approvers:
+      - 10gen/devprod-build
+  - "/compile*":
+    approvers:
+      - 10gen/devprod-build
+  - "/failed_unittests_gather.sh":
+    approvers:
+      - 10gen/devprod-build
+  - "/generate_clang_tidy_report.py":
+    approvers:
+      - 10gen/devprod-build
+  - "/generate_evergreen_bazelrc.sh":
+    approvers:
+      - 10gen/devprod-build
+  - "/native_toolchain_setup.sh":
+    approvers:
+      - 10gen/devprod-build
+  - "get_custom_build_promotion_expansions.sh":
+    approvers:
+      - 10gen/devprod-release-infrastructure
+  - "get_custom_build_promotion_expansions_debug.sh":
+    approvers:
+      - 10gen/devprod-release-infrastructure
+  - "upload_custom_build_to_cloud_env.sh":
+    approvers:
+      - 10gen/devprod-release-infrastructure
+  - "/package*":
+    approvers:
+      - 10gen/devprod-build
+  - "validate_compile_commands.py":
+    approvers:
+      - 10gen/devprod-build
+  - "packager_crypt_py_run.sh":
+    approvers:
+      - 10gen/devprod-build
+  - "perf-submission.sh":
+    approvers:
+      - 10gen/devprod-performance-infrastructure
+  - "streams*":
+    approvers:
+      - 10gen/streams-engine
+  - "selinux_*":
+    approvers:
+      - 10gen/server-security
+  - "generate_sast_report.sh":
+    approvers:
+      - 10gen/devprod-release-infrastructure
+  - "waterfall_gpg_sign.sh":
+    approvers:
+      - 10gen/devprod-release-infrastructure
+  - "write_sast_report_env_file.sh":
+    approvers:
+      - 10gen/devprod-release-infrastructure
+  - "generate_symbol_check_report.py":
+    approvers:
+      - 10gen/devprod-build
+  - "verify_extension_visibility_test.sh":
+    approvers:
+      - 10gen/query-integration-extensions-api
+  - "verify_all_extensions_visibility.sh":
+    approvers:
+      - 10gen/query-integration-extensions-api
+  - "fetch_mongodb_database_tools.sh":
+    approvers:
+      - 10gen/query-optimization-correctness
+  - "remote_execution_containers_generate.sh":
+    approvers:
+      - 10gen/devprod-build

@@ -1,0 +1,294 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/crypto/jwk_manager_test_framework.h"
+#include "mongo/crypto/unix_epoch.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+
+namespace mongo::crypto::test {
+namespace {
+using namespace std::literals::string_view_literals;
+
+BSONObj getCompleteTestJWKSet() {
+    BSONObjBuilder set;
+    BSONArrayBuilder keys(set.subarrayStart("keys"sv));
+
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "RSA");
+        key.append("kid", "custom-key-1");
+        key.append("e", "AQAB");
+        key.append(
+            "n",
+            "ALtUlNS31SzxwqMzMR9jKOJYDhHj8zZtLUYHi3s1en3wLdILp1Uy8O6Jy0Z66tPyM1u8lke0JK5gS-40yhJ-"
+            "bvqioW8CnwbLSLPmzGNmZKdfIJ08Si8aEtrRXMxpDyz4Is7JLnpjIIUZ4lmqC3MnoZHd6qhhJb1v1Qy-"
+            "QGlk4NJy1ZI0aPc_uNEUM7lWhPAJABZsWc6MN8flSWCnY8pJCdIk_cAktA0U17tuvVduuFX_"
+            "94763nWYikZIMJS_cTQMMVxYNMf1xcNNOVFlUSJHYHClk46QT9nT8FWeFlgvvWhlXfhsp9aNAi3pX-"
+            "KxIxqF2wABIAKnhlMa3CJW41323Js");
+        key.doneFast();
+    }
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "RSA");
+        key.append("kid", "custom-key-2");
+        key.append("e", "AQAB");
+        key.append(
+            "n",
+            "4Amo26gLJITvt62AXI7z224KfvfQjwpyREjtpA2DU2mN7pnlz-"
+            "ZDu0sygwkhGcAkRPVbzpEiliXtVo2dYN4vMKLSd5BVBXhtB41bZ6OUxni48uP5txm7w8BUWv8MxzPkzyW_"
+            "3dd8rOfzECdLCF5G3aA4u_XRu2ODUSAMcrxXngnNtAuC-"
+            "OdqgYmvZfgFwqbU0VKNR4bbkhSrw6p9Tct6CUW04Ml4HMacZUovJKXRvNqnHcx3sy4PtVe3CyKlbb4KhBtkj1U"
+            "U_"
+            "cwiosz8uboBbchp7wsATieGVF8x3BUtf0ry94BGYXKbCGY_Mq-TSxcM_3afZiJA1COVZWN7d4GTEw");
+        key.doneFast();
+    }
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "EC");
+        key.append("kid", "ec-prime256v1");
+        key.append("crv", "P-256");
+        key.append("x", "YIq56eQHNCUKUhvpbXssCWvnCHaJkD-5KKoLxwRENxc");
+        key.append("y", "ZoGRVDgfGRZ8OsJN8O3DH6nFfo_LWbVK_e8Bk3ZyT1k");
+        key.doneFast();
+    }
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "EC");
+        key.append("kid", "ec-secp384r1");
+        key.append("crv", "P-384");
+        key.append("x", "INQz_7Dh89R9A4ONlGgYdQKKE9ttkoe0-rPzop9x8OY7fQJ1U5cczA5lJeqAREot");
+        key.append("y", "8SHZNb0g6u-ZB_gg0268dP5RzJJE13_-jYC0GyZ_48B3JGPDGcROMifXwzMPadtX");
+        key.doneFast();
+    }
+    keys.doneFast();
+    return set.obj();
+}
+
+BSONObj getPartialTestJWKSet() {
+    BSONObjBuilder set;
+    BSONArrayBuilder keys(set.subarrayStart("keys"sv));
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "RSA");
+        key.append("kid", "custom-key-1");
+        key.append("e", "AQAB");
+        key.append(
+            "n",
+            "ALtUlNS31SzxwqMzMR9jKOJYDhHj8zZtLUYHi3s1en3wLdILp1Uy8O6Jy0Z66tPyM1u8lke0JK5gS-40yhJ-"
+            "bvqioW8CnwbLSLPmzGNmZKdfIJ08Si8aEtrRXMxpDyz4Is7JLnpjIIUZ4lmqC3MnoZHd6qhhJb1v1Qy-"
+            "QGlk4NJy1ZI0aPc_uNEUM7lWhPAJABZsWc6MN8flSWCnY8pJCdIk_cAktA0U17tuvVduuFX_"
+            "94763nWYikZIMJS_cTQMMVxYNMf1xcNNOVFlUSJHYHClk46QT9nT8FWeFlgvvWhlXfhsp9aNAi3pX-"
+            "KxIxqF2wABIAKnhlMa3CJW41323Js");
+        key.doneFast();
+    }
+
+    keys.doneFast();
+    return set.obj();
+}
+
+// Try to load keys for a supported algorithm (EC) but unsupported curve (P-521)
+BSONObj getUnsupportedCurveJWKSet() {
+    BSONObjBuilder set;
+    BSONArrayBuilder keys(set.subarrayStart("keys"sv));
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "EC");
+        key.append("kid", "ec-secp521r1");
+        key.append("crv", "P-521");
+        key.append("alg", "ES512");
+        key.append("x",
+                   "AEu5vZ_bVcV3d5z5pLNrF1q7Jabh1ZjGN8kwdwrXnd9jRIXTD2t-"
+                   "T3B2TAajO2jzQhOq29FIeycUrcgFCp8ItAtX");
+        key.append("y",
+                   "AOaLCQqebglolZIkUHX-APj_gYZdG0DyC0CL9AZagtKcHMQMuUjhofka-"
+                   "hVCr0xKIvQlhq3U3Y5ggR1IR8vpQ0R9");
+        key.doneFast();
+    }
+    keys.doneFast();
+    return set.obj();
+}
+
+// Try to load keys for an unsupported protocol HS256
+BSONObj getUnsupportedProtocolJWKSet() {
+    BSONObjBuilder set;
+    BSONArrayBuilder keys(set.subarrayStart("keys"sv));
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "EC");
+        key.append("kid", "ec-prime256v1");
+        key.append("crv", "P-256");
+        key.append("x", "YIq56eQHNCUKUhvpbXssCWvnCHaJkD-5KKoLxwRENxc");
+        key.append("y", "ZoGRVDgfGRZ8OsJN8O3DH6nFfo_LWbVK_e8Bk3ZyT1k");
+        key.doneFast();
+    }
+    {
+        BSONObjBuilder key(keys.subobjStart());
+        key.append("kty", "oct");
+        key.append("kid", "hs256");
+        key.append("alg", "HS256");
+        key.append("k", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIK");
+        key.doneFast();
+    }
+    keys.doneFast();
+    return set.obj();
+}
+
+void assertCorrectKeys(JWKManager* manager, BSONObj data) {
+    const auto& currentKeys = manager->getKeys();
+    for (const auto& key : data["keys"sv].Obj()) {
+        auto currentKey = currentKeys.find(key["kid"sv].str());
+        ASSERT(currentKey != currentKeys.end());
+        ASSERT_BSONOBJ_EQ(key.Obj(), currentKey->second);
+    }
+
+    for (const auto& key : data["keys"sv].Obj()) {
+        auto validator = uassertStatusOK(manager->getValidator(key["kid"sv].str()));
+        ASSERT(validator);
+    }
+}
+
+TEST_F(JWKManagerTest, parseJWKSetBasicFromSource) {
+    unittest::ServerParameterGuard quiesceController("JWKSMinimumQuiescePeriodSecs", 0);
+
+    auto data = getCompleteTestJWKSet();
+    jwksFetcher()->setKeys(getCompleteTestJWKSet());
+
+    // Initially, set the fetcher to fail. This should cause the JWKManager to contain no keys
+    // even after loadKeys() is called.
+    jwksFetcher()->setShouldFail(true);
+    ASSERT_EQ(jwkManager()->size(), 0);
+    ASSERT_NOT_OK(jwkManager()->loadKeys());
+    ASSERT_EQ(jwkManager()->size(), 0);
+
+    // Then, set the fetcher to succeed. The subsequent call to loadKeys() should result in the
+    // keys getting updated correctly.
+    jwksFetcher()->setShouldFail(false);
+    ASSERT_OK(jwkManager()->loadKeys());
+    ASSERT_EQ(jwkManager()->size(), 4);
+
+    BSONObjBuilder successfulLoadKeysBob;
+    jwkManager()->serialize(&successfulLoadKeysBob);
+    ASSERT_BSONOBJ_EQ(successfulLoadKeysBob.obj(), data);
+    assertCorrectKeys(jwkManager(), data);
+
+    // Finally, set the fetcher to fail again. The subsequent call to loadKeys() should fail but
+    // leave the manager's keys untouched.
+    jwksFetcher()->setShouldFail(true);
+    ASSERT_NOT_OK(jwkManager()->loadKeys());
+    ASSERT_EQ(jwkManager()->size(), 4);
+
+    BSONObjBuilder failedLoadKeysBob;
+    jwkManager()->serialize(&failedLoadKeysBob);
+    ASSERT_BSONOBJ_EQ(failedLoadKeysBob.obj(), data);
+    assertCorrectKeys(jwkManager(), data);
+}
+
+TEST_F(JWKManagerTest, JWKSFetcherQuiesce) {
+    unittest::ServerParameterGuard quiesceController("JWKSMinimumQuiescePeriodSecs", 5);
+
+    // Initially the fetcher will contain no keys.
+    ASSERT_EQ(jwkManager()->size(), 0);
+
+    // Update keys at time < quiesce period. Fetcher will JIT update since it is the initial key
+    // load.
+    jwksFetcher()->setKeys(getPartialTestJWKSet());
+    getClock()->advance(Seconds{3});
+    ASSERT_OK(jwkManager()->getValidator("custom-key-1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("custom-key-2"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-prime256v1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-secp384r1"sv));
+    ASSERT_EQ(jwkManager()->size(), 1);
+
+    // Add remaining keys at time < quiesce period. Fetcher should not update.
+    jwksFetcher()->setKeys(getCompleteTestJWKSet());
+    getClock()->advance(Seconds{3});
+    ASSERT_OK(jwkManager()->getValidator("custom-key-1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("custom-key-2"sv));
+    ASSERT_EQ(jwkManager()->size(), 1);
+
+    // Advance clock further, but imagine that the JWKS endpoint goes down, Fetcher should
+    // attempt a JIT and fail for all of the new keys.
+    getClock()->advance(Seconds{3});
+    jwksFetcher()->setShouldFail(true /* shouldFail */);
+    ASSERT_OK(jwkManager()->getValidator("custom-key-1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("custom-key-2"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-prime256v1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-secp384r1"sv));
+    ASSERT_EQ(jwkManager()->size(), 1);
+
+    // Advance clock for less than the quiesce period. The JWKS endpoint is back up now,
+    // but the fetcher should refuse to perform another JIT since the quiesce period is now
+    // in effect from the last, failed, JIT refresh.
+    getClock()->advance(Seconds{3});
+    jwksFetcher()->setShouldFail(false /* shouldFail */);
+    ASSERT_OK(jwkManager()->getValidator("custom-key-1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("custom-key-2"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-prime256v1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-secp384r1"sv));
+    ASSERT_EQ(jwkManager()->size(), 1);
+
+    // Advance clock past the quiesce period. The JWKS endpoint is still up, so
+    // the JIT should finally succeed and all validators should be available.
+    getClock()->advance(Seconds{3});
+    ASSERT_OK(jwkManager()->getValidator("custom-key-1"sv));
+    ASSERT_OK(jwkManager()->getValidator("custom-key-2"sv));
+    ASSERT_OK(jwkManager()->getValidator("ec-prime256v1"sv));
+    ASSERT_OK(jwkManager()->getValidator("ec-secp384r1"sv));
+    ASSERT_EQ(jwkManager()->size(), 4);
+}
+
+TEST_F(JWKManagerTest, parseJWKSetUnsupportedCurve) {
+    auto data = getUnsupportedCurveJWKSet();
+    jwksFetcher()->setKeys(data);
+    Status st = jwkManager()->loadKeys();
+    ASSERT_NOT_OK(st);
+    ASSERT_EQ(st.code(), 10858402);
+    ASSERT_NOT_OK(jwkManager()->getValidator("ec-secp521r1"sv));
+}
+
+TEST_F(JWKManagerTest, parseJWKSetUnsupportedProtocol) {
+    auto data = getUnsupportedProtocolJWKSet();
+    jwksFetcher()->setKeys(data);
+    Status st = jwkManager()->loadKeys();
+    // Unsupported protocol should be skipped
+    ASSERT_OK(st);
+    ASSERT_OK(jwkManager()->getValidator("ec-prime256v1"sv));
+    ASSERT_NOT_OK(jwkManager()->getValidator("hs256"sv));
+}
+
+TEST(UnixEpochTest, UnixEpochParse) {
+    auto doParse = [](const auto& val) {
+        return parseUnixEpoch(BSON("unix" << val).firstElement()).toDurationSinceEpoch();
+    };
+
+    ASSERT_EQ(doParse(1234567890LL), Seconds{1234567890});
+    ASSERT_EQ(doParse(123.0), Seconds{123});
+    ASSERT_THROWS_CODE_AND_WHAT(doParse(345.6),
+                                AssertionException,
+                                ErrorCodes::FailedToParse,
+                                "Expected an integer: unix: 345.6");
+    ASSERT_THROWS_CODE_AND_WHAT(doParse("bob"),
+                                AssertionException,
+                                ErrorCodes::BadValue,
+                                "Epoch value must be numeric, got: string");
+    ASSERT_THROWS_CODE_AND_WHAT(doParse(std::numeric_limits<double>::infinity()),
+                                AssertionException,
+                                ErrorCodes::FailedToParse,
+                                "Cannot represent as a 64-bit integer: unix: inf");
+}
+
+TEST(UnixEpochTest, EpochsSerialize) {
+    BSONObjBuilder bob;
+    serializeUnixEpoch(Date_t::fromDurationSinceEpoch(Days{1}), "unix", &bob);
+    auto obj = bob.obj();
+    auto unixElem = obj["unix"];
+    ASSERT_EQ(unixElem.type(), BSONType::numberLong);
+    ASSERT_EQ(unixElem.numberLong(), durationCount<Seconds>(Days{1}));
+}
+
+}  // namespace
+}  // namespace mongo::crypto::test

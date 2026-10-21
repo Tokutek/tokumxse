@@ -1,0 +1,744 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/update_driver.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data_comparator.h"
+#include "mongo/bson/bsonelement_comparator.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/str.h"
+
+#include <map>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+using unittest::assertGet;
+
+write_ops::UpdateModification makeUpdateMod(const BSONObj& bson) {
+    return write_ops::UpdateModification::parseFromClassicUpdate(bson);
+}
+
+TEST(Parse, Normal) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(driver.parse(makeUpdateMod(fromjson("{$set:{a:1}}")), arrayFilters));
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
+}
+
+TEST(Parse, MultiMods) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(driver.parse(makeUpdateMod(fromjson("{$set:{a:1, b:1}}")), arrayFilters));
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
+}
+
+TEST(Parse, MixingMods) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(
+        driver.parse(makeUpdateMod(fromjson("{$set:{a:1}, $unset:{b:1}}")), arrayFilters));
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
+}
+
+TEST(Parse, ObjectReplacment) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(
+        driver.parse(makeUpdateMod(fromjson("{obj: \"obj replacement\"}")), arrayFilters));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kReplacement);
+}
+
+TEST(Parse, ParseUpdateWithPipeline) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto updateObj = BSON("u" << BSON_ARRAY(BSON("$addFields" << BSON("a" << 1))));
+    ASSERT_DOES_NOT_THROW(driver.parse(updateObj["u"], arrayFilters));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kPipeline);
+}
+
+TEST(Parse, ParseUpdateWithPipelineAndVariables) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    const auto variables = BSON("var1" << 1 << "var2"
+                                       << "foo");
+    auto updateObj = BSON("u" << BSON_ARRAY(BSON("$set" << BSON("a" << "$$var1"
+                                                                    << "b"
+                                                                    << "$$var2"))));
+    ASSERT_DOES_NOT_THROW(driver.parse(updateObj["u"], arrayFilters, variables));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kPipeline);
+}
+
+TEST(Parse, EmptyMod) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    // Verifies that {$set: {}} is accepted.
+    ASSERT_DOES_NOT_THROW(driver.parse(makeUpdateMod(fromjson("{$set: {}}")), arrayFilters));
+}
+
+TEST(Parse, WrongMod) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_THROWS_CODE_AND_WHAT(driver.parse(makeUpdateMod(fromjson("{$xyz:{a:1}}")), arrayFilters),
+                                AssertionException,
+                                ErrorCodes::FailedToParse,
+                                "Unknown modifier: $xyz. Expected a valid update modifier or "
+                                "pipeline-style update specified as an array");
+}
+
+TEST(Parse, WrongType) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        driver.parse(makeUpdateMod(fromjson("{$set:[{a:1}]}")), arrayFilters),
+        AssertionException,
+        ErrorCodes::FailedToParse,
+        "Modifiers operate on fields but we found type array instead. For "
+        "example: {$mod: {<field>: ...}} not {$set: [ { a: 1 } ]}");
+}
+
+TEST(Parse, ModsWithLaterObjReplacement) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        driver.parse(makeUpdateMod(fromjson("{$set:{a:1}, obj: \"obj replacement\"}")),
+                     arrayFilters),
+        AssertionException,
+        ErrorCodes::FailedToParse,
+        "Unknown modifier: obj. Expected a valid update modifier or pipeline-style update "
+        "specified as an array");
+}
+
+TEST(Parse, SetOnInsert) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(
+        driver.parse(makeUpdateMod(fromjson("{$setOnInsert:{a:1}}")), arrayFilters));
+    ASSERT_FALSE(driver.type() == UpdateDriver::UpdateType::kReplacement);
+}
+
+TEST(Parse, V1OplogUpdatesOnNonOplogApplicationPath) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    // Oplog updates cannot be applied on the fromOplogApplication path
+    driver.setFromOplogApplication(false);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        driver.parse(makeUpdateMod(fromjson("{$v: 1, $set: {a:1}}")), arrayFilters),
+        AssertionException,
+        ErrorCodes::FailedToParse,
+        "The $v update field is only recognized internally");
+}
+
+TEST(Parse, V2OplogUpdatesOnNonOplogApplicationPath) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    // Oplog updates cannot be applied on the fromOplogApplication path
+    driver.setFromOplogApplication(false);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        driver.parse(makeUpdateMod(fromjson("{$v: 2, diff: {i: {a:1}}}")), arrayFilters),
+        AssertionException,
+        ErrorCodes::FailedToParse,
+        "The $v update field is only recognized internally");
+}
+
+TEST(Parse, ExplicitV1OplogEntry) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    // Oplog updates can only be applied on the fromOplogApplication path
+    driver.setFromOplogApplication(true);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(
+        driver.parse(makeUpdateMod(fromjson("{$v: 1, $set: {a:1}}")), arrayFilters));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kOperator);
+}
+
+TEST(Parse, ImplicitV1OplogEntry) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    // Oplog updates can only be applied on the fromOplogApplication path
+    driver.setFromOplogApplication(true);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_DOES_NOT_THROW(driver.parse(makeUpdateMod(fromjson("{$set: {a:1}}")), arrayFilters));
+    ASSERT_TRUE(driver.type() == UpdateDriver::UpdateType::kOperator);
+}
+
+TEST(Parse, V1WithDuplicateVersionField) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    UpdateDriver driver(expCtx);
+    // Oplog updates can only be applied on the fromOplogApplication path
+    driver.setFromOplogApplication(true);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        driver.parse(makeUpdateMod(fromjson("{$v: 1, $set: {a:1}, $v: 1}")), arrayFilters),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "Duplicate $v in oplog update document");
+}
+
+TEST(Collator, SetCollationUpdatesModifierInterfaces) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    CollatorInterfaceMock reverseStringCollator(CollatorInterfaceMock::MockType::kReverseString);
+    BSONObj updateDocument = fromjson("{$max: {a: 'abd'}}");
+    UpdateDriver driver(expCtx);
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+    ASSERT_DOES_NOT_THROW(driver.parse(makeUpdateMod(updateDocument), arrayFilters));
+
+    const bool validateForStorage = true;
+    const FieldRefSet emptyImmutablePaths;
+    const bool isInsert = false;
+    bool modified = false;
+    mutablebson::Document doc(fromjson("{a: 'cba'}"));
+    driver.setCollator(&reverseStringCollator);
+    ASSERT_OK(driver.update(expCtx->getOperationContext(),
+                            std::string_view(),
+                            &doc,
+                            validateForStorage,
+                            emptyImmutablePaths,
+                            isInsert,
+                            nullptr,
+                            &modified));
+
+    ASSERT_TRUE(modified);
+}
+
+//
+// Tests of creating a base for an upsert from a query document
+// $or, $and, $all get special handling, as does the _id field
+//
+// NONGOAL: Testing all query parsing and nesting combinations
+//
+
+class CreateFromQueryFixture : public ServiceContextTest {
+public:
+    CreateFromQueryFixture()
+        : _driverOps(new UpdateDriver(ExpressionContextBuilder{}
+                                          .opCtx(_opCtx.get())
+                                          .ns(NamespaceString::createNamespaceString_forTest("foo"))
+                                          .build())),
+          _driverRepl(
+              new UpdateDriver(ExpressionContextBuilder{}
+                                   .opCtx(_opCtx.get())
+                                   .ns(NamespaceString::createNamespaceString_forTest("foo"))
+                                   .build())) {
+        _driverOps->parse(makeUpdateMod(fromjson("{$set:{'_':1}}")), _arrayFilters);
+        _driverRepl->parse(makeUpdateMod(fromjson("{}")), _arrayFilters);
+    }
+
+    mutablebson::Document& doc() {
+        return _doc;
+    }
+
+    UpdateDriver& driverOps() {
+        return *_driverOps;
+    }
+
+    UpdateDriver& driverRepl() {
+        return *_driverRepl;
+    }
+
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+private:
+    ServiceContext::UniqueOperationContext _opCtx{makeOperationContext()};
+
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> _arrayFilters;
+    std::unique_ptr<UpdateDriver> _driverOps;
+    std::unique_ptr<UpdateDriver> _driverRepl;
+    mutablebson::Document _doc;
+};
+
+// Make name nicer to report
+typedef CreateFromQueryFixture CreateFromQuery;
+
+static void assertSameFields(const BSONObj& docA, const BSONObj& docB);
+
+/**
+ * Recursively asserts that two BSONElements contain the same data or sub-elements,
+ * ignoring element order.
+ */
+static void assertSameElements(const BSONElement& elA, const BSONElement& elB) {
+    BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore,
+                                 &simpleStringDataComparator);
+    if (elA.type() != elB.type() || (!elA.isABSONObj() && eltCmp.evaluate(elA != elB))) {
+        FAIL(std::string(str::stream() << "element " << elA << " not equal to " << elB));
+    } else if (elA.type() == BSONType::array) {
+        std::vector<BSONElement> elsA = elA.Array();
+        std::vector<BSONElement> elsB = elB.Array();
+        if (elsA.size() != elsB.size())
+            FAIL(std::string(str::stream() << "element " << elA << " not equal to " << elB));
+
+        std::vector<BSONElement>::iterator arrItA = elsA.begin();
+        std::vector<BSONElement>::iterator arrItB = elsB.begin();
+        for (; arrItA != elsA.end(); ++arrItA, ++arrItB) {
+            assertSameElements(*arrItA, *arrItB);
+        }
+    } else if (elA.type() == BSONType::object) {
+        assertSameFields(elA.Obj(), elB.Obj());
+    }
+}
+
+/**
+ * Recursively asserts that two BSONObjects contain the same elements,
+ * ignoring element order.
+ */
+static void assertSameFields(const BSONObj& docA, const BSONObj& docB) {
+    if (docA.nFields() != docB.nFields())
+        FAIL(std::string(str::stream()
+                         << "document " << docA << " has different fields than " << docB));
+
+    std::map<std::string_view, BSONElement> docAMap;
+    BSONObjIterator itA(docA);
+    while (itA.more()) {
+        BSONElement elA = itA.next();
+        docAMap.insert(std::make_pair(elA.fieldNameStringData(), elA));
+    }
+
+    BSONObjIterator itB(docB);
+    while (itB.more()) {
+        BSONElement elB = itB.next();
+
+        std::map<std::string_view, BSONElement>::iterator seenIt =
+            docAMap.find(elB.fieldNameStringData());
+        if (seenIt == docAMap.end())
+            FAIL(std::string(str::stream() << "element " << elB << " not found in " << docA));
+
+        BSONElement elA = seenIt->second;
+        assertSameElements(elA, elB);
+    }
+}
+
+TEST_F(CreateFromQuery, BasicOp) {
+    BSONObj query = fromjson("{a:1,b:2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(query, doc().getObject());
+}
+
+TEST_F(CreateFromQuery, BasicOpEq) {
+    BSONObj query = fromjson("{a:{$eq:1}}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, BasicOpWithId) {
+    BSONObj query = fromjson("{_id:1,a:1,b:2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(query, doc().getObject());
+}
+
+TEST_F(CreateFromQuery, BasicRepl) {
+    BSONObj query = fromjson("{a:1,b:2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, BasicReplWithId) {
+    BSONObj query = fromjson("{_id:1,a:1,b:2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{_id:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, BasicReplWithIdEq) {
+    BSONObj query = fromjson("{_id:{$eq:1},a:1,b:2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{_id:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, NoRootIdOp) {
+    BSONObj query = fromjson("{'_id.a':1,'_id.b':2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{_id:{a:1,b:2}}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, NoRootIdRepl) {
+    BSONObj query = fromjson("{'_id.a':1,'_id.b':2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_NOT_OK(
+        driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+TEST_F(CreateFromQuery, NestedSharedRootOp) {
+    BSONObj query = fromjson("{'a.c':1,'a.b':{$eq:2}}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:{c:1,b:2}}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, OrQueryOp) {
+    BSONObj query = fromjson("{$or:[{a:1}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, OrQueryIdRepl) {
+    BSONObj query = fromjson("{$or:[{_id:1}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{_id:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, OrQueryNoExtractOps) {
+    BSONObj query = fromjson("{$or:[{a:1}, {b:2}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(BSONObj(), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, OrQueryNoExtractIdRepl) {
+    BSONObj query = fromjson("{$or:[{_id:1}, {_id:2}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(BSONObj(), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, AndQueryOp) {
+    BSONObj query = fromjson("{$and:[{'a.c':1},{'a.b':{$eq:2}}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:{c:1,b:2}}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, AndQueryIdRepl) {
+    BSONObj query = fromjson("{$and:[{_id:1},{a:{$eq:2}}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{_id:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, AllArrayOp) {
+    BSONObj query = fromjson("{a:{$all:[1]}}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, AllArrayIdRepl) {
+    BSONObj query = fromjson("{_id:{$all:[1]}, b:2}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{_id:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, ConflictFieldsFailOp) {
+    BSONObj query = fromjson("{a:1,'a.b':1}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_NOT_OK(
+        driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+TEST_F(CreateFromQuery, ConflictFieldsFailSameValueOp) {
+    BSONObj query = fromjson("{a:{b:1},'a.b':1}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_NOT_OK(
+        driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+TEST_F(CreateFromQuery, ConflictWithIdRepl) {
+    BSONObj query = fromjson("{_id:1,'_id.a':1}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_NOT_OK(
+        driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+TEST_F(CreateFromQuery, ConflictAndQueryOp) {
+    BSONObj query = fromjson("{$and:[{a:{b:1}},{'a.b':{$eq:1}}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_NOT_OK(
+        driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+TEST_F(CreateFromQuery, ConflictAllMultipleValsOp) {
+    BSONObj query = fromjson("{a:{$all:[1, 2]}}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_NOT_OK(
+        driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+TEST_F(CreateFromQuery, NoConflictOrQueryOp) {
+    BSONObj query = fromjson("{$or:[{a:{b:1}},{'a.b':{$eq:1}}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(BSONObj(), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, ImmutableFieldsOp) {
+    BSONObj query = fromjson("{$or:[{a:{b:1}},{'a.b':{$eq:1}}]}");
+    FieldRef idFieldRef("_id");
+    FieldRefSet immutablePaths;
+    immutablePaths.insert(&idFieldRef);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(BSONObj(), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, ShardKeyRepl) {
+    BSONObj query = fromjson("{a:{$eq:1}, b:2}");
+    std::vector<std::unique_ptr<FieldRef>> immutablePathsVector;
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("a"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("_id"));
+    FieldRefSet immutablePaths;
+    immutablePaths.fillFrom(immutablePathsVector);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:1}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, NestedShardKeyRepl) {
+    BSONObj query = fromjson("{a:{$eq:1},'b.c':2, d:2}");
+    std::vector<std::unique_ptr<FieldRef>> immutablePathsVector;
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("a"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("b.c"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("_id"));
+    FieldRefSet immutablePaths;
+    immutablePaths.fillFrom(immutablePathsVector);
+    ASSERT_OK(driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:1,b:{c:2}}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, NestedShardKeyOp) {
+    BSONObj query = fromjson("{a:{$eq:1},'b.c':2,d:{$all:[3]},e:2}");
+    std::vector<std::unique_ptr<FieldRef>> immutablePathsVector;
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("a"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("b.c"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("_id"));
+    FieldRefSet immutablePaths;
+    immutablePaths.fillFrom(immutablePathsVector);
+    ASSERT_OK(driverOps().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+    assertSameFields(fromjson("{a:1,b:{c:2},d:3,e:2}"), doc().getObject());
+}
+
+TEST_F(CreateFromQuery, NotFullShardKeyRepl) {
+    BSONObj query = fromjson("{a:{$eq:1}, 'b.c':2, d:2}");
+    std::vector<std::unique_ptr<FieldRef>> immutablePathsVector;
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("a"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("b"));
+    immutablePathsVector.push_back(std::make_unique<FieldRef>("_id"));
+    FieldRefSet immutablePaths;
+    immutablePaths.fillFrom(immutablePathsVector);
+    ASSERT_NOT_OK(
+        driverRepl().populateDocumentWithQueryFields(opCtx(), query, immutablePaths, doc()));
+}
+
+class ModifiedPathsTestFixture : public unittest::Test {
+public:
+    void runUpdate(mutablebson::Document* doc,
+                   const write_ops::UpdateModification& updateSpec,
+                   std::string_view matchedField = std::string_view(),
+                   std::vector<BSONObj> arrayFilterSpec = {},
+                   bool fromOplog = false) {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        _driver = std::make_unique<UpdateDriver>(expCtx);
+        std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+        for (const auto& filter : arrayFilterSpec) {
+            auto parsedFilter = assertGet(MatchExpressionParser::parse(filter, expCtx));
+            auto expr = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+            ASSERT(expr->getPlaceholder());
+            arrayFilters[expr->getPlaceholder().value()] = std::move(expr);
+        }
+
+        _driver->setFromOplogApplication(fromOplog);
+        _driver->parse(updateSpec, arrayFilters);
+
+        const bool validateForStorage = true;
+        const FieldRefSet emptyImmutablePaths;
+        const bool isInsert = false;
+        FieldRefSetWithStorage modifiedPaths;
+        ASSERT_OK(_driver->update(
+            expCtx->getOperationContext(),
+            matchedField,
+            doc,
+            validateForStorage,
+            emptyImmutablePaths,
+            isInsert,
+            nullptr,
+            nullptr,
+            (_driver->type() == UpdateDriver::UpdateType::kOperator) ? &modifiedPaths : nullptr));
+
+        _modifiedPaths = modifiedPaths.toString();
+    }
+
+    std::unique_ptr<UpdateDriver> _driver;
+    std::string _modifiedPaths;
+};
+
+TEST_F(ModifiedPathsTestFixture, SetFieldInRoot) {
+    BSONObj spec = fromjson("{$set: {a: 1}}");
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a}");
+}
+
+TEST_F(ModifiedPathsTestFixture, IncFieldInRoot) {
+    BSONObj spec = fromjson("{$inc: {a: 1}}");
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a}");
+}
+
+TEST_F(ModifiedPathsTestFixture, UnsetFieldInRoot) {
+    BSONObj spec = fromjson("{$unset: {a: ''}}");
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a}");
+}
+
+TEST_F(ModifiedPathsTestFixture, UpdateArrayElement) {
+    BSONObj spec = fromjson("{$set: {'a.0.b': 1}}");
+    mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a.0.b}");
+}
+
+TEST_F(ModifiedPathsTestFixture, SetBeyondTheEndOfArrayShouldReturnPathToArray) {
+    BSONObj spec = fromjson("{$set: {'a.1.b': 1}}");
+    mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a}");
+}
+
+TEST_F(ModifiedPathsTestFixture, InsertingAndUpdatingArrayShouldReturnPathToArray) {
+    BSONObj spec = fromjson("{$set: {'a.0.b': 1, 'a.1.c': 2}}");
+    mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a}");
+
+    spec = fromjson("{$set: {'a.10.b': 1, 'a.1.c': 2}}");
+    mutablebson::Document doc2(fromjson("{a: [{b: 0}, {b: 0}]}"));
+    runUpdate(&doc2, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{a}");
+}
+
+TEST_F(ModifiedPathsTestFixture, UpdateWithPositionalOperator) {
+    BSONObj spec = fromjson("{$set: {'a.$': 1}}");
+    mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
+    runUpdate(&doc, makeUpdateMod(spec), "0"sv);
+    ASSERT_EQ(_modifiedPaths, "{a.0}");
+}
+
+TEST_F(ModifiedPathsTestFixture, UpdateWithPositionalOperatorToNestedField) {
+    BSONObj spec = fromjson("{$set: {'a.$.b': 1}}");
+    mutablebson::Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
+    runUpdate(&doc, makeUpdateMod(spec), "1"sv);
+    ASSERT_EQ(_modifiedPaths, "{a.1.b}");
+}
+
+TEST_F(ModifiedPathsTestFixture, ArrayFilterThatMatchesNoElements) {
+    BSONObj spec = fromjson("{$set: {'a.$[i]': 1}}");
+    BSONObj arrayFilter = fromjson("{i: 0}");
+    mutablebson::Document doc(fromjson("{a: [1, 2, 3]}"));
+    runUpdate(&doc, makeUpdateMod(spec), ""sv, {arrayFilter});
+    ASSERT_EQ(_modifiedPaths, "{a}");
+}
+
+
+TEST_F(ModifiedPathsTestFixture, ReplaceFullDocumentAlwaysAffectsIndex) {
+    BSONObj spec = fromjson("{a: 1, b: 1}");
+    mutablebson::Document doc(fromjson("{a: 0, b: 0}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(_modifiedPaths, "{}");
+}
+
+TEST_F(ModifiedPathsTestFixture, NeedsMatchDetailsIsTrueForPositionalUpdate) {
+    BSONObj spec = fromjson("{$set: {'a.$': 1}}");
+    mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
+    runUpdate(&doc, makeUpdateMod(spec), "0"sv);
+    ASSERT_EQ(true, _driver->needMatchDetails());
+}
+
+TEST_F(ModifiedPathsTestFixture, NeedsMatchDetailsIsFalseForNonPositionalUpdate) {
+    BSONObj spec = fromjson("{$set: {a: 1}}");
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(false, _driver->needMatchDetails());
+}
+
+}  // namespace
+}  // namespace mongo

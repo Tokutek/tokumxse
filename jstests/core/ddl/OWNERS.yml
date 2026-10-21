@@ -1,0 +1,8 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "dbcase*.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog

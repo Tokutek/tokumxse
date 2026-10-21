@@ -1,0 +1,133 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/window_function/window_function_percentile.h"
+
+#include "mongo/db/query/util/represent_as_util.h"
+
+#include <cmath>
+
+namespace mongo {
+namespace {
+// Defense-in-depth bounds check: asserts 'index' is a valid 0-based position into a collection of
+// 'size' values. Both paths through computePercentile() guarantee this by construction (see call
+// sites), so this tassert should never fire.
+int assertRankIndex(int index, size_t size) {
+    tassert(12961700,
+            "percentile rank is not a valid in-bounds index into the window's values",
+            index >= 0 && static_cast<size_t>(index) < size);
+    return index;
+}
+}  // namespace
+
+void WindowFunctionPercentileCommon::add(Value value) {
+    // Only add numeric values.
+    if (!value.numeric()) {
+        return;
+    }
+    const double d = value.coerceToDouble();
+    // NaN violates the strict-weak-ordering required by boost::container::flat_multiset
+    // and would corrupt _values, so skip it (matching AccuratePercentile::incorporate).
+    if (std::isnan(d)) {
+        return;
+    }
+    _values.insert(d);
+    _memUsageTracker.add(sizeof(double));
+}
+
+void WindowFunctionPercentileCommon::remove(Value value) {
+    // Only numeric values were added, so only numeric values need to be removed.
+    if (!value.numeric()) {
+        return;
+    }
+    const double d = value.coerceToDouble();
+    if (std::isnan(d)) {
+        return;
+    }
+
+    auto iter = _values.find(d);
+    tassert(7455904,
+            "Cannot remove a value not tracked by WindowFunctionPercentile",
+            iter != _values.end());
+    _memUsageTracker.add(-static_cast<int64_t>(sizeof(double)));
+    _values.erase(iter);
+}
+
+void WindowFunctionPercentileCommon::reset() {
+    _values.clear();
+    // resetting _memUsageTracker is the responsibility of the derived classes.
+}
+
+Value WindowFunctionPercentileCommon::computePercentile(double p) const {
+    const int n = representAsChecked<int>(_values.size());
+
+    // boost::container::flat_multiset stores the values in ascending order, so we don't need to
+    // sort them before finding the value at index 'rank'.
+    // boost::container::flat_multiset has random-access iterators, so std::advance has an
+    // expected runtime of O(1).
+    if (_method != PercentileMethodEnum::kContinuous) {
+        const int rank = DiscretePercentile::computeTrueRank(n, p);
+        // computeTrueRank() guarantees rank is in [0, n-1]: when p >= 1.0 it returns n-1,
+        // otherwise max(0, ceil(n*p)-1). Since p < 1.0 implies n*p < n and n is an integer,
+        // the result always fits in int and is a valid index.
+        assertRankIndex(rank, _values.size());
+        auto it = _values.begin();
+        std::advance(it, rank);
+        return Value(*it);
+    } else {
+        const double rank = ContinuousPercentile::computeTrueRank(n, p);
+        // representAsChecked<int>() tasserts if rank is non-finite or out of int range.
+        const int ceil_rank =
+            assertRankIndex(representAsChecked<int>(std::ceil(rank)), _values.size());
+        const int floor_rank =
+            assertRankIndex(representAsChecked<int>(std::floor(rank)), _values.size());
+        if (ceil_rank == floor_rank) {  // rank is an exact integer; no interpolation needed
+            auto it = _values.begin();
+            std::advance(it, ceil_rank);
+            return Value(*it);
+        } else {
+            auto it_ceil_rank = _values.begin();
+            std::advance(it_ceil_rank, ceil_rank);
+            auto it_floor_rank = _values.begin();
+            std::advance(it_floor_rank, floor_rank);
+
+            return Value(ContinuousPercentile::linearInterpolate(
+                rank, ceil_rank, floor_rank, *it_ceil_rank, *it_floor_rank));
+        }
+    }
+}
+
+Value WindowFunctionPercentile::getValue(boost::optional<Value> current) const {
+    if (_values.empty()) {
+        std::vector<Value> nulls;
+        nulls.insert(nulls.end(), _ps.size(), Value(BSONNULL));
+        return Value(std::move(nulls));
+    }
+    std::vector<Value> pctls;
+    pctls.reserve(_ps.size());
+    for (double p : _ps) {
+        auto result = WindowFunctionPercentileCommon::computePercentile(p);
+        pctls.push_back(result);
+    }
+
+    return Value(std::move(pctls));
+};
+
+void WindowFunctionPercentile::reset() {
+    WindowFunctionPercentileCommon::reset();
+    _memUsageTracker.set(sizeof(*this) + _ps.capacity() * sizeof(double));
+}
+
+Value WindowFunctionMedian::getValue(boost::optional<Value> current) const {
+    if (_values.empty())
+        return Value{BSONNULL};
+
+    return WindowFunctionPercentileCommon::computePercentile(0.5 /* p */);
+}
+
+void WindowFunctionMedian::reset() {
+    WindowFunctionPercentileCommon::reset();
+    _memUsageTracker.set(sizeof(*this));
+}
+
+}  // namespace mongo

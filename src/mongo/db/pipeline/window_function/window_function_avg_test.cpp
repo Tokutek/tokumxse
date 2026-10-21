@@ -1,0 +1,146 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/window_function/window_function_avg.h"
+
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/unittest/unittest.h"
+
+#include <limits>
+#include <string_view>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+class WindowFunctionAvgTest : public unittest::Test {
+public:
+    WindowFunctionAvgTest() : avg(WindowFunctionAvg(nullptr)) {}
+
+    WindowFunctionAvg avg;
+};
+
+TEST_F(WindowFunctionAvgTest, EmptyWindow) {
+    ASSERT_VALUE_EQ(avg.getValue(), Value{BSONNULL});
+}
+
+TEST_F(WindowFunctionAvgTest, SingletonWindow) {
+    avg.add(Value{5});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{5});
+}
+
+TEST_F(WindowFunctionAvgTest, IgnoresNonnumeric) {
+    avg.add(Value{"not a number"sv});
+    avg.add(Value{1});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{1});
+}
+
+TEST_F(WindowFunctionAvgTest, SmallWindow) {
+    avg.add(Value{5});
+    avg.add(Value{2});
+    avg.add(Value{10});
+    avg.add(Value{3});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{5});
+}
+
+TEST_F(WindowFunctionAvgTest, Removal) {
+    avg.add(Value{5});
+    avg.add(Value{2});
+    avg.add(Value{10});
+    avg.add(Value{3});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{5});
+
+    avg.remove(Value{2});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{6});
+
+    avg.remove(Value{10});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{4});
+}
+
+TEST_F(WindowFunctionAvgTest, FloatingPointAverage) {
+    avg.add(Value{5});
+    avg.add(Value{2});
+    ASSERT_VALUE_EQ(avg.getValue(), Value{7 / 2.0});
+}
+
+TEST_F(WindowFunctionAvgTest, NarrowestType) {
+    avg.add(Value{1});
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDouble);
+
+    avg.add(Value(Decimal128::kPositiveNaN));
+    avg.add(Value(Decimal128::kPositiveInfinity));
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDecimal);
+    // Returned type narrows after removing inf/nan.
+    avg.remove(Value(Decimal128::kPositiveNaN));
+    avg.remove(Value(Decimal128::kPositiveInfinity));
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDouble);
+
+    avg.add(Value{1.5});
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDouble);
+    avg.add(Value{Value(Decimal128("-100000000000000000000000000000"))});
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDecimal);
+    // Returned type narrows after removing all Decimals in window.
+    avg.add(Value{Value(Decimal128("1"))});
+    avg.remove(Value{Value(Decimal128("-100000000000000000000000000000"))});
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDecimal);
+    avg.remove(Value{Value(Decimal128("1"))});
+    ASSERT_EQUALS(avg.getValue().getType(), BSONType::numberDouble);
+}
+
+TEST_F(WindowFunctionAvgTest, HandleNaNs) {
+    Value nan = Value(std::numeric_limits<double>::quiet_NaN());
+
+    avg.add(Value{1});
+    avg.add(nan);
+    ASSERT_VALUE_EQ(avg.getValue(), nan);
+    avg.add(Value{3});
+    ASSERT_VALUE_EQ(avg.getValue(), nan);
+    avg.remove(nan);
+    ASSERT_VALUE_EQ(avg.getValue(), Value{2});
+    // We are not preserving the exact type of NaN.
+    avg.add(Value(Decimal128::kNegativeNaN));
+    ASSERT_VALUE_EQ(avg.getValue(), Value(Decimal128::kPositiveNaN));
+    avg.remove(Value(Decimal128::kNegativeNaN));
+    avg.add(Value(std::numeric_limits<double>::signaling_NaN()));
+    ASSERT_VALUE_EQ(avg.getValue(), nan);
+}
+
+TEST_F(WindowFunctionAvgTest, HandleInfs) {
+    Value posInf1 = Value(std::numeric_limits<double>::infinity());
+    Value negInf1 = Value(-std::numeric_limits<double>::infinity());
+    Value posInf2 = Value(Decimal128::kPositiveInfinity);
+    Value negInf2 = Value(Decimal128::kNegativeInfinity);
+    Value nan = Value(std::numeric_limits<double>::quiet_NaN());
+
+    avg.add(Value{1});  // 1
+    avg.add(posInf1);   // 1, (double) inf
+    ASSERT_VALUE_EQ(avg.getValue(), posInf1);
+
+    avg.remove(posInf1);  // 1
+    ASSERT_VALUE_EQ(avg.getValue(), Value{1});
+
+    avg.add(posInf2);  // 1, (Decimal128) inf
+    ASSERT_VALUE_EQ(avg.getValue(), posInf1);
+
+    avg.remove(posInf2);
+    avg.add(negInf1);  // 1, - (double) inf
+    ASSERT_VALUE_EQ(avg.getValue(), negInf1);
+
+    avg.remove(negInf1);
+    avg.add(negInf2);  // 1, - (Decimal128) inf
+    ASSERT_VALUE_EQ(avg.getValue(), negInf1);
+
+    avg.add(posInf1);  // 1, -inf, inf
+    ASSERT_VALUE_EQ(avg.getValue(), nan);
+
+    avg.remove(posInf1);
+    avg.add(nan);  // 1, -inf, nan
+    ASSERT_VALUE_EQ(avg.getValue(), nan);
+
+    avg.remove(nan);
+    avg.remove(negInf2);  // 1
+    ASSERT_VALUE_EQ(avg.getValue(), Value{1});
+}
+
+}  // namespace
+}  // namespace mongo

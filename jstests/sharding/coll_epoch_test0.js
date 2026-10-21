@@ -1,47 +1,38 @@
-// Tests whether a split and a migrate in a sharded cluster preserve the epoch
+// Tests whether a split and a migrate in a sharded cluster preserve the epoch\
 
-var st = new ShardingTest( { shards : 2, mongos : 1, separateConfig : 1  } )
-// Stop balancer, it'll interfere
-st.stopBalancer()
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var config = st.s.getDB( "config" )
-var admin = st.s.getDB( "admin" )
-var coll = st.s.getCollection( "foo.bar" )
+let st = new ShardingTest({shards: 2, mongos: 1});
+// Balancer is by default stopped, thus it will not interfere
+
+let config = st.s.getDB("config");
+let admin = st.s.getDB("admin");
+const kDbName = "foo";
 
 // First enable sharding
-admin.runCommand({ enableSharding : coll.getDB() + "" })
-admin.runCommand({ shardCollection : coll  + "", key : { _id : 1 } })
+admin.runCommand({enableSharding: kDbName, primaryShard: st.shard1.shardName});
+let coll = st.s.getCollection(kDbName + ".bar");
+admin.runCommand({shardCollection: coll + "", key: {_id: 1}});
 
-var primary = config.databases.find({ _id : coll.getDB() + "" }).primary
-var notPrimary = null
-config.shards.find().forEach( function( doc ){ if( doc._id != primary ) notPrimary = doc._id } )
+let primary = config.databases.find({_id: coll.getDB() + ""}).primary;
+let notPrimary = null;
+config.shards.find().forEach(function (doc) {
+    if (doc._id != primary) notPrimary = doc._id;
+});
 
-var createdEpoch = null;
-var checkEpochs = function(){
-    config.chunks.find({ ns : coll + "" }).forEach( function( chunk ){
-        
-        // Make sure the epochs exist, are non-zero, and are consistent
-        assert( chunk.lastmodEpoch );
-        print( chunk.lastmodEpoch + "" );
-        assert.neq( chunk.lastmodEpoch + "", "000000000000000000000000" )
-        if( createdEpoch == null ) createdEpoch = chunk.lastmodEpoch
-        else assert.eq( createdEpoch, chunk.lastmodEpoch )
-        
-    })
-}   
-
-checkEpochs();
+let originalUuid = config.collections.findOne({_id: coll + ""}).uuid;
+let originalEpoch = config.collections.findOne({_id: coll + ""}).lastmodEpoch;
 
 // Now do a split
-printjson( admin.runCommand({ split : coll + "", middle : { _id : 0 } }) )
+printjson(admin.runCommand({split: coll + "", middle: {_id: 0}}));
 
-// Check all the chunks for epochs
-checkEpochs();
+assert.eq(originalUuid, config.collections.findOne({_id: coll + ""}).uuid);
+assert.eq(originalEpoch, config.collections.findOne({_id: coll + ""}).lastmodEpoch);
 
 // Now do a migrate
-printjson( admin.runCommand({ moveChunk : coll + "", find : { _id : 0 }, to : notPrimary }) )
+printjson(admin.runCommand({moveChunk: coll + "", find: {_id: 0}, to: notPrimary}));
 
-// Check all the chunks for epochs
-checkEpochs();
+assert.eq(originalUuid, config.collections.findOne({_id: coll + ""}).uuid);
+assert.eq(originalEpoch, config.collections.findOne({_id: coll + ""}).lastmodEpoch);
 
-st.stop()
+st.stop();

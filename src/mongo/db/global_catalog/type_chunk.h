@@ -1,0 +1,313 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/global_catalog/type_chunk_base_gen.h"
+#include "mongo/db/global_catalog/type_chunk_range.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+namespace mongo {
+
+class BSONObjBuilder;
+class Status;
+template <typename T>
+class StatusWith;
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ChunkHistory : public ChunkHistoryBase {
+public:
+    using ChunkHistoryBase::serialize;
+    using ChunkHistoryBase::toBSON;
+
+    ChunkHistory() : ChunkHistoryBase() {}
+    ChunkHistory(mongo::Timestamp ts, mongo::ShardId shard) : ChunkHistoryBase() {
+        setValidAfter(std::move(ts));
+        setShard(std::move(shard));
+    }
+    ChunkHistory(const ChunkHistoryBase& b) : ChunkHistoryBase(b) {}
+
+    static StatusWith<std::vector<ChunkHistory>> fromBSON(const BSONArray& source);
+
+    bool operator==(const ChunkHistory& other) const {
+        return getValidAfter() == other.getValidAfter() && getShard() == other.getShard();
+    }
+};
+
+/**
+ * This class represents the layouts and contents of documents contained in the config server's
+ * config.chunks and shard server's config.chunks.uuid collections. All manipulation of documents
+ * coming from these collections should be done with this class. The shard's config.chunks.uuid
+ * collections use the epoch field as the uuid value, and epochs match 1:1 to collection instances
+ * (mmapped in config.collections). Therefore, the shard collections do not need to include epoch or
+ * namespace fields, as these will be known in order to access the collections.
+ *
+ * Expected config server config.chunks collection format:
+ *   {
+ *      _id : "test.foo-a_MinKey",
+ *      uuid : Bindata(UUID),
+ *      min : {
+ *              "a" : { "$minKey" : 1 }
+ *      },
+ *      max : {
+ *              "a" : { "$maxKey" : 1 }
+ *      },
+ *      shard : "test-rs1",
+ *      lastmod : Timestamp(1, 0),
+ *      jumbo : false              // optional field
+ *   }
+ *
+ * Expected shard server config.chunks.<epoch> collection format:
+ *   {
+ *      _id: {
+ *             "a" : { "$minKey" : 1 }
+ *      }
+ *      max : {
+ *              "a" : { "$maxKey" : 1 }
+ *      }
+ *      shard : "test-rs1",
+ *      lastmod : Timestamp(1, 0),
+ *   }
+ *
+ * Note: it is intended to change the config server's collection schema to mirror the new shard
+ * server's collection schema, but that will be future work when the new schema is stable and there
+ * is time to do the extra work, as well as handle the backwards compatibility issues it poses.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ChunkType {
+public:
+    // Name of the chunks collection in the config server.
+    static const NamespaceString ConfigNS;
+
+    // The shard chunks collections' common namespace prefix.
+    static const std::string ShardNSPrefix;
+
+    // Field names and types in the chunks collections.
+    static const BSONField<OID> name;
+    static const BSONField<BSONObj> minShardID;
+    static const BSONField<UUID> collectionUUID;
+    static const BSONField<BSONObj> min;
+    static const BSONField<BSONObj> max;
+    static const BSONField<std::string> shard;
+    static const BSONField<bool> jumbo;
+    static const BSONField<Date_t> lastmod;
+    static const BSONField<BSONObj> history;
+    static const BSONField<int64_t> estimatedSizeBytes;
+    static const BSONField<Timestamp> onCurrentShardSince;
+    static const BSONField<bool> historyIsAt40;
+
+    ChunkType();
+    ChunkType(UUID collectionUUID, ChunkRange range, ChunkVersion version, ShardId shardId);
+
+    /**
+     * Constructs a new ChunkType object from BSON with the following format:
+     * {min: <>, max: <>, shard: <>, uuid: <>, history: <>, jumbo: <>, lastmod: <>,
+     * lastmodEpoch: <>, lastmodTimestamp: <>, onCurrentShardSince: <>}
+     */
+    static StatusWith<ChunkType> parseFromNetworkRequest(const BSONObj& source,
+                                                         bool acceptMissingVersion = false);
+
+    /**
+     * Constructs a new ChunkType object from BSON with the following format:
+     * {_id: <>, min: <>, max: <>, shard: <>, uuid: <>, history: <>, jumbo: <>, lastmod: <>,
+     * estimatedSizeByte: <>, onCurrentShardSince: <>}
+     *
+     * Returns ErrorCodes::NoSuchKey if the '_id' field is missing
+     */
+    static StatusWith<ChunkType> parseFromConfigBSON(const BSONObj& source,
+                                                     const OID& epoch,
+                                                     const Timestamp& timestamp);
+
+    /**
+     * Parses the given chunk documents and validates that they belong to the given collection UUID.
+     * Returns them in the same order as the input.
+     */
+    static std::vector<ChunkType> parseConfigBSONDocuments(const std::vector<BSONObj>& chunkDocs,
+                                                           const UUID& expectedCollectionUUID,
+                                                           const OID& epoch,
+                                                           const Timestamp& timestamp);
+
+    /**
+     * A helper method for using this class with PersistentTaskStore that returns an otherwise
+     * invalid ChunkType object without the proper chunk version set. It is the caller's
+     * responsibility to ensure the ChunkVersion is fixed afterwards.
+     *
+     * TODO SERVER-121075: See if this can be removed.
+     */
+    [[MONGO_MOD_PRIVATE]] static ChunkType parse(const BSONObj& source,
+                                                 const IDLParserContext& ctxt) {
+        return uassertStatusOK(parseFromConfigBSON(source, OID(), Timestamp()));
+    }
+
+    /**
+     * Constructs a new ChunkType object from BSON with the following format:
+     * {_id: <>, max: <>, shard: <>, history: <>, lastmod: <>, onCurrentShardSince: <>}
+     * Also does validation of the contents.
+     */
+    static StatusWith<ChunkType> parseFromShardBSON(const BSONObj& source,
+                                                    const OID& epoch,
+                                                    const Timestamp& timestamp);
+
+    /**
+     * Returns the BSON representation of the entry for the config server's config.chunks
+     * collection.
+     */
+    BSONObj toConfigBSON(bool omitVersion = false) const;
+
+    /**
+     * Returns the BSON representation of the entry for a shard server's config.chunks.<epoch>
+     * collection.
+     */
+    BSONObj toShardBSON() const;
+
+    const OID& getName() const;
+    void setName(const OID& id);
+
+    /**
+     * Getters and setters.
+     */
+    const UUID& getCollectionUUID() const {
+        invariant(_collectionUUID);
+        return *_collectionUUID;
+    }
+    void setCollectionUUID(const UUID& uuid);
+
+    const BSONObj& getMin() const {
+        return _range->getMin();
+    }
+
+    const BSONObj& getMax() const {
+        return _range->getMax();
+    }
+
+    const ChunkRange& getRange() const {
+        return _range.get();
+    }
+    void setRange(const ChunkRange& chunkRange);
+
+    bool isVersionSet() const {
+        return _version.is_initialized();
+    }
+
+    const ChunkVersion& getVersion() const {
+        return _version.get();
+    }
+    void setVersion(const ChunkVersion& version);
+
+    const ShardId& getShard() const {
+        return _shard.get();
+    }
+    void setShard(const ShardId& shard);
+
+    boost::optional<int64_t> getEstimatedSizeBytes() const {
+        return _estimatedSizeBytes;
+    }
+
+    void setEstimatedSizeBytes(const boost::optional<int64_t>& estimatedSize);
+
+    bool getJumbo() const {
+        return _jumbo.get_value_or(false);
+    }
+    void setJumbo(bool jumbo);
+
+    const boost::optional<Timestamp>& getOnCurrentShardSince() const {
+        return _onCurrentShardSince;
+    }
+    void setOnCurrentShardSince(const Timestamp& onCurrentShardSince);
+
+    void setHistory(std::vector<ChunkHistory> history) {
+        _history = std::move(history);
+        if (!_history.empty()) {
+            invariant(_shard == _history.front().getShard());
+        }
+    }
+    const std::vector<ChunkHistory>& getHistory() const {
+        return _history;
+    }
+
+    /**
+     * Returns true if the given shard currently owns this chunk or previously owned it, i.e. it
+     * appears anywhere in the chunk's ownership history.
+     */
+    bool isOwnedNowOrHistoricallyBy(const ShardId& shard) const {
+        if (getShard() == shard) {
+            return true;
+        }
+        for (const auto& entry : _history) {
+            if (entry.getShard() == shard) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void addHistoryToBSON(BSONObjBuilder& builder) const;
+
+    /**
+     * Returns OK if all the mandatory fields have been set. Otherwise returns NoSuchKey and
+     * information about the first field that is missing.
+     */
+    Status validate() const;
+
+    /**
+     * Returns a std::string representation of the current internal state.
+     */
+    std::string toString() const;
+
+private:
+    /**
+     * Parses the base chunk data on all usages:
+     * {history: <>, shard: <>, onCurrentShardSince: <>}
+     */
+    static StatusWith<ChunkType> _parseChunkBase(const BSONObj& source);
+
+
+    // Convention: (M)andatory, (O)ptional, (S)pecial; (C)onfig, (S)hard.
+
+    // (M)(C)     auto-generated object id
+    boost::optional<OID> _id;
+    // (O)(C)     uuid of the collection in the CollectionCatalog
+    boost::optional<UUID> _collectionUUID;
+    // (M)(C)(S)  key range
+    boost::optional<ChunkRange> _range;
+    // (M)(C)(S)  version of this chunk
+    boost::optional<ChunkVersion> _version;
+    // (M)(C)(S)  shard this chunk lives in
+    boost::optional<ShardId> _shard;
+    // (O)(C)     chunk size used for chunk merging operation
+    boost::optional<int64_t> _estimatedSizeBytes;
+    // (O)(C)     too big to move?
+    boost::optional<bool> _jumbo;
+    // (M)(C)(S)  timestamp since this chunk belongs to the current shard
+    boost::optional<Timestamp> _onCurrentShardSince;
+    // history of the chunk
+    std::vector<ChunkHistory> _history;
+};
+
+}  // namespace mongo

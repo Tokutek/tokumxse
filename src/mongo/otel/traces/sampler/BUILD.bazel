@@ -1,0 +1,49 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)
+
+mongo_cc_library(
+    name = "sampler",
+    srcs = [
+        "sampler.cpp",
+        "sampler_server_status_section.cpp",
+    ],
+    deps = [
+        ":sampling_config",
+        "//src/mongo:base",
+        "//src/mongo/db/admission:rate_limiter",
+        "//src/mongo/db/admission:rate_limiter_otel_metrics_recorder",
+        "//src/mongo/db/commands/server_status:server_status_core",
+        "//src/mongo/otel/metrics:otel_metrics_service",
+        "//src/mongo/otel/traces/span:span_name",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "sampler_test",
+    srcs = ["sampler_test.cpp"],
+    tags = [
+        "mongo_unittest_third_group",
+        "tracing_test",
+    ],
+    deps = [
+        ":sampler",
+        ":sampling_config",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/otel/traces/span:span_names",
+    ],
+)
+
+mongo_cc_library(
+    name = "sampling_config",
+    hdrs = ["sampling_config.h"],
+    deps = [
+        "//src/mongo:base",
+    ],
+)

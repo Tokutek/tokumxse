@@ -1,0 +1,79 @@
+VARIATION buildGraph
+output: {
+    "nodes": [
+        {
+            "collectionName": "local.a",
+            "accessPath": {
+                "filter": {
+                    "a": {
+                        "$eq": {"$numberInt":"1"}
+                    }
+                }
+            },
+            "embedPath": ""
+        },
+        {
+            "collectionName": "local.b",
+            "accessPath": {
+                "filter": {
+                    "b": {
+                        "$eq": {"$numberInt":"1"}
+                    }
+                }
+            },
+            "embedPath": "b"
+        },
+        {
+            "collectionName": "local.c",
+            "accessPath": {
+                "filter": {
+                    "c": {
+                        "$eq": {"$numberInt":"1"}
+                    }
+                }
+            },
+            "embedPath": "c"
+        },
+        {
+            "collectionName": "local.d",
+            "accessPath": {},
+            "embedPath": "d"
+        }
+    ],
+    "edges": [
+        {
+            "predicates": [
+                {
+                    "op": "eq",
+                    "left": {"$numberInt":"0"},
+                    "right": {"$numberInt":"1"}
+                }
+            ],
+            "left": {"$numberInt":"0"},
+            "right": {"$numberInt":"1"}
+        },
+        {
+            "predicates": [
+                {
+                    "op": "eq",
+                    "left": {"$numberInt":"2"},
+                    "right": {"$numberInt":"3"}
+                }
+            ],
+            "left": {"$numberInt":"0"},
+            "right": {"$numberInt":"2"}
+        },
+        {
+            "predicates": [
+                {
+                    "op": "eq",
+                    "left": {"$numberInt":"4"},
+                    "right": {"$numberInt":"5"}
+                }
+            ],
+            "left": {"$numberInt":"2"},
+            "right": {"$numberInt":"3"}
+        }
+    ]
+}
+

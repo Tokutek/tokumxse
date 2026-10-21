@@ -1,0 +1,27 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    testDuplicateParameter:
+        description: "This parameter exists and will cause duplicate error"
+        set_at: [startup]
+        cpp_varname: gTestDuplicateParameter
+        cpp_vartype: int
+        default: 50
+        redact: false
+
+commands:
+    testDuplicateParameter:
+        description: "This command has the same name as a server parameter"
+        command_name: testDuplicateParameter
+        namespace: ignored
+        cpp_name: testDuplicateParameter
+        strict: true
+        api_version: "1"
+        reply_type: OkReply

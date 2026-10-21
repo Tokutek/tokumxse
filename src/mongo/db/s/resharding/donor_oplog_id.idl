@@ -1,0 +1,38 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the _id format of oplog entry stored in config.localReshardingOplogBuffer.*.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ReshardingDonorOplogId:
+        description: >-
+            Represents the set of timestamps that belong to an operation from the donor shard.
+        generate_comparison_operators: true
+        # Use strict:true because this type is used as the structure for the _id value in documents
+        # and requires being an exact match.
+        strict: true
+        fields:
+            clusterTime:
+                type: timestamp
+                description: >-
+                    The oplog entry timestamp of the final oplog entry of a transaction. If the
+                    operation is not from a transaction, then it is the same value as the ts field.
+            ts:
+                type: timestamp
+                description: "The oplog entry timestamp associated with this operation."
+            progressMarkId:
+                type: int
+                description: >-
+                    This is only set if this is a progress mark noop oplog entry created by the
+                    oplog fetcher during the "applying" state. The increasing integer id is used
+                    to differentiate a progress marker oplog entry from a regular oplog entry or
+                    another progress marker oplog entry that corresponds to the same oplog entry
+                    on the donor.
+                optional: true

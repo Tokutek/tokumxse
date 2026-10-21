@@ -1,0 +1,9 @@
+load("//bazel/uv:defs.bzl", "dependency")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)

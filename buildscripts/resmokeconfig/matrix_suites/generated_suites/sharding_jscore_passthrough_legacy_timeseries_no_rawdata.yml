@@ -1,0 +1,58 @@
+##########################################################
+# THIS IS A GENERATED FILE -- DO NOT MODIFY.
+# IF YOU WISH TO MODIFY THIS SUITE, MODIFY THE CORRESPONDING MATRIX SUITE MAPPING FILE
+# AND REGENERATE THE MATRIX SUITES.
+#
+# matrix suite mapping file: buildscripts/resmokeconfig/matrix_suites/mappings/sharding_jscore_passthrough_legacy_timeseries_no_rawdata.yml
+# regenerate matrix suites: buildscripts/resmoke.py generate-matrix-suites
+##########################################################
+executor:
+  archive:
+    hooks:
+      - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
+      - ValidateCollections
+  config:
+    shell_options:
+      eval: await import("jstests/libs/override_methods/pin_fcv_to_last_continuous.js");
+      global_vars:
+        TestData:
+          doNotUseRawDataOperations: true
+  fixture:
+    class: ShardedClusterFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        internalQueryStatsErrorsAreCommandFatal: true
+        internalQueryStatsSampleRate: 1.0
+        internalQueryStatsWriteCmdSampleRate: 1
+    mongos_options:
+      set_parameters:
+        enableTestCommands: 1
+        internalQueryStatsErrorsAreCommandFatal: true
+        internalQueryStatsSampleRate: 1.0
+        internalQueryStatsWriteCmdSampleRate: 1
+    num_mongos: 2
+    num_rs_nodes_per_shard: 1
+    num_shards: 2
+  hooks:
+    - class: RunQueryStats
+    - class: CheckReplDBHash
+    - class: CheckMetadataConsistencyInBackground
+    - class: ValidateCollections
+    - class: CheckShardFilteringMetadata
+    - class: CheckOrphansDeleted
+    - class: CheckConnectionCount
+      max_connections_per_test: 1000
+    - class: CleanEveryN
+      n: 20
+matrix_suite: true
+selector:
+  exclude_with_any_tags:
+    - assumes_standalone_mongod
+    - assumes_against_mongod_not_mongos
+    - requires_profiling
+    - requires_fcv_91
+  roots:
+    - jstests/core/timeseries/**/*.js
+test_kind: js_test

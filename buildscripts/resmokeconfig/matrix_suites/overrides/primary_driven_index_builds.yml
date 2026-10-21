@@ -1,0 +1,149 @@
+- name: enable_primary_driven_index_builds_feature_flag_mongod
+  value:
+    executor:
+      fixture:
+        mongod_options:
+          set_parameters:
+            featureFlagContainerWrites: 1
+            featureFlagPrimaryDrivenIndexBuilds: 1
+            featureFlagResumablePrimaryDrivenIndexBuilds: 1
+            featureFlagRecordIdsReplicated: 1
+- name: enable_primary_driven_index_builds_feature_flag_mongos
+  value:
+    executor:
+      fixture:
+        mongos_options:
+          set_parameters:
+            featureFlagContainerWrites: 1
+            featureFlagPrimaryDrivenIndexBuilds: 1
+            featureFlagResumablePrimaryDrivenIndexBuilds: 1
+            featureFlagRecordIdsReplicated: 1
+- name: enable_primary_driven_index_builds_feature_flag_testdata_parameter_mongod
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              setParameters:
+                featureFlagContainerWrites: true
+                featureFlagPrimaryDrivenIndexBuilds: true
+                featureFlagResumablePrimaryDrivenIndexBuilds: true
+                featureFlagRecordIdsReplicated: true
+- name: enable_primary_driven_index_builds_feature_flag_testdata_parameter_mongos
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              setParametersMongos:
+                featureFlagContainerWrites: true
+                featureFlagPrimaryDrivenIndexBuilds: true
+                featureFlagResumablePrimaryDrivenIndexBuilds: true
+                featureFlagRecordIdsReplicated: true
+- name: exclude_primary_driven_index_builds_incompatible_tag
+  value:
+    exclude_with_any_tags:
+      - resumable_primary_driven_index_builds_incompatible
+      - primary_driven_index_builds_incompatible
+      - rolling_index_builds
+      - requires_commit_quorum
+      - requires_capped
+      - requires_rollbacks
+      # Primary-driven index builds are not resumable.
+      - requires_index_build_resumability
+- name: exclude_primary_driven_index_builds_incompatible_with_retryable_writes_tag
+  value:
+    exclude_with_any_tags:
+      # Tests marked with this tag are excluded because primary-driven index builds use batched
+      # writes which config.image_collection does not support.
+      - primary_driven_index_builds_incompatible_with_retryable_writes
+- name: enable_spurious_write_conflicts_hook
+  value:
+    executor:
+      hooks:
+        - class: EnableSpuriousWriteConflicts
+          shell_options:
+            global_vars:
+              TestData:
+                WTWriteConflictExceptionChance: 0.001
+                WTWriteConflictExceptionForReadsChance: 0
+# concurrency_replication's base hooks list is replaced (not appended) when using `overrides`,
+# so we re-declare it here with EnableSpuriousWriteConflicts at the front. Enable must come first
+# so its after_test (which turns the failpoint off) runs before the validation/cleanup hooks'
+# after_test, otherwise validation writes hit the failpoint.
+- name: enable_spurious_write_conflicts_hook_concurrency_replication
+  value:
+    executor:
+      hooks:
+        - class: EnableSpuriousWriteConflicts
+          shell_options:
+            global_vars:
+              TestData:
+                WTWriteConflictExceptionChance: 0.001
+                WTWriteConflictExceptionForReadsChance: 0
+        - class: RunDBCheckInBackground
+        - class: CheckReplDBHashInBackground
+        - class: ValidateCollectionsInBackground
+        - class: CheckReplDBHash
+        - class: ValidateCollections
+        - class: CleanupConcurrencyWorkloads
+# For suites without a persistent fixture (replica_sets, no_passthrough), the hook can't connect
+# to find servers. Instead we inject the failpoints via TestData.setParameters so servers.js
+# automatically passes them as --setParameter to every mongod the test starts.
+- name: enable_spurious_write_conflicts_startup_parameters
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              setParameters:
+                "failpoint.WTWriteConflictException":
+                  mode:
+                    activationProbability: 0.001
+                "failpoint.WTWriteConflictExceptionForReads":
+                  mode:
+                    activationProbability: 0
+- name: implicitly_retry_transactions_on_write_conflicts
+  value:
+    executor:
+      config:
+        shell_options:
+          eval: >-
+            await import('jstests/libs/override_methods/implicitly_retry_transactions_on_write_conflicts.js');
+- name: all_no_passthrough_index_builds_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        - jstests/noPassthrough/**/index_builds/**/*.js
+- name: all_replica_sets_index_builds_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        - jstests/replsets/**/*index_build*.js
+        - jstests/replsets/container_operations.js
+- name: all_sharding_index_builds_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        - jstests/sharding/*index_build*.js
+- name: all_concurrency_index_builds_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        - jstests/concurrency/fsm_workloads/index_builds/*.js
+        - jstests/concurrency/fsm_workloads/ddl/create_index_background/*.js
+- name: all_auth_commands_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        # We are primarily concerned with coverage of the containerInsert and containerDelete
+        # action type, so this selector is sufficient.
+        - jstests/auth/commands_*.js

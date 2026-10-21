@@ -1,0 +1,139 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/query_shard_server_test_fixture.h"
+
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+
+#include <string_view>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+namespace {
+IndexSpec makeIndexSpec(const BSONObj& index, std::string_view indexName) {
+    IndexSpec spec;
+    spec.name(indexName);
+    spec.addKeys(index);
+    return spec;
+}
+
+void validateOutput(const WorkingSet& ws, const WorkingSetID wsid, const BSONObj& expectedKeyData) {
+    // For some reason (at least under OS X clang), we cannot refer to INVALID_ID inside the test
+    // assertion macro.
+    WorkingSetID invalid = WorkingSet::INVALID_ID;
+    ASSERT_NOT_EQUALS(invalid, wsid);
+
+    auto member = ws.get(wsid);
+
+    if (member->hasObj()) {
+        ASSERT_BSONOBJ_EQ(expectedKeyData, member->doc.value().toBson());
+    } else {
+        // Key value is retrieved from working set key data instead of RecordId.
+        ASSERT_EQ(member->keyData.size(), 1);
+        ASSERT_BSONOBJ_EQ(expectedKeyData, member->keyData[0].keyData);
+    }
+}
+}  // namespace
+
+void QueryShardServerTestFixture::doWorkAndValidate(
+    PlanStage& stage,
+    WorkingSet& ws,
+    WorkingSetID& wsid,
+    const std::vector<DoWorkResult>& expectedWorkPattern) {
+    for (const auto& nextExpectedWork : expectedWorkPattern) {
+        const auto nextState = stage.work(&wsid);
+        visit(OverloadedVisitor{
+                  [&nextState](PlanStage::StageState state) { ASSERT_EQ(nextState, state); },
+                  [&nextState, &ws, &wsid](const BSONObj& expectedKeyData) {
+                      ASSERT_EQ(nextState, PlanStage::ADVANCED);
+                      validateOutput(ws, wsid, expectedKeyData);
+                  }},
+              nextExpectedWork);
+    }
+}
+
+void QueryShardServerTestFixture::setUp() {
+    ShardServerTestFixture::setUp();
+    OperationContext* opCtx = operationContext();
+
+    _testNss = NamespaceString::createNamespaceString_forTest("test_db.distinct_test"sv);
+    _expCtx = std::make_unique<ExpressionContextForTest>(opCtx, _testNss);
+    _client = std::make_unique<DBDirectClient>(opCtx);
+}
+
+void QueryShardServerTestFixture::createIndex(const BSONObj index, std::string indexName) {
+    _client->createCollection(_testNss);
+    _client->createIndex(_testNss, makeIndexSpec(index, indexName));
+}
+
+void QueryShardServerTestFixture::insertDocs(const std::vector<BSONObj>& docs) {
+    // Do batched inserts for larger collection sizes.
+    const auto batchSize = docs.size() > 10000 ? 10000 : docs.size();
+    write_ops::InsertCommandRequest insertOp(_testNss);
+    std::vector<BSONObj> batch;
+    batch.reserve(batchSize);
+    auto it = docs.begin();
+    size_t docsSoFar = 0;
+    while (it != docs.end()) {
+        size_t numInCurBatch = std::min(batchSize, docs.size() - docsSoFar);
+        batch.insert(batch.begin(), it, it + numInCurBatch);
+        insertOp.setDocuments(std::move(batch));
+        batch.clear();
+        auto insertReply = _client->insert(insertOp);
+        ASSERT_FALSE(insertReply.getWriteErrors());
+        std::advance(it, numInCurBatch);
+        docsSoFar += numInCurBatch;
+    }
+}
+
+const IndexCatalogEntry& QueryShardServerTestFixture::getIndexEntry(const CollectionPtr& coll,
+                                                                    std::string_view indexName) {
+    auto* opCtx = operationContext();
+    const auto* entry = coll->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    ASSERT_NE(entry, nullptr);
+    return *entry;
+}
+
+CollectionMetadata QueryShardServerTestFixture::prepareTestData(
+    const KeyPattern& shardKeyPattern, const std::vector<ChunkDesc>& chunkDescs) {
+    const UUID uuid = UUID::gen();
+    const OID epoch = OID::gen();
+
+    ShardId curShard("0");
+    ShardId otherShard("1");
+    ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
+
+    _chunks.clear();
+    _chunks.reserve(chunkDescs.size());
+    for (auto&& chunkDesc : chunkDescs) {
+        ChunkType c{uuid, chunkDesc.range, version, chunkDesc.isOnCurShard ? curShard : otherShard};
+        _chunks.push_back(c);
+    };
+
+    auto rt = RoutingTableHistory::makeNew(_testNss,
+                                           uuid,
+                                           shardKeyPattern,
+                                           false, /* unsplittable */
+                                           nullptr,
+                                           false,
+                                           epoch,
+                                           Timestamp(1, 1),
+                                           boost::none /* timeseriesFields */,
+                                           boost::none /* reshardingFields */,
+                                           true,
+                                           _chunks);
+
+    CurrentChunkManager cm(makeStandaloneRoutingTableHistory(std::move(rt)));
+    ASSERT_EQ(_chunks.size(), cm.numChunks());
+
+    {
+        auto scopedCsr = CollectionShardingRuntime::acquireExclusive(operationContext(), _testNss);
+        scopedCsr->setCollectionMetadata(operationContext(), CollectionMetadata(cm, curShard));
+    }
+
+    _manager = std::make_shared<MetadataManager>(
+        getServiceContext(), _testNss, CollectionMetadata(cm, curShard));
+
+    return CollectionMetadata(std::move(cm), curShard);
+}
+}  // namespace mongo

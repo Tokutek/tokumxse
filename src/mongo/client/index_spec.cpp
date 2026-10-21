@@ -1,0 +1,207 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/client/index_spec.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+
+namespace mongo {
+
+const char IndexSpec::kIndexValText[] = "text";
+const char IndexSpec::kIndexValGeo2D[] = "2d";
+const char IndexSpec::kIndexValGeo2DSphere[] = "2dsphere";
+const char IndexSpec::kIndexValHashed[] = "hashed";
+
+namespace {
+
+const int kIndexTypeNumbers[] = {IndexSpec::kIndexValAscending, IndexSpec::kIndexValDescending};
+
+const char* const kIndexTypeStrings[] = {nullptr,
+                                         nullptr,
+                                         IndexSpec::kIndexValText,
+                                         IndexSpec::kIndexValGeo2D,
+                                         IndexSpec::kIndexValGeo2DSphere,
+                                         IndexSpec::kIndexValHashed};
+
+const char kDuplicateKey[] = "duplicate key added to index descriptor";
+const char kDuplicateOption[] = "duplicate option added to index descriptor";
+
+}  // namespace
+
+IndexSpec::IndexSpec() : _dynamicName(true) {}
+
+IndexSpec& IndexSpec::addKey(std::string_view field, IndexType type) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateKey, !_keys.asTempObj().hasField(field));
+    if (type <= kIndexTypeDescending)
+        _keys.append(field, kIndexTypeNumbers[type]);
+    else
+        _keys.append(field, kIndexTypeStrings[type]);
+    _rename();
+    return *this;
+}
+
+IndexSpec& IndexSpec::addKey(const BSONElement& fieldAndType) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateKey,
+            !_keys.asTempObj().hasField(fieldAndType.fieldName()));
+    _keys.append(fieldAndType);
+    _rename();
+    return *this;
+}
+
+IndexSpec& IndexSpec::addKeys(const KeyVector& keys) {
+    KeyVector::const_iterator where = keys.begin();
+    const KeyVector::const_iterator end = keys.end();
+    for (; where != end; ++where)
+        addKey(where->first, where->second);
+    return *this;
+}
+
+IndexSpec& IndexSpec::addKeys(const BSONObj& keys) {
+    BSONObjIterator iter(keys);
+    while (iter.more())
+        addKey(iter.next());
+    return *this;
+}
+
+IndexSpec& IndexSpec::background(bool value) {
+    uassert(
+        ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("background"));
+    _options.append("background", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::unique(bool value) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("unique"));
+    _options.append("unique", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::name(std::string_view value) {
+    _name = std::string{value};
+    _dynamicName = false;
+    return *this;
+}
+
+IndexSpec& IndexSpec::dropDuplicates(bool value) {
+    uassert(
+        ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("dropDups"));
+    _options.append("dropDups", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::sparse(bool value) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("sparse"));
+    _options.append("sparse", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::expireAfterSeconds(int value) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateOption,
+            !_options.asTempObj().hasField("expireAfterSeconds"));
+    _options.append("expireAfterSeconds", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::version(int value) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("v"));
+    _options.append("v", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::textWeights(const BSONObj& value) {
+    uassert(
+        ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("weights"));
+    _options.append("weights", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::textDefaultLanguage(std::string_view value) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateOption,
+            !_options.asTempObj().hasField("default_language"));
+    _options.append("default_language", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::textLanguageOverride(std::string_view value) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateOption,
+            !_options.asTempObj().hasField("language_override"));
+    _options.append("language_override", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::textIndexVersion(int value) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateOption,
+            !_options.asTempObj().hasField("textIndexVersion"));
+    _options.append("textIndexVersion", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::geo2DSphereIndexVersion(int value) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateOption,
+            !_options.asTempObj().hasField("2dsphereIndexVersion"));
+    _options.append("2dsphereIndexVersion", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::geo2DBits(int value) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("bits"));
+    _options.append("bits", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::geo2DMin(double value) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("min"));
+    _options.append("min", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::geo2DMax(double value) {
+    uassert(ErrorCodes::InvalidOptions, kDuplicateOption, !_options.asTempObj().hasField("max"));
+    _options.append("max", value);
+    return *this;
+}
+
+IndexSpec& IndexSpec::addOption(const BSONElement& option) {
+    uassert(ErrorCodes::InvalidOptions,
+            kDuplicateOption,
+            !_options.asTempObj().hasField(option.fieldName()));
+    _options.append(option);
+    return *this;
+}
+
+IndexSpec& IndexSpec::addOptions(const BSONObj& options) {
+    BSONObjIterator iter(options);
+    while (iter.more())
+        addOption(iter.next());
+    return *this;
+}
+
+std::string IndexSpec::name() const {
+    return _name;
+}
+
+BSONObj IndexSpec::toBSON() const {
+    BSONObjBuilder bob;
+    bob.append("name", name());
+    bob.append("key", _keys.asTempObj());
+    bob.appendElements(_options.asTempObj());
+    return bob.obj();
+}
+
+void IndexSpec::_rename() {
+    if (!_dynamicName)
+        return;
+    _name = DBClientBase::genIndexName(_keys.asTempObj());
+}
+
+}  // namespace mongo

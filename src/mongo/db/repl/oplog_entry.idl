@@ -1,0 +1,281 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Oplog Entry IDL File
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/repl/oplog_entry_serialization.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/pipeline/value.idl"
+    - "mongo/db/repl/optime_base.idl"
+    - "mongo/db/repl/replication_types.idl"
+    - "mongo/db/multitenancy.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+    - "mongo/db/record_id.idl"
+    - "mongo/db/version_context.idl"
+    - "mongo/db/replicated_fast_count/durable_size_metadata.idl"
+
+enums:
+    OpType:
+        description: "The type of an operation in the oplog"
+        type: string
+        values:
+            kCommand: "c"
+            kInsert: "i"
+            kUpdate: "u"
+            kDelete: "d"
+            kContainerInsert: "ci"
+            kContainerUpdate: "cu"
+            kContainerDelete: "cd"
+            kNoop: "n"
+            kKeyMaterial: "km"
+            kCMKRotation: "cmk"
+    RetryImage:
+        description:
+            "Dictates whether a pre-image or post-image is to be stored on behalf of this
+            retryable write."
+        type: string
+        values:
+            kPreImage: "preImage"
+            kPostImage: "postImage"
+    MultiOplogEntryType:
+        description: >-
+            Describes this oplog entry's role in a chain of oplog entries.
+            kLegacyMultiOpType: Role must be determined by consulting session/txn, prevOpTime
+                                and partialTxn fields
+            kApplyOpsAppliedSeparately: This oplog entry is an applyOps which should be applied
+                                        independently of other applyOps entries in the chain.
+                                        Used for vectored inserts which require more than one
+                                        storage transaction.
+            kApplyOpsAppliedAtomically: This oplog entry is an applyOps which should be applied
+                                        atomically with the other applyOps entries in the chain.
+                                        Used for a retryable write statement, represented by one or
+                                        more applyOps entries.
+        type: int
+        values:
+            kLegacyMultiOpType: 0
+            kApplyOpsAppliedSeparately: 1
+            kApplyOpsAppliedAtomically: 2
+    CommandType:
+        description: "The type of the command in an oplog entry"
+        type: string
+        values:
+            kNotCommand: ""
+            kCreate: "create"
+            kRenameCollection: "renameCollection"
+            kDbCheck: "dbCheck"
+            kDrop: "drop"
+            kCollMod: "collMod"
+            kApplyOps: "applyOps"
+            kDropDatabase: "dropDatabase"
+            kCreateIndexes: "createIndexes"
+            kStartIndexBuild: "startIndexBuild"
+            kCommitIndexBuild: "commitIndexBuild"
+            kAbortIndexBuild: "abortIndexBuild"
+            kDropIndexes: "dropIndexes"
+            kCommitTransaction: "commitTransaction"
+            kAbortTransaction: "abortTransaction"
+            kImportCollection: "importCollection"
+            kCreateDatabaseMetadata: "createDatabaseMetadata"
+            kDropDatabaseMetadata: "dropDatabaseMetadata"
+            kInvalidateAllCollectionMetadata: "invalidateAllCollectionMetadata"
+            kInvalidateAllDatabaseMetadata: "invalidateAllDatabaseMetadata"
+            kInvalidateCollectionMetadata: "invalidateCollectionMetadata"
+            kSetAllowChunkOperations: "setAllowChunkOperations"
+            kUpdateCollectionMetadata: "updateCollectionMetadata"
+            kTruncateRange: "truncateRange"
+            kUpgradeDowngradeViewlessTimeseries: "upgradeDowngradeViewlessTimeseries"
+            kSetMultikeyMetadata: "setMultikeyMetadata"
+            kDropIdent: "dropIdent"
+            kInitReplicatedFastCount: "initReplicatedFastCount"
+
+types:
+    zeroOneManyStmtId:
+        bson_serialization_type: any
+        description: >-
+            May be absent, a single StmtId, or an array(size > 1) of StmtIds.  Serialized
+            as appropriate depending on the array size.
+        cpp_type: std::vector<StmtId>
+        default: std::vector<StmtId>()
+        serializer: ::mongo::repl::zeroOneManyStmtIdAppend
+        deserializer: ::mongo::repl::parseZeroOneManyStmtId
+        # std::vector<StmtId> is not a view.
+        is_view: false
+structs:
+    DurableReplOperation:
+        description:
+            "A document that represents an operation. Should never be used directly in
+            server code. Instead, create an instance of ReplOperation."
+        fields:
+            op:
+                cpp_name: opType
+                type: OpType
+                description: "The operation type"
+            tid:
+                cpp_name: tid
+                type: tenant_id
+                optional: true
+                description: "The tenant to which the operation applies"
+            ns:
+                cpp_name: nss
+                type: namespacestring
+                description: "The namespace on which to apply the operation"
+            ui:
+                cpp_name: uuid
+                type: uuid
+                optional: true
+                description: "The UUID of the collection"
+            container:
+                cpp_name: container
+                type: string
+                optional: true
+                description:
+                    "The ident of the container targeted by the container op. Used for op
+                    types 'ci', 'cu', and 'cd'."
+            o:
+                cpp_name: object
+                type: object
+                description: "The operation applied"
+            o2:
+                cpp_name: object2
+                type: object
+                optional: true
+                description: "Additional information about the operation applied"
+            isTimeseries:
+                cpp_name: isTimeseries
+                type: bool
+                optional: true
+                description:
+                    "Only set to 'true' on operations for timeseries. This field
+                    allows for filtering out oplog entries on time-series
+                    collections for unsupported operations (such as change streams).
+                    Unset otherwise."
+            rid:
+                cpp_name: recordId
+                type: RecordId
+                optional: true
+                description:
+                    "The RecordId corresponding to the CRUD operation that generated
+                    this oplog entry. Added when operating on a collection with
+                    'recordIdsReplicated' set to true."
+            m:
+                cpp_name: sizeMetadata
+                type:
+                    variant: [SingleOpSizeMetadata, array<MultiOpSizeMetadata>]
+                optional: true
+                description:
+                    "Size metadata present when replicated size and count is enabled. For single
+                    operations (insert, update, delete) this is a SingleOpSizeMetadata object. For
+                    `commitTransaction`, this stores an array of MultiOpSizeMetadata, where each
+                    entry tracks the size and count deltas for a collection impacted by a prepared
+                    transaction."
+            b:
+                cpp_name: upsert
+                type: bool
+                optional: true
+                description:
+                    "If true, treats this update operation as an upsert.
+                    Used when extracting individual update oplog entries from the oplog
+                    entry of an applyOps command that was executed with alwaysUpsert true.
+                    Originally added for backwards compatibility with updates from 3.6
+                    and before."
+            preImageOpTime:
+                type: optime
+                optional: true
+                description:
+                    "The optime of another oplog entry that contains the document
+                    before an update/remove was applied."
+            postImageOpTime:
+                type: optime
+                optional: true
+                description:
+                    "The optime of another oplog entry that contains the document
+                    after an update was applied."
+            needsRetryImage:
+                type: RetryImage
+                optional: true
+                description:
+                    "Identifies whether a secondary should store a pre-image or post-image
+                    associated with this oplog entry."
+            destinedRecipient:
+                cpp_name: destinedRecipient
+                type: shard_id
+                optional: true
+                description:
+                    "The destined recipient for this op under the new shard key pattern.
+                    Only included when a resharding operation is in progress."
+            stmtId:
+                cpp_name: statementIds
+                type: zeroOneManyStmtId
+                description:
+                    "Identifier of the transaction statement(s) which generated this oplog
+                    entry"
+            fromMigrate:
+                type: bool
+                optional: true
+                description:
+                    "Marks the operation as an internal event that should be hidden to the
+                    end user. The field (originally introduced to flag specific meta/data
+                    deletions performed during a chunk migration) maintains its original
+                    name for retro compatibility, but it is now used in a wider range of
+                    contexts."
+            checkExistenceForDiffInsert:
+                type: bool
+                optional: true
+                description:
+                    "Marks that checks on field existence are needed for insert operations
+                    in the diff update."
+            versionContext:
+                type: version_context
+                optional: true
+                description: "Snapshot of the FCV used by the operation,
+                    which ensures that feature flag checks are stable through its execution."
+
+    DropAndRenameOplogEntryO2:
+        description: "The 'o2' field of a 'drop' or 'rename' oplog entry."
+        strict: false
+        fields:
+            numRecords:
+                type: long
+                description: "The number of records in the dropped or renamed collection."
+
+    OplogEntryBase:
+        description: A document in which the server stores an oplog entry.
+        inline_chained_structs: true
+        chained_structs:
+            OperationSessionInfo: OperationSessionInfo
+            DurableReplOperation: DurableReplOperation
+            OpTimeBase: OpTimeBase
+        fields:
+            v:
+                cpp_name: version
+                type: safeInt64
+                default: 2
+                description: "The version of the oplog"
+            wall:
+                cpp_name: wallClockTime
+                type: date
+                description: "A wallclock time with MS resolution"
+            _id:
+                cpp_name: _id
+                type: Value
+                optional: true
+                description:
+                    "Used by tests in replication and also by production resharding code to
+                    store timestamps."
+            prevOpTime:
+                cpp_name: prevWriteOpTimeInTransaction
+                type: optime
+                optional: true # Only for writes that are part of a transaction
+                description: "The opTime of the previous write with the same transaction."
+            multiOpType:
+                cpp_name: multiOpType
+                type: MultiOplogEntryType
+                optional: true
+                description: "This oplog entry's role in an oplog entry chain."

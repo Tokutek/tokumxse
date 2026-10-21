@@ -1,0 +1,903 @@
+load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cc_toolchain")
+load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
+load("@rules_cc//cc/common:cc_shared_library_info.bzl", "CcSharedLibraryInfo")
+load("@rules_cc//cc/common:debug_package_info.bzl", "DebugPackageInfo")
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+
+TagInfo = provider(
+    doc = "A rule provider to pass around tags that were passed to rules.",
+    fields = {
+        "tags": "Bazel tags that were attached to the rule.",
+    },
+)
+
+WITH_DEBUG_SUFFIX = "_with_debug"
+CC_SHARED_LIBRARY_SUFFIX = "_shared"
+SHARED_ARCHIVE_SUFFIX = "_shared_archive"
+MAC_DEBUG_FOLDER_EXTENSION = ".dSYM"
+
+def _gdb_index_message_impl(ctx):
+    if not ctx.attr.enabled:
+        print("WARNING: GDB index generation is disabled for this build. To add an index to a binary, run: bazel run gdb-add-index -- <path-to-binary>. CI compile tasks disable index generation explicitly.")
+    return [DefaultInfo()]
+
+gdb_index_message = rule(
+    implementation = _gdb_index_message_impl,
+    attrs = {
+        "enabled": attr.bool(mandatory = True),
+    },
+)
+
+def flat_solib_name(short_path):
+    """
+    Map a library's workspace-relative path to a unique, flat file name in _solib_<cpu>.
+
+    Binaries record the solib file name in DT_NEEDED (our libraries set no SONAME), and Bazel
+    adds one RUNPATH entry per distinct solib directory. A flat name derived from the full path
+    keeps RUNPATH to a single entry while making every library name unique, so a stale library
+    left in the output tree after a target moves packages can never be loaded in place of the
+    current one. Escaping follows Bazel's own solib mangling ("_" -> "_U", "/" -> "_S").
+    """
+    return "lib" + short_path.replace("_", "_U").replace("/", "_S")
+
+def get_inputs_and_outputs(ctx, shared_ext, static_ext, debug_ext):
+    """
+    Determines and generates the inputs and outputs.
+    Inputs are the extensions for shared libraries, static libraries, and debug files for a given platform.
+    Outputs are:
+        input_bin: the shared or program binary that contains debug info
+                Note it is possible this a static library build in which case input_bin can be None
+        output_bin: The output shared or program binary with the debug info to be stripped
+                    Note it is possible this a static library build in which case output_bin can be None
+                    Note if separate_debug is disabled this will just be a symlink which still contains the debug info
+        debug_info: If this is a separate_debug build, this will be the output file which will be the extracted debug info
+        static_lib: The static library if this build is building static libraries. This will be a symlink
+    """
+    shared_lib = None
+    static_lib = None
+    input_files = ctx.attr.binary_with_debug.files.to_list()
+    if len(input_files) == 0:
+        return None, None, None, None
+    if ctx.attr.type == "library":
+        shared_input = None
+        for file in input_files:
+            if file.path.endswith(WITH_DEBUG_SUFFIX + static_ext):
+                static_lib = file
+            elif file.path.endswith(WITH_DEBUG_SUFFIX + shared_ext):
+                shared_input = file
+
+        if ctx.attr.cc_shared_library != None:
+            for file in ctx.attr.cc_shared_library.files.to_list():
+                if file.path.endswith(WITH_DEBUG_SUFFIX + shared_ext):
+                    shared_lib = file
+
+        if shared_input or shared_lib:
+            basename = shared_input.basename[:-len(WITH_DEBUG_SUFFIX + shared_ext)] if shared_input else ""
+            if shared_lib:
+                basename = shared_lib.basename[:-len(WITH_DEBUG_SUFFIX + shared_ext + CC_SHARED_LIBRARY_SUFFIX)]
+
+            output_bin = ctx.actions.declare_file(basename + shared_ext)
+
+            # Regular libraries are installed under their flat solib name, so name the debug info
+            # to match. This keeps the debuglink, the installed debug file, and the installed
+            # library consistent for tools that pair "<lib>" with "<lib>.debug" by name.
+            # cc_shared_library outputs keep their plain names.
+            debug_basename = basename + shared_ext if shared_lib else flat_solib_name(output_bin.short_path)
+            if ctx.attr.enabled:
+                if debug_ext == MAC_DEBUG_FOLDER_EXTENSION:
+                    debug_info = ctx.actions.declare_directory(debug_basename + debug_ext)
+                else:
+                    debug_info = ctx.actions.declare_file(debug_basename + debug_ext)
+            else:
+                debug_info = None
+            input_bin = shared_input
+            if shared_lib:
+                input_bin = shared_lib
+        else:
+            debug_info = None
+            output_bin = None
+            input_bin = None
+    elif ctx.attr.type == "program":
+        program_bin = input_files[0]
+
+        if program_bin.basename.endswith(WITH_DEBUG_SUFFIX):
+            basename = program_bin.basename[:-len(WITH_DEBUG_SUFFIX)]
+        else:
+            # Some wrappers point at native cc_test targets that were not produced by
+            # mongo_cc_test and therefore do not carry the "_with_debug" suffix.
+            basename = program_bin.basename
+        if ctx.attr.enabled:
+            if debug_ext == MAC_DEBUG_FOLDER_EXTENSION:
+                debug_info = ctx.actions.declare_directory(basename + debug_ext)
+            else:
+                debug_info = ctx.actions.declare_file(basename + debug_ext)
+        else:
+            debug_info = None
+        output_bin = ctx.actions.declare_file(basename)
+        input_bin = program_bin
+    else:
+        fail("Can't extract debug info from unknown type: " + ctx.attr.type)
+
+    return input_bin, output_bin, debug_info, static_lib
+
+def propgate_static_lib(ctx, static_lib, static_ext, inputs):
+    """
+    Static libraries will not have debug info extracts so we symlink to the new target name.
+    """
+    basename = static_lib.basename[:-len(WITH_DEBUG_SUFFIX + static_ext)]
+    unstripped_static_lib = ctx.actions.declare_file(basename + static_ext)
+
+    ctx.actions.symlink(
+        output = unstripped_static_lib,
+        target_file = static_lib,
+    )
+
+    return unstripped_static_lib
+
+def get_transitive_dyn_libs(deps):
+    """
+    Get a transitive list of all dynamic library files under a set of dependencies.
+    """
+
+    # TODO(SERVER-85819): Investigate to see if it's possible to merge the depset without looping over all transitive
+    # dependencies.
+    transitive_dyn_libs = []
+    for dep in deps:
+        for input in dep[CcInfo].linking_context.linker_inputs.to_list():
+            for library in input.libraries:
+                if library.dynamic_library:
+                    transitive_dyn_libs.append(library.dynamic_library)
+    return transitive_dyn_libs
+
+def get_transitive_debug_files(deps):
+    """
+    Get a transitive list of all dynamic library files under a set of dependencies.
+    """
+
+    # TODO(SERVER-85819): Investigate to see if it's possible to merge the depset without looping over all transitive
+    # dependencies.
+    transitive_debugs = []
+    for dep in deps:
+        for input in dep[DefaultInfo].files.to_list():
+            if input.basename.endswith(".debug"):
+                transitive_debugs.append(input)
+    return transitive_debugs
+
+def symlink_shared_archive(ctx, shared_ext, static_ext):
+    """
+    Shared archives (.so.a/.dll.lib) have different extensions depending on the operating system.
+    Strip the suffix added on by the target rule and replace the static library ext with the shared archive
+    ext.
+    """
+    original_output = ctx.attr.shared_archive.files.to_list()[0]
+    basename = original_output.basename[:-len(SHARED_ARCHIVE_SUFFIX + static_ext)]
+    symlink = ctx.actions.declare_file(basename + shared_ext + static_ext)
+
+    ctx.actions.symlink(
+        output = symlink,
+        target_file = original_output,
+    )
+    return symlink
+
+def create_new_ccinfo_library(ctx, cc_toolchain, shared_lib, static_lib, cc_shared_library = None):
+    """
+    We need to create new CcInfo with the new target names, this will take in the newly
+    named library files and construct a new CcInfo basically stripping out the "_with_debug"
+    name.
+    """
+
+    if ctx.attr.type == "library":
+        feature_configuration = cc_common.configure_features(
+            ctx = ctx,
+            cc_toolchain = cc_toolchain,
+            requested_features = ctx.features,
+            unsupported_features = ctx.disabled_features,
+        )
+
+        linker_input_deps = []
+        for dep in ctx.attr.deps:
+            linker_input_deps.append(dep[CcInfo].linking_context.linker_inputs)
+
+        if shared_lib or static_lib:
+            binary_linker_inputs = ctx.attr.binary_with_debug[CcInfo].linking_context.linker_inputs.to_list()
+            if shared_lib and cc_shared_library != None:
+                # cc_shared_library outputs keep their plain, package-relative names (see
+                # get_inputs_and_outputs).
+                so_path = shared_lib.path.replace(ctx.bin_dir.path + "/", "")
+            elif shared_lib:
+                so_path = flat_solib_name(shared_lib.short_path)
+            else:
+                so_path = ""
+            direct_lib = cc_common.create_library_to_link(
+                actions = ctx.actions,
+                feature_configuration = feature_configuration,
+                cc_toolchain = cc_toolchain,
+                dynamic_library = shared_lib,
+                dynamic_library_symlink_path = so_path,
+                static_library = static_lib if shared_lib == None else None,
+                alwayslink = True,
+            )
+
+            # For some reason Bazel isn't deduplicating the user link flags, which leads to them accumulating
+            # with each layer added. Deduplicate them manually.
+            #
+            # This routine works by taking the current library's link args and searching for each of its dependency's link
+            # args present contiguously. If a matching sub list is found, it's removed from the current link line as a duplicate.
+            # This is to avoid removing positional arguments that may appear more than once.
+            #
+            # This solution may break in the case where a base dependency contains only one positional argument,
+            # but this should never happen since we will always inject at least one non positional argument globally.
+            cur_flags = list(binary_linker_inputs[0].user_link_flags)
+            for dep in binary_linker_inputs[1:]:
+                for i in range(len(cur_flags)):
+                    dep_flags = dep.user_link_flags
+                    if dep_flags and cur_flags:
+                        if cur_flags[i] == dep_flags[0] and cur_flags[i:i + len(dep_flags)] == dep_flags:
+                            cur_flags = cur_flags[:i] + cur_flags[i + len(dep_flags):]
+                            break
+
+            linker_input = cc_common.create_linker_input(
+                owner = ctx.label,
+                libraries = depset(direct = [direct_lib]),
+                user_link_flags = cur_flags,
+            )
+            linking_context = cc_common.create_linking_context(linker_inputs = depset(direct = [linker_input], transitive = linker_input_deps))
+
+        else:
+            linking_context = cc_common.create_linking_context(linker_inputs = depset(transitive = linker_input_deps))
+
+    else:
+        linking_context = ctx.attr.binary_with_debug[CcInfo].linking_context
+
+    return CcInfo(
+        compilation_context = ctx.attr.binary_with_debug[CcInfo].compilation_context,
+        linking_context = linking_context,
+    )
+
+def create_new_cc_shared_library_info(ctx, cc_toolchain, output_shared_lib, original_info, static_lib = None):
+    """
+    We need to create a CcSharedLibraryInfo to pass to the cc_binary and cc_library that depend on it
+    so they know to link the cc_shared_library instead of the associated cc_library.
+    name.
+    """
+    feature_configuration = cc_common.configure_features(
+        ctx = ctx,
+        cc_toolchain = cc_toolchain,
+        requested_features = ctx.features,
+        unsupported_features = ctx.disabled_features,
+    )
+
+    # Collect transitive (already stripped) shared libraries
+    # Loop through all dependencies to include their resulting (shared/debug decorator stripped) shared library files
+    # as inputs.
+    # TODO(SERVER-85819): Investigate to see if it's possible to merge the depset without looping over all transitive
+    # dependencies.
+    dep_libraries = []
+    for dep in ctx.attr.deps:
+        for input in dep[CcInfo].linking_context.linker_inputs.to_list():
+            for library in input.libraries:
+                dep_libraries.append(library)
+
+    # Merge user_link_flags with duplicate suppression
+    # CcInfo's linkopts are ignored by cc_shared_library by default. To support both transitive and nontransitive
+    # dynamic linkopts use:
+    #   cc_library's linkopts field for both static and dynamic transitive link opts
+    #   cc_shared_library's user_link_flags field for dynamic non-transitive link opts
+    all_user_link_flags = dict()
+    binary_linker_inputs = ctx.attr.binary_with_debug[CcInfo].linking_context.linker_inputs.to_list()
+    for input in binary_linker_inputs:
+        for flag in input.user_link_flags:
+            all_user_link_flags[flag] = True
+
+    # We define global linkopts here too, remove duplicates to prevent repeats of the global opts
+    # from accumulating.
+    for flag in original_info.linker_input.user_link_flags:
+        all_user_link_flags[flag] = True
+    all_user_link_flags = [flag for flag, _ in all_user_link_flags.items()]
+
+    if output_shared_lib:
+        direct_lib = cc_common.create_library_to_link(
+            actions = ctx.actions,
+            feature_configuration = feature_configuration,
+            cc_toolchain = cc_toolchain,
+            # Replace reference to dynamic library with final name
+            dynamic_library = output_shared_lib,
+            dynamic_library_symlink_path = output_shared_lib.path.replace(ctx.bin_dir.path + "/", ""),
+            # Omit reference to static library
+        )
+        linker_input = cc_common.create_linker_input(
+            owner = ctx.label,
+            libraries = depset(direct = [direct_lib], transitive = [depset(dep_libraries)]),
+            user_link_flags = all_user_link_flags,
+            additional_inputs = depset(original_info.linker_input.additional_inputs),
+        )
+    else:
+        linker_input = cc_common.create_linker_input(
+            owner = ctx.label,
+            libraries = depset(transitive = [depset(dep_libraries)]),
+            user_link_flags = all_user_link_flags,
+            additional_inputs = depset(original_info.linker_input.additional_inputs),
+        )
+
+    return CcSharedLibraryInfo(
+        dynamic_deps = original_info.dynamic_deps,
+        exports = original_info.exports,
+        link_once_static_libs = original_info.link_once_static_libs,
+        linker_input = linker_input,
+    )
+
+# TODO(SERVER-101906): We assume the worst-case resource usage to avoid OOMs. Figure out if we can
+# generalize numInputs for all link configurations so that this can more intelligently set resource
+# expectations.
+def linux_extract_resource_set(os, numInputs):
+    return {
+        "cpu": 6,
+        "memory": 20 * 1024,  # 20 GB
+        "local_test": 1,
+    }
+
+def linux_strip_resource_set(os, numInputs):
+    return {
+        "cpu": 3,
+        "memory": 10 * 1024,  # 10 GB
+        "local_test": 1,
+    }
+
+def _generate_gdb_index(ctx, inputs, input_bin):
+    binary_output_groups = ctx.attr.binary_with_debug[OutputGroupInfo]
+    dwo_files = binary_output_groups.dwo_files if "dwo_files" in binary_output_groups else depset()
+    index_bundle = ctx.actions.declare_directory(input_bin.basename + ".gdb_index")
+    ctx.actions.run(
+        executable = ctx.executable.gdb_generate_index,
+        outputs = [index_bundle],
+        inputs = depset([input_bin], transitive = [inputs, dwo_files]),
+        tools = [ctx.attr.gdb_generate_index[DefaultInfo].files_to_run],
+        arguments = [input_bin.path, index_bundle.path],
+        env = {"BUILD_WORKING_DIRECTORY": ""},
+        resource_set = linux_extract_resource_set,
+        mnemonic = "GdbGenerateIndex",
+    )
+    return index_bundle
+
+def _apply_gdb_index(ctx, cc_toolchain, input_bin, index_bundle, output_bin):
+    ctx.actions.run(
+        executable = ctx.executable.gdb_apply_index,
+        outputs = [output_bin],
+        inputs = depset([input_bin, index_bundle], transitive = [cc_toolchain.all_files]),
+        tools = [ctx.attr.gdb_apply_index[DefaultInfo].files_to_run],
+        arguments = [index_bundle.path, input_bin.path, output_bin.path],
+        env = {"OBJCOPY": cc_toolchain.objcopy_executable},
+        execution_requirements = {
+            "no-remote": "1",
+            "local": "1",
+        },
+        resource_set = linux_strip_resource_set,
+        mnemonic = "GdbApplyIndex",
+    )
+
+def linux_extraction(ctx, cc_toolchain, inputs):
+    outputs = []
+    unstripped_static_bin = None
+    input_bin, output_bin, debug_info, static_lib = get_inputs_and_outputs(ctx, ".so", ".a", ".debug")
+    input_file = ctx.attr.binary_with_debug.files.to_list()
+    if input_bin:
+        gdb_index_added = ctx.attr.type == "program" and ctx.attr.gdb_index_enabled
+        input_bin_with_gdb_index = input_bin
+        if gdb_index_added:
+            index_bundle = _generate_gdb_index(ctx, inputs, input_bin)
+            input_bin_with_gdb_index = ctx.actions.declare_file(input_bin.basename + ".gdb_indexed") if ctx.attr.enabled else output_bin
+            _apply_gdb_index(ctx, cc_toolchain, input_bin, index_bundle, input_bin_with_gdb_index)
+
+        if ctx.attr.enabled:
+            ctx.actions.run(
+                executable = cc_toolchain.objcopy_executable,
+                outputs = [debug_info],
+                inputs = depset([input_bin_with_gdb_index], transitive = [cc_toolchain.all_files]),
+                resource_set = linux_extract_resource_set if ctx.attr.type == "program" else None,
+                arguments = [
+                    "--only-keep-debug",
+                    input_bin_with_gdb_index.path,
+                    debug_info.path,
+                ],
+                mnemonic = "ExtractDebugInfo",
+            )
+
+            ctx.actions.run(
+                executable = cc_toolchain.objcopy_executable,
+                outputs = [output_bin],
+                inputs = depset([input_bin_with_gdb_index, debug_info], transitive = [cc_toolchain.all_files]),
+                resource_set = linux_strip_resource_set if ctx.attr.type == "program" else None,
+                arguments = [
+                    "--strip-debug",
+                    "--add-gnu-debuglink",
+                    debug_info.path,
+                    input_bin_with_gdb_index.path,
+                    output_bin.path,
+                ],
+                mnemonic = "StripDebugInfo",
+            )
+            outputs += [output_bin, debug_info]
+        else:
+            if not gdb_index_added:
+                ctx.actions.symlink(
+                    output = output_bin,
+                    target_file = input_bin,
+                )
+            outputs += [output_bin]
+
+    if len(input_file):
+        if static_lib:
+            unstripped_static_bin = propgate_static_lib(ctx, static_lib, ".a", inputs)
+            outputs.append(unstripped_static_bin)
+
+        if ctx.attr.shared_archive:
+            unstripped_shared_archive = symlink_shared_archive(ctx, ".so", ".a")
+            outputs.append(unstripped_shared_archive)
+
+    # The final program binary depends on the existence of the dependent dynamic library files. With
+    # build-without-the-bytes enabled, these aren't downloaded. Manually collect them and add them to the
+    # output set.
+    dynamic_deps_runfiles = ctx.runfiles(files = [])
+    transitive_debug_files = get_transitive_debug_files(ctx.attr.deps)
+    if ctx.attr.type == "program":
+        dynamic_deps = get_transitive_dyn_libs(ctx.attr.deps)
+        dynamic_deps_runfiles = ctx.attr.binary_with_debug[DefaultInfo].data_runfiles.merge(ctx.runfiles(files = dynamic_deps))
+        outputs.extend(dynamic_deps)
+
+    provided_info = [
+        DefaultInfo(
+            files = depset(outputs, transitive = [depset(transitive_debug_files)]),
+            runfiles = dynamic_deps_runfiles,
+            executable = output_bin if ctx.attr.type == "program" else None,
+        ),
+        create_new_ccinfo_library(ctx, cc_toolchain, output_bin, unstripped_static_bin, ctx.attr.cc_shared_library),
+    ]
+
+    if ctx.attr.type == "program":
+        provided_info += [
+            RunEnvironmentInfo(
+                environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].environment,
+                inherited_environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].inherited_environment,
+            ),
+        ]
+        provided_info += [ctx.attr.binary_with_debug[DebugPackageInfo]]
+
+    if ctx.attr.cc_shared_library != None:
+        provided_info.append(
+            create_new_cc_shared_library_info(ctx, cc_toolchain, output_bin, ctx.attr.cc_shared_library[CcSharedLibraryInfo], static_lib),
+        )
+
+    return provided_info
+
+def macos_extraction(ctx, cc_toolchain, inputs):
+    outputs = []
+    unstripped_static_bin = None
+    input_bin, output_bin, debug_info, static_lib = get_inputs_and_outputs(ctx, ".dylib", ".a", MAC_DEBUG_FOLDER_EXTENSION)
+    input_file = ctx.attr.binary_with_debug.files.to_list()
+
+    if input_bin:
+        if ctx.attr.enabled:
+            ctx.actions.run(
+                executable = "dsymutil",
+                outputs = [debug_info],
+                inputs = [input_bin],
+                arguments = [
+                    "-num-threads",
+                    "1",
+                    input_bin.path,
+                    "-o",
+                    debug_info.path,
+                ],
+                mnemonic = "ExtractDebugInfo",
+            )
+
+            ctx.actions.run(
+                executable = cc_toolchain.strip_executable,
+                outputs = [output_bin],
+                inputs = depset([debug_info]),
+                arguments = [
+                    "-S",
+                    "-o",
+                    output_bin.path,
+                    input_bin.path,
+                ],
+                mnemonic = "StripDebugInfo",
+            )
+            outputs += [output_bin, debug_info]
+        else:
+            ctx.actions.symlink(
+                output = output_bin,
+                target_file = input_bin,
+            )
+            outputs += [output_bin]
+
+    if len(input_file):
+        if static_lib:
+            unstripped_static_bin = propgate_static_lib(ctx, static_lib, ".a", inputs)
+            outputs.append(unstripped_static_bin)
+
+        if ctx.attr.shared_archive:
+            unstripped_shared_archive = symlink_shared_archive(ctx, ".dylib", ".a")
+            outputs.append(unstripped_shared_archive)
+
+    # The final program binary depends on the existence of the dependent dynamic library files. With
+    # build-without-the-bytes enabled, these aren't downloaded. Manually collect them and add them to the
+    # output set.
+    dynamic_deps_runfiles = ctx.runfiles(files = [])
+    if ctx.attr.type == "program":
+        dynamic_deps = get_transitive_dyn_libs(ctx.attr.deps)
+        dynamic_deps_runfiles = ctx.attr.binary_with_debug[DefaultInfo].data_runfiles.merge(ctx.runfiles(files = dynamic_deps))
+        outputs.extend(dynamic_deps)
+
+    provided_info = [
+        DefaultInfo(
+            files = depset(outputs),
+            executable = output_bin if ctx.attr.type == "program" else None,
+            runfiles = ctx.attr.binary_with_debug[DefaultInfo].data_runfiles,
+        ),
+        create_new_ccinfo_library(ctx, cc_toolchain, output_bin, unstripped_static_bin, ctx.attr.cc_shared_library),
+    ]
+
+    if ctx.attr.type == "program":
+        provided_info += [
+            RunEnvironmentInfo(
+                environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].environment,
+                inherited_environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].inherited_environment,
+            ),
+        ]
+
+    if ctx.attr.cc_shared_library != None:
+        provided_info.append(
+            create_new_cc_shared_library_info(ctx, cc_toolchain, output_bin, ctx.attr.cc_shared_library[CcSharedLibraryInfo]),
+        )
+
+    return provided_info
+
+def windows_extraction(ctx, cc_toolchain, inputs):
+    pdb = None
+    if ctx.attr.type == "library":
+        ext = ".lib"
+        if ctx.attr.cc_shared_library and ctx.attr.enable_pdb:
+            pdb = ctx.attr.cc_shared_library[OutputGroupInfo].pdb_file
+    elif ctx.attr.type == "program":
+        ext = ".exe"
+        if ctx.attr.enable_pdb:
+            pdb = ctx.attr.binary_with_debug[OutputGroupInfo].pdb_file
+    else:
+        fail("Can't extract debug info from unknown type: " + ctx.attr.type)
+
+    input_file = ctx.attr.binary_with_debug.files.to_list()
+    outputs = []
+    output_library = None
+    output_dynamic_library = None
+
+    if len(input_file):
+        basename = input_file[0].basename[:-len(WITH_DEBUG_SUFFIX + ext)]
+        output = ctx.actions.declare_file(basename + ext)
+
+        for input in input_file:
+            ext = "." + input.extension
+
+            basename = input.basename[:-len(WITH_DEBUG_SUFFIX + ext)]
+            output = ctx.actions.declare_file(basename + ext)
+            outputs.append(output)
+
+            if ext == ".lib":
+                output_library = output
+
+            ctx.actions.symlink(
+                output = output,
+                target_file = input,
+            )
+
+        if ctx.attr.cc_shared_library != None:
+            for file in ctx.attr.cc_shared_library.files.to_list():
+                if file.path.endswith(".dll"):
+                    basename = file.basename[:-len(WITH_DEBUG_SUFFIX + CC_SHARED_LIBRARY_SUFFIX + ".dll")]
+                    output = ctx.actions.declare_file(basename + ".dll")
+                    outputs.append(output)
+
+                    output_dynamic_library = output
+
+                    ctx.actions.symlink(
+                        output = output,
+                        target_file = file,
+                    )
+
+        if pdb:
+            pdb_files = pdb.to_list()
+            if ctx.attr.cc_shared_library != None:
+                basename = input.basename[:-len(WITH_DEBUG_SUFFIX + ".pdb")]
+                pdb_output = ctx.actions.declare_file(basename + ".dll.pdb")
+            else:
+                basename = input.basename[:-len(WITH_DEBUG_SUFFIX + ext)]
+                pdb_output = ctx.actions.declare_file(basename + ".pdb")
+            outputs.append(pdb_output)
+
+            ctx.actions.symlink(
+                output = pdb_output,
+                target_file = pdb_files[0],
+            )
+
+        if ctx.attr.shared_archive:
+            unstripped_shared_archive = symlink_shared_archive(ctx, ".dll", ".lib")
+            outputs.append(unstripped_shared_archive)
+
+    provided_info = [
+        DefaultInfo(
+            files = depset(outputs),
+            executable = output if ctx.attr.type == "program" else None,
+            runfiles = ctx.attr.binary_with_debug[DefaultInfo].data_runfiles,
+        ),
+        create_new_ccinfo_library(ctx, cc_toolchain, output_dynamic_library, output_library, ctx.attr.cc_shared_library),
+    ]
+
+    if ctx.attr.type == "program":
+        provided_info += [
+            RunEnvironmentInfo(
+                environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].environment,
+                inherited_environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].inherited_environment,
+            ),
+        ]
+
+    if ctx.attr.cc_shared_library != None:
+        provided_info.append(
+            create_new_cc_shared_library_info(ctx, cc_toolchain, output_dynamic_library, ctx.attr.cc_shared_library[CcSharedLibraryInfo]),
+        )
+
+    return provided_info
+
+def wasi_extraction(ctx, cc_toolchain, inputs):
+    """
+    WASI (wasm32) extraction:
+    - Typically no dynamic linking; treat libraries as static (.a) only.
+    - Avoid objcopy/strip; just relabel/symlink outputs (acts like enabled=False path).
+    - Programs are often .wasm; we keep bytes identical and just rename to drop WITH_DEBUG_SUFFIX.
+    """
+    outputs = []
+    unstripped_static_bin = None
+
+    # Use ".so" for shared_ext (there usually isn't one) so get_inputs_and_outputs won't find a shared lib.
+    # Static libs are ".a"; if type == "program", output likely ends up as basename without suffix, which will be .wasm if input had it.
+    input_bin, output_bin, _debug_info, static_lib = get_inputs_and_outputs(ctx, ".so", ".a", ".debug")
+    input_file = ctx.attr.binary_with_debug.files.to_list()
+
+    # For programs (e.g., .wasm), just symlink/rename; no separate debug file generation.
+    if input_bin:
+        ctx.actions.symlink(
+            output = output_bin,
+            target_file = input_bin,
+        )
+        outputs.append(output_bin)
+
+    # For static libraries, propagate the archive with new name.
+    if len(input_file):
+        if static_lib:
+            unstripped_static_bin = propgate_static_lib(ctx, static_lib, ".a", inputs)
+            outputs.append(unstripped_static_bin)
+
+            # Shared archives don't make sense for WASI; ignore if present.
+            # noop
+
+    provided_info = [
+        DefaultInfo(
+            files = depset(outputs),
+            executable = output_bin if ctx.attr.type == "program" else None,
+            runfiles = ctx.attr.binary_with_debug[DefaultInfo].data_runfiles if ctx.attr.type == "program" else ctx.runfiles(),
+        ),
+        create_new_ccinfo_library(ctx, cc_toolchain, output_bin, unstripped_static_bin, ctx.attr.cc_shared_library),
+    ]
+
+    if ctx.attr.type == "program":
+        provided_info += [
+            RunEnvironmentInfo(
+                environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].environment,
+                inherited_environment = ctx.attr.binary_with_debug[RunEnvironmentInfo].inherited_environment,
+            ),
+        ]
+
+    # No cc_shared_library path for WASI by default (no dynamic linking), so we skip appending CcSharedLibraryInfo.
+
+    return provided_info
+
+def extract_debuginfo_impl(ctx):
+    cc_toolchain = find_cc_toolchain(ctx)
+    inputs = depset(transitive = [
+        ctx.attr.binary_with_debug.files,
+        ctx.attr.cc_shared_library.files if ctx.attr.cc_shared_library != None else depset([]),
+        cc_toolchain.all_files,
+    ])
+
+    linux_constraint = ctx.attr._linux_constraint[platform_common.ConstraintValueInfo]
+    macos_constraint = ctx.attr._macos_constraint[platform_common.ConstraintValueInfo]
+    windows_constraint = ctx.attr._windows_constraint[platform_common.ConstraintValueInfo]
+    wasi_constraint = ctx.attr._wasi_constraint[platform_common.ConstraintValueInfo]
+
+    dynamic_libraries = 0
+    if "dynamic_library" in ctx.attr.binary_with_debug[OutputGroupInfo]:
+        dynamic_libraries = len(ctx.attr.binary_with_debug[OutputGroupInfo].dynamic_library.to_list())
+
+    if ctx.target_platform_has_constraint(windows_constraint):
+        return_info = windows_extraction(ctx, cc_toolchain, inputs)
+    elif ctx.attr.type == "library" and ctx.attr.linkstatic == True and ctx.attr.cc_shared_library == None and ctx.attr.skip_archive == True:
+        # On static builds we always skip separating debug in libraries
+        return_info = [ctx.attr.binary_with_debug[CcInfo]]
+    elif ctx.attr.type == "library" and dynamic_libraries == 0 and ctx.attr.cc_shared_library == None and ctx.attr.skip_archive == True:
+        # On dynamic builds we skip separating debug if there are no dynamic libraries
+        return_info = [ctx.attr.binary_with_debug[CcInfo]]
+    elif ctx.target_platform_has_constraint(linux_constraint):
+        return_info = linux_extraction(ctx, cc_toolchain, inputs)
+    elif ctx.target_platform_has_constraint(macos_constraint):
+        return_info = macos_extraction(ctx, cc_toolchain, inputs)
+    elif ctx.target_platform_has_constraint(wasi_constraint):
+        return_info = wasi_extraction(ctx, cc_toolchain, inputs)
+
+    # Forward InstrumentedFilesInfo so that `bazel coverage` can collect coverage
+    # data from binaries produced by this rule. This is equivalent to running against
+    # targets with the _with_debug suffix directly, but more natural for users.
+    return_info.append(
+        coverage_common.instrumented_files_info(
+            ctx,
+            dependency_attributes = ["binary_with_debug"],
+        ),
+    )
+
+    tag_provider = TagInfo(tags = ctx.attr.tags)
+    return_info.append(tag_provider)
+    return return_info
+
+extract_debuginfo = rule(
+    extract_debuginfo_impl,
+    attrs = {
+        "binary_with_debug": attr.label(
+            doc = "The the binary to extract debuginfo from.",
+            allow_files = True,
+        ),
+        "type": attr.string(
+            doc = "Set to either 'library' or 'program' to discern how to extract the info.",
+        ),
+        "enabled": attr.bool(default = False, doc = "Flag to enable/disable separate debug generation."),
+        "gdb_index_enabled": attr.bool(default = False, doc = "Flag to add a GDB index to program binaries."),
+        "gdb_generate_index": attr.label(
+            default = "//bazel:gdb-generate-index-noop",
+            executable = True,
+            cfg = "exec",
+            doc = "Executable used to generate a GDB index bundle for a program binary.",
+        ),
+        "gdb_apply_index": attr.label(
+            default = "//bazel:gdb-apply-index",
+            executable = True,
+            cfg = "exec",
+            doc = "Executable used to apply a GDB index bundle to a program binary.",
+        ),
+        "enable_pdb": attr.bool(default = False, doc = "Flag to enable pdb outputs on windows."),
+        "deps": attr.label_list(providers = [CcInfo]),
+        "linkstatic": attr.bool(default = True, doc = "If binaries are meant to be statically linked."),
+        "cc_shared_library": attr.label(
+            doc = "If extracting from a shared library, the target of the cc_shared_library. Otherwise empty.",
+            allow_files = True,
+        ),
+        "shared_archive": attr.label(
+            doc = "If generating a shared archive(.so.a/.dll.lib), the shared archive's cc_library. Otherwise empty.",
+            allow_files = True,
+        ),
+        "skip_archive": attr.bool(default = False, doc = "Flag to skip generating archives."),
+        "_cc_toolchain": attr.label(default = "@rules_cc//cc:current_cc_toolchain"),
+        "_linux_constraint": attr.label(default = "@platforms//os:linux"),
+        "_macos_constraint": attr.label(default = "@platforms//os:macos"),
+        "_windows_constraint": attr.label(default = "@platforms//os:windows"),
+        "_wasi_constraint": attr.label(default = "@platforms//cpu:wasm32"),
+    },
+    doc = "Extract debuginfo into a separate file",
+    toolchains = ["@bazel_tools//tools/cpp:toolchain_type"],
+    fragments = ["cpp"],
+    provides = [CcInfo],
+)
+
+extract_debuginfo_binary = rule(
+    extract_debuginfo_impl,
+    attrs = {
+        "binary_with_debug": attr.label(
+            doc = "The the binary to extract debuginfo from.",
+            allow_files = True,
+        ),
+        "type": attr.string(
+            doc = "Set to either 'library' or 'program' to discern how to extract the info.",
+        ),
+        "enabled": attr.bool(default = False, doc = "Flag to enable/disable separate debug generation."),
+        "gdb_index_enabled": attr.bool(default = False, doc = "Flag to add a GDB index to program binaries."),
+        "gdb_generate_index": attr.label(
+            default = "//bazel:gdb-generate-index-noop",
+            executable = True,
+            cfg = "exec",
+            doc = "Executable used to generate a GDB index bundle for a program binary.",
+        ),
+        "gdb_apply_index": attr.label(
+            default = "//bazel:gdb-apply-index",
+            executable = True,
+            cfg = "exec",
+            doc = "Executable used to apply a GDB index bundle to a program binary.",
+        ),
+        "enable_pdb": attr.bool(default = False, doc = "Flag to enable pdb outputs on windows."),
+        "deps": attr.label_list(providers = [CcInfo]),
+        "cc_shared_library": attr.label(
+            doc = "If extracting from a shared library, the target of the cc_shared_library. Otherwise empty.",
+            allow_files = True,
+        ),
+        "shared_archive": attr.label(
+            doc = "If generating a shared archive(.so.a/.dll.lib), the shared archive's cc_library. Otherwise empty.",
+            allow_files = True,
+        ),
+        "skip_archive": attr.bool(default = False, doc = "Flag to skip generating archives."),
+        "_cc_toolchain": attr.label(default = "@rules_cc//cc:current_cc_toolchain"),
+        "_linux_constraint": attr.label(default = "@platforms//os:linux"),
+        "_macos_constraint": attr.label(default = "@platforms//os:macos"),
+        "_windows_constraint": attr.label(default = "@platforms//os:windows"),
+        "_wasi_constraint": attr.label(default = "@platforms//cpu:wasm32"),
+    },
+    doc = "Extract debuginfo into a separate file",
+    toolchains = ["@bazel_tools//tools/cpp:toolchain_type"],
+    fragments = ["cpp"],
+    executable = True,
+)
+
+extract_debuginfo_test = rule(
+    extract_debuginfo_impl,
+    attrs = {
+        "binary_with_debug": attr.label(
+            doc = "The the binary to extract debuginfo from.",
+            allow_files = True,
+        ),
+        "type": attr.string(
+            doc = "Set to either 'library' or 'program' to discern how to extract the info.",
+        ),
+        "enabled": attr.bool(default = False, doc = "Flag to enable/disable separate debug generation."),
+        "gdb_index_enabled": attr.bool(default = False, doc = "Flag to add a GDB index to program binaries."),
+        "gdb_generate_index": attr.label(
+            default = "//bazel:gdb-generate-index-noop",
+            executable = True,
+            cfg = "exec",
+            doc = "Executable used to generate a GDB index bundle for a program binary.",
+        ),
+        "gdb_apply_index": attr.label(
+            default = "//bazel:gdb-apply-index",
+            executable = True,
+            cfg = "exec",
+            doc = "Executable used to apply a GDB index bundle to a program binary.",
+        ),
+        "enable_pdb": attr.bool(default = False, doc = "Flag to enable pdb outputs on windows."),
+        "deps": attr.label_list(providers = [CcInfo]),
+        "cc_shared_library": attr.label(
+            doc = "If extracting from a shared library, the target of the cc_shared_library. Otherwise empty.",
+            allow_files = True,
+        ),
+        "shared_archive": attr.label(
+            doc = "If generating a shared archive(.so.a/.dll.lib), the shared archive's cc_library. Otherwise empty.",
+            allow_files = True,
+        ),
+        "skip_archive": attr.bool(default = False, doc = "Flag to skip generating archives."),
+        "_cc_toolchain": attr.label(default = "@rules_cc//cc:current_cc_toolchain"),
+        "_linux_constraint": attr.label(default = "@platforms//os:linux"),
+        "_macos_constraint": attr.label(default = "@platforms//os:macos"),
+        "_windows_constraint": attr.label(default = "@platforms//os:windows"),
+        "_wasi_constraint": attr.label(default = "@platforms//cpu:wasm32"),
+        # Required for `bazel coverage` to invoke the C++ coverage collection
+        # script (collect_cc_coverage.sh) and merge profraw -> _cc_coverage.dat,
+        # matching the behavior of native cc_test.
+        "_lcov_merger": attr.label(
+            default = configuration_field(fragment = "coverage", name = "output_generator"),
+            executable = True,
+            cfg = config.exec(exec_group = "test"),
+        ),
+        "_collect_cc_coverage": attr.label(
+            default = "@bazel_tools//tools/test:collect_cc_coverage",
+            executable = True,
+            cfg = config.exec(exec_group = "test"),
+        ),
+    },
+    doc = "Extract debuginfo into a separate file",
+    toolchains = ["@bazel_tools//tools/cpp:toolchain_type"],
+    fragments = ["cpp", "coverage"],
+    executable = True,
+    test = True,
+)

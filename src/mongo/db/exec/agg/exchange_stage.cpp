@@ -1,0 +1,646 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/agg/exchange_stage.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/exec/agg/pipeline_builder.h"
+#include "mongo/db/hasher.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/pipeline/document_source_exchange.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <iterator>
+#include <set>
+#include <string_view>
+#include <utility>
+
+#include <boost/cstdint.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+
+exec::agg::StagePtr documentSourceExchangeToStageFn(
+    const boost::intrusive_ptr<DocumentSource>& documentSource) {
+    auto ds = boost::dynamic_pointer_cast<DocumentSourceExchange>(documentSource);
+    tassert(10815901, "expected 'DocumentSourceExchange' type", ds);
+    return make_intrusive<exec::agg::ExchangeStage>(
+        ds->kStageName, ds->getExpCtx(), ds->_exchange, ds->_consumerId, ds->_resourceYielder);
+}
+namespace exec::agg {
+using namespace std::literals::string_view_literals;
+REGISTER_AGG_STAGE_MAPPING(exchange, DocumentSourceExchange::id, documentSourceExchangeToStageFn)
+
+MONGO_FAIL_POINT_DEFINE(exchangeFailLoadNextBatch);
+namespace {
+
+class MutexAndResourceLock {
+    OperationContext* _opCtx;
+    ResourceYielder* _resourceYielder;
+    std::unique_lock<std::mutex> _lock;
+
+public:
+    // Must be constructed with the mutex held. 'yielder' may be null if there are no resources
+    // which need to be yielded while waiting.
+    MutexAndResourceLock(OperationContext* opCtx,
+                         std::unique_lock<std::mutex> m,
+                         ResourceYielder* yielder)
+        : _opCtx(opCtx), _resourceYielder(yielder), _lock(std::move(m)) {
+        invariant(_lock.owns_lock());
+    }
+
+    void lock() {
+        // Acquire the operation-wide resources, then the mutex.
+        if (_resourceYielder) {
+            _resourceYielder->unyield(_opCtx);
+        }
+        _lock.lock();
+    }
+    void unlock() {
+        _lock.unlock();
+        if (_resourceYielder) {
+            _resourceYielder->yield(_opCtx);
+        }
+    }
+
+    /**
+     * Releases ownership of the lock to the caller. May only be called when the mutex is held
+     * (after a call to unlock(), for example).
+     */
+    std::unique_lock<std::mutex> releaseLockOwnership() {
+        invariant(_lock.owns_lock());
+        return std::move(_lock);
+    }
+};
+
+}  // namespace
+
+constexpr size_t Exchange::kMaxBufferSize;
+constexpr size_t Exchange::kMaxNumberConsumers;
+
+Exchange::Exchange(OperationContext* opCtx,
+                   ExchangeSpec spec,
+                   std::unique_ptr<mongo::Pipeline> pipeline,
+                   InputMemoryPolicy inputMemoryPolicy)
+    : _spec(std::move(spec)),
+      _pipeline(std::move(pipeline)),
+      _execPipeline{buildPipeline(_pipeline->freeze())},
+      _keyPattern(_spec.getKey().getOwned()),
+      _ordering(extractOrdering(_keyPattern)),
+      _keyPaths(extractKeyPaths(_keyPattern)),
+      _boundaries(extractBoundaries(_spec.getBoundaries(), _ordering)),
+      _consumerIds(extractConsumerIds(_spec.getConsumerIds(), _spec.getConsumers())),
+      _policy(_spec.getPolicy()),
+      _orderPreserving(_spec.getOrderPreserving()),
+      _maxBufferSize(_spec.getBufferSize()),
+      _inputMemoryPolicy(inputMemoryPolicy),
+      _memoryTracker(ownsOperationMemoryTracker()
+                         ? OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(opCtx)
+                         : nullptr) {
+    uassert(50901, "Exchange must have at least one consumer", _spec.getConsumers() > 0);
+
+    uassert(50951,
+            str::stream() << "Specified exchange buffer size (" << _maxBufferSize
+                          << ") exceeds the maximum allowable amount (" << kMaxBufferSize << ").",
+            _maxBufferSize <= kMaxBufferSize);
+
+    for (int idx = 0; idx < _spec.getConsumers(); ++idx) {
+        _consumers.emplace_back(std::make_unique<ExchangeBuffer>());
+    }
+
+    Stage* dynamicBatchStage = nullptr;
+    for (auto& stage : _execPipeline->getStages()) {
+        if (!stage->supportsDynamicBatchSize()) {
+            continue;
+        }
+        tassert(
+            13150702, "Multiple stages support dynamic batch size", dynamicBatchStage == nullptr);
+        dynamicBatchStage = stage.get();
+    }
+
+    if (dynamicBatchStage) {
+        uassert(13150700,
+                "Exchange dynamic batch size is only supported with the keyRange policy",
+                _policy == ExchangePolicyEnum::kKeyRange);
+        dynamicBatchStage->setDynamicBatchSize(&_dynamicBatchSize);
+    }
+
+    if (_policy == ExchangePolicyEnum::kKeyRange) {
+        uassert(50900,
+                "Exchange boundaries do not match number of consumers.",
+                _boundaries.size() == _consumerIds.size() + 1);
+        uassert(50967,
+                str::stream() << "The key pattern " << _keyPattern << " must have at least one key",
+                !_keyPaths.empty());
+    } else {
+        uassert(50899, "Exchange boundaries must not be specified.", _boundaries.empty());
+    }
+
+    _execPipeline->detachFromOperationContext();
+    _pipeline->detachFromOperationContext();
+
+    if (ownsOperationMemoryTracker()) {
+        // When the Exchange owns the producer's operation memory tracker, the shared producer
+        // pipeline is executed under whichever consumer's OperationContext wins the race to load
+        // the next batch, but the producer's memory is meant to be tracked solely by
+        // '_memoryTracker' (published to CurOp only via consumer 0). An expression that lacks a
+        // stage-level tracker would otherwise roll up into the operation-wide tracker of the
+        // current consumer's opCtx, lazily creating one on non-owning consumers and misreporting
+        // their memory metrics. Keep the producer's expression fallback standalone so it never
+        // touches a consumer's opCtx.
+        _pipeline->getContext()->setExcludeExpressionFallbackFromOperationMemoryTracking(true);
+    }
+}
+
+std::vector<std::string> Exchange::extractBoundaries(
+    const boost::optional<std::vector<BSONObj>>& obj, Ordering ordering) {
+    std::vector<std::string> ret;
+
+    if (!obj) {
+        return ret;
+    }
+
+    for (auto& b : *obj) {
+        key_string::Builder key{key_string::Version::V1, b, ordering};
+        ret.emplace_back(key.getView().begin(), key.getView().end());
+    }
+
+    uassert(50960, "Exchange range boundaries are not valid", ret.size() > 1);
+
+    for (size_t idx = 1; idx < ret.size(); ++idx) {
+        uassert(50893,
+                "Exchange range boundaries are not in ascending order.",
+                ret[idx - 1] < ret[idx]);
+    }
+
+    BSONObjBuilder kbMin;
+    BSONObjBuilder kbMax;
+    for (int i = 0; i < obj->front().nFields(); ++i) {
+        kbMin.appendMinKey("");
+        kbMax.appendMaxKey("");
+    }
+
+    key_string::Builder minKey{key_string::Version::V1, kbMin.obj(), ordering};
+    key_string::Builder maxKey{key_string::Version::V1, kbMax.obj(), ordering};
+
+    uassert(50958,
+            "Exchange lower bound must be the minkey.",
+            key_string::compare(ret.front(), minKey.getView()) == 0);
+    uassert(50959,
+            "Exchange upper bound must be the maxkey.",
+            key_string::compare(ret.back(), maxKey.getView()) == 0);
+
+    return ret;
+}
+
+std::vector<size_t> Exchange::extractConsumerIds(
+    const boost::optional<std::vector<std::int32_t>>& consumerIds, size_t nConsumers) {
+
+    uassert(50950,
+            str::stream() << "Specified number of exchange consumers (" << nConsumers
+                          << ") exceeds the maximum allowable amount (" << kMaxNumberConsumers
+                          << ").",
+            nConsumers <= kMaxNumberConsumers);
+
+    std::vector<size_t> ret;
+
+    if (!consumerIds) {
+        // If the ids are not specified than we generate a simple sequence 0,1,2,3,...
+        for (size_t idx = 0; idx < nConsumers; ++idx) {
+            ret.push_back(idx);
+        }
+    } else {
+        // Validate that the ids are dense (no hole) and in the range [0,nConsumers)
+        std::set<size_t> validation;
+
+        for (auto cid : *consumerIds) {
+            validation.insert(cid);
+            ret.push_back(cid);
+        }
+
+        uassert(50894,
+                str::stream() << "Exchange consumers ids are invalid.",
+                nConsumers > 0 && validation.size() == nConsumers && *validation.begin() == 0 &&
+                    *validation.rbegin() == nConsumers - 1);
+    }
+    return ret;
+}
+
+Ordering Exchange::extractOrdering(const BSONObj& keyPattern) {
+    bool hasHashKey = false;
+    bool hasOrderKey = false;
+
+    for (const auto& element : keyPattern) {
+        if (element.type() == BSONType::string) {
+            uassert(50895,
+                    str::stream() << "Exchange key description is invalid: " << element,
+                    element.valueStringData() == "hashed"sv);
+            hasHashKey = true;
+        } else if (element.isNumber()) {
+            auto num = element.number();
+            if (!(num == 1 || num == -1)) {
+                uasserted(50896,
+                          str::stream() << "Exchange key description is invalid: " << element);
+            }
+            hasOrderKey = true;
+        } else {
+            uasserted(50897, str::stream() << "Exchange key description is invalid: " << element);
+        }
+    }
+
+    uassert(50898,
+            str::stream() << "Exchange hash and order keys cannot be mixed together: "
+                          << keyPattern,
+            !(hasHashKey && hasOrderKey));
+
+    return hasHashKey ? Ordering::make(BSONObj()) : Ordering::make(keyPattern);
+}
+
+std::vector<FieldPath> Exchange::extractKeyPaths(const BSONObj& keyPattern) {
+    std::vector<FieldPath> paths;
+    for (auto& elem : keyPattern) {
+        paths.emplace_back(elem.fieldNameStringData());
+    }
+    return paths;
+}
+
+void Exchange::unblockLoading(size_t consumerId) {
+    // See if the loading is blocked on this consumer and if so unblock it.
+    if (_loadingThreadId == consumerId) {
+        _loadingThreadId = kInvalidThreadId;
+        _haveBufferSpace.notify_all();
+    }
+}
+
+void Exchange::attachContext(OperationContext* opCtx, size_t consumerId) {
+    _pipeline->reattachToOperationContext(opCtx);
+    _execPipeline->reattachToOperationContext(opCtx);
+    if (!reportsInputMemoryToCurOp()) {
+        return;
+    }
+
+    auto* trackerOnOpCtx = OperationMemoryUsageTracker::getIfExists(opCtx);
+    // Finding our own tracker on the opCtx is fine, but finding a different one is not.
+    tassert(12920100,
+            str::stream() << "cannot publish the exchange producer's memory tracker: the driving "
+                             "consumer's opCtx already has a different operation memory tracker, "
+                             "consumerId: "
+                          << consumerId,
+            !_memoryTracker || !trackerOnOpCtx || trackerOnOpCtx == _memoryTracker.get());
+
+    // Stats are only reported to CurOp for consumer 0 to avoid double-counting the producer's
+    // memory across multiple curOps. However, a lazily created tracker will report to its curOp
+    // until detachContext() claims the tracker for exchange.
+    const auto reportToCurOp = consumerId == 0 ? OperationMemoryUsageTracker::ReportToCurOp::kYes
+                                               : OperationMemoryUsageTracker::ReportToCurOp::kNo;
+    // Publish a co-owning copy to the consumer driving the load, so that Exchange also remains an
+    // owner for the duration of the load.
+    OperationMemoryUsageTracker::attachToOpCtxIfAvailable(opCtx, _memoryTracker, reportToCurOp);
+}
+
+void Exchange::detachContext(OperationContext* opCtx, size_t consumerId) {
+    if (reportsInputMemoryToCurOp()) {
+        auto detached = OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(opCtx);
+        tassert(13090701,
+                str::stream()
+                    << "cannot reclaim the exchange producer's memory tracker: the driving "
+                       "consumer's opCtx has a different operation memory tracker, consumerId: "
+                    << consumerId
+                    << ", tracker on opCtx: " << static_cast<const void*>(detached.get())
+                    << ", exchange's tracker: " << static_cast<const void*>(_memoryTracker.get()),
+                !_memoryTracker || !detached || detached == _memoryTracker);
+        if (!_memoryTracker) {
+            // Take the memory tracker if it was lazily created by a stage during the load so
+            // Exchange can manage the tracker.
+            _memoryTracker = std::move(detached);
+        }
+    }
+    _execPipeline->detachFromOperationContext();
+    _pipeline->detachFromOperationContext();
+}
+
+DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx,
+                                                size_t consumerId,
+                                                ResourceYielder* resourceYielder) {
+    // Grab a lock.
+    std::unique_lock<std::mutex> lk(_mutex);
+
+    for (;;) {
+        // Guard against some of the trickiness we do with moving the lock to/from the
+        // MutexAndResourceLock.
+        invariant(lk.owns_lock());
+        // Execute only in case we have not encountered an error.
+        if (!_errorInLoadNextBatch.isOK()) {
+            uasserted(ErrorCodes::ExchangePassthrough,
+                      "Exchange failed due to an error on different thread.");
+        }
+
+        // Check if we have a document.
+        if (!_consumers[consumerId]->isEmpty()) {
+            auto doc = _consumers[consumerId]->getNext();
+            unblockLoading(consumerId);
+
+            return doc;
+        }
+
+        // There is not any document so try to load more from the source.
+        if (_loadingThreadId == kInvalidThreadId) {
+            LOGV2_DEBUG(20896, 3, "A consumer begins loading", "consumerId"_attr = consumerId);
+
+            attachContext(opCtx, consumerId);
+            // From this point forward, we need to call detachContext(), no matter what. RAII
+            // helpers like ScopeGuard are not appropriate here because detaching may throw from a
+            // destructor, which can cause std::terminate() to be called if we are already
+            // unwinding. Instead, we call detachContext() below the try/catch for the happy path,
+            // and also inside the catch block if an exception was raised.
+            try {
+                // This consumer won the race and will fill the buffers.
+                _loadingThreadId = consumerId;
+
+
+                // This will execute the subpipeline and return when some exchange buffer is full
+                // and we cannot make any forward progress anymore. The return value is an index of
+                // a full consumer buffer.
+                size_t fullConsumerId = loadNextBatch();
+
+                if (MONGO_unlikely(exchangeFailLoadNextBatch.shouldFail())) {
+                    LOGV2(20897, "exchangeFailLoadNextBatch fail point enabled.");
+                    uasserted(ErrorCodes::FailPointEnabled,
+                              "Asserting on loading the next batch due to failpoint.");
+                }
+
+                // The loading cannot continue until the consumer with the full buffer consumes some
+                // documents.
+                _loadingThreadId = fullConsumerId;
+            } catch (const DBException& ex) {
+                _errorInLoadNextBatch = ex.toStatus();
+
+                LOGV2_DEBUG(10878900,
+                            3,
+                            "Exchange failed while loading the next batch",
+                            "error"_attr = ex.toStatus());
+
+                // We have to wake up all other blocked threads so they can detect the error and
+                // fail too. They can be woken up only after _errorInLoadNextBatch has been set.
+                _haveBufferSpace.notify_all();
+
+                // If this happens to throw, the original exception will be lost.
+                detachContext(opCtx, consumerId);
+
+                throw;
+            }
+
+            detachContext(opCtx, consumerId);
+
+            // Wake up everybody and try to make some progress.
+            _haveBufferSpace.notify_all();
+
+        } else {
+            // Some other consumer is already loading the buffers. There is nothing else we can do
+            // but wait.
+            MutexAndResourceLock mutexAndResourceLock(opCtx, std::move(lk), resourceYielder);
+            _haveBufferSpace.wait(mutexAndResourceLock);
+            lk = mutexAndResourceLock.releaseLockOwnership();
+        }
+    }
+}
+
+size_t Exchange::loadNextBatch() {
+    auto input = _execPipeline->getNextResult();
+
+    for (; input.isAdvanced(); input = _execPipeline->getNextResult()) {
+        // We have a document and we will deliver it to a consumer(s) based on the policy.
+        switch (_policy) {
+            case ExchangePolicyEnum::kBroadcast: {
+                bool full = false;
+                // The document is sent to all consumers.
+                for (auto& c : _consumers) {
+                    // By default the Document is shallow copied. However, the broadcasted document
+                    // can be used by multiple threads (consumers) and the Document is not thread
+                    // safe. Hence we have to clone the Document.
+                    auto copy = DocumentSource::GetNextResult(input.getDocument().clone());
+                    full = c->appendDocument(copy, _maxBufferSize);
+                }
+
+                if (full)
+                    return 0;
+            } break;
+            case ExchangePolicyEnum::kRoundRobin: {
+                size_t target = _roundRobinCounter;
+                _roundRobinCounter = (_roundRobinCounter + 1) % _consumers.size();
+
+                if (_consumers[target]->appendDocument(std::move(input), _maxBufferSize))
+                    return target;
+            } break;
+            case ExchangePolicyEnum::kKeyRange: {
+                // Skip key range lookup when there is only one consumer.
+                size_t target = _consumers.size() == 1 ? 0 : getTargetConsumer(input.getDocument());
+                size_t docLimit = _dynamicBatchSize.docLimit;
+                if (_consumers[target]->appendDocument(
+                        std::move(input), _maxBufferSize, docLimit)) {
+                    if (_orderPreserving) {
+                        // TODO SERVER-123923: send the high watermark here.
+                    }
+                    return target;
+                }
+            } break;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    invariant(input.isEOF());
+
+    // We have reached the end so send EOS to all consumers.
+    for (auto& c : _consumers) {
+        [[maybe_unused]] auto full = c->appendDocument(input, _maxBufferSize);
+    }
+
+    return kInvalidThreadId;
+}
+
+size_t Exchange::getTargetConsumer(const Document& input) {
+    // Build the key.
+    BSONObjBuilder kb;
+    size_t counter = 0;
+    for (const auto& elem : _keyPattern) {
+        auto value = input.getNestedField(_keyPaths[counter]);
+
+        // By definition we send documents with missing fields to the consumer 0.
+        if (value.missing()) {
+            return 0;
+        }
+
+        if (elem.type() == BSONType::string && elem.str() == "hashed") {
+            kb << ""
+               << BSONElementHasher::hash64(BSON("" << value).firstElement(),
+                                            BSONElementHasher::DEFAULT_HASH_SEED);
+        } else {
+            kb << "" << value;
+        }
+        ++counter;
+    }
+
+    key_string::Builder key{key_string::Version::V1, kb.obj(), _ordering};
+    std::string_view keyStr{key.getView().data(), key.getView().size()};
+
+    // Binary search for the consumer id.
+    auto it = std::upper_bound(_boundaries.begin(), _boundaries.end(), keyStr);
+    // upper_bound returns end() when the key equals or exceeds the last boundary. The last
+    // boundary is always MaxKey, so this occurs when a document field value IS MaxKey. Route
+    // such documents to the last consumer bucket (the bucket bounded by the last two boundaries).
+    if (it == _boundaries.end()) {
+        --it;
+    }
+
+    size_t distance = std::distance(_boundaries.begin(), it) - 1;
+    invariant(distance < _consumerIds.size());
+
+    size_t cid = _consumerIds[distance];
+    invariant(cid < _consumers.size());
+
+    return cid;
+}
+
+
+void Exchange::updateMemoryTrackingForDispose(OperationContext* opCtx) {
+    // opCtx might be null here if we are disposing outside of an operation. E.g., when the server
+    // shuts down and we are deleting the CursorManager.
+    if (reportsInputMemoryToCurOp() && _memoryTracker && opCtx) {
+        // As in attachContext(), co-owning the same tracker is fine; displacing a different one
+        // would split the operation's memory across two tallies.
+        auto* trackerOnOpCtx = OperationMemoryUsageTracker::getIfExists(opCtx);
+        tassert(12920101,
+                str::stream()
+                    << "cannot flush the exchange producer's memory tracker while disposing: the "
+                       "opCtx already has a different operation memory tracker, tracker on opCtx: "
+                    << static_cast<const void*>(trackerOnOpCtx)
+                    << ", exchange's tracker: " << static_cast<const void*>(_memoryTracker.get()),
+                !trackerOnOpCtx || trackerOnOpCtx == _memoryTracker.get());
+        OperationMemoryUsageTracker::attachToOpCtxIfAvailable(opCtx, _memoryTracker);
+        // We need the operation memory tracker to stay alive until all consumers have finished, and
+        // dispose has been called for all of the Exchange stage's source stages. So, detach it from
+        // the opCtx that is going away; the Exchange's own reference keeps it alive.
+        OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(opCtx);
+    }
+}
+
+void Exchange::dispose(OperationContext* opCtx, size_t consumerId) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // Some stages (e.g. $limit) proactively dispose their source when satisfied. Guard the rundown
+    // counter and inner-pipeline teardown against double-dispose for the same consumer.
+    if (_consumers[consumerId]->isDisposed()) {
+        return;
+    }
+
+    invariant(_disposeRunDown < getConsumers());
+
+    ++_disposeRunDown;
+
+    if (consumerId == 0) {
+        updateMemoryTrackingForDispose(opCtx);
+    }
+
+    // If _errorInLoadNextBatch status is not OK then an exception was thrown. In that case the
+    // throwing thread will do the dispose.
+    if (!_errorInLoadNextBatch.isOK()) {
+        if (_loadingThreadId == consumerId) {
+            _execPipeline->reattachToOperationContext(opCtx);
+            _execPipeline->dispose();
+        }
+    } else if (_disposeRunDown == getConsumers()) {
+        _execPipeline->reattachToOperationContext(opCtx);
+        _execPipeline->dispose();
+    }
+
+    _consumers[consumerId]->dispose();
+    unblockLoading(consumerId);
+}
+
+DocumentSource::GetNextResult Exchange::ExchangeBuffer::getNext() {
+    invariant(!_buffer.empty());
+
+    auto result = std::move(_buffer.front());
+    _buffer.pop_front();
+
+    if (result.isAdvanced()) {
+        _bytesInBuffer -= result.getDocument().getApproximateSize();
+    }
+
+    return result;
+}
+
+// If the buffer is disposed then we simply ignore any appends.
+bool Exchange::ExchangeBuffer::appendDocument(DocumentSource::GetNextResult input,
+                                              size_t memoryLimit,
+                                              size_t docCountLimit) {
+    if (_disposed) {
+        return false;
+    }
+
+    if (input.isAdvanced()) {
+        _bytesInBuffer += input.getDocument().getApproximateSize();
+        if (docCountLimit > 0) {
+            ++_batchDocCount;
+        }
+    }
+    _buffer.push_back(std::move(input));
+
+    if (_bytesInBuffer >= memoryLimit) {
+        return true;
+    }
+    // Indicate that the buffer is full when docCountLimit is reached, and reset
+    // the counter so the next batch starts fresh once this one is drained.
+    if (docCountLimit > 0 && _batchDocCount >= docCountLimit) {
+        _batchDocCount = 0;
+        return true;
+    }
+    return false;
+}
+
+size_t Exchange::getBatchDocCount_forTest(size_t consumerId) const {
+    return _consumers[consumerId]->getBatchDocCount();
+}
+
+ExchangeStage::ExchangeStage(std::string_view stageName,
+                             const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                             boost::intrusive_ptr<Exchange> exchange,
+                             size_t consumerId,
+                             const std::shared_ptr<ResourceYielder>& resourceYielder)
+    : Stage(stageName, pExpCtx),
+      _exchange(exchange),
+      _consumerId(consumerId),
+      _resourceYielder(resourceYielder) {}
+
+void ExchangeStage::doDispose() {
+    _exchange->dispose(pExpCtx->getOperationContext(), _consumerId);
+}
+
+/**
+ * ExchangeStage does not have a direct source (it is reading through the shared Exchange
+ * pipeline).
+ */
+void ExchangeStage::setSource(Stage* source) {
+    invariant(!source);
+}
+
+DocumentSource::GetNextResult ExchangeStage::doGetNext() {
+    return _exchange->getNext(pExpCtx->getOperationContext(), _consumerId, _resourceYielder.get());
+}
+
+}  // namespace exec::agg
+}  // namespace mongo

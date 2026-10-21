@@ -1,0 +1,159 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/exclusion_projection_executor.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/single_document_transformation_processor.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/modules.h"
+
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+/**
+ * This class is for DocumentSources that take in and return one document at a time, in a 1:1
+ * transformation. It should only be used via an alias that passes the transformation logic through
+ * a ParsedSingleDocumentTransformation. It is not a registered DocumentSource, and it cannot be
+ * created from BSON.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] DocumentSourceSingleDocumentTransformation final
+    : public DocumentSource {
+public:
+    DocumentSourceSingleDocumentTransformation(
+        const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+        std::unique_ptr<TransformerInterface> parsedTransform,
+        std::string_view name,
+        bool independentOfAnyCollection);
+
+    // virtuals from DocumentSource
+    std::string_view getSourceName() const final;
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    boost::intrusive_ptr<DocumentSource> optimize();
+    Value serialize(const query_shape::SerializationOptions& opts =
+                        query_shape::SerializationOptions{}) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+    GetModPathsReturn getModifiedPaths() const final;
+    void describeTransformation(
+        document_transformation::DocumentOperationVisitor& visitor) const override;
+    StageConstraints constraints(PipelineSplitState pipeState) const final;
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic(
+        const DistributedPlanContext* ctx) final {
+        return boost::none;
+    }
+
+    TransformerInterface::TransformerType getTransformerType() const {
+        return _transformationProcessor->getTransformer().getType();
+    }
+
+    const auto& getTransformer() const {
+        return _transformationProcessor->getTransformer();
+    }
+    auto& getTransformer() {
+        return _transformationProcessor->getTransformer();
+    }
+
+    SingleDocumentTransformationProcessor* getTransformationProcessor() {
+        return _transformationProcessor.get();
+    }
+
+    /**
+     * Extract computed projection(s) depending on the 'oldName' argument if the transformation is
+     * of type inclusion projection or computed projection. Extraction is not allowed if the name of
+     * the projection is in the 'reservedNames' set. The function returns a pair of <BSONObj, bool>.
+     * The BSONObj contains the computed projections in which the 'oldName' is substituted for the
+     * 'newName'. The boolean flag is true if the original projection has become empty after the
+     * extraction and can be deleted by the caller.
+     *
+     * For transformation of type inclusion projection the computed projections are replaced with a
+     * projected field or an identity projection depending on their position in the order of
+     * additional fields.
+     * For transformation of type computed projection the extracted computed projections are
+     * removed.
+     *
+     * The function has no effect for exclusion projections, or if there are no computed
+     * projections, or the computed expression depends on other fields than the oldName.
+     */
+    std::pair<BSONObj, bool> extractComputedProjections(
+        std::string_view oldName,
+        std::string_view newName,
+        const std::set<std::string_view>& reservedNames) {
+        return _transformationProcessor->getTransformer().extractComputedProjections(
+            oldName, newName, reservedNames);
+    }
+
+    /**
+     * If this transformation is a project, removes and returns a BSONObj representing the part of
+     * this project that depends only on 'oldName'. Also returns a bool indicating whether this
+     * entire project is extracted. In the extracted $project, 'oldName' is renamed to 'newName'.
+     * 'oldName' should not be dotted.
+     */
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(std::string_view oldName,
+                                                            std::string_view newName) {
+        return _transformationProcessor->getTransformer().extractProjectOnFieldAndRename(oldName,
+                                                                                         newName);
+    }
+
+    DocumentSourceContainer::iterator optimizeAt(DocumentSourceContainer::iterator itr,
+                                                 DocumentSourceContainer* container);
+
+private:
+    friend boost::intrusive_ptr<exec::agg::Stage>
+    documentSourceSingleDocumentTransformationToStageFn(
+        const boost::intrusive_ptr<DocumentSource>&);
+
+    DocumentSourceContainer::iterator maybeCoalesce(
+        DocumentSourceContainer::iterator itr,
+        DocumentSourceContainer* container,
+        DocumentSourceSingleDocumentTransformation* nextSingleDocTransform);
+
+    // TODO SERVER-105521: Check if we can change from 'std::shared_ptr' to 'std::unique_ptr'.
+    std::shared_ptr<SingleDocumentTransformationProcessor> _transformationProcessor;
+
+    projection_executor::ExclusionNode& getExclusionNode();
+
+    // Specific name of the transformation.
+    std::string _name;
+
+    // Set to true if this transformation stage can be run on the collectionless namespace.
+    bool _isIndependentOfAnyCollection;
+
+    // TODO SERVER-105521: Check if we can remove this and use just the '_transformationProcessor'.
+    // Cached stage options in case this DocumentSource is disposed before serialized (e.g. explain
+    // with a sort which will auto-dispose of the pipeline).
+    Document _cachedStageOptions;
+};
+
+}  // namespace mongo

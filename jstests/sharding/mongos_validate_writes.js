@@ -2,90 +2,73 @@
 // Tests that mongos validating writes when stale does not DOS config servers
 //
 // Note that this is *unsafe* with broadcast removes and updates
-//
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var st = new ShardingTest({ shards : 2, mongos : 3, other : { separateConfig : true,
-                                                              shardOptions : { verbose : 2 } } });
-st.stopBalancer()
+let st = new ShardingTest({shards: 2, mongos: 3, other: {rsOptions: {verbose: 2}}});
 
-var mongos = st.s0
-var staleMongosA = st.s1
-var staleMongosB = st.s2
+let mongos = st.s0;
+let staleMongosA = st.s1;
+let staleMongosB = st.s2;
 
-// Additional logging
-printjson( mongos.getDB( "admin" ).runCommand({ setParameter : 1, logLevel : 2 }) )
-printjson( staleMongosA.getDB( "admin" ).runCommand({ setParameter : 1, logLevel : 2 }) )
-printjson( staleMongosB.getDB( "admin" ).runCommand({ setParameter : 1, logLevel : 2 }) )
-printjson( st._connections[0].getDB( "admin" ).runCommand({ setParameter : 1, logLevel : 2 }) )
-printjson( st._connections[1].getDB( "admin" ).runCommand({ setParameter : 1, logLevel : 2 }) )
+let admin = mongos.getDB("admin");
+const kDbName = "foo";
+assert.commandWorked(
+    admin.runCommand({enableSharding: kDbName, primaryShard: st.shard1.shardName}),
+);
+let coll = mongos.getCollection(kDbName + ".bar");
+let staleCollA = staleMongosA.getCollection(coll + "");
+let staleCollB = staleMongosB.getCollection(coll + "");
 
-var admin = mongos.getDB( "admin" )
-var config = mongos.getDB( "config" )
-var coll = mongos.getCollection( "foo.bar" )
-var staleCollA = staleMongosA.getCollection( coll + "" )
-var staleCollB = staleMongosB.getCollection( coll + "" )
+coll.createIndex({a: 1});
 
-printjson( admin.runCommand({ enableSharding : coll.getDB() + "" }) )
-coll.ensureIndex({ a : 1 })
-printjson( admin.runCommand({ shardCollection : coll + "", key : { a : 1 } }) )
+// Shard the collection on {a: 1} and move one chunk to another shard. Updates need to be across
+// two shards to trigger an error, otherwise they are versioned and will succeed after raising a
+// StaleConfig error.
+st.shardColl(coll, {a: 1}, {a: 0}, {a: 1}, coll.getDB(), true);
 
 // Let the stale mongos see the collection state
-staleCollA.findOne()
-staleCollB.findOne()
+staleCollA.findOne();
+staleCollB.findOne();
 
 // Change the collection sharding state
-coll.drop()
-coll.ensureIndex({ b : 1 })
-printjson( admin.runCommand({ shardCollection : coll + "", key : { b : 1 } }) )
+coll.drop();
+coll.createIndex({b: 1});
+st.shardColl(coll, {b: 1}, {b: 0}, {b: 1}, coll.getDB(), true);
 
 // Make sure that we can successfully insert, even though we have stale state
-assert.writeOK(staleCollA.insert({ b : "b" }));
-
-// Make sure we unsuccessfully insert with old info
-assert.writeError(staleCollB.insert({ a : "a" }));
+assert.commandWorked(staleCollA.insert({b: "b"}));
 
 // Change the collection sharding state
-coll.drop()
-coll.ensureIndex({ c : 1 })
-printjson( admin.runCommand({ shardCollection : coll + "", key : { c : 1 } }) )
+coll.drop();
+coll.createIndex({c: 1});
+st.shardColl(coll, {c: 1}, {c: 0}, {c: 1}, coll.getDB(), true);
 
 // Make sure we can successfully upsert, even though we have stale state
-assert.writeOK(staleCollA.update({ c : "c" }, { c : "c" }, true ));
-
-// Make sure we unsuccessfully upsert with old info
-assert.writeError(staleCollB.update({ b : "b" }, { b : "b" }, true ));
+assert.commandWorked(staleCollA.update({c: "c"}, {c: "c"}, true));
 
 // Change the collection sharding state
-coll.drop()
-coll.ensureIndex({ d : 1 })
-printjson( admin.runCommand({ shardCollection : coll + "", key : { d : 1 } }) )
+coll.drop();
+coll.createIndex({d: 1});
+st.shardColl(coll, {d: 1}, {d: 0}, {d: 1}, coll.getDB(), true);
 
 // Make sure we can successfully update, even though we have stale state
-assert.writeOK(coll.insert({ d : "d" }));
+assert.commandWorked(coll.insert({d: "d"}));
 
-assert.writeOK(staleCollA.update({ d : "d" }, { $set : { x : "x" } }, false, false ));
-assert.eq( staleCollA.findOne().x, "x" )
+assert.commandWorked(staleCollA.update({d: "d"}, {$set: {x: "x"}}, false, false));
+assert.eq(staleCollA.findOne().x, "x");
 
-// Make sure we unsuccessfully update with old info
-assert.writeError(staleCollB.update({ c : "c" }, { $set : { x : "y" } }, false, false ));
-assert.eq( staleCollB.findOne().x, "x" )
+assert.eq(staleCollB.findOne().x, "x");
 
 // Change the collection sharding state
-coll.drop()
-coll.ensureIndex({ e : 1 })
-// Deletes need to be across two shards to trigger an error - this is probably an exceptional case
-printjson( admin.runCommand({ movePrimary : coll.getDB() + "", to : "shard0000" }) )
-printjson( admin.runCommand({ shardCollection : coll + "", key : { e : 1 } }) )
-printjson( admin.runCommand({ split : coll + "", middle : { e : 0 } }) )
-printjson( admin.runCommand({ moveChunk : coll + "", find : { e : 0 }, to : "shard0001" }) )
+coll.drop();
+coll.createIndex({e: 1});
+// Deletes need to be across two shards to trigger an error.
+st.shardColl(coll, {e: 1}, {e: 0}, {e: 1}, coll.getDB(), true);
 
 // Make sure we can successfully remove, even though we have stale state
-assert.writeOK(coll.insert({ e : "e" }));
+assert.commandWorked(coll.insert({e: "e"}));
 
-assert.writeOK(staleCollA.remove({ e : "e" }, true));
-assert.eq( null, staleCollA.findOne() )
+assert.commandWorked(staleCollA.remove({e: "e"}, true));
+assert.eq(null, staleCollA.findOne());
 
-// Make sure we unsuccessfully remove with old info
-assert.writeError(staleCollB.remove({ d : "d" }, true ));
-
-st.stop()
+st.stop();

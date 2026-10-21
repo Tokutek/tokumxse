@@ -1,0 +1,664 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/util/stacktrace.h"
+
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+
+#include "mongo/base/parse_number.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/future.h"
+#include "mongo/util/stacktrace_details.h"
+#include "mongo/util/stacktrace_somap.h"
+
+#include <atomic>
+#include <cerrno>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/fstream.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <fmt/format.h>
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+namespace mongo {
+namespace stacktrace_details {
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+constexpr std::string_view kTaskDir = "/proc/self/task"sv;
+
+std::string_view getBaseName(std::string_view path) {
+    size_t lastSlash = path.rfind('/');
+    if (lastSlash == std::string::npos)
+        return path;
+    return path.substr(lastSlash + 1);
+}
+
+ptrdiff_t offsetFromBase(uintptr_t base, uintptr_t addr) {
+    return addr - base;
+}
+
+class CachedMetaGenerator {
+public:
+    class File {
+    public:
+        File(uintptr_t base, std::string id, boost::filesystem::path path)
+            : _base(base), _id(std::move(id)), _path(std::move(path)) {}
+
+        uintptr_t base() const {
+            return _base;
+        }
+
+        std::string_view id() const {
+            return _id;
+        }
+
+        const boost::filesystem::path& path() const {
+            return _path;
+        }
+
+    private:
+        uintptr_t _base;
+        std::string _id;
+        boost::filesystem::path _path;
+    };
+
+    class Symbol {
+    public:
+        Symbol(uintptr_t base, std::string name) : _base(base), _name(std::move(name)) {}
+        uintptr_t base() const {
+            return _base;
+        }
+        std::string_view name() const {
+            return _name;
+        }
+
+    private:
+        uintptr_t _base;
+        std::string _name;
+    };
+
+    class RedactedMeta {
+    public:
+        RedactedMeta(void* a, const File* f, const Symbol* s) : _addr(a), _file(f), _symbol(s) {}
+        void* addr() const {
+            return _addr;
+        }
+        const File* file() const {
+            return _file;
+        }
+        const Symbol* symbol() const {
+            return _symbol;
+        }
+
+    private:
+        void* _addr;
+        const File* _file;
+        const Symbol* _symbol;
+    };
+
+    CachedMetaGenerator() = default;
+
+    ~CachedMetaGenerator() {
+        LOGV2(23393,
+              "CachedMetaGenerator",
+              "hits"_attr = _hits,
+              "hitsAndMisses"_attr = (_hits + _misses));
+    }
+
+    const RedactedMeta& load(void* addr) {
+        auto it = _cache.find(addr);
+        if (it != _cache.end()) {
+            ++_hits;
+            return it->second;
+        }
+        ++_misses;
+        const auto& rawMeta = _gen.load(addr);
+
+        const File* file{};
+        if (const auto& rmf = rawMeta.file(); rmf) {
+            auto it = _files.find(rmf.base());
+            if (it == _files.end()) {
+                it = _files
+                         .insert({rmf.base(),
+                                  File{rmf.base(),
+                                       makeId(),
+                                       boost::filesystem::path{std::string{rmf.name()}}}})
+                         .first;
+            }
+            file = &it->second;
+        }
+
+        const Symbol* sym{};
+        if (const auto& rms = rawMeta.symbol(); rms) {
+            auto it = _symbols.find(rms.base());
+            if (it == _symbols.end())
+                it = _symbols.insert({rms.base(), {rms.base(), std::string{rms.name()}}}).first;
+            sym = &it->second;
+        }
+
+        return _cache.insert({addr, {addr, file, sym}}).first->second;
+    }
+
+    const File* findFile(uintptr_t soBase) const {
+        if (auto it = _files.find(soBase); it != _files.end())
+            return &it->second;
+        return nullptr;
+    }
+
+private:
+    std::string makeId() {
+        return fmt::format("{:03d}", _serial++);
+    }
+
+    size_t _hits = 0;
+    size_t _misses = 0;
+    size_t _serial = 0;
+    std::map<uintptr_t, File> _files;
+    std::map<uintptr_t, Symbol> _symbols;
+    stdx::unordered_map<void*, RedactedMeta> _cache;
+    StackTraceAddressMetadataGenerator _gen;
+};
+
+/** Safe to call from a signal handler. Might wake early with EINTR. */
+void sleepMicros(int64_t usec) {
+    auto nsec = usec * 1000;
+    constexpr static int64_t k1E9 = 1'000'000'000;
+    timespec ts{nsec / k1E9, nsec % k1E9};
+    nanosleep(&ts, nullptr);
+}
+
+/** Cannot yield. AS-Safe. */
+class SimpleSpinLock {
+public:
+    void lock() {
+        while (true) {
+            for (int i = 0; i < 100; ++i) {
+                if (!_flag.test_and_set(std::memory_order_acquire)) {
+                    return;
+                }
+            }
+            sleepMicros(1);
+        }
+    }
+
+    void unlock() {
+        _flag.clear(std::memory_order_release);
+    }
+
+private:
+    std::atomic_flag _flag = ATOMIC_FLAG_INIT;  // NOLINT
+};
+
+template <typename T>
+class AsyncStack {
+public:
+    T* tryPop() {
+        std::lock_guard lock{_spin};
+        T* node = _head;
+        if (node) {
+            node = std::exchange(_head, node->intrusiveNext);
+            node->intrusiveNext = nullptr;
+        }
+        return node;
+    }
+
+    void push(T* node) {
+        std::lock_guard lock{_spin};
+        node->intrusiveNext = std::exchange(_head, node);
+    }
+
+private:
+    T* _head = nullptr;
+    SimpleSpinLock _spin;  // guards _head
+};
+
+class ThreadBacktrace {
+public:
+    ThreadBacktrace* intrusiveNext;
+
+    static const size_t capacity = kStackTraceFrameMax;
+
+    auto addrRange() const {
+        struct AddrRange {
+            void **b, **e;
+            void** begin() const {
+                return b;
+            }
+            void** end() const {
+                return e;
+            }
+        };
+        return AddrRange{addrs, addrs + size};
+    }
+
+    int tid = 0;
+    std::unique_ptr<void*[]> addrStorage = std::make_unique<void*[]>(capacity);
+    void** addrs = addrStorage.get();
+    size_t size = 0;
+};
+
+class State {
+public:
+    void printStacks(StackTraceSink& sink);
+    void printStacks();
+
+    void printAllThreadStacksBlocking();
+
+    /**
+     * We need signals for two purposes in the stack tracing system.
+     *
+     * An external process sends a signal to initiate stack tracing.  When that's received,
+     * we *also* need a signal to send to each thread to cause to dump its backtrace.
+     * The `siginfo` provides enough information to allow one signal to serve both roles.
+     *
+     * Since all threads are open to receiving this signal, any of them can be selected to
+     * receive it when it comes from outside. So we arrange for any thread that receives the
+     * undirected stack trace signal to re-issue it directly at the signal processing thread.
+     *
+     * The signal processing thread will have the signal blocked, and handle it
+     * synchronously with sigwaitinfo, so this handler only applies to the other
+     * respondents.
+     */
+    void action(siginfo_t* si);
+
+    void markProcessingThread() {
+        _processingTid.store(stacktrace_details::getThreadId(), std::memory_order_release);
+    }
+
+    void setSignal(int signal) {
+        _signal = signal;
+    }
+
+private:
+    /** An in-flight all-thread stack collection. */
+    struct StackCollectionOperation {
+        AsyncStack<ThreadBacktrace> pool;
+        AsyncStack<ThreadBacktrace> results;
+    };
+
+    struct AbstractEmitter {
+        virtual void open() = 0;
+        virtual void prologue(const BSONObj& obj) = 0;
+        virtual void threadRecordsOpen() = 0;
+        virtual void threadRecord(const BSONObj& obj) = 0;
+        virtual void threadRecordsClose() = 0;
+        virtual void close() = 0;
+    };
+
+    /** Write several log statements, one per thread. */
+    void printToEmitter(AbstractEmitter& emitter);
+
+    void collectStacks(std::vector<ThreadBacktrace>& messageStorage,
+                       std::vector<ThreadBacktrace*>& received,
+                       std::vector<int>& missedTids);
+
+    ThreadBacktrace* acquireBacktraceBuffer();
+
+    void postBacktrace(ThreadBacktrace* msg) {
+        _stackCollection.load()->results.push(msg);
+    }
+
+    int _signal = 0;
+    std::atomic<int> _processingTid = -1;                               // NOLINT
+    std::atomic<StackCollectionOperation*> _stackCollection = nullptr;  // NOLINT
+    PrintAllStacksSession _printAllStacksSession;
+
+    MONGO_STATIC_ASSERT(decltype(_processingTid)::is_always_lock_free);
+    MONGO_STATIC_ASSERT(decltype(_stackCollection)::is_always_lock_free);
+};
+
+ThreadBacktrace* State::acquireBacktraceBuffer() {
+    while (true) {
+        auto coll = _stackCollection.load();
+        if (!coll) {
+            // Brute sanity check. Should not really happen.
+            // A raise(SIGUSR2) could cause it, but we aren't supporting that.
+            return nullptr;
+        }
+        if (ThreadBacktrace* msg = coll->pool.tryPop(); msg != nullptr)
+            return msg;
+        sleepMicros(1);
+    }
+}
+
+void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
+                          std::vector<ThreadBacktrace*>& received,
+                          std::vector<int>& missedTids) {
+    std::set<int> pendingTids;
+    stacktrace_details::iterateTids([&](int tid) { pendingTids.insert(tid); });
+    LOGV2(23394, "Preparing to dump thread stacks", "numThreads"_attr = pendingTids.size());
+
+    messageStorage.resize(pendingTids.size());
+    received.reserve(pendingTids.size());
+
+    // Make a StackCollectionOperation and load it with enough ThreadBacktrace buffers to serve
+    // every pending thread.
+    StackCollectionOperation collection;
+    for (auto& m : messageStorage)
+        collection.pool.push(&m);
+    _stackCollection.store(&collection, std::memory_order_release);
+
+    for (auto iter = pendingTids.begin(); iter != pendingTids.end();) {
+        errno = 0;
+        if (int r = stacktrace_details::terminateThread(getpid(), *iter, _signal); r < 0) {
+            int errsv = errno;
+            LOGV2(23395,
+                  "Failed to signal thread",
+                  "tid"_attr = *iter,
+                  "error"_attr = strerror(errsv));
+            missedTids.push_back(*iter);
+            iter = pendingTids.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+    LOGV2(23396, "Signalled threads", "numThreads"_attr = pendingTids.size());
+
+    const auto startTime = Date_t::now();
+    Milliseconds requestedNap{0};
+    while (!pendingTids.empty()) {
+        if (ThreadBacktrace* message = collection.results.tryPop(); message) {
+            requestedNap = Milliseconds{0};
+            if (pendingTids.erase(message->tid) != 0) {
+                received.push_back(message);
+            } else {
+                collection.pool.push(message);
+            }
+        } else if (requestedNap < Milliseconds{50}) {
+            // Results queue is dry and we haven't napped enough to justify a reap.
+            static constexpr Milliseconds napInterval{1};
+            requestedNap += napInterval;
+            sleepFor(napInterval);
+        } else {
+            requestedNap = Milliseconds{0};
+            // Prune dead threads from the pendingTids set before retrying.
+            for (auto iter = pendingTids.begin(); iter != pendingTids.end();) {
+                if (!stacktrace_details::tidExists(*iter)) {
+                    const Milliseconds elapsed = Date_t::now() - startTime;
+                    LOGV2(13424301,
+                          "Thread exited while attempting stack collection, skipping",
+                          "tid"_attr = *iter,
+                          "waited"_attr = elapsed);
+                    missedTids.push_back(*iter);
+                    iter = pendingTids.erase(iter);
+                } else {
+                    ++iter;
+                }
+            }
+        }
+    }
+    _stackCollection.store(nullptr, std::memory_order_release);
+}
+
+
+void State::printStacks(StackTraceSink& sink) {
+    struct SinkEmitter : public AbstractEmitter {
+        explicit SinkEmitter(StackTraceSink& s) : _sink{s} {}
+        void open() override {}
+        void prologue(const BSONObj& obj) override {
+            for (auto& e : obj)
+                _bob.append(e);
+        }
+        void threadRecordsOpen() override {
+            _threadRecords = std::make_unique<BSONArrayBuilder>(_bob.subarrayStart("threadInfo"));
+        }
+        void threadRecord(const BSONObj& obj) override {
+            _threadRecords->append(obj);
+        }
+        void threadRecordsClose() override {
+            _threadRecords->done();
+        }
+        void close() override {
+            _sink << tojson(_bob.done(), ExtendedRelaxedV2_0_0);
+        }
+
+        StackTraceSink& _sink;
+        BSONObjBuilder _bob;
+        std::unique_ptr<BSONArrayBuilder> _threadRecords;
+    };
+    SinkEmitter emitter{sink};
+    printToEmitter(emitter);
+}
+
+void State::printStacks() {
+    struct LogEmitter : public AbstractEmitter {
+        void open() override {
+            LOGV2(31423, "===== multithread stacktrace session begin =====");
+        }
+        void prologue(const BSONObj& obj) override {
+            LOGV2(31424, "Stacktrace Prologue", "prologue"_attr = obj);
+        }
+        void threadRecordsOpen() override {}
+        void threadRecord(const BSONObj& obj) override {
+            LOGV2(31425,  //
+                  "Stacktrace Record",
+                  "record"_attr = obj);
+        }
+        void threadRecordsClose() override {}
+        void close() override {
+            LOGV2(31426, "===== multithread stacktrace session end =====");
+        }
+    };
+
+    LogEmitter emitter;
+    auto notifier = _printAllStacksSession.notifier();
+    printToEmitter(emitter);
+}
+
+void State::printAllThreadStacksBlocking() {
+    if (!_signal) {
+        LOGV2_ERROR(9967000, "Failed to print all thread stacks: signal handler not initialized.");
+        return;
+    }
+    auto waiter = _printAllStacksSession.waiter();
+    kill(getpid(), _signal);  // The SignalHandler thread calls printAllThreadStacks.
+}
+
+void State::printToEmitter(AbstractEmitter& emitter) {
+    std::vector<ThreadBacktrace> messageStorage;
+    std::vector<ThreadBacktrace*> received;
+    std::vector<int> missedTids;
+    collectStacks(messageStorage, received, missedTids);
+
+    CachedMetaGenerator metaGen;
+    const BSONObj& bsonProcInfo = globalSharedObjectMapInfo().obj();
+
+    // Load all addrs in all threads into the metaGen.
+    for (auto&& msg : received)
+        for (auto&& addrPtr : msg->addrRange())
+            metaGen.load(addrPtr);
+
+    emitter.open();
+    {
+        BSONObjBuilder prologue;
+        if (!missedTids.empty()) {
+            BSONArrayBuilder tidArray(prologue.subarrayStart("missedThreadIds"sv));
+            for (int tid : missedTids)
+                tidArray.append(tid);
+        }
+        {
+            BSONObjBuilder procInfo(prologue.subobjStart("processInfo"sv));
+            for (const BSONElement& be : bsonProcInfo) {
+                std::string_view key = be.fieldNameStringData();
+
+                // Handle 'somap' specially. Pass everything else through.
+                if (be.type() == BSONType::array && key == "somap"sv) {
+                    BSONArrayBuilder soMapArr(procInfo.subarrayStart(key));
+                    for (const BSONElement& ae : be.Array()) {
+                        BSONObj bRec = ae.embeddedObject();
+                        uintptr_t soBase = Hex::fromHex(bRec.getStringField("b"sv));
+
+                        // Skip any files that aren't present in the metaGen.
+                        const auto* file = metaGen.findFile(soBase);
+                        if (file == nullptr)
+                            continue;
+                        BSONObjBuilder outLibrary(soMapArr.subobjStart());
+
+                        // Replace "b" with the `file->id()`. Pass everything else through.
+                        for (auto&& be : bRec) {
+                            if (be.fieldNameStringData() == "b"sv) {
+                                outLibrary.append("b"sv, file->id());
+                            } else {
+                                outLibrary.append(be);
+                            }
+                        }
+                    }
+                } else {
+                    procInfo.append(be);
+                }
+            }
+        }
+        emitter.prologue(prologue.done());
+    }
+    emitter.threadRecordsOpen();
+    for (ThreadBacktrace* msg : received) {
+        BSONObjBuilder threadRecord;
+        if (auto threadName = stacktrace_details::readThreadName(msg->tid); !threadName.empty()) {
+            threadRecord.append("name"sv, threadName);
+        }
+        threadRecord.append("tid"sv, msg->tid);
+        {
+            BSONArrayBuilder backtrace(threadRecord.subarrayStart("backtrace"sv));
+            for (void* const addrPtr : msg->addrRange()) {
+                const auto& meta = metaGen.load(addrPtr);
+                const uintptr_t addr = reinterpret_cast<uintptr_t>(addrPtr);
+                BSONObjBuilder frame(backtrace.subobjStart());
+                if (const auto& mf = meta.file(); mf) {
+                    std::string_view base = mf->id();  // really a made-up id string
+                    frame.append("b"sv, base);
+                    frame.append("o"sv, Hex(offsetFromBase(mf->base(), addr)));
+                }
+                if (const auto& sym = meta.symbol(); sym) {
+                    frame.append("s"sv, sym->name());
+                    frame.append("s+"sv, Hex(offsetFromBase(sym->base(), addr)));
+                }
+            }
+        }
+        emitter.threadRecord(threadRecord.done());
+    }
+    emitter.threadRecordsClose();
+    emitter.close();
+}
+
+void State::action(siginfo_t* si) {
+    const ScopeGuard errnoGuard([e = errno] { errno = e; });
+    switch (si->si_code) {
+        case SI_USER:
+        case SI_QUEUE:
+            // Received from outside. Forward to signal processing thread if there is one.
+            if (int sigTid = _processingTid.load(std::memory_order_acquire); sigTid != -1)
+                stacktrace_details::terminateThread(getpid(), sigTid, si->si_signo);
+            break;
+        case SI_TKILL:
+            // Users should call the toplevel printAllThreadStacks function.
+            // An SI_TKILL could be a raise(SIGUSR2) call, and we ignore those.
+            // Received from the signal processing thread.
+            // Submit this thread's backtrace to the results stack.
+            if (ThreadBacktrace* msg = acquireBacktraceBuffer(); msg != nullptr) {
+                msg->tid = stacktrace_details::getThreadId();
+                msg->size = rawBacktrace(msg->addrs, msg->capacity);
+                postBacktrace(msg);
+            }
+            break;
+    }
+}
+
+State* stateSingleton = new State{};
+extern "C" void stateSingletonAction(int, siginfo_t* si, void*) {
+    stateSingleton->action(si);
+}
+
+/**
+ * Called from single-thread init time. The stack tracer will use the specified `signal`.
+ */
+void initialize(int signal) {
+    stateSingleton->setSignal(signal);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    // We should never need to add to this lambda because it simply sets up handler
+    // execution. Any changes should either be in State::action or in the signal
+    // handler itself.
+    sa.sa_sigaction = stateSingletonAction;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    if (sigaction(signal, &sa, nullptr) != 0) {
+        int savedErr = errno;
+        LOGV2_FATAL(31376,
+                    "Failed to install sigaction for signal",
+                    "signal"_attr = signal,
+                    "error"_attr = strerror(savedErr));
+    }
+}
+
+}  // namespace
+
+}  // namespace stacktrace_details
+
+
+/*
+ * This function should not be called from outside the SignalHandler thread.
+ */
+void printAllThreadStacks(StackTraceSink& sink) {
+    stacktrace_details::stateSingleton->printStacks(sink);
+}
+
+/*
+ * This function should not be called from outside the SignalHandler thread.
+ */
+void printAllThreadStacks() {
+    stacktrace_details::stateSingleton->printStacks();
+}
+
+/**
+ * For use by threads other than the SignalHandler thread.
+ */
+void printAllThreadStacksBlocking() {
+    stacktrace_details::stateSingleton->printAllThreadStacksBlocking();
+}
+
+void setupStackTraceSignalAction(int signal) {
+    stacktrace_details::initialize(signal);
+}
+
+void markAsStackTraceProcessingThread() {
+    stacktrace_details::stateSingleton->markProcessingThread();
+}
+
+}  // namespace mongo
+#endif  // !defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+// IWYU pragma: no_include <syscall.h>
+// IWYU pragma: no_include "bits/types/siginfo_t.h"

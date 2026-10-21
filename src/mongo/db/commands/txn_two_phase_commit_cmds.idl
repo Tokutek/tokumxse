@@ -1,0 +1,49 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+structs:
+    CommitParticipant:
+        description: "Describes a shard participant in a transaction commit"
+        fields:
+            shardId:
+                description: "The id of the shard"
+                type: shard_id
+
+    PrepareReply:
+        description: "Reply to prepareTransactionCommand"
+        is_command_reply: true
+        fields:
+            prepareTimestamp:
+                description: "Timestamp of prepare transaction operation. Optional for backward compatibility only."
+                type: timestamp
+                optional: true
+            affectedNamespaces:
+                description: "List of namespaces, affected by the transaction. Optional for backward compatibility only."
+                type: array<namespacestring>
+                optional: true
+commands:
+    prepareTransaction:
+        description: "Parser for the 'prepareTransaction' command."
+        command_name: prepareTransaction
+        strict: true
+        namespace: ignored
+        api_version: ""
+        reply_type: PrepareReply
+
+    coordinateCommitTransaction:
+        description: "Parser for the 'coordinateCommitTransaction' command."
+        command_name: coordinateCommitTransaction
+        strict: false
+        namespace: ignored
+        api_version: ""
+        fields:
+            participants:
+                description: "An array of shard participants that must be included in the commit."
+                type: array<CommitParticipant>

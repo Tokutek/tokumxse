@@ -1,0 +1,296 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/stages/loop_join.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/stage_visitors.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+#include <utility>
+
+
+namespace mongo::sbe {
+using namespace std::literals::string_view_literals;
+LoopJoinStage::LoopJoinStage(std::unique_ptr<PlanStage> outer,
+                             std::unique_ptr<PlanStage> inner,
+                             value::SlotVector outerProjects,
+                             value::SlotVector outerCorrelated,
+                             std::unique_ptr<EExpression> predicate,
+                             PlanNodeId nodeId,
+                             bool participateInTrialRunTracking)
+    : LoopJoinStage(std::move(outer),
+                    std::move(inner),
+                    std::move(outerProjects),
+                    std::move(outerCorrelated),
+                    value::SlotVector{},
+                    std::move(predicate),
+                    JoinType::Inner,
+                    nodeId,
+                    participateInTrialRunTracking) {}
+
+LoopJoinStage::LoopJoinStage(std::unique_ptr<PlanStage> outer,
+                             std::unique_ptr<PlanStage> inner,
+                             value::SlotVector outerProjects,
+                             value::SlotVector outerCorrelated,
+                             value::SlotVector innerProjects,
+                             std::unique_ptr<EExpression> predicate,
+                             JoinType joinType,
+                             PlanNodeId nodeId,
+                             bool participateInTrialRunTracking)
+    : PlanStage("nlj"sv, nullptr /* yieldPolicy */, nodeId, participateInTrialRunTracking),
+      _outerProjects(std::move(outerProjects)),
+      _outerCorrelated(std::move(outerCorrelated)),
+      _innerProjects(std::move(innerProjects)),
+      _predicate(std::move(predicate)),
+      _joinType(joinType) {
+    _children.emplace_back(std::move(outer));
+    _children.emplace_back(std::move(inner));
+
+    tassert(11094719,
+            "Expecting either inner or left join in loop join stage",
+            _joinType == JoinType::Inner || _joinType == JoinType::Left);
+}
+
+
+std::unique_ptr<PlanStage> LoopJoinStage::clone() const {
+    return std::make_unique<LoopJoinStage>(_children[0]->clone(),
+                                           _children[1]->clone(),
+                                           _outerProjects,
+                                           _outerCorrelated,
+                                           _innerProjects,
+                                           _predicate ? _predicate->clone() : nullptr,
+                                           _joinType,
+                                           _commonStats.nodeId,
+                                           participateInTrialRunTracking());
+}
+
+void LoopJoinStage::prepare(CompileCtx& ctx) {
+    for (auto& f : _outerProjects) {
+        auto [it, inserted] = _outerRefs.emplace(f);
+        uassert(4822820, str::stream() << "duplicate field: " << f, inserted);
+    }
+    _children[0]->prepare(ctx);
+
+    for (auto& f : _outerCorrelated) {
+        ctx.pushCorrelated(f, _children[0]->getAccessor(ctx, f));
+    }
+    _children[1]->prepare(ctx);
+
+    for (size_t idx = 0; idx < _outerCorrelated.size(); ++idx) {
+        ctx.popCorrelated();
+    }
+
+    if (_joinType == JoinType::Left) {
+        for (auto slot : _innerProjects) {
+            _outProjectAccessors.emplace(
+                slot, value::SwitchAccessor{{_children[1]->getAccessor(ctx, slot), &_constant}});
+        }
+    }
+
+    if (_predicate) {
+        ctx.root = this;
+        _predicateCode = _predicate->compile(ctx);
+    }
+}
+
+value::SlotAccessor* LoopJoinStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    if (_outerRefs.count(slot)) {
+        return _children[0]->getAccessor(ctx, slot);
+    }
+    if (_joinType == JoinType::Left) {
+        if (auto it = _outProjectAccessors.find(slot); it != _outProjectAccessors.end()) {
+            return &it->second;
+        }
+        return ctx.getAccessor(slot);
+    }
+    return _children[1]->getAccessor(ctx, slot);
+}
+
+void LoopJoinStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
+    _commonStats.opens++;
+    _children[0]->open(reOpen);
+    _outerGetNext = true;
+    // Do not open the inner child as we do not have values of correlated parameters yet.
+    // The values are available only after we call getNext on the outer side.
+}
+
+void LoopJoinStage::openInner() {
+    // Reset back to the inputs.
+    if (_joinType == JoinType::Left) {
+        for (auto&& [_, v] : _outProjectAccessors) {
+            v.setIndex(0);
+        }
+    }
+    // (re)open the inner side as it can see the correlated value now.
+    _children[1]->open(_reOpenInner);
+    _reOpenInner = true;
+    ++_specificStats.innerOpens;
+}
+
+PlanState LoopJoinStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+    bool innerSideMatched = true;
+
+    if (_outerGetNext) {
+        auto state = getNextOuterSide();
+        if (state != PlanState::ADVANCED) {
+            return trackPlanState(state);
+        }
+
+        openInner();
+        innerSideMatched = false;
+        _outerGetNext = false;
+    }
+
+    for (;;) {
+        while (_children[1]->getNext() == PlanState::ADVANCED) {
+            if (!_predicateCode || _bytecode.runPredicate(_predicateCode.get())) {
+                return trackPlanState(PlanState::ADVANCED);
+            }
+        }
+
+        if (_joinType == JoinType::Left && !innerSideMatched) {
+            for (auto&& [_, v] : _outProjectAccessors) {
+                v.setIndex(1);
+            }
+            return trackPlanState(PlanState::ADVANCED);
+        }
+
+        auto state = getNextOuterSide();
+        if (state != PlanState::ADVANCED) {
+            return trackPlanState(state);
+        }
+
+        openInner();
+        innerSideMatched = false;
+    }
+}
+
+void LoopJoinStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
+    trackClose();
+
+    if (_reOpenInner) {
+        _children[1]->close();
+
+        _reOpenInner = false;
+        ++_specificStats.innerCloses;
+    }
+
+    _children[0]->close();
+}
+
+void LoopJoinStage::doSaveState() {
+    if (_isReadingLeftSide) {
+        // If we yield while reading the left side, there is no need to prepareForYielding() data
+        // held in the right side, since we will have to re-open it anyway.
+        const bool recursive = true;
+        _children[1]->disableSlotAccess(recursive);
+    }
+}
+
+std::unique_ptr<PlanStageStats> LoopJoinStage::getStats(bool includeDebugInfo) const {
+    auto ret = std::make_unique<PlanStageStats>(_commonStats);
+
+    ret->children.emplace_back(_children[0]->getStats(includeDebugInfo));
+    ret->children.emplace_back(_children[1]->getStats(includeDebugInfo));
+    ret->specific = std::make_unique<LoopJoinStats>(_specificStats);
+
+    if (includeDebugInfo) {
+        BSONObjBuilder bob(StorageAccessStatsVisitor::collectStats(*this, *ret).toBSON());
+        bob.appendNumber("innerOpens", static_cast<long long>(_specificStats.innerOpens))
+            .appendNumber("innerCloses", static_cast<long long>(_specificStats.innerCloses))
+            .append("outerProjects", _outerProjects.begin(), _outerProjects.end())
+            .append("outerCorrelated", _outerCorrelated.begin(), _outerCorrelated.end());
+        if (_predicate) {
+            bob.append("predicate", DebugPrinter{}.print(_predicate->debugPrint()));
+        }
+
+        ret->debugInfo = bob.obj();
+    }
+    return ret;
+}
+
+const SpecificStats* LoopJoinStage::getSpecificStats() const {
+    return &_specificStats;
+}
+
+void LoopJoinStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                                 DebugPrintInfo& debugPrintInfo) const {
+    switch (_joinType) {
+        case JoinType::Inner:
+            ret.emplace_back(DebugPrinter::Block("inner"));
+            break;
+        case JoinType::Left:
+            ret.emplace_back(DebugPrinter::Block("left"));
+            break;
+        case JoinType::Right:
+            ret.emplace_back(DebugPrinter::Block("right"));
+            break;
+    }
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _outerProjects.size(); ++idx) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+
+        DebugPrinter::addIdentifier(ret, _outerProjects[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _outerCorrelated.size(); ++idx) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+
+        DebugPrinter::addIdentifier(ret, _outerCorrelated[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    if (_predicate) {
+        ret.emplace_back("{`");
+        DebugPrinter::addBlocks(ret, _predicate->debugPrint());
+        ret.emplace_back("`}");
+    }
+
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+
+    DebugPrinter::addKeyword(ret, "left");
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, _children[0]->debugPrint(debugPrintInfo));
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+
+    DebugPrinter::addKeyword(ret, "right");
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, _children[1]->debugPrint(debugPrintInfo));
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    if (debugPrintInfo.printBytecode) {
+        PlanStage::debugPrintBytecode(ret, _predicateCode, "PREDICATE_CODE" /*title*/);
+    }
+}
+
+size_t LoopJoinStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_outerProjects);
+    size += size_estimator::estimate(_outerCorrelated);
+    size += _predicate ? _predicate->estimateSize() : 0;
+    size += size_estimator::estimate(_specificStats);
+    return size;
+}
+}  // namespace mongo::sbe

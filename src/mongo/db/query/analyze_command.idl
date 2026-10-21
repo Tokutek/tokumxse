@@ -1,0 +1,82 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/query/query_optimization_knobs.idl"
+
+enums:
+    AnalyzeMode:
+        description: "Mode controlling what the analyze command generates."
+        type: string
+        values:
+            kSample: "sample"
+            kHistograms: "histograms"
+            kNdv: "ndv"
+
+commands:
+    analyze:
+        description: "Command to allow for manual update and creation of statistics."
+        command_name: analyze
+        cpp_name: AnalyzeCommandRequest
+        strict: true
+        namespace: concatenate_with_db
+        api_version: ""
+        access_check:
+            complex:
+                - check: is_authorized_to_parse_namespace_element
+                - privilege:
+                      resource_pattern: exact_namespace
+                      action_type: analyze
+        reply_type: OkReply
+        fields:
+            key:
+                description: >-
+                    The possibly dotted field path for which to create or update stats. Mode
+                    "ndv" also accepts an array of paths, building one composite NDV statistic
+                    over the tuple of fields.
+                type:
+                    variant: [string, array<string>]
+                optional: true
+            sampleRate:
+                description: >-
+                    The proportion of the collection, in the range (0,1] to be sampled
+                    for creating stats.
+                type: safeDouble
+                validator: {gt: 0.0, lte: 1.0}
+                optional: true
+            sampleSize:
+                description: >-
+                    The number of documents used to build the stats, based on a random
+                    sample of the collection.
+                type: safeInt
+                validator: {gt: 0}
+                optional: true
+            numberBuckets:
+                description: "The number of buckets used for creating the histogram."
+                type: safeInt
+                validator: {gt: 0}
+                optional: true
+            mode:
+                description: >-
+                    Whether to collect a persistent sample, build histograms, or collect
+                    number of distinct values (NDV) statistics.
+                type: AnalyzeMode
+                optional: true
+            samplingMethod:
+                description: >-
+                    The sampling method to use when mode is 'sample'. Defaults to the
+                    value of the internalQuerySamplingCEMethodForPersistentSamples.
+                type: SamplingCEMethod
+                optional: true
+            numChunks:
+                description: "The number of chunks to use when samplingMethod is 'chunk'."
+                type: safeInt
+                validator: {gt: 0}
+                optional: true

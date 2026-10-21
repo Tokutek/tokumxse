@@ -1,0 +1,41 @@
+# Set the Cluster-Wide Read/Write Concern Defaults to be the same as the implicit server defaults
+# (for a replica set).  This should be 100% identical to if the defaults had not been set, ie. the
+# non-passthrough core suite.
+
+test_kind: js_test
+
+selector:
+  roots:
+    - jstests/core/**/*.js
+  exclude_files:
+    # This test attempts to read from the "local.oplog.rs" collection, which may be missing entries
+    # if a write was performed on the primary of the replica set instead.
+    - jstests/core/query/awaitdata_getmore_cmd.js
+    # This test relies on the implicit default write concern of w:majority but this suite sets the
+    # default as w:1
+    - jstests/core/query/find_with_resume_after_param.js
+  exclude_with_any_tags:
+    - assumes_standalone_mongod
+
+executor:
+  archive:
+    hooks:
+      - ValidateCollections
+  config:
+    shell_options:
+      eval: >-
+        globalThis.testingReplication = true;
+  hooks:
+    - class: ValidateCollections
+    - class: CleanEveryN
+      n: 20
+  fixture:
+    class: ReplicaSetFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+    num_nodes: 1
+    default_read_concern:
+      level: local
+    default_write_concern:
+      w: 1

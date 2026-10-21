@@ -1,0 +1,251 @@
+/**
+ * BackgroundMutator module for running background operations during change stream tests.
+ *
+ * Responsibilities:
+ * - Runs a configurable sequence of background operations in a loop.
+ * - Waits for a stop signal via Connector (set by join() in the main thread).
+ * - Applies random jitter to delays for realistic timing variation.
+ * - Signals completion via Connector.notifyDone(instanceName).
+ */
+import "jstests/multiVersion/libs/multi_cluster.js";
+
+import {binVersionToFCV} from "src/mongo/shell/feature_compatibility_version.js";
+import {Connector} from "jstests/libs/util/change_stream/change_stream_connector.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {setFCVWithRetryOnBackgroundOpInProgress} from "jstests/libs/set_fcv_helpers.js";
+
+/**
+ * Background operation type constants.
+ */
+const BackgroundMutatorOpType = {
+    ResetPlacementHistory: "resetPlacementHistory",
+    FlipFCV: "flipFCV",
+    FlipBinary: "flipBinary",
+};
+
+/**
+ * BackgroundMutator class for running background operations during tests.
+ */
+class BackgroundMutator {
+    /**
+     * Default delay in milliseconds between downgrade and upgrade operations (FCV or binary).
+     * Can be overridden via config.versionChangeDelayMs or by modifying this static property in tests.
+     */
+    static kDefaultVersionChangeDelayMs = 100;
+    static kDefaultMinDelayMs = 2 * 1000;
+    static kDefaultMaxDelayMs = 5 * 1000;
+    static _thread = null;
+    static _host = null;
+    static _instanceName = null;
+
+    /**
+     * Launch the background mutator in a background thread.
+     * @param {Mongo} conn - MongoDB connection.
+     * @param {Object} config - Configuration object containing:
+     *   - instanceName: Name of the mutator instance (for signaling completion).
+     *   - ops: (Optional) Array of BackgroundMutatorOpType values. Defaults to all op types.
+     *   - minDelayMs: (Optional) Minimum delay between operations (default: 2s).
+     *   - maxDelayMs: (Optional) Maximum delay between operations (default: 5s).
+     *   - versionChangeDelayMs: (Optional) Delay between downgrade and upgrade operations (default kDefaultVersionChangeDelayMs).
+     *   - downgradeFCV: (Optional) FCV to downgrade to for FlipFCV (default: lastContinuousFCV).
+     *   - shardingTest: (Optional) ShardingTest instance, required for FlipBinary.
+     *   - oldBinaryVersion: (Optional) Old binary version to downgrade to for FlipBinary (e.g., "last-lts").
+     */
+    static start(conn, config) {
+        assert(!BackgroundMutator._thread, "BackgroundMutator is already running");
+        BackgroundMutator._host = conn.host;
+        BackgroundMutator._instanceName = config.instanceName;
+        const thread = new Thread(
+            async function (host, config) {
+                const {BackgroundMutator} = await import(
+                    "jstests/libs/util/change_stream/change_stream_background_mutator.js"
+                );
+                const {Connector} = await import(
+                    "jstests/libs/util/change_stream/change_stream_connector.js"
+                );
+                const conn = new Mongo(host);
+                try {
+                    BackgroundMutator._execute(conn, config);
+                } catch (e) {
+                    jsTest.log.info("BackgroundMutator thread FAILED", {
+                        instanceName: config.instanceName,
+                        error: e.toString(),
+                        stack: e.stack,
+                    });
+                    throw e;
+                } finally {
+                    Connector.notifyDone(conn, config.instanceName);
+                }
+            },
+            BackgroundMutator._host,
+            config,
+        );
+        thread.start();
+        BackgroundMutator._thread = thread;
+    }
+
+    /**
+     * Signal the running mutator to stop, then join the thread.
+     */
+    static join() {
+        if (!BackgroundMutator._thread) {
+            return;
+        }
+        Connector.notifyDone(
+            new Mongo(BackgroundMutator._host),
+            `${BackgroundMutator._instanceName}_stop`,
+        );
+        try {
+            BackgroundMutator._thread.join();
+        } finally {
+            BackgroundMutator._thread = null;
+            BackgroundMutator._host = null;
+            BackgroundMutator._instanceName = null;
+        }
+    }
+
+    static _execute(conn, config) {
+        const stopFlag = `${config.instanceName}_stop`;
+        const ops = config.ops || Object.values(BackgroundMutatorOpType);
+        const minDelayMs = config.minDelayMs || BackgroundMutator.kDefaultMinDelayMs;
+        const maxDelayMs = config.maxDelayMs || BackgroundMutator.kDefaultMaxDelayMs;
+
+        Random.setRandomSeed(config.seed);
+
+        while (!Connector.isDone(conn, stopFlag)) {
+            const opType = ops[Random.randInt(ops.length)];
+            const delay = minDelayMs + Random.randInt(maxDelayMs - minDelayMs);
+
+            jsTest.log.debug(
+                `BackgroundMutator [${config.instanceName}]: sleeping ${delay}ms before ${opType}`,
+            );
+            sleep(delay);
+
+            if (Connector.isDone(conn, stopFlag)) {
+                break;
+            }
+
+            jsTest.log.debug(`BackgroundMutator [${config.instanceName}]: running ${opType}`);
+            BackgroundMutator._runOp(conn, opType, config);
+        }
+
+        jsTest.log.debug(`BackgroundMutator [${config.instanceName}]: stop requested, exiting`);
+    }
+
+    /**
+     * Execute a single background operation.
+     * @param {Mongo} conn - MongoDB connection.
+     * @param {string} opType - BackgroundMutatorOpType value.
+     * @param {Object} config - Full configuration object.
+     * @private
+     */
+    static _runOp(conn, opType, config) {
+        switch (opType) {
+            case BackgroundMutatorOpType.ResetPlacementHistory:
+                BackgroundMutator._resetPlacementHistory(conn);
+                break;
+            case BackgroundMutatorOpType.FlipFCV:
+                BackgroundMutator._flipFCV(conn, config);
+                break;
+            case BackgroundMutatorOpType.FlipBinary:
+                BackgroundMutator._flipBinary(conn, config);
+                break;
+            default:
+                throw new Error("Unknown BackgroundMutatorOpType: " + opType);
+        }
+    }
+
+    /**
+     * Reset placement history on the cluster.
+     * @param {Mongo} conn - MongoDB connection (should be mongos or config server).
+     * @private
+     */
+    static _resetPlacementHistory(conn) {
+        try {
+            assert.commandWorked(conn.getDB("admin").runCommand({resetPlacementHistory: 1}));
+        } catch (e) {
+            // resetPlacementHistory requires latestFCV. If FCV is downgraded or mid-transition
+            // (e.g. because _flipFCV just ran), skip this iteration; the loop will retry later.
+            if (e.code === ErrorCodes.CommandNotSupported) {
+                jsTest.log.debug(
+                    "BackgroundMutator: resetPlacementHistory skipped (FCV not at latest)",
+                    {
+                        errmsg: e.message,
+                    },
+                );
+                return;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Flip FCV: downgrade to the configured FCV, wait, then upgrade back to latestFCV.
+     * Following the pattern from jstests/hooks/run_fcv_upgrade_downgrade_background.js,
+     * we wait between operations to let the system settle in each FCV state.
+     * @param {Mongo} conn - MongoDB connection.
+     * @param {Object} config - Configuration object containing:
+     *   - downgradeFCV: (Optional) FCV to downgrade to (default: lastContinuousFCV).
+     *   - versionChangeDelayMs: (Optional) Delay between operations (default: kDefaultVersionChangeDelayMs).
+     * @private
+     */
+    static _flipFCV(conn, config) {
+        const delayMs =
+            config.versionChangeDelayMs || BackgroundMutator.kDefaultVersionChangeDelayMs;
+        // Default to lastContinuousFCV: it is always exactly one step below latestFCV, so the
+        // downgrade is always a valid single-step transition. Callers may pass downgradeFCV
+        // explicitly if they need a specific target (e.g. lastLTSFCV), but must then ensure the
+        // transition is reachable from latestFCV in one step.
+        const downgradeFCV = config.downgradeFCV || lastContinuousFCV;
+
+        // Downgrade to the configured FCV.
+        setFCVWithRetryOnBackgroundOpInProgress(conn, downgradeFCV);
+
+        // Wait for the system to settle in the downgraded state.
+        sleep(delayMs);
+
+        // Upgrade back to latestFCV.
+        setFCVWithRetryOnBackgroundOpInProgress(conn, latestFCV);
+    }
+
+    /**
+     * Flip binary versions: downgrade cluster to old binary, wait, then upgrade back to latest.
+     * Uses st.downgradeCluster() and st.upgradeCluster() from jstests/multiVersion/libs/multi_cluster.js.
+     * Requires shardingTest and oldBinaryVersion to be set in config.
+     * @param {Mongo} conn - MongoDB connection (unused, passed for interface consistency).
+     * @param {Object} config - Configuration with shardingTest, oldBinaryVersion, and optional versionChangeDelayMs.
+     * @private
+     */
+    static _flipBinary(conn, config) {
+        assert(config.shardingTest, "FlipBinary requires shardingTest in config");
+        assert(config.oldBinaryVersion, "FlipBinary requires oldBinaryVersion in config");
+
+        const st = config.shardingTest;
+        const oldBinaryVersion = config.oldBinaryVersion;
+        const delayMs =
+            config.versionChangeDelayMs || BackgroundMutator.kDefaultVersionChangeDelayMs;
+
+        // Phase 1: Downgrade FCV first (required before binary downgrade).
+        // Use binVersionToFCV to get the appropriate FCV for the target binary version.
+        const downgradeFCV = binVersionToFCV(oldBinaryVersion);
+        assert.commandWorked(
+            st.s.adminCommand({setFeatureCompatibilityVersion: downgradeFCV, confirm: true}),
+        );
+
+        // Phase 2: Downgrade binary (mongos first, then shards, then config servers).
+        st.downgradeCluster(oldBinaryVersion, {waitUntilStable: true});
+
+        // Wait for the system to operate in the downgraded state.
+        sleep(delayMs);
+
+        // Phase 3: Upgrade binary (config servers first, then shards, then mongos).
+        st.upgradeCluster("latest", {waitUntilStable: true});
+
+        // Phase 4: Upgrade FCV (after binary upgrade).
+        assert.commandWorked(
+            st.s.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}),
+        );
+    }
+}
+
+export {BackgroundMutator, BackgroundMutatorOpType};

@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file specifies the fields for TopologyVersion.
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    WriteConcernError:
+        description: "WriteConcernError structure shared by all commands"
+        strict: true
+        fields:
+            code: int
+            codeName:
+                type: string
+                optional: true
+            errmsg: string
+            errInfo:
+                type: object
+                optional: true

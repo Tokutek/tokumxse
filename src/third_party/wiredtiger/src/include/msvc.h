@@ -1,96 +1,316 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
+
+#pragma once
+
 #include <intrin.h>
 
 #ifndef _M_AMD64
 #error "Only x64 is supported with MSVC"
 #endif
 
-#define	inline __inline
+#ifndef __cplusplus
+#define inline __inline
+#endif
 
-#define	WT_SIZET_FMT	"Iu"			/* size_t format string */
+/* MSVC Doesn't provide __PRETTY_FUNCTION__, it has __FUNCSIG__ */
+#ifdef _MSC_VER
+#define __PRETTY_FUNCTION__ __FUNCSIG__
+#endif
+
+#define WT_PTRDIFFT_FMT "Id" /* ptrdiff_t format string */
+#define WT_SIZET_FMT "Iu"    /* size_t format string */
+
+/* MSVC-specific attributes. */
+#define WT_PACKED_STRUCT_BEGIN(name) __pragma(pack(push, 1)) struct name {
+
+#define WT_PACKED_STRUCT_END \
+    }                        \
+    ;                        \
+    __pragma(pack(pop))
+
+#define WT_GCC_FUNC_ATTRIBUTE(x)
+#define WT_GCC_FUNC_DECL_ATTRIBUTE(x)
+
+#ifdef __cplusplus
+#define WT_THREAD_LOCAL thread_local
+#else
+#define WT_THREAD_LOCAL __declspec(thread)
+#endif
 
 /*
- * Add MSVC-specific attributes and pragmas to types and function declarations.
+ * WT_COMPILER_BARRIER --
+ *	MSVC implementation of WT_COMPILER_BARRIER.
  */
-#define	WT_COMPILER_TYPE_ALIGN(x)	__declspec(align(x))
+static inline void
+WT_COMPILER_BARRIER(void)
+{
+    _ReadWriteBarrier();
+}
 
-#define	WT_PACKED_STRUCT_BEGIN(name)					\
-	__pragma(pack(push,1))						\
-	struct name {
+/*
+ * WT_FULL_BARRIER --
+ *	MSVC implementation of WT_FULL_BARRIER.
+ */
+static inline void
+WT_FULL_BARRIER(void)
+{
+    _mm_mfence();
+}
 
-#define	WT_PACKED_STRUCT_END						\
-	};								\
-	__pragma(pack(pop))
+/*
+ * WT_PAUSE --
+ *	MSVC implementation of WT_PAUSE.
+ */
+static inline void
+WT_PAUSE(void)
+{
+    _mm_pause();
+}
 
-#define	WT_GCC_FUNC_ATTRIBUTE(x)
-#define	WT_GCC_FUNC_DECL_ATTRIBUTE(x)
+/*
+ * WT_ACQUIRE_BARRIER --
+ *	MSVC implementation of WT_ACQUIRE_BARRIER. As we're running on x86 TSO we only issue a
+ *compiler barrier.
+ */
+static inline void
+WT_ACQUIRE_BARRIER(void)
+{
+    WT_COMPILER_BARRIER();
+}
 
-#define	__WT_ATOMIC_ADD(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchangeAdd ## s((t*)&(v), (t)(val)) + (val))
-#define	__WT_ATOMIC_FETCH_ADD(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchangeAdd ## s((t*)&(v), (t)(val)))
-#define	__WT_ATOMIC_CAS(v, old, new, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedCompareExchange ## s				\
-	((t*)&(v), (t)(new), (t)(old)) == (t)(old))
-#define	__WT_ATOMIC_CAS_VAL(v, old, new, n, s, t)			\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedCompareExchange ## s((t*)&(v), (t)(new), (t)(old)))
-#define	__WT_ATOMIC_STORE(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchange ## s((t*)&(v), (t)(val)))
-#define	__WT_ATOMIC_SUB(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchangeAdd ## s((t*)&(v), -(t) val) - (val))
+/*
+ * WT_RELEASE_BARRIER --
+ *	MSVC implementation of WT_RELEASE_BARRIER. As we're running on x86 TSO we only issue a
+ *compiler barrier.
+ */
+static inline void
+WT_RELEASE_BARRIER(void)
+{
+    WT_COMPILER_BARRIER();
+}
 
-#define	WT_ATOMIC_ADD1(v, val)		__WT_ATOMIC_ADD(v, val, 1, 8, char)
-#define	WT_ATOMIC_FETCH_ADD1(v, val)					\
-	__WT_ATOMIC_FETCH_ADD(v, val, 1, 8, char)
-#define	WT_ATOMIC_CAS1(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 1, 8, char)
-#define	WT_ATOMIC_CAS_VAL1(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 1, 8, char)
-#define	WT_ATOMIC_STORE1(v, val)	__WT_ATOMIC_STORE(v, val, 1, 8, char)
-#define	WT_ATOMIC_SUB1(v, val)		__WT_ATOMIC_SUB(v, val, 1, 8, char)
+/*
+ * !!!
+ * The following functions do not use atomic accesses like they do in gcc.h. MSVC doesn't have
+ * the equivalent relaxed memory ordering atomics on x86 (only ARM has Interlocked*_nf
+ * functions that don't output a fence), so use non-atomic accesses which was the behavior
+ * prior the addition of atomic load and store.
+ */
 
-#define	WT_ATOMIC_ADD2(v, val)		__WT_ATOMIC_ADD(v, val, 2, 16, short)
-#define	WT_ATOMIC_FETCH_ADD2(v, val)					\
-	__WT_ATOMIC_FETCH_ADD(v, val, 2, 16, short)
-#define	WT_ATOMIC_CAS2(v, old, new)					\
-	__WT_ATOMIC_CAS(v, old, new, 2, 16, short)
-#define	WT_ATOMIC_CAS_VAL2(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 2, 16, short)
-#define	WT_ATOMIC_STORE2(v, val)	__WT_ATOMIC_STORE(v, val, 2, 16, short)
-#define	WT_ATOMIC_SUB2(v, val)		__WT_ATOMIC_SUB(v, val, 2, 16, short)
+#define WT_ATOMIC_FUNC_STORE_LOAD(suffix, _type, s, t)                                     \
+    static inline _type __wt_atomic_load_##suffix##_relaxed(_type *vp)                     \
+    {                                                                                      \
+        return (*(vp));                                                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_relaxed(_type *vp, _type v)            \
+    {                                                                                      \
+        *(vp) = (v);                                                                       \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_acquire(_type *vp)                     \
+    {                                                                                      \
+        _type result = *vp;                                                                \
+        WT_ACQUIRE_BARRIER();                                                              \
+        return (result);                                                                   \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_release(_type *vp, _type v)            \
+    {                                                                                      \
+        WT_RELEASE_BARRIER();                                                              \
+        *vp = v;                                                                           \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix(_type *vp)                               \
+    {                                                                                      \
+        return (*(vp));                                                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix(_type *vp, _type v)                      \
+    {                                                                                      \
+        _InterlockedExchange##s((t *)(vp), (t)(v));                                        \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_v_relaxed(volatile _type *vp)          \
+    {                                                                                      \
+        return (*(vp));                                                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_v_relaxed(volatile _type *vp, _type v) \
+    {                                                                                      \
+        *(vp) = (v);                                                                       \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_v_acquire(volatile _type *vp)          \
+    {                                                                                      \
+        _type result = *vp;                                                                \
+        WT_ACQUIRE_BARRIER();                                                              \
+        return (result);                                                                   \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_v_release(volatile _type *vp, _type v) \
+    {                                                                                      \
+        WT_RELEASE_BARRIER();                                                              \
+        *vp = v;                                                                           \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_v(volatile _type *vp)                  \
+    {                                                                                      \
+        return (*(vp));                                                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_v(volatile _type *vp, _type v)         \
+    {                                                                                      \
+        _InterlockedExchange##s((volatile t *)(vp), (t)(v));                               \
+    }
 
-#define	WT_ATOMIC_ADD4(v, val)		__WT_ATOMIC_ADD(v, val, 4, , long)
-#define	WT_ATOMIC_FETCH_ADD4(v, val)	__WT_ATOMIC_FETCH_ADD(v, val, 4, , long)
-#define	WT_ATOMIC_CAS4(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 4, , long)
-#define	WT_ATOMIC_CAS_VAL4(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 4, , long)
-#define	WT_ATOMIC_STORE4(v, val)	__WT_ATOMIC_STORE(v, val, 4, , long)
-#define	WT_ATOMIC_SUB4(v, val)		__WT_ATOMIC_SUB(v, val, 4, , long)
+#define WT_ATOMIC_CAS_FUNC(suffix, _type, s, t)                                                \
+    static inline bool __wt_atomic_cas_##suffix(_type *vp, _type old, _type newv)              \
+    {                                                                                          \
+        return (__WT_ATOMIC_CAS_INTERNAL(vp, &old, newv));                                     \
+    }                                                                                          \
+    static inline bool __wt_atomic_cas_##suffix##_relaxed(_type *vp, _type old, _type newv)    \
+    {                                                                                          \
+        return (__WT_ATOMIC_CAS_INTERNAL(vp, &old, newv));                                     \
+    }                                                                                          \
+    static inline bool __wt_atomic_cas_##suffix##_v(volatile _type *vp, _type old, _type newv) \
+    {                                                                                          \
+        return (__WT_ATOMIC_CAS_INTERNAL(vp, &old, newv));                                     \
+    }                                                                                          \
+    static inline bool __wt_atomic_cas_##suffix##_v_relaxed(                                   \
+      volatile _type *vp, _type old, _type newv)                                               \
+    {                                                                                          \
+        return (__WT_ATOMIC_CAS_INTERNAL(vp, &old, newv));                                     \
+    }
 
-#define	WT_ATOMIC_ADD8(v, val)		__WT_ATOMIC_ADD(v, val, 8, 64, __int64)
-#define	WT_ATOMIC_FETCH_ADD8(v, val)					\
-	__WT_ATOMIC_FETCH_ADD(v, val, 8, 64, __int64)
-#define	WT_ATOMIC_CAS8(v, old, new)					\
-	__WT_ATOMIC_CAS(v, old, new, 8, 64, __int64)
-#define	WT_ATOMIC_CAS_VAL8(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 8, 64, __int64)
-#define	WT_ATOMIC_STORE8(v, val)					\
-	__WT_ATOMIC_STORE(v, val, 8, 64, __int64)
-#define	WT_ATOMIC_SUB8(v, val)		__WT_ATOMIC_SUB(v, val, 8, 64, __int64)
+#define WT_ATOMIC_FUNC(suffix, _type, s, t)                                                        \
+    static inline _type __wt_atomic_add_##suffix(_type *vp, _type v)                               \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)) + (v));                              \
+    }                                                                                              \
+    static inline _type __wt_atomic_add_##suffix##_relaxed(_type *vp, _type v)                     \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)) + (v));                              \
+    }                                                                                              \
+    static inline _type __wt_atomic_fetch_add_##suffix(_type *vp, _type v)                         \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)));                                    \
+    }                                                                                              \
+    static inline _type __wt_atomic_sub_##suffix(_type *vp, _type v)                               \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), -(t)v) - (v));                               \
+    }                                                                                              \
+    static inline _type __wt_atomic_sub_##suffix##_relaxed(_type *vp, _type v)                     \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), -(t)v) - (v));                               \
+    }                                                                                              \
+    static inline _type __wt_atomic_add_##suffix##_v(volatile _type *vp, _type v)                  \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)) + (v));                              \
+    }                                                                                              \
+    static inline _type __wt_atomic_add_##suffix##_v_relaxed(volatile _type *vp, _type v)          \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)) + (v));                              \
+    }                                                                                              \
+    static inline _type __wt_atomic_fetch_add_##suffix##_v(volatile _type *vp, _type v)            \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)));                                    \
+    }                                                                                              \
+    static inline _type __wt_atomic_sub_##suffix##_v(volatile _type *vp, _type v)                  \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), -(t)v) - (v));                               \
+    }                                                                                              \
+    static inline _type __wt_atomic_sub_##suffix##_v_relaxed(volatile _type *vp, _type v)          \
+    {                                                                                              \
+        return (_InterlockedExchangeAdd##s((t *)(vp), -(t)v) - (v));                               \
+    }                                                                                              \
+    static inline bool __wt_atomic_cas_##suffix##_v(                                               \
+      volatile _type *vp, _type old_val, _type new_val)                                            \
+    {                                                                                              \
+        return (                                                                                   \
+          _InterlockedCompareExchange##s((t *)(vp), (t)(new_val), (t)(old_val)) == (t)(old_val));  \
+    }                                                                                              \
+    static inline bool __wt_atomic_cas_##suffix##_v_relaxed(                                       \
+      volatile _type *vp, _type old_val, _type new_val)                                            \
+    {                                                                                              \
+        return (                                                                                   \
+          _InterlockedCompareExchange##s((t *)(vp), (t)(new_val), (t)(old_val)) == (t)(old_val));  \
+    }                                                                                              \
+    static inline bool __wt_atomic_cas_##suffix(_type *vp, _type old_val, _type new_val)           \
+    {                                                                                              \
+        return (                                                                                   \
+          _InterlockedCompareExchange##s((t *)(vp), (t)(new_val), (t)(old_val)) == (t)(old_val));  \
+    }                                                                                              \
+    static inline bool __wt_atomic_cas_##suffix##_relaxed(_type *vp, _type old_val, _type new_val) \
+    {                                                                                              \
+        return (                                                                                   \
+          _InterlockedCompareExchange##s((t *)(vp), (t)(new_val), (t)(old_val)) == (t)(old_val));  \
+    }                                                                                              \
+    WT_ATOMIC_FUNC_STORE_LOAD(suffix, _type, s, t)
 
-static inline void WT_BARRIER(void) { _ReadWriteBarrier(); }
-static inline void WT_FULL_BARRIER(void) { _mm_mfence(); }
-static inline void WT_PAUSE(void) { _mm_pause(); }
-static inline void WT_READ_BARRIER(void) { _mm_lfence(); }
-static inline void WT_WRITE_BARRIER(void) { _mm_sfence(); }
+WT_ATOMIC_FUNC(uint8, uint8_t, 8, char)
+WT_ATOMIC_FUNC(uint16, uint16_t, 16, short)
+WT_ATOMIC_FUNC(uint32, uint32_t, , long)
+WT_ATOMIC_FUNC(uint64, uint64_t, 64, __int64)
+WT_ATOMIC_FUNC(int8, int8_t, 8, char)
+WT_ATOMIC_FUNC(int16, int16_t, 16, short)
+WT_ATOMIC_FUNC(int32, int32_t, , long)
+WT_ATOMIC_FUNC(int64, int64_t, 64, __int64)
+WT_ATOMIC_FUNC(size, size_t, 64, __int64)
+
+WT_ATOMIC_FUNC_STORE_LOAD(bool, bool, 8, char)
+WT_ATOMIC_FUNC_STORE_LOAD(uintmax, uintmax_t, 64, __int64)
+
+/*
+ * __wt_atomic_load_double_relaxed --
+ *     Atomically read a double variable.
+ */
+static inline double
+__wt_atomic_load_double_relaxed(double *vp)
+{
+    return (*vp);
+}
+
+/*
+ * __wt_atomic_store_double_relaxed --
+ *     Atomically set a double variable.
+ */
+static inline void
+__wt_atomic_store_double_relaxed(double *vp, double v)
+{
+    *vp = v;
+}
+
+#define __wt_atomic_load_enum_relaxed(vp) (*(vp))
+#define __wt_atomic_load_enum_acquire(vp) (WT_ACQUIRE_BARRIER(), *(vp))
+#define __wt_atomic_store_enum_relaxed(vp, v) (*(vp) = (v))
+#define __wt_atomic_store_enum_release(vp, v) \
+    do {                                      \
+        WT_RELEASE_BARRIER();                 \
+        *(vp) = (v);                          \
+    } while (0)
+
+#define __wt_atomic_load_ptr_relaxed(vp) (*(vp))
+#define __wt_atomic_store_ptr_relaxed(vp, v) (*(vp) = (v))
+
+/*
+ * Pointer atomic operations with acquire/release semantics using MSVC barrier macros. Note: These
+ * are simplified macros that assume WT_ACQUIRE_READ_WITH_BARRIER and WT_RELEASE_WRITE_WITH_BARRIER
+ * handle the load/store with appropriate barriers.
+ */
+#define __wt_atomic_load_ptr_acquire(vp) (WT_ACQUIRE_BARRIER(), *(vp))
+
+#define __wt_atomic_store_ptr_release(vp, v) \
+    do {                                     \
+        WT_RELEASE_BARRIER();                \
+        *(vp) = (v);                         \
+    } while (0)
+
+/*
+ * __wt_atomic_cas_ptr --
+ *     Pointer compare and swap.
+ */
+static inline bool
+__wt_atomic_cas_ptr(void *vp, void *old, void *newv)
+{
+    return (_InterlockedCompareExchange64((volatile __int64 *)vp, (int64_t)newv, (int64_t)old) ==
+      ((int64_t)old));
+}
+
+#define __wt_atomic_load_generic_relaxed(vp) (*(vp))
+#define __wt_atomic_store_generic_relaxed(vp, v) (*(vp) = (v))

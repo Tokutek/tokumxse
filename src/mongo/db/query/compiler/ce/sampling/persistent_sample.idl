@@ -1,0 +1,75 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo::ce"
+    mod_visibility: private
+    cpp_includes:
+        - "mongo/platform/atomic.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    SamplingTechnique:
+        description: "The method used to generate the sample."
+        type: string
+        values:
+            kRandom: "random"
+            kChunk: "chunk"
+            kFullCollScan: "fullCollScan"
+            kSeqScan: "seqScan"
+            kStrides: "strides"
+
+structs:
+    PersistentSampleDoc:
+        description: >-
+            On-disk document stored in <db>.system.stats.samples for a persisted CE sample.
+            Populated by the analyze command and consumed by the sampling estimator.
+        strict: true
+        fields:
+            # A string key built by 'makePersistentSampleId' as the concatenation of the identity fields.
+            _id:
+                type: string
+            pageNo:
+                type: int
+                validator: {gte: 0}
+            schemaVersion:
+                type: int
+                validator: {gte: 1}
+            collectionUuid:
+                type: string
+            samplingMethod:
+                type: SamplingTechnique
+            sampleSize:
+                type: long
+                validator: {gt: 0}
+            numChunks:
+                type: int
+                optional: true
+                validator: {gt: 0}
+            numDocsDiscarded:
+                type: long
+                validator: {gte: 0}
+            createdAt:
+                type: date
+            # `object` (view), not `object_owned` (per-entry getOwned()): a sample carries
+            # 384–2000 docs that the estimator iterates densely. Keeping them all in one shared
+            # buffer (via post-parse `shareOwnershipWith` in `parsePersistentSample`) avoids
+            # 2k mallocs + memcpys per parse and keeps the docs contiguous in memory for
+            # cache-friendly scanning.
+            docs:
+                type: array<object>
+
+server_parameters:
+    internalQueryMaxPersistentSampleDiscardFraction:
+        description: >-
+            The maximum fraction of a sample that may be discarded before persisting it to the
+            persistent samples collection fails.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryMaxPersistentSampleDiscardFraction"
+        cpp_vartype: Atomic<double>
+        default: 0.1
+        validator:
+            gte: 0.0
+            lte: 1.0
+        redact: false

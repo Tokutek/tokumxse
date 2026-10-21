@@ -1,223 +1,719 @@
-/*    Copyright 2012 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
- * Unit tests of the AuthorizationManager type.
- */
-#include <boost/scoped_ptr.hpp>
+#include "mongo/db/auth/authorization_manager.h"
 
-#include "mongo/base/status.h"
-#include "mongo/bson/mutable/document.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authz_session_external_state_mock.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_backend_interface.h"
+#include "mongo/db/auth/authorization_backend_mock.h"
+#include "mongo/db/auth/authorization_client_handle_shard.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
+#include "mongo/db/auth/authorization_router_impl.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/client.h"
+#include "mongo/db/ldap_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/service_entry_point_shard_role.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_mock.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/map_util.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/net/ssl_peer_info.h"
+#include "mongo/util/net/ssl_types.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/time_support.h"
+
+#include <algorithm>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
 #define ASSERT_NULL(EXPR) ASSERT_FALSE(EXPR)
 #define ASSERT_NON_NULL(EXPR) ASSERT_TRUE(EXPR)
 
 namespace mongo {
 namespace {
+using namespace std::literals::string_view_literals;
 
-    using boost::scoped_ptr;
-    using std::vector;
+using ResolveRoleOption = auth::AuthorizationBackendInterface::ResolveRoleOption;
 
-    TEST(RoleParsingTest, BuildRoleBSON) {
-        RoleGraph graph;
-        RoleName roleA("roleA", "dbA");
-        RoleName roleB("roleB", "dbB");
-        RoleName roleC("roleC", "dbC");
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        actions.addAction(ActionType::insert);
+#ifdef MONGO_CONFIG_SSL
+// Construct a simple, structured X509 name equivalent to "CN=mongodb.com"
+SSLX509Name buildX509Name() {
+    return SSLX509Name(std::vector<std::vector<SSLX509Name::Entry>>(
+        {{{std::string{kOID_CommonName}, 19 /* Printable String */, "mongodb.com"}}}));
+}
 
-        ASSERT_OK(graph.createRole(roleA));
-        ASSERT_OK(graph.createRole(roleB));
-        ASSERT_OK(graph.createRole(roleC));
+void setX509PeerInfo(const std::shared_ptr<transport::Session>& session, SSLPeerInfo info) {
+    auto& sslPeerInfo = SSLPeerInfo::forSession(session);
+    sslPeerInfo = std::make_shared<SSLPeerInfo>(info);
+}
 
-        ASSERT_OK(graph.addRoleToRole(roleA, roleC));
-        ASSERT_OK(graph.addRoleToRole(roleA, roleB));
-        ASSERT_OK(graph.addRoleToRole(roleB, roleC));
+#endif
 
-        ASSERT_OK(graph.addPrivilegeToRole(
-                roleA, Privilege(ResourcePattern::forAnyNormalResource(), actions)));
-        ASSERT_OK(graph.addPrivilegeToRole(
-                roleB, Privilege(ResourcePattern::forExactNamespace(NamespaceString("dbB.foo")),
-                                 actions)));
-        ASSERT_OK(graph.addPrivilegeToRole(
-                roleC, Privilege(ResourcePattern::forClusterResource(), actions)));
-        ASSERT_OK(graph.recomputePrivilegeData());
+const auto kTestDB = DatabaseName::createDatabaseName_forTest(boost::none, "test"sv);
+const auto kTestRsrc = ResourcePattern::forDatabaseName(kTestDB);
 
-
-        // Role A
-        mutablebson::Document doc;
-        ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleA, doc.root()));
-        BSONObj roleDoc = doc.getObject();
-
-        ASSERT_EQUALS("dbA.roleA", roleDoc["_id"].String());
-        ASSERT_EQUALS("roleA", roleDoc["role"].String());
-        ASSERT_EQUALS("dbA", roleDoc["db"].String());
-
-        vector<BSONElement> privs = roleDoc["privileges"].Array();
-        ASSERT_EQUALS(1U, privs.size());
-        ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["db"].String());
-        ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["collection"].String());
-        ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
-        vector<BSONElement> actionElements = privs[0].Obj()["actions"].Array();
-        ASSERT_EQUALS(2U, actionElements.size());
-        ASSERT_EQUALS("find", actionElements[0].String());
-        ASSERT_EQUALS("insert", actionElements[1].String());
-
-        vector<BSONElement> roles = roleDoc["roles"].Array();
-        ASSERT_EQUALS(2U, roles.size());
-        ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
-        ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
-        ASSERT_EQUALS("roleB", roles[1].Obj()["role"].String());
-        ASSERT_EQUALS("dbB", roles[1].Obj()["db"].String());
-
-        // Role B
-        doc.reset();
-        ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleB, doc.root()));
-        roleDoc = doc.getObject();
-
-        ASSERT_EQUALS("dbB.roleB", roleDoc["_id"].String());
-        ASSERT_EQUALS("roleB", roleDoc["role"].String());
-        ASSERT_EQUALS("dbB", roleDoc["db"].String());
-
-        privs = roleDoc["privileges"].Array();
-        ASSERT_EQUALS(1U, privs.size());
-        ASSERT_EQUALS("dbB", privs[0].Obj()["resource"].Obj()["db"].String());
-        ASSERT_EQUALS("foo", privs[0].Obj()["resource"].Obj()["collection"].String());
-        ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
-        actionElements = privs[0].Obj()["actions"].Array();
-        ASSERT_EQUALS(2U, actionElements.size());
-        ASSERT_EQUALS("find", actionElements[0].String());
-        ASSERT_EQUALS("insert", actionElements[1].String());
-
-        roles = roleDoc["roles"].Array();
-        ASSERT_EQUALS(1U, roles.size());
-        ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
-        ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
-
-        // Role C
-        doc.reset();
-        ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleC, doc.root()));
-        roleDoc = doc.getObject();
-
-        ASSERT_EQUALS("dbC.roleC", roleDoc["_id"].String());
-        ASSERT_EQUALS("roleC", roleDoc["role"].String());
-        ASSERT_EQUALS("dbC", roleDoc["db"].String());
-
-        privs = roleDoc["privileges"].Array();
-        ASSERT_EQUALS(1U, privs.size());
-        ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].Bool());
-        ASSERT(privs[0].Obj()["resource"].Obj()["db"].eoo());
-        ASSERT(privs[0].Obj()["resource"].Obj()["collection"].eoo());
-        actionElements = privs[0].Obj()["actions"].Array();
-        ASSERT_EQUALS(2U, actionElements.size());
-        ASSERT_EQUALS("find", actionElements[0].String());
-        ASSERT_EQUALS("insert", actionElements[1].String());
-
-        roles = roleDoc["roles"].Array();
-        ASSERT_EQUALS(0U, roles.size());
+// Custom RecoveryUnit which extends RecoveryUnitNoop to handle entering and exiting WUOWs. Does
+// not work for nested WUOWs.
+class RecoveryUnitMock : public RecoveryUnitNoop {
+    void doBeginUnitOfWork() override {
+        _setState(State::kActive);
     }
 
-    class AuthorizationManagerTest : public ::mongo::unittest::Test {
-    public:
-        virtual ~AuthorizationManagerTest() {
-            if (authzManager)
-                authzManager->invalidateUserCache();
-        }
-
-        void setUp() {
-            externalState = new AuthzManagerExternalStateMock();
-            externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-            authzManager.reset(new AuthorizationManager(externalState));
-            externalState->setAuthorizationManager(authzManager.get());
-            authzManager->setAuthEnabled(true);
-        }
-
-        scoped_ptr<AuthorizationManager> authzManager;
-        AuthzManagerExternalStateMock* externalState;
-    };
-
-    TEST_F(AuthorizationManagerTest, testAcquireV2User) {
-        externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-
-        OperationContextNoop txn;
-
-        ASSERT_OK(externalState->insertPrivilegeDocument(
-                &txn,
-                "admin",
-                BSON("_id" << "admin.v2read" <<
-                     "user" << "v2read" <<
-                     "db" << "test" <<
-                     "credentials" << BSON("MONGODB-CR" << "password") <<
-                     "roles" << BSON_ARRAY(BSON("role" << "read" << "db" << "test"))),
-                BSONObj()));
-        ASSERT_OK(externalState->insertPrivilegeDocument(
-                &txn,
-                "admin",
-                BSON("_id" << "admin.v2cluster" <<
-                     "user" << "v2cluster" <<
-                     "db" << "admin" <<
-                     "credentials" << BSON("MONGODB-CR" << "password") <<
-                     "roles" << BSON_ARRAY(BSON("role" << "clusterAdmin" << "db" << "admin"))),
-                BSONObj()));
-
-        User* v2read;
-        ASSERT_OK(authzManager->acquireUser(&txn, UserName("v2read", "test"), &v2read));
-        ASSERT_EQUALS(UserName("v2read", "test"), v2read->getName());
-        ASSERT(v2read->isValid());
-        ASSERT_EQUALS(1U, v2read->getRefCount());
-        RoleNameIterator roles = v2read->getRoles();
-        ASSERT_EQUALS(RoleName("read", "test"), roles.next());
-        ASSERT_FALSE(roles.more());
-        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
-        authzManager->releaseUser(v2read);
-
-        User* v2cluster;
-        ASSERT_OK(authzManager->acquireUser(&txn, UserName("v2cluster", "admin"), &v2cluster));
-        ASSERT_EQUALS(UserName("v2cluster", "admin"), v2cluster->getName());
-        ASSERT(v2cluster->isValid());
-        ASSERT_EQUALS(1U, v2cluster->getRefCount());
-        RoleNameIterator clusterRoles = v2cluster->getRoles();
-        ASSERT_EQUALS(RoleName("clusterAdmin", "admin"), clusterRoles.next());
-        ASSERT_FALSE(clusterRoles.more());
-        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
-        authzManager->releaseUser(v2cluster);
+    void doCommitUnitOfWork(boost::optional<Timestamp> commitTime) override {
+        _executeCommitHandlers(boost::none);
+        _setState(State::kActiveNotInUnitOfWork);
     }
+
+    void doAbortUnitOfWork() override {
+        _executeRollbackHandlers();
+        _setState(State::kActiveNotInUnitOfWork);
+    }
+};
+
+class AuthorizationManagerTest : public ServiceContextTest {
+public:
+    AuthorizationManagerTest() {
+        // Initialize the serviceEntryPoint so that DBDirectClient can function.
+        getService()->setServiceEntryPoint(std::make_unique<ServiceEntryPointShardRole>());
+
+        // Setup the repl coordinator in standalone mode so we don't need an oplog etc.
+        repl::ReplicationCoordinator::set(getServiceContext(),
+                                          std::make_unique<repl::ReplicationCoordinatorMock>(
+                                              getServiceContext(), repl::ReplSettings()));
+
+        auto globalAuthzManagerFactory = std::make_unique<AuthorizationManagerFactoryMock>();
+        AuthorizationManager::set(getService(),
+                                  globalAuthzManagerFactory->createShard(getService()));
+        authzManager = AuthorizationManager::get(getService());
+        authzManager->setAuthEnabled(true);
+
+        auth::AuthorizationBackendInterface::set(
+            getService(), globalAuthzManagerFactory->createBackendInterface(getService()));
+        mockBackend = reinterpret_cast<auth::AuthorizationBackendMock*>(
+            auth::AuthorizationBackendInterface::get(getService()));
+
+        // Re-initialize the client after setting the AuthorizationManager to get an
+        // AuthorizationSession.
+        Client::releaseCurrent();
+        Client::initThread(getThreadName(), getServiceContext()->getService(), session);
+        opCtx = makeOperationContext();
+
+        credentials = BSON("SCRAM-SHA-1"
+                           << scram::Secrets<SHA1Block>::generateCredentials(
+                                  "password", saslGlobalParams.scramSHA1IterationCount.load())
+                           << "SCRAM-SHA-256"
+                           << scram::Secrets<SHA256Block>::generateCredentials(
+                                  "password", saslGlobalParams.scramSHA256IterationCount.load()));
+
+        shard_role_details::setRecoveryUnit(opCtx.get(),
+                                            std::make_unique<RecoveryUnitMock>(),
+                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    }
+
+    ~AuthorizationManagerTest() override {
+        if (authzManager)
+            AuthorizationManager::get(opCtx->getService())->invalidateUserCache();
+    }
+
+    transport::TransportLayerMock transportLayer;
+    std::shared_ptr<transport::Session> session = transportLayer.createSession();
+    AuthorizationManager* authzManager;
+    auth::AuthorizationBackendMock* mockBackend;
+    BSONObj credentials;
+    ServiceContext::UniqueOperationContext opCtx;
+};
+
+TEST_F(AuthorizationManagerTest, testAcquireV2User) {
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(),
+                                              BSON("_id" << "admin.v2read"
+                                                         << "user"
+                                                         << "v2read"
+                                                         << "db"
+                                                         << "test"
+                                                         << "credentials" << credentials << "roles"
+                                                         << BSON_ARRAY(BSON("role" << "read"
+                                                                                   << "db"
+                                                                                   << "test"))),
+                                              BSONObj()));
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(),
+                                              BSON("_id" << "admin.v2cluster"
+                                                         << "user"
+                                                         << "v2cluster"
+                                                         << "db"
+                                                         << "admin"
+                                                         << "credentials" << credentials << "roles"
+                                                         << BSON_ARRAY(BSON("role" << "clusterAdmin"
+                                                                                   << "db"
+                                                                                   << "admin"))),
+                                              BSONObj()));
+
+    auto swu = authzManager->acquireUser(
+        opCtx.get(), std::make_unique<UserRequestGeneral>(UserName("v2read", "test"), boost::none));
+    ASSERT_OK(swu.getStatus());
+    auto v2read = std::move(swu.getValue());
+    ASSERT_EQUALS(UserName("v2read", "test"), v2read->getName());
+    ASSERT(v2read.isValid());
+    RoleNameIterator roles = v2read->getRoles();
+    ASSERT_EQUALS(RoleName("read", "test"), roles.next());
+    ASSERT_FALSE(roles.more());
+    auto privilegeMap = v2read->getPrivileges();
+    auto testDBPrivilege = privilegeMap[kTestRsrc];
+    ASSERT(testDBPrivilege.getActions().contains(ActionType::find));
+    // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+
+    swu = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("v2cluster", "admin"), boost::none));
+    ASSERT_OK(swu.getStatus());
+    auto v2cluster = std::move(swu.getValue());
+    ASSERT_EQUALS(UserName("v2cluster", "admin"), v2cluster->getName());
+    ASSERT(v2cluster.isValid());
+    RoleNameIterator clusterRoles = v2cluster->getRoles();
+    ASSERT_EQUALS(RoleName("clusterAdmin", "admin"), clusterRoles.next());
+    ASSERT_FALSE(clusterRoles.more());
+    privilegeMap = v2cluster->getPrivileges();
+    auto clusterPrivilege = privilegeMap[ResourcePattern::forClusterResource(boost::none)];
+    ASSERT(clusterPrivilege.getActions().contains(ActionType::serverStatus));
+    // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+}
+
+#ifdef MONGO_CONFIG_SSL
+TEST_F(AuthorizationManagerTest, testLocalX509Authorization) {
+    std::set<RoleName> roles({{"read", "test"}, {"readWrite", "test"}});
+    std::unique_ptr<UserRequest> request =
+        std::make_unique<UserRequestGeneral>(UserName("CN=mongodb.com", "$external"), roles);
+
+    auto swu = authzManager->acquireUser(opCtx.get(), std::move(request));
+    ASSERT_OK(swu.getStatus());
+    auto x509User = std::move(swu.getValue());
+    ASSERT(x509User.isValid());
+
+    std::set<RoleName> gotRoles;
+    for (auto it = x509User->getRoles(); it.more();) {
+        gotRoles.emplace(it.next());
+    }
+    ASSERT_TRUE(roles == gotRoles);
+
+    const User::ResourcePrivilegeMap& privileges = x509User->getPrivileges();
+    ASSERT_FALSE(privileges.empty());
+    auto privilegeIt = privileges.find(kTestRsrc);
+    ASSERT(privilegeIt != privileges.end());
+    ASSERT(privilegeIt->second.includesAction(ActionType::insert));
+}
+
+TEST_F(AuthorizationManagerTest, testLocalX509AuthorizationInvalidUser) {
+    setX509PeerInfo(session,
+                    SSLPeerInfo(buildX509Name(),
+                                boost::none,
+                                {RoleName("read", "test"), RoleName("write", "test")}));
+
+    ASSERT_NOT_OK(authzManager
+                      ->acquireUser(opCtx.get(),
+                                    std::make_unique<UserRequestGeneral>(
+                                        UserName("CN=10gen.com", "$external"), boost::none))
+                      .getStatus());
+}
+
+TEST_F(AuthorizationManagerTest, testLocalX509AuthenticationNoAuthorization) {
+    setX509PeerInfo(session, {});
+
+    ASSERT_NOT_OK(authzManager
+                      ->acquireUser(opCtx.get(),
+                                    std::make_unique<UserRequestGeneral>(
+                                        UserName("CN=mongodb.com", "$external"), boost::none))
+                      .getStatus());
+}
+
+#endif
+
+// Tests SERVER-21535, unrecognized actions should be ignored rather than causing errors.
+TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
+    ASSERT_OK(mockBackend->insertUserDocument(
+        opCtx.get(),
+        BSON("_id" << "admin.myUser"
+                   << "user"
+                   << "myUser"
+                   << "db"
+                   << "test"
+                   << "credentials" << credentials << "roles"
+                   << BSON_ARRAY(BSON("role" << "myRole"
+                                             << "db"
+                                             << "test"))
+                   << "inheritedPrivileges"
+                   << BSON_ARRAY(BSON("resource" << BSON("db" << "test"
+                                                              << "collection"
+                                                              << "")
+                                                 << "actions"
+                                                 << BSON_ARRAY("find" << "fakeAction"
+                                                                      << "insert")))),
+        BSONObj()));
+
+    auto swu = authzManager->acquireUser(
+        opCtx.get(), std::make_unique<UserRequestGeneral>(UserName("myUser", "test"), boost::none));
+    ASSERT_OK(swu.getStatus());
+    auto myUser = std::move(swu.getValue());
+    ASSERT_EQUALS(UserName("myUser", "test"), myUser->getName());
+    ASSERT(myUser.isValid());
+    RoleNameIterator roles = myUser->getRoles();
+    ASSERT_EQUALS(RoleName("myRole", "test"), roles.next());
+    ASSERT_FALSE(roles.more());
+    auto privilegeMap = myUser->getPrivileges();
+    auto testDBPrivilege = privilegeMap[kTestRsrc];
+    ActionSet actions = testDBPrivilege.getActions();
+    ASSERT(actions.contains(ActionType::find));
+    ASSERT(actions.contains(ActionType::insert));
+    actions.removeAction(ActionType::find);
+    actions.removeAction(ActionType::insert);
+    ASSERT(actions.empty());
+}
+
+TEST_F(AuthorizationManagerTest, testRefreshExternalV2User) {
+    constexpr auto kUserFieldName = "user"sv;
+    constexpr auto kDbFieldName = "db"sv;
+    constexpr auto kRoleFieldName = "role"sv;
+
+    // Insert one user on db test and two users on db $external.
+    BSONObj externalCredentials = BSON("external" << true);
+    std::vector<BSONObj> userDocs{BSON("_id" << "admin.v2read"
+                                             << "user"
+                                             << "v2read"
+                                             << "db"
+                                             << "test"
+                                             << "credentials" << credentials << "roles"
+                                             << BSON_ARRAY(BSON("role" << "read"
+                                                                       << "db"
+                                                                       << "test"))),
+                                  BSON("_id" << "admin.v2externalOne"
+                                             << "user"
+                                             << "v2externalOne"
+                                             << "db"
+                                             << "$external"
+                                             << "credentials" << externalCredentials << "roles"
+                                             << BSON_ARRAY(BSON("role" << "read"
+                                                                       << "db"
+                                                                       << "test"))),
+                                  BSON("_id" << "admin.v2externalTwo"
+                                             << "user"
+                                             << "v2externalTwo"
+                                             << "db"
+                                             << "$external"
+                                             << "credentials" << externalCredentials << "roles"
+                                             << BSON_ARRAY(BSON("role" << "read"
+                                                                       << "db"
+                                                                       << "test")))};
+
+    std::vector<BSONObj> initialRoles{BSON("role" << "read"
+                                                  << "db"
+                                                  << "test")};
+    std::vector<BSONObj> updatedRoles{BSON("role" << "readWrite"
+                                                  << "db"
+                                                  << "test")};
+
+    for (const auto& userDoc : userDocs) {
+        ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(), userDoc, BSONObj()));
+    }
+
+    // Acquire these users to force the AuthorizationManager to load these users into the user
+    // cache. Store the users into a vector so that they are checked out.
+    std::vector<UserHandle> checkedOutUsers;
+    checkedOutUsers.reserve(userDocs.size());
+    for (const auto& userDoc : userDocs) {
+        const UserName userName(userDoc.getStringField(kUserFieldName),
+                                userDoc.getStringField(kDbFieldName));
+        auto swUser = authzManager->acquireUser(
+            opCtx.get(), std::make_unique<UserRequestGeneral>(userName, boost::none));
+        ASSERT_OK(swUser.getStatus());
+        auto user = std::move(swUser.getValue());
+        ASSERT_EQUALS(userName, user->getName());
+        ASSERT(user.isValid());
+
+        RoleNameIterator cachedUserRoles = user->getRoles();
+        for (const auto& userDocRole : initialRoles) {
+            ASSERT_EQUALS(cachedUserRoles.next(),
+                          RoleName(userDocRole.getStringField(kRoleFieldName),
+                                   userDocRole.getStringField(kDbFieldName)));
+        }
+        ASSERT_FALSE(cachedUserRoles.more());
+        checkedOutUsers.push_back(std::move(user));
+    }
+
+    // Update each of the users added into the external state so that they gain the readWrite
+    // role.
+    for (const auto& userDoc : userDocs) {
+        BSONObj updateQuery = BSON("user" << userDoc.getStringField(kUserFieldName));
+        ASSERT_OK(
+            mockBackend->updateOne(opCtx.get(),
+                                   NamespaceString::kAdminUsersNamespace,
+                                   updateQuery,
+                                   BSON("$set" << BSON("roles" << BSON_ARRAY(updatedRoles[0]))),
+                                   true,
+                                   BSONObj()));
+    }
+
+    // Refresh all external entries in the authorization manager's cache.
+    ASSERT_OK(authzManager->refreshExternalUsers(opCtx.get()));
+
+    // Assert that all checked-out $external users are now marked invalid.
+    for (const auto& checkedOutUser : checkedOutUsers) {
+        if (checkedOutUser->getName().getDatabaseName().isExternalDB()) {
+            ASSERT(!checkedOutUser.isValid());
+        } else {
+            ASSERT(checkedOutUser.isValid());
+        }
+    }
+
+    // Retrieve all users from the cache and verify that only the external ones contain the
+    // newly added role.
+    for (const auto& userDoc : userDocs) {
+        const UserName userName(userDoc.getStringField(kUserFieldName),
+                                userDoc.getStringField(kDbFieldName));
+        auto swUser = authzManager->acquireUser(
+            opCtx.get(), std::make_unique<UserRequestGeneral>(userName, boost::none));
+        ASSERT_OK(swUser.getStatus());
+        auto user = std::move(swUser.getValue());
+        ASSERT_EQUALS(userName, user->getName());
+        ASSERT(user.isValid());
+
+        RoleNameIterator cachedUserRolesIt = user->getRoles();
+        if (userDoc.getStringField(kDbFieldName) == DatabaseName::kExternal.db(omitTenant)) {
+            for (const auto& userDocRole : updatedRoles) {
+                ASSERT_EQUALS(cachedUserRolesIt.next(),
+                              RoleName(userDocRole.getStringField(kRoleFieldName),
+                                       userDocRole.getStringField(kDbFieldName)));
+            }
+        } else {
+            for (const auto& userDocRole : initialRoles) {
+                ASSERT_EQUALS(cachedUserRolesIt.next(),
+                              RoleName(userDocRole.getStringField(kRoleFieldName),
+                                       userDocRole.getStringField(kDbFieldName)));
+            }
+        }
+        ASSERT_FALSE(cachedUserRolesIt.more());
+    }
+}
+
+// RAII guard that sets ldapGlobalParams for testing and restores originals on destruction.
+class LDAPParamsGuard {
+public:
+    LDAPParamsGuard(bool shouldRefresh, int intervalSecs)
+        : _savedServers(ldapGlobalParams.ldapServers.get()),
+          _savedShouldRefresh(ldapGlobalParams.ldapShouldRefreshUserCacheEntries),
+          _savedRefreshInterval(ldapGlobalParams.ldapUserCacheRefreshInterval.load()),
+          _savedInvalidationInterval(ldapGlobalParams.ldapUserCacheInvalidationInterval.load()),
+          _savedValidateConfig(ldapGlobalParams.ldapValidateLDAPServerConfig) {
+        ldapGlobalParams.setServersStr("localhost");
+        ldapGlobalParams.ldapShouldRefreshUserCacheEntries = shouldRefresh;
+        ldapGlobalParams.ldapUserCacheRefreshInterval.store(intervalSecs);
+        ldapGlobalParams.ldapUserCacheInvalidationInterval.store(intervalSecs);
+        ldapGlobalParams.ldapValidateLDAPServerConfig = false;
+    }
+
+    ~LDAPParamsGuard() {
+        ldapGlobalParams.ldapServers = std::move(_savedServers);
+        ldapGlobalParams.ldapShouldRefreshUserCacheEntries = _savedShouldRefresh;
+        ldapGlobalParams.ldapUserCacheRefreshInterval.store(_savedRefreshInterval);
+        ldapGlobalParams.ldapUserCacheInvalidationInterval.store(_savedInvalidationInterval);
+        ldapGlobalParams.ldapValidateLDAPServerConfig = _savedValidateConfig;
+    }
+
+private:
+    std::vector<std::string> _savedServers;
+    bool _savedShouldRefresh;
+    int _savedRefreshInterval;
+    int _savedInvalidationInterval;
+    bool _savedValidateConfig;
+};
+
+// Verifies that LDAPUserCacheInvalidator::run() takes the refresh path when
+// ldapShouldRefreshUserCacheEntries is true: the background thread calls refreshExternalUsers,
+// which updates cached $external users with changed roles from the backend. A second $external
+// user whose roles do NOT change must remain valid — this distinguishes refresh (selective update)
+// from invalidation (which would invalidate all $external entries).
+TEST_F(AuthorizationManagerTest, testLDAPCacheInvalidatorRunRefreshPath) {
+    LDAPParamsGuard paramsGuard(/*shouldRefresh=*/true, /*intervalSecs=*/1);
+
+    BSONObj externalCredentials = BSON("external" << true);
+    BSONObj changedUserDoc = BSON("_id" << "admin.changedUser"
+                                        << "user"
+                                        << "changedUser"
+                                        << "db"
+                                        << "$external"
+                                        << "credentials" << externalCredentials << "roles"
+                                        << BSON_ARRAY(BSON("role" << "read"
+                                                                  << "db"
+                                                                  << "test")));
+    BSONObj unchangedUserDoc = BSON("_id" << "admin.unchangedUser"
+                                          << "user"
+                                          << "unchangedUser"
+                                          << "db"
+                                          << "$external"
+                                          << "credentials" << externalCredentials << "roles"
+                                          << BSON_ARRAY(BSON("role" << "read"
+                                                                    << "db"
+                                                                    << "test")));
+
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(), changedUserDoc, BSONObj()));
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(), unchangedUserDoc, BSONObj()));
+
+    // Acquire both users to populate the cache.
+    auto swChanged = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("changedUser", "$external"), boost::none));
+    ASSERT_OK(swChanged.getStatus());
+    auto cachedChangedUser = std::move(swChanged.getValue());
+    ASSERT(cachedChangedUser.isValid());
+
+    auto swUnchanged = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("unchangedUser", "$external"), boost::none));
+    ASSERT_OK(swUnchanged.getStatus());
+    auto cachedUnchangedUser = std::move(swUnchanged.getValue());
+    ASSERT(cachedUnchangedUser.isValid());
+
+    // Update only one user's roles in the backend.
+    ASSERT_OK(
+        mockBackend->updateOne(opCtx.get(),
+                               NamespaceString::kAdminUsersNamespace,
+                               BSON("user" << "changedUser"),
+                               BSON("$set" << BSON("roles" << BSON_ARRAY(BSON("role" << "readWrite"
+                                                                                     << "db"
+                                                                                     << "test")))),
+                               true,
+                               BSONObj()));
+
+    // Start the background thread via initialize(). It will enter wait_for(1s).
+    ASSERT_OK(authzManager->initialize(opCtx.get()));
+
+    // Wait for the background thread to tick and perform the refresh.
+    sleepmillis(2000);
+
+    // The changed user's old handle should be invalid (refreshExternalUsers replaces the entry).
+    ASSERT(!cachedChangedUser.isValid());
+
+    // The unchanged user's handle must remain valid — refresh only replaces entries with
+    // different roles. If invalidation had run instead, this handle would be invalid too.
+    ASSERT(cachedUnchangedUser.isValid());
+
+    // Re-acquire the changed user and verify the refreshed cache has the updated role.
+    swChanged = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("changedUser", "$external"), boost::none));
+    ASSERT_OK(swChanged.getStatus());
+    auto refreshedUser = std::move(swChanged.getValue());
+    RoleNameIterator roles = refreshedUser->getRoles();
+    ASSERT_EQUALS(RoleName("readWrite", "test"), roles.next());
+    ASSERT_FALSE(roles.more());
+}
+
+// Verifies that LDAPUserCacheInvalidator::run() takes the invalidation path when
+// ldapShouldRefreshUserCacheEntries is false: the background thread calls
+// invalidateUsersFromDB($external) instead of refreshExternalUsers.
+TEST_F(AuthorizationManagerTest, testLDAPCacheInvalidatorRunInvalidationPath) {
+    LDAPParamsGuard paramsGuard(/*shouldRefresh=*/false, /*intervalSecs=*/1);
+
+    BSONObj externalCredentials = BSON("external" << true);
+    BSONObj extUserDoc = BSON("_id" << "admin.extUser"
+                                    << "user"
+                                    << "extUser"
+                                    << "db"
+                                    << "$external"
+                                    << "credentials" << externalCredentials << "roles"
+                                    << BSON_ARRAY(BSON("role" << "read"
+                                                              << "db"
+                                                              << "test")));
+    BSONObj localUserDoc = BSON("_id" << "admin.localUser"
+                                      << "user"
+                                      << "localUser"
+                                      << "db"
+                                      << "test"
+                                      << "credentials" << credentials << "roles"
+                                      << BSON_ARRAY(BSON("role" << "read"
+                                                                << "db"
+                                                                << "test")));
+
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(), extUserDoc, BSONObj()));
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(), localUserDoc, BSONObj()));
+
+    // Acquire both users to populate cache.
+    auto swExtUser = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("extUser", "$external"), boost::none));
+    ASSERT_OK(swExtUser.getStatus());
+    auto extUser = std::move(swExtUser.getValue());
+
+    auto swLocalUser = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("localUser", "test"), boost::none));
+    ASSERT_OK(swLocalUser.getStatus());
+    auto localUser = std::move(swLocalUser.getValue());
+
+    ASSERT(extUser.isValid());
+    ASSERT(localUser.isValid());
+
+    // Start the background thread. With shouldRefresh=false, it will call
+    // invalidateUsersFromDB($external) on timeout.
+    ASSERT_OK(authzManager->initialize(opCtx.get()));
+
+    // Wait for the background thread to tick.
+    sleepmillis(2000);
+
+    // The $external user handle should be invalidated by the background thread.
+    ASSERT(!extUser.isValid());
+    // The local user should remain valid — invalidation is scoped to $external.
+    ASSERT(localUser.isValid());
+}
+
+// Verifies that LDAPUserCacheInvalidator::run() falls back to invalidation when
+// refreshExternalUsers fails. In run(), shouldRefresh=true but refresh returns an error,
+// so shouldInvalidate stays true and invalidateUsersFromDB($external) is called.
+TEST_F(AuthorizationManagerTest, testLDAPCacheInvalidatorRunRefreshFailureFallsBackToInvalidation) {
+    LDAPParamsGuard paramsGuard(/*shouldRefresh=*/true, /*intervalSecs=*/1);
+
+    BSONObj externalCredentials = BSON("external" << true);
+    BSONObj extUserDoc = BSON("_id" << "admin.extUser"
+                                    << "user"
+                                    << "extUser"
+                                    << "db"
+                                    << "$external"
+                                    << "credentials" << externalCredentials << "roles"
+                                    << BSON_ARRAY(BSON("role" << "read"
+                                                              << "db"
+                                                              << "test")));
+
+    ASSERT_OK(mockBackend->insertUserDocument(opCtx.get(), extUserDoc, BSONObj()));
+
+    // Acquire the user to populate cache.
+    auto swUser = authzManager->acquireUser(
+        opCtx.get(),
+        std::make_unique<UserRequestGeneral>(UserName("extUser", "$external"), boost::none));
+    ASSERT_OK(swUser.getStatus());
+    auto cachedUser = std::move(swUser.getValue());
+    ASSERT(cachedUser.isValid());
+
+    // Start the background thread first before making backend calls fail.
+    ASSERT_OK(authzManager->initialize(opCtx.get()));
+
+    // Now make backend findOne calls fail, so when the thread wakes up and calls
+    // refreshExternalUsers, it will get an error.
+    mockBackend->setFindsShouldFail(true);
+
+    // Wait for the background thread to tick. It will try refresh (fails), then invalidate.
+    sleepmillis(2000);
+
+    // The cached user should be invalidated because refresh failed and the fallback
+    // invalidation path was taken.
+    ASSERT(!cachedUser.isValid());
+
+    mockBackend->setFindsShouldFail(false);
+}
+
+TEST_F(AuthorizationManagerTest, testAuthzBackendResolveRoles) {
+    BSONObj innerCustomRole{BSON("_id" << "admin.innerTestRole"
+                                       << "db"
+                                       << "admin"
+                                       << "role"
+                                       << "innerTestRole"
+                                       << "roles"
+                                       << BSON_ARRAY(BSON("db" << "test"
+                                                               << "role"
+                                                               << "read")))};
+    BSONObj middleCustomRole{BSON("_id" << "admin.middleTestRole"
+                                        << "db"
+                                        << "admin"
+                                        << "role"
+                                        << "middleTestRole"
+                                        << "roles" << BSON_ARRAY(innerCustomRole))};
+    BSONObj outerCustomRole{
+        BSON("_id" << "admin.outerTestRole"
+                   << "db"
+                   << "admin"
+                   << "role"
+                   << "outerTestRole"
+                   << "roles" << BSON_ARRAY(middleCustomRole) << "privileges"
+                   << BSON_ARRAY(BSON("resource" << BSON("cluster" << true) << "actions"
+                                                 << BSON_ARRAY("shutdown")))
+                   << "authenticationRestrictions"
+                   << BSON_ARRAY(BSON("clientSource" << BSON_ARRAY("127.0.0.1/8"))))};
+    std::vector<BSONObj> customRoleDocuments{innerCustomRole, middleCustomRole, outerCustomRole};
+
+    for (const auto& roleDoc : customRoleDocuments) {
+        ASSERT_OK(mockBackend->insertRoleDocument(opCtx.get(), roleDoc, BSONObj()));
+    }
+
+    // First, resolve all roles (but no privileges or restrictions).
+    ResolveRoleOption option{ResolveRoleOption::kRoles()};
+    std::vector<RoleName> roleNames{RoleName{"outerTestRole", "admin"}};
+    auto swResolvedData = mockBackend->resolveRoles_forTest(opCtx.get(), roleNames, option);
+    ASSERT_OK(swResolvedData.getStatus());
+    auto resolvedData = swResolvedData.getValue();
+    ASSERT_TRUE(resolvedData.roles.has_value());
+    ASSERT_EQ(resolvedData.roles->size(), 3);
+    ASSERT_FALSE(resolvedData.privileges.has_value());
+    ASSERT_FALSE(resolvedData.restrictions.has_value());
+
+    // Resolve privileges and roles, no restrictions.
+    option.setPrivileges(true /* shouldEnable */);
+    swResolvedData = mockBackend->resolveRoles_forTest(opCtx.get(), roleNames, option);
+    ASSERT_OK(swResolvedData.getStatus());
+    resolvedData = swResolvedData.getValue();
+    ASSERT_TRUE(resolvedData.roles.has_value());
+    ASSERT_EQ(resolvedData.roles->size(), 3);
+    ASSERT_TRUE(resolvedData.privileges.has_value());
+    ASSERT_FALSE(resolvedData.restrictions.has_value());
+
+    // Resolve all roles, privileges, and restrictions.
+    option.setRestrictions(true /* shouldEnable */);
+    swResolvedData = mockBackend->resolveRoles_forTest(opCtx.get(), roleNames, option);
+    ASSERT_OK(swResolvedData.getStatus());
+    resolvedData = swResolvedData.getValue();
+    ASSERT_TRUE(resolvedData.roles.has_value());
+    ASSERT_EQ(resolvedData.roles->size(), 3);
+    ASSERT_TRUE(resolvedData.privileges.has_value());
+    ASSERT_TRUE(resolvedData.restrictions.has_value());
+
+    // Resolve only direct roles, privileges, and restrictions.
+    option.setDirectOnly(true /* shouldEnable */);
+    swResolvedData = mockBackend->resolveRoles_forTest(opCtx.get(), roleNames, option);
+    ASSERT_OK(swResolvedData.getStatus());
+    resolvedData = swResolvedData.getValue();
+    ASSERT_TRUE(resolvedData.roles.has_value());
+    ASSERT_EQ(resolvedData.roles->size(), 1);
+    ASSERT_TRUE(resolvedData.privileges.has_value());
+    ASSERT_TRUE(resolvedData.restrictions.has_value());
+}
+using AuthorizationManagerTestDeathTest = AuthorizationManagerTest;
+
+TEST_F(AuthorizationManagerTest, UserRequestCtorWithMechanismRequiresUsername) {
+    ASSERT_THROWS_CODE(
+        UserRequestGeneral(UserName(""sv, "admin"sv), boost::none, "SCRAM-SHA-256"sv),
+        DBException,
+        ErrorCodes::BadValue);
+}
+
 
 }  // namespace
 }  // namespace mongo

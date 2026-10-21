@@ -1,173 +1,164 @@
-// pdfiletests.cpp : pdfile unit tests.
-//
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
- *    Copyright (C) 2008 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/insert.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/db.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
-#include "mongo/db/ops/insert.h"
-#include "mongo/dbtests/dbtests.h"
-
+namespace mongo {
 namespace PdfileTests {
+namespace Insert {
 
-    namespace Insert {
-        class Base {
-        public:
-            Base() : _scopedXact(&_txn, MODE_X),
-                     _lk(_txn.lockState()),
-                     _context(&_txn, ns()) {
+class Base {
+public:
+    Base()
+        : _lk(&_opCtx),
+          _db(DatabaseHolder::get(&_opCtx)->openDb(&_opCtx, nss().dbName(), nullptr)) {}
 
-            }
+    virtual ~Base() {
+        if (!collection())
+            return;
+        WriteUnitOfWork wunit(&_opCtx);
+        _db->dropCollection(&_opCtx, nss()).transitional_ignore();
+        wunit.commit();
+    }
 
-            virtual ~Base() {
-                if ( !collection() )
-                    return;
-                WriteUnitOfWork wunit(&_txn);
-                _context.db()->dropCollection( &_txn, ns() );
-                wunit.commit();
-            }
+protected:
+    static NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest("unittests.pdfiletests.Insert");
+    }
+    CollectionPtr collection() {
+        return CollectionPtr::CollectionPtr_UNSAFE(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
+    }
 
-        protected:
-            const char *ns() {
-                return "unittests.pdfiletests.Insert";
-            }
-            Collection* collection() {
-                return _context.db()->getCollection( ns() );
-            }
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
+    Lock::GlobalWrite _lk;
+    Database* _db;
+};
 
-            OperationContextImpl _txn;
-            ScopedTransaction _scopedXact;
-            Lock::GlobalWrite _lk;
-            OldClientContext _context;
-        };
-
-        class InsertNoId : public Base {
-        public:
-            void run() {
-                WriteUnitOfWork wunit(&_txn);
-                BSONObj x = BSON( "x" << 1 );
-                ASSERT( x["_id"].type() == 0 );
-                Collection* collection = _context.db()->getOrCreateCollection( &_txn, ns() );
-                StatusWith<RecordId> dl = collection->insertDocument( &_txn, x, true );
-                ASSERT( !dl.isOK() );
-
-                StatusWith<BSONObj> fixed = fixDocumentForInsert( x );
-                ASSERT( fixed.isOK() );
-                x = fixed.getValue();
-                ASSERT( x["_id"].type() == jstOID );
-                dl = collection->insertDocument( &_txn, x, true );
-                ASSERT( dl.isOK() );
-                wunit.commit();
-            }
-        };
-
-        class UpdateDate : public Base {
-        public:
-            void run() {
-                BSONObjBuilder b;
-                b.appendTimestamp( "a" );
-                b.append( "_id", 1 );
-                BSONObj o = b.done();
-
-                BSONObj fixed = fixDocumentForInsert( o ).getValue();
-                ASSERT_EQUALS( 2, fixed.nFields() );
-                ASSERT( fixed.firstElement().fieldNameStringData() == "_id" );
-                ASSERT( fixed.firstElement().number() == 1 );
-
-                BSONElement a = fixed["a"];
-                ASSERT( o["a"].type() == Timestamp );
-                ASSERT( o["a"].timestampValue() == 0 );
-                ASSERT( a.type() == Timestamp );
-                ASSERT( a.timestampValue() > 0 );
-            }
-        };
-
-        class UpdateDate2 : public Base {
-        public:
-            void run() {
-                BSONObj o;
-                {
-                    BSONObjBuilder b;
-                    b.appendTimestamp( "a" );
-                    b.appendTimestamp( "b" );
-                    b.append( "_id", 1 );
-                    o = b.obj();
-                }
-
-                BSONObj fixed = fixDocumentForInsert( o ).getValue();
-                ASSERT_EQUALS( 3, fixed.nFields() );
-                ASSERT( fixed.firstElement().fieldNameStringData() == "_id" );
-                ASSERT( fixed.firstElement().number() == 1 );
-
-                BSONElement a = fixed["a"];
-                ASSERT( o["a"].type() == Timestamp );
-                ASSERT( o["a"].timestampValue() == 0 );
-                ASSERT( a.type() == Timestamp );
-                ASSERT( a.timestampValue() > 0 );
-
-                BSONElement b = fixed["b"];
-                ASSERT( o["b"].type() == Timestamp );
-                ASSERT( o["b"].timestampValue() == 0 );
-                ASSERT( b.type() == Timestamp );
-                ASSERT( b.timestampValue() > 0 );
-            }
-        };
-
-        class ValidId : public Base {
-        public:
-            void run() {
-                ASSERT( fixDocumentForInsert( BSON( "_id" << 5 ) ).isOK() );
-                ASSERT( fixDocumentForInsert( BSON( "_id" << BSON( "x" << 5 ) ) ).isOK() );
-                ASSERT( !fixDocumentForInsert( BSON( "_id" << BSON( "$x" << 5 ) ) ).isOK() );
-                ASSERT( !fixDocumentForInsert( BSON( "_id" << BSON( "$oid" << 5 ) ) ).isOK() );
-            }
-        };
-    } // namespace Insert
-
-    class All : public Suite {
-    public:
-        All() : Suite( "pdfile" ) {}
-
-        void setupTests() {
-            add< Insert::InsertNoId >();
-            add< Insert::UpdateDate >();
-            add< Insert::UpdateDate2 >();
-            add< Insert::ValidId >();
+class InsertNoId : public Base {
+public:
+    void run() {
+        WriteUnitOfWork wunit(&_opCtx);
+        BSONObj x = BSON("x" << 1);
+        ASSERT(stdx::to_underlying(x["_id"].type()) == 0);
+        CollectionPtr coll = CollectionPtr::CollectionPtr_UNSAFE(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
+        if (!coll) {
+            coll = CollectionPtr::CollectionPtr_UNSAFE(_db->createCollection(&_opCtx, nss()));
         }
-    };
+        ASSERT(coll);
+        ASSERT_NOT_OK(Helpers::insert(&_opCtx, coll, x));
 
-    SuiteInstance<All> myall;
+        StatusWith<BSONObj> fixed = fixDocumentForInsert(&_opCtx, x);
+        ASSERT(fixed.isOK());
+        x = fixed.getValue();
+        ASSERT(x["_id"].type() == BSONType::oid);
+        ASSERT_OK(Helpers::insert(&_opCtx, coll, x));
+        wunit.commit();
+    }
+};
 
-} // namespace PdfileTests
+class UpdateDate : public Base {
+public:
+    void run() {
+        BSONObjBuilder b;
+        b.appendTimestamp("a");
+        b.append("_id", 1);
+        BSONObj o = b.done();
 
+        BSONObj fixed = fixDocumentForInsert(&_opCtx, o).getValue();
+        ASSERT_EQUALS(2, fixed.nFields());
+        ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
+        ASSERT(fixed.firstElement().number() == 1);
+
+        BSONElement a = fixed["a"];
+        ASSERT(o["a"].type() == BSONType::timestamp);
+        ASSERT(o["a"].timestampValue() == 0);
+        ASSERT(a.type() == BSONType::timestamp);
+        ASSERT(a.timestampValue() > 0);
+    }
+};
+
+class UpdateDate2 : public Base {
+public:
+    void run() {
+        BSONObj o;
+        {
+            BSONObjBuilder b;
+            b.appendTimestamp("a");
+            b.appendTimestamp("b");
+            b.append("_id", 1);
+            o = b.obj();
+        }
+
+        BSONObj fixed = fixDocumentForInsert(&_opCtx, o).getValue();
+        ASSERT_EQUALS(3, fixed.nFields());
+        ASSERT(fixed.firstElement().fieldNameStringData() == "_id");
+        ASSERT(fixed.firstElement().number() == 1);
+
+        BSONElement a = fixed["a"];
+        ASSERT(o["a"].type() == BSONType::timestamp);
+        ASSERT(o["a"].timestampValue() == 0);
+        ASSERT(a.type() == BSONType::timestamp);
+        ASSERT(a.timestampValue() > 0);
+
+        BSONElement b = fixed["b"];
+        ASSERT(o["b"].type() == BSONType::timestamp);
+        ASSERT(o["b"].timestampValue() == 0);
+        ASSERT(b.type() == BSONType::timestamp);
+        ASSERT(b.timestampValue() > 0);
+    }
+};
+
+class ValidId : public Base {
+public:
+    void run() {
+        ASSERT(fixDocumentForInsert(&_opCtx, BSON("_id" << 5)).isOK());
+        ASSERT(fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("$x" << 5))).isOK());
+        ASSERT(!fixDocumentForInsert(&_opCtx, BSON("_id" << BSON("$oid" << 5))).isOK());
+    }
+};
+}  // namespace Insert
+
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("pdfile") {}
+
+    void setupTests() override {
+        add<Insert::InsertNoId>();
+        add<Insert::UpdateDate>();
+        add<Insert::UpdateDate2>();
+        add<Insert::ValidId>();
+    }
+};
+
+unittest::OldStyleSuiteInitializer<All> myall;
+
+}  // namespace PdfileTests
+}  // namespace mongo

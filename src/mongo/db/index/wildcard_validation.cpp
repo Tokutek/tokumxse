@@ -1,0 +1,226 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/index/wildcard_validation.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index_names.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <string_view>
+#include <utility>
+#include <vector>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+
+namespace mongo {
+namespace {
+static const std::string_view idFieldName = "_id";
+/*
+ * Validate that wildcardProjection fields do not overlap. It takes a sorted list of the
+ * projection fields.
+ */
+Status validateOverlappingFieldsInWildcardProjectionOnly(
+    const std::vector<FieldRef>& projectionFields) {
+    for (size_t i = 1; i < projectionFields.size(); ++i) {
+        if (projectionFields[i - 1].isPrefixOfOrEqualTo(projectionFields[i]) ||
+            projectionFields[i].isPrefixOfOrEqualTo(projectionFields[i - 1])) {
+            return {ErrorCodes::Error{7246200},
+                    str::stream() << "Fields in Wildcard Projection cannot overlap, however '"
+                                  << projectionFields[i - 1].dottedField()
+                                  << "' is overlapped with '" << projectionFields[i].dottedField()};
+        }
+    }
+
+    return Status::OK();
+}
+
+/*
+ * Parse wildcard index's keyPattern.
+ * It performs basic validation and returns error if the validation fails.
+ */
+Status getWildcardIndexKeyFields(const BSONObj& keyPattern,
+                                 FieldRef& wildcardField,
+                                 std::vector<FieldRef>& indexFields) {
+    for (const auto& keyElement : keyPattern) {
+        auto keyElemFieldName = keyElement.fieldNameStringData();
+        if (WildcardNames::isWildcardFieldName(keyElemFieldName)) {
+            if (!wildcardField.empty()) {
+                return {ErrorCodes::Error{7246201},
+                        "Index Key can contain only one wildcard index field"};
+            }
+            wildcardField = FieldRef{std::move(keyElemFieldName)};
+        } else {
+            indexFields.emplace_back(std::move(keyElemFieldName));
+        }
+    }
+
+    if (wildcardField.empty()) {
+        return {ErrorCodes::Error{7246202},
+                "No wildcard index field is specified for the wildcard index"};
+    }
+
+    return Status::OK();
+}
+}  // namespace
+
+Status validateWildcardIndex(const BSONObj& keyPattern) {
+    FieldRef wildcardRef{};
+    std::vector<FieldRef> indexFields;
+    auto status = getWildcardIndexKeyFields(keyPattern, wildcardRef, indexFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    wildcardRef.removeLastPart();  // remove wildcard part
+
+    // wildcard should not overlap with index key fields if wildcard projection is empty.
+    for (const auto& field : indexFields) {
+        if (wildcardRef.isPrefixOfOrEqualTo(field)) {
+            return Status(
+                ErrorCodes::Error{7246204},
+                str::stream()
+                    << "A wildcard index field should not overlap with and index key fields if "
+                       "wildcard projection is empty, however '"
+                    << field.dottedField() << "' is overlapping with the wildcard index field.");
+        }
+    }
+
+    return Status::OK();
+}
+
+Status validateWildcardProjection(const BSONObj& keyPattern, const BSONObj& pathProjection) {
+    if (pathProjection.isEmpty()) {
+        return {ErrorCodes::Error{7246205}, "WildcardProjection must be non-empty if specified"};
+    }
+
+    // Prepare data for validation.
+    FieldRef wildcardField{};
+    std::vector<FieldRef> indexFields;
+    auto status = getWildcardIndexKeyFields(keyPattern, wildcardField, indexFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (wildcardField.numParts() != 1) {
+        return {
+            ErrorCodes::Error{7246206},
+            str::stream()
+                << "Wildcard index field must be always '$**' if wildcardProjection is specified"};
+    }
+
+    std::vector<FieldRef> projectionIncludedFields;
+    std::vector<FieldRef> projectionExcludedFields;
+    for (const auto& projectionElement : pathProjection) {
+        if (projectionElement.trueValue()) {
+            projectionIncludedFields.emplace_back(projectionElement.fieldNameStringData());
+        } else {
+            projectionExcludedFields.emplace_back(projectionElement.fieldNameStringData());
+        }
+    }
+
+    std::sort(indexFields.begin(), indexFields.end());
+    std::sort(projectionIncludedFields.begin(), projectionIncludedFields.end());
+    std::sort(projectionExcludedFields.begin(), projectionExcludedFields.end());
+
+    status = validateOverlappingFieldsInWildcardProjectionOnly(projectionIncludedFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = validateOverlappingFieldsInWildcardProjectionOnly(projectionExcludedFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // The wildcardProjection cannot combine inclusion and exclusion statements, with the exception
+    // that _id may be excluded for inclusion projections and included for exclusion projections.
+    if (!projectionIncludedFields.empty() && !projectionExcludedFields.empty()) {
+        const FieldRef idFieldRef{idFieldName};
+        const bool idOnlyExclusion =
+            projectionExcludedFields.size() == 1 && projectionExcludedFields.front() == idFieldRef;
+        const bool idOnlyInclusion =
+            projectionIncludedFields.size() == 1 && projectionIncludedFields.front() == idFieldRef;
+
+        // In order for the projection to be valid when there are both inclusions and exclusions,
+        // _id has to be the sole field whose inclusion/exclusion value does not match the others.
+        if (idOnlyExclusion && idOnlyInclusion) {
+            return {ErrorCodes::Error{11368500},
+                    "The wildcard projection both excludes and includes _id"};
+        } else if (!idOnlyExclusion && !idOnlyInclusion) {
+            return {ErrorCodes::Error{7246211},
+                    "The wildcardProjection cannot combine inclusion and exclusion statements, "
+                    "with the exception that _id may be excluded for inclusion projections and "
+                    "included for exclusion projections"};
+        }
+
+        // If _id is the only excluded field, ignore the exclusion in the checks below. For example,
+        // we can treat {_id: 0, a: 1} as just {a: 1}. In wildcard indexes (unlike regular
+        // projections) _id is excluded by default.
+        if (idOnlyExclusion) {
+            projectionExcludedFields.clear();
+        } else {
+            // Here idOnlyInclusion is implied from the checks above. Similarly, ignore an _id-only
+            // inclusion.
+            projectionIncludedFields.clear();
+        }
+    }
+
+    // There cannot be overlap between the index keys and the wildcard projection's inclusions.
+    if (!projectionIncludedFields.empty()) {
+        auto indexPos = indexFields.begin();
+        auto projectionPos = projectionIncludedFields.begin();
+        while (indexPos != indexFields.end() && projectionPos != projectionIncludedFields.end()) {
+            if (projectionPos->isPrefixOfOrEqualTo(*indexPos)) {
+                return {ErrorCodes::Error{7246208},
+                        str::stream()
+                            << "Index Key and Wildcard Projection cannot contain "
+                               "overlapping fields, however '"
+                            << indexPos->dottedField() << "' index field is overlapping with '"
+                            << projectionPos->dottedField() << "' wildcardProjection path"};
+            }
+
+            if (*projectionPos < *indexPos) {
+                ++projectionPos;
+            } else {
+                ++indexPos;
+            }
+        }
+    } else {
+        tassert(11368501,
+                "Expected projectionExcludedFields to be populated",
+                !projectionExcludedFields.empty());
+
+        // If the wildcardProjection is an exclusion, it must exclude all regular index fields.
+        auto indexPos = indexFields.begin();
+        auto projectionPos = projectionExcludedFields.begin();
+        while (indexPos != indexFields.end() && projectionPos != projectionExcludedFields.end()) {
+            if (projectionPos->isPrefixOfOrEqualTo(*indexPos)) {
+                // fine we can move indexPos to test next index field
+                ++indexPos;
+            } else {
+                if (*projectionPos < *indexPos) {
+                    ++projectionPos;
+                } else {
+                    return {ErrorCodes::Error{7246209},
+                            str::stream() << "wildcardProjection paths must exclude all regular "
+                                             "index fields, however '"
+                                          << indexPos->dottedField() << "'is not excluded"};
+                }
+            }
+        }
+
+        if (indexPos != indexFields.end()) {
+            return {ErrorCodes::Error{7246210},
+                    str::stream() << "wildcardProjection paths must exclude all regular "
+                                     "index fields, however '"
+                                  << indexPos->dottedField() << "'is not excluded"};
+        }
+    }
+
+    return Status::OK();
+}
+}  // namespace mongo

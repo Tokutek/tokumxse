@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    minSnapshotHistoryWindowInSeconds:
+        description: "Minimum snapshot history to keep, in seconds"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: minSnapshotHistoryWindowInSeconds
+        default: 300
+        validator: {gte: 0}
+        redact: false

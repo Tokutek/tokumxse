@@ -1,0 +1,53 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/s/migration_coordinator_document.idl"
+
+structs:
+    migrationRecipientRecoveryDocument:
+        description:
+            "Represents an in-progress chunk migration recipient that has reached the
+            critical section stage"
+        strict: false
+        fields:
+            _id:
+                type: uuid
+                description: "A unique identifier for the migration."
+                cpp_name: id
+            nss:
+                type: namespacestring
+                description: "The namespace of the collection that the chunk belongs to."
+            migrationSessionId:
+                type: MigrationSessionId
+                description: "A legacy unique identifier for the migration session."
+            range:
+                type: chunk_range
+                description: "The range being migrated."
+            donorShardIdForLoggingPurposesOnly:
+                type: shard_id
+                description:
+                    "The shard from which the chunk is being migrated. This field should
+                    only be used for logging purposes and it is not properly updated
+                    during the automated restores procedure."
+            lsid:
+                type: LogicalSessionId
+                description: "The sessionId that the donor uses to communicate with the recipient."
+            txnNumber:
+                type: TxnNumber
+                description: "The txnNumber that the donor use to communicate with the recipient."
+            # TODO (SERVER-127253) Remove once v9.0 branches out
+            clearShardCatalogCache:
+                type: safeBool
+                description: >-
+                    Whether the recipient must refresh its filtering metadata when releasing the
+                    migration critical section. The authoritative path installs the post-migration
+                    metadata into the shard catalog directly and does not need the refresh. Defaults
+                    to true to preserve the legacy behavior for documents written before this field
+                    existed.
+                default: true

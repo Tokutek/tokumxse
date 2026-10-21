@@ -1,0 +1,37 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.user_writes_critical_sections.
+# Each document is used to represent that user writes are blocked, for a particular collection or
+# globally.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/topology/user_write_block/user_writes_block_reason.idl"
+
+structs:
+    userWriteBlockingCriticalSectionDocument:
+        description: "Represents an ongoing user-writes blocking critical section."
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            _id:
+                type: namespacestring
+                description:
+                    "The namespace of the collection that is under the collection critical
+                    section. Empty namespacestring indicates global write blocking to all
+                    collections."
+                cpp_name: nss
+            blockNewUserShardedDDL:
+                type: bool
+                default: false
+            blockUserWrites:
+                type: bool
+                default: false
+            blockUserWritesReason:
+                type: UserWritesBlockReason
+                optional: true

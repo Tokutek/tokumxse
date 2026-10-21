@@ -1,110 +1,242 @@
-// devnull_kv_engine.h
-
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/backup_block.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+[[MONGO_MOD_PUBLIC]];
 
 namespace mongo {
 
-    class DevNullKVEngine : public KVEngine {
-    public:
-        virtual ~DevNullKVEngine(){}
+class JournalListener;
 
-        virtual RecoveryUnit* newRecoveryUnit() {
-            return new RecoveryUnitNoop();
-        }
+/**
+ * The devnull storage engine is intended for unit and performance testing.
+ */
+class DevNullKVEngine : public KVEngine {
+public:
+    DevNullKVEngine();
+    ~DevNullKVEngine() override;
 
-        virtual Status createRecordStore( OperationContext* opCtx,
-                                          StringData ns,
-                                          StringData ident,
-                                          const CollectionOptions& options ) {
-            return Status::OK();
-        }
+    std::unique_ptr<RecoveryUnit> newRecoveryUnit() override;
 
-        virtual RecordStore* getRecordStore( OperationContext* opCtx,
-                                             StringData ns,
-                                             StringData ident,
-                                             const CollectionOptions& options );
+    Status createRecordStore(const rss::PersistenceProvider&,
+                             RecoveryUnit& ru,
+                             const NamespaceString& nss,
+                             std::string_view ident,
+                             const RecordStore::Options& options) override {
+        return Status::OK();
+    }
 
-        virtual Status createSortedDataInterface( OperationContext* opCtx,
-                                                  StringData ident,
-                                                  const IndexDescriptor* desc ) {
-            return Status::OK();
-        }
+    std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                std::string_view ident,
+                                                const RecordStore::Options& options,
+                                                boost::optional<UUID> uuid) override;
 
-        virtual SortedDataInterface* getSortedDataInterface( OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc );
+    std::unique_ptr<RecordStore> getInternalRecordStore(RecoveryUnit& ru,
+                                                        std::string_view ident,
+                                                        KeyFormat keyFormat) override;
 
-        virtual Status dropIdent( OperationContext* opCtx,
-                                  StringData ident ) {
-            return Status::OK();
-        }
+    std::unique_ptr<RecordStore> makeInternalRecordStore(RecoveryUnit& ru,
+                                                         std::string_view ident,
+                                                         KeyFormat keyFormat) override;
 
-        virtual bool supportsDocLocking() const {
-            return true;
-        }
+    Status createSortedDataInterface(
+        const rss::PersistenceProvider&,
+        RecoveryUnit&,
+        const NamespaceString& nss,
+        const UUID& uuid,
+        std::string_view ident,
+        const IndexConfig& indexConfig,
+        const boost::optional<mongo::BSONObj>& storageEngineOptions) override {
+        return Status::OK();
+    }
 
-        virtual bool supportsDirectoryPerDB() const {
-            return false;
-        }
+    Status dropSortedDataInterface(RecoveryUnit&, std::string_view ident) override {
+        return Status::OK();
+    }
 
-        virtual bool isDurable() const {
-            return true;
-        }
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(OperationContext* opCtx,
+                                                                RecoveryUnit& ru,
+                                                                const NamespaceString& nss,
+                                                                const UUID& uuid,
+                                                                std::string_view ident,
+                                                                const IndexConfig& config,
+                                                                KeyFormat keyFormat) override;
 
-        virtual int64_t getIdentSize( OperationContext* opCtx,
-                                      StringData ident ) {
-            return 1;
-        }
+    Status dropIdent(RecoveryUnit& ru,
+                     std::string_view ident,
+                     bool identHasSizeInfo,
+                     boost::optional<uint64_t> schemaEpoch,
+                     bool waitForLocks) override {
+        return Status::OK();
+    }
 
-        virtual Status repairIdent( OperationContext* opCtx,
-                                    StringData ident ) {
-            return Status::OK();
-        }
+    void dropIdentForImport(Interruptible&, RecoveryUnit&, std::string_view ident) override {}
 
-        virtual bool hasIdent(OperationContext* opCtx, StringData ident) const {
-            return true;
-        }
+    bool isEphemeral() const override {
+        return true;
+    }
 
-        std::vector<std::string> getAllIdents( OperationContext* opCtx ) const {
-            return std::vector<std::string>();
-        }
+    int64_t getIdentSize(RecoveryUnit&, std::string_view ident) override {
+        return 1;
+    }
 
-        virtual void cleanShutdown() {};
+    Status repairIdent(RecoveryUnit&, std::string_view ident) override {
+        return Status::OK();
+    }
 
-    private:
-        boost::shared_ptr<void> _catalogInfo;
-    };
-}
+    bool hasIdent(RecoveryUnit&, std::string_view ident) const override {
+        return true;
+    }
+
+    std::vector<std::string> getAllIdents(RecoveryUnit&) const override {
+        return std::vector<std::string>();
+    }
+
+    void cleanShutdown(bool memLeakAllowed) override {}
+
+    void setJournalListener(JournalListener* jl) override {}
+
+    Timestamp getAllDurableTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const override {
+        return boost::none;
+    }
+
+    Status beginBackup() override {
+        return Status::OK();
+    }
+
+    void endBackup() override {}
+
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
+        const StorageEngine::BackupOptions& options) override;
+
+    void endNonBlockingBackup() override {}
+
+    Timestamp getBackupCheckpointTimestamp() override {
+        return Timestamp(0, 0);
+    }
+
+    StatusWith<std::deque<std::string>> extendBackupCursor() override;
+
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
+        return boost::none;
+    }
+
+    Timestamp getOldestTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getRecoveryTimestamp() const override {
+        return boost::none;
+    }
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override {}
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 RecordStore* recordsStore) const override {}
+
+    Status oplogDiskLocRegister(RecoveryUnit&,
+                                RecordStore* oplogRecordStore,
+                                const Timestamp& opTime,
+                                bool orderedCommit) override {
+        return Status::OK();
+    }
+
+    bool waitUntilDurable(OperationContext* opCtx) override {
+        return true;
+    }
+
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool) override {
+        return true;
+    }
+
+    StatusWith<Timestamp> pinOldestTimestamp(RecoveryUnit&,
+                                             const std::string& requestingServiceName,
+                                             Timestamp requestedTimestamp,
+                                             bool roundUpIfTooOld) override {
+        return Timestamp(0, 0);
+    }
+
+    void unpinOldestTimestamp(const std::string& requestingServiceName) override {}
+
+    boost::optional<uint64_t> getStableSchemaEpoch() override {
+        return boost::none;
+    }
+    void setStableSchemaEpoch(uint64_t schemaEpoch) override {}
+
+    bool underCachePressure(int concurrentOpOuts) override {
+        return false;
+    }
+
+    BSONObj setFlagToStorageOptions(const BSONObj& storageEngineOptions,
+                                    std::string_view flagName,
+                                    boost::optional<bool> flagValue) const override {
+        return storageEngineOptions;
+    }
+
+    boost::optional<bool> getFlagFromStorageOptions(const BSONObj& storageEngineOptions,
+                                                    std::string_view flagName) const override {
+        return boost::none;
+    }
+
+    [[nodiscard]] BSONObj setStorageTierToStorageOptions(
+        const BSONObj& storageEngineOptions, StorageTierLevelEnum value) const override {
+        return storageEngineOptions;
+    }
+
+    boost::optional<StorageTierLevelEnum> getStorageTierFromStorageOptions(
+        const BSONObj& storageEngineOptions) const override {
+        return boost::none;
+    }
+
+    void dump() const override {}
+
+    std::unique_ptr<KVEngineDirectCrudCursor> getDirectCursor(RecoveryUnit& ru,
+                                                              std::string_view ident,
+                                                              BlindWritePolicy policy) override {
+        return nullptr;
+    }
+
+    // This sets the results of the backup cursor for unit tests.
+    [[MONGO_MOD_PUBLIC]] void setBackupBlocks_forTest(std::deque<KVBackupBlock> newBackupBlocks) {
+        _mockBackupBlocks = std::move(newBackupBlocks);
+    }
+
+private:
+    std::shared_ptr<void> _catalogInfo;
+    int _cachePressureForTest = 0;
+    std::deque<KVBackupBlock> _mockBackupBlocks;
+    boost::filesystem::path _engineDbPath;
+};
+}  // namespace mongo

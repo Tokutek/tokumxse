@@ -1,0 +1,366 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/global_catalog/type_collection_common_types_gen.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/sharding_environment/range_arithmetic.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * The collection metadata has metadata information about a collection, in particular the
+ * sharding information. It's main goal in life is to be capable of answering if a certain
+ * document belongs to it or not. (In some scenarios such as chunk migration, a given
+ * document is in a shard but cannot be accessed.)
+ *
+ * To build a collection from config data, please check the MetadataLoader. The methods
+ * here allow building a new incarnation of a collection's metadata based on an existing
+ * one (e.g, we're splitting in a given collection.).
+ *
+ * This class's chunk mapping is immutable once constructed.
+ */
+class [[MONGO_MOD_PUBLIC]] CollectionMetadata {
+public:
+    /**
+     * Instantiates a metadata object, which represents an unsharded collection. This 'isSharded'
+     * for this object will return false and it is illegal to use it for filtering.
+     */
+    CollectionMetadata() = default;
+
+    /**
+     * The main way to construct CollectionMetadata is through MetadataLoader or clone() methods.
+     *
+     * "thisShardId" is the shard identity of this shard for purposes of answering questions like
+     * "does this key belong to this shard"?
+     */
+    CollectionMetadata(CurrentChunkManager cm, const ShardId& thisShardId);
+
+    CollectionMetadata(PointInTimeChunkManager cm, const ShardId& thisShardId);
+
+    /**
+     * Returns a new CollectionMetadata with the given chunk changes applied to the current
+     * routing table. If those changes have already been applied, returns this metadata unchanged.
+     * This is determined by comparing the collection version against the highest chunk version
+     * among the changed chunks.
+     */
+    CollectionMetadata makeUpdated(const std::vector<ChunkType>& changedChunks,
+                                   bool forceAllowGaps = false) const;
+
+    /**
+     * Returns a CollectionMetadata object for an untracked collection.
+     */
+    static CollectionMetadata UNTRACKED() {
+        return CollectionMetadata();
+    }
+
+    /**
+     * Returns whether this metadata object represents a sharded or unsharded collection.
+     */
+    bool isSharded() const {
+        return _cm && getChunkManagerBase().isSharded();
+    }
+
+    /**
+     * Returns whether this metadata object represents an unsplittable collection.
+     */
+    bool isUnsplittable() const {
+        return _cm && getChunkManagerBase().isUnsplittable();
+    }
+
+    bool hasRoutingTable() const {
+        return _cm && getChunkManagerBase().hasRoutingTable();
+    }
+
+    /**
+     * Returns true if the routing table holds only this shard's owned chunks and may have gaps in
+     * the key range (an authoritative shard-catalog filtering table). A legacy full routing table
+     * that holds every chunk of the collection does not allow gaps. Returns false when there is no
+     * routing table.
+     */
+    bool allowGaps() const {
+        return hasRoutingTable() && getChunkManagerBase().allowGaps();
+    }
+
+    bool allowMigrations() const;
+
+    /**
+     * Returns the resharding key if the coordinator state is such that the recipient is tailing
+     * the donor's oplog.
+     */
+    boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const;
+
+    /**
+     * Throws an exception if resharding fields currently exist in the collection metadata.
+     */
+    void throwIfReshardingInProgress(NamespaceString const& nss) const;
+
+    /**
+     * Returns the current shard's placement version for the collection or UNTRACKED if it does not
+     * have a routing table.
+     */
+    ChunkVersion getShardPlacementVersion() const {
+        return (hasRoutingTable() ? getChunkManagerBase().getVersion(_thisShardId)
+                                  : ChunkVersion::UNTRACKED());
+    }
+
+    /**
+     * Returns the current shard's latest placement timestamp or Timestamp(0, 0) if it is not
+     * sharded. This value indicates the commit time of the latest placement change that this shard
+     * participated in and is used to answer the question of "did any chunks move since some
+     * timestamp".
+     */
+    Timestamp getShardMaxValidAfter() const {
+        return (hasRoutingTable() ? getChunkManagerBase().getMaxValidAfter(_thisShardId)
+                                  : Timestamp(0, 0));
+    }
+
+    /**
+     * Returns the current shard's placement version for the collection or UNTRACKED if it does not
+     * have a routing table.
+     *
+     * Will not throw an exception if _thisShardId is marked as stale by the CollectionMetadata's
+     * current chunk manager. Only use this function when logging the returned ChunkVersion. If the
+     * caller must execute logic based on the returned ChunkVersion, use getShardPlacementVersion()
+     * instead.
+     */
+    ChunkVersion getShardPlacementVersionForLogging() const {
+        return (hasRoutingTable() ? getChunkManagerBase().getVersionForLogging(_thisShardId)
+                                  : ChunkVersion::UNTRACKED());
+    }
+
+    /**
+     * Returns the current collection placement version or UNTRACKED if it does not have a routing
+     * table.
+     */
+    ChunkVersion getCollPlacementVersion() const {
+        return (hasRoutingTable() ? getChunkManagerBase().getVersion() : ChunkVersion::UNTRACKED());
+    }
+
+    /**
+     * Obtains the shard id with which this collection metadata is configured.
+     */
+    const ShardId& shardId() const {
+        tassert(10016205, "Expected a routing table to be initialized", hasRoutingTable());
+        return _thisShardId;
+    }
+
+    const ShardKeyPattern& getShardKeyPattern() const {
+        tassert(10016206, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().getShardKeyPattern();
+    }
+
+    /**
+     * Returns true if 'key' contains exactly the same fields as the shard key pattern.
+     */
+    bool isValidKey(const BSONObj& key) const {
+        return getShardKeyPattern().isShardKey(key);
+    }
+
+    const BSONObj& getKeyPattern() const {
+        return getShardKeyPattern().toBSON();
+    }
+
+    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
+        return getShardKeyPattern().getKeyPatternFields();
+    }
+
+    BSONObj getMinKey() const {
+        return getShardKeyPattern().getKeyPattern().globalMin();
+    }
+
+    BSONObj getMaxKey() const {
+        return getShardKeyPattern().getKeyPattern().globalMax();
+    }
+
+    bool uuidMatches(UUID uuid) const {
+        tassert(10016215, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().uuidMatches(uuid);
+    }
+
+    const UUID& getUUID() const {
+        tassert(10016216, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().getUUID();
+    }
+
+    /**
+     * Returns just the shard key fields, if the collection is sharded, and the _id field, from
+     * `doc`. Does not alter any field values (e.g. by hashing); values are copied verbatim.
+     */
+    BSONObj extractDocumentKey(const BSONObj& doc) const;
+
+    /**
+     * Static version of the function above. Only use this for internal sharding operations where
+     * shard key pattern is fixed and cannot change.
+     */
+    static BSONObj extractDocumentKey(const ShardKeyPattern* shardKeyPattern, const BSONObj& doc);
+
+    /**
+     * String output of the collection and shard placement versions.
+     */
+    std::string toStringBasic() const;
+
+    //
+    // Methods used for orphan filtering and general introspection of the chunks owned by the shard
+    //
+
+    const ChunkManager* getChunkManager() const {
+        tassert(10016207, "Expected a routing table to be initialized", hasRoutingTable());
+        return std::visit([](const auto& cm) -> const ChunkManager* { return &cm; }, *_cm);
+    }
+
+    /**
+     * Returns a pointer to ChunkManager if that's what's stored, nullptr otherwise.
+     * Use this only when you specifically need the current (non-point-in-time) ChunkManager.
+     */
+    const CurrentChunkManager* getCurrentChunkManager() const {
+        tassert(9014101, "Expected a routing table to be initialized", hasRoutingTable());
+        return std::get_if<CurrentChunkManager>(&*_cm);
+    }
+
+    /**
+     * Returns a pointer to PointInTimeChunkManager if that's what's stored, nullptr otherwise.
+     * Use this only when you specifically need the point-in-time ChunkManager.
+     */
+    const PointInTimeChunkManager* getPointInTimeChunkManager() const {
+        tassert(9014102, "Expected a routing table to be initialized", hasRoutingTable());
+        return std::get_if<PointInTimeChunkManager>(&*_cm);
+    }
+
+    /**
+     * Returns true if this metadata holds a point-in-time chunk manager.
+     */
+    bool isAtPointInTime() const {
+        return _cm && std::holds_alternative<PointInTimeChunkManager>(*_cm);
+    }
+
+    /**
+     * Returns true if the document with the given key belongs to this chunkset. If the key is empty
+     * returns false. If key is not a valid shard key, the behaviour is undefined.
+     */
+    bool keyBelongsToMe(const BSONObj& key) const {
+        tassert(10016208, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().keyBelongsToShard(key, _thisShardId);
+    }
+
+    /**
+     * This finds the nearest chunk to a given 'key' owned by the current shard in the
+     * specified chunk map scan 'direction', and returns it as a 'ChunkOwnership'. If the key is
+     * empty returns false. If key is not a valid shard key, the behaviour is undefined.
+     */
+    ChunkManager::ChunkOwnership nearestOwnedChunk(const BSONObj& key,
+                                                   ChunkMap::Direction direction) const {
+        tassert(9526301, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().nearestOwnedChunk(key, _thisShardId, direction);
+    }
+
+    /**
+     * Given a key 'lookupKey' in the shard key range, get the next chunk which overlaps or is
+     * greater than this key.  Returns true if a chunk exists, false otherwise.
+     *
+     * Passing a key that is not a valid shard key for this range results in undefined behavior.
+     */
+    bool getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const;
+
+    /**
+     * Returns true if the argument range overlaps any chunk.
+     */
+    bool rangeOverlapsChunk(const ChunkRange& range) const {
+        tassert(10016209, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().rangeOverlapsShard(range, _thisShardId);
+    }
+
+    /**
+     * Returns true if this shard has any chunks for the collection.
+     */
+    bool currentShardHasAnyChunks() const;
+
+    /**
+     * Given a key in the shard key range, get the next range which overlaps or is greater than
+     * this key.
+     *
+     * This allows us to do the following to iterate over all orphan ranges:
+     *
+     * ChunkRange range;
+     * BSONObj lookupKey = metadata->getMinKey();
+     * boost::optional<ChunkRange> range;
+     * while((range = metadata->getNextOrphanRange(receiveMap, lookupKey))) {
+     *     lookupKey = range->maxKey;
+     * }
+     *
+     * @param lookupKey passing a key that does not belong to this metadata is undefined.
+     * @param receiveMap is an extra set of chunks not considered orphaned.
+     *
+     * @return orphanRange the output range. Note that the NS is not set.
+     */
+    boost::optional<ChunkRange> getNextOrphanRange(const RangeMap& receiveMap,
+                                                   const BSONObj& lookupKey) const;
+
+    /**
+     * Returns all the chunks which are contained on this shard.
+     */
+    RangeMap getChunks() const;
+
+    /**
+     * BSON output of the chunks metadata into a BSONArray
+     */
+    void toBSONChunks(BSONArrayBuilder* builder) const;
+
+    const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
+        tassert(10016210, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        tassert(10016211, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().getTimeseriesFields();
+    }
+
+    bool isUniqueShardKey() const {
+        tassert(10016212, "Expected a routing table to be initialized", hasRoutingTable());
+        return getChunkManagerBase().isUnique();
+    }
+
+private:
+    /**
+     * Helper to access the ChunkManager interface regardless of whether _cm holds
+     * a ChunkManager or PointInTimeChunkManager.
+     */
+    const ChunkManager& getChunkManagerBase() const {
+        tassert(9014100, "Expected _cm to be initialized", _cm.has_value());
+        return std::visit([](const auto& cm) -> const ChunkManager& { return cm; }, *_cm);
+    }
+
+    // Type alias for the variant holding either ChunkManager or PointInTimeChunkManager
+    using ChunkManagerVariant = std::variant<CurrentChunkManager, PointInTimeChunkManager>;
+
+    // The full routing table for the collection or boost::none if the collection is not tracked
+    boost::optional<ChunkManagerVariant> _cm;
+
+    // The identity of this shard, for the purpose of answering "key belongs to me" queries. If the
+    // collection is not tracked (_cm is boost::none), then this value will be empty.
+    ShardId _thisShardId;
+};
+
+}  // namespace mongo

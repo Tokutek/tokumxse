@@ -1,0 +1,56 @@
+version: 1.0.0
+filters:
+  - "building.md":
+    approvers:
+      - 10gen/devprod-build
+  - "change_stream_events.md":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "change_streams.md":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "cpp_style.md":
+    approvers:
+      - 10gen/server-programmability
+  - "devcontainer-setup.md":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "devcontainer/**":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "exception_architecture.md":
+    approvers:
+      - 10gen/server-programmability
+  - "futures_and_promises.md":
+    approvers:
+      - 10gen/server-programmability
+  - "golden_data_test_framework.md":
+    approvers:
+      - 10gen/query-optimization
+  - "idl.md":
+    approvers:
+      - 10gen/server-programmability
+  - "linting.md":
+    approvers:
+      - 10gen/devprod-build
+  - "modularity.md":
+    approvers:
+      - 10gen/server-programmability
+  - "owners/**":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "server_parameters.md":
+    approvers:
+      - 10gen/server-programmability
+  - "unit_test.md":
+    approvers:
+      - 10gen/server-programmability
+  - "priority_port.md":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "fuzztest.md":
+    approvers:
+      - 10gen/platsec-server
+  - "uv_execution.md":
+    approvers:
+      - 10gen/devprod-build

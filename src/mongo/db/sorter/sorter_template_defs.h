@@ -1,0 +1,1402 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sorter/sorter.h"
+#include "mongo/db/sorter/sorter_checksum_calculator.h"
+#include "mongo/db/sorter/sorter_file_name.h"
+#include "mongo/db/sorter/sorter_gen.h"
+#include "mongo/db/sorter/sorter_stats.h"
+#include "mongo/db/storage/spill_util.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/file.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/shared_buffer_fragment.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <functional>
+#include <istream>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <queue>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/optional.hpp>
+
+/**
+ * Template definitions for Sorter implementations.
+ * Separated from sorter.h because these definitions
+ * are used in the definitions of Sorter callers, not
+ * necessary for their public interface.
+ */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo {
+namespace sorter {
+
+inline void checkNoExternalSortOnMongos(bool spillerConfigured) {
+    // This should be checked by consumers, but if it isn't try to fail early.
+    uassert(16947,
+            "Attempting to use external sort from mongos. This is not allowed.",
+            !(serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer) &&
+              spillerConfigured));
+}
+
+[[MONGO_MOD_PUBLIC]] inline SharedBufferFragmentBuilder makeMemPool() {
+    return SharedBufferFragmentBuilder(
+        gOperationMemoryPoolBlockInitialSizeKB.loadRelaxed() * static_cast<size_t>(1024),
+        SharedBufferFragmentBuilder::DoubleGrowStrategy(
+            gOperationMemoryPoolBlockMaxSizeKB.loadRelaxed() * static_cast<size_t>(1024)));
+}
+
+template <typename Key, typename Comparator>
+void dassertCompIsSane(const Comparator& comp, const Key& lhs, const Key& rhs) {
+#if defined(MONGO_CONFIG_DEBUG_BUILD) && !defined(_MSC_VER)
+    // MSVC++ already does similar verification in debug mode in addition to using
+    // algorithms that do more comparisons. Doing our own verification in addition makes
+    // debug builds considerably slower without any additional safety.
+
+    // test reversed comparisons
+    invariant((comp(lhs, rhs) <=> 0) == (0 <=> comp(rhs, lhs)));
+
+    // test reflexivity
+    invariant(comp(lhs, lhs) == 0);
+    invariant(comp(rhs, rhs) == 0);
+#endif
+}
+
+//
+// Iterators
+//
+
+/**
+ * Returns results from sorted in-memory storage.
+ */
+template <typename Key, typename Value, typename Comparator>
+class InMemIterator : public sorter::Iterator<Key, Value> {
+public:
+    typedef std::pair<Key, Value> Data;
+
+    /// No data to iterate
+    explicit InMemIterator(std::shared_ptr<Spiller<Key, Value, Comparator>> spiller = nullptr)
+        : _spiller(spiller) {}
+
+    /// Only a single value
+    explicit InMemIterator(const Data& singleValue,
+                           std::shared_ptr<Spiller<Key, Value, Comparator>> spiller = nullptr)
+        : _data(1, singleValue), _spiller(spiller) {}
+
+    /// Any number of values
+    template <typename Container>
+    explicit InMemIterator(const Container& input,
+                           std::shared_ptr<Spiller<Key, Value, Comparator>> spiller = nullptr)
+        : _data(input.begin(), input.end()), _spiller(spiller) {}
+
+    explicit InMemIterator(std::vector<Data> data,
+                           std::shared_ptr<Spiller<Key, Value, Comparator>> spiller = nullptr)
+        : _data(std::move(data)), _spiller(spiller) {}
+
+    bool more() override {
+        return _index < _data.size();
+    }
+    Data next() override {
+        Data out = std::move(_data[_index]);
+        _index++;
+        return out;
+    }
+
+    Key nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    const Key& peek() override {
+        return _data[_index].first;
+    }
+
+    SorterRange getRange() const override {
+        MONGO_UNREACHABLE_TASSERT(11703800);
+    }
+
+    bool spillable() const override {
+        return _index < _data.size();
+    }
+
+    std::unique_ptr<sorter::Iterator<Key, Value>> spill(
+        const SortOptions& opts, const typename Sorter<Key, Value>::Settings& settings) override {
+        tassert(9917201, "spill() method is called when spillable() returns false", spillable());
+
+        uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
+                "Requested to spill InMemIterator but did not opt in to external sorting",
+                _spiller != nullptr);
+
+        uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+            _spiller->getSpillDir(),
+            static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load())));
+
+        auto iterator = _spiller->spillUnique(opts, settings, std::span{_data}.subspan(_index));
+
+        if (opts.sorterTracker) {
+            opts.sorterTracker->spilledRanges.addAndFetch(1);
+            opts.sorterTracker->spilledKeyValuePairs.addAndFetch(_data.size() - _index);
+        }
+
+        _data.clear();
+        _data.shrink_to_fit();
+        _index = 0;
+
+        return iterator;
+    }
+
+private:
+    std::vector<Data> _data;
+    std::shared_ptr<Spiller<Key, Value, Comparator>> _spiller;
+    uint32_t _index{0};
+};
+
+/**
+ * This class is used to return the in-memory state from the sorter in read-only mode.
+ * This is used by streams checkpoint use case mainly to save in-memory state on persistent
+ * storage.
+ */
+template <typename Key, typename Value, typename Container>
+class InMemReadOnlyIterator : public sorter::Iterator<Key, Value> {
+public:
+    typedef std::pair<Key, Value> Data;
+
+    InMemReadOnlyIterator(const Container& data) : _data(data) {
+        _iterator = _data.begin();
+    }
+
+    bool more() override {
+        return _iterator != _data.end();
+    }
+
+    Data next() override {
+        Data out = *_iterator++;
+        return out;
+    }
+
+    Key nextWithDeferredValue() override {
+        MONGO_UNIMPLEMENTED_TASSERT(8248302);
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNIMPLEMENTED_TASSERT(8248303);
+    }
+
+    const Key& peek() override {
+        return std::prev(_iterator)->first;
+    }
+
+    SorterRange getRange() const override {
+        MONGO_UNREACHABLE_TASSERT(11703801);
+    }
+
+    bool spillable() const override {
+        return false;
+    }
+
+    [[nodiscard]] std::unique_ptr<Iterator<Key, Value>> spill(
+        const SortOptions& opts, const typename Sorter<Key, Value>::Settings& settings) override {
+        MONGO_UNREACHABLE_TASSERT(11703802);
+    }
+
+private:
+    const Container& _data;
+    typename Container::const_iterator _iterator;
+};
+
+/**
+ * Merge-sorts results from 0 or more iterators, all of which should be iterating over sorted
+ * ranges within the same iterators. The input iterators must implement nextWithDeferredValue() and
+ * getDeferredValue() so that the merge can compare keys before reading values..
+ */
+template <typename Key, typename Value, typename Comparator>
+class MergeIterator final : public sorter::Iterator<Key, Value> {
+public:
+    typedef sorter::Iterator<Key, Value> Input;
+    typedef std::pair<Key, Value> Data;
+
+    MergeIterator(std::span<std::shared_ptr<Input>> iters,
+                  const SortOptions& opts,
+                  const Comparator& comp)
+        : _opts(opts),
+          _remaining(opts.limit ? opts.limit : std::numeric_limits<unsigned long long>::max()),
+          _greater(comp) {
+        for (auto& iter : iters) {
+            if (iter->more()) {
+                _heap.push_back(std::make_unique<Stream<Key, Value>>(_maxSourceId++, iter));
+            }
+        }
+
+        if (_heap.empty()) {
+            _remaining = 0;
+            return;
+        }
+
+        std::make_heap(_heap.begin(), _heap.end(), _greater);
+        std::pop_heap(_heap.begin(), _heap.end(), _greater);
+        _current = std::move(_heap.back());
+        _heap.pop_back();
+
+        _positioned = true;
+    }
+
+    ~MergeIterator() override {
+        _current.reset();
+        _heap.clear();
+    }
+
+    void addSource(std::shared_ptr<Input> iter) {
+        if (!iter->more()) {
+            return;
+        }
+
+        _heap.push_back(std::make_unique<Stream<Key, Value>>(++_maxSourceId, iter));
+        std::push_heap(_heap.begin(), _heap.end(), _greater);
+
+        if (_greater(_current, _heap.front())) {
+            std::pop_heap(_heap.begin(), _heap.end(), _greater);
+            std::swap(_current, _heap.back());
+            std::push_heap(_heap.begin(), _heap.end(), _greater);
+        }
+    }
+
+    bool more() override {
+        if (_remaining > 0 && (_positioned || !_heap.empty() || _current->more()))
+            return true;
+
+        _remaining = 0;
+        return false;
+    }
+
+    const Key& peek() override {
+        invariant(_remaining);
+
+        if (!_positioned) {
+            advance();
+            _positioned = true;
+        }
+
+        return _current->current();
+    }
+
+    Data next() override {
+        invariant(_remaining);
+
+        _remaining--;
+
+        if (_positioned) {
+            _positioned = false;
+        } else {
+            advance();
+        }
+        Key key = _current->current();
+        Value value = _current->getDeferredValue();
+        return Data(std::move(key), std::move(value));
+    }
+
+    Key nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    SorterRange getRange() const override {
+        MONGO_UNREACHABLE_TASSERT(11703804);
+    }
+
+    bool spillable() const override {
+        return false;
+    }
+
+    [[nodiscard]] std::unique_ptr<Iterator<Key, Value>> spill(
+        const SortOptions& opts, const typename Sorter<Key, Value>::Settings& settings) override {
+        MONGO_UNREACHABLE_TASSERT(11703805);
+    }
+
+    void advance() {
+        if (!_current->advance()) {
+            invariant(!_heap.empty());
+            std::pop_heap(_heap.begin(), _heap.end(), _greater);
+            _current = std::move(_heap.back());
+            _heap.pop_back();
+        } else if (!_heap.empty() && _greater(_current, _heap.front())) {
+            std::pop_heap(_heap.begin(), _heap.end(), _greater);
+            std::swap(_current, _heap.back());
+            std::push_heap(_heap.begin(), _heap.end(), _greater);
+        }
+    }
+
+    /**
+     * Returns the underlying iterator of the current position.
+     */
+    Input& iterator() {
+        uassert(11722000,
+                "Cannot get underlying iterator when merge iterator has already been exhausted",
+                _remaining);
+
+        if (!_positioned) {
+            advance();
+            _positioned = true;
+        }
+        return _current->iterator();
+    }
+
+private:
+    class STLComparator {  // uses greater rather than less-than to maintain a MinHeap
+    public:
+        explicit STLComparator(const Comparator& comp) : _comp(comp) {}
+
+        template <typename Ptr>
+        bool operator()(const Ptr& lhs, const Ptr& rhs) const {
+            // first compare data
+            dassertCompIsSane(_comp, lhs->current(), rhs->current());
+            if (auto ret = _comp(lhs->current(), rhs->current()); ret != 0)
+                return ret > 0;
+
+            // then compare sourceIds to ensure stability
+            return lhs->sourceId > rhs->sourceId;
+        }
+
+    private:
+        const Comparator _comp;
+    };
+
+    SortOptions _opts;
+    unsigned long long _remaining;
+    bool _positioned = false;
+    std::unique_ptr<Stream<Key, Value>> _current;
+    std::vector<std::unique_ptr<Stream<Key, Value>>> _heap;  // MinHeap
+    STLComparator _greater;                                  // named so calls make sense
+    size_t _maxSourceId = 0;  // The maximum file identifier used thus far
+};
+
+//
+// Sorter types
+//
+
+template <typename Key, typename Value, typename Comparator>
+class MergeableSorter : public Sorter<Key, Value> {
+public:
+    typedef std::pair<typename Key::SorterDeserializeSettings,
+                      typename Value::SorterDeserializeSettings>
+        Settings;
+    typedef sorter::Iterator<Key, Value> Iterator;
+
+    MergeableSorter(const SortOptions& opts,
+                    const Comparator& comp,
+                    std::shared_ptr<Spiller<Key, Value, Comparator>> spiller,
+                    const Settings& settings)
+        : Sorter<Key, Value>(opts), _comp(comp), _settings(settings), _spiller(std::move(spiller)) {
+        setMaxMemoryUsageBytes();
+    }
+
+    MergeableSorter(const SortOptions& opts,
+                    const std::string& storageIdentifier,
+                    const Comparator& comp,
+                    std::shared_ptr<Spiller<Key, Value, Comparator>> spiller,
+                    const Settings& settings)
+        : Sorter<Key, Value>(opts, storageIdentifier),
+          _comp(comp),
+          _settings(settings),
+          _spiller(std::move(spiller)) {
+        setMaxMemoryUsageBytes();
+    }
+
+    typename Sorter<Key, Value>::PersistedState getPersistedState() override {
+        this->_spiller->getStorage().keep();
+
+        auto& iters = this->_spiller->iterators();
+        std::vector<SorterRange> ranges;
+        ranges.reserve(iters.size());
+        std::transform(iters.begin(), iters.end(), std::back_inserter(ranges), [](auto&& it) {
+            return it->getRange();
+        });
+
+        return {this->_spiller->getStorage().getStorageIdentifier(), std::move(ranges)};
+    }
+
+protected:
+    /**
+     * An implementation of a k-way merge sort.
+     *
+     * This method takes a target number of sorted spills (numTargetedSpills) and merges the spills
+     * in batches of at most maxSpillsPerMerge (the maximum number of spill ranges merged together
+     * in a single merge batch while still respecting memory limits) until it reaches the target.
+     *
+     * To give an example, if we have 7 spills, a target of 2 spills after merging and
+     * maxSpillsPerMerge = 3, the algorithm will do the following:
+     *
+     * {1, 2, 3, 4, 5, 6, 7}
+     * {123, 456, 7}
+     * {1234567}
+     */
+    void _mergeSpills(std::size_t numTargetedSpills, std::size_t maxSpillsPerMerge) {
+        if (numTargetedSpills == 0) {
+            return;
+        }
+
+        auto& iters = this->_spiller->iterators();
+        if (iters.size() > numTargetedSpills) {
+            LOGV2_INFO(8203700,
+                       "Merging spills",
+                       "currentNumSpills"_attr = iters.size(),
+                       "targetNumSpills"_attr = numTargetedSpills,
+                       "maxSpillsPerMerge"_attr = maxSpillsPerMerge);
+
+            _spiller->mergeSpills(this->_opts,
+                                  this->_settings,
+                                  this->_stats,
+                                  _comp,
+                                  numTargetedSpills,
+                                  maxSpillsPerMerge);
+        }
+    }
+
+    void _mergeSpills() {
+        // The number of target spills and the number of parallel spills are equal.
+        updateSpillsNumToRespectMemoryLimits();
+        _mergeSpills(_spillsNumToRespectMemoryLimits, _spillsNumToRespectMemoryLimits);
+    }
+
+    const Comparator _comp;
+    const Settings _settings;
+
+    std::shared_ptr<Spiller<Key, Value, Comparator>> _spiller;
+    /**
+     * The size of the iterator for the underlying storage used by the spiller.
+     * Only set if spiller != nullptr.
+     */
+    size_t _iteratorSize = 0;
+
+    /**
+     * The size of the buffer for the underlying storage used by the spiller.
+     * _bufferSize is populated by updateSpillsNumToRespectMemoryLimits() before a merge, which is
+     * the only point at which it is consumed.
+     */
+    size_t _bufferSize = 0;
+
+    /**
+     * The maximum number of spills that can be merged simultaneously in order to respect memory
+     * limits. While merging, each active iterator consumes memory proportional to its buffer size.
+     * The total memory consumed by iterator buffers should not exceed the available memory.
+     * Only set if spiller != nullptr.
+     * _spillsNumToRespectMemoryLimits is populated by updateSpillsNumToRespectMemoryLimits()
+     * immediately before a merge, which is the only point at which it is consumed.
+     */
+    size_t _spillsNumToRespectMemoryLimits = 0;
+
+    size_t iteratorsMaxBytesSize =
+        1 * 1024 * 1024;  // Memory Iterators for spilled data area allowed to use.
+    size_t iteratorsMaxNum = 0;
+
+    /**
+     * Re-queries getBufferSize() from the storage and recomputes _spillsNumToRespectMemoryLimits.
+     * Called before a merge so the fan-in limit reflects the actual data that has been
+     * spilled.
+     */
+    void updateSpillsNumToRespectMemoryLimits() {
+        if (this->_spiller == nullptr) {
+            return;
+        }
+        _bufferSize = this->_spiller->getStorage().getBufferSize();
+        if (_bufferSize == 0) {
+            return;
+        }
+        _spillsNumToRespectMemoryLimits =
+            std::max(this->_opts.maxMemoryUsageBytes / _bufferSize, static_cast<std::size_t>(2));
+    }
+
+private:
+    // Update the maxMemoryUsageBytes subtracting the memory reserved for iterators. Iterators can
+    // use up to maxIteratorsMemoryUsagePercentage of the maxMemoryUsageBytes with lower bound
+    // iteratorsMaxBytesSize and upper bound 1MB.
+    void setMaxMemoryUsageBytes() {
+        if (this->_spiller == nullptr) {
+            this->iteratorsMaxBytesSize = 0;
+            return;
+        }
+        _iteratorSize = this->_spiller->getStorage().getIteratorSize();
+        double percRequested = maxIteratorsMemoryUsagePercentage.load();
+        auto iteratorMemBytesRequested =
+            static_cast<size_t>(this->_opts.maxMemoryUsageBytes * percRequested);
+        if (iteratorMemBytesRequested < this->iteratorsMaxBytesSize) {
+            this->iteratorsMaxBytesSize = std::max(_iteratorSize, iteratorMemBytesRequested);
+        }
+        this->iteratorsMaxNum = static_cast<size_t>(this->iteratorsMaxBytesSize / _iteratorSize);
+        this->iteratorsMaxBytesSize = _iteratorSize * this->iteratorsMaxNum;
+
+        if (this->iteratorsMaxBytesSize >= this->_opts.maxMemoryUsageBytes) {
+            this->_opts.MaxMemoryUsageBytes(0);
+        } else {
+            this->_opts.MaxMemoryUsageBytes(this->_opts.maxMemoryUsageBytes -
+                                            this->iteratorsMaxBytesSize);
+        }
+    }
+};
+
+template <typename Key, typename Value, typename Comparator>
+class NoLimitSorter : public MergeableSorter<Key, Value, Comparator> {
+public:
+    typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
+    using Iterator = typename MergeableSorter<Key, Value, Comparator>::Iterator;
+    using Settings = typename MergeableSorter<Key, Value, Comparator>::Settings;
+
+    NoLimitSorter(const SortOptions& opts,
+                  const Comparator& comp,
+                  std::shared_ptr<Spiller<Key, Value, Comparator>> spiller,
+                  const Settings& settings)
+        : MergeableSorter<Key, Value, Comparator>(opts, comp, std::move(spiller), settings) {
+        invariant(opts.limit == 0);
+    }
+
+    NoLimitSorter(const std::string& storageIdentifier,
+                  const std::vector<SorterRange>& ranges,
+                  const SortOptions& opts,
+                  const Comparator& comp,
+                  std::shared_ptr<Spiller<Key, Value, Comparator>> spiller,
+                  const Settings& settings)
+        : MergeableSorter<Key, Value, Comparator>(
+              opts, storageIdentifier, comp, std::move(spiller), settings) {
+        invariant(this->_spiller != nullptr);
+        uassert(ErrorCodes::BadValue, "Cannot resume sorter from empty ranges", !ranges.empty());
+
+        auto& iters = this->_spiller->iterators();
+        iters.reserve(ranges.size());
+        std::transform(ranges.begin(),
+                       ranges.end(),
+                       std::back_inserter(iters),
+                       [this](const SorterRange& range) {
+                           return this->_spiller->getStorage().getSortedIterator(range,
+                                                                                 this->_settings);
+                       });
+        this->_stats.setSpilledRanges(iters.size());
+    }
+
+    template <typename DataProducer>
+    void addImpl(DataProducer dataProducer) {
+        invariant(!_done);
+        invariant(!_paused);
+
+        auto& keyVal = _data.emplace_back(dataProducer());
+
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            auto memUsedInsideSorter = (sizeof(Key) + sizeof(Value)) * (_data.size() + 1);
+            this->_stats.setMemUsage(memPool->memUsage() + memUsedInsideSorter);
+        } else {
+            auto memUsage = keyVal.first.memUsageForSorter() + keyVal.second.memUsageForSorter();
+            this->_stats.incrementMemUsage(memUsage);
+        }
+
+        this->_spillIfOverBudget();
+    }
+
+    void add(const Key& key, const Value& val) override {
+        addImpl([&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl([&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
+    }
+
+    std::unique_ptr<Iterator> done() override {
+        invariant(!std::exchange(_done, true));
+
+        if (!this->_spiller || this->_spiller->iterators().empty()) {
+            sort();
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return std::make_unique<InMemIterator<Key, Value, Comparator>>(std::move(_data),
+                                                                               this->_spiller);
+            }
+            return std::make_unique<InMemIterator<Key, Value, Comparator>>(_data, this->_spiller);
+        }
+
+        spill();
+        this->_mergeSpills();
+
+        return sorter::merge<Key, Value>(this->_spiller->iterators(), this->_opts, this->_comp);
+    }
+
+    std::unique_ptr<Iterator> pause() override {
+        invariant(!_done);
+        invariant(!_paused);
+
+        _paused = true;
+        tassert(8248300,
+                "Spilled sort cannot be paused",
+                !this->_spiller || this->_spiller->iterators().empty());
+        return std::make_unique<InMemReadOnlyIterator<Key, Value, std::vector<Data>>>(_data);
+    }
+
+    void resume() override {
+        _paused = false;
+    }
+
+    typename Sorter<Key, Value>::PersistedState persistDataForShutdown() override {
+        spill();
+        return this->getPersistedState();
+    }
+
+private:
+    class STLComparator {
+    public:
+        explicit STLComparator(const Comparator& comp) : _comp(comp) {}
+        bool operator()(const Data& lhs, const Data& rhs) const {
+            dassertCompIsSane(_comp, lhs.first, rhs.first);
+            return _comp(lhs.first, rhs.first) < 0;
+        }
+
+    private:
+        const Comparator& _comp;
+    };
+
+    void sort() {
+        STLComparator less(this->_comp);
+        std::sort(_data.begin(), _data.end(), less);
+        this->_stats.incrementNumSorted(_data.size());
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            invariant(memPool->totalFragmentBytesUsed() >= this->_stats.bytesSorted());
+            this->_stats.incrementBytesSorted(memPool->totalFragmentBytesUsed() -
+                                              this->_stats.bytesSorted());
+        } else {
+            this->_stats.incrementBytesSorted(this->_stats.memUsage());
+        }
+    }
+
+    void spill() override {
+        if (_data.empty()) {
+            return;
+        }
+
+        if (this->_spiller == nullptr) {
+            // This error message only applies to sorts from user queries made through the find or
+            // aggregation commands. Other clients, such as bulk index builds, should suppress this
+            // error, either by allowing external sorting or by catching and throwing a more
+            // appropriate error.
+            uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
+                      str::stream()
+                          << "Sort exceeded memory limit of "
+                          << (this->_opts.maxMemoryUsageBytes + this->iteratorsMaxBytesSize)
+                          << " bytes, but did not opt in to external sorting.");
+        }
+
+        // Ensure there is sufficient disk space for spilling
+        uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+            this->_spiller->getSpillDir(),
+            static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load())));
+
+        sort();
+
+        this->_spiller->spill(this->_opts, this->_settings, _data);
+
+        this->_stats.incrementSpilledKeyValuePairs(_data.size());
+        _data.clear();
+        // _data may have grown very large. Even though it's clear()ed, we need to
+        // free the excess memory.
+        _data.shrink_to_fit();
+
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            // We expect that all buffers are unused at this point.
+            memPool->freeUnused();
+            this->_stats.setMemUsage(memPool->memUsage());
+        } else {
+            this->_stats.resetMemUsage();
+        }
+
+        this->_stats.incrementSpilledRanges();
+
+        // Merge spills to remain below the `iteratorsMaxBytesSize` threshold.
+        auto& iters = this->_spiller->iterators();
+        if (iters.size() >= this->iteratorsMaxNum) {
+            this->updateSpillsNumToRespectMemoryLimits();
+            this->_mergeSpills(iters.size() / 2, this->_spillsNumToRespectMemoryLimits);
+        }
+    }
+
+    std::vector<Data> _data;  // Data that has not been spilled.
+    bool _done = false;
+    bool _paused = false;
+};
+
+template <typename Key, typename Value, typename Comparator>
+class LimitOneSorter : public Sorter<Key, Value> {
+    // Since this class is only used for limit==1, it omits all logic to
+    // spill and only tracks memory usage if explicitly requested.
+public:
+    typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
+    typedef sorter::Iterator<Key, Value> Iterator;
+
+    LimitOneSorter(const SortOptions& opts, const Comparator& comp)
+        : Sorter<Key, Value>(opts), _comp(comp), _haveData(false) {
+        invariant(opts.limit == 1);
+    }
+
+    template <typename DataProducer>
+    void addImpl(const Key& key, DataProducer dataProducer) {
+        this->_stats.incrementNumSorted();
+        if (_haveData) {
+            dassertCompIsSane(_comp, _best.first, key);
+            if (_comp(_best.first, key) <= 0)
+                return;  // not good enough
+        } else {
+            _haveData = true;
+        }
+
+        // Invoking dataProducer could invalidate key if it uses move semantics,
+        // don't reference them anymore from this point on.
+        _best = dataProducer();
+    }
+
+    void add(const Key& key, const Value& val) override {
+        addImpl(key, [&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl(key, [&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
+    }
+
+    std::unique_ptr<Iterator> done() override {
+        if (_haveData) {
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return std::make_unique<InMemIterator<Key, Value, Comparator>>(std::move(_best));
+            }
+            return std::make_unique<InMemIterator<Key, Value, Comparator>>(_best);
+        } else {
+            return std::make_unique<InMemIterator<Key, Value, Comparator>>();
+        }
+    }
+
+    std::unique_ptr<Iterator> pause() override {
+        if (_haveData) {
+            // ok to return InMemIterator as this is a single value constructed from copy
+            return std::make_unique<InMemIterator<Key, Value, Comparator>>(_best);
+        } else {
+            return std::make_unique<InMemIterator<Key, Value, Comparator>>();
+        }
+    }
+
+    void resume() override {}
+
+private:
+    void spill() override {
+        invariant(false, "LimitOneSorter does not spill to disk");
+    }
+
+    const Comparator _comp;
+    Data _best;
+    bool _haveData;  // false at start, set to true on first call to add()
+};
+
+template <typename Key, typename Value, typename Comparator>
+class TopKSorter : public MergeableSorter<Key, Value, Comparator> {
+public:
+    typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
+    using Iterator = typename MergeableSorter<Key, Value, Comparator>::Iterator;
+    using Settings = typename MergeableSorter<Key, Value, Comparator>::Settings;
+
+    TopKSorter(const SortOptions& opts,
+               const Comparator& comp,
+               std::shared_ptr<Spiller<Key, Value, Comparator>> spiller,
+               const Settings& settings)
+        : MergeableSorter<Key, Value, Comparator>(opts, comp, std::move(spiller), settings),
+          _haveCutoff(false),
+          _worstCount(0),
+          _medianCount(0) {
+        // This also *works* with limit==1 but LimitOneSorter should be used instead
+        invariant(opts.limit > 1);
+
+        // Preallocate a fixed sized vector of the required size if we don't expect it to have a
+        // major impact on our memory budget. This is the common case with small limits.
+        if (opts.limit <
+            std::min((opts.maxMemoryUsageBytes / 10) / sizeof(typename decltype(_data)::value_type),
+                     _data.max_size())) {
+            _data.reserve(opts.limit);
+        }
+    }
+
+    template <typename DataProducer>
+    void addImpl(const Key& key, DataProducer dataProducer) {
+        invariant(!_done);
+        invariant(!_paused);
+
+        this->_stats.incrementNumSorted();
+
+        STLComparator less(this->_comp);
+
+        if (_data.size() < this->_opts.limit) {
+            if (_haveCutoff && this->_comp(key, _cutoff.first) >= 0)
+                return;
+
+            // Invoking dataProducer could invalidate key if it uses move semantics,
+            // don't reference them anymore from this point on.
+            auto& keyVal = _data.emplace_back(dataProducer());
+
+            auto memUsage = keyVal.first.memUsageForSorter() + keyVal.second.memUsageForSorter();
+            this->_stats.incrementMemUsage(memUsage);
+
+            if (_data.size() == this->_opts.limit)
+                std::make_heap(_data.begin(), _data.end(), less);
+
+            this->_spillIfOverBudget();
+
+            return;
+        }
+
+        invariant(_data.size() == this->_opts.limit);
+
+        if (this->_comp(key, _data.front().first) >= 0)
+            return;  // not good enough
+
+        // Remove the old worst pair and insert the contender, adjusting _memUsed
+
+        this->_stats.decrementMemUsage(_data.front().first.memUsageForSorter());
+        this->_stats.decrementMemUsage(_data.front().second.memUsageForSorter());
+
+        std::pop_heap(_data.begin(), _data.end(), less);
+
+        // Invoking dataProducer could invalidate key if it uses move semantics,
+        // don't reference them anymore from this point on.
+        _data.back() = dataProducer();
+
+        this->_stats.incrementMemUsage(_data.back().first.memUsageForSorter());
+        this->_stats.incrementMemUsage(_data.back().second.memUsageForSorter());
+
+        std::push_heap(_data.begin(), _data.end(), less);
+
+        this->_spillIfOverBudget();
+    }
+
+    void add(const Key& key, const Value& val) override {
+        addImpl(key, [&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl(key, [&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
+    }
+
+    std::unique_ptr<Iterator> done() override {
+        if (!this->_spiller || this->_spiller->iterators().empty()) {
+            sort();
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return std::make_unique<InMemIterator<Key, Value, Comparator>>(std::move(_data),
+                                                                               this->_spiller);
+            }
+            return std::make_unique<InMemIterator<Key, Value, Comparator>>(_data, this->_spiller);
+        }
+
+        spill();
+        this->_mergeSpills();
+
+        _done = true;
+        return sorter::merge<Key, Value>(this->_spiller->iterators(), this->_opts, this->_comp);
+    }
+
+    std::unique_ptr<Iterator> pause() override {
+        invariant(!_done);
+        invariant(!_paused);
+        _paused = true;
+
+        tassert(8248301,
+                "Spilled sort cannot be paused",
+                !this->_spiller || this->_spiller->iterators().empty());
+        return std::make_unique<InMemReadOnlyIterator<Key, Value, std::vector<Data>>>(_data);
+    }
+
+    void resume() override {
+        _paused = false;
+    }
+
+private:
+    class STLComparator {
+    public:
+        explicit STLComparator(const Comparator& comp) : _comp(comp) {}
+        bool operator()(const Data& lhs, const Data& rhs) const {
+            dassertCompIsSane(_comp, lhs.first, rhs.first);
+            return _comp(lhs.first, rhs.first) < 0;
+        }
+
+    private:
+        const Comparator& _comp;
+    };
+
+    void sort() {
+        STLComparator less(this->_comp);
+
+        if (_data.size() == this->_opts.limit) {
+            std::sort_heap(_data.begin(), _data.end(), less);
+        } else {
+            std::sort(_data.begin(), _data.end(), less);
+        }
+
+        this->_stats.incrementBytesSorted(this->_stats.memUsage());
+    }
+
+    // Can only be called after _data is sorted
+    void updateCutoff() {
+        // Theory of operation: We want to be able to eagerly ignore values we know will not
+        // be in the TopK result set by setting _cutoff to a value we know we have at least
+        // K values equal to or better than. There are two values that we track to
+        // potentially become the next value of _cutoff: _worstSeen and _lastMedian. When
+        // one of these values becomes the new _cutoff, its associated counter is reset to 0
+        // and a new value is chosen for that member the next time we spill.
+        //
+        // _worstSeen is the worst value we've seen so that all kept values are better than
+        // (or equal to) it. This means that once _worstCount >= _opts.limit there is no
+        // reason to consider values worse than _worstSeen so it can become the new _cutoff.
+        // This technique is especially useful when the input is already roughly sorted (eg
+        // sorting ASC on an ObjectId or Date field) since we will quickly find a cutoff
+        // that will exclude most later values, making the full TopK operation including
+        // the MergeIterator phase is O(K) in space and O(N + K*Log(K)) in time.
+        //
+        // _lastMedian was the median of the _data in the first spill() either overall or
+        // following a promotion of _lastMedian to _cutoff. We count the number of kept
+        // values that are better than or equal to _lastMedian in _medianCount and can
+        // promote _lastMedian to _cutoff once _medianCount >=_opts.limit. Assuming
+        // reasonable median selection (which should happen when the data is completely
+        // unsorted), after the first K spilled values, we will keep roughly 50% of the
+        // incoming values, 25% after the second K, 12.5% after the third K, etc. This means
+        // that by the time we spill 3*K values, we will have seen (1*K + 2*K + 4*K) values,
+        // so the expected number of kept values is O(Log(N/K) * K). The final run time if
+        // using the O(K*Log(N)) merge algorithm in MergeIterator is O(N + K*Log(K) +
+        // K*LogLog(N/K)) which is much closer to O(N) than O(N*Log(K)).
+        //
+        // This leaves a currently unoptimized worst case of data that is already roughly
+        // sorted, but in the wrong direction, such that the desired results are all the
+        // last ones seen. It will require O(N) space and O(N*Log(K)) time. Since this
+        // should be trivially detectable, as a future optimization it might be nice to
+        // detect this case and reverse the direction of input (if possible) which would
+        // turn this into the best case described above.
+        //
+        // Pedantic notes: The time complexities above (which count number of comparisons)
+        // ignore the sorting of batches prior to spilling to disk since they make it more
+        // confusing without changing the results. If you want to add them back in, add an
+        // extra term to each time complexity of (SPACE_COMPLEXITY * Log(BATCH_SIZE)). Also,
+        // all space complexities measure disk space rather than memory since this class is
+        // O(1) in memory due to the _opts.maxMemoryUsageBytes limit.
+
+        STLComparator less(this->_comp);  // less is "better" for TopK.
+
+        // Pick a new _worstSeen or _lastMedian if should.
+        if (_worstCount == 0 || less(_worstSeen, _data.back())) {
+            _worstSeen = _data.back();
+        }
+        if (_medianCount == 0) {
+            size_t medianIndex = _data.size() / 2;  // chooses the higher if size() is even.
+            _lastMedian = _data[medianIndex];
+        }
+
+        // Add the counters of kept objects better than or equal to _worstSeen/_lastMedian.
+        _worstCount += _data.size();  // everything is better or equal
+        typename std::vector<Data>::iterator firstWorseThanLastMedian =
+            std::upper_bound(_data.begin(), _data.end(), _lastMedian, less);
+        _medianCount += std::distance(_data.begin(), firstWorseThanLastMedian);
+
+
+        // Promote _worstSeen or _lastMedian to _cutoff and reset counters if should.
+        if (_worstCount >= this->_opts.limit) {
+            if (!_haveCutoff || less(_worstSeen, _cutoff)) {
+                _cutoff = _worstSeen;
+                _haveCutoff = true;
+            }
+            _worstCount = 0;
+        }
+        if (_medianCount >= this->_opts.limit) {
+            if (!_haveCutoff || less(_lastMedian, _cutoff)) {
+                _cutoff = _lastMedian;
+                _haveCutoff = true;
+            }
+            _medianCount = 0;
+        }
+    }
+
+    void spill() override {
+        if (_data.empty())
+            return;
+
+        invariant(!_done);
+
+        if (this->_spiller == nullptr) {
+            // This error message only applies to sorts from user queries made through the find or
+            // aggregation commands. Other clients should suppress this error, either by allowing
+            // external sorting or by catching and throwing a more appropriate error.
+            uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
+                      str::stream()
+                          << "Sort exceeded memory limit of "
+                          << (this->_opts.maxMemoryUsageBytes + this->iteratorsMaxBytesSize)
+                          << " bytes, but did not opt in to external sorting. Aborting operation."
+                          << " Pass allowDiskUse:true to opt in.");
+        }
+
+        sort();
+        updateCutoff();
+
+        this->_spiller->spill(this->_opts, this->_settings, _data);
+
+        this->_stats.incrementSpilledKeyValuePairs(_data.size());
+        _data.clear();
+        // _data may have grown very large. Even though it's clear()ed, we need to
+        // free the excess memory.
+        _data.shrink_to_fit();
+
+        this->_stats.resetMemUsage();
+        this->_stats.incrementSpilledRanges();
+
+        // Merge spills to remain below the `iteratorsMaxBytesSize` threshold.
+        auto& iters = this->_spiller->iterators();
+        if (iters.size() >= this->iteratorsMaxNum) {
+            this->updateSpillsNumToRespectMemoryLimits();
+            this->_mergeSpills(iters.size() / 2, this->_spillsNumToRespectMemoryLimits);
+        }
+    }
+
+    bool _done = false;
+    bool _paused = false;
+
+    // Data that has not been spilled. Organized as max-heap if size == limit.
+    std::vector<Data> _data;
+
+    // See updateCutoff() for a full description of how these members are used.
+    bool _haveCutoff;
+    Data _cutoff;         // We can definitely ignore values worse than this.
+    Data _worstSeen;      // The worst Data seen so far. Reset when _worstCount >= _opts.limit.
+    size_t _worstCount;   // Number of docs better or equal to _worstSeen kept so far.
+    Data _lastMedian;     // Median of a batch. Reset when _medianCount >= _opts.limit.
+    size_t _medianCount;  // Number of docs better or equal to _lastMedian kept so far.
+};
+
+}  // namespace sorter
+
+//
+// Sorter members
+//
+
+template <typename Key, typename Value>
+Sorter<Key, Value>::Sorter(const SortOptions& opts) : SorterBase(opts.sorterTracker), _opts(opts) {
+    if (opts.useMemPool) {
+        _memPool.emplace(sorter::makeMemPool());
+    }
+}
+
+template <typename Key, typename Value>
+Sorter<Key, Value>::Sorter(const SortOptions& opts, std::string storageIdentifier)
+    : SorterBase(opts.sorterTracker), _opts(opts) {
+    invariant(!storageIdentifier.empty());
+    if (opts.useMemPool) {
+        _memPool.emplace(sorter::makeMemPool());
+    }
+}
+
+//
+// SortedStorageWriter
+//
+template <typename Key, typename Value>
+SortedStorageWriter<Key, Value>::SortedStorageWriter(
+    const SortOptions& opts,
+    const Settings& settings,
+    const SorterChecksumCalculator checksumCalculator)
+    : _settings(settings), _checksumCalculator(checksumCalculator), _opts(opts) {
+    // This should be checked by consumers, but if we get here don't allow writes.
+    uassert(16946,
+            "Attempting to use external sort from mongos. This is not allowed.",
+            !serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer));
+}
+
+//
+// BoundedSorter members
+//
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+BoundedSorter<Key, Value, Comparator, BoundMaker>::BoundedSorter(
+    const SortOptions& opts,
+    Comparator comp,
+    BoundMaker makeBound,
+    std::shared_ptr<sorter::Spiller<Key, Value, Comparator>> spiller,
+    bool checkInput)
+    : BoundedSorterInterface<Key, Value>(opts),
+      compare(comp),
+      makeBound(makeBound),
+      _spiller(spiller),
+      _checkInput(checkInput),
+      _opts(opts),
+      _heap(Greater<Key, Value, Comparator>{&compare}) {}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::add(Key key, Value value) {
+    invariant(!_done);
+    // If a new value violates what we thought was our min bound, something has gone wrong.
+    uassert(6369910,
+            str::stream() << "BoundedSorter input is too out-of-order: with bound "
+                          << _min->toString() << ", did not expect input " << key.toString(),
+            !_checkInput || !_min || compare(*_min, key) <= 0);
+
+    // Each new item can potentially give us a tighter bound (a higher min).
+    setBound(makeBound(key, value));
+
+    auto memUsage = key.memUsageForSorter() + value.memUsageForSorter();
+    _heap.emplace(std::move(key), std::move(value));
+
+    this->_stats.incrementMemUsage(memUsage);
+    this->_stats.incrementBytesSorted(memUsage);
+    if (this->_stats.memUsage() > _opts.maxMemoryUsageBytes)
+        _spill(_opts.maxMemoryUsageBytes);
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::restart() {
+    tassert(
+        6434804, "BoundedSorter must be in state kDone to restart()", getState() == State::kDone);
+
+    // In state kDone, the heap and spill are usually empty, because kDone means the sorter has
+    // no more elements to return. However, if there is a limit then we can also reach state
+    // kDone when 'this->_stats.numSorted() == _opts.limit'.
+    _spillIter.reset();
+    _heap = decltype(_heap){Greater<Key, Value, Comparator>{&compare}};
+    this->_stats.resetMemUsage();
+
+    _done = false;
+    _min.reset();
+
+    // There are now two possible states we could be in:
+    // - Typically, we should be ready for more input (kWait).
+    // - If there is a limit and we reached it, then we're done. We were done before restart()
+    //   and we're still done.
+    if (_opts.limit && this->_stats.numSorted() == _opts.limit) {
+        tassert(6434806,
+                "BoundedSorter has fulfilled _opts.limit and should still be in state kDone",
+                getState() == State::kDone);
+    } else {
+        tassert(6434805, "BoundedSorter should now be ready for input", getState() == State::kWait);
+    }
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+typename BoundedSorterInterface<Key, Value>::State
+BoundedSorter<Key, Value, Comparator, BoundMaker>::getState() const {
+    if (_opts.limit > 0 && _opts.limit == this->_stats.numSorted()) {
+        return State::kDone;
+    }
+
+    if (_done) {
+        // No more input will arrive, so we're never in state kWait.
+        return _heap.empty() && !_spillIter ? State::kDone : State::kReady;
+    }
+
+    if (_heap.empty() && !_spillIter)
+        return State::kWait;
+
+    // _heap.top() is the min of _heap, but we also need to consider whether a smaller input
+    // will arrive later. So _heap.top() is safe to return only if _heap.top() < _min.
+    if (!_heap.empty() && compare(_heap.top().first, *_min) < 0)
+        return State::kReady;
+
+    // Similarly, we can return the next element from the spilled iterator if it's < _min.
+    if (_spillIter && compare(_spillIter->peek(), *_min) < 0)
+        return State::kReady;
+
+    // A later call to add() may improve _min. Or in the worst case, after done() is called
+    // we will return everything in _heap.
+    return State::kWait;
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+std::pair<Key, Value> BoundedSorter<Key, Value, Comparator, BoundMaker>::next() {
+    dassert(getState() == State::kReady);
+    std::pair<Key, Value> result;
+
+    auto pullFromHeap = [this, &result]() {
+        result = std::move(_heap.top());
+        _heap.pop();
+
+        auto memUsage = result.first.memUsageForSorter() + result.second.memUsageForSorter();
+        this->_stats.decrementMemUsage(memUsage);
+    };
+
+    auto pullFromSpilled = [this, &result]() {
+        result = _spillIter->next();
+        if (!_spillIter->more()) {
+            _spillIter.reset();
+        }
+    };
+
+    if (!_heap.empty() && _spillIter) {
+        if (compare(_heap.top().first, _spillIter->peek()) <= 0) {
+            pullFromHeap();
+        } else {
+            pullFromSpilled();
+        }
+    } else if (!_heap.empty()) {
+        pullFromHeap();
+    } else {
+        pullFromSpilled();
+    }
+
+    this->_stats.incrementNumSorted();
+
+    return result;
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::setBound(Key key) {
+    if (!_min || compare(*_min, key) < 0) {
+        _min = key;
+    }
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::_spill(size_t maxMemoryUsageBytes) {
+    if (_heap.empty())
+        return;
+
+    // If we have a small $limit, we can simply extract that many of the smallest elements from
+    // the _heap and discard the rest, avoiding an expensive spill to disk.
+    if (_opts.limit > 0 && _opts.limit < (_heap.size() / 2)) {
+        this->_stats.resetMemUsage();
+        decltype(_heap) retained{Greater<Key, Value, Comparator>{&compare}};
+        for (size_t i = 0; i < _opts.limit; ++i) {
+            this->_stats.incrementMemUsage(_heap.top().first.memUsageForSorter() +
+                                           _heap.top().second.memUsageForSorter());
+            retained.emplace(_heap.top());
+            _heap.pop();
+        }
+        _heap.swap(retained);
+
+        if (this->_stats.memUsage() < maxMemoryUsageBytes) {
+            return;
+        }
+    }
+
+    uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
+            str::stream() << "Sort exceeded memory limit of " << maxMemoryUsageBytes
+                          << " bytes, but did not opt in to external sorting.",
+            this->_spiller != nullptr);
+
+    uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+        this->_spiller->getSpillDir(),
+        internalQuerySpillingMinAvailableDiskSpaceBytes.loadRelaxed()));
+
+    this->_stats.incrementSpilledKeyValuePairs(_heap.size());
+    this->_stats.incrementSpilledRanges();
+
+    // Write out all the values from the heap in sorted order.
+    auto iteratorPtr = this->_spiller->spillWithHeap(_opts, Settings(), _heap);
+
+    if (auto* mergeIter = static_cast<typename sorter::MergeIterator<Key, Value, Comparator>*>(
+            _spillIter.get())) {
+        mergeIter->addSource(std::move(iteratorPtr));
+    } else {
+        _spillIter = sorter::merge<Key, Value>(std::span(&iteratorPtr, 1), _opts, compare);
+    }
+
+    dassert(_spillIter->more());
+
+    this->_stats.resetMemUsage();
+}
+
+//
+// Factory Functions
+//
+
+namespace sorter {
+template <typename Key, typename Value, typename Comparator>
+std::unique_ptr<MergeIterator<Key, Value, Comparator>> merge(
+    std::span<std::shared_ptr<Iterator<Key, Value>>> iters,
+    const SortOptions& opts,
+    const Comparator& comp) {
+    return std::make_unique<sorter::MergeIterator<Key, Value, Comparator>>(iters, opts, comp);
+}
+}  // namespace sorter
+
+template <typename Key, typename Value>
+template <typename Comparator>
+std::unique_ptr<Sorter<Key, Value>> Sorter<Key, Value>::make(
+    const SortOptions& opts,
+    const Comparator& comp,
+    std::shared_ptr<sorter::Spiller<Key, Value, Comparator>> spiller,
+    const Settings& settings) {
+    sorter::checkNoExternalSortOnMongos(spiller != nullptr);
+    switch (opts.limit) {
+        case 0:
+            return std::make_unique<sorter::NoLimitSorter<Key, Value, Comparator>>(
+                opts, comp, std::move(spiller), settings);
+        case 1:
+            return std::make_unique<sorter::LimitOneSorter<Key, Value, Comparator>>(opts, comp);
+        default:
+            return std::make_unique<sorter::TopKSorter<Key, Value, Comparator>>(
+                opts, comp, std::move(spiller), settings);
+    }
+}
+
+template <typename Key, typename Value>
+template <typename Comparator>
+std::unique_ptr<Sorter<Key, Value>> Sorter<Key, Value>::makeFromExistingRanges(
+    std::string storageIdentifier,
+    const std::vector<SorterRange>& ranges,
+    const SortOptions& opts,
+    const Comparator& comp,
+    std::shared_ptr<sorter::Spiller<Key, Value, Comparator>> spiller,
+    const Settings& settings) {
+    sorter::checkNoExternalSortOnMongos(spiller != nullptr);
+
+    invariant(opts.limit == 0,
+              str::stream() << "Creating a Sorter from existing ranges is only available with the "
+                               "NoLimitSorter (limit 0), but got limit "
+                            << opts.limit);
+
+    return std::make_unique<sorter::NoLimitSorter<Key, Value, Comparator>>(
+        storageIdentifier, ranges, opts, comp, std::move(spiller), settings);
+}
+}  // namespace mongo
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

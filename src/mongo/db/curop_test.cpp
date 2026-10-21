@@ -1,93 +1,2360 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
-
-#include <boost/thread/thread.hpp>
-
-#include "mongo/base/init.h"
 #include "mongo/db/curop.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/admission/execution_control/execution_control_parameters_gen.h"
+#include "mongo/db/admission/execution_control/ticketing_system.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context_options_gen.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_stats/mock_key.h"
+#include "mongo/db/query/query_stats/plan_shape_counters/plan_shape_counts.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/storage/storage_stats.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/transport/mock_session.h"
+#include "mongo/transport/transport_layer_mock.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/tick_source_mock.h"
+
+#include <algorithm>
+#include <initializer_list>
+#include <mutex>
+#include <thread>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
 
-    namespace {
+TEST(CurOpTest, CopyConstructors) {
+    OpDebug::AdditiveMetrics a, b;
+    a.keysExamined = 1;
+    b.keysExamined = 2;
 
-        const long long intervalLong = 2000 * 1000; // 2s in micros
-        const long long intervalShort = 10 * 1000; // 10ms in micros
+    // Test copy constructor.
+    OpDebug::AdditiveMetrics c = a;
+    ASSERT_EQ(a.keysExamined, c.keysExamined);
 
-        //
-        // Before executing the TimeHasExpired suite, spawn a dummy listener thread to be the
-        // process time tracker (the tests rely on Listener::_timeTracker being available).
-        //
+    // Test copy assignment.
+    a = b;
+    ASSERT_EQ(a.keysExamined, b.keysExamined);
+}
 
-        class TestListener : public Listener {
-        public:
-            TestListener() : Listener("test", "", 0) {} // port 0 => any available high port
-            virtual void acceptedMP(MessagingPort *mp) {}
-        };
+TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
+    using plan_shape_counters::AccessPathCounter;
+    using plan_shape_counters::PlanShapeCounter;
+    using plan_shape_counters::QsnNodeCounter;
 
-        void timeTrackerSetup() {
-            TestListener listener;
-            listener.setAsTimeTracker();
-            listener.setupSockets();
-            listener.initAndListen();
+    OpDebug::AdditiveMetrics currentAdditiveMetrics = OpDebug::AdditiveMetrics();
+    OpDebug::AdditiveMetrics additiveMetricsToAdd = OpDebug::AdditiveMetrics();
+
+    // Initialize field values for both AdditiveMetrics objects.
+    currentAdditiveMetrics.keysExamined = 0;
+    additiveMetricsToAdd.keysExamined = 2;
+    currentAdditiveMetrics.docsExamined = 4;
+    additiveMetricsToAdd.docsExamined = 2;
+    currentAdditiveMetrics.nMatched = 5;
+    additiveMetricsToAdd.nMatched = 5;
+    currentAdditiveMetrics.nreturned = 10;
+    additiveMetricsToAdd.nreturned = 5;
+    currentAdditiveMetrics.nBatches = 2;
+    additiveMetricsToAdd.nBatches = 1;
+    currentAdditiveMetrics.nModified = 3;
+    additiveMetricsToAdd.nModified = 1;
+    currentAdditiveMetrics.ninserted = 4;
+    additiveMetricsToAdd.ninserted = 0;
+    currentAdditiveMetrics.ndeleted = 3;
+    additiveMetricsToAdd.ndeleted = 2;
+    currentAdditiveMetrics.nUpserted = 7;
+    additiveMetricsToAdd.nUpserted = 8;
+    currentAdditiveMetrics.nUpdateOps = 5;
+    additiveMetricsToAdd.nUpdateOps = 6;
+    currentAdditiveMetrics.nDeleteOps = 3;
+    additiveMetricsToAdd.nDeleteOps = 4;
+    currentAdditiveMetrics.keysInserted = 6;
+    additiveMetricsToAdd.keysInserted = 5;
+    currentAdditiveMetrics.keysDeleted = 4;
+    additiveMetricsToAdd.keysDeleted = 2;
+    currentAdditiveMetrics.executionTime = Microseconds{200};
+    additiveMetricsToAdd.executionTime = Microseconds{80};
+    currentAdditiveMetrics.clusterWorkingTime = Milliseconds{30};
+    additiveMetricsToAdd.clusterWorkingTime = Milliseconds{10};
+    currentAdditiveMetrics.cpuNanos = Nanoseconds{1000};
+    additiveMetricsToAdd.cpuNanos = Nanoseconds{21};
+    currentAdditiveMetrics.delinquentAcquisitions = 1;
+    additiveMetricsToAdd.delinquentAcquisitions = 2;
+    currentAdditiveMetrics.totalAcquisitionDelinquency = Milliseconds{300};
+    additiveMetricsToAdd.totalAcquisitionDelinquency = Milliseconds{200};
+    currentAdditiveMetrics.maxAcquisitionDelinquency = Milliseconds{300};
+    additiveMetricsToAdd.maxAcquisitionDelinquency = Milliseconds{100};
+    currentAdditiveMetrics.totalTimeQueuedMicros = Microseconds{300};
+    additiveMetricsToAdd.totalTimeQueuedMicros = Microseconds{200};
+    currentAdditiveMetrics.totalAdmissions = 1;
+    additiveMetricsToAdd.totalAdmissions = 2;
+    currentAdditiveMetrics.wasLoadShed = false;
+    additiveMetricsToAdd.wasLoadShed = true;
+    currentAdditiveMetrics.wasDeprioritized = false;
+    additiveMetricsToAdd.wasDeprioritized = true;
+    currentAdditiveMetrics.wasMarkedNonDeprioritizable = false;
+    additiveMetricsToAdd.wasMarkedNonDeprioritizable = true;
+    currentAdditiveMetrics.numInterruptChecks = 1;
+    additiveMetricsToAdd.numInterruptChecks = 2;
+    currentAdditiveMetrics.overdueInterruptApproxMax = Milliseconds{100};
+    additiveMetricsToAdd.overdueInterruptApproxMax = Milliseconds{300};
+    currentAdditiveMetrics.planningTime = Microseconds{100};
+    additiveMetricsToAdd.planningTime = Microseconds{50};
+    currentAdditiveMetrics.nDocsSampled = 10;
+    additiveMetricsToAdd.nDocsSampled = 15;
+    currentAdditiveMetrics.peakTrackedMemBytes = 2048;
+    additiveMetricsToAdd.peakTrackedMemBytes = 3000;
+    currentAdditiveMetrics.clusterPeakTrackedMemBytes = 2048;
+    additiveMetricsToAdd.clusterPeakTrackedMemBytes = 2000;
+    currentAdditiveMetrics.planShapeCounts.increment(PlanShapeCounter::kCollscan, 3);
+    currentAdditiveMetrics.planShapeCounts.increment(PlanShapeCounter::kIxscanFetch, 5);
+    currentAdditiveMetrics.planShapeCounts.increment(QsnNodeCounter::kCollscanWithFilter, 3);
+    currentAdditiveMetrics.planShapeCounts.increment(AccessPathCounter::kCollscan, 3);
+    additiveMetricsToAdd.planShapeCounts.increment(PlanShapeCounter::kIxscanFetch, 2);
+    additiveMetricsToAdd.planShapeCounts.increment(PlanShapeCounter::kIxscanProject, 7);
+    additiveMetricsToAdd.planShapeCounts.increment(QsnNodeCounter::kCollscanWithFilter, 4);
+    additiveMetricsToAdd.planShapeCounts.increment(AccessPathCounter::kBtreeIxscan, 6);
+
+    // Save the current AdditiveMetrics object before adding.
+    OpDebug::AdditiveMetrics additiveMetricsBeforeAdd;
+    additiveMetricsBeforeAdd.add(currentAdditiveMetrics);
+    currentAdditiveMetrics.add(additiveMetricsToAdd);
+
+    // The following field values should have changed after adding.
+    ASSERT_EQ(*currentAdditiveMetrics.keysExamined,
+              *additiveMetricsBeforeAdd.keysExamined + *additiveMetricsToAdd.keysExamined);
+    ASSERT_EQ(*currentAdditiveMetrics.docsExamined,
+              *additiveMetricsBeforeAdd.docsExamined + *additiveMetricsToAdd.docsExamined);
+    ASSERT_EQ(*currentAdditiveMetrics.nMatched,
+              *additiveMetricsBeforeAdd.nMatched + *additiveMetricsToAdd.nMatched);
+    ASSERT_EQ(*currentAdditiveMetrics.nreturned,
+              *additiveMetricsBeforeAdd.nreturned + *additiveMetricsToAdd.nreturned);
+    ASSERT_EQ(*currentAdditiveMetrics.nBatches,
+              *additiveMetricsBeforeAdd.nBatches + *additiveMetricsToAdd.nBatches);
+    ASSERT_EQ(*currentAdditiveMetrics.nModified,
+              *additiveMetricsBeforeAdd.nModified + *additiveMetricsToAdd.nModified);
+    ASSERT_EQ(*currentAdditiveMetrics.ninserted,
+              *additiveMetricsBeforeAdd.ninserted + *additiveMetricsToAdd.ninserted);
+    ASSERT_EQ(*currentAdditiveMetrics.ndeleted,
+              *additiveMetricsBeforeAdd.ndeleted + *additiveMetricsToAdd.ndeleted);
+    ASSERT_EQ(*currentAdditiveMetrics.nUpserted,
+              *additiveMetricsBeforeAdd.nUpserted + *additiveMetricsToAdd.nUpserted);
+    // For nUpdateOps, we keep the existing value as the value to return.
+    ASSERT_EQ(*currentAdditiveMetrics.nUpdateOps, additiveMetricsBeforeAdd.nUpdateOps);
+    // For nDeleteOps, we keep the existing value as the value to return.
+    ASSERT_EQ(*currentAdditiveMetrics.nDeleteOps, additiveMetricsBeforeAdd.nDeleteOps);
+    ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
+              *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
+    ASSERT_EQ(*currentAdditiveMetrics.keysDeleted,
+              *additiveMetricsBeforeAdd.keysDeleted + *additiveMetricsToAdd.keysDeleted);
+    ASSERT_EQ(*currentAdditiveMetrics.executionTime,
+              *additiveMetricsBeforeAdd.executionTime + *additiveMetricsToAdd.executionTime);
+    ASSERT_EQ(*currentAdditiveMetrics.clusterWorkingTime,
+              *additiveMetricsBeforeAdd.clusterWorkingTime +
+                  *additiveMetricsToAdd.clusterWorkingTime);
+    ASSERT_EQ(*currentAdditiveMetrics.cpuNanos,
+              *additiveMetricsBeforeAdd.cpuNanos + *additiveMetricsToAdd.cpuNanos);
+    ASSERT_EQ(*currentAdditiveMetrics.delinquentAcquisitions,
+              *additiveMetricsBeforeAdd.delinquentAcquisitions +
+                  *additiveMetricsToAdd.delinquentAcquisitions);
+    ASSERT_EQ(*currentAdditiveMetrics.totalAcquisitionDelinquency,
+              *additiveMetricsBeforeAdd.totalAcquisitionDelinquency +
+                  *additiveMetricsToAdd.totalAcquisitionDelinquency);
+    ASSERT_EQ(*currentAdditiveMetrics.maxAcquisitionDelinquency,
+              std::max(*additiveMetricsBeforeAdd.maxAcquisitionDelinquency,
+                       *additiveMetricsToAdd.maxAcquisitionDelinquency));
+    ASSERT_EQ(*currentAdditiveMetrics.totalTimeQueuedMicros,
+              *additiveMetricsBeforeAdd.totalTimeQueuedMicros +
+                  *additiveMetricsToAdd.totalTimeQueuedMicros);
+    ASSERT_EQ(*currentAdditiveMetrics.totalAdmissions,
+              *additiveMetricsBeforeAdd.totalAdmissions + *additiveMetricsToAdd.totalAdmissions);
+    ASSERT_EQ(*currentAdditiveMetrics.wasLoadShed,
+              *additiveMetricsBeforeAdd.wasLoadShed || *additiveMetricsToAdd.wasLoadShed);
+    ASSERT_EQ(*currentAdditiveMetrics.wasDeprioritized,
+              *additiveMetricsBeforeAdd.wasDeprioritized || *additiveMetricsToAdd.wasDeprioritized);
+    ASSERT_EQ(*currentAdditiveMetrics.wasMarkedNonDeprioritizable,
+              *additiveMetricsBeforeAdd.wasMarkedNonDeprioritizable ||
+                  *additiveMetricsToAdd.wasMarkedNonDeprioritizable);
+    ASSERT_EQ(*currentAdditiveMetrics.numInterruptChecks,
+              *additiveMetricsBeforeAdd.numInterruptChecks +
+                  *additiveMetricsToAdd.numInterruptChecks);
+    ASSERT_EQ(*currentAdditiveMetrics.overdueInterruptApproxMax,
+              std::max(*additiveMetricsBeforeAdd.overdueInterruptApproxMax,
+                       *additiveMetricsToAdd.overdueInterruptApproxMax));
+    ASSERT_EQ(*currentAdditiveMetrics.planningTime,
+              *additiveMetricsBeforeAdd.planningTime + *additiveMetricsToAdd.planningTime);
+    ASSERT_EQ(*currentAdditiveMetrics.nDocsSampled,
+              *additiveMetricsBeforeAdd.nDocsSampled + *additiveMetricsToAdd.nDocsSampled);
+    ASSERT_EQ(*currentAdditiveMetrics.peakTrackedMemBytes,
+              std::max(*additiveMetricsBeforeAdd.peakTrackedMemBytes,
+                       *additiveMetricsToAdd.peakTrackedMemBytes));
+    ASSERT_EQ(*currentAdditiveMetrics.clusterPeakTrackedMemBytes,
+              std::max(*additiveMetricsBeforeAdd.clusterPeakTrackedMemBytes,
+                       *additiveMetricsToAdd.clusterPeakTrackedMemBytes));
+    // Plan shape counters should be summed per shape, including shapes present in only one object.
+    ASSERT_EQ(currentAdditiveMetrics.planShapeCounts.getCount(PlanShapeCounter::kCollscan),
+              additiveMetricsBeforeAdd.planShapeCounts.getCount(PlanShapeCounter::kCollscan) +
+                  additiveMetricsToAdd.planShapeCounts.getCount(PlanShapeCounter::kCollscan));
+    ASSERT_EQ(currentAdditiveMetrics.planShapeCounts.getCount(PlanShapeCounter::kIxscanFetch),
+              additiveMetricsBeforeAdd.planShapeCounts.getCount(PlanShapeCounter::kIxscanFetch) +
+                  additiveMetricsToAdd.planShapeCounts.getCount(PlanShapeCounter::kIxscanFetch));
+    ASSERT_EQ(currentAdditiveMetrics.planShapeCounts.getCount(PlanShapeCounter::kIxscanProject),
+              additiveMetricsBeforeAdd.planShapeCounts.getCount(PlanShapeCounter::kIxscanProject) +
+                  additiveMetricsToAdd.planShapeCounts.getCount(PlanShapeCounter::kIxscanProject));
+    ASSERT_EQ(
+        currentAdditiveMetrics.planShapeCounts.getCount(QsnNodeCounter::kCollscanWithFilter),
+        additiveMetricsBeforeAdd.planShapeCounts.getCount(QsnNodeCounter::kCollscanWithFilter) +
+            additiveMetricsToAdd.planShapeCounts.getCount(QsnNodeCounter::kCollscanWithFilter));
+    ASSERT_EQ(currentAdditiveMetrics.planShapeCounts.getCount(AccessPathCounter::kCollscan),
+              additiveMetricsBeforeAdd.planShapeCounts.getCount(AccessPathCounter::kCollscan) +
+                  additiveMetricsToAdd.planShapeCounts.getCount(AccessPathCounter::kCollscan));
+    ASSERT_EQ(currentAdditiveMetrics.planShapeCounts.getCount(AccessPathCounter::kBtreeIxscan),
+              additiveMetricsBeforeAdd.planShapeCounts.getCount(AccessPathCounter::kBtreeIxscan) +
+                  additiveMetricsToAdd.planShapeCounts.getCount(AccessPathCounter::kBtreeIxscan));
+}
+
+TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
+    OpDebug::AdditiveMetrics currentAdditiveMetrics = OpDebug::AdditiveMetrics();
+    OpDebug::AdditiveMetrics additiveMetricsToAdd = OpDebug::AdditiveMetrics();
+
+    // Initialize field values for both AdditiveMetrics objects.
+    additiveMetricsToAdd.keysExamined = 5;
+    currentAdditiveMetrics.docsExamined = 4;
+    currentAdditiveMetrics.nreturned = 2;
+    additiveMetricsToAdd.nBatches = 1;
+    currentAdditiveMetrics.nModified = 3;
+    additiveMetricsToAdd.ninserted = 0;
+    currentAdditiveMetrics.keysInserted = 6;
+    additiveMetricsToAdd.keysInserted = 5;
+    currentAdditiveMetrics.keysDeleted = 4;
+    additiveMetricsToAdd.keysDeleted = 2;
+    additiveMetricsToAdd.cpuNanos = Nanoseconds(1);
+    additiveMetricsToAdd.delinquentAcquisitions = 1;
+    additiveMetricsToAdd.totalAcquisitionDelinquency = Milliseconds(100);
+    additiveMetricsToAdd.maxAcquisitionDelinquency = Milliseconds(100);
+    additiveMetricsToAdd.totalTimeQueuedMicros = Microseconds(100);
+    additiveMetricsToAdd.totalAdmissions = 1;
+    additiveMetricsToAdd.wasLoadShed = true;
+    additiveMetricsToAdd.wasDeprioritized = true;
+    additiveMetricsToAdd.wasMarkedNonDeprioritizable = true;
+    additiveMetricsToAdd.maxAcquisitionDelinquency = Milliseconds(100);
+    additiveMetricsToAdd.numInterruptChecks = 1;
+    additiveMetricsToAdd.overdueInterruptApproxMax = Milliseconds(100);
+    additiveMetricsToAdd.planningTime = Microseconds(100);
+    additiveMetricsToAdd.nDocsSampled = 10;
+    additiveMetricsToAdd.nUpdateOps = 5;
+    additiveMetricsToAdd.nDeleteOps = 7;
+
+    // Save the current AdditiveMetrics object before adding.
+    OpDebug::AdditiveMetrics additiveMetricsBeforeAdd;
+    additiveMetricsBeforeAdd.add(currentAdditiveMetrics);
+    currentAdditiveMetrics.add(additiveMetricsToAdd);
+
+    // The 'keysExamined' field for the current AdditiveMetrics object was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.keysExamined, *additiveMetricsToAdd.keysExamined);
+
+    // The 'docsExamined' field for the AdditiveMetrics object to add was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.docsExamined, *additiveMetricsBeforeAdd.docsExamined);
+
+    // The 'nreturned' field for the AdditiveMetrics object to add was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.nreturned, *additiveMetricsBeforeAdd.nreturned);
+
+    // The 'nBatches' field for the current AdditiveMetrics object was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.nBatches, *additiveMetricsToAdd.nBatches);
+
+    // The 'nMatched' field for both the current AdditiveMetrics object and the AdditiveMetrics
+    // object to add were not initialized, so nMatched should still be uninitialized after the add.
+    ASSERT_EQ(currentAdditiveMetrics.nMatched, boost::none);
+
+    // The 'nUpserted' field for both the current AdditiveMetrics object and the AdditiveMetrics
+    // object to add were not initialized, so nUpserted should still be uninitialized after the add.
+    ASSERT_EQ(currentAdditiveMetrics.nUpserted, boost::none);
+
+    // The 'nUpdateOps' field for the current AdditiveMetrics object was not initialized, so it
+    // should return the AdditiveMEtrics object to add value.
+    ASSERT_EQ(currentAdditiveMetrics.nUpdateOps, *additiveMetricsToAdd.nUpdateOps);
+
+    // The 'nDeleteOps' field for the current AdditiveMetrics object was not initialized, so it
+    // should return the AdditiveMetrics object to add value.
+    ASSERT_EQ(currentAdditiveMetrics.nDeleteOps, *additiveMetricsToAdd.nDeleteOps);
+
+    // The 'executionTime' field for both the current AdditiveMetrics object and the AdditiveMetrics
+    // object to add were not initialized, so executionTime should still be uninitialized after the
+    // add.
+    ASSERT_EQ(currentAdditiveMetrics.executionTime, boost::none);
+
+    // The following field values should have changed after adding.
+    ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
+              *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
+    ASSERT_EQ(*currentAdditiveMetrics.keysDeleted,
+              *additiveMetricsBeforeAdd.keysDeleted + *additiveMetricsToAdd.keysDeleted);
+
+    // The 'cpuNanos' field for the current AdditiveMetrics object was not initialized, so it
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.cpuNanos, *additiveMetricsToAdd.cpuNanos);
+
+    // The delinquency fields for the current AdditiveMetrics object were not initialized, so they
+    // should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.delinquentAcquisitions,
+              *additiveMetricsToAdd.delinquentAcquisitions);
+    ASSERT_EQ(*currentAdditiveMetrics.totalAcquisitionDelinquency,
+              *additiveMetricsToAdd.totalAcquisitionDelinquency);
+    ASSERT_EQ(*currentAdditiveMetrics.maxAcquisitionDelinquency,
+              *additiveMetricsToAdd.maxAcquisitionDelinquency);
+    ASSERT_EQ(*currentAdditiveMetrics.numInterruptChecks, *additiveMetricsToAdd.numInterruptChecks);
+    ASSERT_EQ(*currentAdditiveMetrics.overdueInterruptApproxMax,
+              *additiveMetricsToAdd.overdueInterruptApproxMax);
+
+    // The execution control fields for the current AdditiveMetrics object were not initialized, so
+    // they should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.totalTimeQueuedMicros,
+              *additiveMetricsToAdd.totalTimeQueuedMicros);
+    ASSERT_EQ(*currentAdditiveMetrics.totalAdmissions, *additiveMetricsToAdd.totalAdmissions);
+    ASSERT_EQ(*currentAdditiveMetrics.wasLoadShed, *additiveMetricsToAdd.wasLoadShed);
+    ASSERT_EQ(*currentAdditiveMetrics.wasDeprioritized, *additiveMetricsToAdd.wasDeprioritized);
+    ASSERT_EQ(*currentAdditiveMetrics.wasMarkedNonDeprioritizable,
+              *additiveMetricsToAdd.wasMarkedNonDeprioritizable);
+
+    // The 'planningTime' and 'nDocsSampled' fields for the current AdditiveMetrics object were not
+    // initialized, so they should be treated as zero.
+    ASSERT_EQ(*currentAdditiveMetrics.planningTime, *additiveMetricsToAdd.planningTime);
+    ASSERT_EQ(*currentAdditiveMetrics.nDocsSampled, *additiveMetricsToAdd.nDocsSampled);
+}
+
+TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
+    OpDebug::AdditiveMetrics additiveMetrics = OpDebug::AdditiveMetrics();
+
+    // Initialize field values.
+    additiveMetrics.keysInserted = 2;
+    additiveMetrics.nreturned = 3;
+
+    // Increment the fields.
+    additiveMetrics.incrementKeysInserted(5);
+    additiveMetrics.incrementKeysDeleted(0);
+    additiveMetrics.incrementNinserted(3);
+    additiveMetrics.incrementNUpserted(6);
+    additiveMetrics.incrementNreturned(2);
+    additiveMetrics.incrementNBatches();
+
+    ASSERT_EQ(*additiveMetrics.keysInserted, 7);
+    ASSERT_EQ(*additiveMetrics.keysDeleted, 0);
+    ASSERT_EQ(*additiveMetrics.ninserted, 3);
+    ASSERT_EQ(*additiveMetrics.nUpserted, 6);
+    ASSERT_EQ(*additiveMetrics.nreturned, 5);
+    ASSERT_EQ(*additiveMetrics.nBatches, 1);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateCursorMetrics) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = 1;
+    additiveMetrics.docsExamined = 2;
+    additiveMetrics.clusterWorkingTime = Milliseconds(3);
+    additiveMetrics.readingTime = Microseconds(4);
+    additiveMetrics.bytesRead = 5;
+    additiveMetrics.hasSortStage = false;
+    additiveMetrics.usedDisk = false;
+    additiveMetrics.cpuNanos = Nanoseconds(8);
+    additiveMetrics.delinquentAcquisitions = 2;
+    additiveMetrics.totalAcquisitionDelinquency = Milliseconds(400);
+    additiveMetrics.maxAcquisitionDelinquency = Milliseconds(300);
+    additiveMetrics.totalTimeQueuedMicros = Microseconds(400);
+    additiveMetrics.totalAdmissions = 2;
+    additiveMetrics.wasLoadShed = false;
+    additiveMetrics.wasDeprioritized = false;
+    additiveMetrics.wasMarkedNonDeprioritizable = false;
+    additiveMetrics.numInterruptChecks = 2;
+    additiveMetrics.overdueInterruptApproxMax = Milliseconds(100);
+    additiveMetrics.nMatched = 1;
+    additiveMetrics.nUpserted = 0;
+    additiveMetrics.nModified = 1;
+    additiveMetrics.ndeleted = 0;
+    additiveMetrics.ninserted = 0;
+    additiveMetrics.keysInserted = 3;
+    additiveMetrics.keysDeleted = 1;
+    additiveMetrics.planningTime = Microseconds(100);
+    additiveMetrics.nDocsSampled = 10;
+    additiveMetrics.planShapeCounts.increment(plan_shape_counters::PlanShapeCounter::kCollscan, 1);
+
+    CursorMetrics cursorMetrics(3 /* keysExamined */,
+                                4 /* docsExamined */,
+                                10 /* bytesRead */,
+                                11 /* readingTimeMicros */,
+                                5 /* workingTimeMillis */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+    cursorMetrics.setPlanningTimeMicros(150);
+    cursorMetrics.setNDocsSampled(15);
+    cursorMetrics.setCpuNanos(9);
+    cursorMetrics.setNumInterruptChecks(3);
+    cursorMetrics.setNMatched(1);
+    cursorMetrics.setNUpserted(0);
+    cursorMetrics.setNModified(1);
+    cursorMetrics.setNDeleted(0);
+    cursorMetrics.setNInserted(0);
+    cursorMetrics.setKeysInserted(4);
+    cursorMetrics.setKeysDeleted(2);
+    CardinalityEstimationMethods ceMethods1;
+    ceMethods1.setHistogram(1);
+    ceMethods1.setSampling(1);
+    cursorMetrics.setCardinalityEstimationMethods(ceMethods1);
+    cursorMetrics.setDelinquentAcquisitions(3);
+    cursorMetrics.setTotalAcquisitionDelinquencyMillis(400);
+    cursorMetrics.setMaxAcquisitionDelinquencyMillis(200);
+    cursorMetrics.setOverdueInterruptApproxMaxMillis(200);
+    cursorMetrics.setTotalTimeQueuedMicros(400);
+    cursorMetrics.setTotalAdmissions(5);
+    cursorMetrics.setWasLoadShed(true);
+    cursorMetrics.setWasDeprioritized(true);
+    cursorMetrics.setWasMarkedNonDeprioritizable(true);
+    plan_shape_counters::PlanShapeCounts planShapeCounts;
+    planShapeCounts.increment(plan_shape_counters::PlanShapeCounter::kCollscan, 2);
+    planShapeCounts.increment(plan_shape_counters::PlanShapeCounter::kIxscanFetch, 1);
+    planShapeCounts.increment(plan_shape_counters::QsnNodeCounter::kCollscanWithFilter, 2);
+    planShapeCounts.increment(plan_shape_counters::AccessPathCounter::kCollscan, 2);
+    cursorMetrics.setPlanShapeCounts(planShapeCounts);
+
+    // Assert that every field in cursor metrics is initialized.
+    BSONObj serializedCursorMetrics = cursorMetrics.toBSON();
+    for (const auto& fieldName : CursorMetrics::fieldNames) {
+        if (fieldName == "serialization_context") {
+            // This field is unrelated to cursor metric logic and is needed by IDL.
+            continue;
         }
+        ASSERT_TRUE(serializedCursorMetrics.hasField(fieldName))
+            << "CursorMetrics field '" << fieldName
+            << "' was not populated by this test; serialized: " << serializedCursorMetrics;
+    }
 
-        MONGO_INITIALIZER(CurOpTest)(InitializerContext* context) {
-            boost::thread t(timeTrackerSetup);
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
 
-            // Wait for listener thread to start tracking time.
-            while (Listener::getElapsedTimeMillis() == 0) {
-                sleepmillis(10);
+    ASSERT_EQ(*additiveMetrics.keysExamined, 4);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 6);
+    ASSERT_EQ(additiveMetrics.clusterWorkingTime, Milliseconds(8));
+    ASSERT_EQ(additiveMetrics.readingTime, Microseconds(15));
+    ASSERT_EQ(*additiveMetrics.bytesRead, 15);
+    ASSERT_EQ(additiveMetrics.hasSortStage, true);
+    ASSERT_EQ(additiveMetrics.usedDisk, false);
+    ASSERT_EQ(additiveMetrics.cpuNanos, Nanoseconds(17));
+    ASSERT_EQ(*additiveMetrics.delinquentAcquisitions, 5);
+    ASSERT_EQ(*additiveMetrics.totalAcquisitionDelinquency, Milliseconds(800));
+    ASSERT_EQ(*additiveMetrics.maxAcquisitionDelinquency, Milliseconds(300));
+    ASSERT_EQ(*additiveMetrics.numInterruptChecks, 5);
+    ASSERT_EQ(*additiveMetrics.overdueInterruptApproxMax, Milliseconds(200));
+    ASSERT_EQ(*additiveMetrics.nMatched, 2);
+    ASSERT_EQ(*additiveMetrics.nUpserted, 0);
+    ASSERT_EQ(*additiveMetrics.nModified, 2);
+    ASSERT_EQ(*additiveMetrics.ndeleted, 0);
+    ASSERT_EQ(*additiveMetrics.ninserted, 0);
+    ASSERT_EQ(*additiveMetrics.keysInserted, 7);
+    ASSERT_EQ(*additiveMetrics.keysDeleted, 3);
+    ASSERT_EQ(*additiveMetrics.totalTimeQueuedMicros, Microseconds(800));
+    ASSERT_EQ(*additiveMetrics.totalAdmissions, 7);
+    ASSERT_EQ(*additiveMetrics.wasLoadShed, true);
+    ASSERT_EQ(*additiveMetrics.wasDeprioritized, true);
+    ASSERT_EQ(*additiveMetrics.wasMarkedNonDeprioritizable, true);
+    ASSERT_EQ(*additiveMetrics.planningTime, Microseconds(250));
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getHistogram().value_or(0), 1);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getSampling().value_or(0), 1);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getHeuristics().value_or(0), 0);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getMixed().value_or(0), 0);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getMetadata().value_or(0), 0);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getCode().value_or(0), 0);
+    ASSERT_EQ(*additiveMetrics.nDocsSampled, 25);
+    ASSERT_EQ(
+        additiveMetrics.planShapeCounts.getCount(plan_shape_counters::PlanShapeCounter::kCollscan),
+        3);
+    ASSERT_EQ(additiveMetrics.planShapeCounts.getCount(
+                  plan_shape_counters::PlanShapeCounter::kIxscanFetch),
+              1);
+    ASSERT_EQ(additiveMetrics.planShapeCounts.getCount(
+                  plan_shape_counters::QsnNodeCounter::kCollscanWithFilter),
+              2);
+    ASSERT_EQ(
+        additiveMetrics.planShapeCounts.getCount(plan_shape_counters::AccessPathCounter::kCollscan),
+        2);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateNegativeCpuNanos) {
+    // CPU time can be negative -1 if the platform doesn't support collecting cpu time.
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.cpuNanos = Nanoseconds(-1);
+
+    CursorMetrics cursorMetrics(1 /* keysExamined */,
+                                2 /* docsExamined */,
+                                3 /* bytesRead */,
+                                10 /* workingTimeMillis */,
+                                11 /* readingTimeMicros */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+    cursorMetrics.setPlanningTimeMicros(12);
+    cursorMetrics.setNDocsSampled(15);
+    cursorMetrics.setCpuNanos(-1);
+    cursorMetrics.setNumInterruptChecks(3);
+    cursorMetrics.setNMatched(1);
+    cursorMetrics.setNUpserted(0);
+    cursorMetrics.setNModified(1);
+    cursorMetrics.setNDeleted(0);
+    cursorMetrics.setNInserted(0);
+
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
+    ASSERT_EQ(additiveMetrics.cpuNanos, Nanoseconds(-2));
+}
+
+TEST(CurOpTest, AdditiveMetricsAggregateCursorMetricsTreatsNoneAsZero) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = boost::none;
+    additiveMetrics.docsExamined = boost::none;
+    additiveMetrics.bytesRead = boost::none;
+    additiveMetrics.planningTime = boost::none;
+    additiveMetrics.nDocsSampled = boost::none;
+
+    CursorMetrics cursorMetrics(1 /* keysExamined */,
+                                2 /* docsExamined */,
+                                3 /* bytesRead */,
+                                10 /* workingTimeMillis */,
+                                11 /* readingTimeMicros */,
+                                true /* hasSortStage */,
+                                false /* usedDisk */,
+                                true /* fromMultiPlanner */,
+                                false /* fromPlanCache */);
+    cursorMetrics.setPlanningTimeMicros(100);
+    cursorMetrics.setNDocsSampled(15);
+    cursorMetrics.setCpuNanos(10);
+    cursorMetrics.setNumInterruptChecks(3);
+    cursorMetrics.setNMatched(1);
+    cursorMetrics.setNUpserted(0);
+    cursorMetrics.setNModified(1);
+    cursorMetrics.setNDeleted(0);
+    cursorMetrics.setNInserted(0);
+
+    additiveMetrics.aggregateCursorMetrics(cursorMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 1);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 2);
+    ASSERT_EQ(*additiveMetrics.bytesRead, 3);
+    ASSERT_EQ(*additiveMetrics.planningTime, Microseconds(100));
+    ASSERT_EQ(*additiveMetrics.nDocsSampled, 15);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateDataBearingNodeMetrics) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = 1;
+    additiveMetrics.docsExamined = 2;
+    additiveMetrics.clusterWorkingTime = Milliseconds(3);
+    additiveMetrics.hasSortStage = false;
+    additiveMetrics.usedDisk = false;
+    additiveMetrics.cpuNanos = Nanoseconds(5);
+    additiveMetrics.delinquentAcquisitions = 2;
+    additiveMetrics.totalAcquisitionDelinquency = Milliseconds(400);
+    additiveMetrics.maxAcquisitionDelinquency = Milliseconds(200);
+    additiveMetrics.totalTimeQueuedMicros = Microseconds(400);
+    additiveMetrics.totalAdmissions = 3;
+    additiveMetrics.wasLoadShed = true;
+    additiveMetrics.wasDeprioritized = true;
+    additiveMetrics.wasMarkedNonDeprioritizable = true;
+    additiveMetrics.numInterruptChecks = 2;
+    additiveMetrics.overdueInterruptApproxMax = Milliseconds(100);
+    additiveMetrics.planningTime = Microseconds(100);
+    additiveMetrics.cardinalityEstimationMethods.setHeuristics(2);
+    additiveMetrics.nDocsSampled = 10;
+    additiveMetrics.clusterPeakTrackedMemBytes = 1000;
+
+    query_stats::DataBearingNodeMetrics remoteMetrics;
+    remoteMetrics.keysExamined = 3;
+    remoteMetrics.docsExamined = 4;
+    remoteMetrics.clusterWorkingTime = Milliseconds(5);
+    remoteMetrics.hasSortStage = true;
+    remoteMetrics.usedDisk = false;
+    remoteMetrics.cpuNanos = Nanoseconds(6);
+    remoteMetrics.delinquentAcquisitions = 1;
+    remoteMetrics.totalAcquisitionDelinquency = Milliseconds(300);
+    remoteMetrics.maxAcquisitionDelinquency = Milliseconds(300);
+    remoteMetrics.totalTimeQueuedMicros = Microseconds(300);
+    remoteMetrics.totalAdmissions = 2;
+    remoteMetrics.wasLoadShed = false;
+    remoteMetrics.wasDeprioritized = false;
+    remoteMetrics.wasMarkedNonDeprioritizable = false;
+    remoteMetrics.numInterruptChecks = 1;
+    remoteMetrics.overdueInterruptApproxMax = Milliseconds(300);
+    remoteMetrics.planningTime = Microseconds(150);
+    remoteMetrics.cardinalityEstimationMethods.setHeuristics(1);
+    remoteMetrics.cardinalityEstimationMethods.setHistogram(1);
+    remoteMetrics.cardinalityEstimationMethods.setSampling(1);
+    remoteMetrics.nDocsSampled = 15;
+    remoteMetrics.clusterPeakTrackedMemBytes = 2048;
+
+    additiveMetrics.aggregateDataBearingNodeMetrics(remoteMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 4);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 6);
+    ASSERT_EQ(additiveMetrics.clusterWorkingTime, Milliseconds(8));
+    ASSERT_EQ(additiveMetrics.hasSortStage, true);
+    ASSERT_EQ(additiveMetrics.usedDisk, false);
+    ASSERT_EQ(additiveMetrics.cpuNanos, Nanoseconds(11));
+    ASSERT_EQ(*additiveMetrics.delinquentAcquisitions, 3);
+    ASSERT_EQ(*additiveMetrics.totalAcquisitionDelinquency, Milliseconds(700));
+    ASSERT_EQ(*additiveMetrics.maxAcquisitionDelinquency, Milliseconds(300));
+    ASSERT_EQ(*additiveMetrics.totalTimeQueuedMicros, Microseconds(700));
+    ASSERT_EQ(*additiveMetrics.totalAdmissions, 5);
+    ASSERT_EQ(*additiveMetrics.wasLoadShed, true);
+    ASSERT_EQ(*additiveMetrics.wasDeprioritized, true);
+    ASSERT_EQ(*additiveMetrics.wasMarkedNonDeprioritizable, true);
+    ASSERT_EQ(*additiveMetrics.numInterruptChecks, 3);
+    ASSERT_EQ(*additiveMetrics.overdueInterruptApproxMax, Milliseconds(300));
+    ASSERT_EQ(*additiveMetrics.planningTime, Microseconds(250));
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getHeuristics().value_or(0), 3);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getHistogram().value_or(0), 1);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getSampling().value_or(0), 1);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getMixed().value_or(0), 0);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getMetadata().value_or(0), 0);
+    ASSERT_EQ(additiveMetrics.cardinalityEstimationMethods.getCode().value_or(0), 0);
+    ASSERT_EQ(*additiveMetrics.nDocsSampled, 25);
+    ASSERT_EQ(*additiveMetrics.clusterPeakTrackedMemBytes, 3048);
+}
+
+TEST(CurOpTest, AdditiveMetricsAggregateDataBearingNodeMetricsTreatsNoneAsZero) {
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.keysExamined = boost::none;
+    additiveMetrics.docsExamined = boost::none;
+
+    query_stats::DataBearingNodeMetrics remoteMetrics;
+    remoteMetrics.keysExamined = 1;
+    remoteMetrics.docsExamined = 2;
+
+    additiveMetrics.aggregateDataBearingNodeMetrics(remoteMetrics);
+
+    ASSERT_EQ(*additiveMetrics.keysExamined, 1);
+    ASSERT_EQ(*additiveMetrics.docsExamined, 2);
+}
+
+TEST(CurOpTest, AdditiveMetricsShouldAggregateStorageStats) {
+    class StorageStatsForTest final : public StorageStats {
+        uint64_t _bytesRead;
+        Microseconds _readingTime;
+
+    public:
+        StorageStatsForTest(uint64_t bytesRead, Microseconds readingTime)
+            : _bytesRead(bytesRead), _readingTime(readingTime) {}
+        void appendToBsonObjBuilder(BSONObjBuilder& builder) const final {}
+        BSONObj toBSON() const final {
+            return {};
+        }
+        uint64_t bytesRead() const final {
+            return _bytesRead;
+        }
+        Microseconds readingTime() const final {
+            return _readingTime;
+        }
+        std::unique_ptr<StorageStats> clone() const final {
+            return nullptr;
+        }
+        StorageStats& operator+=(const StorageStats&) final {
+            return *this;
+        }
+        StorageStats& operator-=(const StorageStats&) final {
+            return *this;
+        }
+    };
+
+    OpDebug::AdditiveMetrics additiveMetrics;
+
+    additiveMetrics.bytesRead = 2;
+    additiveMetrics.readingTime = Microseconds(3);
+
+    StorageStatsForTest storageStats{5 /* bytesRead */, Microseconds(7) /* readingTime */};
+
+    additiveMetrics.aggregateStorageStats(storageStats);
+
+    ASSERT_EQ(*additiveMetrics.bytesRead, 7);
+    ASSERT_EQ(*additiveMetrics.readingTime, Microseconds(10));
+}
+
+TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
+    // 'basicFields' should always be present in the logs and profiler, for any operation.
+    std::vector<std::string> basicFields{"op",
+                                         "ns",
+                                         "isFromPriorityPortConnection",
+                                         "command",
+                                         "opid",
+                                         "numYield",
+                                         "numInterruptChecks",
+                                         "locks",
+                                         "millis",
+                                         "micros",
+                                         "flowControl",
+                                         "rateLimit",
+                                         "planRanker",
+                                         "queues"};
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    const OpDebug& od = curop->debug();
+
+    // Create dummy command.
+    BSONObj command = BSON("a" << 3);
+
+    // Set dummy 'ns' and 'command'.
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+
+    BSONObjBuilder builder;
+    od.append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+    auto bs = builder.done();
+
+    // Append should always include these basic fields.
+    for (const std::string& field : basicFields) {
+        ASSERT_TRUE(bs.hasField(field));
+    }
+
+    // Append should include only the basic fields when just initialized.
+    for (const auto& elem : bs) {
+        ASSERT(std::find(basicFields.begin(), basicFields.end(), elem.fieldName()) !=
+               basicFields.end())
+            << "Unexpected extra field in output: " << elem.fieldName();
+    }
+}
+
+TEST(CurOpTest, AppendReportsUserAcquisitionAndLDAPOperationStatsAsDistinctObjects) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    const OpDebug& od = curop->debug();
+
+    // Record one user-cache acquisition (authorization)and one LDAP bind (LDAPOperations) so that
+    // both sets of stats report.
+    auto userAcquisitionStats = curop->getUserAcquisitionStats();
+    auto* tickSource = opCtx->getServiceContext()->getTickSource();
+    {
+        UserAcquisitionStatsHandle handle(userAcquisitionStats.get(), tickSource, kCache);
+    }
+    {
+        UserAcquisitionStatsHandle handle(userAcquisitionStats.get(), tickSource, kBind);
+    }
+    ASSERT_TRUE(userAcquisitionStats->shouldReportUserCacheAccessStats());
+    ASSERT_TRUE(userAcquisitionStats->shouldReportLDAPOperationStats());
+
+    BSONObjBuilder builder;
+    od.append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+    BSONObj bs = builder.done();
+
+    ASSERT_TRUE(bs.hasField("authorization")) << bs;
+    ASSERT_EQ(bs["authorization"].type(), BSONType::object) << bs;
+    ASSERT_FALSE(bs.getObjectField("authorization").isEmpty()) << bs;
+
+    ASSERT_TRUE(bs.hasField("LDAPOperations")) << bs;
+    ASSERT_EQ(bs["LDAPOperations"].type(), BSONType::object) << bs;
+    BSONObj ldapObj = bs.getObjectField("LDAPOperations");
+    ASSERT_TRUE(ldapObj.hasField("LDAPNumberOfReferrals")) << ldapObj;
+    ASSERT_TRUE(ldapObj.hasField("bindStats")) << ldapObj;
+
+    // The two objects are distinct top-level fields.
+    ASSERT_BSONOBJ_NE(bs.getObjectField("authorization"), bs.getObjectField("LDAPOperations"));
+}
+
+TEST(CurOpTest, PlanSelectionStrategyAppendedToProfilerOutput) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+
+    auto appendAndGetPlanRanker = [&]() -> boost::optional<std::string> {
+        BSONObjBuilder builder;
+        curop->debug().append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+        auto bs = builder.done();
+        if (auto elem = bs["planRanker"]) {
+            return elem.String();
+        }
+        return boost::none;
+    };
+
+    // An unset strategy emits "none", and the field is always present so readers can distinguish
+    // "no plan was selected" from "field missing / old server".
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "none");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kSinglePlan;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "singlePlan");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kMultiPlanner;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "multiPlanning");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCostBasedRanker;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "costBased");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCachedPlan;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "cachedPlan");
+}
+
+TEST(CurOpTest, PlanSelectionStrategyInSlowQueryLogReport) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+    curop->ensureStarted();
+    curop->done();
+
+    auto getPlanRankerAttr = [&]() -> boost::optional<std::string> {
+        logv2::DynamicAttributes pAttrs;
+        Date_t deadline = opCtx->getDeadline();
+        curop->debug().report(opCtx.get(), &ls, {}, 0, &deadline, &pAttrs);
+        logv2::TypeErasedAttributeStorage attrs{pAttrs};
+        for (auto it = attrs.begin(); it != attrs.end(); ++it) {
+            if (it->name == "planRanker"sv) {
+                return std::string(std::get<std::string_view>(it->value));
             }
+        }
+        return boost::none;
+    };
 
-            return Status::OK();
+    // report() should always emit planRanker for every strategy.
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "none");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kSinglePlan;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "singlePlan");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kMultiPlanner;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "multiPlanning");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCostBasedRanker;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "costBased");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCachedPlan;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "cachedPlan");
+}
+
+TEST(CurOpTest, PlanSelectionStrategyInProfileFilterAppendStaged) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto curop = CurOp::get(*opCtx);
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+
+    auto stagedAndGetPlanRanker = [&]() -> boost::optional<std::string> {
+        auto fn = OpDebug::appendStaged(opCtx.get(), {"planRanker"}, false /*needWholeDocument*/);
+        OpDebug::AppendArgs args{opCtx.get(), curop->debug(), *curop};
+        BSONObj result = fn(args);
+        if (auto elem = result["planRanker"]) {
+            return elem.String();
+        }
+        return boost::none;
+    };
+
+    // appendStaged() is used for profile filter evaluation; planRanker must be accessible there.
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "none");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kSinglePlan;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "singlePlan");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kMultiPlanner;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "multiPlanning");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCostBasedRanker;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "costBased");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCachedPlan;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "cachedPlan");
+}
+
+TEST(CurOpTest, UsedJoinOptimizationExposedInAllOutputs) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+    curop->ensureStarted();
+    curop->done();
+
+    // Profiler output.
+    auto appendAndGetUsedJoinOptimization = [&]() -> boost::optional<bool> {
+        BSONObjBuilder builder;
+        curop->debug().append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+        auto bs = builder.done();
+        if (auto elem = bs["usedJoinOptimization"]) {
+            return elem.Bool();
+        }
+        return boost::none;
+    };
+
+    // Slow query log output.
+    auto reportAndGetUsedJoinOptimization = [&]() -> boost::optional<bool> {
+        logv2::DynamicAttributes pAttrs;
+        Date_t deadline = opCtx->getDeadline();
+        curop->debug().report(opCtx.get(), &ls, {}, 0, &deadline, &pAttrs);
+        logv2::TypeErasedAttributeStorage attrs{pAttrs};
+        for (auto it = attrs.begin(); it != attrs.end(); ++it) {
+            if (it->name == "usedJoinOptimization"sv) {
+                return std::get<bool>(it->value);
+            }
+        }
+        return boost::none;
+    };
+
+    // Profile filter evaluation.
+    auto stagedAndGetUsedJoinOptimization = [&]() -> boost::optional<bool> {
+        auto fn = OpDebug::appendStaged(
+            opCtx.get(), {"usedJoinOptimization"}, false /*needWholeDocument*/);
+        OpDebug::AppendArgs args{opCtx.get(), curop->debug(), *curop};
+        BSONObj result = fn(args);
+        if (auto elem = result["usedJoinOptimization"]) {
+            return elem.Bool();
+        }
+        return boost::none;
+    };
+
+    // The field is omitted when the join optimizer was not used, so that the vast majority of
+    // queries don't pay for an extra field.
+    ASSERT_FALSE(appendAndGetUsedJoinOptimization().has_value());
+    ASSERT_FALSE(reportAndGetUsedJoinOptimization().has_value());
+    ASSERT_FALSE(stagedAndGetUsedJoinOptimization().has_value());
+
+    curop->debug().usedJoinOptimization = true;
+    ASSERT_EQ(appendAndGetUsedJoinOptimization().value_or(false), true);
+    ASSERT_EQ(reportAndGetUsedJoinOptimization().value_or(false), true);
+    ASSERT_EQ(stagedAndGetUsedJoinOptimization().value_or(false), true);
+}
+
+TEST(CurOpTest, JoinOptimizationFallbackReasonExposedInAllOutputs) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+    curop->ensureStarted();
+    curop->done();
+
+    auto setFallbackReason = [&](join_ordering::JoinFallbackReason reason) {
+        curop->debug().joinOptimizationMetrics.emplace();
+        curop->debug().joinOptimizationMetrics->fallbackReason = reason;
+    };
+
+    auto appendAndGetFallbackReason = [&]() -> boost::optional<std::string> {
+        BSONObjBuilder builder;
+        curop->debug().append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+        auto bs = builder.done();
+        if (auto elem = bs["fallbackReason"]) {
+            return elem.String();
+        }
+        return boost::none;
+    };
+
+    auto reportAndGetFallbackReason = [&]() -> boost::optional<std::string> {
+        logv2::DynamicAttributes pAttrs;
+        Date_t deadline = opCtx->getDeadline();
+        curop->debug().report(opCtx.get(), &ls, {}, 0, &deadline, &pAttrs);
+        logv2::TypeErasedAttributeStorage attrs{pAttrs};
+        for (auto it = attrs.begin(); it != attrs.end(); ++it) {
+            if (it->name == "fallbackReason"sv) {
+                return std::string{std::get<std::string_view>(it->value)};
+            }
+        }
+        return boost::none;
+    };
+
+    auto stagedAndGetFallbackReason = [&]() -> boost::optional<std::string> {
+        auto fn =
+            OpDebug::appendStaged(opCtx.get(), {"fallbackReason"}, false /*needWholeDocument*/);
+        OpDebug::AppendArgs args{opCtx.get(), curop->debug(), *curop};
+        BSONObj result = fn(args);
+        if (auto elem = result["fallbackReason"]) {
+            return elem.String();
+        }
+        return boost::none;
+    };
+
+    ASSERT_FALSE(appendAndGetFallbackReason().has_value());
+    ASSERT_FALSE(reportAndGetFallbackReason().has_value());
+    ASSERT_FALSE(stagedAndGetFallbackReason().has_value());
+
+    setFallbackReason(join_ordering::JoinFallbackReason::kGraphDisconnected);
+    ASSERT_EQ(appendAndGetFallbackReason().value_or(""), "graphDisconnected");
+    ASSERT_EQ(reportAndGetFallbackReason().value_or(""), "graphDisconnected");
+    ASSERT_EQ(stagedAndGetFallbackReason().value_or(""), "graphDisconnected");
+}
+
+TEST(CurOpTest, UsedJoinOptimizationPropagatedFromPlanSummaryStats) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    ASSERT_FALSE(curop->debug().usedJoinOptimization);
+
+    {
+        PlanSummaryStats stats;
+        stats.usedJoinOptimization = false;
+        curop->debug().setPlanSummaryMetrics(std::move(stats));
+    }
+    ASSERT_FALSE(curop->debug().usedJoinOptimization);
+
+    {
+        PlanSummaryStats stats;
+        stats.usedJoinOptimization = true;
+        curop->debug().setPlanSummaryMetrics(std::move(stats));
+    }
+    ASSERT_TRUE(curop->debug().usedJoinOptimization);
+
+    // Once any part of the operation used the join optimizer, a subsequent plan which did not must
+    // not clear the flag.
+    {
+        PlanSummaryStats stats;
+        stats.usedJoinOptimization = false;
+        curop->debug().setPlanSummaryMetrics(std::move(stats));
+    }
+    ASSERT_TRUE(curop->debug().usedJoinOptimization);
+}
+
+TEST(CurOpTest, ShouldUpdateMemoryStats) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    unittest::ServerParameterGuard featureFlagController("featureFlagQueryMemoryTracking", true);
+
+    ASSERT_EQ(0, curop->getInUseTrackedMemoryBytes());
+    ASSERT_EQ(0, curop->getPeakTrackedMemoryBytes());
+
+    curop->setMemoryTrackingStats(10 /*inUseTrackedMemoryBytes*/, 15 /*peakTrackedMemoryBytes*/);
+    ASSERT_EQ(10, curop->getInUseTrackedMemoryBytes());
+    ASSERT_EQ(15, curop->getPeakTrackedMemoryBytes());
+
+    // The max memory usage is updated if the new max is greater than the current max.
+    curop->setMemoryTrackingStats(21 /*inUseTrackedMemoryBytes*/, 20 /*peakTrackedMemoryBytes*/);
+    ASSERT_EQ(21, curop->getInUseTrackedMemoryBytes());
+    ASSERT_EQ(20, curop->getPeakTrackedMemoryBytes());
+
+    // The max memory usage is not updated if the new max is not greater than the current max.
+    curop->setMemoryTrackingStats(31 /*inUseTrackedMemoryBytes*/, 15 /*peakTrackedMemoryBytes*/);
+    ASSERT_EQ(31, curop->getInUseTrackedMemoryBytes());
+    ASSERT_EQ(20, curop->getPeakTrackedMemoryBytes());
+}
+
+TEST(CurOpTest, SystemWidePeakMemoryUsageOperationMetric) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagQueryMemoryTracking", true);
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    // Reads the system-wide metrics.query.peakMemoryUsageOperation value out of the serverStatus
+    // metric tree. We navigate to and serialize only this one metric (rather than appending the
+    // entire tree) since other registered metrics may require a running global ServiceContext.
+    // Returns none when the metric is absent, e.g. on build variants without OpenTelemetry.
+    auto readSystemPeak = []() -> boost::optional<long long> {
+        const MetricTree::ChildMap* children = &globalMetricTreeSet()[ClusterRole::None].children();
+        const MetricTree::TreeNode* leaf = nullptr;
+        for (std::string_view component : {"metrics"sv, "query"sv, "peakMemoryUsageOperation"sv}) {
+            auto it = children->find(component);
+            if (it == children->end()) {
+                return boost::none;
+            }
+            if (component == "peakMemoryUsageOperation"sv) {
+                leaf = &it->second;
+                break;
+            }
+            if (!it->second.isSubtree()) {
+                return boost::none;
+            }
+            children = &it->second.getSubtree()->children();
+        }
+        if (!leaf || leaf->isSubtree()) {
+            return boost::none;
         }
 
-        // Long operation + short timeout => time should expire.
-        TEST(TimeHasExpired, PosSimple) {
-            CurOp curOp(NULL);
-            curOp.setMaxTimeMicros(intervalShort);
-            curOp.ensureStarted();
-            sleepmicros(intervalLong);
-            ASSERT_TRUE(curOp.maxTimeHasExpired());
+        BSONObjBuilder bob;
+        leaf->getMetric()->appendTo(bob, "peakMemoryUsageOperation");
+        BSONObj obj = bob.obj();
+        BSONElement el = obj.getField("peakMemoryUsageOperation");
+        if (el.eoo()) {
+            return boost::none;
+        }
+        return el.Long();
+    };
+
+    auto before = readSystemPeak();
+    if (!before) {
+        // serverStatus surfacing of OpenTelemetry metrics is unavailable on this build variant.
+        return;
+    }
+
+    // The metric is process-wide and monotonically non-decreasing, so it may already reflect peaks
+    // observed by other operations/tests. Establish a new maximum well above anything else sets.
+    const int64_t newPeak = *before + (1LL << 30);
+    curop->setMemoryTrackingStats(1 /*inUseTrackedMemoryBytes*/,
+                                  newPeak /*peakTrackedMemoryBytes*/);
+    ASSERT_EQ(*readSystemPeak(), newPeak);
+
+    // A smaller per-operation peak must not lower the system-wide high-water mark.
+    curop->setMemoryTrackingStats(1 /*inUseTrackedMemoryBytes*/,
+                                  newPeak - 100 /*peakTrackedMemoryBytes*/);
+    ASSERT_EQ(*readSystemPeak(), newPeak);
+}
+
+TEST(CurOpTest, CanReadMemoryStatsWithoutFeatureFlag) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    unittest::ServerParameterGuard featureFlagController("featureFlagQueryMemoryTracking", false);
+
+    ASSERT_EQ(0, curop->getInUseTrackedMemoryBytes());
+    ASSERT_EQ(0, curop->getPeakTrackedMemoryBytes());
+}
+
+DEATH_TEST(CurOpTestDeathTest, RequireFeatureFlagEnabledToUpdateMemoryStats, "tassert") {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    unittest::ServerParameterGuard featureFlagController("featureFlagQueryMemoryTracking", false);
+    curop->setMemoryTrackingStats(10 /*inUseTrackedMemoryBytes*/, 15 /*peakTrackedMemoryBytes*/);
+}
+
+/**
+ * When featureFlagQueryMemoryTracking is enabled, non-zero memory tracking stats should appear in
+ * the profiler.
+ */
+TEST(CurOpTest, MemoryStatsDisplayedIfNonZero) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagQueryMemoryTracking", true);
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto curop = CurOp::get(*opCtx);
+    const OpDebug& opDebug = curop->debug();
+    SingleThreadedLockStats ls;
+
+    BSONObjBuilder bob;
+    opDebug.append(opCtx.get(), ls, {}, {}, 0, true /*omitCommand*/, bob);
+
+    // If the memory tracker has not updated CurOp, the memory tracking stat should not appear in
+    // the profiler output.
+    auto res = bob.done();
+    ASSERT_EQ(0, curop->getPeakTrackedMemoryBytes());
+    ASSERT_FALSE(res.hasField("peakTrackedMemBytes"));
+
+    curop->setMemoryTrackingStats(10 /*inUseTrackedMemoryBytes*/, 15 /*peakTrackedMemoryBytes*/);
+    BSONObjBuilder bobWithMemStats;
+    opDebug.append(opCtx.get(), ls, {}, {}, 0, true /*omitCommand*/, bobWithMemStats);
+    res = bobWithMemStats.done();
+
+    ASSERT_EQ(15, curop->getPeakTrackedMemoryBytes());
+    ASSERT_EQ(15, res.getIntField("peakTrackedMemBytes"));
+}
+
+TEST(CurOpTest, ReportStateIncludesMemoryStatsIfNonZero) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagQueryMemoryTracking", true);
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+
+    // If the memory stats are zero, they are *not* included in the state.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+        ASSERT_FALSE(state.hasField("inUseTrackedMemBytes"));
+        ASSERT_FALSE(state.hasField("peakTrackedMemBytes"));
+    }
+
+    // If the memory stats are not zero, they *are* included in the state.
+    {
+        BSONObjBuilder bob;
+        curOp->setMemoryTrackingStats(128, 256);
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+        ASSERT_TRUE(state.hasField("inUseTrackedMemBytes"));
+        ASSERT_EQ(state["inUseTrackedMemBytes"].Long(), 128);
+        ASSERT_TRUE(state.hasField("peakTrackedMemBytes"));
+        ASSERT_EQ(state["peakTrackedMemBytes"].Long(), 256);
+    }
+}
+
+TEST(CurOpTest, ReportStateIncludesDelinquentStatsIfNonZero) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+    auto tickSourcePtr = dynamic_cast<TickSourceMock<Nanoseconds>*>(
+        serviceContext.getServiceContext()->getTickSource());
+    tickSourcePtr->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+    curOp->setTickSource_forTest(tickSourcePtr);
+    curOp->ensureStarted();
+
+    // If the delinquent stats are zero, they are *not* included in the state.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+        ASSERT_FALSE(state.hasField("delinquencyInfo"));
+        // Field numInterruptChecks and priorityLowered should be always shown.
+        ASSERT_TRUE(state.hasField("numInterruptChecks"));
+        ASSERT_TRUE(state.hasField("priorityLowered"));
+    }
+
+    // If the delinquent stats are not zero, they *are* included in the state.
+    {
+        ExecutionAdmissionContext::get(opCtx.get()).recordDelinquentAcquisition(Milliseconds(20));
+        ExecutionAdmissionContext::get(opCtx.get()).recordDelinquentAcquisition(Milliseconds(10));
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+        ASSERT_TRUE(state.hasField("delinquencyInfo"));
+        ASSERT_EQ(state["delinquencyInfo"]["totalDelinquentAcquisitions"].Long(), 2);
+        ASSERT_EQ(state["delinquencyInfo"]["totalAcquisitionDelinquencyMillis"].Long(), 30);
+        ASSERT_EQ(state["delinquencyInfo"]["maxAcquisitionDelinquencyMillis"].Long(), 20);
+    }
+
+    {
+        tickSourcePtr->advance(Milliseconds{200});
+        opCtx->checkForInterrupt();
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+
+        const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+
+        ASSERT_TRUE(state.hasField("numInterruptChecks")) << state.toString();
+        ASSERT_EQ(state["numInterruptChecks"].Number(), 1);
+
+        ASSERT_TRUE(state.hasField("delinquencyInfo"));
+        ASSERT_EQ(state["delinquencyInfo"]["overdueInterruptChecks"].Number(), 1);
+        ASSERT_EQ(state["delinquencyInfo"]["overdueInterruptTotalMillis"].Number(),
+                  200 - interval.count());
+        ASSERT_EQ(state["delinquencyInfo"]["overdueInterruptApproxMaxMillis"].Number(),
+                  200 - interval.count());
+    }
+}
+
+TEST(CurOpTest, AppendIncludesDelinquentStatsIfNonZero) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+    auto tickSourcePtr = dynamic_cast<TickSourceMock<Nanoseconds>*>(
+        serviceContext.getServiceContext()->getTickSource());
+    tickSourcePtr->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+    curOp->setTickSource_forTest(tickSourcePtr);
+    curOp->setNS(WithLock::withoutLock(),
+                 NamespaceString::createNamespaceString_forTest("test", "foo"));
+    curOp->ensureStarted();
+
+    auto appendProfileDoc = [&]() {
+        BSONObjBuilder bob;
+        curOp->debug().append(opCtx.get(),
+                              SingleThreadedLockStats{},
+                              FlowControlTicketholder::CurOp{},
+                              SingleThreadedStorageMetrics{},
+                              0 /*prepareReadConflicts*/,
+                              true /*omitCommand*/,
+                              bob);
+        return bob.obj();
+    };
+
+    // If the delinquent stats are zero, they are *not* included in the profile document.
+    {
+        BSONObj doc = appendProfileDoc();
+        ASSERT_FALSE(doc.hasField("delinquencyInfo"));
+        ASSERT_TRUE(doc.hasField("numInterruptChecks"));
+    }
+
+    // If the delinquent stats are not zero, they *are* included in the profile document.
+    {
+        ExecutionAdmissionContext::get(opCtx.get()).recordDelinquentAcquisition(Milliseconds(20));
+        ExecutionAdmissionContext::get(opCtx.get()).recordDelinquentAcquisition(Milliseconds(10));
+        BSONObj doc = appendProfileDoc();
+        ASSERT_TRUE(doc.hasField("delinquencyInfo"));
+        ASSERT_EQ(doc["delinquencyInfo"]["totalDelinquentAcquisitions"].Long(), 2);
+        ASSERT_EQ(doc["delinquencyInfo"]["totalAcquisitionDelinquencyMillis"].Long(), 30);
+        ASSERT_EQ(doc["delinquencyInfo"]["maxAcquisitionDelinquencyMillis"].Long(), 20);
+    }
+
+    {
+        tickSourcePtr->advance(Milliseconds{200});
+        opCtx->checkForInterrupt();
+        BSONObj doc = appendProfileDoc();
+
+        const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+
+        ASSERT_TRUE(doc.hasField("numInterruptChecks")) << doc.toString();
+        ASSERT_EQ(doc["numInterruptChecks"].Number(), 1);
+
+        ASSERT_TRUE(doc.hasField("delinquencyInfo"));
+        ASSERT_EQ(doc["delinquencyInfo"]["overdueInterruptChecks"].Number(), 1);
+        ASSERT_EQ(doc["delinquencyInfo"]["overdueInterruptTotalMillis"].Number(),
+                  200 - interval.count());
+        ASSERT_EQ(doc["delinquencyInfo"]["overdueInterruptApproxMaxMillis"].Number(),
+                  200 - interval.count());
+    }
+}
+
+TEST(CurOpTest, AppendStagedIncludesDelinquentFields) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto* curop = CurOp::get(*opCtx);
+
+    // profile_filter.js requires every field append() emits to be filterable via appendStaged().
+    StringSet requestedFields = {"numInterruptChecks", "delinquencyInfo"};
+    auto makeDoc = OpDebug::appendStaged(opCtx.get(), requestedFields, /*needWholeDocument=*/false);
+    auto stagedDoc = [&]() {
+        return makeDoc(OpDebug::AppendArgs{opCtx.get(), curop->debug(), *curop});
+    };
+
+    {
+        BSONObj doc = stagedDoc();
+        ASSERT_TRUE(doc.hasField("numInterruptChecks"));
+        ASSERT_FALSE(doc.hasField("delinquencyInfo"));
+    }
+
+    {
+        ExecutionAdmissionContext::get(opCtx.get()).recordDelinquentAcquisition(Milliseconds(20));
+        BSONObj doc = stagedDoc();
+        ASSERT_TRUE(doc.hasField("delinquencyInfo"));
+        ASSERT_EQ(doc["delinquencyInfo"]["totalDelinquentAcquisitions"].Long(), 1);
+        ASSERT_EQ(doc["delinquencyInfo"]["maxAcquisitionDelinquencyMillis"].Long(), 20);
+    }
+}
+
+TEST(CurOpTest, ReportDeprioritizationStats) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+    curOp->ensureStarted();
+
+    // 1. Check the default state. If they're zero, they're not reported.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+        ASSERT_FALSE(state.hasField("totalTimeQueuedMicros"));
+        ASSERT_FALSE(state.hasField("totalAdmissions"));
+        ASSERT_FALSE(state.hasField("wasLoadShed"));
+        ASSERT_FALSE(state.hasField("wasDeprioritized"));
+    }
+
+    // 2. If there are admissions then report the stats.
+    {
+        ExecutionAdmissionContext::get(opCtx.get()).setAdmission_forTest(1);
+        ExecutionAdmissionContext::get(opCtx.get()).setTotalTimeQueuedMicros_forTest(100);
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+        ASSERT_TRUE(state.hasField("totalAdmissions"));
+        ASSERT_EQ(state["totalAdmissions"].Number(), 1);
+        ASSERT_TRUE(state.hasField("totalTimeQueuedMicros"));
+        ASSERT_EQ(state["totalTimeQueuedMicros"].Number(), 100);
+        ASSERT_TRUE(state.hasField("wasLoadShed"));
+        ASSERT_FALSE(state["wasLoadShed"].Bool());
+        ASSERT_TRUE(state.hasField("wasDeprioritized"));
+        ASSERT_FALSE(state["wasDeprioritized"].Bool());
+    }
+}
+
+TEST(CurOpTest, ReportStateIncludesPriorityLowered) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+    curOp->ensureStarted();
+
+    // 1. Check the default state.
+    // The 'priorityLowered' field should always be present and default to 'false'.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+
+        ASSERT_TRUE(state.hasField("priorityLowered"));
+        ASSERT_FALSE(state["priorityLowered"].Bool());
+    }
+
+    // 2. Lower the operation's priority via the ExecutionAdmissionContext.
+    ExecutionAdmissionContext::get(opCtx.get()).priorityLowered();
+
+    // 3. Check the state again.
+    // The 'priorityLowered' field should now be 'true'.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+
+        ASSERT_TRUE(state.hasField("priorityLowered"));
+        ASSERT_TRUE(state["priorityLowered"].Bool());
+    }
+}
+
+TEST(CurOpTest, ReportStateIncludesWasMarkedNonDeprioritizable) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+    curOp->ensureStarted();
+
+    // 1. Check the default state.
+    // The 'wasMarkedNonDeprioritizable' field should always be present and default to 'false'.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+
+        ASSERT_TRUE(state.hasField("wasMarkedNonDeprioritizable"));
+        ASSERT_FALSE(state["wasMarkedNonDeprioritizable"].Bool());
+    }
+
+    // 2. Mark the operation non-deprioritizable via the ExecutionAdmissionContext.
+    admission::execution_control::ScopedTaskTypeNonDeprioritizable nonDeprioritizableTask(
+        opCtx.get());
+
+    // 3. Check the state again.
+    // The 'wasMarkedNonDeprioritizable' field should now be 'true'.
+    {
+        BSONObjBuilder bob;
+        curOp->reportState(&bob, SerializationContext{});
+        BSONObj state = bob.obj();
+
+        ASSERT_TRUE(state.hasField("wasMarkedNonDeprioritizable"));
+        ASSERT_TRUE(state["wasMarkedNonDeprioritizable"].Bool());
+    }
+}
+
+TEST(CurOpTest, ShouldFinalizeExecutionStatsWhenOperationHasNoValidResponse) {
+    using namespace admission::execution_control;
+
+    QueryTestServiceContext serviceContext;
+    auto service = serviceContext.getServiceContext();
+
+    TicketingSystem::RWTicketHolder normal{std::make_unique<TicketHolder>(service, 100, true, 100),
+                                           std::make_unique<TicketHolder>(service, 100, true, 100)};
+    TicketingSystem::RWTicketHolder low{std::make_unique<TicketHolder>(service, 100, true, 100),
+                                        std::make_unique<TicketHolder>(service, 100, true, 100)};
+    TicketingSystem::use(
+        service,
+        std::make_unique<TicketingSystem>(
+            service,
+            std::move(normal),
+            std::move(low),
+            ExecutionControlConcurrencyAdjustmentAlgorithmEnum::kFixedConcurrentTransactions));
+
+    {
+        auto opCtx = serviceContext.makeOperationContext();
+        CurOp::get(*opCtx)->ensureStarted();
+
+        // Simulate that the operation had admissions
+        ExecutionAdmissionContext::get(opCtx.get()).setAdmission_forTest(1);
+
+        // Intentionally do NOT call completeAndLogOperation().
+    }
+
+    // Verify stats were finalized, meaning that totalOpsFinished should have been incremented by 1.
+    BSONObjBuilder bob;
+    TicketingSystem::get(service)->appendStats(bob);
+    BSONObj stats = bob.obj();
+    ASSERT_TRUE(stats.hasField("nonDeprioritizable"));
+    ASSERT_EQ(stats["nonDeprioritizable"]["totalOpsFinished"].Long(), 1);
+}
+
+TEST(CurOpTest, ShouldNotReportFailpointMsgIfNotSet) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto curop = CurOp::get(*opCtx);
+
+    // Test the reported state should _not_ contain 'failpointMsg'.
+    BSONObjBuilder reportedStateWithoutFailpointMsg;
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportState(&reportedStateWithoutFailpointMsg, SerializationContext());
+    }
+    auto bsonObj = reportedStateWithoutFailpointMsg.done();
+
+    // bsonObj should _not_ contain 'failpointMsg' if a fail point is not set.
+    ASSERT_FALSE(bsonObj.hasField("failpointMsg"));
+}
+
+TEST(CurOpTest, ShouldReportIsFromUserConnection) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto client = serviceContext.getClient();
+
+    // Mock a client with a user connection.
+    transport::TransportLayerMock transportLayer;
+    auto clientUserConn = serviceContext.getServiceContext()->getService()->makeClient(
+        "userconn", transportLayer.createSession());
+
+    auto curop = CurOp::get(*opCtx);
+
+    BSONObjBuilder curOpObj;
+    BSONObjBuilder curOpObjUserConn;
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        auto nss = NamespaceString::createNamespaceString_forTest("db", "coll");
+
+        // Serialization Context on expression context should be non-empty in
+        // reportCurrentOpForClient.
+        auto sc = SerializationContext(SerializationContext::Source::Command,
+                                       SerializationContext::CallerType::Reply,
+                                       SerializationContext::Prefix::ExcludePrefix);
+        auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), nss, sc);
+
+        curop->reportCurrentOpForClient(lk, expCtx, client, false, &curOpObj);
+        curop->reportCurrentOpForClient(lk, expCtx, clientUserConn.get(), false, &curOpObjUserConn);
+    }
+    auto bsonObj = curOpObj.done();
+    auto bsonObjUserConn = curOpObjUserConn.done();
+
+    ASSERT_TRUE(bsonObj.hasField("isFromUserConnection"));
+    ASSERT_TRUE(bsonObjUserConn.hasField("isFromUserConnection"));
+    ASSERT_FALSE(bsonObj.getField("isFromUserConnection").Bool());
+    ASSERT_TRUE(bsonObjUserConn.getField("isFromUserConnection").Bool());
+}
+
+TEST(CurOpTest, ShouldNotReportIsFromPriorityPortConnectionWhenFFDisabled) {
+    gFeatureFlagDedicatedPortForPriorityOperations.setForServerParameter(false);
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto client = serviceContext.getClient();
+
+    // Mock a client with a user connection.
+    transport::TransportLayerMock transportLayer;
+    transportLayer.createSessionHook = [](transport::TransportLayer* tl) {
+        return std::make_shared<transport::MockPrioritySession>(tl);
+    };
+    auto clientPriorityConn = serviceContext.getServiceContext()->getService()->makeClient(
+        "priorityConn", transportLayer.createSession());
+
+    auto curop = CurOp::get(*opCtx);
+
+    BSONObjBuilder curOpObj;
+    BSONObjBuilder curOpObjPriorityConn;
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        auto nss = NamespaceString::createNamespaceString_forTest("db", "coll");
+
+        // Serialization Context on expression context should be non-empty in
+        // reportCurrentOpForClient.
+        auto sc = SerializationContext(SerializationContext::Source::Command,
+                                       SerializationContext::CallerType::Reply,
+                                       SerializationContext::Prefix::ExcludePrefix);
+        auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), nss, sc);
+
+        curop->reportCurrentOpForClient(lk, expCtx, client, false, &curOpObj);
+        curop->reportCurrentOpForClient(
+            lk, expCtx, clientPriorityConn.get(), false, &curOpObjPriorityConn);
+    }
+    auto bsonObj = curOpObj.done();
+    auto bsonObjPriorityConn = curOpObjPriorityConn.done();
+
+    ASSERT_FALSE(bsonObj.hasField("isFromPriorityPortConnection"));
+    ASSERT_FALSE(bsonObjPriorityConn.hasField("isFromPriorityPortConnection"));
+}
+
+TEST(CurOpTest, ShouldReportIsFromPriorityPortConnection) {
+    gFeatureFlagDedicatedPortForPriorityOperations.setForServerParameter(true);
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto client = serviceContext.getClient();
+
+    // Mock a client with a user connection.
+    transport::TransportLayerMock transportLayer;
+    transportLayer.createSessionHook = [](transport::TransportLayer* tl) {
+        return std::make_shared<transport::MockPrioritySession>(tl);
+    };
+    auto clientPriorityConn = serviceContext.getServiceContext()->getService()->makeClient(
+        "priorityConn", transportLayer.createSession());
+
+    auto curop = CurOp::get(*opCtx);
+
+    BSONObjBuilder curOpObj;
+    BSONObjBuilder curOpObjPriorityConn;
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        auto nss = NamespaceString::createNamespaceString_forTest("db", "coll");
+
+        // Serialization Context on expression context should be non-empty in
+        // reportCurrentOpForClient.
+        auto sc = SerializationContext(SerializationContext::Source::Command,
+                                       SerializationContext::CallerType::Reply,
+                                       SerializationContext::Prefix::ExcludePrefix);
+        auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), nss, sc);
+
+        curop->reportCurrentOpForClient(lk, expCtx, client, false, &curOpObj);
+        curop->reportCurrentOpForClient(
+            lk, expCtx, clientPriorityConn.get(), false, &curOpObjPriorityConn);
+    }
+    auto bsonObj = curOpObj.done();
+    auto bsonObjPriorityConn = curOpObjPriorityConn.done();
+
+    ASSERT_TRUE(bsonObj.hasField("isFromPriorityPortConnection"));
+    ASSERT_TRUE(bsonObjPriorityConn.hasField("isFromPriorityPortConnection"));
+    ASSERT_FALSE(bsonObj.getField("isFromPriorityPortConnection").Bool());
+    ASSERT_TRUE(bsonObjPriorityConn.getField("isFromPriorityPortConnection").Bool());
+}
+
+TEST(CurOpTest, ElapsedTimeReflectsTickSource) {
+    QueryTestServiceContext serviceContext;
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSourceMock.get());
+
+    ASSERT_FALSE(curop->isStarted());
+
+    curop->ensureStarted();
+    ASSERT_TRUE(curop->isStarted());
+
+    tickSourceMock->advance(Milliseconds{20});
+
+    ASSERT_FALSE(curop->isDone());
+
+    curop->done();
+    ASSERT_TRUE(curop->isDone());
+
+    ASSERT_EQ(Milliseconds{20}, duration_cast<Milliseconds>(curop->elapsedTimeTotal()));
+}
+
+TEST(CurOpTest, CheckNSAgainstSerializationContext) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    TenantId tid = TenantId(OID::gen());
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto curop = CurOp::get(*opCtx);
+
+    // Create dummy command.
+    BSONObj command = BSON("a" << 3);
+
+    // Set dummy 'ns' and 'command'.
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest(tid, "testDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+
+    // Test expectPrefix field.
+    for (bool expectPrefix : {false, true}) {
+        SerializationContext sc = SerializationContext::stateCommandReply();
+        sc.setPrefixState(expectPrefix);
+
+        BSONObjBuilder builder;
+        {
+            std::lock_guard<Client> lk(*opCtx->getClient());
+            curop->reportState(&builder, sc);
+        }
+        auto bsonObj = builder.done();
+
+        std::string serializedNs = expectPrefix ? tid.toString() + "_testDb.coll" : "testDb.coll";
+        ASSERT_EQ(serializedNs, bsonObj.getField("ns").String());
+    }
+}
+
+TEST(CurOpTest, GetCursorMetricsProducesValidObject) {
+    // This test just checks that the cursor metrics object produced by getCursorMetrics
+    // is a valid, serializable object. In particular, it must have all required fields.
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    auto metrics = curop->debug().getCursorMetrics();
+    ASSERT_DOES_NOT_THROW(metrics.toBSON());
+}
+
+TEST(CurOpTest, KilledOperationReportsLatency) {
+    QueryTestServiceContext serviceContext(std::make_unique<TickSourceMock<Nanoseconds>>());
+    auto opCtx = serviceContext.makeOperationContext();
+    auto tickSourcePtr = dynamic_cast<TickSourceMock<Nanoseconds>*>(
+        serviceContext.getServiceContext()->getTickSource());
+
+    tickSourcePtr->advance(Nanoseconds(3));
+    const int killLatency = 32;
+
+    opCtx->markKilled();
+    ASSERT_FALSE(opCtx->checkForInterruptNoAssert().isOK());
+    tickSourcePtr->advance(Nanoseconds(killLatency));
+
+    auto curop = CurOp::get(*opCtx);
+    const OpDebug& opDebug = curop->debug();
+    SingleThreadedLockStats ls;
+
+    BSONObjBuilder bob;
+    opDebug.append(opCtx.get(), ls, {}, {}, 0, true /*omitCommand*/, bob);
+
+    auto res = bob.done();
+    ASSERT_TRUE(res.hasField("interruptLatencyNanos")) << res.toString();
+    ASSERT_EQ(killLatency, res.getIntField("interruptLatencyNanos"));
+}
+
+TEST(CurOpTest, ShouldReportDeadline) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    Date_t expectedDeadline = Date_t::now();
+    opCtx->setDeadlineByDate(expectedDeadline, ErrorCodes::MaxTimeMSExpired);
+
+    auto curop = CurOp::get(*opCtx);
+    const OpDebug& opDebug = curop->debug();
+    SingleThreadedLockStats ls;
+
+    BSONObjBuilder bob;
+    opDebug.append(opCtx.get(), ls, {}, {}, 0, true /*omitCommand*/, bob);
+
+    auto res = bob.done();
+    ASSERT_TRUE(res.hasField("deadline")) << res.toString();
+    ASSERT_EQ(res.getField("deadline").Date(), expectedDeadline);
+
+    unittest::LogCaptureGuard logs;
+
+    curop->completeAndLogOperation(logv2::LogOptions{logv2::LogComponent::kTest},
+                                   nullptr,
+                                   boost::none,
+                                   boost::none,
+                                   true /*forceLog*/);
+
+
+    static constexpr long long kSlowQueryLogId = 51803;
+    ASSERT_GTE(logs.countBSONContainingSubset(BSON("id" << kSlowQueryLogId)), 1);
+    for (const auto& logObj : logs.getBSON()) {
+        if (logObj.getField("id").numberLong() != kSlowQueryLogId) {
+            continue;
         }
 
-        // Short operation + long timeout => time should not expire.
-        TEST(TimeHasExpired, NegSimple) {
-            CurOp curOp(NULL);
-            curOp.setMaxTimeMicros(intervalLong);
-            curOp.ensureStarted();
-            sleepmicros(intervalShort);
-            ASSERT_FALSE(curOp.maxTimeHasExpired());
+        BSONObj attrs = logObj.getField("attr").Obj();
+        ASSERT_EQ(attrs.getField("deadline").Date(), expectedDeadline);
+    }
+}
+
+TEST(CurOpTest, SlowLogFinishesWithDuration) {
+    // Best effort test to try and verify that durationMillis is the last field reported by
+    // report(). This doesn't populate every possible fields but makes some attempt to ensure
+    // that there are a few.
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    // Create dummy command.
+    BSONObj command = BSON("a" << 3);
+    TenantId tid = TenantId(OID::gen());
+
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest(tid, "testDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+
+    const OpDebug& opDebug = curop->debug();
+    SingleThreadedLockStats lockStats;
+
+    curop->ensureStarted();
+    curop->done();
+    curop->calculateCpuTime();
+
+    logv2::DynamicAttributes pattrs;
+    Date_t deadline = opCtx->getDeadline();
+    opDebug.report(opCtx.get(), &lockStats, {}, 0, &deadline, &pattrs);
+
+    logv2::TypeErasedAttributeStorage attrs{pattrs};
+    ASSERT_GTE(attrs.size(), 1);
+    std::string lastName = (attrs.end() - 1)->name;
+    ASSERT_EQ("durationMillis", lastName);
+}
+
+TEST(CurOpTest, OpDebugAllowsMultipleQueryStatsInfos) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    CurOp* curOp = CurOp::get(*opCtx);
+    OpDebug& opDebug = curOp->debug();
+
+    // Create a new set of metrics for an operation at index 10.
+    const size_t opIndex = 10;
+    auto key = std::make_unique<query_stats::MockKey>(opCtx.get());
+    auto keyPtr = key.get();
+    opDebug.setQueryStatsInfoAtOpIndex(opIndex,
+                                       {
+                                           .key = std::move(key),
+                                           .keyHash = 42,
+                                           .metricsRequested = true,
+                                       });
+
+    // If we fetch the info with the getter, it should contain the values we have passed in.
+    OpDebug::QueryStatsInfo& qsi = opDebug.getQueryStatsInfo(opIndex);
+    ASSERT_EQ(qsi.key.get(), keyPtr);
+    ASSERT_TRUE(qsi.keyHash.has_value());
+    ASSERT_EQ(qsi.keyHash.value(), 42);
+    ASSERT_EQ(qsi.metricsRequested, true);
+
+    // The new set of metrics should be distinct from the one for the main operation.
+    OpDebug::QueryStatsInfo& mainQsi = opDebug.getQueryStatsInfo();
+    ASSERT_NE(&qsi, &mainQsi);
+}
+
+TEST(CurOpTest, OpDebugAllowsMultipleAdditiveMetrics) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    CurOp* curOp = CurOp::get(*opCtx);
+    OpDebug& opDebug = curOp->debug();
+
+    // Create a new set of metrics for an operation at index 10.
+    const size_t opIndex = 10;
+    opDebug.setQueryStatsInfoAtOpIndex(opIndex, {});
+    OpDebug::AdditiveMetrics& am = opDebug.getQueryStatsInfo(opIndex).additiveMetrics;
+
+    // If we fetch the metrics with the getter, it whould be the same object.
+    OpDebug::AdditiveMetrics& am2 = opDebug.getAdditiveMetrics(opIndex);
+    ASSERT_EQ(&am, &am2);
+
+    // The new set of metrics should be distinct from the one for the main operation.
+    OpDebug::AdditiveMetrics& mainAm = opDebug.getAdditiveMetrics();
+    ASSERT_NE(&mainAm, &am);
+}
+
+/**
+ * Characterize the full set of metrics collected by setEndOfOpMetricsForBatchWrites().
+ */
+TEST(CurOpTest, SetEndOfOpMetricsForBatchWritesPopulatesAllMetrics) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+    auto tickSourcePtr = serviceContext.tickSource();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourcePtr->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    CurOp* curOp = CurOp::get(*opCtx);
+    OpDebug& opDebug = curOp->debug();
+    curOp->setTickSource_forTest(tickSourcePtr);
+
+    // Set up batch write query stats entries at two different op indices.
+    const size_t opIndex1 = 0;
+    const size_t opIndex2 = 3;
+    opDebug.setQueryStatsInfoAtOpIndex(opIndex1, {.keyHash = 42});
+    opDebug.setQueryStatsInfoAtOpIndex(opIndex2, {.keyHash = 43});
+
+    // Set up the admission context with delinquency and admission data.
+    auto& admCtx = ExecutionAdmissionContext::get(opCtx.get());
+    admCtx.recordDelinquentAcquisition(Milliseconds(20));
+    admCtx.recordDelinquentAcquisition(Milliseconds(10));
+    admCtx.setAdmission_forTest(2);
+    admCtx.setTotalTimeQueuedMicros_forTest(500);
+
+    // Start the CurOp and advance time past the overdue interrupt check interval so that
+    // interrupt check metrics are populated.
+    curOp->ensureStarted();
+    const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+    tickSourcePtr->advance(interval * 2);
+    opCtx->checkForInterrupt();
+    tickSourcePtr->advance(Milliseconds{100});
+    curOp->done();
+
+    // Call the method under test.
+    curOp->setEndOfOpMetricsForBatchWrites();
+
+    // Verify that the metrics for each batch write entry are populated.
+    auto& metrics1 = opDebug.getAdditiveMetrics(opIndex1);
+    auto& metrics2 = opDebug.getAdditiveMetrics(opIndex2);
+
+    // -- Timing metrics --
+    // executionTime should be set to the elapsed time of the CurOp.
+    ASSERT_TRUE(metrics1.executionTime.has_value());
+    ASSERT_GT(*metrics1.executionTime, Microseconds(0));
+    ASSERT_EQ(metrics1.executionTime, metrics2.executionTime);
+
+    // clusterWorkingTime should be set (elapsed minus blocked time).
+    ASSERT_TRUE(metrics1.clusterWorkingTime.has_value());
+    ASSERT_GTE(*metrics1.clusterWorkingTime, Milliseconds(0));
+    ASSERT_EQ(metrics1.clusterWorkingTime, metrics2.clusterWorkingTime);
+
+    // cpuNanos should be set. On Linux it will be a real measurement; on other platforms
+    // it may be negative.
+    ASSERT_TRUE(metrics1.cpuNanos.has_value());
+    ASSERT_EQ(metrics1.cpuNanos, metrics2.cpuNanos);
+
+    // -- Delinquency metrics --
+    // Should be populated from the ExecutionAdmissionContext.
+    ASSERT_TRUE(metrics1.delinquentAcquisitions.has_value());
+    ASSERT_EQ(*metrics1.delinquentAcquisitions, 2UL);
+    ASSERT_EQ(metrics1.delinquentAcquisitions, metrics2.delinquentAcquisitions);
+
+    ASSERT_TRUE(metrics1.totalAcquisitionDelinquency.has_value());
+    ASSERT_EQ(*metrics1.totalAcquisitionDelinquency, Milliseconds(30));
+    ASSERT_EQ(metrics1.totalAcquisitionDelinquency, metrics2.totalAcquisitionDelinquency);
+
+    ASSERT_TRUE(metrics1.maxAcquisitionDelinquency.has_value());
+    ASSERT_EQ(*metrics1.maxAcquisitionDelinquency, Milliseconds(20));
+    ASSERT_EQ(metrics1.maxAcquisitionDelinquency, metrics2.maxAcquisitionDelinquency);
+
+    // -- Admission metrics --
+    ASSERT_TRUE(metrics1.totalTimeQueuedMicros.has_value());
+    ASSERT_EQ(*metrics1.totalTimeQueuedMicros, Microseconds(500));
+    ASSERT_EQ(metrics1.totalTimeQueuedMicros, metrics2.totalTimeQueuedMicros);
+
+    ASSERT_TRUE(metrics1.totalAdmissions.has_value());
+    ASSERT_EQ(*metrics1.totalAdmissions, 2UL);
+    ASSERT_EQ(metrics1.totalAdmissions, metrics2.totalAdmissions);
+
+    // wasLoadShed and wasDeprioritized default to false when no load shedding/deprioritization
+    // has occurred.
+    ASSERT_TRUE(metrics1.wasLoadShed.has_value());
+    ASSERT_FALSE(*metrics1.wasLoadShed);
+    ASSERT_TRUE(metrics1.wasDeprioritized.has_value());
+    ASSERT_FALSE(*metrics1.wasDeprioritized);
+    ASSERT_TRUE(metrics1.wasMarkedNonDeprioritizable.has_value());
+    ASSERT_FALSE(*metrics1.wasMarkedNonDeprioritizable);
+
+    // -- Interrupt check metrics --
+    // numInterruptChecks should reflect the checkForInterrupt() call.
+    ASSERT_TRUE(metrics1.numInterruptChecks.has_value());
+    ASSERT_EQ(*metrics1.numInterruptChecks, 1UL);
+    ASSERT_EQ(metrics1.numInterruptChecks, metrics2.numInterruptChecks);
+
+    // overdueInterruptApproxMax should be set since we advanced past the interval.
+    ASSERT_TRUE(metrics1.overdueInterruptApproxMax.has_value());
+    ASSERT_GT(*metrics1.overdueInterruptApproxMax, Milliseconds(0));
+    ASSERT_EQ(metrics1.overdueInterruptApproxMax, metrics2.overdueInterruptApproxMax);
+}
+
+/**
+ * Verify that setEndOfOpMetricsForBatchWrites is a no-op when there are no batch write entries.
+ */
+TEST(CurOpTest, SetEndOfOpMetricsForBatchWritesNoOpWithoutEntries) {
+    QueryTestServiceContext serviceContext;
+    auto tickSourcePtr = serviceContext.tickSource();
+    tickSourcePtr->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    CurOp* curOp = CurOp::get(*opCtx);
+    curOp->setTickSource_forTest(tickSourcePtr);
+
+    curOp->ensureStarted();
+    tickSourcePtr->advance(Milliseconds{50});
+    curOp->done();
+
+    // No batch write entries have been created. Calling this should be a no-op and not crash.
+    curOp->setEndOfOpMetricsForBatchWrites();
+
+    // The main operation's additive metrics should not be affected.
+    auto& mainMetrics = curOp->debug().getAdditiveMetrics();
+    ASSERT_FALSE(mainMetrics.executionTime.has_value());
+}
+
+TEST(CurOpTest, AppendStagedIdLookupMetricsOmittedWhenNotPopulated) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto* curop = CurOp::get(*opCtx);
+    auto* opDebug = &curop->debug();
+
+    // The metrics should be default initialized to nullptr.
+    ASSERT_TRUE(opDebug->searchIdLookupMetrics == nullptr);
+
+    StringSet requestedFields = {
+        "idLookupSuccessRate", "docsSeenByIdLookup", "docsReturnedByIdLookup"};
+    auto makeDoc = OpDebug::appendStaged(opCtx.get(), requestedFields, /*needWholeDocument=*/false);
+    BSONObj result = makeDoc(OpDebug::AppendArgs{opCtx.get(), *opDebug, *curop});
+
+    ASSERT_TRUE(result.isEmpty()) << "Expected empty doc when searchIdLookupMetrics is null, got: "
+                                  << result;
+}
+
+TEST(CurOpTest, AppendStagedIdLookupMetricsReportedCorrectly) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto* curop = CurOp::get(*opCtx);
+    auto* opDebug = &curop->debug();
+
+    // 3 docs seen, 1 returned → success rate = 1/3.
+    std::shared_ptr<OpDebug::SearchIdLookupMetrics> metrics =
+        std::make_shared<OpDebug::SearchIdLookupMetrics>();
+    metrics->incrementDocsSeenByIdLookup();
+    metrics->incrementDocsSeenByIdLookup();
+    metrics->incrementDocsSeenByIdLookup();
+    metrics->incrementDocsReturnedByIdLookup();
+    opDebug->searchIdLookupMetrics = metrics;
+
+    StringSet requestedFields = {
+        "idLookupSuccessRate", "docsSeenByIdLookup", "docsReturnedByIdLookup"};
+    auto makeDoc = OpDebug::appendStaged(opCtx.get(), requestedFields, /*needWholeDocument=*/false);
+    BSONObj result = makeDoc(OpDebug::AppendArgs{opCtx.get(), *opDebug, *curop});
+
+    ASSERT_EQ(result["docsSeenByIdLookup"].Long(), 3LL);
+    ASSERT_EQ(result["docsReturnedByIdLookup"].Long(), 1LL);
+    ASSERT_APPROX_EQUAL(result["idLookupSuccessRate"].Double(), 1.0 / 3.0, 1e-9);
+}
+
+TEST(CurOpTest, ExecutionTimeMicrosPreservesSubMillisecondPrecision) {
+    // Use a 1-tick-per-microsecond source so the tick value equals the microsecond count.
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // CurOp treats tick value 0 as "not started", so advance past it first.
+    tickSourceMock->advance(Microseconds{1});
+
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto* curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSourceMock.get());
+
+    curop->ensureStarted();
+
+    // Advance by 500 µs — deliberately not a round millisecond multiple — to prove the value
+    // is stored at microsecond precision rather than rounded to the nearest millisecond.
+    constexpr Microseconds kElapsed{500};
+    tickSourceMock->advance(kElapsed);
+
+    curop->done();
+
+    ASSERT_EQ(curop->elapsedTimeTotal(), kElapsed);
+
+    // Verify round-trip through AdditiveMetrics BSON output.
+    OpDebug::AdditiveMetrics metrics;
+    metrics.executionTime = kElapsed;
+    BSONObj bson = metrics.reportBSON();
+
+    // "durationMicros" should be the exact microsecond count, not just millis * 1,000.
+    ASSERT_EQ(bson["durationMicros"].safeNumberLong(), durationCount<Microseconds>(kElapsed));
+    // "durationMillis" should be 0 because kElapsed < 1 ms.
+    ASSERT_EQ(bson["durationMillis"].safeNumberLong(), 0LL);
+    // The microsecond value must not be a round multiple of 1,000 (which would indicate it was
+    // derived from a millisecond value rather than stored directly).
+    ASSERT_NE(bson["durationMicros"].safeNumberLong() % 1'000, 0LL);
+}
+
+// A mock command with one redacted field, used to verify that reportState() applies the command's
+// field-level redaction (the same the slow-query log uses) to its output.
+class CurOpMockCmd : public BasicCommand {
+public:
+    CurOpMockCmd() : BasicCommand("curOpMockCmd") {}
+
+    std::set<std::string_view> sensitiveFieldNames() const final {
+        return {"field"};
+    }
+    bool run(OperationContext*, const DatabaseName&, const BSONObj&, BSONObjBuilder&) override {
+        return true;
+    }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return false;
+    }
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
+};
+
+TEST(CurOpTest, ReportStateRedactsCommandFields) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+
+    CurOpMockCmd cmd;
+    BSONObj cmdObj = BSON("curOpMockCmd" << 1 << "field"
+                                         << "value"
+                                         << "$db"
+                                         << "admin");
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curOp->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("admin.$cmd"),
+            &cmd,
+            cmdObj,
+            NetworkOp::dbQuery);
+    }
+
+    BSONObjBuilder bob;
+    curOp->reportState(&bob, SerializationContext{});
+    BSONObj state = bob.obj();
+
+    ASSERT_TRUE(state.hasField("command"));
+    BSONObj command = state["command"].Obj();
+    ASSERT_TRUE(command.hasField("field"));
+    // A field the command marks for redaction is scrubbed in the output, the
+    // same as the slow-query log.
+    ASSERT_EQ(command["field"].str(), "xxx");
+}
+
+TEST(CurOpTest, ReportStateReportsUnrecognizedCommand) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+
+    // A command op with no resolved Command* (unrecognized command).
+    BSONObj cmdObj = BSON("someUnknownCommand" << 1 << "field"
+                                               << "value"
+                                               << "$db"
+                                               << "admin");
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curOp->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("admin.$cmd"),
+            /*command*/ nullptr,
+            cmdObj,
+            NetworkOp::dbQuery);
+    }
+
+    BSONObjBuilder bob;
+    curOp->reportState(&bob, SerializationContext{});
+    BSONObj state = bob.obj();
+
+    // With no Command*, the request is reported as "unrecognized" rather than echoed, consistent
+    // with the slow-query log.
+    ASSERT_EQ(state["command"].str(), "unrecognized");
+}
+
+// A minimal StorageStats implementation so the test can populate CurOp's storage statistics
+// without depending on a storage engine. Only toBSON()/bytesRead() are exercised here.
+class MockStorageStats : public StorageStats {
+public:
+    explicit MockStorageStats(uint64_t bytesRead) : _bytesRead(bytesRead) {}
+
+    void appendToBsonObjBuilder(BSONObjBuilder& builder) const override {
+        BSONObjBuilder dataSection(builder.subobjStart("data"));
+        dataSection.append("bytesRead", static_cast<long long>(_bytesRead));
+    }
+
+    BSONObj toBSON() const override {
+        BSONObjBuilder builder;
+        appendToBsonObjBuilder(builder);
+        return builder.obj();
+    }
+
+    uint64_t bytesRead() const override {
+        return _bytesRead;
+    }
+    Microseconds readingTime() const override {
+        return Microseconds{0};
+    }
+    std::unique_ptr<StorageStats> clone() const override {
+        return std::make_unique<MockStorageStats>(_bytesRead);
+    }
+    StorageStats& operator+=(const StorageStats&) override {
+        return *this;
+    }
+    StorageStats& operator-=(const StorageStats&) override {
+        return *this;
+    }
+
+private:
+    uint64_t _bytesRead;
+};
+
+TEST(CurOpTest, ReportDebugInfoIncludesCurOpState) {
+    QueryTestServiceContext serviceContext;
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSourceMock.get());
+
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    const BSONObj command = BSON("find" << "coll");
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->setNS(lk, nss);
+        curop->setOpDescription(lk, command);
+        curop->setPlanSummary(lk, std::string{"COLLSCAN"});
+    }
+    curop->ensureStarted();
+    // Advance beyond one second so that 'secs_running' rounds to a non-zero value.
+    tickSourceMock->advance(Seconds{2});
+
+    curop->debug().planCacheShapeHash = 12345u;
+    curop->debug().planCacheKey = 67890u;
+    curop->debug().storageStats = std::make_unique<MockStorageStats>(4096);
+    curop->yielded(3);
+
+    BSONObjBuilder builder;
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportDebugInfo(&builder);
+    }
+    auto bsonObj = builder.done();
+
+    // ns
+    ASSERT_EQ(bsonObj.getStringField("ns"),
+              NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    // redacted command
+    ASSERT_TRUE(bsonObj.hasField("command"));
+    ASSERT_EQ(bsonObj["command"].Obj().firstElementFieldName(), std::string{"find"});
+    // planCacheShapeHash (formerly 'queryHash') and planCacheKey
+    ASSERT_EQ(bsonObj.getStringField("planCacheShapeHash"), zeroPaddedHex(12345u));
+    ASSERT_EQ(bsonObj.getStringField("planCacheKey"), zeroPaddedHex(67890u));
+    // planSummary
+    ASSERT_EQ(bsonObj.getStringField("planSummary"), "COLLSCAN");
+    // secs_running
+    ASSERT_EQ(bsonObj["secs_running"].numberLong(), 2);
+    // numYields
+    ASSERT_EQ(bsonObj["numYields"].numberInt(), 3);
+    // storage.data.bytesRead
+    ASSERT_EQ(bsonObj["storage"]["data"]["bytesRead"].numberLong(), 4096);
+}
+
+// Mutating the cross-thread-readable OpDebug members while another thread calls
+// reportDebugInfo() must be synchronized via lockCrossThreadDebugInfo().
+TEST(CurOpTest, ReportDebugInfoIsSynchronizedWithCrossThreadDebugInfoMutations) {
+    QueryTestServiceContext serviceContext;
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->ensureStarted();
+
+    AtomicWord<bool> stop{false};
+    std::thread writer([&] {
+        while (!stop.load()) {
+            auto debugInfoLock = curop->lockCrossThreadDebugInfo();
+            curop->debug().planCacheShapeHash = 12345u;
+            curop->debug().planCacheKey = 67890u;
+            if (curop->debug().storageStats) {
+                *curop->debug().storageStats += MockStorageStats(4096);
+            } else {
+                curop->debug().storageStats = std::make_unique<MockStorageStats>(4096);
+            }
         }
+    });
 
-    } // namespace
+    ON_BLOCK_EXIT([&] {
+        stop.store(true);
+        writer.join();
+    });
 
-} // namespace mongo
+    for (int i = 0; i < 1000; ++i) {
+        BSONObjBuilder builder;
+        // The Client lock is required to call reportDebugInfo() from another thread.
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportDebugInfo(&builder);
+        auto bsonObj = builder.done();
+        // Whatever values reportDebugInfo() observed, it must see them consistently.
+        if (bsonObj.hasField("planCacheShapeHash")) {
+            ASSERT_EQ(bsonObj.getStringField("planCacheShapeHash"), zeroPaddedHex(12345u));
+            ASSERT_EQ(bsonObj.getStringField("planCacheKey"), zeroPaddedHex(67890u));
+        }
+        if (bsonObj.hasField("storage")) {
+            ASSERT_EQ(bsonObj["storage"]["data"]["bytesRead"].numberLong(), 4096);
+        }
+    }
+}
+
+}  // namespace
+}  // namespace mongo

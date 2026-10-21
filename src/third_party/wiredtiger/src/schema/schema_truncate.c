@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,183 +9,236 @@
 #include "wt_internal.h"
 
 /*
- * __truncate_file --
- *	WT_SESSION::truncate for a file.
+ * __truncate_table --
+ *     WT_SESSION::truncate for a table.
  */
 static int
-__truncate_file(WT_SESSION_IMPL *session, const char *name)
+__truncate_table(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
 {
-	WT_DECL_RET;
-	const char *filename;
-	uint32_t allocsize;
+    WT_DECL_RET;
+    WT_TABLE *table;
+    u_int i;
 
-	filename = name;
-	if (!WT_PREFIX_SKIP(filename, "file:"))
-		return (EINVAL);
+    WT_RET(__wt_schema_get_table(session, uri, strlen(uri), false, 0, &table));
+    WT_STAT_DSRC_INCR(session, cursor_truncate);
 
-	/* Open and lock the file. */
-	WT_RET(__wt_session_get_btree(
-	    session, name, NULL, NULL, WT_DHANDLE_EXCLUSIVE));
+    /* Truncate the column groups. */
+    for (i = 0; i < WT_COLGROUPS(table); i++)
+        WT_ERR(__wt_schema_truncate(session, table->cgroups[i]->source, cfg));
 
-	/* Get the allocation size. */
-	allocsize = S2BT(session)->allocsize;
+    /* Truncate the indices. */
+    WT_ERR(__wt_schema_open_indices(session, table));
+    for (i = 0; i < table->nindices; i++)
+        WT_ERR(__wt_schema_truncate(session, table->indices[i]->source, cfg));
 
-	WT_RET(__wt_session_release_btree(session));
-
-	/* Close any btree handles in the file. */
-	WT_WITH_DHANDLE_LOCK(session,
-	    ret = __wt_conn_dhandle_close_all(session, name, 0));
-	WT_RET(ret);
-
-	/* Delete the root address and truncate the file. */
-	WT_RET(__wt_meta_checkpoint_clear(session, name));
-	WT_RET(__wt_block_manager_truncate(session, filename, allocsize));
-
-	return (0);
+err:
+    WT_TRET(__wt_schema_release_table(session, &table));
+    return (ret);
 }
 
 /*
- * __truncate_table --
- *	WT_SESSION::truncate for a table.
+ * __truncate_layered --
+ *     Truncate for a layered data source. Opens both start and stop cursors so the downstream
+ *     truncate list entry can be stored with concrete keys on both ends.
  */
 static int
-__truncate_table(WT_SESSION_IMPL *session, const char *name, const char *cfg[])
+__truncate_layered(WT_SESSION_IMPL *session, const char *uri)
 {
-	WT_DECL_RET;
-	WT_TABLE *table;
-	u_int i;
+    WT_CURSOR *start, *stop;
+    WT_DECL_RET;
 
-	WT_RET(__wt_schema_get_table(session, name, strlen(name), 0, &table));
+    start = stop = NULL;
 
-	/* Truncate the column groups. */
-	for (i = 0; i < WT_COLGROUPS(table); i++)
-		WT_ERR(__wt_schema_truncate(
-		    session, table->cgroups[i]->source, cfg));
+    WT_STAT_DSRC_INCR(session, cursor_truncate);
 
-	/* Truncate the indices. */
-	WT_ERR(__wt_schema_open_indices(session, table));
-	for (i = 0; i < table->nindices; i++)
-		WT_ERR(__wt_schema_truncate(
-		    session, table->indices[i]->source, cfg));
+    /* To bypass the truncate requiring a btree uri. */
+    WT_ERR(__wt_open_cursor(session, uri, NULL, NULL, &start));
+    WT_ERR_NOTFOUND_OK(start->next(start), true);
+    if (ret == WT_NOTFOUND) {
+        ret = 0;
+        goto done;
+    }
+    WT_ERR(__wt_open_cursor(session, uri, NULL, NULL, &stop));
+    WT_ERR(stop->prev(stop));
+    WT_ERR(__wt_session_range_truncate(session, NULL, start, stop));
 
-err:	__wt_schema_release_table(session, table);
-	return (ret);
+done:
+err:
+    if (start != NULL)
+        WT_TRET(start->close(start));
+    if (stop != NULL)
+        WT_TRET(stop->close(stop));
+    return (ret);
 }
 
 /*
  * __truncate_dsrc --
- *	WT_SESSION::truncate for a data-source without a truncate operation.
+ *     WT_SESSION::truncate for a data-source without a truncate operation.
  */
 static int
 __truncate_dsrc(WT_SESSION_IMPL *session, const char *uri)
 {
-	WT_CURSOR *cursor;
-	WT_DECL_RET;
-	const char *cfg[2];
+    WT_CURSOR *cursor;
+    WT_DECL_RET;
+    const char *cfg[2];
 
-	/* Open a cursor and traverse the object, removing every entry. */
-	cfg[0] = WT_CONFIG_BASE(session, session_open_cursor);
-	cfg[1] = NULL;
-	WT_RET(__wt_open_cursor(session, uri, NULL, cfg, &cursor));
-	while ((ret = cursor->next(cursor)) == 0)
-		WT_ERR(cursor->remove(cursor));
-	WT_ERR_NOTFOUND_OK(ret);
+    /* Open a cursor and traverse the object, removing every entry. */
+    cfg[0] = WT_CONFIG_BASE(session, WT_SESSION_open_cursor);
+    cfg[1] = NULL;
+    WT_RET(__wt_open_cursor(session, uri, NULL, cfg, &cursor));
+    while ((ret = cursor->next(cursor)) == 0)
+        WT_ERR(cursor->remove(cursor));
+    WT_ERR_NOTFOUND_OK(ret, false);
+    WT_STAT_DSRC_INCR(session, cursor_truncate);
 
-err:	WT_TRET(cursor->close(cursor));
-	return (ret);
+err:
+    WT_TRET(cursor->close(cursor));
+    return (ret);
 }
 
 /*
  * __wt_schema_truncate --
- *	WT_SESSION::truncate without a range.
+ *     WT_SESSION::truncate without a range.
  */
 int
-__wt_schema_truncate(
-    WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
+__wt_schema_truncate(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
 {
-	WT_DATA_SOURCE *dsrc;
-	WT_DECL_RET;
-	const char *tablename;
+    WT_DATA_SOURCE *dsrc;
+    WT_DECL_RET;
+    const char *tablename;
 
-	tablename = uri;
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->checkpoint_lock);
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->schema_lock);
 
-	if (WT_PREFIX_MATCH(uri, "file:")) {
-		ret = __truncate_file(session, uri);
-	} else if (WT_PREFIX_MATCH(uri, "lsm:"))
-		ret = __wt_lsm_tree_truncate(session, uri, cfg);
-	else if (WT_PREFIX_SKIP(tablename, "table:"))
-		ret = __truncate_table(session, tablename, cfg);
-	else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL)
-		ret = dsrc->truncate == NULL ?
-		    __truncate_dsrc(session, uri) :
-		    dsrc->truncate(
-		    dsrc, &session->iface, uri, (WT_CONFIG_ARG *)cfg);
-	else
-		ret = __wt_bad_object_type(session, uri);
+    WT_ASSERT_NO_SCHEMA_OP_DURING_STEP_UP(session);
 
-	/* If we didn't find a metadata entry, map that error to ENOENT. */
-	return (ret == WT_NOTFOUND ? ENOENT : ret);
+    tablename = uri;
+
+    if (WT_PREFIX_MATCH(uri, "file:"))
+        /*
+         * File truncate translates into a range truncate.
+         */
+        ret = __wt_session_range_truncate(session, uri, NULL, NULL);
+    else if (WT_PREFIX_MATCH(uri, "layered:"))
+        ret = __truncate_layered(session, uri);
+    else if (WT_PREFIX_SKIP(tablename, "table:"))
+        ret = __truncate_table(session, tablename, cfg);
+    else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL)
+        ret = dsrc->truncate == NULL ?
+          __truncate_dsrc(session, uri) :
+          dsrc->truncate(dsrc, &session->iface, uri, (WT_CONFIG_ARG *)cfg);
+    else
+        ret = __wt_bad_object_type(session, uri);
+
+    /* If we didn't find a metadata entry, map that error to ENOENT. */
+    return (ret == WT_NOTFOUND ? ENOENT : ret);
 }
 
 /*
  * __wt_range_truncate --
- *	Truncate of a cursor range, default implementation.
+ *     Truncate of a cursor range, default implementation. This truncate takes explicit cursors
+ *     rather than a truncate information structure since it is used to implement truncate for
+ *     column groups within a complex table, and those use different cursors than the API level
+ *     truncate tracks.
  */
 int
 __wt_range_truncate(WT_CURSOR *start, WT_CURSOR *stop)
 {
-	WT_DECL_RET;
-	int cmp;
+    WT_DECL_RET;
+    int cmp;
 
-	if (start == NULL) {
-		do {
-			WT_RET(stop->remove(stop));
-		} while ((ret = stop->prev(stop)) == 0);
-		WT_RET_NOTFOUND_OK(ret);
-	} else {
-		cmp = -1;
-		do {
-			if (stop != NULL)
-				WT_RET(start->compare(start, stop, &cmp));
-			WT_RET(start->remove(start));
-		} while (cmp < 0 && (ret = start->next(start)) == 0);
-		WT_RET_NOTFOUND_OK(ret);
-	}
-	return (0);
+    if (start == NULL) {
+        do {
+            WT_RET(stop->remove(stop));
+        } while ((ret = stop->prev(stop)) == 0);
+        WT_RET_NOTFOUND_OK(ret);
+    } else {
+        cmp = -1;
+        do {
+            if (stop != NULL)
+                WT_RET(start->compare(start, stop, &cmp));
+            WT_RET(start->remove(start));
+        } while (cmp < 0 && (ret = start->next(start)) == 0);
+        WT_RET_NOTFOUND_OK(ret);
+    }
+    return (0);
+}
+
+/*
+ * __layered_range_truncate --
+ *     Truncate of a cursor range, layered table implementation. The truncate-list entries require
+ *     keys to be set on both sides. Therefore resolve any NULL start/stop to the table's first/last
+ *     visible key.
+ */
+static int
+__layered_range_truncate(WT_TRUNCATE_INFO *trunc_info)
+{
+    WT_CURSOR *local_stop;
+    WT_DECL_RET;
+    WT_SESSION_IMPL *session;
+
+    session = trunc_info->session;
+    local_stop = NULL;
+
+    /* The caller always creates a start cursor and positions it. */
+    WT_ERR(__cursor_needkey(trunc_info->start));
+
+    /*
+     * If there is no given stop cursor, create a local one and position it to last key on table.
+     *
+     * FIXME-WT-17308: Remove once the session truncate starts creating local cursors.
+     */
+    if (trunc_info->stop == NULL) {
+        WT_ERR(__wt_open_cursor(session, trunc_info->uri, NULL, NULL, &local_stop));
+        WT_ERR(local_stop->prev(local_stop));
+        trunc_info->stop = local_stop;
+    }
+
+    ret = __wt_layered_truncate(trunc_info);
+
+err:
+    if (local_stop != NULL) {
+        trunc_info->stop = NULL;
+        WT_TRET(local_stop->close(local_stop));
+    }
+    return (ret);
 }
 
 /*
  * __wt_schema_range_truncate --
- *	WT_SESSION::truncate with a range.
+ *     WT_SESSION::truncate with a range.
  */
 int
-__wt_schema_range_truncate(
-    WT_SESSION_IMPL *session, WT_CURSOR *start, WT_CURSOR *stop)
+__wt_schema_range_truncate(WT_TRUNCATE_INFO *trunc_info)
 {
-	WT_CURSOR *cursor;
-	WT_DATA_SOURCE *dsrc;
-	WT_DECL_RET;
-	const char *uri;
+    WT_DATA_SOURCE *dsrc;
+    WT_DECL_RET;
+    WT_SESSION_IMPL *session;
+    const char *uri;
 
-	cursor = (start != NULL) ? start : stop;
-	uri = cursor->internal_uri;
+    session = trunc_info->session;
+    uri = trunc_info->uri;
 
-	if (WT_PREFIX_MATCH(uri, "file:")) {
-		if (start != NULL)
-			WT_CURSOR_NEEDKEY(start);
-		if (stop != NULL)
-			WT_CURSOR_NEEDKEY(stop);
-		WT_WITH_BTREE(session, ((WT_CURSOR_BTREE *)cursor)->btree,
-		    ret = __wt_btcur_range_truncate(
-			(WT_CURSOR_BTREE *)start, (WT_CURSOR_BTREE *)stop));
-	} else if (WT_PREFIX_MATCH(uri, "table:"))
-		ret = __wt_table_range_truncate(
-		    (WT_CURSOR_TABLE *)start, (WT_CURSOR_TABLE *)stop);
-	else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL &&
-	    dsrc->range_truncate != NULL)
-		ret = dsrc->range_truncate(dsrc, &session->iface, start, stop);
-	else
-		ret = __wt_range_truncate(start, stop);
+    if (WT_IS_URI_HS(uri))
+        ret = __wt_curhs_range_truncate(trunc_info);
+    else if (WT_PREFIX_MATCH(uri, "file:") && F_ISSET(session, WT_SESSION_INGEST_REPLAY))
+        ret = __wt_clayered_range_truncate_stable_replay(trunc_info);
+    else if (WT_PREFIX_MATCH(uri, "file:")) {
+        WT_ERR(__cursor_needkey(trunc_info->start));
+        if (F_ISSET(trunc_info, WT_TRUNC_EXPLICIT_STOP))
+            WT_ERR(__cursor_needkey(trunc_info->stop));
+        WT_WITH_BTREE(
+          session, CUR2BT(trunc_info->start), ret = __wt_btcur_range_truncate(trunc_info));
+    } else if (WT_PREFIX_MATCH(uri, "table:"))
+        ret = __wt_table_range_truncate(trunc_info);
+    else if (WT_PREFIX_MATCH(uri, "layered:") &&
+      (__wt_atomic_load_bool_relaxed(&S2C(session)->layered_table_manager.leader) ||
+        !FLD_ISSET(S2C(session)->debug.flags, WT_CONN_DEBUG_DISAGG_SLOW_TRUNCATE_FOLLOWER)))
+        ret = __layered_range_truncate(trunc_info);
+    else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL && dsrc->range_truncate != NULL)
+        ret = dsrc->range_truncate(dsrc, &session->iface, trunc_info->start, trunc_info->stop);
+    else
+        ret = __wt_range_truncate(trunc_info->start, trunc_info->stop);
 err:
-	return (ret);
+    return (ret);
 }

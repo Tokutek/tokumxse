@@ -1,0 +1,53 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    AuthenticateReply:
+        description: "Response for MONGODB-X509 authenticate command"
+        strict: true
+        is_command_reply: true
+        fields:
+            dbname:
+                description: "Name of the database the user is authenticating to"
+                type: "string"
+                stability: stable
+            user:
+                description: "Username"
+                type: "string"
+                stability: stable
+
+commands:
+    authenticate:
+        description: "Begin a X509 based authentication session"
+        api_version: "1"
+        access_check:
+            none: true
+        namespace: ignored
+        command_name: authenticate
+        cpp_name: AuthenticateCommand
+        reply_type: AuthenticateReply
+        strict: true
+        fields:
+            mechanism:
+                description: "Mechanism used for authentication. Should be 'MONGODB-X509'."
+                type: string
+                stability: stable
+            user:
+                description: "The user attempting to authenticate"
+                type: string
+                optional: true
+                stability: stable
+
+    logout:
+        description: "Deauthenticate from the current database"
+        command_name: logout
+        namespace: ignored
+        cpp_name: LogoutCommand
+        api_version: ""

@@ -1,0 +1,38 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::executor"
+
+server_parameters:
+    opportunisticSecondaryTargeting:
+        description: >-
+            DEPRECATED. Has no effect on server behavior.
+            Previously allowed attempting to establish connections to multiple secondaries and
+            directing the request to the first secondary that accepts the connection.
+        set_at: [startup, runtime]
+        cpp_class:
+            name: OpportunisticSecondaryTargetingParameter
+            override_set: true
+        redact: false
+
+    slowConnectionThresholdMillis:
+        description: >-
+            Log egress connections that take longer than this threshold, in milliseconds, to establish.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<long long>
+        cpp_varname: gSlowConnectionThresholdMillis
+        default: 100
+        redact: false
+
+    maxTimeMsLocalBufferTimeMillis:
+        description: >-
+            The buffer (in milliseconds) to add to the local timeouts when forwarding requests to
+            remote nodes. This ensures that remote nodes have a chance to respond with MaxTimeMSExpired
+            errors, rather than letting the timeout expire locally and churning the associated connection
+            to cancel the request.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxTimeMsLocalBufferTimeMillis
+        default: 50
+        redact: false

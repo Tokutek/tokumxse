@@ -1,0 +1,355 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_global_options_gen.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <functional>
+#include <iterator>
+
+#include <wiredtiger.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
+namespace mongo {
+
+WiredTigerConnection::WiredTigerConnection(WiredTigerKVEngineBase* engine, int32_t sessionCacheMax)
+    : WiredTigerConnection(engine->getConn(), engine->getClockSource(), sessionCacheMax, engine) {}
+
+WiredTigerConnection::WiredTigerConnection(WT_CONNECTION* conn,
+                                           ClockSource* cs,
+                                           int32_t sessionCacheMax,
+                                           WiredTigerKVEngineBase* engine)
+    : _conn(conn), _clockSource(cs), _sessionCacheMax(sessionCacheMax), _engine(engine) {
+    uassertStatusOK(_compiledConfigurations.compileAll(_conn));
+    uassert(9728400,
+            "wiredTigerCursorCacheSize parameter value must be <= 0",
+            gWiredTigerCursorCacheSize.load() <= 0);
+}
+
+WiredTigerConnection::~WiredTigerConnection() {
+    shuttingDown(ShutdownReason::kCleanShutdown);
+}
+
+void WiredTigerConnection::shuttingDown(ShutdownReason reason) {
+    const auto shutdownMask =
+        kShuttingDownMask | (reason == ShutdownReason::kCleanShutdown ? kCleanShutdownMask : 0);
+
+    // Atomically transition into shutdown and publish the shutdown reason only if this thread
+    // wins the transition, while preserving any existing blocker bits.
+    for (auto current = _shuttingDown.load();;) {
+        if (current & kShuttingDownMask) {
+            return;
+        }
+        const auto newValue = current | shutdownMask;
+        if (_shuttingDown.compareAndSwap(&current, newValue)) {
+            break;
+        }
+    }
+
+    // Spin as long as there are threads blocking shutdown.
+    while ((_shuttingDown.load() & ~kCleanShutdownMask) != kShuttingDownMask) {
+        sleepmillis(1);
+    }
+
+    closeAll(reason);
+}
+
+void WiredTigerConnection::restart() {
+    _shuttingDown.fetchAndBitAnd(~(kShuttingDownMask | kCleanShutdownMask));
+}
+
+bool WiredTigerConnection::isShuttingDown() {
+    return _shuttingDown.load() & kShuttingDownMask;
+}
+
+bool WiredTigerConnection::isCleanShuttingDown() {
+    constexpr uint32_t both = kShuttingDownMask | kCleanShutdownMask;
+    return (_shuttingDown.load() & both) == both;
+}
+
+void WiredTigerConnection::waitUntilPreparedUnitOfWorkCommitsOrAborts(Interruptible& interruptible,
+                                                                      std::uint64_t lastCount) {
+    // It is possible for a prepared transaction to block on bonus eviction inside WiredTiger after
+    // it commits or rolls-back, but this delays it from signalling us to wake up. In the very
+    // worst case that the only evictable page is the one pinned by our cursor, AND there are no
+    // other prepared transactions committing or aborting, we could reach a deadlock. Since the
+    // caller is already expecting spurious wakeups, we impose a large timeout to periodically force
+    // the caller to retry its operation.
+    const auto deadline = Date_t::max();
+    std::unique_lock<std::mutex> lk(_prepareCommittedOrAbortedMutex);
+    if (lastCount == _prepareCommitOrAbortCounter.loadRelaxed()) {
+        interruptible.waitForConditionOrInterruptUntil(
+            _prepareCommittedOrAbortedCond, lk, deadline, [&] {
+                return _prepareCommitOrAbortCounter.loadRelaxed() > lastCount;
+            });
+    }
+}
+
+void WiredTigerConnection::notifyPreparedUnitOfWorkHasCommittedOrAborted() {
+    std::unique_lock<std::mutex> lk(_prepareCommittedOrAbortedMutex);
+    _prepareCommitOrAbortCounter.fetchAndAdd(1);
+    _prepareCommittedOrAbortedCond.notify_all();
+}
+
+size_t WiredTigerConnection::getIdleSessionsCount() {
+    std::lock_guard<std::mutex> lock(_cacheLock);
+    return _sessions.size();
+}
+
+Microseconds WiredTigerConnection::getTotalEngineTime() {
+    std::lock_guard<std::mutex> lock(_cacheLock);
+    return _totalEngineTime;
+}
+
+void WiredTigerConnection::closeExpiredIdleSessions(int64_t idleTimeMillis) {
+    // Do nothing if session close idle time is set to 0 or less
+    if (idleTimeMillis <= 0) {
+        return;
+    }
+
+    auto cutoffTime = _clockSource->now() - Milliseconds(idleTimeMillis);
+
+    // Closing expired idle sessions is expensive, so do it outside of the cache mutex. This helps
+    // to avoid periodic operation latency spikes as seen in SERVER-52879.
+    SessionCache sessionsToClose;
+    {
+        std::lock_guard<std::mutex> lock(_cacheLock);
+
+        // Discard all sessions that became idle before the cutoff time
+        auto isSessionExpired = [cutoffTime](auto& session) {
+            invariant(session->getIdleExpireTime() != Date_t::min());
+            return session->getIdleExpireTime() < cutoffTime;
+        };
+        // Re-order non expired sessions to the beginning and return the position of the first
+        // expired.
+        auto it = std::partition(_sessions.begin(), _sessions.end(), std::not_fn(isSessionExpired));
+
+        // Move expired session
+        sessionsToClose.insert(sessionsToClose.end(),
+                               std::make_move_iterator(it),
+                               std::make_move_iterator(_sessions.end()));
+
+        // Erase moved sessions
+        _sessions.erase(it, _sessions.end());
+    }
+}
+
+void WiredTigerConnection::closeAll(ShutdownReason reason) {
+    SessionCache swap;
+
+    {
+        std::lock_guard<std::mutex> lock(_cacheLock);
+        switch (reason) {
+            case ShutdownReason::kCleanShutdown:
+                // Bump the engine epoch during clean shutdowns to ensure that any session or cursor
+                // checked out during shutdown are not returned to the cache.
+                _engineEpoch.fetchAndAdd(1);
+                break;
+            case ShutdownReason::kRollbackToStable:
+                // Bump the rollback to stable epoch during a rollback to stable operation.
+                // This ensures that any stale sessions are not cached and that stale cursors are
+                // closed.
+                _rtsEpoch.fetchAndAdd(1);
+                break;
+        }
+        _sessions.swap(swap);
+    }
+}
+
+bool WiredTigerConnection::isEphemeral() {
+    return _engine && _engine->isEphemeral();
+}
+
+WiredTigerManagedSession WiredTigerConnection::getSession(OperationContext& opCtx,
+                                                          const char* config) {
+    const auto isInternal = opCtx.getClient()->isInternalClient();
+    auto session = getUninterruptibleSession(config, isInternal);
+    session->attachOperationContext(opCtx);
+    return session;
+}
+
+WiredTigerManagedSession WiredTigerConnection::getUninterruptibleSession(const char* config,
+                                                                         const bool isInternal) {
+    // We should never be able to get here after _shuttingDown is set, because no new
+    // operations should be allowed to start. This invariant looks specifically for the mask to
+    // match as it also indicates that no outstanding operations are blocking shutdown.
+    invariant(_shuttingDown.load() != kShuttingDownMask);
+
+    {
+        std::lock_guard<std::mutex> lock(_cacheLock);
+        if (!_sessions.empty()) {
+            // Get the most recently used session so that if we discard sessions, we're
+            // discarding older ones
+            std::unique_ptr<WiredTigerSession> cachedSession = std::move(_sessions.back());
+            _sessions.pop_back();
+            // Reset the idle time
+            cachedSession->setIdleExpireTime(Date_t::min());
+            return WiredTigerManagedSession(std::move(cachedSession));
+        }
+    }
+
+    // Outside of the cache partition lock, but on release will be put back on the cache
+    return WiredTigerManagedSession(std::make_unique<WiredTigerSession>(
+        this, _engineEpoch.load(), _rtsEpoch.load(), config, isInternal));
+}
+
+int32_t WiredTigerConnection::getSessionCacheMax() const {
+    return _sessionCacheMax;
+}
+
+void WiredTigerConnection::_releaseSession(std::unique_ptr<WiredTigerSession> session) {
+    invariant(session);
+
+    BlockShutdown blockShutdown(this);
+    // Ensure session destructs before the blockShutdown is released.
+    // This is necessary to prevent shutdown racing with the wrapped session's destruction, as the
+    // blockShutdown guard will clean up earlier than the passed-in session otherwise.
+    ON_BLOCK_EXIT([&session] { session.reset(); });
+
+    uint64_t currentEngineEpoch = _engineEpoch.load();
+    uint64_t currentRtsEpoch = _rtsEpoch.load();
+    if (isCleanShuttingDown() || session->_getEngineEpoch() != currentEngineEpoch) {
+        invariant(session->_getEngineEpoch() <= currentEngineEpoch);
+        // There is a race condition with clean shutdown, where the storage engine is ripped
+        // from underneath OperationContexts, which are not "active" (i.e., do not have any
+        // locks), but are just about to delete the recovery unit. See SERVER-16031 for more
+        // information. Since shutting down the WT_CONNECTION will close all WT_SESSIONS, we
+        // shouldn't also try to directly close this session.
+        session->dropSessionBeforeDeleting();
+        return;
+    }
+
+    if (isShuttingDown() || session->_getRtsEpoch() != currentRtsEpoch) {
+        // The session is stale due to a rollback to stable, which leaves the WT_CONNECTION intact.
+        // Skip caching and return early: the session and its cursors must still be closed, which
+        // the session wrapper does, or WiredTiger keeps holding the data handles of their tables.
+        invariant(session->_getRtsEpoch() <= currentRtsEpoch);
+        return;
+    }
+
+    invariant(session->cursorsOut() == 0);
+    session->detachOperationContext();
+    Microseconds currentEngineTime(Microseconds::zero());
+    std::swap(currentEngineTime, session->_storageEngineTime);
+
+    {
+        // Release resources in the session we're about to cache.
+        session->closeAllCursors("");
+        invariant(session->cachedCursors() == 0);
+
+        session->resetSessionConfiguration();
+        invariantWTOK(session->reset(), *session);
+    }
+
+    // Set the time this session got idle at.
+    session->setIdleExpireTime(_clockSource->now());
+    {
+        std::lock_guard<std::mutex> lock(_cacheLock);
+
+        if (static_cast<int32_t>(_sessions.size()) < _sessionCacheMax) {
+            _sessions.emplace_back(std::move(session));
+        }
+
+        _totalEngineTime += currentEngineTime;
+    }
+
+    if (_engine) {
+        _engine->sizeStorerPeriodicFlush();
+    }
+}
+
+WT_SESSION* WiredTigerConnection::_openSession(WiredTigerSession* session,
+                                               WT_EVENT_HANDLER* handler,
+                                               const char* config) {
+    return _openSessionInternal(session, handler, config, _conn);
+}
+
+WT_SESSION* WiredTigerConnection::_openSession(WiredTigerSession* session,
+                                               WT_EVENT_HANDLER* handler,
+                                               StatsCollectionPermit& permit,
+                                               const char* config) {
+    invariant(permit.conn());
+    invariant(handler);
+    return _openSessionInternal(session, handler, config, permit.conn());
+}
+
+WT_SESSION* WiredTigerConnection::_openSession(WiredTigerSession* session,
+                                               StatsCollectionPermit& permit,
+                                               const char* config) {
+    invariant(permit.conn());
+    return _openSessionInternal(session, nullptr, config, permit.conn());
+}
+
+WT_SESSION* WiredTigerConnection::_openSessionInternal(WiredTigerSession* session,
+                                                       WT_EVENT_HANDLER* handler,
+                                                       const char* config,
+                                                       WT_CONNECTION* conn) {
+    WT_SESSION* rawSession;
+
+    _incrementSessionCount(session->isInternalSession());
+    ScopeGuard rollback([&] { _decrementSessionCount(session->isInternalSession()); });
+
+    const auto sessionMax = wiredTigerGlobalOptions.sessionMax;
+    uassert(10828100,
+            str::stream() << "Exceeded configured WiredTiger session_max=" << sessionMax
+                          << " while opening a WiredTiger session",
+            _openSessions.loadRelaxed() <= sessionMax);
+
+
+    const auto reserved = wiredTigerGlobalOptions.reservedSessionMax;
+    const auto maxOpenUserSession = sessionMax - reserved;
+    if ((!session->isInternalSession()) && (_openUserSessions.loadRelaxed() > maxOpenUserSession)) {
+        uasserted(10828101,
+                  str::stream() << "Exceeded configured maximum WiredTiger user session "
+                                << "wiredTigerReservedSessionMax=" << reserved
+                                << " while opening a WiredTiger user session");
+    }
+
+    uassert(8268800,
+            "Failed to open a session",
+            conn->open_session(conn, handler, config, &rawSession) == 0);
+
+    rollback.dismiss();
+
+    return rawSession;
+}
+
+void WiredTigerConnection::_closeSession(const bool isInternalSession) {
+    _decrementSessionCount(isInternalSession);
+}
+
+void WiredTigerConnection::_incrementSessionCount(const bool isInternalSession) {
+    _openSessions.fetchAndAdd(1);
+
+    if (!isInternalSession) {
+        _openUserSessions.fetchAndAdd(1);
+    }
+}
+
+void WiredTigerConnection::_decrementSessionCount(const bool isInternalSession) {
+    _openSessions.fetchAndSubtractRelaxed(1);
+
+    if (!isInternalSession) {
+        _openUserSessions.fetchAndSubtractRelaxed(1);
+    }
+}
+
+}  // namespace mongo

@@ -1,0 +1,340 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/rpc/message.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+#include <stack>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class AScopedConnection;
+class DBClientBase;
+
+class AggregateCommandRequest;
+
+/**
+ * The internal client's cursor representation for find or agg cursors. The cursor is iterated by
+ * the caller using the 'more()' and 'next()' methods. Any necessary getMore requests are
+ * constructed and issued internally. The cursor is killed when the object is destroyed unless:
+ * - The caller set 'keepCursorOpen' to true. The cursor is expected to be killed by the caller when
+ *   it is no longer needed.
+ * - The client used to created the cursor has been interrupted.
+ * - The last command (find, aggregate or getMore) returned an error that indicated the cursor is no
+ *   longer open on the server side.
+ */
+class [[MONGO_MOD_PUBLIC]] DBClientCursor {
+    DBClientCursor(const DBClientCursor&) = delete;
+    DBClientCursor& operator=(const DBClientCursor&) = delete;
+
+public:
+    /**
+     * Constructs a 'DBClientCursor' that will be opened by issuing the aggregate command described
+     * by 'aggRequest'.
+     */
+    static StatusWith<std::unique_ptr<DBClientCursor>> fromAggregationRequest(
+        DBClientBase* client,
+        const AggregateCommandRequest& aggRequest,
+        bool secondaryOk,
+        bool useExhaust,
+        bool keepCursorOpen = false);
+
+    /**
+     * Constructs a 'DBClientCursor' that will be opened by issuing the find command described by
+     * 'findRequest'.
+     */
+    DBClientCursor(DBClientBase* client,
+                   FindCommandRequest findRequest,
+                   const ReadPreferenceSetting& readPref,
+                   bool isExhaust,
+                   bool keepCursorOpen = false);
+
+    /**
+     * Constructs a 'DBClientCursor' from a pre-existing cursor id.
+     */
+    DBClientCursor(DBClientBase* client,
+                   const NamespaceStringOrUUID& nsOrUuid,
+                   long long cursorId,
+                   bool isExhaust,
+                   std::vector<BSONObj> initialBatch = {},
+                   boost::optional<Timestamp> operationTime = boost::none,
+                   boost::optional<BSONObj> postBatchResumeToken = boost::none,
+                   bool keepCursorOpen = false);
+
+    virtual ~DBClientCursor();
+
+    /**
+     * If true, safe to call next(). Requests more from server if necessary.
+     */
+    virtual bool more();
+
+    bool hasMoreToCome() const {
+        tassert(9279700, "Cursor is not initialized", _isInitialized);
+        return _connectionHasPendingReplies;
+    }
+
+    /**
+     * If true, there is more in our local buffers to be fetched via next(). Returns false when a
+     * getMore request back to server would be required. You can use this if you want to exhaust
+     * whatever data has been fetched to the client already but then perhaps stop.
+     */
+    int objsLeftInBatch() const {
+        tassert(9279701, "Cursor is not initialized", _isInitialized);
+        return _batch.objs.size() - _batch.pos;
+    }
+
+    bool moreInCurrentBatch() {
+        return objsLeftInBatch() > 0;
+    }
+
+    /**
+     * Returns the next object from the cursor.
+     *
+     * On error at the remote server, you will get back:
+     *    {$err: <std::string>
+     *
+     * If you do not want to handle that yourself, call 'nextSafe()'.
+     */
+    virtual BSONObj next();
+
+    /**
+     * Similar to 'next()', but throws an AssertionException on error.
+     */
+    BSONObj nextSafe();
+
+    /**
+     * Peek ahead at items buffered for future next() calls. Never requests new data from the
+     * server.
+     */
+    void peek(std::vector<BSONObj>&, int atMost) const;
+
+    /**
+     * Peeks at first element. If no first element exists, returns an empty object.
+     */
+    BSONObj peekFirst() const;
+
+    /**
+     * peek ahead and see if an error occurred, and get the error if so.
+     */
+    bool peekError(BSONObj* error = nullptr) const;
+
+    /**
+     * Iterates the rest of the cursor and returns the resulting number if items.
+     */
+    int itcount() {
+        int c = 0;
+        while (more()) {
+            next();
+            c++;
+        }
+        return c;
+    }
+
+    /**
+     * Returns true if the cursor is no longer open on the remote node (the remote node has returned
+     * a cursor id of zero).
+     */
+    bool isDead() const {
+        return _cursorId == 0;
+    }
+
+    bool wasError() const {
+        return _wasError;
+    }
+
+    bool isInitialized() const {
+        return _isInitialized;
+    }
+
+    bool tailable() const {
+        return _findRequest && _findRequest->getTailable();
+    }
+
+    bool tailableAwaitData() const {
+        return tailable() && _findRequest->getAwaitData();
+    }
+
+    bool isExhaust() const {
+        return _isExhaust;
+    }
+
+    /**
+     * Changes the cursor's batchSize after construction. Can change after requesting first batch.
+     */
+    void setBatchSize(int newBatchSize) {
+        _batchSize = newBatchSize;
+    }
+
+    long long getCursorId() const {
+        return _cursorId;
+    }
+
+    void attach(AScopedConnection* conn);
+
+    std::string originalHost() const {
+        return _originalHost;
+    }
+
+    const NamespaceString& getNamespaceString() const {
+        return _ns;
+    }
+
+    /**
+     * Performs the initial query, opening the cursor.
+     */
+    bool init();
+
+    /**
+     * Marks this object as dead and sends the KillCursors message to the server.
+     *
+     * Any errors that result from this are swallowed since this is typically performed as part of
+     * cleanup and a failure to kill the cursor should not result in a failure of the operation
+     * using the cursor.
+     *
+     * Killing an already killed or exhausted cursor does nothing, so it is safe to always call this
+     * if you want to ensure that a cursor is killed.
+     */
+    void kill();
+
+    /**
+     * Returns true if the connection this cursor is using has pending replies.
+     *
+     * If true, you should not try to use the connection for any other purpose or return it to a
+     * pool.
+     *
+     * This can happen if an exhaust query was started but not completed.
+     */
+    bool connectionHasPendingReplies() const {
+        return _connectionHasPendingReplies;
+    }
+
+    Milliseconds getAwaitDataTimeoutMS() const {
+        return _awaitDataTimeout;
+    }
+
+    void setAwaitDataTimeoutMS(Milliseconds timeout) {
+        // It only makes sense to set awaitData timeout if the cursor is in tailable awaitData mode.
+        tassert(9279703, "Cursor is not in tailable awaitData mode", tailableAwaitData());
+        _awaitDataTimeout = timeout;
+    }
+
+    // Only used for tailable awaitData oplog fetching requests.
+    void setCurrentTermAndLastCommittedOpTime(
+        const boost::optional<long long>& term,
+        const boost::optional<repl::OpTime>& lastCommittedOpTime) {
+        tassert(9279704, "Cursor is not in tailable awaitData mode", tailableAwaitData());
+        _term = term;
+        _lastKnownCommittedOpTime = lastCommittedOpTime;
+    }
+
+    /**
+     * Returns the resume token for the latest batch, it set.
+     */
+    virtual boost::optional<BSONObj> getPostBatchResumeToken() const {
+        return _postBatchResumeToken;
+    }
+
+    /**
+     * Returns the operation time for the latest batch, if set.
+     */
+    virtual boost::optional<Timestamp> getOperationTime() const {
+        return _operationTime;
+    }
+
+protected:
+    struct Batch {
+        // TODO remove constructors after c++17 toolchain upgrade
+        Batch() = default;
+        Batch(std::vector<BSONObj> initial, size_t initialPos = 0)
+            : objs(std::move(initial)), pos(initialPos) {}
+        std::vector<BSONObj> objs;
+        size_t pos = 0;
+    };
+
+    Batch _batch;
+
+private:
+    void dataReceived(const Message& reply) {
+        bool retry;
+        std::string lazyHost;
+        dataReceived(reply, retry, lazyHost);
+    }
+    void dataReceived(const Message& reply, bool& retry, std::string& lazyHost);
+
+    /**
+     * Parses and returns command replies regardless of which command protocol was used.
+     * Does *not* parse replies from non-command OP_QUERY finds.
+     */
+    BSONObj commandDataReceived(const Message& reply);
+
+    void requestMore();
+
+    void exhaustReceiveMore();
+
+    Message assembleInit();
+    Message assembleGetMore();
+
+    DBClientBase* _client;
+    std::string _originalHost;
+    NamespaceStringOrUUID _nsOrUuid;
+
+    // In order to fully initialize a DBClientCursor object, one must first call its constructor
+    // and then subsequently call DBClientCursor::init().
+    bool _isInitialized = false;
+
+    // 'ns' is initially the NamespaceString passed in, or the dbName if doing a find by UUID.
+    // After a successful 'find' command, 'ns' is updated to contain the namespace returned by that
+    // command.
+    NamespaceString _ns;
+
+    long long _cursorId = 0;
+
+    std::string _scopedHost;
+    bool _wasError = false;
+    bool _connectionHasPendingReplies = false;
+    int _lastRequestId = 0;
+    bool _lastRequestHadMoreToCome = false;
+
+    int _batchSize = 0;
+
+    // A description of the find command provided by the caller which is used to open the cursor.
+    //
+    // Has a value of boost::none if the caller constructed this cursor using a pre-existing cursor
+    // id.
+    boost::optional<FindCommandRequest> _findRequest;
+
+    ReadPreferenceSetting _readPref;
+    bool _isExhaust;
+
+    Milliseconds _awaitDataTimeout = Milliseconds{0};
+    boost::optional<long long> _term;
+    boost::optional<repl::OpTime> _lastKnownCommittedOpTime;
+    boost::optional<Timestamp> _operationTime;
+    boost::optional<BSONObj> _postBatchResumeToken;
+    // If set to true, the cursor will not be killed when the 'DBClientCursor' is destroyed.
+    const bool _keepCursorOpen;
+};
+
+}  // namespace mongo

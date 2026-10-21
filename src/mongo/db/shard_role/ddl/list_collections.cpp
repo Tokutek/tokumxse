@@ -1,0 +1,823 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/queued_data_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/global_catalog/ddl/shuffle_list_command_results.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/client_cursor/clientcursor.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_manager.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_enabled.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/ddl/list_collections_filter.h"
+#include "mongo/db/shard_role/ddl/list_collections_gen.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog_helper.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/version_context.h"
+#include "mongo/db/views/view.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <iosfwd>
+#include <limits>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+
+using std::string;
+using std::stringstream;
+using std::unique_ptr;
+using std::vector;
+
+namespace {
+
+// Failpoint which causes to hang "listCollections" cmd after acquiring the DB lock.
+MONGO_FAIL_POINT_DEFINE(hangBeforeListCollections);
+
+/**
+ * Determines if 'matcher' is an exact match on the "name" field. If so, returns a vector of all
+ * the collection names it is matching against. Returns {} if there is no obvious exact match on
+ * name.
+ *
+ * Note the collection names returned are not guaranteed to exist, nor are they guaranteed to
+ * match 'matcher'.
+ */
+boost::optional<vector<std::string_view>> _getExactNameMatches(const MatchExpression* matcher) {
+    if (!matcher) {
+        return {};
+    }
+
+    MatchExpression::MatchType matchType(matcher->matchType());
+    if (matchType == MatchExpression::EQ) {
+        auto eqMatch = checked_cast<const EqualityMatchExpression*>(matcher);
+        if (eqMatch->path() == "name") {
+            std::string_view name(eqMatch->getData().valueStringDataSafe());
+            if (name.size()) {
+                return {vector<std::string_view>{name}};
+            } else {
+                return vector<std::string_view>();
+            }
+        }
+    } else if (matchType == MatchExpression::MATCH_IN) {
+        auto matchIn = checked_cast<const InMatchExpression*>(matcher);
+        if (matchIn->path() == "name" && matchIn->getRegexes().empty()) {
+            vector<std::string_view> exactMatches;
+            for (auto&& elem : matchIn->getEqualities()) {
+                std::string_view name(elem.valueStringDataSafe());
+                if (name.size()) {
+                    exactMatches.push_back(elem.valueStringData());
+                }
+            }
+            return {std::move(exactMatches)};
+        }
+    }
+    return {};
+}
+
+// Carries replicated fast count emission state through a single listCollections response. The fast
+// count timestamp store is a singleton, so it is read once for the whole response and emitted on
+// the first eligible collection that is actually returned to the client. This type makes the three
+// possible states explicit:
+//   - disabled():           the feature is off (or rawData was not requested); no fast count fields
+//                           are emitted for any collection.
+//   - enabled(ts), pending: the feature is on; 'ts' (boost::none for an empty store) still needs to
+//                           be emitted on an eligible collection.
+//   - enabled, consumed:    the timestamp store value was already emitted on an earlier collection
+//                           that passed the matcher, and must not be repeated.
+//
+// Consumption is deliberately deferred until a collection entry carrying the timestamp passes the
+// matcher in _addWorkingSetMember. Building a collection's BSON only reads the pending value
+// (getTimestampStoreTs); _addWorkingSetMember consumes it once a doc carrying the timestamp clears
+// the matcher. If that entry is instead filtered out, the timestamp remains pending so the next
+// eligible, matching collection can emit it.
+class FastCountListCollectionsState {
+public:
+    static FastCountListCollectionsState disabled() {
+        return FastCountListCollectionsState{};
+    }
+
+    static FastCountListCollectionsState enabled(boost::optional<Timestamp> timestampStoreTs) {
+        FastCountListCollectionsState state;
+        state._enabled = true;
+        state._timestampStoreTs = timestampStoreTs;
+        return state;
+    }
+
+    bool isEnabled() const {
+        return _enabled;
+    }
+
+    bool isConsumed() const {
+        return _consumed;
+    }
+
+    // Returns the pending timestamp store value, or boost::none if the feature is disabled, the
+    // store was empty, or the value has already been consumed by an earlier collection entry. This
+    // is a pure read and does not mark the value as consumed.
+    boost::optional<Timestamp> getTimestampStoreTs() const {
+        if (_consumed || !_enabled) {
+            return boost::none;
+        }
+        return _timestampStoreTs;
+    }
+
+    // Marks the timestamp as consumed so future calls to getTimestampStoreTs() return boost::none.
+    // Called from _addWorkingSetMember once we know the entry carrying the timestamp passed the
+    // matcher and will appear in the listCollections output, enforcing that it is included once.
+    void consume() {
+        _consumed = true;
+    }
+
+private:
+    bool _enabled = false;
+    bool _consumed = false;
+    boost::optional<Timestamp> _timestampStoreTs;
+};
+
+/**
+ * Uses 'matcher' to determine if the collection's information should be added to 'root'. If so,
+ * allocates a WorkingSetMember containing information about 'collection', and adds it to
+ * 'results'.
+ *
+ * Does not add any information about non-existent collections.
+ *
+ * If 'maybe' carries the replicated fast count timestamp store value, that value is marked consumed
+ * only once 'maybe' has passed the matcher and is being added to 'results'. This guarantees the
+ * singleton timestamp is not lost on an entry that the matcher filters out. View and timeseries
+ * entries pass a disabled state and never carry the timestamp, so they never consume it.
+ */
+void _addWorkingSetMember(OperationContext* opCtx,
+                          const BSONObj& maybe,
+                          const MatchExpression* matcher,
+                          WorkingSet* ws,
+                          std::vector<WorkingSetID>& results,
+                          FastCountListCollectionsState& fastCountState) {
+    if (matcher && !exec::matcher::matchesBSON(matcher, maybe)) {
+        return;
+    }
+
+    if (fastCountState.isEnabled() && !fastCountState.isConsumed() &&
+        maybe.getObjectField("info").getObjectField("fastCount").hasField("timestampStoreTs")) {
+        fastCountState.consume();
+    }
+
+    WorkingSetID id = ws->allocate();
+    WorkingSetMember* member = ws->get(id);
+    member->keyData.clear();
+    member->recordId = RecordId();
+    member->resetDocument(SnapshotId(), maybe);
+    member->transitionToOwnedObj();
+    results.emplace_back(std::move(id));
+}
+
+// 'fastCountState' carries the replicated fast count emission state for the whole listCollections
+// response (see FastCountListCollectionsState). Views (including viewful timeseries views) entries
+// pass a disabled state; only the collection path passes an enabled one. The pending timestamp
+// store value is emitted here but not consumed; _addWorkingSetMember consumes it once this entry
+// passes the matcher.
+BSONObj buildInfoField(OperationContext* opCtx,
+                       bool readOnly,
+                       const NamespaceString& nss,
+                       boost::optional<UUID> uuid,
+                       boost::optional<bool> recordIdsReplicated,
+                       const FastCountListCollectionsState& fastCountState) {
+    BSONObjBuilder infoBuilder;
+    infoBuilder.append("readOnly", readOnly);
+    if (uuid) {
+        infoBuilder.appendElements(uuid->toBSON());
+    }
+
+    // TODO SERVER-122753 Not returning recordIdsReplicated when the persintence provider
+    // requires it (DSC).
+    const auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+    if (!provider.shouldUseReplicatedRecordIds() && recordIdsReplicated.get_value_or(false)) {
+        infoBuilder.appendBool("recordIdsReplicated", true);
+    }
+
+    if (const auto configDebugDump =
+            catalog::getConfigDebugDump(VersionContext::getDecoration(opCtx), nss);
+        configDebugDump.has_value()) {
+        infoBuilder.append("configDebugDump", *configDebugDump);
+    }
+
+    // Emit replicated fast count metadata so initial sync clients can seed local stores
+    // before applying oplog entries. Restrict to fast count eligible namespaces only.
+    // fastCountState.enabled() is true iff the caller (typedRun) already verified rawData was
+    // requested and the feature flags are enabled, so this check doubles as the feature-enabled
+    // gate with no per-collection FCV snapshot acquisition.
+    if (fastCountState.isEnabled() && uuid && isReplicatedFastCountEligible(nss)) {
+        auto& mgr =
+            replicated_fast_count::ReplicatedFastCountManager::get(opCtx->getServiceContext());
+        const auto entry = mgr.findPersisted(opCtx, *uuid);
+        // The timestamp store is a singleton; it is emitted on one eligible collection entry. Only
+        // read the pending value here; the caller marks it consumed once this entry passes the
+        // matcher (see _addWorkingSetMember), so it is not lost if the entry is filtered out.
+        const auto timestampStoreTs = fastCountState.getTimestampStoreTs();
+        if (entry || timestampStoreTs) {
+            BSONObjBuilder fastCountBuilder(infoBuilder.subobjStart("fastCount"));
+            if (entry) {
+                const auto& [metadata, validAsOf] = *entry;
+                fastCountBuilder.append("size", metadata.sizeCount.size);
+                fastCountBuilder.append("count", metadata.sizeCount.count);
+                fastCountBuilder.append("validAsOf", validAsOf);
+            }
+            if (timestampStoreTs) {
+                fastCountBuilder.append("timestampStoreTs", *timestampStoreTs);
+            }
+        }
+    }
+    return infoBuilder.obj();
+}
+
+BSONObj buildViewBson(OperationContext* opCtx, const ViewDefinition& view, bool nameOnly) {
+    invariant(!view.timeseries());
+
+    BSONObjBuilder b;
+    b.append("name", view.name().coll());
+    b.append("type", "view");
+
+    if (nameOnly) {
+        return b.obj();
+    }
+
+    BSONObjBuilder optionsBuilder(b.subobjStart("options"));
+    optionsBuilder.append("viewOn", view.viewOn().coll());
+    optionsBuilder.append("pipeline", view.pipeline());
+    if (view.defaultCollator()) {
+        optionsBuilder.append("collation", view.defaultCollator()->getSpec().toBSON());
+    }
+    optionsBuilder.doneFast();
+
+    b.append("info",
+             buildInfoField(opCtx,
+                            true /*readOnly*/,
+                            view.name(),
+                            boost::none /*uuid*/,
+                            boost::none /*recordIdsReplicated*/,
+                            FastCountListCollectionsState::disabled()));
+    return b.obj();
+}
+
+BSONObj buildTimeseriesBson(OperationContext* opCtx, const Collection* collection, bool nameOnly) {
+    invariant(collection);
+
+    BSONObjBuilder builder;
+    builder.append("name", collection->ns().getTimeseriesViewNamespace().coll());
+    builder.append("type", "timeseries");
+
+    if (nameOnly) {
+        return builder.obj();
+    }
+
+    builder.append("options",
+                   collection->getCollectionOptions().toBSON(
+                       false /* includeUUID */, timeseries::kAllowedCollectionCreationOptions));
+    builder.append("info",
+                   buildInfoField(opCtx,
+                                  opCtx->readOnly(),
+                                  collection->ns(),
+                                  boost::none /*uuid*/,
+                                  boost::none /*recordIdsReplicated*/,
+                                  FastCountListCollectionsState::disabled()));
+    return builder.obj();
+}
+
+BSONObj buildTimeseriesBson(OperationContext* opCtx, const NamespaceString& nss, bool nameOnly) {
+    BSONObjBuilder builder;
+    builder.append("name", nss.coll());
+    builder.append("type", "timeseries");
+
+    if (nameOnly) {
+        return builder.obj();
+    }
+
+    builder.append("options", BSONObj{});
+    builder.append("info",
+                   buildInfoField(opCtx,
+                                  opCtx->readOnly(),
+                                  nss,
+                                  boost::none /*uuid*/,
+                                  boost::none /*recordIdsReplicated*/,
+                                  FastCountListCollectionsState::disabled()));
+
+    return builder.obj();
+}
+
+/**
+ * Return an object describing the collection. Takes a collection lock if nameOnly is false.
+ */
+BSONObj buildCollectionBson(OperationContext* opCtx,
+                            const Collection* collection,
+                            bool nameOnly,
+                            bool isRawData,
+                            const FastCountListCollectionsState& fastCountState) {
+    if (!collection) {
+        return {};
+    }
+    const auto& nss = collection->ns();
+
+    BSONObjBuilder b;
+    b.append("name", nss.coll());
+
+    const auto showAsTimeseries = collection->isTimeseriesCollection() &&
+        collection->isNewTimeseriesWithoutView() && !isRawData;
+    const auto collectionType = [&] {
+        if (showAsTimeseries) {
+            return "timeseries";
+        } else {
+            return "collection";
+        }
+    }();
+
+    b.append("type", collectionType);
+
+    if (nameOnly) {
+        return b.obj();
+    }
+
+    const auto& options = collection->getCollectionOptions();
+    const auto& includeOptionsFields = [&]() -> auto& {
+        if (showAsTimeseries) {
+            return timeseries::kAllowedCollectionCreationOptions;
+        } else {
+            static const StringDataSet INCLUDE_ALL_OPTIONS = {};
+            return INCLUDE_ALL_OPTIONS;
+        }
+    }();
+
+    // While the UUID is stored as a collection option, from the user's perspective it is an
+    // unsettable read-only property, so put it in the 'info' section. Pass 'false' to toBSON so
+    // it doesn't include 'uuid' here.
+    b.append("options", options.toBSON(false /* includeUUID */, includeOptionsFields));
+    b.append("info",
+             buildInfoField(opCtx,
+                            opCtx->readOnly(),
+                            collection->ns(),
+                            options.uuid,
+                            collection->areRecordIdsReplicated(),
+                            fastCountState));
+
+    auto idIndex = collection->getIndexCatalog()->findIdIndex(opCtx);
+    if (idIndex) {
+        b.append("idIndex", idIndex->descriptor()->infoObj());
+    }
+
+    return b.obj();
+}
+
+ListCollectionsReply createListCollectionsCursorReply(
+    CursorId cursorId,
+    const NamespaceString& cursorNss,
+    const SerializationContext& respSerializationContext,
+    std::vector<mongo::ListCollectionsReplyItem>&& firstBatch) {
+    return ListCollectionsReply(
+        ListCollectionsReplyCursor(
+            cursorId, cursorNss, std::move(firstBatch), respSerializationContext),
+        respSerializationContext);
+}
+
+class CmdListCollections : public ListCollectionsCmdVersion1Gen<CmdListCollections> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kOptIn;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool maintenanceOk() const final {
+        return false;
+    }
+
+    bool adminOnly() const final {
+        return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    std::string help() const final {
+        return "list collections for this db";
+    }
+
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return false;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        bool supportsRawData() const final {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
+            uassertStatusOK(authzSession->checkAuthorizedToListCollections(request()));
+        }
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
+
+        Reply typedRun(OperationContext* opCtx) final {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            unique_ptr<MatchExpression> matcher;
+            const auto as = AuthorizationSession::get(opCtx->getClient());
+
+            const auto listCollRequest = request();
+            const auto dbName = listCollRequest.getDbName();
+            const bool nameOnly = listCollRequest.getNameOnly();
+            const bool authorizedCollections = listCollRequest.getAuthorizedCollections();
+            const bool isRawData = isRawDataOperation(opCtx);
+
+            // We need to copy the serialization context from the request to the reply object
+            const auto respSerializationContext =
+                SerializationContext::stateCommandReply(listCollRequest.getSerializationContext());
+
+            // The collator is null because collection objects are compared using binary
+            // comparison.
+            auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(ns()).build();
+
+            if (listCollRequest.getFilter()) {
+                matcher = uassertStatusOK(
+                    MatchExpressionParser::parse(*listCollRequest.getFilter(), expCtx));
+            }
+
+            const NamespaceString cursorNss = NamespaceString::makeListCollectionsNSS(dbName);
+            std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
+            std::vector<mongo::ListCollectionsReplyItem> firstBatch;
+            boost::optional<Reply> exhaustiveListCollectionsReply = writeConflictRetry(
+                opCtx, "listCollections", NamespaceString(dbName), [&]() -> boost::optional<Reply> {
+                    // Reset state so retries start fresh.
+                    exec.reset();
+                    firstBatch.clear();
+
+                    // Acquire only the global lock and set up a consistent in-memory catalog and
+                    // storage snapshot.
+                    AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, dbName);
+                    auto catalog = CollectionCatalog::get(opCtx);
+
+                    // The replicated fast count timestamp store is a singleton, so read it a single
+                    // time for the whole response; buildCollectionBson emits it on the first
+                    // eligible collection. Only emit the metadata for rawData requests (initial
+                    // sync, the sole consumer, sets rawData) to avoid changing the user-facing
+                    // listCollections output and to limit the added per-collection reads.
+                    auto fastCountState = FastCountListCollectionsState::disabled();
+                    if (isRawData && isReplicatedFastCountListCollectionsEnabled(opCtx)) {
+                        fastCountState = FastCountListCollectionsState::enabled(
+                            replicated_fast_count::ReplicatedFastCountManager::get(
+                                opCtx->getServiceContext())
+                                .findPersistedTimestampStoreTs(opCtx));
+                    }
+
+                    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                        &hangBeforeListCollections,
+                        opCtx,
+                        "hangBeforeListCollections",
+                        []() {},
+                        cursorNss);
+
+                    auto ws = std::make_unique<WorkingSet>();
+                    auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
+                    std::vector<WorkingSetID> results;
+                    tassert(
+                        9089302,
+                        "point in time catalog lookup for a collection list is not supported",
+                        RecoveryUnit::ReadSource::kNoTimestamp ==
+                            shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource());
+
+                    if (DatabaseHolder::get(opCtx)->dbExists(opCtx, dbName)) {
+                        if (auto collNames = _getExactNameMatches(matcher.get())) {
+                            for (auto&& collName : *collNames) {
+                                auto nss = NamespaceStringUtil::deserialize(dbName, collName);
+
+                                // Only validate on a per-collection basis if the user requested
+                                // a list of authorized collections
+                                if (authorizedCollections &&
+                                    (!as->isAuthorizedForAnyActionOnResource(
+                                        ResourcePattern::forExactNamespace(nss)))) {
+                                    continue;
+                                }
+
+                                auto collBson = [&] {
+                                    auto collection = catalog->establishConsistentCollection(
+                                        opCtx, nss, boost::none);
+                                    if (collection) {
+                                        return buildCollectionBson(opCtx,
+                                                                   collection.get(),
+                                                                   nameOnly,
+                                                                   isRawData,
+                                                                   fastCountState);
+                                    }
+
+                                    std::shared_ptr<const ViewDefinition> view =
+                                        catalog->lookupView(opCtx, nss);
+                                    // TODO SERVER-101594: remove this once 9.0 becomes last LTS
+                                    // legacy timeseries view won't exist anymore.
+                                    if (view && view->timeseries()) {
+                                        if (auto bucketsCollection =
+                                                catalog->establishConsistentCollection(
+                                                    opCtx, view->viewOn(), boost::none)) {
+                                            return buildTimeseriesBson(
+                                                opCtx, bucketsCollection.get(), nameOnly);
+                                        } else {
+                                            // The buckets collection does not exist, so the
+                                            // time-series view will be appended when we iterate
+                                            // through the view catalog below.
+                                        }
+                                    }
+
+                                    return BSONObj{};
+                                }();
+
+                                if (!collBson.isEmpty()) {
+                                    _addWorkingSetMember(opCtx,
+                                                         collBson,
+                                                         matcher.get(),
+                                                         ws.get(),
+                                                         results,
+                                                         fastCountState);
+                                }
+                            }
+                        } else {
+                            auto perCollectionWork = [&](const Collection* collection) {
+                                // TODO SERVER-101594: remove this once 9.0 becomes last LTS
+                                // buckets collection ('system.buckets') won't exist anymore.
+                                if (collection->isTimeseriesCollection() &&
+                                    !collection->isNewTimeseriesWithoutView()) {
+                                    auto viewNss = collection->ns().getTimeseriesViewNamespace();
+                                    auto view =
+                                        catalog->lookupViewWithoutValidatingDurable(opCtx, viewNss);
+                                    if (view && view->timeseries() &&
+                                        (!authorizedCollections ||
+                                         as->isAuthorizedForAnyActionOnResource(
+                                             ResourcePattern::forExactNamespace(viewNss)))) {
+                                        // The time-series view for this buckets namespace exists,
+                                        // so add it here while we have the collection options.
+                                        _addWorkingSetMember(
+                                            opCtx,
+                                            buildTimeseriesBson(opCtx, collection, nameOnly),
+                                            matcher.get(),
+                                            ws.get(),
+                                            results,
+                                            fastCountState);
+                                    }
+                                }
+
+                                if (authorizedCollections &&
+                                    (!as->isAuthorizedForAnyActionOnResource(
+                                        ResourcePattern::forExactNamespace(collection->ns())))) {
+                                    return true;
+                                }
+
+                                BSONObj collBson = buildCollectionBson(
+                                    opCtx, collection, nameOnly, isRawData, fastCountState);
+                                if (!collBson.isEmpty()) {
+                                    _addWorkingSetMember(opCtx,
+                                                         collBson,
+                                                         matcher.get(),
+                                                         ws.get(),
+                                                         results,
+                                                         fastCountState);
+                                }
+
+                                return true;
+                            };
+
+                            auto collections =
+                                catalog->establishConsistentCollections(opCtx, dbName);
+                            for (const auto& collection : collections) {
+                                perCollectionWork(collection.get());
+                            }
+                        }
+
+                        // Skipping views is only necessary for internal cloning operations.
+                        // Skip views if filter matches makeTypeCollectionFilter() or
+                        // makeExcludeViewsFilter().
+                        bool skipViews = false;
+                        if (listCollRequest.getFilter()) {
+                            const auto& filter = *listCollRequest.getFilter();
+                            skipViews =
+                                SimpleBSONObjComparator::kInstance.evaluate(
+                                    filter == ListCollectionsFilter::makeTypeCollectionFilter()) ||
+                                SimpleBSONObjComparator::kInstance.evaluate(
+                                    filter == ListCollectionsFilter::makeExcludeViewsFilter());
+                        }
+
+                        if (!skipViews) {
+                            catalog->iterateViews(opCtx, dbName, [&](const ViewDefinition& view) {
+                                if (authorizedCollections &&
+                                    !as->isAuthorizedForAnyActionOnResource(
+                                        ResourcePattern::forExactNamespace(view.name()))) {
+                                    return true;
+                                }
+
+                                // TODO SERVER-101594: remove once 9.0 becomes last LTS
+                                // legacy timeseries view won't exist anymore.
+                                if (view.timeseries()) {
+                                    if (!catalog->lookupCollectionByNamespace(opCtx,
+                                                                              view.viewOn())) {
+                                        // There is no buckets collection backing this time-series
+                                        // view, which means that it was not already added along
+                                        // with the buckets collection above.
+                                        _addWorkingSetMember(
+                                            opCtx,
+                                            buildTimeseriesBson(opCtx, view.name(), nameOnly),
+                                            matcher.get(),
+                                            ws.get(),
+                                            results,
+                                            fastCountState);
+                                    }
+                                    return true;
+                                }
+
+                                BSONObj viewBson = buildViewBson(opCtx, view, nameOnly);
+                                if (!viewBson.isEmpty()) {
+                                    _addWorkingSetMember(opCtx,
+                                                         viewBson,
+                                                         matcher.get(),
+                                                         ws.get(),
+                                                         results,
+                                                         fastCountState);
+                                }
+                                return true;
+                            });
+                        }
+                    }
+
+                    shuffleListCommandResults.execute([&](const auto&) {
+                        std::random_device rd;
+                        std::mt19937 g(rd());
+                        std::shuffle(results.begin(), results.end(), g);
+                    });
+
+                    for (const auto& id : results) {
+                        root->pushBack(id);
+                    }
+
+                    exec =
+                        plan_executor_factory::make(expCtx,
+                                                    std::move(ws),
+                                                    std::move(root),
+                                                    boost::none,
+                                                    PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                    false, /* whether owned BSON must be returned */
+                                                    cursorNss);
+
+                    long long batchSize = std::numeric_limits<long long>::max();
+                    if (listCollRequest.getCursor() &&
+                        listCollRequest.getCursor()->getBatchSize()) {
+                        batchSize = *listCollRequest.getCursor()->getBatchSize();
+                    }
+
+                    FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
+                    for (long long objCount = 0; objCount < batchSize; objCount++) {
+                        BSONObj nextDoc;
+                        PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
+                        if (state == PlanExecutor::IS_EOF) {
+                            break;
+                        }
+                        invariant(state == PlanExecutor::ADVANCED);
+
+                        // If we can't fit this result inside the current batch, then we stash it
+                        // for later.
+                        if (!responseSizeTracker.haveSpaceForNext(nextDoc)) {
+                            exec->stashResult(nextDoc);
+                            break;
+                        }
+
+                        try {
+                            firstBatch.push_back(ListCollectionsReplyItem::parse(
+                                nextDoc,
+                                IDLParserContext("ListCollectionsReplyItem",
+                                                 auth::ValidatedTenancyScope::get(opCtx),
+                                                 cursorNss.tenantId(),
+                                                 respSerializationContext)));
+                        } catch (const DBException& exc) {
+                            LOGV2_ERROR(
+                                5254300,
+                                "Could not parse catalog entry while replying to listCollections",
+                                "entry"_attr = nextDoc,
+                                "error"_attr = exc);
+                            fassertFailed(5254301);
+                        }
+                        responseSizeTracker.add(nextDoc);
+                    }
+                    if (exec->isEOF()) {
+                        return boost::make_optional(
+                            createListCollectionsCursorReply(0 /* cursorId */,
+                                                             cursorNss,
+                                                             respSerializationContext,
+                                                             std::move(firstBatch)));
+                    }
+                    exec->saveState();
+                    exec->detachFromOperationContext();
+                    return boost::none;
+                });
+
+            if (exhaustiveListCollectionsReply) {
+                return std::move(*exhaustiveListCollectionsReply);
+            }
+
+            // Global cursor registration must be done without holding any locks, so we do this
+            // outside the DBLock and the write conflict retry.
+            auto cmdObj = listCollRequest.toBSON();
+            auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 cursorNss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName(),
+                 APIParameters::get(opCtx),
+                 opCtx->getWriteConcern(),
+                 repl::ReadConcernArgs::get(opCtx),
+                 ReadPreferenceSetting::get(opCtx),
+                 cmdObj,
+                 uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                     ->checkAuthorizedToListCollections(listCollRequest))});
+            pinnedCursor->incNBatches();
+            pinnedCursor->incNReturnedSoFar(firstBatch.size());
+
+            return createListCollectionsCursorReply(pinnedCursor.getCursor()->cursorid(),
+                                                    cursorNss,
+                                                    respSerializationContext,
+                                                    std::move(firstBatch));
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(CmdListCollections).forShard();
+
+}  // namespace
+}  // namespace mongo

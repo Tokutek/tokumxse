@@ -1,0 +1,21 @@
+# Don't UBSAN most of third_party, but do ubsan WT
+src:src/third_party/IntelRDFPMathLib20U1/*
+src:src/third_party/mozjs/*
+src:src/third_party/snappy-*/*
+src:src/third_party/icu4c-*/*
+
+# s2 compatibility
+fun:_ZN8S2CellId14FromFaceIJWrapEiii
+
+src:src/third_party/abseil-cpp/dist/absl/numeric/int128_have_intrinsic.inc
+
+# fuzztest calls memcpy with a null dst when deserializing empty byte-vector corpus entries.
+src:external/fuzztest~/*
+
+# SERVER-62972
+# libunwind has some UB when doing stack unwinding
+[alignment]
+fun:access_mem
+
+# TODO SERVER-102630 warns of unaligned access on code whose purpose is to prevent unaligned access.
+src:src/third_party/gperftools/dist/src/base/basictypes.h

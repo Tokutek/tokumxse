@@ -1,0 +1,144 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/common/exception.h"
+
+#include "mongo/scripting/mozjs/common/error.h"
+#include "mongo/scripting/mozjs/common/jsstringwrapper.h"
+#include "mongo/scripting/mozjs/common/objectwrapper.h"
+#include "mongo/scripting/mozjs/common/runtime.h"
+#include "mongo/scripting/mozjs/common/types/status.h"
+#include "mongo/scripting/mozjs/common/valuewriter.h"
+#include "mongo/scripting/mozjs/common/wraptype.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+#include <utility>
+
+#include <js/ErrorReport.h>
+#include <js/Exception.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <js/friend/ErrorMessages.h>
+#ifdef MONGO_MOZJS_WASI_BUILD
+#include "mongo/scripting/mozjs/wasm/engine/error.h"
+#else
+#include <mongo/scripting/mozjs/mongoErrorReportToString.h>
+#endif
+
+namespace mongo {
+namespace mozjs {
+
+void mongoToJSException(JSContext* cx) {
+    auto status = exceptionToStatus();
+
+    if (status.code() != ErrorCodes::JSUncatchableError) {
+        if (!JS_IsExceptionPending(cx)) {
+            JS::RootedValue val(cx);
+            statusToJSException(cx, status, &val);
+
+            JS_SetPendingException(cx, val);
+        }
+    } else {
+        JS::ReportUncatchableException(cx);
+        // If a JSAPI callback returns false without setting a pending exception, SpiderMonkey will
+        // treat it as an uncatchable error.
+        auto* runtime = getCommonRuntime(cx);
+        runtime->setStatus(std::move(status));
+    }
+}
+
+std::string currentJSStackToString(JSContext* cx) {
+    auto* runtime = getCommonRuntime(cx);
+
+    JS::RootedValue error(cx);
+    getProto<ErrorInfo>(runtime).newInstance(&error);
+
+    return ObjectWrapper(cx, error).getString("stack");
+}
+
+Status currentJSExceptionToStatus(JSContext* cx,
+                                  ErrorCodes::Error altCode,
+                                  std::string_view altReason) {
+    JS::RootedValue vp(cx);
+    if (!JS_GetPendingException(cx, &vp))
+        return Status(altCode, altReason);
+
+    return jsExceptionToStatus(cx, vp, altCode, altReason);
+}
+
+Status JSErrorReportToStatus(JSContext* cx,
+                             JSErrorReport* report,
+                             ErrorCodes::Error altCode,
+                             std::string_view altReason) {
+    JSStringWrapper jsstr(cx, mongoErrorReportToString(cx, report));
+    if (!jsstr)
+        return Status(altCode, altReason);
+
+    ErrorCodes::Error error = altCode;
+
+    if (report->errorNumber) {
+        if (report->errorNumber < JSErr_Limit) {
+            error = ErrorCodes::JSInterpreterFailure;
+        } else {
+            error = ErrorCodes::Error(report->errorNumber - JSErr_Limit);
+            invariant(!ErrorCodes::canHaveExtraInfo(error));
+        }
+    }
+
+    return Status(error, std::string{jsstr.toStringData()});
+}
+
+void throwCurrentJSException(JSContext* cx, ErrorCodes::Error altCode, std::string_view altReason) {
+    uassertStatusOK(currentJSExceptionToStatus(cx, altCode, altReason));
+    MONGO_UNREACHABLE;
+}
+
+/**
+ * Turns a status into a js exception
+ */
+void statusToJSException(JSContext* cx, Status status, JS::MutableHandleValue out) {
+    MongoStatusInfo::fromStatus(cx, std::move(status), out);
+}
+
+/**
+ * Turns a js exception into a status
+ */
+Status jsExceptionToStatus(JSContext* cx,
+                           JS::HandleValue excn,
+                           ErrorCodes::Error altCode,
+                           std::string_view altReason) {
+    auto* runtime = getCommonRuntime(cx);
+
+    // It's possible that we have an uncaught exception for OOM, which is reported on the
+    // exception status of the JSContext. We must check for this OOM exception first to ensure
+    // we return the correct error code and message (i.e JSInterpreterFailure). This is consistent
+    // with MozJSImplScope::_checkForPendingException().
+    // JS_IsThrowingOutOfMemoryException is a MongoDB-specific modification to
+    // SpiderMonkey (see src/third_party/mozjs). The WASI build uses upstream
+    // Firefox SpiderMonkey which doesn't have this.
+#ifndef MONGO_MOZJS_WASI_BUILD
+    if (JS_IsThrowingOutOfMemoryException(cx, excn)) {
+        return Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
+    }
+#endif
+
+    if (!excn.isObject()) {
+        return Status(altCode, ValueWriter(cx, excn).toString());
+    }
+
+    if (getProto<MongoStatusInfo>(runtime).instanceOf(excn)) {
+        return MongoStatusInfo::toStatus(cx, excn);
+    }
+
+    JS::RootedObject obj(cx, excn.toObjectOrNull());
+
+    JSErrorReport* report = JS_ErrorFromException(cx, obj);
+    if (!report)
+        return Status(altCode, altReason);
+
+    return JSErrorReportToStatus(cx, report, altCode, altReason);
+}
+
+}  // namespace mozjs
+}  // namespace mongo

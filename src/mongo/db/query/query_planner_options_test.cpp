@@ -1,0 +1,1062 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/metadata/index_entry.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/index_tag.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/log_capture.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cstddef>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+
+namespace mongo {
+namespace {
+
+/**
+ * Make a minimal IndexEntry from just a key pattern and a name.
+ */
+IndexEntry buildSimpleIndexEntry(const BSONObj& kp, const std::string& indexName) {
+    return {kp,
+            IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            IndexConfig::kLatestIndexVersion,
+            false,
+            {},
+            {},
+            false,
+            false,
+            CoreIndexInfo::Identifier(indexName),
+            {},
+            nullptr};
+}
+
+
+//
+// Min/Max
+//
+
+TEST_F(QueryPlannerTest, MinValid) {
+    addIndex(BSON("a" << 1));
+    runQueryHintMinMax(BSONObj(), BSONObj(fromjson("{a: 1}")), fromjson("{a: 1}"), BSONObj());
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MinWithoutIndex) {
+    runInvalidQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1}")), fromjson("{a: 1}"), BSONObj());
+}
+
+TEST_F(QueryPlannerTest, MinBadHint) {
+    addIndex(BSON("b" << 1));
+    runInvalidQueryHintMinMax(BSONObj(), fromjson("{b: 1}"), fromjson("{a: 1}"), BSONObj());
+}
+
+TEST_F(QueryPlannerTest, MaxValid) {
+    addIndex(BSON("a" << 1));
+    runQueryHintMinMax(BSONObj(), BSONObj(fromjson("{a: 1}")), BSONObj(), fromjson("{a: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxWithoutMinMultipleComponents) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1, b: 1}")), BSONObj(), fromjson("{a: 1, b: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1, b: 1},"
+        "bounds: {'$startKey': {'': {$minKey: 1}, '': {$minKey: 1}}, '$endKey': {'': 1, '': 1}}"
+        "}}}}");
+}
+
+TEST_F(QueryPlannerTest, MinWithoutMaxMultipleComponents) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+    runQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1, b: 1}")), fromjson("{a: 1, b: 1}"), BSONObj());
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1, b: 1},"
+        "bounds: {'$startKey': {'': 1, '': 1}, '$endKey': {'': {$maxKey:1}, '': {$maxKey:1}}}"
+        "}}}}");
+}
+
+TEST_F(QueryPlannerTest, MinMaxSameValue) {
+    addIndex(BSON("a" << 1));
+    runInvalidQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1}")), fromjson("{a: 1}"), fromjson("{a: 1}"));
+}
+
+TEST_F(QueryPlannerTest, MaxWithoutIndex) {
+    runInvalidQueryHintMinMax(
+        BSONObj(), BSONObj(fromjson("{a: 1}")), BSONObj(), fromjson("{a: 1}"));
+}
+
+TEST_F(QueryPlannerTest, MaxBadHint) {
+    addIndex(BSON("b" << 1));
+    runInvalidQueryHintMinMax(BSONObj(), fromjson("{b: 1}"), BSONObj(), fromjson("{a: 1}"));
+}
+
+TEST_F(QueryPlannerTest, MaxMinSort) {
+    addIndex(BSON("a" << 1));
+
+    // Run an empty query, sort {a: 1}, max/min arguments.
+    runQueryFull(BSONObj(),
+                 fromjson("{a: 1}"),
+                 BSONObj(),
+                 0,
+                 0,
+                 fromjson("{a: 1}"),
+                 fromjson("{a: 2}"),
+                 fromjson("{a: 8}"));
+
+    assertNumSolutions(1);
+    assertSolutionExists("{fetch: {node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxMinSortEqualityFirstSortSecond) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    // Run an empty query, sort {b: 1}, max/min arguments.
+    runQueryFull(BSONObj(),
+                 fromjson("{b: 1}"),
+                 BSONObj(),
+                 0,
+                 0,
+                 fromjson("{a: 1, b: 1}"),
+                 fromjson("{a: 1, b: 1}"),
+                 fromjson("{a: 1, b: 2}"));
+
+    assertNumSolutions(1);
+    assertSolutionExists("{fetch: {node: {ixscan: {filter: null, pattern: {a: 1, b: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxMinSortInequalityFirstSortSecond) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    // Run an empty query, sort {b: 1}, max/min arguments.
+    runQueryFull(BSONObj(),
+                 fromjson("{b: 1}"),
+                 BSONObj(),
+                 0,
+                 0,
+                 fromjson("{a: 1, b: 1}"),
+                 fromjson("{a: 1, b: 1}"),
+                 fromjson("{a: 2, b: 2}"));
+
+    assertNumSolutions(1);
+    assertSolutionExists(
+        "{fetch: {node: {sort: {pattern: {b: 1}, limit: 0, type: 'default', node: {ixscan: "
+        "{filter: null, pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxMinReverseSort) {
+    addIndex(BSON("a" << 1));
+
+    // Run an empty query, sort {a: -1}, max/min arguments.
+    runQueryFull(BSONObj(),
+                 fromjson("{a: -1}"),
+                 BSONObj(),
+                 0,
+                 0,
+                 fromjson("{a: 1}"),
+                 fromjson("{a: 2}"),
+                 fromjson("{a: 8}"));
+
+    assertNumSolutions(1);
+    assertSolutionExists("{fetch: {node: {ixscan: {filter: null, dir: -1, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxMinReverseIndexDir) {
+    addIndex(BSON("a" << -1));
+
+    // Because the index is descending, the min is numerically larger than the max.
+    runQueryFull(BSONObj(),
+                 fromjson("{a: -1}"),
+                 BSONObj(),
+                 0,
+                 0,
+                 fromjson("{a: -1}"),
+                 fromjson("{a: 8}"),
+                 fromjson("{a: 2}"));
+
+    assertNumSolutions(1);
+    assertSolutionExists("{fetch: {node: {ixscan: {filter: null, dir: 1, pattern: {a: -1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxMinReverseIndexDirSort) {
+    addIndex(BSON("a" << -1));
+
+    // Min/max specifies a forward scan with bounds [{a: 8}, {a: 2}]. Asking for
+    // an ascending sort reverses the direction of the scan to [{a: 2}, {a: 8}].
+    runQueryFull(BSONObj(),
+                 fromjson("{a: 1}"),
+                 BSONObj(),
+                 0,
+                 0,
+                 fromjson("{a: -1}"),
+                 fromjson("{a: 8}"),
+                 fromjson("{a: 2}"));
+
+    assertNumSolutions(1);
+    assertSolutionExists(
+        "{fetch: {node: {ixscan: {filter: null, dir: -1,"
+        "pattern: {a: -1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxMinNoMatchingIndexDir) {
+    addIndex(BSON("a" << -1));
+    runInvalidQueryHintMinMax(
+        BSONObj(), fromjson("{a: 1}"), BSONObj(fromjson("{a: 2}")), fromjson("{a: 8}"));
+}
+
+TEST_F(QueryPlannerTest, MaxMinBadHintIfIndexOrderDoesNotMatch) {
+    // There are both ascending and descending indices on 'a'.
+    addIndex(BSON("a" << 1));
+
+    // A query hinting on {a: 1} is bad if min is {a: 8} and {a: 2} because this
+    // min/max pairing requires a descending index.
+    runInvalidQueryFull(BSONObj(),
+                        BSONObj(),
+                        BSONObj(),
+                        0,
+                        0,
+                        fromjson("{a: 1}"),
+                        fromjson("{a: 8}"),
+                        fromjson("{a: 2}"));
+}
+
+
+//
+// Hint tests
+//
+
+TEST_F(QueryPlannerTest, NaturalHint) {
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    runQuerySortHint(BSON("a" << 1), BSON("b" << 1), BSON("$natural" << 1));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {filter: {a: 1}, dir: 1}}}}");
+}
+
+// Test $natural sort and its interaction with $natural hint.
+TEST_F(QueryPlannerTest, NaturalSortAndHint) {
+    addIndex(BSON("x" << 1));
+
+    // Non-empty query, -1 sort, no hint.
+    runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << -1), BSONObj());
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: -1}}");
+
+    // Non-empty query, 1 sort, no hint.
+    runQuerySortHint(fromjson("{x: {$exists: true}}"), BSON("$natural" << 1), BSONObj());
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+
+    // Non-empty query, -1 sort, -1 hint.
+    runQuerySortHint(
+        fromjson("{x: {$exists: true}}"), BSON("$natural" << -1), BSON("$natural" << -1));
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: -1}}");
+
+    // Non-empty query, 1 sort, 1 hint.
+    runQuerySortHint(
+        fromjson("{x: {$exists: true}}"), BSON("$natural" << 1), BSON("$natural" << 1));
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+
+    // Empty query, -1 sort, no hint.
+    runQuerySortHint(BSONObj(), BSON("$natural" << -1), BSONObj());
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: -1}}");
+
+    // Empty query, 1 sort, no hint.
+    runQuerySortHint(BSONObj(), BSON("$natural" << 1), BSONObj());
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+
+    // Empty query, -1 sort, -1 hint.
+    runQuerySortHint(BSONObj(), BSON("$natural" << -1), BSON("$natural" << -1));
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: -1}}");
+
+    // Empty query, 1 sort, 1 hint.
+    runQuerySortHint(BSONObj(), BSON("$natural" << 1), BSON("$natural" << 1));
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+}
+
+TEST_F(QueryPlannerTest, HintValid) {
+    addIndex(BSON("a" << 1));
+    runQueryHint(BSONObj(), fromjson("{a: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, HintValidWithPredicate) {
+    addIndex(BSON("a" << 1));
+    runQueryHint(fromjson("{a: {$gt: 1}}"), fromjson("{a: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: null, "
+        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, HintValidWithSort) {
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    runQuerySortHint(fromjson("{a: 100, b: 200}"), fromjson("{b: 1}"), fromjson("{a: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {filter: {b: 200}, "
+        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, HintElemMatch) {
+    // true means multikey
+    addIndex(fromjson("{'a.b': 1}"), true);
+    runQueryHint(fromjson("{'a.b': 1, a: {$elemMatch: {b: 2}}}"), fromjson("{'a.b': 1}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{fetch: {filter: {$and: [{a:{$elemMatch:{b:2}}}, {'a.b': 1}]}, "
+        "node: {ixscan: {filter: null, pattern: {'a.b': 1}, bounds: "
+        "{'a.b': [[2, 2, true, true]]}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {a:{$elemMatch:{b:2}}}, "
+        "node: {ixscan: {filter: null, pattern: {'a.b': 1}, bounds: "
+        "{'a.b': [[1, 1, true, true]]}}}}}");
+}
+
+TEST_F(QueryPlannerTest, HintInvalid) {
+    addIndex(BSON("a" << 1));
+    runInvalidQueryHint(BSONObj(), fromjson("{b: 1}"));
+}
+
+//
+// Test shard filter query planning
+//
+
+TEST_F(QueryPlannerTest, ShardFilterCollScan) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1);
+    addIndex(BSON("a" << 1));
+
+    runQuery(fromjson("{b: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sharding_filter: {node: "
+        "{cscan: {dir: 1}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterBasicIndex) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1);
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+
+    runQuery(fromjson("{b: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sharding_filter: {node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterBasicCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1);
+    addIndex(BSON("a" << 1));
+
+    runQuery(fromjson("{a: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {node: "
+        "{sharding_filter: {node: "
+        "{ixscan: {pattern: {a: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterBasicProjCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1);
+    addIndex(BSON("a" << 1));
+
+    runQuerySortProj(fromjson("{a: 1}"), BSONObj(), fromjson("{_id : 0, a : 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1}, type: 'coveredIndex', node: "
+        "{sharding_filter: {node: "
+        "{ixscan: {pattern: {a: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterCompoundProjCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1 << "b" << 1);
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    runQuerySortProj(fromjson("{a: 1}"), BSONObj(), fromjson("{_id: 0, a: 1, b: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: 1 }, type: 'coveredIndex', node: "
+        "{sharding_filter: {node: "
+        "{ixscan: {pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterNestedProjCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1 << "b.c" << 1);
+    addIndex(BSON("a" << 1 << "b.c" << 1));
+
+    runQuerySortProj(fromjson("{a: 1}"), BSONObj(), fromjson("{_id: 0, a: 1, 'b.c': 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, 'b.c': 1 }, type: 'default', node: "
+        "{sharding_filter: {node: "
+        "{ixscan: {filter: null, pattern: {a: 1, 'b.c': 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterHashProjNotCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << "hashed");
+    addIndex(BSON("a" << "hashed"));
+
+    runQuerySortProj(fromjson("{a: 1}"), BSONObj(), fromjson("{_id : 0, a : 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0,a: 1}, type: 'simple', node: "
+        "{sharding_filter : {node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {a: 'hashed'}}}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterKeyPrefixIndexCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << 1);
+    addIndex(BSON("a" << 1 << "b" << 1 << "_id" << 1));
+
+    runQuerySortProj(fromjson("{a: 1}"), BSONObj(), fromjson("{a : 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {a: 1}, type: 'coveredIndex', node: "
+        "{sharding_filter : {node: "
+        "{ixscan: {pattern: {a: 1, b: 1, _id: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ShardFilterNoIndexNotCovered) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    params.shardKey = BSON("a" << "hashed");
+    addIndex(BSON("b" << 1));
+
+    runQuerySortProj(fromjson("{b: 1}"), BSONObj(), fromjson("{_id : 0, a : 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0,a: 1}, type: 'simple', node: "
+        "{sharding_filter : {node: "
+        "{fetch: {node: "
+        "{ixscan: {pattern: {b: 1}}}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotTrimIxisectParam) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+
+    runQuery(fromjson("{a: 1, b: 1, c: 1}"));
+
+    assertNumSolutions(3U);
+    assertSolutionExists(
+        "{fetch: {filter: {b: 1, c: 1}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {a: 1, c: 1}, node: "
+        "{ixscan: {filter: null, pattern: {b: 1}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {a:1,b:1,c:1}, node: {andSorted: {nodes: ["
+        "{ixscan: {filter: null, pattern: {a:1}}},"
+        "{ixscan: {filter: null, pattern: {b:1}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotTrimIxisectParamBeneathOr) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+
+    runQuery(fromjson("{d: 1, $or: [{a: 1}, {b: 1, c: 1}]}"));
+
+    assertNumSolutions(3U);
+
+    assertSolutionExists(
+        "{fetch: {filter: {d: 1}, node: {or: {nodes: ["
+        "{fetch: {filter: {c: 1}, node: {ixscan: {filter: null,"
+        "pattern: {b: 1}, bounds: {b: [[1,1,true,true]]}}}}},"
+        "{ixscan: {filter: null, pattern: {a: 1},"
+        "bounds: {a: [[1,1,true,true]]}}}]}}}}");
+
+    assertSolutionExists(
+        "{fetch: {filter: {d: 1}, node: {or: {nodes: ["
+        "{fetch: {filter: {b: 1}, node: {ixscan: {filter: null,"
+        "pattern: {c: 1}, bounds: {c: [[1,1,true,true]]}}}}},"
+        "{ixscan: {filter: null, pattern: {a: 1},"
+        "bounds: {a: [[1,1,true,true]]}}}]}}}}");
+
+    assertSolutionExists(
+        "{fetch: {filter: {d: 1}, node: {or: {nodes: ["
+        "{fetch: {filter: {b: 1, c: 1}, node: {andSorted: {nodes: ["
+        "{ixscan: {filter: null, pattern: {b: 1}}},"
+        "{ixscan: {filter: null, pattern: {c: 1}}}]}}}},"
+        "{ixscan: {filter: null, pattern: {a: 1}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotTrimIxisectAndHashWithOrChild) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+
+    runQuery(fromjson("{c: 1, $or: [{a: 1}, {b: 1, d: 1}]}"));
+
+    assertNumSolutions(3U);
+
+    assertSolutionExists(
+        "{fetch: {filter: {c: 1}, node: {or: {nodes: ["
+        "{fetch: {filter: {d: 1}, node: {ixscan: {filter: null,"
+        "pattern: {b: 1}, bounds: {b: [[1,1,true,true]]}}}}},"
+        "{ixscan: {filter: null, pattern: {a: 1},"
+        "bounds: {a: [[1,1,true,true]]}}}]}}}}");
+
+    assertSolutionExists(
+        "{fetch: {filter: {$or:[{b:1,d:1},{a:1}]}, node:"
+        "{ixscan: {filter: null, pattern: {c: 1}}}}}");
+
+    assertSolutionExists(
+        "{fetch: {filter: {c:1,$or:[{a:1},{b:1,d:1}]}, node:{andHash:{nodes:["
+        "{or: {nodes: ["
+        "{fetch: {filter: {d:1}, node: {ixscan: {pattern: {b: 1}}}}},"
+        "{ixscan: {filter: null, pattern: {a: 1}}}]}},"
+        "{ixscan: {filter: null, pattern: {c: 1}}}]}}}}");
+}
+
+TEST_F(QueryPlannerTest, CannotTrimIxisectParamSelfIntersection) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
+
+    // true means multikey
+    addIndex(BSON("a" << 1), true);
+
+    runQuery(fromjson("{a: {$all: [1, 2, 3]}}"));
+
+    assertNumSolutions(4U);
+    assertSolutionExists(
+        "{fetch: {filter: {$and: [{a:2}, {a:3}]}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {$and: [{a:1}, {a:3}]}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {$and: [{a:2}, {a:3}]}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {a: {$all: [1, 2, 3]}}, node: {andSorted: {nodes: ["
+        "{ixscan: {filter: null, pattern: {a:1},"
+        "bounds: {a: [[1,1,true,true]]}}},"
+        "{ixscan: {filter: null, pattern: {a:1},"
+        "bounds: {a: [[2,2,true,true]]}}},"
+        "{ixscan: {filter: null, pattern: {a:1},"
+        "bounds: {a: [[3,3,true,true]]}}}]}}}}");
+}
+
+
+// If a lookup against a unique index is available as a possible plan, then the planner
+// should not generate other possibilities.
+TEST_F(QueryPlannerTest, UniqueIndexLookup) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+    params.mainCollectionInfo.options |= QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1),
+             false,  // multikey
+             false,  // sparse,
+             true);  // unique
+
+    runQuery(fromjson("{a: 1, b: 1}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {a: 1}, node: "
+        "{ixscan: {filter: null, pattern: {b: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, HintOnNonUniqueIndex) {
+    params.mainCollectionInfo.options = QueryPlannerParams::INDEX_INTERSECTION;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1),
+             false,  // multikey
+             false,  // sparse,
+             true);  // unique
+
+    runQueryHint(fromjson("{a: 1, b: 1}"), BSON("a" << 1));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {b: 1}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, UniqueIndexLookupBelowOr) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+    addIndex(BSON("d" << 1),
+             false,  // multikey
+             false,  // sparse,
+             true);  // unique
+
+    runQuery(fromjson("{$or: [{a: 1, b: 1}, {c: 1, d: 1}]}"));
+
+    // Only two plans because we throw out plans for the right branch of the $or that do not
+    // use equality over the unique index.
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{fetch: {filter: {a: 1}, node: {ixscan: {pattern: {b: 1}}}}},"
+        "{fetch: {filter: {c: 1}, node: {ixscan: {pattern: {d: 1}}}}}]}}");
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{fetch: {filter: {b: 1}, node: {ixscan: {pattern: {a: 1}}}}},"
+        "{fetch: {filter: {c: 1}, node: {ixscan: {pattern: {d: 1}}}}}]}}");
+}
+
+TEST_F(QueryPlannerTest, UniqueIndexLookupBelowOrBelowAnd) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+    addIndex(BSON("d" << 1),
+             false,  // multikey
+             false,  // sparse,
+             true);  // unique
+
+    runQuery(fromjson("{e: 1, $or: [{a: 1, b: 1}, {c: 1, d: 1}]}"));
+
+    // Only two plans because we throw out plans for the right branch of the $or that do not
+    // use equality over the unique index.
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{fetch: {filter: {e: 1}, node: {or: {nodes: ["
+        "{fetch: {filter: {a: 1}, node: {ixscan: {pattern: {b: 1}}}}},"
+        "{fetch: {filter: {c: 1}, node: {ixscan: {pattern: {d: 1}}}}}"
+        "]}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: {e: 1}, node: {or: {nodes: ["
+        "{fetch: {filter: {b: 1}, node: {ixscan: {pattern: {a: 1}}}}},"
+        "{fetch: {filter: {c: 1}, node: {ixscan: {pattern: {d: 1}}}}}"
+        "]}}}}");
+}
+
+TEST_F(QueryPlannerTest, CoveredOrUniqueIndexLookup) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN;
+
+    addIndex(BSON("a" << 1 << "b" << 1));
+    addIndex(BSON("a" << 1),
+             false,  // multikey
+             false,  // sparse,
+             true);  // unique
+
+    runQuerySortProj(fromjson("{a: 1, b: 1}"), BSONObj(), fromjson("{_id: 0, a: 1}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1}, node: "
+        "{fetch: {filter: {b: 1}, node: {ixscan: {pattern: {a: 1}}}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1, b: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, SortKeyMetaProjection) {
+    addIndex(BSON("a" << 1));
+
+    runQuerySortProj(BSONObj(), fromjson("{a: 1}"), fromjson("{b: {$meta: 'sortKey'}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {b: {$meta: 'sortKey'}}, node: "
+        "{sort: {limit: 0, pattern: {a: 1}, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {b: {$meta: 'sortKey'}}, node: "
+        "{sortKeyGen: {node: {fetch: {filter: null, node: "
+        "{ixscan: {pattern: {a: 1}}}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, SortKeyMetaProjectionCovered) {
+    addIndex(BSON("a" << 1));
+
+    runQuerySortProj(
+        BSONObj(), fromjson("{a: 1}"), fromjson("{_id: 0, a: 1, b: {$meta: 'sortKey'}}"));
+
+    assertNumSolutions(2U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: {$meta: 'sortKey'}}, node: "
+        "{sort: {limit: 0, pattern: {a: 1}, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: {$meta: 'sortKey'}}, node: "
+        "{sortKeyGen: {node: "
+        "{ixscan: {pattern: {a: 1}}}}}}}");
+}
+
+
+//
+// Test bad input to query planner helpers.
+//
+
+TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
+    // Null match expression.
+    std::vector<IndexEntry> relevantIndices;
+    ASSERT_NOT_OK(QueryPlanner::cacheDataFromTaggedTree(nullptr, relevantIndices).getStatus());
+
+    // No relevant index matching the index tag.
+    relevantIndices.push_back(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
+
+    auto findCommand = std::make_unique<FindCommandRequest>(
+        NamespaceString::createNamespaceString_forTest("test.collection"));
+    findCommand->setFilter(BSON("a" << 3));
+    auto scopedCq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    scopedCq->getPrimaryMatchExpression()->setTag(new IndexTag(1));
+
+    ASSERT_NOT_OK(QueryPlanner::cacheDataFromTaggedTree(scopedCq->getPrimaryMatchExpression(),
+                                                        relevantIndices)
+                      .getStatus());
+}
+
+TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.collection");
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("a" << 3));
+    auto scopedCq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+
+    std::unique_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
+    indexTree->setIndexEntry(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
+
+    std::map<IndexEntry::Identifier, size_t> indexMap;
+
+    // Null filter.
+    Status s = QueryPlanner::tagAccordingToCache(nullptr, indexTree.get(), indexMap);
+    ASSERT_NOT_OK(s);
+
+    // Null indexTree.
+    s = QueryPlanner::tagAccordingToCache(scopedCq->getPrimaryMatchExpression(), nullptr, indexMap);
+    ASSERT_NOT_OK(s);
+
+    // Index not found.
+    s = QueryPlanner::tagAccordingToCache(
+        scopedCq->getPrimaryMatchExpression(), indexTree.get(), indexMap);
+    ASSERT_NOT_OK(s);
+
+    // Index found once added to the map.
+    indexMap[IndexEntry::Identifier{"a_1"}] = 0;
+    s = QueryPlanner::tagAccordingToCache(
+        scopedCq->getPrimaryMatchExpression(), indexTree.get(), indexMap);
+    ASSERT_OK(s);
+
+    // Regenerate canonical query in order to clear tags.
+    auto newQR = std::make_unique<FindCommandRequest>(nss);
+    newQR->setFilter(BSON("a" << 3));
+    scopedCq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *newQR).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(newQR)}});
+
+    // Mismatched tree topology.
+    auto child = std::make_unique<PlanCacheIndexTree>();
+    child->setIndexEntry(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
+    indexTree->children.push_back(std::move(child));
+    s = QueryPlanner::tagAccordingToCache(
+        scopedCq->getPrimaryMatchExpression(), indexTree.get(), indexMap);
+    ASSERT_NOT_OK(s);
+}
+
+TEST_F(QueryPlannerTest, DollarResumeAfterFieldPropagatedFromQueryRequestToStageBuilder) {
+    BSONObj cmdObj = BSON("find" << nss.ns_forTest() << "hint" << BSON("$natural" << 1) << "sort"
+                                 << BSON("$natural" << 1) << "$_requestResumeToken" << true
+                                 << "$_resumeAfter" << BSON("$recordId" << 42LL));
+
+    runQueryAsCommand(cmdObj);
+    assertHasOnlyCollscan();
+
+    const auto* node = solns.front()->root();
+    const CollectionScanNode* csn = static_cast<const CollectionScanNode*>(node);
+    ASSERT_EQUALS(RecordId(42LL), csn->resumeScanPoint->recordId);
+    ASSERT_FALSE(csn->resumeScanPoint->tolerateKeyNotFound);
+}
+
+TEST_F(QueryPlannerTest, DollarStartAtFieldPropagatedFromQueryRequestToStageBuilder) {
+    BSONObj cmdObj = BSON("find" << nss.ns_forTest() << "hint" << BSON("$natural" << 1) << "sort"
+                                 << BSON("$natural" << 1) << "$_requestResumeToken" << true
+                                 << "$_startAt" << BSON("$recordId" << 42LL));
+
+    runQueryAsCommand(cmdObj);
+    assertHasOnlyCollscan();
+
+    const auto* node = solns.front()->root();
+    const CollectionScanNode* csn = static_cast<const CollectionScanNode*>(node);
+    ASSERT_EQUALS(RecordId(42LL), csn->resumeScanPoint->recordId);
+    ASSERT_TRUE(csn->resumeScanPoint->tolerateKeyNotFound);
+}
+
+TEST_F(QueryPlannerTest, PreserveRecordIdOptionPrecludesSimpleSort) {
+    forceRecordId = true;
+
+    runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'default', node: {cscan: {dir: 1}}}}");
+}
+
+// ---------------------------------------------------------------------------
+// maxEstimatedScanBytes: COLLECTION_EXCEEDS_SCAN_BYTES flag unit tests
+// ---------------------------------------------------------------------------
+
+TEST_F(QueryPlannerTest, NoLargeCollscanRejectsUnboundedCollscan) {
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize = 1000;
+    params.mainCollectionInfo.maxEstimatedScanBytesThreshold = 500;
+
+    unittest::MinimumLoggedSeverityGuard logSeverityGuard{logv2::LogComponent::kQuery,
+                                                          logv2::LogSeverity::Debug(2)};
+    unittest::LogCaptureGuard logs;
+    runInvalidQuery(fromjson("{a: 1}"));
+    assertNoSolutions();
+
+    // The main planning path (query_planner.cpp's QueryPlanner::plan()) should log the rejection
+    // at default verbosity so operators can see it without raising log verbosity.
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << 13466402)), 1);
+    ASSERT_EQ(logs.countBSONContainingSubset(
+                  BSON("attr" << BSON("namespace" << "test.collection" << "estimatedSize" << 1000
+                                                  << "threshold" << 500))),
+              1);
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanRejectsUnboundedCollscanOnTailableCursor) {
+    // The tailable-cursor path (attemptCollectionScan()) is a distinct code path from the main
+    // plan() collScanRequired branch, and uses its own LOGV2 id.
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize = 2000;
+    params.mainCollectionInfo.maxEstimatedScanBytesThreshold = 1000;
+
+    unittest::MinimumLoggedSeverityGuard logSeverityGuard{logv2::LogComponent::kQuery,
+                                                          logv2::LogSeverity::Debug(2)};
+    unittest::LogCaptureGuard logs;
+    runInvalidQueryAsCommand(fromjson("{find: 'collection', filter: {}, tailable: true}"));
+    assertNoSolutions();
+
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << 13466401)), 1);
+    ASSERT_EQ(logs.countBSONContainingSubset(
+                  BSON("attr" << BSON("namespace" << "test.collection" << "estimatedSize" << 2000
+                                                  << "threshold" << 1000))),
+              1);
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanRejectsUnboundedCollscanOnCacheReplay) {
+    // planFromCache() re-checks COLLECTION_EXCEEDS_SCAN_BYTES on cache replay so that setting the
+    // parameter at runtime takes effect even for queries whose COLLSCAN was already cached; this
+    // is a third distinct code path from the two above, with its own LOGV2 id.
+    runQuery(fromjson("{a: 1}"));
+    assertNumSolutions(1U);
+    ASSERT_TRUE(solns.front()->cacheData);
+    ASSERT_EQ(solns.front()->cacheData->solnType, SolutionCacheData::COLLSCAN_SOLN);
+    auto cachedSolnData = solns.front()->cacheData->clone();
+
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize = 3000;
+    params.mainCollectionInfo.maxEstimatedScanBytesThreshold = 1500;
+
+    unittest::MinimumLoggedSeverityGuard logSeverityGuard{logv2::LogComponent::kQuery,
+                                                          logv2::LogSeverity::Debug(2)};
+    unittest::LogCaptureGuard logs;
+    auto status = QueryPlanner::planFromCache(*cq, params, *cachedSolnData);
+    ASSERT_NOT_OK(status.getStatus());
+    ASSERT_EQ(status.getStatus().code(), ErrorCodes::NoQueryExecutionPlans);
+
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << 13466400)), 1);
+    ASSERT_EQ(logs.countBSONContainingSubset(
+                  BSON("attr" << BSON("namespace" << "test.collection" << "estimatedSize" << 3000
+                                                  << "threshold" << 1500))),
+              1);
+}
+
+TEST_F(QueryPlannerTest, RateLimitsRejectionLoggingByNamespace) {
+    // Unique namespaces avoid the file-scope suppressor state left by the "test.collection" tests.
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize = 1000;
+    params.mainCollectionInfo.maxEstimatedScanBytesThreshold = 500;
+
+    // Capture at Debug(2) so downgraded lines are observed alongside Info.
+    unittest::MinimumLoggedSeverityGuard logSeverityGuard{logv2::LogComponent::kQuery,
+                                                          logv2::LogSeverity::Debug(2)};
+    unittest::LogCaptureGuard logs;
+
+    auto rejectionSeverities = [&](int32_t id) {
+        std::vector<std::string> severities;
+        for (const auto& obj : logs.getBSON()) {
+            if (obj.getIntField("id") == id) {
+                severities.push_back(std::string(obj.getStringField("s")));
+            }
+        }
+        return severities;
+    };
+
+    nss = NamespaceString::createNamespaceString_forTest("test.rateLimitedCollection");
+    // Info, then downgraded to Debug(2) on repeat, then Info for a different namespace.
+    runInvalidQuery(fromjson("{a: 1}"));
+    runInvalidQuery(fromjson("{a: 1}"));
+
+    nss = NamespaceString::createNamespaceString_forTest("test.rateLimitedOtherCollection");
+    runInvalidQuery(fromjson("{a: 1}"));
+
+    ASSERT_EQ(rejectionSeverities(13466402), std::vector<std::string>({"I", "D2", "I"}));
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanAllowsCollscanWithLimit) {
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    // limit > 0 exempts the COLLSCAN.
+    runQuerySortProjSkipLimit(fromjson("{a: 1}"), BSONObj(), BSONObj(), 0, 5);
+    assertNumSolutions(1U);
+    assertSolutionExists("{limit: {n: 5, node: {cscan: {dir: 1}}}}");
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanAllowsCollscanWithLimitOne) {
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    runQuerySortProjSkipLimit(fromjson("{a: 1}"), BSONObj(), BSONObj(), 0, 1);
+    assertNumSolutions(1U);
+    assertSolutionExists("{limit: {n: 1, node: {cscan: {dir: 1}}}}");
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanDoesNotRejectIndexedPlan) {
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    addIndex(BSON("a" << 1));
+    runQuery(fromjson("{a: 1}"));
+    assertNumSolutions(1U);
+    assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, MaxEstimatedScanBytesDryRunAllowsUnboundedCollscan) {
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES |
+        QueryPlannerParams::MAX_ESTIMATED_SCAN_BYTES_DRY_RUN;
+    // Dry-run mode allows the COLLSCAN through instead of rejecting it.
+    runQuery(fromjson("{a: 1}"));
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+}
+
+TEST_F(QueryPlannerTest, MaxEstimatedScanBytesDryRunBitAloneHasNoEffect) {
+    // Without COLLECTION_EXCEEDS_SCAN_BYTES also set, the dry-run bit alone does nothing: there
+    // was never a rejection to suppress.
+    params.mainCollectionInfo.options |= QueryPlannerParams::MAX_ESTIMATED_SCAN_BYTES_DRY_RUN;
+    runQuery(fromjson("{a: 1}"));
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanFallsBackToIndexWhenCollscanBlocked) {
+    params.mainCollectionInfo.options |=
+        QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES | QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(BSON("a" << 1));
+    // INCLUDE_COLLSCAN would normally add a COLLSCAN alongside the index plan,
+    // but COLLECTION_EXCEEDS_SCAN_BYTES + no limit suppresses it.
+    runQuery(fromjson("{a: 1}"));
+    assertNumSolutions(1U);
+    assertSolutionExists("{fetch: {node: {ixscan: {pattern: {a: 1}}}}}");
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanAllowsBoundedClusteredScan) {
+    // A predicate on the cluster key (_id) produces a bounded scan, which is exempt.
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    params.clusteredInfo = clustered_util::makeDefaultClusteredIdIndex();
+    runQuery(fromjson("{_id: {$gte: 5}}"));
+    // Both the _id ixscan and the bounded clustered scan are valid solutions.
+    assertNumSolutions(2U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+}
+
+TEST_F(QueryPlannerTest, NoLargeCollscanRejectsUnboundedClusteredScan) {
+    // A predicate on a non-cluster-key field leaves the scan unbounded — still rejected.
+    params.mainCollectionInfo.options |= QueryPlannerParams::COLLECTION_EXCEEDS_SCAN_BYTES;
+    params.clusteredInfo = clustered_util::makeDefaultClusteredIdIndex();
+    runInvalidQuery(fromjson("{a: 1}"));
+    assertNoSolutions();
+}
+
+}  // namespace
+}  // namespace mongo

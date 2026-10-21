@@ -1,0 +1,225 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/index_builds/index_build_interceptor.h"
+#include "mongo/db/index_builds/multi_index_block.h"
+#include "mongo/db/index_builds/rebuild_indexes.h"
+#include "mongo/db/index_builds/repl_index_build_state.h"
+#include "mongo/db/index_builds/resumable_index_builds_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+enum IndexBuildRecoveryState { Building, Verifying, Committing };
+
+/**
+ * This is the interface through which to act on index builders. Index builder life times are
+ * managed here, and all actions taken on index builders pass through this interface. Index builder
+ * state is set up and then cleaned up by this class.
+ */
+class IndexBuildsManager {
+    IndexBuildsManager(const IndexBuildsManager&) = delete;
+    IndexBuildsManager& operator=(const IndexBuildsManager&) = delete;
+
+public:
+    using RetrySkippedRecordMode = MultiIndexBlock::RetrySkippedRecordMode;
+
+    /**
+     * Indicates whether or not to ignore indexing constraints.
+     */
+    enum class IndexConstraints { kEnforce, kRelax };
+
+    /**
+     * Additional options for setUpIndexBuild. The default values are sufficient in most cases.
+     */
+    struct SetupOptions {
+        SetupOptions();
+        IndexConstraints indexConstraints = IndexConstraints::kEnforce;
+        IndexBuildProtocol protocol = IndexBuildProtocol::kSinglePhase;
+        IndexBuildMethodEnum method = IndexBuildMethodEnum::kHybrid;
+        bool forRecovery = false;
+        bool isResumable = false;
+    };
+
+    IndexBuildsManager() = default;
+    ~IndexBuildsManager();
+
+    /**
+     * Sets up the index build state and registers it in the manager.
+     */
+    using OnInitFn = MultiIndexBlock::OnInitFn;
+    Status setUpIndexBuild(OperationContext* opCtx,
+                           CollectionWriter& collection,
+                           const std::vector<IndexBuildInfo>& indexes,
+                           const UUID& buildUUID,
+                           OnInitFn onInit,
+                           SetupOptions options = {},
+                           const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
+
+    /**
+     * Unregisters the builder associated with the given buildUUID from the _builders map, causing
+     * the index build in-memory state to be destroyed.
+     */
+    void tearDownAndUnregisterIndexBuild(const UUID& buildUUID);
+
+    /**
+     * Runs the scanning/insertion phase of the index build..
+     */
+    Status startBuildingIndex(OperationContext* opCtx,
+                              const DatabaseName& dbName,
+                              const UUID& collectionUUID,
+                              const UUID& buildUUID,
+                              const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
+
+    Status resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
+                                                const CollectionAcquisition& collection,
+                                                const UUID& buildUUID);
+
+    /**
+     * Iterates through every record in the collection to index it. May also remove documents
+     * that are not valid BSON objects, if repair is set to kYes.
+     *
+     * Returns the number of records and the size of the data iterated over.
+     */
+    StatusWith<std::pair<long long, long long>> startBuildingIndexForRecovery(
+        OperationContext* opCtx, const CollectionAcquisition& coll, const UUID& buildUUID);
+
+    /**
+     * Document inserts observed during the scanning/insertion phase of an index build are not
+     * added but are instead stored in a temporary buffer until this function is invoked.
+     */
+    Status drainBackgroundWrites(OperationContext* opCtx,
+                                 const UUID& buildUUID,
+                                 RecoveryUnit::ReadSource readSource,
+                                 IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
+
+    /**
+     * By default, retries the key generation and insertion of records that were skipped during the
+     * scanning phase due to error suppression.
+     */
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const UUID& buildUUID,
+        const CollectionPtr& collection,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
+
+    /**
+     * Runs the index constraint violation checking phase of the index build..
+     */
+    Status checkIndexConstraintViolations(OperationContext* opCtx,
+                                          const CollectionPtr& collection,
+                                          const UUID& buildUUID);
+
+    /**
+     * Persists information in the index catalog entry that the index is ready for use, as well as
+     * updating the in-memory index catalog entry for this index to ready.
+     */
+    using OnCreateEachFn = MultiIndexBlock::OnCreateEachFn;
+    using OnCommitFn = MultiIndexBlock::OnCommitFn;
+    Status commitIndexBuild(OperationContext* opCtx,
+                            CollectionWriter& collection,
+                            const NamespaceString& nss,
+                            const UUID& buildUUID,
+                            OnCreateEachFn onCreateEachFn,
+                            OnCommitFn onCommitFn);
+
+    /**
+     * Deletes the index entry from the durable catalog.
+     */
+    using OnCleanUpFn = MultiIndexBlock::OnCleanUpFn;
+    bool abortIndexBuild(OperationContext* opCtx,
+                         CollectionWriter& collection,
+                         const UUID& buildUUID,
+                         OnCleanUpFn onCleanUpFn);
+
+    /**
+     * Signals the index build to be aborted without being cleaned up and returns without waiting
+     * for it to stop. Does nothing if the index build has already been cleared away.
+     *
+     * Writes the current state of the index build to disk if the specified index build is a
+     * two-phase hybrid index build and resumable index builds are supported.
+     *
+     * Returns true if a build existed to be signaled, as opposed to having already finished and
+     * been cleared away, or not having yet started.
+     */
+    bool abortIndexBuildWithoutCleanup(OperationContext* opCtx,
+                                       const CollectionPtr& collection,
+                                       const UUID& buildUUID);
+
+    /**
+     * Updates the resumability flag on an active builder.
+     */
+    void setIsResumable(const UUID& buildUUID, bool isResumable);
+
+    /**
+     * Returns true if the index build supports background writes while building an index. This is
+     * true for the kHybrid method.
+     */
+    bool isBackgroundBuilding(const UUID& buildUUID);
+
+    /**
+     * Provides passthrough access to MultiIndexBlock for index build info.
+     * Does nothing if build UUID does not refer to an active index build.
+     */
+    void appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const;
+
+    /**
+     * Provides passthrough access to MultiIndexBlock for the phase the build is currently in.
+     * Returns boost::none if the build UUID does not refer to an active index build.
+     */
+    boost::optional<IndexBuildPhaseEnum> getPhase(const UUID& buildUUID) const;
+
+    /**
+     * Provides passthrough access to MultiIndexBlock for the number of keys and bytes the build has
+     * written to the index tables. Returns boost::none if the build UUID does not refer to an
+     * active index build.
+     */
+    boost::optional<MultiIndexBlock::IndexBuildWriteStats> getNumKeysAndBytesWritten(
+        const UUID& buildUUID) const;
+
+    /**
+     * Checks via invariant that the manager has no index builds presently.
+     */
+    void verifyNoIndexBuilds_forTestOnly();
+
+private:
+    /**
+     * Creates and registers a new builder in the _builders map, mapped by the provided buildUUID.
+     */
+    void _registerIndexBuild(UUID buildUUID);
+
+    /**
+     * Returns a pointer to the builder. Returns a bad status if the builder does not exist.
+     */
+    StatusWith<MultiIndexBlock*> _getBuilder(const UUID& buildUUID);
+
+    // Protects the map data structures below.
+    mutable std::mutex _mutex;
+
+    // Map of index builders by build UUID. Allows access to the builders so that actions can be
+    // taken on and information passed to and from index builds.
+    std::map<UUID, std::unique_ptr<MultiIndexBlock>> _builders;
+};
+
+}  // namespace mongo

@@ -1,0 +1,324 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/sorter/file.h"
+#include "mongo/db/sorter/file_based_spiller.h"
+#include "mongo/db/sorter/sorter.h"
+#include "mongo/db/sorter/sorter_template_defs.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/temp_dir.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/modules.h"
+
+#include <climits>
+#include <type_traits>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::sorter {
+static constexpr int64_t testSpillingMinAvailableDiskSpaceBytes = 500 * 1024 * 1024;
+//
+// Sorter framework testing utilities
+//
+
+/**
+ * Restricted to the types BufBuilder::appendNum() has an exact overload for.
+ */
+template <typename T>
+requires(std::is_same_v<T, char> || std::is_same_v<T, int16_t> || std::is_same_v<T, int32_t> ||
+         std::is_same_v<T, int64_t>)
+class ContainerElementWrapper {
+public:
+    using ElementType = T;
+
+    ContainerElementWrapper() = default;
+    constexpr ContainerElementWrapper(T i) : _i{i} {}  // Implicit conversion is allowed.
+    constexpr operator const T&() const {
+        return _i;
+    }
+
+    /// members for Sorter
+    struct SorterDeserializeSettings {};  // unused
+    void serializeForSorter(BufBuilder& buf) const {
+        buf.appendNum(_i);
+    }
+    static ContainerElementWrapper deserializeForSorter(BufReader& buf,
+                                                        const SorterDeserializeSettings&) {
+        return buf.read<LittleEndian<T>>().value;
+    }
+    int memUsageForSorter() const {
+        return sizeof(ContainerElementWrapper);
+    }
+    ContainerElementWrapper getOwned() const {
+        return *this;
+    }
+    void makeOwned() {}
+
+    std::string toString() const {
+        return std::to_string(_i);
+    }
+
+private:
+    T _i{};
+};
+
+using IntWrapper = ContainerElementWrapper<int32_t>;
+static_assert(static_cast<int32_t>(IntWrapper{}) == 0, "IntWrapper default-constructs to 0");
+
+typedef std::pair<IntWrapper, IntWrapper> IWPair;
+typedef sorter::Iterator<IntWrapper, IntWrapper> IWIterator;
+typedef Sorter<IntWrapper, IntWrapper> IWSorter;
+
+enum Direction { ASC = 1, DESC = -1 };
+class IWComparator {
+public:
+    IWComparator(Direction dir = ASC) : _dir(dir) {}
+    int operator()(const IntWrapper& lhs, const IntWrapper& rhs) const {
+        if (lhs == rhs)
+            return 0;
+        if (lhs < rhs)
+            return -1 * _dir;
+        return 1 * _dir;
+    }
+
+private:
+    Direction _dir;
+};
+
+class IntIterator : public IWIterator {
+public:
+    IntIterator(int start = 0, int stop = INT_MAX, int increment = 1)
+        : _current(start), _increment(increment), _stop(stop) {}
+    bool more() override {
+        if (_increment == 0)
+            return true;
+        if (_increment > 0)
+            return _current < _stop;
+        return _current > _stop;
+    }
+    IWPair next() override {
+        IWPair out(_current, -_current);
+        _current += _increment;
+        return out;
+    }
+    IntWrapper nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+    IntWrapper getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+    const IntWrapper& peek() override {
+        MONGO_UNREACHABLE;
+    }
+    SorterRange getRange() const override {
+        MONGO_UNREACHABLE;
+    }
+    bool spillable() const override {
+        return false;
+    }
+    [[nodiscard]] std::unique_ptr<Iterator<IntWrapper, IntWrapper>> spill(
+        const SortOptions& opts,
+        const typename Sorter<IntWrapper, IntWrapper>::Settings& settings) override {
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    int _current;
+    int _increment;
+    int _stop;
+};
+
+class EmptyIterator : public IWIterator {
+public:
+    bool more() override {
+        return false;
+    }
+    Data next() override {
+        MONGO_UNREACHABLE;
+    }
+    IntWrapper nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+    IntWrapper getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+    const IntWrapper& peek() override {
+        MONGO_UNREACHABLE;
+    }
+    SorterRange getRange() const override {
+        MONGO_UNREACHABLE;
+    }
+    bool spillable() const override {
+        return false;
+    }
+    [[nodiscard]] std::unique_ptr<Iterator<IntWrapper, IntWrapper>> spill(
+        const SortOptions& opts,
+        const typename Sorter<IntWrapper, IntWrapper>::Settings& settings) override {
+        MONGO_UNREACHABLE;
+    }
+};
+
+class RangeOnlyIterator : public EmptyIterator {
+public:
+    explicit RangeOnlyIterator(SorterRange range) : _range(std::move(range)) {}
+
+    SorterRange getRange() const override {
+        return _range;
+    }
+
+private:
+    SorterRange _range;
+};
+
+class LimitIterator : public IWIterator {
+public:
+    LimitIterator(long long limit, std::shared_ptr<IWIterator> source)
+        : _remaining(limit), _source(source) {
+        invariant(limit > 0);
+    }
+
+    bool more() override {
+        return _remaining && _source->more();
+    }
+    Data next() override {
+        invariant(more());
+        _remaining--;
+        return _source->next();
+    }
+    IntWrapper nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+    IntWrapper getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+    const IntWrapper& peek() override {
+        MONGO_UNREACHABLE;
+    }
+    SorterRange getRange() const override {
+        MONGO_UNREACHABLE;
+    }
+    bool spillable() const override {
+        return false;
+    }
+    [[nodiscard]] std::unique_ptr<Iterator<IntWrapper, IntWrapper>> spill(
+        const SortOptions& opts,
+        const typename Sorter<IntWrapper, IntWrapper>::Settings& settings) override {
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    long long _remaining;
+    std::shared_ptr<IWIterator> _source;
+};
+
+template <typename It1, typename It2>
+void _assertIteratorsEquivalent(It1&& it1, It2&& it2, int line) {
+    int iteration;
+    try {
+        for (iteration = 0; true; iteration++) {
+            ASSERT_EQUALS(it1->more(), it2->more()) << "on iteration " << iteration;
+            // make sure more() is safe to call twice
+            ASSERT_EQUALS(it1->more(), it2->more()) << "on iteration " << iteration;
+            if (!it1->more())
+                return;
+
+            sorter::IWPair pair1 = it1->next();
+            sorter::IWPair pair2 = it2->next();
+            ASSERT_EQUALS(pair1.first, pair2.first) << "on iteration " << iteration;
+            ASSERT_EQUALS(pair1.second, pair2.second) << "on iteration " << iteration;
+        }
+    } catch (...) {
+        LOGV2(22047,
+              "Failure from line {line} on iteration {iteration}",
+              "line"_attr = line,
+              "iteration"_attr = iteration);
+        throw;
+    }
+}
+
+#define ASSERT_ITERATORS_EQUIVALENT(it1, it2) _assertIteratorsEquivalent(it1, it2, __LINE__)
+
+template <typename It1, typename It2>
+void _assertIteratorsEquivalentForNSteps(It1& it1, It2& it2, int maxSteps, int line) {
+    int iteration;
+    try {
+        for (iteration = 0; iteration < maxSteps; iteration++) {
+            ASSERT_EQUALS(it1->more(), it2->more()) << "on iteration " << iteration;
+            // make sure more() is safe to call twice
+            ASSERT_EQUALS(it1->more(), it2->more()) << "on iteration " << iteration;
+            if (!it1->more())
+                return;
+
+            IWPair pair1 = it1->next();
+            IWPair pair2 = it2->next();
+            ASSERT_EQUALS(pair1.first, pair2.first) << "on iteration " << iteration;
+            ASSERT_EQUALS(pair1.second, pair2.second) << "on iteration " << iteration;
+        }
+    } catch (...) {
+        LOGV2(6409300,
+              "Failure from line {line} on iteration {iteration}",
+              "line"_attr = line,
+              "iteration"_attr = iteration);
+        throw;
+    }
+}
+
+#define ASSERT_ITERATORS_EQUIVALENT_FOR_N_STEPS(it1, it2, n) \
+    _assertIteratorsEquivalentForNSteps(it1, it2, n, __LINE__)
+
+template <int N>
+std::shared_ptr<IWIterator> makeInMemIterator(
+    const int (&array)[N],
+    std::shared_ptr<Spiller<IntWrapper, IntWrapper, IWComparator>> spiller = nullptr);
+
+template <int N>
+std::shared_ptr<IWIterator> makeInMemIterator(
+    const int (&array)[N], std::shared_ptr<Spiller<IntWrapper, IntWrapper, IWComparator>> spiller) {
+    std::vector<IWPair> vec;
+    for (int i = 0; i < N; i++)
+        vec.push_back(IWPair(array[i], -array[i]));
+    return std::make_shared<InMemIterator<IntWrapper, IntWrapper, IWComparator>>(vec, spiller);
+}
+
+/**
+ * Spills the contents of inputIter to a file and returns a FileIterator for reading the data
+ * back. This is needed because the MergeIterator currently requires that it is merging from
+ * sorted spill file segments (as opposed to any other kind of iterator).
+ */
+template <typename IteratorPtr>
+std::shared_ptr<IWIterator> spillToFile(IteratorPtr inputIter,
+                                        SorterFileStats* fileStats,
+                                        const unittest::TempDir& spillDir) {
+    if (!inputIter->more()) {
+        return std::make_shared<EmptyIterator>();
+    }
+    const SortOptions opts = SortOptions();
+    auto spillFile = std::make_shared<File>(sorter::nextFileName(spillDir.path()), fileStats);
+    FileBasedStorage<IntWrapper, IntWrapper> sorterStorage(
+        spillFile, /*dbName=*/boost::none, SorterChecksumVersion::v2);
+    std::unique_ptr<SortedStorageWriter<IntWrapper, IntWrapper>> writer =
+        sorterStorage.makeWriter(opts, /*settings=*/{});
+    while (inputIter->more()) {
+        auto pair = inputIter->next();
+        writer->addAlreadySorted(pair.first, pair.second);
+    }
+    return writer->done();
+}
+
+template <typename IteratorPtr, int N>
+std::shared_ptr<IWIterator> mergeIterators(IteratorPtr (&array)[N],
+                                           const unittest::TempDir& spillDir,
+                                           Direction Dir = ASC,
+                                           const SortOptions& opts = SortOptions()) {
+    std::vector<std::shared_ptr<IWIterator>> vec;
+    for (auto& it : array) {
+        // Spill iterator outputs to a file and obtain a new iterator for it.
+        vec.push_back(spillToFile(std::move(it), /*fileStats=*/nullptr, spillDir));
+    }
+    return sorter::merge<IntWrapper, IntWrapper>(vec, opts, IWComparator(Dir));
+}
+}  // namespace mongo::sorter
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

@@ -1,0 +1,33 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/record_id.idl"
+
+structs:
+    TruncateRangeOplogEntry:
+        description: "The object field of a truncateRange oplog entry"
+        strict: false
+        fields:
+            truncateRange:
+                description: "Full namespace for the collection being truncated"
+                type: namespacestring
+            minRecordId:
+                description: "Inclusive lower bound of the range to truncate"
+                type: RecordId
+            maxRecordId:
+                description: "Inclusive upper bound of the range to truncate"
+                type: RecordId
+            bytesDeleted:
+                description: "Bytes that will be truncated"
+                type: exactInt64
+                validator: {gte: 0}
+            docsDeleted:
+                description: "Number of documents that will be truncated"
+                type: exactInt64
+                validator: {gte: 0}

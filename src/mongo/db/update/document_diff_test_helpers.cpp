@@ -1,0 +1,111 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/document_diff_test_helpers.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/update/document_diff_applier.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <string_view>
+#include <vector>
+
+namespace mongo::doc_diff {
+using namespace std::literals::string_view_literals;
+
+BSONObj createObjWithLargePrefix(const std::string& suffix) {
+    const static auto largeObj = BSON("prefixLargeField" << std::string(200, 'a'));
+    return largeObj.addFields(fromjson(suffix));
+}
+
+std::string getFieldName(int level, int fieldNum) {
+    return str::stream() << "f" << level << fieldNum;
+}
+
+Value getScalarFieldValue(PseudoRandom* rng) {
+    switch (rng->nextInt32(10)) {
+        case 0:
+            return Value("val"sv);
+        case 1:
+            return Value(BSONNULL);
+        case 2:
+            return Value(-1LL);
+        case 3:
+            return Value(0);
+        case 4:
+            return Value(1.10);
+        case 5:
+            return Value(false);
+        case 6:
+            return Value(BSONRegEx("p"));
+        case 7:
+            return Value(Date_t());
+        case 8:
+            return Value(UUID::gen());
+        case 9:
+            return Value(BSONBinData("asdf", 4, BinDataGeneral));
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+BSONObj generateDoc(PseudoRandom* rng, MutableDocument* doc, int depthLevel) {
+    // Append a large field at each level so that the likelihood of generating a sub-diff is high.
+    auto largeFieldObj = createObjWithLargePrefix("{}");
+    doc->addField("prefixLargeField", Value(largeFieldObj.firstElement()));
+
+    // Reduce the probabilty of generated nested objects as we go deeper. After depth level 6, we
+    // should not be generating anymore nested objects.
+    const double subObjProbability = 0.3 - (depthLevel * 0.05);
+    const double subArrayProbability = 0.2 - (depthLevel * 0.05);
+
+    const int numFields = (5 - depthLevel) + rng->nextInt32(4);
+    for (int fieldNum = 0; fieldNum < numFields; ++fieldNum) {
+        const auto fieldName = getFieldName(depthLevel, fieldNum);
+        auto num = rng->nextCanonicalDouble();
+        if (num <= subObjProbability) {
+            MutableDocument subDoc;
+            doc->addField(fieldName, Value(generateDoc(rng, &subDoc, depthLevel + 1)));
+        } else if (num <= (subObjProbability + subArrayProbability)) {
+            const auto arrayLength = rng->nextInt32(10);
+            std::vector<Value> values;
+            auto numSubObjs = 0;
+            for (auto i = 0; i < arrayLength; i++) {
+                // The probablilty of generating a sub-object goes down as we generate more
+                // sub-objects and as the array position increases.
+                if (!rng->nextInt32(2 + numSubObjs + i)) {
+                    MutableDocument subDoc;
+
+                    // Ensure that the depth is higher as we generate more sub-objects, to avoid
+                    // bloating up the document size exponentially.
+                    values.push_back(
+                        Value(generateDoc(rng, &subDoc, depthLevel + 1 + numSubObjs * 2)));
+                    ++numSubObjs;
+                } else {
+                    values.push_back(getScalarFieldValue(rng));
+                }
+            }
+
+            doc->addField(fieldName, Value(values));
+        } else {
+            doc->addField(fieldName, getScalarFieldValue(rng));
+        }
+    }
+    return doc->freeze().toBson();
+}
+
+BSONObj applyDiffTestHelper(BSONObj preImage,
+                            BSONObj diff,
+                            bool mustCheckExistenceForInsertOperations) {
+    return applyDiff(preImage, diff, mustCheckExistenceForInsertOperations);
+}
+
+}  // namespace mongo::doc_diff

@@ -1,0 +1,106 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "views",
+    srcs = [
+        "util.cpp",
+        "view.cpp",
+        "view_graph.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/query/collation:collator_factory_interface",
+        "//src/mongo/db/query/collation:collator_interface",
+    ],
+)
+
+mongo_cc_library(
+    name = "resolved_view",
+    srcs = [
+        "resolved_namespace_timeseries.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/pipeline:aggregation_request_helper",
+        "//src/mongo/db/pipeline:lite_parsed_document_source",
+        "//src/mongo/db/timeseries:timeseries_conversion_util",
+        "//src/mongo/db/timeseries:timeseries_options",
+    ],
+)
+
+mongo_cc_library(
+    name = "pipeline_resolver",
+    srcs = [
+        "pipeline_resolver.cpp",
+    ],
+    # This library has a mutual dependency with //src/mongo/db/pipeline:pipeline.
+    # pipeline_resolver.cpp uses Pipeline::parseFromLiteParsed. To break the cycle,
+    # pipeline depends on pipeline_resolver, and the Pipeline symbols are resolved at
+    # link time when both libraries are combined.
+    no_undefined_ref_DO_NOT_USE = False,
+    deps = [
+        ":resolved_view",
+        "//src/mongo/db/pipeline:lite_parsed_desugarer",
+        "//src/mongo/db/pipeline/search:mongot_extension_name",
+    ],
+)
+
+mongo_cc_library(
+    name = "view_catalog_helpers",
+    srcs = [
+        "view_catalog_helpers.cpp",
+    ],
+    deps = [
+        ":resolved_view",
+        ":views",
+        "//src/mongo/db/pipeline:aggregation",
+        "//src/mongo/db/shard_role/shard_catalog:collection_catalog",
+        "//src/mongo/db/storage:storage_options",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "db_views_test",
+    srcs = [
+        "resolved_view_test.cpp",
+        "view_catalog_test.cpp",
+        "view_definition_test.cpp",
+        "view_graph_test.cpp",
+    ],
+    tags = ["mongo_unittest_sixth_group"],
+    deps = [
+        ":view_catalog_helpers",
+        ":views",
+        "//src/mongo/db:multitenancy",
+        "//src/mongo/db/auth:authmocks",
+        "//src/mongo/db/query:query_test_service_context",
+        "//src/mongo/db/query/collation:collator_interface_mock",
+        "//src/mongo/db/repl:replmocks",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "pipeline_resolver_test",
+    srcs = [
+        "pipeline_resolver_test.cpp",
+    ],
+    tags = ["mongo_unittest_seventh_group"],
+    deps = [
+        ":pipeline_resolver",
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/pipeline:lite_parsed_document_source",
+        "//src/mongo/unittest",
+    ],
+)

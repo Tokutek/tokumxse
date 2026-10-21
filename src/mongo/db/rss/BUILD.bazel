@@ -1,0 +1,97 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_benchmark", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "replicated_storage_service",
+    srcs = [
+        "replicated_storage_service.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/rss:persistence_provider",
+        "//src/mongo/db/rss:service_lifecycle",
+    ],
+)
+
+mongo_cc_library(
+    name = "persistence_provider",
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/storage:checkpoint_schedule_policy",
+    ],
+)
+
+mongo_cc_library(
+    name = "service_lifecycle",
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/repl:repl_coordinator_interface",
+    ],
+)
+
+mongo_cc_library(
+    name = "persistence_provider_impl",
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/rss:persistence_provider",
+        "//src/mongo/db/rss/attached_storage:attached_persistence_provider",
+    ] + select({
+        "//bazel/config:build_atlas_required_settings": [
+            "//src/mongo/db/modules/atlas/src/disagg_storage:disaggregated_persistence_provider",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+mongo_cc_library(
+    name = "service_lifecycle_impl",
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/rss:service_lifecycle",
+        "//src/mongo/db/rss/attached_storage:attached_service_lifecycle",
+    ] + select({
+        "//bazel/config:build_atlas_required_settings": [
+            "//src/mongo/db/modules/atlas/src/disagg_storage:disaggregated_service_lifecycle",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+mongo_cc_library(
+    name = "disable_snapshotting_fail_point",
+    srcs = ["disable_snapshotting_fail_point.cpp"],
+    hdrs = ["disable_snapshotting_fail_point.h"],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/util:fail_point",
+    ],
+)
+
+idl_generator(
+    name = "snapshot_window_options_gen",
+    src = "snapshot_window_options.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "snapshot_window_options",
+    srcs = [
+        ":snapshot_window_options_gen",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+    ],
+)

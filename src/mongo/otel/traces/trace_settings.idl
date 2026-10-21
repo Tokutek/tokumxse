@@ -1,0 +1,109 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::otel::traces"
+    cpp_includes:
+        - "mongo/otel/traces/trace_settings.h"
+
+server_parameters:
+    opentelemetryTraceDirectory:
+        description: Enable OpenTelemetry with trace file exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTraceDirectory
+        cpp_vartype: std::string
+        redact: false
+    # HTTP exporter can be easier to use for local testing using Jaeger.
+    # Set this parameter to the port used by your local trace collector.
+    # Example:
+    #     --opentelemetryHttpEndpoint="http://localhost:4318/v1/traces"
+    opentelemetryHttpEndpoint:
+        description: Enable OpenTelemetry with HTTP exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryHttpEndpoint
+        cpp_vartype: std::string
+        redact: false
+    openTelemetryTracingHttpExportHeaders:
+        description: >-
+            A BSON document containing custom headers to send when exporting traces.
+            The field name is the header name and the value is either a string or an array of
+            strings, representing the header value(s).
+            Translates W3C Baggage literals to avoid parsing conflicts on the command line;
+            for example, '{MyCommaValue: the%2Cvalue}' will be decoded as 'the,value'.
+            See https://www.w3.org/TR/baggage/ for more information.
+            Only applies to the HTTP exporter; ignored for file and Prometheus exporters.
+            These headers are merged with any headers already configured via the
+            OTEL_EXPORTER_OTLP_HEADERS or OTEL_EXPORTER_OTLP_TRACES_HEADERS environment variables.
+        set_at: startup
+        cpp_class:
+            name: OpenTelemetryTracingHttpExportHeaders
+            override_set: true
+        redact: true
+    openTelemetryTracingCompression:
+        description: >-
+            Compression type for exporting OTel traces. Valid options are ["none", "gzip"]. Default
+            is "none". Values other than "none" are only supported for the HTTP exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTracingCompression
+        cpp_vartype: std::string
+        redact: false
+        default: none
+    openTelemetryTracingBatchExportIntervalMillis:
+        description: The time interval in milliseconds between two consecutive batch span exports.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTracingBatchExportIntervalMillis
+        cpp_vartype: int
+        redact: false
+        default: 1000
+        validator: {gte: 1}
+    openTelemetryTracingFileFlushCount:
+        description: >-
+            The number of exported span records the file exporter buffers before flushing them to
+            the trace file. Spans are not readable by other processes until a flush happens, so
+            lower this when a reader needs to observe spans promptly. Only applies to the file
+            exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTracingFileFlushCount
+        cpp_vartype: int
+        redact: false
+        default: 256
+        validator: {gte: 1}
+    openTelemetryTracingFileFlushIntervalMillis:
+        description: >-
+            The maximum time in milliseconds the file exporter buffers exported span records before
+            flushing them to the trace file, regardless of openTelemetryTracingFileFlushCount.
+            Only applies to the file exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTracingFileFlushIntervalMillis
+        cpp_vartype: int
+        redact: false
+        default: 30000
+        validator: {gte: 1}
+    openTelemetryTracingMaxBatchSize:
+        description: >-
+            The maximum number of spans to export in a single batch. Must be less than or equal to
+            openTelemetryTracingMaxQueueSize.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTracingMaxBatchSize
+        cpp_vartype: int
+        redact: false
+        default: 512
+        validator: {gte: 1}
+    openTelemetryTracingMaxQueueSize:
+        description: The maximum number of spans that can be queued before spans are dropped.
+        set_at: startup
+        cpp_varname: gOpenTelemetryTracingMaxQueueSize
+        cpp_vartype: int
+        redact: false
+        default: 2048
+        validator: {gte: 1}
+    openTelemetryTracingResourceAttributes:
+        description: >-
+            A BSON document of key-value string pairs to add as resource attributes to all exported
+            spans. Attributes "service.name" and "service.instance.id" are set with default values
+            if no user configuration is provided for these attributes.
+        set_at: startup
+        cpp_class:
+            name: OpenTelemetryTracingResourceAttributes
+            override_set: true
+        redact: false

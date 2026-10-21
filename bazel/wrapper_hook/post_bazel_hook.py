@@ -1,0 +1,37 @@
+# Hook to be called after a Bazel invocation.
+import os
+import pathlib
+import sys
+
+REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
+sys.path.append(str(REPO_ROOT))
+
+from bazel.wrapper_hook.install_modules import bootstrap_modules
+
+BAZEL_USER_NAMESPACE = "user-prod"
+BAZEL_CI_NAMESPACE = "ci-prod"
+
+
+def main():
+    bootstrap_modules(sys.argv[1], sys.argv[1:])
+
+    from bazel.wrapper_hook.compiledb import finalize_compiledb_posthook
+    from bazel.wrapper_hook.flag_sync import sync_flags
+    from bazel.wrapper_hook.hermetic_container.symlinks import (
+        restore_hermetic_container_convenience_symlinks_from_env,
+    )
+
+    if os.environ.get("NO_FLAG_SYNC") is None:
+        if os.environ.get("CI") is None:
+            sync_flags(BAZEL_USER_NAMESPACE)
+        else:
+            sync_flags(BAZEL_CI_NAMESPACE)
+
+    enterprise = (REPO_ROOT / "src" / "mongo" / "db" / "modules" / "enterprise").exists()
+    atlas = (REPO_ROOT / "src" / "mongo" / "db" / "modules" / "atlas").exists()
+    finalize_compiledb_posthook(sys.argv[1], enterprise=enterprise, atlas=atlas)
+    restore_hermetic_container_convenience_symlinks_from_env()
+
+
+if __name__ == "__main__":
+    main()

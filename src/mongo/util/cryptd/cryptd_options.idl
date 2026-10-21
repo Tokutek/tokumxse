@@ -1,0 +1,31 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+    configs:
+        section: "MongoCryptD Options"
+        source: [yaml, cli]
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+configs:
+    # Command Line: --idleShutdownTimeoutSecs
+    # YAML Name: processManagement.idleShutdownTimeoutSecs
+    processManagement.idleShutdownTimeoutSecs:
+        description: "Number of seconds since last received request until server shuts down"
+        short_name: idleShutdownTimeoutSecs
+        arg_vartype: Int
+        default: 0
+
+structs:
+    cryptdPidFile:
+        description: "Pid File JSON Format"
+        fields:
+            port: int
+            domainSocket:
+                type: string
+                optional: true
+            pid: int

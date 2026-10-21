@@ -1,0 +1,243 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <set>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include <boost/exception/exception.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+/**
+ * CommonProcessInterface provides base implementations of any MongoProcessInterface methods
+ * whose code is largely identical on mongoD and mongoS.
+ */
+class [[MONGO_MOD_PUBLIC]] CommonProcessInterface : public MongoProcessInterface {
+public:
+    using MongoProcessInterface::MongoProcessInterface;
+    ~CommonProcessInterface() override = default;
+
+    /**
+     * Estimates the size of writes that will be executed on the current node. Note that this
+     * does not account for the full size of an update statement because in the case of local
+     * writes, we will not have to serialize to BSON and are therefore not subject to the 16MB
+     * BSONObj size limit.
+     */
+    class LocalWriteSizeEstimator final : public WriteSizeEstimator {
+    public:
+        int estimateInsertHeaderSize(
+            const write_ops::InsertCommandRequest& insertReq) const override {
+            return 0;
+        }
+
+        int estimateUpdateHeaderSize(
+            const write_ops::UpdateCommandRequest& insertReq) const override {
+            return 0;
+        }
+
+        int estimateInsertSizeBytes(const BSONObj& insert) const override {
+            return insert.objsize();
+        }
+
+        int estimateUpdateSizeBytes(const BatchObject& batchObject,
+                                    UpsertType type) const override {
+            int size = get<write_ops::UpdateModification>(batchObject).objsize();
+            if (auto vars = get<boost::optional<BSONObj>>(batchObject)) {
+                size += vars->objsize();
+            }
+            return size;
+        }
+    };
+
+    /**
+     * Estimate the size of writes that will be sent to the replica set primary.
+     */
+    class TargetPrimaryWriteSizeEstimator final : public WriteSizeEstimator {
+    public:
+        int estimateInsertHeaderSize(
+            const write_ops::InsertCommandRequest& insertReq) const override {
+            return write_ops::getInsertHeaderSizeEstimate(insertReq);
+        }
+
+        int estimateUpdateHeaderSize(
+            const write_ops::UpdateCommandRequest& updateReq) const override {
+            return write_ops::getUpdateHeaderSizeEstimate(updateReq);
+        }
+
+        int estimateInsertSizeBytes(const BSONObj& insert) const override {
+            return insert.objsize() + write_ops::kWriteCommandBSONArrayPerElementOverheadBytes;
+        }
+
+        int estimateUpdateSizeBytes(const BatchObject& batchObject,
+                                    UpsertType type) const override {
+            return getUpdateSizeEstimate(
+                       get<BSONObj>(batchObject),
+                       get<write_ops::UpdateModification>(batchObject),
+                       get<boost::optional<BSONObj>>(batchObject),
+                       type != UpsertType::kNone /* includeUpsertSupplied */,
+                       boost::none /* collation */,
+                       boost::none /* arrayFilters */,
+                       boost::none /* sort */,
+                       BSONObj() /* hint*/,
+                       boost::none /* sampleId */,
+                       false /* $_allowShardKeyUpdatesWithoutFullShardKeyInQuery */,
+                       boost::none /* includeQueryStatsMetricsForOpIndex */) +
+                write_ops::kWriteCommandBSONArrayPerElementOverheadBytes;
+        }
+    };
+
+    /**
+     * Checks if the given index on 'nss' have properties that will guarantee that a document with
+     * non-array values for each of 'fieldPaths' will have at most one matching document in 'nss'.
+     */
+    static SupportingUniqueIndex supportsUniqueKey(const IndexDescriptor* indexDescriptor,
+                                                   const CollatorInterface* indexCollator,
+                                                   const CollatorInterface* queryCollator,
+                                                   const ShardKeyPattern* shardKeyPattern,
+                                                   const std::set<FieldPath>& uniqueKeyPaths);
+
+    /**
+     * Converts the fields from a ShardKeyPattern to a vector of FieldPaths, including the _id if
+     * it's not already in 'keyPatternFields'.
+     */
+    static std::vector<FieldPath> shardKeyToDocumentKeyFields(
+        const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields);
+
+    /**
+     * Utility which determines which shard owns 'nss'. More precisely, if 'nss' resides on
+     * a single shard and is not sharded (that is, it is either unsplittable or untracked), we
+     * return the id of the shard which owns 'nss'. Note that this decision is inherently racy and
+     * subject to become stale. This is okay because either choice will work correctly, we are
+     * simply applying a heuristic optimization.
+     *
+     * As written, this function can only be called in a sharded context.
+     *
+     * Note that the first overload creates an instance of RoutingContext, while the second takes
+     * it as a parameter.
+     */
+    static boost::optional<ShardId> findOwningShard(OperationContext* opCtx,
+                                                    const NamespaceString& nss);
+    static boost::optional<ShardId> findOwningShard(OperationContext* opCtx,
+                                                    RoutingContext& routingCtx,
+                                                    const NamespaceString& nss);
+
+
+    std::vector<BSONObj> getCurrentOps(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       CurrentOpConnectionsMode connMode,
+                                       CurrentOpSessionsMode sessionMode,
+                                       CurrentOpUserMode userMode,
+                                       CurrentOpTruncateMode truncateMode,
+                                       CurrentOpCursorMode cursorMode) const final;
+
+    std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+        OperationContext*,
+        const NamespaceString&,
+        RoutingContext* routingCtx = nullptr) const override = 0;
+
+    void updateClientOperationTime(OperationContext* opCtx) const final;
+
+    boost::optional<ShardId> determineSpecificMergeShard(
+        OperationContext* opCtx, const NamespaceString& nss) const override {
+        return boost::none;
+    };
+
+    std::string getHostAndPort(OperationContext* opCtx) const override;
+
+protected:
+    /**
+     * Returns a BSONObj representing a report of the operation which is currently being
+     * executed by the supplied client. This method is called by the getCurrentOps method of
+     * CommonProcessInterface to delegate to the mongoS- or mongoD- specific implementation.
+     */
+    virtual BSONObj _reportCurrentOpForClient(WithLock,
+                                              const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              Client* client,
+                                              CurrentOpTruncateMode truncateOps) const = 0;
+
+    /**
+     * Iterates through all entries in the local SessionCatalog, and adds an entry to the 'ops'
+     * vector for each idle session that has stashed its transaction locks while sleeping.
+     */
+    virtual void _reportCurrentOpsForIdleSessions(OperationContext* opCtx,
+                                                  CurrentOpUserMode userMode,
+                                                  std::vector<BSONObj>* ops) const = 0;
+
+
+    /**
+     * Report information about transaction coordinators by iterating through all
+     * TransactionCoordinators in the TransactionCoordinatorCatalog.
+     */
+    virtual void _reportCurrentOpsForTransactionCoordinators(OperationContext* opCtx,
+                                                             bool includeIdle,
+                                                             std::vector<BSONObj>* ops) const = 0;
+
+    /**
+     * Reports information about PrimaryOnlyServices.
+     */
+    virtual void _reportCurrentOpsForPrimaryOnlyServices(OperationContext* opCtx,
+                                                         CurrentOpConnectionsMode connMode,
+                                                         CurrentOpSessionsMode sessionMode,
+                                                         std::vector<BSONObj>* ops) const = 0;
+
+    /**
+     * Reports information about query sampling.
+     */
+    virtual void _reportCurrentOpsForQueryAnalysis(OperationContext* opCtx,
+                                                   std::vector<BSONObj>* ops) const = 0;
+
+    /**
+     * Get all the databases. This method can only run on a sharded cluster.
+     */
+    std::vector<DatabaseName> _getAllDatabasesOnAShardedCluster(OperationContext* opCtx,
+                                                                boost::optional<TenantId> tenantId);
+
+    struct RunListCollectionsCommandOptions {
+        // Get the raw collection options (for viewless timeseries collections).
+        bool rawData = false;
+        // Adds a "primary" field to each collection with the primary shard.
+        bool addPrimaryShard = false;
+        // Run the command with primary read preference.
+        bool runOnPrimary = false;
+        // Additional filter to apply to the listCollections command. This filter may include
+        // a 'name' field only when 'nss' is collectionless (database-only); otherwise, name
+        // filtering is automatically derived from 'nss'.
+        BSONObj filter;
+    };
+
+    /**
+     * Utility to run a 'listCollections' command on the primary shard corresponding to the database
+     * in 'nss'. If the namespace is collectionless, it will return all the collections for the
+     * given database. Otherwise, it'll return just the requested collection.
+     * This method can only run on a sharded cluster.
+     */
+    std::vector<BSONObj> _runListCollectionsCommandOnAShardedCluster(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const RunListCollectionsCommandOptions& opts);
+};
+
+}  // namespace mongo

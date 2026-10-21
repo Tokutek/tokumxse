@@ -1,0 +1,168 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include <cstddef>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <utility>
+
+namespace mongo {
+
+/**
+ * Simple generator-type iterator
+ *
+ * This Iterator caches/obscures the underlying data type to allow subclasses to wrap its more()
+ * and next() functions.
+ */
+template <typename DataT>
+class RegistryListIterator {
+public:
+    using DataType = DataT;
+    using ElementType = typename DataT::value_type;
+
+    explicit RegistryListIterator(DataT data) : _data{std::move(data)} {}
+
+    virtual ~RegistryListIterator() = default;
+
+    /**
+     * Return the next element and advance the iterator
+     */
+    auto next() {
+        if (!more()) {
+            return ElementType();
+        }
+
+        return _data[_index++];
+    }
+
+    /**
+     * Return true if there are more elements available
+     */
+    virtual bool more() const {
+        return _index < _data.size();
+    }
+
+private:
+    DataType _data;
+
+    size_t _index = 0;
+};
+
+/**
+ * A synchronized add-only list of elements
+ *
+ * A RegistryList is intended to allow concurrent iteration, insertion, and access with minimal
+ * amounts of resource contention. If each element in the list is a pointer or index, the overhead
+ * of "deactivated" elements is minimal.
+ *
+ * This class does no lifetime management for its elements besides construction and destruction. If
+ * you use it to store pointers, the pointed-to memory should be immortal.
+ */
+template <typename ElementT>
+requires std::is_default_constructible_v<ElementT>
+class RegistryList {
+public:
+    using ElementType = ElementT;
+    using DataType = std::deque<ElementT>;
+    using Iterator = RegistryListIterator<DataType>;
+
+    virtual ~RegistryList() = default;
+
+    /**
+     * Add an element to the list
+     *
+     * @returns  The index of the new pointer element
+     */
+    size_t add(ElementType ptr) {
+        std::lock_guard lk(_m);
+
+        _data.emplace_back(std::move(ptr));
+        return _data.size() - 1;
+    }
+
+    /**
+     * Returns an element at the given index within the list
+     */
+    ElementType at(size_t index) const {
+        std::lock_guard lk(_m);
+
+        if (index >= _data.size()) {
+            // If index is past our synchronized end on the deque, then indexing it will be UB.
+            return ElementType();
+        }
+
+        return _data[index];
+    }
+
+    /**
+     * Return the total number of elements in this list
+     */
+    size_t size() const {
+        std::lock_guard lk(_m);
+
+        return _data.size();
+    }
+
+    /**
+     * Return a copy of the underlying data structure
+     */
+    DataType data() const {
+        std::lock_guard lk(_m);
+
+        return _data;
+    }
+
+    /**
+     * Return an iterator for this list
+     *
+     * This iterator copies the state of the list at the time of capture. If additional elements are
+     * added after this function is invoked, they will not be visible via the Iterator.
+     */
+    auto iter() const {
+        return Iterator(data());
+    }
+
+private:
+    mutable std::mutex _m;
+    DataType _data;
+};
+
+/**
+ * Wrap the basic RegistryList concept to handle weak_ptrs
+ */
+template <typename T>
+requires std::is_constructible_v<std::weak_ptr<T>>
+class WeakPtrRegistryList : public RegistryList<std::weak_ptr<T>> {
+public:
+    using ElementType = std::weak_ptr<T>;
+    using BaseList = RegistryList<ElementType>;
+    using DataType = typename BaseList::DataType;
+
+    class Iterator final : public BaseList::Iterator {
+    public:
+        using BaseList::Iterator::Iterator;
+
+        auto next() {
+            return BaseList::Iterator::next().lock();
+        }
+    };
+
+    ~WeakPtrRegistryList() override = default;
+
+    auto add(const std::shared_ptr<T>& ptr) {
+        return BaseList::add(std::weak_ptr<T>(ptr));
+    }
+
+    auto at(size_t index) const {
+        return BaseList::at(index).lock();
+    }
+
+    auto iter() const {
+        return Iterator(BaseList::data());
+    }
+};
+
+}  // namespace mongo

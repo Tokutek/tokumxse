@@ -1,0 +1,160 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/status.h"
+#include "mongo/logv2/component_settings_filter.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
+#include "mongo/logv2/text_formatter.h"
+#include "mongo/util/assert_util.h"
+
+#include <iostream>
+#include <string>
+#include <string_view>
+
+#include <benchmark/benchmark.h>
+#include <boost/core/typeinfo.hpp>
+#include <boost/exception/exception.hpp>
+#include <boost/iostreams/categories.hpp>
+#include <boost/iostreams/device/null.hpp>
+#include <boost/iostreams/imbue.hpp>
+#include <boost/iostreams/stream.hpp>
+#include <boost/log/core/core.hpp>
+#include <boost/log/sinks/sync_frontend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/smart_ptr/make_shared_object.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+#include <boost/thread/exceptions.hpp>
+// IWYU pragma: no_include "boost/iostreams/detail/error.hpp"
+// IWYU pragma: no_include "boost/iostreams/detail/streambuf/indirect_streambuf.hpp"
+// IWYU pragma: no_include "boost/iostreams/detail/wrap_unwrap.hpp"
+// IWYU pragma: no_include "boost/log/detail/attachable_sstream_buf.hpp"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+boost::shared_ptr<std::ostream> makeNullStream() {
+    namespace bios = boost::iostreams;
+    return boost::make_shared<bios::stream<bios::null_sink>>(bios::null_sink{});
+}
+
+// RAII style helper class for init/deinit new log system
+class ScopedLogV2Bench {
+public:
+    ScopedLogV2Bench(benchmark::State& state) {
+        _shouldInit = state.thread_index == 0;
+        if (_shouldInit) {
+            setupAppender();
+        }
+    }
+
+    ~ScopedLogV2Bench() {
+        if (_shouldInit) {
+            tearDownAppender();
+        }
+    }
+
+private:
+    void setupAppender() {
+        logv2::LogDomainGlobal::ConfigurationOptions config;
+        config.makeDisabled();
+        invariant(logv2::LogManager::global().getGlobalDomainInternal().configure(config));
+
+        auto backend = boost::make_shared<boost::log::sinks::text_ostream_backend>();
+        backend->add_stream(makeNullStream());
+        backend->auto_flush(true);
+
+        _sink = boost::make_shared<
+            boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>>(backend);
+        _sink->set_filter(
+            logv2::ComponentSettingsFilter(logv2::LogManager::global().getGlobalDomain(),
+                                           logv2::LogManager::global().getGlobalSettings()));
+        _sink->set_formatter(logv2::TextFormatter());
+        boost::log::core::get()->add_sink(_sink);
+    }
+
+    void tearDownAppender() {
+        boost::log::core::get()->remove_sink(_sink);
+        invariant(logv2::LogManager::global().getGlobalDomainInternal().configure({}));
+    }
+
+    boost::shared_ptr<boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>>
+        _sink;
+    bool _shouldInit;
+};
+
+// "Expensive" way to create a string.
+std::string createLongString() {
+    return std::string(1000, 'a') + std::string(1000, 'b') + std::string(1000, 'c') +
+        std::string(1000, 'd') + std::string(1000, 'e');
+}
+
+void BM_NoopLogV2(benchmark::State& state) {
+    ScopedLogV2Bench init(state);
+
+    for (auto _ : state)
+        LOGV2_DEBUG(20074, 1, "noop log");
+}
+
+void BM_NoopLogV2Arg(benchmark::State& state) {
+    ScopedLogV2Bench init(state);
+
+    for (auto _ : state)
+        LOGV2_DEBUG(20075, 1, "noop log {}", "str"_attr = createLongString());
+}
+
+void BM_EnabledLogV2(benchmark::State& state) {
+    ScopedLogV2Bench init(state);
+
+    for (auto _ : state)
+        LOGV2(20071, "enabled log");
+}
+
+void BM_EnabledLogV2ExpensiveArg(benchmark::State& state) {
+    ScopedLogV2Bench init(state);
+
+    for (auto _ : state)
+        LOGV2(20072, "enabled log {}", "str"_attr = createLongString());
+}
+
+void BM_EnabledLogV2ManySmallArg(benchmark::State& state) {
+    ScopedLogV2Bench init(state);
+
+    for (auto _ : state) {
+        LOGV2(20073,
+              "enabled log {}{}{}{}{}{}{}{}{}{}",
+              "1"_attr = 1,
+              "2"_attr = 2,
+              "3"_attr = "3",
+              "4"_attr = 4.0,
+              "5"_attr = "5",
+              "6"_attr = "6"sv,
+              "7"_attr = 7,
+              "8"_attr = 8,
+              "9"_attr = "9",
+              "10"_attr = "10"sv);
+    }
+}
+
+void ThreadCounts(benchmark::internal::Benchmark* b) {
+    int tc[] = {1, 2, 4, 8};
+    for (int t : tc)
+        b->Threads(t);
+}
+
+BENCHMARK(BM_NoopLogV2)->Apply(ThreadCounts);
+BENCHMARK(BM_NoopLogV2Arg)->Apply(ThreadCounts);
+BENCHMARK(BM_EnabledLogV2)->Apply(ThreadCounts);
+BENCHMARK(BM_EnabledLogV2ExpensiveArg)->Apply(ThreadCounts);
+BENCHMARK(BM_EnabledLogV2ManySmallArg)->Apply(ThreadCounts);
+
+}  // namespace
+}  // namespace mongo

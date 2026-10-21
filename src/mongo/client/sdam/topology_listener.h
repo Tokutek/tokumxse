@@ -1,0 +1,138 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/sdam/sdam_datatypes.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/util/net/hostandport.h"
+
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+namespace mongo::sdam {
+
+/**
+ * An interface for handling topology related events.
+ */
+class TopologyListener {
+public:
+    virtual ~TopologyListener() {}
+
+    /**
+     * Called when a TopologyDescriptionChangedEvent is published - The TopologyDescription changed
+     * and the new TopologyDescription does not match the old.
+     */
+    virtual void onTopologyDescriptionChangedEvent(TopologyDescriptionPtr previousDescription,
+                                                   TopologyDescriptionPtr newDescription) {};
+
+    virtual void onServerHeartbeatFailureEvent(Status errorStatus,
+                                               const HostAndPort& hostAndPort,
+                                               const BSONObj reply) {};
+    /**
+     * Called when a ServerHandshakeCompleteEvent is published - The initial handshake to the server
+     * at hostAndPort was successful. duration is the measured RTT (Round Trip Time).
+     */
+    virtual void onServerHandshakeCompleteEvent(HelloRTT duration,
+                                                const HostAndPort& address,
+                                                const BSONObj reply = BSONObj()) {};
+
+    virtual void onServerHandshakeFailedEvent(const HostAndPort& address,
+                                              const Status& status,
+                                              const BSONObj reply) {};
+
+    /**
+     * Called when a ServerHeartBeatSucceededEvent is published - A heartbeat sent to the server at
+     * hostAndPort succeeded. duration is the execution time of the event, including the time it
+     * took to send the message and receive the reply from the server.
+     */
+    virtual void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
+                                                 const BSONObj reply) {};
+
+    /*
+     * Called when a ServerPingFailedEvent is published - A monitoring ping to the server at
+     * hostAndPort was not successful.
+     */
+    virtual void onServerPingFailedEvent(const HostAndPort& hostAndPort, const Status& status) {};
+
+    /**
+     * Called when a ServerPingSucceededEvent is published - A monitoring ping to the server at
+     * hostAndPort was successful. duration is the measured RTT (Round Trip Time).
+     */
+    virtual void onServerPingSucceededEvent(HelloRTT duration, const HostAndPort& hostAndPort) {};
+};
+
+/**
+ * This class publishes TopologyListener events to a group of registered listeners.
+ *
+ * To publish an event to all registered listeners call the corresponding event function on the
+ * TopologyEventsPublisher instance.
+ */
+class TopologyEventsPublisher : public TopologyListener,
+                                public std::enable_shared_from_this<TopologyEventsPublisher> {
+public:
+    TopologyEventsPublisher(std::shared_ptr<executor::TaskExecutor> executor)
+        : _executor(executor) {};
+    void registerListener(TopologyListenerPtr listener);
+    void removeListener(TopologyListenerPtr listener);
+    void close();
+
+    void onTopologyDescriptionChangedEvent(TopologyDescriptionPtr previousDescription,
+                                           TopologyDescriptionPtr newDescription) override;
+    void onServerHandshakeCompleteEvent(HelloRTT duration,
+                                        const HostAndPort& address,
+                                        BSONObj reply = BSONObj()) override;
+
+    void onServerHandshakeFailedEvent(const HostAndPort& address,
+                                      const Status& status,
+                                      BSONObj reply) override;
+
+    void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort, BSONObj reply) override;
+    void onServerHeartbeatFailureEvent(Status errorStatus,
+                                       const HostAndPort& hostAndPort,
+                                       BSONObj reply) override;
+    void onServerPingFailedEvent(const HostAndPort& hostAndPort, const Status& status) override;
+    void onServerPingSucceededEvent(HelloRTT duration, const HostAndPort& hostAndPort) override;
+
+private:
+    enum class EventType {
+        HEARTBEAT_SUCCESS,
+        HEARTBEAT_FAILURE,
+        PING_SUCCESS,
+        PING_FAILURE,
+        TOPOLOGY_DESCRIPTION_CHANGED,
+        HANDSHAKE_COMPLETE,
+        HANDSHAKE_FAILURE
+    };
+
+    struct Event {
+        EventType type;
+        HostAndPort hostAndPort;
+        HelloRTT duration;
+        BSONObj reply;
+        TopologyDescriptionPtr previousDescription;
+        TopologyDescriptionPtr newDescription;
+        Status status = Status::OK();
+    };
+    using EventPtr = std::unique_ptr<Event>;
+
+    void _sendEvent(TopologyListener* listener, const TopologyEventsPublisher::Event& event);
+    void _nextDelivery();
+    void _scheduleNextDelivery();
+
+    // Lock acquisition order to avoid deadlock is _eventQueueMutex -> _mutex
+    std::mutex _eventQueueMutex;
+    std::deque<EventPtr> _eventQueue;
+
+    std::mutex _mutex;
+    bool _isClosed = false;
+    std::shared_ptr<executor::TaskExecutor> _executor;
+    std::vector<TopologyListenerPtr> _listeners;
+};
+
+using TopologyEventsPublisherPtr = std::shared_ptr<TopologyEventsPublisher>;
+}  // namespace mongo::sdam

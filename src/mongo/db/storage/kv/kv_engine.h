@@ -1,141 +1,844 @@
-// kv_engine.h
-
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <string>
-#include <vector>
-
 #include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
-#include "mongo/db/catalog/collection_options.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/rss/persistence_provider.h"
+#include "mongo/db/storage/compact_options.h"
+#include "mongo/db/storage/engine_extension.h"
+#include "mongo/db/storage/flush_all_files_observer.h"
+#include "mongo/db/storage/prepared_transactions_iterator.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/shared_buffer.h"
+
+#include <memory>
+#include <mutex>
+#include <span>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
 
 namespace mongo {
 
-    class IndexDescriptor;
-    class OperationContext;
-    class RecordStore;
-    class RecoveryUnit;
-    class SortedDataInterface;
+class JournalListener;
+class OperationContext;
+class RecoveryUnit;
+class SnapshotManager;
+class StorageOplogManager;
+class KVEngineDirectCrudCursor;
 
-    class KVEngine {
-    public:
+/**
+ * Whether a write may skip the read-before-write existence check the storage engine would
+ * otherwise perform. A "blind" write is safe only when the caller has already validated the
+ * operation (e.g. secondary oplog application of an op the primary accepted).
+ */
+enum class [[MONGO_MOD_PUBLIC]] BlindWritePolicy {
+    // Storage engine performs its usual existence check before writing.
+    nonBlind,
+    // Skip the existence check; overwrite if a value is already present.
+    blind,
+};
 
-        virtual RecoveryUnit* newRecoveryUnit() = 0;
+class [[MONGO_MOD_OPEN]] KVEngine : public percona::EngineExtension {
+public:
+    /**
+     * During the startup process, the storage engine is one of the first components to be started
+     * up and fully initialized. But that fully initialized storage engine may not be recognized as
+     * the end for the remaining storage startup tasks that still need to be performed.
+     *
+     * For example, after the storage engine has been fully initialized, we need to access it in
+     * order to set up all of the collections and indexes based on the metadata, or perform some
+     * corrective measures on the data files, etc.
+     *
+     * When all of the storage startup tasks are completed as a whole, then this function is called
+     * by the external force managing the startup process.
+     */
+    virtual void notifyStorageStartupRecoveryComplete() {}
 
-        // ---------
+    /**
+     * Perform any operations in the storage layer that are unblocked now that the server has exited
+     * recovery and considers itself stable.
+     *
+     * This will be called during a node's transition to steady state replication.
+     *
+     * This function may race with shutdown. As a result, any steps within this function that should
+     * not race with shutdown should obtain the global lock.
+     */
+    virtual void notifyReplStartupRecoveryComplete(RecoveryUnit&) {}
 
-        /**
-         * Caller takes ownership
-         * Having multiple out for the same ns is a rules violation;
-         * Calling on a non-created ident is invalid and may crash.
-         */
-        virtual RecordStore* getRecordStore( OperationContext* opCtx,
-                                             StringData ns,
-                                             StringData ident,
-                                             const CollectionOptions& options ) = 0;
+    /**
+     * The storage engine can save several elements of ReplSettings on construction.  Standalone
+     * mode is one such setting that can change after construction and need to be updated.
+     */
+    virtual void setInStandaloneMode() {}
 
-        virtual SortedDataInterface* getSortedDataInterface( OperationContext* opCtx,
-                                                             StringData ident,
-                                                             const IndexDescriptor* desc ) = 0;
+    virtual std::unique_ptr<RecoveryUnit> newRecoveryUnit() {
+        MONGO_UNREACHABLE;
+    }
 
-        //
-        // The create and drop methods on KVEngine are not transactional. Transactional semantics
-        // are provided by the KVStorageEngine code that calls these. For example, drop will be
-        // called if a create is rolled back. A higher-level drop operation will only propagate to a
-        // drop call on the KVEngine once the WUOW commits. Therefore drops will never be rolled
-        // back and it is safe to immediately reclaim storage.
-        //
+    /**
+     * Creates a RecordStore instance for the given ident. The ident must exist, and the behavior if
+     * it does not is undefined.
+     *
+     * At most one non-point-in-time RecordStore should exist for a given ident at a time. Multiple
+     * instances do not synchronize with each other, and writing via multiple instances or writing
+     * via one instance while reading from another (non-PIT) instance may break in surprising ways.
+     *
+     * Instantiating RecordStores is expensive, and the returned pointer should be cached by the
+     * caller if it will be used multiple times. In normal usage, this is managed by Collection and
+     * RecordSTore instances should be obtained via that.
+     */
+    virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
+                                                        const NamespaceString& nss,
+                                                        std::string_view ident,
+                                                        const RecordStore::Options& options,
+                                                        boost::optional<UUID> uuid) = 0;
+    /**
+     * Opens an existing ident as an internal record store. Must be used for record stores created
+     * with `makeInternalRecordStore`. Using `getRecordStore` would cause the record store to use
+     * the same settings as a regular collection, and would differ in behaviour as when it was
+     * originally created with `makeInternalRecordStore`.
+     */
+    virtual std::unique_ptr<RecordStore> getInternalRecordStore(RecoveryUnit& ru,
+                                                                std::string_view ident,
+                                                                KeyFormat keyFormat) = 0;
 
-        virtual Status createRecordStore( OperationContext* opCtx,
-                                          StringData ns,
-                                          StringData ident,
-                                          const CollectionOptions& options ) = 0;
+    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(OperationContext* opCtx,
+                                                                        RecoveryUnit& ru,
+                                                                        const NamespaceString& nss,
+                                                                        const UUID& uuid,
+                                                                        std::string_view ident,
+                                                                        const IndexConfig& config,
+                                                                        KeyFormat keyFormat) = 0;
 
-        virtual Status createSortedDataInterface( OperationContext* opCtx,
-                                                  StringData ident,
-                                                  const IndexDescriptor* desc ) = 0;
+    /**
+     * The create and drop methods on KVEngine are not transactional. Transactional semantics
+     * are provided by the StorageEngine code that calls these. For example, drop will be
+     * called if a create is rolled back. A higher-level drop operation will only propagate to a
+     * drop call on the KVEngine once the WUOW commits. Therefore drops will never be rolled
+     * back and it is safe to immediately reclaim storage.
+     *
+     * Creates a 'RecordStore' and generated from the provided 'options'.
+     */
+    virtual Status createRecordStore(const rss::PersistenceProvider&,
+                                     RecoveryUnit& ru,
+                                     const NamespaceString& nss,
+                                     std::string_view ident,
+                                     const RecordStore::Options& options) = 0;
 
-        virtual int64_t getIdentSize( OperationContext* opCtx,
-                                      StringData ident ) = 0;
+    /**
+     * RecordStores initially created with `makeInternalRecordStore` must be opened with
+     * `getInternalRecordStore`.
+     */
+    virtual std::unique_ptr<RecordStore> makeInternalRecordStore(RecoveryUnit& ru,
+                                                                 std::string_view ident,
+                                                                 KeyFormat keyFormat) = 0;
 
-        virtual Status repairIdent( OperationContext* opCtx,
-                                    StringData ident ) = 0;
+    /**
+     * Similar to createRecordStore but this imports from an existing table with the provided ident
+     * instead of creating a new one.
+     */
+    virtual Status importRecordStore(RecoveryUnit& ru,
+                                     std::string_view ident,
+                                     const BSONObj& storageMetadata,
+                                     bool panicOnCorruptWtMetadata,
+                                     bool repair) {
+        MONGO_UNREACHABLE;
+    }
 
-        virtual Status dropIdent( OperationContext* opCtx,
-                                  StringData ident ) = 0;
+    /**
+     * When we write to an oplog, we call this so that that the storage engine can manage the
+     * visibility of oplog entries to ensure they are ordered.
+     *
+     * Since this is called inside of a WriteUnitOfWork while holding a std::mutex, it is
+     * illegal to acquire any LockManager locks inside of this function.
+     *
+     * If `orderedCommit` is true, the storage engine can assume the input `opTime` has become
+     * visible in the oplog. Otherwise the storage engine must continue to maintain its own
+     * visibility management. Calls with `orderedCommit` true will not be concurrent with calls of
+     * `orderedCommit` false.
+     */
+    virtual Status oplogDiskLocRegister(RecoveryUnit&,
+                                        RecordStore* oplogRecordStore,
+                                        const Timestamp& opTime,
+                                        bool orderedCommit) = 0;
 
-        // optional
-        virtual int flushAllFiles( bool sync ) { return 0; }
+    /**
+     * Waits for all writes that completed before this call to be visible to forward scans.
+     * See the comment on RecordCursor for more details about the visibility rules.
+     *
+     * It is only legal to call this on an oplog. It is illegal to call this inside a
+     * WriteUnitOfWork.
+     */
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                         RecordStore* oplogRecordStore) const = 0;
 
-        virtual bool isDurable() const = 0;
+    /**
+     * Gets the StorageOplogManager which updates oplog visibility.
+     */
+    virtual StorageOplogManager* getOplogManager() const {
+        return nullptr;
+    }
 
-        /**
-         * This must not change over the lifetime of the engine.
-         */
-        virtual bool supportsDocLocking() const = 0;
+    /**
+     * Returns whether this node was started as a replica set member. This governs oplog visibility
+     * behavior and is fixed for the lifetime of the engine.
+     */
+    virtual bool isReplSet() const {
+        return false;
+    }
 
-        /**
-         * Returns true if storage engine supports --directoryperdb.
-         * See:
-         *     http://docs.mongodb.org/manual/reference/program/mongod/#cmdoption--directoryperdb
-         */
-        virtual bool supportsDirectoryPerDB() const = 0;
+    /**
+     * Waits until all commits that happened before this call are durable in the journal. Returns
+     * true, unless the storage engine cannot guarantee durability, which should never happen when
+     * the engine is non-ephemeral. This cannot be called from inside a unit of work, and should
+     * fail if it is. This method invariants if the caller holds any locks, except for repair.
+     *
+     * Can throw write interruption errors from the JournalListener.
+     */
+    virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
 
-        virtual Status okToRename( OperationContext* opCtx,
-                                   StringData fromNS,
-                                   StringData toNS,
-                                   StringData ident,
-                                   const RecordStore* originalRecordStore ) const {
-            return Status::OK();
+    /**
+     * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
+     * on unjournaled tables that are behind the current stable timestamp. If the storage engine
+     * is starting from an "unstable" checkpoint or 'stableCheckpoint'=false, this method call will
+     * turn into an unstable checkpoint.
+     *
+     * This must not be called by a system taking user writes until after a stable timestamp is
+     * passed to the storage engine.
+     */
+    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
+                                                   bool stableCheckpoint) = 0;
+
+    virtual bool underCachePressure(int concurrentOpOuts) = 0;
+
+    virtual Status createSortedDataInterface(
+        const rss::PersistenceProvider&,
+        RecoveryUnit&,
+        const NamespaceString& nss,
+        const UUID& uuid,
+        std::string_view ident,
+        const IndexConfig& indexConfig,
+        const boost::optional<mongo::BSONObj>& storageEngineIndexOptions) = 0;
+
+    /**
+     * Similar to createSortedDataInterface but this imports from an existing table with the
+     * provided ident instead of creating a new one.
+     */
+    virtual Status importSortedDataInterface(RecoveryUnit&,
+                                             std::string_view ident,
+                                             const BSONObj& storageMetadata,
+                                             bool panicOnCorruptWtMetadata,
+                                             bool repair) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual Status dropSortedDataInterface(RecoveryUnit&, std::string_view ident) = 0;
+
+    virtual int64_t getIdentSize(RecoveryUnit&, std::string_view ident) = 0;
+
+    /**
+     * Repair an ident. Returns Status::OK if repair did not modify data. Returns a non-fatal status
+     * of DataModifiedByRepair if a repair operation succeeded, but may have modified data.
+     */
+    virtual Status repairIdent(RecoveryUnit& ru, std::string_view ident) = 0;
+
+    /**
+     * Removes any knowledge of the ident from the storage engines metadata which includes removing
+     * the underlying files belonging to the ident. If a 'schemaEpoch' is specified, it indicates
+     * the schema epoch at which the ident drop should become visible in checkpoints. If
+     * waitForLocks is false dropIdent() will return LockBusy if acquiring any locks would require
+     * waiting.
+     */
+    virtual Status dropIdent(RecoveryUnit& ru,
+                             std::string_view ident,
+                             bool identHasSizeInfo,
+                             boost::optional<uint64_t> schemaEpoch = boost::none,
+                             bool waitForLocks = true) = 0;
+
+    /**
+     * Removes any knowledge of the ident from the storage engines metadata without removing the
+     * underlying files belonging to the ident.
+     */
+    virtual void dropIdentForImport(Interruptible&, RecoveryUnit&, std::string_view ident) = 0;
+
+    /**
+     * Attempts to locate and recover a file that is "orphaned" from the storage engine's metadata,
+     * but may still exist on disk if this is a durable storage engine. Returns DataModifiedByRepair
+     * if a new record store was successfully created and Status::OK() if no data was modified.
+     *
+     * This may return an error if the storage engine attempted to recover the file and failed.
+     *
+     * This recovery process makes no guarantees about the integrity of data recovered or even that
+     * it still exists when recovered.
+     *
+     * Must be called from within a WriteUnitOfWork.
+     */
+    virtual Status recoverOrphanedIdent(const rss::PersistenceProvider& provider,
+                                        RecoveryUnit& ru,
+                                        const NamespaceString& nss,
+                                        std::string_view ident,
+                                        const RecordStore::Options& recordStoreOptions) {
+        auto status = createRecordStore(provider, ru, nss, ident, recordStoreOptions);
+        if (status.isOK()) {
+            return {ErrorCodes::DataModifiedByRepair, "Orphan recovery created a new record store"};
         }
+        return status;
+    }
 
-        virtual bool hasIdent(OperationContext* opCtx, StringData ident) const = 0;
+    virtual void alterIdentMetadata(RecoveryUnit&,
+                                    std::string_view ident,
+                                    const IndexConfig& config,
+                                    bool isForceUpdateMetadata) {}
 
-        virtual std::vector<std::string> getAllIdents( OperationContext* opCtx ) const = 0;
+    /**
+     * See StorageEngine::flushAllFiles for details
+     */
+    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) {}
 
-        /**
-         * This method will be called before there is a clean shutdown.  Storage engines should
-         * override this method if they have clean-up to do that is different from unclean shutdown.
-         * MongoDB will not call into the storage subsystem after calling this function.
-         *
-         * There is intentionally no uncleanShutdown().
-         */
-        virtual void cleanShutdown() = 0;
+    /**
+     * See StorageEngine::beginBackup for details
+     */
+    virtual Status beginBackup() {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
 
-        /**
-         * The destructor will never be called from mongod, but may be called from tests.
-         * Engines may assume that this will only be called in the case of clean shutdown, even if
-         * cleanShutdown() hasn't been called.
-         */
-        virtual ~KVEngine() {}
+    /**
+     * See StorageEngine::endBackup for details
+     */
+    virtual void endBackup() {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual Timestamp getBackupCheckpointTimestamp() = 0;
+
+    virtual Status disableIncrementalBackup() {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
+        const StorageEngine::BackupOptions& options) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
+    virtual void endNonBlockingBackup() {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual StatusWith<std::deque<std::string>> extendBackupCursor() {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
+    /**
+     * Returns whether the KVEngine supports checkpoints.
+     */
+    virtual bool supportsCheckpoints() const {
+        return false;
+    }
+
+    virtual void checkpoint() {}
+
+    virtual StorageEngine::CheckpointIteration getCheckpointIteration() const {
+        return StorageEngine::CheckpointIteration{0};
+    }
+
+    virtual bool hasDataBeenCheckpointed(
+        StorageEngine::CheckpointIteration checkpointIteration) const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns true if the KVEngine is ephemeral -- that is, it is NOT persistent and all data is
+     * lost after shutdown. Otherwise, returns false.
+     */
+    virtual bool isEphemeral() const = 0;
+
+    /**
+     * This must not change over the lifetime of the engine.
+     */
+    virtual bool supportsCappedCollections() const {
+        return true;
+    }
+
+    virtual bool hasIdent(RecoveryUnit&, std::string_view ident) const = 0;
+
+    virtual std::vector<std::string> getAllIdents(RecoveryUnit&) const = 0;
+
+    /**
+     * This method will be called before there is a clean shutdown.  Storage engines should
+     * override this method if they have clean-up to do that is different from unclean shutdown.
+     * MongoDB will not call into the storage subsystem after calling this function.
+     *
+     * The storage engine is allowed to leak memory for faster shutdown, except when the process is
+     * not exiting or when running tools to look for memory leaks.
+     *
+     * There is intentionally no uncleanShutdown().
+     */
+    virtual void cleanShutdown(bool memLeakAllowed) = 0;
+
+    /**
+     * Return the SnapshotManager for this KVEngine or NULL if not supported.
+     *
+     * Pointer remains owned by the StorageEngine, not the caller.
+     */
+    virtual SnapshotManager* getSnapshotManager() const {
+        return nullptr;
+    }
+
+    /**
+     * Sets a new JournalListener, which is used to alert the rest of the
+     * system about journaled write progress.
+     */
+    virtual void setJournalListener(JournalListener* jl) = 0;
+
+    /**
+     * Sets the FlushAllFilesObserver that the engine notifies while it flushes all files.
+     * Engines that do not support this leave it unset.
+     */
+    virtual void setFlushAllFilesObserver(FlushAllFilesObserver* observer) {}
+
+    /**
+     * Returns the registered FlushAllFilesObserver, or nullptr if none has been set.
+     */
+    virtual FlushAllFilesObserver* getFlushAllFilesObserver() const {
+        return nullptr;
+    }
+
+    /**
+     * See `StorageEngine::setLastMaterializedLsn`
+     */
+    virtual void setLastMaterializedLsn(uint64_t lsn) {}
+
+    /**
+     * Configures the specified checkpoint as the starting point for recovery.
+     */
+    virtual Status setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) {
+        return Status::OK();
+    }
+
+    /**
+     * Configures the storage engine as the leader, allowing it to flush checkpoints to remote
+     * storage.
+     * Invariants on failure.
+     * This is NOT idempotent - it will invariant if the storage engine is already in leader mode.
+     */
+    virtual void promoteToLeader() {}
+
+    /**
+     * Configures the storage engine as a follower. Inverse of promoteToLeader().
+     * Invariants on failure.
+     * This is NOT idempotent - it will invariant if the storage engine is already in
+     * follower mode.
+     */
+    virtual void demoteToFollower() {}
+
+    /**
+     * See `StorageEngine::setStableTimestamp`
+     */
+    virtual void setStableTimestamp(Timestamp stableTimestamp, bool force) {}
+
+    /**
+     * See `StorageEngine::setStepDownTimestamp`
+     */
+    virtual void setStepDownTimestamp(WithLock, Timestamp stepDownTimestamp) {}
+
+    /**
+     * See `StorageEngine::getStepDownTimestamp`
+     */
+    virtual Timestamp getStepDownTimestamp() const {
+        return Timestamp();
+    }
+
+    /**
+     * See `StorageEngine::lockStepDown`
+     */
+    virtual std::unique_lock<std::mutex> lockStepDown() {
+        return {};
+    }
+
+    /**
+     * See `StorageEngine::setInitialDataTimestamp`
+     */
+    virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
+
+    /**
+     * See `StorageEngine::getInitialDataTimestamp`
+     */
+    virtual Timestamp getInitialDataTimestamp() const {
+        return Timestamp();
+    }
+
+    /**
+     * See `StorageEngine::setOldestActiveTransactionTimestampCallback`
+     */
+    virtual void setOldestActiveTransactionTimestampCallback(
+        StorageEngine::OldestActiveTransactionTimestampCallback callback) {};
+
+    /**
+     * See `StorageEngine::setOldestTimestamp`
+     */
+    virtual void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {}
+
+    /**
+     * See `StorageEngine::supportsRecoverToStableTimestamp`
+     */
+    virtual bool supportsRecoverToStableTimestamp() const {
+        return false;
+    }
+
+    /**
+     * See `StorageEngine::supportsRecoveryTimestamp`
+     */
+    virtual bool supportsRecoveryTimestamp() const {
+        return false;
+    }
+
+    /**
+     * See `StorageEngine::recoverToStableTimestamp`
+     */
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(Interruptible&) {
+        fassertFailed(50664);
+    }
+
+    /**
+     * See `StorageEngine::getRecoveryTimestamp`
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getLastStableRecoveryTimestamp`
+     */
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getAllDurableTimestamp`
+     */
+    virtual Timestamp getAllDurableTimestamp() const = 0;
+
+    /**
+     * See `StorageEngine::getOplogNeededForCrashRecovery`
+     */
+    virtual boost::optional<Timestamp> getOplogNeededForCrashRecovery() const = 0;
+
+    /**
+     * See `StorageEngine::getPinnedOplog`
+     */
+    virtual Timestamp getPinnedOplog() const {
+        return Timestamp::min();
+    }
+
+    /**
+     * See `StorageEngine::supportsReadConcernSnapshot`
+     */
+    virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    /**
+     * Methods to access the storage engine's timestamps.
+     */
+    virtual Timestamp getCheckpointTimestamp() const {
+        return Timestamp();
+    }
+
+    virtual Timestamp getOldestTimestamp() const {
+        return Timestamp();
+    }
+
+    virtual Timestamp getStableTimestamp() const {
+        return Timestamp();
+    }
+
+    virtual StatusWith<Timestamp> pinOldestTimestamp(RecoveryUnit&,
+                                                     const std::string& requestingServiceName,
+                                                     Timestamp requestedTimestamp,
+                                                     bool roundUpIfTooOld) = 0;
+
+    virtual void unpinOldestTimestamp(const std::string& requestingServiceName) = 0;
+
+    /**
+     * See `StorageEngine::setPinnedOplogTimestamp`
+     */
+    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) = 0;
+
+    /**
+     * The initial stable schema epoch which must be set on startup prior to creating any tables
+     * when schema epochs are in use.
+     */
+    static constexpr uint64_t kInitialSchemaEpoch = 1;
+
+    /**
+     * Untimestamped writes which create tables must still have a schema epoch when those are in
+     * use. This constant is a value which will be accepted as a schema epoch when untimestamped
+     * writes are allowed, and rejected when they are unsafe.
+     */
+    static constexpr uint64_t kUntimestampedSchemaEpoch = 2;
+
+    /**
+     * Reads the current stable schema epoch from the storage engine, returning none if it has not
+     * been set or if schema epochs are not enabled.
+     */
+    virtual boost::optional<uint64_t> getStableSchemaEpoch() = 0;
+
+    /**
+     * Explicitly sets the stable schema epoch to the specified value. Normally the stable epoch is
+     * derived from the stable timestamp, but during initial setup there is a dependency cycle where
+     * we must create several tables before timestamps are available. Has no effect if schema epochs
+     * are not enabled by the persistence provider.
+     */
+    virtual void setStableSchemaEpoch(uint64_t schemaEpoch) = 0;
+
+    /**
+     * Returns the blind-write policy to use for a write on this engine in the given context. The
+     * default returns `nonBlind`; engines that support blind writes override to sample based on
+     * engine state.
+     */
+    virtual BlindWritePolicy chooseBlindWritePolicy(OperationContext* opCtx) {
+        return BlindWritePolicy::nonBlind;
+    }
+
+    /**
+     * Returns a cursor for performing direct key-value CRUD operations on the specified 'ident'.
+     * All operations performed through the cursor use the given blind-write 'policy'. Must be used
+     * from within a storage transaction on 'ru'.
+     */
+    virtual std::unique_ptr<KVEngineDirectCrudCursor> getDirectCursor(
+        RecoveryUnit& ru,
+        std::string_view ident,
+        BlindWritePolicy policy = BlindWritePolicy::nonBlind) = 0;
+
+    /**
+     * See `StorageEngine::dump`
+     */
+    virtual void dump() const = 0;
+
+    /**
+     * Instructs the KVEngine to (re-)configure any internal logging
+     * capabilities. Returns Status::OK() if the logging subsystem was successfully
+     * configured (or if defaulting to the virtual implementation).
+     */
+    virtual Status reconfigureLogging() {
+        return Status::OK();
+    }
+
+    virtual StatusWith<BSONObj> getStorageMetadata(std::string_view ident) const {
+        return BSONObj{};
     };
 
-}
+    /**
+     * Returns the 'KeyFormat' tied to 'ident'.
+     */
+    virtual KeyFormat getKeyFormat(RecoveryUnit&, std::string_view ident) const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns the cache size in MB.
+     */
+    virtual size_t getCacheSizeMB() const {
+        return 0;
+    }
+
+    /**
+     * Sets an optional boolean value (true / false / unset) associated to an arbitrary
+     * `flagName` key on the storage engine options BSON object of a collection / index.
+     * The way the flag is stored in the BSON object is engine-specific, and callers should only
+     * assume that the persisted value can be later recovered using `getFlagFromStorageOptions`.
+     *
+     * This method only exists to support a critical fix (SERVER-91195), which required introducing
+     * a backportable way to persist boolean flags; do not add new usages.
+     * TODO SERVER-92265 evaluate getting rid of this method.
+     */
+    virtual BSONObj setFlagToStorageOptions(const BSONObj& storageEngineOptions,
+                                            std::string_view flagName,
+                                            boost::optional<bool> flagValue) const = 0;
+
+    /**
+     * Gets an optional boolean flag (true / false / unset) associated to an arbitrary
+     * `flagName` key on the storage engine options BSON object of a collection / index,
+     * as previously set by `setFlagToStorageOptions`.
+     * The default value, if one has not been previously set, is the unset state (`boost::none`).
+     *
+     * TODO SERVER-92265 evaluate getting rid of this method.
+     */
+    virtual boost::optional<bool> getFlagFromStorageOptions(const BSONObj& storageEngineOptions,
+                                                            std::string_view flagName) const = 0;
+
+    /**
+     * Append `disaggregated.storage_tier` in the storage engine BSON object of a collection /
+     * index. Returns the updated storage engine options BSON object with the new value set.
+     */
+    [[nodiscard]] virtual BSONObj setStorageTierToStorageOptions(
+        const BSONObj& storageEngineOptions, StorageTierLevelEnum value) const = 0;
+
+    /**
+     * Returns the value of `disaggregated.storage_tier` from the storage engine BSON object of a
+     * collection / index, or boost::none if not set.
+     */
+    virtual boost::optional<StorageTierLevelEnum> getStorageTierFromStorageOptions(
+        const BSONObj& storageEngineOptions) const = 0;
+
+    /**
+     * Returns a collection of statistics about the storage engine, or boost::none
+     * if the engine is unable to collect or by default.
+     */
+    virtual boost::optional<BSONObj> collectStorageStats() {
+        return boost::none;
+    }
+
+    /**
+     * Returns the input storage engine options, sanitized to remove options that may not apply to
+     * this node, such as encryption. Might be called for both collection and index options. See
+     * SERVER-68122.
+     *
+     * TODO SERVER-81069: Remove this since it's intrinsically tied to encryption options only.
+     */
+    virtual BSONObj getSanitizedStorageOptionsForSecondaryReplication(
+        const BSONObj& options) const {
+        return options;
+    }
+
+    /**
+     * See StorageEngine::autoCompact for details.
+     */
+    virtual Status autoCompact(RecoveryUnit&, const AutoCompactOptions& options) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support auto compact");
+    }
+
+    /**
+     * See StorageEngine::wiredTigerRepair for details.
+     */
+    virtual StatusWith<std::string> wiredTigerRepair(const std::string& config) {
+        return {ErrorCodes::CommandNotSupported,
+                "The current storage engine does not support wiredTigerRepair"};
+    }
+
+    /**
+     * See StorageEngine::fixDatabaseSize for details.
+     */
+    virtual Status fixDatabaseSize() {
+        return {ErrorCodes::CommandNotSupported,
+                "The current storage engine does not support fixDatabaseSize"};
+    }
+
+    /**
+     * See StorageEngine::getIndexStorageSize for details.
+     */
+    virtual StatusWith<int64_t> getIndexStorageSize(
+        OperationContext*, const std::vector<std::string>& indexIdents) const {
+        return 0;
+    }
+
+    /**
+     * See StorageEngine::getSharedHistoryStoreStorageSize for details.
+     */
+    virtual StatusWith<int64_t> getSharedHistoryStoreStorageSize(OperationContext*) const {
+        return 0;
+    }
+
+    /**
+     * Pauses background auto-compaction for a replica set write block transition. Auto-compaction
+     * must be explicitly re-enabled after the write block is released.
+     */
+    virtual Status pauseAutoCompactForReplicaSetWritesBlock(RecoveryUnit&) {
+        return Status::OK();
+    }
+
+    /**
+     * The destructor will never be called from mongod, but may be called from tests.
+     * Engines may assume that this will only be called in the case of clean shutdown, even if
+     * cleanShutdown() hasn't been called.
+     */
+    ~KVEngine() override {}
+
+    /**
+     * Returns whether the kv-engine is currently trying to live-restore its database.
+     */
+    virtual bool hasOngoingLiveRestore() {
+        return false;
+    }
+
+    /**
+     * Returns whether the kv-engine is currently in leader mode.
+     */
+    virtual bool isInLeaderMode() {
+        return false;
+    }
+
+    /**
+     * Returns an iterator that yields the prepared_id of unclaimed prepared transactions that exist
+     * in the checkpoint on startup recovery. Callers can use these prepared_ids to reclaim the
+     * prepared transactions through the storage engine.
+     */
+    virtual std::unique_ptr<PreparedTransactionsIterator>
+    getUnclaimedPreparedTransactionsForStartupRecovery(OperationContext* opCtx) const {
+        MONGO_UNREACHABLE;
+    }
+};
+
+/**
+ * A cursor which exposes low-level CRUD operations to a specific ident in a KV store without going
+ * through the normal collection interface. A direct cursor's lifetime is tied to the storage
+ * transaction which was used to obtain it.
+ */
+class [[MONGO_MOD_OPEN]] KVEngineDirectCrudCursor {
+public:
+    using Key = std::variant<std::span<const char>, int64_t>;
+
+    virtual ~KVEngineDirectCrudCursor() = default;
+
+    /**
+     * Inserts a key-value pair into the cursor's ident. Must be called from within a storage
+     * transaction. With `BlindWritePolicy::nonBlind` duplicate keys are rejected. With
+     * `BlindWritePolicy::blind` the duplicate key check is skipped: any existing value at `key` is
+     * silently overwritten.
+     *
+     * Returns OK on success, `DuplicateKey` if the key already exists (nonBlind only), or the
+     * error returned by the underlying storage engine on other failures.
+     */
+    virtual Status insert(RecoveryUnit& ru, Key key, std::span<const char> value) = 0;
+
+    /**
+     * Updates the value associated with `key` in the cursor's ident. Must be called from within
+     * a storage transaction. With `BlindWritePolicy::nonBlind` the key must already exist; missing
+     * keys are rejected with `NoSuchKey`. With `BlindWritePolicy::blind` the key-existence check
+     * is skipped and the operation becomes an upsert: a missing key is inserted, and an existing
+     * value is overwritten.
+     *
+     * Returns OK on success, `NoSuchKey` if the key does not exist (nonBlind only), or the error
+     * returned by the underlying storage engine on other failures.
+     */
+    virtual Status update(RecoveryUnit& ru, Key key, std::span<const char> value) = 0;
+
+    /**
+     * Retrieves the value associated with 'key' from the cursor's ident.
+     *
+     * Returns a 'UniqueBuffer' containing the value on success, 'NoSuchKey' if the key does not
+     * exist, or the error returned by the underlying storage engine on other failures.
+     */
+    virtual StatusWith<UniqueBuffer> get(Key key) = 0;
+
+    /**
+     * Deletes the key from the cursor's ident.
+     *
+     * Returns OK on success, 'NoSuchKey' if the key does not exist, or the error returned by the
+     * underlying storage engine on other failures. Must be called from within a storage
+     * transaction.
+     */
+    virtual Status remove(RecoveryUnit& ru, Key key) = 0;
+};
+}  // namespace mongo

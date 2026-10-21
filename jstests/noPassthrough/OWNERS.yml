@@ -1,0 +1,44 @@
+version: 1.0.0
+filters:
+  - "*reproducible_initializer*":
+    approvers:
+      - 10gen/server-programmability
+  - "version.js":
+    approvers:
+      - 10gen/server-programmability
+  - "exit_logging.js":
+    approvers:
+      - 10gen/server-programmability
+  - "*tassert*":
+    approvers:
+      - 10gen/server-programmability
+  - "*pin_code_segments*":
+    approvers:
+      - 10gen/server-programmability
+  - "*utf8_paths*":
+    approvers:
+      - 10gen/server-programmability
+  - "*failcommand*":
+    approvers:
+      - 10gen/server-programmability
+  - "delinquent*":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "validate_js_generated_bson.js":
+    approvers:
+      - 10gen/server-programmability
+  - "timeseries_upgrade_downgrade_apply_ops.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "server_side_js_import_disabled.js":
+    approvers:
+      - 10gen/query-integration-features
+  - "*auth*":
+    approvers:
+      - 10gen/server-security
+  - "common.bzl":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "resharding_donor_pin_tassert_no_crash.js":
+    approvers:
+      - 10gen/server-cluster-scalability

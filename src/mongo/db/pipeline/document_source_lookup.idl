@@ -1,0 +1,72 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/pipeline/aggregate_command.idl"
+
+structs:
+    DocumentSourceLookupSpec:
+        description: Specification for a $lookup stage.
+        strict: true
+        fields:
+            pipeline:
+                description: The pipeline to run on the foreign collection
+                type: pipeline
+                optional: true
+            let:
+                description: The variables to use in the pipeline stages
+                cpp_name: letVars
+                type: object
+                optional: true
+            $_internalUnwind:
+                description: Internal use only. Used when an unwind is coalesced into a lookup.
+                cpp_name: unwindSpec
+                type: object
+                optional: true
+            from:
+                description: The foreign collection to join into the local collection for the aggregation
+                type: IDLAnyType
+                optional: true
+            as:
+                description: The name of the new array field to add to the input documents
+                type: string
+            localField:
+                description: The local field to use when joining the foreign collection
+                type: string
+                optional: true
+            foreignField:
+                description: The foreign field used to perform equality match with localField
+                type: string
+                optional: true
+            # When a hybrid search stage is de-sugared, then serialized into sub-pipeline BSON to be sent
+            # across the wire (i.e. from mongos to mongod), its unclear from inspecting the BSON that the
+            # original query was a hybrid search, so this internal field preserves that information.
+            $_internalIsHybridSearch:
+                description: An optional internal field specifying if the subpipeline is a hybrid search.
+                type: optionalBool
+                stability: internal
+                cpp_name: isHybridSearch
+            $_internalFieldMatchPipelineIdx:
+                description: >-
+                    Internal use only. On the mongos-to-shard dispatch path for a localField/foreignField
+                    $lookup against a view, this field carries the correct _fieldMatchPipelineIdx so the
+                    shard inserts the equality match after the view stages.
+                type: safeInt64
+                optional: true
+                stability: internal
+                cpp_name: internalFieldMatchPipelineIdx
+            $_internalFromIsAView:
+                description: >-
+                    Internal use only. Carried by the mongos-to-shard $lookup rewrite when
+                    the original foreign namespace was a view (including a rename-only
+                    identity view with `pipeline: []`). The shard uses it to restore
+                    _fromNsIsAView so the "$lookup against a view is never SBE-lowered"
+                    invariant holds after the rewrite has erased the view name.
+                type: optionalBool
+                stability: internal
+                cpp_name: internalFromIsAView

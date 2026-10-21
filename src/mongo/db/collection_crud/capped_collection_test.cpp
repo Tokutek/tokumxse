@@ -1,0 +1,229 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/lock_manager/locker.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+class CappedCollectionTest : public ServiceContextMongoDTest {
+public:
+    CappedCollectionTest() : ServiceContextMongoDTest(Options().engine("wiredTiger")) {}
+
+protected:
+    void setUp() override {
+        // Set up mongod.
+        ServiceContextMongoDTest::setUp();
+
+        auto service = getServiceContext();
+        _storage = std::make_unique<repl::StorageInterfaceImpl>();
+
+        // Set up ReplicationCoordinator and ensure that we are primary.
+        auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(service);
+        ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+        repl::ReplicationCoordinator::set(service, std::move(replCoord));
+
+        // Set up oplog collection. If the WT storage engine is used, the oplog collection is
+        // expected to exist when fetching the next opTime (LocalOplogInfo::getNextOpTimes) to use
+        // for a write.
+        {
+            auto opCtx = newOperationContext();
+            repl::createOplog(opCtx.get());
+        }
+    }
+
+
+    void makeCapped(NamespaceString nss, long long cappedSize = 8192) {
+        CollectionOptions options;
+        options.capped = true;
+        options.cappedSize = cappedSize;  // Maximum size of capped collection in bytes.
+        bool createIdIndex = false;
+        auto opCtx = newOperationContext();
+        ASSERT_OK(storageInterface()->createCollection(opCtx.get(), nss, options, createIdIndex));
+    }
+
+    ServiceContext::UniqueOperationContext newOperationContext() {
+        return Client::getCurrent()->makeOperationContext();
+    }
+
+    typedef std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>
+        ClientAndCtx;
+
+    ClientAndCtx makeClientAndCtx(const std::string& clientName) {
+        auto client = getServiceContext()->getService()->makeClient(clientName);
+        auto opCtx = client->makeOperationContext();
+        return std::make_pair(std::move(client), std::move(opCtx));
+    }
+
+    repl::StorageInterface* storageInterface() {
+        return _storage.get();
+    }
+
+    std::unique_ptr<repl::StorageInterface> _storage;
+};
+
+Status _insertOplogBSON(OperationContext* opCtx, const CollectionPtr& coll, RecordId id) {
+    BSONObj obj = BSON("ts" << Timestamp(id.getLong()));
+    InsertStatement insert(obj);
+    insert.replicatedRecordId = id;
+    return collection_internal::insertDocument(opCtx, coll, insert, nullptr);
+}
+
+CollectionAcquisition acquireCollForRead(OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+}
+
+CollectionAcquisition acquireCollForReadLockFree(OperationContext* opCtx,
+                                                 const NamespaceString& nss) {
+    return acquireCollectionMaybeLockFree(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kRead));
+}
+
+TEST_F(CappedCollectionTest, SeekOplogWithReadTimestamp) {
+    NamespaceString nss = NamespaceString::kRsOplogNamespace;
+    const auto oneSec = Timestamp(1, 0).asULL();
+    {
+        auto [c1, t1] = makeClientAndCtx("t1");
+        WriteUnitOfWork wuow(t1.get());
+        AutoGetCollection ac(t1.get(), nss, MODE_IX);
+        const CollectionPtr& oplog = *ac;
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 2)));
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 4)));
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 6)));
+        ASSERT_OK(_insertOplogBSON(t1.get(), oplog, RecordId(oneSec + 8)));
+        wuow.commit();
+    }
+
+#define checkSeek(cursor, recordNum, expectedInclusiveNum, expectedExclusiveNum)    \
+    do {                                                                            \
+        auto record = cursor->seek(RecordId(oneSec + recordNum),                    \
+                                   SeekableRecordCursor::BoundInclusion::kInclude); \
+        if (expectedInclusiveNum > 0) {                                             \
+            ASSERT(record);                                                         \
+            EXPECT_EQ(expectedInclusiveNum, record->id.getLong() - oneSec);         \
+        } else {                                                                    \
+            ASSERT(!record);                                                        \
+        }                                                                           \
+        record = cursor->seek(RecordId(oneSec + recordNum),                         \
+                              SeekableRecordCursor::BoundInclusion::kExclude);      \
+        if (expectedExclusiveNum > 0) {                                             \
+            ASSERT(record);                                                         \
+            EXPECT_EQ(expectedExclusiveNum, record->id.getLong() - oneSec);         \
+        } else {                                                                    \
+            ASSERT(!record);                                                        \
+        }                                                                           \
+    } while (0);
+
+    // Forward, no read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        const auto acr = acquireCollForReadLockFree(t2.get(), nss);
+        shard_role_details::getRecoveryUnit(t2.get())->setOplogVisibilityTs(boost::none);
+        auto cursor = acr.getCollectionPtr()->getCursor(t2.get());
+        checkSeek(cursor, 1, 2, 2);
+        checkSeek(cursor, 2, 2, 4);
+        checkSeek(cursor, 3, 4, 4);
+        checkSeek(cursor, 4, 4, 6);
+        checkSeek(cursor, 5, 6, 6);
+        checkSeek(cursor, 6, 6, 8);
+        checkSeek(cursor, 7, 8, 8);
+        checkSeek(cursor, 8, 8, -1);
+        checkSeek(cursor, 9, -1, -1);
+    }
+    // Backward, no read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        const auto acr = acquireCollForReadLockFree(t2.get(), nss);
+        auto cursor = acr.getCollectionPtr()->getCursor(t2.get(), false);
+        checkSeek(cursor, 1, -1, -1);
+        checkSeek(cursor, 2, 2, -1);
+        checkSeek(cursor, 3, 2, 2);
+        checkSeek(cursor, 4, 4, 2);
+        checkSeek(cursor, 5, 4, 4);
+        checkSeek(cursor, 6, 6, 4);
+        checkSeek(cursor, 7, 6, 6);
+        checkSeek(cursor, 8, 8, 6);
+        checkSeek(cursor, 9, 8, 8);
+    }
+    // Forward, with read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        shard_role_details::getRecoveryUnit(t2.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, Timestamp(1, 6));
+        const auto acr = acquireCollForReadLockFree(t2.get(), nss);
+        shard_role_details::getRecoveryUnit(t2.get())->setOplogVisibilityTs(boost::none);
+        auto cursor = acr.getCollectionPtr()->getCursor(t2.get());
+        checkSeek(cursor, 1, 2, 2);
+        checkSeek(cursor, 2, 2, 4);
+        checkSeek(cursor, 3, 4, 4);
+        checkSeek(cursor, 4, 4, 6);
+        checkSeek(cursor, 5, 6, 6);
+        checkSeek(cursor, 6, 6, -1);
+        checkSeek(cursor, 7, -1, -1);
+        checkSeek(cursor, 8, -1, -1);
+        checkSeek(cursor, 9, -1, -1);
+    }
+    // Backward, with read timestamp.
+    {
+        auto [c2, t2] = makeClientAndCtx("t2");
+        shard_role_details::getRecoveryUnit(t2.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kProvided, Timestamp(1, 6));
+        const auto acr = acquireCollForReadLockFree(t2.get(), nss);
+        auto cursor = acr.getCollectionPtr()->getCursor(t2.get(), false);
+        checkSeek(cursor, 1, -1, -1);
+        checkSeek(cursor, 2, 2, -1);
+        checkSeek(cursor, 3, 2, 2);
+        checkSeek(cursor, 4, 4, 2);
+        checkSeek(cursor, 5, 4, 4);
+        checkSeek(cursor, 6, 6, 4);
+        checkSeek(cursor, 7, 6, 6);
+        checkSeek(cursor, 8, 6, 6);
+        checkSeek(cursor, 9, 6, 6);
+    }
+}
+
+}  // namespace
+}  // namespace mongo

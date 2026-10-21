@@ -1,0 +1,170 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/auth/auth_name.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/util/assert_util.h"
+
+#include <bitset>
+#include <string_view>
+#include <type_traits>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+namespace {
+constexpr auto kTenantFieldName = "tenant"sv;
+}  // namespace
+
+template <typename T>
+StatusWith<T> AuthName<T>::parse(std::string_view str, const boost::optional<TenantId>& tenant) {
+    auto split = str.find('.');
+
+    if (split == std::string::npos) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << T::kName << " must contain a '.' separated database."
+                                    << T::kFieldName << " pair");
+    }
+
+    return T(str.substr(split + 1), str.substr(0, split), tenant);
+}
+
+template <typename T>
+T AuthName<T>::parseFromVariant(const std::variant<std::string, BSONObj>& name,
+                                const boost::optional<TenantId>& tenant) {
+    if (holds_alternative<std::string>(name)) {
+        return uassertStatusOK(parse(get<std::string>(name)));
+    }
+
+    return parseFromBSONObj(get<BSONObj>(name), tenant);
+}
+
+template <typename T>
+T AuthName<T>::parseFromBSONObj(const BSONObj& obj, const boost::optional<TenantId>& activeTenant) {
+    std::bitset<3> usedFields;
+    constexpr size_t kNameFieldBit = 0;
+    constexpr size_t kDbFieldBit = 1;
+    constexpr size_t kTenantFieldBit = 2;
+    std::string_view name, db;
+    boost::optional<TenantId> tenant = activeTenant;
+
+    const auto validateField = [&](const BSONElement& elem, const size_t bit, BSONType expType) {
+        const auto fieldName = elem.fieldNameStringData();
+        uassert(ErrorCodes::BadValue,
+                str::stream() << T::kName << " must contain a " << typeName(expType)
+                              << " field named: " << fieldName << ". But, has type "
+                              << typeName(elem.type()),
+                elem.type() == expType);
+        uassert(ErrorCodes::BadValue,
+                str::stream() << T::kName << " has more than one field named: " << fieldName,
+                !usedFields[bit]);
+        usedFields.set(bit);
+    };
+
+    for (const auto& element : obj) {
+        const auto fieldName = element.fieldNameStringData();
+
+        if (fieldName == T::kFieldName) {
+            validateField(element, kNameFieldBit, BSONType::string);
+            name = element.valueStringData();
+
+        } else if (fieldName == "db"sv) {
+            validateField(element, kDbFieldBit, BSONType::string);
+            db = element.valueStringData();
+
+        } else if (fieldName == kTenantFieldName) {
+            validateField(element, kTenantFieldBit, BSONType::oid);
+            tenant = TenantId::parseFromBSON(element);
+            if (activeTenant) {
+                uassert(ErrorCodes::BadValue,
+                        str::stream()
+                            << T::kName
+                            << " contains a TenantId which does not match the active tenant",
+                        tenant == activeTenant);
+            }
+
+        } else if constexpr (std::is_same_v<UserName, T>) {
+            // Only UserName is strict, RoleName is non-strict.
+            uasserted(ErrorCodes::BadValue,
+                      str::stream()
+                          << T::kName << " contains an unknown field named: '" << fieldName);
+        }
+    }
+
+    uassert(ErrorCodes::BadValue,
+            str::stream() << T::kName << " must contain a field named: " << T::kFieldName,
+            usedFields[kNameFieldBit]);
+
+    uassert(ErrorCodes::BadValue,
+            str::stream() << T::kName << " must contain a field named: db",
+            usedFields[kDbFieldBit]);
+
+    return T(name, db, tenant);
+}
+
+template <typename T>
+T AuthName<T>::parseFromBSON(const BSONElement& elem,
+                             const boost::optional<TenantId>& activeTenant) {
+    if (elem.type() == BSONType::string) {
+        return uassertStatusOK(parse(elem.valueStringData(), activeTenant));
+    } else if (elem.type() == BSONType::object) {
+        const auto obj = elem.embeddedObject();
+        return parseFromBSONObj(obj, activeTenant);
+    } else {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << T::kName << " must be either a string or an object");
+    }
+}
+
+template <typename T>
+void AuthName<T>::serializeToBSON(std::string_view fieldName, BSONObjBuilder* bob) const {
+    BSONObjBuilder builder(bob->subobjStart(fieldName));
+    appendToBSON(&builder);
+}
+
+template <typename T>
+void AuthName<T>::serializeToBSON(BSONArrayBuilder* bob) const {
+    BSONObjBuilder builder(bob->subobjStart());
+    appendToBSON(&builder);
+}
+
+template <typename T>
+void AuthName<T>::appendToBSON(BSONObjBuilder* bob, bool encodeTenant) const {
+    *bob << T::kFieldName << getName() << "db"sv << getDB();
+    if (encodeTenant) {
+        if (auto tenant = _dbname.tenantId()) {
+            *bob << kTenantFieldName << *tenant;
+        }
+    }
+}
+
+template <typename T>
+BSONObj AuthName<T>::toBSON(bool encodeTenant) const {
+    BSONObjBuilder bob;
+    appendToBSON(&bob, encodeTenant);
+    return bob.obj();
+}
+
+template <typename T>
+std::size_t AuthName<T>::getBSONObjSize() const {
+    return 4UL +                            // BSONObj size
+        1UL + T::kFieldName.size() + 1UL +  // FieldName elem type, FieldName, terminating NULL.
+        4UL + getName().size() + 1UL +      // Length of name data, name data, terminating NULL.
+        1UL + ("db"sv).size() + 1UL +       // DB field elem type, "db", terminating NULL.
+        4UL + getDB().size() + 1UL +        // DB value length, DB value, terminating NULL.
+        1UL;                                // EOD marker.
+}
+
+// Materialize the types we care about.
+template class AuthName<RoleName>;
+template class AuthName<UserName>;
+
+}  // namespace mongo

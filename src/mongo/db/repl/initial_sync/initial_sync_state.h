@@ -1,0 +1,41 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#pragma once
+
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/initial_sync/all_database_cloner.h"
+#include "mongo/db/repl/initial_sync/fast_count_initial_sync_aggregator.h"
+#include "mongo/util/modules.h"
+
+namespace mongo {
+namespace repl {
+
+/**
+ * Holder of state for initial sync (InitialSyncer).
+ */
+struct InitialSyncState {
+    InitialSyncState(std::unique_ptr<AllDatabaseCloner> cloner,
+                     std::shared_ptr<FastCountInitialSyncAggregator> aggregator)
+        : allDatabaseCloner(std::move(cloner)), fastCountAggregator(std::move(aggregator)) {};
+
+    std::unique_ptr<AllDatabaseCloner>
+        allDatabaseCloner;  // Cloner for all databases included in initial sync.
+    std::shared_ptr<FastCountInitialSyncAggregator>
+        fastCountAggregator;  // Accumulator for replicated fast count metadata harvested
+                              // from listCollections during cloning.
+    Future<void> allDatabaseClonerFuture;  // Future for holding result of AllDatabaseCloner
+    Timestamp beginApplyingTimestamp;  // Timestamp from the latest entry in oplog when started. It
+                                       // is also the timestamp after which we will start applying
+                                       // operations during initial sync.
+    Timestamp beginFetchingTimestamp;  // Timestamp from the earliest active transaction that had an
+                                       // oplog entry.
+    Timestamp stopTimestamp;  // Referred to as minvalid, or the place we can transition states.
+    Timer timer;              // Timer for timing how long each initial sync attempt takes.
+    size_t appliedOps = 0;
+};
+
+}  // namespace repl
+}  // namespace mongo

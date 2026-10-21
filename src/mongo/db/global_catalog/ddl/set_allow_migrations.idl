@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+commands:
+    _configsvrSetAllowMigrations:
+        command_name: _configsvrSetAllowMigrations
+        cpp_name: ConfigsvrSetAllowMigrations
+        description: "internal setAllowMigrations command for config server"
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        fields:
+            allowMigrations:
+                type: bool
+                description: "The new allowMigrations flag state to be set."
+                optional: false
+            collectionUUID:
+                type: uuid
+                description: "The uuid of the collection."
+                optional: true # Optional for backwards compatibility
+
+    setAllowMigrations:
+        command_name: setAllowMigrations
+        cpp_name: SetAllowMigrations
+        description: "user faced setAllowMigrations command"
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        chained_structs:
+            SetAllowMigrationsRequest: SetAllowMigrationsRequest

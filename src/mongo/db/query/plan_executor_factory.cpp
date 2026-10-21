@@ -1,0 +1,209 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/plan_executor_factory.h"
+
+#include "mongo/base/status.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/query/plan_executor_sbe.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/sbe_plan_ranker.h"
+#include "mongo/logv2/log.h"
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo::plan_executor_factory {
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    std::unique_ptr<CanonicalQuery> cq,
+    std::unique_ptr<WorkingSet> ws,
+    std::unique_ptr<PlanStage> rootStage,
+    const boost::optional<CollectionAcquisition>& collection,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    size_t plannerOptions,
+    NamespaceString nss,
+    std::unique_ptr<QuerySolution> qs,
+    boost::optional<size_t> cachedPlanHash,
+    boost::optional<std::string> replanReason,
+    boost::optional<PlanSelectionStrategy> planSelectionStrategy) {
+    auto expCtx = cq->getExpCtx();
+    return make(expCtx->getOperationContext(),
+                std::move(ws),
+                std::move(rootStage),
+                std::move(qs),
+                std::move(cq),
+                expCtx,
+                collection,
+                plannerOptions,
+                std::move(nss),
+                yieldPolicy,
+                cachedPlanHash,
+                std::move(replanReason),
+                boost::none /* maybeExplainData */,
+                planSelectionStrategy);
+}
+
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::unique_ptr<WorkingSet> ws,
+    std::unique_ptr<PlanStage> rootStage,
+    const boost::optional<CollectionAcquisition>& collection,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    size_t plannerOptions,
+    NamespaceString nss,
+    std::unique_ptr<QuerySolution> qs) {
+
+    return make(expCtx->getOperationContext(),
+                std::move(ws),
+                std::move(rootStage),
+                std::move(qs),
+                nullptr,
+                expCtx,
+                collection,
+                plannerOptions,
+                std::move(nss),
+                yieldPolicy,
+                boost::none /* cachedPlanHash */,
+                boost::none /* replanReason */,
+                boost::none /* maybeExplainData */);
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    OperationContext* opCtx,
+    std::unique_ptr<WorkingSet> ws,
+    std::unique_ptr<PlanStage> rootStage,
+    std::unique_ptr<QuerySolution> qs,
+    std::unique_ptr<CanonicalQuery> cq,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const boost::optional<CollectionAcquisition>& collection,
+    size_t plannerOptions,
+    NamespaceString nss,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    boost::optional<size_t> cachedPlanHash,
+    boost::optional<std::string> replanReason,
+    boost::optional<PlanExplainerData> maybeExplainData,
+    boost::optional<PlanSelectionStrategy> planSelectionStrategy) {
+    auto execImpl = new PlanExecutorImpl(opCtx,
+                                         std::move(ws),
+                                         std::move(rootStage),
+                                         std::move(qs),
+                                         std::move(cq),
+                                         expCtx,
+                                         collection,
+                                         plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA,
+                                         std::move(nss),
+                                         yieldPolicy,
+                                         cachedPlanHash,
+                                         std::move(replanReason),
+                                         std::move(maybeExplainData),
+                                         planSelectionStrategy);
+    PlanExecutor::Deleter planDeleter(opCtx);
+    return std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>(execImpl, std::move(planDeleter));
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    OperationContext* opCtx,
+    std::unique_ptr<CanonicalQuery> cq,
+    std::unique_ptr<QuerySolution> solution,
+    std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
+    const MultipleCollectionAccessor& collections,
+    size_t plannerOptions,
+    NamespaceString nss,
+    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+    bool planIsFromCache,
+    boost::optional<size_t> cachedPlanHash,
+    bool usedJoinOpt,
+    std::vector<JoinOptPlan> rejectedJoinPlans,
+    std::unique_ptr<RemoteCursorMap> remoteCursors,
+    std::unique_ptr<RemoteExplainVector> remoteExplains,
+    std::unique_ptr<MultiPlanStage> classicRuntimePlannerStage,
+    boost::optional<PlanExplainerData> maybeExplainData,
+    boost::optional<PlanSelectionStrategy> planSelectionStrategy) {
+    auto&& [rootStage, data] = root;
+    sbe::DebugPrintInfo debugPrintInfo{};
+    LOGV2_DEBUG(4822860,
+                5,
+                "SBE plan",
+                "slots"_attr = redact(data.debugString()),
+                "stages"_attr = redact(sbe::DebugPrinter{}.print(*rootStage, debugPrintInfo)));
+
+    return {new PlanExecutorSBE(opCtx,
+                                std::move(cq),
+                                sbe::plan_ranker::CandidatePlan{
+                                    .solution = std::move(solution),
+                                    .root = std::move(rootStage),
+                                    .data = sbe::plan_ranker::CandidatePlanData{std::move(data)},
+                                    .status = Status::OK(),
+                                    .fromPlanCache = planIsFromCache},
+                                plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA,
+                                std::move(nss),
+                                false /*isOpen*/,
+                                std::move(yieldPolicy),
+                                cachedPlanHash,
+                                std::move(remoteCursors),
+                                std::move(remoteExplains),
+                                std::move(classicRuntimePlannerStage),
+                                collections,
+                                usedJoinOpt,
+                                std::move(rejectedJoinPlans),
+                                std::move(maybeExplainData),
+                                planSelectionStrategy),
+            PlanExecutor::Deleter{opCtx}};
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    OperationContext* opCtx,
+    std::unique_ptr<CanonicalQuery> cq,
+    sbe::plan_ranker::CandidatePlan candidate,
+    const MultipleCollectionAccessor& collections,
+    size_t plannerOptions,
+    NamespaceString nss,
+    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+    std::unique_ptr<RemoteCursorMap> remoteCursors,
+    std::unique_ptr<RemoteExplainVector> remoteExplains,
+    boost::optional<size_t> cachedPlanHash,
+    boost::optional<PlanSelectionStrategy> planSelectionStrategy) {
+    sbe::DebugPrintInfo debugPrintInfo{};
+    LOGV2_DEBUG(4822861,
+                5,
+                "SBE plan",
+                "slots"_attr = redact(candidate.data.stageData.debugString()),
+                "stages"_attr = redact(sbe::DebugPrinter{}.print(*candidate.root, debugPrintInfo)));
+
+    return {new PlanExecutorSBE(opCtx,
+                                std::move(cq),
+                                std::move(candidate),
+                                plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA,
+                                std::move(nss),
+                                true, /*isOpen*/
+                                std::move(yieldPolicy),
+                                cachedPlanHash,
+                                std::move(remoteCursors),
+                                std::move(remoteExplains),
+                                nullptr /*classicRuntimePlannerStage*/,
+                                collections,
+                                false /*usedJoinOpt*/,
+                                {} /*rejectedJoinPlans*/,
+                                boost::none /*maybeExplainData*/,
+                                planSelectionStrategy),
+            PlanExecutor::Deleter{opCtx}};
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    std::unique_ptr<Pipeline> pipeline,
+    PlanExecutorPipeline::ResumableScanType resumableScanType) {
+    auto* opCtx = expCtx->getOperationContext();
+    auto exec = new PlanExecutorPipeline(std::move(expCtx), std::move(pipeline), resumableScanType);
+    return {exec, PlanExecutor::Deleter{opCtx}};
+}
+
+}  // namespace mongo::plan_executor_factory

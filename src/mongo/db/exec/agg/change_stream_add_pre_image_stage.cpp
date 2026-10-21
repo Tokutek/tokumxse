@@ -1,0 +1,123 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/agg/change_stream_add_pre_image_stage.h"
+
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/pipeline/change_stream_hashed_field_accessors.h"
+#include "mongo/db/pipeline/change_stream_preimage_gen.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_add_pre_image.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+
+namespace mongo {
+using FieldAccessors = change_stream::HashedFieldAccessors;
+
+boost::intrusive_ptr<exec::agg::Stage> documentSourceChangeStreamAddPreImageToStageFn(
+    const boost::intrusive_ptr<DocumentSource>& documentSource) {
+    auto* changeStreamAddPreImageDS =
+        dynamic_cast<DocumentSourceChangeStreamAddPreImage*>(documentSource.get());
+
+    tassert(10561300,
+            "expected 'DocumentSourceChangeStreamAddPreImage' type",
+            changeStreamAddPreImageDS);
+
+    return make_intrusive<exec::agg::ChangeStreamAddPreImageStage>(
+        changeStreamAddPreImageDS->kStageName,
+        changeStreamAddPreImageDS->getExpCtx(),
+        changeStreamAddPreImageDS->_fullDocumentBeforeChangeMode);
+}
+
+namespace exec::agg {
+
+REGISTER_AGG_STAGE_MAPPING(_internalChangeStreamAddPreImage,
+                           DocumentSourceChangeStreamAddPreImage::id,
+                           documentSourceChangeStreamAddPreImageToStageFn)
+
+ChangeStreamAddPreImageStage::ChangeStreamAddPreImageStage(
+    std::string_view stageName,
+    const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+    const FullDocumentBeforeChangeModeEnum& fullDocumentBeforeChangeMode)
+    : Stage(stageName, pExpCtx), _fullDocumentBeforeChangeMode(fullDocumentBeforeChangeMode) {}
+
+GetNextResult ChangeStreamAddPreImageStage::doGetNext() {
+    auto input = pSource->getNext();
+    if (!input.isAdvanced()) {
+        return input;
+    }
+
+    // If this is not an update, replace or delete, then just pass along the result.
+    const auto opType = input.getDocument()[FieldAccessors::kOperationType];
+    DocumentSourceChangeStream::checkValueType(
+        opType, DocumentSourceChangeStream::kOperationTypeField, BSONType::string);
+    if (auto opTypeValue = opType.getStringData();
+        opTypeValue != DocumentSourceChangeStream::kUpdateOpType &&
+        opTypeValue != DocumentSourceChangeStream::kReplaceOpType &&
+        opTypeValue != DocumentSourceChangeStream::kDeleteOpType) {
+        return input;
+    }
+
+    auto preImageId = input.getDocument()[FieldAccessors::kPreImageId];
+    tassert(6091900, "Pre-image id field is missing", !preImageId.missing());
+    tassert(5868900,
+            "Expected pre-image id field to be a document",
+            preImageId.getType() == BSONType::object);
+
+    // Obtain the pre-image document, if available, given the specified preImageId.
+    auto preImageDoc = lookupPreImage(pExpCtx, preImageId.getDocument());
+    uassert(
+        ErrorCodes::NoMatchingDocument,
+        str::stream() << "Change stream was configured to require a pre-image for all update, "
+                         "delete and replace events, but the pre-image was not found for event: "
+                      << makePreImageNotFoundErrorMsg(input.getDocument()),
+        preImageDoc ||
+            _fullDocumentBeforeChangeMode != FullDocumentBeforeChangeModeEnum::kRequired);
+
+    // Even if no pre-image was found, we have to populate the 'fullDocumentBeforeChange' field.
+    MutableDocument outputDoc(input.releaseDocument());
+    outputDoc[DocumentSourceChangeStreamAddPreImage::kFullDocumentBeforeChangeFieldName] =
+        (preImageDoc ? Value(*preImageDoc) : Value(BSONNULL));
+
+    // Do not propagate preImageId field further through the pipeline.
+    outputDoc.remove(DocumentSourceChangeStreamAddPreImage::kPreImageIdFieldName);
+
+    return outputDoc.freeze();
+}
+
+std::string ChangeStreamAddPreImageStage::makePreImageNotFoundErrorMsg(const Document& event) {
+    auto errMsgDoc = Document{{DocumentSourceChangeStream::kOperationTypeField,
+                               event[DocumentSourceChangeStream::kOperationTypeField]},
+                              {DocumentSourceChangeStream::kNamespaceField,
+                               event[DocumentSourceChangeStream::kNamespaceField]},
+                              {DocumentSourceChangeStream::kClusterTimeField,
+                               event[DocumentSourceChangeStream::kClusterTimeField]},
+                              {DocumentSourceChangeStream::kTxnNumberField,
+                               event[DocumentSourceChangeStream::kTxnNumberField]}};
+    return errMsgDoc.toString();
+}
+
+boost::optional<Document> ChangeStreamAddPreImageStage::lookupPreImage(
+    boost::intrusive_ptr<ExpressionContext> pExpCtx, const Document& preImageId) {
+    // Look up the pre-image document on the local node by id.
+    auto lookedUpDoc = pExpCtx->getMongoProcessInterface()->lookupSingleDocumentLocally(
+        pExpCtx,
+        NamespaceString::kChangeStreamPreImagesNamespace,
+        Document{{ChangeStreamPreImage::kIdFieldName, preImageId}});
+
+    // Return boost::none to signify that we failed to find the pre-image.
+    if (!lookedUpDoc) {
+        return boost::none;
+    }
+
+    // Return "preImage" field value from the document.
+    auto preImageField = lookedUpDoc->getField(FieldAccessors::kPreImage);
+    tassert(
+        6148000, "Pre-image document must contain the 'preImage' field", !preImageField.nullish());
+    return preImageField.getDocument().getOwned();
+}
+
+}  // namespace exec::agg
+}  // namespace mongo

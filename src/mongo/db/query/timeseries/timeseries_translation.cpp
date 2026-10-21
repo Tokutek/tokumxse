@@ -1,0 +1,325 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/timeseries/timeseries_translation.h"
+
+#include "mongo/db/pipeline/document_source_index_stats.h"
+#include "mongo/db/pipeline/document_source_internal_convert_bucket_index_stats.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/timeseries/timeseries_2dsphere_index_version_lookup.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_options.h"
+
+#include <string_view>
+
+namespace mongo {
+
+namespace timeseries {
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Determine whether the catalog data indicates that the collection is a viewless timeseries
+ * collection.
+ */
+inline bool isViewlessTimeseriesCollection(const auto& catalogData) {
+    static_assert(
+        requires { catalogData.isTimeseriesCollection(); } &&
+            requires { catalogData.isNewTimeseriesWithoutView(); },
+        "Catalog information must provide isTimeseriesCollection() and "
+        "isNewTimeseriesWithoutView() when determining whether the collection is a viewless "
+        "timeseries collection.");
+    return catalogData.isTimeseriesCollection() && catalogData.isNewTimeseriesWithoutView();
+}
+
+bool requiresViewlessTimeseriesTranslation(OperationContext* const opCtx, const Collection& coll) {
+    return !isRawDataOperation(opCtx) && isViewlessTimeseriesCollection(coll);
+}
+
+bool requiresViewlessTimeseriesTranslation(OperationContext* const opCtx,
+                                           const CollectionPtr& collPtr) {
+    return collPtr && requiresViewlessTimeseriesTranslation(opCtx, *collPtr.get());
+}
+
+inline bool requiresCustomTranslation(DocumentSource* stage) {
+    return stage->getSourceName() == DocumentSourceIndexStats::kStageName;
+}
+
+void performCustomTranslation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              DocumentSource* stage,
+                              Pipeline& pipeline,
+                              const TimeseriesTranslationParams& params) {
+    tassert(10601103,
+            "The only custom translation is for $indexStats",
+            stage->getSourceName() == DocumentSourceIndexStats::kStageName);
+
+    BSONObjBuilder bob;
+    {
+        BSONObjBuilder tsOptsBob(bob.subobjStart(""sv));
+
+        tsOptsBob.append(timeseries::kTimeFieldName, params.tsOptions.getTimeField());
+
+        const boost::optional<std::string_view>& maybeMetaField = params.tsOptions.getMetaField();
+        if (maybeMetaField) {
+            tsOptsBob.append(timeseries::kMetaFieldName, *maybeMetaField);
+        }
+    }
+
+    // Add the $_internalConvertBucketIndexStats stage right after the $indexStats stage.
+    pipeline.addSourceAtPosition(DocumentSourceInternalConvertBucketIndexStats::createFromBson(
+                                     bob.obj().firstElement(), expCtx),
+                                 1);
+}
+
+void prependUnpackStageToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                  Pipeline& pipeline,
+                                  const TimeseriesTranslationParams& params) {
+    BSONObjBuilder bob;
+    {
+        BSONObjBuilder tsOptsBob(bob.subobjStart(""sv));
+
+        tsOptsBob.append(timeseries::kTimeFieldName, params.tsOptions.getTimeField());
+
+        const boost::optional<std::string_view>& maybeMetaField = params.tsOptions.getMetaField();
+        if (maybeMetaField) {
+            tsOptsBob.append(timeseries::kMetaFieldName, *maybeMetaField);
+        }
+
+        tsOptsBob.append(DocumentSourceInternalUnpackBucket::kAssumeNoMixedSchemaData,
+                         params.assumeNoMixedSchemaData);
+
+        tsOptsBob.append(DocumentSourceInternalUnpackBucket::kFixedBuckets,
+                         params.areTimeseriesBucketsFixed);
+
+        const auto& bucketMaxSpanSeconds = params.tsOptions.getBucketMaxSpanSeconds();
+        tassert(10601102,
+                "'bucketMaxSpanSeconds' must be set for a timeseries collection",
+                bucketMaxSpanSeconds);
+        tsOptsBob.append(DocumentSourceInternalUnpackBucket::kBucketMaxSpanSeconds,
+                         *bucketMaxSpanSeconds);
+    }
+
+    // Add the unpack stage to the front of the pipeline.
+    pipeline.addInitialSource(DocumentSourceInternalUnpackBucket::createFromBsonInternal(
+        bob.obj().firstElement(), expCtx));
+}
+
+void translatePipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                       Pipeline& pipeline,
+                       const TimeseriesTranslationParams& params) {
+    // The query has been translated to something that should run directly against the
+    // raw timeseries buckets. We set this flag to indicate that this translation should not happen
+    // again.
+    pipeline.setTranslated();
+
+    // When the pipeline is empty, all documents in the collection are returned. Therefore, we need
+    // to add the unpack stage.
+    if (MONGO_unlikely(pipeline.empty())) {
+        prependUnpackStageToPipeline(expCtx, pipeline, params);
+        return;
+    }
+
+    DocumentSource* initialStage = pipeline.peekFront();
+    tassert(10601104, "A non-empty pipeline must have an initial stage", initialStage);
+    if (requiresCustomTranslation(initialStage)) {
+        performCustomTranslation(expCtx, initialStage, pipeline, params);
+        return;
+    }
+
+    bool consumesCollectionData = initialStage->constraints().consumesLogicalCollectionData;
+    if (consumesCollectionData) {
+        prependUnpackStageToPipeline(expCtx, pipeline, params);
+    }
+}
+
+boost::optional<TimeseriesTranslationParams> getTimeseriesTranslationParamsIfRequired(
+    OperationContext* opCtx, const CollectionRoutingInfo& cri) {
+
+    const bool isViewlessTimeseriesColl =
+        cri.hasRoutingTable() && isViewlessTimeseriesCollection(cri.getChunkManager());
+
+    if (isRawDataOperation(opCtx) || !isViewlessTimeseriesColl) {
+        // No translation necessary in these cases.
+        return boost::none;
+    }
+
+    const auto& timeseriesFields = cri.getChunkManager().getTimeseriesFields();
+    tassert(10601101,
+            "Timeseries collections must have timeseries options",
+            timeseriesFields.has_value());
+
+    // TypeCollectionTimeseriesFields carries no usesExtendedRange info, so the router cannot know
+    // whether it's safe to apply fixed-bucket optimizations; omitting the argument conservatively
+    // disables them. Shards set fixedBuckets correctly via
+    // populateUnpackBucketStagesFromCollection.
+    return TimeseriesTranslationParams{
+        timeseriesFields->getTimeseriesOptions(),
+        !timeseriesFields->getTimeseriesBucketsMayHaveMixedSchemaData().value_or(true),
+        canUseFixedBucketOptimizations(timeseriesFields->getTimeseriesOptions())};
+}
+
+boost::optional<TimeseriesTranslationParams> getTimeseriesTranslationParamsIfRequired(
+    OperationContext* opCtx, const CollectionOrViewAcquisition& collOrView) {
+    if (!collOrView.isCollection()) {
+        return boost::none;
+    }
+
+    const CollectionPtr& collPtr = collOrView.getCollectionPtr();
+    const bool isViewlessTimeseriesColl = collPtr && isViewlessTimeseriesCollection(*collPtr.get());
+
+    if (isRawDataOperation(opCtx) || !isViewlessTimeseriesColl) {
+        // No translation necessary in these cases.
+        return boost::none;
+    }
+
+    tassert(10601100,
+            "Timeseries collection must have timeseries options",
+            collPtr->getTimeseriesOptions());
+    return TimeseriesTranslationParams{
+        collPtr->getTimeseriesOptions().get(),
+        !collPtr->getTimeseriesMixedSchemaBucketsState().mustConsiderMixedSchemaBucketsInReads(),
+        canUseFixedBucketOptimizations(*collPtr->getTimeseriesOptions(),
+                                       collPtr->getRequiresTimeseriesExtendedRangeSupport())};
+}
+
+template <class T>
+void translateStagesIfRequiredImpl(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   Pipeline& pipeline,
+                                   const T& catalogData) {
+    // Do not double translate.
+    if (pipeline.isTranslated()) {
+        return;
+    }
+
+    const boost::optional<TimeseriesTranslationParams> params =
+        getTimeseriesTranslationParamsIfRequired(expCtx->getOperationContext(), catalogData);
+    if (!params) {
+        return;
+    }
+
+    translatePipeline(expCtx, pipeline, params.get());
+}
+
+template <class T>
+void translateIndexHintIfRequiredImpl(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      const T& catalogData,
+                                      AggregateCommandRequest& request) {
+    if (request.getTranslatedForViewlessTimeseries()) {
+        return;
+    }
+
+    const auto& hint = request.getHint();
+    if (!hint || !timeseries::isHintIndexKey(*hint)) {
+        return;
+    }
+
+    const boost::optional<TimeseriesTranslationParams> params =
+        getTimeseriesTranslationParamsIfRequired(expCtx->getOperationContext(), catalogData);
+    if (!params) {
+        return;
+    }
+
+    if (const auto rewrittenHintWithStatus =
+            timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(params->tsOptions, *hint);
+        rewrittenHintWithStatus.isOK()) {
+        request.setHint(rewrittenHintWithStatus.getValue());
+    }
+}
+
+// Walks 'pipeline' looking for $_internalUnpackBucket stages that were deserialized without
+// collection-derived parameters (e.g. a pipeline received from a router that lacked index info,
+// or a view-based timeseries subpipeline whose unpack BSON lacked catalog metadata), and fills
+// them in from the already-acquired 'collPtr'. This is the mechanism by which shard-side
+// executions obtain parameters that can only be derived from the actual collection.
+void populateUnpackBucketStagesFromCollection(Pipeline& pipeline, const CollectionPtr& collPtr) {
+    if (!collPtr) {
+        return;
+    }
+    for (auto& source : pipeline.getSources()) {
+        auto* unpack = dynamic_cast<DocumentSourceInternalUnpackBucket*>(source.get());
+        if (!unpack) {
+            continue;
+        }
+
+        if (!unpack->has2dsphereIndexVersions()) {
+            boost::optional<StringMap<int>> versions =
+                timeseries::build2dsphereIndexVersionMap(*collPtr.get());
+            unpack->set2dsphereIndexVersions(versions);
+        }
+
+        if (collPtr->getTimeseriesOptions().has_value()) {
+            if (!unpack->assumeNoMixedSchemaData()) {
+                bool mustConsider = collPtr->getTimeseriesMixedSchemaBucketsState()
+                                        .mustConsiderMixedSchemaBucketsInReads();
+                unpack->setAssumeNoMixedSchemaData(!mustConsider);
+            }
+
+            if (!unpack->fixedBuckets()) {
+                unpack->setFixedBuckets(canUseFixedBucketOptimizations(
+                    *collPtr->getTimeseriesOptions(),
+                    collPtr->getRequiresTimeseriesExtendedRangeSupport()));
+            }
+
+            if (!unpack->usesExtendedRange()) {
+                unpack->setUsesExtendedRange(collPtr->getRequiresTimeseriesExtendedRangeSupport());
+            }
+        }
+
+        break;
+    }
+}
+
+}  // namespace
+
+bool requiresViewlessTimeseriesTranslation(OperationContext* const opCtx,
+                                           const CollectionOrViewAcquisition& collOrView) {
+    return collOrView.isCollection() &&
+        requiresViewlessTimeseriesTranslation(opCtx, collOrView.getCollection().getCollectionPtr());
+}
+
+bool requiresViewlessTimeseriesTranslationInRouter(OperationContext* const opCtx,
+                                                   const CollectionRoutingInfo& cri) {
+    return !isRawDataOperation(opCtx) && cri.hasRoutingTable() &&
+        isViewlessTimeseriesCollection(cri.getChunkManager());
+}
+
+void translateStagesIfRequired(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                               Pipeline& pipeline,
+                               const CollectionOrViewAcquisition& collOrView) {
+    translateStagesIfRequiredImpl<CollectionOrViewAcquisition>(expCtx, pipeline, collOrView);
+    // For pipelines that arrived pre-translated from a router (where CollectionRoutingInfo was used
+    // and no index info was available), modify the unpack stage with any collection-related
+    // metadata.
+    if (collOrView.isCollection()) {
+        populateUnpackBucketStagesFromCollection(pipeline, collOrView.getCollectionPtr());
+    }
+}
+
+void translateStagesIfRequired(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                               Pipeline& pipeline,
+                               const CollectionRoutingInfo& cri) {
+    translateStagesIfRequiredImpl<CollectionRoutingInfo>(expCtx, pipeline, cri);
+}
+
+void translateIndexHintIfRequired(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                  const CollectionOrViewAcquisition& collOrView,
+                                  AggregateCommandRequest& request) {
+    translateIndexHintIfRequiredImpl<CollectionOrViewAcquisition>(expCtx, collOrView, request);
+}
+
+void translateIndexHintIfRequired(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                  const CollectionRoutingInfo& cri,
+                                  AggregateCommandRequest& request) {
+    translateIndexHintIfRequiredImpl<CollectionRoutingInfo>(expCtx, cri, request);
+}
+
+void prependUnpackStageToPipeline_forTest(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                          Pipeline& pipeline,
+                                          const TimeseriesTranslationParams& params) {
+    prependUnpackStageToPipeline(expCtx, pipeline, params);
+}
+
+}  // namespace timeseries
+}  // namespace mongo

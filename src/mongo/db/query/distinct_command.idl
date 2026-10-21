@@ -1,0 +1,60 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/query/hint.idl"
+    - "mongo/db/query/query_settings/query_settings.idl"
+    - "mongo/db/query/query_shape/query_shape_hash.idl"
+
+commands:
+    distinct:
+        description: "Parser for the 'distinct' command."
+        command_name: distinct
+        cpp_name: DistinctCommandRequest
+        namespace: concatenate_with_db_or_uuid
+        api_version: ""
+        strict: true
+        fields:
+            key:
+                description: "The field path for which to return distinct values."
+                type: string
+            query:
+                description:
+                    "Optional query that filters the documents from which to retrieve the
+                    distinct values."
+                type: object_owned
+                optional: true
+            collation:
+                description: "Optional collation for the command."
+                type: object_owned
+                optional: true
+            mirrored:
+                description: "Indicates whether the operation is a mirrored read"
+                type: optionalBool
+            sampleId:
+                description: "The unique sample id for the operation if it has been chosen for sampling."
+                type: uuid
+                optional: true
+            hint:
+                description: "The index name to use or the index specification document."
+                type: indexHint
+                default: BSONObj()
+            querySettings:
+                description: "Query settings for the given query"
+                type: QuerySettings
+                optional: true
+            includeQueryStatsMetrics:
+                description: "Determines whether or not to include query stats metrics in the response."
+                type: optionalBool
+            originalQueryShapeHash:
+                description:
+                    "The query shape hash of the first query to enter the query system. For example
+                    if the router received a query and this is the shard's portion of the query,
+                    this hash will be the hash of the query that the router saw."
+                type: QueryShapeHash
+                optional: true

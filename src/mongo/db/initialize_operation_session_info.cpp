@@ -1,0 +1,224 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/initialize_operation_session_info.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <cstdint>
+#include <mutex>
+#include <utility>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+namespace {
+bool isAuthorizedForInternalClusterAction(OperationContext* opCtx,
+                                          const boost::optional<TenantId>& validatedTenantId,
+                                          boost::optional<bool>& cachedResult) {
+    if (!cachedResult.has_value()) {
+        cachedResult =
+            AuthorizationSession::get(opCtx->getClient())
+                ->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forClusterResource(validatedTenantId), ActionType::internal);
+    }
+    return *cachedResult;
+}
+}  // namespace
+
+/**
+ * A client is internal if the connection is a self connection, a connection from a mongos or
+ * different mongod or a DBDirectClient connection.
+ */
+bool isInternalClient(OperationContext* opCtx) {
+    return !opCtx->getClient()->session() || opCtx->getClient()->isInternalClient() ||
+        opCtx->getClient()->isInDirectClient();
+}
+
+OperationSessionInfoFromClient initializeOperationSessionInfo(
+    OperationContext* opCtx,
+    const boost::optional<TenantId>& validatedTenantId,
+    const OperationSessionInfoFromClientBase& osi,
+    bool requiresAuth,
+    bool attachToOpCtx,
+    bool isReplSetMemberOrMongos) {
+    if (opCtx->getClient()->isInDirectClient()) {
+        uassert(50891,
+                "Invalid to set operation session info in a direct client",
+                !osi.getSessionId() && !osi.getTxnNumber() && !osi.getAutocommit() &&
+                    !osi.getStartTransaction() && !osi.getStartOrContinueTransaction());
+    }
+
+    if (!requiresAuth) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "This command is not supported in transactions",
+                !osi.getAutocommit());
+        uassert(
+            50889, "It is illegal to provide a txnNumber for this command", !osi.getTxnNumber());
+    }
+
+    if (auto authSession = AuthorizationSession::get(opCtx->getClient())) {
+        // If we're using the localhost bypass, and the client hasn't authenticated,
+        // logical sessions are disabled. A client may authenticate as the __sytem user,
+        // or as an externally authorized user.
+        if (authSession->isUsingLocalhostBypass() && !authSession->isAuthenticated()) {
+            return OperationSessionInfoFromClient();
+        }
+
+        // Do not initialize lsid when auth is enabled and no user is logged in since
+        // there is no sensible uid that can be assigned to it.
+        if (AuthorizationManager::get(opCtx->getService())->isAuthEnabled() &&
+            !authSession->isAuthenticated() && !requiresAuth) {
+            return OperationSessionInfoFromClient();
+        }
+    }
+
+    boost::optional<bool> cachedIsAuthorizedForInternalClusterAction;
+    if (osi.getSessionId()) {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+
+        auto lsc = LogicalSessionCache::get(opCtx->getServiceContext());
+        if (!lsc) {
+            // Ignore session information if the logical session cache has not been set up, e.g. on
+            // the embedded version of mongod.
+            return OperationSessionInfoFromClient();
+        }
+
+        // If osi lsid includes the uid, makeLogicalSessionId will also verify that the hash
+        // matches with the current user logged in.
+        auto lsid = makeLogicalSessionId(osi.getSessionId().value(), opCtx);
+
+        if (!attachToOpCtx) {
+            return OperationSessionInfoFromClient();
+        }
+
+        if (isChildSession(lsid)) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "Internal sessions are only allowed for internal clients",
+                    isAuthorizedForInternalClusterAction(
+                        opCtx, validatedTenantId, cachedIsAuthorizedForInternalClusterAction));
+            uassert(ErrorCodes::InvalidOptions,
+                    "Internal sessions are not supported outside of transactions",
+                    osi.getTxnNumber() && osi.getAutocommit() && !osi.getAutocommit().value());
+        }
+
+        opCtx->setLogicalSessionId(std::move(lsid));
+        uassertStatusOK(lsc->vivify(opCtx, opCtx->getLogicalSessionId().value()));
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "Transaction number requires a session ID to also be specified",
+                !osi.getTxnNumber());
+    }
+
+    if (osi.getTxnNumber()) {
+        invariant(osi.getSessionId());
+        std::lock_guard<Client> lk(*opCtx->getClient());
+
+        uassert(ErrorCodes::IllegalOperation,
+                "Transaction numbers are only allowed on a replica set member or mongos",
+                isReplSetMemberOrMongos);
+        uassert(ErrorCodes::InvalidOptions,
+                "Transaction number cannot be negative",
+                *osi.getTxnNumber() >= 0);
+
+        opCtx->setTxnNumber(*osi.getTxnNumber());
+
+        if (auto txnRetryCounter = osi.getTxnRetryCounter()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "txnRetryCounter is only allowed for internal clients",
+                    isAuthorizedForInternalClusterAction(
+                        opCtx, validatedTenantId, cachedIsAuthorizedForInternalClusterAction));
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Cannot specify txnRetryCounter for a retryable write",
+                    osi.getAutocommit().has_value());
+            uassert(ErrorCodes::InvalidOptions,
+                    "txnRetryCounter cannot be negative",
+                    txnRetryCounter >= 0);
+            opCtx->setTxnRetryCounter(*txnRetryCounter);
+        }
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "'autocommit' field requires a transaction number to also be specified",
+                !osi.getAutocommit());
+    }
+
+    if (osi.getAutocommit()) {
+        invariant(osi.getTxnNumber());
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying autocommit=true is not allowed.",
+                !osi.getAutocommit().value());
+        opCtx->setInMultiDocumentTransaction();
+    } else {
+        uassert(ErrorCodes::InvalidOptions,
+                "'startTransaction' field requires 'autocommit' field to also be specified",
+                !osi.getStartTransaction());
+        uassert(
+            ErrorCodes::InvalidOptions,
+            "'startOrContinueTransaction' field requires 'autocommit' field to also be specified",
+            !osi.getStartOrContinueTransaction());
+    }
+
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot specify both 'startTransaction' and 'startOrContinueTransaction'",
+            !(osi.getStartTransaction() && osi.getStartOrContinueTransaction()));
+
+    if (osi.getStartTransaction()) {
+        invariant(osi.getAutocommit());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying startTransaction=false is not allowed.",
+                osi.getStartTransaction().value());
+    }
+
+    if (osi.getIsServerInitiatedTransaction().has_value()) {
+        uassert(ErrorCodes::Unauthorized,
+                "'isServerInitiatedTransaction' is only allowed for internal clients",
+                isAuthorizedForInternalClusterAction(
+                    opCtx, validatedTenantId, cachedIsAuthorizedForInternalClusterAction));
+    }
+
+    if (osi.getStartOrContinueTransaction()) {
+        invariant(osi.getAutocommit());
+        uassert(ErrorCodes::InvalidOptions,
+                "Specifying startOrContinueTransaction=false is not allowed.",
+                osi.getStartOrContinueTransaction().value());
+        uassert(ErrorCodes::Unauthorized,
+                "'startOrContinueTransaction' is only allowed for internal clients",
+                isAuthorizedForInternalClusterAction(
+                    opCtx, validatedTenantId, cachedIsAuthorizedForInternalClusterAction));
+    }
+
+    if (osi.getTxnNumber()) {
+        if (!osi.getAutocommit()) {
+            if (isInternalClient(opCtx)) {
+                getQueryCounters(opCtx).internalRetryableWriteCount.increment(1);
+            } else {
+                getQueryCounters(opCtx).externalRetryableWriteCount.increment(1);
+            }
+        } else {
+            if (osi.getSessionId()->getTxnNumber() && osi.getSessionId()->getTxnUUID()) {
+                getQueryCounters(opCtx).retryableInternalTransactionCount.increment(1);
+            }
+        }
+    }
+
+    return OperationSessionInfoFromClient(std::move(osi));
+}
+
+}  // namespace mongo

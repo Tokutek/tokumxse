@@ -1,0 +1,125 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/query/compiler/optimizer/join/join_graph.h"
+#include "mongo/db/query/compiler/optimizer/join/path_resolver.h"
+#include "mongo/util/modules.h"
+
+namespace mongo::join_ordering {
+
+/**
+ * Class representing an agg expression of the form {$eq: ['$foreignCollFieldPath',
+ * '$$localCollVar']} or a localField/foreignField join, used in join predicate resolution.
+ */
+class ExtractedJoinPredicate {
+public:
+    /**
+     * Note: this expects 'expr', 'letVars', & 'source' to outlive the returned instance. This
+     * doesn't take ownership of either.
+     */
+    static ExtractedJoinPredicate make(const DocumentSource* source,
+                                       const ExpressionCompare* expr,
+                                       const std::vector<LetVariable>& letVars);
+    static ExtractedJoinPredicate make(FieldPath localField,
+                                       FieldPath foreignField,
+                                       const DocumentSource* source);
+
+    const FieldPath& localField() const {
+        return _localField;
+    }
+
+    const FieldPath& foreignField() const {
+        return _foreignField;
+    }
+
+    // Used by unit tests.
+    auto serialize() const {
+        return _expr ? _expr->serialize() : Value(BSONNULL);
+    }
+
+    auto source() const {
+        return _source;
+    }
+
+    bool isExpr() const {
+        return _isExpr;
+    }
+
+private:
+    ExtractedJoinPredicate(bool isExpr,
+                           FieldPath localField,
+                           FieldPath foreignField,
+                           const ExpressionCompare* expr,
+                           const DocumentSource* source)
+        : _isExpr{isExpr},
+          _localField(std::move(localField)),
+          _foreignField(std::move(foreignField)),
+          _expr(expr),
+          _source{source} {}
+
+    // Is this a $expr predicate (true) or a localFieldForeign field join (false)?
+    bool _isExpr;
+    FieldPath _localField;
+    FieldPath _foreignField;
+    // These track both the origin document source and the expression this was extracted from.
+    const ExpressionCompare* _expr;
+    // In particular, _source is needed for dependency analysis, which operates on DocumentSource*'s
+    // in order to figure out where a field came from.
+    const DocumentSource* _source;
+};
+
+/**
+ * Represents the result of splitting a MatchExpression from a $match in the subpipeline of a
+ * $lookup into parts representing equijoin predicates and residual single table predicates.
+ */
+struct SplitPredicatesResult {
+    // List of equijoin predicates. Each element will be an agg expression of the form:
+    // {$eq: ['$fieldPathInForeignNSS', '$$varCorrespondingToPathInLocalNSS']}
+    // Note that the order of operands is not guaranteed and there may be semantically duplicate
+    // entries.
+    std::vector<ExtractedJoinPredicate> joinPredicates;
+    // Residual predicate on the single table which does not contain any correlated predicates. In
+    // other terms, this expression is able to be pushed down to the find layer.
+    std::unique_ptr<MatchExpression> singleTablePredicates;
+};
+
+/**
+ * Given a MatchExpression and set of variables corresponding to the 'let' statement of a $lookup,
+ * attempt to split the expression into equijoin predicates and single table predicates. The
+ * equijoin predicates are suitable to insert into the JoinGraph while the single table predicates
+ * are intended to be pushed into the find layer for the foreign namespace. If this function fails
+ * to split the expression, it returns boost::none. The main reason this would occur is the
+ * expression contains variables referencing the local namespace which are not equijoin predicates.
+ * This function does not modify its inputs.
+ */
+boost::optional<SplitPredicatesResult> splitJoinAndSingleCollectionPredicates(
+    const DocumentSourceMatch* match, const std::vector<LetVariable>& variables);
+
+
+struct ExprPredicatesResult {
+    bool expressionIsFullyAbsorbed;
+
+    // Extracted join predicates.
+    std::vector<JoinPredicate> predicates;
+
+    // Reason why we may have failed to extract. Only set if a predicate field was rejected because
+    // it isn't a legal join predicate path.
+    boost::optional<JoinFallbackReason> reason;
+};
+
+/**
+ * Extract join equality predicates from the given MatchExpression 'expr'.
+ * A predicate can be qualified as a proper join equality predicate only if satisfies the following
+ * conditions: it must be a $expr equality predicate which contains two field paths belonging to
+ * different collections.
+ * The 'expr' can be fully absorbed into join graph if it contains only proper join equality
+ * predicates and $and's.
+ * The function returns 'ExprPredicatesResult' which contains a list of join predicates and a
+ * boolean value identifying whether the 'expr' was fully absorbed, or a metrics 'reason' why this
+ * failed.
+ */
+ExprPredicatesResult extractExprPredicates(PathResolver& pathResolver,
+                                           const DocumentSourceMatch* match);
+}  // namespace mongo::join_ordering

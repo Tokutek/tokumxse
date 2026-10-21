@@ -1,0 +1,980 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/apply_ops.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_backend_interface.h"
+#include "mongo/db/auth/authorization_backend_mock.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authorization_session_for_test.h"
+#include "mongo/db/auth/authz_session_external_state_mock.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/repl/apply_ops_command_info.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/versioning_protocol/stale_exception.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/legacy_reply_builder.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <ostream>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace repl {
+namespace {
+
+/**
+ * Mock OpObserver that tracks applyOps events.
+ */
+class OpObserverMock : public OpObserverNoop {
+public:
+    // If not empty, holds the command object passed to last invocation of onApplyOps().
+    BSONObj onApplyOpsCmdObj;
+};
+
+/**
+ * Test fixture for applyOps().
+ */
+class ApplyOpsTest : public ServiceContextMongoDTest {
+private:
+    void setUp() override;
+    void tearDown() override;
+
+protected:
+    // Reset default log level when each test is over in case it was changed.
+    unittest::MinimumLoggedSeverityGuard _verbosityGuard{logv2::LogComponent::kReplication};
+
+    OpObserverMock* _opObserver = nullptr;
+    std::unique_ptr<StorageInterface> _storage;
+};
+
+void ApplyOpsTest::setUp() {
+    // Set up mongod.
+    ServiceContextMongoDTest::setUp();
+
+    auto service = getServiceContext();
+    auto opCtx = cc().makeOperationContext();
+
+    // Set up ReplicationCoordinator and create oplog.
+    ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
+    createOplog(opCtx.get());
+
+    // Ensure that we are primary.
+    auto replCoord = ReplicationCoordinator::get(opCtx.get());
+    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
+
+    // Use OpObserverMock to track notifications for applyOps().
+    auto opObserver = std::make_unique<OpObserverMock>();
+    _opObserver = opObserver.get();
+    opObserverRegistry()->addObserver(std::move(opObserver));
+
+    // This test uses StorageInterface to create collections and inspect documents inside
+    // collections.
+    _storage = std::make_unique<StorageInterfaceImpl>();
+}
+
+void ApplyOpsTest::tearDown() {
+    _storage = {};
+    _opObserver = nullptr;
+
+    ServiceContextMongoDTest::tearDown();
+}
+
+/**
+ * Fixes up result document returned by applyOps and converts to Status.
+ */
+Status getStatusFromApplyOpsResult(const BSONObj& result) {
+    if (result["ok"]) {
+        return getStatusFromCommandResult(result);
+    }
+
+    BSONObjBuilder builder;
+    builder.appendElements(result);
+    auto code = result.getIntField("code");
+    builder.appendNumber("ok", code == 0);
+    auto newResult = builder.obj();
+    return getStatusFromCommandResult(newResult);
+}
+
+TEST_F(ApplyOpsTest, CommandInNestedApplyOpsReturnsSuccess) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+    BSONObjBuilder resultBuilder;
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "foo");
+    auto innerCmdObj = BSON("op" << "c"
+                                 << "ns" << nss.getCommandNS().ns_forTest() << "o"
+                                 << BSON("create" << nss.coll()));
+    auto innerApplyOpsObj = BSON("op" << "c"
+                                      << "ns" << nss.getCommandNS().ns_forTest() << "o"
+                                      << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
+    auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
+
+    ASSERT_OK(applyOps(opCtx.get(), nss.dbName(), cmdObj, mode, &resultBuilder));
+}
+
+/**
+ * Creates an applyOps command object with a single insert operation.
+ */
+BSONObj makeApplyOpsWithInsertOperation(
+    const NamespaceString& nss,
+    const BSONObj& documentToInsert,
+    const boost::optional<UUID>& uuid = boost::none,
+    const boost::optional<RetryImageEnum>& needsRetryImage = boost::none) {
+    auto insertOp = BSON("op" << "i"
+                              << "ns" << nss.ns_forTest() << "o" << documentToInsert);
+    if (uuid.has_value()) {
+        insertOp = insertOp.addFields(BSON("ui" << *uuid));
+    }
+    if (needsRetryImage.has_value()) {
+        invariant(*needsRetryImage == RetryImageEnum::kPreImage ||
+                  *needsRetryImage == RetryImageEnum::kPostImage);
+        insertOp = insertOp.addFields(
+            BSON("needsRetryImage"
+                 << (*needsRetryImage == RetryImageEnum::kPreImage ? "preImage" : "postImage")));
+    }
+    return BSON("applyOps" << BSON_ARRAY(insertOp));
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsInsertIntoNonexistentCollectionReturnsNamespaceNotFoundInResult) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
+    auto documentToInsert = BSON("_id" << 0);
+    auto cmdObj = makeApplyOpsWithInsertOperation(nss, documentToInsert);
+    BSONObjBuilder resultBuilder;
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
+                  applyOps(opCtx.get(),
+                           DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                           cmdObj,
+                           mode,
+                           &resultBuilder));
+    auto result = resultBuilder.obj();
+    auto status = getStatusFromApplyOpsResult(result);
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsCmdFailsIfNeedsRetryImagePresent) {
+    auto opCtx = cc().makeOperationContext();
+    constexpr auto mode = OplogApplication::Mode::kApplyOpsCmd;
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
+
+    auto documentToInsert = BSON("_id" << 0);
+    constexpr std::array<RetryImageEnum, 2> needsRetryImageOptions{
+        {RetryImageEnum::kPreImage, RetryImageEnum::kPostImage}};
+    constexpr std::string_view expectedErrorMessage =
+        "applyOps command does not support the internal `needsRetryImage` field";
+
+    for (const auto& needsRetryImage : needsRetryImageOptions) {
+        auto cmdObj =
+            makeApplyOpsWithInsertOperation(nss, documentToInsert, boost::none, needsRetryImage);
+        BSONObjBuilder resultBuilder;
+        ASSERT_EQUALS(ErrorCodes::InvalidOptions,
+                      applyOps(opCtx.get(),
+                               DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                               cmdObj,
+                               mode,
+                               &resultBuilder));
+        auto result = resultBuilder.obj();
+        auto status = getStatusFromApplyOpsResult(result);
+        ASSERT_EQUALS(ErrorCodes::InvalidOptions, status);
+        ASSERT_EQUALS(expectedErrorMessage, status.reason());
+    }
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsInsertWithUuidIntoCollectionWithOtherUuid) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
+
+    auto applyOpsUuid = UUID::gen();
+
+    // Collection has a different UUID.
+    CollectionOptions collectionOptions;
+    collectionOptions.uuid = UUID::gen();
+    ASSERT_NOT_EQUALS(applyOpsUuid, *collectionOptions.uuid);
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
+
+    // The applyOps returns an Unknown error because of the failed UUID lookup
+    // even though a collection exists with the same namespace as the insert operation.
+    auto documentToInsert = BSON("_id" << 0);
+    auto cmdObj = makeApplyOpsWithInsertOperation(nss, documentToInsert, applyOpsUuid);
+    BSONObjBuilder resultBuilder;
+    ASSERT_EQUALS(ErrorCodes::UnknownError,
+                  applyOps(opCtx.get(),
+                           DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                           cmdObj,
+                           mode,
+                           &resultBuilder));
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
+    auto opCtx = cc().makeOperationContext();
+
+    // Increase log component verbosity to check for op application messages.
+    auto verbosityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kReplication,
+                                                               logv2::LogSeverity::Debug(3)};
+
+    // Test that the 'applyOps' function passes the oplog application mode through correctly to the
+    // underlying op application functions.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    auto uuid = UUID::gen();
+
+    // Create a collection for us to insert documents into.
+    CollectionOptions collectionOptions;
+    collectionOptions.uuid = uuid;
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
+
+    BSONObjBuilder resultBuilder;
+
+    // Make sure the oplog application mode is passed through via 'applyOps' correctly.
+    unittest::LogCaptureGuard logs;
+
+    auto docToInsert0 = BSON("_id" << 0);
+    auto cmdObj = makeApplyOpsWithInsertOperation(nss, docToInsert0, uuid);
+
+    ASSERT_OK(applyOps(
+        opCtx.get(), nss.dbName(), cmdObj, OplogApplication::Mode::kInitialSync, &resultBuilder));
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("oplogApplicationMode" << "InitialSync"))));
+
+    auto docToInsert1 = BSON("_id" << 1);
+    cmdObj = makeApplyOpsWithInsertOperation(nss, docToInsert1, uuid);
+
+    ASSERT_OK(applyOps(
+        opCtx.get(), nss.dbName(), cmdObj, OplogApplication::Mode::kSecondary, &resultBuilder));
+    ASSERT_EQUALS(1,
+                  logs.countBSONContainingSubset(
+                      BSON("attr" << BSON("oplogApplicationMode" << "Secondary"))));
+}
+
+/**
+ * Generates oplog entries with the given number used for the timestamp.
+ */
+OplogEntry makeOplogEntry(OpTypeEnum opType,
+                          const BSONObj& oField,
+                          const std::vector<StmtId>& stmtIds = {},
+                          OperationSessionInfo sessionInfo = {}) {
+    return {DurableOplogEntry(OpTime(Timestamp(1, 1), 1),                             // optime
+                              opType,                                                 // op type
+                              NamespaceString::createNamespaceString_forTest("a.a"),  // namespace
+                              boost::none,                                            // uuid
+                              boost::none,                                            // fromMigrate
+                              boost::none,                // checkExistenceForDiffInsert
+                              boost::none,                // versionContext
+                              OplogEntry::kOplogVersion,  // version
+                              oField,                     // o
+                              boost::none,                // o2
+                              sessionInfo,                // sessionInfo
+                              boost::none,                // upsert
+                              Date_t(),                   // wall clock time
+                              stmtIds,                    // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none,    // _id
+                              boost::none)};  // needsRetryImage
+}
+
+TEST_F(ApplyOpsTest, ExtractOperationsReturnsTypeMismatchIfNotCommand) {
+    ASSERT_THROWS_CODE(
+        ApplyOps::extractOperations(makeOplogEntry(OpTypeEnum::kInsert, BSON("_id" << 0))),
+        DBException,
+        ErrorCodes::TypeMismatch);
+}
+
+TEST_F(ApplyOpsTest, ExtractOperationsReturnsCommandNotSupportedIfNotApplyOpsCommand) {
+    ASSERT_THROWS_CODE(
+        ApplyOps::extractOperations(makeOplogEntry(OpTypeEnum::kCommand, BSON("create" << "t"))),
+        DBException,
+        ErrorCodes::CommandNotSupported);
+}
+
+TEST_F(ApplyOpsTest, ExtractOperationsReturnsEmptyArrayIfApplyOpsContainsNoOperations) {
+    auto operations = ApplyOps::extractOperations(
+        makeOplogEntry(OpTypeEnum::kCommand, BSON("applyOps" << BSONArray())));
+    ASSERT_EQUALS(0U, operations.size());
+}
+
+TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps) {
+    NamespaceString ns1 = NamespaceString::createNamespaceString_forTest("test.a");
+    auto ui1 = UUID::gen();
+    auto op1 = BSON("op" << "i"
+                         << "ns" << ns1.ns_forTest() << "ui" << ui1 << "o" << BSON("_id" << 1));
+
+    NamespaceString ns2 = NamespaceString::createNamespaceString_forTest("test.b");
+    auto ui2 = UUID::gen();
+    auto op2 = BSON("op" << "i"
+                         << "ns" << ns2.ns_forTest() << "ui" << ui2 << "o" << BSON("_id" << 2));
+
+    NamespaceString ns3 = NamespaceString::createNamespaceString_forTest("test.c");
+    auto ui3 = UUID::gen();
+    auto op3 = BSON("op" << "u"
+                         << "ns" << ns3.ns_forTest() << "ui" << ui3 << "b" << true << "o"
+                         << BSON("x" << 1) << "o2" << BSON("_id" << 3));
+
+    auto oplogEntry =
+        makeOplogEntry(OpTypeEnum::kCommand, BSON("applyOps" << BSON_ARRAY(op1 << op2 << op3)));
+
+    auto operations = ApplyOps::extractOperations(oplogEntry);
+    ASSERT_EQUALS(3U, operations.size())
+        << "Unexpected number of operations extracted: " << oplogEntry.toBSONForLogging();
+
+    // Check extracted CRUD operations.
+    auto it = operations.cbegin();
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation1 = *(it++);
+        ASSERT(OpTypeEnum::kInsert == operation1.getOpType())
+            << "Unexpected op type: " << operation1.toBSONForLogging();
+        ASSERT_EQUALS(ui1, *operation1.getUuid());
+        ASSERT_EQUALS(ns1, operation1.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), operation1.getOperationToApply());
+
+        // OpTime of CRUD operation should match applyOps.
+        ASSERT_EQUALS(oplogEntry.getOpTime(), operation1.getOpTime());
+    }
+
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation2 = *(it++);
+        ASSERT(OpTypeEnum::kInsert == operation2.getOpType())
+            << "Unexpected op type: " << operation2.toBSONForLogging();
+        ASSERT_EQUALS(ui2, *operation2.getUuid());
+        ASSERT_EQUALS(ns2, operation2.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 2), operation2.getOperationToApply());
+
+        // OpTime of CRUD operation should match applyOps.
+        ASSERT_EQUALS(oplogEntry.getOpTime(), operation2.getOpTime());
+    }
+
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation3 = *(it++);
+        ASSERT(OpTypeEnum::kUpdate == operation3.getOpType())
+            << "Unexpected op type: " << operation3.toBSONForLogging();
+        ASSERT_EQUALS(ui3, *operation3.getUuid());
+        ASSERT_EQUALS(ns3, operation3.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("x" << 1), operation3.getOperationToApply());
+
+        auto optionalUpsertBool = operation3.getUpsert();
+        ASSERT(optionalUpsertBool);
+        ASSERT(*optionalUpsertBool);
+
+        // OpTime of CRUD operation should match applyOps.
+        ASSERT_EQUALS(oplogEntry.getOpTime(), operation3.getOpTime());
+    }
+
+    ASSERT(operations.cend() == it);
+}
+
+TEST_F(ApplyOpsTest, ExtractOperationsFromApplyOpsMultiStmtIds) {
+    NamespaceString ns1 = NamespaceString::createNamespaceString_forTest("test.a");
+    auto ui1 = UUID::gen();
+    auto op1 = BSON("op" << "i"
+                         << "ns" << ns1.ns_forTest() << "ui" << ui1 << "o" << BSON("_id" << 1));
+
+    NamespaceString ns2 = NamespaceString::createNamespaceString_forTest("test.b");
+    auto ui2 = UUID::gen();
+    auto op2 = BSON("op" << "u"
+                         << "ns" << ns2.ns_forTest() << "ui" << ui2 << "b" << true << "o"
+                         << BSON("x" << 1) << "o2" << BSON("_id" << 2));
+
+    auto oplogEntry =
+        makeOplogEntry(OpTypeEnum::kCommand, BSON("applyOps" << BSON_ARRAY(op1 << op2)), {0, 1});
+
+    auto operations = ApplyOps::extractOperations(oplogEntry);
+    ASSERT_EQUALS(2U, operations.size())
+        << "Unexpected number of operations extracted: " << oplogEntry.toBSONForLogging();
+
+    // Check extracted CRUD operations.
+    auto it = operations.cbegin();
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation1 = *(it++);
+        ASSERT(OpTypeEnum::kInsert == operation1.getOpType())
+            << "Unexpected op type: " << operation1.toBSONForLogging();
+        ASSERT_EQUALS(ui1, *operation1.getUuid());
+        ASSERT_EQUALS(ns1, operation1.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), operation1.getOperationToApply());
+
+        // OpTime of CRUD operation should match applyOps.
+        ASSERT_EQUALS(oplogEntry.getOpTime(), operation1.getOpTime());
+    }
+
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation2 = *(it++);
+        ASSERT(OpTypeEnum::kUpdate == operation2.getOpType())
+            << "Unexpected op type: " << operation2.toBSONForLogging();
+        ASSERT_EQUALS(ui2, *operation2.getUuid());
+        ASSERT_EQUALS(ns2, operation2.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("x" << 1), operation2.getOperationToApply());
+
+        auto optionalUpsertBool = operation2.getUpsert();
+        ASSERT(optionalUpsertBool);
+        ASSERT(*optionalUpsertBool);
+
+        // OpTime of CRUD operation should match applyOps.
+        ASSERT_EQUALS(oplogEntry.getOpTime(), operation2.getOpTime());
+    }
+
+    ASSERT(operations.cend() == it);
+}
+
+TEST_F(ApplyOpsTest, ExtractOperationsIsUpsertDependsOnOperationAndAlwaysUpsert) {
+    NamespaceString ns1 = NamespaceString::createNamespaceString_forTest("test.a");
+    auto ui1 = UUID::gen();
+    auto op1 = BSON("op" << "u"
+                         << "ns" << ns1.ns_forTest() << "ui" << ui1 << "o"
+                         << BSON("$set" << BSON("a" << 1)) << "o2" << BSON("_id" << 1));
+
+    NamespaceString ns2 = NamespaceString::createNamespaceString_forTest("test.b");
+    auto ui2 = UUID::gen();
+    auto op2 =
+        BSON("op" << "u"
+                  << "ns" << ns2.ns_forTest() << "ui" << ui2 << "o"
+                  << BSON("$set" << BSON("a" << 2)) << "o2" << BSON("_id" << 2) << "b" << false);
+
+    NamespaceString ns3 = NamespaceString::createNamespaceString_forTest("test.c");
+    auto ui3 = UUID::gen();
+    auto op3 = BSON("op" << "u"
+                         << "ns" << ns3.ns_forTest() << "ui" << ui3 << "b" << true << "o"
+                         << BSON("$set" << BSON("a" << 3)) << "o2" << BSON("_id" << 3));
+
+    // AlwayUpsert defaults to false.
+    auto oplogEntry =
+        makeOplogEntry(OpTypeEnum::kCommand, BSON("applyOps" << BSON_ARRAY(op1 << op2 << op3)));
+
+    auto operations = ApplyOps::extractOperations(oplogEntry);
+    ASSERT_EQUALS(3U, operations.size())
+        << "Unexpected number of operations extracted: " << oplogEntry.toBSONForLogging();
+
+    // Check extracted CRUD operations.
+    auto it = operations.cbegin();
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation1 = *(it++);
+        ASSERT(OpTypeEnum::kUpdate == operation1.getOpType())
+            << "Unexpected op type: " << operation1.toBSONForLogging();
+        ASSERT_EQUALS(ui1, *operation1.getUuid());
+        ASSERT_EQUALS(ns1, operation1.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("$set" << BSON("a" << 1)), operation1.getOperationToApply());
+        ASSERT(operation1.getObject2());
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), *operation1.getObject2());
+
+        // No "b" and "alwaysUpsert" false -> no upsert.
+        ASSERT_FALSE(operation1.getUpsert());
+    }
+
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation2 = *(it++);
+        ASSERT(OpTypeEnum::kUpdate == operation2.getOpType())
+            << "Unexpected op type: " << operation2.toBSONForLogging();
+        ASSERT_EQUALS(ui2, *operation2.getUuid());
+        ASSERT_EQUALS(ns2, operation2.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("$set" << BSON("a" << 2)), operation2.getOperationToApply());
+        ASSERT(operation2.getObject2());
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 2), *operation2.getObject2());
+
+        // "b" false and "alwaysUpsert" false -> upsert false.
+        ASSERT_TRUE(operation2.getUpsert());
+        ASSERT_FALSE(*operation2.getUpsert());
+    }
+
+    {
+        ASSERT(operations.cend() != it);
+        const auto& operation3 = *(it++);
+        ASSERT(OpTypeEnum::kUpdate == operation3.getOpType())
+            << "Unexpected op type: " << operation3.toBSONForLogging();
+        ASSERT_EQUALS(ui3, *operation3.getUuid());
+        ASSERT_EQUALS(ns3, operation3.getNss());
+        ASSERT_BSONOBJ_EQ(BSON("$set" << BSON("a" << 3)), operation3.getOperationToApply());
+        ASSERT(operation3.getObject2());
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 3), *operation3.getObject2());
+
+        // "b" true and "alwaysUpsert" false -> upsert true.
+        ASSERT_TRUE(operation3.getUpsert());
+        ASSERT(*operation3.getUpsert());
+    }
+    ASSERT(operations.cend() == it);
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsFailsToDropAdmin) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    // Create a collection on the admin database.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("admin.foo");
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, options));
+
+    auto dropDatabaseOp =
+        BSON("op" << "c"
+                  << "ns" << nss.getCommandNS().ns_forTest() << "o" << BSON("dropDatabase" << 1));
+
+    auto dropDatabaseCmdObj = BSON("applyOps" << BSON_ARRAY(dropDatabaseOp));
+    BSONObjBuilder resultBuilder;
+    auto status = applyOps(opCtx.get(), nss.dbName(), dropDatabaseCmdObj, mode, &resultBuilder);
+    ASSERT_EQUALS(ErrorCodes::IllegalOperation, status);
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsCmdStaleConfigSetsShardingOperationFailedStatus) {
+    class OpObserverMockThrowsStaleConfig : public OpObserverNoop {
+    public:
+        void onInserts(OperationContext* opCtx,
+                       const CollectionPtr& coll,
+                       std::vector<InsertStatement>::const_iterator begin,
+                       std::vector<InsertStatement>::const_iterator end,
+                       const std::vector<RecordId>& recordIds,
+                       const std::vector<bool>& fromMigrate,
+                       bool defaultFromMigrate,
+                       OpStateAccumulator* opAccumulator = nullptr) override {
+            // Throw a staleConfig error.
+            uasserted(StaleConfigInfo(
+                          coll->ns(), ShardVersion::UNTRACKED(), boost::none, ShardId{"shardId"}),
+                      "stale shard");
+        }
+    };
+
+    // Install an opObserver that always throws a StaleConfig error on insert.
+    opObserverRegistry()->addObserver(std::make_unique<OpObserverMockThrowsStaleConfig>());
+
+    auto opCtx = cc().makeOperationContext();
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    auto uuid = UUID::gen();
+
+    // Create a collection for us to insert documents into.
+    CollectionOptions collectionOptions;
+    collectionOptions.uuid = uuid;
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
+
+    // Run an applyOps command with an insert into the collection.
+    auto applyOpsCmd = CommandHelpers::findCommand(opCtx.get(), "applyOps");
+    ASSERT(applyOpsCmd);
+
+    const auto cmdInvocationBson =
+        BSON("applyOps" << BSON_ARRAY(BSON("op" << "i"
+                                                << "ns" << nss.ns_forTest() << "o"
+                                                << BSON("_id" << 0) << "ui" << uuid)));
+    const auto cmdInvocationRequest = OpMsgRequestBuilder::create(
+        auth::ValidatedTenancyScope::kNotRequired, nss.dbName(), cmdInvocationBson);
+
+    const auto cmdInvocation = applyOpsCmd->parse(opCtx.get(), cmdInvocationRequest);
+    rpc::LegacyReplyBuilder replyBuilder;
+    cmdInvocation->run(opCtx.get(), &replyBuilder);
+
+    // Expect the sharding error to be set on the OperationShardingState.
+    const auto ossError =
+        OperationShardingState::get(opCtx.get()).resetShardingOperationFailedStatus();
+    ASSERT_EQ(ErrorCodes::StaleConfig, ossError->code());
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsNoRidOnRridCollection) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("test.ApplyOpsNoRidOnRridCollection");
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, {}));
+
+    auto insertOp = BSON("op" << "i"
+                              << "ns" << nss.toString_forTest() << "o" << BSON("_id" << 1));
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(insertOp));
+    BSONObjBuilder resultBuilder;
+    ASSERT_OK(applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder));
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsCreateWithRecordIdsReplicatedRridDisabled) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "test.ApplyOpsCreateWithRecordIdsReplicatedRridDisabled");
+
+    auto createOpWithRecordIdsReplicated =
+        BSON("op" << "c"
+                  << "ns" << nss.getCommandNS().ns_forTest() << "o"
+                  << BSON("create" << nss.coll() << "recordIdsReplicated" << true));
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(createOpWithRecordIdsReplicated));
+    BSONObjBuilder resultBuilder;
+    unittest::ServerParameterGuard _featureFlagReplRidController{"featureFlagRecordIdsReplicated",
+                                                                 false};
+    ASSERT_EQ(ErrorCodes::CommandNotSupported,
+              applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder));
+}
+
+TEST_F(ApplyOpsTest, ContainerOpsRequireFeatureFlagAndTestCommands) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.ContainerOpsTest");
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, {}));
+
+    auto* storageEngine = getServiceContext()->getStorageEngine();
+    std::string containerIdent = storageEngine->generateNewInternalIdent();
+    auto ru = storageEngine->newRecoveryUnit();
+    StorageWriteTransaction swt(*ru);
+    auto rs =
+        storageEngine->getEngine()->makeInternalRecordStore(*ru, containerIdent, KeyFormat::String);
+    swt.commit();
+
+    auto makeApplyOpsCmd = [&](OpTime opTime) {
+        auto entry = makeContainerInsertOplogEntry(opTime,
+                                                   containerIdent,
+                                                   BSONBinData("K", 1, BinDataGeneral),
+                                                   BSONBinData("V", 1, BinDataGeneral));
+        auto containerInsertOp = entry.getEntry().toBSON();
+        return BSON("applyOps" << BSON_ARRAY(containerInsertOp));
+    };
+
+    auto testContainerOps =
+        [&](bool featureFlagEnabled, bool testCommandsEnabled, bool commandSucceeds) {
+            unittest::ServerParameterGuard featureFlagController{"featureFlagContainerWrites",
+                                                                 featureFlagEnabled};
+            setTestCommandsEnabled(testCommandsEnabled);
+
+            BSONObjBuilder resultBuilder;
+            auto status = applyOps(opCtx.get(),
+                                   nss.dbName(),
+                                   makeApplyOpsCmd(OpTime(Timestamp(1, 1), 1)),
+                                   mode,
+                                   &resultBuilder);
+            if (commandSucceeds) {
+                ASSERT_OK(status);
+            } else {
+                ASSERT_EQ(status.code(), ErrorCodes::InvalidOptions);
+                ASSERT_EQ(status.reason(), "Container ops are not enabled");
+            }
+        };
+
+    testContainerOps(false, false, false);
+    testContainerOps(false, true, false);
+    testContainerOps(true, false, false);
+    testContainerOps(true, true, true);
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsCreateWithoutRecordIdsReplicatedRridEnabled) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "test.ApplyOpsCreateWithoutRecordIdsReplicatedRridEnabled");
+
+    auto createOpWithoutRecordIdsReplicated = BSON("op" << "c"
+                                                        << "ns" << nss.getCommandNS().ns_forTest()
+                                                        << "o" << BSON("create" << nss.coll()));
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(createOpWithoutRecordIdsReplicated));
+    BSONObjBuilder resultBuilder;
+    unittest::ServerParameterGuard _featureFlagReplRidController{"featureFlagRecordIdsReplicated",
+                                                                 true};
+    ASSERT_OK(applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder));
+
+    // validating that the collection has recordIdsReplicated even when it was not present.
+    auto coll = acquireCollection(
+        opCtx.get(),
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx.get()),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    ASSERT_TRUE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsCreateWithRecordIdsTrueReplicatedRridEnabled) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "test.ApplyOpsCreateWithRecordIdsTrueReplicatedRridEnabled");
+
+    auto createOpWithRecordIdsReplicatedTrue =
+        BSON("op" << "c"
+                  << "ns" << nss.getCommandNS().ns_forTest() << "o"
+                  << BSON("create" << nss.coll() << "recordIdsReplicated" << true));
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(createOpWithRecordIdsReplicatedTrue));
+    BSONObjBuilder resultBuilder;
+    unittest::ServerParameterGuard _featureFlagReplRidController{"featureFlagRecordIdsReplicated",
+                                                                 true};
+    ASSERT_OK(applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder));
+
+    // validating that the collection has recordIdsReplicated.
+    auto coll = acquireCollection(
+        opCtx.get(),
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx.get()),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    ASSERT_TRUE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+TEST_F(ApplyOpsTest, ApplyOpsCreateWithRecordIdsFalseReplicatedRridEnabled) {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kApplyOpsCmd;
+
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "test.ApplyOpsCreateWithRecordIdsFalseReplicatedRridEnabled");
+
+    auto createOpWithRecordIdsReplicatedFalse =
+        BSON("op" << "c"
+                  << "ns" << nss.getCommandNS().ns_forTest() << "o"
+                  << BSON("create" << nss.coll() << "recordIdsReplicated" << false));
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(createOpWithRecordIdsReplicatedFalse));
+    BSONObjBuilder resultBuilder;
+    unittest::ServerParameterGuard _featureFlagReplRidController{"featureFlagRecordIdsReplicated",
+                                                                 true};
+    ASSERT_OK(applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder));
+
+    // validating that the collection does not have recordIdsReplicated.
+    auto coll = acquireCollection(
+        opCtx.get(),
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx.get()),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    ASSERT_FALSE(coll.getCollectionPtr()->areRecordIdsReplicated());
+}
+
+using ApplyOpsDeathTest = ApplyOpsTest;
+DEATH_TEST_F(ApplyOpsDeathTest, SteadyStateNoRidOnRridCollection, "11454701") {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kSecondary;
+
+    // Create a collection on the admin database.
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("test.SteadyStateNoRidOnRridCollection");
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, {}));
+
+    auto insertOp = BSON("op" << "i"
+                              << "ns" << nss.ns_forTest() << "o" << BSON("_id" << 1));
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(insertOp));
+    BSONObjBuilder resultBuilder;
+    (void)applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder);
+}
+
+DEATH_TEST_F(ApplyOpsDeathTest, SteadyStateRidOnNonRridCollection, "11454701") {
+    auto opCtx = cc().makeOperationContext();
+    auto mode = OplogApplication::Mode::kSecondary;
+
+    // Create a collection on the admin database.
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("test.SteadyStateRidOnNonRridCollection");
+    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, {}));
+
+    auto insertOpWithRid =
+        BSON("op" << "i"
+                  << "ns" << nss.ns_forTest() << "o" << BSON("_id" << 1) << "rid" << 0);
+
+    auto applyOpsCmdObj = BSON("applyOps" << BSON_ARRAY(insertOpWithRid));
+    BSONObjBuilder resultBuilder;
+    (void)applyOps(opCtx.get(), nss.dbName(), applyOpsCmdObj, mode, &resultBuilder);
+}
+
+/**
+ * Fixture for the apply-side authorization helpers in repl::detail. Installs a controllable
+ * AuthorizationSessionForTest on the test client and registers a collection so its UUID resolves in
+ * the catalog.
+ */
+class ApplyOpsUUIDAuthTest : public ServiceContextMongoDTest {
+protected:
+    ApplyOpsUUIDAuthTest() : ServiceContextMongoDTest(Options{}.setAuthObjects(true)) {}
+
+    void setUp() override {
+        ServiceContextMongoDTest::setUp();
+
+        auto* service = getServiceContext();
+        ReplicationCoordinator::set(service, std::make_unique<ReplicationCoordinatorMock>(service));
+
+        _opCtx = cc().makeOperationContext();
+        createOplog(_opCtx.get());
+        ASSERT_OK(
+            ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
+
+        // Install an AuthorizationSessionForTest on the client so that
+        // AuthorizationSession::get(client) returns a session whose privileges we control via
+        // assumePrivilegesForDB().
+        auto* client = _opCtx->getClient();
+        auth::AuthorizationBackendInterface::set(
+            client->getService(), std::make_unique<auth::AuthorizationBackendMock>());
+        auto authzSession = std::make_unique<AuthorizationSessionForTest>(
+            std::make_unique<AuthzSessionExternalStateMock>(client), client);
+        _authzSession = authzSession.get();
+        AuthorizationSession::set(client, std::move(authzSession));
+
+        // Register a collection so its UUID resolves to '_nss'.
+        _storage = std::make_unique<StorageInterfaceImpl>();
+        CollectionOptions options;
+        options.uuid = _collUUID;
+        ASSERT_OK(_storage->createCollection(_opCtx.get(), _nss, options));
+    }
+
+    void tearDown() override {
+        _storage.reset();
+        _opCtx.reset();
+        ServiceContextMongoDTest::tearDown();
+    }
+
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+    // Builds a command ('c') oplog entry targeting the given (optional) UUID with command body
+    // 'oField'.
+    OplogEntry makeCommandOplogEntry(boost::optional<UUID> uuid, const BSONObj& oField) {
+        return {DurableOplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
+                                  OpTypeEnum::kCommand,        // op type
+                                  _nss.getCommandNS(),         // namespace
+                                  uuid,                        // uuid
+                                  boost::none,                 // fromMigrate
+                                  boost::none,                 // checkExistenceForDiffInsert
+                                  boost::none,                 // versionContext
+                                  OplogEntry::kOplogVersion,   // version
+                                  oField,                      // o
+                                  boost::none,                 // o2
+                                  OperationSessionInfo(),      // sessionInfo
+                                  boost::none,                 // upsert
+                                  Date_t(),                    // wall clock time
+                                  {},                          // statement ids
+                                  boost::none,  // optime of previous write within same transaction
+                                  boost::none,  // pre-image optime
+                                  boost::none,  // post-image optime
+                                  boost::none,  // ShardId of resharding recipient
+                                  boost::none,  // _id
+                                  boost::none)};  // needsRetryImage
+    }
+
+    // Asserts that the helper denies 'cmdType' on '_nss' before any privileges are granted, then
+    // permits it once 'neededActions' are granted on '_nss'.
+    void runIsAuthorizedCase(OplogEntry::CommandType cmdType, ActionSet neededActions) {
+        ASSERT_FALSE(detail::isAuthorizedForUUIDTargetedCommand(_authzSession, cmdType, _nss));
+        _authzSession->assumePrivilegesForDB(
+            Privilege(ResourcePattern::forExactNamespace(_nss), std::move(neededActions)),
+            _nss.dbName());
+        ASSERT_TRUE(detail::isAuthorizedForUUIDTargetedCommand(_authzSession, cmdType, _nss));
+    }
+
+    const NamespaceString _nss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    const UUID _collUUID = UUID::gen();
+    AuthorizationSessionForTest* _authzSession = nullptr;
+    ServiceContext::UniqueOperationContext _opCtx;
+    std::unique_ptr<StorageInterface> _storage;
+};
+
+// ---- isAuthorizedForUUIDTargetedCommand ----
+
+TEST_F(ApplyOpsUUIDAuthTest, IsAuthorizedReturnsTrueWhenNoAuthorizationSession) {
+    ASSERT_TRUE(
+        detail::isAuthorizedForUUIDTargetedCommand(nullptr, OplogEntry::CommandType::kDrop, _nss));
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, IsAuthorizedReturnsTrueForUnexpectedCommandType) {
+    // A command type the helper does not target is authorized even without any granted privileges.
+    ASSERT_TRUE(detail::isAuthorizedForUUIDTargetedCommand(
+        _authzSession, OplogEntry::CommandType::kCreate, _nss));
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, IsAuthorizedForDrop) {
+    runIsAuthorizedCase(OplogEntry::CommandType::kDrop, ActionSet{ActionType::dropCollection});
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, IsAuthorizedForDropIndexes) {
+    runIsAuthorizedCase(OplogEntry::CommandType::kDropIndexes, ActionSet{ActionType::dropIndex});
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, IsAuthorizedForCollMod) {
+    runIsAuthorizedCase(OplogEntry::CommandType::kCollMod, ActionSet{ActionType::collMod});
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, IsAuthorizedForRenameCollection) {
+    runIsAuthorizedCase(OplogEntry::CommandType::kRenameCollection,
+                        ActionSet{ActionType::find, ActionType::dropCollection});
+}
+
+// ---- checkAuthForUUIDTargetedCommand ----
+
+TEST_F(ApplyOpsUUIDAuthTest, CheckAuthDoesNotThrowWhenOpHasNoUUID) {
+    auto entry = makeCommandOplogEntry(boost::none, BSON("drop" << "placeholder"));
+    ASSERT_DOES_NOT_THROW(detail::checkAuthForUUIDTargetedCommand(opCtx(), entry));
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, CheckAuthDoesNotThrowForNonTargetedCommand) {
+    auto entry = makeCommandOplogEntry(_collUUID, BSON("create" << "placeholder"));
+    ASSERT_DOES_NOT_THROW(detail::checkAuthForUUIDTargetedCommand(opCtx(), entry));
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, CheckAuthDoesNotThrowWhenUUIDDoesNotResolve) {
+    auto entry = makeCommandOplogEntry(UUID::gen(), BSON("drop" << "placeholder"));
+    ASSERT_DOES_NOT_THROW(detail::checkAuthForUUIDTargetedCommand(opCtx(), entry));
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, CheckAuthThrowsUnauthorizedWhenNotAuthorizedForResolvedCollection) {
+    auto entry = makeCommandOplogEntry(_collUUID, BSON("drop" << "placeholder"));
+    ASSERT_THROWS_CODE(detail::checkAuthForUUIDTargetedCommand(opCtx(), entry),
+                       DBException,
+                       ErrorCodes::Unauthorized);
+}
+
+TEST_F(ApplyOpsUUIDAuthTest, CheckAuthSucceedsWhenAuthorizedForResolvedCollection) {
+    _authzSession->assumePrivilegesForDB(
+        Privilege(ResourcePattern::forExactNamespace(_nss), ActionType::dropCollection),
+        _nss.dbName());
+    auto entry = makeCommandOplogEntry(_collUUID, BSON("drop" << "placeholder"));
+    ASSERT_DOES_NOT_THROW(detail::checkAuthForUUIDTargetedCommand(opCtx(), entry));
+}
+
+}  // namespace
+}  // namespace repl
+}  // namespace mongo

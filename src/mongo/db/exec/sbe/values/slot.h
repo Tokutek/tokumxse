@@ -1,0 +1,666 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/config.h"
+#include "mongo/db/exec/sbe/util/id_generator.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/slot_util.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/util/modules.h"
+
+namespace mongo::sbe::value {
+/**
+ * Uniquely identifies a slot in an SBE plan. The slot ids are allocated as part of creating the
+ * SBE plan, and remain constant during query runtime.
+ *
+ * Each slot id corresponds to a particular 'SlotAccessor' instance. The various slot accessor
+ * implementations provide the mechanism for manipulating values held in slots.
+ */
+using SlotId = int64_t;
+
+/**
+ * Interface for accessing a value held inside a slot. SBE plans assign unique ids to each slot. The
+ * id is needed to find the corresponding accessor during plan preparation, but need not be known by
+ * the slot accessor object itself.
+ */
+class SlotAccessor {
+public:
+    virtual ~SlotAccessor() = default;
+
+    /**
+     * Returns a non-owning view of value currently stored in the slot. The returned value is valid
+     * until the content of this slot changes (usually as a result of calling getNext()). If the
+     * caller needs to hold onto the value longer then it must make a copy of the value.
+     */
+    virtual TagValueView getViewOfValue() const = 0;
+
+    /**
+     * Returns an owned copy of the value currently stored in the slot.
+     */
+    inline TagValueOwned getCopyOfValue() const {
+        auto [tag, val] = getViewOfValue();
+        return TagValueOwned::fromRaw(sbe::value::copyValue(tag, val));
+    }
+
+    /**
+     * Sometimes it may be determined that a caller is the last one to access this slot. If that is
+     * the case then the caller can use this optimized method to move out the value out of the slot
+     * saving the extra copy operation. Not all slots own the values stored in them so they must
+     * make a deep copy. The returned value is owned by the caller.
+     */
+    virtual TagValueOwned copyOrMoveValue() = 0;
+
+    template <typename T>
+    bool is() const {
+        return dynamic_cast<const T*>(this) != nullptr;
+    }
+
+    template <typename T>
+    T* as() {
+        return dynamic_cast<T*>(this);
+    }
+
+    template <typename T>
+    const T* as() const {
+        return dynamic_cast<const T*>(this);
+    }
+};
+
+/**
+ * Interface for assigning a value to a slot that can store values of any type and can have
+ * ownership of the stored value.
+ */
+class AssignableSlotAccessor : public SlotAccessor {
+public:
+    /**
+     * Assigns a new value to this slot and releases the previous value if it was owned.
+     * Prefer the typed overloads (reset(TagValueOwned), reset(TagValueView),
+     * reset(TagValueMaybeOwned)) as they encode ownership in the type system and eliminate
+     * the risk of a mismatch between the 'owned' flag and the actual ownership of the value.
+     */
+    virtual void reset_raw(bool owned, TypeTags tag, Value val) = 0;
+
+    void reset(TagValueMaybeOwned value) {
+        auto [owned, tag, val] = value.releaseToRaw();
+        reset_raw(owned, tag, val);
+    }
+
+    void reset(TagValueOwned value) {
+        auto [tag, val] = value.releaseToRaw();
+        reset_raw(true, tag, val);
+    }
+
+    void reset(TagValueView value) {
+        reset_raw(false, value.tag, value.value);
+    }
+};
+
+/**
+ * Accessor for a slot which provides a view of a value that is owned elsewhere.
+ */
+class ViewOfValueAccessor final : public SlotAccessor {
+public:
+    /**
+     * Returns non-owning view of the value.
+     */
+    TagValueView getViewOfValue() const override {
+        return {_tag, _val};
+    }
+
+    /**
+     * Returns a copy of the value.
+     */
+    TagValueOwned copyOrMoveValue() override {
+        return TagValueOwned::fromRaw(copyValue(_tag, _val));
+    }
+
+    void reset() {
+        reset(TypeTags::Nothing, 0);
+    }
+
+    void reset(TypeTags tag, Value val) {
+        _tag = tag;
+        _val = val;
+    }
+
+    void reset(TagValueView valView) {
+        _tag = valView.tag;
+        _val = valView.value;
+    }
+
+private:
+    TypeTags _tag{TypeTags::Nothing};
+    Value _val{0};
+};
+
+/**
+ * Accessor for a slot which can own the value held by that slot.
+ */
+class OwnedValueAccessor final : public AssignableSlotAccessor {
+public:
+    OwnedValueAccessor() = default;
+
+    OwnedValueAccessor(const OwnedValueAccessor& other) {
+        if (other._owned) {
+            auto [tag, val] = copyValue(other._tag, other._val);
+            _tag = tag;
+            _val = val;
+            _owned = true;
+        } else {
+            _tag = other._tag;
+            _val = other._val;
+            _owned = false;
+        }
+    }
+
+    OwnedValueAccessor(OwnedValueAccessor&& other) noexcept {
+        _tag = other._tag;
+        _val = other._val;
+        _owned = other._owned;
+
+        other._owned = false;
+    }
+
+    ~OwnedValueAccessor() override {
+        if (_owned) {
+            releaseValue(_tag, _val);
+        }
+    }
+
+    // Copy and swap idiom for a single copy/move assignment operator.
+    OwnedValueAccessor& operator=(OwnedValueAccessor other) noexcept {
+        std::swap(_tag, other._tag);
+        std::swap(_val, other._val);
+        std::swap(_owned, other._owned);
+        return *this;
+    }
+
+    /**
+     * Returns a non-owning view of the value.
+     */
+    TagValueView getViewOfValue() const override {
+        SlotAccessorHelper::dassertValidSlotValue(_tag, _val);
+        return {_tag, _val};
+    }
+
+    /**
+     * If a the value is owned by this slot, then the slot relinquishes ownership of the returned
+     * value. Alternatively, if the value is unowned, then the caller receives a copy. Either way,
+     * the caller owns the resulting value.
+     */
+    TagValueOwned copyOrMoveValue() override {
+        SlotAccessorHelper::dassertValidSlotValue(_tag, _val);
+        if (_owned) {
+            _owned = false;
+            return TagValueOwned::fromRaw(_tag, _val);
+        } else {
+            return TagValueOwned::fromRaw(copyValue(_tag, _val));
+        }
+    }
+
+    /*
+     * Note that 'OwnedValueAccessor' _shadows_ the 'reset()' methods instead of inheriting them.
+     * Whereas the parent 'AssignableSlotAccessor' implementations delegate their operation to the
+     * virtual 'reset_raw()' method, these implementations delegate to a non-virtual method
+     * implementing the same logic that 'reset_raw()' does.
+     *
+     * This trick allows calls to 'reset()' through a variable, pointer, or reference with
+     * 'OwnedValueAccessor' type to always skip virtual dispatch, which measurably speeds up
+     * workloads. However, it precludes any class from inheriting this class and overriding its
+     * 'reset_raw()' method. Keep 'OwnedValueAccessor' as a 'final' class to ensure this requirement
+     * is met.
+     */
+    void reset() {
+        reset(TagValueView::nothing());
+    }
+
+    void reset(TypeTags tag, Value val) {
+        resetImpl(true, tag, val);
+    }
+
+    void reset(TagValueView value) {
+        resetImpl(false, value.tag, value.value);
+    }
+
+    void reset(TagValueOwned value) {
+        auto [tag, val] = value.releaseToRaw();
+        resetImpl(true, tag, val);
+    }
+
+    void reset(TagValueMaybeOwned value) {
+        auto [owned, tag, val] = value.releaseToRaw();
+        resetImpl(owned, tag, val);
+    }
+
+    void reset_raw(bool owned, TypeTags tag, Value val) override {
+        resetImpl(owned, tag, val);
+    }
+
+    void makeOwned() {
+        if (_owned) {
+            return;
+        }
+
+        std::tie(_tag, _val) = copyValue(_tag, _val);
+        _owned = true;
+    }
+
+private:
+    void resetImpl(bool owned, TypeTags tag, Value val) {
+        if (_owned) {
+            releaseValue(_tag, _val);
+        }
+
+        _tag = tag;
+        _val = val;
+        _owned = owned;
+    }
+
+    bool _owned{false};
+    TypeTags _tag{TypeTags::Nothing};
+    Value _val{0};
+};  // class OwnedValueAccessor
+
+/**
+ * An accessor for a slot which must hold an array-like type (e.g. 'TypeTags::Array' or
+ * 'TypeTags::bsonArray'). The array is never owned by this slot. Provides an interface to iterate
+ * over the values that constitute the array.
+ *
+ * It is illegal to fill out the slot with a type that is not array-like.
+ */
+class ArrayAccessor final : public SlotAccessor {
+public:
+    void reset(SlotAccessor* input) {
+        _input = input;
+        _currentIndex = 0;
+        refresh();
+    }
+
+    // Return non-owning view of the value.
+    TagValueView getViewOfValue() const override {
+        return _enumerator.getViewOfValue();
+    }
+    TagValueOwned copyOrMoveValue() override {
+        // We can never move out values from array.
+        auto [tag, val] = getViewOfValue();
+        return TagValueOwned::fromRaw(copyValue(tag, val));
+    }
+
+    bool atEnd() const {
+        return _enumerator.atEnd();
+    }
+
+    bool advance() {
+        ++_currentIndex;
+        return _enumerator.advance();
+    }
+
+    void refresh() {
+        if (_input) {
+            auto [tag, val] = _input->getViewOfValue();
+            _enumerator.reset(tag, val, _currentIndex);
+        }
+    }
+
+private:
+    size_t _currentIndex = 0;
+    SlotAccessor* _input{nullptr};
+    ArrayEnumerator _enumerator;
+};  // class ArrayAccessor
+
+/**
+ * This is a switched accessor - it holds a vector of accessors and operates on an accessor selected
+ * (switched) by the index field.
+ */
+class SwitchAccessor final : public SlotAccessor {
+public:
+    SwitchAccessor(std::vector<SlotAccessor*> accessors) : _accessors(std::move(accessors)) {
+        tassert(11093601, "Vector of SlotAccessor must not be empty", !_accessors.empty());
+    }
+
+    TagValueView getViewOfValue() const override {
+        return _accessors[_index]->getViewOfValue();
+    }
+    TagValueOwned copyOrMoveValue() override {
+        return _accessors[_index]->copyOrMoveValue();
+    }
+
+    void setIndex(size_t index) {
+        tassert(11093602, "Index out of bounds", index < _accessors.size());
+        _index = index;
+    }
+
+private:
+    std::vector<SlotAccessor*> _accessors;
+    size_t _index{0};
+};
+
+/**
+ * Some SBE stages must materialize rows inside (key, value) data structures, e.g. for the sort or
+ * hash aggregation operators. In such cases, both key and value are each materialized rows which
+ * may consist of multiple 'sbe::Value' instances. This accessor provides a view of a particular
+ * value inside a particular key for such a data structure.
+ *
+ * T is the type of an iterator pointing to the (key, value) pair of interest.
+ */
+template <typename T>
+class MaterializedRowKeyAccessor final : public SlotAccessor {
+public:
+    MaterializedRowKeyAccessor(T& it, size_t slot) : _it(it), _slot(slot) {}
+
+    TagValueView getViewOfValue() const override {
+        return _it->first.getViewOfValue(_slot);
+    }
+    TagValueOwned copyOrMoveValue() override {
+        // We can never move out values from keys.
+        auto [tag, val] = getViewOfValue();
+        return TagValueOwned::fromRaw(copyValue(tag, val));
+    }
+
+private:
+    T& _it;
+    size_t _slot;
+};
+
+/**
+ * Some SBE stages must materialize rows inside (key, value) data structures, e.g. for the sort or
+ * hash aggregation operators. In such cases, both key and value are each materialized rows which
+ * may consist of multiple 'sbe::Value' instances. This accessor provides a view of a particular
+ * 'sbe::Value' inside the materialized row which serves as the "value" part of the (key, value)
+ * pair.
+ *
+ * T is the type of an iterator pointing to the (key, value) pair of interest.
+ */
+template <typename T, bool CanMove = true>
+class MaterializedRowValueAccessor final : public AssignableSlotAccessor {
+public:
+    using AssignableSlotAccessor::reset;
+
+    MaterializedRowValueAccessor(T& it, size_t slot) : _it(it), _slot(slot) {}
+
+    TagValueView getViewOfValue() const override {
+        return _it->second.getViewOfValue(_slot);
+    }
+    TagValueOwned copyOrMoveValue() override {
+        if constexpr (CanMove) {
+            return _it->second.copyOrMoveValue(_slot);
+        } else {
+            auto [tag, val] = getViewOfValue();
+            return TagValueOwned::fromRaw(copyValue(tag, val));
+        }
+    }
+
+    void reset_raw(bool owned, TypeTags tag, Value val) override {
+        _it->second.reset(_slot, TagValueMaybeOwned::fromRaw(owned, tag, val));
+    }
+
+private:
+    T& _it;
+    size_t _slot;
+};
+
+/**
+ * Provides a view of  a particular slot inside a particular row of an abstract table-like container
+ * of type T.
+ */
+template <typename T>
+class MaterializedRowAccessor final : public AssignableSlotAccessor {
+public:
+    using AssignableSlotAccessor::reset;
+
+    /**
+     * Constructs an accessor for the row with index 'it' inside the given 'container'. Within that
+     * row, the resulting accessor provides a vew of the value at the given 'slot'.
+     */
+    MaterializedRowAccessor(T& container, const size_t& it, size_t slot)
+        : _container(container), _it(it), _slot(slot) {}
+
+    TagValueView getViewOfValue() const override {
+        return _container[_it].getViewOfValue(_slot);
+    }
+    TagValueOwned copyOrMoveValue() override {
+        return _container[_it].copyOrMoveValue(_slot);
+    }
+
+    void reset_raw(bool owned, TypeTags tag, Value val) override {
+        _container[_it].reset(_slot, TagValueMaybeOwned::fromRaw(owned, tag, val));
+    }
+
+private:
+    T& _container;
+    const size_t& _it;
+    const size_t _slot;
+};
+
+/**
+ * Provides a view of a slot inside a single MaterializedRow.
+ */
+template <typename RowType>
+class SingleRowAccessor final : public AssignableSlotAccessor {
+public:
+    using AssignableSlotAccessor::reset;
+
+    /**
+     * Constructs an accessor that gives a view of the value at the given 'slot' of a
+     * given single row.
+     */
+    SingleRowAccessor(RowType& row, size_t slot) : _row(row), _slot(slot) {}
+
+    TagValueView getViewOfValue() const override {
+        return _row.getViewOfValue(_slot);
+    }
+    TagValueOwned copyOrMoveValue() override {
+        return _row.copyOrMoveValue(_slot);
+    }
+    void reset_raw(bool owned, TypeTags tag, Value val) override {
+        _row.reset(_slot, TagValueMaybeOwned::fromRaw(owned, tag, val));
+    }
+
+private:
+    RowType& _row;
+    const size_t _slot;
+};
+typedef SingleRowAccessor<MaterializedRow> MaterializedSingleRowAccessor;
+typedef SingleRowAccessor<FixedSizeRow<1 /*N*/>> FixedSizeSingleRowAccessor;
+
+
+/**
+ * Provides a view of a slot inside a single MaterializedRow pointed to by pointer T
+ */
+template <typename T>
+requires std::is_pointer_v<T>
+class SingleRowPointerAccessor : public SlotAccessor {
+public:
+    /**
+     * Constructs an accessor that gives a view of the value at the given 'slot' of a
+     * given single row pointed to by T.
+     */
+    SingleRowPointerAccessor(T& ptr, size_t slot) : _ptr(ptr), _slot(slot) {}
+
+    TagValueView getViewOfValue() const override {
+        return _ptr->getViewOfValue(_slot);
+    }
+    TagValueOwned copyOrMoveValue() override {
+        using PointedType = std::remove_pointer_t<T>;
+        if constexpr (std::is_const_v<PointedType>) {
+            auto [tag, val] = getViewOfValue();
+            return TagValueOwned::fromRaw(copyValue(tag, val));
+        } else {
+            return _ptr->copyOrMoveValue();
+        }
+    }
+
+private:
+    T& _ptr;
+    const size_t _slot;
+};
+
+/**
+ * Read the components of the 'keyString' value and populate 'accessors' with those components. Some
+ * components are appended into the 'valueBufferBuilder' object's internal buffer, and the accessors
+ * populated with those values will hold pointers into the buffer. The 'valueBufferBuilder' is
+ * caller owned, and it can be reset and reused once it is safe to invalidate any accessors that
+ * might reference it.
+ */
+void readKeyStringValueIntoAccessors(
+    const SortedDataKeyValueView& keyString,
+    const Ordering& ordering,
+    BufBuilder* valueBufferBuilder,
+    std::vector<OwnedValueAccessor>* accessors,
+    boost::optional<IndexKeysInclusionSet> indexKeysToInclude = boost::none);
+
+
+/**
+ * Commonly used containers.
+ */
+template <typename T>
+using SlotMap = absl::flat_hash_map<SlotId, T>;
+using SlotAccessorMap = SlotMap<SlotAccessor*>;
+using FieldAccessorMap = StringMap<std::unique_ptr<OwnedValueAccessor>>;
+using FieldViewAccessorMap = StringMap<std::unique_ptr<ViewOfValueAccessor>>;
+using SlotSet = absl::flat_hash_set<SlotId>;
+using SlotVector = absl::InlinedVector<SlotId, 2>;
+
+using SlotIdGenerator = IdGenerator<value::SlotId, SlotVector>;
+using FrameIdGenerator = IdGenerator<FrameId>;
+using SpoolIdGenerator = IdGenerator<SpoolId>;
+
+/**
+ * Accessor for a slot which can own the value held by that slot and provides optimized BSONObj
+ * access.
+ */
+class BSONObjValueAccessor final : public AssignableSlotAccessor {
+public:
+    using AssignableSlotAccessor::reset;
+
+    BSONObjValueAccessor() = default;
+
+    BSONObjValueAccessor(const BSONObjValueAccessor& other) {
+        if (other._owned) {
+            auto [tag, val] = copyValue(other._tag, other._val);
+            _tag = tag;
+            _val = val;
+            _owned = true;
+        } else {
+            _tag = other._tag;
+            _val = other._val;
+            _owned = false;
+            _hasBsonObj = other._hasBsonObj;
+            _bsonObj = other._bsonObj;
+        }
+    }
+
+    BSONObjValueAccessor(BSONObjValueAccessor&& other) noexcept {
+        _hasBsonObj = other._hasBsonObj;
+        _tag = other._tag;
+        _val = other._val;
+        _owned = other._owned;
+        _bsonObj = other._bsonObj;
+
+        other._hasBsonObj = false;
+        other._owned = false;
+        other._bsonObj = BSONObj();
+    }
+
+    ~BSONObjValueAccessor() override {
+        if (_owned) {
+            releaseValue(_tag, _val);
+        }
+    }
+
+    // Copy and swap idiom for a single copy/move assignment operator.
+    BSONObjValueAccessor& operator=(BSONObjValueAccessor other) noexcept {
+        std::swap(_hasBsonObj, other._hasBsonObj);
+        std::swap(_tag, other._tag);
+        std::swap(_val, other._val);
+        std::swap(_owned, other._owned);
+        std::swap(_bsonObj, other._bsonObj);
+        return *this;
+    }
+
+    /**
+     * Returns a non-owning view of the value.
+     */
+    TagValueView getViewOfValue() const override {
+        SlotAccessorHelper::dassertValidSlotValue(_tag, _val);
+        return {_tag, _val};
+    }
+
+    /**
+     * If a the value is owned by this slot, then the slot relinquishes ownership of the returned
+     * value. Alternatively, if the value is unowned, then the caller receives a copy. Either way,
+     * the caller owns the resulting value.
+     */
+    TagValueOwned copyOrMoveValue() override {
+        SlotAccessorHelper::dassertValidSlotValue(_tag, _val);
+        if (_owned && !_hasBsonObj) {
+            _owned = false;
+            return TagValueOwned::fromRaw(_tag, _val);
+        } else {
+            return TagValueOwned::fromRaw(copyValue(_tag, _val));
+        }
+    }
+
+    BSONObj getOwnedBSONObj() {
+        tassert(11093603, "Expected bsonObject tag type", _tag == TypeTags::bsonObject);
+        if (!_hasBsonObj) {
+            if (!_owned) {
+                std::tie(_tag, _val) = copyValue(_tag, _val);
+            }
+
+            auto sharedBuf =
+                SharedBuffer(UniqueBuffer::reclaim(sbe::value::bitcastTo<char*>(_val)));
+            _hasBsonObj = true;
+            _owned = false;
+            _bsonObj = BSONObj{std::move(sharedBuf)};
+        }
+
+        return _bsonObj;
+    }
+
+    void reset() {
+        reset(TypeTags::Nothing, 0);
+    }
+
+    void reset(TypeTags tag, Value val) {
+        reset_raw(true, tag, val);
+    }
+
+    void reset_raw(bool owned, TypeTags tag, Value val) override {
+        release();
+
+        _tag = tag;
+        _val = val;
+        _owned = owned;
+    }
+
+    void makeOwned() {
+        if (_owned || _hasBsonObj) {
+            return;
+        }
+
+        std::tie(_tag, _val) = copyValue(_tag, _val);
+        _owned = true;
+    }
+
+private:
+    void release() {
+        if (_owned) {
+            releaseValue(_tag, _val);
+            _owned = false;
+        }
+        _hasBsonObj = false;
+        _bsonObj = BSONObj();
+    }
+
+    bool _hasBsonObj{false};
+    bool _owned{false};
+    TypeTags _tag{TypeTags::Nothing};
+    Value _val{0};
+    BSONObj _bsonObj;
+};  // class BSONObjValueAccessor
+
+}  // namespace mongo::sbe::value

@@ -1,0 +1,331 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/fle/range_predicate.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/crypto/fle_crypto.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/matcher/expression_expr.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/fle/encrypted_predicate.h"
+#include "mongo/db/query/fle/encrypted_predicate_test_fixtures.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+
+#include <functional>
+#include <initializer_list>
+#include <set>
+#include <string_view>
+#include <utility>
+#include <variant>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo::fle {
+namespace {
+using namespace std::literals::string_view_literals;
+class MockRangePredicate : public RangePredicate {
+public:
+    MockRangePredicate(const QueryRewriterInterface* rewriter) : RangePredicate(rewriter) {}
+
+    MockRangePredicate(const QueryRewriterInterface* rewriter,
+                       TagMap tags,
+                       std::set<std::string_view> encryptedFields)
+        : RangePredicate(rewriter) {}
+
+    bool payloadValid = true;
+    bool isStubPayload = false;
+
+protected:
+    bool isPayload(const BSONElement& elt) const override {
+        return payloadValid;
+    }
+
+    bool isPayload(const Value& v) const override {
+        return payloadValid;
+    }
+
+    bool isStub(BSONElement elt) const override {
+        return isStubPayload;
+    }
+
+    bool isStub(Value elt) const override {
+        return isStubPayload;
+    }
+
+    std::vector<PrfBlock> generateTags(BSONValue payload, std::string_view) const override {
+        return visit(
+            OverloadedVisitor{[&](BSONElement p) {
+                                  if (p.isABSONObj()) {
+                                      std::vector<PrfBlock> allTags;
+                                      for (auto& val : p.Array()) {
+                                          allTags.push_back(PrfBlock(
+                                              {static_cast<unsigned char>(val.safeNumberInt())}));
+                                      }
+                                      return allTags;
+                                  } else {
+                                      return std::vector<PrfBlock>{};
+                                  }
+                              },
+                              [&](std::reference_wrapper<Value> v) {
+                                  if (v.get().isArray()) {
+                                      auto arr = v.get().getArray();
+                                      std::vector<PrfBlock> allTags;
+                                      for (auto& val : arr) {
+                                          allTags.push_back(PrfBlock(
+                                              {static_cast<unsigned char>(val.coerceToInt())}));
+                                      }
+                                      return allTags;
+                                  } else {
+                                      return std::vector<PrfBlock>{};
+                                  }
+                              }},
+            payload);
+    }
+};
+class RangePredicateRewriteTest : public EncryptedPredicateRewriteTest {
+public:
+    RangePredicateRewriteTest() : _predicate(&_mock) {}
+
+protected:
+    MockRangePredicate _predicate;
+};
+
+TEST_F(RangePredicateRewriteTest, MatchRangeRewrite_NoStub) {
+    std::vector<PrfBlock> allTags = {{1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}};
+
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+
+    auto payload = fromjson("{x: [1, 2, 3, 4, 5, 6, 7, 8, 9]}");
+
+    assertRewriteForOp<GTMatchExpression>(_predicate, payload.firstElement(), allTags);
+    assertRewriteForOp<GTEMatchExpression>(_predicate, payload.firstElement(), allTags);
+    assertRewriteForOp<LTMatchExpression>(_predicate, payload.firstElement(), allTags);
+    assertRewriteForOp<LTEMatchExpression>(_predicate, payload.firstElement(), allTags);
+}
+
+TEST_F(RangePredicateRewriteTest, MatchRangeRewrite_Stub) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+
+    auto payload = fromjson("{x: [1, 2, 3, 4, 5, 6, 7, 8, 9]}");
+
+#define ASSERT_REWRITE_TO_TRUE(T)                                                            \
+    {                                                                                        \
+        std::unique_ptr<MatchExpression> inputExpr = std::make_unique<T>("age"sv, Value(0)); \
+        _predicate.isStubPayload = true;                                                     \
+        auto rewrite = _predicate.rewrite(inputExpr.get());                                  \
+        ASSERT_EQ(rewrite->matchType(), MatchExpression::ALWAYS_TRUE);                       \
+    }
+
+    // Rewrites that would normally go to disjunctions.
+    {
+        ASSERT_REWRITE_TO_TRUE(GTMatchExpression);
+        ASSERT_REWRITE_TO_TRUE(GTEMatchExpression);
+        ASSERT_REWRITE_TO_TRUE(LTMatchExpression);
+        ASSERT_REWRITE_TO_TRUE(LTEMatchExpression);
+    }
+
+    // Rewrites that would normally go to $internalFleBetween.
+    {
+        _mock.setForceEncryptedCollScanForTest();
+        ASSERT_REWRITE_TO_TRUE(GTMatchExpression);
+        ASSERT_REWRITE_TO_TRUE(GTEMatchExpression);
+        ASSERT_REWRITE_TO_TRUE(LTMatchExpression);
+        ASSERT_REWRITE_TO_TRUE(LTEMatchExpression);
+    }
+}
+
+TEST_F(RangePredicateRewriteTest, AggRangeRewrite_Stub) {
+    auto ops = {"$gt", "$lt", "$gte", "$lte"};
+    for (auto& op : ops) {
+        auto input = fromjson(str::stream() << "{" << op << ": [\"$age\", {$literal: [1, 2, 3]}]}");
+        auto inputExpr =
+            ExpressionCompare::parseExpression(&_expCtx, input, _expCtx.variablesParseState);
+
+        auto expected = ExpressionConstant::create(&_expCtx, Value(true));
+
+        _predicate.isStubPayload = true;
+        auto actual = _predicate.rewrite(inputExpr.get());
+        ASSERT(actual);
+        ASSERT_BSONOBJ_EQ(actual->serialize().getDocument().toBson(),
+                          expected->serialize().getDocument().toBson());
+    }
+}
+
+TEST_F(RangePredicateRewriteTest, AggRangeRewrite) {
+    auto ops = {"$gt", "$lt", "$gte", "$lte"};
+    for (auto& op : ops) {
+        auto input = fromjson(str::stream() << "{" << op << ": [\"$age\", {$literal: [1, 2, 3]}]}");
+        auto inputExpr =
+            ExpressionCompare::parseExpression(&_expCtx, input, _expCtx.variablesParseState);
+
+        auto expected = makeTagDisjunction(&_expCtx, toValues({{1}, {2}, {3}}));
+
+        auto actual = _predicate.rewrite(inputExpr.get());
+
+        ASSERT_BSONOBJ_EQ(actual->serialize().getDocument().toBson(),
+                          expected->serialize().getDocument().toBson());
+    }
+}
+
+TEST_F(RangePredicateRewriteTest, AggRangeRewriteNoOp) {
+    auto ops = {"$gt", "$lt", "$gte", "$lte"};
+    for (auto& op : ops) {
+        auto input = fromjson(str::stream() << "{" << op << ": [\"$age\", {$literal: [1, 2, 3]}]}");
+        auto inputExpr =
+            ExpressionCompare::parseExpression(&_expCtx, input, _expCtx.variablesParseState);
+
+        auto expected = inputExpr;
+
+        _predicate.payloadValid = false;
+        auto actual = _predicate.rewrite(inputExpr.get());
+        ASSERT(actual == nullptr);
+    }
+}
+
+BSONObj generateFFP(std::string_view path, int lb, int ub, int min, int max) {
+    auto indexKey = getIndexKey();
+    FLEIndexKeyAndId indexKeyAndId(indexKey.data, indexKeyId);
+    auto userKey = getUserKey();
+    FLEUserKeyAndId userKeyAndId(userKey.data, indexKeyId);
+
+    auto edges = minCoverInt32(lb, true, ub, true, min, max, 1, 0);
+    FLE2RangeFindSpec spec(0, Fle2RangeOperator::kGt);
+    auto ffp = FLEClientCrypto::serializeFindRangePayloadV2(
+        indexKeyAndId, userKeyAndId, edges, 0, 1, spec);
+
+    BSONObjBuilder builder;
+    toEncryptedBinData(path, EncryptedBinDataType::kFLE2FindRangePayloadV2, ffp, &builder);
+    return builder.obj();
+}
+
+template <typename T>
+std::unique_ptr<MatchExpression> generateOpWithFFP(std::string_view path, BSONObj ffp) {
+    return std::make_unique<T>(path, ffp.firstElement());
+}
+
+std::unique_ptr<Expression> generateBetweenWithFFP(
+    ExpressionContext* expCtx, ExpressionCompare::CmpOp op, std::string_view path, int lb, int ub) {
+    auto ffp = Value(generateFFP(path, lb, ub, 0, 255).firstElement());
+    auto ffpExpr = make_intrusive<ExpressionConstant>(expCtx, ffp);
+    auto fieldpath = ExpressionFieldPath::createPathFromString(
+        expCtx, std::string{path}, expCtx->variablesParseState);
+    std::vector<boost::intrusive_ptr<Expression>> children = {std::move(fieldpath),
+                                                              std::move(ffpExpr)};
+    return std::make_unique<ExpressionCompare>(expCtx, op, std::move(children));
+}
+
+TEST_F(RangePredicateRewriteTest, CollScanRewriteMatch) {
+    _mock.setForceEncryptedCollScanForTest();
+    auto expected = fromjson(R"({
+        "$_internalFleBetween": {
+            "field": "$age",
+            "server": [
+                {
+                    "$binary": {
+                        "base64": "CKPIq22z0nimnLE48v2/ZyeljOYmlDVlUYEWiCINEhII",
+                        "subType": "6"
+                    }
+                },
+                {
+                    "$binary": {
+                        "base64": "CGO26k3E2Qb5M5GlI1SoqcxUkXJbsCwHlwPwTbzesr53",
+                        "subType": "6"
+                    }
+                },
+                {
+                    "$binary": {
+                        "base64": "CJ0Xu3p6LfkwHkE1EAR0DLCWEx1SPlyLHL3kkNPlOaxz",
+                        "subType": "6"
+                    }
+                }
+
+            ]
+        }
+    })");
+#define ASSERT_REWRITE_TO_INTERNAL_BETWEEN(T)                                     \
+    {                                                                             \
+        auto path = "age";                                                        \
+        BSONObj ffp = generateFFP(path, 23, 35, 0, 255);                          \
+        auto input = generateOpWithFFP<T>(path, ffp);                             \
+        auto result = _predicate.rewrite(input.get());                            \
+        ASSERT(result);                                                           \
+        ASSERT_EQ(result->matchType(), MatchExpression::EXPRESSION);              \
+        auto* expr = static_cast<ExprMatchExpression*>(result.get());             \
+        auto aggExpr = expr->getExpression();                                     \
+        ASSERT_BSONOBJ_EQ(aggExpr->serialize().getDocument().toBson(), expected); \
+    }
+    ASSERT_REWRITE_TO_INTERNAL_BETWEEN(GTMatchExpression);
+    ASSERT_REWRITE_TO_INTERNAL_BETWEEN(GTEMatchExpression);
+    ASSERT_REWRITE_TO_INTERNAL_BETWEEN(LTMatchExpression);
+    ASSERT_REWRITE_TO_INTERNAL_BETWEEN(LTEMatchExpression);
+}
+
+TEST_F(RangePredicateRewriteTest, CollScanRewriteAgg) {
+    _mock.setForceEncryptedCollScanForTest();
+    auto expected = fromjson(R"({
+        "$_internalFleBetween": {
+            "field": "$age",
+            "server": [
+                {
+                    "$binary": {
+                        "base64": "CKPIq22z0nimnLE48v2/ZyeljOYmlDVlUYEWiCINEhII",
+                        "subType": "6"
+                    }
+                },
+                {
+                    "$binary": {
+                        "base64": "CGO26k3E2Qb5M5GlI1SoqcxUkXJbsCwHlwPwTbzesr53",
+                        "subType": "6"
+                    }
+                },
+                {
+                    "$binary": {
+                        "base64": "CJ0Xu3p6LfkwHkE1EAR0DLCWEx1SPlyLHL3kkNPlOaxz",
+                        "subType": "6"
+                    }
+                }
+
+            ]
+        }
+    })");
+    auto ops = {ExpressionCompare::GT,
+                ExpressionCompare::GTE,
+                ExpressionCompare::LT,
+                ExpressionCompare::LTE};
+    for (auto& op : ops) {
+        auto input = generateBetweenWithFFP(&_expCtx, op, "age", 23, 35);
+        auto result = _predicate.rewrite(input.get());
+        ASSERT(result);
+        ASSERT_BSONOBJ_EQ(result->serialize().getDocument().toBson(), expected);
+    }
+}
+
+
+TEST_F(RangePredicateRewriteTest, UnsupportedComparisonOps) {
+    auto ops = {ExpressionCompare::CMP, ExpressionCompare::EQ, ExpressionCompare::NE};
+    for (auto& op : ops) {
+        auto input = generateBetweenWithFFP(&_expCtx, op, "age", 23, 35);
+        auto result = _predicate.rewrite(input.get());
+        ASSERT(result == nullptr);
+    }
+    _mock.setForceEncryptedCollScanForTest();
+    for (auto& op : ops) {
+        auto input = generateBetweenWithFFP(&_expCtx, op, "age", 23, 35);
+        auto result = _predicate.rewrite(input.get());
+        ASSERT(result == nullptr);
+    }
+}
+
+};  // namespace
+}  // namespace mongo::fle

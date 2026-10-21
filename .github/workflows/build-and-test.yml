@@ -1,0 +1,1257 @@
+name: build-and-test
+
+# This workflow runs on three triggers with different trust models:
+#
+# * pull_request_target -- runs the workflow file from the BASE branch (master)
+#   and exposes secrets, while pull_request would withhold secrets for fork PRs
+#   and break RBE. Because we still need to build the PR's source, the checkout
+#   step below overrides the default base ref to the PR head SHA (TARGET_REF).
+#   That re-introduces the "pwn-request" risk (running untrusted code with a
+#   secret), which is mitigated by routing untrusted authors through the
+#   rbe-approve environment whose required reviewers must approve every push.
+# * schedule (weekly cron) -- a full weekly regression run on `master`.
+# * workflow_dispatch (manual) -- run on demand, optionally against a specific
+#   commit hash / tag / branch via the `ref` input (empty => the branch the
+#   dispatch was started on).
+#
+# schedule and workflow_dispatch run TRUSTED code, so there is no
+# untrusted-author pwn-request to mitigate: schedule always builds
+# already-merged `master`, and workflow_dispatch -- though it may target an
+# arbitrary, possibly-unmerged ref -- is restricted by GitHub to actors with
+# write access, so the ref was chosen by a trusted operator. Both bypass the
+# rbe-approve approval gate and route straight to the ungated `rbe` environment
+# (see the gate job's `environment:` and the event-aware guards below). All of
+# the PR-only context (`github.event.pull_request.*`, `github.base_ref`) is
+# absent on these events, so ref resolution and gating are generalized via the
+# TARGET_REF / TRUSTED_REF env vars and the `github.event_name` checks below.
+on:
+  pull_request_target:
+    # Deliberately NOT triggered on labeled/unlabeled. The workflow is a single
+    # gated pipeline (gate -> format_gate -> build -> {binary_tests, unittests} ->
+    # jstests); whether jstests runs is decided from the PR's labels at run time
+    # by jstests_gate,
+    # so it does not need a label trigger. Listening to label events would also
+    # make every label a producer like mergai stamps on a PR (ci-skip-clang-tidy
+    # / ci-skip-format, meant for other workflows) spawn an extra run that skips
+    # the heavy jobs and shadows the real code run -- the regression that made
+    # build/unittests/binary_tests show "skipped" on mergai PRs.
+    #
+    # ready_for_review runs the heavy jobs for a PR opened as a draft: they are
+    # gated on `draft == false` (see their `if:` below) so they skip while the
+    # PR is a draft and run once it is marked ready. Code events
+    # (opened/synchronize/reopened) run them directly on a non-draft PR.
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - master
+      - "mergai/**"
+  # Weekly full regression, Friday 22:00 UTC (late evening, clear of the daily
+  # 05:00 periodic-merge and the weekday 06:00 update-fork-status runs). Always
+  # runs on `master` (see TARGET_REF); GitHub only schedules cron from the
+  # default branch. cron cadence must be a literal here -- it cannot come from a
+  # repo variable.
+  schedule:
+    - cron: "0 22 * * 5"
+  # Manual entry point. `ref` optionally targets a specific commit hash, tag, or
+  # branch; when left empty it defaults to the branch the dispatch runs on
+  # (github.ref) via TARGET_REF. Restricted by GitHub to actors with write
+  # access, so it is trusted and skips the rbe-approve gate.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit hash, tag, or branch to build and test. Empty => the branch this run was started on."
+        required: false
+        type: string
+        default: ""
+
+# One concurrency group per PR: a newer code event (push, reopen, ready) for the
+# same PR supersedes an older in-flight run (cancel-in-progress). Non-PR events
+# have no pull_request.number, so they fall back to github.run_id -- a value
+# unique per run, giving each scheduled/manual run its own group so they never
+# cancel one another (a weekly run must not kill an in-flight manual
+# investigation, and vice versa).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required for the credential helper's GitHub Actions OIDC tier:
+  # GHA injects ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN into the runner only
+  # when this permission is granted, and without them the helper cannot
+  # mint a GH OIDC id_token to exchange for a Dex JWT.
+  id-token: write
+  # Lets the jstests_gate job read fresh PR labels via
+  # `gh api repos/.../pulls/<N>` to decide whether the jstests job runs.
+  pull-requests: read
+  # Lets the format_gate job read the `format` workflow runs for this PR head SHA
+  # via `gh api repos/.../actions/workflows/format.yml/runs` and hold build until
+  # format has passed.
+  actions: read
+
+# RBE connection parameters, shared between jobs, sourced from repo variables
+# under the PSMDB_RBE_ prefix (matching the PSMDB_RBE_GHA_AUDIENCE /
+# PSMDB_RBE_OIDC_ISSUER secrets) so a repo or fork points CI at its own RBE
+# cluster by setting variables — no endpoint is baked into the workflow. The
+# four service endpoints are full URLs, one variable per Bazel flag; the
+# credential helper takes only its host from vars.PSMDB_RBE_HOST (its path is a
+# fixed security invariant, see below). Values are surfaced here under short
+# RBE_* names purely so the job steps below stay readable and byte-identical.
+#
+# The whole RBE pipeline is gated on `vars.PSMDB_RBE_ENABLED == 'true'` (see the
+# `if:` on every job). When it is unset or any other value, every RBE job is
+# skipped, so these values are only ever read on the remote path — an empty
+# variable never reaches a running bazel invocation. If you set
+# PSMDB_RBE_ENABLED=true you MUST also set the PSMDB_RBE_* variables below.
+env:
+  # Single source of truth for what to build/test, resolved once from the
+  # trigger and consumed by every "Checkout target ref" step. The OR chain is
+  # ordered so each event hits its own clause before reaching `inputs.ref`
+  # (which only exists for workflow_dispatch):
+  #   pull_request_target -> PR head SHA (untrusted code; gated by rbe-approve)
+  #   schedule            -> master (weekly regression)
+  #   workflow_dispatch   -> the `ref` input, or github.ref when it is empty
+  # GHA `&&`/`||` short-circuits: a false left side falls through to the next
+  # clause, and `inputs.ref != '' && inputs.ref` yields the input only when set.
+  TARGET_REF: >-
+    ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha
+    || github.event_name == 'schedule' && 'master'
+    || inputs.ref != '' && inputs.ref
+    || github.ref }}
+  # The trusted, branch-protected ref that composite actions are loaded from
+  # (the `_trusted/` checkout). For a PR this is the base branch (master or
+  # mergai/*), NEVER the untrusted PR head -- see the per-job checkout comments.
+  # For schedule/workflow_dispatch the entire checkout is already trusted
+  # (merged code, or a ref a write-access operator explicitly chose), so the
+  # trusted copy is just the target ref itself and this mirrors TARGET_REF.
+  TRUSTED_REF: >-
+    ${{ github.event_name == 'pull_request_target' && github.base_ref
+    || github.event_name == 'schedule' && 'master'
+    || inputs.ref != '' && inputs.ref
+    || github.ref }}
+  RBE_REMOTE_EXECUTOR: ${{ vars.PSMDB_RBE_REMOTE_EXECUTOR }}
+  RBE_REMOTE_CACHE: ${{ vars.PSMDB_RBE_REMOTE_CACHE }}
+  RBE_BES_BACKEND: ${{ vars.PSMDB_RBE_BES_BACKEND }}
+  RBE_BES_RESULTS_URL: ${{ vars.PSMDB_RBE_BES_RESULTS_URL }}
+  # Credential-helper flag value: <host>=<workspace-relative path>. Only the
+  # host varies per cluster, so it is taken from vars.PSMDB_RBE_HOST; the path is
+  # a fixed security invariant (see below) and is kept literal here rather than
+  # exposed as a variable that a misconfiguration could point outside _trusted/.
+  # %workspace% is a Bazel substitution (not a shell expansion), so the value is
+  # carried literally through to Bazel.
+  #
+  # Resolved against the TRUSTED base checkout under _trusted/ (the same
+  # base-branch copy used for composite actions), NOT %workspace% root
+  # (the untrusted PR head). The credential helper mints/exchanges the
+  # OIDC token, so running the PR-head copy would let a malicious PR
+  # rewrite it to exfiltrate ACTIONS_ID_TOKEN_REQUEST_TOKEN / the minted
+  # Dex JWT once the gate is approved. The helper computes REPO_ROOT from
+  # its own __file__ and imports its sibling rbe_auth.py, so pinning the
+  # path to _trusted/ keeps the entire import chain on the trusted copy.
+  RBE_CREDENTIAL_HELPER: ${{ vars.PSMDB_RBE_HOST }}=%workspace%/_trusted/bazel/wrapper_hook/credential_helper.py
+
+# Jobs: gate, format_gate, build, unittests, binary_tests, jstests (plus the
+# jstests_gate decider). `gate` is a no-op whose only purpose is to host the
+# protected `rbe-approve` environment so a single maintainer approval authorizes
+# the entire workflow run. `format_gate` waits for the `format` workflow and
+# gates `build`; the test jobs inherit the format requirement transitively via
+# build. See those jobs. The test jobs depend on `gate` (transitively) and use
+# the unattended `rbe` environment — same secrets, no approval prompt — so the
+# maintainer isn't re-prompted between jobs.
+#
+# Build and unittests deliberately run on separate runners with separate
+# Bazel servers, so neither shares local state — both pay the action-graph
+# analysis cost and re-fetch toplevel install outputs. The tradeoff is
+# intentional: distinct GH UI checks make build-vs-test failures obvious
+# in PR status, and a flaky test rerun doesn't re-do the build (and
+# doesn't need a fresh approval, because `rbe` is ungated). RBE absorbs
+# the duplicated work as cache hits; if cache pressure ever makes that
+# uneconomical, collapse build and unittests into one job rather than
+# trying to ship build artifacts between runners.
+#
+# One-time environment setup (GH repo settings UI):
+#   - `rbe-approve`: required reviewers = dev-psmdb-approvers team. Carries
+#     PSMDB_RBE_GHA_AUDIENCE + PSMDB_RBE_OIDC_ISSUER secrets.
+#   - `rbe`: NO required reviewers. Same two secrets, same values.
+#     "Deployment branches and tags" = ALL branches. This workflow runs on
+#     pull_request_target and GitHub evaluates the environment branch rule
+#     against the PR HEAD ref, so restricting `rbe` to `master`/`mergai/**`
+#     would block ordinary same-repo PR builds (feature branches). Fork PRs
+#     are kept off `rbe` by the gate ternary below (they resolve to
+#     `rbe-approve` and require approval), not by a branch rule.
+#
+# One-time repo/org Variables (GH repo settings UI -> Variables):
+#   - PSMDB_RBE_ENABLED = 'true' to run the RBE pipeline (see the env block
+#     above and the `if:` on every job). Unset/other value => whole pipeline
+#     skips.
+#   - PSMDB_RBE_REMOTE_EXECUTOR / PSMDB_RBE_REMOTE_CACHE / PSMDB_RBE_BES_BACKEND
+#     / PSMDB_RBE_BES_RESULTS_URL: full RBE endpoint URLs.
+#   - PSMDB_RBE_HOST: the RBE host (no scheme/port); used to build the
+#     credential-helper flag (see the env block above).
+#
+# Trust model: same-repo PRs (head repo == base repo) route to the ungated
+# `rbe` environment; forks/external PRs route to `rbe-approve` and pay the
+# approval cost. A branch can only exist in this repo if someone with write
+# access pushed it, so same-repo is the trust signal -- mergai PRs
+# (mergai/** on this repo) and maintainers' own branches skip the approval,
+# forks do not. author_association is intentionally NOT used (spoofable in some
+# contexts); same-repo is the reliable signal. Non-PR events
+# (schedule/workflow_dispatch) also route to the ungated `rbe`: schedule runs
+# already-merged `master`, and workflow_dispatch (which may target an unmerged
+# ref) is restricted by GitHub to write-access actors, so there is no untrusted
+# author to gate.
+#
+# SECURITY PREREQUISITES for the production repo (defense in depth; less
+# critical on a personal test fork): (1) audit how a malicious
+# .github/actions/** change could exfiltrate the OIDC credential on the now
+# unattended `rbe` path, and (2) wire CODEOWNERS on .github/** to dev-psmdb so
+# such an edit cannot be merged.
+jobs:
+  # No-op gatekeeper. For fork/external PRs the approval click on this job's
+  # `rbe-approve` environment authorizes the entire workflow run's downstream
+  # RBE access, including the `unittests` job that doesn't run until ~30
+  # minutes later -- the maintainer reviewing the PR is implicitly approving
+  # every job that transitively depends on `gate`. Same-repo PRs and non-PR
+  # events (schedule/workflow_dispatch) resolve to the ungated `rbe` environment
+  # and proceed with no click. Runs on every trigger.
+  gate:
+    name: gate
+    # Master switch for the entire RBE pipeline: `vars.PSMDB_RBE_ENABLED` must
+    # be exactly the string 'true' for any RBE job to run. Unset or any other
+    # value skips this gate; because every downstream RBE job also repeats this
+    # guard (so each independently honors the switch), the whole pipeline goes
+    # dark on a repo/fork that has not opted into remote Bazel.
+    if: ${{ vars.PSMDB_RBE_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    # Route to the ungated `rbe` environment (no approval) for any non-PR event
+    # (schedule runs already-merged `master`; workflow_dispatch may target an
+    # unmerged ref but is write-access only, so it is trusted) and for same-repo
+    # PRs; fork/external PRs get the gated
+    # `rbe-approve`. On non-PR events `github.event.pull_request.*` is empty, so
+    # the head-repo comparison would spuriously resolve to `rbe-approve` -- the
+    # explicit event_name check short-circuits that.
+    environment: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && 'rbe' || 'rbe-approve' }}
+    steps:
+      # Fail fast on RBE misconfiguration. This job runs only when
+      # PSMDB_RBE_ENABLED == 'true', and in that case every RBE endpoint variable
+      # must be set — otherwise Bazel would receive empty --remote_* /
+      # --credential_helper values and fail deep inside build/unittests/binary_tests/
+      # jstests with an opaque error (or silently fall back to local execution).
+      # Checking here, in the root job every RBE job transitively depends on,
+      # turns that into one clear message before any heavy job starts. Values are
+      # read via env (not inline ${{ }}) so an empty variable can't break the
+      # shell, and the check only asserts presence — Bazel validates the URLs.
+      - name: Validate RBE configuration
+        env:
+          PSMDB_RBE_HOST: ${{ vars.PSMDB_RBE_HOST }}
+          PSMDB_RBE_REMOTE_EXECUTOR: ${{ vars.PSMDB_RBE_REMOTE_EXECUTOR }}
+          PSMDB_RBE_REMOTE_CACHE: ${{ vars.PSMDB_RBE_REMOTE_CACHE }}
+          PSMDB_RBE_BES_BACKEND: ${{ vars.PSMDB_RBE_BES_BACKEND }}
+          PSMDB_RBE_BES_RESULTS_URL: ${{ vars.PSMDB_RBE_BES_RESULTS_URL }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for v in PSMDB_RBE_HOST PSMDB_RBE_REMOTE_EXECUTOR PSMDB_RBE_REMOTE_CACHE \
+                   PSMDB_RBE_BES_BACKEND PSMDB_RBE_BES_RESULTS_URL; do
+            [ -n "${!v}" ] || missing+=("$v")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::PSMDB_RBE_ENABLED is 'true' but these repo variables are unset/empty: ${missing[*]}. Set them under Settings -> Secrets and variables -> Actions -> Variables, or set PSMDB_RBE_ENABLED to 'false' to disable the RBE pipeline."
+            exit 1
+          fi
+          echo "RBE configuration present (host=$PSMDB_RBE_HOST)."
+
+      # Block scalar (|) so the literal '#' in "PR #N" is not interpreted
+      # as a YAML comment marker — that's what truncated the string and
+      # produced the "unexpected EOF" bash error on the first run. The PR
+      # number is empty on schedule/workflow_dispatch, so the message reports
+      # the event and resolved ref instead of a "PR #".
+      - run: |
+          echo "RBE access approved for ${{ github.event_name }} (ref=${TARGET_REF}) by ${{ github.actor }}"
+
+  # Format gate. `build` waits for it, so build never starts until the `format`
+  # workflow has passed (format is ~6 min, so the happy-path delay is small). The
+  # test jobs inherit this transitively: they gate on build success, and build
+  # only succeeds after format passed. A format FAILURE skips build (and the test
+  # jobs that chain off it), so we don't burn RBE on a SHA that a format fix will
+  # supersede (this run is then cancelled by concurrency.cancel-in-progress when
+  # the fix lands).
+  #
+  # clang-tidy is deliberately NOT gated here: its workflow concludes `success`
+  # even when clang-tidy reports findings (those surface as Code Scanning alerts,
+  # not a failing run, because the non-strict .clang-tidy has no WarningsAsErrors),
+  # so a gate on its run conclusion would only catch infra failures, not lint
+  # findings -- not worth holding the pipeline on.
+  #
+  # `format` runs on `pull_request` against the SAME head SHA as this
+  # `pull_request_target` run, so the gate locates the format run for that SHA
+  # and waits for it to conclude. The workflow ALWAYS produces a run: on the
+  # ci-skip-format label the analyze job is skipped but the run still concludes
+  # `success`, so requiring conclusion == 'success' treats that skip case as a
+  # pass and only a genuine FAILURE (or cancellation) blocks build.
+  #
+  # The poll loop is unbounded on purpose: a slow-but-passing format run must not
+  # wrongly skip build. The hard backstop is the job-level timeout
+  # (`timeout-minutes`, GitHub's 6h default); if the run never concludes the job
+  # times out -> `passed` stays empty -> build skips (fail-safe). In practice
+  # format is superseded by its own concurrency.cancel-in-progress on a new push,
+  # which makes the run conclude `cancelled` and the loop exit promptly.
+  #
+  # Job ID uses an underscore (so expressions can use dot access, consistent with
+  # jstests_gate); the display `name` uses a hyphen for the PR check label.
+  format_gate:
+    name: format-gate
+    needs: gate
+    # Skipped on a draft PR, exactly like build. build additionally requires
+    # passed == 'true', which is empty (falsey) when this job is skipped, so a
+    # draft stays fully skipped and consistent. The draft check is guarded by
+    # the event name: on schedule/workflow_dispatch there is no PR (draft is
+    # empty, not `false`), so the job must still run -- it then short-circuits
+    # to passed=true in the step below (there is no format run to wait for).
+    if: >-
+      ${{ vars.PSMDB_RBE_ENABLED == 'true'
+      && (github.event_name != 'pull_request_target'
+      || github.event.pull_request.draft == false) }}
+    runs-on: ubuntu-24.04
+    outputs:
+      passed: ${{ steps.wait.outputs.passed }}
+    steps:
+      - name: Wait for format to pass
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW: format.yml
+        run: |
+          set -euo pipefail
+          # No format gate for non-PR events: the `format` workflow only runs on
+          # `pull_request`, so a scheduled/manual ref has no format run to poll
+          # (an unbounded poll would just hang until the job timeout). Treat the
+          # gate as passed and let build proceed -- the ref is trusted, merged
+          # code (or an operator-chosen ref) that was format-checked when merged.
+          if [ "${{ github.event_name }}" != "pull_request_target" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${{ github.event_name }}) -> skipping format gate."
+            exit 0
+          fi
+          # Poll the workflow's latest run for this PR head SHA until it
+          # completes, then read its conclusion. status/conclusion stay empty
+          # while the run hasn't appeared or is still running. Unbounded; the
+          # job-level timeout is the backstop (see the comment above the job).
+          status=""; conclusion=""
+          while :; do
+            read -r status conclusion < <(gh api \
+              "repos/$REPO/actions/workflows/$WORKFLOW/runs?head_sha=$HEAD_SHA&per_page=1" \
+              --jq '.workflow_runs[0] | "\(.status) \(.conclusion)"' 2>/dev/null || echo " ")
+            echo "[$WORKFLOW] status=${status:-none} conclusion=${conclusion:-none}" >&2
+            [ "$status" = "completed" ] && break
+            sleep 30
+          done
+          if [ "$conclusion" = "success" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "format passed -> build will run."
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping build/tests (format conclusion=${conclusion:-none})."
+          fi
+
+  build:
+    name: build
+    needs: [gate, format_gate]
+    # Runs after gate approval AND format passing, on every non-draft trigger.
+    # Skipped while the PR is a DRAFT (draft == false guard) so a draft gets no
+    # heavy CI; marking it ready fires `ready_for_review` (draft == false) and
+    # build runs then. needs.format_gate.outputs.passed holds build until format
+    # has passed (~6 min); it is empty (falsey) when format failed or was
+    # skipped, so a format failure skips build (and the test jobs that chain off
+    # it). unittests and binary_tests chain off `needs.build.result == 'success'`, so
+    # they inherit the draft + format skip automatically; jstests carries its own
+    # draft guard.
+    if: >-
+      ${{ vars.PSMDB_RBE_ENABLED == 'true'
+      && (github.event_name != 'pull_request_target'
+      || github.event.pull_request.draft == false)
+      && needs.format_gate.outputs.passed == 'true' }}
+    # Pinned to ubuntu-24.04 (not ubuntu-latest) because this workflow
+    # depends on runner specifics that change silently when GH rolls the
+    # alias forward: the /mnt ephemeral-disk layout assumed by
+    # free-disk-space, the preinstalled toolchain paths it reclaims, and
+    # the 16 GB RAM budget the -Xmx12g JVM heap targets. Bump deliberately
+    # after retesting those assumptions.
+    runs-on: ubuntu-24.04
+    # Unattended environment (no required reviewers). Carries the same
+    # secrets as `rbe-approve` so the credential helper resolves the
+    # same OIDC audience/issuer values without a fresh approval prompt.
+    # The `gate` job above is what authorizes us to be in `rbe` here.
+    environment: rbe
+    # Job-level env (not workflow-level) so environment-scoped secrets on
+    # `rbe` / `rbe-approve` resolve correctly — workflow-level env can
+    # only read repo/org secrets, never environment ones.
+    env:
+      PSMDB_RBE_GHA_AUDIENCE: ${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}
+      PSMDB_RBE_OIDC_ISSUER: ${{ secrets.PSMDB_RBE_OIDC_ISSUER }}
+    steps:
+      # TARGET_REF is the source we're going to build/test (PR head SHA on a PR;
+      # master on the weekly run; the input/branch on a manual run -- see the
+      # workflow env block). Loaded into the default workspace
+      # ($GITHUB_WORKSPACE) so bazel sees it as the checkout root. Done FIRST so
+      # the subsequent trusted checkout into `_trusted/` lands alongside without
+      # `git clean` ever traversing it.
+      - name: Checkout target ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TARGET_REF }}
+          fetch-depth: 0
+
+      # Trusted copy of the repo (TRUSTED_REF), used ONLY to resolve composite
+      # actions referenced below via `./_trusted/.github/actions/<name>`.
+      # Without this, `uses: ./.github/actions/<name>` would resolve against
+      # the TARGET_REF checkout above, letting a malicious PR replace the
+      # action's contents and run arbitrary code with the `rbe` environment
+      # secrets and `id-token: write` capability that this job carries.
+      # On a PR, TRUSTED_REF is `github.base_ref` -- a branch name (master or
+      # mergai/*), both protected against force-push, so the resolved tip is
+      # trusted by the same branch-protection rules that gate normal merges. On
+      # schedule/workflow_dispatch there is no untrusted PR head: TRUSTED_REF
+      # equals TARGET_REF (trusted merged code / an operator-chosen ref), so
+      # this simply re-checks out the same trusted tree for the composite
+      # actions.
+      - name: Checkout base (trusted) for composite actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TRUSTED_REF }}
+          path: _trusted
+          fetch-depth: 1
+
+      - name: Fetch tags
+        uses: ./_trusted/.github/actions/fetch-tags
+
+      - name: Free disk space and redirect Bazel to /mnt
+        uses: ./_trusted/.github/actions/free-disk-space
+
+      - name: Setup environment
+        uses: ./_trusted/.github/actions/setup-env
+
+      - name: Build //:install-devcore via RBE
+        run: |
+          # --host_jvm_args raises the Bazel server's max heap. The default
+          # is too small for PSMDB's action graph on a 16 GB GH-hosted
+          # runner; NestedSet expansion in RemoteSpawnRunner can OOM the
+          # JVM during param-file materialization. 12 GB leaves headroom
+          # for the runner and the remote-cache uploader.
+          #
+          # --output_user_root puts Bazel's cache on /mnt (see the disk step
+          # above). --remote_download_outputs=toplevel overrides .bazelrc's
+          # 'common --remote_download_outputs=all' so only the requested
+          # install outputs (plus what local link actions pull on demand) are
+          # fetched, instead of every intermediate.
+          #
+          # GIT_COMMIT_HASH is pinned to the constant 'nogitversion' (the same
+          # value remote_unittest pins in .bazelrc) INSTEAD of $(git rev-parse
+          # HEAD). psmdb_buildfarm links locally (CppLink=local), so injecting
+          # the real per-commit SHA changed the version object every push and
+          # invalidated the local link of every binary depending on it -- the
+          # ~1,900 'local' link actions that re-ran on every no-op re-trigger
+          # while compiles were 100% remote cache hits. A constant value keeps
+          # those link-action keys stable across pushes so the uploaded local
+          # link results become remote cache hits on re-runs. The tradeoff is
+          # that the CI-built binaries advertise 'nogitversion' rather than the
+          # real SHA; these are test binaries, not release artifacts, and the
+          # unittests/jstests jobs already accept exactly this tradeoff.
+          bazel \
+            --output_user_root=/mnt/bazel \
+            --host_jvm_args=-Xmx12g \
+            build \
+            --config=psmdb_buildfarm \
+            --remote_executor=$RBE_REMOTE_EXECUTOR \
+            --remote_cache=$RBE_REMOTE_CACHE \
+            --bes_backend=$RBE_BES_BACKEND \
+            --bes_results_url=$RBE_BES_RESULTS_URL \
+            --credential_helper=$RBE_CREDENTIAL_HELPER \
+            --define=GIT_COMMIT_HASH=nogitversion \
+            --jobs=300 \
+            --keep_going \
+            --remote_download_outputs=toplevel \
+            --build_event_json_file=bazel-bep.json \
+            //:install-devcore
+
+      # Upload BEP on failure so consumers can fetch it via the
+      # GH artifacts API and parse the failure deterministically (BEP is
+      # machine-readable). if-no-files-found=ignore covers the case where the
+      # prune step above removed the only file.
+      - name: Upload build failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-failure-artifacts
+          path: bazel-bep.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  unittests:
+    name: unittests
+    # Runs in PARALLEL with binary_tests: both depend only on `build`, so once
+    # build succeeds the two test jobs start together (pipeline is build ->
+    # {binary_tests, unittests} -> jstests). This trades the old strict
+    # serialization (build ran the two test jobs one after the other) for
+    # wall-clock: on a cached PR unittests is all remote cache hits (0 local
+    # actions) and binary_tests' RBE use is only its build phase, so the two
+    # barely contend for RBE workers; on a real code change they may compete,
+    # which the bb-psmdb farm (300-way jobs) absorbs.
+    needs: [gate, build]
+    # Gated on build success: build runs only after the gate passed AND format
+    # passing, so build.result == 'success' implies the gate passed (fork:
+    # rbe-approve was approved; same-repo: ungated rbe), the PR was not a draft,
+    # and format passed. !cancelled() keeps the explicit result check
+    # authoritative rather than the bare-needs short-circuit.
+    if: >-
+      ${{ !cancelled()
+      && vars.PSMDB_RBE_ENABLED == 'true'
+      && needs.gate.result == 'success'
+      && needs.build.result == 'success' }}
+    # See `build.runs-on` above for why this is pinned, not `ubuntu-latest`.
+    runs-on: ubuntu-24.04
+    # Same unattended `rbe` environment as `build` — see `build.environment`
+    # above. `needs: build` transitively pulls in `needs: gate`, so this job
+    # only runs after the gate passed (fork: rbe-approve approved by a
+    # maintainer; same-repo: ungated rbe).
+    environment: rbe
+    # See `build.env` above for why this is at job level, not workflow level.
+    env:
+      PSMDB_RBE_GHA_AUDIENCE: ${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}
+      PSMDB_RBE_OIDC_ISSUER: ${{ secrets.PSMDB_RBE_OIDC_ISSUER }}
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TARGET_REF }}
+          fetch-depth: 0
+
+      # See the matching step in `build` for the rationale behind loading
+      # composite actions from a trusted base checkout under `_trusted/`.
+      - name: Checkout base (trusted) for composite actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TRUSTED_REF }}
+          path: _trusted
+          fetch-depth: 1
+
+      - name: Fetch tags
+        uses: ./_trusted/.github/actions/fetch-tags
+
+      - name: Free disk space and redirect Bazel to /mnt
+        uses: ./_trusted/.github/actions/free-disk-space
+
+      - name: Setup environment
+        uses: ./_trusted/.github/actions/setup-env
+
+      # psmdb_remote_unittest (defined in .bazelrc.psmdb) extends upstream's
+      # remote_unittest with the -cpu:2 tag exclusion that the bb-psmdb
+      # scheduler currently can't satisfy. See the rationale block above
+      # the config definition there. Keeping the filter in .bazelrc.psmdb
+      # rather than on the CLI lets a local
+      # `bazel test --config=psmdb_buildfarm --config=psmdb_remote_unittest //src/...`
+      # reproduce the CI filter byte-for-byte.
+      #
+      # The --gtest_filter below excludes a single death test that provokes
+      # a fatal assertion via boost::filesystem::permissions(dir(), no_perms)
+      # on the FTDC output directory. The BB RBE worker container runs as
+      # root, so CAP_DAC_OVERRIDE makes the kernel ignore the file-mode
+      # bits, the FTDC write succeeds, the expected fatal assertion never
+      # fires, and the death test fails. The other three sibling death
+      # tests (which use mock collectors throwing C++ exceptions) pass.
+      #
+      # TODO(PSMDB-2102): drop this --gtest_filter once the underlying
+      # test is patched to GTEST_SKIP() under euid 0 (or the worker is
+      # run as non-root).
+      - name: Test //src/... (mongo_unittest) via RBE
+        run: |
+          # See the build step for why --host_jvm_args is needed. The test
+          # action graph is much larger than build's, which is what tripped
+          # the OOM in the first place.
+          #
+          # Deliberately NOT passing --define=GIT_COMMIT_HASH here, unlike
+          # the build job. remote_unittest (pulled in by psmdb_remote_unittest)
+          # pins GIT_COMMIT_HASH=nogitversion precisely to keep the action
+          # key stable across PR pushes — under remote_test, CppLink runs
+          # on RBE workers, so injecting the real SHA would invalidate the
+          # remote-link cache for every test binary that transitively
+          # depends on the version object, on every push. Tests don't care
+          # what version string they advertise; the build job (where link
+          # is local and the binaries are real artifacts) is the right
+          # place to exercise the SHA-injection path.
+          bazel \
+            --output_user_root=/mnt/bazel \
+            --host_jvm_args=-Xmx12g \
+            test \
+            --config=psmdb_buildfarm \
+            --config=psmdb_remote_unittest \
+            --remote_executor=$RBE_REMOTE_EXECUTOR \
+            --remote_cache=$RBE_REMOTE_CACHE \
+            --bes_backend=$RBE_BES_BACKEND \
+            --bes_results_url=$RBE_BES_RESULTS_URL \
+            --credential_helper=$RBE_CREDENTIAL_HELPER \
+            --jobs=300 \
+            --keep_going \
+            --test_output=errors \
+            --test_arg=--gtest_filter=-FTDCControllerTestDeathTest.LogAndTerminateWhenCollectionFails \
+            --build_event_json_file=bazel-bep.json \
+            //src/...
+
+      # Render a pass/fail/skip table into the GitHub job summary by parsing
+      # Bazel's Build Event Protocol JSON (--build_event_json_file above), which
+      # is always written to the runner and carries a testSummary per target --
+      # unlike test.xml, which under minimal output download stays in the remote
+      # cache. if: always() so the summary appears on failure too -- that's when
+      # it's most useful. Loaded from _trusted/ (base branch) like every other
+      # composite action.
+      - name: Report unittest results
+        if: always()
+        uses: ./_trusted/.github/actions/test-report
+        with:
+          title: "🧪 Unit test results"
+          detailed: "true"
+
+      # Upload bazel-testlogs (per-target test.log + test.xml JUnit) plus the
+      # BEP stream on failure. bazel-testlogs is a symlink into the bazel
+      # output base; upload-artifact@v4 follows symlinks. Consumers
+      # can locate the specific failing test under
+      # bazel-testlogs/<package>/<target>/test.log and parse the JUnit XML
+      # for a structured failure list.
+      - name: Upload unittest failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unittest-failure-artifacts
+          path: |
+            bazel-testlogs/
+            bazel-bep.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # Runs the project's standalone C++ test binaries -- ones that are
+  # mongo_cc_binary runners with NO Bazel test target, so `bazel test` never
+  # executes them. Each is built on RBE (a cache hit for most objects, since the
+  # build job compiled the same tree) and then driven by resmoke LOCALLY on the
+  # runner, unlike the jstests job which runs each suite ON the remote executors.
+  # None need a mongod fixture. Currently three binaries, one resmoke suite each:
+  #   - //src/mongo/dbtests:dbtest              (suite `dbtest`)
+  #   - //src/mongo/client/sdam:sdam_json_test  (suite `sdam_json_test`)
+  #   - //src/mongo/client/sdam:server_selection_json_test
+  #                                             (suite `server_selection_json_test`)
+  # dbtest is one monolithic binary whose resmoke db_test kind enumerates the
+  # sub-suites from `dbtest --list`; the two SDAM runners replay JSON spec files
+  # (one spec per process). They all share this single job/check and one job-
+  # summary section ("Binary test results"). The binaries are built HERE (not
+  # in the build job) so build only fetches install-devcore.
+  #
+  # `needs: [gate, build]` so it runs right after build, in PARALLEL with
+  # unittests (which also depends only on build). jstests orders AFTER both via
+  # its own needs, so the pipeline is build -> {binary_tests, unittests} -> jstests.
+  # Each job gates on BUILD success, not on a sibling test job, so a failure in
+  # one does not block the others: both test jobs run whenever build passed.
+  # `needs.gate.result == 'success'` preserves the gate (fork: rbe-approve
+  # approval; same-repo: ungated rbe — same secrets via the `rbe` environment).
+  binary_tests:
+    name: binary-tests
+    needs: [gate, build]
+    # Gated on build success, which implies the gate approval AND format passing
+    # (build gates on format_gate). No separate lint gate here.
+    if: >-
+      ${{ !cancelled()
+      && vars.PSMDB_RBE_ENABLED == 'true'
+      && needs.gate.result == 'success'
+      && needs.build.result == 'success' }}
+    # See `build.runs-on` above for why this is pinned, not `ubuntu-latest`.
+    runs-on: ubuntu-24.04
+    # Same unattended `rbe` environment as `build` / `unittests`.
+    environment: rbe
+    # See `build.env` above for why this is at job level, not workflow level.
+    env:
+      PSMDB_RBE_GHA_AUDIENCE: ${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}
+      PSMDB_RBE_OIDC_ISSUER: ${{ secrets.PSMDB_RBE_OIDC_ISSUER }}
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TARGET_REF }}
+          fetch-depth: 0
+
+      # See the matching step in `build` for the rationale behind loading
+      # composite actions from a trusted base checkout under `_trusted/`.
+      - name: Checkout base (trusted) for composite actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TRUSTED_REF }}
+          path: _trusted
+          fetch-depth: 1
+
+      - name: Fetch tags
+        uses: ./_trusted/.github/actions/fetch-tags
+
+      - name: Free disk space and redirect Bazel to /mnt
+        uses: ./_trusted/.github/actions/free-disk-space
+
+      - name: Setup environment
+        uses: ./_trusted/.github/actions/setup-env
+
+      # Build the C++ binary test install targets on RBE, all in one invocation.
+      # Mirrors the build job's flags (same --host_jvm_args / --output_user_root
+      # rationale, and the same GIT_COMMIT_HASH=nogitversion pin -- see the build
+      # step for why a constant keeps the local link-action keys stable across
+      # pushes so they cache-hit on re-runs instead of re-linking every no-op
+      # trigger).
+      #
+      # Unlike the build job, binary_tests does NOT pass
+      # --remote_download_outputs=toplevel: it must RUN these binaries locally, so
+      # each whole install tree -- bazel-bin/install-<name>/{bin/<binary>,lib/*.so}
+      # -- and everything those entries resolve to has to be materialized on the
+      # runner. The build job overrides the .bazelrc default to `toplevel` purely
+      # for download efficiency because it never executes what it builds; here we
+      # fall back to that .bazelrc default (--remote_download_outputs=all) so each
+      # install tree and the binary/.so outputs it points at are all present.
+      # (toplevel left the install symlinks' targets unmaterialized, so resmoke
+      # failed with "File not found: bazel-bin/install-dbtest/bin/dbtest".)
+      - name: Build binary test install targets via RBE
+        run: |
+          bazel \
+            --output_user_root=/mnt/bazel \
+            --host_jvm_args=-Xmx12g \
+            build \
+            --config=psmdb_buildfarm \
+            --remote_executor=$RBE_REMOTE_EXECUTOR \
+            --remote_cache=$RBE_REMOTE_CACHE \
+            --bes_backend=$RBE_BES_BACKEND \
+            --bes_results_url=$RBE_BES_RESULTS_URL \
+            --credential_helper=$RBE_CREDENTIAL_HELPER \
+            --define=GIT_COMMIT_HASH=nogitversion \
+            --jobs=300 \
+            --keep_going \
+            --build_event_json_file=bazel-bep.json \
+            //:install-dbtest \
+            //:install-sdam_json_test \
+            //:install-server_selection_json_test
+
+      # Run each C++ binary test suite locally against its freshly built binary.
+      # resmoke runs via the uv venv set up by setup-env, one job per CPU, and
+      # writes a per-suite report.json under binary-test-reports/ (the report step
+      # globs them all into one summary section). Tee each console to a file
+      # (pipefail so resmoke's exit, not tee's, decides the outcome) for the
+      # failure-artifact upload. Every suite runs even if an earlier one fails
+      # (rc is accumulated, not short-circuited), so the summary is complete and
+      # one flaky binary doesn't mask another's result; the step exits non-zero if
+      # any suite failed.
+      - name: Run binary test suites (local)
+        run: |
+          mkdir -p binary-test-logs binary-test-reports
+          set -o pipefail
+
+          # Locate an installed test binary by its install tree + binary name.
+          # The `bazel-bin/...` convenience-symlink path is unreliable here (the
+          # build ran with --output_user_root=/mnt/bazel and the symlink/config
+          # dir did not resolve to the install tree), so find the real install
+          # output under the Bazel output base. Each binary links its libs via
+          # rpath $ORIGIN/../lib and every install tree keeps lib/ a sibling of
+          # bin/, so an absolute bin/<binary> path still resolves the .so files.
+          locate_bin() {
+            local tree="$1" name="$2" p
+            p="$(find -L /mnt/bazel -maxdepth 14 -type f -path "*/install-${tree}/bin/${name}" 2>/dev/null | head -1)"
+            if [ -z "$p" ]; then
+              p="$(find -L "$PWD" -maxdepth 8 -type f -path "*/install-${tree}/bin/${name}" 2>/dev/null | head -1)"
+            fi
+            echo "$p"
+          }
+
+          # Prefix every test_file in a suite's resmoke report with "<suite>:" so
+          # the merged summary table (and the uploaded report) shows which suite
+          # each row came from -- resmoke's own test_file is a dbtest sub-suite
+          # name or a bare JSON spec path with no suite tag. jq is preinstalled on
+          # the GH-hosted ubuntu runner. No-op if the suite wrote no report.
+          prefix_report() {
+            local suite="$1" file="$2"
+            [ -f "$file" ] || return 0
+            jq --arg s "$suite" '.results |= map(.test_file = $s + ":" + (.test_file // ""))' \
+              "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+          }
+
+          echo "workspace=$(pwd)"
+          echo "bazel-bin -> $(readlink bazel-bin 2>/dev/null || echo MISSING)"
+          rc=0
+
+          # All three are standalone C++ test binaries whose install tree, binary,
+          # and resmoke suite share the target name, so one loop drives them. They
+          # differ only in how resmoke is pointed at the binary: dbtest is one
+          # monolithic binary (resmoke enumerates its sub-suites from
+          # `dbtest --list`) taking --dbtest=<path>; the SDAM JSON spec runners
+          # (one spec file per process, no mongod fixture) take --installDir=<bin
+          # dir> so rpath $ORIGIN/../lib resolves their .so siblings. rc is
+          # accumulated (not short-circuited) so every suite runs and uploads its
+          # report even if an earlier one fails; the step exits non-zero if any did.
+          for suite in dbtest sdam_json_test server_selection_json_test; do
+            echo "::group::$suite"
+            BIN="$(locate_bin "$suite" "$suite")"
+            echo "resolved $suite=${BIN:-NOT FOUND}"
+            if [ -z "$BIN" ]; then
+              echo "ERROR: $suite binary not found under the Bazel output base after build" >&2
+              rc=1
+              echo "::endgroup::"
+              continue
+            fi
+            if [ "$suite" = dbtest ]; then
+              locator=(--dbtest="$BIN")
+            else
+              locator=(--installDir="$(dirname "$BIN")")
+            fi
+            report="binary-test-reports/$suite.json"
+            uv run --no-sync python buildscripts/resmoke.py run \
+              --suites="$suite" \
+              "${locator[@]}" \
+              --jobs="$(nproc)" \
+              --reportFile="$report" \
+              2>&1 | tee "binary-test-logs/$suite.log" || rc=1
+            prefix_report "$suite" "$report"
+            echo "::endgroup::"
+          done
+
+          exit $rc
+
+      # Render one pass/fail table into the job summary from every suite's resmoke
+      # report.json, merged via a single glob. Each report's test_file was
+      # prefixed with its suite name (see prefix_report above), so a row like
+      # `sdam_json_test:rs/discover.json` shows which suite ran it and the sorted
+      # table clusters each suite together. Same composite action as
+      # build/unittests/jstests, but a local resmoke run emits no Bazel BEP, so
+      # bep-glob is cleared and the reports are fed via resmoke-report instead.
+      # if: always() so the summary is present on failure (each report.json is
+      # written even when suites fail).
+      - name: Report binary test results
+        if: always()
+        uses: ./_trusted/.github/actions/test-report
+        with:
+          title: "🧪 Binary test results"
+          bep-glob: ""
+          resmoke-report: binary-test-reports/*.json
+          detailed: "true"
+
+      # On failure, upload the teed per-suite resmoke console logs (rich per-test
+      # failure output), the machine-readable per-suite resmoke report.json, and
+      # the build BEP. The artifact name `binary-test-failure-logs` is referenced
+      # by .mergai/config.yml -- keep the two in sync when renaming.
+      # mongod/dbtest core dumps are not collected.
+      - name: Upload binary test failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-test-failure-logs
+          path: |
+            binary-test-logs/
+            binary-test-reports/
+            bazel-bep.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Runs the mongo_cc_integration_test targets ON the remote executors, the same
+  # way `unittests` runs the mongo_unittest targets. Each integration-test
+  # binary is a client that connects to a fixture; there is no fixture host on
+  # RBE, so //bazel:integration_test_wrapper (wired as --run_under by the
+  # psmdb_remote_integration_test config) starts a private mongod fixture
+  # inside each test action's own sandbox -- no change to the RBE worker image.
+  # mongod is pulled into the test's runfiles by the mongo_cc_integration_test
+  # macro, gated on //bazel/config:remote_test_enabled.
+  #
+  # `needs: [gate, build]` so it runs right after build, in PARALLEL with
+  # binary_tests and unittests (pipeline is build -> {binary_tests, unittests,
+  # integration_tests} -> jstests). Each job gates on BUILD success, not on a
+  # sibling test job, so a failure in one does not block the others. Like
+  # unittests it does not consume build's artifacts -- mongod and the test
+  # binaries are (re)built here as RBE cache hits.
+  #
+  # Each test picks its fixture topology via the `fixture` attribute on
+  # mongo_cc_integration_test, which the wrapper spins up in-sandbox: standalone
+  # (the default) plus the three that need a richer topology --
+  # network_interface_ssl_test (TLS), replica_set_monitor_integration_test
+  # (replica set), and grpc_transport_integration_test (gRPC).
+  integration_tests:
+    name: integration_tests
+    needs: [gate, build]
+    # Same gating rationale as unittests: build success implies the gate
+    # approval AND format passing. !cancelled() keeps the explicit result check
+    # authoritative rather than the bare-needs short-circuit.
+    if: >-
+      ${{ !cancelled()
+      && vars.PSMDB_RBE_ENABLED == 'true'
+      && needs.gate.result == 'success'
+      && needs.build.result == 'success' }}
+    # See `build.runs-on` above for why this is pinned, not `ubuntu-latest`.
+    runs-on: ubuntu-24.04
+    # Same unattended `rbe` environment as build / unittests.
+    environment: rbe
+    # See `build.env` above for why this is at job level, not workflow level.
+    env:
+      PSMDB_RBE_GHA_AUDIENCE: ${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}
+      PSMDB_RBE_OIDC_ISSUER: ${{ secrets.PSMDB_RBE_OIDC_ISSUER }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # See the matching step in `build` for the rationale behind loading
+      # composite actions from a trusted base checkout under `_trusted/`.
+      - name: Checkout base (trusted) for composite actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.base_ref }}
+          path: _trusted
+          fetch-depth: 1
+
+      - name: Fetch tags
+        uses: ./_trusted/.github/actions/fetch-tags
+
+      - name: Free disk space and redirect Bazel to /mnt
+        uses: ./_trusted/.github/actions/free-disk-space
+
+      - name: Setup environment
+        uses: ./_trusted/.github/actions/setup-env
+
+      # psmdb_remote_integration_test (defined in .bazelrc.psmdb) extends
+      # upstream's remote_test with the mongo_integration_test tag selector, the
+      # --run_under fixture launcher, and the -cpu:2 exclusion. Keeping the
+      # filter there rather than on the CLI lets a local
+      # `bazel test --config=psmdb_buildfarm --config=psmdb_remote_integration_test //src/...`
+      # reproduce the CI filter byte-for-byte.
+      #
+      # Deliberately NOT passing --define=GIT_COMMIT_HASH here -- same rationale
+      # as the unittests job: remote_test links on RBE workers, so pinning the
+      # real SHA would invalidate the remote-link cache on every push. The
+      # config inherits GIT_COMMIT_HASH=nogitversion via remote_test.
+      - name: Test //src/... (mongo_integration_test) via RBE
+        run: |
+          bazel \
+            --output_user_root=/mnt/bazel \
+            --host_jvm_args=-Xmx12g \
+            test \
+            --config=psmdb_buildfarm \
+            --config=psmdb_remote_integration_test \
+            --remote_executor=$RBE_REMOTE_EXECUTOR \
+            --remote_cache=$RBE_REMOTE_CACHE \
+            --bes_backend=$RBE_BES_BACKEND \
+            --bes_results_url=$RBE_BES_RESULTS_URL \
+            --credential_helper=$RBE_CREDENTIAL_HELPER \
+            --jobs=300 \
+            --keep_going \
+            --test_output=errors \
+            --build_event_json_file=bazel-bep.json \
+            //src/...
+
+      # Render a pass/fail/skip table into the job summary from the BEP JSON --
+      # same composite action as unittests. if: always() so the summary appears
+      # on failure too.
+      - name: Report integration test results
+        if: always()
+        uses: ./_trusted/.github/actions/test-report
+        with:
+          title: "🧪 Integration test results"
+          detailed: "true"
+
+      # Upload bazel-testlogs (per-target test.log + test.xml) plus the BEP
+      # stream on failure -- mirrors the unittests failure-artifact upload.
+      - name: Upload integration test failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-test-failure-artifacts
+          path: |
+            bazel-testlogs/
+            bazel-bep.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # Decides whether the jstests job runs, from PR labels and a repo/org
+  # variable. Labels are read fresh via `gh api` (not github.event.*.labels) so
+  # the decision reflects the current label set -- same freshness trick as
+  # format.yml / clang-tidy.yml.
+  #
+  # `needs: [binary_tests, unittests, integration_tests]` (with `if:
+  # !cancelled()` so it still runs when those are skipped or failed) makes this
+  # resolve LATE -- after all three parallel test jobs -- so it reads a
+  # ci-skip-jstests / ci-run-jstests label applied *while the build/tests were
+  # running* and that label takes effect on the same run. (The workflow is not
+  # triggered by label changes, so toggling a label after the run finishes only
+  # takes effect on the next push.) Depending on all three keeps jstests
+  # serialized after the parallel binary_tests+unittests+integration_tests group.
+  #
+  # Precedence: ci-skip-jstests > ci-run-jstests > vars.RUN_JSTESTS (default run).
+  #   - ci-skip-jstests label : force skip.
+  #   - ci-run-jstests label  : force run (overrides a default-off variable).
+  #   - vars.RUN_JSTESTS      : project default. Unset or 'true' => run;
+  #                             'false' => skip unless ci-run-jstests is set.
+  jstests_gate:
+    name: jstests gate
+    needs: [binary_tests, unittests, integration_tests]
+    if: ${{ !cancelled() && vars.PSMDB_RBE_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - name: Decide whether to run jstests
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_JSTESTS: ${{ vars.RUN_JSTESTS }}
+        run: |
+          # No PR labels to consult on schedule/workflow_dispatch: run the full
+          # jstests suite unconditionally (the weekly/manual regression is the
+          # whole point). This also overrides a repo-level vars.RUN_JSTESTS=false
+          # default, which is only meant to trim PR runs.
+          if [ "${{ github.event_name }}" != "pull_request_target" ]; then
+            echo "Non-PR event (${{ github.event_name }}) -> running full jstests suite"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fetch the PR's current labels (fresh, not from the trigger payload).
+          LABELS=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} --jq '.labels[].name' 2>/dev/null || echo "")
+          if echo "$LABELS" | grep -qx "ci-skip-jstests"; then
+            echo "ci-skip-jstests label present -> skipping jstests"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -qx "ci-run-jstests"; then
+            echo "ci-run-jstests label present -> running jstests"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$RUN_JSTESTS" = "false" ]; then
+            echo "vars.RUN_JSTESTS=false and no run label -> skipping jstests"
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "default -> running jstests"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Runs the Percona resmoke jstest suites on RBE. Separate runner / GH check
+  # from build+unittests (see the build-vs-unittests rationale block at the top
+  # for why distinct runners are intentional). `needs: [binary_tests, unittests,
+  # integration_tests]` so it runs AFTER all three parallel test jobs rather
+  # than alongside them -- jstests stays serialized at the tail
+  # (build -> {binary_tests, unittests, integration_tests} -> jstests) and avoids
+  # competing for the same RBE workers. Ordering only: the `if` gates on build
+  # success, not sibling test-job success, so a unittest (or C++ binary test or
+  # integration-test) failure does not block jstests. It does not consume the
+  # upstream jobs'
+  # artifacts -- mongod/mongos/mongo are rebuilt here as RBE cache hits.
+  #
+  # Gated on jstests_gate: skipped when ci-skip-jstests is set, or when
+  # vars.RUN_JSTESTS=false and ci-run-jstests is absent.
+  #
+  # The `if` uses !cancelled() + explicit result checks (not a bare `needs`) so
+  # jstests still runs after a unittest failure. `needs.gate.result ==
+  # 'success'` keeps the security gate (jstests only runs after the gate passed:
+  # fork rbe-approve approval, or same-repo ungated rbe), and
+  # `needs.build.result == 'success'` means a failed build
+  # (-> all test jobs skipped) still blocks jstests rather than slipping through
+  # on a 'skipped' result, while a unittest failure (build still 'success')
+  # does not.
+  #
+  # All jstest-running config lives in `--config=psmdb_remote_jstest`
+  # (.bazelrc.psmdb): the remote test-execution strategies inherited from
+  # remote_test (which brings its core/mdmp/gz force-download regex with it), the
+  # test_timeout, and the -incompatible_with_bazel_remote_test / -cpu:2 tag
+  # filter. Keeping it there lets a local
+  # `bazel test --config=psmdb_buildfarm --config=psmdb_remote_jstest ...`
+  # reproduce CI byte-for-byte.
+  #
+  # Suites are grouped the same way as the run_percona_jstests.sh helper:
+  #   - reliable      : pass consistently -> one parallel invocation.
+  #   - load-sensitive: flake under full-farm contention -> one at a time.
+  #   - skipped       : aggregation_tde_* (EMFILE / RLIMIT_NOFILE) and
+  #                     replica_sets_tde_*/sharding_tde_* (resources:cpu:2, no
+  #                     2-core pool) -- re-enable once PSMDB-2100 §1 lands.
+  jstests:
+    name: jstests
+    # `binary_tests` and `unittests` are in needs for ORDERING (jstests runs
+    # after both, so the heavy jobs stay serialized), but the `if` gates on BUILD
+    # success, not their success, so a binary-test/unittest failure does not block
+    # jstests -- all run whenever build passed. `build` is in needs so the `if`
+    # can read needs.build.result.
+    needs:
+      [gate, build, binary_tests, unittests, integration_tests, jstests_gate]
+    # `draft == false` so jstests never runs on a draft (it runs once the PR is
+    # marked ready). `build` is in needs so the `if` can read needs.build.result
+    # (which implies format passed via format_gate).
+    if: >-
+      ${{ !cancelled()
+      && vars.PSMDB_RBE_ENABLED == 'true'
+      && needs.gate.result == 'success'
+      && needs.jstests_gate.result == 'success'
+      && needs.jstests_gate.outputs.should_run == 'true'
+      && (github.event_name != 'pull_request_target'
+      || github.event.pull_request.draft == false)
+      && needs.build.result == 'success' }}
+    # See `build.runs-on` above for why this is pinned, not `ubuntu-latest`.
+    runs-on: ubuntu-24.04
+    # Same unattended `rbe` environment as `build` / `unittests`.
+    environment: rbe
+    # See `build.env` above for why this is at job level, not workflow level.
+    env:
+      PSMDB_RBE_GHA_AUDIENCE: ${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}
+      PSMDB_RBE_OIDC_ISSUER: ${{ secrets.PSMDB_RBE_OIDC_ISSUER }}
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TARGET_REF }}
+          fetch-depth: 0
+
+      # See the matching step in `build` for the rationale behind loading
+      # composite actions from a trusted base checkout under `_trusted/`.
+      - name: Checkout base (trusted) for composite actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TRUSTED_REF }}
+          path: _trusted
+          fetch-depth: 1
+
+      - name: Fetch tags
+        uses: ./_trusted/.github/actions/fetch-tags
+
+      - name: Free disk space and redirect Bazel to /mnt
+        uses: ./_trusted/.github/actions/free-disk-space
+
+      - name: Setup environment
+        uses: ./_trusted/.github/actions/setup-env
+
+      # Reliable suites: run together in one parallel invocation. See the build
+      # step for why --host_jvm_args / --output_user_root are set; GIT_COMMIT_HASH
+      # is deliberately omitted (as in unittests) to keep the remote CppLink cache
+      # key stable across pushes.
+      - name: Run reliable jstest suites via RBE
+        run: |
+          mkdir -p jstest-logs
+          # Tee the console to a file as a fallback. The primary diagnostic source
+          # is the per-test test.log collected from bazel-testlogs below: under
+          # --remote_download_outputs=minimal those stay in the remote cache, so
+          # --remote_download_regex force-downloads just test.log/test.xml to the
+          # runner (the global .bazelrc regex only covers test.xml). The tee still
+          # helps when a failure log exceeds --experimental_ui_max_stdouterr_bytes
+          # and bazel skips printing it.
+          # pipefail so bazel's exit status (not tee's) decides the step result.
+          set -o pipefail
+          bazel \
+            --output_user_root=/mnt/bazel \
+            --host_jvm_args=-Xmx12g \
+            test \
+            --config=psmdb_buildfarm \
+            --config=psmdb_remote_jstest \
+            --remote_executor=$RBE_REMOTE_EXECUTOR \
+            --remote_cache=$RBE_REMOTE_CACHE \
+            --bes_backend=$RBE_BES_BACKEND \
+            --bes_results_url=$RBE_BES_RESULTS_URL \
+            --credential_helper=$RBE_CREDENTIAL_HELPER \
+            --jobs=300 \
+            --keep_going \
+            --test_output=errors \
+            --remote_download_regex='.*/test\.(log|xml)$' \
+            --build_event_json_file=bazel-bep.json \
+            //jstests/knobs:knobs \
+            //jstests/percona/noPassthroughWithMongod:percona_no_passthrough_with_mongod \
+            //jstests/redaction:redaction \
+            //jstests/telemetry:telemetry \
+            //jstests/audit:audit \
+            //jstests/oidc:oidc \
+            //jstests/ldapauthz:ldapauthz_mock 2>&1 | tee jstest-logs/reliable.log
+
+      # Load-sensitive suites: each on its own invocation so it gets the workers
+      # uncontended (they flake when run alongside the full fan-out). Keep going
+      # across all of them and fail the step if any failed. The Bazel server (one
+      # --output_user_root) persists across iterations, so bazel-testlogs/
+      # accumulates every suite's logs for the failure-artifact upload.
+      - name: Run load-sensitive jstest suites via RBE (one at a time)
+        run: |
+          mkdir -p jstest-logs
+          # pipefail so the teed pipeline reports bazel's exit, not tee's.
+          set -o pipefail
+          rc=0
+          for t in \
+            //jstests/ratelimit:ratelimit \
+            //jstests/backup:backup \
+            //jstests/backup:backup_tde_cbc \
+            //jstests/backup:backup_tde_gcm \
+            //jstests/percona/tde:tde_cbc \
+            //jstests/percona/tde:tde_gcm \
+            //jstests/percona/tde:core_tde_cbc \
+            //jstests/percona/tde:core_tde_gcm; do
+            echo "::group::$t"
+            name=$(echo "$t" | sed 's#[/:]#_#g')
+            # Tee each suite's console (incl. failed-test logs via
+            # --test_output=errors) so the failure artifact has its diagnostics.
+            bazel \
+              --output_user_root=/mnt/bazel \
+              --host_jvm_args=-Xmx12g \
+              test \
+              --config=psmdb_buildfarm \
+              --config=psmdb_remote_jstest \
+              --remote_executor=$RBE_REMOTE_EXECUTOR \
+              --remote_cache=$RBE_REMOTE_CACHE \
+              --bes_backend=$RBE_BES_BACKEND \
+              --bes_results_url=$RBE_BES_RESULTS_URL \
+              --credential_helper=$RBE_CREDENTIAL_HELPER \
+              --jobs=300 \
+              --keep_going \
+              --test_output=errors \
+              --remote_download_regex='.*/test\.(log|xml)$' \
+              --build_event_json_file="bazel-bep-${name}.json" \
+              "$t" 2>&1 | tee "jstest-logs/${name}.log" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      # Render the jstest results table into the job summary. One Bazel server
+      # (--output_user_root) served every suite above, so bazel-testlogs holds
+      # the reliable batch plus each load-sensitive suite. if: always() so the
+      # summary is present on failure. See the unittests job for the rationale.
+      - name: Report jstest results
+        if: always()
+        uses: ./_trusted/.github/actions/test-report
+        with:
+          title: "🧪 jstest results"
+          detailed: "true"
+
+      # Always upload the machine-readable test report: one bazel-bep*.json per
+      # invocation (reliable + each load-sensitive suite) carries every target's
+      # status. Uploaded on success too so results are downloadable from any run.
+      - name: Upload jstest reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jstest-reports
+          path: bazel-bep*.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      # On failure, gather the diagnostics. The primary source is the per-test
+      # test.log/test.xml under bazel-testlogs: the jstest test steps add
+      # --remote_download_regex='.*/test\.(log|xml)$' so those two files are
+      # downloaded to the runner even under --remote_download_outputs=minimal
+      # (without it they would stay in the remote cache and this copy would be
+      # empty). The teed console logs (jstest-logs/) are kept as a fallback for
+      # logs bazel skips printing when they exceed the UI byte cap. mongod core
+      # dumps are intentionally never downloaded.
+      - name: Collect jstest failure logs
+        if: failure()
+        run: |
+          mkdir -p jstest-failure-logs
+          cp -f jstest-logs/*.log jstest-failure-logs/ 2>/dev/null || true
+          cp -f bazel-bep*.json jstest-failure-logs/ 2>/dev/null || true
+          if [ -e bazel-testlogs ]; then
+            mkdir -p jstest-failure-logs/testlogs
+            cp -RL "$(readlink -f bazel-testlogs)"/. jstest-failure-logs/testlogs/ 2>/dev/null || true
+          fi
+          echo "Collected:"
+          find jstest-failure-logs -type f 2>/dev/null | sort
+
+      - name: Upload jstest failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jstest-failure-logs
+          path: jstest-failure-logs/
+          retention-days: 14
+          if-no-files-found: warn

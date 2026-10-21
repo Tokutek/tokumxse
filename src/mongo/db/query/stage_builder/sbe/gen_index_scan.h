@@ -1,0 +1,111 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::stage_builder {
+
+class PlanStageReqs;
+class PlanStageSlots;
+
+constexpr std::string_view kIdIndexName = IndexConstants::kIdIndexName;
+
+/**
+ * A list of low and high key values representing ranges over a particular index.
+ */
+using IndexIntervals = std::vector<std::pair<key_string::Value, key_string::Value>>;
+
+/**
+ * This method returns a pair containing: (1) an SBE plan stage tree implementing an index scan;
+ * and (2) a PlanStageSlots object containing a kRecordId slot, possibly some other kMeta slots,
+ * and slots produced by the index scan that were required by 'reqs'.
+ */
+std::pair<SbStage, PlanStageSlots> generateIndexScan(StageBuilderState& state,
+                                                     const CollectionPtr& collection,
+                                                     const IndexScanNode* ixn,
+                                                     const PlanStageReqs& reqs);
+
+/**
+ * Constructs the most simple version of an index scan from the single interval index bounds.
+ * 'isPointInterval' indicates if the single interval is a point interval.
+ *
+ * In case when the 'lowKey'/'lowKeySlot' and 'highKey' are not specified, slots will be registered
+ * for them in the runtime environment and their slot ids returned as a pair in the third element of
+ * the tuple.
+ *
+ * If 'indexKeySlot' is provided, than the corresponding slot will be filled out with each KeyString
+ * in the index.
+ */
+std::tuple<SbStage, PlanStageSlots, boost::optional<std::pair<SbSlot, SbSlot>>>
+generateSingleIntervalIndexScanAndSlots(StageBuilderState& state,
+                                        const CollectionPtr& collection,
+                                        const std::string& indexName,
+                                        const BSONObj& keyPattern,
+                                        bool forward,
+                                        boost::optional<key_string::Value> lowKey,
+                                        boost::optional<key_string::Value> highKey,
+                                        const PlanStageReqs& reqs,
+                                        PlanNodeId planNodeId,
+                                        bool isPointInterval);
+
+/**
+ * Constructs low/high key values from the given index 'bounds' if they can be represented either as
+ * a single interval between the low and high keys, or multiple single intervals. If index bounds
+ * for some interval cannot be expressed as valid low/high keys, then an empty vector is returned.
+ */
+IndexIntervals makeIntervalsFromIndexBounds(const IndexBounds& bounds,
+                                            bool forward,
+                                            key_string::Version version,
+                                            Ordering ordering);
+
+/**
+ * Construct an array containing objects with the low and high keys for each interval.
+ *
+ * E.g., [ {l: KS(...), h: KS(...)},
+ *         {l: KS(...), h: KS(...)}, ... ]
+ */
+std::pair<sbe::value::TypeTags, sbe::value::Value> packIndexIntervalsInSbeArray(
+    IndexIntervals intervals);
+
+/**
+ * Constructs a generic multi-interval index scan. Depending on the intervals will either execute
+ * the optimized or the generic index scan subplan.
+ *
+ * This method returns a pair containing: (1) an SBE plan stage tree implementing a generic multi-
+ * interval index scan; and (2) a PlanStageSlots object containing a kRecordId slot, possibly some
+ * other kMeta slots, and slots produced by the index scan that were required by 'reqs'.
+ */
+std::pair<SbStage, PlanStageSlots> generateIndexScanWithDynamicBounds(
+    StageBuilderState& state,
+    const CollectionPtr& collection,
+    const IndexScanNode* ixn,
+    const PlanStageReqs& reqs);
+
+/**
+ * Checks if 'iets' resolves to a single point interval. It must be a sequence of '$eq' or constant
+ * point intervals.
+ */
+bool ietsArePointInterval(const std::vector<interval_evaluation_tree::IET>& iets);
+
+}  // namespace mongo::stage_builder

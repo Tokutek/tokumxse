@@ -1,0 +1,759 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/semantic_analysis.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_test_optimizations.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/pipeline_factory.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
+
+#include <iterator>
+#include <list>
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+namespace {
+
+using namespace semantic_analysis;
+
+using SemanticAnalysisRenamedPaths = AggregationContextFixture;
+
+class RenamesAToB : public DocumentSourceTestOptimizations {
+public:
+    RenamesAToB(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceTestOptimizations(expCtx) {}
+    GetModPathsReturn getModifiedPaths() const final {
+        // Pretend this stage simply renames the "a" field to be "b", leaving the value of "a" the
+        // same. This would be the equivalent of an {$addFields: {b: "$a"}}.
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"b", "a"}}};
+    }
+};
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesReturnSimpleRenameFromFiniteSetRename) {
+    RenamesAToB renamesAToB(getExpCtx());
+    {
+        auto renames = renamedPaths({"a"}, renamesAToB, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["a"], "b");
+    }
+    {
+        auto renames = renamedPaths({"b"}, renamesAToB, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["b"], "a");
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, ReturnsSimpleMapForUnaffectedFieldsFromFiniteSetRename) {
+    RenamesAToB renamesAToB(getExpCtx());
+    {
+        auto renames = renamedPaths({"c"}, renamesAToB, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["c"], "c");
+    }
+    {
+        auto renames = renamedPaths({"c"}, renamesAToB, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["c"], "c");
+    }
+    {
+        auto renames = renamedPaths({"a"}, renamesAToB, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["a"], "b");
+    }
+    {
+        auto renames = renamedPaths({"b"}, renamesAToB, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["b"], "a");
+    }
+    {
+        auto renames = renamedPaths({"e", "f", "g"}, renamesAToB, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 3UL);
+        ASSERT_EQ(map["e"], "e");
+        ASSERT_EQ(map["f"], "f");
+        ASSERT_EQ(map["g"], "g");
+    }
+    {
+        auto renames = renamedPaths({"e", "f", "g"}, renamesAToB, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 3UL);
+        ASSERT_EQ(map["e"], "e");
+        ASSERT_EQ(map["f"], "f");
+        ASSERT_EQ(map["g"], "g");
+    }
+}
+
+class RenameCToDPreserveEFG : public DocumentSourceTestOptimizations {
+public:
+    RenameCToDPreserveEFG(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceTestOptimizations(expCtx) {}
+
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kAllExcept, OrderedPathSet{"e", "f", "g"}, {{"d", "c"}}};
+    }
+};
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesReturnSimpleRenameFromAllExceptRename) {
+    RenameCToDPreserveEFG renameCToDPreserveEFG(getExpCtx());
+    {
+        auto renames = renamedPaths({"c"}, renameCToDPreserveEFG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["c"], "d");
+    }
+    {
+        auto renames = renamedPaths({"d"}, renameCToDPreserveEFG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["d"], "c");
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, ReturnsSimpleMapForUnaffectedFieldsFromAllExceptRename) {
+    RenameCToDPreserveEFG renameCToDPreserveEFG(getExpCtx());
+    {
+        auto renames = renamedPaths({"e"}, renameCToDPreserveEFG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["e"], "e");
+    }
+    {
+        auto renames = renamedPaths({"e"}, renameCToDPreserveEFG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["e"], "e");
+    }
+    {
+        auto renames = renamedPaths({"f", "g"}, renameCToDPreserveEFG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["f"], "f");
+        ASSERT_EQ(map["g"], "g");
+    }
+    {
+        auto renames = renamedPaths({"f", "g"}, renameCToDPreserveEFG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["f"], "f");
+        ASSERT_EQ(map["g"], "g");
+    }
+}
+
+class RenameCDotDToEPreserveFDotG : public DocumentSourceTestOptimizations {
+public:
+    RenameCDotDToEPreserveFDotG(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceTestOptimizations(expCtx) {}
+
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kAllExcept, OrderedPathSet{"f.g"}, {{"e", "c.d"}}};
+    }
+};
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesReturnRenameToDottedFieldFromAllExceptRename) {
+    RenameCDotDToEPreserveFDotG renameCDotDToEPreserveFDotG(getExpCtx());
+    {
+        auto renames = renamedPaths({"c.d"}, renameCDotDToEPreserveFDotG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["c.d"], "e");
+    }
+    {
+        auto renames = renamedPaths({"e"}, renameCDotDToEPreserveFDotG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["e"], "c.d");
+    }
+    {
+        auto renames =
+            renamedPaths({"c.d.x", "c.d.y"}, renameCDotDToEPreserveFDotG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["c.d.x"], "e.x");
+        ASSERT_EQ(map["c.d.y"], "e.y");
+    }
+    {
+        auto renames =
+            renamedPaths({"e.x", "e.y"}, renameCDotDToEPreserveFDotG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["e.x"], "c.d.x");
+        ASSERT_EQ(map["e.y"], "c.d.y");
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths,
+       DoesNotTreatPrefixAsUnmodifiedWhenSuffixIsModifiedFromAllExcept) {
+    RenameCDotDToEPreserveFDotG renameCDotDToEPreserveFDotG(getExpCtx());
+    {
+        auto renames = renamedPaths({"f"}, renameCDotDToEPreserveFDotG, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"f"}, renameCDotDToEPreserveFDotG, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        // This is the exception, the only path that is not modified.
+        auto renames = renamedPaths({"f.g"}, renameCDotDToEPreserveFDotG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["f.g"], "f.g");
+    }
+    {
+        // This is the exception, the only path that is not modified.
+        auto renames = renamedPaths({"f.g"}, renameCDotDToEPreserveFDotG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["f.g"], "f.g");
+    }
+    {
+        // We know "f.g" is preserved, so it follows that a subpath of that path is also preserved.
+        auto renames = renamedPaths(
+            {"f.g.x", "f.g.xyz.foobarbaz"}, renameCDotDToEPreserveFDotG, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["f.g.x"], "f.g.x");
+        ASSERT_EQ(map["f.g.xyz.foobarbaz"], "f.g.xyz.foobarbaz");
+    }
+    {
+        auto renames = renamedPaths(
+            {"f.g.x", "f.g.xyz.foobarbaz"}, renameCDotDToEPreserveFDotG, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["f.g.x"], "f.g.x");
+        ASSERT_EQ(map["f.g.xyz.foobarbaz"], "f.g.xyz.foobarbaz");
+    }
+    {
+        // This shares a prefix with the unmodified path, but should not be reported as unmodified.
+        auto renames = renamedPaths({"f.x"}, renameCDotDToEPreserveFDotG, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+class RenameAToXDotYModifyCDotD : public DocumentSourceTestOptimizations {
+public:
+    RenameAToXDotYModifyCDotD(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceTestOptimizations(expCtx) {}
+
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{"c.d"}, {{"x.y", "a"}}};
+    }
+};
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesReturnRenameToDottedFieldFromFiniteSetRename) {
+    RenameAToXDotYModifyCDotD renameAToXDotYModifyCDotD(getExpCtx());
+    {
+        auto renames = renamedPaths({"a"}, renameAToXDotYModifyCDotD, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["a"], "x.y");
+    }
+    {
+        auto renames = renamedPaths({"x.y"}, renameAToXDotYModifyCDotD, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 1UL);
+        ASSERT_EQ(map["x.y"], "a");
+    }
+    {
+        auto renames =
+            renamedPaths({"a.z", "a.a.b.c"}, renameAToXDotYModifyCDotD, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["a.z"], "x.y.z");
+        ASSERT_EQ(map["a.a.b.c"], "x.y.a.b.c");
+    }
+    {
+        auto renames =
+            renamedPaths({"x.y.z", "x.y.a.b.c"}, renameAToXDotYModifyCDotD, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["x.y.z"], "a.z");
+        ASSERT_EQ(map["x.y.a.b.c"], "a.a.b.c");
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesNotTreatPrefixAsUnmodifiedWhenSuffixIsPartOfModifiedSet) {
+    RenameAToXDotYModifyCDotD renameAToXDotYModifyCDotD(getExpCtx());
+    {
+        auto renames = renamedPaths({"c"}, renameAToXDotYModifyCDotD, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"c.d"}, renameAToXDotYModifyCDotD, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"c.d.e"}, renameAToXDotYModifyCDotD, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"c"}, renameAToXDotYModifyCDotD, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"c.d"}, renameAToXDotYModifyCDotD, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"c.d.e"}, renameAToXDotYModifyCDotD, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths({"c.not_d", "c.decoy"}, renameAToXDotYModifyCDotD, Direction::kForward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["c.not_d"], "c.not_d");
+        ASSERT_EQ(map["c.decoy"], "c.decoy");
+    }
+    {
+        auto renames =
+            renamedPaths({"c.not_d", "c.decoy"}, renameAToXDotYModifyCDotD, Direction::kBackward);
+        ASSERT(static_cast<bool>(renames));
+        auto map = *renames;
+        ASSERT_EQ(map.size(), 2UL);
+        ASSERT_EQ(map["c.not_d"], "c.not_d");
+        ASSERT_EQ(map["c.decoy"], "c.decoy");
+    }
+}
+
+class ModifiesAllPaths : public DocumentSourceTestOptimizations {
+public:
+    ModifiesAllPaths(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceTestOptimizations(expCtx) {}
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
+    }
+};
+
+TEST_F(SemanticAnalysisRenamedPaths, ReturnsNoneWhenAllPathsAreModified) {
+    ModifiesAllPaths modifiesAllPaths(getExpCtx());
+    {
+        auto renames = renamedPaths({"a"}, modifiesAllPaths, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"a", "b", "c.d"}, modifiesAllPaths, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"a"}, modifiesAllPaths, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"a", "b", "c.d"}, modifiesAllPaths, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+class ModificationsUnknown : public DocumentSourceTestOptimizations {
+public:
+    ModificationsUnknown(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSourceTestOptimizations(expCtx) {}
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kNotSupported, OrderedPathSet{}, {}};
+    }
+};
+
+TEST_F(SemanticAnalysisRenamedPaths, ReturnsNoneWhenModificationsAreNotKnown) {
+    ModificationsUnknown modificationsUnknown(getExpCtx());
+    {
+        auto renames = renamedPaths({"a"}, modificationsUnknown, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"a", "b", "c.d"}, modificationsUnknown, Direction::kForward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"a"}, modificationsUnknown, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths({"a", "b", "c.d"}, modificationsUnknown, Direction::kBackward);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DetectsSimpleReplaceRootPattern) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$ROOT'}}"), fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"b"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DetectsReplaceRootPatternAllowsIntermediateStages) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+         fromjson("{$set: {bigEnough: {$gte: [{$bsonSize: '$nested'}, 300]}}}"),
+         fromjson("{$match: {bigEnough: true}}"),
+         fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"b"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, AdditionalStageValidatorCallbackPassed) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+         fromjson("{$set: {bigEnough: {$gte: [{$bsonSize: '$nested'}, 300]}}}"),
+         fromjson("{$match: {bigEnough: true}}"),
+         fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    std::function<bool(DocumentSource*)> callback = [](DocumentSource* stage) {
+        return !static_cast<bool>(stage->distributedPlanLogic());
+    };
+    {
+        auto renames = renamedPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"}, callback);
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"b"}, callback);
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths(
+            pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"}, callback);
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, AdditionalStageValidatorCallbackNotPassed) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+         fromjson("{$set: {bigEnough: {$gte: [{$bsonSize: '$nested'}, 300]}}}"),
+         fromjson("{$match: {bigEnough: true}}"),
+         fromjson("{$sort: {x: 1}}"),
+         fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    std::function<bool(DocumentSource*)> callback = [](DocumentSource* stage) {
+        return !static_cast<bool>(stage->distributedPlanLogic());
+    };
+    {
+        auto renames = renamedPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"}, callback);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames = renamedPaths(
+            pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"}, callback);
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DetectsReplaceRootPatternDisallowsIntermediateModification) {
+    auto pipeline =
+        pipeline_factory::makePipeline({fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+                                        fromjson("{$set: {'nested.field': 'anyNewValue'}}"),
+                                        fromjson("{$replaceWith: '$nested'}")},
+                                       getExpCtx(),
+                                       pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesNotDetectFalseReplaceRootIfTypoed) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$ROOT'}}"), fromjson("{$replaceWith: '$nestedTypo'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DetectsReplaceRootPatternIfCurrentInsteadOfROOT) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$CURRENT'}}"), fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_TRUE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesNotDetectFalseReplaceRootIfNoROOT) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$subObj'}}"), fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+TEST_F(SemanticAnalysisRenamedPaths, DoesNotDetectFalseReplaceRootIfTargetPathIsRenamed) {
+
+    {
+        auto pipeline =
+            pipeline_factory::makePipeline({fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+                                            fromjson("{$unset : 'nested'}"),
+                                            fromjson("{$replaceWith: '$nested'}")},
+                                           getExpCtx(),
+                                           pipeline_factory::kOptionsMinimal);
+        auto renames =
+            renamedPaths(pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        auto pipeline =
+            pipeline_factory::makePipeline({fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+                                            fromjson("{$set : {nested: '$somethingElese'}}"),
+                                            fromjson("{$replaceWith: '$nested'}")},
+                                           getExpCtx(),
+                                           pipeline_factory::kOptionsMinimal);
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        // This case could someday work - we leave it as a future improvement.
+        auto pipeline =
+            pipeline_factory::makePipeline({fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+                                            fromjson("{$set : {somethingElse: '$nested'}}"),
+                                            fromjson("{$replaceWith: '$somethingElse'}")},
+                                           getExpCtx(),
+                                           pipeline_factory::kOptionsMinimal);
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        // This is a tricky one. The pattern does exist, but it's doubly nested and only unnested
+        // once.
+        auto pipeline =
+            pipeline_factory::makePipeline({fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+                                            fromjson("{$replaceWith: {doubleNested: '$nested'}}"),
+                                            fromjson("{$replaceWith: '$doubleNested'}")},
+                                           getExpCtx(),
+                                           pipeline_factory::kOptionsMinimal);
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+    {
+        // Similar to above but double nested then double unnested. We could someday make this work,
+        // but leave it for a future improvement.
+        auto pipeline =
+            pipeline_factory::makePipeline({fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+                                            fromjson("{$replaceWith: {doubleNested: '$nested'}}"),
+                                            fromjson("{$replaceWith: '$doubleNested'}"),
+                                            fromjson("{$replaceWith: '$nested'}")},
+                                           getExpCtx(),
+                                           pipeline_factory::kOptionsMinimal);
+        auto renames =
+            renamedPaths(pipeline->getSources().crbegin(), pipeline->getSources().crend(), {"b"});
+        ASSERT_FALSE(static_cast<bool>(renames));
+    }
+}
+
+using SemanticAnalysisFindLongestViablePrefix = AggregationContextFixture;
+TEST_F(SemanticAnalysisFindLongestViablePrefix, AllowsReplaceRootPattern) {
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {nested: '$$ROOT'}}"),
+         fromjson("{$set: {bigEnough: {$gte: [{$bsonSize: '$nested'}, 300]}}}"),
+         fromjson("{$match: {bigEnough: true}}"),
+         fromjson("{$replaceWith: '$nested'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+        pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+    ASSERT(itr == pipeline->getSources().cend());
+}
+
+TEST_F(SemanticAnalysisFindLongestViablePrefix, FindsPrefixWithoutReplaceRoot) {
+    auto pipeline = pipeline_factory::makePipeline({fromjson("{$match: {testing: true}}"),
+                                                    fromjson("{$unset: 'unset'}"),
+                                                    fromjson("{$set: {x: '$y'}}")},
+                                                   getExpCtx(),
+                                                   pipeline_factory::kOptionsMinimal);
+    {
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"a"});
+        ASSERT(itr == pipeline->getSources().cend());
+    }
+    {
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"unset"});
+        ASSERT(itr == std::next(pipeline->getSources().cbegin()));
+    }
+    {
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"y"});
+        ASSERT(itr == pipeline->getSources().cend());
+        ASSERT(renames["y"] == "x");
+    }
+    {
+        // "x" is overwritten by the $set, so is not preserved.
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"x"});
+        ASSERT(itr == std::prev(pipeline->getSources().cend()));
+        ASSERT(renames["x"] == "x");
+    }
+}
+
+TEST_F(SemanticAnalysisFindLongestViablePrefix, FindsLastPossibleStageWithCallback) {
+    auto pipeline = pipeline_factory::makePipeline({fromjson("{$match: {testing: true}}"),
+                                                    fromjson("{$unset: 'unset'}"),
+                                                    fromjson("{$sort: {y: 1}}"),
+                                                    fromjson("{$set: {x: '$y'}}")},
+                                                   getExpCtx(),
+                                                   pipeline_factory::kOptionsMinimal);
+    {
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"y"});
+        ASSERT(itr == pipeline->getSources().cend());
+        ASSERT(renames["y"] == "x");
+    }
+    std::function<bool(DocumentSource*)> callback = [](DocumentSource* stage) {
+        return !static_cast<bool>(stage->distributedPlanLogic());
+    };
+    {
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"y"}, callback);
+        ASSERT(itr == std::prev(std::prev(pipeline->getSources().cend())));
+        ASSERT(renames["y"] == "y");
+    }
+}
+
+TEST_F(SemanticAnalysisFindLongestViablePrefix, CorrectlyAnswersReshardingUseCase) {
+    auto expCtx = getExpCtx();
+    auto lookupNss = NamespaceString::createNamespaceString_forTest("config.cache.chunks.test");
+    expCtx->setResolvedNamespace(lookupNss, ResolvedNamespace{lookupNss, {}});
+    auto pipeline = pipeline_factory::makePipeline(
+        {fromjson("{$replaceWith: {original: '$$ROOT'}}"),
+         fromjson("{$lookup: {from: {db: 'config', coll: 'cache.chunks.test'}, "
+                  "pipeline: [], as: 'intersectingChunk'}}"),
+         fromjson("{$match: {intersectingChunk: {$ne: []}}}"),
+         fromjson("{$replaceWith: '$original'}")},
+        getExpCtx(),
+        pipeline_factory::kOptionsMinimal);
+    std::function<bool(DocumentSource*)> callback = [](DocumentSource* stage) {
+        return !static_cast<bool>(stage->distributedPlanLogic());
+    };
+    {
+        auto [itr, renames] = findLongestViablePrefixPreservingPaths(
+            pipeline->getSources().cbegin(), pipeline->getSources().cend(), {"_id"}, callback);
+        ASSERT(itr == pipeline->getSources().cend());
+        ASSERT(renames["_id"] == "_id");
+    }
+}
+
+}  // namespace
+}  // namespace mongo

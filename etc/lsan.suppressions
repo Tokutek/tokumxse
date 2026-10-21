@@ -1,14 +1,34 @@
 # Client objects are leaked in threads that are never terminated
 leak:mongo::Client::Client
 
-# Insanity related to the fact that the static observer
-# prevents deleting mutexes during clean shutdown. If you
-# remove the StaticObserver, remove this too.
-leak:mongo::mutex::mutex
+# DiagnosticListeners and WaitListeners need to be available in detached threads
+leak:mongo::latch_detail::getDiagnosticListenerState
+leak:mongo::latch_detail::installDiagnosticListener
+leak:mongo::Interruptible::installWaitListener
+
+# The singleton must live throughout the lifetime of all SSL threads
+leak::mongo::SSLThreadInfo::ThreadIDManager::idManager
 
 # Thread names leak from threads that are never terminated.
 leak:mongo::setThreadName
+leak:mongo::getThreadName
+leak:__cxa_thread_atexit_impl
 
-# lets just ignore v8 for now. If we upgrade to newer v8
-# try removing this suppression
-leak:v8::
+# Threads leak from thread pools not joined at shutdown.
+leak:mongo::ThreadPool::Impl::_startWorkerThread_inlock()
+
+leak:glob64
+
+# Cleanup on io_context may not run due to race with shutdown.
+leak:mongo::transport::AsioReactor::run()
+leak:mongo::transport::AsioReactor::drain()
+leak:UnitTest_SuiteNameTaskExecutorCursorFixtureTestNamePinnedExecutorDestroyedOnUnderlying
+
+# Allocations from these functions in libresolv are stored in thread-locals.
+# Threads that are not joined by the time the leak-detector runs (like those spawned by ASIO) may
+# still have pointers to these allocated objects but LSAN isn't able to identify them and add them
+# to do the root-set, resulting in false-positive leak reports. LSAN may report different functions
+# leaking depending on the version of libresolv.
+# TODO SERVER-65936: Re-evaluate if this is needed with a clean shutdown that joins all threads.
+leak:__res_context_send
+leak:__res_context_query

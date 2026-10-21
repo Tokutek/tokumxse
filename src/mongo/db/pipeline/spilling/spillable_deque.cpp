@@ -1,0 +1,151 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/spilling/spillable_deque.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/pipeline/spilling/spill_table_batch_writer.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/spill_util.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/util/assert_util.h"
+
+#include <utility>
+
+namespace mongo {
+
+bool SpillableDeque::isIdInCache(int id) const {
+    tassert(5643005,
+            str::stream() << "Requested expired document from SpillableDeque. Expected range was "
+                          << _nextFreedIndex << "-" << _nextIndex - 1 << " but got " << id,
+            _nextFreedIndex <= id);
+    return id < _nextIndex;
+}
+
+void SpillableDeque::verifyInCache(int id) const {
+    tassert(5643004,
+            str::stream() << "Requested document not in SpillableDeque. Expected range was "
+                          << _nextFreedIndex << "-" << _nextIndex - 1 << " but got " << id,
+            isIdInCache(id));
+}
+void SpillableDeque::addDocument(Document input) {
+    _memCache.emplace_back(MemoryUsageToken{input.getApproximateSize(), &_memTracker},
+                           std::move(input));
+    if (!_memTracker.withinMemoryLimit(_expCtx->getOperationContext())) {
+        _memTracker.assertCanSpill(_expCtx->getAllowDiskUse(), "SPILLABLE_DEQUE");
+        spillToDisk();
+    }
+    ++_nextIndex;
+}
+Document SpillableDeque::getDocumentById(int id) const {
+    verifyInCache(id);
+    if (id < _diskWrittenIndex) {
+        return readDocumentFromDiskById(id);
+    }
+    return readDocumentFromMemCacheById(id);
+}
+void SpillableDeque::freeUpTo(int id) {
+    for (int i = _nextFreedIndex; i <= id; ++i) {
+        verifyInCache(i);
+        // Deleting is expensive in WT. Only delete in memory documents, documents in the record
+        // store will only be deleted when we drop the table.
+        if (i >= _diskWrittenIndex) {
+            tassert(5643010,
+                    "Attempted to remove document from empty memCache in SpillableDeque",
+                    _memCache.size() > 0);
+            _memCache.pop_front();
+        }
+        ++_nextFreedIndex;
+    }
+}
+void SpillableDeque::clear() {
+    if (_diskCache) {
+        _expCtx->getMongoProcessInterface()->truncateSpillTable(_expCtx, *_diskCache);
+    }
+    _memCache.clear();
+    _diskWrittenIndex = 0;
+    _nextIndex = 0;
+    _nextFreedIndex = 0;
+}
+
+void SpillableDeque::spillToDisk() {
+    if (!_diskCache) {
+        uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
+                "Exceeded memory limit and can't spill to disk. Set allowDiskUse: true to allow "
+                "spilling",
+                _expCtx->getAllowDiskUse());
+        tassert(5872800,
+                "SpillableDeque attempted to write to disk in an environment which is not prepared "
+                "to do so",
+                _expCtx->getOperationContext()->getServiceContext());
+        tassert(5872801,
+                "SpillableDeque attempted to write to disk in an environment without a storage "
+                "engine configured",
+                _expCtx->getOperationContext()->getServiceContext()->getStorageEngine());
+        _diskCache =
+            _expCtx->getMongoProcessInterface()->createSpillTable(_expCtx, KeyFormat::Long);
+    }
+
+    // Ensure there is sufficient disk space for spilling
+    uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+        storageGlobalParams.dbpath,
+        static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load())));
+
+    // If we've freed things from cache before writing to disk, we need to update
+    // '_diskWrittenIndex' to be the actual index of the document we're going to write.
+    if (_diskWrittenIndex < _nextFreedIndex) {
+        _diskWrittenIndex = _nextFreedIndex;
+    }
+
+    SpillTableBatchWriter writer{_expCtx, *_diskCache};
+    for (auto& memoryTokenWithDoc : _memCache) {
+        RecordId recordId{++_diskWrittenIndex};
+        auto bsonDoc = memoryTokenWithDoc.value().toBsonWithMetaData();
+        writer.write(recordId, std::move(bsonDoc));
+    }
+    _memCache.clear();
+    // Write final batch.
+    writer.flush();
+
+    _stats.updateSpillingStats(1,
+                               writer.writtenBytes(),
+                               writer.writtenRecords(),
+                               static_cast<uint64_t>(_diskCache->storageSize()));
+    CurOp::get(_expCtx->getOperationContext())
+        ->updateSpillStorageStats(_diskCache->computeOperationStatisticsSinceLastCall());
+}
+
+void SpillableDeque::updateStorageSizeStat() {
+    _stats.updateSpilledDataStorageSize(_diskCache->storageSize());
+}
+
+Document SpillableDeque::readDocumentFromDiskById(int desired) const {
+    tassert(5643006,
+            str::stream() << "Attempted to read id " << desired
+                          << "from disk in SpillableDeque before writing",
+            _diskCache && desired < _diskWrittenIndex);
+    return _expCtx->getMongoProcessInterface()->readRecordFromSpillTable(
+        _expCtx, *_diskCache, RecordId(desired + 1));
+}
+Document SpillableDeque::readDocumentFromMemCacheById(int desired) const {
+    // If we have only freed documents from disk, the index into '_memCache' is off by the number of
+    // documents we've ever written to disk. If we have freed documents from the cache, the index
+    // into '_memCache' is off by how many documents we've ever freed. In this case what we've
+    // written to disk doesn't matter, since those no longer affect in memory indexes.
+    size_t lookupIndex = _diskWrittenIndex > _nextFreedIndex ? desired - _diskWrittenIndex
+                                                             : desired - _nextFreedIndex;
+
+    tassert(5643007,
+            str::stream() << "Attempted to lookup " << lookupIndex << " but cache is only holding "
+                          << _memCache.size(),
+            lookupIndex < _memCache.size());
+    return _memCache[lookupIndex].value();
+}
+
+}  // namespace mongo

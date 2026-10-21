@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,138 +9,326 @@
 #include "wt_internal.h"
 
 /*
- * __wt_schema_worker --
- *	Get Btree handles for the object and cycle through calls to an
- *	underlying worker function with each handle.
+ * __schema_worker_awaits_publish --
+ *     Set skip if the URI maps to an already-open tree that is awaiting publication. Only a
+ *     resident handle is inspected: opening one here to read the flag would fault on the corrupted
+ *     table verify is meant to diagnose.
+ */
+static int
+__schema_worker_awaits_publish(WT_SESSION_IMPL *session, const char *uri, bool *skipp)
+{
+    WT_DATA_HANDLE *dhandle;
+    WT_DECL_RET;
+
+    *skipp = false;
+    ret = __wt_conn_dhandle_find(session, uri, NULL);
+    if (ret == WT_NOTFOUND)
+        return (0);
+    WT_RET(ret);
+
+    dhandle = session->dhandle;
+    *skipp = F_ISSET(dhandle, WT_DHANDLE_OPEN) && WT_DHANDLE_BTREE(dhandle) &&
+      F_ISSET_ATOMIC_32((WT_BTREE *)dhandle->handle, WT_BTREE_AWAITS_PUBLISH);
+    WT_DHANDLE_CLEAR(session);
+    return (0);
+}
+
+/*
+ * __wti_execute_handle_operation --
+ *     Apply a function to a handle, getting exclusive access if requested.
  */
 int
-__wt_schema_worker(WT_SESSION_IMPL *session,
-   const char *uri,
-   int (*file_func)(WT_SESSION_IMPL *, const char *[]),
-   int (*name_func)(WT_SESSION_IMPL *, const char *, int *),
-   const char *cfg[], uint32_t open_flags)
+__wti_execute_handle_operation(WT_SESSION_IMPL *session, const char *uri,
+  int (*file_func)(WT_SESSION_IMPL *, const char *[]), const char *cfg[], uint32_t open_flags)
 {
-	WT_COLGROUP *colgroup;
-	WT_DATA_SOURCE *dsrc;
-	WT_DECL_RET;
-	WT_INDEX *idx;
-	WT_SESSION *wt_session;
-	WT_TABLE *table;
-	const char *tablename;
-	u_int i;
-	int skip;
+    WT_DECL_RET;
+    bool skip;
 
-	table = NULL;
-	tablename = uri;
+    /*
+     * A tree awaiting publication has no on-disk data to verify, and the exclusive open would
+     * discard its in-memory content. Skip it.
+     */
+    if (FLD_ISSET(open_flags, WT_BTREE_VERIFY)) {
+        WT_WITH_HANDLE_LIST_READ_LOCK(
+          session, ret = __schema_worker_awaits_publish(session, uri, &skip));
+        WT_RET(ret);
+        if (skip)
+            return (0);
+    }
 
-	skip = 0;
-	if (name_func != NULL)
-		WT_ERR(name_func(session, uri, &skip));
+    /*
+     * If the operation requires exclusive access, close any open file handles, including
+     * checkpoints.
+     */
+    if (FLD_ISSET(open_flags, WT_DHANDLE_EXCLUSIVE)) {
+        WT_WITH_HANDLE_LIST_WRITE_LOCK(
+          session, ret = __wt_conn_dhandle_close_all(session, uri, false, false, false));
+        WT_RET(ret);
+    }
 
-	/* If the callback said to skip this object, we're done. */
-	if (skip)
-		return (0);
+    WT_RET(__wt_session_get_btree_ckpt(session, uri, cfg, open_flags, NULL, NULL));
+    WT_SAVE_DHANDLE(session, ret = file_func(session, cfg));
+    WT_TRET(__wt_session_release_dhandle(session));
 
-	/* Get the btree handle(s) and call the underlying function. */
-	if (WT_PREFIX_MATCH(uri, "file:")) {
-		if (file_func != NULL) {
-			/*
-			 * If the operation requires exclusive access, close
-			 * any open file handles, including checkpoints.
-			 */
-			if (FLD_ISSET(open_flags, WT_DHANDLE_EXCLUSIVE)) {
-				WT_WITH_DHANDLE_LOCK(session,
-				    ret = __wt_conn_dhandle_close_all(
-				    session, uri, 0));
-				WT_ERR(ret);
-			}
+    return (ret);
+}
 
-			if ((ret = __wt_session_get_btree_ckpt(
-			    session, uri, cfg, open_flags)) == 0) {
-				WT_SAVE_DHANDLE(session,
-				    ret = file_func(session, cfg));
-				WT_TRET(__wt_session_release_btree(session));
-			} else if (ret == EBUSY)
-				/* TODO: Decode checkpoint from cfg. */
-				WT_WITH_DHANDLE_LOCK(session,
-				    ret = __wt_conn_btree_apply_single_ckpt(
-				    session, uri, file_func, cfg));
-			WT_ERR(ret);
-		}
-	} else if (WT_PREFIX_MATCH(uri, "colgroup:")) {
-		WT_ERR(__wt_schema_get_colgroup(
-		    session, uri, 0, NULL, &colgroup));
-		WT_ERR(__wt_schema_worker(session,
-		    colgroup->source, file_func, name_func, cfg, open_flags));
-	} else if (WT_PREFIX_SKIP(tablename, "index:")) {
-		idx = NULL;
-		WT_ERR(__wt_schema_get_index(session, uri, 0, NULL, &idx));
-		WT_ERR(__wt_schema_worker(session, idx->source,
-		    file_func, name_func, cfg, open_flags));
-	} else if (WT_PREFIX_MATCH(uri, "lsm:")) {
-		/*
-		 * LSM compaction is handled elsewhere, but if we get here
-		 * trying to compact files, don't descend into an LSM tree.
-		 */
-		if (file_func != __wt_compact)
-			WT_ERR(__wt_lsm_tree_worker(session,
-			    uri, file_func, name_func, cfg, open_flags));
-	} else if (WT_PREFIX_SKIP(tablename, "table:")) {
-		WT_ERR(__wt_schema_get_table(session,
-		    tablename, strlen(tablename), 0, &table));
-		WT_ASSERT(session, session->dhandle == NULL);
+/*
+ * __schema_layered_stable_worker_verify --
+ *     Verify the layered stable table.
+ */
+static int
+__schema_layered_stable_worker_verify(WT_SESSION_IMPL *session, const char *stable_uri,
+  int (*file_func)(WT_SESSION_IMPL *, const char *[]),
+  int (*name_func)(WT_SESSION_IMPL *, const char *, bool *), const char *cfg[], uint32_t open_flags)
+{
+    WT_DECL_ITEM(ckpt_uri);
+    WT_DECL_RET;
+    wt_timestamp_t step_down_ts;
+    char ts_string[WT_TS_INT_STRING_SIZE];
+    const char *checkpoint_name = NULL;
+    bool leader;
 
-		/*
-		 * We could make a recursive call for each colgroup or index
-		 * URI, but since we have already opened the table, we can take
-		 * a short cut and skip straight to the sources.  If we have a
-		 * name function, it needs to know about the intermediate URIs.
-		 */
-		for (i = 0; i < WT_COLGROUPS(table); i++) {
-			colgroup = table->cgroups[i];
-			skip = 0;
-			if (name_func != NULL)
-				WT_ERR(name_func(
-				    session, colgroup->name, &skip));
-			if (!skip)
-				WT_ERR(__wt_schema_worker(
-				    session, colgroup->source,
-				    file_func, name_func, cfg, open_flags));
-		}
+    WT_ASSERT(session, stable_uri != NULL);
 
-		WT_ERR(__wt_schema_open_indices(session, table));
-		for (i = 0; i < table->nindices; i++) {
-			idx = table->indices[i];
-			skip = 0;
-			if (name_func != NULL)
-				WT_ERR(name_func(session, idx->name, &skip));
-			if (!skip)
-				WT_ERR(__wt_schema_worker(session, idx->source,
-				    file_func, name_func, cfg, open_flags));
-		}
-	} else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL) {
-		wt_session = (WT_SESSION *)session;
-		if (file_func == __wt_compact && dsrc->compact != NULL)
-			WT_ERR(dsrc->compact(
-			    dsrc, wt_session, uri, (WT_CONFIG_ARG *)cfg));
-		else if (file_func == __wt_salvage && dsrc->salvage != NULL)
-			WT_ERR(dsrc->salvage(
-			   dsrc, wt_session, uri, (WT_CONFIG_ARG *)cfg));
-		else if (file_func == __wt_verify && dsrc->verify != NULL)
-			WT_ERR(dsrc->verify(
-			   dsrc, wt_session, uri, (WT_CONFIG_ARG *)cfg));
-		else if (file_func == __wt_checkpoint)
-			;
-		else if (file_func == __wt_checkpoint_list)
-			;
-		else if (file_func == __wt_checkpoint_sync)
-			;
-		else
-			WT_ERR(__wt_object_unsupported(session, uri));
-	} else
-		WT_ERR(__wt_bad_object_type(session, uri));
+    /* Sample the role once so the open and the error message below agree if it changes. */
+    leader = __wt_atomic_load_bool_relaxed(&S2C(session)->layered_table_manager.leader);
 
-err:	if (table != NULL)
-		__wt_schema_release_table(session, table);
-	return (ret);
+    if (leader) {
+        /* Verify the stable table of the layered table. */
+        WT_WITHOUT_DHANDLE(session,
+          ret = __wt_schema_worker(session, stable_uri, file_func, name_func, cfg, open_flags));
+
+        /*
+         * A table created after the step-down timestamp was set has no stable constituent, so there
+         * is nothing on the stable side to verify. The schema lock held here serializes the
+         * timestamp, making the relaxed load safe.
+         */
+        step_down_ts =
+          __wt_atomic_load_uint64_relaxed(&S2C(session)->txn_global.step_down_timestamp);
+        if (ret == ENOENT && step_down_ts != WT_TS_NONE) {
+            __wt_verbose_info(session, WT_VERB_LAYERED,
+              "%s: no stable constituent to verify, the step-down timestamp %s is set", stable_uri,
+              __wt_timestamp_to_string(step_down_ts, ts_string));
+            ret = 0;
+        }
+    } else {
+        WT_ERR(__wt_scr_alloc(session, 0, &ckpt_uri));
+
+        /* A follower always verifies the stable tree at the last picked-up checkpoint. */
+        WT_ERR_NOTFOUND_OK(
+          __wt_meta_checkpoint_last_name(session, stable_uri, &checkpoint_name, NULL, NULL), true);
+
+        /* There is nothing to verify before the first checkpoint is picked up. */
+        if (ret == WT_NOTFOUND) {
+            ret = 0;
+            goto err;
+        }
+
+        /* Use a URI with a "/<checkpoint name> suffix. */
+        WT_ERR(__wt_buf_fmt(session, ckpt_uri, "%s/%s", stable_uri, checkpoint_name));
+
+        /*
+         * Verify the stable table of the layered table. The open returns EBUSY when a concurrent
+         * pickup supersedes the checkpoint; the caller treats EBUSY as transient.
+         */
+        WT_WITHOUT_DHANDLE(session,
+          ret = __wt_schema_worker(session, ckpt_uri->data, file_func, name_func, cfg, open_flags));
+    }
+
+err:
+    __wt_scr_free(session, &ckpt_uri);
+    __wt_free(session, checkpoint_name);
+    if (ret != 0 && ret != EBUSY)
+        WT_RET_MSG(session, ret, "Verify (layered): %s stable table verification failed on the %s",
+          stable_uri, leader ? "leader" : "follower");
+    return (ret);
+}
+
+/*
+ * __schema_layered_ingest_worker_verify --
+ *     Verify the layered ingest table.
+ */
+static int
+__schema_layered_ingest_worker_verify(WT_SESSION_IMPL *session, const char *ingest_uri)
+{
+    WT_DECL_RET;
+    WT_CONNECTION_IMPL *conn = S2C(session);
+    WT_CURSOR *ingest_cursor = NULL;
+
+    WT_ASSERT(session, ingest_uri != NULL);
+
+    /* We don't verify the ingest table on a follower. */
+    if (!__wt_atomic_load_bool_relaxed(&conn->layered_table_manager.leader))
+        return (0);
+
+    /*
+     * While a step-down timestamp is set, the leader directs writes to ingest, so it is expected to
+     * hold the post-cutoff content rather than be empty.
+     */
+    if (__wt_atomic_load_uint64_relaxed(&conn->txn_global.step_down_timestamp) != WT_TS_NONE)
+        return (0);
+
+    /* The ingest table on a leader has to be empty. Use a standard cursor to verify this. */
+    const char *cursor_config[] = {
+      WT_CONFIG_BASE(session, WT_SESSION_open_cursor), "readonly", NULL, NULL};
+    WT_WITHOUT_DHANDLE(
+      session, ret = __wt_open_cursor(session, ingest_uri, NULL, cursor_config, &ingest_cursor));
+    WT_ERR(ret);
+
+    ret = ingest_cursor->next(ingest_cursor);
+    if (ret == WT_NOTFOUND)
+        ret = 0; /* Expected. */
+    else if (ret == 0) {
+        /* We found a record in the ingest table, which is unexpected. */
+        ret = WT_ERROR;
+        WT_ERR_MSG(session, ret,
+          "Verify (layered): %s ingest table verification failed. Ingest on leader must be "
+          "empty.",
+          ingest_uri);
+    } else
+        WT_ERR_MSG(session, ret,
+          "Verify (layered): %s ingest table verification failed. Unexpected error code.",
+          ingest_uri);
+
+err:
+    if (ingest_cursor != NULL)
+        WT_TRET(ingest_cursor->close(ingest_cursor));
+    return (ret);
+}
+
+/*
+ * __schema_layered_worker_verify --
+ *     Run the verify operation on the layered table.
+ */
+static int
+__schema_layered_worker_verify(WT_SESSION_IMPL *session, const char *uri,
+  int (*file_func)(WT_SESSION_IMPL *, const char *[]),
+  int (*name_func)(WT_SESSION_IMPL *, const char *, bool *), const char *cfg[], uint32_t open_flags)
+{
+    WT_DECL_RET;
+    int ingest_ret;
+
+    WT_ASSERT(session, file_func == __wt_verify);
+
+    WT_RET(__wt_session_get_dhandle(session, uri, NULL, NULL, open_flags));
+    WT_LAYERED_TABLE *layered = (WT_LAYERED_TABLE *)session->dhandle;
+
+    WT_ERR_ERROR_OK(__schema_layered_stable_worker_verify(
+                      session, layered->stable_uri, file_func, name_func, cfg, open_flags),
+      EBUSY, true);
+
+    ingest_ret = __schema_layered_ingest_worker_verify(session, layered->ingest_uri);
+    /* At this point, ret can only be EBUSY or 0 and ingest_ret can hold any error code. */
+    ret = ingest_ret != 0 ? ingest_ret : ret;
+
+err:
+    WT_TRET(__wt_session_release_dhandle(session));
+    return (ret);
+}
+
+/*
+ * __wt_schema_worker --
+ *     Get Btree handles for the object and cycle through calls to an underlying worker function
+ *     with each handle.
+ */
+int
+__wt_schema_worker(WT_SESSION_IMPL *session, const char *uri,
+  int (*file_func)(WT_SESSION_IMPL *, const char *[]),
+  int (*name_func)(WT_SESSION_IMPL *, const char *, bool *), const char *cfg[], uint32_t open_flags)
+{
+    WT_COLGROUP *colgroup;
+    WT_DATA_SOURCE *dsrc;
+    WT_DECL_RET;
+    WT_INDEX *idx;
+    WT_SESSION *wt_session;
+    WT_TABLE *table;
+    u_int i;
+    bool skip;
+
+    table = NULL;
+    skip = false;
+
+    if (name_func != NULL)
+        WT_ERR(name_func(session, uri, &skip));
+
+    /* If the callback said to skip this object, we're done. */
+    if (skip)
+        return (0);
+
+    /* Get the btree handle(s) and call the underlying function. */
+    if (WT_PREFIX_MATCH(uri, "file:")) {
+        if (file_func != NULL)
+            WT_ERR(__wti_execute_handle_operation(session, uri, file_func, cfg, open_flags));
+    } else if (WT_PREFIX_MATCH(uri, "colgroup:")) {
+        WT_ERR(__wt_schema_get_colgroup(session, uri, false, NULL, &colgroup));
+        WT_ERR(
+          __wt_schema_worker(session, colgroup->source, file_func, name_func, cfg, open_flags));
+    } else if (WT_PREFIX_MATCH(uri, "index:")) {
+        idx = NULL;
+        WT_ERR(__wti_schema_get_index(session, uri, false, false, &idx));
+        WT_ERR(__wt_schema_worker(session, idx->source, file_func, name_func, cfg, open_flags));
+    } else if (WT_PREFIX_MATCH(uri, "table:")) {
+        /*
+         * Note: we would like to use open_flags here (e.g., to lock the table exclusive during
+         * schema-changing operations), but that is currently problematic because we get the table
+         * again in order to discover column groups and indexes.
+         */
+        WT_ERR(__wt_schema_get_table_uri(session, uri, false, 0, &table));
+
+        /*
+         * We could make a recursive call for each colgroup or index URI, but since we have already
+         * opened the table, we can take a short cut and skip straight to the sources. If we have a
+         * name function, it needs to know about the intermediate URIs.
+         */
+        for (i = 0; i < WT_COLGROUPS(table); i++) {
+            colgroup = table->cgroups[i];
+
+            skip = false;
+            if (name_func != NULL)
+                WT_ERR(name_func(session, colgroup->name, &skip));
+            if (!skip)
+                WT_ERR(__wt_schema_worker(
+                  session, colgroup->source, file_func, name_func, cfg, open_flags));
+        }
+
+        /*
+         * Some operations that walk handles, such as backup, need to open indexes. Others, such as
+         * checkpoints, do not. Opening indexes requires the handle write lock, so check whether
+         * that lock is held when deciding what to do.
+         */
+        if (FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_TABLE_WRITE))
+            WT_ERR(__wt_schema_open_indices(session, table));
+
+        for (i = 0; i < table->nindices; i++) {
+            idx = table->indices[i];
+            skip = false;
+            if (name_func != NULL)
+                WT_ERR(name_func(session, idx->name, &skip));
+            if (!skip)
+                WT_ERR(
+                  __wt_schema_worker(session, idx->source, file_func, name_func, cfg, open_flags));
+        }
+    } else if (WT_PREFIX_MATCH(uri, "layered:") && file_func == __wt_verify) {
+        WT_ERR(__schema_layered_worker_verify(session, uri, file_func, name_func, cfg, open_flags));
+    } else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL) {
+        wt_session = (WT_SESSION *)session;
+        if (file_func == __wt_salvage && dsrc->salvage != NULL)
+            WT_ERR(dsrc->salvage(dsrc, wt_session, uri, (WT_CONFIG_ARG *)cfg));
+        else if (file_func == __wt_verify && dsrc->verify != NULL)
+            WT_ERR(dsrc->verify(dsrc, wt_session, uri, (WT_CONFIG_ARG *)cfg));
+        else if (file_func == __wt_checkpoint_file)
+            ;
+        else if (file_func == __wt_checkpoint_get_handles)
+            ;
+        else if (file_func == __wt_checkpoint_sync)
+            ;
+        else
+            WT_ERR(__wt_object_unsupported(session, uri));
+    } else
+        WT_ERR(__wt_bad_object_type(session, uri));
+
+err:
+    WT_TRET(__wt_schema_release_table(session, &table));
+    return (ret);
 }

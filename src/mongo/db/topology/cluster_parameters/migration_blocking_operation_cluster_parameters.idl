@@ -1,0 +1,39 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+imports:
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+global:
+    cpp_namespace: mongo::migration_blocking_operation
+    cpp_includes:
+        - "mongo/s/migration_blocking_operation/migration_blocking_operation_feature_flags_gen.h"
+    mod_visibility: needs_replacement
+
+structs:
+    PauseMigrationsDuringMultiUpdatesParam:
+        description: >-
+            Cluster parameter determining if chunk migrations should be prevented while updateMany or
+            deleteMany operations are ongoing.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            enabled:
+                description: >-
+                    If true, migrations will be paused during multi updates.
+                type: bool
+                default: false
+
+server_parameters:
+    pauseMigrationsDuringMultiUpdates:
+        description: >-
+            Cluster parameter determining if chunk migrations should be prevented while updateMany
+            or deleteMany operations are ongoing.
+        set_at: cluster
+        cpp_vartype: PauseMigrationsDuringMultiUpdatesParam
+        cpp_varname: pauseMigrationsDuringMultiUpdates
+        condition:
+            feature_flag: gFeatureFlagPauseMigrationsDuringMultiUpdatesAvailable
+        redact: false
+        omit_in_ftdc: false

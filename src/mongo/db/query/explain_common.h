@@ -1,77 +1,65 @@
-/**
- *    Copyright (C) 2013-2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/modules.h"
 
-namespace mongo {
+#include <string_view>
 
-    /**
-     * Utilities used for explain implementations on both mongod and mongos.
-     */
-    class ExplainCommon {
-    public:
-        /**
-         * The various supported verbosity levels for explain. The order is
-         * significant: the enum values are assigned in order of increasing verbosity.
-         */
-        enum Verbosity {
-            // At all verbosities greater than or equal to QUERY_PLANNER, we display information
-            // about the plan selected and alternate rejected plans. Does not include any execution-
-            // related info. String alias is "queryPlanner".
-            QUERY_PLANNER = 0,
+/**
+ * Namespace for static methods that are shared between explain on mongod and on mongos.
+ */
+namespace mongo::explain_common {
 
-            // At all verbosities greater than or equal to EXEC_STATS, we display a section of
-            // output containing both overall execution stats, and stats per stage in the
-            // execution tree. String alias is "execStats".
-            EXEC_STATS = 1,
+/**
+ * Adds the 'serverInfo' explain section to the BSON object being built by 'out'.
+ *
+ * This section include the host, port, version, and gitVersion.
+ */
+void generateServerInfo(BSONObjBuilder* out);
 
-            // At this second-highest verbosity level, we generate the execution stats for each
-            // rejected plan as well as the winning plan. String alias is "allPlansExecution".
-            EXEC_ALL_PLANS = 2,
-        };
+/**
+ * Adds the 'serverParameters' explain section to the BSON object being built by 'out'.
+ *
+ * This section includes various server-wide internal limits/knobs.
+ */
+void generateServerParameters(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              BSONObjBuilder* out);
 
-        /**
-         * Converts an explain verbosity to its string representation.
-         */
-        static const char* verbosityString(ExplainCommon::Verbosity verbosity);
+/**
+ * Adds the 'queryKnobs' explain section to the BSON object being built by 'out'.
+ *
+ * Contains every query knob with a non-default source, keyed by wire name with nested "value" and
+ * "source" fields. setParameter overrides appear with source "setParameter"; QuerySettings
+ * overrides appear with source "querySettings" (even when the value equals the compiled-in
+ * default). Knobs at their default source are omitted. The section is absent entirely when no knob
+ * has been overridden.
+ */
+void generateQueryKnobs(const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObjBuilder* out);
 
-        /**
-         * Does some basic validation of the command BSON, and retrieves the explain verbosity.
-         *
-         * Returns a non-OK status if parsing fails.
-         *
-         * On success, populates "verbosity".
-         */
-        static Status parseCmdBSON(const BSONObj& cmdObj, ExplainCommon::Verbosity* verbosity);
+/**
+ * Adds the 'queryShapeHash' value to the BSON object being built by 'out'.
+ */
+void generateQueryShapeHash(OperationContext* opCtx, BSONObjBuilder* out);
 
-    };
+/**
+ * Adds the 'peakTrackedMemBytes' value to the BSON object being built by 'out'.
+ */
+void generatePeakTrackedMemBytes(const OperationContext* opCtx, BSONObjBuilder* out);
 
-} // namespace
+/**
+ * Conditionally appends a BSONObj to 'bob' depending on whether or not the maximum user size for a
+ * BSON object will be exceeded.
+ */
+bool appendIfRoom(const BSONObj& toAppend, std::string_view fieldName, BSONObjBuilder* out);
+
+/**
+ * Conditionally appends a BSONArray to 'bob' depending on whether or not the maximum user size for
+ * a BSON object will be exceeded.
+ */
+bool appendIfRoom(const BSONArray& toAppend, std::string_view fieldName, BSONObjBuilder* out);
+}  // namespace mongo::explain_common

@@ -1,0 +1,621 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/optimizer/join/join_graph.h"
+
+#include "mongo/db/query/compiler/optimizer/join/unit_test_helpers.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+
+namespace mongo::join_ordering {
+TEST(JoinGraphTests, AddNode) {
+    MutableJoinGraph graph{};
+
+    auto first = *graph.addNode(makeNSS("first"), nullptr, boost::none);
+    auto second = *graph.addNode(makeNSS("second"), nullptr, FieldPath("snd"));
+
+    ASSERT_EQ(graph.numNodes(), 2);
+    ASSERT_EQ(graph.numEdges(), 0);
+
+    ASSERT_EQ(graph.getNode(first).collectionName, makeNSS("first"));
+    ASSERT_EQ(graph.getNode(second).collectionName, makeNSS("second"));
+}
+
+TEST(JoinGraphTests, AddEdge) {
+    MutableJoinGraph mgraph{};
+
+    auto first = *mgraph.addNode(makeNSS("first"), nullptr, boost::none);
+    auto second = *mgraph.addNode(makeNSS("second"), nullptr, FieldPath("snd"));
+    auto third = *mgraph.addNode(makeNSS("third"), nullptr, FieldPath("trd"));
+
+
+    auto firstSecond = mgraph.addSimpleEqualityEdge(first, second, 0, 1);
+    auto secondThird = mgraph.addSimpleEqualityEdge(second, third, 2, 3);
+
+    JoinGraph graph(std::move(mgraph));
+
+    ASSERT_EQ(graph.numNodes(), 3);
+    ASSERT_EQ(graph.numEdges(), 2);
+
+    ASSERT_TRUE(firstSecond.has_value());
+    ASSERT_TRUE(secondThird.has_value());
+
+    ASSERT_EQ(graph.getEdge(*firstSecond).left, first);
+    ASSERT_EQ(graph.getEdge(*firstSecond).right, second);
+    ASSERT_EQ(graph.getEdge(*secondThird).left, second);
+    ASSERT_EQ(graph.getEdge(*secondThird).right, third);
+
+    ASSERT_EQ(graph.findEdge(first, second), firstSecond);
+    ASSERT_EQ(graph.findEdge(second, first), firstSecond);
+    ASSERT_EQ(graph.findEdge(second, third), secondThird);
+    ASSERT_EQ(graph.findEdge(third, second), secondThird);
+    ASSERT_EQ(graph.findEdge(first, third), boost::none);
+    ASSERT_EQ(graph.findEdge(third, first), boost::none);
+}
+
+TEST(JoinGraphTests, DedupEqualityPredicates) {
+    MutableJoinGraph mgraph{};
+
+    auto first = *mgraph.addNode(makeNSS("first"), nullptr, boost::none);
+    auto second = *mgraph.addNode(makeNSS("second"), nullptr, FieldPath("snd"));
+    auto third = *mgraph.addNode(makeNSS("third"), nullptr, FieldPath("tree"));
+    auto fourth = *mgraph.addNode(makeNSS("fourth"), nullptr, FieldPath("for"));
+
+    auto e1 = mgraph.addSimpleEqualityEdge(first, second, 0, 1);
+    auto e2 = mgraph.addExprEqualityEdge(second, first, 1, 0);
+    ASSERT(e1.has_value());
+    ASSERT(e2.has_value());
+    ASSERT(e1 == e2);
+
+    auto e3 = mgraph.addExprEqualityEdge(third, first, 2, 0);
+    auto e4 = mgraph.addSimpleEqualityEdge(first, third, 0, 2);
+    ASSERT(e3.has_value());
+    ASSERT(e4.has_value());
+    ASSERT(e3 == e4);
+
+    auto e5 = mgraph.addExprEqualityEdge(third, second, 2, 1);
+    auto e6 = mgraph.addExprEqualityEdge(second, third, 1, 2);
+    ASSERT(e5.has_value());
+    ASSERT(e6.has_value());
+    ASSERT(e5 == e6);
+
+    auto e7 = mgraph.addSimpleEqualityEdge(third, fourth, 2, 3);
+    auto e8 = mgraph.addSimpleEqualityEdge(fourth, third, 3, 2);
+    ASSERT(e7.has_value());
+    ASSERT(e8.has_value());
+    ASSERT(e7 == e8);
+
+    JoinGraph graph(std::move(mgraph));
+
+    ASSERT_EQ(graph.numNodes(), 4);
+    ASSERT_EQ(graph.numEdges(), 4);
+
+    ASSERT_EQ(graph.findEdge(first, second), e1);
+    ASSERT_EQ(graph.findEdge(second, first), e1);
+    ASSERT_EQ(graph.findEdge(second, third), e5);
+    ASSERT_EQ(graph.findEdge(third, second), e5);
+    ASSERT_EQ(graph.findEdge(first, third), e3);
+    ASSERT_EQ(graph.findEdge(third, first), e3);
+    ASSERT_EQ(graph.findEdge(fourth, third), e7);
+    ASSERT_EQ(graph.findEdge(third, fourth), e7);
+
+    auto edge1 = graph.getEdge(*e1);
+    ASSERT_EQ(edge1.predicates.size(), 1);
+    ASSERT_EQ(edge1.predicates[0].op, JoinPredicate::ExprEq);
+
+    auto edge2 = graph.getEdge(*e3);
+    ASSERT_EQ(edge2.predicates.size(), 1);
+    ASSERT_EQ(edge2.predicates[0].op, JoinPredicate::ExprEq);
+
+    auto edge3 = graph.getEdge(*e5);
+    ASSERT_EQ(edge3.predicates.size(), 1);
+    ASSERT_EQ(edge3.predicates[0].op, JoinPredicate::ExprEq);
+
+    auto edge4 = graph.getEdge(*e7);
+    ASSERT_EQ(edge4.predicates.size(), 1);
+    ASSERT_EQ(edge4.predicates[0].op, JoinPredicate::Eq);
+}
+
+DEATH_TEST(JoinGraphTestsDeathTest,
+           AddEdgeSimpleSelfEdgeForbidden,
+           "Self edges are not permitted") {
+    MutableJoinGraph graph{};
+
+    auto a = *graph.addNode(makeNSS("a"), nullptr, boost::none);
+    *graph.addNode(makeNSS("b"), nullptr, boost::none);
+
+    // Try adding a self-edge (a) -- (a).
+    graph.addSimpleEqualityEdge(a, a, 0, 1);
+}
+
+TEST(JoinGraphTests, getJoinEdges) {
+    MutableJoinGraph mgraph{};
+
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, FieldPath("b"));
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, FieldPath("c"));
+    auto d = *mgraph.addNode(makeNSS("d"), nullptr, FieldPath("d"));
+
+    auto ab = *mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+    auto ac = *mgraph.addSimpleEqualityEdge(a, c, 2, 3);
+    auto cd = *mgraph.addSimpleEqualityEdge(c, d, 4, 5);
+
+    JoinGraph graph(std::move(mgraph));
+
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"0001"}, NodeSet{"0010"}), std::vector<EdgeId>{ab});
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"0001"}, NodeSet{"0100"}), std::vector<EdgeId>{ac});
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"0100"}, NodeSet{"1000"}), std::vector<EdgeId>{cd});
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"0001"}, NodeSet{"0110"}), (std::vector<EdgeId>{ab, ac}));
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"1001"}, NodeSet{"0110"}),
+              (std::vector<EdgeId>{ab, ac, cd}));
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"0001"}, NodeSet{"1000"}), std::vector<EdgeId>{});
+    ASSERT_EQ(graph.getJoinEdges(NodeSet{"1001"}, NodeSet{"1000"}), std::vector<EdgeId>{});
+}
+
+TEST(JoinGraph, MultiplePredicatesSameEdge) {
+    MutableJoinGraph mgraph{};
+
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+
+    auto ab = *mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+    auto ab2 = *mgraph.addSimpleEqualityEdge(a, b, 2, 3);
+    // Opposite order of nodes
+    auto ab3 = *mgraph.addSimpleEqualityEdge(b, a, 5, 4);
+
+    // Edge is deduplicated
+    ASSERT_EQ(ab, ab2);
+    ASSERT_EQ(ab2, ab3);
+
+    JoinGraph graph(std::move(mgraph));
+    auto edges = graph.getJoinEdges(makeNodeSet(a), makeNodeSet(b));
+
+    ASSERT_EQ(1, edges.size());
+    // Edge returned when order of nodes reversed
+    ASSERT_EQ(edges, graph.getJoinEdges(makeNodeSet(b), makeNodeSet(a)));
+
+    auto edge = graph.getEdge(edges[0]);
+
+    ASSERT_EQ(edge.left, a);
+    ASSERT_EQ(edge.right, b);
+    ASSERT_BSONOBJ_EQ_AUTO(
+        R"({
+            "predicates": [
+                {
+                    "op": "eq",
+                    "left": 0,
+                    "right": 1
+                },
+                {
+                    "op": "eq",
+                    "left": 2,
+                    "right": 3
+                },
+                {
+                    "op": "eq",
+                    "left": 4,
+                    "right": 5
+                }
+            ],
+            "left": {"$numberInt":"0"},
+            "right": {"$numberInt":"1"}
+        })",
+        edge.toBSON());
+}
+
+TEST(JoinGraphTests, GetNeighborsSimpleEqualityEdges_NoEdges) {
+    MutableJoinGraph mgraph{};
+
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+    auto d = *mgraph.addNode(makeNSS("d"), nullptr, boost::none);
+    auto e = *mgraph.addNode(makeNSS("e"), nullptr, boost::none);
+
+    JoinGraph graph(std::move(mgraph));
+
+    // At this point, no edges.
+    ASSERT_EQ(graph.getNeighbors(a), NodeSet{});
+    ASSERT_EQ(graph.getNeighbors(b), NodeSet{});
+    ASSERT_EQ(graph.getNeighbors(c), NodeSet{});
+    ASSERT_EQ(graph.getNeighbors(d), NodeSet{});
+    ASSERT_EQ(graph.getNeighbors(e), NodeSet{});
+}
+
+TEST(JoinGraphTests, GetNeighborsSimpleEqualityEdges_WithEdges) {
+    MutableJoinGraph mgraph{};
+
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+    auto d = *mgraph.addNode(makeNSS("d"), nullptr, boost::none);
+    auto e = *mgraph.addNode(makeNSS("e"), nullptr, boost::none);
+
+    // Now add edges: a -- b, a -- c, c -- d.
+    mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+    mgraph.addSimpleEqualityEdge(a, c, 2, 3);
+    mgraph.addSimpleEqualityEdge(c, d, 4, 5);
+
+    JoinGraph graph(std::move(mgraph));
+
+    // A connected to b,c. B connected to a. C connected to a,d. D connected to c. E not
+    // connected.
+    ASSERT_EQ(graph.getNeighbors(a), makeNodeSet(b, c));
+    ASSERT_EQ(graph.getNeighbors(b), makeNodeSet(a));
+    ASSERT_EQ(graph.getNeighbors(c), makeNodeSet(a, d));
+    ASSERT_EQ(graph.getNeighbors(d), makeNodeSet(c));
+    ASSERT_EQ(graph.getNeighbors(e), NodeSet{});
+}
+
+TEST(JoinGraph, GetNeighborsMultiEdges) {
+    MutableJoinGraph mgraph{};
+
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+
+    // Now add two edges between "a" and "b". These could in theory be simplified into a single
+    // complex edge with multiple predicates, but this demonstrates that getNeighbors supports it.
+    mgraph.addEdge(a, b, {});
+    mgraph.addEdge(b, a, {});
+
+    JoinGraph graph(std::move(mgraph));
+
+    // A connected to b. B connected to a.
+    ASSERT_EQ(graph.getNeighbors(a), makeNodeSet(b));
+    ASSERT_EQ(graph.getNeighbors(b), makeNodeSet(a));
+    ASSERT_EQ(graph.getNeighbors(c), NodeSet{});
+}
+
+TEST(JoinGraph, GetNeighborsCycle) {
+    MutableJoinGraph mgraph{};
+
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+    auto d = *mgraph.addNode(makeNSS("d"), nullptr, boost::none);
+
+    // Introduce a cycle involving all four nodes.
+    mgraph.addEdge(a, b, {});
+    mgraph.addEdge(b, c, {});
+    mgraph.addEdge(c, d, {});
+    mgraph.addEdge(d, a, {});
+
+    JoinGraph graph(std::move(mgraph));
+
+    // Each node is connected to only two others.
+    ASSERT_EQ(graph.getNeighbors(a), makeNodeSet(b, d));
+    ASSERT_EQ(graph.getNeighbors(b), makeNodeSet(a, c));
+    ASSERT_EQ(graph.getNeighbors(c), makeNodeSet(b, d));
+    ASSERT_EQ(graph.getNeighbors(d), makeNodeSet(a, c));
+}
+
+TEST(JoinGraph, GetEdgesForSubgraph) {
+    /** Construct a graph like so
+     * a -- b -- c
+     *          / \
+     *         d -- e
+     */
+    MutableJoinGraph mgraph{};
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, FieldPath("b"));
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, FieldPath("c"));
+    auto d = *mgraph.addNode(makeNSS("d"), nullptr, FieldPath("d"));
+    auto e = *mgraph.addNode(makeNSS("e"), nullptr, FieldPath("d"));
+
+    auto ab = *mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+    auto bc = *mgraph.addSimpleEqualityEdge(b, c, 1, 2);
+    auto cd = *mgraph.addSimpleEqualityEdge(c, d, 2, 3);
+    auto de = *mgraph.addSimpleEqualityEdge(d, e, 3, 4);
+    auto ce = *mgraph.addSimpleEqualityEdge(c, e, 2, 4);
+
+    JoinGraph graph(std::move(mgraph));
+
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a)), std::vector<EdgeId>{});
+
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b)), std::vector<EdgeId>{ab});
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, c)), std::vector<EdgeId>{});
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(c, d)), std::vector<EdgeId>{cd});
+
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b, c)), (std::vector<EdgeId>{ab, bc}));
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b, e)), std::vector<EdgeId>{ab});
+
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b, c, d)),
+              (std::vector<EdgeId>{ab, bc, cd}));
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b, c, e)),
+              (std::vector<EdgeId>{ab, bc, ce}));
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b, d, e)), (std::vector<EdgeId>{ab, de}));
+
+    ASSERT_EQ(graph.getEdgesForSubgraph(makeNodeSet(a, b, c, d, e)),
+              (std::vector<EdgeId>{ab, bc, cd, de, ce}));
+}
+
+TEST(JoinGraph, BuildParams) {
+    JoinGraphBuildParams buildParams(16, 32, 64);
+    MutableJoinGraph mgraph(buildParams);
+
+    // Case 1: Validate the maximum number of nodes.
+    std::vector<NodeId> nodeIds;
+    nodeIds.reserve(buildParams.maxNodesInJoin);
+
+    for (size_t i = 0; i < buildParams.maxNodesInJoin + 10; ++i) {
+        auto nodeId = mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        if (nodeId.has_value()) {
+            nodeIds.emplace_back(*nodeId);
+        }
+    }
+    // Validate that the number of nodes is of the expected size.
+    ASSERT_EQ(mgraph.numNodes(), buildParams.maxNodesInJoin);
+    // Validate that the nodes creation status was correctly reported.
+    ASSERT_EQ(nodeIds.size(), buildParams.maxNodesInJoin);
+
+    PathId pathId{100};
+
+    // Case 2. Validate the maximum number of edges.
+    std::vector<EdgeId> edgeIds;
+    edgeIds.reserve(buildParams.maxEdgesInJoin);
+    for (auto left : nodeIds) {
+        for (auto right : nodeIds) {
+            if (left >= right) {
+                continue;
+            }
+            auto edgeId = mgraph.addSimpleEqualityEdge(left, right, pathId + 1, pathId + 2);
+            if (edgeId.has_value()) {
+                edgeIds.emplace_back(*edgeId);
+                pathId += 2;
+            }
+        }
+    }
+    // Validate that the number of edges is of the expected size.
+    ASSERT_EQ(mgraph.numEdges(), buildParams.maxEdgesInJoin);
+    // Validate that the edges creation status was correctly reported.
+    ASSERT_EQ(edgeIds.size(), buildParams.maxEdgesInJoin);
+
+    // Case 3. Validate the maximum number of predicates.
+    auto edge = mgraph.edges().back();
+    size_t numPredicates = mgraph.numEdges();
+    for (size_t i = 0; i < buildParams.maxPredicatesInJoin + 10; ++i) {
+        auto edgeId = mgraph.addSimpleEqualityEdge(edge.right, edge.left, pathId + 1, pathId + 2);
+        if (edgeId.has_value()) {
+            ++numPredicates;
+            pathId += 2;
+        }
+    }
+    // Validate that the predicates creation status was correctly reported.
+    ASSERT_EQ(numPredicates, buildParams.maxPredicatesInJoin);
+}
+
+TEST(JoinGraphTests, IsConnected) {
+    {
+        // Two nodes with an edge is connected: a -- b.
+        MutableJoinGraph mgraph{};
+        auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+        mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+        JoinGraph graph(std::move(mgraph));
+        ASSERT_TRUE(graph.getShape() & JoinGraph::GraphShapeFlags::Connected);
+    }
+    {
+        // Two nodes without an edge is not connected: a   b.
+        MutableJoinGraph mgraph{};
+        mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+        JoinGraph graph(std::move(mgraph));
+        ASSERT_FALSE(graph.getShape() & JoinGraph::GraphShapeFlags::Connected);
+    }
+    {
+        // Three nodes in a line is connected: a -- b -- c.
+        MutableJoinGraph mgraph{};
+        auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+        auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+        mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+        mgraph.addSimpleEqualityEdge(b, c, 2, 3);
+        JoinGraph graph(std::move(mgraph));
+        ASSERT_TRUE(graph.getShape() & JoinGraph::GraphShapeFlags::Connected);
+    }
+    {
+        // Three nodes with one disconnected is not connected: a -- b   c.
+        MutableJoinGraph mgraph{};
+        auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+        mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+        mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+        JoinGraph graph(std::move(mgraph));
+        ASSERT_FALSE(graph.getShape() & JoinGraph::GraphShapeFlags::Connected);
+    }
+    {
+        // Four nodes with a cycle is connected: a -- b -- c -- d and a -- d.
+        MutableJoinGraph mgraph{};
+        auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+        auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+        auto d = *mgraph.addNode(makeNSS("d"), nullptr, boost::none);
+        mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+        mgraph.addSimpleEqualityEdge(b, c, 2, 3);
+        mgraph.addSimpleEqualityEdge(c, d, 4, 5);
+        mgraph.addSimpleEqualityEdge(d, a, 6, 7);
+        JoinGraph graph(std::move(mgraph));
+        ASSERT_TRUE(graph.getShape() & JoinGraph::GraphShapeFlags::Connected);
+    }
+    {
+        // Four nodes with a cycle and one disconnected node is not connected, even though the
+        // it could be with this number of edges: a -- b -- c   d and a -- c.
+        MutableJoinGraph mgraph{};
+        auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+        auto b = *mgraph.addNode(makeNSS("b"), nullptr, boost::none);
+        auto c = *mgraph.addNode(makeNSS("c"), nullptr, boost::none);
+        mgraph.addNode(makeNSS("d"), nullptr, boost::none);
+        mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+        mgraph.addSimpleEqualityEdge(b, c, 2, 3);
+        mgraph.addSimpleEqualityEdge(c, a, 4, 5);
+        JoinGraph graph(std::move(mgraph));
+        ASSERT_FALSE(graph.getShape() & JoinGraph::GraphShapeFlags::Connected);
+    }
+}
+
+namespace {
+// The topology predicates under test. These are not mutually exclusive.
+struct ExpectedShape {
+    bool isClique;
+    bool isStar;
+    bool isCycle;
+    bool isChain;
+};
+
+/**
+ * Builds a graph over 'numNodes' nodes joined by 'edges', given as (left, right) node pairs in the
+ * order they should be added. Each edge gets its own pair of path ids so that no two edges are
+ * merged.
+ */
+JoinGraph makeGraph(size_t numNodes, const std::vector<std::pair<NodeId, NodeId>>& edges) {
+    MutableJoinGraph mgraph{};
+    for (size_t i = 0; i < numNodes; ++i) {
+        mgraph.addNode(makeNSS("n" + std::to_string(i)), nullptr, boost::none);
+    }
+    size_t pathId = 0;
+    for (auto&& [left, right] : edges) {
+        mgraph.addSimpleEqualityEdge(left, right, pathId, pathId + 1);
+        pathId += 2;
+    }
+    return JoinGraph(std::move(mgraph));
+}
+
+void assertShape(const JoinGraph& graph, ExpectedShape expected) {
+    const auto shape = graph.getShape();
+    // Every case below is a connected graph, which the other flags imply.
+    ASSERT_TRUE(shape & JoinGraph::GraphShapeFlags::Connected);
+    ASSERT_EQ(bool(shape & JoinGraph::GraphShapeFlags::Clique), expected.isClique) << "isClique";
+    ASSERT_EQ(bool(shape & JoinGraph::GraphShapeFlags::Star), expected.isStar) << "isStar";
+    ASSERT_EQ(bool(shape & JoinGraph::GraphShapeFlags::Cycle), expected.isCycle) << "isCycle";
+    ASSERT_EQ(bool(shape & JoinGraph::GraphShapeFlags::Chain), expected.isChain) << "isChain";
+    // A chain or a star is always a tree, and a tree never contains a cycle.
+    if (expected.isChain || expected.isStar) {
+        ASSERT_TRUE(shape & JoinGraph::GraphShapeFlags::Tree);
+    }
+    ASSERT_EQ(bool(shape & JoinGraph::GraphShapeFlags::Tree),
+              !(shape & JoinGraph::GraphShapeFlags::Cycle))
+        << "isTree";
+}
+}  // namespace
+
+TEST(JoinGraphTests, ShapeSingleEdge) {
+    // a -- b. Trivially a clique, a star and a chain all at once.
+    assertShape(makeGraph(2, {{0, 1}}),
+                {.isClique = true, .isStar = true, .isCycle = false, .isChain = true});
+}
+
+TEST(JoinGraphTests, ShapeChain) {
+    // a -- b -- c. A three-node path is both a chain and a star centered on 'b'.
+    assertShape(makeGraph(3, {{0, 1}, {1, 2}}),
+                {.isClique = false, .isStar = true, .isCycle = false, .isChain = true});
+
+    // a -- b -- c -- d.
+    assertShape(makeGraph(4, {{0, 1}, {1, 2}, {2, 3}}),
+                {.isClique = false, .isStar = false, .isCycle = false, .isChain = true});
+
+    // The same four-node chain, but with the edges added in an order where the first two edges
+    // share no node: a -- b, c -- d, then b -- c.
+    assertShape(makeGraph(4, {{0, 1}, {2, 3}, {1, 2}}),
+                {.isClique = false, .isStar = false, .isCycle = false, .isChain = true});
+}
+
+TEST(JoinGraphTests, ShapeStar) {
+    // A hub 'a' joined to three leaves: a -- b, a -- c, a -- d.
+    assertShape(makeGraph(4, {{0, 1}, {0, 2}, {0, 3}}),
+                {.isClique = false, .isStar = true, .isCycle = false, .isChain = false});
+
+    // The same star, but with the hub on the right-hand side of every edge.
+    assertShape(makeGraph(4, {{1, 0}, {2, 0}, {3, 0}}),
+                {.isClique = false, .isStar = true, .isCycle = false, .isChain = false});
+
+    // A hub with four leaves, so that the hub has even degree.
+    assertShape(makeGraph(5, {{0, 1}, {0, 2}, {0, 3}, {0, 4}}),
+                {.isClique = false, .isStar = true, .isCycle = false, .isChain = false});
+}
+
+TEST(JoinGraphTests, ShapeTreeThatIsNeitherChainNorStar) {
+    // A tree with two branch points and three leaves, so no single node is the center and the
+    // nodes don't form a single path: a -- b, b -- c, b -- d, d -- e.
+    assertShape(makeGraph(5, {{0, 1}, {1, 2}, {1, 3}, {3, 4}}),
+                {.isClique = false, .isStar = false, .isCycle = false, .isChain = false});
+}
+
+TEST(JoinGraphTests, ShapeCycle) {
+    // A triangle is a cycle, and is also complete.
+    assertShape(makeGraph(3, {{0, 1}, {1, 2}, {2, 0}}),
+                {.isClique = true, .isStar = false, .isCycle = true, .isChain = false});
+
+    // A four-node ring is a cycle, but not complete.
+    assertShape(makeGraph(4, {{0, 1}, {1, 2}, {2, 3}, {3, 0}}),
+                {.isClique = false, .isStar = false, .isCycle = true, .isChain = false});
+
+    // A triangle with a tail contains a cycle even though not every node is on it.
+    assertShape(makeGraph(4, {{0, 1}, {1, 2}, {2, 0}, {2, 3}}),
+                {.isClique = false, .isStar = false, .isCycle = true, .isChain = false});
+}
+
+TEST(JoinGraphTests, ShapeClique) {
+    // Every pair of four nodes is joined. A clique this size also contains cycles.
+    assertShape(makeGraph(4, {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}}),
+                {.isClique = true, .isStar = false, .isCycle = true, .isChain = false});
+
+    // One edge short of a clique.
+    assertShape(makeGraph(4, {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}}),
+                {.isClique = false, .isStar = false, .isCycle = true, .isChain = false});
+}
+
+TEST(JoinGraphTests, ShapeDisconnected) {
+    // a -- b, c -- d. We don't track shapes of disconnected graphs.
+    ASSERT_EQ(makeGraph(4, {{0, 1}, {2, 3}}).getShape(), 0);
+}
+
+TEST(JoinGraphTests, ShapeSelfJoin) {
+    // A collection joined to itself gets one node per occurrence, so the shape only depends on how
+    // those nodes are connected, not on them sharing a namespace.
+    MutableJoinGraph mgraph{};
+    auto a1 = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto a2 = *mgraph.addNode(makeNSS("a"), nullptr, FieldPath("a2"));
+    auto a3 = *mgraph.addNode(makeNSS("a"), nullptr, FieldPath("a3"));
+    mgraph.addSimpleEqualityEdge(a1, a2, 0, 1);
+    mgraph.addSimpleEqualityEdge(a2, a3, 2, 3);
+
+    // a1 -- a2 -- a3, the same shape as the three-node chain over distinct collections.
+    assertShape(JoinGraph(std::move(mgraph)),
+                {.isClique = false, .isStar = true, .isCycle = false, .isChain = true});
+}
+
+TEST(JoinGraphTests, ShapeMultiplePredicatesPerEdge) {
+    // Several predicates between the same pair of nodes are merged into one edge, so they don't
+    // change the shape of the graph.
+    MutableJoinGraph mgraph{};
+    auto a = *mgraph.addNode(makeNSS("a"), nullptr, boost::none);
+    auto b = *mgraph.addNode(makeNSS("b"), nullptr, FieldPath("b"));
+    auto c = *mgraph.addNode(makeNSS("c"), nullptr, FieldPath("c"));
+
+    // Three predicates on a -- b: a second one in the reverse node order and one of a different
+    // operator type.
+    auto ab = *mgraph.addSimpleEqualityEdge(a, b, 0, 1);
+    ASSERT_EQ(mgraph.addSimpleEqualityEdge(b, a, 3, 2), ab);
+    ASSERT_EQ(mgraph.addExprEqualityEdge(a, b, 4, 5), ab);
+    // Two predicates on b -- c.
+    auto bc = *mgraph.addSimpleEqualityEdge(b, c, 1, 6);
+    ASSERT_EQ(mgraph.addSimpleEqualityEdge(b, c, 7, 8), bc);
+
+    ASSERT_EQ(mgraph.numEdges(), 2);
+    ASSERT_EQ(mgraph.getEdge(ab).predicates.size(), 3);
+    ASSERT_EQ(mgraph.getEdge(bc).predicates.size(), 2);
+
+    // a -- b -- c, a chain despite the five predicates.
+    assertShape(JoinGraph(std::move(mgraph)),
+                {.isClique = false, .isStar = true, .isCycle = false, .isChain = true});
+}
+
+ASSERT_DOES_NOT_COMPILE(NodeSetNotConstructibleFromNodeIdDirectInit,
+                        typename T = NodeSet,
+                        T(std::declval<NodeId>()));
+
+ASSERT_DOES_NOT_COMPILE(NodeSetNotConstructibleFromNodeIdUniformInit,
+                        typename T = NodeSet,
+                        T{std::declval<NodeId>()});
+}  // namespace mongo::join_ordering

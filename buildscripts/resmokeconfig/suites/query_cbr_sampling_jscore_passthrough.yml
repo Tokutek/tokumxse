@@ -1,0 +1,71 @@
+# This is equivalent to the core suite, but runs with CBR with sampling CE enabled.
+
+test_kind: js_test
+selector:
+  roots:
+    - jstests/core/**/*.js
+    - jstests/core_standalone/**/*.js
+  exclude_files:
+    # Transactions are not supported on MongoDB standalone nodes, so we do not run these tests in the
+    # 'core' suite. Instead we run them against a 1-node replica set in the 'core_txns' suite.
+    - jstests/core/txns/**/*.js
+    # Queryable encryption is not supported on standalone.
+    - jstests/core/query/queryable_encryption/**/*.js
+    # Query settings are not supported on standalone.
+    - jstests/core/query/query_settings/**/*.js
+
+    # TODO SERVER-116684: Enable this test, it asserts on the length of creationExecStats.
+    - jstests/core/query/plan_cache/plan_cache_list_plans.js
+
+    # CBR sampling picks different plans for different parameter values (different selectivities),
+    # but this test asserts the solutionHash is stable across parameter values for the same shape.
+    - jstests/core/query/plan_cache/query_solution_hash.js
+
+    # CBR picks a different plan which results in different results due to SERVER-23229
+    - jstests/core/query/project/projection_dotted_paths.js
+
+    # TODO SERVER-100610
+    # CBR picks plan without blocking sort, but test asserts on specific plan chosen
+    - jstests/core/query/sort/sort_array.js
+    - jstests/core/query/sort/sortg.js
+    # CBR picks index intersection plan and test asserts on specific plan
+    - jstests/core/index/index_check2.js
+
+    # Asserts on output of allPlansExecution. CBR picks a single plan so there is no multiplanning.
+    - jstests/core/query/explain/explain_winning_plan.js
+
+    # TODO SERVER-100417
+    - jstests/core/query/explain/explain_multi_plan_count.js
+
+    # TODO SERVER-92589: Fails in all feature flags variant because SBE explain not supported
+    - jstests/core/query/index_deduplication.js
+    - jstests/core/query/explain/explain_all_plans_execution_stats.js
+    - jstests/core/query/explain/explain_multi_plan.js
+
+    # TODO SERVER-99091 re-enable this test to get coverage of switching between plan ranker modes.
+    - jstests/core/query/query_knob_correctness_pbt.js
+
+    # Replica set write block is not supported on standalone.
+    - jstests/core/administrative/block_replica_set_writes.js
+
+  exclude_with_any_tags:
+    # Profiler entries will have different shape in CBR
+    - requires_profiling
+    # CBR can run multiplanning trials even for CBR chosen solutions in which case it will be a single solution.
+    # This can break tests that expect explain to succeed in the single solution case.
+    - does_not_support_multiplanning_single_solutions
+executor:
+  config:
+    shell_options:
+      crashOnInvalidBSONError: ""
+      eval: |
+        await import("jstests/libs/override_methods/detect_spawning_own_mongod.js");
+  fixture:
+    class: MongoDFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        featureFlagCostBasedRanker: true
+        internalQueryPlanRanker: "costBased"
+        internalQueryCBRCEMode: "samplingCE"
+        internalQuerySamplingBySequentialScan: true

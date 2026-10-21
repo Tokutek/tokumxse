@@ -1,0 +1,167 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_managed_session.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/shared_buffer.h"
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+
+#include <wiredtiger.h>
+
+#include <boost/optional.hpp>
+
+namespace mongo {
+
+/**
+ * This is an object wrapper for WT_CURSOR. It obtains a cursor from the WiredTigerSession and is
+ * responsible for returning or closing the cursor when destructed.
+ */
+class WiredTigerCursor {
+public:
+    struct Params {
+        // The table id this cursor will operate on.
+        uint64_t tableID{0};
+        // When 'true', data read from disk should not be kept in the storage engine cache.
+        bool readOnce{false};
+        bool allowOverwrite{false};
+        bool random{false};
+        // When 'true', open the cursor with the WiredTiger debug=(size_stats) option so it
+        // accumulates a per-b-tree size summary as it traverses. Such cursors bypass the cursor
+        // cache so the summary counters are reset exactly once per open, and the owning cursor logs
+        // the summary when the scan completes. Requires an ordered walk, so it is incompatible with
+        // 'random'.
+        bool sizeStats{false};
+    };
+
+    /**
+     * If 'allowOverwrite' is true, insert operations will not return an error if the record
+     * already exists, and update/remove operations will not return error if the record does not
+     * exist.
+     *
+     * If 'random' is true, every next calls will yield records in a random order.
+     */
+    WiredTigerCursor(Params params, const std::string& uri, WiredTigerSession& session);
+
+    // Prevent duplication of the logical owned-ness of the cursors via move or copy.
+    WiredTigerCursor(WiredTigerCursor&&) = delete;
+    WiredTigerCursor(const WiredTigerCursor&) = delete;
+    WiredTigerCursor& operator=(WiredTigerCursor&&) = delete;
+    WiredTigerCursor& operator=(const WiredTigerCursor&) = delete;
+
+    ~WiredTigerCursor();
+
+    WT_CURSOR* get() const {
+        return _cursor;
+    }
+
+    WT_CURSOR* operator->() const {
+        return get();
+    }
+
+    WiredTigerSession* getSession() {
+        return &_session;
+    }
+
+    // Called by the owning cursor when a forward walk has reached the end of the data, i.e. the
+    // size-stats scan is complete. In most cases this is a no-op.
+    void onScanComplete();
+
+protected:
+    uint64_t _tableID;
+    WiredTigerSession& _session;
+    std::string _config;
+    // When 'true', this cursor was opened outside the cursor cache and must be closed (not returned
+    // to the cache) on destruction so its size-summary counters are never reused across opens.
+    bool _sizeStats = false;
+    // Set once a size_stats cursor has logged its summary, so onScanComplete() is idempotent.
+    bool _sizeStatsLogged = false;
+    // On-disk table URI, set only for size_stats cursors so onScanComplete() can read back and log
+    // the accumulated summary. Left unset (none) otherwise.
+    boost::optional<std::string> _uri;
+
+    WT_CURSOR* _cursor = nullptr;  // Owned
+};
+
+/**
+ * An owning object wrapper for a WT_SESSION and WT_CURSOR configured for bulk loading when
+ * possible. The cursor is created and closed independently of the cursor cache, which does not
+ * store bulk cursors. It uses its own session to avoid hijacking an existing transaction in the
+ * current session.
+ */
+class WiredTigerBulkLoadCursor {
+public:
+    WiredTigerBulkLoadCursor(OperationContext* opCtx,
+                             WiredTigerSession& outerSession,
+                             const std::string& indexUri);
+
+    ~WiredTigerBulkLoadCursor() {
+        _cursor->close(_cursor);
+    }
+
+    WT_CURSOR* get() const {
+        return _cursor;
+    }
+
+    WT_CURSOR* operator->() const {
+        return get();
+    }
+
+private:
+    WiredTigerManagedSession const _session;
+    WT_CURSOR* _cursor = nullptr;  // Owned
+};
+
+/**
+ * An owning object wrapper for a WT_CURSOR configured to return prepared_id for all unresolved
+ * prepared transactions in the current checkpoint that have not yet been claimed. It is used to
+ * reconstruct prepared transactions after loading the initial checkpoint as a standby.
+ */
+class WiredTigerPrepareCursor {
+public:
+    // The caller must ensure that 'session' remains alive and valid for the entire lifetime
+    // of this cursor. In practice, this usually means keeping the owning WiredTigerManagedSession
+    // alive for at least as long as the cursor.
+    WiredTigerPrepareCursor(WiredTigerSession& session);
+    ~WiredTigerPrepareCursor();
+
+    WT_CURSOR* get() const {
+        return _cursor;
+    }
+
+    WT_CURSOR* operator->() const {
+        return get();
+    }
+
+private:
+    WT_CURSOR* _cursor = nullptr;  // Owned
+    WiredTigerSession& _session;
+};
+
+/**
+ * A WiredTiger implementation of KVEngineDirectCrudCursor, wrapping a single reusable
+ * WiredTigerCursor for direct key-value CRUD operations on an ident.
+ */
+class WiredTigerDirectCrudCursor : public KVEngineDirectCrudCursor {
+public:
+    WiredTigerDirectCrudCursor(WiredTigerCursor::Params params,
+                               const std::string& uri,
+                               WiredTigerSession& session)
+        : _cursor(params, uri, session) {}
+
+    Status insert(RecoveryUnit& ru, Key key, std::span<const char> value) override;
+    Status update(RecoveryUnit& ru, Key key, std::span<const char> value) override;
+    StatusWith<UniqueBuffer> get(Key key) override;
+    Status remove(RecoveryUnit& ru, Key key) override;
+
+private:
+    WiredTigerCursor _cursor;
+};
+}  // namespace mongo

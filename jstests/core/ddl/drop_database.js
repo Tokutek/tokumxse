@@ -1,0 +1,55 @@
+/**
+ * Test that a db does not exist after it is dropped.
+ */
+
+let testDB = db.getSiblingDB("jstests_dropdb");
+const dbName = testDB.getName();
+const collNames = ["coll1", "coll2", "coll3"];
+
+function listDatabases(options) {
+    return assert.commandWorked(
+        db.adminCommand(Object.assign({listDatabases: 1, nameOnly: true}, options)),
+    ).databases;
+}
+
+function assertNamespacesDoNotExist() {
+    assert.eq(0, testDB.getCollectionNames());
+
+    if (!TestData.runningWithBalancer) {
+        // When the balancer is running in the background, concurrent moveCollection operations can
+        // cause the database to be recreated unexpectedly. Therefore, skip this assertion.
+        assert.eq(0, listDatabases({filter: {name: dbName}}).length);
+    }
+}
+
+function assertNamespacesExist() {
+    assert.eq(
+        1,
+        listDatabases({filter: {name: dbName}}).length,
+        "database " + dbName + " not found in " + tojson(listDatabases()),
+    );
+    let dbCollections = testDB.getCollectionNames();
+    if (TestData.runningWithBalancer) {
+        // Concurrent moveCollection can create temporary system.resharding.* collections.
+        dbCollections = dbCollections.filter((name) => !name.startsWith("system.resharding."));
+    }
+    assert.sameMembers(dbCollections, collNames);
+}
+
+jsTest.log("dropDatabase cleans data and metadata about itself and its child collections");
+for (let i = 0; i < collNames.length; i++) {
+    for (let j = 0; j < collNames.length; j++) {
+        const collName = collNames[(i + j) % collNames.length];
+        assert.commandWorked(testDB[collName].insert({x: 1}));
+    }
+
+    assertNamespacesExist();
+    assert.commandWorked(testDB.dropDatabase());
+    assertNamespacesDoNotExist();
+}
+
+jsTest.log("dropDatabase is idempotent");
+{
+    assert.commandWorked(testDB.dropDatabase());
+    assertNamespacesDoNotExist();
+}

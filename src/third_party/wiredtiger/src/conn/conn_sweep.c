@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,263 +8,732 @@
 
 #include "wt_internal.h"
 
+#define WT_DHANDLE_CAN_DISCARD(dhandle)                                 \
+    (!F_ISSET(dhandle, WT_DHANDLE_EXCLUSIVE | WT_DHANDLE_OPEN) &&       \
+      __wt_atomic_load_int32_relaxed(&(dhandle)->session_inuse) == 0 && \
+      __wt_atomic_load_uint32_relaxed(&(dhandle)->references) == 0)
+
+/*
+ * Grace period before closing an outdated checkpoint handle so the next generation can reuse its
+ * shared disk image. The shared disk cache uses the same window to stop serving reads.
+ */
+#define WT_DISAGG_OUTDATED_GRACE_SECS 5
+
+/*
+ * __sweep_file_dhandle_check_and_reset_tod --
+ *     Check if the file dhandle exists for the table dhandle and resets its time-of-death if it
+ *     does.
+ */
+static int
+__sweep_file_dhandle_check_and_reset_tod(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle)
+{
+    WT_DECL_RET;
+    WT_TABLE *table;
+
+    ret = WT_NOTFOUND;
+
+    /*
+     * The sweep server's algorithm is altered to prevent unnecessary table dhandle closures. This
+     * is done by checking for associated file dhandles before marking table dhandles for sweeping.
+     * It resolves schema lock contention caused by repetitive table dhandle operations during
+     * MongoDB cursor activity on simple tables, and ensures table dhandles are retained for active
+     * file dhandles, which is required for file dhandle access.
+     */
+    table = (WT_TABLE *)dhandle;
+    if (table->is_simple && table->cg_complete) {
+        ret = __wt_conn_dhandle_find(session, table->cgroups[0]->source, NULL);
+
+        /*
+         * Reset the time of death if the file dhandle exists for the associated table dhandle.
+         */
+        if (ret == 0) {
+            __wt_atomic_store_uint64_relaxed(&dhandle->timeofdeath, 0);
+            WT_DHANDLE_CLEAR(session);
+            return (WT_ERROR_LOG_ADD(ret));
+        }
+    }
+
+    return (WT_ERROR_LOG_ADD(ret));
+}
+
+/*
+ * __sweep_mark --
+ *     Mark idle handles with a time of death, and note if we see dead handles.
+ */
+static void
+__sweep_mark(WT_SESSION_IMPL *session, uint64_t now)
+{
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dhandle;
+    WT_DECL_RET;
+
+    conn = S2C(session);
+
+    /*
+     * This walk, like the other sweep-server walks below, doesn't take the handle list lock. During
+     * normal operation, the sweep server is the only thing that ever removes a handle from this
+     * list, so nothing else invalidates the pointers this walk follows. A new handle is fully
+     * initialized, behind a release barrier, before it is linked in, so this walk never finds one
+     * half-built either.
+     *
+     * That only holds walking forward. Removing whatever handle currently sits at the tail is
+     * routine, not rare -- it happens on every ordinary reap of the oldest resident handle -- and
+     * it updates only the tail-side pointers. Walking this list backwards without the lock would
+     * routinely follow one of those into a handle that has already been freed.
+     */
+    TAILQ_FOREACH (dhandle, &conn->dhqh, q) {
+        if (WT_IS_METADATA(dhandle))
+            continue;
+
+        /*
+         * There are some internal increments of the in-use count such as eviction. Don't keep
+         * handles alive because of those cases, but if we see multiple cursors open, clear the time
+         * of death.
+         */
+        if (__wt_atomic_load_int32_relaxed(&dhandle->session_inuse) > 1)
+            __wt_atomic_store_uint64_relaxed(&dhandle->timeofdeath, 0);
+
+        /*
+         * If the handle is open exclusive or currently in use, or the time of death is already set,
+         * move on.
+         */
+        if (F_ISSET(dhandle, WT_DHANDLE_EXCLUSIVE) ||
+          __wt_atomic_load_int32_relaxed(&dhandle->session_inuse) > 0 ||
+          __wt_atomic_load_uint64_relaxed(&dhandle->timeofdeath) != 0)
+            continue;
+
+        /* For table dhandles, skip expiration if associated file dhandles exist. */
+        if (dhandle->type == WT_DHANDLE_TYPE_TABLE) {
+            WT_WITH_TABLE_READ_LOCK(session,
+              WT_WITH_HANDLE_LIST_READ_LOCK(
+                session, (ret = __sweep_file_dhandle_check_and_reset_tod(session, dhandle))));
+
+            /* Continue if the file dhandle exists for the associated table dhandle. */
+            if (ret == 0)
+                continue;
+
+            WT_ASSERT_ALWAYS(
+              session, ret == WT_NOTFOUND, "Connection dhandle find has returned an error.");
+        }
+
+        /*
+         * Never close the layered dhandle. If sweep server removes the layered dhandle, it will not
+         * be processed when we drain the ingest table during step-up.
+         *
+         * FIXME-WT-16982: Optimization to close layered dhandles with empty ingest tables and on
+         * leader mode.
+         */
+        if (dhandle->type == WT_DHANDLE_TYPE_LAYERED)
+            continue;
+        /*
+         * Never close out the history store handle via sweep. It can cause a deadlock if eviction
+         * needs to re-open a handle to the history store while a checkpoint is getting started.
+         */
+        if (WT_IS_HS(dhandle))
+            continue;
+
+        __wt_verbose_level(session, WT_VERB_SWEEP, WT_VERBOSE_DEBUG_3,
+          "Sweep server setting the time of death for dhandle %s", dhandle->name);
+
+        __wt_atomic_store_uint64_relaxed(&dhandle->timeofdeath, now);
+        WT_STAT_CONN_INCR(session, dh_sweep_tod);
+    }
+}
+
+/*
+ * __sweep_close_dhandle_locked --
+ *     Close write-locked dhandle.
+ */
+static int
+__sweep_close_dhandle_locked(WT_SESSION_IMPL *session)
+{
+    WT_BTREE *btree;
+    WT_DATA_HANDLE *dhandle;
+
+    dhandle = session->dhandle;
+    btree = WT_DHANDLE_BTREE(dhandle) ? dhandle->handle : NULL;
+
+    /* This method expects dhandle write lock. */
+    WT_ASSERT(session, FLD_ISSET(dhandle->lock_flags, WT_DHANDLE_LOCK_WRITE));
+
+    /*
+     * A tree awaiting publication holds the only copy of its contents, and that state cannot be
+     * recovered once the handle is closed.
+     */
+    if (btree != NULL && F_ISSET_ATOMIC_32(btree, WT_BTREE_AWAITS_PUBLISH))
+        return (0);
+
+    /*
+     * Sweep only closes clean trees, with one exception: an ingest btree whose entire contents are
+     * known to be durable in the stable table.
+     */
+    if (btree != NULL && btree->modified) {
+        /*
+         * We check that there are no cursors open that can be adding new content, and we hold the
+         * dhandle write lock, which blocks new opens. Open transaction modifications also bump the
+         * in use counter, so we won't close trees in that state.
+         */
+        if (!F_ISSET(btree, WT_BTREE_GARBAGE_COLLECT) ||
+          __wt_atomic_load_int32_acquire(&dhandle->session_inuse) != 0)
+            return (0);
+
+        /* Be certain that we're dealing with an ingest table. */
+        WT_ASSERT(session, WT_URI_IS_INGEST(dhandle->name));
+
+        /*
+         * The maximum write timestamp is a potentially conservative maximum of durable timestamps
+         * made in this tree. Conservative or not, it guarantees that there are no writes newer than
+         * that timestamp. Only if the checkpoint covers that timestamp, can we proceed with the
+         * close.
+         */
+        wt_timestamp_t max_write_ts = __wt_atomic_load_uint64_relaxed(&btree->max_ingest_write_ts);
+        if (max_write_ts == WT_TS_NONE ||
+          max_write_ts >
+            __wt_atomic_load_uint64_acquire(&S2C(session)->txn_global.last_ckpt_timestamp))
+            return (0);
+    }
+
+    /*
+     * Mark the handle dead and close the underlying handle.
+     *
+     * For btree handles, closing the handle decrements the open file count, meaning the close loop
+     * won't overrun the configured minimum.
+     */
+    return (__wt_conn_dhandle_close(session, false, true, false));
+}
+
+/*
+ * __sweep_expire_one --
+ *     Mark a single handle dead.
+ */
+static int
+__sweep_expire_one(WT_SESSION_IMPL *session)
+{
+    WT_DECL_RET;
+    /*
+     * Acquire an exclusive lock on the handle and mark it dead.
+     *
+     * The close would require I/O if an update cannot be written (updates in a no-longer-referenced
+     * file might not yet be globally visible if sessions have disjoint sets of files open). In that
+     * case, skip it: we'll retry the close the next time, after the transaction state has
+     * progressed.
+     *
+     * We don't set WT_DHANDLE_EXCLUSIVE deliberately, we want opens to block on us and then retry
+     * rather than returning an EBUSY error to the application. This is done holding the handle list
+     * lock so that connection-level handle searches never need to retry.
+     */
+    WT_WITH_DHANDLE_WRITE_LOCK_NOWAIT(session, ret, ret = __sweep_close_dhandle_locked(session));
+
+    return (ret);
+}
+
+/*
+ * __sweep_expire --
+ *     Mark trees dead if they are clean and haven't been accessed recently, until we have reached
+ *     the configured minimum number of handles.
+ */
+static int
+__sweep_expire(WT_SESSION_IMPL *session, uint64_t now)
+{
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dhandle;
+    WT_DECL_RET;
+
+    conn = S2C(session);
+
+    /*
+     * This walk doesn't take the handle list lock. During normal operation, the sweep server is the
+     * only thing that ever removes a handle from this list, so nothing else invalidates the
+     * pointers this walk follows. A new handle is fully initialized, behind a release barrier,
+     * before it is linked in, so this walk never finds one half-built either.
+     *
+     * That only holds walking forward. Removing whatever handle currently sits at the tail is
+     * routine, not rare -- it happens on every ordinary reap of the oldest resident handle -- and
+     * it updates only the tail-side pointers. Walking this list backwards without the lock would
+     * routinely follow one of those into a handle that has already been freed.
+     */
+    TAILQ_FOREACH (dhandle, &conn->dhqh, q) {
+        bool sweep_non_outdated_handle =
+          __wt_atomic_load_uint32_relaxed(&conn->open_btree_count) >= conn->sweep.handles_min;
+        /*
+         * Ignore open files once the btree file count is below the minimum number of handles.
+         */
+        if (!__wt_conn_is_disagg(session) && !sweep_non_outdated_handle)
+            break;
+
+        if (!__wt_atomic_load_bool_relaxed(&dhandle->outdated) && !sweep_non_outdated_handle)
+            continue;
+        /*
+         * For outdated btrees, hold standby node checkpoint handles for a short grace period,
+         * otherwise close them immediately. For trees not marked with outdated, wait until the idle
+         * time has elapsed since time of death.
+         */
+        uint64_t tod = __wt_atomic_load_uint64_relaxed(&dhandle->timeofdeath);
+        if (__wt_atomic_load_bool_relaxed(&dhandle->outdated)) {
+            if (__wt_atomic_load_int32_relaxed(&dhandle->session_inuse) > 0)
+                continue;
+            if (__wt_conn_is_disagg(session) && WT_URI_IS_STABLE_CHECKPOINT(dhandle->name)) {
+                if (tod == 0) {
+                    __wt_atomic_store_uint64_relaxed(&dhandle->timeofdeath, now);
+                    continue;
+                }
+                if (now - tod <= WT_DISAGG_OUTDATED_GRACE_SECS)
+                    continue;
+            }
+        } else if (WT_IS_METADATA(dhandle) || !F_ISSET(dhandle, WT_DHANDLE_OPEN) ||
+          __wt_atomic_load_int32_relaxed(&dhandle->session_inuse) != 0 || tod == 0 ||
+          now - tod <= conn->sweep.idle_time)
+            continue;
+
+        /*
+         * For tables, we need to hold the table lock to avoid racing with cursor opens.
+         */
+        if (__wt_atomic_load_enum_relaxed(&dhandle->type) == WT_DHANDLE_TYPE_TABLE)
+            WT_WITH_TABLE_WRITE_LOCK(
+              session, WT_WITH_DHANDLE(session, dhandle, ret = __sweep_expire_one(session)));
+        else
+            WT_WITH_DHANDLE(session, dhandle, ret = __sweep_expire_one(session));
+
+        if (ret == 0)
+            WT_STAT_CONN_INCR(session, dh_sweep_expired_close);
+        else
+            WT_STAT_CONN_INCR(session, dh_sweep_ref);
+
+        WT_RET_BUSY_OK(ret);
+    }
+
+    return (0);
+}
+
+/*
+ * __sweep_discard_trees --
+ *     Discard pages from dead trees.
+ */
+static int
+__sweep_discard_trees(WT_SESSION_IMPL *session, u_int *dead_handlesp)
+{
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dhandle;
+    WT_DECL_RET;
+
+    *dead_handlesp = 0;
+
+    conn = S2C(session);
+
+    /*
+     * This walk doesn't take the handle list lock. During normal operation, the sweep server is the
+     * only thing that ever removes a handle from this list, so nothing else invalidates the
+     * pointers this walk follows. A new handle is fully initialized, behind a release barrier,
+     * before it is linked in, so this walk never finds one half-built either.
+     *
+     * That only holds walking forward. Removing whatever handle currently sits at the tail is
+     * routine, not rare -- it happens on every ordinary reap of the oldest resident handle -- and
+     * it updates only the tail-side pointers. Walking this list backwards without the lock would
+     * routinely follow one of those into a handle that has already been freed.
+     */
+    TAILQ_FOREACH (dhandle, &conn->dhqh, q) {
+        if (WT_DHANDLE_CAN_DISCARD(dhandle))
+            ++*dead_handlesp;
+
+        if (!F_ISSET(dhandle, WT_DHANDLE_OPEN) || !F_ISSET(dhandle, WT_DHANDLE_DEAD))
+            continue;
+        /* If the handle is marked dead, flush it from cache. */
+        WT_WITH_DHANDLE(
+          session, dhandle, ret = __wt_conn_dhandle_close(session, false, false, false));
+
+        /* We closed the btree handle. */
+        if (ret == 0) {
+            WT_STAT_CONN_INCR(session, dh_sweep_dead_close);
+            ++*dead_handlesp;
+        } else
+            WT_STAT_CONN_INCR(session, dh_sweep_ref);
+
+        WT_RET_BUSY_OK(ret);
+    }
+
+    return (0);
+}
+
+/*
+ * __sweep_remove_one --
+ *     Remove a closed handle from the connection list.
+ */
+static int
+__sweep_remove_one(WT_SESSION_IMPL *session)
+{
+    WT_DECL_RET;
+
+    /* Try to get exclusive access. */
+    WT_RET(__wt_session_dhandle_try_writelock(session));
+
+    /*
+     * If there are no longer any references to the handle in any sessions, attempt to discard it.
+     */
+    if (!WT_DHANDLE_CAN_DISCARD(session->dhandle))
+        WT_ERR(EBUSY);
+
+    ret = __wti_conn_dhandle_discard_single(session, false, true);
+
+    /*
+     * If the handle was not successfully discarded, unlock it and don't retry the discard until it
+     * times out again.
+     */
+    if (ret != 0) {
+err:
+        __wt_session_dhandle_writeunlock(session);
+    }
+
+    return (ret);
+}
+
 /*
  * __sweep_remove_handles --
- *	Remove closed dhandles from the connection list.
+ *     Remove closed handles from the connection list.
  */
 static int
 __sweep_remove_handles(WT_SESSION_IMPL *session)
 {
-	WT_CONNECTION_IMPL *conn;
-	WT_DATA_HANDLE *dhandle, *dhandle_next;
-	WT_DECL_RET;
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dhandle, *dhandle_tmp;
+    WT_DECL_RET;
 
-	conn = S2C(session);
-	dhandle = SLIST_FIRST(&conn->dhlh);
+    conn = S2C(session);
 
-	for (; dhandle != NULL; dhandle = dhandle_next) {
-		dhandle_next = SLIST_NEXT(dhandle, l);
-		if (WT_IS_METADATA(dhandle))
-			continue;
-		if (F_ISSET(dhandle, WT_DHANDLE_OPEN))
-			continue;
+    /*
+     * This walk doesn't take the handle list lock. During normal operation, the sweep server is the
+     * only thing that ever removes a handle from this list, so nothing else invalidates the
+     * pointers this walk follows. A new handle is fully initialized, behind a release barrier,
+     * before it is linked in, so this walk never finds one half-built either.
+     *
+     * The safe variant lets this loop remove the handle it is currently visiting, which is the one
+     * thing it does that the other sweep walks don't.
+     *
+     * That only holds walking forward. Removing whatever handle currently sits at the tail is
+     * routine, not rare -- it happens on every ordinary reap of the oldest resident handle -- and
+     * it updates only the tail-side pointers. Walking this list backwards without the lock would
+     * routinely follow one of those into a handle that has already been freed.
+     */
+    TAILQ_FOREACH_SAFE(dhandle, &conn->dhqh, q, dhandle_tmp)
+    {
+        if (WT_IS_METADATA(dhandle))
+            continue;
+        if (!WT_DHANDLE_CAN_DISCARD(dhandle))
+            continue;
 
-		/* Make sure we get exclusive access. */
-		if ((ret =
-		    __wt_try_writelock(session, dhandle->rwlock)) == EBUSY)
-			continue;
-		WT_RET(ret);
+        if (__wt_atomic_load_enum_relaxed(&dhandle->type) == WT_DHANDLE_TYPE_TABLE)
+            WT_WITH_TABLE_WRITE_LOCK(session,
+              WT_WITH_HANDLE_LIST_WRITE_LOCK(
+                session, WT_WITH_DHANDLE(session, dhandle, ret = __sweep_remove_one(session))));
+        else
+            WT_WITH_HANDLE_LIST_WRITE_LOCK(
+              session, WT_WITH_DHANDLE(session, dhandle, ret = __sweep_remove_one(session)));
+        if (ret == 0)
+            WT_STAT_CONN_INCR(session, dh_sweep_remove);
+        else
+            WT_STAT_CONN_INCR(session, dh_sweep_ref);
+        WT_RET_BUSY_OK(ret);
+    }
 
-		/*
-		 * If there are no longer any references to the handle in any
-		 * sessions, attempt to discard it.
-		 */
-		if (F_ISSET(dhandle, WT_DHANDLE_OPEN) ||
-		    dhandle->session_inuse != 0 || dhandle->session_ref != 0) {
-			WT_RET(__wt_writeunlock(session, dhandle->rwlock));
-			continue;
-		}
-
-		WT_WITH_DHANDLE(session, dhandle,
-		    ret = __wt_conn_dhandle_discard_single(session, 0));
-
-		/* If the handle was not successfully discarded, unlock it. */
-		if (ret != 0)
-			WT_TRET(__wt_writeunlock(session, dhandle->rwlock));
-		WT_RET_BUSY_OK(ret);
-		WT_STAT_FAST_CONN_INCR(session, dh_conn_ref);
-	}
-
-	return (ret == EBUSY ? 0 : ret);
+    return (ret == EBUSY ? 0 : ret);
 }
 
 /*
- * __sweep --
- *	Close unused dhandles on the connection dhandle list.
+ * __sweep_server_run_chk --
+ *     Check to decide if the sweep server should continue running.
+ */
+static bool
+__sweep_server_run_chk(WT_SESSION_IMPL *session)
+{
+    return (FLD_ISSET(S2C(session)->server_flags, WT_CONN_SERVER_SWEEP));
+}
+
+/*
+ * __sweep_check_session_callback --
+ *     Check if a given session hasn't swept. Callback from the session array walk.
  */
 static int
-__sweep(WT_SESSION_IMPL *session)
+__sweep_check_session_callback(
+  WT_SESSION_IMPL *session, WT_SESSION_IMPL *array_session, bool *exit_walkp, void *cookiep)
 {
-	WT_BTREE *btree;
-	WT_CONNECTION_IMPL *conn;
-	WT_DATA_HANDLE *dhandle;
-	WT_DECL_RET;
-	time_t now;
-	int closed_handles;
+    WT_SWEEP_COOKIE *cookie;
+    uint64_t last, last_sweep;
 
-	conn = S2C(session);
-	closed_handles = 0;
+    cookie = (WT_SWEEP_COOKIE *)cookiep;
+    WT_UNUSED(exit_walkp);
 
-	/* Don't discard handles that have been open recently. */
-	WT_RET(__wt_seconds(session, &now));
+    last = array_session->last_cursor_big_sweep;
+    last_sweep = __wt_atomic_load_uint64_relaxed(&array_session->last_sweep);
+    const char *session_name = __wt_atomic_load_ptr_relaxed(&array_session->name);
 
-	WT_STAT_FAST_CONN_INCR(session, dh_conn_sweeps);
-	SLIST_FOREACH(dhandle, &conn->dhlh, l) {
-		if (WT_IS_METADATA(dhandle))
-			continue;
-		if (!F_ISSET(dhandle, WT_DHANDLE_OPEN) &&
-		    dhandle->session_inuse == 0 && dhandle->session_ref == 0) {
-			++closed_handles;
-			continue;
-		}
-		if (dhandle->session_inuse != 0 ||
-		    now <= dhandle->timeofdeath + conn->sweep_idle_time)
-			continue;
-		if (dhandle->timeofdeath == 0) {
-			dhandle->timeofdeath = now;
-			WT_STAT_FAST_CONN_INCR(session, dh_conn_tod);
-			continue;
-		}
+    /*
+     * Get the earlier of the two timestamps, as they refer to sweeps of two different data
+     * structures that reference data handles
+     */
+    if (last_sweep != 0 && (last == 0 || last_sweep < last))
+        last = last_sweep;
+    if (last == 0)
+        return (0);
 
-		/*
-		 * We have a candidate for closing; if it's open, acquire an
-		 * exclusive lock on the handle and close it.
-		 *
-		 * The close would require I/O if an update cannot be written
-		 * (updates in a no-longer-referenced file might not yet be
-		 * globally visible if sessions have disjoint sets of files
-		 * open).  In that case, skip it: we'll retry the close the
-		 * next time, after the transaction state has progressed.
-		 *
-		 * We don't set WT_DHANDLE_EXCLUSIVE deliberately, we want
-		 * opens to block on us rather than returning an EBUSY error to
-		 * the application.
-		 */
-		if ((ret =
-		    __wt_try_writelock(session, dhandle->rwlock)) == EBUSY)
-			continue;
-		WT_RET(ret);
+    /*
+     * Check if the session did not run a sweep in 5 minutes. Handle the issue only once per
+     * violation.
+     */
+    if (last + 5 * 60 < cookie->now) {
+        if (!array_session->sweep_warning_5min) {
+            array_session->sweep_warning_5min = 1;
+            WT_STAT_CONN_INCR(session, no_session_sweep_5min);
+        }
+    } else {
+        array_session->sweep_warning_5min = 0;
+    }
 
-		/* Only sweep clean trees where all updates are visible. */
-		btree = dhandle->handle;
-		if (btree->modified ||
-		    !__wt_txn_visible_all(session, btree->rec_max_txn))
-			goto unlock;
+    /*
+     * The same for 60 minutes.
+     */
+    if (last + 60 * 60 < cookie->now) {
+        if (!array_session->sweep_warning_60min) {
+            array_session->sweep_warning_60min = 1;
+            WT_STAT_CONN_INCR(session, no_session_sweep_60min);
+            /*
+             * The name in this comment is marked as "possible" because it is obtained using a
+             * relaxed read. This means the name may be outdated with a very small probability;
+             * therefore, it should not be treated as an authoritative source. Please use session id
+             * output instead, as it is more reliable.
+             */
+            __wt_verbose_warning(session, WT_VERB_SWEEP,
+              "Session %" PRIu32 " (@: 0x%p possible name: %s) did not run a sweep for 60 minutes.",
+              array_session->id, (void *)array_session,
+              session_name == NULL ? "EMPTY" : session_name);
+        }
+    } else {
+        array_session->sweep_warning_60min = 0;
+    }
 
-		/* If the handle is open, try to close it. */
-		if (F_ISSET(dhandle, WT_DHANDLE_OPEN)) {
-			WT_WITH_DHANDLE(session, dhandle, ret =
-			    __wt_conn_btree_sync_and_close(session, 0, 0));
+    return (0);
+}
 
-			/* We closed the btree handle, bump the statistic. */
-			if (ret == 0)
-				WT_STAT_FAST_CONN_INCR(
-				    session, dh_conn_handles);
-		}
+/*
+ * __sweep_check_session_sweep --
+ *     Check for any "rogue" sessions, which did not run a session sweep in a long time.
+ */
+static void
+__sweep_check_session_sweep(WT_SESSION_IMPL *session, uint64_t now)
+{
+    WT_SWEEP_COOKIE cookie;
 
-		if (dhandle->session_inuse == 0 && dhandle->session_ref == 0)
-			++closed_handles;
+    WT_CLEAR(cookie);
+    cookie.now = now;
 
-unlock:		WT_TRET(__wt_writeunlock(session, dhandle->rwlock));
-		WT_RET_BUSY_OK(ret);
-	}
-
-	if (closed_handles) {
-		WT_WITH_DHANDLE_LOCK(session,
-		    ret = __sweep_remove_handles(session));
-		WT_RET(ret);
-	}
-
-	return (0);
+    WT_IGNORE_RET(__wt_session_array_walk(session, __sweep_check_session_callback, true, &cookie));
 }
 
 /*
  * __sweep_server --
- *	The handle sweep server thread.
+ *     The handle sweep server thread.
  */
 static WT_THREAD_RET
 __sweep_server(void *arg)
 {
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_SESSION_IMPL *session;
+    WT_CONNECTION_IMPL *conn;
+    WT_DECL_RET;
+    WT_SESSION_IMPL *session;
+    uint64_t last, now;
+    uint64_t sweep_interval;
+    u_int dead_handles;
+    bool cv_signalled;
 
-	session = arg;
-	conn = S2C(session);
+    session = arg;
+    conn = S2C(session);
 
-	/*
-	 * Sweep for dead handles.
-	 */
-	while (F_ISSET(conn, WT_CONN_SERVER_RUN) &&
-	    F_ISSET(conn, WT_CONN_SERVER_SWEEP)) {
-		/* Wait until the next event. */
-		WT_ERR(__wt_cond_wait(session, conn->sweep_cond,
-		    (uint64_t)conn->sweep_interval * WT_MILLION));
+    /*
+     * Sweep for dead and excess handles.
+     */
+    __wt_seconds(session, &last);
+    for (;;) {
+        /* Wait until the next event. */
+        if (FLD_ISSET(conn->timing_stress_flags, WT_TIMING_STRESS_AGGRESSIVE_SWEEP))
+            sweep_interval = conn->sweep.interval / 10;
+        else
+            sweep_interval = conn->sweep.interval;
+        __wt_cond_wait_signal(session, conn->sweep.cond, sweep_interval * WT_MILLION,
+          __sweep_server_run_chk, &cv_signalled);
 
-		/* Sweep the handles. */
-		WT_ERR(__sweep(session));
-	}
+        /* Check if we're quitting or being reconfigured. */
+        if (!__sweep_server_run_chk(session))
+            break;
 
-	if (0) {
-err:		WT_PANIC_MSG(session, ret, "handle sweep server error");
-	}
-	return (WT_THREAD_RET_VALUE);
+        __wt_seconds(session, &now);
+
+        /*
+         * See if it is time to sweep the data handles. Those are swept less frequently than the
+         * history store table by default and the frequency is controlled by a user setting. We want
+         * to avoid sweeping while checkpoint is gathering handles. Both need to lock the dhandle
+         * list and sweep acquiring that lock can interfere with checkpoint and cause it to take
+         * longer. Sweep is an operation that typically has long intervals so skipping some for
+         * checkpoint should have little impact.
+         */
+        if (!cv_signalled && (now - last < sweep_interval))
+            continue;
+        if (F_ISSET_ATOMIC_32(conn, WT_CONN_CKPT_GATHER)) {
+            WT_STAT_CONN_INCR(session, dh_sweep_skip_ckpt);
+            continue;
+        }
+        WT_STAT_CONN_INCR(session, dh_sweeps);
+
+        /*
+         * Report the cache-consumer rankings if their verbose category is enabled. A diagnostic
+         * report that cannot allocate is not a reason to lose the connection.
+         */
+        WT_IGNORE_RET(__wt_cache_top_maintain(session));
+
+        /*
+         * Mark handles with a time of death, and report whether any handles are marked dead. If
+         * sweep_idle_time is 0, handles never become idle.
+         */
+        if (conn->sweep.idle_time != 0)
+            __sweep_mark(session, now);
+
+        /*
+         * Close handles if we have reached the configured limit or in disaggregated storage. If
+         * sweep_idle_time is 0, handles never become idle.
+         */
+        if (conn->sweep.idle_time != 0 &&
+          (__wt_atomic_load_uint32_relaxed(&conn->open_btree_count) >= conn->sweep.handles_min ||
+            __wt_conn_is_disagg(session)))
+            WT_ERR(__sweep_expire(session, now));
+
+        WT_ERR(__sweep_discard_trees(session, &dead_handles));
+
+        if (dead_handles > 0)
+            WT_ERR(__sweep_remove_handles(session));
+
+        /*
+         * Check for any "rogue" sessions, which did not run a session sweep in a long time.
+         */
+        __wt_verbose_level(session, WT_VERB_SWEEP, WT_VERBOSE_DEBUG_3,
+          "Sweep server performing a session check after removing %u dead handles", dead_handles);
+
+        __sweep_check_session_sweep(session, now);
+
+        /* On a stepped-up leader, mark the shared disk cache dead once its reuse window elapses. */
+        if (__wt_conn_is_disagg(session) &&
+          __wt_atomic_load_bool_relaxed(&conn->layered_table_manager.leader) &&
+          __wt_atomic_load_uint8_acquire(&conn->cache->shared_dsk_cache.state) ==
+            WT_DSK_CACHE_READONLY) {
+            uint64_t readonly_since =
+              __wt_atomic_load_uint64_relaxed(&conn->cache->shared_dsk_cache.readonly_since);
+            if (now > readonly_since && now - readonly_since > WT_DISAGG_OUTDATED_GRACE_SECS) {
+                /*
+                 * A failed swap means a concurrent step-down reactivated the cache, leave it alone.
+                 */
+                if (!__wt_atomic_cas_uint8(&conn->cache->shared_dsk_cache.state,
+                      WT_DSK_CACHE_READONLY, WT_DSK_CACHE_DEAD))
+                    WT_ASSERT(session,
+                      WT_DSK_CACHE_READABLE(
+                        __wt_atomic_load_uint8_relaxed(&conn->cache->shared_dsk_cache.state)));
+            }
+        }
+
+        /* Remember the last sweep time. */
+        last = now;
+    }
+
+    if (0) {
+err:
+        WT_IGNORE_RET(__wt_panic(session, ret, "handle sweep server error"));
+    }
+    return (WT_THREAD_RET_VALUE);
 }
 
 /*
- * __wt_sweep_config --
- *	Pull out sweep configuration settings
+ * __wti_sweep_config --
+ *     Pull out sweep configuration settings
  */
 int
-__wt_sweep_config(WT_SESSION_IMPL *session, const char *cfg[])
+__wti_sweep_config(WT_SESSION_IMPL *session, const char *cfg[])
 {
-	WT_CONFIG_ITEM cval;
-	WT_CONNECTION_IMPL *conn;
+    WT_CONFIG_ITEM cval;
+    WT_CONNECTION_IMPL *conn;
 
-	conn = S2C(session);
+    conn = S2C(session);
 
-	/* Pull out the sweep configurations. */
-	WT_RET(__wt_config_gets(session,
-	    cfg, "file_manager.close_idle_time", &cval));
-	conn->sweep_idle_time = (time_t)cval.val;
+    /*
+     * A non-zero idle time is incompatible with in-memory, and the default is non-zero; set the
+     * in-memory configuration idle time to zero.
+     */
+    conn->sweep.idle_time = 0;
+    WT_RET(__wt_config_gets(session, cfg, "in_memory", &cval));
+    if (cval.val == 0) {
+        WT_RET(__wt_config_gets(session, cfg, "file_manager.close_idle_time", &cval));
+        conn->sweep.idle_time = (uint64_t)cval.val;
+    }
 
-	WT_RET(__wt_config_gets(session,
-	    cfg, "file_manager.close_scan_interval", &cval));
-	conn->sweep_interval = (time_t)cval.val;
+    WT_RET(__wt_config_gets(session, cfg, "file_manager.close_scan_interval", &cval));
+    conn->sweep.interval = (uint64_t)cval.val;
 
-	return (0);
+    WT_RET(__wt_config_gets(session, cfg, "file_manager.close_handle_minimum", &cval));
+    conn->sweep.handles_min = (uint64_t)cval.val;
+
+    return (0);
 }
 
 /*
- * __wt_sweep_create --
- *	Start the handle sweep thread.
+ * __wti_sweep_create --
+ *     Start the handle sweep thread.
  */
 int
-__wt_sweep_create(WT_SESSION_IMPL *session)
+__wti_sweep_create(WT_SESSION_IMPL *session)
 {
-	WT_CONNECTION_IMPL *conn;
+    WT_CONNECTION_IMPL *conn;
+    uint32_t session_flags;
 
-	conn = S2C(session);
+    conn = S2C(session);
 
-	/* Set first, the thread might run before we finish up. */
-	F_SET(conn, WT_CONN_SERVER_SWEEP);
+    /* Set first, the thread might run before we finish up. */
+    FLD_SET(conn->server_flags, WT_CONN_SERVER_SWEEP);
 
-	WT_RET(__wt_open_internal_session(
-	    conn, "sweep-server", 1, 1, &conn->sweep_session));
-	session = conn->sweep_session;
+    /*
+     * Handle sweep does enough I/O it may be called upon to perform slow operations for the block
+     * manager. Sweep should not block due to the cache being full.
+     */
+    session_flags = WT_SESSION_CAN_WAIT | WT_SESSION_IGNORE_CACHE_SIZE;
+    WT_RET(__wt_open_internal_session(
+      conn, "sweep-server", true, session_flags, 0, &conn->sweep.session));
+    session = conn->sweep.session;
 
-	/*
-	 * Handle sweep does enough I/O it may be called upon to perform slow
-	 * operations for the block manager.
-	 */
-	F_SET(session, WT_SESSION_CAN_WAIT);
+    WT_RET(__wt_cond_alloc(session, "handle sweep server", &conn->sweep.cond));
 
-	WT_RET(__wt_cond_alloc(
-	    session, "handle sweep server", 0, &conn->sweep_cond));
+    WT_RET(__wt_thread_create(session, &conn->sweep.tid, __sweep_server, session));
+    conn->sweep.tid_set = 1;
 
-	WT_RET(__wt_thread_create(
-	    session, &conn->sweep_tid, __sweep_server, session));
-	conn->sweep_tid_set = 1;
-
-	return (0);
+    return (0);
 }
 
 /*
- * __wt_sweep_destroy --
- *	Destroy the handle-sweep thread.
+ * __wti_sweep_destroy --
+ *     Destroy the handle-sweep thread.
  */
 int
-__wt_sweep_destroy(WT_SESSION_IMPL *session)
+__wti_sweep_destroy(WT_SESSION_IMPL *session)
 {
-	WT_CONNECTION_IMPL *conn;
-	WT_DECL_RET;
-	WT_SESSION *wt_session;
+    WT_CONNECTION_IMPL *conn;
+    WT_DECL_RET;
 
-	conn = S2C(session);
+    conn = S2C(session);
 
-	F_CLR(conn, WT_CONN_SERVER_SWEEP);
-	if (conn->sweep_tid_set) {
-		WT_TRET(__wt_cond_signal(session, conn->sweep_cond));
-		WT_TRET(__wt_thread_join(session, conn->sweep_tid));
-		conn->sweep_tid_set = 0;
-	}
-	WT_TRET(__wt_cond_destroy(session, &conn->sweep_cond));
+    FLD_CLR(conn->server_flags, WT_CONN_SERVER_SWEEP);
+    if (conn->sweep.tid_set) {
+        __wt_cond_signal(session, conn->sweep.cond);
+        WT_TRET(__wt_thread_join(session, &conn->sweep.tid));
+        conn->sweep.tid_set = 0;
+    }
+    __wt_cond_destroy(session, &conn->sweep.cond);
 
-	if (conn->sweep_session != NULL) {
-		wt_session = &conn->sweep_session->iface;
-		WT_TRET(wt_session->close(wt_session, NULL));
+    if (conn->sweep.session != NULL) {
+        WT_TRET(__wt_session_close_internal(conn->sweep.session));
 
-		conn->sweep_session = NULL;
-	}
-	return (ret);
+        conn->sweep.session = NULL;
+    }
+
+    return (ret);
 }

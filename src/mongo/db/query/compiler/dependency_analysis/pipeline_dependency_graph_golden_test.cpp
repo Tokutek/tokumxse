@@ -1,0 +1,536 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/compiler/dependency_analysis/pipeline_dependency_graph.h"
+#include "mongo/db/query/compiler/dependency_analysis/pipeline_dependency_graph_test_util.h"
+#include "mongo/unittest/golden_test.h"
+#include "mongo/unittest/unittest.h"
+
+namespace mongo::pipeline::dependency_graph {
+namespace {
+
+class PipelineDependencyGraphGoldenTest : public unittest::Test {
+public:
+    struct TestCase {
+        const std::string& name;
+        const std::string& pipeline;
+        const std::vector<std::string> nonArrayPaths;
+    };
+
+    PipelineDependencyGraphGoldenTest()
+        : _cfg{"src/mongo/db/test_output/query/compiler/dependency_analysis"} {}
+
+    void runVariation(TestCase testCase) {
+        auto [name, pipelineStr, nonArrayPaths] = testCase;
+        auto pipeline = parsePipeline(pipelineStr);
+
+        auto pathArrayness = std::make_shared<PathArrayness>();
+        for (const auto& path : nonArrayPaths) {
+            pathArrayness->addPath(path, {}, true);
+        }
+        pipeline->getContext()->setPathArraynessForNss(pipeline->getContext()->getNamespaceString(),
+                                                       pathArrayness);
+        auto canPathBeArray = [this, &pipeline](std::string_view path) -> bool {
+            return pipeline->getContext()->canPathBeArrayForNss(
+                FieldRef(path), pipeline->getContext()->getNamespaceString());
+        };
+
+        DependencyGraph graph(pipeline->getSources(), canPathBeArray);
+
+        // Run the golden test portion.
+        {
+            unittest::GoldenTestContext ctx(&_cfg);
+            ctx.outStream() << "VARIATION " << name << std::endl;
+            ctx.outStream() << "input: " << toString(*pipeline) << std::endl;
+            ctx.outStream() << "output: " << graph.toDebugString() << std::endl;
+            ctx.outStream() << std::endl;
+        }
+
+        // Now that we've established that the result is correct, assert that it doesn't change if
+        // we recompute a part of the graph starting from any stage in the pipeline.
+        recomputeAndCompare(graph, *pipeline);
+    }
+
+private:
+    /**
+     * Recompute the subgraphs corresponding to every stage and assert that the graph remains the
+     * same in every case.
+     */
+    void recomputeAndCompare(DependencyGraph& graph, const Pipeline& pipeline) {
+        std::string base = graph.toDebugString();
+        recomputeAndAssert(graph, pipeline, [&] {
+            std::string current = graph.toDebugString();
+            ASSERT_EQ(base, current);
+        });
+    }
+
+    unittest::GoldenTestConfig _cfg;
+};
+
+TEST_F(PipelineDependencyGraphGoldenTest, SimpleSet) {
+    runVariation({
+        .name = "SimpleSet",
+        .pipeline = "[{$set: { a: 'foo' }},"
+                    "{$match: { a: 'foo' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, Shadowing) {
+    runVariation({
+        .name = "Shadowing",
+        .pipeline = "[{$set: { a: 'foo' }},"
+                    "{$set: { b: 'bar' }},"
+                    "{$set: { a: 'baz' }},"
+                    "{$match: { a: 'baz' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ComplexPaths) {
+    runVariation({
+        .name = "ComplexPaths",
+        .pipeline = "[{$set: { a: 1, b: 1, 'c.c': 1 }},"
+                    "{$set: { 'a.a': 1, 'a.b': 1, 'b.b.b': 1, c: 1 }},"
+                    "{$set: { 'a.b.a': 1, 'b.b': 1, 'b.a': 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionProjection) {
+    runVariation({
+        .name = "InclusionProjection",
+        .pipeline = "[{$set: { a: 'foo' }},"
+                    "{$set: { b: 'bar' }},"
+                    "{$set: { c: 'baz' }},"
+                    "{$project: { b: 1, c: 1 }},"
+                    "{$match: { a: 'foo', b: 'bar' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ExhaustiveStage) {
+    runVariation({
+        .name = "ExhaustiveStage",
+        .pipeline = "[{$replaceRoot: { newRoot: {} }},"
+                    "{$set: { b: 'bar' }},"
+                    "{$match: { a: 'baz' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, MultipleModifications) {
+    runVariation({
+        .name = "MultipleModifications",
+        .pipeline = "[{$set: { a: 'foo', b: 'bar' }},"
+                    "{$set: { a: 'foo2' }},"
+                    "{$set: { b: 'bar2' }},"
+                    "{$match: { a: 'foo', b: 'bar' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, RenameChain) {
+    runVariation({
+        .name = "RenameChain",
+        .pipeline = "[{$set: { b: 'a' }},"
+                    "{$set: { c: '$b' }},"
+                    "{$set: { d: '$c' }},"
+                    "{$set: { e: '$d' }},"
+                    "{$match: { e: 1, c: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, Swap) {
+    runVariation({
+        .name = "Swap",
+        .pipeline = "[{$set: {a: 1, b: 1}},"
+                    "{$set: { a: '$b', b: '$a' }},"
+                    "{$match: { a: 1, b: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ParentOverwritesEmbeddedScope) {
+    runVariation({
+        .name = "ParentOverwritesEmbeddedScope",
+        .pipeline = "[{$set: { 'a.b': 1, 'a.c': 2 }},"
+                    "{$set: { a: 3 }},"
+                    "{$match: { 'a.b': 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, DottedRenamesReuseParentScope) {
+    runVariation({
+        .name = "RenamesWithDeepDottedPaths",
+        .pipeline = "[{$set: { 'a1.b1.c1.d1.e1.f1': '$a.b.c.d.e.f', b: '$foo1.bar1.baz1' }},"
+                    "{$set: { 'a2.b2.c2.d2.e2.f2': '$a1.b1.c1.d1.e1.f1' }},"
+                    "{$match: { 'a.b.c.d.e.f': 0,  'a2.b2.c2.d2.e2.f2': 2 }},"
+                    "{$match: { $expr: {$eq: ['$a2', '$a1.b2']} }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ComplexRename) {
+    runVariation({
+        .name = "ComplexRename",
+        .pipeline = "[{$set: { 'a.b': 1 }},"
+                    "{$set: { c: '$a.b' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, DottedRename) {
+    runVariation({
+        .name = "DottedRename",
+        .pipeline = "[{$set: { 'a.b.c': 1, 'd.e': 1 }},"
+                    "{$set: { f: '$a.b.c', g: '$d.e.h', 'i.j': '$a' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, RenameShadowedField) {
+    runVariation({
+        .name = "DottedRename",
+        .pipeline = "[{$set: { 'a.b': 1 }},"
+                    "{$set: { 'a': 1 }},"
+                    "{$set: { d: '$a.b' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, RenameMissingField) {
+    runVariation({
+        .name = "RenameMissingField",
+        .pipeline = "[{$replaceWith: {}},"
+                    "{$set: { a: '$b' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, DottedRenameMissingField) {
+    runVariation({
+        .name = "DottedRenameMissingField",
+        .pipeline = "[{$replaceWith: {}},"
+                    "{$set: { a: '$b.c', d: '$e.f.g', 'h.i': '$j.k' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, RenameCollectionField) {
+    runVariation({
+        .name = "RenameCollectionField",
+        .pipeline = "[{$set: { a: '$b' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, DottedRenameCollectionField) {
+    runVariation({
+        .name = "DottedRenameCollectionField",
+        .pipeline = "[{$set: { a: '$b.c', d: '$e.f.g', 'h.i': '$j.k' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, RenameSameFieldsTwice) {
+    runVariation({
+        .name = "RenameSameFieldsTwice",
+        .pipeline = "[{$set: { a: 1 }},"
+                    " {$set: { b: '$a', c: '$a', d: '$f', e: '$f' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionMixedFieldOrigins) {
+    runVariation({
+        .name = "InclusionMixedFieldOrigins",
+        .pipeline = "[{$set: { a: 1 }},"
+                    "{$project: { a: 1, b: 1 }},"
+                    "{$match: { a: 1, b: 1, c: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionAfterReplaceRoot) {
+    runVariation({
+        .name = "InclusionAfterReplaceRoot",
+        .pipeline = "[{$replaceRoot: { newRoot: '$x' }},"
+                    "{$project: { a: 1, 'b.c': 1 }},"
+                    "{$match: { a: 1, 'b.c': 1, d: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionDottedKnownSubfields) {
+    runVariation({
+        .name = "InclusionDottedKnownSubfields",
+        .pipeline = "[{$set: { 'a.b': 1, 'a.c': 2, 'a.d': 3 }},"
+                    "{$project: { 'a.b': 1, 'a.d': 1 }},"
+                    "{$match: { 'a.b': 1, 'a.c': 1, 'a.d': 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionAndModificationOfSubfields) {
+    runVariation({
+        .name = "InclusionAndModificationOfSubfields",
+        .pipeline = "[{$set: { 'a.b.c': 1 }},"
+                    " {$project: { 'a.str': 'value', 'a.b.c': 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ModificationOfSubfieldDropsPriorSiblings) {
+    runVariation({
+        .name = "ModificationOfSubfieldDropsPriorSiblings",
+        .pipeline = "[{$set: { 'a.b.c': 1 }},"
+                    " {$project: { 'a.str': 'value' }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ChainedInclusionProjections) {
+    runVariation({
+        .name = "ChainedInclusionProjections",
+        .pipeline = "[{$set: { a: 1, b: 1, c: 1 }},"
+                    "{$project: { a: 1, b: 1 }},"
+                    "{$project: { a: 1 }},"
+                    "{$match: { a: 1, b: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ChainedExclusionProjections) {
+    runVariation({
+        .name = "ChainedExclusionProjections",
+        .pipeline = "[{$set: { a: 1, b: 1, c: 1 }},"
+                    "{$project: { c: 0 }},"
+                    "{$project: { b: 0, c: 0 }},"
+                    "{$match: { a: 1, b: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionBaseCollectionDotted) {
+    runVariation({
+        .name = "InclusionBaseCollectionDotted",
+        .pipeline = "[{$project: { 'a.b.c': 1, 'a.b.d': 1, 'x': 1 }},"
+                    "{$match: { 'a.b.c': 1, 'a.b.d': 1, 'a.b.e': 1, 'a.b': 1, x: 1 }}]",
+    });
+}
+
+// TODO(SERVER-121660): Revisit this.
+TEST_F(PipelineDependencyGraphGoldenTest, SetTopLevelFieldThenIncludeSubfields) {
+    runVariation({
+        .name = "SetTopLevelFieldThenIncludeSubfields",
+        .pipeline = "[{$set: {a: 1, b: {c: 1 }}},"
+                    "{$project: {'a.x': 1, 'b.x': 1}},"
+                    "{$match: {a: 1, 'a.x': 1, 'b.x': 1, b: 1}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ReplaceRootThenSet) {
+    runVariation({
+        .name = "ReplaceRootThenSet",
+        .pipeline = "[{$set: { a: 1, b: 1 }},"
+                    "{$replaceRoot: { newRoot: '$a' }},"
+                    "{$set: { c: 1 }},"
+                    "{$match: { a: 1, b: 1, c: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ReplaceRootThenInclusion) {
+    runVariation({
+        .name = "ReplaceRootThenInclusion",
+        .pipeline = "[{$replaceRoot: { newRoot: '$x' }},"
+                    "{$project: { a: 1, b: 1 }},"
+                    "{$match: { a: 1, b: 1, c: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ChainedReplaceRoots) {
+    runVariation({
+        .name = "ChainedReplaceRoots",
+        .pipeline = "[{$set: { a: 1 }},"
+                    "{$replaceRoot: { newRoot: '$a' }},"
+                    "{$replaceRoot: { newRoot: '$b' }},"
+                    "{$set: { c: 1 }},"
+                    "{$match: { a: 1, c: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ReplaceRootSetAndDottedLookup) {
+    runVariation({
+        .name = "ReplaceRootSetAndDottedLookup",
+        .pipeline = "[{$replaceRoot: { newRoot: '$x' }},"
+                    "{$set: { 'a.b': 1 }},"
+                    "{$match: { 'a.b': 1, 'a.c': 1, d: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, GroupSimpleKey) {
+    runVariation({
+        .name = "GroupSimpleKey",
+        .pipeline = "[{$set: { x: 1 }},"
+                    "{$group: { _id: '$x', count: { $sum: 1 } }},"
+                    "{$match: { _id: 1, count: 1, a: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, GroupCompoundKey) {
+    runVariation({
+        .name = "GroupCompoundKey",
+        .pipeline = "[{$set: { x: 1, y: 1 }},"
+                    "{$group: { _id: { a: '$x', b: '$y' } }},"
+                    "{$match: { '_id.a': 1, '_id.b': 1, '_id.c': 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, GroupNullKeyThenSet) {
+    runVariation({
+        .name = "GroupNullKeyThenSet",
+        .pipeline = "[{$group: { _id: null, total: { $sum: 1 } }},"
+                    "{$set: { a: 1 }},"
+                    "{$match: { _id: 1, total: 1, a: 1, b: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, SetGroupSet) {
+    runVariation({
+        .name = "SetGroupSet",
+        .pipeline = "[{$set: { x: 1, y: 1 }},"
+                    "{$group: { _id: '$x' }},"
+                    "{$set: { a: 1 }},"
+                    "{$match: { _id: 1, a: 1, b: 1, x: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, GroupKeyFromBaseDocument) {
+    runVariation({
+        .name = "GroupKeyFromBaseDocument",
+        .pipeline = "[{$group: { _id: '$x' }},"
+                    "{$match: { _id: 1, x: 1 }}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InternalInhibitOptimization) {
+    runVariation({
+        .name = "InternalInhibitOptimization",
+        .pipeline = "[{$_internalInhibitOptimization: {}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, MiddleStageDependsOnWholeDocument) {
+    runVariation({
+        .name = "MiddleStageDependsOnWholeDocument",
+        .pipeline = "[{$set: {}}, {$_internalInhibitOptimization: {}}, {$set: {}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ExpressionDependencies) {
+    runVariation({
+        .name = "ExpressionDependencies",
+        .pipeline = "[{$set: {a: 1, b: 1, c: 1}},"
+                    " {$set: {a_plus_b: {$add: ['$a', '$b']}, b_plus_c: {$add: ['$b', '$c']}}},"
+                    " {$set: {a_plus_x: {$add: ['$a', '$x']}, x_plus_d: {$add: ['$x', '$d']}}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, SetFieldExpressionDependencies) {
+    runVariation({
+        .name = "SetFieldExpressionDependencies",
+        .pipeline = "[{$set: {'a.b': 1, c: 1}},"
+                    " {$set: {d: {$setField: {field: 'c', input: '$a', value: 2}}, e: '$c'}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, GetFieldExpressionDependencies) {
+    runVariation({
+        .name = "GetFieldExpressionDependencies",
+        .pipeline = "[{$set: {'a.b': 1, c: 1}},"
+                    " {$set: {d: {$getField: {field: 'b', input: '$a'}}, e: '$c'}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, NonExpressionModificationDependencies) {
+    runVariation({
+        .name = "NonExpressionModificationDependencies",
+        .pipeline = "[{$set: {a: [1, 2]}},"
+                    " {$unwind: '$a'}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, RedeclaredArraySibling) {
+    runVariation({
+        .name = "RedeclaredArraySibling",
+        .pipeline = "[{$set: {a: [{b: 99}]}},"
+                    " {$set: {'a.c': 1}},"
+                    " {$match: {'a.b': 1}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ExpressionWholeDocumentDependencyInLaterStage) {
+    runVariation({
+        .name = "ExpressionWholeDocumentDependencyInLaterStage",
+        .pipeline = "[{$set: {a: 1}},"
+                    " {$set: {b: '$$ROOT'}},"
+                    " {$set: {c: 2}}]",
+    });
+}
+
+// Since we don't know if 'a' is an array, we should assume that as: "a.b" could
+// discard the array and replace it with {a: {b: <result>}}
+TEST_F(PipelineDependencyGraphGoldenTest, LookupDottedAsPrefixCanBeArray) {
+    runVariation({
+        .name = "LookupDottedAsPrefixCanBeArray",
+        .pipeline = R"([{$set: {'a.c': 1}},
+                        {$lookup: {from: "coll_b", as: "a.b", pipeline: []}}])",
+    });
+}
+
+// Since we know 'a' cannot be an array, the field 'c' can be preserved.
+TEST_F(PipelineDependencyGraphGoldenTest, LookupDottedAsPrefixCannotBeArray) {
+    runVariation({
+        .name = "LookupDottedAsPrefixCannotBeArray",
+        .pipeline = R"([{$set: {a: 1}},
+                        {$set: {'a.c': 1}},
+                        {$lookup: {from: "coll_b", as: "a.b", pipeline: []}}])",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ConstantScalarSet) {
+    runVariation({
+        .name = "ConstantScalarSet",
+        .pipeline = "[{$set: {a: 1, b: 'foo', c: true, d: null}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ConstantDottedPath) {
+    runVariation({
+        .name = "ConstantDottedPath",
+        .pipeline = "[{$set: {'a.b.c': 42}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ConstantPropagatedThroughRename) {
+    runVariation({
+        .name = "ConstantPropagatedThroughRename",
+        .pipeline = "[{$set: {a: 7}},"
+                    " {$set: {b: '$a'}},"
+                    " {$set: {c: '$b'}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ConstantNotTrackedForRuntimeVariable) {
+    runVariation({
+        .name = "ConstantNotTrackedForRuntimeVariable",
+        .pipeline = "[{$set: {a: '$$NOW'}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ConstantArrayLiteral) {
+    // $literal forces an ExpressionConstant so the array is captured as a constant Value (whereas
+    // a plain `[1,2,3]` parses as ExpressionArray, which would only fold to a constant after
+    // 'optimize()' — the fixture parses with 'kOptionsMinimal' and skips optimize).
+    runVariation({
+        .name = "ConstantArrayLiteral",
+        .pipeline = "[{$set: {a: {$literal: [1, 2, 3]}}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, ConstantOverwritten) {
+    runVariation({
+        .name = "ConstantOverwritten",
+        .pipeline = "[{$set: {a: 1}},"
+                    " {$set: {a: 2}}]",
+    });
+}
+
+TEST_F(PipelineDependencyGraphGoldenTest, InclusionDottedAfterPriorStage) {
+    runVariation({.name = "InclusionDottedPathAfterPriorStageIsNotArray",
+                  .pipeline = "[{$match: {x: 1}},"
+                              " {$project: {'a.b.c': 1, 'a.b.d.e': 1}}]",
+                  .nonArrayPaths = {"a.b.c"}});
+}
+
+}  // namespace
+}  // namespace mongo::pipeline::dependency_graph

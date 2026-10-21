@@ -1,0 +1,156 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <string_view>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class BSONObjBuilder;
+template <typename T>
+class StatusWith;
+struct WriteConcernOptions;
+
+/**
+ * Returns the default write concern for migration cleanup on the donor shard and for cloning
+ * documents on the destination shard.
+ */
+class MigrationSecondaryThrottleOptions {
+public:
+    enum SecondaryThrottleOption {
+        // The secondary throttle option is not set explicitly. Use the default for the service.
+        kDefault,
+
+        // The secondary throttle option is explicitly disabled.
+        kOff,
+
+        // The secondary throttle option is explicitly enabled and there potentially might be a
+        // write concern specified. If no write concern was specified, use the default.
+        kOn
+    };
+
+    /**
+     * Constructs an object with the specified secondary throttle option and no custom write
+     * concern.
+     */
+    static MigrationSecondaryThrottleOptions create(SecondaryThrottleOption option);
+
+    /**
+     * Constructs an object with the secondary throttle enabled and with the specified write
+     * concern.
+     */
+    static MigrationSecondaryThrottleOptions createWithWriteConcern(
+        const WriteConcernOptions& writeConcern);
+
+    /**
+     * Extracts the write concern settings from a BSON with the following format:
+     *
+     * {
+     *     secondaryThrottle: <bool>,                           // optional
+     *     _secondaryThrottle: <bool>,                          // optional
+     *     writeConcern: <WriteConcern formatted as BSONObj>    // optional
+     * }
+     *
+     * Note: secondaryThrottle takes precedence over _secondaryThrottle. If either of the two are
+     * missing, the secondaryThrottle enabled status defaults to true.
+     *
+     * Returns OK if the parse was successful.
+     */
+    static StatusWith<MigrationSecondaryThrottleOptions> createFromCommand(const BSONObj& obj);
+
+    /*
+     * Same as `createFromCommand`, but throwing in case of parsing exception
+     */
+    static MigrationSecondaryThrottleOptions parseFromBSON(const BSONObj& obj) {
+        return uassertStatusOK(createFromCommand(obj));
+    }
+
+    /**
+     * IDL deserializer for BalancerSettings._secondaryThrottle field.
+     * Handles both boolean values (true/false) and WriteConcern objects formatted as BSON.
+     * This method is specifically designed for parsing the _secondaryThrottle field
+     * from balancer configuration documents.
+     */
+    static MigrationSecondaryThrottleOptions parseFromBalancerConfigElement(
+        const BSONElement& element);
+
+    /**
+     * IDL serializer for BalancerSettings._secondaryThrottle field.
+     * Serializes to either a boolean value (true/false) or a WriteConcern BSON object,
+     * depending on the internal configuration. This method is specifically designed
+     * for serializing the _secondaryThrottle field in balancer configuration documents.
+     *
+     * @param fieldName The name of the field to serialize (typically "_secondaryThrottle").
+     * @param builder The BSON object builder to append the field to.
+     */
+    void serializeToBalancerConfigElement(std::string_view fieldName,
+                                          BSONObjBuilder* builder) const;
+
+    /**
+     * Extracts the secondary throttle settings from a balancer configuration document, which can
+     * have the following format:
+     *
+     * {
+     *     _secondaryThrottle: <bool> | <WriteConcern formatted as BSONObj> // optional
+     * }
+     *
+     * If secondary throttle is not specified, uses kDefault.
+     */
+    static StatusWith<MigrationSecondaryThrottleOptions> createFromBalancerConfig(
+        const BSONElement& elem);
+
+    /**
+     * Returns the selected secondary throttle option.
+     */
+    SecondaryThrottleOption getSecondaryThrottle() const {
+        return _secondaryThrottle;
+    }
+
+    /**
+     * Returns whether secondary throttle is enabled and write concern was requested.
+     */
+    bool isWriteConcernSpecified() const {
+        return _writeConcernBSON.is_initialized();
+    }
+
+    /**
+     * Returns the custom write concern, which was requested. Must only be called if
+     * isWriteConcernSpecified returns true.
+     */
+    WriteConcernOptions getWriteConcern() const;
+
+    /**
+     * Returns a BSON representation of the current secondary throttle settings.
+     */
+    void append(BSONObjBuilder* builder) const;
+    BSONObj toBSON() const;
+
+    /**
+     * Returns true if the options match exactly.
+     */
+    bool operator==(const MigrationSecondaryThrottleOptions& other) const;
+    bool operator!=(const MigrationSecondaryThrottleOptions& other) const;
+
+private:
+    MigrationSecondaryThrottleOptions(SecondaryThrottleOption secondaryThrottle,
+                                      boost::optional<BSONObj> writeConcernBSON);
+
+    // What is the state of the secondaryThrottle option (kDefault means that it has not been set)
+    SecondaryThrottleOption _secondaryThrottle;
+
+    // Owned BSON object with the contents of the writeConcern. If this object is set, then
+    // secodaryThrottle must be true.
+    boost::optional<BSONObj> _writeConcernBSON;
+};
+
+}  // namespace mongo

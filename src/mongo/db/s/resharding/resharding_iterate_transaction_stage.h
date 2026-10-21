@@ -1,0 +1,143 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/agg/stage.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <stack>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo::exec::agg {
+
+/**
+ * This stage keeps track of applyOps oplog entries that represent transactions and iterates them
+ * whenever an oplog entry commits a transaction. When the stage observes an applyOps or commit
+ * command that commits a transaction, it emits one document for each applyOps in the transaction.
+ *
+ * If 'includeCommitTransactionTimestamp' is true, this stage is responsible for attaching the
+ * transaction commit timestamp to each applyOps oplog entry document that it emits and a
+ * downstream stage is expected to use this timestamp when generating the resharding's _id field
+ * for the document (as described below).
+ *
+ * If 'includeCommitTransactionTimestamp' is false, this stage is responsible for generating
+ * the resharding's _id field for each oplog entry document that it emits. For a document that
+ * corresponds to an applyOps oplog entry for a committed transaction, this will be
+ * {clusterTime: <transaction commit timestamp>, ts: <applyOps optime.ts>}. For all other documents,
+ * this will be {clusterTime: <optime.ts>, ts: <optime.ts>}.
+ */
+class ReshardingIterateTransactionStage final : public Stage {
+public:
+    ReshardingIterateTransactionStage(std::string_view stageName,
+                                      const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      bool includeCommitTransactionTimestamp);
+
+private:
+    GetNextResult doGetNext() override;
+
+    /**
+     * Validates if the supplied document contains transaction details.
+     */
+    bool _isTransactionOplogEntry(const Document& doc);
+
+    /**
+     * Represents the DocumentSource's state if it's currently reading from a transaction.
+     * Transaction operations are packed into 'applyOps' entries in the oplog.
+     *
+     * This iterator returns applyOps entries from a transaction in the same order they appear on
+     * the oplog (chronological order). Note that the TransactionHistoryIterator, which this class
+     * uses to query the oplog, returns the oplog entries in _reverse_ order. We internally reverse
+     * the output of the TransactionHistoryIterator in order to get the desired order.
+     */
+    class TransactionOpIterator {
+    public:
+        TransactionOpIterator(const TransactionOpIterator&) = delete;
+        TransactionOpIterator& operator=(const TransactionOpIterator&) = delete;
+
+        TransactionOpIterator(OperationContext* opCtx,
+                              std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
+                              const Document& input,
+                              bool includeCommitTransactionTimestamp);
+
+        Timestamp clusterTime() const {
+            return _clusterTime;
+        }
+
+        Document lsid() const {
+            return _lsid;
+        }
+
+        TxnNumber txnNumber() const {
+            return _txnNumber;
+        }
+
+        /**
+         * Returns the next 'applyOps' oplog entry from the transaction. Returns boost::none to
+         * indicate that there are no operations left.
+         */
+        boost::optional<Document> getNextApplyOpsTxnEntry(OperationContext* opCtx);
+
+    private:
+        // Perform a find on the oplog to find an OplogEntry by its OpTime.
+        repl::OplogEntry _lookUpOplogEntryByOpTime(OperationContext* opCtx,
+                                                   repl::OpTime lookupTime) const;
+
+        // Traverse backwards through the oplog by starting at the entry at 'firstOpTime' and
+        // following "prevOpTime" links until reaching the terminal "prevOpTime" value, and push the
+        // OpTime value to '_txnOplogEntries' for each entry traversed, including the 'firstOpTime'
+        // entry. Note that we follow the oplog links _backwards_ through the oplog (i.e., in
+        // reverse chronological order) but because this is a stack, the iterator will process them
+        // in the opposite order, allowing iteration to proceed forwards and return operations in
+        // chronological order.
+        //
+        // 'opsStillToCollect' bounds the walk for a retryable batch; an empty budget walks to the
+        // end of the chain, as a transaction does. See walkApplyOpsChain().
+        void _collectAllOpTimesFromTransaction(OperationContext* opCtx,
+                                               repl::OpTime firstOpTime,
+                                               boost::optional<std::size_t> opsStillToCollect);
+
+        // This stack contains the timestamps for all oplog entries in this transaction that have
+        // yet to be processed by the iterator. Each time the TransactionOpIterator returns an
+        // applyOps entry, it pops the next optime off the stack and uses it to load the next
+        // applyOps entry, meaning that the top entry is always the next entry to be processed. From
+        // top-to-bottom, the stack is ordered chronologically, in the same order as entries appear
+        // in the oplog.
+        std::stack<repl::OpTime> _txnOplogEntries;
+
+        // The clusterTime of the entry which committed the transaction.
+        Timestamp _clusterTime;
+
+        // Fields that were taken from the oplog entry which committed the transaction.
+        Document _lsid;
+        TxnNumber _txnNumber;
+
+        // Used for traversing the oplog with TransactionHistoryInterface.
+        std::shared_ptr<MongoProcessInterface> _mongoProcessInterface;
+
+        bool _includeCommitTransactionTimestamp;
+    };
+
+    // Set to true if this stage should attach the transaction commit timestamp to the applyOps
+    // oplog entry documents that it emits instead of generating a resharding id for the documents
+    // that it emits.
+    bool _includeCommitTransactionTimestamp;
+
+    std::string _stageName;
+
+    // Represents the current transaction we're unwinding, if any.
+    boost::optional<TransactionOpIterator> _txnIterator;
+};
+
+}  // namespace mongo::exec::agg

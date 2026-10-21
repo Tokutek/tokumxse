@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -10,27 +10,28 @@
 
 /*
  * __wt_getenv --
- * 	Get a non-NULL, greater than zero-length environment variable.
+ *     Get a non-NULL, greater than zero-length environment variable.
  */
 int
 __wt_getenv(WT_SESSION_IMPL *session, const char *variable, const char **envp)
 {
-	WT_DECL_RET;
-	DWORD size;
+    WT_DECL_RET;
+    DWORD size, windows_error;
 
-	*envp = NULL;
+    *envp = NULL;
 
-	size = GetEnvironmentVariableA(variable, NULL, 0);
-	if (size <= 1)
-		return (WT_NOTFOUND);
+    if ((size = GetEnvironmentVariableA(variable, NULL, 0)) <= 1)
+        return (0);
 
-	WT_RET(__wt_calloc(session, 1, size, envp));
+    WT_RET(__wt_malloc(session, (size_t)size, envp));
 
-	ret = GetEnvironmentVariableA(variable, *envp, size);
-	/* We expect the number of bytes not including nul terminator. */
-	if ((ret + 1) != size)
-		WT_RET_MSG(session, __wt_errno(),
-		    "GetEnvironmentVariableA failed: %s", variable);
+    /* We expect the number of bytes not including nul terminator. */
+    if (GetEnvironmentVariableA(variable, *envp, size) == size - 1)
+        return (0);
 
-	return (0);
+    windows_error = __wt_getlasterror();
+    ret = __wt_map_windows_error(windows_error);
+    __wt_err(session, ret, "GetEnvironmentVariableA: %s: %s", variable,
+      __wt_formatmessage(session, windows_error));
+    return (ret);
 }

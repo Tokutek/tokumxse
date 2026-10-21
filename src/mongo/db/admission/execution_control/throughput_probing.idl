@@ -1,0 +1,111 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo::admission::execution_control::throughput_probing"
+    cpp_includes:
+        - "mongo/db/admission/execution_control/throughput_probing.h"
+
+server_parameters:
+    throughputProbingStepMultiple:
+        description: "The step size for throughput probing is this multiple of the current concurrency"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<double>
+        cpp_varname: gStepMultiple
+        default: 0.1
+        validator:
+            gte: 0.01
+            lte: 0.5
+        redact: false
+
+    throughputProbingInitialConcurrency:
+        description: >-
+            The initial total number of concurrent read and write transactions when throughput probing
+            starts. This value represents the combined concurrency across both ticket pools. A value of 0
+            (the default) uses twice the number of logical CPU cores. If specified, the value must be in
+            the range [2 * throughputProbingMinConcurrency, 2 * throughputProbingMaxConcurrency]; values
+            outside this range will be clamped and a warning will be logged.
+        set_at: startup
+        cpp_vartype: int32_t
+        cpp_varname: gInitialConcurrency
+        default: 0
+        validator:
+            callback: validateInitialConcurrency
+        redact: false
+
+    throughputProbingMinConcurrency:
+        description: >-
+            The minimum number of concurrent read/write transactions for throughput probing. This minimum
+            is applied to reads and writes separately.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gMinConcurrency
+        default: 4
+        validator:
+            callback: validateMinConcurrency
+        redact: false
+
+    throughputProbingMaxConcurrency:
+        description: >-
+            The maximum number of concurrent read/write transactions for throughput probing. This maximum
+            is applied to reads and writes separately.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gMaxConcurrency
+        default: 128
+        validator:
+            callback: validateMaxConcurrency
+        redact: false
+
+    throughputProbingReadWriteRatio:
+        description: >-
+            The ratio of reads/writes when using throughput probing. A value of 0.5 indicates a 1:1 ratio,
+            while a value greater than 0.5 favors reads and a value less than 0.5 favors writes.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<double>
+        cpp_varname: gReadWriteRatio
+        default: 0.5
+        validator:
+            gte: 0
+            lte: 1
+        redact: false
+
+    throughputProbingConcurrencyMovingAverageWeight:
+        description: >-
+            How much to weigh newer concurrency measurements into the exponentially-decaying moving
+            average. Higher values respond faster to changes, but with more variability. Lower values
+            respond slower, but with less variability.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<double>
+        cpp_varname: gConcurrencyMovingAverageWeight
+        default: 0.2
+        validator:
+            gt: 0
+            lte: 1
+        redact: false
+
+    throughputProbingStallDetectionTimeoutMs:
+        description: >-
+            How long we wait until we report a stall
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gStallDetectionTimeoutMs
+        default: 60000
+        validator:
+            gt: 0
+        redact: false
+
+    throughputProbingConcurrencyAdjustmentIntervalMillis:
+        description: >-
+            The interval in milliseconds in which to run the concurrency adjustment algorithm.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gConcurrencyAdjustmentIntervalMillis
+        deprecated_name:
+            - storageEngineConcurrencyAdjustmentIntervalMillis
+        default: 100
+        on_update: onUpdateConcurrencyAdjustmentIntervalMillis
+        validator:
+            gte: 10
+        redact: false

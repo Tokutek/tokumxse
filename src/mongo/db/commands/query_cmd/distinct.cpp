@@ -1,0 +1,845 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/authorization_checks.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/validated_tenancy_scope_factory.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/query_cmd/run_aggregate.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_diagnostic_printer.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/query/bson/multikey_dotted_path_support.h"
+#include "mongo/db/query/canonical_distinct.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/client_cursor/collect_query_stats_mongod.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/collection_index_usage_tracker_decoration.h"
+#include "mongo/db/query/distinct_command_gen.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/explain_diagnostic_printer.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_settings/query_settings_service.h"
+#include "mongo/db/query/query_shape/distinct_cmd_shape.h"
+#include "mongo/db/query/query_shape/query_shape.h"
+#include "mongo/db/query/query_stats/distinct_key.h"
+#include "mongo/db/query/query_stats/query_stats.h"
+#include "mongo/db/query/query_utils.h"
+#include "mongo/db/query/shard_key_diagnostic_printer.h"
+#include "mongo/db/query/timeseries/timeseries_translation.h"
+#include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/read_concern_support_result.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/query_analysis_writer.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/shard_role/shard_catalog/scoped_collection_metadata.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/timeseries/timeseries_request_util.h"
+#include "mongo/db/version_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/analyze_shard_key_common_gen.h"
+#include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/serialization_context.h"
+
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+std::unique_ptr<CanonicalQuery> parseDistinctCmd(
+    OperationContext* opCtx,
+    const CollectionOrViewAcquisition& collOrViewAcquisition,
+    const NamespaceString& nss,
+    const DistinctCommandRequest& request,
+    const ExtensionsCallback& extensionsCallback,
+    const CollatorInterface* defaultCollator,
+    boost::optional<ExplainOptions::Verbosity> verbosity) {
+    // Start the query planning timer right after parsing.
+    CurOp::get(opCtx)->beginQueryPlanningTimer();
+
+    auto distinctCommand = std::make_unique<DistinctCommandRequest>(request);
+    assertInternalParamsAreSetByInternalClients(opCtx->getClient(), *distinctCommand);
+    auto expCtx = ExpressionContextBuilder{}
+                      .fromRequest(opCtx, *distinctCommand, defaultCollator)
+                      .ns(nss)
+                      .explain(verbosity)
+                      .build();
+    auto parsedDistinct =
+        parsed_distinct_command::parse(expCtx,
+                                       std::move(distinctCommand),
+                                       extensionsCallback,
+                                       MatchExpressionParser::kAllowAllSpecialFeatures);
+
+    // Compute QueryShapeHash and record it in CurOp.
+    query_shape::DeferredQueryShape deferredShape{[&]() {
+        return shape_helpers::tryMakeShape<query_shape::DistinctCmdShape>(*parsedDistinct, expCtx);
+    }};
+    auto queryShapeHash = CurOp::get(opCtx)->debug().ensureQueryShapeHash(
+        opCtx, [&]() { return shape_helpers::computeQueryShapeHash(expCtx, deferredShape); });
+
+    // Resolve the query settings for this operation.
+    auto& querySettingsService = query_settings::QuerySettingsService::get(opCtx);
+    auto& distinctReq = *parsedDistinct->distinctCommandRequest;
+    querySettingsService.initializeSettingsForQuery(
+        expCtx, queryShapeHash, distinctReq.getQuerySettings());
+
+    // We do not collect queryStats on explain for distinct.
+    if (!verbosity.has_value()) {
+        query_stats::registerRequest(opCtx, nss, [&]() {
+            uassertStatusOKWithContext(deferredShape->getStatus(), "Failed to compute query shape");
+            return std::make_unique<query_stats::DistinctKey>(
+                expCtx,
+                distinctReq,
+                std::move(deferredShape->getValue()),
+                collOrViewAcquisition.getCollectionType());
+        });
+
+        if (distinctReq.getIncludeQueryStatsMetrics()) {
+            CurOp::get(opCtx)->debug().getQueryStatsInfo().metricsRequested = true;
+        }
+    }
+
+    return parsed_distinct_command::parseCanonicalQuery(
+        std::move(expCtx), std::move(parsedDistinct), nullptr);
+}
+
+
+namespace mdps = multikey_dotted_path_support;
+
+// This function might create a classic or SBE plan executor. It relies on some assumptions that are
+// specific to the distinct() command and shouldn't be blindly reused in other "distinct" contexts.
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createExecutorForDistinctCommand(
+    OperationContext* opCtx,
+    std::unique_ptr<CanonicalQuery> canonicalQuery,
+    const CollectionAcquisition& coll) {
+    const auto yieldPolicy = PlanYieldPolicy::YieldPolicy::YIELD_AUTO;
+    const auto& collectionPtr = coll.getCollectionPtr();
+    const MultipleCollectionAccessor collections{coll};
+
+    const bool isFeatureFlagShardFilteringDistinctScanEnabled =
+        canonicalQuery->getExpCtx()->isFeatureFlagShardFilteringDistinctScanEnabled();
+
+    // If there's a $natural hint via query settings, we need to go through the query planner to
+    // ensure it gets enforced.
+    const auto hasNaturalHintViaQuerySettings = [&] {
+        const auto& indexHintSpecs =
+            canonicalQuery->getExpCtx()->getQuerySettings().getIndexHints();
+        if (!indexHintSpecs) {
+            return false;
+        }
+        for (const auto& hintSpec : *indexHintSpecs) {
+            for (const auto& hint : hintSpec.getAllowedIndexes()) {
+                if (hint.getNaturalHint()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // If the query has no filter or sort, there's no need to do multiplanning and we will
+    // short-cut the planner by immediately picking the index with the smallest suitable key.
+    // Ultimately the query planner would do the same, but the additional planning work done
+    // before that can add up to a noticeable regression for fast queries.
+    const bool shouldMultiplan = isFeatureFlagShardFilteringDistinctScanEnabled &&
+        (!canonicalQuery->getFindCommandRequest().getFilter().isEmpty() ||
+         canonicalQuery->getSortPattern() || hasNaturalHintViaQuerySettings());
+
+    if (shouldMultiplan) {
+        return uassertStatusOK(
+            getExecutorFind(opCtx,
+                            collections,
+                            std::move(canonicalQuery),
+                            yieldPolicy,
+                            // TODO SERVER-93018: Investigate why we prefer a collection scan
+                            // against a 'GENERATE_COVERED_IXSCANS' when no filter is present.
+                            QueryPlannerParams::DEFAULT));
+    }
+
+    size_t plannerOptions = QueryPlannerParams::DEFAULT;
+    if (isFeatureFlagShardFilteringDistinctScanEnabled &&
+        coll.getShardingDescription().isSharded()) {
+        plannerOptions |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+    }
+
+    // If the collection doesn't exist 'getExecutor()' should create an EOF plan for it no
+    // matter the query.
+    if (!collectionPtr) {
+        return uassertStatusOK(
+            getExecutorFind(opCtx, collections, std::move(canonicalQuery), yieldPolicy));
+    }
+
+    // Try creating a plan that does DISTINCT_SCAN.
+    auto swQuerySolution =
+        tryGetQuerySolutionForDistinct(collections, plannerOptions, *canonicalQuery);
+    if (swQuerySolution.isOK()) {
+        return uassertStatusOK(getExecutorDistinct(collections,
+                                                   plannerOptions,
+                                                   std::move(canonicalQuery),
+                                                   std::move(swQuerySolution.getValue())));
+    }
+
+    // If there is no DISTINCT_SCAN plan, create whatever non-distinct plan is appropriate, because
+    // 'distinct()' command is capable of de-duplicating and unwinding its inputs. Note: In order to
+    // allow a covered DISTINCT_SCAN we've inserted a projection -- there is no point of keeping it
+    // if a DISTINCT_SCAN didn't bake out.
+    auto findCommand =
+        std::make_unique<FindCommandRequest>(canonicalQuery->getFindCommandRequest());
+    findCommand->setProjection(BSONObj());
+
+    auto cqWithoutProjection = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = canonicalQuery->getExpCtx(),
+        .parsedFind =
+            ParsedFindCommandParams{
+                .findCommand = std::move(findCommand),
+                .extensionsCallback = ExtensionsCallbackReal(opCtx, &collectionPtr->ns()),
+                .allowedFeatures = MatchExpressionParser::kAllowAllSpecialFeatures},
+    });
+
+    return uassertStatusOK(
+        getExecutorFind(opCtx, collections, std::move(cqWithoutProjection), yieldPolicy));
+}
+
+template <class NamespaceType>
+void translateRequestForRawData(OperationContext* opCtx,
+                                DistinctCommandRequest& request,
+                                NamespaceType& ns,
+                                boost::optional<CollectionOrViewAcquisition>& collectionOrView,
+                                const std::function<CollectionOrViewAcquisition()>& acquire) {
+    if (isRawDataOperation(opCtx)) {
+        auto [isTimeseriesViewRequest, translatedNs] =
+            timeseries::isTimeseriesViewRequest(opCtx, request);
+        if (isTimeseriesViewRequest) {
+            ns = translatedNs;
+            collectionOrView = acquire();
+            request.setNamespaceOrUUID(ns);
+        }
+    }
+}
+
+class DistinctCommand : public TypedCommand<DistinctCommand> {
+public:
+    using Request = DistinctCommandRequest;
+    DistinctCommand() : TypedCommand(Request::kCommandName) {}
+
+    std::string help() const override {
+        return "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
+    }
+
+    bool supportsQuerySettings() const override {
+        return true;
+    }
+
+    std::size_t reserveBytesForReply() const override {
+        return FindCommon::kInitReplyBufferSize;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool shouldAffectReadOptionCounters() const override {
+        return true;
+    }
+
+    class Invocation final : public MinimalInvocationBase {
+    public:
+        Invocation(OperationContext* opCtx, Command* cmd, const OpMsgRequest& opMsgRequest)
+            : MinimalInvocationBase(opCtx, cmd, opMsgRequest),
+              _ns(request().getNamespaceOrUUID().isNamespaceString()
+                      ? request().getNamespaceOrUUID().nss()
+                      : shard_role_nocheck::resolveNssWithoutAcquisitionAtLatest(
+                            opCtx,
+                            request().getNamespaceOrUUID().dbName(),
+                            request().getNamespaceOrUUID().uuid())) {
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid namespace specified '" << _ns.toStringForErrorMsg()
+                                  << "'",
+                    _ns.isValid());
+            CommandHelpers::ensureValidCollectionName(_ns);
+        }
+
+        bool supportsWriteConcern() const override {
+            return false;
+        }
+
+        bool canIgnorePrepareConflicts() const override {
+            return true;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const override {
+            return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+        }
+
+        bool supportsRawData() const override {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        bool supportsReadMirroring() const override {
+            return true;
+        }
+
+        NamespaceString ns() const override {
+            return _ns;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    authSession->isAuthorizedToParseNamespaceElement(
+                        unparsedRequest().body.firstElement()));
+
+            const auto hasTerm = false;
+            const auto& nsOrUUID = request().getNamespaceOrUUID();
+            if (nsOrUUID.isNamespaceString()) {
+                uassertStatusOK(auth::checkAuthForFind(authSession, nsOrUUID.nss(), hasTerm));
+                return;
+            }
+
+            const auto resolvedNss = shard_role_nocheck::resolveNssWithoutAcquisitionAtLatest(
+                opCtx, nsOrUUID.dbName(), nsOrUUID.uuid());
+            uassertStatusOK(auth::checkAuthForFind(authSession, resolvedNss, hasTerm));
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* reply) override {
+            const auto dbName = request().getDbName();
+            const BSONObj& originalCmdObj = unparsedRequest().body;
+            auto distinctRequest = request();
+
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Collection name must be provided. UUID is not valid in this "
+                                  << "context",
+                    !request().getNamespaceOrUUID().isUUID());
+
+            auto nss = ns();
+
+            // Acquire locks and resolve possible UUID. The RAII object is optional, because in
+            // the case of a view, the locks need to be released.
+            AutoStatsTracker tracker(opCtx,
+                                     nss,
+                                     Top::LockType::ReadLocked,
+                                     AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                     DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                         .getDatabaseProfileLevel(dbName));
+
+            auto acquire = [&] {
+                return acquireCollectionOrViewMaybeLockFree(
+                    opCtx,
+                    CollectionOrViewAcquisitionRequest::fromOpCtx(
+                        opCtx, nss, AcquisitionPrerequisites::kRead));
+            };
+            boost::optional<CollectionOrViewAcquisition> collectionOrView = acquire();
+
+            translateRequestForRawData(opCtx, distinctRequest, nss, collectionOrView, acquire);
+
+            const CollatorInterface* defaultCollator = collectionOrView->getCollectionPtr()
+                ? collectionOrView->getCollectionPtr()->getDefaultCollator()
+                : nullptr;
+
+            auto canonicalQuery = parseDistinctCmd(opCtx,
+                                                   *collectionOrView,
+                                                   nss,
+                                                   request(),
+                                                   ExtensionsCallbackReal(opCtx, &nss),
+                                                   defaultCollator,
+                                                   verbosity);
+
+            // Create an RAII object that prints useful information about the ExpressionContext in
+            // the case of a tassert or crash.
+            ScopedDebugInfo expCtxDiagnostics(
+                "ExpCtxDiagnostics",
+                diagnostic_printers::ExpressionContextPrinter{canonicalQuery->getExpCtx()});
+
+            if (collectionOrView->isView() ||
+                timeseries::requiresViewlessTimeseriesTranslation(opCtx, *collectionOrView)) {
+                // Relinquish locks. The aggregation command will re-acquire them.
+                collectionOrView.reset();
+                runDistinctAsAgg(opCtx, std::move(canonicalQuery), verbosity, reply);
+                return;
+            }
+            // For the purposes of OpDebug's reporting, we only need 'collectionType' to distinguish
+            // between view/timeseries/collection. For view/timeseries, 'collectionType' will be set
+            // on the agg path taken above. In the normal path (i.e. here), we bypass the
+            // getCollectionType() call and hardcode "kCollection" for performance reasons.
+            CurOp::get(opCtx)->debug().collectionType = query_shape::CollectionType::kCollection;
+
+            // Create an RAII object that prints the collection's shard key in the case of a tassert
+            // or crash.
+            auto collShardingDescription =
+                collectionOrView->getCollection().getShardingDescription();
+            ScopedDebugInfo shardKeyDiagnostics("ShardKeyDiagnostics",
+                                                diagnostic_printers::ShardKeyDiagnosticPrinter{
+                                                    collShardingDescription.isSharded()
+                                                        ? collShardingDescription.getKeyPattern()
+                                                        : BSONObj()});
+
+            auto executor = createExecutorForDistinctCommand(
+                opCtx, std::move(canonicalQuery), collectionOrView->getCollection());
+            SerializationContext serializationCtx = request().getSerializationContext();
+            auto bodyBuilder = reply->getBodyBuilder();
+
+            ScopedDebugInfo explainDiagnostics(
+                "explainDiagnostics",
+                diagnostic_printers::ExplainDiagnosticPrinter{executor.get()});
+            Explain::explainStages(executor.get(),
+                                   collectionOrView->getCollection(),
+                                   verbosity,
+                                   BSONObj(),
+                                   SerializationContext::stateCommandReply(serializationCtx),
+                                   originalCmdObj,
+                                   &bodyBuilder);
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            markOperationQueryMemorySheddingEligible(opCtx);
+            auto distinctRequest = request();
+
+            // Acquire locks and resolve possible UUID. The RAII object is optional, because in
+            // the case of a view, the locks need to be released.
+
+            // TODO SERVER-79175: Make nicer. We need to instantiate the AutoStatsTracker
+            // before the acquisition in case it would throw so we can ensure data is
+            // written to the profile collection that some test may rely on. However, we
+            // might not know the namespace at this point so it is wrapped in a
+            // boost::optional. If the request is with a UUID we instantiate it after, but
+            // this is fine as the request should not be for sharded collections.
+            boost::optional<AutoStatsTracker> tracker;
+            auto const initializeTracker = [&](const NamespaceString& nss) {
+                tracker.emplace(opCtx,
+                                nss,
+                                Top::LockType::ReadLocked,
+                                AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                    .getDatabaseProfileLevel(nss.dbName()));
+            };
+            auto nssOrUUID = distinctRequest.getNamespaceOrUUID();
+
+            if (nssOrUUID.isNamespaceString()) {
+                initializeTracker(nssOrUUID.nss());
+            }
+            auto acquire = [&] {
+                return acquireCollectionOrViewMaybeLockFree(
+                    opCtx,
+                    CollectionOrViewAcquisitionRequest::fromOpCtx(
+                        opCtx, nssOrUUID, AcquisitionPrerequisites::kRead));
+            };
+            boost::optional<CollectionOrViewAcquisition> collectionOrView = acquire();
+
+            translateRequestForRawData(
+                opCtx, distinctRequest, nssOrUUID, collectionOrView, acquire);
+            const auto nss = collectionOrView->nss();
+
+            if (!tracker) {
+                initializeTracker(nss);
+            }
+
+            if (collectionOrView->isCollection()) {
+                const auto& coll = collectionOrView->getCollection();
+                // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
+                // collections in multi-document transactions.
+                uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                        "Cannot run 'distinct' on a sharded collection in a multi-document "
+                        "transaction. "
+                        "Please see http://dochub.mongodb.org/core/transaction-distinct for a "
+                        "recommended "
+                        "alternative.",
+                        !opCtx->inMultiDocumentTransaction() ||
+                            !coll.getShardingDescription().isSharded());
+
+                // Similarly, we ban readConcern level snapshot for sharded collections.
+                uassert(ErrorCodes::InvalidOptions,
+                        "Cannot run 'distinct' on a sharded collection with readConcern level "
+                        "'snapshot'",
+                        repl::ReadConcernArgs::get(opCtx).getLevel() !=
+                                repl::ReadConcernLevel::kSnapshotReadConcern ||
+                            !coll.getShardingDescription().isSharded());
+            }
+            const CollatorInterface* defaultCollation = collectionOrView->getCollectionPtr()
+                ? collectionOrView->getCollectionPtr()->getDefaultCollator()
+                : nullptr;
+
+            auto canonicalQuery = parseDistinctCmd(opCtx,
+                                                   *collectionOrView,
+                                                   nss,
+                                                   request(),
+                                                   ExtensionsCallbackReal(opCtx, &nss),
+                                                   defaultCollation,
+                                                   {});
+            const CanonicalDistinct& canonicalDistinct = *canonicalQuery->getDistinct();
+
+            // Create an RAII object that prints useful information about the ExpressionContext in
+            // the case of a tassert or crash.
+            ScopedDebugInfo expCtxDiagnostics(
+                "ExpCtxDiagnostics",
+                diagnostic_printers::ExpressionContextPrinter{canonicalQuery->getExpCtx()});
+
+            if (canonicalDistinct.isMirrored()) {
+                const auto& invocation = CommandInvocation::get(opCtx);
+                invocation->markMirrored();
+            } else if (auto sampleId = analyze_shard_key::getOrGenerateSampleId(
+                           opCtx,
+                           nss,
+                           analyze_shard_key::SampledCommandNameEnum::kDistinct,
+                           canonicalDistinct)) {
+                analyze_shard_key::QueryAnalysisWriter::get(opCtx)
+                    ->addDistinctQuery(*sampleId,
+                                       nss,
+                                       canonicalQuery->getQueryObj(),
+                                       canonicalQuery->getFindCommandRequest().getCollation())
+                    .getAsync([](auto) {});
+            }
+
+            if (collectionOrView->isView() ||
+                timeseries::requiresViewlessTimeseriesTranslation(opCtx, *collectionOrView)) {
+                // Relinquish locks. The aggregation command will re-acquire them.
+                collectionOrView.reset();
+                runDistinctAsAgg(
+                    opCtx, std::move(canonicalQuery), boost::none /* verbosity */, reply);
+                return;
+            }
+
+            // For the purposes of OpDebug's reporting, we only need 'collectionType' to distinguish
+            // between view/timeseries/collection. For view/timeseries, 'collectionType' will be set
+            // on the agg path taken above. In the normal path (i.e. here), we bypass the
+            // getCollectionType() call and hardcode "kCollection".
+            CurOp::get(opCtx)->debug().collectionType = query_shape::CollectionType::kCollection;
+
+            // Create an RAII object that prints the collection's shard key in the case of a tassert
+            // or crash.
+            auto collShardingDescription =
+                collectionOrView->getCollection().getShardingDescription();
+            ScopedDebugInfo shardKeyDiagnostics("ShardKeyDiagnostics",
+                                                diagnostic_printers::ShardKeyDiagnosticPrinter{
+                                                    collShardingDescription.isSharded()
+                                                        ? collShardingDescription.getKeyPattern()
+                                                        : BSONObj()});
+
+            // Check whether we are allowed to read from this node after acquiring our locks.
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            uassertStatusOK(replCoord->checkCanServeReadsFor(
+                opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
+
+            auto executor = createExecutorForDistinctCommand(
+                opCtx, std::move(canonicalQuery), collectionOrView->getCollection());
+
+            {
+                std::lock_guard<Client> lk(*opCtx->getClient());
+                CurOp::get(opCtx)->setPlanSummary(lk,
+                                                  executor->getPlanExplainer().getPlanSummary());
+                CurOp::get(opCtx)->debug().queryFramework = executor->getQueryFramework();
+            }
+
+            const auto key = distinctRequest.getKey();
+
+            std::vector<BSONObj> distinctValueHolder;
+            BSONElementSet values(executor->getCanonicalQuery()->getCollator());
+
+            const int kMaxResponseSize = BSONObjMaxUserSize - 4096;
+
+            // Capture diagnostics to be logged in the case of a failure.
+            ScopedDebugInfo explainDiagnostics(
+                "explainDiagnostics",
+                diagnostic_printers::ExplainDiagnosticPrinter{executor.get()});
+            try {
+                size_t listApproxBytes = 0;
+                BSONObj obj;
+                while (PlanExecutor::ADVANCED == executor->getNext(&obj, nullptr)) {
+                    // Distinct expands arrays.
+                    //
+                    // If our query is covered, each value of the key should be in the index key and
+                    // available to us without this.  If a collection scan is providing the data, we
+                    // may have to expand an array.
+                    BSONElementSet elts;
+                    mdps::extractAllElementsAlongPath(obj, key, elts);
+
+                    for (BSONElementSet::iterator it = elts.begin(); it != elts.end(); ++it) {
+                        BSONElement elt = *it;
+                        if (values.count(elt)) {
+                            continue;
+                        }
+
+                        // This is an approximate size check which safeguards against use of
+                        // unbounded memory by the distinct command. We perform a more precise check
+                        // at the end of this method to confirm that the response size is less than
+                        // 16MB.
+                        listApproxBytes += elt.size();
+                        uassert(17217,
+                                "distinct too big, 16mb cap",
+                                listApproxBytes < kMaxResponseSize);
+
+                        auto distinctObj = elt.wrap();
+                        values.insert(distinctObj.firstElement());
+                        distinctValueHolder.push_back(std::move(distinctObj));
+                    }
+                }
+            } catch (DBException& exception) {
+                auto&& explainer = executor->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                LOGV2_WARNING(23797,
+                              "Plan executor error during distinct command",
+                              "error"_attr = exception.toStatus(),
+                              "stats"_attr = redact(stats),
+                              "cmd"_attr = redact(unparsedRequest().body));
+
+                exception.addContext(str::stream()
+                                     << "Executor error during distinct command on namespace: "
+                                     << nss.toStringForErrorMsg());
+                throw;
+            }
+
+            auto curOp = CurOp::get(opCtx);
+            const auto& collection = collectionOrView->getCollectionPtr();
+
+            // Get summary information about the plan.
+            PlanSummaryStats stats;
+            auto&& explainer = executor->getPlanExplainer();
+            explainer.getSummaryStats(&stats);
+            if (collection) {
+                CollectionIndexUsageTrackerDecoration::recordCollectionIndexUsage(
+                    collection.get(),
+                    stats.collectionScans,
+                    stats.collectionScansNonTailable,
+                    stats.indexesUsed);
+            }
+
+            curOp->debug().setPlanSummaryMetrics(std::move(stats));
+            curOp->setEndOfOpMetrics(values.size());
+
+            if (curOp->shouldDBProfile()) {
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                curOp->debug().execStats = std::move(stats);
+            }
+
+            BSONObjBuilder result = reply->getBodyBuilder();
+            BSONArrayBuilder valueListBuilder(result.subarrayStart("values"));
+            for (const auto& value : values) {
+                valueListBuilder.append(value);
+            }
+            valueListBuilder.doneFast();
+
+            if (!opCtx->inMultiDocumentTransaction() &&
+                repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
+                result.append(
+                    "atClusterTime"sv,
+                    repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()->asTimestamp());
+            }
+
+            uassert(31299, "distinct too big, 16mb cap", result.len() < kMaxResponseSize);
+
+            auto* cq = executor->getCanonicalQuery();
+            collectQueryStatsMongod(
+                opCtx, cq->getExpCtx(), std::move(curOp->debug().getQueryStatsInfo().key));
+
+            // Include queryStats metrics in the result to be sent to mongos.
+            const bool includeMetrics =
+                CurOp::get(opCtx)->debug().getQueryStatsInfo().metricsRequested;
+
+            if (includeMetrics) {
+                // It is safe to unconditionally add the metrics because we are assured that the
+                // user data will not exceed the user size limit, and the limit enforced for sending
+                // the entire message is actually several KB larger, intentionally leaving buffer
+                // for metadata like this.
+                auto metrics = CurOp::get(opCtx)->debug().getCursorMetrics().toBSON();
+                result.append("metrics", metrics);
+            }
+        }
+
+        void runDistinctAsAgg(OperationContext* opCtx,
+                              std::unique_ptr<CanonicalQuery> canonicalQuery,
+                              boost::optional<ExplainOptions::Verbosity> verbosity,
+                              rpc::ReplyBuilderInterface* replyBuilder) const {
+            const auto& nss = canonicalQuery->nss();
+            const auto& dbName = nss.dbName();
+            const auto& vts = auth::ValidatedTenancyScope::get(opCtx);
+            const auto serializationContext = vts != boost::none
+                ? SerializationContext::stateCommandRequest(vts->hasTenantId(),
+                                                            vts->isFromAtlasProxy())
+                : SerializationContext::stateCommandRequest();
+
+            auto distinctAggRequest = parsed_distinct_command::asAggregation(
+                *canonicalQuery, verbosity, serializationContext);
+
+            distinctAggRequest.setQuerySettings(canonicalQuery->getExpCtx()->getQuerySettings());
+
+            auto curOp = CurOp::get(opCtx);
+
+            // We must store the key in distinct to prevent collecting query stats when the
+            // aggregation runs.
+            auto ownedQueryStatsKey = std::move(curOp->debug().getQueryStatsInfo().key);
+            curOp->debug().getQueryStatsInfo().disableForSubqueryExecution = true;
+
+            // This aggregation was derived locally from the distinct, so any IFR flag kickback it
+            // raises has to be absorbed here rather than propagated to the router.
+            //
+            // If running explain distinct as agg, then aggregate is executed without privilege
+            // checks and without response formatting.
+            if (verbosity) {
+                retryOnLocalIFRFlagKickback(
+                    opCtx, distinctAggRequest, "explain distinct as aggregation", [&] {
+                        uassertStatusOK(runAggregate(opCtx,
+                                                     distinctAggRequest,
+                                                     {distinctAggRequest},
+                                                     distinctAggRequest.toBSON(),
+                                                     PrivilegeVector(),
+                                                     verbosity,
+                                                     replyBuilder));
+                    });
+                return;
+            }
+
+            const auto privileges = uassertStatusOK(
+                auth::getPrivilegesForAggregate(opCtx,
+                                                AuthorizationSession::get(opCtx->getClient()),
+                                                distinctAggRequest.getNamespace(),
+                                                distinctAggRequest,
+                                                false /* isMongos */));
+            retryOnLocalIFRFlagKickback(opCtx, distinctAggRequest, "distinct as aggregation", [&] {
+                uassertStatusOK(runAggregate(opCtx,
+                                             distinctAggRequest,
+                                             {distinctAggRequest},
+                                             distinctAggRequest.toBSON(),
+                                             privileges,
+                                             verbosity,
+                                             replyBuilder));
+            });
+
+            // Copy the result from the aggregate command.
+            auto resultBuilder = replyBuilder->getBodyBuilder();
+            CommandHelpers::extractOrAppendOk(resultBuilder);
+            ViewResponseFormatter responseFormatter(resultBuilder.asTempObj().copy());
+
+            // Reset the builder state, as the response will be written to the same builder.
+            resultBuilder.resetToEmpty();
+
+            // Include queryStats metrics in the result to be sent to mongos. While most views for
+            // distinct on mongos will run through an aggregate pipeline on mongos, views on
+            // collections that can be read completely locally, such as non-existent database
+            // collections or unsplittable collections, will run through this distinct path on
+            // mongod and return metrics back to mongos.
+            const bool includeMetrics = curOp->debug().getQueryStatsInfo().metricsRequested;
+            boost::optional<BSONObj> metrics = includeMetrics
+                ? boost::make_optional(curOp->debug().getCursorMetrics().toBSON())
+                : boost::none;
+            uassertStatusOK(responseFormatter.appendAsDistinctResponse(
+                &resultBuilder, dbName.tenantId(), metrics));
+
+            curOp->setEndOfOpMetrics(resultBuilder.asTempObj().getObjectField("values").nFields());
+            collectQueryStatsMongod(
+                opCtx, canonicalQuery->getExpCtx(), std::move(ownedQueryStatsKey));
+        }
+
+        void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+            static const auto kMirrorableKeys = [] {
+                BSONObjBuilder keyBob;
+                keyBob.append("distinct", 1);
+                keyBob.append("key", 1);
+                keyBob.append("query", 1);
+                keyBob.append("hint", 1);
+                keyBob.append("collation", 1);
+                keyBob.append("rawData", 1);
+                keyBob.append("shardVersion", 1);
+                keyBob.append("databaseVersion", 1);
+                return keyBob.obj();
+            }();
+
+            // Filter the keys that can be mirrored
+            unparsedRequest().body.filterFieldsUndotted(bob, kMirrorableKeys, true);
+        }
+
+    private:
+        NamespaceString _ns;
+    };
+};
+MONGO_REGISTER_COMMAND(DistinctCommand).forShard();
+
+}  // namespace
+}  // namespace mongo

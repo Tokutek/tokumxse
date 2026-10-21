@@ -1,0 +1,176 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <string_view>
+
+#include <boost/optional.hpp>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+
+/**
+ * Wraps a boost::optional<bool> to provide consistent semantics. A standard boost::optional<bool>
+ * can introduce ambiguity because its 'operator bool' will resolve to 'true' if the optional is
+ * populated, even if is populated with boolean 'false'. By contrast, an instance of this class
+ * always resolves to the populated value, or false if not yet populated. This class will also
+ * serialize to BSON via the IDL only if the value has been explicitly set.
+ */
+class OptionalBool {
+public:
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    static OptionalBool parseFromBSON(BSONElement element) {
+        uassert(ErrorCodes::TypeMismatch,
+                str::stream() << "Field '" << element.fieldNameStringData()
+                              << "' should be a boolean value, but found: " << element.type(),
+                !element || element.type() == BSONType::boolean);
+        return element ? OptionalBool{element.boolean()} : OptionalBool{};
+    }
+
+    OptionalBool(boost::optional<bool> value) : _value(std::move(value)) {}
+    OptionalBool(bool value) : _value(value) {}
+
+    OptionalBool() : OptionalBool(boost::none) {}
+
+    /**
+     * Returns true only if _value is populated with a value of true.
+     */
+    operator bool() const {
+        return _value.value_or(false);
+    }
+
+    /**
+     * Returns the stored value or the given defaultValue if nothing is stored.
+     */
+    bool value_or(bool defaultValue) const {
+        return _value.value_or(defaultValue);
+    }
+
+    /**
+     * Returns true if the value has been populated, false otherwise.
+     */
+    bool has_value() const {
+        return _value.has_value();
+    }
+
+    /**
+     * Serialize this object as a field in a document. If _value is empty, omit the field.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    void serializeToBSON(std::string_view fieldName, BSONObjBuilder* builder) const {
+        if (_value) {
+            builder->appendBool(fieldName, *_value);
+        }
+    }
+
+    /**
+     * Serialize this object as an element of a BSON array. If _value is empty, omit the entry.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    void serializeToBSON(BSONArrayBuilder* builder) const {
+        if (_value) {
+            builder->append(*_value);
+        }
+    }
+
+    /**
+     * Returns a string representation of the current value.
+     */
+    std::string toString() const {
+        return *this ? "1" : "0";
+    }
+    operator std::string() const {
+        return toString();
+    }
+
+private:
+    boost::optional<bool> _value;
+};
+
+template <typename H>
+H AbslHashValue(H h, const OptionalBool& optBool) {
+    return H::combine(std::move(h), optBool.has_value(), bool(optBool));
+}
+
+/**
+ * Class to represent a BSON element with any type from IDL. The caller must ensure that the backing
+ * BSON stays alive while this type is in use.
+ */
+class IDLAnyType {
+public:
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    static IDLAnyType parseFromBSON(const BSONElement& element) {
+        return IDLAnyType(element);
+    }
+
+    IDLAnyType() = default;
+    IDLAnyType(const BSONElement& element) : _element(element) {}
+
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    void serializeToBSON(std::string_view fieldName, BSONObjBuilder* builder) const {
+        builder->appendAs(_element, fieldName);
+    }
+
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    void serializeToBSON(BSONArrayBuilder* builder) const {
+        builder->append(_element);
+    }
+
+    const BSONElement& getElement() const {
+        return _element;
+    }
+
+protected:
+    BSONElement _element;
+};
+
+/**
+ * Class to represent a BSON element with any type from IDL. Unlike IDLAnyType, here the caller
+ * does not need to ensure the backing BSON stays alive; it is handled by the class.
+ */
+class IDLAnyTypeOwned : public IDLAnyType {
+public:
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    static IDLAnyTypeOwned parseFromBSON(const BSONElement& element) {
+        return IDLAnyTypeOwned(element);
+    }
+
+    IDLAnyTypeOwned() = default;
+    IDLAnyTypeOwned(const BSONElement& element) {
+        _obj = element.wrap();
+        _element = _obj.firstElement();
+    }
+    // This constructor can be used to avoid copying the contents of 'element'.
+    IDLAnyTypeOwned(const BSONElement& element, BSONObj owningBSONObj)
+        : IDLAnyType(element), _obj(std::move(owningBSONObj)) {}
+
+private:
+    BSONObj _obj;
+};
+}  // namespace mongo

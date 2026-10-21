@@ -1,0 +1,34 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    redactEncryptedFields:
+        description: "Enables redaction of encrypted fields in BSON Objects, defaults to on"
+        set_at: [startup, runtime]
+        cpp_class:
+            name: RedactEncryptedFields
+            override_set: true
+        redact: false
+
+    ramLogMaxLines:
+        description: "Sets the maximum number of lines the RamLog can store."
+        set_at: [startup, runtime]
+        cpp_class:
+            name: RamLogMaxLines
+            override_set: true
+        redact: false
+
+    ramLogMaxSizeBytes:
+        description: "Sets the maximum number of bytes the RamLog can store."
+        set_at: [startup, runtime]
+        cpp_class:
+            name: RamLogMaxSizeBytes
+            override_set: true
+        redact: false

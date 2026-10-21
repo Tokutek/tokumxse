@@ -1,56 +1,62 @@
-/*    Copyright 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
 
+#include "mongo/base/status.h"
 #include "mongo/bson/oid.h"
-#include "mongo/util/background.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/periodic_runner.h"
 
-#include <string>
+#include <memory>
+#include <variant>
 
 namespace mongo {
 
-    class AuthorizationManager;
+class AuthorizationManager;
+class OperationContext;
+
+/**
+ * Background job that runs only in mongos and periodically checks in with the config servers
+ * to determine whether any authorization information has changed, and if so causes the
+ * AuthorizationManager to throw out its in-memory cache of User objects (which contains the
+ * users' credentials, roles, privileges, etc).
+ */
+class [[MONGO_MOD_PUBLIC]] UserCacheInvalidator {
+public:
+    using OIDorTimestamp = std::variant<OID, Timestamp>;
 
     /**
-     * Background job that runs only in mongos and periodically checks in with the config servers
-     * to determine whether any authorization information has changed, and if so causes the
-     * AuthorizationManager to throw out its in-memory cache of User objects (which contains the
-     * users' credentials, roles, privileges, etc).
+     * Create a new UserCacheInvalidator as a decorator on the service context
+     * and start the background job.
      */
-    class UserCacheInvalidator : public BackgroundJob {
-    public:
-        explicit UserCacheInvalidator(AuthorizationManager* authzManager);
+    static void start(ServiceContext* serviceCtx, OperationContext* opCtx);
 
-    protected:
-        virtual std::string name() const;
-        virtual void run();
+    /**
+     * Waits for the job to complete and stops the thread.
+     */
+    static void stop(ServiceContext* serviceCtx);
 
-    private:
-        AuthorizationManager* _authzManager;
-        OID _previousCacheGeneration;
-    };
+    /**
+     * Set the period of the background job. This should only be used internally (by the
+     * setParameter).
+     */
+    void setPeriod(Milliseconds period);
 
-} // namespace mongo
+private:
+    void initialize(OperationContext* opCtx);
+    void run();
+
+    PeriodicJobAnchor _job;
+
+    OIDorTimestamp _previousGeneration;
+
+    // this mutex serializes start and stop+detach on the periodic job
+    std::mutex _jobMutex;
+};
+
+Status userCacheInvalidationIntervalSecsNotify(const int& newValue);
+
+}  // namespace mongo

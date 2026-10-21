@@ -1,0 +1,344 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/scripting/mozjs/common/valuereader.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/mozjs/common/runtime.h"
+#include "mongo/scripting/mozjs/common/types/bindata.h"
+#include "mongo/scripting/mozjs/common/types/bson.h"
+#include "mongo/scripting/mozjs/common/types/code.h"
+#include "mongo/scripting/mozjs/common/types/dbpointer.h"
+#include "mongo/scripting/mozjs/common/types/dbref.h"
+#include "mongo/scripting/mozjs/common/types/maxkey.h"
+#include "mongo/scripting/mozjs/common/types/minkey.h"
+#include "mongo/scripting/mozjs/common/types/numberdecimal.h"
+#include "mongo/scripting/mozjs/common/types/numberlong.h"
+#include "mongo/scripting/mozjs/common/types/oid.h"
+#include "mongo/scripting/mozjs/common/types/regexp.h"
+#include "mongo/scripting/mozjs/common/types/timestamp.h"
+#include "mongo/scripting/mozjs/common/wraptype.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <cmath>
+#include <cstdio>
+#include <iosfwd>
+
+#if !defined(MONGO_MOZJS_WASI_BUILD)
+#include <string_view>
+
+#include <jscustomallocator.h>
+#endif
+
+#include <js/Array.h>
+#include <js/CharacterEncoding.h>
+#include <js/Date.h>
+#include <js/GCVector.h>
+#include <js/Object.h>
+#include <js/RootingAPI.h>
+#include <js/String.h>
+#include <js/TypeDecls.h>
+#include <js/Utility.h>
+#include <js/Value.h>
+#include <js/ValueArray.h>
+#include <mozilla/UniquePtr.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo {
+namespace mozjs {
+
+ValueReader::ValueReader(JSContext* cx, JS::MutableHandleValue value)
+    : _context(cx), _value(value) {}
+
+void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent, bool readOnly) {
+    auto runtime = getCommonRuntime(_context);
+
+    switch (elem.type()) {
+        case BSONType::code:
+            // javascriptProtection prevents Code and CodeWScope BSON types from
+            // being automatically marshalled into executable functions.
+            if (runtime->isJavaScriptProtectionEnabled()) {
+                JS::RootedValueArray<1> args(_context);
+                ValueReader(_context, args[0]).fromStringData(elem.valueStringData());
+                getProto<CodeInfo>(runtime).newInstance(args, _value);
+            } else {
+                runtime->newFunction(elem.valueStringData(), _value);
+            }
+            return;
+        case BSONType::codeWScope:
+            if (runtime->isJavaScriptProtectionEnabled()) {
+                JS::RootedValueArray<2> args(_context);
+                ValueReader(_context, args[0]).fromStringData(elem.codeWScopeCode());
+                ValueReader(_context, args[1])
+                    .fromBSON(elem.codeWScopeObject().getOwned(), nullptr, readOnly);
+                getProto<CodeInfo>(runtime).newInstance(args, _value);
+            } else {
+#ifndef MONGO_MOZJS_WASI_BUILD
+                if (!elem.codeWScopeObject().isEmpty())
+                    LOGV2_WARNING(23826, "CodeWScope doesn't transfer to db.eval");
+#endif
+                runtime->newFunction(
+                    std::string_view(elem.codeWScopeCode(), elem.codeWScopeCodeLen() - 1), _value);
+            }
+            return;
+        case BSONType::symbol:
+        case BSONType::string:
+            fromStringData(elem.valueStringData());
+            return;
+        case BSONType::oid: {
+            OIDInfo::make(_context, elem.OID(), _value);
+            return;
+        }
+        case BSONType::numberDouble:
+            fromDouble(elem.Number());
+            return;
+        case BSONType::numberInt:
+            _value.setInt32(elem.Int());
+            return;
+        case BSONType::array: {
+            fromBSONArray(elem.embeddedObject(), &parent, readOnly);
+            return;
+        }
+        case BSONType::object:
+            fromBSON(elem.embeddedObject(), &parent, readOnly);
+            return;
+        case BSONType::date:
+            _value.setObjectOrNull(
+                JS::NewDateObject(_context, JS::TimeClip(elem.Date().toMillisSinceEpoch())));
+            return;
+        case BSONType::boolean:
+            _value.setBoolean(elem.Bool());
+            return;
+        case BSONType::null:
+            _value.setNull();
+            return;
+        case BSONType::eoo:
+        case BSONType::undefined:
+            _value.setUndefined();
+            return;
+        case BSONType::regEx: {
+            JS::RootedValueArray<2> args(_context);
+
+            ValueReader(_context, args[0]).fromStringData(elem.regex());
+            ValueReader(_context, args[1]).fromStringData(elem.regexFlags());
+
+            JS::RootedObject obj(_context);
+            getProto<RegExpInfo>(runtime).newInstance(args, &obj);
+
+            _value.setObjectOrNull(obj);
+
+            return;
+        }
+        case BSONType::binData: {
+            int len;
+            const char* data = elem.binData(len);
+            std::stringstream ss;
+            base64::encode(ss, std::string_view(data, len));
+
+            JS::RootedValueArray<2> args(_context);
+
+            args[0].setInt32(elem.binDataType());
+
+            ValueReader(_context, args[1]).fromStringData(ss.str());
+
+            getProto<BinDataInfo>(runtime).newInstance(args, _value);
+            return;
+        }
+        case BSONType::timestamp: {
+            JS::RootedValueArray<2> args(_context);
+
+            ValueReader(_context, args[0])
+                .fromDouble(static_cast<double>(elem.timestampTime().toMillisSinceEpoch()) / 1000);
+            ValueReader(_context, args[1]).fromDouble(elem.timestampInc());
+
+            getProto<TimestampInfo>(runtime).newInstance(args, _value);
+
+            return;
+        }
+        case BSONType::numberLong: {
+            JS::RootedObject thisv(_context);
+            getProto<NumberLongInfo>(runtime).newObject(&thisv);
+            JS::SetReservedSlot(thisv,
+                                NumberLongInfo::Int64Slot,
+                                JS::PrivateValue(runtime->trackedNewInt64(elem.numberLong())));
+            _value.setObjectOrNull(thisv);
+            return;
+        }
+        case BSONType::numberDecimal: {
+            Decimal128 decimal = elem.numberDecimal();
+            JS::RootedValueArray<1> args(_context);
+            ValueReader(_context, args[0]).fromDecimal128(decimal);
+            JS::RootedObject obj(_context);
+
+            getProto<NumberDecimalInfo>(runtime).newInstance(args, &obj);
+            _value.setObjectOrNull(obj);
+
+            return;
+        }
+        case BSONType::minKey:
+            getProto<MinKeyInfo>(runtime).newInstance(_value);
+            return;
+        case BSONType::maxKey:
+            getProto<MaxKeyInfo>(runtime).newInstance(_value);
+            return;
+        case BSONType::dbRef: {
+            JS::RootedValueArray<1> oidArgs(_context);
+            ValueReader(_context, oidArgs[0]).fromStringData(elem.dbrefOID().toString());
+
+            JS::RootedValueArray<2> dbPointerArgs(_context);
+            ValueReader(_context, dbPointerArgs[0]).fromStringData(elem.dbrefNS());
+            getProto<OIDInfo>(runtime).newInstance(oidArgs, dbPointerArgs[1]);
+
+            getProto<DBPointerInfo>(runtime).newInstance(dbPointerArgs, _value);
+            return;
+        }
+        default:
+            massert(16661,
+                    str::stream() << "can't handle type: " << elem.type() << " " << elem.toString(),
+                    false);
+            break;
+    }
+
+    _value.setUndefined();
+}
+
+void ValueReader::fromBSONElementUnowned(const BSONElement& elem, bool readOnly) {
+    switch (elem.type()) {
+        case BSONType::array:
+            fromBSONArray(elem.embeddedObject(), nullptr, readOnly);
+            return;
+        case BSONType::object:
+            fromBSON(elem.embeddedObject(), nullptr, readOnly);
+            return;
+        default:
+            // For all non-object types (scalars, OIDs, dates, etc.) no BSONHolder is
+            // created, so parent ownership is irrelevant — delegate to the regular path.
+            fromBSONElement(elem, BSONObj::kEmptyObject, readOnly);
+            return;
+    }
+}
+
+void ValueReader::fromBSON(const BSONObj& obj, const BSONObj* parent, bool readOnly) {
+    JS::RootedObject child(_context);
+
+    bool filledDBRef = false;
+    if (obj.firstElementType() == BSONType::string &&
+        obj.firstElementFieldNameStringData() == "$ref") {
+        BSONObjIterator it(obj);
+        it.next();
+        const BSONElement id = it.next();
+
+        if (id.ok() && id.fieldNameStringData() == "$id") {
+            DBRefInfo::make(_context, &child, obj, parent, readOnly);
+            filledDBRef = true;
+        }
+    }
+
+    if (!filledDBRef) {
+        BSONInfo::make(_context, &child, obj, parent, readOnly);
+    }
+
+    _value.setObjectOrNull(child);
+}
+
+void ValueReader::fromBSONArray(const BSONObj& obj, const BSONObj* parent, bool readOnly) {
+    JS::RootedValueVector avv(_context);
+
+    for (auto&& elem : obj) {
+        JS::RootedValue member(_context);
+
+        ValueReader(_context, &member).fromBSONElement(elem, parent ? *parent : obj, readOnly);
+        if (!avv.append(member)) {
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to append to JS array");
+        }
+    }
+    JS::RootedObject array(_context, JS::NewArrayObject(_context, avv));
+    if (!array) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to JS::NewArrayObject");
+    }
+    if (readOnly && !JS_FreezeObject(_context, array)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Failed to freeze JS array");
+    }
+    _value.setObjectOrNull(array);
+}
+
+/**
+ * SpiderMonkey doesn't have a direct entry point to create a jsstring from
+ * utf8, so we have to flow through some slightly less public interfaces.
+ *
+ * Basically, we have to use their routines to convert to utf16, then assign
+ * those bytes with JS_NewUCStringCopyN
+ */
+void ValueReader::fromStringData(std::string_view sd) {
+    size_t utf16Len;
+
+    // TODO SERVER-122825: we have tests that involve dropping garbage in. Do we want to throw, or
+    // to take the lossy conversion?
+    auto utf16 = JS::LossyUTF8CharsToNewTwoByteCharsZ(
+        _context, JS::UTF8Chars(sd.data(), sd.size()), &utf16Len, js::StringBufferArena);
+
+    mozilla::UniquePtr<char16_t, JS::FreePolicy> utf16Deleter(utf16.get());
+
+    uassert(ErrorCodes::JSInterpreterFailure,
+            str::stream() << "Failed to encode \"" << sd << "\" as utf16",
+            utf16);
+
+    auto jsStr = JS_NewUCStringCopyN(_context, utf16.get(), utf16Len);
+
+    uassert(ErrorCodes::JSInterpreterFailure,
+            str::stream() << "Unable to copy \"" << sd << "\" into MozJS",
+            jsStr);
+
+    _value.setString(jsStr);
+}
+
+/**
+ * SpiderMonkey doesn't have a direct entry point to create a Decimal128
+ *
+ * Read NumberDecimal as a string
+ * Note: This prevents shell arithmetic, which is performed for number longs
+ * by converting them to doubles, which is imprecise. Until there is a better
+ * method to handle non-double shell arithmetic, decimals will remain
+ * as a non-numeric js type.
+ */
+void ValueReader::fromDecimal128(Decimal128 decimal) {
+    NumberDecimalInfo::make(_context, _value, decimal);
+}
+
+/**
+ * SpiderMonkey has a nasty habit of interpreting certain NaN patterns as other boxed types (it
+ * assumes that only one kind of NaN exists in JS, rather than the full ieee754 spectrum).  Thus we
+ * have to flow all double setting through a wrapper which ensures that nan's are coerced to the
+ * canonical javascript NaN.
+ *
+ * See SERVER-24054 for more details.
+ */
+void ValueReader::fromDouble(double d) {
+    if (std::isnan(d)) {
+        _value.set(JS::NaNValue());
+    } else {
+        _value.setDouble(d);
+    }
+}
+
+void ValueReader::fromInt64(int64_t i) {
+    auto runtime = getCommonRuntime(_context);
+    JS::RootedObject num(_context);
+    getProto<NumberLongInfo>(runtime).newObject(&num);
+    JS::SetReservedSlot(
+        num, NumberLongInfo::Int64Slot, JS::PrivateValue(runtime->trackedNewInt64(i)));
+    _value.setObjectOrNull(num);
+}
+
+}  // namespace mozjs
+}  // namespace mongo

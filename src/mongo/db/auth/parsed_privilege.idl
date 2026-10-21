@@ -1,0 +1,52 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::auth"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/auth/auth_types.idl"
+
+structs:
+    ParsedResource:
+        description: ResourcePattern as read from disk
+        strict: false
+        fields:
+            cluster:
+                # Conflicts with all other resource subfields
+                description: "ResourcePattern::forClusterResource"
+                type: safeBool
+                optional: true
+            anyResource:
+                # Conflicts with all other resource subfields
+                description: "ResourcePattern::forAnyResource"
+                type: safeBool
+                optional: true
+            db:
+                # Conflicts with all but 'collection' and 'system_buckets'
+                description: "Used with anyNormalResource or partial/exact namespace match"
+                type: string
+                optional: true
+            collection:
+                # Conflicts with all but 'db', which is required
+                description: "Used with anyNormalResource or partial/exact namespace match"
+                type: string
+                optional: true
+            system_buckets:
+                # conflicts with all but 'db', which is optional
+                type: string
+                cpp_name: systemBuckets
+                optional: true
+
+    ParsedPrivilege:
+        description: Privilege document as read from disk
+        strict: false
+        fields:
+            resource:
+                description: A description of the ResourcePattern used by this Privilege
+                type: ParsedResource
+            actions:
+                description: A list of ActionType names granted for the described resource
+                type: array<string>

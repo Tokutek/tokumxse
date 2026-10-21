@@ -1,0 +1,261 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/replicated_fast_count/replicated_fast_count_init.h"
+
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/replicated_fast_count/init_replicated_fast_count_oplog_entry_gen.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
+
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+namespace mongo {
+
+namespace {
+
+void _writeInitReplicatedFastCountOplogEntry(OperationContext* opCtx) {
+    InitReplicatedFastCountO2 o2;
+    o2.setFastCountMetadataStoreIdent(std::string(ident::kFastCountMetadataStore));
+    o2.setFastCountMetadataStoreKeyFormat(static_cast<int>(KeyFormat::String));
+    o2.setFastCountMetadataStoreTimestampsIdent(
+        std::string(ident::kFastCountMetadataStoreTimestamps));
+    o2.setFastCountMetadataStoreTimestampsKeyFormat(static_cast<int>(KeyFormat::Long));
+
+    repl::OpTime opTime;
+    opCtx->getServiceContext()->getOpObserver()->onInitReplicatedFastCount(opCtx, o2, opTime);
+}
+}  // namespace
+
+void setUpReplicatedFastCount(OperationContext* opCtx) {
+    auto& manager =
+        replicated_fast_count::ReplicatedFastCountManager::get(opCtx->getServiceContext());
+
+    auto status = createInternalFastCountContainers(opCtx,
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/true);
+    if (status == ErrorCodes::ObjectAlreadyExists) {
+        LOGV2(12309403,
+              "Replicated fast count idents already exist",
+              "metadataIdent"_attr = ident::kFastCountMetadataStore,
+              "timestampsIdent"_attr = ident::kFastCountMetadataStoreTimestamps);
+    } else {
+        massertStatusOK(status);
+    }
+
+    auto* engine = opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto metadataRS = engine->getRecordStore(opCtx,
+                                             NamespaceString::kAdminCommandNamespace,
+                                             ident::kFastCountMetadataStore,
+                                             RecordStore::Options{.keyFormat = KeyFormat::String},
+                                             /*uuid=*/boost::none);
+    auto timestampsRS = engine->getRecordStore(opCtx,
+                                               NamespaceString::kAdminCommandNamespace,
+                                               ident::kFastCountMetadataStoreTimestamps,
+                                               RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                               /*uuid=*/boost::none);
+    manager.initializeContainerStores(std::move(metadataRS), std::move(timestampsRS));
+
+    manager.startup(opCtx);
+
+    // Register the manager as the storage engine's FlushAllFilesObserver so the engine notifies it
+    // to flush size and count metadata when flushing all files.
+    opCtx->getServiceContext()->getStorageEngine()->setFlushAllFilesObserver(&manager);
+
+    // Standalones reach an invariant that there are no active storage transactions during setFCV so
+    // we abandon the snapshot.
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+}
+
+namespace {
+Status _createInternalFastCountContainer(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         std::string_view ident,
+                                         KeyFormat keyFormat) {
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    auto* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto* engine = storageEngine->getEngine();
+    auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+
+    // Rolling back table creation performs a two-phase drop, so this ident may be pending drop. If
+    // it is we'll need to complete the drop before we can proceed. If it isn't, this is a no-op.
+    if (auto status = storageEngine->immediatelyCompletePendingDrop(opCtx, ident); !status.isOK()) {
+        LOGV2(12309404,
+              "Replicated fast count ident being created was drop-pending and could not be dropped "
+              "immediately",
+              "ident"_attr = ident,
+              "error"_attr = status);
+        return status;
+    }
+
+    RecordStore::Options options;
+    options.keyFormat = keyFormat;
+    auto status = engine->createRecordStore(provider, ru, nss, ident, options);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    ru.onRollback([ident = std::string(ident)](OperationContext* opCtx) {
+        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        storageEngine->addDropPendingIdent(StorageEngine::Immediate{},
+                                           std::make_shared<Ident>(ident));
+    });
+
+    return status;
+}
+}  // namespace
+
+std::pair<Status, std::string> handleExistingFastCountIdent(OperationContext* opCtx,
+                                                            const NamespaceString& nss,
+                                                            std::string_view existingIdent,
+                                                            KeyFormat existingIdentFormat) {
+    auto* engine = opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+
+    RecordStore::Options existingIdentOptions{.keyFormat = existingIdentFormat};
+
+    bool empty = false;
+    try {
+        auto existingRs = engine->getRecordStore(opCtx,
+                                                 nss,
+                                                 existingIdent,
+                                                 existingIdentOptions,
+                                                 /*uuid=*/boost::none);
+        auto cursor = existingRs->getCursor(opCtx, ru);
+        empty = !cursor->next();
+    } catch (const DBException& ex) {
+        return {ex.toStatus(), ""};
+    }
+
+    if (!empty) {
+        return {Status(ErrorCodes::Error{12309402},
+                       fmt::format("The fast count ident {} already exists and was non-empty",
+                                   existingIdent)),
+                ""};
+    }
+
+    return {Status::OK(),
+            fmt::format("Fast count ident {} already exists on disk after drop attempt "
+                        "but it can be re-used",
+                        existingIdent)};
+}
+
+Status createInternalFastCountContainers(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         std::string_view metadataIdent,
+                                         KeyFormat metadataKeyFormat,
+                                         std::string_view timestampsIdent,
+                                         KeyFormat timestampsKeyFormat,
+                                         bool writeToOplog) {
+    // During secondary oplog application we need to use local write intent since regular write
+    // intent is for writable primaries.
+    auto intent = writeToOplog ? rss::consensus::IntentRegistry::Intent::Write
+                               : rss::consensus::IntentRegistry::Intent::LocalWrite;
+    Lock::GlobalLock globalLock(opCtx, MODE_IX, Lock::GlobalLockOptions{.explicitIntent = intent});
+
+    return writeConflictRetry(opCtx, "createInternalFastCountContainers", nss, [&]() -> Status {
+        // Try creating both containers. ObjectAlreadyExists tells us which idents exist.
+
+        WriteUnitOfWork wuow(opCtx);
+        auto metadataStatus =
+            _createInternalFastCountContainer(opCtx, nss, metadataIdent, metadataKeyFormat);
+        auto timestampsStatus =
+            _createInternalFastCountContainer(opCtx, nss, timestampsIdent, timestampsKeyFormat);
+
+        if (metadataStatus.isOK() && timestampsStatus.isOK()) {
+            if (writeToOplog) {
+                _writeInitReplicatedFastCountOplogEntry(opCtx);
+            }
+            wuow.commit();
+            LOGV2(12231704,
+                  "Created replicated fast count idents",
+                  "metadataIdent"_attr = ident::kFastCountMetadataStore,
+                  "timestampsIdent"_attr = ident::kFastCountMetadataStoreTimestamps);
+            return Status::OK();
+        }
+
+        if (metadataStatus == ErrorCodes::ObjectAlreadyExists &&
+            timestampsStatus == ErrorCodes::ObjectAlreadyExists) {
+            // Handling for both idents existing differs between stepup initialization and oplog
+            // application.
+            return metadataStatus;
+        }
+
+        if ((!metadataStatus.isOK() && metadataStatus != ErrorCodes::ObjectAlreadyExists) ||
+            (!timestampsStatus.isOK() && timestampsStatus != ErrorCodes::ObjectAlreadyExists)) {
+            // Return any unexpected error. WUOW rollback will remove any ident that was newly
+            // created.
+            return !metadataStatus.isOK() ? metadataStatus : timestampsStatus;
+        }
+
+        // TODO SERVER-114575 Layered table drops can sometimes report OK but collide with
+        // subsequent table creations. We can re-use the colliding ident as long as it is empty.
+        Status existingIdentStatus = Status::OK();
+        std::string msg;
+        if (metadataStatus == ErrorCodes::ObjectAlreadyExists) {
+            std::tie(existingIdentStatus, msg) =
+                handleExistingFastCountIdent(opCtx, nss, metadataIdent, metadataKeyFormat);
+        } else if (timestampsStatus == ErrorCodes::ObjectAlreadyExists) {
+            std::tie(existingIdentStatus, msg) =
+                handleExistingFastCountIdent(opCtx, nss, timestampsIdent, timestampsKeyFormat);
+        } else {
+            // Success cases or unexpected errors should have already been handled.
+            MONGO_UNREACHABLE_TASSERT(12309405);
+        }
+
+        if (existingIdentStatus.isOK()) {
+            // The colliding ident was empty so we can treat it as newly created.
+            LOGV2(12309400, "Reusing empty ident", "details"_attr = msg);
+            if (writeToOplog) {
+                _writeInitReplicatedFastCountOplogEntry(opCtx);
+            }
+            wuow.commit();
+        }
+        return existingIdentStatus;
+    });
+}
+
+void dropInternalFastCountContainers(OperationContext* opCtx) {
+    auto* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    auto* engine = storageEngine->getEngine();
+    if (!engine) {
+        // No underlying KVEngine (e.g. mock storage engines used in unit tests). There are no
+        // internal fast count container idents to drop.
+        return;
+    }
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+
+    for (std::string_view containerIdent :
+         {ident::kFastCountMetadataStore, ident::kFastCountMetadataStoreTimestamps}) {
+        if (!engine->hasIdent(ru, containerIdent)) {
+            continue;
+        }
+        storageEngine->addDropPendingIdent(StorageEngine::Immediate{},
+                                           std::make_shared<Ident>(std::string(containerIdent)));
+        LOGV2(12549700,
+              "Marked internal replicated fast count container ident for immediate drop",
+              "ident"_attr = containerIdent);
+    }
+}
+}  // namespace mongo

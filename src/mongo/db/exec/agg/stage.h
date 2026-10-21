@@ -1,0 +1,342 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/plan_stage_timer.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <string_view>
+
+namespace mongo {
+
+class DocumentSource;
+
+namespace exec {
+namespace agg {
+
+struct DynamicBatchSize;
+
+/**
+ * This is what is returned from the main 'Stage' API: getNext(). It is essentially a
+ * (ReturnStatus, Document) pair, with the first entry being used to communicate information
+ * about the execution of the 'Stage', such as whether or not it has been exhausted.
+ *
+ * TODO SERVER-112775: Remove 'server_backup_restore' dependency on this class.
+ * TODO SERVER-112776: Remove 'data_movement' dependency on this class.
+ * TODO SERVER-112777: Remove 'atlas_streams' dependency on this class.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] GetNextResult {
+public:
+    enum class ReturnStatus {
+        // There is a result to be processed.
+        kAdvanced,
+
+        // There is a control document to be processed. Control documents are documents with
+        // additional metadata that will be passed on by most pipeline stages unmodified and
+        // without further inspection.
+        // Currently only produced inside change streams.
+        kAdvancedControlDocument,
+
+        // There will be no further results.
+        kEOF,
+        // There is not a result to be processed yet, but there may be more results in the future.
+        // If a 'Stage' retrieves this status from its child, it must propagate it
+        // without doing any further work.
+        kPauseExecution,
+    };
+
+    static GetNextResult makeEOF() {
+        return GetNextResult(ReturnStatus::kEOF);
+    }
+
+    static GetNextResult makePauseExecution() {
+        return GetNextResult(ReturnStatus::kPauseExecution);
+    }
+
+    /**
+     * Builder method to create an 'advanced' GetNextResult containing a change stream control
+     * event.
+     */
+    static GetNextResult makeAdvancedControlDocument(Document&& result) {
+        dassert(result.metadata().isChangeStreamControlEvent());
+        return GetNextResult(ReturnStatus::kAdvancedControlDocument, std::move(result));
+    }
+
+    /**
+     * Shortcut constructor for the common case of creating an 'advanced' GetNextResult from the
+     * given 'result'. Accepts only an rvalue reference as an argument, since a Stage
+     * will want to move 'result' into this GetNextResult, and should have to opt in to making a
+     * copy.
+     */
+    /* implicit */ GetNextResult(Document&& result)
+        : GetNextResult(ReturnStatus::kAdvanced, std::move(result)) {
+        dassert(!_result.metadata().isChangeStreamControlEvent());
+    }
+
+    /**
+     * Gets the result document. It is an error to call this if both 'isAdvanced()' and
+     * 'isAdvancedControlDocument()' return false.
+     */
+    const Document& getDocument() const {
+        dassert(isAdvanced() || isAdvancedControlDocument());
+        return _result;
+    }
+
+    /**
+     * Releases the result document, transferring ownership to the caller. It is an error to
+     * call this if both 'isAdvanced()' and 'isAdvancedControlDocument()' return false.
+     */
+    Document releaseDocument() {
+        dassert(isAdvanced() || isAdvancedControlDocument());
+        return std::move(_result);
+    }
+
+    ReturnStatus getStatus() const {
+        return _status;
+    }
+
+    bool isAdvanced() const {
+        return _status == ReturnStatus::kAdvanced;
+    }
+
+    bool isEOF() const {
+        return _status == ReturnStatus::kEOF;
+    }
+
+    bool isPaused() const {
+        return _status == ReturnStatus::kPauseExecution;
+    }
+
+    bool isAdvancedControlDocument() const {
+        return _status == ReturnStatus::kAdvancedControlDocument;
+    }
+
+private:
+    // Private constructors, called from public constructor or builder methods above.
+    GetNextResult(ReturnStatus status) : _status(status) {}
+
+    GetNextResult(ReturnStatus status, Document&& result)
+        : _status(status), _result(std::move(result)) {}
+
+    ReturnStatus _status;
+    Document _result;
+};
+
+/**
+ * TODO SPM-4106: Remove inheritance once the refactoring is done.
+ * TODO SERVER-112775: Resolve 'server_backup_restore' dependency on this class.
+ * TODO SERVER-112776: Resolve 'data_movement' dependency on this class.
+ * TODO SERVER-112777: Resolve 'atlas_streams' dependency on this class.
+ */
+class [[MONGO_MOD_OPEN]] Stage : public virtual RefCountable {
+public:
+    Stage(std::string_view stageName, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    ~Stage() override {}
+
+    /**
+     * The stage spills its data and asks from all its children to spill their data as well.
+     */
+    void forceSpill() {
+        pExpCtx->checkForInterrupt();
+        doForceSpill();
+        if (pSource) {
+            pSource->forceSpill();
+        }
+    }
+
+    /**
+     * The main execution API of a Stage. Returns an intermediate query result
+     * generated by this Stage.
+     *
+     * For performance reasons, a streaming stage must not keep references to documents across calls
+     * to getNext(). Such stages must retrieve a result from their child and then release it (or
+     * return it) before asking for another result. Failing to do so can result in extra work, since
+     * the Document/Value library must copy data on write when that data has a refcount above one.
+     */
+    GetNextResult getNext() {
+        pExpCtx->checkForInterrupt();
+
+        if (MONGO_likely(!pExpCtx->shouldCollectDocumentSourceExecStats())) {
+            return doGetNext();
+        }
+
+        auto serviceCtx = pExpCtx->getOperationContext()->getServiceContext();
+        dassert(serviceCtx);
+
+        auto timer = getOptTimer(serviceCtx);
+
+        ++_commonStats.works;
+
+        GetNextResult next = doGetNext();
+        _commonStats.advanced += static_cast<unsigned>(next.isAdvanced());
+        return next;
+    }
+
+    /**
+     * Informs the stage that it is no longer needed and can release its resources. After dispose()
+     * is called the stage must still be able to handle calls to getNext(), but can return kEOF.
+     *
+     * This is a non-virtual public interface to ensure dispose() is threaded through the entire
+     * pipeline. Subclasses should override doDispose() to implement their disposal.
+     *
+     * The pipeline and its constituent stages should be attached to a valid 'OperationContext'
+     * pointer when calling this method.
+     */
+    void dispose() {
+        doDispose();
+        if (pSource) {
+            pSource->dispose();
+        }
+    }
+
+    /**
+     * Get the CommonStats for this Stage.
+     */
+    const CommonStats& getCommonStats() const {
+        return _commonStats;
+    }
+
+    /**
+     * Get the stats specific to the Stage. It is legal for the Stage
+     * to return nullptr to indicate that no specific stats are available.
+     */
+    virtual const SpecificStats* getSpecificStats() const {
+        return nullptr;
+    }
+
+    /**
+     * Returns the expression context from the stage's context.
+     */
+    const boost::intrusive_ptr<ExpressionContext>& getContext() const {
+        return pExpCtx;
+    }
+
+    /**
+     * Walks the chain of stages that feed into this stage, starting with its immediate source and
+     * proceeding towards the source of the pipeline. Invokes 'callback' on each stage in turn until
+     * either the callback returns false or there are no more stages to visit. The callback must be
+     * callable as 'bool(Stage&)'; returning true continues the walk, returning false stops it.
+     */
+    template <typename Callback>
+    void forEachSourceStage(Callback&& callback) {
+        for (Stage* source = pSource; source; source = source->pSource) {
+            if (!callback(*source)) {
+                break;
+            }
+        }
+    }
+
+    virtual void detachFromOperationContext() {}
+
+    virtual void reattachToOperationContext(OperationContext* opCtx) {}
+
+    /**
+     * Validate that all operation contexts associated with this document source, including any
+     * subpipelines, match the argument.
+     */
+    virtual bool validateOperationContext(const OperationContext* opCtx) const {
+        return getContext()->getOperationContext() == opCtx;
+    }
+
+    virtual bool usedDisk() const {
+        return false;
+    }
+
+    /**
+     * Returns true if the stage is known to be exhausted. Can be a false-negative (returns
+     * false when actually at EOF) but must never be a false-positive (returns true when there
+     * is more data). The default implementation conservatively returns false. Stages that can
+     * cheaply detect EOF should override this.
+     */
+    virtual bool isEOF() const {
+        return false;
+    }
+
+    virtual bool supportsDynamicBatchSize() const {
+        return false;
+    }
+
+    virtual void setDynamicBatchSize(DynamicBatchSize*) {
+        tasserted(13150707, "Dynamic batch size is not supported by this stage");
+    }
+
+    virtual Document getExplainOutput(
+        const query_shape::SerializationOptions& opts = query_shape::SerializationOptions{}) const;
+
+protected:
+    /**
+     * The main execution API of a Stage. Returns an intermediate query result
+     * generated by this Stage. See comment at getNext().
+     */
+    virtual GetNextResult doGetNext() = 0;
+
+    /**
+     * Release any resources held by this stage. After doDispose() is called the stage must still be
+     * able to handle calls to getNext(), but can return kEOF.
+     */
+    virtual void doDispose() {}
+
+
+    /**
+     * Spills the stage's data to disk. Stages that can spill their own data need to override this
+     * method.
+     */
+    virtual void doForceSpill() {}
+
+    /**
+     * Most Stages have an underlying source they get their data
+     * from. This is a convenience for them.
+     *
+     * The default implementation of setSourceStage() sets this; if you don't
+     * need a source, override that to verify(). The default is to verify()
+     * if this has already been set.
+     */
+    Stage* pSource;
+
+    boost::intrusive_ptr<ExpressionContext> pExpCtx;
+
+    CommonStats _commonStats;
+
+    /**
+     * Set the underlying source this stage should use to get Documents from. Must not throw
+     * exceptions. Overrides should call this base implementation to ensure any future default
+     * behaviour is captured. External callers should use exec::agg::buildStageAndStitch(),
+     * exec::agg::stitchStage(), or test helpers instead.
+     */
+    virtual void setSource(Stage* source) {
+        pSource = source;
+    }
+
+private:
+    friend boost::intrusive_ptr<Stage> buildStageAndStitch(
+        const boost::intrusive_ptr<DocumentSource>& ds,
+        const boost::intrusive_ptr<Stage>& sourceStage);
+
+    friend void stitchStage(Stage& stage, Stage* prior);
+
+    friend class MockStage;
+
+    /**
+     * Returns an optional timer which is used to collect the execution time.
+     * May return boost::none if it is not necessary to collect timing info.
+     */
+    boost::optional<ScopedTimer> getOptTimer(ServiceContext* serviceCtx) {
+        return maybeMakeScopedTimer(serviceCtx,
+                                    _commonStats.executionTime.precision,
+                                    &_commonStats.executionTime.executionTimeEstimate);
+    }
+};
+
+// TODO SERVER-105494: Use 'std::unique_ptr' instead of 'boost::intrusive_ptr'.
+using StagePtr = boost::intrusive_ptr<Stage>;
+
+}  // namespace agg
+}  // namespace exec
+}  // namespace mongo

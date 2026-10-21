@@ -1,0 +1,259 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/stage_builder/sbe/builder_state.h"
+
+#include "mongo/db/exec/docval_to_sbeval.h"
+#include "mongo/db/exec/sbe/in_list.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/query/stage_builder/sbe/builder_data.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/db/query/stage_builder/sbe/sbe_stage_blueprint.h"
+
+namespace mongo::stage_builder {
+
+StageBuilderState::StageBuilderState(OperationContext* opCtx,
+                                     Environment& env,
+                                     PlanStageStaticData* data,
+                                     const Variables& variables,
+                                     PlanYieldPolicySBE* yieldPolicy,
+                                     sbe::value::SlotIdGenerator* slotIdGenerator,
+                                     sbe::value::FrameIdGenerator* frameIdGenerator,
+                                     sbe::value::SpoolIdGenerator* spoolIdGenerator,
+                                     InListsMap* inListsMap,
+                                     CollatorsMap* collatorsMap,
+                                     SortSpecMap* sortSpecMap,
+                                     boost::intrusive_ptr<ExpressionContext> expCtx,
+                                     bool needsMerge,
+                                     bool allowDiskUse,
+                                     IncrementalFeatureRolloutContext& ifrContext)
+    : slotIdGenerator{slotIdGenerator},
+      frameIdGenerator{frameIdGenerator},
+      spoolIdGenerator{spoolIdGenerator},
+      inListsMap{inListsMap},
+      collatorsMap{collatorsMap},
+      sortSpecMap{sortSpecMap},
+      opCtx{opCtx},
+      env{env},
+      data{data},
+      variables{variables},
+      yieldPolicy{yieldPolicy},
+      expCtx{expCtx},
+      needsMerge{needsMerge},
+      allowDiskUse{allowDiskUse},
+      legacyDottedPathNullSemantics{internalQueryLegacyDottedPathNullSemantics.loadRelaxed()},
+      ifrContext(ifrContext),
+      _blueprint(std::make_unique<SbBlueprint>()) {}
+
+StageBuilderState::~StageBuilderState() = default;
+using namespace std::literals::string_view_literals;
+sbe::value::SlotId StageBuilderState::getGlobalVariableSlot(Variables::Id variableId) {
+    if (auto it = data->variableIdToSlotMap.find(variableId);
+        it != data->variableIdToSlotMap.end()) {
+        return it->second;
+    }
+
+    auto slotId =
+        env->registerSlot(sbe::value::TypeTags::Nothing, 0, false /* owned */, slotIdGenerator);
+    data->variableIdToSlotMap.emplace(variableId, slotId);
+    return slotId;
+}
+
+const CollatorInterface* StageBuilderState::makeOwnedCollator(const CollatorInterface* coll) {
+    if (!coll) {
+        return nullptr;
+    }
+
+    auto queryColl = data->queryCollator.get();
+    if (coll == queryColl || CollatorInterface::collatorsMatch(coll, queryColl)) {
+        return queryColl;
+    }
+
+    if (auto it = collatorsMap->find(coll); it != collatorsMap->end()) {
+        return it->second;
+    }
+
+    data->collators.emplace_back(coll->clone());
+    auto clonedColl = data->collators.back().get();
+
+    (*collatorsMap)[coll] = clonedColl;
+    (*collatorsMap)[clonedColl] = clonedColl;
+    return clonedColl;
+}
+
+sbe::InList* StageBuilderState::makeOwnedInList(const InMatchExpression* ime) {
+    if (inListsMap) {
+        if (auto it = inListsMap->find(ime); it != inListsMap->end()) {
+            return it->second;
+        }
+    }
+
+    // Get the InMatchExpression's InListData.
+    std::shared_ptr<const InListData> inListData = ime->getInListDataPtr();
+
+    // If the InListData's BSON is not owned, clone the InListData object and make its BSON owned.
+    if (!inListData->isBSONOwned()) {
+        std::shared_ptr<InListData> clonedData = inListData->clone();
+        clonedData->makeBSONOwned();
+        clonedData->setShared();
+
+        inListData = std::move(clonedData);
+    }
+
+    const CollatorInterface* coll = inListData->getCollator();
+
+    // If 'coll' is not null, make it owned.
+    if (coll != nullptr) {
+        coll = makeOwnedCollator(coll);
+    }
+
+    // Create an InList from 'inListData' and 'coll'.
+    auto inListPtr = std::make_unique<sbe::InList>(std::move(inListData), coll);
+    sbe::InList* inList = inListPtr.get();
+
+    // Store 'inListPtr' into the PlanStageStaticData.
+    data->inLists.emplace_back(std::move(inListPtr));
+
+    // Add 'inList' to 'inListsMap' so that we can retrieve it if makeOwnedInList() is called
+    // again on the same InMatchExpression.
+    if (inListsMap) {
+        inListsMap->emplace(ime, inList);
+    }
+
+    return inList;
+}
+
+sbe::value::SlotId StageBuilderState::getSortSpecSlot(const AccumulationStatement* acc) {
+    tassert(8679706, "Expected non-null AccumulationStatement", acc != nullptr);
+    const void* key = static_cast<const void*>(acc);
+
+    auto it = sortSpecMap->find(key);
+    if (it != sortSpecMap->end()) {
+        auto slot = it->second;
+        return slot;
+    }
+
+    // If we don't have a SortSpec for this AccumulationStatement yet, create one and
+    // add it the map and return it.
+    auto sortSpec = makeSortSpecFromSortPattern(getSortPattern(*acc));
+
+    auto tag = sbe::value::TypeTags::sortSpec;
+    auto val = sbe::value::bitcastFrom<sbe::SortSpec*>(sortSpec.release());
+    auto slot = env->registerSlot(tag, val, true, slotIdGenerator);
+
+    (*sortSpecMap)[key] = slot;
+    return slot;
+}
+
+sbe::value::SlotId StageBuilderState::registerInputParamSlot(
+    MatchExpression::InputParamId paramId) {
+    auto it = data->inputParamToSlotMap.find(paramId);
+    if (it != data->inputParamToSlotMap.end()) {
+        // This input parameter id has already been tied to a particular runtime environment slot.
+        // Just return that slot to the caller. This can happen if a query planning optimization or
+        // rewrite chose to clone one of the input expressions from the user's query.
+        return it->second;
+    }
+
+    auto slotId =
+        env->registerSlot(sbe::value::TypeTags::Nothing, 0, false /* owned */, slotIdGenerator);
+    data->inputParamToSlotMap.emplace(paramId, slotId);
+    return slotId;
+}
+
+sbe::value::SlotId StageBuilderState::getNothingSlot() {
+    auto slotId = env->getSlotIfExists(kNothingEnvSlotName);
+
+    if (!slotId) {
+        return env->registerSlot(
+            kNothingEnvSlotName, sbe::value::TypeTags::Nothing, 0, false, slotIdGenerator);
+    }
+
+    return *slotId;
+}
+
+bool StageBuilderState::isNothingSlot(sbe::value::SlotId slot) {
+    return slot == env->getSlotIfExists(kNothingEnvSlotName);
+}
+
+sbe::value::SlotId StageBuilderState::getEmptyObjSlot() {
+    auto slotId = env->getSlotIfExists("emptyObj"sv);
+
+    if (!slotId) {
+        auto tag = sbe::value::TypeTags::bsonObject;
+        auto val = sbe::value::bitcastFrom<const char*>(BSONObj::kEmptyObject.objdata());
+        return env->registerSlot("emptyObj"sv, tag, val, false, slotIdGenerator);
+    }
+
+    return *slotId;
+}
+
+boost::optional<sbe::value::SlotId> StageBuilderState::getTimeZoneDBSlot() {
+    auto slotId = env->getSlotIfExists("timeZoneDB"sv);
+
+    if (!slotId) {
+        return env->registerSlot(
+            "timeZoneDB"sv,
+            sbe::value::TypeTags::timeZoneDB,
+            sbe::value::bitcastFrom<const TimeZoneDatabase*>(getTimeZoneDatabase(opCtx)),
+            false,
+            slotIdGenerator);
+    }
+
+    return slotId;
+}
+
+boost::optional<sbe::value::SlotId> StageBuilderState::getCollatorSlot() {
+    auto slotId = env->getSlotIfExists("collator"sv);
+
+    if (!slotId && data != nullptr) {
+        if (auto coll = data->queryCollator.get()) {
+            return env->registerSlot("collator"sv,
+                                     sbe::value::TypeTags::collator,
+                                     sbe::value::bitcastFrom<const CollatorInterface*>(coll),
+                                     false,
+                                     slotIdGenerator);
+        }
+    }
+
+    return slotId;
+}
+
+boost::optional<sbe::value::SlotId> StageBuilderState::getOplogTsSlot() {
+    auto slotId = env->getSlotIfExists("oplogTs"sv);
+
+    if (!slotId) {
+        return env->registerSlot(
+            "oplogTs"sv, sbe::value::TypeTags::Nothing, 0, false, slotIdGenerator);
+    }
+
+    return slotId;
+}
+
+boost::optional<sbe::value::SlotId> StageBuilderState::getBuiltinVarSlot(Variables::Id id) {
+    if (id == Variables::kRootId || id == Variables::kRemoveId) {
+        return boost::none;
+    }
+
+    auto it = Variables::kIdToBuiltinVarName.find(id);
+    tassert(7690415, "Expected 'id' to be in map", it != Variables::kIdToBuiltinVarName.end());
+
+    auto& name = it->second;
+    auto slotId = env->getSlotIfExists(name);
+    if (!slotId) {
+        if (variables.hasValue(id)) {
+            auto [tag, val] = sbe::value::makeValue(variables.getValue(id));
+            return env->registerSlot(name, tag, val, true, slotIdGenerator);
+        } else if (id == Variables::kSearchMetaId) {
+            // Normally, $search is responsible for setting a value for SEARCH_META, in which case
+            // we will bind the value to a slot above. However, in the event of a query that does
+            // not use $search, but references SEARCH_META, we need to bind a value of 'missing' to
+            // a slot so that the plan can run correctly.
+            return env->registerSlot(
+                name, sbe::value::TypeTags::Nothing, 0, false, slotIdGenerator);
+        }
+    }
+
+    return slotId;
+}
+}  // namespace mongo::stage_builder

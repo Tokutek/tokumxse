@@ -1,0 +1,127 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.DDL.Operations.
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/s/forwardable_operation_metadata.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/versioning_protocol/database_version.idl"
+    - "mongo/db/global_catalog/ddl/coordinator_session.idl"
+
+enums:
+    CoordinatorType:
+        description: "Type of the coordinator."
+        type: string
+        values:
+            kMovePrimary: "movePrimary"
+            kDropDatabase: "dropDatabase_V2"
+            kDropCollection: "dropCollection_V2"
+            kDropIndexes: "dropIndexes"
+            kRenameCollection: "renameCollection_V2"
+            kCreateCollection: "createCollection_V4"
+            kRefineCollectionShardKey: "refineCollectionShardKey_V2"
+            kSetAllowMigrations: "setAllowMigrations"
+            kCollMod: "collMod_V3"
+            kReshardCollection: "reshardCollection"
+            # Note: the V3 refers to the coordinator version, not the FLE2 protocol version
+            kCompactStructuredEncryptionData: "compactStructuredEncryptionData_V3"
+            kCleanupStructuredEncryptionData: "cleanupStructuredEncryptionData"
+            kMigrationBlockingOperation: "migrationBlockingOperation"
+            kMigrationBlockingOperationV2: "migrationBlockingOperationV2"
+            kConvertToCapped: "convertToCapped"
+            kUntrackUnsplittableCollection: "untrackUnsplittableCollection"
+            kCreateDatabase: "createDatabase"
+            kRemoveShardCommit: "removeShardCommit"
+            kAddShard: "addShard"
+            kCloneAuthoritativeMetadata: "cloneAuthoritativeMetadata"
+            kInitializePlacementHistory: "initializePlacementHistory"
+            # TODO (SERVER-116499): Remove this coordinator type once 9.0 becomes last LTS.
+            kTimeseriesUpgradeDowngrade: "upgradeDowngradeViewlessTimeseries"
+            kMergeChunks: "mergeChunks"
+            kMergeAllChunks: "mergeAllChunks"
+            kSplitChunk: "splitChunk"
+            kMoveRange: "moveRange"
+            kTestCoordinator: "testCoordinator"
+
+    # TODO (SERVER-98118): Remove this enum once v9.0 become last-lts.
+    AuthoritativeMetadataAccessLevel:
+        description: >-
+            Indicates the level of access to authoritative metadata granted by the FCV state at the
+            time of DDL document creation. The possible values are:
+                - `kNone`: No access to authoritative metadata. The DDL operates in a
+                    non-authoritative mode.
+                - `kWritesAllowed`: Write operations are permitted on authoritative metadata, but
+                    read access remains restricted. In this phase, the DDL is responsible for
+                    cloning the authoritative metadata from the global catalog to the shard catalog
+                    and committing changes to both catalogs.
+                - `kWritesAndReadsAllowed`: Both read and write operations are fully enabled. The
+                    DDL must still commit to both catalogs, but cloning is no longer required, as
+                    authoritative metadata is already present and reliable.
+        type: string
+        values:
+            kNone: "none"
+            kWritesAllowed: "writesAllowed"
+            kWritesAndReadsAllowed: "writesAndReadsAllowed"
+
+types:
+    ForwardableOperationMetadata:
+        description: "Forwardable operation metadata assiociated with this coordinator."
+        cpp_type: ForwardableOperationMetadata
+        bson_serialization_type: object
+        serializer: "mongo::ForwardableOperationMetadata::toBSON"
+        deserializer: "mongo::ForwardableOperationMetadata"
+        # ForwardableOperationMetadata has only non view members.
+        is_view: false
+
+structs:
+    ShardingCoordinatorId:
+        description: "Identifier for a specific sharding Coordinator."
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            namespace:
+                description: "The target namespace of the operation."
+                cpp_name: nss
+                type: namespacestring
+            operationType:
+                description: "Type of the sharding coordinator."
+                type: CoordinatorType
+
+    ShardingCoordinatorMetadata:
+        description: "Common metadata for all sharding coordinator."
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            _id:
+                type: ShardingCoordinatorId
+                cpp_name: id
+            recoveredFromDisk:
+                type: bool
+                default: false
+            forwardableOpMetadata:
+                type: ForwardableOperationMetadata
+                optional: true
+            databaseVersion:
+                type: DatabaseVersion
+                optional: true
+            session:
+                type: CoordinatorSession
+                optional: true
+            bucketNss:
+                description: "In case of sharded timeseries this variable will hold the underlying bucket namespace"
+                type: namespacestring
+                optional: true
+            abortReason:
+                description: "Error triggering the cleanup pipeline"
+                type: error_status
+                optional: true
+            authoritativeMetadataAccessLevel:
+                type: AuthoritativeMetadataAccessLevel
+                description: "The access level to authoritative metadata granted by the FCV state at the creation of this document."
+                default: kNone

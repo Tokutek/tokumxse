@@ -1,0 +1,531 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/query_shape/serialization_options.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+
+#include <string>
+#include <string_view>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo::query_shape {
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+// We'll pre-declare all of these strings so that we can avoid the allocations when we reference
+// them later.
+static constexpr std::string_view kUndefinedTypeString = "?undefined"sv;
+static constexpr std::string_view kStringTypeString = "?string"sv;
+static constexpr std::string_view kNumberTypeString = "?number"sv;
+static constexpr std::string_view kMinKeyTypeString = "?minKey"sv;
+static constexpr std::string_view kObjectTypeString = "?object"sv;
+static constexpr std::string_view kArrayTypeString = "?array"sv;
+static constexpr std::string_view kBinDataTypeString = "?binData"sv;
+static constexpr std::string_view kObjectIdTypeString = "?objectId"sv;
+static constexpr std::string_view kBoolTypeString = "?bool"sv;
+static constexpr std::string_view kDateTypeString = "?date"sv;
+static constexpr std::string_view kNullTypeString = "?null"sv;
+static constexpr std::string_view kRegexTypeString = "?regex"sv;
+static constexpr std::string_view kDbPointerTypeString = "?dbPointer"sv;
+static constexpr std::string_view kJavascriptTypeString = "?javascript"sv;
+static constexpr std::string_view kJavascriptWithScopeTypeString = "?javascriptWithScope"sv;
+static constexpr std::string_view kTimestampTypeString = "?timestamp"sv;
+static constexpr std::string_view kMaxKeyTypeString = "?maxKey"sv;
+
+static const StringMap<std::string_view> kArrayTypeStringConstants{
+    {kUndefinedTypeString.data(), "?array<?undefined>"sv},
+    {kStringTypeString.data(), "?array<?string>"sv},
+    {kNumberTypeString.data(), "?array<?number>"sv},
+    {kMinKeyTypeString.data(), "?array<?minKey>"sv},
+    {kObjectTypeString.data(), "?array<?object>"sv},
+    {kArrayTypeString.data(), "?array<?array>"sv},
+    {kBinDataTypeString.data(), "?array<?binData>"sv},
+    {kObjectIdTypeString.data(), "?array<?objectId>"sv},
+    {kBoolTypeString.data(), "?array<?bool>"sv},
+    {kDateTypeString.data(), "?array<?date>"sv},
+    {kNullTypeString.data(), "?array<?null>"sv},
+    {kRegexTypeString.data(), "?array<?regex>"sv},
+    {kDbPointerTypeString.data(), "?array<?dbPointer>"sv},
+    {kJavascriptTypeString.data(), "?array<?javascript>"sv},
+    {kJavascriptWithScopeTypeString.data(), "?array<?javascriptWithScope>"sv},
+    {kTimestampTypeString.data(), "?array<?timestamp>"sv},
+    {kMaxKeyTypeString.data(), "?array<?maxKey>"sv},
+};
+
+static constexpr auto kRepresentativeString = "?"sv;
+static constexpr auto kRepresentativeNumber = 1;
+static const auto kRepresentativeObject = BSON("?" << "?");
+static const auto kRepresentativeArray = BSONArray();
+static constexpr auto kRepresentativeBinData = BSONBinData();
+static const auto kRepresentativeObjectId = OID::max();
+static constexpr auto kRepresentativeBool = true;
+static const auto kRepresentativeDate = Date_t::fromMillisSinceEpoch(0);
+static const auto kRepresentativeRegex = BSONRegEx("/\?/");
+static const auto kRepresentativeDbPointer = BSONDBRef("?.?", OID::max());
+static const auto kRepresentativeJavascript = BSONCode("return ?;");
+static const auto kRepresentativeJavascriptWithScope = BSONCodeWScope("return ?;", BSONObj());
+static const auto kRepresentativeTimestamp = Timestamp::min();
+
+/**
+ * A default redaction strategy that generates easy to check results for testing purposes.
+ */
+std::string applyHmacForTest(std::string_view s) {
+    // Avoid ending in a parenthesis since the results will occur in a raw string where the )"
+    // sequence will accidentally terminate the string.
+    return str::stream() << "HASH<" << s << ">";
+}
+
+/**
+ * Computes a debug string meant to represent "any value of type t", where "t" is the type of the
+ * provided argument. For example "?number" for any number (int, double, etc.).
+ */
+std::string_view debugTypeString(BSONType t) {
+    // This is tightly coupled with 'canonicalizeBSONType' and therefore also with
+    // sorting/comparison semantics.
+    switch (t) {
+        case BSONType::eoo:
+        case BSONType::undefined:
+            return kUndefinedTypeString;
+        case BSONType::symbol:
+        case BSONType::string:
+            return kStringTypeString;
+        case BSONType::numberInt:
+        case BSONType::numberLong:
+        case BSONType::numberDouble:
+        case BSONType::numberDecimal:
+            return kNumberTypeString;
+        case BSONType::minKey:
+            return kMinKeyTypeString;
+        case BSONType::object:
+            return kObjectTypeString;
+        case BSONType::array:
+            // This case should only happen if we have an array within an array.
+            return kArrayTypeString;
+        case BSONType::binData:
+            return kBinDataTypeString;
+        case BSONType::oid:
+            return kObjectIdTypeString;
+        case BSONType::boolean:
+            return kBoolTypeString;
+        case BSONType::date:
+            return kDateTypeString;
+        case BSONType::null:
+            return kNullTypeString;
+        case BSONType::regEx:
+            return kRegexTypeString;
+        case BSONType::dbRef:
+            return kDbPointerTypeString;
+        case BSONType::code:
+            return kJavascriptTypeString;
+        case BSONType::codeWScope:
+            return kJavascriptWithScopeTypeString;
+        case BSONType::timestamp:
+            return kTimestampTypeString;
+        case BSONType::maxKey:
+            return kMaxKeyTypeString;
+        default:
+            MONGO_UNREACHABLE_TASSERT(7539806);
+    }
+}
+
+/**
+ * Returns an arbitrary value of the same type as the one given. For any number, this will be the
+ * number 1. For any boolean this will be true.
+ * TODO if you need a different value to make sure it will parse, you should not use this API.
+ */
+ImplicitValue defaultLiteralOfType(BSONType t) {
+    // This is tightly coupled with 'canonicalizeBSONType' and therefore also with
+    // sorting/comparison semantics.
+    switch (t) {
+        case BSONType::eoo:
+        case BSONType::undefined:
+            return BSONUndefined;
+        case BSONType::symbol:
+        case BSONType::string:
+            return kRepresentativeString;
+        case BSONType::numberInt:
+        case BSONType::numberLong:
+        case BSONType::numberDouble:
+        case BSONType::numberDecimal:
+            return kRepresentativeNumber;
+        case BSONType::minKey:
+            return MINKEY;
+        case BSONType::object:
+            return kRepresentativeObject;
+        case BSONType::array:
+            // This case should only happen if we have an array within an array.
+            return kRepresentativeArray;
+        case BSONType::binData:
+            return kRepresentativeBinData;
+        case BSONType::oid:
+            return kRepresentativeObjectId;
+        case BSONType::boolean:
+            return kRepresentativeBool;
+        case BSONType::date:
+            return kRepresentativeDate;
+        case BSONType::null:
+            return BSONNULL;
+        case BSONType::regEx:
+            return kRepresentativeRegex;
+        case BSONType::dbRef:
+            return kRepresentativeDbPointer;
+        case BSONType::code:
+            return kRepresentativeJavascript;
+        case BSONType::codeWScope:
+            return kRepresentativeJavascriptWithScope;
+        case BSONType::timestamp:
+            return kRepresentativeTimestamp;
+        case BSONType::maxKey:
+            return MAXKEY;
+        default:
+            MONGO_UNREACHABLE_TASSERT(7539803);
+    }
+}
+
+/**
+ * A struct representing the sub-type information for an array.
+ */
+struct ArraySubtypeInfo {
+    /**
+     * Whether the values of an array are all the same BSON type or not (mixed).
+     */
+    enum class NTypes { kEmpty, kOneType, kMixed };
+    ArraySubtypeInfo(NTypes nTypes_) : nTypes(nTypes_) {}
+    ArraySubtypeInfo(BSONType oneType) : nTypes(NTypes::kOneType), singleType(oneType) {}
+
+    NTypes nTypes;
+    boost::optional<BSONType> singleType = boost::none;
+};
+
+template <typename ValueType>
+using GetTypeFn = std::function<BSONType(ValueType)>;
+
+static GetTypeFn<BSONElement> getBSONElementType = [](const BSONElement& e) {
+    return e.type();
+};
+static GetTypeFn<Value> getValueType = [](const Value& v) {
+    return v.getType();
+};
+
+/**
+ * Scans 'arrayOfValues' to see if all values are of the same type or not. Returns this info in a
+ * struct - see the struct definition for how it is represented.
+ *
+ * Templated algorithm to handle both iterators of BSONElements or iterators of Values.
+ * 'getTypeCallback' is provided to abstract away the different '.type()' vs '.getType()' APIs.
+ */
+template <typename ArrayType, typename ValueType>
+ArraySubtypeInfo determineArraySubType(const ArrayType& arrayOfValues,
+                                       GetTypeFn<ValueType> getTypeCallback) {
+    boost::optional<BSONType> firstType = boost::none;
+    for (auto&& v : arrayOfValues) {
+        if (!firstType) {
+            firstType.emplace(getTypeCallback(v));
+        } else if (*firstType != getTypeCallback(v)) {
+            return {ArraySubtypeInfo::NTypes::kMixed};
+        }
+    }
+    return firstType ? ArraySubtypeInfo{*firstType}
+                     : ArraySubtypeInfo{ArraySubtypeInfo::NTypes::kEmpty};
+}
+
+ArraySubtypeInfo determineArraySubType(const BSONObj& arrayAsObj) {
+    return determineArraySubType<BSONObj, BSONElement>(arrayAsObj, getBSONElementType);
+}
+ArraySubtypeInfo determineArraySubType(const std::vector<Value>& values) {
+    return determineArraySubType<std::vector<Value>, Value>(values, getValueType);
+}
+
+template <typename ValueType>
+std::string_view debugTypeString(
+    const ValueType& v,
+    GetTypeFn<ValueType> getTypeCallback,
+    std::function<ArraySubtypeInfo(ValueType)> determineArraySubTypeCallback) {
+    if (getTypeCallback(v) == BSONType::array) {
+        // Iterating the array as .Obj(), as if it were a BSONObj (with field names '0', '1', etc.)
+        // is faster than converting the whole thing to an array which would force a copy.
+        auto typeInfo = determineArraySubTypeCallback(v);
+        switch (typeInfo.nTypes) {
+            case ArraySubtypeInfo::NTypes::kEmpty:
+                return "[]"sv;
+            case ArraySubtypeInfo::NTypes::kOneType:
+                return kArrayTypeStringConstants.at(debugTypeString(*typeInfo.singleType));
+            case ArraySubtypeInfo::NTypes::kMixed:
+                return "?array<>";
+            default:
+                MONGO_UNREACHABLE_TASSERT(7539801);
+        }
+    }
+    return debugTypeString(getTypeCallback(v));
+}
+
+template <typename ValueType>
+ImplicitValue defaultLiteralOfType(
+    const ValueType& v,
+    GetTypeFn<ValueType> getTypeCallback,
+    std::function<ArraySubtypeInfo(ValueType)> determineArraySubTypeCallback) {
+    if (getTypeCallback(v) == BSONType::array) {
+        auto typeInfo = determineArraySubTypeCallback(v);
+        switch (typeInfo.nTypes) {
+            case ArraySubtypeInfo::NTypes::kEmpty:
+                return BSONArray();
+            case ArraySubtypeInfo::NTypes::kOneType:
+                return std::vector<Value>{defaultLiteralOfType(*typeInfo.singleType)};
+            case ArraySubtypeInfo::NTypes::kMixed:
+                // We don't care which types, we'll use a number and a string as the canonical
+                // mixed type array regardless. This is to ensure we don't get 2^N possibilities
+                // for mixed type scenarios - we wish to collapse all "mixed type" arrays to one
+                // canonical mix. The choice of int and string is mostly arbitrary - hopefully
+                // somewhat comprehensible at a glance.
+                return std::vector<Value>{Value(2), Value("or more types"sv)};
+            default:
+                MONGO_UNREACHABLE_TASSERT(7539805);
+        }
+    }
+    return defaultLiteralOfType(getTypeCallback(v));
+}
+
+ArraySubtypeInfo getSubTypeFromBSONElemArray(BSONElement arrayElem) {
+    // Iterating the array as .Obj(), as if it were a BSONObj (with field names '0', '1', etc.)
+    // is faster than converting the whole thing to an array which would force a copy.
+    return determineArraySubType(arrayElem.Obj());
+}
+ArraySubtypeInfo getSubTypeFromValueArray(const Value& arrayVal) {
+    return determineArraySubType(arrayVal.getArray());
+}
+
+void appendDefaultOfNonArrayType(BSONObjBuilder* bob, std::string_view name, const BSONElement& e) {
+    switch (e.type()) {
+        case BSONType::eoo:
+        case BSONType::undefined:
+            bob->appendUndefined(name);
+            return;
+        case BSONType::symbol:
+        case BSONType::string:
+            bob->append(name, kRepresentativeString);
+            return;
+        case BSONType::numberInt:
+        case BSONType::numberLong:
+        case BSONType::numberDouble:
+        case BSONType::numberDecimal:
+            bob->append(name, kRepresentativeNumber);
+            return;
+        case BSONType::minKey:
+            bob->appendMinKey(name);
+            return;
+        case BSONType::object:
+            bob->append(name, kRepresentativeObject);
+            return;
+        case BSONType::array:
+            // This case is more complicated and callers should use a more generic helper.
+            MONGO_UNREACHABLE_TASSERT(8094100);
+        case BSONType::binData:
+            bob->append(name, kRepresentativeBinData);
+            return;
+        case BSONType::oid:
+            bob->append(name, kRepresentativeObjectId);
+            return;
+        case BSONType::boolean:
+            bob->append(name, kRepresentativeBool);
+            return;
+        case BSONType::date:
+            bob->append(name, kRepresentativeDate);
+            return;
+        case BSONType::null:
+            bob->appendNull(name);
+            return;
+        case BSONType::regEx:
+            bob->append(name, kRepresentativeRegex);
+            return;
+        case BSONType::dbRef:
+            bob->append(name, kRepresentativeDbPointer);
+            return;
+        case BSONType::code:
+            bob->append(name, kRepresentativeJavascript);
+            return;
+        case BSONType::codeWScope:
+            bob->append(name, kRepresentativeJavascriptWithScope);
+            return;
+        case BSONType::timestamp:
+            bob->append(name, kRepresentativeTimestamp);
+            return;
+        case BSONType::maxKey:
+            bob->appendMaxKey(name);
+            return;
+        default:
+            MONGO_UNREACHABLE_TASSERT(8094101);
+    };
+}
+}  // namespace
+
+const SerializationOptions SerializationOptions::kRepresentativeQueryShapeSerializeOptions =
+    SerializationOptions{.literalPolicy =
+                             LiteralSerializationPolicy::kToRepresentativeParseableValue,
+                         .inMatchExprSortAndDedupElements = false};
+
+const SerializationOptions SerializationOptions::kDebugQueryShapeSerializeOptions =
+    SerializationOptions{.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString,
+                         .inMatchExprSortAndDedupElements = false};
+
+const SerializationOptions SerializationOptions::kMarkIdentifiers_FOR_TEST = SerializationOptions{
+    .transformIdentifiers = true, .transformIdentifiersCallback = applyHmacForTest};
+
+const SerializationOptions SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST =
+    SerializationOptions{.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString,
+                         .transformIdentifiers = true,
+                         .transformIdentifiersCallback = applyHmacForTest};
+
+// Overloads for BSONElem and Value.
+std::string_view debugTypeString(BSONElement e) {
+    return debugTypeString<BSONElement>(e, getBSONElementType, getSubTypeFromBSONElemArray);
+}
+std::string_view debugTypeString(const Value& v) {
+    return debugTypeString<Value>(v, getValueType, getSubTypeFromValueArray);
+}
+
+// Overloads for BSONElem and Value.
+ImplicitValue defaultLiteralOfType(const Value& v) {
+    return defaultLiteralOfType<Value>(v, getValueType, getSubTypeFromValueArray);
+}
+ImplicitValue defaultLiteralOfType(BSONElement e) {
+    return defaultLiteralOfType<BSONElement>(e, getBSONElementType, getSubTypeFromBSONElemArray);
+}
+
+void SerializationOptions::appendLiteral(BSONObjBuilder* bob, const BSONElement& e) const {
+    appendLiteral(bob, e.fieldNameStringData(), e);
+}
+void SerializationOptions::appendLiteral(BSONObjBuilder* bob,
+                                         std::string_view name,
+                                         const BSONElement& e) const {
+    // The first two cases are particularly performance sensitive. We could answer everything here
+    // with the code inside the 'kToDebugTypeString' branch, but there are some relatively easy ways
+    // to accomplish the first two policy cases (in the common cases), so we'll special case those
+    // in order to avoid constructing a temporary Value.
+    switch (literalPolicy) {
+        case LiteralSerializationPolicy::kUnchanged:
+            bob->appendAs(e, name);
+            return;
+        case LiteralSerializationPolicy::kToRepresentativeParseableValue: {
+            if (e.type() != BSONType::array) {
+                appendDefaultOfNonArrayType(bob, name, e);
+                return;
+            }
+            // If it's an array we'll default to the slow but general codepath below.
+            [[fallthrough]];
+        }
+        case LiteralSerializationPolicy::kToDebugTypeString: {
+            // Performance isn't as sensitive here.
+            return serializeLiteral(e).addToBsonObj(bob, name);
+        }
+        default:
+            MONGO_UNREACHABLE_TASSERT(8094102);
+    }
+}
+
+void SerializationOptions::appendLiteral(BSONObjBuilder* bob,
+                                         std::string_view fieldName,
+                                         const ImplicitValue& v,
+                                         const boost::optional<Value>& representativeValue) const {
+    serializeLiteral(v, representativeValue).addToBsonObj(bob, fieldName);
+}
+
+Value SerializationOptions::serializeLiteral(
+    const BSONElement& e, const boost::optional<Value>& representativeValue) const {
+    switch (literalPolicy) {
+        case LiteralSerializationPolicy::kUnchanged:
+            return Value(e);
+        case LiteralSerializationPolicy::kToDebugTypeString:
+            return Value(debugTypeString(e));
+        case LiteralSerializationPolicy::kToRepresentativeParseableValue:
+            return representativeValue.value_or(defaultLiteralOfType(e));
+        default:
+            MONGO_UNREACHABLE_TASSERT(7539802);
+    }
+}
+
+Value SerializationOptions::serializeLiteral(
+    const ImplicitValue& v, const boost::optional<Value>& representativeValue) const {
+    switch (literalPolicy) {
+        case LiteralSerializationPolicy::kUnchanged:
+            return v;
+        case LiteralSerializationPolicy::kToDebugTypeString:
+            return Value(debugTypeString(v));
+        case LiteralSerializationPolicy::kToRepresentativeParseableValue:
+            return representativeValue.value_or(defaultLiteralOfType(v));
+        default:
+            MONGO_UNREACHABLE_TASSERT(7539804);
+    }
+}
+
+std::string SerializationOptions::serializeFieldPathFromString(std::string_view path) const {
+    if (transformIdentifiers) {
+        try {
+            return serializeFieldPath(FieldPath(path, false, false));
+        } catch (DBException& ex) {
+            LOGV2_DEBUG(7549808,
+                        1,
+                        "Failed to convert a path string to a FieldPath",
+                        "pathString"_attr = path,
+                        "failure"_attr = ex.toStatus());
+            return serializeFieldPath("invalidFieldPathPlaceholder");
+        }
+    }
+    return std::string{path};
+}
+
+std::string SerializationOptions::serializeFieldRef(const FieldRef& fieldRef) const {
+    if (transformIdentifiers) {
+        std::stringstream hmaced;
+        for (size_t i = 0; i < fieldRef.numParts(); ++i) {
+            if (i > 0) {
+                hmaced << ".";
+            }
+            std::string_view part = fieldRef.getPart(i);
+            hmaced << transformIdentifier(part);
+        }
+        return hmaced.str();
+    }
+    return std::string{fieldRef.dottedField()};
+}
+
+bool SerializationOptions::isDefaultSerialization() const {
+    return literalPolicy == LiteralSerializationPolicy::kUnchanged && !transformIdentifiers;
+}
+
+bool SerializationOptions::isKeepingLiteralsUnchanged() const {
+    return literalPolicy == LiteralSerializationPolicy::kUnchanged;
+}
+
+bool SerializationOptions::isSerializingLiteralsAsDebugTypes() const {
+    return literalPolicy == LiteralSerializationPolicy::kToDebugTypeString;
+}
+
+bool SerializationOptions::isReplacingLiteralsWithRepresentativeValues() const {
+    return literalPolicy == LiteralSerializationPolicy::kToRepresentativeParseableValue;
+}
+
+bool SerializationOptions::isSerializingForExplain() const {
+    return verbosity.has_value();
+}
+
+bool SerializationOptions::isShapifying() const {
+    return literalPolicy != LiteralSerializationPolicy::kUnchanged || transformIdentifiers;
+}
+
+}  // namespace mongo::query_shape

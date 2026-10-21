@@ -1,0 +1,49 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo
+    mod_visibility: public
+
+server_parameters:
+    internalProhibitShardOperationRetry:
+        description: >-
+            Prohibit retrying shard operations.
+        set_at: [startup, runtime]
+        default: false
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gInternalProhibitShardOperationRetry
+        redact: false
+
+    findChunksOnConfigTimeoutMS:
+        description: >-
+            The timeout for find operations against config.chunks.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gFindChunksOnConfigTimeoutMS
+        default: 900000
+        validator:
+            gte: 0
+        redact: false
+
+    findShardsOnConfigTimeoutMS:
+        description: >-
+            The timeout for find operations against config.shards.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gFindShardsOnConfigTimeoutMS
+        default: 20000
+        validator:
+            gte: 0
+        redact: false
+
+    defaultConfigCommandTimeoutMS:
+        description: Default timeout used for operations run against the config server.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: defaultConfigCommandTimeoutMS
+        # Default to 30 seconds
+        default: 30000
+        validator:
+            gte: 0
+        redact: false

@@ -1,0 +1,45 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+structs:
+    ClusterServerParameterTest:
+        description: "On-disk representation of CSP test case"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            # _id == 'cspTest'
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            intValue:
+                description: Simple scalar
+                type: safeInt
+                default: 42
+            strValue:
+                description: String value
+                type: string
+                default: '""'
+
+server_parameters:
+    cspTest:
+        set_at: cluster
+        description: "Cluster server parameter OpObserver test param"
+        cpp_vartype: ClusterServerParameterTest
+        cpp_varname: cspTestStorage
+        redact: false
+        omit_in_ftdc: false
+
+    cspTest2:
+        set_at: cluster
+        description: "Cluster server parameter OpObserver test param #2"
+        cpp_vartype: ClusterServerParameterTest
+        cpp_varname: cspTest2Storage
+        redact: false
+        omit_in_ftdc: false

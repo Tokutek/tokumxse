@@ -1,939 +1,1075 @@
-// sorted_data_interface_test_cursor_advanceto.cpp
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
-#include <boost/scoped_ptr.hpp>
-
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/sorted_data_interface_test_assert.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/unittest/unittest.h"
 
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
 namespace mongo {
+namespace {
 
-    using boost::scoped_ptr;
-    using std::vector;
+// Insert multiple single-field keys and advance to each of them
+// using a forward cursor by specifying their exact key. When
+// advanceTo() is called on a duplicate key, the cursor is
+// positioned at the first occurrence of that key in ascending
+// order by RecordId.
+TEST_F(SortedDataInterfaceTest, AdvanceTo) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-    // Insert multiple single-field keys and advance to each of them
-    // using a forward cursor by specifying their exact key. When
-    // advanceTo() is called on a duplicate key, the cursor is
-    // positioned at the next occurrence of that key in ascending
-    // order by RecordId.
-    TEST( SortedDataInterface, AdvanceTo ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc2, true /* allow duplicates */ ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc3, true /* allow duplicates */ ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc4, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc5, true ) );
-                uow.commit();
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 5, sorted->numEntries( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key1, 1, false, keyEnd, keyEndInclusive );
-                // SERVER-15489 forward cursor is positioned at first occurrence of key in index
-                //              when advanceTo() called on duplicate key
-                // ASSERT_EQUALS( key1, cursor->getKey() );
-                // ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key2, 1, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key2, cursor->getKey() );
-                ASSERT_EQUALS( loc4, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key3, 1, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key3, cursor->getKey() );
-                ASSERT_EQUALS( loc5, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key4, 1, false, keyEnd, keyEndInclusive );
-                ASSERT( cursor->isEOF() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key1, loc2),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key1, loc3),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key2, loc4), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc5), true));
+        txn.commit();
     }
 
-    // Insert multiple single-field keys and advance to each of them
-    // using a reverse cursor by specifying their exact key. When
-    // advanceTo() is called on a duplicate key, the cursor is
-    // positioned at the next occurrence of that key in descending
-    // order by RecordId.
-    TEST( SortedDataInterface, AdvanceToReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc2, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc3, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc4, true /* allow duplicates */ ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc5, true /* allow duplicates */ ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 5, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key1;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = -1;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        seekPoint.keyPrefix = key2;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key2, loc4));
+        builder.resetToEmpty(sorted->getOrdering());
 
-            ASSERT( cursor->locate( key3, loc5 ) );
-            ASSERT_EQUALS( key3, cursor->getKey() );
-            ASSERT_EQUALS( loc5, cursor->getRecordId() );
+        seekPoint.keyPrefix = key3;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key3, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+        seekPoint.keyPrefix = key4;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
 
-                cursor->advanceTo( key3, 1, false, keyEnd, keyEndInclusive );
-                // SERVER-15490 reverse cursor is positioned at last occurrence of key in index
-                //              when advanceTo() called on duplicate key
-                // ASSERT_EQUALS( key3, cursor->getKey() );
-                // ASSERT_EQUALS( loc4, cursor->getRecordId() );
-            }
+// Insert multiple single-field keys and advance to each of them
+// using a reverse cursor by specifying their exact key. When
+// advanceTo() is called on a duplicate key, the cursor is
+// positioned at the first occurrence of that key in descending
+// order by RecordId (last occurrence in index order).
+TEST_F(SortedDataInterfaceTest, AdvanceToReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                cursor->advanceTo( key2, 1, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key2, cursor->getKey() );
-                ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key1, 1, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key1, cursor->getKey() );
-                ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key0, 1, false, keyEnd, keyEndInclusive );
-                ASSERT( cursor->isEOF() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key2, loc2), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc3), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key3, loc4),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key3, loc5),
+                                            true /* allow duplicates */));
+        txn.commit();
     }
 
-    // Insert two single-field keys and advance to the larger one using
-    // a forward cursor positioned at the smaller one, by specifying a key
-    // before the current position of the cursor.
-    TEST( SortedDataInterface, AdvanceToKeyBeforeCursorPosition ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        bool isForward = false;
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), isForward));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc2, true ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), key3, isForward, true).finishAndGetBuffer()),
+            IndexKeyEntry(key3, loc5));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key3;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = -1;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key3, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
+        seekPoint.keyPrefix = key2;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key2, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
+        seekPoint.keyPrefix = key1;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+        seekPoint.keyPrefix = key0;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  boost::none);
+    }
+}
 
-                cursor->advanceTo( key0, 1, false, keyEnd, keyEndInclusive );
-                // SERVER-15489 forward cursor is positioned at first key in index
-                //              when advanceTo() called with key smaller than any entry
-                // ASSERT_EQUALS( key2, cursor->getKey() );
-                // ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
-        }
+// Insert two single-field keys, then seek a forward cursor to the larger one then seek behind
+// the smaller one.  Ending position is on the smaller one since a seek describes where to go
+// and should not be effected by current position.
+TEST_F(SortedDataInterfaceTest, AdvanceToKeyBeforeCursorPosition) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key0, 1, true, keyEnd, keyEndInclusive );
-                // SERVER-15489 forward cursor is positioned at first key in index
-                //              when advanceTo() called with key smaller than any entry
-                // ASSERT_EQUALS( key2, cursor->getKey() );
-                // ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key2, loc2), true));
+        txn.commit();
     }
 
-    // Insert two single-field keys and advance to the smaller one using
-    // a reverse cursor positioned at the larger one, by specifying a key
-    // after the current position of the cursor.
-    TEST( SortedDataInterface, AdvanceToKeyAfterCursorPositionReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc2, true ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key0;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = -1;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        seekPoint.firstExclusive = 0;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key1, loc1));
+    }
+}
 
-            ASSERT( cursor->locate( key2, loc2 ) );
-            ASSERT_EQUALS( key2, cursor->getKey() );
-            ASSERT_EQUALS( loc2, cursor->getRecordId() );
+// Insert two single-field keys, then seek a reverse cursor to the smaller one then seek behind
+// the larger one.  Ending position is on the larger one since a seek describes where to go
+// and should not be effected by current position.
+TEST_F(SortedDataInterfaceTest, AdvanceToKeyAfterCursorPositionReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                cursor->advanceTo( key3, 1, false, keyEnd, keyEndInclusive );
-                // SERVER-15490 reverse cursor is positioned at last key in index
-                //              when advanceTo() called with key larger than any entry
-                // ASSERT_EQUALS( key1, cursor->getKey() );
-                // ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-
-            ASSERT( cursor->locate( key2, loc2 ) );
-            ASSERT_EQUALS( key2, cursor->getKey() );
-            ASSERT_EQUALS( loc2, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key3, 1, true, keyEnd, keyEndInclusive );
-                // SERVER-15490 reverse cursor is positioned at last key in index
-                //              when advanceTo() called with key larger than any entry
-                // ASSERT_EQUALS( key1, cursor->getKey() );
-                // ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key2, loc2), true));
+        txn.commit();
     }
 
-    // Insert a single-field key and advance to EOF using a forward cursor
-    // by specifying that exact key. When advanceTo() is called with the key
-    // where the cursor is positioned (and it is the last entry for that key),
-    // the cursor should advance to EOF regardless of whether it is in non-
-    // or inclusive mode.
-    TEST( SortedDataInterface, AdvanceToKeyAtCursorPosition ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        bool isForward = false;
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), isForward));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), key2, isForward, true).finishAndGetBuffer()),
+            IndexKeyEntry(key2, loc2));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key3;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = -1;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key2, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
+        seekPoint.firstExclusive = 0;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key2, loc2));
+    }
+}
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
+// Insert a single-field key and advance to EOF using a forward cursor
+// by specifying that exact key. When seek() is called with the key
+// where the cursor is positioned (and it is the first entry for that key),
+// the cursor should remain at its current position. An exclusive seek will
+// position the cursor on the next position, which may be EOF.
+TEST_F(SortedDataInterfaceTest, AdvanceToKeyAtCursorPosition) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                // SERVER-15483 forward cursor positioned at last entry in index should move
-                //              to EOF when advanceTo() is called with that particular key
-                // cursor->advanceTo( key1, 1, false, keyEnd, keyEndInclusive );
-                // ASSERT( cursor->isEOF() );
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key1, 1, true, keyEnd, keyEndInclusive );
-                ASSERT( cursor->isEOF() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        txn.commit();
     }
 
-    // Insert a single-field key and advance to EOF using a reverse cursor
-    // by specifying that exact key. When advanceTo() is called with the key
-    // where the cursor is positioned (and it is the first entry for that key),
-    // the cursor should advance to EOF regardless of whether it is in non-
-    // or inclusive mode.
-    TEST( SortedDataInterface, AdvanceToKeyAtCursorPositionReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key1;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = -1;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        seekPoint.firstExclusive = 0;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
+// Insert a single-field key and advance to EOF using a reverse cursor
+// by specifying that exact key. When seek() is called with the key
+// where the cursor is positioned (and it is the first entry for that key),
+// the cursor should remain at its current position. An exclusive seek will
+// position the cursor on the next position, which may be EOF.
+TEST_F(SortedDataInterfaceTest, AdvanceToKeyAtCursorPositionReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                // SERVER-15483 reverse cursor positioned at first entry in index should move
-                //              to EOF when advanceTo() is called with that particular key
-                // cursor->advanceTo( key1, 1, false, keyEnd, keyEndInclusive );
-                // ASSERT( cursor->isEOF() );
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key1, 1, true, keyEnd, keyEndInclusive );
-                ASSERT( cursor->isEOF() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        txn.commit();
     }
 
-    // Insert multiple single-field keys and advance to each of them using
-    // a forward cursor by specifying a key that comes immediately before.
-    // When advanceTo() is called in non-inclusive mode, the cursor is
-    // positioned at the key that comes after the one specified.
-    TEST( SortedDataInterface, AdvanceToExclusive ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        bool isForward = false;
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), isForward));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc2, true /* allow duplicates */ ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc3, true /* allow duplicates */ ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc4, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc5, true ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), key1, isForward, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 5, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key1;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = -1;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
+        seekPoint.firstExclusive = 0;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  boost::none);
+    }
+}
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
+// Insert multiple single-field keys and advance to each of them using
+// a forward cursor by specifying a key that comes immediately before.
+// When advanceTo() is called in non-inclusive mode, the cursor is
+// positioned at the key that comes after the one specified.
+TEST_F(SortedDataInterfaceTest, AdvanceToExclusive) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                cursor->advanceTo( key1, 1, true, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key2, cursor->getKey() );
-                ASSERT_EQUALS( loc4, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key2, 1, true, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key3, cursor->getKey() );
-                ASSERT_EQUALS( loc5, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key3, 1, true, keyEnd, keyEndInclusive );
-                ASSERT( cursor->isEOF() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                // SERVER-15449 forward cursor positioned at EOF should stay at EOF
-                //              when advanceTo() is called
-                // cursor->advanceTo( key4, 1, true, keyEnd, keyEndInclusive );
-                // ASSERT( cursor->isEOF() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key1, loc2),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key1, loc3),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key2, loc4), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc5), true));
+        txn.commit();
     }
 
-    // Insert multiple single-field keys and advance to each of them using
-    // a reverse cursor by specifying a key that comes immediately after.
-    // When advanceTo() is called in non-inclusive mode, the cursor is
-    // positioned at the key that comes before the one specified.
-    TEST( SortedDataInterface, AdvanceToExclusiveReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc2, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc3, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc4, true /* allow duplicates */ ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc5, true /* allow duplicates */ ) );
-                uow.commit();
-            }
-        }
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 5, sorted->numEntries( opCtx.get() ) );
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key1;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = 0;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key2, loc4));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        seekPoint.keyPrefix = key2;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key3, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
 
-            ASSERT( cursor->locate( key3, loc5 ) );
-            ASSERT_EQUALS( key3, cursor->getKey() );
-            ASSERT_EQUALS( loc5, cursor->getRecordId() );
+        seekPoint.keyPrefix = key3;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+        builder.resetToEmpty(sorted->getOrdering());
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+        seekPoint.keyPrefix = key4;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
 
-                cursor->advanceTo( key3, 1, true, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key2, cursor->getKey() );
-                ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
+// Insert multiple single-field keys and advance to each of them using
+// a reverse cursor by specifying a key that comes immediately after.
+// When advanceTo() is called in non-inclusive mode, the cursor is
+// positioned at the key that comes before the one specified.
+TEST_F(SortedDataInterfaceTest, AdvanceToExclusiveReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                cursor->advanceTo( key2, 1, true, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key1, cursor->getKey() );
-                ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                cursor->advanceTo( key1, 1, true, keyEnd, keyEndInclusive );
-                ASSERT( cursor->isEOF() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                // SERVER-15449 reverse cursor positioned at EOF should stay at EOF
-                //              when advanceTo() is called
-                // cursor->advanceTo( key0, 1, true, keyEnd, keyEndInclusive );
-                // ASSERT( cursor->isEOF() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key2, loc2), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc3), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key3, loc4),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), key3, loc5),
+                                            true /* allow duplicates */));
+        txn.commit();
     }
 
-    // Insert multiple, non-consecutive, single-field keys and advance to
-    // each of them using a forward cursor by specifying a key between their
-    // exact key and the current position of the cursor.
-    TEST( SortedDataInterface, AdvanceToIndirect ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        BSONObj unusedKey = key6; // larger than any inserted key
+    {
+        bool isForward = false;
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), isForward));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), key3, isForward, true).finishAndGetBuffer()),
+            IndexKeyEntry(key3, loc5));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc2, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key5, loc3, true ) );
-                uow.commit();
-            }
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = key3;
+        seekPoint.prefixLen = 1;
+        seekPoint.firstExclusive = 0;
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key2, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+        seekPoint.keyPrefix = key2;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
+        seekPoint.keyPrefix = key1;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  boost::none);
+        builder.resetToEmpty(sorted->getOrdering());
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
+        seekPoint.keyPrefix = key0;
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  boost::none);
+    }
+}
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+// Insert multiple, non-consecutive, single-field keys and advance to
+// each of them using a forward cursor by specifying a key between their
+// exact key and the current position of the cursor.
+TEST_F(SortedDataInterfaceTest, AdvanceToIndirect) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-                const BSONElement end0 = key2.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = true;
+    BSONObj unusedKey = key6;  // larger than any inserted key
 
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key3, cursor->getKey() );
-                ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                const BSONElement end0 = key4.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = true;
-
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key5, cursor->getKey() );
-                ASSERT_EQUALS( loc3, cursor->getRecordId() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc2), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key5, loc3), true));
+        txn.commit();
     }
 
-    // Insert multiple, non-consecutive, single-field keys and advance to
-    // each of them using a reverse cursor by specifying a key between their
-    // exact key and the current position of the cursor.
-    TEST( SortedDataInterface, AdvanceToIndirectReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        BSONObj unusedKey = key0; // smaller than any inserted key
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc2, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key5, loc3, true ) );
-                uow.commit();
-            }
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.prefixLen = 0;
+        seekPoint.keySuffix = {key2.firstElement()};
+        seekPoint.firstExclusive = -1;
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key3, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        seekPoint.keySuffix = {key4.firstElement()};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key5, loc3));
+    }
+}
 
-            ASSERT( cursor->locate( key5, loc3 ) );
-            ASSERT_EQUALS( key5, cursor->getKey() );
-            ASSERT_EQUALS( loc3, cursor->getRecordId() );
+// Insert multiple, non-consecutive, single-field keys and advance to
+// each of them using a reverse cursor by specifying a key between their
+// exact key and the current position of the cursor.
+TEST_F(SortedDataInterfaceTest, AdvanceToIndirectReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    BSONObj unusedKey = key0;  // smaller than any inserted key
 
-                const BSONElement end0 = key4.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = true;
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key3, cursor->getKey() );
-                ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                const BSONElement end0 = key2.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = true;
-
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT_EQUALS( key1, cursor->getKey() );
-                ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc2), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key5, loc3), true));
+        txn.commit();
     }
 
-    // Insert multiple, non-consecutive, single-field keys and advance to
-    // each of them using a forward cursor by specifying a key between their
-    // exact key and the current position of the cursor. When advanceTo()
-    // is called in non-inclusive mode, the cursor is positioned at the key
-    // that comes after the one specified.
-    TEST( SortedDataInterface, AdvanceToIndirectExclusive ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        BSONObj unusedKey = key6; // larger than any inserted key
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+        ASSERT_EQ(cursor->seek(
+                      recoveryUnit(),
+                      makeKeyStringForSeek(sorted.get(), key5, false, true).finishAndGetBuffer()),
+                  IndexKeyEntry(key5, loc3));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc2, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key5, loc3, true ) );
-                uow.commit();
-            }
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.prefixLen = 0;
+        seekPoint.keySuffix = {key4.firstElement()};
+        seekPoint.firstExclusive = -1;
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key3, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
+        seekPoint.keySuffix = {key2.firstElement()};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key1, loc1));
+    }
+}
 
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
+// Insert multiple, non-consecutive, single-field keys and advance to
+// each of them using a forward cursor by specifying a key between their
+// exact key and the current position of the cursor. When advanceTo()
+// is called in non-inclusive mode, the cursor is positioned at the key
+// that comes after the one specified.
+TEST_F(SortedDataInterfaceTest, AdvanceToIndirectExclusive) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    BSONObj unusedKey = key6;  // larger than any inserted key
 
-                const BSONElement end0 = key2.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = false;
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( key3, cursor->getKey() );
-                ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                const BSONElement end0 = key4.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = false;
-
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( key5, cursor->getKey() );
-                ASSERT_EQUALS( loc3, cursor->getRecordId() );
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-
-            ASSERT( cursor->locate( key1, loc1 ) );
-            ASSERT_EQUALS( key1, cursor->getKey() );
-            ASSERT_EQUALS( loc1, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                const BSONElement end0 = key3.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = false;
-
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( key5, cursor->getKey() );
-                ASSERT_EQUALS( loc3, cursor->getRecordId() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc2), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key5, loc3), true));
+        txn.commit();
     }
 
-    // Insert multiple, non-consecutive, single-field keys and advance to
-    // each of them using a reverse cursor by specifying a key between their
-    // exact key and the current position of the cursor. When advanceTo()
-    // is called in non-inclusive mode, the cursor is positioned at the key
-    // that comes before the one specified.
-    TEST( SortedDataInterface, AdvanceToIndirectExclusiveReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        BSONObj unusedKey = key0; // smaller than any inserted key
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc2, true ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key5, loc3, true ) );
-                uow.commit();
-            }
-        }
+        IndexSeekPoint seekPoint;
+        seekPoint.prefixLen = 0;
+        seekPoint.keySuffix = {key2.firstElement()};
+        seekPoint.firstExclusive = 0;
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key3, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        seekPoint.keySuffix = {key4.firstElement()};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key5, loc3));
+        builder.resetToEmpty(sorted->getOrdering());
 
-            ASSERT( cursor->locate( key5, loc3 ) );
-            ASSERT_EQUALS( key5, cursor->getKey() );
-            ASSERT_EQUALS( loc3, cursor->getRecordId() );
+        ASSERT_EQ(
+            cursor->seek(recoveryUnit(),
+                         makeKeyStringForSeek(sorted.get(), key1, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(key1, loc1));
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+        seekPoint.keySuffix = {key3.firstElement()};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(key5, loc3));
+    }
+}
 
-                const BSONElement end0 = key4.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = false;
+// Insert multiple, non-consecutive, single-field keys and advance to
+// each of them using a reverse cursor by specifying a key between their
+// exact key and the current position of the cursor. When advanceTo()
+// is called in non-inclusive mode, the cursor is positioned at the key
+// that comes before the one specified.
+TEST_F(SortedDataInterfaceTest, AdvanceToIndirectExclusiveReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( key3, cursor->getKey() );
-                ASSERT_EQUALS( loc2, cursor->getRecordId() );
-            }
+    BSONObj unusedKey = key0;  // smaller than any inserted key
 
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-                const BSONElement end0 = key2.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = false;
-
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( key1, cursor->getKey() );
-                ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-
-            ASSERT( cursor->locate( key5, loc3 ) );
-            ASSERT_EQUALS( key5, cursor->getKey() );
-            ASSERT_EQUALS( loc3, cursor->getRecordId() );
-
-            {
-                vector<const BSONElement*> keyEnd( 1 );
-                vector<bool> keyEndInclusive( 1 );
-
-                const BSONElement end0 = key3.firstElement();
-                keyEnd[0] = &end0;
-                keyEndInclusive[0] = false;
-
-                cursor->advanceTo( unusedKey, 0, false, keyEnd, keyEndInclusive );
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( key1, cursor->getKey() );
-                ASSERT_EQUALS( loc1, cursor->getRecordId() );
-            }
-        }
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key1, loc1), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key3, loc2), true));
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key5, loc3), true));
+        txn.commit();
     }
 
-} // namespace mongo
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx(), recoveryUnit()));
+
+    {
+        bool isForward = false;
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), isForward));
+
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), key5, isForward, true).finishAndGetBuffer()),
+            IndexKeyEntry(key5, loc3));
+
+        IndexSeekPoint seekPoint;
+        seekPoint.prefixLen = 0;
+        seekPoint.keySuffix = {key4.firstElement()};
+        seekPoint.firstExclusive = 0;
+
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key3, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keySuffix = {key2.firstElement()};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key1, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), key5, isForward, true).finishAndGetBuffer()),
+            IndexKeyEntry(key5, loc3));
+
+        seekPoint.keySuffix = {key3.firstElement()};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, isForward, builder)),
+                  IndexKeyEntry(key1, loc1));
+    }
+}
+
+// Insert multiple two-field keys and advance to each of them using a forward cursor by specifying
+// their exact key. When advanceTo() is called on a duplicate key, the cursor is positioned at the
+// first occurrence of that key in ascending order by RecordId.
+TEST_F(SortedDataInterfaceTest, AdvanceToCompoundWithPrefixAndSuffixInclusive) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), compoundKey1a, loc2),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                            recoveryUnit(),
+                                            makeKeyString(sorted.get(), compoundKey1a, loc3),
+                                            true /* allow duplicates */));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey2b, loc4), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey3b, loc5), true));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(compoundKey1a, loc1));
+
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = compoundKey1a;
+        seekPoint.prefixLen = 1;  // Get first field from the prefix
+        std::vector<BSONElement> suffix;
+        compoundKey1a.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        seekPoint.firstExclusive = -1;  // Get second field from the suffix, no exclusive fields
+
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey1a, loc1));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey2b;
+        suffix.clear();
+        compoundKey2b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey2b, loc4));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3b;
+        suffix.clear();
+        compoundKey3b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey3b, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3c;
+        suffix.clear();
+        compoundKey3c.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
+
+// Insert multiple two-field keys and advance to each of them using a forward cursor by specifying a
+// key that comes before. When advanceTo() is called in non-inclusive mode, the cursor is positioned
+// at the key that comes after the one specified. When dealing with prefixes, that means that any
+// keys that match on the prefix are skipped.
+TEST_F(SortedDataInterfaceTest, AdvanceToCompoundWithPrefixExclusive) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1c, loc3), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey2b, loc4), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey3b, loc5), true));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(compoundKey1a, loc1));
+
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = compoundKey1a;
+        seekPoint.prefixLen = 1;  // Get first field from prefix
+        std::vector<BSONElement> suffix;
+        compoundKey1a.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        seekPoint.firstExclusive = 0;  // Ignore the suffix, make prefix exclusive
+
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey2b, loc4));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey2b;
+        suffix.clear();
+        compoundKey2b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey3b, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3b;
+        suffix.clear();
+        compoundKey3b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3c;
+        suffix.clear();
+        compoundKey3c.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
+
+// Insert multiple two-field keys and advance to each of them using a forward cursor by specifying a
+// key that comes before. When advanceTo() is called in non-inclusive mode, the cursor is positioned
+// at the key that comes after the one specified.
+TEST_F(SortedDataInterfaceTest, AdvanceToCompoundWithPrefixAndSuffixExclusive) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1c, loc3), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey2b, loc4), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey3b, loc5), true));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(compoundKey1a, loc1));
+
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = compoundKey1a;
+        seekPoint.prefixLen = 1;  // Get first field from the prefix
+        std::vector<BSONElement> suffix;
+        compoundKey1a.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        seekPoint.firstExclusive = 1;  // Get second field from suffix, make it exclusive
+
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey1b, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey2b;
+        suffix.clear();
+        compoundKey2b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey3b, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3b;
+        suffix.clear();
+        compoundKey3b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3c;
+        suffix.clear();
+        compoundKey3c.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
+
+// Insert multiple two-field keys and advance to each of them using a forward cursor by specifying a
+// key that comes before. When advanceTo() is called in non-inclusive mode, the cursor is positioned
+// at the key that comes after the one specified.
+TEST_F(SortedDataInterfaceTest, AdvanceToCompoundWithSuffixExclusive) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1a, loc1), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1b, loc2), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey1c, loc3), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey2b, loc4), true));
+        ASSERT_SDI_INSERT_OK(sorted->insert(
+            opCtx(), recoveryUnit(), makeKeyString(sorted.get(), compoundKey3b, loc5), true));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+
+        ASSERT_EQ(
+            cursor->seek(
+                recoveryUnit(),
+                makeKeyStringForSeek(sorted.get(), compoundKey1a, true, true).finishAndGetBuffer()),
+            IndexKeyEntry(compoundKey1a, loc1));
+
+        IndexSeekPoint seekPoint;
+        seekPoint.keyPrefix = compoundKey1a;
+        seekPoint.prefixLen = 0;  // Ignore the prefix
+        std::vector<BSONElement> suffix;
+        compoundKey1a.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        seekPoint.firstExclusive = 1;  // Get both fields from the suffix, make the second exclusive
+        key_string::Builder builder(sorted->getKeyStringVersion(), sorted->getOrdering());
+
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey1b, loc2));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey2b;
+        suffix.clear();
+        compoundKey2b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  IndexKeyEntry(compoundKey3b, loc5));
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3b;
+        suffix.clear();
+        compoundKey3b.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+        builder.resetToEmpty(sorted->getOrdering());
+
+        seekPoint.keyPrefix = compoundKey3c;
+        suffix.clear();
+        compoundKey3c.elems(suffix);
+        seekPoint.keySuffix = {suffix[0], suffix[1]};
+        ASSERT_EQ(cursor->seek(recoveryUnit(),
+                               IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                                   seekPoint, true, builder)),
+                  boost::none);
+    }
+}
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,14 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+enums:
+    StorageTierLevel:
+        description: "Disaggregated storage 'hotness' level for a collection or index"
+        type: string
+        values:
+            hot: hot
+            cold: cold

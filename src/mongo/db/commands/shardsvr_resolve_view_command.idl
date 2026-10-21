@@ -1,0 +1,50 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/pipeline/resolved_namespace.h"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+types:
+    resolved_view:
+        description:
+            "custom IDL type that wraps the cpp_type ResolvedNamespace, used by ShardsvrResolveViewReply.
+            The custom serialize and deserialize methods instruct IDL how to covert to/from C++ and BSON.  "
+        bson_serialization_type: any
+        cpp_type: "mongo::ResolvedNamespace"
+        is_view: true
+        serializer: "mongo::ResolvedNamespace::serializeToBSON"
+        deserializer: "mongo::ResolvedNamespace::parseFromBSON"
+
+structs:
+    ShardsvrResolveViewReply:
+        description: "The response that the primary shard returns to mongos upon receiving a shardsvrResolveView command"
+        fields:
+            collectionUUID:
+                type: uuid
+                optional: true
+            resolvedView:
+                type: resolved_view
+                optional: true
+
+commands:
+    _shardsvrResolveView:
+        command_name: _shardsvrResolveView
+        cpp_name: ShardsvrResolveView
+        description:
+            "Mongos issues this command on the primary shard to resolve the view for search index commands,
+            which require the view's name and effectivePipeline included in the request"
+        namespace: ignored
+        api_version: ""
+        strict: true
+        reply_type: ShardsvrResolveViewReply
+        fields:
+            nss:
+                description: "current operation namespace"
+                type: namespacestring
+                optional: false

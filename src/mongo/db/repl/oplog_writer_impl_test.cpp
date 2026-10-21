@@ -1,0 +1,252 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/oplog_writer_impl.h"
+
+#include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_applier_batcher_test_fixture.h"
+#include "mongo/db/repl/oplog_writer.h"
+#include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/unittest/death_test.h"
+
+namespace mongo {
+namespace repl {
+namespace {
+using namespace std::literals::string_view_literals;
+
+const auto kDbName = DatabaseName::createDatabaseName_forTest(boost::none, "test"sv);
+const auto kNss1 = NamespaceString::createNamespaceString_forTest(kDbName, "foo");
+const auto kNss2 = NamespaceString::createNamespaceString_forTest(kDbName, "bar");
+
+BSONObj makeRawInsertOplogEntry(int t, const NamespaceString& nss) {
+    auto entry = makeInsertOplogEntry(t, nss);
+    return entry.getEntry().getRaw();
+}
+
+
+class JournalListenerMock : public JournalListener {
+public:
+    class Token : public JournalListener::Token {
+    public:
+        Token(OpTimeAndWallTime opTimeAndWallTime, bool isPrimary)
+            : opTimeAndWallTime(opTimeAndWallTime), isPrimary(isPrimary) {}
+        OpTimeAndWallTime opTimeAndWallTime;
+        bool isPrimary;
+    };
+
+    std::unique_ptr<JournalListener::Token> getToken(OperationContext* opCtx) override {
+        return std::make_unique<Token>(
+            repl::ReplicationCoordinator::get(opCtx)->getMyLastWrittenOpTimeAndWallTime(true),
+            false /* isPrimary */);
+    }
+
+    void onDurable(const JournalListener::Token& t) override {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto& token = dynamic_cast<const Token&>(t);
+        _onDurableToken = token.opTimeAndWallTime;
+    }
+
+    OpTimeAndWallTime getOnDurableToken() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _onDurableToken;
+    }
+
+private:
+    std::mutex _mutex;
+    OpTimeAndWallTime _onDurableToken;
+};
+
+class OplogWriterImplTest : public ServiceContextMongoDTest {
+protected:
+    explicit OplogWriterImplTest(Options options = {})
+        : ServiceContextMongoDTest(options.useReplSettings(true).useJournalListener(
+              std::make_unique<JournalListenerMock>())) {}
+
+    void setUp() override;
+    void tearDown() override;
+
+    OperationContext* opCtx() const;
+
+    ThreadPool* getWriterPool() const;
+    ReplicationCoordinator* getReplCoord() const;
+    StorageInterface* getStorageInterface() const;
+    ReplicationConsistencyMarkers* getConsistencyMarkers() const;
+    JournalListenerMock* getJournalListener() const;
+    int getOplogDocsCount() const;
+
+    ServiceContext* _serviceContext;
+    ServiceContext::UniqueOperationContext _opCtxHolder;
+    std::unique_ptr<ThreadPool> _workerPool;
+    std::unique_ptr<ReplicationConsistencyMarkers> _consistencyMarkers;
+};
+
+void OplogWriterImplTest::setUp() {
+    ServiceContextMongoDTest::setUp();
+
+    _serviceContext = getServiceContext();
+    _opCtxHolder = makeOperationContext();
+
+    ReplicationCoordinator::set(_serviceContext,
+                                std::make_unique<ReplicationCoordinatorMock>(_serviceContext));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
+    StorageInterface::set(_serviceContext, std::make_unique<StorageInterfaceImpl>());
+
+    _consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
+
+    MongoDSessionCatalog::set(
+        _serviceContext,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+
+    repl::createOplog(opCtx());
+
+    _workerPool = makeReplWorkerPool();
+}
+
+int OplogWriterImplTest::getOplogDocsCount() const {
+    AutoGetOplogFastPath oplogRead(opCtx(), OplogAccessMode::kRead);
+    const auto& oplog = oplogRead.getCollection();
+    return oplog->getRecordStore()->numRecords();
+}
+
+void OplogWriterImplTest::tearDown() {
+    _opCtxHolder = {};
+    _workerPool = {};
+    _consistencyMarkers = {};
+    StorageInterface::set(_serviceContext, {});
+    ServiceContextMongoDTest::tearDown();
+}
+
+OperationContext* OplogWriterImplTest::opCtx() const {
+    return _opCtxHolder.get();
+}
+
+ThreadPool* OplogWriterImplTest::getWriterPool() const {
+    return _workerPool.get();
+}
+
+ReplicationCoordinator* OplogWriterImplTest::getReplCoord() const {
+    return ReplicationCoordinator::get(_serviceContext);
+}
+
+StorageInterface* OplogWriterImplTest::getStorageInterface() const {
+    return StorageInterface::get(_serviceContext);
+}
+
+ReplicationConsistencyMarkers* OplogWriterImplTest::getConsistencyMarkers() const {
+    return _consistencyMarkers.get();
+}
+
+JournalListenerMock* OplogWriterImplTest::getJournalListener() const {
+    return static_cast<JournalListenerMock*>(journalListener());
+}
+
+using OplogWriterImplTestDeathTest = OplogWriterImplTest;
+DEATH_TEST_F(OplogWriterImplTestDeathTest, WriteEmptyBatchFails, "!ops.empty()") {
+    OplogWriter::Options options(false /* skipWritesToOplogColl */);
+
+    OplogWriterImpl oplogWriter(nullptr,  // executor
+                                nullptr,  // writeBuffer
+                                nullptr,  // applyBuffer
+                                nullptr,  // workerPool
+                                getReplCoord(),
+                                getStorageInterface(),
+                                getConsistencyMarkers(),
+                                options);
+
+    // Writing an empty batch should hit an invariant.
+    oplogWriter.writeOplogBatch(opCtx(), std::vector<BSONObj>{});
+}
+
+TEST_F(OplogWriterImplTest, WriteOplogCollection) {
+    OplogWriter::Options options(false /* skipWritesToOplogColl */);
+
+    OplogWriterImpl oplogWriter(nullptr,  // executor
+                                nullptr,  // writeBuffer
+                                nullptr,  // applyBuffer
+                                nullptr,  // workerPool
+                                getReplCoord(),
+                                getStorageInterface(),
+                                getConsistencyMarkers(),
+                                options);
+
+    std::vector<BSONObj> ops;
+    ops.push_back(makeRawInsertOplogEntry(1, kNss1));
+    ops.push_back(makeRawInsertOplogEntry(2, kNss2));
+
+    auto written = oplogWriter.writeOplogBatch(opCtx(), std::move(ops));
+
+    // Verify that the batch is only written to the oplog collection.
+    ASSERT(written);
+    ASSERT_EQ(2, getOplogDocsCount());
+}
+
+TEST_F(OplogWriterImplTest, SkipWriteToOplogCollection) {
+    OplogWriter::Options options(true /* skipWritesToOplogColl */);
+
+    OplogWriterImpl oplogWriter(nullptr,  // executor
+                                nullptr,  // writeBuffer
+                                nullptr,  // applyBuffer
+                                nullptr,  // workerPool
+                                getReplCoord(),
+                                getStorageInterface(),
+                                getConsistencyMarkers(),
+                                options);
+
+    std::vector<BSONObj> ops;
+    ops.push_back(makeRawInsertOplogEntry(1, kNss1));
+    ops.push_back(makeRawInsertOplogEntry(2, kNss2));
+
+    auto written = oplogWriter.writeOplogBatch(opCtx(), std::move(ops));
+
+    // Verify that the batch is not written any collection.
+    ASSERT(!written);
+    ASSERT_EQ(0, getOplogDocsCount());
+}
+
+TEST_F(OplogWriterImplTest, finalizeOplogBatchCorrectlyUpdatesOpTimes) {
+    OplogWriter::Options options(false /* skipWritesToOplogColl */);
+
+    OplogWriterImpl oplogWriter(nullptr,  // executor
+                                nullptr,  // writeBuffer
+                                nullptr,  // applyBuffer
+                                nullptr,  // workerPool
+                                getReplCoord(),
+                                getStorageInterface(),
+                                getConsistencyMarkers(),
+                                options);
+
+    auto curOpTime = OpTime(Timestamp(2, 2), 1);
+    auto curWallTime = Date_t::now();
+    OpTimeAndWallTime curOpTimeAndWallTime{curOpTime, curWallTime};
+
+    getReplCoord()->setMyLastWrittenOpTimeAndWallTimeForward(curOpTimeAndWallTime);
+    getReplCoord()->setMyLastAppliedOpTimeAndWallTimeForward(curOpTimeAndWallTime);
+    getReplCoord()->setMyLastDurableOpTimeAndWallTimeForward(curOpTimeAndWallTime);
+
+    OpTime newOpTime(curOpTime.getTimestamp() + 16, curOpTime.getTerm());
+    Date_t newWallTime = curWallTime + Seconds(10);
+    OpTimeAndWallTime newOpTimeAndWallTime{newOpTime, newWallTime};
+
+    oplogWriter.finalizeOplogBatch(opCtx(), newOpTimeAndWallTime, true);
+
+    // The finalizeOplogBatch() function only triggers the journal flusher but does not
+    // wait for it, so we sleep for a while and verify that the lastWritten opTime has
+    // been correctly updated and that the journal flusher has finished and invoked the
+    // onDurable callback. The test fixture disables periodic journal flush by default,
+    // making sure that it is finalizeOplogBatch() that triggers the journal flush.
+    sleepmillis(2000);
+    ASSERT_EQ(newOpTimeAndWallTime, getReplCoord()->getMyLastWrittenOpTimeAndWallTime());
+    ASSERT_EQ(newOpTimeAndWallTime, getJournalListener()->getOnDurableToken());
+}
+
+}  // namespace
+}  // namespace repl
+}  // namespace mongo

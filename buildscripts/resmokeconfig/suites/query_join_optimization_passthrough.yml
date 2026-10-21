@@ -1,0 +1,63 @@
+# Run tests that may contain $lookup using internalEnableJoinOptimization=true
+test_kind: js_test
+selector:
+  roots:
+    - jstests/sharding/**/*.js
+    - jstests/aggregation/**/*.js
+    - jstests/core/**/*.js
+    - jstests/core_standalone/**/*.js
+    - jstests/noPassthrough/**/*.js
+  exclude_files:
+    - jstests/sharding/libs/**/*.js
+    - jstests/noPassthrough/shell/**/*.js
+    # Tests that require a replica set member or mongos
+    - jstests/core/txns/**/*.js
+    - jstests/core/query/query_settings/**/*.js
+    - jstests/core/query/queryable_encryption/query_settings_fle.js
+    - jstests/core/query/queryable_encryption/basic_crud.js
+    - jstests/noPassthrough/traffic_recording/traffic_replaying.js
+    - jstests/noPassthrough/read_write_concern/read_write_concern_defaults_metrics.js
+    - jstests/sharding/cluster_cardinality_parameter_interrupt.js
+    - jstests/sharding/updates_to_rangedeletions_collection_trigger_range_deletions.js
+    - jstests/sharding/mongos_writes_wait_for_write_concern_transactions.js
+    - jstests/sharding/flush_resharding_state_change_errors.js
+    - jstests/sharding/resharding_critical_section_abort_txns.js
+    - jstests/sharding/resharding_abort_while_monitoring_to_commit.js
+    - jstests/sharding/query/change_streams/change_stream_no_orphans.js
+    # Tests that expect a specific plan
+    - jstests/aggregation/sources/lookup/lookup_query_stats.js
+    - jstests/aggregation/sources/lookup/lookup_unwind_sbe_pushdown.js
+    - jstests/noPassthrough/memory_tracking/hash_lookup_unwind_reports_memory_metrics.js
+    - jstests/noPassthrough/query/query-execution/spill_to_disk_server_status.js
+    - jstests/core/query/index_deduplication.js
+    - jstests/core/administrative/profile/*.js
+    - jstests/core/index/index_filter_commands.js
+    - jstests/core/query/explain/explain_multi_plan_count.js
+    - jstests/sharding/query/explain/explain_find_transformed_query.js
+    # TODO SERVER-100610: CBR picks plan without blocking sort, but test asserts on a plan with sort.
+    - jstests/core/query/sort/sort_array.js
+    # Plan cache failures unrelated to Join Optimization
+    - jstests/**/plan_cache/**/*.js
+    - jstests/sharding/query/sbe_plan_cache_does_not_block_range_deletion.js
+    # Requires external sort
+    - jstests/core/query/sort/sortg.js
+    # Replica set write block is not supported on standalone.
+    - jstests/core/administrative/block_replica_set_writes.js
+  exclude_with_any_tags:
+    - requires_kernel_619
+    - assumes_change_streams_v1
+    - requires_kernel_7014
+executor:
+  config:
+    shell_options:
+      crashOnInvalidBSONError: ""
+  fixture:
+    class: MongoDFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        internalEnableJoinOptimization: true
+        # Path arrayness is required for join optimization.
+        featureFlagPathArrayness: true
+        # Join optimization needs samplingCE for cardinality estimation
+        featureFlagCostBasedRanker: true

@@ -1,0 +1,102 @@
+/**
+ * Provides a hook to check that indexes are consistent across the sharded cluster.
+ *
+ * The hook checks that for every collection, all the shards that own chunks for the
+ * collection have the same indexes.
+ */
+import {ShardedIndexUtil} from "jstests/sharding/libs/sharded_index_util.js";
+
+export var ClusterIndexConsistencyChecker = (function () {
+    function run(mongos, keyFile) {
+        /**
+         * Returns an array of config.collections docs for all collections except temporary
+         * resharding ones.
+         *
+         * TODO(SERVER-134200): The system.resharding.* can be unaccessible during resharding
+         * operation, in the window between commit of temporary collection placement metadata
+         * to config and recipient shard fetching the new placement metadata from global catalog.
+         * This is a known limitation that can lead to transient errors and create noise.
+         * Therefore until the flaw of resharding pipeline is fixed, the validation is skipped
+         * for temporary resharding collections.
+         *
+         */
+        function getCollDocs() {
+            return mongos
+                .getDB("config")
+                .collections.find({_id: {$not: /\.system\.resharding\./}})
+                .readConcern("local")
+                .toArray();
+        }
+
+        /**
+         * Returns a function that returns an array of index docs for the namespace grouped
+         * by shard.
+         */
+        function makeGetIndexDocsFunc(ns) {
+            return () => {
+                while (true) {
+                    try {
+                        return ShardedIndexUtil.getPerShardIndexes(mongos.getCollection(ns));
+                    } catch (e) {
+                        // Getting the indexes can fail with ShardNotFound if the router's
+                        // ShardRegistry reloads after choosing which shards to target and a chosen
+                        // shard is no longer in the cluster. This error should be transient, so it
+                        // can be retried on.
+                        //
+                        // Getting the indexes can also fail with HostUnreachable if the mongos
+                        // routes to a node that stepped down since the mongos last polled its SDAM
+                        // state (e.g. after replSetStepUp). The mongos intentionally rewrites
+                        // NotPrimary shard errors as HostUnreachable so that the client retries
+                        // without triggering an SDAM state change. Once the mongos refreshes its
+                        // topology the retry will succeed.
+                        if (
+                            e.code === ErrorCodes.ShardNotFound ||
+                            e.code === ErrorCodes.HostUnreachable
+                        ) {
+                            jsTest.log.info("Retrying $indexStats aggregation on transient error", {
+                                error: e,
+                            });
+                            continue;
+                        }
+                        throw e;
+                    }
+                }
+            };
+        }
+
+        mongos.fullOptions = mongos.fullOptions || {};
+        const requiresAuth = keyFile || mongos.fullOptions.clusterAuthMode === "x509";
+        const collDocs = requiresAuth
+            ? authutil.asCluster(mongos, keyFile, getCollDocs)
+            : getCollDocs();
+        for (const collDoc of collDocs) {
+            const ns = collDoc._id;
+            const getIndexDocsForNs = makeGetIndexDocsFunc(ns);
+            jsTest.log.info(`Checking that the indexes for ${ns} are consistent across shards...`);
+
+            const indexDocs = requiresAuth
+                ? authutil.asCluster(mongos, keyFile, getIndexDocsForNs)
+                : getIndexDocsForNs();
+
+            if (indexDocs.length == 0) {
+                jsTest.log.info(`Found no indexes for ${ns}, skipping index consistency check`);
+                continue;
+            }
+
+            const inconsistentIndexes =
+                ShardedIndexUtil.findInconsistentIndexesAcrossShards(indexDocs);
+
+            for (const shard in inconsistentIndexes) {
+                const shardInconsistentIndexes = inconsistentIndexes[shard];
+                assert(
+                    shardInconsistentIndexes.length === 0,
+                    `found inconsistent indexes for ${ns}: ${tojson(inconsistentIndexes)}`,
+                );
+            }
+        }
+    }
+
+    return {
+        run: run,
+    };
+})();

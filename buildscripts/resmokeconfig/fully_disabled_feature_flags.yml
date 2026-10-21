@@ -1,0 +1,48 @@
+# Feature flags here are turned off even on the "all feature flags" build variants.
+# Feature flags here disable jstests that are tagged with these feature flags on all variants.
+#
+# These flags can be enabled on a per-task or per-build-variant basis
+# by modifying their respective definitions in evergreen.yml.
+
+- featureFlagFryer
+# This flag exists to help users in managed environments that upgraded to 6.0 before 6.0.0-rc8 was
+# released create the transactions collection index and is only meant to be enabled adhoc, so only
+# its targeted tests should enable it.
+- featureFlagAlwaysCreateConfigTransactionsPartialIndexOnStepUp
+- featureFlagUpdateDocumentShardKeyUsingTransactionApi
+# TODO SERVER-102586: Revisit propagation of the VersionContext to checks,
+# if featureFlagAllMongodsAreSharded is re-enabled.
+- featureFlagAllMongodsAreSharded
+- featureFlagGRPC
+- featureFlagGaplessFTDC
+# TODO SERVER-67034: re-enable 'featureFlagSbeFull'.
+- featureFlagSbeFull
+# TODO (SERVER-108818): test primary-driven index builds in allFeatureFlag variant.
+- featureFlagPrimaryDrivenIndexBuilds
+- featureFlagResumablePrimaryDrivenIndexBuilds
+- featureFlagContainerWrites
+# TODO (SERVER-133236): Remove once the pipelined oplog applier works end-to-end, so it
+# can bake in the all-feature-flags variants before being enabled by default.
+- featureFlagPipelinedOplogApplier
+# TODO SERVER-117454: Enable the feature flag in the all-feature-flags variant.
+- featureFlagReplicatedFastCount
+# TODO (SERVER-117324): Remove featureFlagDisallowFindAndModifyImageCollection
+- featureFlagDisallowFindAndModifyImageCollection
+# TODO (SERVER-117924): Re-enable testing coverage for arbitrary updates on timeseries
+- featureFlagTimeseriesUpdatesSupport
+# Streams feature flag is excluded by default because streams requires a separate build flag
+# (--streams_release_build=True) to compile the streams code into the binary. Variants that
+# support streams should explicitly enable this flag.
+- featureFlagStreams
+# TODO SERVER-130858: Enable in the all-feature-flags variant.
+- featureFlagContinuousInternodeValidationPerDocument
+# TODO SERVER-131999: Enable in the all-feature-flags variant.
+- featureFlagContinuousInternodeValidationPerCollection
+# Metrics filtering cannot be enabled by default in tests because that is expected to cause
+# tests that depend on metrics not in the allowlists to fail.
+- featureFlagMetricsFiltering
+- featureFlagServerStatusMetricsFiltering
+- featureFlagReplSetGetStatusMetricsFiltering
+- featureFlagCollStatsMetricsFiltering
+# TODO SERVER-136165: Remove or re-enable featureFlagListIndexesAlwaysIncludesSimpleCollation.
+- featureFlagListIndexesAlwaysIncludesSimpleCollation

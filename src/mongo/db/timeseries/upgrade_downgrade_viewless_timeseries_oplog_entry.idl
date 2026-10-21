@@ -1,0 +1,36 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    UpgradeDowngradeViewlessTimeseriesOplogEntry:
+        description: >
+            The object field of an upgradeDowngradeViewlessTimeseries oplog entry.
+
+            Transforms a timeseries collection from viewful (`myts` view + `system.buckets.myts`
+            collection) to viewless format (unified `myts` timeseries collection) or viceversa.
+        strict: false
+        mod_visibility: public
+        fields:
+            upgradeDowngradeViewlessTimeseries:
+                description: >
+                    The name of the timeseries collection being upgraded or downgraded.
+                    This is the main colection name, i.e. it never has the system.buckets prefix.
+                type: string
+            skipViewCreation:
+                description: >
+                    If true, the view creation is skipped during downgrade. This is used for
+                    non-primary shards in a sharded cluster where only the primary shard
+                    should have the view.
+                type: bool
+                optional: true
+            isUpgrade:
+                description: >
+                    True if the operation is an upgrade from viewful to viewless timeseries.
+                    False if the operation is a downgrade from viewless to viewful timeseries.
+                type: bool

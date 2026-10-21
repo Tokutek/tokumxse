@@ -1,0 +1,11 @@
+test_kind: js_test
+
+selector:
+  roots:
+    - jstests/ratelimit/*.js
+
+# ratelimit tests start their own mongod's.
+executor:
+  config:
+    shell_options:
+      nodb: ""

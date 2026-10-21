@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.ddl.dropCollections, used by the
+# shard coordinator to guarantee resilience in the event of stepdowns while creating collections.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+structs:
+    SetAllowMigrationsCoordinatorDocument:
+        description: "Represents a set allow migrations operation on the coordinator shard."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            SetAllowMigrationsRequest: SetAllowMigrationsRequest

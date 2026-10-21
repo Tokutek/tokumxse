@@ -1,0 +1,418 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/query_cmd/bulk_write_common.h"
+#include "mongo/db/commands/query_cmd/bulk_write_gen.h"
+#include "mongo/db/commands/query_cmd/bulk_write_parser.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/shard_key_diagnostic_printer.h"
+#include "mongo/db/router_role/collection_routing_info_targeter.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/cluster_write.h"
+#include "mongo/s/commands/document_shard_key_update_util.h"
+#include "mongo/s/commands/query_cmd/cluster_explain.h"
+#include "mongo/s/commands/query_cmd/cluster_write_cmd.h"
+#include "mongo/s/commands/query_cmd/populate_cursor.h"
+#include "mongo/s/query/exec/cluster_client_cursor.h"
+#include "mongo/s/query/exec/cluster_cursor_manager.h"
+#include "mongo/s/query/exec/router_exec_stage.h"
+#include "mongo/s/would_change_owning_shard_exception.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/s/write_ops/bulk_write_exec.h"
+#include "mongo/s/write_ops/unified_write_executor/stats.h"
+#include "mongo/s/write_ops/unified_write_executor/unified_write_executor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+template <typename Impl>
+class ClusterBulkWriteCmd : public TypedCommand<ClusterBulkWriteCmd<Impl>> {
+public:
+    using TC = TypedCommand<ClusterBulkWriteCmd<Impl>>;
+    using Request = BulkWriteCommandRequest;
+    using Reply = BulkWriteCommandRequest::Reply;
+    ClusterBulkWriteCmd() : TC(Impl::kName) {}
+
+    bool adminOnly() const final {
+        return true;
+    }
+
+    const std::set<std::string>& apiVersions() const override {
+        return Impl::getApiVersions();
+    }
+
+    typename TC::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return TC::AllowedOnSecondary::kNever;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    typename TC::ReadWriteType getReadWriteType() const final {
+        return TC::ReadWriteType::kWrite;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    bool shouldAffectCommandCounter() const final {
+        return false;
+    }
+
+    LogicalOp getLogicalOp() const final {
+        return LogicalOp::opBulkWrite;
+    }
+
+    std::string help() const override {
+        return "command to apply inserts, updates and deletes in bulk";
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    class Invocation : public TC::InvocationBase {
+        using TC::InvocationBase::request;
+        using TC::InvocationBase::unparsedRequest;
+
+    public:
+        Invocation(OperationContext* opCtx, Command* cmd, const OpMsgRequest& opMsgRequest)
+            : TC::InvocationBase(opCtx, cmd, opMsgRequest) {
+            uassert(ErrorCodes::CommandNotSupported,
+                    "BulkWrite may not be run without featureFlagBulkWriteCommand enabled",
+                    gFeatureFlagBulkWriteCommand.isEnabled());
+
+            bulk_write_exec::addIdsForInserts(request());
+            bulk_write_common::validateRequest(request(), /*isRouter=*/true);
+        }
+
+        Reply typedRun(OperationContext* opCtx) {
+            preRunImplHook(opCtx);
+            BulkWriteCommandReply response;
+            auto& bulkRequest = request();
+            // We pre-create the targeters to pass in, as having access to the targeters is
+            // necessary for handling WouldChangeOwningShard errors, as for TS views we need to be
+            // able to obtain the bucket namespace to write to which we get via targeter.
+            std::vector<std::unique_ptr<NSTargeter>> targeters;
+            targeters.reserve(bulkRequest.getNsInfo().size());
+
+            if (auto let = bulkRequest.getLet()) {
+                // Evaluate the let parameters.
+                auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).letParameters(*let).build();
+                expCtx->variables.seedVariablesWithLetParameters(
+                    expCtx.get(), *let, [](const Expression* expr) {
+                        return expression::getDependencies(expr).hasNoRequirements();
+                    });
+                bulkRequest.setLet(expCtx->variables.toBSON(expCtx->variablesParseState, *let));
+            }
+
+            bulk_write_exec::BulkWriteExecStats execStats;
+            bulk_write_exec::BulkWriteReplyInfo replyInfo;
+            unified_write_executor::Stats uweStats;
+            if (unified_write_executor::isEnabled(opCtx)) {
+                replyInfo = unified_write_executor::bulkWrite(opCtx, bulkRequest, uweStats);
+                execStats.markIgnore();
+            } else {
+                // This is used only for the ScopedDebugInfo construction below.
+                stdx::unordered_map<NamespaceString, boost::optional<BSONObj>>
+                    shardKeyDiagnosticInfo;
+
+                for (const auto& nsInfo : bulkRequest.getNsInfo()) {
+                    auto targeter =
+                        std::make_unique<CollectionRoutingInfoTargeter>(opCtx, nsInfo.getNs());
+
+                    shardKeyDiagnosticInfo.insert(
+                        {nsInfo.getNs(),
+                         targeter->getRoutingInfo().getChunkManager().isSharded()
+                             ? boost::optional<BSONObj>(targeter->getRoutingInfo()
+                                                            .getChunkManager()
+                                                            .getShardKeyPattern()
+                                                            .toBSON())
+                             : boost::none});
+
+                    targeters.push_back(std::move(targeter));
+                }
+
+                // Create an RAII object that prints each collection's shard key in the case of a
+                // tassert or crash.
+                ScopedDebugInfo shardKeyDiagnostics(
+                    "MultipleShardKeysDiagnostics",
+                    diagnostic_printers::MultipleShardKeysDiagnosticPrinter{
+                        shardKeyDiagnosticInfo});
+
+                // Dispatch the bulk write through the cluster.
+                // - To ensure that possible writeErrors are properly managed, a "fire and forget"
+                //   request needs to be temporarily upgraded to 'w:1'(unless the request belongs to
+                //   a transaction, where per-operation WC settings are not supported);
+                // - Once done, The original WC is re-established to allow populateCursorReply
+                //   evaluating whether a reply needs to be returned to the external client.
+                replyInfo = [&] {
+                    WriteConcernOptions originalWC = opCtx->getWriteConcern();
+                    ScopeGuard resetWriteConcernGuard(
+                        [opCtx, &originalWC] { opCtx->setWriteConcern(originalWC); });
+                    if (auto wc = opCtx->getWriteConcern(); !wc.requiresWriteAcknowledgement() &&
+                        !opCtx->inMultiDocumentTransaction()) {
+                        wc.w = 1;
+                        opCtx->setWriteConcern(wc);
+                    }
+                    return cluster::bulkWrite(opCtx, bulkRequest, targeters, execStats);
+                }();
+            }
+            bool updatedShardKey =
+                handleWouldChangeOwningShardError(opCtx, bulkRequest, replyInfo, targeters);
+            // TODO SERVER-83869 handle BulkWriteExecStats for batches of size > 1 containing
+            // updates that modify a document’s owning shard.
+            if (!execStats.getIgnore()) {
+                execStats.updateMetrics(opCtx, targeters, updatedShardKey);
+            } else {
+                uweStats.updateMetrics(opCtx, updatedShardKey);
+            }
+
+            response = populateCursorReply(
+                opCtx, bulkRequest, unparsedRequest().body, std::move(replyInfo));
+            return response;
+        }
+
+    private:
+        void preRunImplHook(OperationContext* opCtx) const {
+            Impl::checkCanRunHere(opCtx);
+        }
+
+        void preExplainImplHook(OperationContext* opCtx) const {
+            Impl::checkCanExplainHere(opCtx);
+        }
+
+        void doCheckAuthorizationHook(AuthorizationSession* authzSession) const {
+            Impl::doCheckAuthorization(
+                authzSession, request().getBypassDocumentValidation(), request());
+        }
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        bool supportsRawData() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            try {
+                doCheckAuthorizationHook(AuthorizationSession::get(opCtx->getClient()));
+            } catch (const DBException& e) {
+                NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(e.code());
+                throw;
+            }
+        }
+
+        /**
+         * Inspects the provided response to determine if it contains any 'WouldChangeOwningShard'
+         * errors.
+         * - If none are found, returns boost::none.
+         * - If exactly 1 is found and the batchSize is 1, returns the contained information.
+         * - If 1+ are found and the batchSize is > 1, it means the user sent a write that changes
+         *   a document's owning shard but did not send it in its own batch, which is currently
+         *   unsupported behavior. Accordingly, if we see this behavior:
+         *     - In a txn, we raise a top-level error.
+         *     - Otherwise, we set the reply status for the corresponding write(s) to a new error.
+         */
+        boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
+            bulk_write_exec::BulkWriteReplyInfo& response, bool inTransaction) const {
+            if (response.summaryFields.nErrors == 0) {
+                return boost::none;
+            }
+
+            auto batchSize = request().getOps().size();
+            for (auto& replyItem : response.replyItems) {
+                if (replyItem.getStatus() == ErrorCodes::WouldChangeOwningShard) {
+                    if (batchSize != 1) {
+                        if (inTransaction)
+                            uasserted(ErrorCodes::InvalidOptions,
+                                      "Document shard key value updates that cause the doc to move "
+                                      "shards must be sent with write batch of size 1");
+
+                        replyItem.setStatus(
+                            {ErrorCodes::InvalidOptions,
+                             "Document shard key value updates that cause the doc to move shards "
+                             "must be sent with write batch of size 1"});
+                    } else {
+                        BSONObjBuilder extraInfoBuilder;
+                        replyItem.getStatus().extraInfo()->serialize(&extraInfoBuilder);
+                        auto extraInfo = extraInfoBuilder.obj();
+                        return WouldChangeOwningShardInfo::parseFromCommandError(extraInfo);
+                    }
+                }
+            }
+
+            return boost::none;
+        }
+
+        /**
+         * If the provided response contains a WouldChangeOwningShardError, handles executing the
+         * transactional delete from old shard and insert to new shard, and updates the response
+         * accordingly. If it does not contain such an error, does nothing.
+         *
+         * Returns true if a document shard key update was actually performed.
+         */
+        bool handleWouldChangeOwningShardError(
+            OperationContext* opCtx,
+            const BulkWriteCommandRequest& request,
+            bulk_write_exec::BulkWriteReplyInfo& response,
+            const std::vector<std::unique_ptr<NSTargeter>>& targeters) const {
+            auto wcosInfo =
+                getWouldChangeOwningShardErrorInfo(response, opCtx->inMultiDocumentTransaction());
+            if (!wcosInfo)
+                return false;
+
+            // A shard should only give us back this error if one of these conditions are true. If
+            // neither are, we would get back an IllegalOperation error instead.
+            tassert(7279300,
+                    "Unexpectedly got a WouldChangeOwningShard error back from a shard outside of "
+                    "a retryable write or transaction",
+                    opCtx->isRetryableWrite() || opCtx->inMultiDocumentTransaction());
+
+            // Obtain the targeted namespace that we got the WCOS error for.This is always the
+            // targeted namespace for the first op, as a write that change's a document's owning
+            // shard must be the only write in the incoming request.
+            auto firstWriteNSIndex = BulkWriteCRUDOp(request.getOps()[0]).getNsInfoIdx();
+            auto nss = request.getNsInfo()[firstWriteNSIndex].getNs();
+
+            bool updatedShardKey = false;
+            boost::optional<BSONObj> upsertedId;
+
+            opCtx->setQuerySamplingOptions(OperationContext::QuerySamplingOptions::kOptOut);
+
+            if (opCtx->inMultiDocumentTransaction()) {
+                std::tie(updatedShardKey, upsertedId) =
+                    documentShardKeyUpdateUtil::handleWouldChangeOwningShardErrorTransactionLegacy(
+                        opCtx, nss, *wcosInfo);
+            } else {
+                // We must be in a retryable write.
+                std::tie(updatedShardKey, upsertedId) = documentShardKeyUpdateUtil::
+                    handleWouldChangeOwningShardErrorRetryableWriteLegacy(
+                        opCtx,
+                        nss,
+                        // RerunOriginalWriteFn:
+                        [&]() {
+                            bulk_write_exec::BulkWriteExecStats execStats;
+                            response = cluster::bulkWrite(opCtx, request, targeters, execStats);
+                            return getWouldChangeOwningShardErrorInfo(
+                                response, opCtx->inMultiDocumentTransaction());
+                        },
+                        // ProcessWCEFn:
+                        [&](std::unique_ptr<WriteConcernErrorDetail> wce) {
+                            auto bwWce = BulkWriteWriteConcernError::parseOwned(
+                                wce->toBSON(), IDLParserContext("BulkWriteWriteConcernError"));
+                            response.wcErrors = bwWce;
+                        },
+                        // ProcessWriteErrorFn:
+                        [&](DBException& e) { response.replyItems[0].setStatus(e.toStatus()); });
+            }
+
+            // See BulkWriteOp::generateReplyInfo, it is easier to handle this metric for
+            // WouldChangeOwningShardError here.
+            globalOpCounters().gotUpdate();
+
+            if (updatedShardKey) {
+                // Remove the WCOS error from the count. Since this write must have been sent in its
+                // own batch it is not possible there are statistics for any other writes in
+                // summaryFields.
+                response.summaryFields.nErrors = 0;
+
+                auto successReply = BulkWriteReplyItem(0);
+                // 'n' is always 1 for an update, regardless of it was an upsert, and indicates the
+                // number matched *or* inserted.
+                successReply.setN(1);
+
+                if (upsertedId) {
+                    successReply.setNModified(0);
+                    successReply.setUpserted(IDLAnyTypeOwned(upsertedId->getField("_id")));
+                    response.summaryFields.nUpserted = 1;
+                } else {
+                    successReply.setNModified(1);
+                    response.summaryFields.nMatched = 1;
+                    response.summaryFields.nModified = 1;
+                }
+
+                response.replyItems.clear();
+                if (!request.getErrorsOnly()) {
+                    response.replyItems.push_back(successReply);
+                }
+            }
+
+            return updatedShardKey;
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+            preExplainImplHook(opCtx);
+
+            uassert(ErrorCodes::InvalidLength,
+                    "explained bulkWrite must be of size 1",
+                    request().getOps().size() == 1U);
+
+            auto op = BulkWriteCRUDOp(request().getOps()[0]);
+            BatchedCommandRequest batchedRequest = [&]() {
+                auto type = op.getType();
+                if (type == BulkWriteCRUDOp::kInsert) {
+                    return BatchedCommandRequest::buildInsertOp(
+                        request().getNsInfo()[op.getNsInfoIdx()].getNs(),
+                        {op.getInsert()->getDocument()});
+                } else if (type == BulkWriteCRUDOp::kUpdate) {
+                    return BatchedCommandRequest(
+                        bulk_write_common::makeUpdateCommandRequestFromUpdateOp(
+                            opCtx, op.getUpdate(), request(), 0));
+                } else if (type == BulkWriteCRUDOp::kDelete) {
+                    return BatchedCommandRequest(bulk_write_common::makeDeleteCommandRequestForFLE(
+                        opCtx,
+                        op.getDelete(),
+                        request(),
+                        request().getNsInfo()[op.getNsInfoIdx()]));
+                } else {
+                    MONGO_UNREACHABLE;
+                }
+            }();
+
+            cluster_write_cmd::executeWriteOpExplain(
+                opCtx, batchedRequest, batchedRequest.toBSON(), verbosity, result);
+        }
+    };
+};
+
+}  // namespace mongo

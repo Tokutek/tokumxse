@@ -1,0 +1,27 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: "public"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    InitReplicatedFastCountO2:
+        description: "The o2 field of an initReplicatedFastCount oplog entry"
+        strict: false
+        fields:
+            fastCountMetadataStoreIdent:
+                description: "The storage ident for the metadata Container"
+                type: string
+            fastCountMetadataStoreKeyFormat:
+                description: "The key format of the metadata Container"
+                type: safeInt
+            fastCountMetadataStoreTimestampsIdent:
+                description: "The storage ident for the timestamps Container"
+                type: string
+            fastCountMetadataStoreTimestampsKeyFormat:
+                description: "The key format of the timestamps Container"
+                type: safeInt

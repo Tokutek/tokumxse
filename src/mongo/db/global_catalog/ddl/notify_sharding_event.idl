@@ -1,0 +1,122 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/client/connection_string.h"
+        - "mongo/db/global_catalog/ddl/notify_sharding_event_utils.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+structs:
+    CollectionSharded:
+        description: "Event describing the details of a committing shardCollection operation."
+        strict: false
+        fields:
+            nss:
+                description: "The namespace of the sharded collection."
+                type: namespacestring
+            uuid:
+                description: "The UUID of the collection."
+                type: uuid
+            request:
+                type: object_owned
+                description: "The user request that originated this event."
+
+    CollectionResharded:
+        description: "Event describing the details of a committing reshardCollection operation."
+        strict: false
+        fields:
+            nss:
+                description: "The namespace of the resharded collection."
+                type: namespacestring
+            sourceUUID:
+                description: "The original UUID of the collection."
+                type: uuid
+            reshardingUUID:
+                description: "The UUID of the resharded collection."
+                type: uuid
+            sourceKey:
+                description: "The original shard key of the collection
+                    (defined as optional for retro compatibility)."
+                type: object_owned
+                optional: true
+            unique:
+                type: bool
+                description: "The user-specified value for the unique request field."
+                optional: true
+            collation:
+                type: object_owned
+                description: "The user-specified value for the collation request field."
+                optional: true
+            reshardingKey:
+                description: "The shard key of the resharded collection."
+                type: object_owned
+            numInitialChunks:
+                type: long
+                description: "The number of chunks the new collection should have after resharding."
+                optional: true
+            referenceToZoneList:
+                type: namespacestring
+                description:
+                    "The full collection name that is currently associated to the set of zones created as part of this operation.
+                    When no value is specified, the nss field will be used instead."
+                optional: true
+            provenance:
+                type: ReshardingProvenance
+                description: "The type of user/system request that originated
+                    the commit of this reshardCollection."
+                optional: true
+
+    NamespacePlacementChanged:
+        description:
+            "Marker event matching the commit of a generic DDL operation that caused
+            a modification of the set of shards serving data for a specific collection or database."
+        strict: false
+        fields:
+            nss:
+                description: "The database or collection name whose placement across shards got changed."
+                type: namespacestring
+            committedAt:
+                description: "The cluster time at which the placement-changing DDL got recorded into the global catalog."
+                type: timestamp
+
+    PlacementHistoryMetadataChanged:
+        description:
+            "Notification of the commit of a metadata change affecting the whole content of config.placementHistory.
+            Shards are expected to react by emitting a no-op log entry directed to change stream readers."
+        strict: false
+        fields:
+            committedAt:
+                description:
+                    "The cluster time associated to the metadata change,
+                    as persistent in the related config.placementHistory documents."
+                type: timestamp
+
+commands:
+    _shardsvrNotifyShardingEvent:
+        command_name: _shardsvrNotifyShardingEvent
+        cpp_name: ShardsvrNotifyShardingEventRequest
+        description:
+            "Internal command supporting the integration between Sharding DDL operations and change stream readers.
+            A remote coordinator node may use it to dispatch the notification of an upcoming/committed event to one or more of its participants.
+            The recipient is expected to react with the generation of a no-op entry describing the details of the notification,
+            which will be later interpreted as a change/control event by change stream readers targeting it."
+        namespace: ignored
+        api_version: ""
+        strict: false
+        reply_type: OkReply
+        fields:
+            eventType:
+                type: string
+                description: "The type of sharding event"
+                validator:
+                    {callback: "notify_sharding_event::validateEventType"}
+            details:
+                type: object_owned
+                description: "A descriptor of the sharding event
+                    (to be serialized and interpreted based on the value of eventType)."

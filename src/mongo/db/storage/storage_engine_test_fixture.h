@@ -1,0 +1,258 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_repair.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_impl.h"
+#include "mongo/db/shard_role/shard_catalog/durable_catalog.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/mdb_catalog.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/spill_table.h"
+#include "mongo/db/storage/storage_engine_impl.h"
+#include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/modules.h"
+
+#include <string_view>
+
+#include <boost/iterator/transform_iterator.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo {
+
+class [[MONGO_MOD_OPEN]] StorageEngineTest : public ServiceContextMongoDTest {
+public:
+    // Storage engine tests cover spill table creation and management, requiring the spill
+    // WiredTiger instance.
+    explicit StorageEngineTest(Options options = {})
+        : ServiceContextMongoDTest(std::move(options).enableSpillEngine()),
+          _storageEngine(getServiceContext()->getStorageEngine()) {}
+
+    MDBCatalog::EntryIdentifier createCollection(OperationContext* opCtx,
+                                                 NamespaceString ns,
+                                                 CollectionOptions options = {}) {
+        Lock::GlobalWrite lk(opCtx);
+        AutoGetDb db(opCtx, ns.dbName(), LockMode::MODE_X);
+        if (!options.uuid) {
+            options.uuid = UUID::gen();
+        }
+        RecordId catalogId;
+        std::unique_ptr<RecordStore> rs;
+        auto mdbCatalog = _storageEngine->getMDBCatalog();
+        {
+            WriteUnitOfWork wuow(opCtx);
+            const auto ident = _storageEngine->generateNewCollectionIdent(ns.dbName());
+            catalogId = mdbCatalog->reserveCatalogId(opCtx);
+            rs = unittest::assertGet(durable_catalog::createCollection(
+                opCtx, catalogId, ns, ident, options, mdbCatalog));
+            wuow.commit();
+        }
+        CollectionImplFactory factory;
+        std::shared_ptr<Collection> coll = factory.make(
+            opCtx,
+            ns,
+            catalogId,
+            durable_catalog::getParsedCatalogEntry(opCtx, catalogId, mdbCatalog)->metadata,
+            std::move(rs));
+        coll->init(opCtx);
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.registerCollection(opCtx, std::move(coll), /*ts=*/boost::none);
+        });
+
+        return mdbCatalog->getEntry(catalogId);
+    }
+
+    MDBCatalog::EntryIdentifier createTempCollection(OperationContext* opCtx, NamespaceString ns) {
+        CollectionOptions options;
+        options.temp = true;
+        return createCollection(opCtx, ns, options);
+    }
+
+    std::unique_ptr<SpillTable> makeSpillTable(OperationContext* opCtx,
+                                               KeyFormat keyFormat,
+                                               int64_t thresholdBytes) {
+        return _storageEngine->makeSpillTable(opCtx, keyFormat, thresholdBytes);
+    }
+
+    std::unique_ptr<RecordStore> makeTemporary(OperationContext* opCtx) {
+        WriteUnitOfWork wuow(opCtx);
+        auto rs = _storageEngine->makeInternalRecordStore(
+            opCtx, _storageEngine->generateNewInternalIdent(), KeyFormat::Long);
+        wuow.commit();
+        return rs;
+    }
+
+    std::unique_ptr<RecordStore> makeTemporaryClustered(OperationContext* opCtx) {
+        WriteUnitOfWork wuow(opCtx);
+        auto rs = _storageEngine->makeInternalRecordStore(
+            opCtx, _storageEngine->generateNewInternalIdent(), KeyFormat::String);
+        wuow.commit();
+        return rs;
+    }
+
+    /**
+     * Create a collection table in the KVEngine not reflected in the MDBCatalog / durable_catalog.
+     */
+    Status createCollTable(OperationContext* opCtx, NamespaceString collName) {
+        const std::string identName = _storageEngine->generateNewCollectionIdent(collName.dbName());
+        auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+        WriteUnitOfWork wuow(opCtx);
+        auto rs = _storageEngine->getEngine()->createRecordStore(
+            provider, ru, collName, identName, RecordStore::Options{});
+        wuow.commit();
+        return rs;
+    }
+
+    Status dropIndexTable(OperationContext* opCtx,
+                          NamespaceString nss,
+                          std::string_view indexName) {
+        RecordId catalogId =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)->getCatalogId();
+        std::string indexIdent =
+            _storageEngine->getMDBCatalog()->getIndexIdent(opCtx, catalogId, indexName);
+        return dropIdent(*shard_role_details::getRecoveryUnit(opCtx), indexIdent, false);
+    }
+
+    Status dropIdent(RecoveryUnit& ru, std::string_view ident, bool identHasSizeInfo) {
+        return _storageEngine->getEngine()->dropIdent(ru, ident, identHasSizeInfo);
+    }
+
+    StatusWith<StorageEngine::ReconcileResult> reconcile(OperationContext* opCtx) {
+        Lock::GlobalLock globalLock{opCtx, MODE_IX};
+        return catalog_repair::reconcileCatalogAndIdents(
+            opCtx,
+            _storageEngine,
+            Timestamp::min(),
+            StorageEngine::LastShutdownState::kClean,
+            reinterpret_cast<StorageEngineImpl*>(_storageEngine)->_options.forRepair);
+    }
+
+    StatusWith<StorageEngine::ReconcileResult> reconcileAfterUncleanShutdown(
+        OperationContext* opCtx) {
+        return catalog_repair::reconcileCatalogAndIdents(
+            opCtx,
+            _storageEngine,
+            Timestamp::min(),
+            StorageEngine::LastShutdownState::kUnclean,
+            reinterpret_cast<StorageEngineImpl*>(_storageEngine)->_options.forRepair);
+    }
+
+    std::vector<std::string> getAllKVEngineIdents(OperationContext* opCtx) {
+        return _storageEngine->getEngine()->getAllIdents(
+            *shard_role_details::getRecoveryUnit(opCtx));
+    }
+
+    std::vector<std::string> getAllSpillKVEngineIdents(OperationContext* opCtx) {
+        return _storageEngine->getSpillEngine()->getAllIdents(
+            *_storageEngine->getSpillEngine()->newRecoveryUnit());
+    }
+
+    bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
+        std::vector<MDBCatalog::EntryIdentifier> allCollections =
+            _storageEngine->getMDBCatalog()->getAllCatalogEntries(opCtx);
+        return std::count_if(allCollections.begin(), allCollections.end(), [&](auto& entry) {
+            return nss == entry.nss;
+        });
+    }
+
+    bool identExists(OperationContext* opCtx, std::string_view ident) {
+        auto idents = getAllKVEngineIdents(opCtx);
+        return std::find(idents.begin(), idents.end(), ident) != idents.end();
+    }
+
+    bool spillIdentExists(OperationContext* opCtx, std::string_view ident) {
+        auto idents = getAllSpillKVEngineIdents(opCtx);
+        return std::find(idents.begin(), idents.end(), ident) != idents.end();
+    }
+
+    /**
+     * Create an index with a key of `{<key>: 1}` and a `name` of <key>.
+     */
+    Status createIndex(OperationContext* opCtx, NamespaceString collNs, std::string_view key) {
+        auto buildUUID = UUID::gen();
+        auto ret = startIndexBuild(opCtx, collNs, key, buildUUID);
+        if (!ret.isOK()) {
+            return ret;
+        }
+
+        indexBuildSuccess(opCtx, collNs, key);
+        return Status::OK();
+    }
+
+    Status startIndexBuild(OperationContext* opCtx,
+                           NamespaceString collNs,
+                           std::string_view key,
+                           boost::optional<UUID> buildUUID) {
+        BSONObjBuilder builder;
+        BSONObj spec = BSON("v" << 2 << "key" << BSON(key << 1) << "name" << key);
+
+        CollectionWriter writer{opCtx, collNs};
+        Collection* collection = writer.getWritableCollection(opCtx);
+        IndexDescriptor descriptor(IndexNames::BTREE, spec);
+        return collection->prepareForIndexBuild(
+            opCtx, &descriptor, _storageEngine->generateNewIndexIdent(collNs.dbName()), buildUUID);
+    }
+
+    void indexBuildSuccess(OperationContext* opCtx, NamespaceString collNs, std::string_view key) {
+        CollectionWriter writer{opCtx, collNs};
+        Collection* collection = writer.getWritableCollection(opCtx);
+        auto writableEntry = collection->getIndexCatalog()->getWritableEntryByName(
+            opCtx,
+            key,
+            IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
+        ASSERT(writableEntry);
+        collection->indexBuildSuccess(opCtx, writableEntry);
+    }
+
+    Status removeEntry(OperationContext* opCtx, std::string_view collNs, MDBCatalog* catalog) {
+        const Collection* collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+            opCtx, NamespaceString::createNamespaceString_forTest(collNs));
+        return catalog->removeEntry(opCtx, collection->getCatalogId());
+    }
+
+    StorageEngine* _storageEngine;
+};
+
+class [[MONGO_MOD_OPEN]] StorageEngineRepairTest : public StorageEngineTest {
+public:
+    StorageEngineRepairTest() : StorageEngineTest(Options{}.enableRepair().inMemory(false)) {
+        repl::StorageInterface::set(getServiceContext(),
+                                    std::make_unique<repl::StorageInterfaceImpl>());
+    }
+
+    void tearDown() override {
+        auto repairObserver = StorageRepairObserver::get(getGlobalServiceContext());
+        ASSERT(repairObserver->isDone());
+
+        auto asString = [](const StorageRepairObserver::Modification& mod) {
+            return mod.getDescription();
+        };
+        auto modifications = repairObserver->getModifications();
+        LOGV2(24150,
+              "Modifications",
+              "modifications"_attr =
+                  logv2::seqLog(boost::make_transform_iterator(modifications.begin(), asString),
+                                boost::make_transform_iterator(modifications.end(), asString)));
+    }
+};
+
+class [[MONGO_MOD_OPEN]] StorageEngineTestNotEphemeral : public StorageEngineTest {
+public:
+    StorageEngineTestNotEphemeral() : StorageEngineTest(Options{}.inMemory(false)) {}
+};
+
+}  // namespace mongo
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

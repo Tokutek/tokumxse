@@ -1,0 +1,43 @@
+load("//bazel:mongo_js_rules.bzl", "all_subpackage_javascript_files", "mongo_js_library")
+load("//bazel/resmoke:resmoke.bzl", "resmoke_suite_test")
+load(":common.bzl", "NO_PASSTHROUGH_DATA")
+
+package(default_visibility = ["//visibility:public"])
+
+mongo_js_library(
+    name = "all_javascript_files",
+    srcs = glob([
+        "*.js",
+    ]),
+)
+
+all_subpackage_javascript_files()
+
+resmoke_suite_test(
+    name = "no_passthrough",
+    config = "//buildscripts/resmokeconfig:suites/no_passthrough.yml",
+    data = NO_PASSTHROUGH_DATA,
+    shard_count = 40,
+    tags = [
+        "ci-all-variants",
+        "incompatible_debug_mode",
+        "incompatible_with_bazel_remote_test",  # TODO(SERVER-122822), Many tests in this suite are currently incompatible with remote execution.
+        "misc_js",
+        "requires_execution_on_windows_patch_build",
+        "requires_xlarge_host",
+    ],
+    target_compatible_with = select({
+        "@platforms//cpu:ppc64le": ["@platforms//:incompatible"],
+        "@platforms//cpu:s390x": ["@platforms//:incompatible"],
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//src/mongo/db:mongod",
+        "//src/mongo/replay:mongor",
+        "//src/mongo/s:mongos",
+        "//src/mongo/shell:mongo",
+        "//src/mongo/tools/mongobridge_tool:mongobridge",
+        "//src/third_party/wiredtiger:wt",
+    ],
+)

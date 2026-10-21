@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+server_parameters:
+    allowDiskUseByDefault:
+        description: >-
+            Allow queries which exceed their memory budget to spill to disk. This option can
+            be overriden at the per-query level.
+        set_at: [startup, runtime]
+        cpp_varname: "allowDiskUseByDefault"
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false

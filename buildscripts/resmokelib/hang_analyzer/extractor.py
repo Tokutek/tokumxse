@@ -1,0 +1,1285 @@
+"""Extracts `mongo-debugsymbols.tgz` in an idempotent manner for performance."""
+
+import concurrent.futures
+import glob
+import gzip
+import json
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+import zipfile
+from logging import Logger
+from pathlib import Path
+from typing import Callable, Optional
+
+from opentelemetry import trace
+from opentelemetry.trace.status import StatusCode
+from retry import retry
+
+from buildscripts.create_rbe_sysroot import create_rbe_sysroot
+from buildscripts.resmokelib.hang_analyzer.dumper import Dumper
+from buildscripts.resmokelib.setup_multiversion import download
+from buildscripts.resmokelib.setup_multiversion.download import DownloadError
+from buildscripts.resmokelib.setup_multiversion.setup_multiversion import (
+    SetupMultiversion,
+    _DownloadOptions,
+)
+from buildscripts.resmokelib.symbolizer import Symbolizer
+from buildscripts.resmokelib.utils import evergreen_conn, filesystem
+from buildscripts.resmokelib.utils.filesystem import build_hygienic_bin_path
+from buildscripts.resmokelib.utils.otel_thread_pool_executor import OtelThreadPoolExecutor
+from buildscripts.resmokelib.utils.otel_utils import get_default_current_span
+from buildscripts.resmokelib.utils.runtime_recorder import compare_start_time
+from buildscripts.util.download_utils import (
+    download_from_s3_with_requests,
+    extract_s3_bucket_key,
+)
+from evergreen.task import Artifact, Task
+
+_DEBUG_FILE_BASE_NAMES = ["mongo", "mongod", "mongos"]
+TOOLCHAIN_ROOT = "/opt/mongodbtoolchain/v5"
+TRACER = trace.get_tracer("resmoke")
+
+
+def run_with_retries(
+    root_logger: Logger, func: Callable[..., bool], timeout_secs: int, retry_secs: int, **kwargs
+) -> bool:
+    start_time = time.time()
+    while True:
+        try:
+            if func(root_logger=root_logger, **kwargs):
+                return True
+        except Exception as ex:
+            root_logger.error(f"Exception hit while running {func.__name__}")
+            root_logger.error(ex)
+
+        time_difference = time.time() - start_time
+        if time_difference > timeout_secs:
+            root_logger.error(
+                f"Timeout hit for function {func.__name__} after {time_difference} seconds."
+            )
+            return False
+
+        root_logger.error(f"Failed to run {func.__name__}, retrying in {retry_secs} seconds...")
+        time.sleep(retry_secs)
+
+
+def download_hang_analyzer_js_stacks(root_logger: Logger, task: Task, download_dir: str) -> bool:
+    """Extract debugger_jsscope_<pid>_<i>.txt files from the hang analyzer output into core-dumps/.
+
+    The hang analyzer captures JS stack traces from the live process and packages them in
+    mongo-hanganalyzer.tgz. Extracting them alongside the core dumps lets analyze_core include
+    them in the per-core analysis output.
+    """
+    hang_analyzer_artifact = None
+    for artifact in task.artifacts:
+        if artifact.name.startswith("Hang Analyzer Output"):
+            hang_analyzer_artifact = artifact
+            break
+
+    if hang_analyzer_artifact is None:
+        root_logger.info("No hang analyzer output artifact found, skipping JS stack extraction.")
+        return True
+
+    core_dumps_dir = os.path.join(download_dir, "core-dumps")
+    os.makedirs(core_dumps_dir, exist_ok=True)
+
+    tgz_path = os.path.join(download_dir, "mongo-hanganalyzer.tgz")
+    try:
+        root_logger.info("Downloading hang analyzer output from %s", hang_analyzer_artifact.url)
+        urllib.request.urlretrieve(hang_analyzer_artifact.url, tgz_path)
+
+        with tarfile.open(tgz_path, "r:gz") as tar:
+            for member in tar.getmembers():
+                filename = os.path.basename(member.name)
+                if not re.match(r"debugger_jsscope_\d+_\d+\.txt$", filename):
+                    continue
+                member.name = filename  # strip any path prefix before extracting
+                tar.extract(member, path=core_dumps_dir)
+                root_logger.info("Extracted JS stack trace file: %s", filename)
+        return True
+    except Exception as ex:
+        root_logger.error("Failed to extract JS stack traces from hang analyzer output: %s", ex)
+        return False
+    finally:
+        if os.path.exists(tgz_path):
+            os.remove(tgz_path)
+
+
+def filter_core_dumps(
+    artifacts: list,
+    boring_core_dump_pids: set,
+    max_core_dumps: int,
+    logger: Logger,
+) -> list:
+    """Filter core dump artifacts by removing boring PIDs and applying a maximum cap.
+
+    Expected URL suffix format: dump_<binary>.<pid>.core.gz
+    """
+    if not boring_core_dump_pids:
+        boring_core_dump_pids = set()
+
+    total = len(artifacts)
+    interesting = []
+    skipped_boring = []
+
+    for artifact in artifacts:
+        filename = artifact.url.split("/")[-1].split("?")[0]
+        # strip .gz → dump_mongod.808516.core, then split on '.'
+        parts = os.path.splitext(filename)[0].split(".")
+        pid = parts[-2] if len(parts) >= 3 and parts[-2].isdigit() else None
+        if pid and pid in boring_core_dump_pids:
+            skipped_boring.append(filename)
+        else:
+            interesting.append(artifact)
+
+    if skipped_boring:
+        logger.info("Skipping %d boring core dump(s): %s", len(skipped_boring), skipped_boring)
+
+    if len(interesting) > max_core_dumps:
+        logger.info(
+            "Capping download at %d core dumps (%d total interesting)",
+            max_core_dumps,
+            len(interesting),
+        )
+        interesting = interesting[:max_core_dumps]
+
+    # TODO DEVPROD-31034 Keep the report/telemetry reporting from dumper.py if possible?
+    logger.info(
+        "Downloading %d of %d core dump(s) (%d boring skipped)",
+        len(interesting),
+        total,
+        len(skipped_boring),
+    )
+    return interesting
+
+
+def _get_free_disk_bytes(path: str = ".") -> int:
+    """Return the number of free bytes on the filesystem containing `path`."""
+    return shutil.disk_usage(path).free
+
+
+# 1 GiB – enough headroom for binaries, debugsymbols, OTel traces, and
+# other artifacts that are downloaded / generated in parallel.
+_DISK_RESERVE_BYTES = 1 * (1024**3)
+
+
+@TRACER.start_as_current_span("core_analyzer.download_core_dumps")
+def download_core_dumps(
+    root_logger: Logger,
+    task: Task,
+    download_dir: str,
+    debugger: Dumper,
+    multiversion_versions: set,
+    boring_core_dump_pids: set = None,
+    max_core_dumps: int = 10,
+) -> bool:
+    root_logger.info("Looking for core dumps")
+    all_core_dump_artifacts = [a for a in task.artifacts if a.name.startswith("Core Dump")]
+    core_dump_artifacts = filter_core_dumps(
+        all_core_dump_artifacts,
+        boring_core_dump_pids,
+        max_core_dumps,
+        root_logger,
+    )
+
+    if not core_dump_artifacts and all_core_dump_artifacts:
+        root_logger.info(
+            "All %d core dump(s) were filtered as boring. Nothing to analyze.",
+            len(all_core_dump_artifacts),
+        )
+        return True
+
+    core_dumps_found = 0
+    core_dumps_skipped_disk_space = 0
+    core_dumps_dir = os.path.join(download_dir, "core-dumps")
+    os.makedirs(core_dumps_dir, exist_ok=True)
+    current_span = get_default_current_span()
+    for artifact in core_dump_artifacts:
+        _, key = extract_s3_bucket_key(artifact.url)
+        file_name = posixpath.basename(key)
+        extracted_name, _ = os.path.splitext(file_name)
+        extract_path = os.path.join(core_dumps_dir, extracted_name)
+
+        free_bytes = _get_free_disk_bytes(download_dir)
+        if free_bytes < _DISK_RESERVE_BYTES:
+            remaining = len(core_dump_artifacts) - core_dumps_found - core_dumps_skipped_disk_space
+            root_logger.warning(
+                "Low disk space (%.2f GiB free, %.2f GiB reserve). "
+                "Skipping remaining %d core dump(s).",
+                free_bytes / (1024**3),
+                _DISK_RESERVE_BYTES / (1024**3),
+                remaining,
+            )
+            core_dumps_skipped_disk_space += remaining
+            current_span.set_attributes(
+                {
+                    "core_dumps_skipped_disk_space": core_dumps_skipped_disk_space,
+                    "core_dumps_free_bytes_at_skip": free_bytes,
+                }
+            )
+            break
+
+        with TRACER.start_as_current_span(
+            "core_analyzer.download_core_dump",
+            attributes={
+                "core_dump_file_name": file_name,
+                "core_dump_file_url": artifact.url,
+            },
+        ) as core_dump_span:
+            attempts = 0
+            core_dump_span.set_status(StatusCode.OK)
+            try:
+
+                @retry(tries=3, delay=5)
+                def download_core_dump(artifact: Artifact):
+                    nonlocal attempts
+                    attempts += 1
+                    root_logger.info(f"Downloading core dump: {file_name}")
+                    if os.path.exists(file_name):
+                        os.remove(file_name)
+                    download_from_s3_with_requests(artifact.url, file_name, raise_on_error=True)
+                    root_logger.info(f"Extracting core dump: {file_name}")
+                    if os.path.exists(extract_path):
+                        os.remove(extract_path)
+                    with gzip.open(file_name, "rb") as f_in:
+                        with open(extract_path, "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+
+                    core_dump_span.set_attributes(
+                        {
+                            "core_dump_compressed_size": os.path.getsize(file_name),
+                            "core_dump_extracted_size": os.path.getsize(extract_path),
+                            "core_dump_download_attempts": attempts,
+                        }
+                    )
+                    root_logger.info(
+                        f"Done extracting core dump {extracted_name} to {extract_path}"
+                    )
+                    os.remove(file_name)
+
+                    _, bin_version = debugger.get_binary_from_core_dump(extract_path)
+                    if bin_version:
+                        multiversion_versions.add(bin_version)
+
+                download_core_dump(artifact)
+                core_dumps_found += 1
+
+            except Exception as ex:
+                root_logger.error(
+                    "An error occured while trying to download and extract core dump %s",
+                    extracted_name,
+                )
+                root_logger.error(ex)
+                core_dump_span.set_status(StatusCode.ERROR, "Failed to download core dump.")
+                core_dump_span.set_attributes(
+                    {
+                        "core_dump_download_attempts": attempts,
+                        "core_dump_error": ex,
+                    }
+                )
+
+    core_dump_directory_size = sum(f.stat().st_size for f in Path("./").glob("**/*") if f.is_file())
+    current_span.set_attributes(
+        {
+            "core_dumps_dir": core_dumps_dir,
+            "core_dump_directory_size": core_dump_directory_size,
+        }
+    )
+
+    if not core_dumps_found:
+        root_logger.error("No core dumps found")
+        current_span.set_status(StatusCode.ERROR, description="No core dumps found")
+        current_span.set_attributes(
+            {
+                "core_dumps_error": "No core dumps found",
+            }
+        )
+        return False
+
+    return True
+
+
+@TRACER.start_as_current_span("core_analyzer.download_multiversion_artifact")
+def download_multiversion_artifact(
+    root_logger: Logger,
+    version_id: str,
+    variant: str,
+    download_options: _DownloadOptions,
+    download_dir: str,
+    name: str,
+    bin_version: str = None,
+) -> bool:
+    current_span = get_default_current_span(
+        {"downloaded_artifact_type": name, "version": bin_version if bin_version else "current"}
+    )
+    try:
+        root_logger.info("Downloading %s", name)
+        multiversion_setup = SetupMultiversion(
+            download_options=download_options,
+            ignore_failed_push=True,
+            link_dir=os.path.abspath(download_dir),
+        )
+        urlinfo = multiversion_setup.get_urls(version=version_id, buildvariant_name=variant)
+        if bin_version:
+            install_dir = os.path.abspath(os.path.join(download_dir, bin_version, "install"))
+            os.makedirs(install_dir, exist_ok=True)
+            multiversion_setup.download_and_extract_from_urls(
+                urlinfo.urls, bin_suffix=bin_version, install_dir=install_dir, skip_symlinks=False
+            )
+        else:
+            install_dir = os.path.abspath(os.path.join(download_dir, "install"))
+            os.makedirs(install_dir, exist_ok=True)
+            multiversion_setup.download_and_extract_from_urls(
+                urlinfo.urls, bin_suffix=None, install_dir=install_dir, skip_symlinks=True
+            )
+        root_logger.info("Downloaded %s", name)
+        return True
+    except Exception as ex:
+        root_logger.error("An error occured while trying to download %s", name)
+        root_logger.error(ex)
+        current_span.set_status(StatusCode.ERROR, f"Failed to download {name}")
+        current_span.set_attribute("download_multiversion_artifact_error", ex)
+        return False
+
+
+def download_release_multiversion_artifact(
+    root_logger: Logger,
+    release_urls: dict,
+    download_options: _DownloadOptions,
+    download_dir: str,
+    name: str,
+    bin_version: str,
+) -> bool:
+    """Download a version pinned to the public release feed (e.g. last-patch), which has a plain
+    download URL instead of an Evergreen version/variant to resolve.
+    """
+    current_span = get_default_current_span(
+        {"downloaded_artifact_type": name, "version": bin_version}
+    )
+    try:
+        root_logger.info("Downloading %s", name)
+        url = (
+            release_urls.get("binary")
+            if download_options.download_binaries
+            else release_urls.get("debug_symbols")
+        )
+        if not url:
+            raise DownloadError(f"Release download URL not found for {name}")
+
+        # This is a plain public download.mongodb.com URL, not an S3 object -- go straight through
+        # the generic HTTP path rather than download.download_from_s3, which assumes any
+        # non-presigned URL is an S3 bucket and would 403 trying to sign a request for it.
+        install_dir = os.path.abspath(os.path.join(download_dir, bin_version, "install"))
+        os.makedirs(install_dir, exist_ok=True)
+        filename = os.path.join(filesystem.mkdtemp_in_build_dir(), url.split("/")[-1].split("?")[0])
+        download_from_s3_with_requests(url, filename, raise_on_error=True)
+        download.extract_archive(filename, install_dir)
+        os.remove(filename)
+
+        if download_options.download_binaries:
+            download.symlink_version(bin_version, install_dir, os.path.abspath(download_dir))
+
+        root_logger.info("Downloaded %s", name)
+        return True
+    except Exception as ex:
+        root_logger.error("An error occured while trying to download %s", name)
+        root_logger.error(ex)
+        current_span.set_status(StatusCode.ERROR, f"Failed to download {name}")
+        current_span.set_attribute("download_multiversion_artifact_error", str(ex))
+        return False
+
+
+def get_dwarf_version(dwarf_dump):
+    """
+    Find the dwarf version of a compile unit that was produced by a MongoDB compiler or
+    has mongodb sources in its name.
+
+    See a segment of a dwarf dump in buildscripts/tests/resmokelib/hang_analyzer/test_extractor.py
+    """
+
+    # Checks if a compile unit contains "mongo" or "src/third_party".
+    # The DW_AT_producer tag will contain the compiler used, which may be stamped with 'MongoDB' for our
+    # toolchain compilers.
+    # The DW_AT_name can contain the source file, for which we hope to find 'src/mongo' or 'src/third_party'
+    mongo_pattern = r"mongo|src/third_party"
+    version_pattern = r"version = 0x([0-9]{4}),"
+
+    for unit in dwarf_dump.split("Compile Unit"):
+        if re.search(mongo_pattern, unit, re.IGNORECASE):
+            matches = re.search(version_pattern, unit)
+            if matches:
+                return int(matches.group(1))
+
+    # If we didn't find any compile unit that looks like the patterns, fallback to ANY dwarf version
+    # listed in the output.
+    matches = re.search(version_pattern, dwarf_dump)
+    if matches:
+        return int(matches.group(1))
+
+    return None
+
+
+@TRACER.start_as_current_span("core_analyzer.post_install_gdb_optimization")
+def post_install_gdb_optimization(download_dir: str, root_looger: Logger):
+    @TRACER.start_as_current_span("core_analyzer.post_install_gdb_optimization.add_index")
+    def add_index(file_path: str):
+        """Generate and add gdb-index to ELF binary."""
+        current_span = get_default_current_span(
+            {
+                "file": file_path,
+                "add_index_status": "success",
+                "add_index_original_file_size": os.path.getsize(file_path),
+            }
+        )
+        start_time = time.time()
+        process = subprocess.run(
+            [f"{TOOLCHAIN_ROOT}/bin/llvm-dwarfdump", "-r", "0", file_path],
+            capture_output=True,
+            text=True,
+        )
+
+        # it is normal for non debug binaries to fail this command
+        # there also can be some python files in the bin dir that will fail
+        if process.returncode != 0:
+            current_span.set_attribute("add_index_status", "skipped")
+            return
+
+        version = get_dwarf_version(process.stdout)
+        if version:
+            current_span.set_attribute("dwarf_version", version)
+        else:
+            current_span.set_status(StatusCode.ERROR, "Could not find dwarf version in file.")
+            current_span.set_attributes(
+                {
+                    "add_index_status": "failed",
+                    "add_index_error": "Could not find dwarf version in file",
+                }
+            )
+            # The file has no debug info if stdout ends like this
+            if process.stdout.strip().endswith(".debug_info contents:"):
+                return
+            raise RuntimeError(f"Could not find dwarf version in file {file_path}")
+
+        target_dir = os.path.dirname(file_path)
+
+        try:
+            # logic copied from https://sourceware.org/gdb/onlinedocs/gdb/Index-Files.html
+            if version == 5:
+                subprocess.run(
+                    [
+                        f"{TOOLCHAIN_ROOT}/bin/gdb",
+                        "--batch-silent",
+                        "--quiet",
+                        "--nx",
+                        "--eval-command",
+                        f"save gdb-index -dwarf-5 {target_dir}",
+                        file_path,
+                    ],
+                    check=True,
+                )
+
+                # objcopy overwrites the input executable when only given one positional argument.
+                # /dev/null is specified as the second positional argument to simultaneously prevent
+                # the debug symbol file from being overwritten and to discard the generated copy.
+                subprocess.run(
+                    [
+                        f"{TOOLCHAIN_ROOT}/bin/objcopy",
+                        "--dump-section",
+                        f".debug_str={file_path}.debug_str.new",
+                        file_path,
+                        "/dev/null",
+                    ],
+                    check=True,
+                )
+                with open(f"{file_path}.debug_str", "r") as file1:
+                    with open(f"{file_path}.debug_str.new", "a") as file2:
+                        file2.write(file1.read())
+
+                # Ensure the file is writable, we have seen the uploaded binaries be non-writable.
+                os.chmod(file_path, 0o775)
+                subprocess.run(
+                    [
+                        f"{TOOLCHAIN_ROOT}/bin/objcopy",
+                        "--add-section",
+                        f".debug_names={file_path}.debug_names",
+                        "--set-section-flags",
+                        ".debug_names=readonly",
+                        "--update-section",
+                        f".debug_str={file_path}.debug_str.new",
+                        file_path,
+                        file_path,
+                    ],
+                    check=True,
+                )
+                os.remove(f"{file_path}.debug_str.new")
+                os.remove(f"{file_path}.debug_str")
+                os.remove(f"{file_path}.debug_names")
+
+            elif version == 4:
+                subprocess.run(
+                    [
+                        f"{TOOLCHAIN_ROOT}/bin/gdb",
+                        "--batch-silent",
+                        "--quiet",
+                        "--nx",
+                        "--eval-command",
+                        f"save gdb-index {target_dir}",
+                        file_path,
+                    ],
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        f"{TOOLCHAIN_ROOT}/bin/objcopy",
+                        "--add-section",
+                        f".gdb_index={file_path}.gdb-index",
+                        "--set-section-flags",
+                        ".gdb_index=readonly",
+                        file_path,
+                        file_path,
+                    ],
+                    check=True,
+                )
+                os.remove(f"{file_path}.gdb-index")
+            else:
+                current_span.set_status(StatusCode.ERROR, f"Unsupported dwarf version: {version}")
+                current_span.set_attributes(
+                    {
+                        "add_index_status": "failed",
+                        "add_index_error": "Does not support dwarf version",
+                    }
+                )
+                raise RuntimeError(f"Does not support dwarf version {version}")
+        except Exception as ex:
+            root_looger.exception("Failed to add gdb index to %s", file_path)
+            current_span.set_status(StatusCode.ERROR, "Failed to add gdb index")
+            current_span.set_attributes(
+                {
+                    "add_index_status": "failed",
+                    "add_index_error": str(ex),
+                }
+            )
+            raise ex
+
+        current_span.set_attribute("add_index_changed_file_size", os.path.getsize(file_path))
+
+        root_looger.debug(
+            "Finished creating gdb-index for %s in %s", file_path, (time.time() - start_time)
+        )
+
+    @TRACER.start_as_current_span("core_analyzer.post_install_gdb_optimization.recalc_debuglink")
+    def recalc_debuglink(file_path: str):
+        """
+        Recalcuate the debuglink for ELF binaries.
+
+        After creating the index file in a separate debug file, the debuglink CRC
+        is no longer valid, this will simply recreate the debuglink and therefore
+        update the CRC to match.
+        """
+        current_span = get_default_current_span(
+            {"file": file_path, "recalc_debuglink_status": "success"}
+        )
+
+        process = subprocess.run(
+            [f"{TOOLCHAIN_ROOT}/bin/eu-readelf", "-n", file_path], capture_output=True, text=True
+        )
+        if process.returncode != 0:
+            current_span.set_attribute("recalc_debuglink_status", "skipped")
+            return
+        binary_build_id = get_build_id(process.stdout)
+        process = subprocess.run(
+            [f"{TOOLCHAIN_ROOT}/bin/eu-readelf", "-n", f"{file_path}.debug"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        debugsymbol_build_id = get_build_id(process.stdout)
+        if binary_build_id != debugsymbol_build_id:
+            print(f"{file_path} build id: {binary_build_id}")
+            print(f"{file_path}.debug build id: {debugsymbol_build_id}")
+            raise RuntimeError("binary and debugsymbol build ids do not match")
+        try:
+            # Ensure the file is writable, we have seen the uploaded binaries be non-writable.
+            os.chmod(file_path, 0o775)
+            subprocess.run(
+                [f"{TOOLCHAIN_ROOT}/bin/objcopy", "--remove-section", ".gnu_debuglink", file_path],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    f"{TOOLCHAIN_ROOT}/bin/objcopy",
+                    "--add-gnu-debuglink",
+                    f"{os.path.abspath(file_path)}.debug",
+                    file_path,
+                ],
+                check=True,
+            )
+        except Exception as ex:
+            root_looger.exception("Failed to recalculate debuglink")
+            current_span.set_status(StatusCode.ERROR, "Failed to recalculate debuglink")
+            current_span.set_attributes(
+                {
+                    "recalc_debuglink_status": "failed",
+                    "recalc_debuglink_error": str(ex),
+                }
+            )
+            raise ex
+
+        root_looger.debug("Finished recalculating the debuglink for %s", file_path)
+
+    install_dir = os.path.join(download_dir, "install")
+    if os.path.exists(os.path.join(install_dir, "dist-test")):
+        install_dir = os.path.join(install_dir, "dist-test")
+    bin_dir = os.path.join(install_dir, "bin")
+    if not os.path.isdir(bin_dir):
+        # Pre-hygienic tarballs (e.g. the public release feed used for last-patch) have no
+        # nested bin/ dir -- extract_archive() flattens them so the executables land directly
+        # in install_dir, matching the layout symlink_version() already falls back to.
+        bin_dir = install_dir
+    bin_files = [os.path.join(bin_dir, file_path) for file_path in os.listdir(bin_dir)]
+    lib_dir = os.path.join(install_dir, "lib")
+    lib_files = []
+    if os.path.exists(lib_dir):
+        lib_files = [os.path.join(lib_dir, file_path) for file_path in os.listdir(lib_dir)]
+
+    current_span = get_default_current_span()
+
+    # add gdb indexes so gdb can process these libraries faster, we cannot do this to the binaries.
+    with OtelThreadPoolExecutor() as executor:
+        with TRACER.start_as_current_span(
+            "core_analyzer.post_install_gdb_optimization.add_indexes"
+        ) as current_span:
+            futures = []
+            current_span.set_status(StatusCode.OK)
+            for file_path in lib_files:
+                # If a debug file exists for this file, then the debug symbols are
+                # over in that other file and we can skip this file.
+                if os.path.exists(f"{file_path}.debug"):
+                    continue
+
+                # When we add the .gdb_index section to binaries being ran with gdb
+                # it makes gdb not longer recognize them as the binary that generated
+                # the core dumps
+                futures.append(executor.submit(add_index, file_path=file_path))
+
+            for future in concurrent.futures.as_completed(futures):
+                # raise any exceptions that were thrown in child processes
+                future.result()
+
+        # add gnu_debuglink section to all libraries and debugsymbols. This tells gdb where to look
+        # to find the debugsymbols.
+        with TRACER.start_as_current_span(
+            "core_analyzer.post_install_gdb_optimization.recalc_debuglink"
+        ):
+            futures = []
+            current_span = get_default_current_span()
+            for file_path in lib_files + bin_files:
+                # There will be no debuglinks in the separate debug files
+                # We do not want to edit any of the binary files that gdb might directly run
+                # so we skip the bin directory
+                if file_path.endswith(".debug") or not os.path.exists(f"{file_path}.debug"):
+                    continue
+                futures.append(executor.submit(recalc_debuglink, file_path=file_path))
+
+            for future in concurrent.futures.as_completed(futures):
+                # raise any exceptions that were thrown in child processes
+                future.result()
+
+
+def get_build_id(process_output: str) -> str:
+    result = re.search("Build ID: ([0-9a-z]+)", process_output)
+    return result.group(1)
+
+
+@TRACER.start_as_current_span("core_analyzer.download_task_artifacts")
+def download_task_artifacts(
+    root_logger: Logger,
+    task_id: str,
+    download_dir: str,
+    debugger: Dumper,
+    multiversion_dir: str,
+    execution: Optional[int] = None,
+    retry_secs: int = 10,
+    download_timeout_secs: int = 30 * 60,
+    boring_core_dump_pids: set = None,
+    max_core_dumps: int = 10,
+) -> bool:
+    if os.path.exists(download_dir):
+        # quick sanity check to ensure we don't delete a repo
+        if os.path.exists(os.path.join(download_dir, ".git")):
+            raise RuntimeError(f"Input dir cannot be a git repo: {download_dir}")
+
+        shutil.rmtree(download_dir)
+        root_logger.info(f"Deleted existing dir at {download_dir}")
+
+    os.mkdir(download_dir)
+
+    current_span = get_default_current_span({"download_task_id": task_id})
+    evg_api = evergreen_conn.get_evergreen_api()
+    if execution is not None:
+        task_info = evg_api.task_by_id(task_id=task_id, execution=execution)
+    else:
+        task_info = evg_api.task_by_id(task_id)
+    binary_download_options = _DownloadOptions(db=True, ds=False, da=False, dv=False)
+    debugsymbols_download_options = _DownloadOptions(db=False, ds=True, da=False, dv=False)
+
+    @retry(tries=3, delay=5)
+    def get_multiversion_download_links(task: Task) -> Optional[dict]:
+        for artifact in task.artifacts:
+            if artifact.name != "Multiversion download links":
+                continue
+
+            with urllib.request.urlopen(artifact.url) as url:
+                return json.load(url)
+        return None
+
+    # dictionary of versions and the information about where to download that version
+    # The key is the version, if the key is an empty string that means master was downloaded
+    multiversion_downloads = get_multiversion_download_links(task_info)
+
+    # We support `skip_compile` tasks that download master instead of compiling it
+    # For analysis on these tasks we should download the same binaries that the task downloaded
+    variant = task_info.build_variant
+    version_id = task_info.version_id
+    if multiversion_downloads:
+        skip_download = next(
+            filter(lambda v: v.get("bin_suffix") == "", multiversion_downloads), None
+        )
+        skip_download_urls_info = skip_download.get("evg_urls_info") if skip_download else None
+        if skip_download_urls_info:
+            version_id = skip_download_urls_info["evg_version_id"]
+            variant = skip_download_urls_info["evg_build_variant"]
+
+    if variant == "enterprise-rhel-8-64-bit-future-git-tag-multiversion":
+        # Tasks on this variant depend on multiple archive_dist_test tasks from the same version, so
+        # it is ambiguous which binaries/debug symbols to download. We want "-latest" for the "new" binaries,
+        # and -last-lts/-last-continuous will come from the multiversion download list for the "old".
+        variant = "linux-x86-dynamic-compile-future-tag-multiversion-latest"
+
+    all_downloaded = True
+    multiversion_versions = set()
+    skipped_versions = set()
+    with OtelThreadPoolExecutor() as executor:
+        futures = []
+        futures.append(
+            executor.submit(
+                run_with_retries,
+                root_logger=root_logger,
+                func=download_core_dumps,
+                timeout_secs=download_timeout_secs,
+                retry_secs=retry_secs,
+                task=task_info,
+                download_dir=download_dir,
+                debugger=debugger,
+                multiversion_versions=multiversion_versions,
+                boring_core_dump_pids=boring_core_dump_pids,
+                max_core_dumps=max_core_dumps,
+            )
+        )
+        futures.append(
+            executor.submit(
+                run_with_retries,
+                func=download_multiversion_artifact,
+                timeout_secs=download_timeout_secs,
+                retry_secs=retry_secs,
+                root_logger=root_logger,
+                version_id=version_id,
+                variant=variant,
+                download_options=binary_download_options,
+                download_dir=download_dir,
+                name="binaries",
+            )
+        )
+        futures.append(
+            executor.submit(
+                run_with_retries,
+                func=download_multiversion_artifact,
+                timeout_secs=download_timeout_secs,
+                retry_secs=retry_secs,
+                root_logger=root_logger,
+                version_id=version_id,
+                variant=variant,
+                download_options=debugsymbols_download_options,
+                download_dir=download_dir,
+                name="debugsymbols",
+            )
+        )
+
+        futures.append(
+            executor.submit(
+                download_hang_analyzer_js_stacks,
+                root_logger=root_logger,
+                task=task_info,
+                download_dir=download_dir,
+            )
+        )
+
+        for future in concurrent.futures.as_completed(futures):
+            if not future.result():
+                current_span.set_status(StatusCode.ERROR, "Errors occured while fetching artifacts")
+                current_span.set_attribute(
+                    "download_task_artifacts_error", "Errors occured while fetching artifacts"
+                )
+                root_logger.error("Errors occured while fetching artifacts")
+                all_downloaded = False
+                break
+
+    if multiversion_versions:
+        if not multiversion_downloads:
+            raise RuntimeError("Multiversion core dumps were found without download links.")
+
+        with OtelThreadPoolExecutor() as executor:
+            futures = []
+            for version in multiversion_versions:
+                version_downloads = next(
+                    filter(
+                        lambda actual, desired=version: actual.get("bin_suffix") == desired,
+                        multiversion_downloads,
+                    ),
+                    None,
+                )
+                evg_urls_info = (
+                    version_downloads.get("evg_urls_info") if version_downloads else None
+                )
+                release_urls_info = (
+                    version_downloads.get("release_urls_info") if version_downloads else None
+                )
+                if evg_urls_info:
+                    futures.append(
+                        executor.submit(
+                            run_with_retries,
+                            func=download_multiversion_artifact,
+                            timeout_secs=download_timeout_secs,
+                            retry_secs=retry_secs,
+                            root_logger=root_logger,
+                            version_id=evg_urls_info["evg_version_id"],
+                            variant=evg_urls_info["evg_build_variant"],
+                            download_options=binary_download_options,
+                            download_dir=multiversion_dir,
+                            name=f"binaries-{version}",
+                            bin_version=version,
+                        )
+                    )
+                    futures.append(
+                        executor.submit(
+                            run_with_retries,
+                            func=download_multiversion_artifact,
+                            timeout_secs=download_timeout_secs,
+                            retry_secs=retry_secs,
+                            root_logger=root_logger,
+                            version_id=evg_urls_info["evg_version_id"],
+                            variant=evg_urls_info["evg_build_variant"],
+                            download_options=debugsymbols_download_options,
+                            download_dir=multiversion_dir,
+                            name=f"debugsymbols-{version}",
+                            bin_version=version,
+                        )
+                    )
+                elif release_urls_info and release_urls_info.get("urls"):
+                    # No Evergreen version to resolve (e.g. last-patch, pinned to the public
+                    # release feed instead), but there is a plain download URL to use directly.
+                    release_urls = release_urls_info["urls"]
+                    futures.append(
+                        executor.submit(
+                            run_with_retries,
+                            func=download_release_multiversion_artifact,
+                            timeout_secs=download_timeout_secs,
+                            retry_secs=retry_secs,
+                            root_logger=root_logger,
+                            release_urls=release_urls,
+                            download_options=binary_download_options,
+                            download_dir=multiversion_dir,
+                            name=f"binaries-{version}",
+                            bin_version=version,
+                        )
+                    )
+                    futures.append(
+                        executor.submit(
+                            run_with_retries,
+                            func=download_release_multiversion_artifact,
+                            timeout_secs=download_timeout_secs,
+                            retry_secs=retry_secs,
+                            root_logger=root_logger,
+                            release_urls=release_urls,
+                            download_options=debugsymbols_download_options,
+                            download_dir=multiversion_dir,
+                            name=f"debugsymbols-{version}",
+                            bin_version=version,
+                        )
+                    )
+                else:
+                    # No download info at all for this version -- it was built locally rather
+                    # than downloaded (e.g. the binary under test), so there is nothing to fetch.
+                    root_logger.info(
+                        f"No download info for version '{version}' found in a core dump; "
+                        "skipping (likely built locally rather than downloaded)."
+                    )
+                    skipped_versions.add(version)
+
+            for future in concurrent.futures.as_completed(futures):
+                if not future.result():
+                    current_span.set_status(
+                        StatusCode.ERROR, "Errors occured while fetching old version artifacts"
+                    )
+                    current_span.set_attribute(
+                        "download_task_artifacts_error",
+                        "Errors occured while fetching old version artifacts",
+                    )
+                    root_logger.error("Errors occured while fetching old version artifacts")
+                    all_downloaded = False
+                    break
+
+    if all_downloaded and sys.platform.startswith("linux"):
+        post_install_gdb_optimization(download_dir, root_logger)
+
+        for version in multiversion_versions - skipped_versions:
+            post_install_gdb_optimization(os.path.join(multiversion_dir, version), root_logger)
+
+    return all_downloaded
+
+
+def download_debug_symbols(
+    root_logger, symbolizer: Symbolizer, retry_secs: int = 10, download_timeout_secs: int = 10 * 60
+):
+    """
+    Extract debug symbols. Idempotent.
+
+    :param root_logger: logger to use
+    :param symbolizer: pre-configured instance of symbolizer for downloading symbols.
+    :param retry_secs: seconds before retrying to download symbols
+    :param download_timeout_secs: timeout in seconds before failing to download
+    :return: None
+    """
+
+    # Check if the files are already there. They would be on *SAN builds.
+    sym_files = _get_symbol_files()
+
+    if len(sym_files) >= len(_DEBUG_FILE_BASE_NAMES):
+        root_logger.info(
+            "Skipping downloading debug symbols as there are already symbol files present"
+        )
+        return
+
+    while True:
+        try:
+            symbolizer.execute()
+            root_logger.info("Debug symbols successfully downloaded")
+            break
+        except (tarfile.ReadError, DownloadError):
+            root_logger.warn(
+                "Debug symbols unavailable after %s secs, retrying in %s secs, waiting for a total of %s secs",
+                compare_start_time(time.time()),
+                retry_secs,
+                download_timeout_secs,
+            )
+        time.sleep(retry_secs)
+
+        if compare_start_time(time.time()) > download_timeout_secs:
+            root_logger.warn(
+                "Debug-symbols archive-file does not exist after %s secs; "
+                "Hang-Analyzer may not complete successfully.",
+                download_timeout_secs,
+            )
+            break
+
+
+def _get_symbol_files():
+    out = []
+    for ext in ["debug", "dSYM", "pdb"]:
+        for file in _DEBUG_FILE_BASE_NAMES:
+            haystack = build_hygienic_bin_path(child="{file}.{ext}".format(file=file, ext=ext))
+            for needle in glob.glob(haystack):
+                out.append((needle, os.path.join(os.getcwd(), os.path.basename(needle))))
+    return out
+
+
+def check_manifest_for_cores(root_logger: Logger, manifest_url: str) -> bool:
+    """Check if a test.outputs manifest contains core dumps."""
+    try:
+        with urllib.request.urlopen(manifest_url) as response:
+            manifest_content = response.read().decode("utf-8")
+
+            has_cores = ".core" in manifest_content or ".mdmp" in manifest_content
+            if has_cores:
+                root_logger.info("Manifest indicates core dumps are present")
+            else:
+                root_logger.info("Manifest indicates no core dumps")
+            return has_cores
+    except Exception as ex:
+        root_logger.warning(
+            f"Could not read manifest: {ex}. Will download entire test outputs and check for cores."
+        )
+        return True  # If we can't read the manifest, assume cores might be present
+
+
+@TRACER.start_as_current_span("core_analyzer.download_bazel_result_task_cores")
+def download_bazel_result_task_cores(root_logger: Logger, task_id: str, download_dir: str) -> bool:
+    root_logger.info(f"Downloading cores from task {task_id}")
+    current_span = get_default_current_span({"download_task_id": task_id})
+
+    evg_api = evergreen_conn.get_evergreen_api()
+    task_info = evg_api.task_by_id(task_id)
+
+    core_dumps_dir = os.path.join(download_dir, "core-dumps")
+    os.makedirs(core_dumps_dir, exist_ok=True)
+
+    outputs_artifacts = []
+    manifest_map = {}  # Map of outputs zip archive to its manifest
+    for artifact in task_info.artifacts:
+        if "test.outputs" in artifact.name and artifact.name.endswith(".zip"):
+            outputs_artifacts.append(artifact)
+        elif "_manifest__MANIFEST" in artifact.name:
+            manifest_map[artifact.name.replace("_manifest__MANIFEST", "__outputs.zip")] = (
+                artifact.url
+            )
+
+    if not outputs_artifacts:
+        root_logger.warning("No test.outputs artifacts found in result task")
+        return False
+
+    core_dumps_found = 0
+
+    for artifact in outputs_artifacts:
+        root_logger.info(f"Processing artifact: {artifact.name}")
+
+        # Check manifest first to see if cores are present
+        manifest_url = manifest_map.get(artifact.name)
+        if manifest_url:
+            if not check_manifest_for_cores(root_logger, manifest_url):
+                root_logger.info(f"Skipping {artifact.name} - no cores in manifest")
+                continue
+        else:
+            root_logger.warning(f"No manifest found for {artifact.name}, will download anyway")
+
+        file_name = artifact.name
+        zip_path = os.path.join(download_dir, file_name)
+
+        try:
+
+            @retry(tries=3, delay=5)
+            def download_outputs_zip():
+                root_logger.info(f"Downloading {file_name}")
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                download_from_s3_with_requests(artifact.url, zip_path)
+
+            download_outputs_zip()
+
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                for member in zip_ref.namelist():
+                    if member.endswith(".core") or member.endswith(".mdmp"):
+                        core_name = os.path.basename(member)
+                        extract_path = os.path.join(core_dumps_dir, core_name)
+                        root_logger.info(f"Extracting core dump: {core_name}")
+
+                        with zip_ref.open(member) as source, open(extract_path, "wb") as target:
+                            shutil.copyfileobj(source, target)
+
+                        core_dumps_found += 1
+
+            os.remove(zip_path)
+
+        except Exception as ex:
+            root_logger.error(f"Error processing artifact {artifact.name}: {ex}")
+            current_span.set_status(
+                StatusCode.ERROR, f"Failed to download artifact {artifact.name}"
+            )
+            current_span.set_attribute("download_error", str(ex))
+
+    root_logger.info(f"Downloaded {core_dumps_found} core dump(s)")
+
+    if core_dumps_found == 0:
+        root_logger.error("No core dumps found in test.outputs")
+        current_span.set_status(StatusCode.ERROR, "No core dumps found")
+        return False
+
+    current_span.set_attribute("core_dumps_found", core_dumps_found)
+    return True
+
+
+def find_test_task_with_binaries(evg_api, results_task_id: str):
+    """
+    Find the test task in the same build that has dist-tests artifacts.
+
+    :param evg_api: Evergreen API client
+    :param results_task_id:
+    :return: Task ID of the resmoke_tests task, or None if not found
+    """
+
+    try:
+        task = evg_api.task_by_id(results_task_id)
+        tasks = evg_api.tasks_by_build(task.build_id)
+
+        if "_burn_in_" in task.display_name:
+            resmoke_tests_task = list(
+                filter(lambda t: t.display_name.startswith("resmoke_tests_burn_in"), tasks)
+            )
+        else:
+            resmoke_tests_task = list(filter(lambda t: t.display_name == "resmoke_tests", tasks))
+        assert (
+            len(resmoke_tests_task) == 1
+        ), f"Could not find a unique resmoke test task in this variant {task.build_variant_display_name}"
+
+        return resmoke_tests_task[0]
+
+    except Exception as ex:
+        print(f"ERROR: Failed to query Evergreen for test task: {ex}")
+        return None
+
+
+def _find_binary_artifacts(root_logger: Logger, evg_api, task_id: str) -> list:
+    """
+    Find the archive of symbolized binaries to analyze cores against.
+
+    The runner (resmoke_tests) task relinks and uploads binaries for the targets that failed in its
+    own execution. A result task restarted on its own by stepback or the autoreverter re-runs the
+    test itself, and uploads its own binaries, so prefer the result task's archive.
+
+    :return: List of matching artifacts, empty if none were found on either task.
+    """
+    candidates = []
+
+    try:
+        candidates.append(evg_api.task_by_id(task_id))
+    except Exception as ex:
+        root_logger.error(f"Failed to query Evergreen for result task {task_id}: {ex}")
+
+    runner_task = find_test_task_with_binaries(evg_api, task_id)
+    if runner_task is not None:
+        candidates.append(runner_task)
+
+    for task in candidates:
+        artifacts = [a for a in task.artifacts if "Test binaries and libraries" in a.name]
+        if artifacts:
+            root_logger.info(f"Downloading binaries from task {task.display_name} ({task.task_id})")
+            return artifacts
+        root_logger.info(f"No binary archive found on task {task.display_name} ({task.task_id})")
+
+    return []
+
+
+@TRACER.start_as_current_span("core_analyzer.download_bazel_test_task_binaries")
+def download_bazel_test_task_binaries(root_logger: Logger, task_id: str, download_dir: str) -> bool:
+    evg_api = evergreen_conn.get_evergreen_api()
+
+    dist_tests_artifacts = _find_binary_artifacts(root_logger, evg_api, task_id)
+    if not dist_tests_artifacts:
+        root_logger.error("No binary archive found in the result task or the resmoke_tests task")
+        return False
+
+    install_dir = os.path.join(download_dir, "install")
+    os.makedirs(install_dir, exist_ok=True)
+
+    for artifact in dist_tests_artifacts:
+        file_name = "resmoke_tests.tgz"
+        download_path = os.path.join(download_dir, file_name)
+
+        try:
+
+            @retry(tries=3, delay=5)
+            def download_binary_artifact():
+                root_logger.info(f"Downloading {file_name}")
+                if os.path.exists(download_path):
+                    os.remove(download_path)
+                download_from_s3_with_requests(artifact.url, download_path)
+
+            download_binary_artifact()
+
+            root_logger.info(f"Extracting {file_name}")
+
+            with tarfile.open(download_path, "r:gz") as tar:
+                # Extract members, mapping dist-tests -> dist-test
+                for member in tar.getmembers():
+                    if member.name.startswith("dist-tests/"):
+                        member.name = member.name.replace("dist-tests/", "dist-test/", 1)
+                    tar.extract(member, install_dir)
+
+            os.remove(download_path)
+
+        except Exception as ex:
+            root_logger.error(f"Error downloading/extracting {file_name}: {ex}")
+            return False
+
+    root_logger.info("Successfully downloaded and extracted binaries")
+    return True
+
+
+@TRACER.start_as_current_span("core_analyzer.download_bazel_task_artifacts")
+def download_bazel_task_artifacts(
+    root_logger: Logger,
+    task_id: str,
+    download_dir: str,
+    retry_secs: int = 10,
+    download_timeout_secs: int = 30 * 60,
+) -> bool:
+    if os.path.exists(download_dir):
+        # quick sanity check to ensure we don't delete a repo
+        if os.path.exists(os.path.join(download_dir, ".git")):
+            raise RuntimeError(f"Input dir cannot be a git repo: {download_dir}")
+
+        shutil.rmtree(download_dir)
+        root_logger.info(f"Deleted existing dir at {download_dir}")
+
+    os.mkdir(download_dir)
+
+    current_span = get_default_current_span({"task_id": task_id})
+
+    # Download cores and binaries in parallel
+    with OtelThreadPoolExecutor() as executor:
+        futures = []
+
+        # Download core dumps from result task
+        futures.append(
+            executor.submit(
+                run_with_retries,
+                root_logger=root_logger,
+                func=download_bazel_result_task_cores,
+                timeout_secs=download_timeout_secs,
+                retry_secs=retry_secs,
+                task_id=task_id,
+                download_dir=download_dir,
+            )
+        )
+
+        # Download binaries from test task
+        futures.append(
+            executor.submit(
+                run_with_retries,
+                root_logger=root_logger,
+                func=download_bazel_test_task_binaries,
+                timeout_secs=download_timeout_secs,
+                retry_secs=retry_secs,
+                task_id=task_id,
+                download_dir=download_dir,
+            )
+        )
+
+        all_downloaded = True
+        for future in concurrent.futures.as_completed(futures):
+            if not future.result():
+                current_span.set_status(
+                    StatusCode.ERROR, "Errors occurred while fetching artifacts"
+                )
+                current_span.set_attribute(
+                    "download_bazel_task_artifacts_error",
+                    "Errors occurred while fetching artifacts",
+                )
+                root_logger.error("Errors occurred while fetching bazel artifacts")
+                all_downloaded = False
+                break
+
+    sysroot = None
+    if all_downloaded and sys.platform.startswith("linux"):
+        sysroot = os.path.join(download_dir, "rbe_sysroot")
+        create_rbe_sysroot(sysroot)
+
+        post_install_gdb_optimization(download_dir, root_logger)
+
+    return all_downloaded, sysroot

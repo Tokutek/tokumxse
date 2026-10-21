@@ -1,0 +1,268 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/db/exec/sbe/util/print_options.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/values/value_printer.h"
+#include "mongo/db/exec/sbe/vm/vm_printer.h"
+#include "mongo/unittest/golden_test.h"
+#include "mongo/unittest/golden_test_base.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/modules.h"
+
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace mongo::sbe {
+
+typedef std::pair<value::TypeTags, value::Value> TypedValue;
+typedef std::vector<TypedValue> TypedValues;
+
+extern unittest::GoldenTestConfig goldenTestConfigSbe;
+
+class SBETestFixture : public virtual mongo::unittest::Test {
+protected:
+    template <typename Stream>
+    value::ValuePrinter<Stream> makeValuePrinter(Stream& stream) {
+        return value::ValuePrinters::make(
+            stream, PrintOptions().useTagForAmbiguousValues(true).normalizeOutput(true));
+    }
+
+    vm::CodeFragmentPrinter makeCodeFragmentPrinter() {
+        return vm::CodeFragmentPrinter(vm::CodeFragment::PrintFormat::Stable);
+    }
+};
+
+class GoldenSBETestFixture : public virtual SBETestFixture {
+public:
+    GoldenSBETestFixture(bool debug = false) : _debug(debug), _variationCount(0) {}
+
+    void setUp() override;
+
+    void tearDown() override;
+
+    void printVariation(const std::string& name = "");
+
+protected:
+    std::unique_ptr<unittest::GoldenTestContext> gctx;
+
+private:
+    bool _debug;
+    int _variationCount;
+};
+
+/** SBE Value Equal to. */
+class ValueEqMatcher {
+public:
+    explicit ValueEqMatcher(TypedValue v) : _v{v} {}
+    explicit ValueEqMatcher(value::TagValueView v) : _v{v.tag, v.value} {}
+
+    void DescribeTo(std::ostream* os) const {
+        *os << "ValueEq(" << _v << ")";
+    }
+
+    void DescribeNegationTo(std::ostream* os) const {
+        *os << "not ValueEq(" << _v << ")";
+    }
+
+    bool MatchAndExplain(const TypedValue& x, ::testing::MatchResultListener* listener) const {
+        auto [tag, val] = sbe::value::compareValue(_v.first, _v.second, x.first, x.second);
+        return tag == sbe::value::TypeTags::NumberInt32 && sbe::value::bitcastTo<int>(val) == 0;
+    }
+
+    bool MatchAndExplain(const value::TagValueView& x,
+                         ::testing::MatchResultListener* listener) const {
+        return MatchAndExplain(std::make_pair(x.tag, x.value), listener);
+    }
+
+private:
+    TypedValue _v;
+};
+
+inline auto ValueEq(TypedValue v) {
+    return ::testing::MakePolymorphicMatcher(ValueEqMatcher(v));
+}
+
+inline auto ValueEq(value::TagValueView v) {
+    return ::testing::MakePolymorphicMatcher(ValueEqMatcher(v));
+}
+
+/* Similar to ValueEq, but also value difference within certain limit for double and decimal */
+MATCHER_P2(ValueRoughEq, v, limit, "") {
+    auto [tag, val] = sbe::value::compareValue(v.first, v.second, arg.first, arg.second);
+    bool equal = tag == sbe::value::TypeTags::NumberInt32 && sbe::value::bitcastTo<int>(val) == 0;
+    if (!equal) {
+        if (v.first == sbe::value::TypeTags::NumberDouble &&
+            arg.first == sbe::value::TypeTags::NumberDouble) {
+            auto diff =
+                sbe::value::bitcastTo<double>(v.second) - sbe::value::bitcastTo<double>(arg.second);
+            equal = std::abs(diff) <= limit;
+        } else if (v.first == sbe::value::TypeTags::NumberDecimal &&
+                   arg.first == sbe::value::TypeTags::NumberDecimal) {
+            auto diff = sbe::value::bitcastTo<Decimal128>(v.second).subtract(
+                sbe::value::bitcastTo<Decimal128>(arg.second));
+            equal = diff.toAbs().toDouble() <= limit;
+        }
+    }
+    return equal;
+}
+
+static std::pair<value::TypeTags, value::Value> makeBsonArray(const BSONArray& ba) {
+    return value::copyValue(value::TypeTags::bsonArray,
+                            value::bitcastFrom<const char*>(ba.objdata()));
+}
+
+static std::pair<value::TypeTags, value::Value> makeBsonObject(const BSONObj& bo) {
+    return value::copyValue(value::TypeTags::bsonObject,
+                            value::bitcastFrom<const char*>(bo.objdata()));
+}
+
+static std::pair<value::TypeTags, value::Value> makeArraySetWithCollator(
+    const BSONArray& arr, CollatorInterface* collator) {
+    value::TagValueOwned tmpArr = value::TagValueOwned::fromRaw(makeBsonArray(arr));
+
+    value::ArrayEnumerator enumerator{tmpArr.tag(), tmpArr.value()};
+
+    auto [arrTag, arrVal] = value::makeNewArraySet(collator);
+    value::TagValueOwned arrSet = value::TagValueOwned::fromRaw(arrTag, arrVal);
+
+    auto arrView = value::getArraySetView(arrVal);
+
+    while (!enumerator.atEnd()) {
+        auto [tag, val] = enumerator.getViewOfValue();
+        enumerator.advance();
+
+        arrView->push_back_clone(tag, val);
+    }
+    arrSet.reset();
+
+    return {arrTag, arrVal};
+}
+
+static std::pair<value::TypeTags, value::Value> makeArraySet(const BSONArray& arr) {
+    value::TagValueOwned tmpArr = value::TagValueOwned::fromRaw(makeBsonArray(arr));
+
+    value::ArrayEnumerator enumerator{tmpArr.tag(), tmpArr.value()};
+
+    auto [arrTag, arrVal] = value::makeNewArraySet();
+    value::TagValueOwned arrSet = value::TagValueOwned::fromRaw(arrTag, arrVal);
+
+    auto arrView = value::getArraySetView(arrVal);
+
+    while (!enumerator.atEnd()) {
+        auto [tag, val] = enumerator.getViewOfValue();
+        enumerator.advance();
+
+        arrView->push_back_clone(tag, val);
+    }
+    arrSet.reset();
+
+    return {arrTag, arrVal};
+}
+
+static std::pair<value::TypeTags, value::Value> makeArray(const BSONArray& arr) {
+    value::TagValueOwned tmpArr = value::TagValueOwned::fromRaw(makeBsonArray(arr));
+
+    value::ArrayEnumerator enumerator{tmpArr.tag(), tmpArr.value()};
+
+    auto [arrTag, arrVal] = value::makeNewArray();
+    value::TagValueOwned arrOwned = value::TagValueOwned::fromRaw(arrTag, arrVal);
+
+    auto arrView = value::getArrayView(arrVal);
+
+    while (!enumerator.atEnd()) {
+        auto [tag, val] = enumerator.getViewOfValue();
+        enumerator.advance();
+
+        auto [copyTag, copyVal] = value::copyValue(tag, val);
+        arrView->push_back_raw(copyTag, copyVal);
+    }
+    arrOwned.reset();
+
+    return {arrTag, arrVal};
+}
+
+static std::pair<value::TypeTags, value::Value> makeObject(const BSONObj& obj) {
+    value::TagValueOwned tmpObj = value::TagValueOwned::fromRaw(makeBsonObject(obj));
+
+    value::ObjectEnumerator enumerator{tmpObj.tag(), tmpObj.value()};
+
+    auto [objTag, objVal] = value::makeNewObject();
+    value::TagValueOwned objOwned = value::TagValueOwned::fromRaw(objTag, objVal);
+
+    auto objView = value::getObjectView(objVal);
+
+    while (!enumerator.atEnd()) {
+        auto [tag, val] = enumerator.getViewOfValue();
+        auto [copyTag, copyVal] = value::copyValue(tag, val);
+        objView->push_back_raw(enumerator.getFieldName(), copyTag, copyVal);
+        enumerator.advance();
+    }
+    objOwned.reset();
+
+    return {objTag, objVal};
+}
+
+static std::pair<value::TypeTags, value::Value> makeNothing() {
+    return {value::TypeTags::Nothing, value::bitcastFrom<int64_t>(0)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeNull() {
+    return {value::TypeTags::Null, value::bitcastFrom<int64_t>(0)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeUndefined() {
+    return {value::TypeTags::bsonUndefined, value::bitcastFrom<int64_t>(0)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeInt32(int32_t value) {
+    return {value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(value)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeInt64(int64_t value) {
+    return {value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(value)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeDouble(double value) {
+    return {value::TypeTags::NumberDouble, value::bitcastFrom<double>(value)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeDecimal(std::string value) {
+    return value::makeCopyDecimal(Decimal128(value));
+}
+
+static std::pair<value::TypeTags, value::Value> makeBool(bool value) {
+    return {value::TypeTags::Boolean, value::bitcastFrom<bool>(value)};
+}
+
+static std::pair<value::TypeTags, value::Value> makeTimestamp(Timestamp timestamp) {
+    return {value::TypeTags::Timestamp, value::bitcastFrom<uint64_t>(timestamp.asULL())};
+}
+
+static std::vector<value::TagValueOwned> makeOwnedVector(std::initializer_list<TypedValue> values) {
+    std::vector<value::TagValueOwned> owned;
+    owned.reserve(values.size());
+    for (const auto& tv : values) {
+        owned.push_back(value::TagValueOwned::fromRaw(tv));
+    }
+    return owned;
+}
+
+static std::pair<value::TypeTags, value::Value> makeEmptyState(
+    size_t maxSize, int32_t memLimit = std::numeric_limits<int32_t>::max()) {
+    auto [stateTag, stateVal] = value::makeNewArray();
+    auto state = value::getArrayView(stateVal);
+
+    state->push_back_raw(value::makeNewArray() /* internalArr */);
+    state->push_back_raw(makeInt64(0) /* StartIdx */);
+    state->push_back_raw(makeInt64(maxSize) /* MaxSize */);
+    state->push_back_raw(makeInt32(0) /* MemUsage */);
+    state->push_back_raw(makeInt32(memLimit) /* MemLimit */);
+    state->push_back_raw(makeBool(true) /* IsGroupAccum */);
+
+    return {stateTag, stateVal};
+}
+}  // namespace mongo::sbe

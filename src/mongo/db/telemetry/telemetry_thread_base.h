@@ -1,0 +1,144 @@
+/*======
+This file is part of Percona Server for MongoDB.
+
+Copyright (C) 2024-present Percona and/or its affiliates. All rights reserved.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the Server Side Public License, version 1,
+    as published by MongoDB, Inc.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    Server Side Public License for more details.
+
+    You should have received a copy of the Server Side Public License
+    along with this program. If not, see
+    <http://www.mongodb.com/licensing/server-side-public-license>.
+
+    As a special exception, the copyright holders give permission to link the
+    code of portions of this program with the OpenSSL library under certain
+    conditions as described in each individual source file and distribute
+    linked combinations including the program with the OpenSSL library. You
+    must comply with the Server Side Public License in all respects for
+    all of the code used other than as permitted herein. If you modify file(s)
+    with this exception, you may extend this exception to your version of the
+    file(s), but you are not obligated to do so. If you do not wish to do so,
+    delete this exception statement from your version. If you delete this
+    exception statement from all source files in the program, then also delete
+    it in the license file.
+======= */
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/util/background.h"
+#include "mongo/util/time_support.h"
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+
+#include <boost/filesystem.hpp>  // IWYU pragma: keep
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+class TelemetryThreadBase : public BackgroundJob {
+public:
+    // Pointer to the function to create subclass instance
+    static std::unique_ptr<TelemetryThreadBase> (*create)();
+
+    TelemetryThreadBase();
+
+    static TelemetryThreadBase* get(ServiceContext* serviceCtx);
+    static void set(ServiceContext* serviceCtx,
+                    std::unique_ptr<TelemetryThreadBase> newTelemetryThread);
+
+    std::string name() const final {
+        return "PerconaTelemetry";
+    }
+
+    void run() final;
+    void shutdown();
+
+protected:
+    static boost::filesystem::path sdPath(std::string_view sd);
+    static std::string_view boolName(bool v);
+
+    // methods called from _initParameters
+    virtual std::string_view _sourceName() = 0;
+    virtual Status _initInstanceId(const OID& initialId) = 0;
+    virtual Status _initDbId(ServiceContext* serviceContext,
+                             OperationContext* opCtx,
+                             const OID& initalId) = 0;
+
+    // methods called from _advance
+    virtual Status _advancePersist(ServiceContext* serviceContext) = 0;
+
+    // methods called from _writeMetrics
+    virtual void _appendMetrics(ServiceContext* serviceContext, BSONObjBuilder* builder) = 0;
+
+    // names of the fields in the metric file
+    static constexpr std::string_view kDbInstanceId = "db_instance_id"sv;
+    static constexpr std::string_view kDbInternalId = "db_internal_id"sv;
+    static constexpr std::string_view kPillarVersion = "pillar_version"sv;
+    static constexpr std::string_view kPerconaFeatures = "percona_features"sv;
+    static constexpr std::string_view kStorageEngine = "storage_engine"sv;
+    static constexpr std::string_view kReplicaSetId = "db_replication_id"sv;
+    static constexpr std::string_view kReplMemberState = "replication_state"sv;
+    static constexpr std::string_view kClusterId = "db_cluster_id"sv;
+    static constexpr std::string_view kShardSvr = "shard_svr"sv;
+    static constexpr std::string_view kConfigSvr = "config_svr"sv;
+    static constexpr std::string_view kUptime = "uptime"sv;
+    static constexpr std::string_view kSource = "source"sv;
+    static constexpr std::string_view kOIDCEnabled = "oidc_enabled"sv;
+    static constexpr std::string_view kLDAPEnabled = "ldap_enabled"sv;
+    static constexpr std::string_view kLDAPAuthorizationEnabled = "ldap_authorization_enabled"sv;
+    static constexpr std::string_view kLDAPSaslAuthenticationEnabled =
+        "ldap_sasl_authentication_enabled"sv;
+    static constexpr std::string_view kKerberosAuthenticationEnabled = "kerberos_enabled"sv;
+    static constexpr std::string_view kX509AuthenticationEnabled = "x509_enabled"sv;
+    static constexpr std::string_view kX509ServerAuthenticationEnabled = "x509_server_enabled"sv;
+
+    // instance id stored in kTelemetryFileName
+    OID _instid;
+
+    // nextScarpe is set to "now + grace" in the constructor
+    // but it is overwritten if we read scheduled time from kTelemetryCollection
+    Date_t _nextScrape;
+
+    // database id stored as kTelemetryCollection._id
+    OID _dbid;
+    // constant prefix for each metrics file
+    BSONObj _prefix;
+
+private:
+    Status _initParameters(ServiceContext* serviceContext);
+    Status _advance(ServiceContext* serviceContext);
+    Status _cleanupTelemetryDir();
+    Status _writeMetrics(ServiceContext* serviceContext);
+
+    // Used as suffix in metric file names.
+    // Accessed only from the telemetry thread so synchronization is not necessary
+    static std::string _metricFileSuffix;
+
+    AtomicWord<bool> _shuttingDown{false};
+
+    std::mutex _mutex;  // protects _condvar
+    // The telemetry thread idles on this condition variable for a particular time duration
+    // between creating metrics files. It can be triggered early to expediate shutdown.
+    stdx::condition_variable _condvar;
+};
+
+void initPerconaTelemetryInternal(ServiceContext* serviceContext);
+
+}  // namespace mongo

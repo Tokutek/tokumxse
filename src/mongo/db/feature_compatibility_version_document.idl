@@ -1,0 +1,73 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/feature_compatibility_version_parser.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    featureCompatibilityVersionDocument:
+        description: "featureCompatibilityVersion on-disk document format"
+        generate_comparison_operators: true
+        fields:
+            _id:
+                type: string
+                description: "Key of the featureCompatibilityVersion state singleton document"
+                default: '"featureCompatibilityVersion"'
+            version:
+                description: "Effective featureCompatibilityVersion"
+                type: fcv_string
+            targetVersion:
+                description: "Target featureCompatibilityVersion for upgrade/downgrade"
+                type: fcv_string
+                optional: true
+            previousVersion:
+                description: >-
+                    Previous featureCompatibilityVersion for upgrade/downgrade. Only set if version == targetVersion.
+                    For downgrades, this will always be kLatest. For upgrades, it's unset until the the effective FCV
+                    reaches the target version (phase >= kEnableTargetFeatures), then it is kLastLTS/kLastContinuous.
+                type: fcv_string
+                optional: true
+                validator:
+                    callback: "FeatureCompatibilityVersionParser::validatePreviousVersionField"
+            changeTimestamp:
+                description:
+                    "Timestamp used to identify the 2-phase setFCV request. Both phases (kStart and
+                    kComplete) must have the same timestamp for the entire sequence, and every new
+                    sequence started must strictly have incrementing timestamp."
+                type: timestamp
+                optional: true
+            isCleaningServerMetadata:
+                description:
+                    "Boolean indicating whether the setFCV downgrade request is in the middle of
+                    cleaning up internal server metadata."
+                type: bool
+                optional: true
+            phase:
+                description: "An enum that indicates the current phase of the upgrade or downgrade process."
+                type: SetFCVPhase
+                optional: true
+
+# Note: the order of the phases in the enum below matters, as the code relies on the order to determine whether a phase
+# should be run or not based on the current phase stored in the FCV document.
+enums:
+    SetFCVPhase:
+        description: "Enum that defines the phases of the 3-phase setFCV protocol."
+        type: string
+        values:
+            # Tells shards to transition to kUpgrading/kDowngrading FCV.
+            kStart: "start"
+            # Tells shards to perform upgrade-ability/downgrade-ability checks and any actions needed
+            # before transitioning to the fully upgraded/downgraded state.
+            kPrepare: "prepare"
+            # Tells shards to execute possibly metadata-changing upgrade/downgrade actions and
+            # transition to the fully upgraded/downgraded FCV.
+            kComplete: "complete"
+            # Tells shards to enable target-version features.
+            kEnableTargetFeatures: "enable_target_features"
+            # Tells shards to commit features added in the target version.
+            kCommitAddedFeatures: "commit_added_features"

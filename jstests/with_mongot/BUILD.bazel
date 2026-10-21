@@ -1,0 +1,21 @@
+load("//bazel:mongo_js_rules.bzl", "all_subpackage_javascript_files", "mongo_js_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    ["keyfile_for_testing"],
+)
+
+mongo_js_library(
+    name = "common_utils",
+    srcs = ["common_utils.js"],
+)
+
+mongo_js_library(
+    name = "all_javascript_files",
+    srcs = glob([
+        "*.js",
+    ]),
+)
+
+all_subpackage_javascript_files()

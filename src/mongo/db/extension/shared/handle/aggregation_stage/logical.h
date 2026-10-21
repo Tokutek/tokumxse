@@ -1,0 +1,162 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/extension/public/api.h"
+#include "mongo/db/extension/public/extension_agg_stage_static_properties_gen.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/executable_agg_stage.h"
+#include "mongo/db/extension/shared/handle/handle.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/util/modules.h"
+
+#include <string_view>
+
+namespace mongo::extension {
+
+using DistributedPlanLogicHandle = OwnedHandle<::MongoExtensionDistributedPlanLogic>;
+using LogicalAggStageHandle = OwnedHandle<::MongoExtensionLogicalAggStage>;
+using UnownedLogicalAggStageHandle = UnownedHandle<::MongoExtensionLogicalAggStage>;
+
+class LogicalAggStageAPI;
+
+template <>
+struct c_api_to_cpp_api<::MongoExtensionLogicalAggStage> {
+    using CppApi_t = LogicalAggStageAPI;
+};
+
+/**
+ * LogicalAggStageHandle is a wrapper around a MongoExtensionLogicalAggStage vtable API.
+ */
+class LogicalAggStageAPI : public VTableAPI<::MongoExtensionLogicalAggStage> {
+public:
+    LogicalAggStageAPI(::MongoExtensionLogicalAggStage* ptr)
+        : VTableAPI<::MongoExtensionLogicalAggStage>(ptr) {}
+
+    std::string_view getName() const;
+
+    BSONObj serialize() const;
+
+    /**
+     * Collects explain output at the specified verbosity from this logical stage.
+     */
+    BSONObj explain(MongoExtensionQueryExecutionContext& execCtx,
+                    ExplainOptions::Verbosity verbosity) const;
+
+    /**
+     * Compiles a logical stage into an execution stage.
+     */
+    ExecAggStageHandle compile() const;
+
+    /**
+     * Returns the distributed plan logic for this stage if it requires specific sharding logic. If
+     * a stage can run fully in parallel on the shards, the returned handle is invalid.
+     */
+    DistributedPlanLogicHandle getDistributedPlanLogic() const;
+
+    /**
+     * Clones the logical stage.
+     */
+    LogicalAggStageHandle clone() const;
+
+    /**
+     * Propagates the extracted limit value if it exists across the boundary, otherwise propagates
+     * nullptr. This is needed by the $vectorSearch extension stage in order for it to apply its
+     * optimizations requiring a limit value.
+     */
+    void setExtractedLimitVal_deprecated(boost::optional<long long> extractedLimitVal);
+
+    /**
+     * Evaluates the precondition of the rule identified by name. Return the precondition value.
+     */
+    bool evaluatePipelineRewriteRulePrecondition(
+        std::string_view ruleName,
+        MongoExtensionPipelineRewriteContext* pipelineRewriteContext) const;
+
+    /**
+     * Applies the transform of the rule identified by name. Returns true if pipeline was modified
+     * and rule should be requeued in RBR engine.
+     */
+    bool evaluatePipelineRewriteRuleTransform(
+        std::string_view ruleName, MongoExtensionPipelineRewriteContext* pipelineRewriteContext);
+
+    /**
+     * Returns the filter predicate applied by this stage for shard targeting. Returns an empty
+     * BSONObj if the stage does not apply a filter.
+     */
+    BSONObj getFilter() const;
+
+    /**
+     * Pushes the pipeline dependencies to the extension stage.
+     */
+    void applyPipelineSuffixDependencies(const ::MongoExtensionPipelineDependencies* deps);
+
+    /**
+     * Returns the sort pattern applied by this stage. Returns an empty BSONObj if the stage does
+     * not apply a sort pattern.
+     */
+    BSONObj getSortPattern() const;
+
+    /**
+     * Notifies the logical stage that the stream identified by streamType will not produce any more
+     * documents.
+     */
+    void skipStream(::MongoExtensionStreamType streamType);
+
+    void skipMetadataStream() {
+        skipStream(::MongoExtensionStreamType::kMongoExtensionStreamTypeMetaResult);
+    }
+
+    /**
+     * Returns the DocsNeededBounds info for this stage. Returns boost::none if the extension
+     * does not provide bounds info.
+     */
+    boost::optional<MongoExtensionDocsNeededBoundsInfo> getDocsNeededBounds() const;
+
+    static void assertVTableConstraints(const VTable_t& vtable) {
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'get_name' is null",
+                vtable.get_name != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'serialize' is null",
+                vtable.serialize != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'explain' is null",
+                vtable.explain != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'compile' is null",
+                vtable.compile != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'get_distributed_plan_logic' is null",
+                vtable.get_distributed_plan_logic != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'clone' is null",
+                vtable.clone != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'set_vector_search_limit_for_optimization' is null",
+                vtable.set_vector_search_limit_for_optimization_deprecated != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'evaluate_pipeline_rewrite_rule_precondition' is null",
+                vtable.evaluate_pipeline_rewrite_rule_precondition != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'evaluate_pipeline_rewrite_rule_transform' is null",
+                vtable.evaluate_pipeline_rewrite_rule_transform != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'get_filter' is null",
+                vtable.get_filter != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'apply_pipeline_suffix_dependencies' is null",
+                vtable.apply_pipeline_suffix_dependencies != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'get_sort_pattern' is null",
+                vtable.get_sort_pattern != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'skip_stream' is null",
+                vtable.skip_stream != nullptr);
+        tassert(ErrorCodes::InvalidExtensionVTable,
+                "LogicalAggStage 'get_docs_needed_bounds' is null",
+                vtable.get_docs_needed_bounds != nullptr);
+    }
+};
+
+}  // namespace mongo::extension

@@ -1,0 +1,390 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands/query_cmd/bulk_write_gen.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/router_role/collection_routing_info_targeter.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/s/analyze_shard_key_cmd_gen.h"
+#include "mongo/s/analyze_shard_key_common_gen.h"
+#include "mongo/s/analyze_shard_key_documents_gen.h"
+#include "mongo/s/analyze_shard_key_server_parameters_gen.h"
+#include "mongo/s/query/shard_key_pattern_query_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <set>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace analyze_shard_key {
+
+using QueryTargetingInfo = shard_key_pattern_query_util::QueryTargetingInfo;
+
+/**
+ * The utility class for calculating read or write distribution metrics for sampled queries against
+ * the collection with the given routing info.
+ */
+template <typename DistributionMetricsType, typename SampleSizeType>
+class DistributionMetricsCalculator {
+public:
+    DistributionMetricsCalculator(const CollectionRoutingInfoTargeter& targeter)
+        : _targeter(targeter),
+          _firstShardKeyFieldName(
+              _getChunkManager().getShardKeyPattern().toBSON().firstElement().fieldName()) {
+        _getChunkManager().forEachChunk([&](const auto& chunk) {
+            _numByRange.emplace(std::make_pair(chunk.getRange(), 0));
+            return true;
+        });
+    };
+
+    /**
+     * Calculates metrics for the given sampled query.
+     */
+    virtual void addQuery(OperationContext* opCtx, const SampledQueryDocument& doc) = 0;
+
+    /**
+     * Returns the metrics calculated based on the sampled queries added so far.
+     */
+    virtual DistributionMetricsType getMetrics() const = 0;
+
+    /**
+     * Returns the total number of sampled queries added so far.
+     */
+    virtual int64_t getNumTotal() const = 0;
+
+protected:
+    virtual SampleSizeType _getSampleSize() const = 0;
+
+    DistributionMetricsType _getMetrics() const;
+
+    void _incrementNumSingleShard() {
+        _numSingleShard++;
+    }
+
+    void _incrementNumMultiShard() {
+        _numMultiShard++;
+    }
+
+    void _incrementNumScatterGather() {
+        _numScatterGather++;
+    }
+
+    void _incrementNumByRanges(const std::set<ChunkRange>& chunkRanges) {
+        for (const auto& chunkRange : chunkRanges) {
+            auto it = _numByRange.find(chunkRange);
+            invariant(it != _numByRange.end());
+            it->second++;
+        }
+    }
+
+    /**
+     * The helper used by 'addQuery' to get the targeting info for a query with the given filter,
+     * collation, let parameters and runtime contants.
+     */
+    QueryTargetingInfo _getTargetingInfoForQuery(
+        OperationContext* opCtx,
+        const BSONObj& filter,
+        const BSONObj& collation,
+        const boost::optional<BSONObj>& letParameters = boost::none,
+        const boost::optional<LegacyRuntimeConstants>& runtimeConstants = boost::none);
+
+    /**
+     * The helper used by 'addQuery' to increment the metrics for a query with the given targeting
+     * info.
+     */
+    void _incrementMetricsForQuery(const QueryTargetingInfo& info);
+
+    const ChunkManager& _getChunkManager() const {
+        return _targeter.getRoutingInfo().getChunkManager();
+    }
+
+    const ShardKeyPattern& _getShardKeyPattern() const {
+        return _getChunkManager().getShardKeyPattern();
+    }
+
+    const CollatorInterface* _getDefaultCollator() const {
+        return _getChunkManager().getDefaultCollator();
+    }
+
+    const CollectionRoutingInfoTargeter& _targeter;
+    const std::string_view _firstShardKeyFieldName;
+
+    int64_t _numSingleShard = 0;
+    int64_t _numMultiShard = 0;
+    int64_t _numScatterGather = 0;
+
+    std::map<ChunkRange, int64_t> _numByRange;
+};
+
+class ReadDistributionMetricsCalculator
+    : public DistributionMetricsCalculator<ReadDistributionMetrics, ReadSampleSize> {
+public:
+    ReadDistributionMetricsCalculator(const CollectionRoutingInfoTargeter& targeter)
+        : DistributionMetricsCalculator(targeter) {}
+
+    void addQuery(OperationContext* opCtx, const SampledQueryDocument& doc) override;
+
+    ReadDistributionMetrics getMetrics() const override;
+
+    int64_t getNumTotal() const override {
+        return _numFind + _numAggregate + _numCount + _numDistinct;
+    }
+
+private:
+    ReadSampleSize _getSampleSize() const override;
+
+    int64_t _numFind = 0;
+    int64_t _numAggregate = 0;
+    int64_t _numCount = 0;
+    int64_t _numDistinct = 0;
+};
+
+class WriteDistributionMetricsCalculator
+    : public DistributionMetricsCalculator<WriteDistributionMetrics, WriteSampleSize> {
+public:
+    WriteDistributionMetricsCalculator(const CollectionRoutingInfoTargeter& targeter)
+        : DistributionMetricsCalculator(targeter) {}
+
+    void addQuery(OperationContext* opCtx, const SampledQueryDocument& doc) override;
+
+    WriteDistributionMetrics getMetrics() const override;
+
+    int64_t getNumTotal() const override {
+        return _numUpdate + _numDelete + _numFindAndModify;
+    }
+
+    int64_t getNumShardKeyUpdates() const {
+        return _numShardKeyUpdates;
+    }
+
+    void setNumShardKeyUpdates(int64_t num) {
+        invariant(num >= 0);
+        _numShardKeyUpdates = num;
+    }
+
+private:
+    WriteSampleSize _getSampleSize() const override;
+
+    void _addUpdateQuery(OperationContext* opCtx,
+                         const NamespaceString& ns,
+                         const BSONObj& filter,
+                         const BSONObj& collation,
+                         const write_ops::UpdateModification& updateMod,
+                         bool upsert,
+                         bool multi,
+                         const boost::optional<BSONObj>& letParameters,
+                         const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
+    void _addUpdateQuery(OperationContext* opCtx, const write_ops::UpdateCommandRequest& cmd);
+
+    void _addDeleteQuery(OperationContext* opCtx,
+                         const BSONObj& filter,
+                         const BSONObj& collation,
+                         bool multi,
+                         const boost::optional<BSONObj>& letParameters,
+                         const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
+    void _addDeleteQuery(OperationContext* opCtx, const write_ops::DeleteCommandRequest& cmd);
+
+    void _addFindAndModifyQuery(OperationContext* opCtx,
+                                const write_ops::FindAndModifyCommandRequest& cmd);
+
+    void _addBulkWriteQuery(OperationContext* opCtx, const BulkWriteCommandRequest& cmd);
+
+    void _incrementNumSingleWritesWithoutShardKey() {
+        _numSingleWritesWithoutShardKey++;
+    }
+
+    void _incrementNumMultiWritesWithoutShardKey() {
+        _numMultiWritesWithoutShardKey++;
+    }
+
+    void _incrementMetricsForQuery(const QueryTargetingInfo& info, bool isMulti);
+
+    int64_t _numUpdate = 0;
+    int64_t _numDelete = 0;
+    int64_t _numFindAndModify = 0;
+
+    int64_t _numShardKeyUpdates = 0;
+    int64_t _numSingleWritesWithoutShardKey = 0;
+    int64_t _numMultiWritesWithoutShardKey = 0;
+};
+
+// Override the + operator and == operator for ReadSampleSize, WriteSampleSize,
+// ReadDistributionMetrics and WriteDistributionMetrics.
+
+inline ReadSampleSize operator+(const ReadSampleSize& l, const ReadSampleSize& r) {
+    ReadSampleSize sampleSize;
+    sampleSize.setTotal(l.getTotal() + r.getTotal());
+    sampleSize.setFind(l.getFind() + r.getFind());
+    sampleSize.setAggregate(l.getAggregate() + r.getAggregate());
+    sampleSize.setCount(l.getCount() + r.getCount());
+    sampleSize.setDistinct(l.getDistinct() + r.getDistinct());
+    return sampleSize;
+}
+
+inline bool operator==(const ReadSampleSize& l, const ReadSampleSize& r) {
+    return l.getTotal() == r.getTotal() && l.getFind() == r.getFind() &&
+        l.getAggregate() == r.getAggregate() && l.getCount() == r.getCount() &&
+        l.getDistinct() == r.getDistinct();
+}
+
+inline WriteSampleSize operator+(const WriteSampleSize& l, const WriteSampleSize& r) {
+    WriteSampleSize sampleSize;
+    sampleSize.setTotal(l.getTotal() + r.getTotal());
+    sampleSize.setUpdate(l.getUpdate() + r.getUpdate());
+    sampleSize.setDelete(l.getDelete() + r.getDelete());
+    sampleSize.setFindAndModify(l.getFindAndModify() + r.getFindAndModify());
+    return sampleSize;
+}
+
+inline bool operator==(const WriteSampleSize& l, const WriteSampleSize& r) {
+    return l.getTotal() == r.getTotal() && l.getUpdate() == r.getUpdate() &&
+        l.getDelete() == r.getDelete() && l.getFindAndModify() == r.getFindAndModify();
+}
+
+template <typename T>
+std::vector<T> addNumByRange(const std::vector<T>& l, const std::vector<T>& r) {
+    invariant(!l.empty());
+    invariant(!r.empty());
+    uassert(
+        7559401,
+        str::stream()
+            << "Failed to combine the 'numByRange' metrics from two shards since one has length "
+            << l.size() << " and the other one has length " << r.size()
+            << ". This is likely because one of the shard fetched the split point documents after "
+               "TTL deletions had started. The lifetime of the split point documents is "
+               "configurable via 'analyzeShardKeySplitPointExpirationSecs' which is currently set "
+               "to "
+            << gAnalyzeShardKeySplitPointExpirationSecs.load()
+            << ". Please retry the command again.",
+        l.size() == r.size());
+
+    std::vector<T> result;
+    result.reserve(l.size());
+
+    std::transform(l.begin(), l.end(), r.begin(), std::back_inserter(result), std::plus<T>());
+    return result;
+}
+
+template <typename DistributionMetricsType>
+DistributionMetricsType addDistributionMetricsBase(DistributionMetricsType l,
+                                                   DistributionMetricsType r) {
+    DistributionMetricsType metrics;
+    metrics.setSampleSize(l.getSampleSize() + r.getSampleSize());
+    if (auto numTotal = metrics.getSampleSize().getTotal(); numTotal > 0) {
+        auto numSingleShard = l.getNumSingleShard().value_or(0) + r.getNumSingleShard().value_or(0);
+        metrics.setNumSingleShard(numSingleShard);
+        metrics.setPercentageOfSingleShard(calculatePercentage(numSingleShard, numTotal));
+
+        auto numMultiShard = l.getNumMultiShard().value_or(0) + r.getNumMultiShard().value_or(0);
+        metrics.setNumMultiShard(numMultiShard);
+        metrics.setPercentageOfMultiShard(calculatePercentage(numMultiShard, numTotal));
+
+        auto numScatterGather =
+            l.getNumScatterGather().value_or(0) + r.getNumScatterGather().value_or(0);
+        metrics.setNumScatterGather(numScatterGather);
+        metrics.setPercentageOfScatterGather(calculatePercentage(numScatterGather, numTotal));
+
+        if (l.getNumByRange() && r.getNumByRange()) {
+            metrics.setNumByRange(addNumByRange(*l.getNumByRange(), *r.getNumByRange()));
+        } else if (l.getNumByRange()) {
+            metrics.setNumByRange(*l.getNumByRange());
+        } else if (r.getNumByRange()) {
+            metrics.setNumByRange(*r.getNumByRange());
+        }
+    }
+    return metrics;
+}
+
+template <typename DistributionMetricsType>
+inline bool areEqualDistributionMetricsBase(const DistributionMetricsType& l,
+                                            const DistributionMetricsType& r) {
+    return l.getSampleSize() == r.getSampleSize() &&
+        l.getNumSingleShard() == r.getNumSingleShard() &&
+        l.getPercentageOfSingleShard() == r.getPercentageOfSingleShard() &&
+        l.getNumMultiShard() == r.getNumMultiShard() &&
+        l.getPercentageOfMultiShard() == r.getPercentageOfMultiShard() &&
+        l.getNumScatterGather() == r.getNumScatterGather() &&
+        l.getPercentageOfScatterGather() == r.getPercentageOfScatterGather();
+}
+
+inline ReadDistributionMetrics operator+(const ReadDistributionMetrics& l,
+                                         const ReadDistributionMetrics& r) {
+    auto metrics = addDistributionMetricsBase(l, r);
+    return metrics;
+}
+
+inline bool operator==(const ReadDistributionMetrics& l, const ReadDistributionMetrics& r) {
+    return areEqualDistributionMetricsBase(l, r);
+}
+
+inline bool operator!=(const ReadDistributionMetrics& l, const ReadDistributionMetrics& r) {
+    return !(l == r);
+}
+
+inline WriteDistributionMetrics operator+(const WriteDistributionMetrics& l,
+                                          const WriteDistributionMetrics& r) {
+    auto metrics = addDistributionMetricsBase(l, r);
+    if (auto numTotal = metrics.getSampleSize().getTotal(); numTotal > 0) {
+        auto numShardKeyUpdates =
+            l.getNumShardKeyUpdates().value_or(0) + r.getNumShardKeyUpdates().value_or(0);
+        metrics.setNumShardKeyUpdates(numShardKeyUpdates);
+        metrics.setPercentageOfShardKeyUpdates(calculatePercentage(numShardKeyUpdates, numTotal));
+
+        auto numSingleWritesWithoutShardKey = l.getNumSingleWritesWithoutShardKey().value_or(0) +
+            r.getNumSingleWritesWithoutShardKey().value_or(0);
+        metrics.setNumSingleWritesWithoutShardKey(numSingleWritesWithoutShardKey);
+        metrics.setPercentageOfSingleWritesWithoutShardKey(
+            calculatePercentage(numSingleWritesWithoutShardKey, numTotal));
+
+        auto numMultiWritesWithoutShardKey = l.getNumMultiWritesWithoutShardKey().value_or(0) +
+            r.getNumMultiWritesWithoutShardKey().value_or(0);
+        metrics.setNumMultiWritesWithoutShardKey(numMultiWritesWithoutShardKey);
+        metrics.setPercentageOfMultiWritesWithoutShardKey(
+            calculatePercentage(numMultiWritesWithoutShardKey, numTotal));
+    }
+    return metrics;
+}
+
+inline bool operator==(const WriteDistributionMetrics& l, const WriteDistributionMetrics& r) {
+    return areEqualDistributionMetricsBase(l, r) &&
+        l.getNumShardKeyUpdates() == r.getNumShardKeyUpdates() &&
+        l.getPercentageOfShardKeyUpdates() == r.getPercentageOfShardKeyUpdates() &&
+        l.getNumSingleWritesWithoutShardKey() == r.getNumSingleWritesWithoutShardKey() &&
+        l.getPercentageOfSingleWritesWithoutShardKey() ==
+        r.getPercentageOfSingleWritesWithoutShardKey() &&
+        l.getNumMultiWritesWithoutShardKey() == r.getNumMultiWritesWithoutShardKey() &&
+        l.getPercentageOfMultiWritesWithoutShardKey() ==
+        r.getPercentageOfMultiWritesWithoutShardKey();
+}
+
+inline bool operator!=(const WriteDistributionMetrics& l, const WriteDistributionMetrics& r) {
+    return !(l == r);
+}
+
+}  // namespace analyze_shard_key
+}  // namespace mongo

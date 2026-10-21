@@ -1,0 +1,193 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/change_stream_reader_builder_mock.h"
+#include "mongo/db/pipeline/change_stream_test_helpers.h"
+#include "mongo/db/pipeline/data_to_shards_allocation_query_service_mock.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+class ExecutableStubMongoProcessInterface : public StubMongoProcessInterface {
+    bool isExpectedToExecuteQueries() override {
+        return true;
+    }
+};
+
+class ChangeStreamStageTestNoSetup : public AggregationContextFixture {
+public:
+    ChangeStreamStageTestNoSetup();
+    explicit ChangeStreamStageTestNoSetup(NamespaceString nsString);
+
+private:
+    // Register v2 reader prerequisites that drive '_determineChangeStreamReaderVersion' to v1
+    // (kNotAvailable mirrors the production fallback when shard placement info is missing). Tests
+    // that exercise v2 override these via their own scoped guards.
+    ScopedChangeStreamReaderBuilderMock _readerBuilder{
+        std::make_unique<ChangeStreamReaderBuilderMock>()};
+    ScopedDataToShardsAllocationQueryServiceMock _queryService{
+        AllocationToShardsStatus::kNotAvailable};
+};
+
+struct ChangeStreamMockMongoInterface final : public ExecutableStubMongoProcessInterface {
+    // Used by operations which need to obtain the oplog's UUID.
+    static const UUID& oplogUuid();
+
+    ChangeStreamMockMongoInterface(std::vector<repl::OplogEntry> transactionEntries = {},
+                                   std::vector<Document> documentsForLookup = {});
+
+    // For tests of transactions that involve multiple oplog entries.
+    std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
+        repl::OpTime time) const override;
+
+    // Called by DocumentSourceAddPreImage to obtain the UUID of the oplog. Since that's the only
+    // piece of collection info we need for now, just return a BSONObj with the mock oplog UUID.
+    BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) override;
+
+    boost::optional<Document> lookupSingleDocument(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss,
+        boost::optional<UUID> collectionUUID,
+        const Document& documentKey,
+        boost::optional<BSONObj> readConcern) final;
+
+    // Stores oplog entries associated with a commit operation, including the oplog entries that a
+    // real DocumentSourceChangeStream would not see, because they are marked with a "prepare" or
+    // "partialTxn" flag. When the DocumentSourceChangeStream sees the commit for the transaction,
+    // either an explicit "commitCommand" or an implicit commit represented by an "applyOps" that is
+    // not marked with the "prepare" or "partialTxn" flag, it uses a TransactionHistoryIterator to
+    // go back and look up these entries.
+    //
+    // These entries are stored in the order they would be returned by the
+    // TransactionHistoryIterator, which is the _reverse_ of the order they appear in the oplog.
+    std::vector<repl::OplogEntry> _transactionEntries;
+
+    // These documents are used to feed the 'lookupSingleDocument' method.
+    std::vector<Document> _documentsForLookup;
+};
+
+class ChangeStreamStageTest : public ChangeStreamStageTestNoSetup {
+public:
+    ChangeStreamStageTest();
+
+    explicit ChangeStreamStageTest(NamespaceString nsString);
+
+    void checkTransformation(const repl::OplogEntry& entry,
+                             const boost::optional<Document>& expectedDoc,
+                             const BSONObj& spec = change_stream_test_helper::kDefaultSpec,
+                             const boost::optional<Document>& expectedInvalidate = {},
+                             const std::vector<repl::OplogEntry>& transactionEntries = {},
+                             std::vector<Document> documentsForLookup = {},
+                             const boost::optional<std::int32_t>& expectedErrorCode = {});
+
+    /**
+     * Returns a list of stages expanded from a $changStream specification, starting with a
+     * DocumentSourceMock which contains a single document representing 'entry'.
+     *
+     * Stages such as DSEnsureResumeTokenPresent which can swallow results are removed from the
+     * returned list.
+     */
+    std::unique_ptr<exec::agg::Pipeline> makeExecPipeline(BSONObj entry, const BSONObj& spec);
+
+    /**
+     * Returns a list of the stages expanded from a $changStream specification, starting with a
+     * DocumentSourceMock which contains a list of document representing 'entries'.
+     */
+    std::unique_ptr<exec::agg::Pipeline> makeExecPipeline(
+        std::vector<BSONObj> entries,
+        const BSONObj& spec,
+        bool removeEnsureResumeTokenStage = false);
+
+    std::unique_ptr<exec::agg::Pipeline> makeExecPipeline(
+        const repl::OplogEntry& entry,
+        const BSONObj& spec = change_stream_test_helper::kDefaultSpec);
+
+    repl::OplogEntry createCommand(const BSONObj& oField,
+                                   boost::optional<UUID> uuid = boost::none,
+                                   boost::optional<bool> fromMigrate = boost::none,
+                                   boost::optional<repl::OpTime> opTime = boost::none);
+    /**
+     * Helper for running an applyOps through the pipeline, and getting all of the results.
+     */
+    std::vector<Document> getApplyOpsResults(
+        const Document& applyOpsDoc,
+        const LogicalSessionFromClient& lsid,
+        BSONObj spec = change_stream_test_helper::kDefaultSpec,
+        bool hasTxnNumber = true,
+        boost::optional<repl::MultiOplogEntryType> multiOpType = boost::none);
+
+    Document makeExpectedUpdateEvent(Timestamp ts,
+                                     const NamespaceString& nss,
+                                     BSONObj documentKey,
+                                     Document updateDescription,
+                                     bool expandedEvents = false);
+
+    /**
+     * Helper function to do a $v:2 delta oplog test.
+     */
+    void runUpdateV2OplogTest(BSONObj diff, Document updateModificationEntry);
+
+    /**
+     * Helper to create a change stream pipeline for testing.
+     * A side-effect of calling this function is that the 'inRouter' flag in the ExpressionContext
+     * will be set.
+     */
+    std::unique_ptr<Pipeline> buildTestPipeline(const std::vector<BSONObj>& rawPipeline);
+
+    /**
+     * Helper to create a collection-level change stream pipeline for testing.
+     * Side-effect of calling this function are that the 'inRouter' flag in the ExpressionContext
+     * will be set, and the namespace in the ExpressionContext will be set to the specified
+     * namespace.
+     */
+    std::unique_ptr<Pipeline> buildTestPipelineForCollection(
+        const std::vector<BSONObj>& rawPipeline, std::string_view ns = "a.collection");
+
+    /**
+     * Helper to create a database-level change stream pipeline for testing.
+     * Side-effect of calling this function are that the 'inRouter' flag in the ExpressionContext
+     * will be set, and the namespace in the ExpressionContext will be set to the specified
+     * namespace.
+     */
+    std::unique_ptr<Pipeline> buildTestPipelineForDatabase(const std::vector<BSONObj>& rawPipeline,
+                                                           std::string_view ns = "test");
+
+    /**
+     * Helper to create change stream pipeline for testing.
+     * Side-effect of calling this function are that the 'inRouter' flag in the ExpressionContext
+     * will be set, and the namespace in the ExpressionContext will be set to 'admin'.
+     */
+    std::unique_ptr<Pipeline> buildTestPipelineForCluster(const std::vector<BSONObj>& rawPipeline);
+
+    /**
+     * Helper to verify if the change stream pipeline contains expected stages.
+     */
+    void assertStagesNameOrder(std::unique_ptr<Pipeline> pipeline,
+                               const std::vector<std::string>& expectedStages);
+};
+
+}  // namespace mongo

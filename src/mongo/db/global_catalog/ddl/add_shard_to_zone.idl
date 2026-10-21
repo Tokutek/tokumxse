@@ -1,0 +1,36 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    addShardToZone:
+        command_name: addShardToZone
+        command_alias: addshardtozone
+        description: The public addShardToZone command to add a shard to a zone."
+        strict: true
+        namespace: type
+        type: string
+        api_version: ""
+        fields:
+            zone:
+                description: "The zone that the specified shard is being added to."
+                type: string
+
+    _configsvrAddShardToZone:
+        command_name: _configsvrAddShardToZone
+        cpp_name: ConfigsvrAddShardToZone
+        description: "The internal _configsvrAddShardToZone command to add a shard to a zone."
+        strict: false
+        namespace: type
+        type: string
+        api_version: ""
+        fields:
+            zone:
+                description: "The zone that the specified shard is being added to."
+                type: string

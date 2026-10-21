@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,84 +9,816 @@
 #include "wt_internal.h"
 
 /*
- * __wt_cache_read --
- *	Read a page from the file.
+ * Define functions that increment histogram statistics for reconstruction of pages with deltas.
+ */
+WT_STAT_USECS_HIST_INCR_FUNC(internal_reconstruct, perf_hist_internal_reconstruct_latency)
+WT_STAT_USECS_HIST_INCR_FUNC(leaf_reconstruct, perf_hist_leaf_reconstruct_latency)
+
+/*
+ * __evict_force_check --
+ *     Check if a page matches the criteria for forced eviction.
+ */
+static bool
+__evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
+{
+    WT_BTREE *btree;
+    WT_PAGE *page;
+    size_t footprint;
+
+    btree = S2BT(session);
+    page = ref->page;
+
+    /* Leaf pages only. */
+    if (F_ISSET(ref, WT_REF_FLAG_INTERNAL))
+        return (false);
+
+    /*
+     * It's hard to imagine a page with a huge memory footprint that has never been modified, but
+     * check to be sure.
+     */
+    if (__wt_page_evict_clean(page))
+        return (false);
+
+    /*
+     * Exclude the disk image size from the footprint checks.  Usually the
+     * disk image size is small compared with the in-memory limit (e.g.
+     * 16KB vs 5MB), so this doesn't make a big difference.  Where it is
+     * important is for pages with a small number of large values, where
+     * the disk image size takes into account large values that have
+     * already been written and should not trigger forced eviction.
+     */
+    footprint = __wt_atomic_load_size_relaxed(&page->memory_footprint);
+    if (page->dsk != NULL)
+        footprint -= page->dsk->mem_size;
+
+    /* Pages are usually small enough, check that first. */
+    if (footprint < btree->splitmempage)
+        return (false);
+
+    /*
+     * If this session has more than one hazard pointer, eviction will fail and there is no point
+     * trying.
+     */
+    if (__wt_hazard_count(session, ref) > 1)
+        return (false);
+
+    /*
+     * If the page is less than the maximum size and can be split in-memory, let's try that first
+     * without forcing the page to evict on release.
+     */
+    if (footprint < btree->maxmempage) {
+        if (__wt_leaf_page_can_split(session, page))
+            return (true);
+        return (false);
+    }
+
+    /* Bump the oldest ID, we're about to do some visibility checks. */
+    WT_IGNORE_RET(__wt_txn_update_oldest(session, 0));
+
+    /*
+     * Allow some leeway if the transaction ID isn't moving forward since it is unlikely eviction
+     * will be able to evict the page. Don't keep skipping the page indefinitely or large records
+     * can lead to extremely large memory footprints.
+     */
+    if (!__wt_page_evict_retry(session, page))
+        return (false);
+
+    /* Trigger eviction on the next page release. */
+    __wt_evict_page_soon(session, ref);
+
+    /* If eviction cannot succeed, don't try. */
+    return (__wt_page_can_evict(session, ref, NULL));
+}
+
+/*
+ * __wt_page_release_evict --
+ *     Release a reference to a page, and attempt to immediately evict it.
  */
 int
-__wt_cache_read(WT_SESSION_IMPL *session, WT_REF *ref)
+__wt_page_release_evict(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 {
-	WT_DECL_RET;
-	WT_ITEM tmp;
-	WT_PAGE *page;
-	WT_PAGE_STATE previous_state;
-	size_t addr_size;
-	const uint8_t *addr;
+    WT_BTREE *btree;
+    WT_DECL_RET;
+    WT_REF_STATE previous_state;
+    uint32_t evict_flags;
+    bool locked;
 
-	page = NULL;
+    btree = S2BT(session);
 
-	/*
-	 * Don't pass an allocated buffer to the underlying block read function,
-	 * force allocation of new memory of the appropriate size.
-	 */
-	WT_CLEAR(tmp);
+    /*
+     * This function always releases the hazard pointer - ensure that's done regardless of whether
+     * we can get exclusive access. Take some care with order of operations: if we release the
+     * hazard pointer without first locking the page, it could be evicted in between.
+     */
+    previous_state = WT_REF_GET_STATE(ref);
+    locked =
+      previous_state == WT_REF_MEM && WT_REF_CAS_STATE(session, ref, previous_state, WT_REF_LOCKED);
+    if ((ret = __wt_hazard_clear(session, ref)) != 0 || !locked) {
+        if (locked)
+            WT_REF_SET_STATE(ref, previous_state);
+        return (ret == 0 ? EBUSY : ret);
+    }
 
-	/*
-	 * Attempt to set the state to WT_REF_READING for normal reads, or
-	 * WT_REF_LOCKED, for deleted pages.  If successful, we've won the
-	 * race, read the page.
-	 */
-	if (WT_ATOMIC_CAS4(ref->state, WT_REF_DISK, WT_REF_READING))
-		previous_state = WT_REF_DISK;
-	else if (WT_ATOMIC_CAS4(ref->state, WT_REF_DELETED, WT_REF_LOCKED))
-		previous_state = WT_REF_DELETED;
-	else
-		return (0);
+    evict_flags = LF_ISSET(WT_READ_NO_SPLIT) ? WT_EVICT_CALL_NO_SPLIT : 0;
+    FLD_SET(evict_flags, WT_EVICT_CALL_URGENT);
 
-	/*
-	 * Get the address: if there is no address, the page was deleted, but a
-	 * subsequent search or insert is forcing re-creation of the name space.
-	 * Otherwise, there's an address, read the backing disk page and build
-	 * an in-memory version of the page.
-	 */
-	WT_ERR(__wt_ref_info(session, ref, &addr, &addr_size, NULL));
-	if (addr == NULL) {
-		WT_ASSERT(session, previous_state == WT_REF_DELETED);
+    /*
+     * There is no need to cache a history store cursor if evicting a readonly page. That includes
+     * pages from a checkpoint. Note that opening a history store cursor on a checkpoint page from
+     * here will explode because the identity of the matching history store checkpoint isn't
+     * available.
+     */
+    if (ref->page != NULL && !__wt_page_evict_clean(ref->page)) {
+        WT_ASSERT(session, !WT_READING_CHECKPOINT(session));
+        ret = __wt_curhs_cache(session);
+        if (ret != 0) {
+            WT_ASSERT(session, locked);
+            WT_REF_SET_STATE(ref, previous_state);
+            return (ret);
+        }
+    }
+    (void)__wt_atomic_add_uint32_v(&btree->evict_busy, 1);
+    ret = __wt_evict(session, ref, previous_state, evict_flags);
+    (void)__wt_atomic_sub_uint32_v(&btree->evict_busy, 1);
 
-		WT_ERR(__wt_btree_new_leaf_page(session, &page));
-		ref->page = page;
-	} else {
-		/*
-		 * Read the page, then build the in-memory version of the page.
-		 * Clear any local reference to an allocated copy of the disk
-		 * image on return, the page steals it.
-		 */
-		WT_ERR(__wt_bt_read(session, &tmp, addr, addr_size));
-		WT_ERR(__wt_page_inmem(session, ref, tmp.data, tmp.memsize,
-		    WT_DATA_IN_ITEM(&tmp) ?
-		    WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED, &page));
-		tmp.mem = NULL;
+    return (ret);
+}
 
-		/* If the page was deleted, instantiate that information. */
-		if (previous_state == WT_REF_DELETED)
-			WT_ERR(__wt_delete_page_instantiate(session, ref));
-	}
+/*
+ * __page_read_build_full_disk_image --
+ *     Build a full disk image of the page after reading from disk.
+ */
+static int
+__page_read_build_full_disk_image(WT_SESSION_IMPL *session, WT_ITEM *deltas, size_t delta_size,
+  WT_ITEM *new_image, const void *base_image_addr
+#ifdef HAVE_DIAGNOSTIC
+  ,
+  WT_TIME_AGGREGATE *ta
+#endif
+)
+{
+    WT_DECL_RET;
+    WT_PAGE_HEADER *base_dsk;
+    uint64_t time_start, time_stop;
 
-	WT_ERR(__wt_verbose(session, WT_VERB_READ,
-	    "page %p: %s", page, __wt_page_type_string(page->type)));
+    base_dsk = (WT_PAGE_HEADER *)base_image_addr;
+    WT_ASSERT(session, base_dsk != NULL);
 
-	WT_PUBLISH(ref->state, WT_REF_MEM);
-	return (0);
+    /*
+     * Merge deltas directly with the base image to build the new disk image in a single pass. The
+     * merge helpers will also update ta (if non-NULL) as they emit cells.
+     */
+    if (base_dsk->type == WT_PAGE_ROW_LEAF) {
+        time_start = __wt_clock(session);
+        ret = __wti_page_merge_deltas_with_base_image_leaf(
+          session, deltas, delta_size, new_image, base_dsk
+#ifdef HAVE_DIAGNOSTIC
+          ,
+          ta
+#endif
+        );
+        WT_ERR(ret);
+        time_stop = __wt_clock(session);
+        __wt_stat_usecs_hist_incr_leaf_reconstruct(session, WT_CLOCKDIFF_US(time_stop, time_start));
+        WT_STAT_CONN_DSRC_INCR(session, cache_read_leaf_delta);
+    } else {
+        time_start = __wt_clock(session);
+        ret = __wti_page_merge_deltas_with_base_image_int(
+          session, deltas, delta_size, new_image, base_image_addr
+#ifdef HAVE_DIAGNOSTIC
+          ,
+          ta
+#endif
+        );
+        WT_ERR(ret);
+        time_stop = __wt_clock(session);
+        __wt_stat_usecs_hist_incr_internal_reconstruct(
+          session, WT_CLOCKDIFF_US(time_stop, time_start));
+        WT_STAT_CONN_DSRC_INCR(session, cache_read_internal_delta);
+    }
 
-err:	/*
-	 * If the function building an in-memory version of the page failed,
-	 * it discarded the page, but not the disk image.  Discard the page
-	 * and separately discard the disk image in all cases.
-	 */
-	if (ref->page != NULL)
-		__wt_ref_out(session, ref);
-	WT_PUBLISH(ref->state, previous_state);
+err:
 
-	__wt_buf_free(session, &tmp);
+    return (ret);
+}
 
-	return (ret);
+/*
+ * __page_read --
+ *     Read a page from the file.
+ */
+static int
+__page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
+{
+    WT_ADDR_COPY addr;
+    WT_BTREE *btree;
+    WT_DECL_RET;
+    WT_DSK_CACHE_STATE dsk_cache_state;
+    WT_ITEM *deltas;
+    WT_ITEM *disk_image_buf;
+    WT_ITEM new_image, new_image_copy;
+    WT_ITEM *tmp;
+    WT_PAGE *page;
+    WT_PAGE_BLOCK_META block_meta;
+    WT_REF_STATE previous_state;
+    WT_SHARED_DSK_CACHE *shared_dsk_cache;
+    WT_SHARED_DSK_ITEM *shared_dsk_item;
+    size_t count, i;
+    uint32_t page_flags;
+    bool instantiate_upd, disk_image_set, page_change, build_full_disk_image_from_deltas;
+
+    shared_dsk_cache = &S2C(session)->cache->shared_dsk_cache;
+    btree = S2BT(session);
+    WT_CLEAR(block_meta);
+    tmp = NULL;
+    count = 0;
+    disk_image_set = page_change = build_full_disk_image_from_deltas = false;
+    shared_dsk_item = NULL;
+    page = NULL;
+    WT_CLEAR(new_image);
+    WT_CLEAR(new_image_copy);
+
+    page_flags = 0;
+    /*
+     * If a page is read with eviction disabled, we don't count evicting it as progress. Since
+     * disabling eviction allows pages to be read even when the cache is full, we want to avoid
+     * workloads repeatedly reading a page with eviction disabled (e.g., a metadata page), then
+     * evicting that page and deciding that is a sign that eviction is unstuck.
+     */
+    if (LF_ISSET(WT_READ_IGNORE_CACHE_SIZE))
+        FLD_SET(page_flags, WT_PAGE_EVICT_NO_PROGRESS);
+    if (LF_ISSET(WT_READ_PREFETCH))
+        FLD_SET(page_flags, WT_PAGE_PREFETCH);
+
+    /* Lock the WT_REF. */
+    switch (previous_state = WT_REF_GET_STATE(ref)) {
+    case WT_REF_DISK:
+    case WT_REF_DELETED:
+        if (WT_REF_CAS_STATE(session, ref, previous_state, WT_REF_LOCKED))
+            break;
+        return (0);
+    default:
+        return (0);
+    }
+
+    /*
+     * Set the WT_REF_FLAG_READING flag for normal reads; this causes reconciliation of the parent
+     * page to skip examining this page in detail and write out a reference to the on-disk version.
+     * Don't do this for deleted pages, as the reconciliation needs to examine the page delete
+     * information. That requires locking the ref, which requires waiting for the read to finish.
+     * (It is possible that always writing out a reference to the on-disk version of the page is
+     * sufficient in this case, but it's not entirely clear; we expect reads of deleted pages to be
+     * rare, so it's better to do the safe thing.)
+     */
+    if (previous_state == WT_REF_DISK)
+        F_SET_ATOMIC_8(ref, WT_REF_FLAG_READING);
+
+    /*
+     * Get the address: if there is no address, the page was deleted and a subsequent search or
+     * insert is forcing re-creation of the name space. There can't be page delete information,
+     * because that information is an amendment to an on-disk page; when a page is deleted any page
+     * delete information should expire and be removed before the original on-disk page is actually
+     * discarded.
+     */
+    if (!__wt_ref_addr_copy(session, ref, &addr)) {
+        WT_ASSERT(session, previous_state == WT_REF_DELETED);
+        WT_ASSERT(session, ref->page_del == NULL);
+        WT_ERR(__wti_btree_new_leaf_page(session, ref));
+        goto skip_read;
+    }
+
+    /*
+     * If the page is deleted and the deletion is globally visible, don't bother reading and
+     * explicitly instantiating the existing page. Get a fresh page and pretend we got it by reading
+     * the on-disk page. Note that it's important to set the instantiated flag on the page so that
+     * reconciling the parent internal page knows it was previously deleted. Otherwise it's possible
+     * to write out a reference to the original page without the deletion, which will cause it to
+     * come back to life unexpectedly.
+     *
+     * Setting the instantiated flag requires a modify structure. We don't need to mark it dirty; if
+     * it gets discarded before something else modifies it, eviction will see the instantiated flag
+     * and set the ref state back to WT_REF_DELETED.
+     *
+     * Skip this optimization in cases that need the obsolete values. For disaggregated storage,
+     * this optimization results in the loss of page ID information, which can lead to a leaked
+     * block. To minimize the number of special cases, use the same test as for skipping
+     * instantiation below.
+     */
+    if (previous_state == WT_REF_DELETED && !F_ISSET(btree, WT_BTREE_DISAGGREGATED) &&
+      !F_ISSET(btree, WT_BTREE_SALVAGE | WT_BTREE_VERIFY)) {
+        /*
+         * If the deletion has not yet been found to be globally visible (page_del isn't NULL),
+         * check if it is now, in case we can in fact avoid reading the page. Hide prepared deletes
+         * from this check; if the deletion is prepared we still need to load the page, because the
+         * reader might be reading at a timestamp early enough to not conflict with the prepare.
+         * Update oldest before checking; we're about to read from disk so it's worth doing some
+         * work to avoid that.
+         */
+        WT_ERR(__wt_txn_update_oldest(session, WT_TXN_OLDEST_STRICT | WT_TXN_OLDEST_WAIT));
+        if (ref->page_del != NULL && __wt_page_del_visible_all(session, ref->page_del, true))
+            __wt_overwrite_and_free(session, ref->page_del);
+
+        if (ref->page_del == NULL) {
+            WT_ERR(__wti_btree_new_leaf_page(session, ref));
+            WT_ERR(__wt_page_modify_init(session, ref->page));
+            ref->page->modify->instantiated = true;
+            goto skip_read;
+        }
+    }
+
+    dsk_cache_state = __wt_atomic_load_uint8_acquire(&shared_dsk_cache->state);
+    if (WT_DSK_CACHE_CAN_READ(dsk_cache_state, btree)) {
+        __wt_shared_dsk_cache_get(session, addr.addr, addr.size, &shared_dsk_item);
+        if (shared_dsk_item != NULL) {
+            /* Disagg always owns the disk image, so stamp the ownership flag directly. */
+            FLD_SET(page_flags, WT_PAGE_DISK_ALLOC);
+            WT_ERR(__wti_page_inmem(session, ref, shared_dsk_item->data, page_flags,
+              shared_dsk_item, &page, &instantiate_upd));
+            goto skip_disk_read;
+        }
+    }
+
+    /* There's an address, read the backing disk page and build an in-memory version of the page. */
+    WT_ERR(__wt_blkcache_read_multi(session, &tmp, &count, &block_meta, addr.addr, addr.size));
+
+    WT_ASSERT(session, tmp != NULL && count > 0);
+
+    if (count > 1)
+        deltas = &tmp[1];
+    else
+        deltas = NULL;
+
+    FLD_SET(page_flags, WT_DATA_IN_ITEM(&tmp[0]) ? WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED);
+
+    /* After reading the page from disk, construct a full disk image. */
+    if (count > 1) {
+        size_t new_image_buf_size;
+        uint32_t split_size;
+
+        /* Allocate enough size for the new image, similar to __rec_split_chunk_init. */
+        split_size = __wt_split_page_size(btree->split_pct, btree->maxleafpage, btree->allocsize);
+        new_image_buf_size = 2 * WT_ALIGN(WT_MAX(btree->maxleafpage, split_size), btree->allocsize);
+
+        WT_ERR(__wt_buf_init(session, &new_image, new_image_buf_size));
+#ifdef HAVE_DIAGNOSTIC
+        WT_TIME_AGGREGATE full_image_ta;
+#endif
+        ret = __page_read_build_full_disk_image(session, deltas, count - 1, &new_image, tmp[0].data
+#ifdef HAVE_DIAGNOSTIC
+          ,
+          &full_image_ta
+#endif
+        );
+        WT_ERR(ret);
+
+#ifdef HAVE_DIAGNOSTIC
+        WT_ADDR addr_tmp;
+        addr_tmp.block_cookie = addr.addr;
+        addr_tmp.block_cookie_size = addr.size;
+        addr_tmp.type = addr.type;
+        WT_TIME_AGGREGATE_COPY(&addr_tmp.ta, &full_image_ta);
+
+        int verify_ret = __wt_verify_dsk_image(session,
+          "[verify the newly built full disk image from deltas]", new_image.data, new_image.size,
+          &addr_tmp, WT_VRFY_DISK_EMPTY_PAGE_OK | WT_VRFY_DISK_FROM_DELTA);
+        WT_ASSERT_ALWAYS(session, verify_ret == 0,
+          "verification failed for the newly built full disk image from deltas!");
+#endif
+
+        build_full_disk_image_from_deltas = true;
+        WT_PAGE_HEADER *tmp_header = (WT_PAGE_HEADER *)new_image.data;
+        __wt_verbose_debug2(session, WT_VERB_PAGE_DELTA,
+          "Full disk image built from deltas for page type %u with %d deltas, new size %d",
+          tmp_header->type, (int)count - 1, (int)new_image.size);
+
+        /*
+         * We initially allocated the maximum possible buffer for new_image, but only part of it is
+         * used. Copy the used portion into a right-sized buffer and free the original oversized
+         * buffer.
+         */
+        WT_ERR(__wt_buf_initsize(session, &new_image_copy, new_image.size));
+        memcpy(new_image_copy.mem, new_image.data, new_image.size);
+
+        __wt_buf_free(session, &new_image);
+        for (i = 0; i < count - 1; ++i)
+            __wt_buf_free(session, &deltas[i]);
+        __wt_buf_free(session, &tmp[0]);
+
+        WT_ERR(ret);
+    }
+
+    disk_image_buf = build_full_disk_image_from_deltas ? &new_image_copy : &tmp[0];
+
+    if (WT_DSK_CACHE_CAN_WRITE(dsk_cache_state, btree)) {
+        bool shared_dsk_inserted = false;
+
+        /* A cache hit takes the skip_disk_read path, so we can't already have an item here. */
+        WT_ASSERT(session, shared_dsk_item == NULL);
+        /* Disagg should never use mmap, so the image must be an owned allocation. */
+        WT_ASSERT(session, FLD_ISSET(page_flags, WT_PAGE_DISK_ALLOC));
+        WT_ERR(__wt_shared_dsk_cache_put(session, disk_image_buf->mem, disk_image_buf->size,
+          addr.addr, addr.size, &block_meta, &shared_dsk_item, &shared_dsk_inserted));
+        if (shared_dsk_inserted) {
+            /* The cache took ownership of the data; clear our local reference. */
+            disk_image_buf->mem = NULL;
+        } else {
+            /*
+             * Another thread cached this image concurrently. Drop our redundant local copy and use
+             * the shared dsk instead.
+             */
+            __wt_buf_free(session, disk_image_buf);
+            /*
+             * The collided entry was populated from the same on-disk address, so the stored
+             * block_meta must match our own.
+             */
+            WT_ASSERT(
+              session, memcmp(&shared_dsk_item->block_meta, &block_meta, sizeof(block_meta)) == 0);
+        }
+    }
+
+    WT_ASSERT(session,
+      WT_DSK_CACHE_CAN_WRITE(dsk_cache_state, btree) ? shared_dsk_item != NULL :
+                                                       shared_dsk_item == NULL);
+    WT_ERR(__wti_page_inmem(session, ref,
+      shared_dsk_item != NULL ? shared_dsk_item->data : disk_image_buf->data, page_flags,
+      shared_dsk_item, &page, &instantiate_upd));
+    if (!build_full_disk_image_from_deltas) {
+        WT_ASSERT(session, ref->page == page);
+        tmp[0].mem = NULL;
+    }
+    __wt_free(session, tmp);
+
+skip_disk_read:
+    if (page->type == WT_PAGE_ROW_LEAF && page->entries > 0)
+        __wt_btree_row_leaf_entries_update(btree, page->entries);
+    if (page->disagg_info != NULL) {
+        if (shared_dsk_item != NULL)
+            block_meta = shared_dsk_item->block_meta;
+        page->disagg_info->block_meta = block_meta;
+        page->disagg_info->old_rec_lsn_max = block_meta.disagg_lsn;
+        page->disagg_info->rec_lsn_max = block_meta.disagg_lsn;
+    }
+    if (!page_change && instantiate_upd && !WT_IS_HS(session->dhandle))
+        WT_ERR(__wti_page_inmem_updates(session, ref));
+
+    /*
+     * In the case of a fast delete, move all of the page's records to a deleted state based on the
+     * fast-delete information. Skip for special commands that don't care about an in-memory state.
+     * (But do set up page->modify and set page->modify->instantiated so evicting the pages while
+     * these commands are working doesn't go off the rails.)
+     *
+     * There are two possible cases: the state was WT_REF_DELETED and page_del was or wasn't NULL.
+     * It used to also be possible for eviction to set the state to WT_REF_DISK while the parent
+     * page nonetheless had a WT_CELL_ADDR_DEL cell. This is not supposed to happen any more, so for
+     * now at least assert it doesn't.
+     *
+     * page_del gets cleared and set to NULL if the deletion is found to be globally visible; this
+     * can happen in any of several places.
+     */
+    WT_ASSERT(
+      session, previous_state != WT_REF_DISK || (ref->page_del == NULL && addr.del_set == false));
+
+    if (previous_state == WT_REF_DELETED) {
+        if (F_ISSET(btree, WT_BTREE_SALVAGE | WT_BTREE_VERIFY)) {
+            WT_ERR(__wt_page_modify_init(session, page));
+            ref->page->modify->instantiated = true;
+        } else
+            WT_ERR(__wti_delete_page_instantiate(session, ref));
+    }
+
+    /* Track page reads for debugging purposes. */
+    WT_ERR(__wt_conn_page_history_track_read(session, page));
+
+    /* Read only page must be clean. */
+    WT_ASSERT(
+      session, !F_ISSET_ATOMIC_32(btree, WT_BTREE_READONLY) || !__wt_page_is_modified(page));
+
+skip_read:
+    F_CLR_ATOMIC_8(ref, WT_REF_FLAG_READING);
+    WT_REF_SET_STATE(ref, WT_REF_MEM);
+
+    WT_ASSERT(session, ret == 0);
+    return (0);
+
+err:
+    /*
+     * If the page was successfully built but a later step failed, discard it. Track whether the
+     * page took ownership of the disk image so we avoid double-freeing it below.
+     */
+    if (page != NULL) {
+        disk_image_set = page->dsk != NULL;
+        __wt_page_modify_clear(session, page);
+        __wt_ref_out(session, ref);
+    } else if (shared_dsk_item != NULL)
+        /* If the page build failed, release our reference to the shared disk item. */
+        __wt_shared_dsk_cache_release(session, shared_dsk_item);
+
+    /* Free any disk images or delta buffers we allocated or read. */
+    if (tmp != NULL) {
+        for (i = 0; i < count; ++i)
+            __wt_buf_free(session, &tmp[i]);
+        __wt_free(session, tmp);
+    }
+
+    __wt_buf_free(session, &new_image);
+    if (!disk_image_set)
+        __wt_buf_free(session, &new_image_copy);
+    F_CLR_ATOMIC_8(ref, WT_REF_FLAG_READING);
+    WT_REF_SET_STATE(ref, previous_state);
+
+    return (ret);
+}
+
+/*
+ * __wt_page_in_func --
+ *     Acquire a hazard pointer to a page; if the page is not in-memory, read it from the disk and
+ *     build an in-memory version.
+ */
+int
+__wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
+#ifdef HAVE_DIAGNOSTIC
+  ,
+  const char *func, int line
+#endif
+)
+{
+    WT_BTREE *btree;
+    WT_DECL_RET;
+    WT_PAGE *page;
+    WT_REF_STATE current_state;
+    WT_TXN *txn;
+    size_t sleep_count;
+    uint64_t sleep_usecs, yield_cnt;
+    int force_attempts;
+    bool busy, cache_work, evict_skip, read_from_disk, stalled, wont_need;
+
+    btree = S2BT(session);
+    txn = session->txn;
+    sleep_count = 0;
+
+    if (F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE))
+        LF_SET(WT_READ_IGNORE_CACHE_SIZE);
+
+    /*
+     * Ignore reads of pages already known to be in cache, otherwise the eviction server can
+     * dominate these statistics.
+     */
+    if (!LF_ISSET(WT_READ_CACHE)) {
+        WT_STAT_CONN_DSRC_INCR(session, cache_pages_requested);
+        if (WT_IS_HS(session->dhandle))
+            WT_STAT_CONN_DSRC_INCR(session, cache_pages_requested_hs);
+        if (F_ISSET(ref, WT_REF_FLAG_INTERNAL))
+            WT_STAT_CONN_DSRC_INCR(session, cache_pages_requested_internal);
+        else
+            WT_STAT_CONN_DSRC_INCR(session, cache_pages_requested_leaf);
+    }
+
+    if (LF_ISSET(WT_READ_PREFETCH))
+        WT_STAT_CONN_INCR(session, cache_pages_prefetch);
+
+    /*
+     * If configured, free stashed memory more aggressively to encourage finding bugs in generation
+     * tracking code.
+     */
+    if (FLD_ISSET(S2C(session)->timing_stress_flags, WT_TIMING_STRESS_AGGRESSIVE_STASH_FREE))
+        __wt_stash_discard(session);
+
+    for (evict_skip = read_from_disk = wont_need = false, force_attempts = 0,
+        sleep_usecs = yield_cnt = 0;
+      ;) {
+        switch (current_state = WT_REF_GET_STATE(ref)) {
+        case WT_REF_DELETED:
+            /* Optionally limit reads to cache-only. */
+            if (LF_ISSET(WT_READ_CACHE | WT_READ_NO_WAIT))
+                return (WT_NOTFOUND);
+            if (LF_ISSET(WT_READ_SKIP_DELETED) &&
+              __wti_delete_page_skip(session, ref, !F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))) {
+                WT_STAT_CONN_INCR(session, page_read_skip_deleted);
+                return (WT_NOTFOUND);
+            }
+            goto read;
+        case WT_REF_DISK:
+            /* Optionally limit reads to cache-only. */
+            if (LF_ISSET(WT_READ_CACHE))
+                return (WT_NOTFOUND);
+read:
+            /*
+             * The page isn't in memory, read it. If this thread respects the cache size, check if
+             * the cache needs help evicting clean pages (don't force a read to do dirty eviction).
+             */
+            if (!LF_ISSET(WT_READ_IGNORE_CACHE_SIZE))
+                WT_RET(__wt_evict_app_assist_worker_check(
+                  session, true, txn->mod_count == 0, false, false, NULL));
+            WT_RET(__page_read(session, ref, flags));
+            read_from_disk = true;
+            /* We just read a page, don't evict it before we have a chance to use it. */
+            evict_skip = true;
+            FLD_CLR(session->dhandle->advisory_flags, WT_DHANDLE_ADVISORY_EVICTED);
+
+            /*
+             * If configured to not trash the cache, leave the page generation unset, we'll set it
+             * before returning to the oldest read generation, so the page is forcibly evicted as
+             * soon as possible. We don't do that set here because we don't want to evict the page
+             * before we "acquire" it. Also avoid queuing a pre-fetch page for forced eviction
+             * before it has a chance of being used. Otherwise the work we've just done is wasted.
+             */
+            wont_need = LF_ISSET(WT_READ_WONT_NEED) ||
+              F_ISSET(session, WT_SESSION_READ_WONT_NEED) ||
+              (!LF_ISSET(WT_READ_PREFETCH) && F_ISSET(S2C(session)->evict, WT_EVICT_CACHE_NOKEEP));
+            continue;
+        case WT_REF_LOCKED:
+            if (LF_ISSET(WT_READ_NO_WAIT))
+                return (WT_NOTFOUND);
+
+            if (F_ISSET_ATOMIC_8(ref, WT_REF_FLAG_READING)) {
+                if (LF_ISSET(WT_READ_CACHE))
+                    return (WT_NOTFOUND);
+
+                /* Waiting on another thread's read, stall. */
+                WT_STAT_CONN_INCR(session, page_read_blocked);
+            } else
+                /* Waiting on eviction, stall. */
+                WT_STAT_CONN_INCR(session, page_locked_blocked);
+
+            stalled = true;
+            break;
+        case WT_REF_SPLIT:
+            WT_STAT_CONN_INCR(session, page_split_restart);
+            return (WT_RESTART);
+        case WT_REF_MEM:
+            /*
+             * The page is in memory.
+             *
+             * Get a hazard pointer if one is required. We cannot be evicting if no hazard pointer
+             * is required, we're done.
+             */
+            if (F_ISSET(btree, WT_BTREE_NO_EVICT))
+                goto skip_evict;
+
+/*
+ * The expected reason we can't get a hazard pointer is because the page is being evicted, yield,
+ * try again.
+ */
+#ifdef HAVE_DIAGNOSTIC
+            WT_RET(__wt_hazard_set_func(session, ref, &busy, func, line));
+#else
+            WT_RET(__wt_hazard_set_func(session, ref, &busy));
+#endif
+            if (busy) {
+                /*
+                 * Treat a busy page-in as a stall so we skip the yield loop and proceed directly to
+                 * eviction assistance or adaptive backoff. The page is busy because it's being
+                 * evicted; yielding won't help and wastes CPU spinning when the thread could be
+                 * doing useful eviction work instead.
+                 */
+                stalled = true;
+                WT_STAT_CONN_INCR(session, page_busy_blocked);
+                break;
+            }
+
+            WT_ASSERT(session, __wt_tsan_suppress_load_wt_page_ptr(&ref->page) != NULL);
+            /*
+             * If a page has grown too large, we'll try and forcibly evict it before making it
+             * available to the caller. There are a variety of cases where that's not possible.
+             * Don't involve a thread resolving a transaction in forced eviction, they're usually
+             * making the problem better.
+             */
+            if (evict_skip || F_ISSET(session, WT_SESSION_RESOLVING_TXN) ||
+              LF_ISSET(WT_READ_NO_SPLIT) || btree->evict_disabled > 0)
+                goto skip_evict;
+
+            /*
+             * If reconciliation is disabled (e.g., when inserting into the history store table),
+             * skip forced eviction if the page can't split.
+             */
+            if (F_ISSET(session, WT_SESSION_NO_RECONCILE) &&
+              !__wt_leaf_page_can_split(session, ref->page))
+                goto skip_evict;
+
+            /*
+             * Don't evict if we are operating in a transaction on a checkpoint cursor. Eviction
+             * would use the cursor's snapshot, which won't be correct.
+             */
+            if (F_ISSET(session->txn, WT_TXN_IS_CHECKPOINT))
+                goto skip_evict;
+
+            /*
+             * Don't forcibly evict ingest b-tree pages, this often creates a negative pattern where
+             * writes (oplog application) threads are blocked waiting for pages to be evicted, but
+             * ultimately they cannot be evicted anyway.
+             */
+            if (F_ISSET(btree, WT_BTREE_GARBAGE_COLLECT))
+                goto skip_evict;
+
+            /*
+             * Forcibly evict pages that are too big.
+             */
+            if (force_attempts < 10 && __evict_force_check(session, ref)) {
+                ++force_attempts;
+                ret = __wt_page_release_evict(session, ref, 0);
+                /*
+                 * If forced eviction succeeded, don't retry. If it failed, stall.
+                 */
+                if (ret == 0)
+                    evict_skip = true;
+                else if (ret == EBUSY) {
+                    WT_NOT_READ(ret, 0);
+                    /*
+                     * Don't back off if the session is configured not to do reconciliation, that
+                     * just wastes time for no benefit. Without this check a reconciliation of a
+                     * page that requires writing content to the history store can stall trying to
+                     * force-evict a history store page when there is no chance it will be evicted.
+                     */
+
+                    if (F_ISSET(session, WT_SESSION_NO_RECONCILE)) {
+                        WT_STAT_CONN_INCR(session, eviction_force_no_retry);
+                        evict_skip = true;
+                    } else {
+                        WT_STAT_CONN_INCR(session, page_forcible_evict_blocked);
+                        stalled = true;
+                        break;
+                    }
+                }
+                WT_RET(ret);
+
+                /*
+                 * The result of a successful forced eviction is a page-state transition
+                 * (potentially to an in-memory page we can use, or a restart return for our
+                 * caller), continue the outer page-acquisition loop.
+                 */
+                continue;
+            }
+
+skip_evict:
+            page = ref->page;
+            WT_ASSERT(session, page != NULL);
+
+            /*
+             * Keep track of whether a session is reading leaf pages into the cache. This allows for
+             * the session to decide whether pre-fetch would be helpful. It might not work if a
+             * session has multiple cursors on different tables open, since the operations on
+             * different tables get in the way of the heuristic. That isn't super likely - this is
+             * to catch traversals through a btree, not complex multi-table user transactions.
+             */
+            if (!LF_ISSET(WT_READ_PREFETCH) && F_ISSET(ref, WT_REF_FLAG_LEAF)) {
+                /*
+                 * If the page was read by this retrieval or was pulled into the cache via the
+                 * pre-fetch mechanism, count that as a page read directly from disk.
+                 */
+                if (F_ISSET_ATOMIC_16(page, WT_PAGE_PREFETCH) || read_from_disk)
+                    ++session->pf.prefetch_disk_read_count;
+                else
+                    session->pf.prefetch_disk_read_count = 0;
+            }
+
+            __wt_evict_touch_page(session, page, LF_ISSET(WT_READ_INTERNAL_OP), wont_need);
+
+            /*
+             * Check if we need an autocommit transaction. Starting a transaction can trigger
+             * eviction, so skip it if eviction isn't permitted.
+             *
+             * The logic here is a little weird: some code paths do a blanket ban on checking the
+             * cache size in sessions, but still require a transaction (e.g., when updating metadata
+             * or the history store). If WT_READ_IGNORE_CACHE_SIZE was passed in explicitly, we're
+             * done. If we set WT_READ_IGNORE_CACHE_SIZE because it was set in the session then make
+             * sure we start a transaction.
+             */
+            return (LF_ISSET(WT_READ_IGNORE_CACHE_SIZE) &&
+                  !F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE) ?
+                0 :
+                __wt_txn_autocommit_check(session));
+        default:
+            return (__wt_illegal_value(session, current_state));
+        }
+
+        /*
+         * We failed to get the page -- yield before retrying, and if we've yielded enough times,
+         * start sleeping so we don't burn CPU to no purpose.
+         */
+        if (yield_cnt < WT_THOUSAND) {
+            if (!stalled) {
+                ++yield_cnt;
+                __wt_yield();
+                continue;
+            }
+            yield_cnt = WT_THOUSAND;
+        }
+
+        /*
+         * If stalling and this thread is allowed to do eviction work, check if the cache needs help
+         * evicting clean pages (don't force a read to do dirty eviction). If we do work for the
+         * cache, substitute that for a sleep.
+         */
+        if (!LF_ISSET(WT_READ_IGNORE_CACHE_SIZE)) {
+            WT_RET(
+              __wt_evict_app_assist_worker_check(session, true, true, false, false, &cache_work));
+            if (cache_work)
+                continue;
+        }
+        __wt_spin_backoff(&yield_cnt, &sleep_usecs);
+        ++sleep_count;
+        if (sleep_count > 10 * WT_THOUSAND && sleep_count % (10 * WT_THOUSAND) == 0)
+            __wt_verbose_warning(session, WT_VERB_READ,
+              "sleep to wait the page %p for %" WT_SIZET_FMT " times", (void *)ref, sleep_count);
+        WT_STAT_CONN_INCRV(session, page_sleep, sleep_usecs);
+    }
 }

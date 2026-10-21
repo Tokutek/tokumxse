@@ -1,0 +1,197 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/observable_mutex.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/system_clock_source.h"
+#include "mongo/util/time_support.h"
+
+#include <string_view>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+/**
+ * The registry keeps track of all registered instances of `ObservableMutex` and provides an
+ * interface to collect contention stats.
+ */
+class [[MONGO_MOD_PUBLIC]] ObservableMutexRegistry {
+public:
+    static constexpr auto kTotalAcquisitionsFieldName = "total"sv;
+    static constexpr auto kTotalContentionsFieldName = "contentions"sv;
+    static constexpr auto kTotalWaitCyclesFieldName = "waitCycles"sv;
+    static constexpr auto kTotalWaitMicrosFieldName = "waitMicros"sv;
+    static constexpr auto kExclusiveFieldName = "exclusive"sv;
+    static constexpr auto kSharedFieldName = "shared"sv;
+    static constexpr auto kMutexFieldName = "mutexes"sv;
+    static constexpr auto kIdFieldName = "id"sv;
+    static constexpr auto kRegisteredFieldName = "registered"sv;
+    static constexpr auto kInstanceLabelFieldName = "instanceLabel"sv;
+
+    static constexpr auto kRegistrationMutexTag = "observableMutexRegistryRegistrationMutex"sv;
+    static constexpr auto kCollectionMutexTag = "observableMutexRegistryCollectionMutex"sv;
+
+    struct StatsRecord {
+        MutexStats data;
+        boost::optional<int64_t> mutexId;
+        boost::optional<Date_t> registered;
+        boost::optional<std::string> instanceLabel;
+    };
+
+    static ObservableMutexRegistry& get();
+
+    ObservableMutexRegistry() : ObservableMutexRegistry(SystemClockSource::get()) {}
+    explicit ObservableMutexRegistry(ClockSource* clk) : _clockSource(clk) {
+        add(kRegistrationMutexTag, _registrationMutex);
+        add(kCollectionMutexTag, _collectionMutex);
+    }
+
+    /**
+     * Adds a mutex to the registry in order for its stats to be included in `report`.
+     * - `tag`: groups this mutex with others of the same tag (stats are aggregated per tag); must
+     * form a valid OTel metric name segment (see `_validateTag`).
+     * - `mutex`: the mutex instance to register.
+     * - `instanceLabel`: optional human-readable label to distinguish individual instances under
+     * the same tag; included in the "mutexes" list when `listAll` is enabled in `report`.
+     */
+    template <typename MutexType>
+    void add(std::string_view tag,
+             const MutexType& mutex,
+             boost::optional<std::string_view> instanceLabel = boost::none) {
+        _validateTag(tag);
+// TODO(SERVER-110898): Remove once TSAN works with ObservableMutex.
+#if !__has_feature(thread_sanitizer)
+        std::list<NewMutexEntry> newNode;
+        newNode.push_back({.tag = std::string(tag),
+                           .instanceLabel = instanceLabel
+                               ? boost::optional<std::string>(*instanceLabel)
+                               : boost::none,
+                           .registrationTime = _clockSource->now(),
+                           .token = mutex.token()});
+        std::lock_guard lk(_registrationMutex);
+        _newMutexEntries.splice(_newMutexEntries.end(), newNode);
+#endif
+    }
+
+    /**
+     * Gathers statistics for each mutex that was added to the registry in the following format.
+     * Mutexes that share the same tag will have their stats aggregated under "exclusive" and
+     * "shared". These aggregated stats will also include the data of invalidated tokens that were
+     * previously added to the registry.
+     *
+     * If listAll is enabled, all valid mutexes within the registry will be listed separately in
+     * the "mutexes" field. Furthermore, when listAll is active, each mutex entry will include a
+     * timestamp indicating when the mutex was registered in _mutexEntries, along with a unique
+     * identifier.
+     *
+     * {
+     *     [TagName]: {
+     *         "exclusive": {
+     *             "total": "0",
+     *             "contentions": "0",
+     *             "waitCycles": "0",
+     *             "waitMicros": "0",
+     *         },
+     *         "shared": {
+     *             "total": "0",
+     *             "contentions": "0",
+     *             "waitCycles": "0",
+     *             "waitMicros": "0",
+     *         },
+     *         "mutexes" : [    // Only emitted if listAll == true.
+     *             {
+     *                 "id": 0,
+     *                 "instanceLabel": ...,   // Only emitted if label was provided at
+     * registration.
+     *                 "registered": ...,
+     *                 "exclusive": {
+     *                     ...
+     *                 },
+     *                 "shared": {
+     *                     ...
+     *                 }
+     *             },
+     *             ...
+     *         ]
+     *     }
+     * }
+     */
+    BSONObj report(bool listAll);
+
+    /**
+     * Returns the aggregated MutexStats for each registered mutex tag without serializing to BSON.
+     * Prefer this over report() when the caller needs plain MutexStats structs directly (e.g., for
+     * OTel metric collection).
+     *
+     * {
+     *     [TagName]: MutexStats{
+     *         exclusiveAcquisitions: {
+     *             total:      <uint64_t>,
+     *             contentions: <uint64_t>,
+     *             waitCycles: <uint64_t>,
+     *         },
+     *         sharedAcquisitions: {
+     *             total:      <uint64_t>,
+     *             contentions: <uint64_t>,
+     *             waitCycles: <uint64_t>,
+     *         },
+     *     },
+     *     ...
+     * }
+     */
+    StringMap<MutexStats> statsPerTag();
+
+private:
+    // `MutexEntry` is what is stored for each registered mutex.
+    struct MutexEntry {
+        int64_t id;
+        boost::optional<std::string> instanceLabel;
+        Date_t registrationTime;
+        std::shared_ptr<ObservationToken> token;
+    };
+
+    // When a mutex is `add`ed, a `NewMutexEntry` is stored for later retrieval within `report`.
+    // `report` then converts the `NewMutexEntry` into a `MutexEntry`.
+    struct NewMutexEntry {
+        std::string tag;
+        boost::optional<std::string> instanceLabel;
+        Date_t registrationTime;
+        std::shared_ptr<ObservationToken> token;
+    };
+
+    /**
+     * Visits all registered mutex objects stored in the registry and collects their stats. For any
+     * invalid mutex that is visited, its stats are added to _removedTokensSnapshots. Returns stats
+     * mapped by tag for all valid mutex entries along with stats stored in _removedTokensSnapshots.
+     */
+    StringMap<std::vector<StatsRecord>> _collectStats();
+
+    /**
+     * Asserts that `tag` is a valid OTel metric name segment: it starts with a lowercase letter and
+     * is either snake_case or camelCase (see otel::metrics::validateOtelMetricName).
+     */
+    static void _validateTag(std::string_view tag);
+
+    /**
+     * Adds stats from _removedTokensSnapshots into statsMap. Optional fields within a statsMap
+     * entry are left blank.
+     */
+    void _includeRemovedSnapshots(WithLock, StringMap<std::vector<StatsRecord>>& statsMap);
+
+    ClockSource* _clockSource;
+
+    mutable ObservableMutex<std::mutex> _registrationMutex;
+    std::list<NewMutexEntry> _newMutexEntries;
+
+    mutable ObservableMutex<std::mutex> _collectionMutex;
+    int64_t _nextMutexId{0};
+    StringMap<std::list<MutexEntry>> _mutexEntries;
+    // Maps a Mutex tag to the sum of all its invalidated token stats.
+    StringMap<MutexStats> _removedTokensSnapshots;
+};
+
+}  // namespace mongo

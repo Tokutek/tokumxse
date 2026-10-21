@@ -1,0 +1,192 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/query_cmd/update_metrics.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/read_concern_support_result.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/balancer_configuration.h"
+#include "mongo/s/commands/document_shard_key_update_util.h"
+#include "mongo/s/commands/query_cmd/cluster_explain.h"
+#include "mongo/s/commands/strategy.h"
+#include "mongo/util/modules.h"
+
+#include <set>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class FindAndModifyCmd : public write_ops::FindAndModifyCmdVersion1Gen<FindAndModifyCmd> {
+public:
+    using Base = write_ops::FindAndModifyCmdVersion1Gen<FindAndModifyCmd>;
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kWrite;
+    }
+
+    bool adminOnly() const override {
+        return false;
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    class Invocation final : public Base::MinimalInvocationBase {
+    public:
+        using Base::MinimalInvocationBase::MinimalInvocationBase;
+
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool supportsRawData() const final {
+            return true;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const override {
+            return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                         level != repl::ReadConcernLevel::kSnapshotReadConcern,
+                     {ErrorCodes::InvalidOptions, "read concern not supported"}},
+                    {{ErrorCodes::InvalidOptions, "default read concern not permitted"}}};
+        }
+
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final;
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) final;
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) final;
+    };
+
+    /**
+     * Changes the shard key for the document if the response object contains a
+     * WouldChangeOwningShard error. If the original command was sent as a retryable write, starts a
+     * transaction on the same session and txnNum, deletes the original document, inserts the new
+     * one, and commits the transaction. If the original command is part of a transaction, deletes
+     * the original document and inserts the new one.
+     */
+    static void handleWouldChangeOwningShardErrorUsingTransactionApi(
+        OperationContext* opCtx,
+        const ShardId& shardId,
+        const NamespaceString& nss,
+        const write_ops::FindAndModifyCommandRequest& cmdRequest,
+        const Status& responseStatus,
+        BSONObjBuilder* result);
+
+protected:
+    void doInitializeClusterRole(ClusterRole role) override {
+        Base::doInitializeClusterRole(role);
+        _updateMetrics.emplace(getName(), role);
+    }
+
+private:
+    static bool getCrudProcessedFromCmd(const write_ops::FindAndModifyCommandRequest& cmdRequest);
+
+    // Catches errors in the given response, and reruns the command if necessary. Uses the given
+    // response to construct the findAndModify command result passed to the client.
+    static void _handleResponseAndConstructResult(
+        OperationContext* opCtx,
+        const ShardId& shardId,
+        const CollectionRoutingInfo& cri,
+        const NamespaceString& nss,
+        const write_ops::FindAndModifyCommandRequest& cmdRequest,
+        const Status& responseStatus,
+        const BSONObj& response,
+        bool isTimeseriesViewRequest,
+        BSONObjBuilder* result);
+
+    // Two-phase protocol to run a findAndModify command without a shard key or _id.
+    static void _runCommandWithoutShardKey(OperationContext* opCtx,
+                                           const CollectionRoutingInfo& cri,
+                                           const NamespaceString& nss,
+                                           const write_ops::FindAndModifyCommandRequest& cmdRequest,
+                                           bool isTimeseriesViewRequest,
+                                           BSONObjBuilder* result);
+
+    // Two-phase protocol to run an explain for a findAndModify command without a shard key or _id.
+    static void _runExplainWithoutShardKey(OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           const BSONObj& cmdObj,
+                                           ExplainOptions::Verbosity verbosity,
+                                           BSONObjBuilder* result);
+
+    // Command invocation to be used if a shard key is specified or the collection is unsharded.
+    // cmdRequest is used for WouldChangeOwningShard handling; cmdObjForDispatch is the command
+    // actually sent to the shard — cmdRequest.toBSON() for run(), and an explain-wrapped command
+    // for explain().
+    static void _runCommand(OperationContext* opCtx,
+                            const ShardId& shardId,
+                            const CollectionRoutingInfo& cri,
+                            const NamespaceString& nss,
+                            const write_ops::FindAndModifyCommandRequest& cmdRequest,
+                            const BSONObj& cmdObjForDispatch,
+                            boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery,
+                            bool isTimeseriesViewRequest,
+                            BSONObjBuilder* result,
+                            bool eligibleForSampling = true);
+
+    // TODO SERVER-67429: Remove this function.
+    static void _handleWouldChangeOwningShardErrorRetryableWriteLegacy(
+        OperationContext* opCtx,
+        const ShardId& shardId,
+        const CollectionRoutingInfo& cri,
+        const NamespaceString& nss,
+        const write_ops::FindAndModifyCommandRequest& cmdRequest,
+        bool isTimeseriesViewRequest,
+        BSONObjBuilder* result);
+
+    static void handleWouldChangeOwningShardError(
+        OperationContext* opCtx,
+        const ShardId& shardId,
+        const CollectionRoutingInfo& cri,
+        const NamespaceString& nss,
+        const Status& responseStatus,
+        const write_ops::FindAndModifyCommandRequest& cmdRequest,
+        bool isTimeseriesViewRequest,
+        BSONObjBuilder* result);
+
+    // Update related command execution metrics.
+    mutable boost::optional<UpdateMetrics> _updateMetrics;
+};
+
+}  // namespace mongo

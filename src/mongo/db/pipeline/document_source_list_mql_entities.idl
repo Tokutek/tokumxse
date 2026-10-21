@@ -1,0 +1,25 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    MqlEntityType:
+        description: "A type representing a MQL entity"
+        type: string
+        values:
+            aggregationStages: "aggregationStages"
+
+structs:
+    ListMqlEntitiesSpec:
+        description: "$listMqlEntities aggregation stage"
+        strict: true
+        fields:
+            entityType:
+                description: "The type of MQL entities this stage should return"
+                type: MqlEntityType

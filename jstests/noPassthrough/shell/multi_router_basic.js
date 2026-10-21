@@ -1,0 +1,1450 @@
+/**
+ * Unit test the MultiRouterMongo class provided in the shell
+ * @tags: [requires_sharding]
+ */
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {EncryptedClient, isEnterpriseShell} from "jstests/fle2/libs/encrypted_client_util.js";
+
+const st = new ShardingTest({shards: 1, mongos: 3});
+const getMongosesURI = function () {
+    const mongosHosts = st._mongos.map((m) => m.host).join(",");
+    const uri = `mongodb://${mongosHosts}/test`;
+    return uri;
+};
+
+function testCase(description, fn) {
+    chatty(`[MULTI-ROUTER-TEST] ${description}`);
+    fn();
+}
+
+// Given a Multi-Router Mongo, extend _getNextMongo to count calls.
+// _getNextMongo is responsible for iterating over multiple mongos.
+// Counting _getNextMongo is useful to verify how many times the multi-router had to switch connections.
+function overrideGetNextMongoCountingCalls(multiRouterMongo) {
+    let getNextMongoCount = 0;
+    const originalGetNextMongo = multiRouterMongo._getNextMongo.bind(multiRouterMongo);
+    multiRouterMongo._getNextMongo = function () {
+        const mongo = originalGetNextMongo();
+        getNextMongoCount++;
+        return mongo;
+    };
+    return {
+        count: () => getNextMongoCount,
+        reset: () => {
+            getNextMongoCount = 0;
+        },
+    };
+}
+
+// ============================================================================
+// Test toConnectionList
+// ============================================================================
+
+testCase("Testing toConnectionList with single server", () => {
+    const uri = `mongodb://${st.s0.host}/test`;
+    const uriList = toConnectionsList(new MongoURI(uri));
+
+    assert.eq(uriList.length, 1, "Should have 1 URI");
+    assert(uriList[0].includes(st.s0.host), "URI should contain correct host");
+    assert(uriList[0].includes("/test"), "URI should contain database");
+});
+
+testCase("Testing toConnectionList with multiple servers", () => {
+    const uri = getMongosesURI();
+    const uriList = toConnectionsList(new MongoURI(uri));
+
+    assert.eq(uriList.length, 3, "Should have 3 URIs");
+
+    // Verify each URI is unique and contains correct parts
+    uriList.forEach((uri) => {
+        assert(uri.startsWith("mongodb://"), "URI should start with mongodb://");
+        assert(uri.includes("/test"), "URI should contain database");
+    });
+});
+
+testCase("Testing toConnectionList preserves options", () => {
+    const mongosHosts = st._mongos.map((m) => m.host).join(",");
+    const uri = `mongodb://${mongosHosts}/test?readPreference=secondary&retryWrites=true`;
+    const uriList = toConnectionsList(new MongoURI(uri));
+
+    assert.eq(uriList.length, 3, "Should have 3 URIs");
+
+    uriList.forEach((uri) => {
+        assert(
+            uri.includes("readPreference=secondary"),
+            "URI should contain readPreference option",
+        );
+        assert(uri.includes("retryWrites=true"), "URI should contain retryWrites option");
+    });
+});
+
+// ============================================================================
+// Test connection type
+// ============================================================================
+
+testCase("Standalone mongod", () => {
+    const standalone = MongoRunner.runMongod({});
+    const uri = `mongodb://${standalone.host}/test`;
+
+    const db = connect(uri);
+
+    // Should be regular Mongo, not MultiRouterMongo
+    assert.eq(db.getMongo().isMultiRouter, undefined, "Should not be MultiRouterMongo");
+    MongoRunner.stopMongod(standalone);
+});
+
+testCase("Single mongos", () => {
+    const uri = `mongodb://${st.s1.host}/test`;
+
+    const db = connect(uri);
+
+    // Should be regular Mongo, not MultiRouterMongo
+    assert.eq(db.getMongo().isMultiRouter, undefined, "Should not be MultiRouterMongo");
+});
+
+testCase("Replica set", () => {
+    const rst = new ReplSetTest({nodes: 3});
+    rst.startSet();
+    rst.initiate();
+    rst.getPrimary();
+
+    // Note we can't use the "getURL" method provided by the ReplSetTest.
+    // That method provides a valid URL for establishing a connection via Mongo.
+    // The 'connect' function we are testing expects a valid fixture url,
+    // which is composed by a protocol followed by a comma-separated list of host:port pairs and options.
+    const mongodHosts = rst.nodes.map((m) => m.host).join(",");
+    const uri = `mongodb://${mongodHosts}/test?replicaSet=${rst.name}`;
+    const mongo = connect(uri).getMongo();
+
+    // Should be regular Mongo, not MultiRouterMongo
+    assert.eq(mongo.isMultiRouter, undefined, "Should not be MultiRouterMongo");
+
+    //Every node of the replica-set is also a regular Mongo
+    rst.nodes.forEach((node) => {
+        // Assert is a mongo but not a multi-router type
+        assert.neq(node._getDefaultSession, undefined);
+        assert.eq(
+            node.isMultiRouter,
+            undefined,
+            `Replica-Set node ${node} should not be MultiRouterMongo`,
+        );
+    });
+
+    rst.stopSet();
+});
+
+testCase("Individual shard connections are regular Mongo", () => {
+    // Check each shard connection
+    st._connections.forEach((shardConn, idx) => {
+        // Assert is a mongo but not a multi-router type
+        assert.neq(shardConn._getDefaultSession, undefined);
+        assert.eq(
+            shardConn.isMultiRouter,
+            undefined,
+            `Shard ${idx} should not be MultiRouterMongo`,
+        );
+    });
+
+    // Check individual mongos connections (when accessed directly)
+    st._mongos.forEach((mongos, idx) => {
+        // Assert is a mongo but not a multi-router type
+        assert.neq(mongos._getDefaultSession, undefined);
+        assert.eq(
+            mongos.isMultiRouter,
+            undefined,
+            `Individual mongos ${idx} should not be MultiRouterMongo`,
+        );
+    });
+});
+
+testCase("Multiple mongos creates MultiRouterMongo", () => {
+    const uri = getMongosesURI();
+    const db = connect(uri);
+
+    // Should be MultiRouterMongo
+    assert.eq(db.getMongo().isMultiRouter, true, "Should be MultiRouterMongo");
+    assert.eq(
+        db.getMongo().isConnectedToMongos(),
+        true,
+        "MultiRouterMongo must be connected to a mongos",
+    );
+    assert.eq(db.getMongo()._mongoConnections.length, 3, "Should have 3 mongo connections");
+});
+
+// ============================================================================
+// Test basic properties
+// ============================================================================
+
+testCase("getSiblingDB returns a proxy", () => {
+    const uri = getMongosesURI();
+    const db = connect(uri);
+
+    assert.eq(db.getMongo().isMultiRouter, true, "Should be MultiRouterMongo");
+
+    let newDb = db.getSiblingDB("admin");
+
+    // Should be MultiRouterMongo
+    assert.eq(newDb.getMongo().isMultiRouter, true, "Should be MultiRouterMongo");
+    assert.eq(
+        newDb.getMongo().isConnectedToMongos(),
+        true,
+        "MultiRouterMongo must be connected to a mongos",
+    );
+    assert.eq(newDb.getMongo()._mongoConnections.length, 3, "Should have 3 mongo connections");
+});
+
+// ============================================================================
+// Test mongos selections via basic commands
+// ============================================================================
+
+testCase("adminCommand is intercepted by proxy's runCommand", () => {
+    const uri = getMongosesURI();
+    const db = connect(uri);
+    const conn = db.getMongo();
+
+    // Track runCommand calls
+    let countCalls = 0;
+    const originalRunCommand = conn._runCommandImpl.bind(conn);
+    conn._runCommandImpl = function (dbname, cmd, options, secToken, traceparent) {
+        assert.eq(dbname, "admin");
+        countCalls++;
+        return originalRunCommand(dbname, cmd, options, secToken, traceparent);
+    };
+
+    db.adminCommand({ping: 1});
+    assert.eq(db.getMongo().isMultiRouter, true, "Should be MultiRouterMongo");
+    assert.eq(countCalls, 1, "Should call run command at least once!");
+});
+
+testCase("Testing basic call distribution among the mongoses pool via ping", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const kOperations = 10;
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Run commands
+    let adminDb = conn.getDB("admin");
+    for (let i = 0; i < kOperations; i++) {
+        adminDb.runCommand({ping: 1});
+    }
+
+    // The first runCommand will start a session which also calls _getNextMongo. We check it's called at least kTotalCount times.
+    assert.gte(getNextMongoTracker.count(), kOperations);
+});
+
+testCase("Testing call distribution via insert", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.test;
+    const kOperations = 10;
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    for (let i = 0; i < kOperations; i++) {
+        coll.insert({x: i, type: "insert"});
+    }
+
+    // Should route randomly for all operations
+    assert.gte(
+        getNextMongoTracker.count(),
+        kOperations,
+        "Should route randomly for insert operations",
+    );
+
+    // Verify all documents were inserted
+    assert.eq(kOperations, coll.count({type: "insert"}), "All inserts should succeed");
+
+    coll.drop();
+});
+
+testCase("Testing call distribution via update", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.test;
+    const kOperations = 10;
+
+    // Insert test data
+    const docs = [];
+    for (let i = 0; i < kOperations; i++) {
+        docs.push({x: i, updated: false});
+    }
+    coll.insertMany(docs);
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    for (let i = 0; i < kOperations; i++) {
+        coll.updateOne({x: i}, {$set: {updated: true}});
+    }
+
+    // Should route randomly for all operations
+    assert.gte(
+        getNextMongoTracker.count(),
+        kOperations,
+        "Should route randomly for update operations",
+    );
+
+    // Verify all documents were updated
+    assert.eq(kOperations, coll.count({updated: true}), "All updates should succeed");
+
+    coll.drop();
+});
+
+testCase("Testing call distribution via delete", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.test;
+    const kOperations = 10;
+
+    // Insert test data
+    const docs = [];
+    for (let i = 0; i < kOperations; i++) {
+        docs.push({x: i, toDelete: true});
+    }
+    coll.insertMany(docs);
+    assert.eq(kOperations, coll.count({}), "Should have documents to delete");
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    for (let i = 0; i < kOperations; i++) {
+        coll.deleteOne({x: i});
+    }
+
+    // Should route randomly for all operations
+    assert.gte(
+        getNextMongoTracker.count(),
+        kOperations,
+        "Should route randomly for delete operations",
+    );
+
+    // Verify correct number of documents remain
+    assert.eq(0, coll.count({}), "Should have no documents remaining");
+
+    coll.drop();
+});
+
+// ============================================================================
+// Test mongos selections via aggregate and find
+// ============================================================================
+
+function insertSampleData(coll, totalDocs) {
+    // Insert test data
+    const docs = [];
+    for (let i = 0; i < totalDocs; i++) {
+        docs.push({_id: i, value: i});
+    }
+    coll.insertMany(docs);
+}
+
+function overrideRunCommandCountingCallsForCommand(conn, commandName) {
+    // Track getMore calls
+    let commandCount = 0;
+    const originalRunCommand = conn._runCommandImpl.bind(conn);
+    conn._runCommandImpl = function (dbname, cmd, options, secToken, traceparent) {
+        if (cmd[commandName]) {
+            commandCount++;
+        }
+        return originalRunCommand(dbname, cmd, options, secToken, traceparent);
+    };
+    return {
+        count: () => commandCount,
+    };
+}
+
+testCase("Testing basic find + getMore will stick to the same connection", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const coll = conn.getDB("test").cursorTest;
+    const kTotalDocs = 120;
+
+    // Insert sample data
+    insertSampleData(coll, kTotalDocs);
+
+    // Track getMore calls
+    const getMoreTracker = overrideRunCommandCountingCallsForCommand(conn, "getMore");
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Create cursor with small batch size to force getMore
+    const cursor = coll.find({value: {$gte: 0}}).batchSize(2);
+    let countDocs = 0;
+    while (cursor.hasNext()) {
+        countDocs++;
+        cursor.next();
+    }
+
+    assert.eq(countDocs, kTotalDocs, "GetMore never run!");
+    assert.gte(getMoreTracker.count(), 0, "Must not have tracked getMore commands");
+    // Only the find command must have run _getNextMongo
+    assert.eq(
+        getNextMongoTracker.count(),
+        1,
+        "Must run getNextMongoCount only once when executing the find",
+    );
+    assert.eq(conn._cursorTracker.count(), 1, "Should have exactly 1 tracked cursor");
+
+    coll.drop();
+});
+
+testCase("Testing basic aggregate + getMore will stick to the same connection", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const coll = conn.getDB("test").cursorTest;
+    const kTotalDocs = 120;
+
+    // Insert sample data
+    insertSampleData(coll, kTotalDocs);
+
+    // Track getMore calls
+    const getMoreTracker = overrideRunCommandCountingCallsForCommand(conn, "getMore");
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Create cursor with small batch size to force getMore
+    const cursor = coll.aggregate([{$match: {value: {$gte: 0}}}], {cursor: {batchSize: 2}});
+    let countDocs = 0;
+    while (cursor.hasNext()) {
+        countDocs++;
+        cursor.next();
+    }
+
+    assert.eq(countDocs, kTotalDocs, "GetMore never run!");
+    // GetMore will never hit the proxy unless explicitly run via runCommand. next() self handle this case.
+    assert.gte(getMoreTracker.count(), 0, "Must have executed getMore commands");
+    // Only the aggregate command must have run _getNextMongo
+    assert.eq(
+        getNextMongoTracker.count(),
+        1,
+        "Must run getNextMongoCount only once when executing the aggregate",
+    );
+    assert.eq(conn._cursorTracker.count(), 1, "Should have exactly 1 tracked cursor");
+
+    coll.drop();
+});
+
+testCase(
+    "Testing basic aggregate + getMore run explicitly will stick to the same connection",
+    () => {
+        const uri = getMongosesURI();
+        const db = connect(uri);
+        const conn = db.getMongo();
+        const coll = db.cursorTest;
+        const kTotalDocs = 120;
+
+        // Insert sample data
+        insertSampleData(coll, kTotalDocs);
+
+        // Track getMore calls
+        const getMoreTracker = overrideRunCommandCountingCallsForCommand(conn, "getMore");
+
+        // Track _getNextMongo calls
+        const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+        // Create cursor with small batch size and force a getMore.
+        const cursor = coll.aggregate([{$match: {value: {$gte: 0}}}], {cursor: {batchSize: 2}});
+        assert.commandWorked(db.runCommand({getMore: cursor.getId(), collection: "cursorTest"}));
+
+        // We must have called getMore via proxy
+        assert.eq(getMoreTracker.count(), 1, "Must have executed getMore commands");
+
+        // Only the aggregate command must have run _getNextMongo
+        assert.eq(
+            getNextMongoTracker.count(),
+            1,
+            "Must run getNextMongoCount only once when executing the aggregate",
+        );
+        assert.eq(conn._cursorTracker.count(), 1, "Should have exactly 1 tracked cursor");
+
+        coll.drop();
+    },
+);
+
+testCase("Testing basic find + releaseMemory will stick to the same connection", () => {
+    const uri = getMongosesURI();
+    const db = connect(uri);
+    const conn = db.getMongo();
+    const coll = db.cursorTest;
+    const kTotalDocs = 120;
+
+    // Insert sample data
+    insertSampleData(coll, kTotalDocs);
+
+    // Track releaseMemory calls
+    const releaseMemoryTracker = overrideRunCommandCountingCallsForCommand(conn, "releaseMemory");
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Create cursor with small batch size to force ReleaseMemory.
+    const cursor = coll.find({value: {$gte: 0}}).batchSize(2);
+    assert.commandWorked(db.adminCommand({releaseMemory: [cursor.getId()]}));
+
+    // We must have called releaseMemory via proxy
+    assert.eq(releaseMemoryTracker.count(), 1, "Must have releaseMemory commands");
+
+    // Only the find command must have run _getNextMongo
+    assert.eq(
+        getNextMongoTracker.count(),
+        1,
+        "Must run getNextMongoCount only once when executing the find",
+    );
+    assert.eq(conn._cursorTracker.count(), 1, "Should have exactly 1 tracked cursor");
+
+    coll.drop();
+});
+
+testCase("Testing basic find + killCursors will stick to the same connection", () => {
+    const uri = getMongosesURI();
+    const db = connect(uri);
+    const conn = db.getMongo();
+    const coll = db.cursorTest;
+    const kTotalDocs = 120;
+
+    // Insert sample data
+    insertSampleData(coll, kTotalDocs);
+
+    // Track killCursors calls
+    const killCursorsTracker = overrideRunCommandCountingCallsForCommand(conn, "killCursors");
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Create cursor with small batch size to force killCursors.
+    const cursor = coll.find({value: {$gte: 0}}).batchSize(2);
+    assert.commandWorked(db.adminCommand({killCursors: "cursorTest", cursors: [cursor.getId()]}));
+
+    // We must have called killCursors via proxy
+    assert.eq(killCursorsTracker.count(), 1, "Must have tracked killCursors commands");
+
+    // Only the find command must have run _getNextMongo
+    assert.eq(
+        getNextMongoTracker.count(),
+        1,
+        "Must run getNextMongoCount only once when executing the find",
+    );
+    assert.eq(conn._cursorTracker.count(), 1, "Should have exactly 1 tracked cursor");
+
+    coll.drop();
+});
+
+// ============================================================================
+// Test disable Multi-Routing
+// ============================================================================
+
+testCase(
+    "Testing isMultiRoutingDisabled will make the proxy run like a single router connection",
+    () => {
+        const uri = getMongosesURI();
+        const conn = connect(uri).getMongo();
+        const kTotalCount = 30;
+
+        // Track _getNextMongo calls
+        const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+        assert.eq(conn.isMultiRouter, true, "Should be MultiRouterMongo");
+
+        TestData.pinToSingleMongos = true;
+        // Run commands
+        let adminDb = conn.getDB("admin");
+        for (let i = 0; i < kTotalCount; i++) {
+            adminDb.runCommand({ping: 1});
+        }
+
+        // We should never call _getNextMongo if multi routing is disabled
+        assert.neq(
+            conn.isMultiRouter,
+            true,
+            "When pinToSingleMongos is false, the connection should not be identified as MultiRouterMongo",
+        );
+        assert.eq(
+            0,
+            getNextMongoTracker.count(),
+            "Should never call _getNextMongo when multi routing is disabled",
+        );
+        // Set back to false for other tests
+        TestData.pinToSingleMongos = false;
+        assert.eq(conn.isMultiRouter, true, "Should be MultiRouterMongo");
+        assert.eq(conn.hasPrimaryMongoRefreshed, true, "Should be MultiRouterMongo");
+    },
+);
+
+// ============================================================================
+// Test session mapping with transactions
+// ============================================================================
+
+testCase("Testing explicit session without transaction routes randomly", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.sessionTest;
+
+    const session = conn.startSession();
+    const sessionDB = session.getDatabase("test");
+    const sessionColl = sessionDB.sessionTest;
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    const kOperations = 10;
+    for (let i = 0; i < kOperations; i++) {
+        sessionColl.insert({x: i, type: "no-txn"}, {session});
+    }
+
+    // Should have called _getNextMongo for each operation (random routing)
+    assert.gte(
+        getNextMongoTracker.count(),
+        kOperations,
+        "Should route randomly for non-transactional operations",
+    );
+
+    // Session should NOT be tracked in the map
+    assert.eq(
+        conn._sessionToMongoMap.size(),
+        0,
+        "Session should not be tracked without transaction",
+    );
+
+    session.endSession();
+    coll.drop();
+});
+
+testCase("Testing lazy mapping only occurs when txnNumber is present", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.sessionTest;
+
+    const session = conn.startSession();
+
+    // After creating session, map should be empty
+    assert.eq(conn._sessionToMongoMap.size(), 0, "Map should be empty after session creation");
+
+    const sessionDB = session.getDatabase("test");
+    const sessionColl = sessionDB.sessionTest;
+
+    // Perform non-transactional operation
+    sessionColl.insert({x: 1, phase: "no-txn"}, {session});
+
+    // Map should still be empty (no txnNumber)
+    assert.eq(conn._sessionToMongoMap.size(), 0, "Map should remain empty for non-txn operations");
+
+    // Start transaction (first operation with txnNumber)
+    session.startTransaction();
+    sessionColl.insert({x: 2, phase: "txn"}, {session});
+
+    // Now map should contain the session
+    assert.eq(conn._sessionToMongoMap.size(), 1, "Map should contain session after txn starts");
+
+    session.commitTransaction_forTesting();
+    session.endSession();
+    coll.drop();
+});
+
+testCase("Testing transaction operations pin to same mongos", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.sessionTest;
+
+    const session = conn.startSession();
+    const sessionDB = session.getDatabase("test");
+    const sessionColl = sessionDB.sessionTest;
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    withRetryOnTransientTxnError(() => {
+        getNextMongoTracker.reset();
+
+        session.startTransaction();
+
+        // First operation in transaction
+        sessionColl.insert({x: 1, type: "txn"}, {session});
+
+        // Should have called _getNextMongo once for first operation
+        assert.eq(
+            getNextMongoTracker.count(),
+            1,
+            "Should call _getNextMongo once for first txn operation",
+        );
+        // Session should now be tracked
+        assert.eq(
+            conn._sessionToMongoMap.size(),
+            1,
+            "Session should be tracked after first txn operation",
+        );
+
+        // Subsequent operations should not call _getNextMongo (pinned to same mongos)
+        for (let i = 2; i <= 5; i++) {
+            sessionColl.insert({x: i, type: "txn"}, {session});
+        }
+
+        assert.eq(
+            getNextMongoTracker.count(),
+            1,
+            "Should not call _getNextMongo for subsequent txn operations",
+        );
+        assert.eq(
+            conn._sessionToMongoMap.size(),
+            1,
+            "Session should be tracked after first txn operation",
+        );
+
+        assert.commandWorked(session.commitTransaction_forTesting());
+
+        // Verify all documents were inserted
+        assert.eq(5, coll.count({type: "txn"}), "All transaction inserts should succeed");
+    });
+    session.endSession();
+    coll.drop();
+});
+
+testCase(
+    "Test 3 transactional operations for the same session use different mongos across transactions",
+    () => {
+        const uri = getMongosesURI();
+        const conn = connect(uri).getMongo();
+        const db = conn.getDB("test");
+        const coll = db.sessionTest;
+        const kNumInserts = 5;
+
+        const session = conn.startSession();
+        const sessionDB = session.getDatabase("test");
+        const sessionColl = sessionDB.sessionTest;
+
+        // Track _getNextMongo calls
+        const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+        // Transaction 1
+        withRetryOnTransientTxnError(() => {
+            getNextMongoTracker.reset();
+
+            session.startTransaction();
+
+            // First operation in transaction
+            sessionColl.insert({x: 1, type: "txn"}, {session});
+
+            // Should _getNextMongo once for first operation
+            assert.eq(
+                getNextMongoTracker.count(),
+                1,
+                "Should call _getNextMongo once for first txn operation",
+            );
+            // Session should now be tracked
+            assert.eq(
+                conn._sessionToMongoMap.size(),
+                1,
+                "Session should be tracked after first txn operation",
+            );
+
+            // Subsequent operations should not call _getNextMongo (pinned to same mongos)
+            for (let i = 2; i <= kNumInserts; i++) {
+                sessionColl.insert({x: i, type: "txn"}, {session});
+            }
+
+            assert.eq(
+                getNextMongoTracker.count(),
+                1,
+                "Should not call _getNextMongo for subsequent txn operations",
+            );
+            assert.eq(
+                conn._sessionToMongoMap.size(),
+                1,
+                "Session should be tracked after first txn operation",
+            );
+
+            assert.commandWorked(session.commitTransaction_forTesting());
+        });
+
+        // Transaction 2
+        withRetryOnTransientTxnError(() => {
+            getNextMongoTracker.reset();
+
+            session.startTransaction();
+
+            // First operation in transaction
+            sessionColl.insert({x: 1, type: "txn"}, {session});
+
+            assert.eq(
+                getNextMongoTracker.count(),
+                1,
+                "Should call _getNextMongo once for first txn operation",
+            );
+            assert.eq(
+                conn._sessionToMongoMap.size(),
+                1,
+                "Session should be tracked after first txn operation",
+            );
+
+            // Subsequent operations should not call _getNextMongo (pinned to same mongos)
+            for (let i = 2; i <= kNumInserts; i++) {
+                sessionColl.insert({y: i, type: "txn"}, {session});
+            }
+
+            assert.eq(
+                getNextMongoTracker.count(),
+                1,
+                "Should not call _getNextMongo for subsequent txn operations",
+            );
+            assert.eq(
+                conn._sessionToMongoMap.size(),
+                1,
+                "Session should be tracked after first txn operation",
+            );
+
+            assert.commandWorked(session.commitTransaction_forTesting());
+        });
+
+        // Transaction 3
+        withRetryOnTransientTxnError(() => {
+            getNextMongoTracker.reset();
+
+            session.startTransaction();
+
+            // First operation in transaction
+            sessionColl.insert({z: 1, type: "txn"}, {session});
+
+            assert.eq(
+                getNextMongoTracker.count(),
+                1,
+                "Should call _getNextMongo once for first txn operation",
+            );
+            assert.eq(
+                conn._sessionToMongoMap.size(),
+                1,
+                "Session should be tracked after first txn operation",
+            );
+
+            // Subsequent operations should not call _getNextMongo (pinned to same mongos)
+            for (let i = 2; i <= kNumInserts; i++) {
+                sessionColl.insert({y: i, type: "txn"}, {session});
+            }
+
+            assert.eq(
+                getNextMongoTracker.count(),
+                1,
+                "Should not call _getNextMongo for subsequent txn operations",
+            );
+            assert.eq(
+                conn._sessionToMongoMap.size(),
+                1,
+                "Session should be tracked after first txn operation",
+            );
+
+            assert.commandWorked(session.commitTransaction_forTesting());
+        });
+
+        assert.eq(
+            kNumInserts * 3,
+            coll.count({type: "txn"}),
+            "All transaction inserts should succeed",
+        );
+
+        session.endSession();
+        coll.drop();
+    },
+);
+
+testCase("Testing session reuse after transaction routes randomly", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.sessionTest;
+
+    const session = conn.startSession();
+    const sessionDB = session.getDatabase("test");
+    const sessionColl = sessionDB.sessionTest;
+
+    // Start and complete a transaction
+    withRetryOnTransientTxnError(() => {
+        session.startTransaction();
+        sessionColl.insert({x: 1, phase: "txn"}, {session});
+        assert.commandWorked(session.commitTransaction_forTesting());
+    });
+    // Session should be tracked
+    assert.eq(conn._sessionToMongoMap.size(), 1, "Session should be tracked after transaction");
+
+    // Track _getNextMongo calls for post-transaction operations
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Perform non-transactional operations on same session
+    const kOperations = 10;
+    for (let i = 0; i < kOperations; i++) {
+        sessionColl.insert({x: i, phase: "post-txn"}, {session});
+    }
+
+    // Should route randomly (no txnNumber in these operations)
+    assert.gte(
+        getNextMongoTracker.count(),
+        kOperations,
+        "Should route randomly after transaction completes",
+    );
+
+    // Session remains tracked but operations without txnNumber don't use the mapping
+    assert.eq(
+        conn._sessionToMongoMap.size(),
+        1,
+        "Session tracking persists but doesn't affect non-txn ops",
+    );
+
+    session.endSession();
+    coll.drop();
+});
+
+testCase("Testing multiple concurrent transactions can use different mongos", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const kCollName = "sessionTest";
+    assert.commandWorked(db.createCollection(kCollName));
+    const coll = db.getCollection(kCollName);
+
+    const session1 = conn.startSession();
+    const session2 = conn.startSession();
+    const sessionDB1 = session1.getDatabase("test");
+    const sessionDB2 = session2.getDatabase("test");
+    withRetryOnTransientTxnError(() => {
+        // Start transactions on both sessions
+        session1.startTransaction();
+        session2.startTransaction();
+
+        // Perform operations in both transactions
+        sessionDB1.sessionTest.insert({session: 1, value: "s1"}, {session: session1});
+        sessionDB2.sessionTest.insert({session: 2, value: "s2"}, {session: session2});
+
+        sessionDB1.sessionTest.insert({session: 1, value: "s1-2"}, {session: session1});
+        sessionDB2.sessionTest.insert({session: 2, value: "s2-2"}, {session: session2});
+
+        // Both sessions should be tracked
+        assert.eq(conn._sessionToMongoMap.size(), 2, "Both sessions should be tracked");
+
+        // Commit both transactions
+        assert.commandWorked(session1.commitTransaction_forTesting());
+        assert.commandWorked(session2.commitTransaction_forTesting());
+    });
+    // Verify both transactions succeeded
+    assert.eq(2, coll.count({session: 1}), "Session 1 transaction should succeed");
+    assert.eq(2, coll.count({session: 2}), "Session 2 transaction should succeed");
+
+    session1.endSession();
+    session2.endSession();
+    coll.drop();
+});
+
+testCase("Testing retryable writes pin to same mongos", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.sessionTest;
+    const kOperations = 5;
+
+    const session = conn.startSession({retryWrites: true});
+    const sessionDB = session.getDatabase("test");
+    const sessionColl = sessionDB.sessionTest;
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    // Subsequent operations should not call _getNextMongo (pinned to same mongos)
+    for (let i = 1; i <= kOperations; i++) {
+        sessionColl.insert({x: i, type: "retryable"}, {session});
+    }
+
+    assert.eq(
+        getNextMongoTracker.count(),
+        5,
+        "Should not call _getNextMongo for subsequent retryable writes",
+    );
+    assert.eq(conn._sessionToMongoMap.size(), 1, "We should have exactly 1 tracked session");
+
+    // Verify all writes succeeded
+    assert.eq(5, coll.count({type: "retryable"}), "All retryable writes should succeed");
+
+    session.endSession();
+    coll.drop();
+});
+
+testCase("Testing aborted transaction maintains session tracking", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+    const coll = db.sessionTest;
+
+    const session = conn.startSession();
+    const sessionDB = session.getDatabase("test");
+    const sessionColl = sessionDB.sessionTest;
+
+    // Start transaction
+    session.startTransaction();
+    sessionColl.insert({x: 1, type: "aborted"}, {session});
+
+    // Session should be tracked
+    assert.eq(conn._sessionToMongoMap.size(), 1, "Session should be tracked in transaction");
+
+    // Abort transaction
+    session.abortTransaction_forTesting();
+
+    // Session remains tracked (mapping persists)
+    assert.eq(conn._sessionToMongoMap.size(), 1, "Session tracking persists after abort");
+
+    // Verify document was not inserted (transaction aborted)
+    assert.eq(0, coll.count({type: "aborted"}), "Aborted transaction should not insert documents");
+
+    session.endSession();
+    coll.drop();
+});
+
+// ============================================================================
+// Test auto encryption methods
+// ============================================================================
+
+testCase("Testing setAutoEncryption propagates to all mongos connections", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+
+    assert.eq(conn.isMultiRouter, true, "Should be MultiRouterMongo");
+    assert.eq(conn._mongoConnections.length, 3, "Should have 3 mongo connections");
+
+    const localKMS = {
+        key: BinData(
+            0,
+            "/tu9jUCBqZdwCelwE/EAm/4WqdxrSMi04B8e9uAV+m30rI1J2nhKZZtQjdvsSCwuI4erR6IEcEK+5eGUAODv43NDNIR9QheT2edWFewUfHKsl9cnzTc86meIzOmYl6dr",
+        ),
+    };
+
+    const clientSideFLEOptions = {
+        kmsProviders: {local: localKMS},
+        keyVaultNamespace: "test.keystore",
+        schemaMap: {},
+    };
+
+    // Set auto encryption on the multi-router connection
+    const result = conn.setAutoEncryption(clientSideFLEOptions);
+    assert(result, "setAutoEncryption should succeed");
+
+    // Verify all underlying mongos connections have auto encryption options set
+    conn._mongoConnections.forEach((mongo, idx) => {
+        const options = mongo.getAutoEncryptionOptions();
+        assert.neq(options, undefined, `Mongos ${idx} should have auto encryption options`);
+        assert.eq(
+            options.keyVaultNamespace,
+            "test.keystore",
+            `Mongos ${idx} should have correct keyVaultNamespace`,
+        );
+    });
+
+    // Clean up
+    conn.unsetAutoEncryption();
+    // Verify all connections are cleaned up
+    conn._mongoConnections.forEach((mongo, idx) => {
+        const options = mongo.getAutoEncryptionOptions();
+        assert.eq(
+            options,
+            undefined,
+            `Mongos ${idx} should not have auto encryption options after cleanup`,
+        );
+    });
+});
+
+testCase("Testing toggleAutoEncryption propagates to all mongos connections", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+
+    assert.eq(conn.isMultiRouter, true, "Should be MultiRouterMongo");
+    assert.eq(conn._mongoConnections.length, 3, "Should have 3 mongo connections");
+
+    const localKMS = {
+        key: BinData(
+            0,
+            "/tu9jUCBqZdwCelwE/EAm/4WqdxrSMi04B8e9uAV+m30rI1J2nhKZZtQjdvsSCwuI4erR6IEcEK+5eGUAODv43NDNIR9QheT2edWFewUfHKsl9cnzTc86meIzOmYl6dr",
+        ),
+    };
+
+    const clientSideFLEOptions = {
+        kmsProviders: {local: localKMS},
+        keyVaultNamespace: "test.keystore",
+        schemaMap: {},
+    };
+
+    // Set auto encryption first
+    assert(conn.setAutoEncryption(clientSideFLEOptions), "setAutoEncryption should succeed");
+
+    // Toggle auto encryption on
+    const toggleOnResult = conn.toggleAutoEncryption(true);
+    assert(toggleOnResult, "toggleAutoEncryption(true) should succeed");
+
+    // Verify all underlying mongos connections have auto encryption toggled on
+    conn._mongoConnections.forEach((mongo, idx) => {
+        // We can't directly check the toggle state, but we can verify options exist
+        const options = mongo.getAutoEncryptionOptions();
+        assert.neq(
+            options,
+            undefined,
+            `Mongos ${idx} should have auto encryption options after toggle on`,
+        );
+    });
+
+    // Toggle auto encryption off
+    const toggleOffResult = conn.toggleAutoEncryption(false);
+    assert(toggleOffResult, "toggleAutoEncryption(false) should succeed");
+
+    // Verify all underlying mongos connections have auto encryption toggled off
+    conn._mongoConnections.forEach((mongo, idx) => {
+        const options = mongo.getAutoEncryptionOptions();
+        assert.neq(
+            options,
+            undefined,
+            `Mongos ${idx} should still have auto encryption options after toggle off`,
+        );
+    });
+
+    // Clean up by unsetting auto encryption
+    conn.unsetAutoEncryption();
+});
+
+testCase("Testing encryption state is independently maintained per mongos", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+
+    assert.eq(conn.isMultiRouter, true, "Should be MultiRouterMongo");
+    assert.eq(conn._mongoConnections.length, 3, "Should have 3 mongo connections");
+
+    const localKMS = {
+        key: BinData(
+            0,
+            "/tu9jUCBqZdwCelwE/EAm/4WqdxrSMi04B8e9uAV+m30rI1J2nhKZZtQjdvsSCwuI4erR6IEcEK+5eGUAODv43NDNIR9QheT2edWFewUfHKsl9cnzTc86meIzOmYl6dr",
+        ),
+    };
+
+    const clientSideFLEOptions = {
+        kmsProviders: {local: localKMS},
+        keyVaultNamespace: "test.keystore",
+        schemaMap: {},
+    };
+
+    // Set and toggle auto encryption multiple times
+    assert(conn.setAutoEncryption(clientSideFLEOptions), "setAutoEncryption should succeed");
+    assert(conn.toggleAutoEncryption(true), "toggleAutoEncryption(true) should succeed");
+    assert(conn.toggleAutoEncryption(false), "toggleAutoEncryption(false) should succeed");
+    assert(conn.toggleAutoEncryption(true), "toggleAutoEncryption(true) should succeed again");
+
+    // Verify all connections maintain consistent state
+    conn._mongoConnections.forEach((mongo, idx) => {
+        const options = mongo.getAutoEncryptionOptions();
+        assert.neq(options, undefined, `Mongos ${idx} should have auto encryption options`);
+        assert.eq(
+            options.keyVaultNamespace,
+            "test.keystore",
+            `Mongos ${idx} should have correct keyVaultNamespace`,
+        );
+    });
+
+    // Clean up
+    assert(conn.unsetAutoEncryption());
+
+    // Verify all connections are cleaned up
+    conn._mongoConnections.forEach((mongo, idx) => {
+        const options = mongo.getAutoEncryptionOptions();
+        assert.eq(
+            options,
+            undefined,
+            `Mongos ${idx} should not have auto encryption options after cleanup`,
+        );
+    });
+});
+
+testCase("Testing encrypted inserts are routed randomly", () => {
+    // Skip if not enterprise shell or the EncryptedClient is unavailable
+    if (!isEnterpriseShell()) {
+        return;
+    }
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const kOperations = 10;
+    const kCollName = "encryptedColl";
+
+    let client = new EncryptedClient(conn, "test");
+    let edb = client.getDB();
+    assert(edb.getMongo().isMultiRouter, "EncryptedClient should be MultiRouterMongo");
+
+    assert.commandWorked(
+        client.createEncryptionCollection(kCollName, {
+            encryptedFields: {
+                "fields": [
+                    {"path": "first", "bsonType": "string", "queries": {"queryType": "equality"}},
+                ],
+            },
+        }),
+    );
+
+    const ecoll = edb.getCollection(kCollName);
+
+    // Track _getNextMongo calls
+    const getNextMongoTracker = overrideGetNextMongoCountingCalls(conn);
+
+    for (let i = 0; i < kOperations; i++) {
+        ecoll.einsertOne({x: i, type: "insert"});
+    }
+
+    // Should route randomly for all operations
+    assert.gte(
+        getNextMongoTracker.count(),
+        kOperations,
+        "Should route randomly for insert operations",
+    );
+
+    ecoll.drop();
+    assert(edb.dropDatabase());
+});
+
+// ============================================================================
+// Test unsupported commands
+// ============================================================================
+
+function stringContains(msg, keyword) {
+    return msg.indexOf(keyword) != -1;
+}
+
+testCase("Testing unsupported commands throw errors", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("test");
+
+    // Test releaseMemory with multiple targets
+    let msg = assert.throws(() => {
+        db.runCommand({releaseMemory: ["target1", "target2"]});
+    }).message;
+    assert(
+        stringContains(msg, "releaseMemory"),
+        "The error should be about releaseMemory, but found: " + msg,
+    );
+
+    // Test killCursors with multiple cursors
+    msg = assert.throws(() => {
+        db.runCommand({killCursors: "collection", cursors: [NumberLong(1), NumberLong(2)]});
+    }).message;
+    assert(
+        stringContains(msg, "killCursors"),
+        "The error should be about killCursors, but found: " + msg,
+    );
+
+    // Test aggregate with $currentOp and localOps: true
+    msg = assert.throws(() => {
+        db.runCommand({aggregate: 1, pipeline: [{$currentOp: {localOps: true}}], cursor: {}});
+    }).message;
+    assert(
+        stringContains(msg, "currentOp"),
+        "The error should be about currentOp, but found: " + msg,
+    );
+
+    // Test aggregate with $listLocalSessions
+    msg = assert.throws(() => {
+        db.runCommand({aggregate: 1, pipeline: [{$listLocalSessions: {}}], cursor: {}});
+    }).message;
+    assert(
+        stringContains(msg, "listLocalSessions"),
+        "The error should be about listLocalSessions, but found: " + msg,
+    );
+
+    // Test getShardVersion
+    msg = assert.throws(() => {
+        db.runCommand({getShardVersion: "test.collection"});
+    }).message;
+    assert(
+        stringContains(msg, "getShardVersion"),
+        "The error should be about getShardVersion, but found: " + msg,
+    );
+
+    // Test getDatabaseVersion
+    msg = assert.throws(() => {
+        db.runCommand({getDatabaseVersion: "test.collection"});
+    }).message;
+    assert(
+        stringContains(msg, "getDatabaseVersion"),
+        "The error should be about getDatabaseVersion, but found: " + msg,
+    );
+
+    // Test getLog
+    msg = assert.throws(() => {
+        db.runCommand({getLog: "global"});
+    }).message;
+    assert(stringContains(msg, "getLog"), "The error should be about getLog, but found: " + msg);
+    // Test configureFailPoint
+    msg = assert.throws(() => {
+        db.runCommand({
+            configureFailPoint: "failCommand",
+            mode: "alwaysOn",
+            data: {failCommands: ["ping"]},
+        });
+    }).message;
+    assert(
+        stringContains(msg, "configureFailPoint"),
+        "The error should be about configureFailPoint, but found: " + msg,
+    );
+});
+
+// ============================================================================
+// Test broadcast commands
+// ============================================================================
+
+function spyUnderlyingConnectionsRunCommand(multiRouterConn, predicate) {
+    const counts = new Array(multiRouterConn._mongoConnections.length).fill(0);
+    multiRouterConn._mongoConnections.forEach((conn, idx) => {
+        const originalRunCommand = conn._runCommandImpl.bind(conn);
+        conn._runCommandImpl = function (dbname, cmd, options, secToken, traceparent) {
+            if (predicate(dbname, cmd, options)) {
+                counts[idx]++;
+            }
+            return originalRunCommand(dbname, cmd, options, secToken, traceparent);
+        };
+    });
+    return {
+        getCounts: () => counts,
+    };
+}
+
+testCase("Testing setLogLevel hits every mongos", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+
+    const spy = spyUnderlyingConnectionsRunCommand(conn, (dbname, cmd, options) => {
+        return cmd.setParameter;
+    });
+
+    conn.setLogLevel(1);
+
+    const counts = spy.getCounts();
+    const nMongos = conn._mongoConnections.length;
+    assert.eq(counts.length, nMongos, "Should have correct number of connections");
+    counts.forEach((count, idx) => {
+        assert.eq(count, 1, `Mongos ${idx} should have received setLogLevel`);
+    });
+});
+
+testCase("Testing refreshLogicalSessionCacheNow is broadcasted", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("admin");
+
+    const spy = spyUnderlyingConnectionsRunCommand(conn, (dbname, cmd, options) => {
+        return cmd.refreshLogicalSessionCacheNow;
+    });
+
+    assert.commandWorked(db.runCommand({refreshLogicalSessionCacheNow: 1}));
+
+    const counts = spy.getCounts();
+    const nMongos = conn._mongoConnections.length;
+    assert.eq(counts.length, nMongos, "Should have correct number of connections");
+    counts.forEach((count, idx) => {
+        assert.eq(count, 1, `Mongos ${idx} should have received refreshLogicalSessionCacheNow`);
+    });
+});
+
+testCase("Testing setParameters is broadcasted", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    const db = conn.getDB("admin");
+
+    const spy = spyUnderlyingConnectionsRunCommand(conn, (dbname, cmd, options) => {
+        return cmd.setParameter;
+    });
+
+    assert.commandWorked(db.runCommand({setParameter: 1, internalQueryDisablePlanCache: true}));
+
+    const counts = spy.getCounts();
+    const nMongos = conn._mongoConnections.length;
+    assert.eq(counts.length, nMongos, "Should have correct number of connections");
+    counts.forEach((count, idx) => {
+        assert.eq(count, 1, `Mongos ${idx} should have received setParameters`);
+    });
+});
+
+// ============================================================================
+// Test _mongo property on command results always points to MultiRouter
+// ============================================================================
+
+testCase("Test hello result _mongo points to MultiRouter", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    assert.eq(conn.isMultiRouter, true);
+
+    const result = conn.getDB("admin").runCommand({hello: 1});
+    assert.commandWorked(result);
+    assert(result._mongo, "hello result must have _mongo set");
+    assert.eq(
+        result._mongo.isMultiRouter,
+        true,
+        "hello result _mongo must be the MultiRouter, not a raw mongos",
+    );
+});
+
+testCase("Test query result _mongo points to MultiRouter (exhausted cursor)", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    assert.eq(conn.isMultiRouter, true);
+
+    const db = conn.getDB("test");
+    const coll = db.coll;
+    coll.insert({x: 1, tag: "test123"});
+
+    const result = db.runCommand({find: "coll", filter: {tag: "test123"}});
+    assert.commandWorked(result);
+    assert(result.cursor, "find result must have a cursor");
+    assert.eq(result.cursor.id, 0, "small result set should produce an exhausted cursor (id 0)");
+    assert(result._mongo, "find result with exhausted cursor must have _mongo set");
+    assert.eq(
+        result._mongo.isMultiRouter,
+        true,
+        "find result _mongo must be the MultiRouter, not the raw mongos that served the query",
+    );
+
+    coll.drop();
+});
+
+testCase("Test find result _mongo points to MultiRouter within a transaction", () => {
+    const uri = getMongosesURI();
+    const conn = connect(uri).getMongo();
+    assert.eq(conn.isMultiRouter, true);
+
+    const db = conn.getDB("test");
+    const coll = db.mongoResultTest;
+    coll.insert({x: 1, tag: "mongoResultTxn"});
+
+    const session = conn.startSession();
+    const sessionDB = session.getDatabase("test");
+
+    withRetryOnTransientTxnError(() => {
+        session.startTransaction();
+
+        const findResult = sessionDB.runCommand({
+            find: "mongoResultTest",
+            filter: {tag: "mongoResultTxn"},
+        });
+        assert.commandWorked(findResult);
+        assert(findResult.cursor, "find result in transaction must have a cursor");
+        assert(findResult._mongo, "find result in transaction must have _mongo set");
+        assert.eq(
+            findResult._mongo.isMultiRouter,
+            true,
+            "find result _mongo in transaction must be the MultiRouter",
+        );
+
+        assert.commandWorked(session.commitTransaction_forTesting());
+    });
+
+    session.endSession();
+    coll.drop();
+});
+
+st.stop();

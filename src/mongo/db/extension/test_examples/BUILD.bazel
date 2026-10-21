@@ -1,0 +1,341 @@
+load("//bazel/install_rules:install_rules.bzl", "extensions_with_config")
+load("//bazel/uv:defs.bzl", "dependency")
+load("//bazel/config:render_template.bzl", "render_template")
+load("//bazel:signing.bzl", "signed_mongo_cc_extension_shared_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob(
+        [
+            "*.h",
+        ],
+        allow_empty = True,
+    ),
+)
+
+filegroup(
+    name = "resmoke_data",
+    srcs = [
+        "aggregation_stage_fallback_parsers.json",
+        "configurations.yml",
+        "//src/mongo/db/extension/test_examples/test_extensions_signing_keys:test_extensions_signing_public_key.asc",
+    ],
+)
+
+# This sets up the valid extension targets to use in the top level `dist-test`
+# and `extensions` targets. Using Bazel's transition system, this rule ensures
+# that the extensions are built with the correct configuration. All extensions
+# that may be loaded in jstests should be included here. Extensions that are
+# built only for unit tests should be omitted.
+extensions_with_config(
+    name = "dist_test_extensions",
+    srcs = [
+        ##################### EXTENSIONS FOR PASSTHROUGH TESTS #####################
+        # Any extension that we intend to load in extensions passthrough tests and in the
+        # extension-enabled variant MUST have the "_mongo_extension" suffix for the resmoke
+        # scripts to recognize it.
+
+        # TODO SERVER-109838: Remove the comment below once extension stages are no longer
+        # listed by $listMqlEntities.
+        # Any extension added here will result in the with-extensions Evergreen variant
+        # automatically loading it into the server for its tasks. This means that
+        # null_chars_string_input.js will break as not all stages from $listMqlEntities
+        # will have a null character test. To resolve this, ensure that these new stages
+        # are added to the "skips" list in that test.
+        ":bar_mongo_extension_signed_lib",
+        ":foo_mongo_extension_signed_lib",
+        ":limit_mongo_extension_signed_lib",
+        ":logging_mongo_extension_signed_lib",
+        ":debug_logging_mongo_extension_signed_lib",
+        ":parse_options_mongo_extension_signed_lib",
+        ":test_options_mongo_extension_signed_lib",
+        ":toaster_mongo_extension_signed_lib",
+        ":extension_errors_mongo_extension_signed_lib",
+        ":shapify_mongo_extension_signed_lib",
+        ":sharded_execution_serialization_mongo_extension_signed_lib",
+        ":read_n_documents_mongo_extension_signed_lib",
+        ":explain_mongo_extension_signed_lib",
+        ":metadata_mongo_extension_signed_lib",
+        ":idle_threads_mongo_extension_signed_lib",
+        ":interrupt_mongo_extension_signed_lib",
+        ":match_topN_mongo_extension_signed_lib",
+        ":match_top_n_with_metrics_mongo_extension_signed_lib",
+        ":native_vector_search_mongo_extension_signed_lib",
+        ":selection_optimization_mongo_extension_signed_lib",
+        ":metrics_mongo_extension_signed_lib",
+        ":other_metrics_mongo_extension_signed_lib",
+        ":sleep_mongo_extension_signed_lib",
+        ":vector_search_optimization_mongo_extension_signed_lib",
+        ":view_pipeline_validator_mongo_extension_signed_lib",
+        ":disallow_view_mongo_extension_signed_lib",
+        ":desugar_add_view_name_mongo_extension_signed_lib",
+        ":add_fields_match_mongo_extension_signed_lib",
+        ":modify_for_log_mongo_extension_signed_lib",
+        ":shard_id_mongo_extension_signed_lib",
+        ":track_deps_mongo_extension_signed_lib",
+        ":multi_stream_mongo_extension_signed_lib",
+        ":internal_stage_mongo_extension_signed_lib",
+
+        #################### EXTENSIONS FOR NO-PASSTHROUGH TESTS ####################
+        # Any extension that is just loaded in a no-passthrough test MUST NOT have the
+        # "_mongo_extension" suffix.
+        ":no_symbol_bad_extension_signed_lib",
+        ":duplicate_stage_descriptor_bad_extension_signed_lib",
+        ":foo_extension_v2_signed_lib",
+        ":vector_search_extension_signed_lib",
+        ":search_extension_signed_lib",
+        ":assert_deadline_increased_after_batch_extension_signed_lib",
+    ],
+)
+
+# Extension .so's used by signature_validator_test and rnp_test to validate GPG signatures. Built
+# with extensions_transition so they share a configuration with load_extension_test_extensions
+# below (both wrap foo_mongo_extension_signed_lib and read_n_documents_mongo_extension_signed_lib)
+# instead of colliding with it in the install-mongo_unittest output tree.
+extensions_with_config(
+    name = "signature_test_extensions",
+    srcs = [
+        ":foo_mongo_extension_signed_lib",
+        ":read_n_documents_mongo_extension_signed_lib",
+    ],
+)
+
+# Extension .so's used by load_extension_test.cpp. Built with extensions_transition so they
+# are linked statically like jstest extensions.
+extensions_with_config(
+    name = "load_extension_test_extensions",
+    srcs = [
+        ":bar_mongo_extension_signed_lib",
+        ":duplicate_stage_descriptor_bad_extension_signed_lib",
+        ":duplicate_version_bad_extension_signed_lib",
+        ":explain_mongo_extension_signed_lib",
+        ":extension_errors_mongo_extension_signed_lib",
+        ":foo_mongo_extension_signed_lib",
+        ":host_version_fails_bad_extension_signed_lib",
+        ":host_version_succeeds_mongo_extension_signed_lib",
+        ":initialize_version_fails_bad_extension_signed_lib",
+        ":limit_mongo_extension_signed_lib",
+        ":load_highest_compatible_version_mongo_extension_signed_lib",
+        ":load_two_stages_mongo_extension_signed_lib",
+        ":major_version_max_int_bad_extension_signed_lib",
+        ":major_version_too_high_bad_extension_signed_lib",
+        ":major_version_too_low_bad_extension_signed_lib",
+        ":match_topN_mongo_extension_signed_lib",
+        ":minor_version_too_high_bad_extension_signed_lib",
+        ":native_vector_search_mongo_extension_signed_lib",
+        ":no_get_extension_symbol_bad_extension_signed_lib",
+        ":no_symbol_bad_extension_signed_lib",
+        ":null_initialize_function_bad_extension_signed_lib",
+        ":null_mongo_extension_bad_extension_signed_lib",
+        ":null_stage_descriptor_bad_extension_signed_lib",
+        ":parse_options_mongo_extension_signed_lib",
+        ":read_n_documents_mongo_extension_signed_lib",
+        ":sharded_execution_serialization_mongo_extension_signed_lib",
+        ":test_options_mongo_extension_signed_lib",
+        ":toaster_mongo_extension_signed_lib",
+        ":vector_search_optimization_mongo_extension_signed_lib",
+    ],
+)
+
+pkg_name = "//" + package_name() + "/"
+
+############################## EXTENSIONS FOR PASSTHROUGH TESTS ##############################
+### Any extension name suffix'ed with "_mongo_extension" with be automatically picked up by
+### the extension passthroughs and loaded on all nodes, if it is also added to
+### "dist_test_extensions".
+
+# Extensions under test_examples/
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_mongo_extension",
+        srcs = [extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "foo",
+        "metadata",
+        "foo_v2",
+        "bar",
+        "read_n_documents",
+        "disallow_view",
+        "desugar_add_view_name",
+        "view_pipeline_validator",
+        "shard_id",
+        "track_deps",
+        "multi_stream",
+        "internal_stage",
+    ]
+]
+
+# Extensions under test_examples/desugar/
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_mongo_extension",
+        srcs = [pkg_name + "desugar:" + extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "limit",
+        "match_topN",
+        "match_top_n_with_metrics",
+        "native_vector_search",
+        "selection_optimization",
+        "vector_search_optimization",
+        "add_fields_match",
+    ]
+]
+
+[
+    render_template(
+        name = extension_name + "_conf",
+        srcs = [
+            "configurations.yml",
+        ],
+        cmd = [
+            "$(location " + extension_name + ".conf)",
+            "$(location configurations.yml)",
+            extension_name,
+        ],
+        output = extension_name + ".conf",
+        python_file = ":gen_conf.py",
+        python_libs = [
+            dependency(
+                "pyyaml",
+                group = "core",
+            ),
+        ],
+    )
+    for extension_name in [
+        "test_options",
+        "parse_options",
+        "toaster",
+    ]
+]
+
+filegroup(
+    name = "extension_options_configs",
+    srcs = [
+        "parse_options_conf",
+        "test_options_conf",
+        "toaster_conf",
+        ":aggregation_stage_fallback_parsers.json",
+    ],
+)
+
+# Extensions under test_examples/extension_options/
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_mongo_extension",
+        srcs = [pkg_name + "extension_options:" + extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "test_options",
+        "parse_options",
+        "toaster",
+    ]
+]
+
+# Extensions under test_examples/loading/
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_mongo_extension",
+        srcs = [pkg_name + "loading:" + extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "host_version_succeeds",
+        "load_highest_compatible_version",
+        "load_two_stages",
+    ]
+]
+
+# Extensions under test_examples/host_services/
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_mongo_extension",
+        srcs = [pkg_name + "host_services:" + extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "logging",
+        "extension_errors",
+        "debug_logging",
+        "idle_threads",
+    ]
+]
+
+# Extensions under test_examples/observability/
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_mongo_extension",
+        srcs = [pkg_name + "observability:" + extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "sharded_execution_serialization",
+        "explain",
+        "shapify",
+        "metrics",
+        "other_metrics",
+        "interrupt",
+        "sleep",
+        "modify_for_log",
+    ]
+]
+
+######################### EXTENSIONS FOR NO PASSTHROUGH OR UNIT TESTS #########################
+### To be manually loaded in a no-passthrough e2e test, the extension must also be added to
+### "dist_test_extensions".
+### To be manually loaded in a unit test, the extension must also be added to the list of "data"
+### for that test's Bazel target.
+
+# Extensions under test_examples/fail_to_load/
+# Each of these should fail startup.
+[
+    signed_mongo_cc_extension_shared_library(
+        name = extension_name + "_bad_extension",
+        srcs = [pkg_name + "fail_to_load:" + extension_name + ".cpp"],
+    )
+    for extension_name in [
+        "no_symbol",
+        "no_get_extension_symbol",
+        "null_mongo_extension",
+        "major_version_too_high",
+        "major_version_too_low",
+        "minor_version_too_high",
+        "null_initialize_function",
+        "major_version_max_int",
+        "duplicate_stage_descriptor",
+        "host_version_fails",
+        "initialize_version_fails",
+        "null_stage_descriptor",
+        "duplicate_version",
+    ]
+]
+
+# "foo_v2" is used for testing upgrade scenarios as the upgrade of "foo" from above. We cannot use
+# the "mongo_extension" suffix since loading this extension in passthroughs with "foo" V1 should
+# cause duplicate stage errors.
+signed_mongo_cc_extension_shared_library(
+    name = "foo_extension_v2",
+    srcs = ["foo_v2.cpp"],
+)
+
+# "vector_search" is used to test that we can override the existing $vectorSearch implementation.
+# It must not have the _mongo_extension suffix so that it doesn't get loaded in the
+# Extensions-enabled variant since that would break real $vectorSearch tests.
+signed_mongo_cc_extension_shared_library(
+    name = "vector_search_extension",
+    srcs = ["vector_search.cpp"],
+)
+
+# "search" is used to test that we can override the existing $search and $searchMeta
+# implementations. It must not have the _mongo_extension suffix so that it doesn't get loaded in
+# the Extensions-enabled variant since that would break real $search/$searchMeta tests.
+signed_mongo_cc_extension_shared_library(
+    name = "search_extension",
+    srcs = ["search.cpp"],
+)
+
+# "assert_deadline_increased_after_batch" is used to test that the operation deadline
+# is correctly refreshed when issuing a getMore command.
+signed_mongo_cc_extension_shared_library(
+    name = "assert_deadline_increased_after_batch_extension",
+    srcs = ["assert_deadline_increased_after_batch.cpp"],
+)

@@ -1,0 +1,57 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+structs:
+    DropReply:
+        description: "The drop command's reply."
+        is_command_reply: true
+        fields:
+            nIndexesWas:
+                type: int
+                optional: true
+                stability: stable
+            ns:
+                type: namespacestring
+                optional: true
+                stability: stable
+            info:
+                type: string
+                optional: true
+                stability: stable
+            # Include "ok" so mongos can use this struct to parse shard replies.
+            ok:
+                type: safeDouble
+                optional: true
+                stability: stable
+
+commands:
+    drop:
+        description: "Parser for the drop command"
+        command_name: drop
+        namespace: concatenate_with_db
+        cpp_name: drop
+        strict: true
+        api_version: "1"
+        reply_type: DropReply
+        # TODO (SERVER-115805): Remove this module visibility override once this command’s API and
+        # implementation are part of the same module.
+        mod_visibility: unfortunately_open
+        access_check:
+            simple:
+                privilege:
+                    resource_pattern: exact_namespace
+                    action_type: dropCollection
+        fields:
+            collectionUUID:
+                description: "The expected UUID of the collection."
+                type: uuid
+                optional: true
+                stability: unstable

@@ -1,0 +1,62 @@
+load("//bazel/resmoke:resmoke.bzl", "resmoke_suite_test")
+load("//bazel:mongo_js_rules.bzl", "mongo_js_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "fully_disabled_feature_flags.yml",
+    "resmoke_modules.yml",
+])
+
+filegroup(
+    name = "all_files",
+    srcs = glob(["**"]),
+    visibility = ["//visibility:public"],
+)
+
+# Javascript imports that are used in most, if not all, jstests. These are typically
+# imports added unconditionally by resmoke when starting the mongo shell or used by
+# resmoke hooks.
+mongo_js_library(
+    name = "required_jstest_data",
+    deps = [
+        "//jstests/aggregation/extras:utils",
+        "//jstests/concurrency/fsm_workload_helpers:auto_retry_transaction",
+        "//jstests/concurrency/fsm_workload_helpers:server_types",
+        "//jstests/core/timeseries/libs:all_javascript_files",
+        "//jstests/hooks:all_subpackage_javascript_files",
+        "//jstests/libs:all_subpackage_javascript_files",
+        "//jstests/noPassthrough/libs:all_subpackage_javascript_files",
+        "//jstests/replsets:rslib",
+        "//jstests/replsets/libs:all_javascript_files",
+        "//jstests/sharding/libs:sharded_index_util",
+        "//jstests/third_party/fast_check:all_javascript_files",
+    ],
+)
+
+# Javascript imports that are using a at least several jstest suties. This list is a tradeoff
+# to spend less effort finding the exact javascript dependencies and data files each suite needs.
+# TODO(SERVER-122756), prune this, ideally removing it entirely.
+mongo_js_library(
+    name = "common_jstest_data",
+    deps = [
+        "//jstests/aggregation/extras:all_subpackage_javascript_files",
+        "//jstests/concurrency/fsm_libs:all_subpackage_javascript_files",
+        "//jstests/concurrency/fsm_utils:all_subpackage_javascript_files",
+        "//jstests/concurrency/fsm_workload_helpers",
+        "//jstests/concurrency/fsm_workload_modifiers:all_subpackage_javascript_files",
+        "//jstests/concurrency/fsm_workloads:all_subpackage_javascript_files",
+        "//jstests/core/libs:all_subpackage_javascript_files",
+        "//jstests/disk/libs:all_subpackage_javascript_files",
+        "//jstests/fle2/libs:all_subpackage_javascript_files",
+        "//jstests/multiVersion/libs:all_subpackage_javascript_files",
+        "//jstests/noPassthrough/libs:all_subpackage_javascript_files",
+        "//jstests/ocsp/lib:all_subpackage_javascript_files",
+        "//jstests/sharding/analyze_shard_key/libs:all_subpackage_javascript_files",
+        "//jstests/sharding/libs:all_subpackage_javascript_files",
+        "//jstests/ssl/libs",
+        "//jstests/with_mongot/e2e_lib",
+        "//jstests/with_mongot/mongotmock/lib",
+        "//jstests/with_mongot/search_mocked/ssl/lib:all_subpackage_javascript_files",
+    ],
+)

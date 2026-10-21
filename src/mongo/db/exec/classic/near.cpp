@@ -1,0 +1,347 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/exec/classic/near.h"
+
+#include "mongo/db/exec/classic/filter.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
+#include "mongo/db/sorter/file_based_spiller.h"
+#include "mongo/db/sorter/sorter_template_defs.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/util/assert_util.h"
+
+#include <limits>
+#include <memory>
+#include <string_view>
+
+namespace mongo {
+
+NearStage::NearStage(ExpressionContext* expCtx,
+                     std::string_view typeName,
+                     StageType type,
+                     WorkingSet* workingSet,
+                     CollectionAcquisition collection,
+                     const IndexCatalogEntry* indexEntry)
+    : RequiresIndexStage(typeName, expCtx, collection, indexEntry, workingSet),
+      _workingSet(workingSet),
+      _searchState(SearchState::Initializing),
+      _seenDocuments(expCtx),
+      _nextIntervalStats(nullptr),
+      _sorterFileStats(/*sorterTracker=*/nullptr),
+      _resultBuffer(
+          makeSortOptions(),
+          SorterKeyComparator{},
+          NoOpBound{},
+          (expCtx->getAllowDiskUse() && feature_flags::gFeatureFlagExtendedAutoSpilling.isEnabled())
+              ? std::make_shared<
+                    sorter::FileBasedSpiller<SorterKey, SorterValue, SorterKeyComparator>>(
+                    expCtx->getTempDir(),
+                    &_sorterFileStats,
+                    /*dbName=*/boost::none,
+                    sorter::kLatestChecksumVersion,
+                    static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load()))
+              : nullptr,
+          /*settings=*/{}),
+      _stageType(type),
+      _nextInterval(nullptr),
+      _memoryTracker(OperationMemoryUsageTracker::createSimpleMemoryUsageTrackerForStage(
+          *expCtx, loadMemoryLimit(StageMemoryLimit::NearStageMaxMemoryBytes))),
+      _dedupReporter(OperationMemoryUsageTracker::createDeduplicatorReporter(
+          [](int64_t deduplicatedBytes, int64_t deduplicatedRecords) {
+              nearCounters.incrementPerDeduplication(deduplicatedBytes, deduplicatedRecords);
+          },
+          internalQueryMaxWriteToServerStatusMemoryUsageBytes.loadRelaxed())) {}
+
+NearStage::~NearStage() {}
+
+NearStage::CoveredInterval::CoveredInterval(PlanStage* covering,
+                                            double minDistance,
+                                            double maxDistance,
+                                            bool isLastInterval)
+    : covering(covering),
+      minDistance(minDistance),
+      maxDistance(maxDistance),
+      isLastInterval(isLastInterval) {}
+
+
+PlanStage::StageState NearStage::initNext(WorkingSetID* out) {
+    PlanStage::StageState state = initialize(opCtx(), _workingSet, out);
+    if (state == PlanStage::IS_EOF) {
+        _searchState = SearchState::Buffering;
+        return PlanStage::NEED_TIME;
+    }
+
+    invariant(state != PlanStage::ADVANCED);
+
+    // Propagate NEED_TIME or errors upward.
+    return state;
+}
+
+PlanStage::StageState NearStage::doWork(WorkingSetID* out) {
+    WorkingSetID toReturn = WorkingSet::INVALID_ID;
+    PlanStage::StageState nextState = PlanStage::NEED_TIME;
+
+    //
+    // Work the search
+    //
+
+    if (SearchState::Initializing == _searchState) {
+        nextState = initNext(&toReturn);
+    } else if (SearchState::Buffering == _searchState) {
+        nextState = bufferNext(&toReturn);
+    } else if (SearchState::Advancing == _searchState) {
+        nextState = advanceNext(&toReturn);
+    } else {
+        tassert(
+            11051669, "Unknown search state of NearStage", SearchState::Finished == _searchState);
+        nextState = PlanStage::IS_EOF;
+    }
+
+    //
+    // Handle the results
+    //
+
+    if (PlanStage::ADVANCED == nextState) {
+        *out = toReturn;
+    } else if (PlanStage::NEED_YIELD == nextState) {
+        *out = toReturn;
+    } else if (PlanStage::IS_EOF == nextState) {
+        _commonStats.isEOF = true;
+    }
+
+    return nextState;
+}
+
+// Set "toReturn" when NEED_YIELD.
+PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn) {
+    //
+    // Try to retrieve the next covered member
+    //
+
+    if (!_nextInterval) {
+        auto interval = nextInterval(opCtx(), _workingSet);
+        if (!interval) {
+            _searchState = SearchState::Finished;
+            return PlanStage::IS_EOF;
+        }
+
+        tassert(10922800,
+                "Intervals must be continuous",
+                _childrenIntervals.empty() ||
+                    interval->minDistance <= _childrenIntervals.back()->maxDistance +
+                            std::numeric_limits<double>::epsilon());
+
+        // CoveredInterval and its child stage are owned by _childrenIntervals
+        _childrenIntervals.push_back(std::move(interval));
+        _nextInterval = _childrenIntervals.back().get();
+
+        _specificStats.intervalStats.emplace_back();
+        _nextIntervalStats = &_specificStats.intervalStats.back();
+        _nextIntervalStats->minDistanceAllowed = _nextInterval->minDistance;
+        _nextIntervalStats->maxDistanceAllowed = _nextInterval->maxDistance;
+        _nextIntervalStats->inclusiveMaxDistanceAllowed = _nextInterval->isLastInterval;
+    }
+
+    WorkingSetID nextMemberID;
+    PlanStage::StageState intervalState = _nextInterval->covering->work(&nextMemberID);
+
+    if (PlanStage::IS_EOF == intervalState) {
+        if (_nextInterval->isLastInterval) {
+            _resultBuffer.done();
+        } else {
+            _resultBuffer.setBound(SorterKey{_nextInterval->maxDistance});
+        }
+
+        _searchState = SearchState::Advancing;
+        return PlanStage::NEED_TIME;
+    } else if (PlanStage::NEED_YIELD == intervalState) {
+        *toReturn = nextMemberID;
+        return intervalState;
+    } else if (PlanStage::ADVANCED != intervalState) {
+        return intervalState;
+    }
+
+    //
+    // Try to buffer the next covered member
+    //
+
+    WorkingSetMember nextMember = _workingSet->extract(nextMemberID);
+    uint64_t dedupBytesBefore = nextMember.hasRecordId() ? _seenDocuments.getApproximateSize() : 0;
+
+    // The child stage may not dedup so we must dedup them ourselves.
+    if (nextMember.hasRecordId()) {
+        if (!_seenDocuments.insert(nextMember.recordId)) {
+            return PlanStage::NEED_TIME;
+        }
+        const uint64_t dedupBytesAfter = _seenDocuments.getApproximateSize();
+        const int64_t dedupBytesAdditional =
+            static_cast<int64_t>(dedupBytesAfter) - static_cast<int64_t>(dedupBytesBefore);
+        _dedupReporter.add(dedupBytesAdditional);
+        _memoryTracker.add(dedupBytesAdditional);
+        _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+        dedupBytesBefore = dedupBytesAfter;
+    }
+
+    auto memberDistance = computeDistance(&nextMember);
+    // Documents outside of the search annulus can never be returned and are dropped right away:
+    // one closer than the current interval's minimum was already covered by an earlier interval,
+    // and one beyond the largest distance of the search fails the interval check of every interval,
+    // including the last one. Dropping them here also means the residual predicate below is only
+    // ever evaluated on documents that the search actually returns.
+    if (memberDistance < _nextInterval->minDistance || memberDistance > maxSearchDistance()) {
+        if (nextMember.hasRecordId()) {
+            _seenDocuments.freeMemory(nextMember.recordId);
+            const uint64_t dedupBytesAfter = _seenDocuments.getApproximateSize();
+            const int64_t dedupBytesDiff =
+                static_cast<int64_t>(dedupBytesAfter) - static_cast<int64_t>(dedupBytesBefore);
+            _dedupReporter.add(dedupBytesDiff, -1);
+            _memoryTracker.add(dedupBytesDiff);
+            _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+        }
+        return PlanStage::NEED_TIME;
+    }
+
+    // Apply the residual document-level predicate that was pushed down from the FETCH stage which
+    // used to sit above this one. This has to happen after the distance checks above: a document
+    // that the near search discards must never be handed to the predicate, both because that is
+    // wasted work and because predicates such as $expr can throw errors on documents that the
+    // query would never have returned. Documents rejected here are still recorded in
+    // '_seenDocuments', which is what the equivalent plan with a FETCH above this stage did.
+    if (!Filter::passes(&nextMember, residualFilter())) {
+        ++_nextIntervalStats->numRejectedByFilter;
+        return PlanStage::NEED_TIME;
+    }
+
+    ++_nextIntervalStats->numResultsBuffered;
+
+    // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+    nextMember.makeObjOwnedIfNeeded();
+    const uint64_t bufferBytesBefore = _resultBuffer.stats().memUsage();
+    _resultBuffer.add(SorterKey{memberDistance}, std::move(nextMember));
+    _memoryTracker.add(static_cast<int64_t>(_resultBuffer.stats().memUsage()) -
+                       static_cast<int64_t>(bufferBytesBefore));
+
+    if (!_memoryTracker.withinMemoryLimit(opCtx()) &&
+        feature_flags::gFeatureFlagExtendedAutoSpilling.isEnabled()) {
+        spill();
+    }
+
+    _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+    _memoryTracker.assertWithinMemoryLimit(opCtx(), _commonStats.stageTypeStr);
+    return PlanStage::NEED_TIME;
+}
+
+PlanStage::StageState NearStage::advanceNext(WorkingSetID* toReturn) {
+    // Returns documents to the parent stage.
+    // If the document does not fall in the current interval, it will be buffered so that
+    // it might be returned in a following interval.
+
+    // Check if the next member is in the search interval and that the buffer isn't empty
+    WorkingSetID resultID = WorkingSet::INVALID_ID;
+    if (_resultBuffer.getState() == ResultBufferSorter::State::kReady) {
+        // _resultBuffer.next() removes an element from the buffer.
+        uint64_t bytesBefore = _resultBuffer.stats().memUsage();
+        auto [memberDistance, member] = _resultBuffer.next();
+        uint64_t bytesAfter = _resultBuffer.stats().memUsage();
+
+        if (member->hasRecordId()) {
+            const uint64_t dedupBytesBefore = _seenDocuments.getApproximateSize();
+            _seenDocuments.freeMemory(member->recordId);
+            const uint64_t dedupBytesAfter = _seenDocuments.getApproximateSize();
+            _dedupReporter.add(
+                static_cast<int64_t>(dedupBytesAfter) - static_cast<int64_t>(dedupBytesBefore), -1);
+
+            bytesBefore += dedupBytesBefore;
+            bytesAfter += dedupBytesAfter;
+        }
+
+        _memoryTracker.add(static_cast<int64_t>(bytesAfter) - static_cast<int64_t>(bytesBefore));
+        _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+
+        const bool inInterval = _nextInterval->isLastInterval
+            ? memberDistance.value <= _nextInterval->maxDistance
+            : memberDistance.value < _nextInterval->maxDistance;
+        if (inInterval) {
+            resultID = _workingSet->emplace(member.extract());
+        }
+    }
+
+    // memberDistance is not in the interval or _resultBuffer is empty,
+    // so we need to move to the next interval.
+    if (WorkingSet::INVALID_ID == resultID) {
+        _nextInterval = nullptr;
+        _nextIntervalStats = nullptr;
+        _searchState = SearchState::Buffering;
+        return PlanStage::NEED_TIME;
+    }
+
+    *toReturn = resultID;
+
+    // This value is used by nextInterval() to determine the size of the next interval.
+    ++_nextIntervalStats->numResultsReturned;
+
+    return PlanStage::ADVANCED;
+}
+
+SortOptions NearStage::makeSortOptions() {
+    return SortOptions{}  // Spilling will handled externally by NearStage::spill method
+        .MaxMemoryUsageBytes(std::numeric_limits<int64_t>::max());
+}
+
+void NearStage::updateSpillingStats() {
+    auto additionalSpilledBytes = _sorterFileStats.bytesSpilledUncompressed() -
+        _specificStats.spillingStats.getSpilledBytes();
+    auto additionalSpilledRecords = _resultBuffer.stats().spilledKeyValuePairs() -
+        _specificStats.spillingStats.getSpilledRecords();
+
+    auto spilledDataStorageIncrease =
+        _specificStats.spillingStats.updateSpillingStats(1 /*spills*/,
+                                                         additionalSpilledBytes,
+                                                         additionalSpilledRecords,
+                                                         _sorterFileStats.bytesSpilled());
+
+    geoNearCounters.incrementPerSpilling(
+        1, additionalSpilledBytes, additionalSpilledRecords, spilledDataStorageIncrease);
+}
+
+void NearStage::spill() {
+    _memoryTracker.assertCanSpill(expCtx()->getAllowDiskUse(), _commonStats.stageTypeStr);
+    const uint64_t bufferBytesBefore = _resultBuffer.stats().memUsage();
+    _resultBuffer.forceSpill();
+    _memoryTracker.add(static_cast<int64_t>(_resultBuffer.stats().memUsage()) -
+                       static_cast<int64_t>(bufferBytesBefore));
+    updateSpillingStats();
+}
+
+bool NearStage::isEOF() const {
+    return SearchState::Finished == _searchState;
+}
+
+std::unique_ptr<PlanStageStats> NearStage::getStats() {
+    // Report the residual predicate that was pushed into this stage as the stage's filter, the same
+    // way FetchStage reports its own filter. Without this the predicate would disappear from
+    // explain output entirely once the FETCH above this stage is optimized away.
+    if (const MatchExpression* filter = residualFilter();
+        nullptr != filter && _commonStats.filter.isEmpty()) {
+        _commonStats.filter = filter->serialize();
+    }
+    auto ret = std::make_unique<PlanStageStats>(_commonStats, _stageType);
+    ret->specific = std::make_unique<NearStats>(_specificStats);
+    ret->children.reserve(_childrenIntervals.size());
+    for (size_t i = 0; i < _childrenIntervals.size(); ++i) {
+        ret->children.emplace_back(_childrenIntervals[i]->covering->getStats());
+    }
+    return ret;
+}
+
+StageType NearStage::stageType() const {
+    return _stageType;
+}
+
+const SpecificStats* NearStage::getSpecificStats() const {
+    return &_specificStats;
+}
+
+}  // namespace mongo

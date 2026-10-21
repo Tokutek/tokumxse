@@ -1,0 +1,223 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_benchmark", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+idl_generator(
+    name = "generic_argument_gen",
+    src = "generic_argument.idl",
+    deps = [
+        "//src/mongo/client:hedging_mode_gen",
+        "//src/mongo/client:read_preference_gen",
+        "//src/mongo/client:read_preference_setting_gen",
+        "//src/mongo/db:basic_types_gen",
+        "//src/mongo/db:feature_flag_gen",
+        "//src/mongo/db:version_context_gen",
+        "//src/mongo/db:write_concern_options_gen",
+        "//src/mongo/db/admission/execution_control:execution_admission_type_gen",
+        "//src/mongo/db/repl:read_concern_args_gen",
+        "//src/mongo/db/repl:read_concern_gen",
+        "//src/mongo/db/router_role:gossiped_routing_cache_gen",
+        "//src/mongo/db/session:logical_session_id_gen",
+        "//src/mongo/db/sharding_environment:sharding_types_gen",
+        "//src/mongo/db/topology/vector_clock:vector_clock_gen",
+        "//src/mongo/db/transaction:transaction_runtime_context_gen",
+        "//src/mongo/rpc/metadata:audit_metadata_gen",
+    ],
+)
+
+idl_generator(
+    name = "config_option_no_init_test_gen",
+    src = "config_option_no_init_test.idl",
+)
+
+idl_generator(
+    name = "config_option_test_gen",
+    src = "config_option_test.idl",
+)
+
+idl_generator(
+    name = "server_parameter_specialized_test_gen",
+    src = "server_parameter_specialized_test.idl",
+)
+
+idl_generator(
+    name = "server_parameter_with_storage_test_structs_gen",
+    src = "server_parameter_with_storage_test_structs.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+        "//src/mongo/db/topology/cluster_parameters:cluster_server_parameter_gen",
+    ],
+)
+
+idl_generator(
+    name = "server_parameter_with_storage_test_gen",
+    src = "server_parameter_with_storage_test.idl",
+    deps = [
+        ":server_parameter_with_storage_test_structs_gen",
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+idl_generator(
+    name = "unittest_import_gen",
+    src = "unittest_import.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+idl_generator(
+    name = "unittest_gen",
+    src = "unittest.idl",
+    deps = [
+        ":generic_argument_gen",
+        ":unittest_import_gen",
+        "//src/mongo/db:basic_types_gen",
+        "//src/mongo/db/auth:access_checks_gen",
+        "//src/mongo/db/auth:action_type_gen",
+    ],
+)
+
+idl_generator(
+    name = "idl_parser_bm_gen",
+    src = "idl_parser_bm.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "idl_parser",
+    srcs = [
+        "idl_parser.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:cluster_role",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "ifr_sender_version_test",
+    srcs = [
+        "ifr_sender_version_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "server-programmability",
+    ],
+    deps = [
+        ":idl_parser",
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_library(
+    name = "idl_test_base",
+    srcs = [
+        "server_parameter_specialized_test_defs.cpp",
+        "server_parameter_with_storage_test_defs.cpp",
+        ":idl_test_defs.cpp",
+        ":server_parameter_specialized_test_gen",
+        ":server_parameter_with_storage_test_gen",
+        ":server_parameter_with_storage_test_structs_gen",
+        ":unittest_gen",
+        ":unittest_import_gen",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/client:connection_string",
+        "//src/mongo/db/topology/cluster_parameters:cluster_server_parameter",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "config_option_test",
+    srcs = [
+        "config_option_test.cpp",
+        "config_option_test_main.cpp",
+        ":config_option_no_init_test_gen",
+        ":config_option_test_gen",
+    ],
+    provides_main = True,
+    tags = [
+        "mongo_unittest_fourth_group",
+        "server-programmability",
+    ],
+    deps = [
+        "idl_test_base",
+        "//src/mongo/db/auth:authprivilege",
+        "//src/mongo/unittest:unittest_main_core",
+        "//src/mongo/util/cmdline_utils",
+        "//src/mongo/util/options_parser",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "idl_test",
+    srcs = [
+        "command_generic_argument_test.cpp",
+        "feature_flag_test.cpp",
+        "idl_test.cpp",
+        "server_parameter_specialized_test.cpp",
+        "server_parameter_with_storage_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-programmability",
+    ],
+    deps = [
+        ":idl_parser",
+        ":idl_test_base",
+        "//src/mongo/client:connection_string",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db/auth:authprivilege",
+        "//src/mongo/db/auth:security_token_auth",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/db/topology/cluster_parameters:cluster_server_parameter",
+        "//src/mongo/rpc:message",
+        "//src/mongo/util:version_impl",
+        "//src/mongo/util/options_parser",
+    ],
+)
+
+mongo_cc_benchmark(
+    name = "idl_parser_bm",
+    srcs = [
+        "idl_parser_bm.cpp",
+        ":idl_parser_bm_gen",
+    ],
+    deps = [
+        ":idl_parser",
+        "//src/mongo/db:api_parameters",
+        "//src/mongo/db/auth:authprivilege",
+        "//src/mongo/db/query:query_request",
+        "//src/mongo/db/query/write_ops:write_ops_parsers",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/rpc:message",
+    ],
+)
+
+mongo_cc_library(
+    name = "basic_types_serialization",
+    srcs = [
+        "basic_types_serialization.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/bson/util:bson_extract",
+        "//src/mongo/db:logical_time",
+        "//src/mongo/rpc:get_status_from_command_result",
+    ],
+)

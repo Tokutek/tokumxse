@@ -1,0 +1,137 @@
+/**
+ * Pretty-printing helpers for query plans in explain.
+ */
+import {line} from "jstests/libs/query/pretty_md.js";
+import {prettyPrintTree} from "jstests/query_golden/libs/pretty_tree.js";
+import {
+    normalizePlan,
+    getWinningPlanFromExplain,
+    kExplainChildFieldNames,
+    getRejectedPlans,
+} from "jstests/libs/query/analyze_plan.js";
+import {joinStageAbbreviation} from "jstests/libs/query/join_utils.js";
+
+//
+// Helpers used below to get an abbreviated join order.
+//
+
+function formatEmbeddingField(field) {
+    if (field && field !== "none") {
+        return field;
+    }
+    return "_";
+}
+
+function abbreviate(node) {
+    const abbrev = joinStageAbbreviation(node.stage);
+    if (abbrev == node.stage) {
+        if (node.nss) {
+            return `${node.stage} [${node.nss}]`;
+        }
+        return abbrev;
+    }
+    const l = formatEmbeddingField(node.leftEmbeddingField);
+    const r = formatEmbeddingField(node.rightEmbeddingField);
+    const children = node.inputStages.map(abbreviate);
+    assert.eq(children.length, 2);
+    return `(${abbrev} ${l} = ${children[0]}, ${r} = ${children[1]})`;
+}
+
+//
+// End of helpers.
+//
+
+/**
+ * Helper function to extract a one line join order from the input plan.
+ * Useful for checking if this is a duplicate join order.
+ */
+export function getJoinOrderOneLine(plan) {
+    const winningPlan = normalizePlan(plan, false /*shouldFlatten*/);
+    const x = abbreviate(winningPlan);
+    return x;
+}
+
+/**
+ * Same as above, but for the winning plan in an 'explain'.
+ */
+export function getWinningJoinOrderOneLine(explain) {
+    return getJoinOrderOneLine(getWinningPlanFromExplain(explain));
+}
+
+//
+// Helpers used below to get a query plan pretty-printed as a tree.
+//
+
+function shortenField(node, fieldName) {
+    return node[fieldName] ? " [" + node[fieldName] + "]" : "";
+}
+
+function printPlanNode(node) {
+    // Place any fields with special formatting/ that we don't want in the default output here.
+    const bannedFieldNames = ["stage", "planNodeId", "nss", "joinPredicates"].concat(
+        kExplainChildFieldNames,
+    );
+
+    // Omit empty filters.
+    const entries = Object.entries(node).filter(
+        ([f, v]) =>
+            !bannedFieldNames.includes(f) && !(f == "filter" && Object.entries(v).length == 0),
+    );
+    let str = `${node.stage}${shortenField(node, "nss")}${shortenField(node, "joinPredicates")}\n`;
+    for (let i = 0; i < entries.length; i++) {
+        const [f, v] = entries[i];
+        str += `${f}: ${tojsononeline(v)}${i < entries.length - 1 ? "\n" : ""}`;
+    }
+    return str;
+}
+
+function getNodeChildren(node) {
+    let children = [];
+    for (const [field, entry] of Object.entries(node)) {
+        if (kExplainChildFieldNames.includes(field)) {
+            if (Array.isArray(entry)) {
+                children = children.concat(entry);
+            } else {
+                children.push(entry);
+            }
+        }
+    }
+    return children;
+}
+
+//
+// End of helpers.
+//
+
+/**
+ * Pretty-prints the given plan as a tree.
+ */
+export function prettyPrintPlan(plan) {
+    const normPlan = normalizePlan(plan, false /*shouldFlatten*/);
+    prettyPrintTree(normPlan, printPlanNode, getNodeChildren);
+}
+
+/**
+ * Same as above, but extracts the winning plan from 'explain' to print.
+ */
+export function prettyPrintWinningPlan(explain) {
+    prettyPrintPlan(getWinningPlanFromExplain(explain));
+}
+
+/**
+ * Same as above, but extracts the rejected plans from 'explain' to print.
+ */
+export function prettyPrintRejectedPlans(explain, max = undefined) {
+    let rejectedPlans = getRejectedPlans(explain);
+    if (max && rejectedPlans.length > max) {
+        line(`Too many plans, printing only top ${max} by cost.`);
+        rejectedPlans = rejectedPlans
+            .sort((l, r) => {
+                return l.queryPlan.costEstimate - r.queryPlan.costEstimate;
+            })
+            .slice(0, max);
+    }
+    for (const plan of rejectedPlans) {
+        prettyPrintPlan(plan.queryPlan);
+    }
+}

@@ -1,0 +1,128 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/util/modules.h"
+
+#include <iosfwd>
+#include <memory>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+class OperationContext;
+class ServiceContext;
+
+/**
+ * Determines whether a WriteUnitOfWork should group its oplog entries into a single commit
+ * timestamp. Registered per ServiceContext to avoid a dependency cycle between this library and
+ * higher-level code that makes the actual determination.
+ */
+class [[MONGO_MOD_OPEN]] OplogGroupingPolicy {
+public:
+    virtual ~OplogGroupingPolicy() = default;
+    virtual bool shouldGroupOplogEntries(OperationContext* opCtx) const {
+        return false;
+    }
+
+    static OplogGroupingPolicy& get(ServiceContext* svc);
+    static void set(ServiceContext* svc, std::unique_ptr<OplogGroupingPolicy> policy);
+};
+
+/**
+ * The WriteUnitOfWork is an RAII type that begins a storage engine write unit of work on both the
+ * Locker and the RecoveryUnit of the OperationContext. Any writes that occur during the lifetime of
+ * this object will be committed when commit() is called, and rolled back (aborted) when the object
+ * is destructed without a call to commit() or release().
+ *
+ * A WriteUnitOfWork can be nested with others, but only the top level WriteUnitOfWork will commit
+ * the unit of work on the RecoveryUnit. If a low level WriteUnitOfWork aborts, any parents will
+ * also abort.
+ *
+ * The WriteUnitOfWork may be used in read only mode, where it allows callbacks to be registered
+ * with the RecoveryUnit and executes them on commit/abort without opening any unit of work on the
+ * RecoveryUnit. This can be used to unify code that performs in-memory writes using the callback
+ * functionality of the RecoveryUnit.
+ */
+class WriteUnitOfWork {
+    WriteUnitOfWork(const WriteUnitOfWork&) = delete;
+    WriteUnitOfWork& operator=(const WriteUnitOfWork&) = delete;
+
+public:
+    /**
+     * The RecoveryUnitState is used to ensure valid state transitions.
+     */
+    enum RecoveryUnitState {
+        kNotInUnitOfWork,   // not in a unit of work, no writes allowed
+        kActiveUnitOfWork,  // in a unit of work that still may either commit or abort
+        kFailedUnitOfWork   // in a unit of work that has failed and must be aborted
+    };
+
+    enum OplogEntryGroupType {
+        // The caller requests no specific grouping. When an OplogGroupingPolicy enables grouping, a
+        // top-level WriteUnitOfWork is grouped atomically; otherwise its writes are not grouped and
+        // each gets its own oplog entry.
+        noGroup,
+        atomicGroup,
+        nonAtomicGroup,
+    };
+
+    WriteUnitOfWork(OperationContext* opCtx, OplogEntryGroupType groupType = noGroup);
+
+    ~WriteUnitOfWork();
+
+    /**
+     * Creates a top-level WriteUnitOfWork without changing RecoveryUnit or Locker state. For use
+     * when the RecoveryUnit and Locker are in active or failed state.
+     */
+    static std::unique_ptr<WriteUnitOfWork> createForSnapshotResume(OperationContext* opCtx,
+                                                                    RecoveryUnitState ruState);
+
+    /**
+     * Releases the OperationContext RecoveryUnit and Locker objects from management without
+     * changing state. Allows for use of these objects beyond the WriteUnitOfWork lifespan. Prepared
+     * units of work are not allowed be released. Returns the state of the RecoveryUnit.
+     */
+    RecoveryUnitState release();
+
+    /**
+     * Transitions the WriteUnitOfWork to the "prepared" state. The RecoveryUnit state in the
+     * OperationContext must be active. The WriteUnitOfWork may not be nested and will invariant in
+     * that case. Will throw CommandNotSupported if the storage engine does not support prepared
+     * transactions. May throw WriteConflictException.
+     *
+     * No subsequent operations are allowed except for commit or abort (when the object is
+     * destructed).
+     */
+    void prepare();
+
+    /**
+     * Commits the WriteUnitOfWork. If this is the top level unit of work, the RecoveryUnit's unit
+     * of work is committed. Commit can only be called once on an active unit of work, and may not
+     * be called on a released WriteUnitOfWork.
+     */
+    void commit();
+
+private:
+    WriteUnitOfWork() = default;  // for createForSnapshotResume
+
+    /**
+     * Whether this WUOW is grouping oplog entries, regardless of the grouping type.
+     */
+    bool _isGroupingOplogEntries() const {
+        return _groupOplogEntries != noGroup;
+    }
+
+    OperationContext* _opCtx;
+
+    bool _toplevel;
+    OplogEntryGroupType _groupOplogEntries;
+
+    bool _committed = false;
+    bool _prepared = false;
+    bool _released = false;
+};
+
+std::ostream& operator<<(std::ostream& os, WriteUnitOfWork::RecoveryUnitState state);
+
+}  // namespace mongo

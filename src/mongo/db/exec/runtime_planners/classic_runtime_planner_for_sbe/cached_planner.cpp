@@ -1,0 +1,455 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/db/exec/runtime_planners/classic_runtime_planner_for_sbe/planner_interface.h"
+#include "mongo/db/exec/trial_period_utils.h"
+#include "mongo/db/query/all_indices_required_checker.h"
+#include "mongo/db/query/bind_input_params.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
+#include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/db/query/replanning_required_info.h"
+#include "mongo/db/query/sbe_trial_runtime_executor.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+MONGO_FAIL_POINT_DEFINE(planCacheAlwaysReplanSBE);
+
+namespace mongo::classic_runtime_planner_for_sbe {
+
+namespace {
+class ValidCandidatePlanner : public PlannerBase {
+public:
+    ValidCandidatePlanner(PlannerDataForSBE plannerData, sbe::plan_ranker::CandidatePlan candidate)
+        : PlannerBase(std::move(plannerData), PlanSelectionStrategy::kCachedPlan),
+          _candidate(std::move(candidate)) {}
+
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExecutor(
+        std::unique_ptr<CanonicalQuery> canonicalQuery) override {
+        auto nss = cq()->nss();
+        auto remoteCursors = cq()->getExpCtx()->getExplain()
+            ? nullptr
+            : search_helpers::getSearchRemoteCursors(cq()->cqPipeline());
+        auto remoteExplains = cq()->getExpCtx()->getExplain()
+            ? search_helpers::getSearchRemoteExplains(cq()->getExpCtxRaw(), cq()->cqPipeline())
+            : nullptr;
+        return plan_executor_factory::make(opCtx(),
+                                           std::move(canonicalQuery),
+                                           std::move(_candidate),
+                                           collections(),
+                                           plannerOptions(),
+                                           std::move(nss),
+                                           extractSbeYieldPolicy(),
+                                           std::move(remoteCursors),
+                                           std::move(remoteExplains),
+                                           boost::none /* cachedPlanHash */,
+                                           planSelectionStrategy());
+    }
+
+
+    PlanRankingResult extractPlanRankingResult() override {
+        tassert(11756604,
+                "Expected `extractPlanRankingResult` to only be called with get executor deferred "
+                "feature flag enabled.",
+                cq()->getExpCtx()->getIfrContext()->getSavedFlagValue(
+                    feature_flags::gFeatureFlagGetExecutorDeferredEngineChoice));
+        std::vector<std::unique_ptr<QuerySolution>> v;
+        v.push_back(std::move(_candidate.solution));
+        return PlanRankingResult{
+            .solutions = std::move(v),
+            .maybeExplainData = PlanExplainerData{.fromPlanCache = true},
+            .execState = SavedExecState{SbeExecState{.sbeCandidate = std::move(_candidate),
+                                                     .sbeYieldPolicy = extractSbeYieldPolicy()}},
+            .plannerParams = extractPlannerParams(),
+            .cachedPlanHash = cachedPlanHash(),
+            .engineSelection = EngineChoice::kSbe,
+            .planSelectionStrategy = planSelectionStrategy()};
+    }
+
+private:
+    sbe::plan_ranker::CandidatePlan _candidate;
+};
+
+/**
+ * Recover $where expression JS function predicate from the SBE runtime environemnt, if
+ * necessary, so we could successfully replan the query. The primary match expression was
+ * modified during the input parameters bind-in process while we were collecting execution
+ * stats above.
+ */
+void recoverWhereExpression(CanonicalQuery* canonicalQuery,
+                            sbe::plan_ranker::CandidatePlan candidate) {
+    if (canonicalQuery->getExpCtxRaw()->getHasWhereClause()) {
+        input_params::recoverWhereExprPredicate(canonicalQuery->getPrimaryMatchExpression(),
+                                                candidate.data.stageData);
+    }
+}
+
+/**
+ * Executes the "trial" portion of a single plan until it
+ *   - reaches EOF,
+ *   - reaches the 'maxNumResults' limit,
+ *   - early exits via the TrialRunTracker, or
+ *   - returns a failure Status.
+ *
+ * All documents returned by the plan are enqueued into the 'CandidatePlan->results' queue.
+ */
+sbe::plan_ranker::CandidatePlan collectExecutionStatsForCachedPlan(
+    const PlannerDataForSBE& plannerData,
+    std::unique_ptr<QuerySolution> solution,
+    const AllIndicesRequiredChecker& indexExistenceChecker,
+    std::unique_ptr<sbe::PlanStage> root,
+    stage_builder::PlanStageData data,
+    size_t maxTrialPeriodNumReads) {
+    // If we have an aggregation pipeline, we should track results via kNumResults metric,
+    // instead of returned documents, because aggregation stages like $unwind or $group can change
+    // the amount of returned documents arbitrarily.
+    const size_t maxNumResults = trial_period::getTrialPeriodNumToReturn(*plannerData.cq);
+    const size_t maxTrialResults =
+        plannerData.cq->cqPipeline().empty() ? maxNumResults : std::numeric_limits<size_t>::max();
+    const size_t maxTrialResultsFromPlanningRoot =
+        plannerData.cq->cqPipeline().empty() ? 0 : maxNumResults;
+
+    sbe::plan_ranker::CandidatePlan candidate{
+        .solution = std::move(solution),
+        .root = std::move(root),
+        .data = sbe::plan_ranker::CandidatePlanData{std::move(data)},
+        .status = Status::OK(),
+        .fromPlanCache = true};
+    ON_BLOCK_EXIT([rootPtr = candidate.root.get()] { rootPtr->detachFromTrialRunTracker(); });
+
+    // Callback for the tracker when it exceeds any of the tracked metrics. If the tracker exceeds
+    // the number of reads before finishing the trial run, it means that the
+    // cached plan isn't performing as well as it used to and we'll need to replan, so we let the
+    // tracker terminate the trial. If the tracker reaches 'maxTrialResultsFromPlanningRoot'
+    // planning results, the trial run finishes and the plan is used to complete the query.
+    auto onMetricReached = [&candidate](TrialRunTracker::TrialRunMetric metric) {
+        switch (metric) {
+            case TrialRunTracker::kNumReads:
+                return true;  // terminate the trial run
+            case TrialRunTracker::kNumResults:
+                candidate.root->detachFromTrialRunTracker();
+                return false;  // upgrade the trial run into a normal one
+            default:
+                MONGO_UNREACHABLE;
+        }
+    };
+    candidate.data.tracker = std::make_unique<TrialRunTracker>(
+        std::move(onMetricReached), maxTrialResultsFromPlanningRoot, maxTrialPeriodNumReads);
+    candidate.root->attachToTrialRunTracker(
+        candidate.data.tracker.get(),
+        candidate.data.stageData.staticData->runtimePlanningRootNodeId);
+
+    sbe::TrialRuntimeExecutor{plannerData.opCtx,
+                              plannerData.collections,
+                              *plannerData.cq,
+                              plannerData.sbeYieldPolicy.get(),
+                              indexExistenceChecker,
+                              static_cast<size_t>(plannerData.cq->getExpCtx()
+                                                      ->getQueryKnobConfiguration()
+                                                      .getSbePlanEvaluationMaxMemoryBytes())}
+        .executeCachedCandidateTrial(&candidate, maxTrialResults);
+
+    return candidate;
+}
+
+// TODO SERVER-120501 Trigger replanning by throwing an exception, instead of creating another
+// planner.
+std::unique_ptr<PlannerInterface> replan(
+    PlannerDataForSBE plannerData,
+    const AllIndicesRequiredChecker& indexExistenceChecker,
+    std::string replanReason,
+    bool shouldCache,
+    const std::function<void()>& incrementReplanCounterCb,
+    const std::function<void()>& incrementReplannedPlanIsCachedPlanCounterCb) {
+    incrementReplanCounterCb();
+
+    // The trial run might have allowed DDL commands to be executed during yields. Check if the
+    // provided planner parameters still match the current view of the index catalog.
+    indexExistenceChecker.check(plannerData.opCtx, plannerData.collections);
+
+    // The plan drawn from the cache is being discarded, and should no longer be
+    // registered with the yield policy.
+    plannerData.sbeYieldPolicy->clearRegisteredPlans();
+
+    // Use the query planning module to plan the whole query.
+    auto solutions =
+        uassertStatusOK(QueryPlanner::plan(*plannerData.cq, *plannerData.plannerParams));
+
+    // There's a single solution, there's a special planner for just this case.
+    if (solutions.size() == 1) {
+        LOGV2_DEBUG(8523804,
+                    1,
+                    "Replanning of query resulted in a single query solution",
+                    "query"_attr = redact(plannerData.cq->toStringShort()),
+                    "shouldCache"_attr = (shouldCache ? "yes" : "no"));
+        return std::make_unique<SingleSolutionPassthroughPlanner>(
+            std::move(plannerData),
+            std::move(solutions[0]),
+            PlanSelectionStrategy::kSinglePlan,
+            std::move(replanReason));
+    }
+
+    // Multiple solutions. Resort to multiplanning.
+    LOGV2_DEBUG(8523805,
+                1,
+                "Query plan after replanning and its cache status",
+                "query"_attr = redact(plannerData.cq->toStringShort()),
+                "shouldCache"_attr = (shouldCache ? "yes" : "no"));
+    return std::make_unique<MultiPlanner>(std::move(plannerData),
+                                          std::move(solutions),
+                                          shouldCache,
+                                          incrementReplannedPlanIsCachedPlanCounterCb,
+                                          std::move(replanReason),
+                                          PlanSelectionStrategy::kMultiPlanner);
+}
+
+std::unique_ptr<PlannerInterface> attemptToUsePlan(
+    PlannerDataForSBE plannerData,
+    boost::optional<size_t> decisionReads,
+    std::unique_ptr<sbe::PlanStage> sbePlan,
+    stage_builder::PlanStageData planStageData,
+    std::unique_ptr<QuerySolution> solution,
+    const AllIndicesRequiredChecker& indexExistenceChecker,
+    const std::function<void(const PlannerData&)>& deactivateCb,
+    const std::function<void()>& incrementReplanCounterCb,
+    const std::function<void()>& incrementReplannedPlanIsCachedPlanCounterCb) {
+    const bool isPinnedCacheEntry = !decisionReads.has_value();
+    if (isPinnedCacheEntry) {
+        auto sbePlanAndData = std::make_pair(std::move(sbePlan), std::move(planStageData));
+        return std::make_unique<SingleSolutionPassthroughPlanner>(std::move(plannerData),
+                                                                  std::move(sbePlanAndData));
+    }
+
+    size_t maxReadsBeforeReplan = internalQueryCacheEvictionRatio.load() * *decisionReads;
+
+    // When the failpoint is active, force the cached plan to always be replanned by setting the
+    // threshold to zero.
+    if (MONGO_unlikely(planCacheAlwaysReplanSBE.shouldFail())) {
+        maxReadsBeforeReplan = 0;
+    }
+    auto candidate = collectExecutionStatsForCachedPlan(plannerData,
+                                                        std::move(solution),
+                                                        indexExistenceChecker,
+                                                        std::move(sbePlan),
+                                                        std::move(planStageData),
+                                                        maxReadsBeforeReplan);
+
+    auto getPlanSummary = [&]() {
+        return plan_cache_util::buildDebugInfo(plannerData.cq->nss(), candidate.solution.get())
+            .planSummary;
+    };
+
+    const bool deferredExecutorEnabled =
+        plannerData.cq->getExpCtx()->getIfrContext()->getSavedFlagValue(
+            feature_flags::gFeatureFlagGetExecutorDeferredEngineChoice);
+    if (!candidate.status.isOK()) {
+        // On failure, fall back to replanning the whole query. We neither evict the existing cache
+        // entry, nor cache the result of replanning.
+        LOGV2_DEBUG(8523802,
+                    1,
+                    "Execution of cached plan failed, falling back to replan",
+                    "query"_attr = redact(plannerData.cq->toStringShort()),
+                    "planSummary"_attr = getPlanSummary(),
+                    "error"_attr = candidate.status.toString());
+        std::string replanReason = str::stream() << "cached plan returned: " << candidate.status;
+        recoverWhereExpression(plannerData.cq, std::move(candidate));
+
+        if (deferredExecutorEnabled) {
+            // If we're using the deferred get_executor, we throw an exception which is caught be a
+            // higher level replanning try/catch, and will reuse the top-level planning path. If
+            // we're using the regular get_executor, this counter is incremented in `replan`.
+            incrementReplanCounterCb();
+            uassertStatusOK(Status(ReplanningRequiredInfo(plan_cache_util::CacheMode::NeverCache,
+                                                          *plannerData.cachedPlanSolutionHash),
+                                   std::move(replanReason)));
+        }
+
+        return replan(std::move(plannerData),
+                      indexExistenceChecker,
+                      std::move(replanReason),  // NOLINT(bugprone-use-after-move)
+                      /* shouldCache */ false,
+                      incrementReplanCounterCb,
+                      incrementReplannedPlanIsCachedPlanCounterCb);
+    }
+
+    if (candidate.stopCondition == MultiPlannerStopCondition::kExhaustedBudget) {
+        // The trial period took more than 'maxReadsBeforeReplan' physical reads. This plan may not
+        // be efficient any longer, so we replan from scratch.
+        auto numReads =
+            candidate.data.tracker->getMetric<TrialRunTracker::TrialRunMetric::kNumReads>();
+        LOGV2_DEBUG(
+            8523803,
+            1,
+            "Evicting cache entry for a query and replanning it since the number of required reads "
+            "mismatch the number of cached reads",
+            "maxReadsBeforeReplan"_attr = maxReadsBeforeReplan,
+            "decisionReads"_attr = decisionReads,
+            "numReads"_attr = numReads,
+            "query"_attr = redact(plannerData.cq->toStringShort()),
+            "planSummary"_attr = getPlanSummary());
+
+        deactivateCb(plannerData);
+
+        std::string replanReason = str::stream()
+            << "cached plan was less efficient than expected: expected trial execution to take "
+            << decisionReads << " reads but it took at least " << numReads << " reads";
+        recoverWhereExpression(plannerData.cq, std::move(candidate));
+
+        if (deferredExecutorEnabled) {
+            incrementReplanCounterCb();
+            uassertStatusOK(Status(ReplanningRequiredInfo(plan_cache_util::CacheMode::AlwaysCache,
+                                                          *plannerData.cachedPlanSolutionHash),
+                                   std::move(replanReason)));  // NOLINT(bugprone-use-after-move)
+        }
+        return replan(std::move(plannerData),
+                      indexExistenceChecker,
+                      std::move(replanReason),  // NOLINT(bugprone-use-after-move)
+                      /* shouldCache */ true,
+                      incrementReplanCounterCb,
+                      incrementReplannedPlanIsCachedPlanCounterCb);
+    }
+
+    // If the trial run did not exit early, it means no replanning is necessary and can return this
+    // candidate to the executor. All results generated during the trial are stored with the
+    // candidate so that the executor will be able to reuse them.
+    return std::make_unique<ValidCandidatePlanner>(std::move(plannerData), std::move(candidate));
+}
+}  // namespace
+
+PlannerGeneratorFromClassicCacheEntry::PlannerGeneratorFromClassicCacheEntry(
+    PlannerDataForSBE plannerDataArg,
+    std::unique_ptr<QuerySolution> solution,
+    boost::optional<size_t> decisionReads)
+    : _plannerData(std::move(plannerDataArg)),
+      _solution(std::move(solution)),
+      _decisionReads(decisionReads) {
+    LOGV2_DEBUG(8523445,
+                5,
+                "Building SBE plan from the classic plan cache",
+                "decisionReads"_attr = decisionReads);
+
+    // After retrieving a classic cache entry, we have a QSN tree for the winning plan. Now we
+    // lower it to SBE.
+    std::tie(_sbePlan, _planStageData) =
+        stage_builder::buildSlotBasedExecutableTree(_plannerData.opCtx,
+                                                    _plannerData.collections,
+                                                    *_plannerData.cq,
+                                                    *_solution,
+                                                    _plannerData.sbeYieldPolicy.get());
+}
+
+std::unique_ptr<PlannerInterface> PlannerGeneratorFromClassicCacheEntry::makePlanner() {
+    // Note that planStageData.debugInfo is not set here. This will be set when an explainer is
+    // created.
+    AllIndicesRequiredChecker indexExistenceChecker{_plannerData.collections};
+    auto deactivateEntry = [](const PlannerData& plannerData) {
+        auto& collection = plannerData.collections.getMainCollectionAcquisition();
+        auto classicCacheKey =
+            plan_cache_key_factory::make<PlanCacheKey>(*plannerData.cq, collection);
+        auto classicPlanCache =
+            CollectionQueryInfo::get(collection.getCollectionPtr()).getPlanCache();
+        size_t evictedCount = classicPlanCache->deactivate(classicCacheKey);
+        planCacheCounters.incrementClassicCachedPlansEvictedCounter(evictedCount);
+    };
+
+    return attemptToUsePlan(
+        std::move(_plannerData),
+        _decisionReads,
+        std::move(_sbePlan),
+        std::move(*_planStageData),
+        std::move(_solution),
+        indexExistenceChecker,
+        deactivateEntry,
+        []() { planCacheCounters.incrementClassicReplannedCounter(); },
+        []() { planCacheCounters.incrementClassicReplannedPlanIsCachedPlanCounter(); });
+}
+
+std::unique_ptr<PlannerInterface> PlannerGeneratorFromSbeCacheEntry::makePlanner() {
+    AllIndicesRequiredChecker indexExistenceChecker{_plannerData.collections};
+    const boost::optional<size_t> decisionReads = _cachedPlanHolder->decisionReads();
+    auto sbePlan = std::move(_cachedPlanHolder->cachedPlan->root);
+    auto planStageData = std::move(_cachedPlanHolder->cachedPlan->planStageData);
+    planStageData.debugInfo = _cachedPlanHolder->debugInfo;
+
+    LOGV2_DEBUG(8523404,
+                5,
+                "Recovering SBE plan from the SBE plan cache",
+                "decisionReads"_attr = decisionReads);
+
+    const auto& foreignHashJoinCollections = planStageData.staticData->foreignHashJoinCollections;
+    if (!_plannerData.cq->cqPipeline().empty() && !foreignHashJoinCollections.empty()) {
+        // We'd like to check if there is any foreign collection in the hash_lookup stage
+        // that is no longer eligible for using a hash_lookup plan. In this case we
+        // invalidate the cache and immediately replan without ever running a trial period.
+        const auto& secondaryCollectionsInfo = _plannerData.plannerParams->secondaryCollectionsInfo;
+
+        for (const auto& foreignCollection : foreignHashJoinCollections) {
+            const auto collectionInfo = secondaryCollectionsInfo.find(foreignCollection);
+            tassert(8832902,
+                    "Foreign collection must be present in the collections info",
+                    collectionInfo != secondaryCollectionsInfo.end());
+            tassert(8832901, "Foreign collection must exist", collectionInfo->second.exists);
+
+            if (!QueryPlannerAnalysis::isEligibleForHashJoin(
+                    _plannerData.cq->getExpCtx()->getQueryKnobConfiguration(),
+                    collectionInfo->second)) {
+                return replan(
+                    std::move(_plannerData),
+                    indexExistenceChecker,
+                    str::stream() << "Foreign collection "
+                                  << foreignCollection.toStringForErrorMsg()
+                                  << " is not eligible for hash join anymore",
+                    /* shouldCache */ true,
+                    []() { planCacheCounters.incrementSbeReplannedCounter(); },
+                    []() { planCacheCounters.incrementSbeReplannedPlanIsCachedPlanCounter(); });
+            }
+        }
+    }
+
+    auto deactivateEntry = [](const PlannerData& plannerData) {
+        // Deactivate the current cache entry.
+        auto& sbePlanCache = sbe::getPlanCache(plannerData.opCtx);
+        size_t evictedCount = sbePlanCache.deactivate(
+            plan_cache_key_factory::make(*plannerData.cq, plannerData.collections));
+        planCacheCounters.incrementSbeCachedPlansEvictedCounter(evictedCount);
+    };
+
+    return attemptToUsePlan(
+        std::move(_plannerData),
+        decisionReads,
+        std::move(sbePlan),
+        std::move(planStageData),
+        nullptr, /* solution */
+        indexExistenceChecker,
+        deactivateEntry,
+        []() { planCacheCounters.incrementSbeReplannedCounter(); },
+        []() { planCacheCounters.incrementSbeReplannedPlanIsCachedPlanCounter(); });
+}
+
+std::unique_ptr<PlannerInterface> makePlannerForSbeCacheEntry(
+    PlannerDataForSBE plannerData,
+    std::unique_ptr<sbe::CachedPlanHolder> cachedPlanHolder,
+    const size_t cachedSolutionHash) {
+    plannerData.cachedPlanSolutionHash = cachedSolutionHash;
+    PlannerGeneratorFromSbeCacheEntry generator(std::move(plannerData),
+                                                std::move(cachedPlanHolder));
+    return generator.makePlanner();
+}
+
+std::unique_ptr<PlannerInterface> makePlannerForClassicCacheEntry(
+    PlannerDataForSBE plannerData,
+    std::unique_ptr<QuerySolution> solution,
+    const size_t cachedSolutionHash,
+    boost::optional<size_t> decisionReads) {
+    plannerData.cachedPlanSolutionHash = cachedSolutionHash;
+    PlannerGeneratorFromClassicCacheEntry generator(
+        std::move(plannerData), std::move(solution), decisionReads);
+    return generator.makePlanner();
+}
+}  // namespace mongo::classic_runtime_planner_for_sbe

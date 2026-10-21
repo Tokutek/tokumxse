@@ -1,0 +1,44 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/coordinator_session.idl"
+
+enums:
+    ConfigsvrCoordinatorType:
+        description: "Coordinator type"
+        type: string
+        values:
+            kSetUserWriteBlockMode: "setUserWriteBlockMode"
+            kSetClusterParameter: "setClusterParameter"
+
+structs:
+    ConfigsvrCoordinatorId:
+        description: "Identifier for a specific instance of ConfigsvrCoordinator"
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            coordinatorType:
+                description: "Type of the ConfigsvrCoordinator"
+                type: ConfigsvrCoordinatorType
+            subId:
+                description: "Identifier to distinguish from other instances of same type"
+                type: string
+                optional: true
+
+    ConfigsvrCoordinatorMetadata:
+        description: "Common metadata for all ConfigsvrCoordinators"
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            _id:
+                cpp_name: id
+                type: ConfigsvrCoordinatorId
+            session:
+                type: CoordinatorSession
+                optional: true

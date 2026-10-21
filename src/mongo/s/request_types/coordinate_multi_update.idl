@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ShardsvrCoordinateMultiUpdateResponse:
+        description: "Response for the internal multi update command."
+        strict: false
+        is_command_reply: true
+        fields:
+            result:
+                type: object_owned
+                description: >-
+                    Stores the result of the underlying update command. If the MultiUpdateCoordinator 
+                    fails, the error reason will be stored here instead.
+                optional: true
+
+commands:
+    _shardsvrCoordinateMultiUpdate:
+        command_name: _shardsvrCoordinateMultiUpdate
+        cpp_name: ShardsvrCoordinateMultiUpdate
+        description: Command called by mongos when pauseMigrationsDuringMultiUpdates is enabled.
+        strict: false
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        fields:
+            uuid:
+                description: "The unique identifier for this multi update operation."
+                type: uuid
+                optional: false
+            command:
+                type: object
+                description: The original multi update command to coordinate.
+                optional: false

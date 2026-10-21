@@ -1,0 +1,19 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+# Visibility is restricted to because db-contrib-tool downloads binaries
+# from external sources at build time.
+# Non-hermetic external downloads should not influence the core build graph.
+package(default_visibility = [
+    "//:__pkg__",
+])
+
+sh_binary(
+    name = "db-contrib-tool",
+    srcs = ["db_contrib_tool.sh"],
+    data = [
+        "//bazel/resmoke:resmoke_mongo_version",
+        "//buildscripts:resmoke",
+        "@db_contrib_tool//:db-contrib-tool",
+    ],
+    env = {"DB_CONTRIB_TOOL": "$(rootpath @db_contrib_tool//:db-contrib-tool)"},
+)

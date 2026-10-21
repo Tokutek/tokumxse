@@ -1,0 +1,384 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/database_name_util.h"
+
+#include "mongo/bson/oid.h"
+#include "mongo/db/database_name.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+TEST(AuthDatabaseNameUtil, Deserialize) {
+
+    for (const bool multitenancy : {true, false}) {
+        unittest::ServerParameterGuard multitenanyController("multitenancySupport", multitenancy);
+
+        auto nss = AuthDatabaseNameUtil::deserialize("bar");
+        ASSERT_EQ(nss.db(omitTenant), "bar");
+
+        auto emptyNs = AuthDatabaseNameUtil::deserialize("");
+        ASSERT_EQ(emptyNs.db(omitTenant), "");
+    }
+}
+
+const auto stateDefault = SerializationContext::stateDefault();
+
+// TenantID is not included in serialization when multitenancySupport and
+// featureFlagRequireTenantID are enabled.
+TEST(DatabaseNameUtilTest, SerializeMultitenancySupportOnFeatureFlagRequireTenantIDOn) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", true);
+    TenantId tenantId(OID::gen());
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(tenantId, "foo");
+    ASSERT_EQ(DatabaseNameUtil::serialize(dbName, stateDefault), "foo");
+}
+
+// TenantID is included in serialization when multitenancySupport is enabled and
+// featureFlagRequireTenantID is disabled.
+TEST(DatabaseNameUtilTest, SerializeMultitenancySupportOnFeatureFlagRequireTenantIDOff) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", false);
+    TenantId tenantId(OID::gen());
+    std::string tenantDbStr = str::stream() << tenantId.toString() << "_foo";
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(tenantId, "foo");
+    ASSERT_EQ(DatabaseNameUtil::serialize(dbName, stateDefault), tenantDbStr);
+}
+
+// Serialize correctly when multitenancySupport is disabled.
+TEST(DatabaseNameUtilTest, SerializeMultitenancySupportOff) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", false);
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(boost::none, "foo");
+    ASSERT_EQ(DatabaseNameUtil::serialize(dbName, stateDefault), "foo");
+}
+
+// Assert that if multitenancySupport and featureFlagRequireTenantID are on, then tenantId is set.
+TEST(DatabaseNameUtilTest,
+     DeserializeAssertTenantIdSetMultitenancySupportOnFeatureFlagRequireTenantIDOn) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", true);
+    ASSERT_THROWS_CODE(
+        DatabaseNameUtil::deserialize(boost::none, "foo", SerializationContext::stateDefault()),
+        AssertionException,
+        7005300 /*"TenantId must be set"*/);
+}
+
+// If the database is an inernal db, it's acceptable not to have a tenantId even if
+// multitenancySupport and featureFlagRequireTenantID are on.
+TEST(DatabaseNameUtilTest,
+     DeserializeInternalDbTenantIdSetMultitenancySupportOnFeatureFlagRequireTenantIDOn) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", true);
+    DatabaseName dbName =
+        DatabaseNameUtil::deserialize(boost::none, "local", SerializationContext::stateDefault());
+    ASSERT_EQ(dbName, DatabaseName::kLocal);
+}
+
+// Deserialize DatabaseName using the tenantID as a parameter to the DatabaseName constructor
+// when multitenancySupport and featureFlagRequireTenantID are enabled and ns does not have prefixed
+// tenantID.
+TEST(DatabaseNameUtilTest,
+     DeserializeNSSWithoutPrefixedTenantIDMultitenancySupportOnFeatureFlagRequireTenantIDOn) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", true);
+    TenantId tenantId(OID::gen());
+    DatabaseName dbName =
+        DatabaseNameUtil::deserialize(tenantId, "foo", SerializationContext::stateDefault());
+    ASSERT_EQ(dbName.toString_forTest(), "foo");
+    ASSERT(dbName.tenantId());
+    ASSERT_EQ(dbName, DatabaseName::createDatabaseName_forTest(tenantId, "foo"));
+}
+
+// Deserialize DatabaseName when multitenancySupport is enabled and featureFlagRequireTenantID is
+// disabled.
+TEST(DatabaseNameUtilTest, DeserializeMultitenancySupportOnFeatureFlagRequireTenantIDOff) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", false);
+    TenantId tenantId(OID::gen());
+    std::string tenantDbStr = str::stream() << tenantId.toString() << "_foo";
+    DatabaseName dbName = DatabaseNameUtil::deserialize(
+        boost::none, tenantDbStr, SerializationContext::stateDefault());
+    DatabaseName dbName1 =
+        DatabaseNameUtil::deserialize(tenantId, tenantDbStr, SerializationContext::stateDefault());
+    ASSERT_EQ(dbName.toString_forTest(), "foo");
+    ASSERT(dbName.tenantId());
+    ASSERT_EQ(dbName, DatabaseName::createDatabaseName_forTest(tenantId, "foo"));
+    ASSERT_EQ(dbName, dbName1);
+}
+
+// Assert tenantID is not initialized when multitenancySupport is disabled.
+TEST(DatabaseNameUtilTest, DeserializeMultitenancySupportOff) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", false);
+    TenantId tenantId(OID::gen());
+    ASSERT_THROWS_CODE(
+        DatabaseNameUtil::deserialize(tenantId, "foo", SerializationContext::stateDefault()),
+        AssertionException,
+        7005302);
+}
+
+// Deserialize DatabaseName with prefixed tenantId when multitenancySupport and
+// featureFlagRequireTenantId are disabled.
+TEST(DatabaseNameUtilTest,
+     DeserializeWithTenantIdInStringMultitenancySupportOffFeatureFlagRequireTenantIDOff) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", false);
+    TenantId tenantId(OID::gen());
+    std::string dbNameStr = str::stream() << tenantId.toString() << "_foo";
+    DatabaseName dbName =
+        DatabaseNameUtil::deserialize(boost::none, dbNameStr, SerializationContext::stateDefault());
+    ASSERT_EQ(dbName.tenantId(), boost::none);
+    ASSERT_EQ(dbName.toString_forTest(), dbNameStr);
+}
+
+// Deserialize DatabaseName when multitenancySupport and featureFlagRequireTenantID are disabled.
+TEST(DatabaseNameUtilTest, DeserializeMultitenancySupportOffFeatureFlagRequireTenantIDOff) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", false);
+    unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID", false);
+    DatabaseName dbName =
+        DatabaseNameUtil::deserialize(boost::none, "foo", SerializationContext::stateDefault());
+    ASSERT_EQ(dbName.toString_forTest(), "foo");
+    ASSERT(!dbName.tenantId());
+    ASSERT_EQ(dbName, DatabaseName::createDatabaseName_forTest(boost::none, "foo"));
+}
+
+// We will focus on specific configurations of the SerializationContext ie. Command Request and
+// Command Reply as this is a defaulted parameter where tests that don't specify this parameter
+// already test the default codepath.
+
+TEST(DatabaseNameUtilTest, SerializeExpectPrefixFalse_CommandReply) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    TenantId tenantId(OID::gen());
+    const std::string dbnString = "foo";
+    const std::string dbnPrefixString = str::stream() << tenantId.toString() << "_" << dbnString;
+
+    SerializationContext ctxt(SerializationContext::stateCommandReply());
+
+    {  // No prefix, no tenantId.
+        // request --> { ns: database.coll }
+        auto dbName = DatabaseName::createDatabaseName_forTest(boost::none, dbnString);
+        ASSERT_EQ(DatabaseNameUtil::serialize(dbName, ctxt), dbnString);
+    }
+
+    {  // Has prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy
+        // request --> { ns: tenantId_database.coll}
+        auto dbName = DatabaseName::createDatabaseName_forTest(boost::none, dbnPrefixString);
+        ASSERT_EQ(DatabaseNameUtil::serialize(dbName, ctxt), dbnPrefixString);
+    }
+}
+
+// Serializing with SerializationContext, with an expectPrefix set to true
+TEST(DatabaseNameUtilTest, SerializeExpectPrefixTrue_CommandReply) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    TenantId tenantId(OID::gen());
+    const std::string dbnString = "foo";
+    const std::string dbnPrefixString = str::stream() << tenantId.toString() << "_" << dbnString;
+
+    SerializationContext ctxt(SerializationContext::stateCommandReply());
+    ctxt.setPrefixState(true);
+
+    {  // No prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
+        // request --> { ns: database.coll, expectPrefix: true }
+        auto dbName = DatabaseName::createDatabaseName_forTest(tenantId, dbnString);
+        ASSERT_EQ(DatabaseNameUtil::serialize(dbName, ctxt), dbnPrefixString);
+    }
+
+    {  // Has prefix, has tenantId.
+        // request -->  { ns: tenantId_database.coll, expectPrefix: true }
+        const std::string nsDoublePrefixString = str::stream()
+            << tenantId.toString() << "_" << tenantId.toString() << "_" << dbnString;
+        auto dbName = DatabaseName::createDatabaseName_forTest(tenantId, dbnPrefixString);
+        ASSERT_EQ(DatabaseNameUtil::serialize(dbName, ctxt), nsDoublePrefixString);
+    }
+}
+
+TEST(DatabaseNameUtilTest, Serialize_StorageCatalog) {
+    TenantId tenantId(OID::gen());
+    const std::string dbnString = "foo";
+    const std::string dbnPrefixString = str::stream() << tenantId.toString() << "_" << dbnString;
+
+    {
+        unittest::ServerParameterGuard multitenanyController("multitenancySupport", false);
+        {  // No prefix, no tenantId.
+            // request --> { ns: database.coll }
+            auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbnString, SerializationContext::stateCatalog());
+            ASSERT_EQ(dbName.tenantId(), boost::none);
+            ASSERT_EQ(DatabaseNameUtil::serialize(dbName, SerializationContext::stateCatalog()),
+                      dbnString);
+        }
+
+        {  // Has prefix, no tenantId. Storage catalog always returns prefixed dbname.
+            // request --> { ns: tenantId_database.coll }
+            auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbnPrefixString, SerializationContext::stateCatalog());
+            ASSERT_EQ(dbName.tenantId(), boost::none);
+            ASSERT_EQ(DatabaseNameUtil::serialize(dbName, SerializationContext::stateCatalog()),
+                      dbnPrefixString);
+        }
+    }
+
+    {
+        unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+        {  // No prefix, no tenantId.
+            // request --> { ns: database.coll }
+            auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbnString, SerializationContext::stateCatalog());
+            ASSERT_EQ(dbName.tenantId(), boost::none);
+            ASSERT_EQ(DatabaseNameUtil::serialize(dbName, SerializationContext::stateCatalog()),
+                      dbnString);
+        }
+
+        {  // Has prefix, no tenantId. Storage catalog always returns prefixed dbname.
+            // request --> { ns: tenantId_database.coll }
+            auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbnPrefixString, SerializationContext::stateCatalog());
+            ASSERT_EQ(dbName.tenantId(), tenantId);
+            ASSERT_EQ(DatabaseNameUtil::serialize(dbName, SerializationContext::stateCatalog()),
+                      dbnPrefixString);
+        }
+    }
+}
+
+TEST(DatabaseNameUtilTest, DeserializeExpectPrefixFalse_CommandRequest) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    TenantId tenantId(OID::gen());
+    const std::string dbnString = "foo";
+    const std::string dbnPrefixString = str::stream() << tenantId.toString() << "_" << dbnString;
+
+    SerializationContext ctxt(SerializationContext::stateCommandRequest());
+
+    {
+        // No prefix, no tenantId.
+        // request --> { ns: database.coll }
+        ASSERT_THROWS_CODE(DatabaseNameUtil::deserialize(boost::none, dbnString, ctxt),
+                           AssertionException,
+                           8423388 /*"TenantId must be set"*/);
+    }
+
+    {  // Has prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy
+        // request --> { ns: tenantId_database.coll }
+        ASSERT_THROWS_CODE(DatabaseNameUtil::deserialize(boost::none, dbnPrefixString, ctxt),
+                           AssertionException,
+                           8233503);
+    }
+
+    {  // No prefix, has tenantId.
+        // request --> { ns: database.coll }
+        auto dbName = DatabaseNameUtil::deserialize(tenantId, dbnString, ctxt);
+        ASSERT_EQ(dbName.tenantId(), tenantId);
+        ASSERT_EQ(dbName.toString_forTest(), dbnString);
+    }
+
+    {
+        // Has prefix, has tenantId. ** Allowed however the prefix is *not* extracted.
+        auto dbName = DatabaseNameUtil::deserialize(tenantId, "foo_bar", ctxt);
+        ASSERT_EQ(dbName.tenantId(), tenantId);
+        ASSERT_EQ(dbName.toString_forTest(), "foo_bar");
+
+        // The prefix could be a valid tenant string.
+        dbName = DatabaseNameUtil::deserialize(tenantId, dbnPrefixString, ctxt);
+        ASSERT_EQ(dbName.tenantId(), tenantId);
+        ASSERT_EQ(dbName.toString_forTest(), dbnPrefixString);
+    }
+}
+
+TEST(DatabaseNameUtilTest, DeserializeExpectPrefixTrue_CommandRequest) {
+    unittest::ServerParameterGuard multitenanyController("multitenancySupport", true);
+    TenantId tenantId(OID::gen());
+    const std::string dbnString = "foo";
+    const std::string dbnPrefixString = str::stream() << tenantId.toString() << "_" << dbnString;
+
+    SerializationContext ctxt(SerializationContext::stateCommandRequest());
+    ctxt.setPrefixState(true);
+
+    {
+        // No prefix, no tenantId.  *** we shouldn't see this from Atlas Proxy in MT mode
+        // request --> { ns: database.coll, expectPrefix: true }
+        ASSERT_THROWS_CODE(DatabaseNameUtil::deserialize(boost::none, dbnString, ctxt),
+                           AssertionException,
+                           8423388 /*"TenantId must be set"*/);
+    }
+
+    {  // Has prefix, no tenantId. Not Valid.
+        // request --> { ns: tenantId_database.coll, expectPrefix: true }
+        ASSERT_THROWS_CODE(DatabaseNameUtil::deserialize(boost::none, dbnPrefixString, ctxt),
+                           AssertionException,
+                           8233503);
+    }
+
+    {  // No prefix, has tenantId.  *** we shouldn't see this from Atlas Proxy
+        // request --> { ns: database.coll, expectPrefix: true }
+        ASSERT_THROWS_CODE(
+            DatabaseNameUtil::deserialize(tenantId, dbnString, ctxt), AssertionException, 8423386);
+    }
+
+    {  // Has prefix, has tenantId.
+        // request -->  { ns: tenantId_database.coll, expectPrefix: true }
+        auto dbName = DatabaseNameUtil::deserialize(tenantId, dbnPrefixString, ctxt);
+        ASSERT_EQ(dbName.tenantId(), tenantId);
+        ASSERT_EQ(dbName.toString_forTest(), dbnString);
+    }
+}
+
+TEST(DatabaseNameUtilTest, ParseFailPointData) {
+    const TenantId tid = TenantId(OID::gen());
+
+    for (bool multitenancy : {false, true}) {
+        unittest::ServerParameterGuard multitenancyController("multitenancySupport", multitenancy);
+        // Test fail point data has tenantId
+        {
+            auto fpData = BSON("a" << "1"
+                                   << "db"
+                                   << "myDb"
+                                   << "tenantId" << tid);
+            if (multitenancy) {
+                auto dbName = DatabaseNameUtil::parseFailPointData(fpData, "db"sv);
+                ASSERT_EQ(DatabaseName::createDatabaseName_forTest(tid, "myDb"), dbName);
+            } else {
+                ASSERT_THROWS_CODE(DatabaseNameUtil::parseFailPointData(fpData, "db"sv),
+                                   AssertionException,
+                                   7005302);
+            }
+        }
+        // Test fail point data only has tenantId
+        {
+            auto fpData = BSON("tenantId" << tid);
+            if (multitenancy) {
+                auto dbName = DatabaseNameUtil::parseFailPointData(fpData, "db"sv);
+                ASSERT_EQ(DatabaseName::createDatabaseName_forTest(tid, ""), dbName);
+            } else {
+                ASSERT_THROWS_CODE(DatabaseNameUtil::parseFailPointData(fpData, "db"sv),
+                                   AssertionException,
+                                   7005302);
+            }
+        }
+        // Test fail point data has no tenantId
+        {
+            auto fpData = BSON("b" << "2"
+                                   << "db"
+                                   << "myDb");
+            const auto dbName = DatabaseNameUtil::parseFailPointData(fpData, "db"sv);
+            ASSERT_EQ(DatabaseName::createDatabaseName_forTest(boost::none, "myDb"), dbName);
+        }
+        // Test fail point data only has db
+        {
+            auto fpData = BSON("db" << "myDb");
+            const auto dbName = DatabaseNameUtil::parseFailPointData(fpData, "db"sv);
+            ASSERT_EQ(DatabaseName::createDatabaseName_forTest(boost::none, "myDb"), dbName);
+        }
+        // Test fail point data empty
+        {
+            auto dbName = DatabaseNameUtil::parseFailPointData(BSONObj(), "db"sv);
+            ASSERT_EQ(DatabaseName(), dbName);
+        }
+    }
+}
+
+}  // namespace mongo

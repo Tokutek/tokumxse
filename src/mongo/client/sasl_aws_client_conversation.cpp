@@ -1,0 +1,216 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/client/sasl_aws_client_conversation.h"
+
+#include "mongo/base/data_builder.h"
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/client/sasl_aws_client_options.h"
+#include "mongo/client/sasl_aws_client_protocol.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/http_client.h"
+#include "mongo/util/str.h"
+
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include <boost/move/utility_core.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
+namespace mongo {
+namespace awsIam {
+SASLAwsClientGlobalParams saslAwsClientGlobalParams;
+}  // namespace awsIam
+
+namespace {
+std::string getDefaultEC2Host() {
+    return awsIam::saslAwsClientGlobalParams.awsEC2InstanceMetadataUrl;
+}
+
+std::string getDefaultECSHost() {
+    return awsIam::saslAwsClientGlobalParams.awsECSInstanceMetadataUrl;
+}
+
+std::string_view toString(DataBuilder& builder) {
+    ConstDataRange cdr = builder.getCursor();
+    std::string_view str;
+    cdr.readInto<std::string_view>(&str);
+    return str;
+}
+
+std::string_view nullableStringView(const char* p) {
+    return p ? p : std::string_view{};
+}
+
+}  // namespace
+
+SaslAWSClientConversation::SaslAWSClientConversation(SaslClientSession* saslClientSession)
+    : SaslClientConversation(saslClientSession) {}
+
+awsIam::AWSCredentials SaslAWSClientConversation::_getCredentials() const {
+
+    if (_saslClientSession->hasParameter(SaslClientSession::parameterUser) &&
+        _saslClientSession->hasParameter(SaslClientSession::parameterPassword)) {
+        return _getUserCredentials();
+    } else {
+        return _getLocalAWSCredentials();
+    }
+}
+
+awsIam::AWSCredentials SaslAWSClientConversation::_getUserCredentials() const {
+    if (_saslClientSession->hasParameter(SaslClientSession::parameterAWSSessionToken)) {
+        return awsIam::AWSCredentials(
+            std::string{_saslClientSession->getParameter(SaslClientSession::parameterUser)},
+            std::string{_saslClientSession->getParameter(SaslClientSession::parameterPassword)},
+            std::string{
+                _saslClientSession->getParameter(SaslClientSession::parameterAWSSessionToken)});
+    }
+
+    return awsIam::AWSCredentials(
+        std::string{_saslClientSession->getParameter(SaslClientSession::parameterUser)},
+        std::string{_saslClientSession->getParameter(SaslClientSession::parameterPassword)});
+}
+
+awsIam::AWSCredentials SaslAWSClientConversation::_getLocalAWSCredentials() const {
+    // Check the environment variables
+    // These are set by AWS Lambda to pass in credentials and can be set by users.
+    auto awsAccessKeyId = nullableStringView(getenv("AWS_ACCESS_KEY_ID"));
+    auto awsSecretAccessKey = nullableStringView(getenv("AWS_SECRET_ACCESS_KEY"));
+    auto awsSessionToken = nullableStringView(getenv("AWS_SESSION_TOKEN"));
+
+    if (!awsAccessKeyId.empty() && !awsSecretAccessKey.empty()) {
+        if (!awsSessionToken.empty()) {
+            return awsIam::AWSCredentials(std::string{awsAccessKeyId},
+                                          std::string{awsSecretAccessKey},
+                                          std::string{awsSessionToken});
+        }
+
+        return awsIam::AWSCredentials(std::string{awsAccessKeyId}, std::string{awsSecretAccessKey});
+    }
+
+    auto ecsMetadata = nullableStringView(getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
+    if (!ecsMetadata.empty()) {
+        return _getEcsCredentials(ecsMetadata);
+    }
+    return _getEc2Credentials();
+}
+
+
+awsIam::AWSCredentials SaslAWSClientConversation::_getEc2Credentials() const {
+    try {
+
+        std::unique_ptr<HttpClient> httpClient = HttpClient::create();
+
+        // The local web server is just a normal HTTP server
+        httpClient->allowInsecureHTTP(true);
+
+        // Get the token for authenticating with Instance Metadata Version 2
+        // Set a lifetime of 30 seconds since we are only going to use this token for one set of
+        // requests.
+        std::vector<std::string> headers{"X-aws-ec2-metadata-token-ttl-seconds: 30", "Expect:"};
+        httpClient->setHeaders(headers);
+        DataBuilder getToken = httpClient->put(getDefaultEC2Host() + "/latest/api/token",
+                                               ConstDataRange(nullptr, nullptr));
+
+        std::string_view token = toString(getToken);
+
+        headers.clear();
+        headers.push_back("X-aws-ec2-metadata-token: " + std::string{token});
+        httpClient->setHeaders(headers);
+
+        // Retrieve the role attached to the EC2 instance
+        DataBuilder getRoleResult =
+            httpClient->get(getDefaultEC2Host() + "/latest/meta-data/iam/security-credentials/");
+
+        std::string_view getRoleOutput = toString(getRoleResult);
+
+        std::string role = awsIam::parseRoleFromEC2IamSecurityCredentials(getRoleOutput);
+
+        // Retrieve the temporary credentials of the EC2 instance
+        DataBuilder getRoleCredentialsResult = httpClient->get(
+            str::stream() << getDefaultEC2Host() + "/latest/meta-data/iam/security-credentials/"
+                          << role);
+
+        std::string_view getRoleCredentialsOutput = toString(getRoleCredentialsResult);
+
+        return awsIam::parseCredentialsFromEC2IamSecurityCredentials(getRoleCredentialsOutput);
+    } catch (const DBException& e) {
+        // Wrap exceptions from HTTP to make them clearer
+        uassertStatusOKWithContext(
+            e.toStatus(),
+            "Failed to retrieve EC2 Instance Metadata Service Credentials. Ensure there is a role "
+            "via an instance profile assigned to this machine.");
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+awsIam::AWSCredentials SaslAWSClientConversation::_getEcsCredentials(
+    std::string_view relativeUri) const {
+    try {
+
+        std::unique_ptr<HttpClient> httpClient = HttpClient::create();
+
+        // The local web server is just a normal HTTP server
+        httpClient->allowInsecureHTTP(true);
+
+        // Retrieve the security token attached to the ECS task
+        DataBuilder getRoleResult = httpClient->get(getDefaultECSHost() + std::string{relativeUri});
+
+        std::string_view getRoleOutput = toString(getRoleResult);
+
+        return awsIam::parseCredentialsFromECSTaskIamCredentials(getRoleOutput);
+    } catch (const DBException& e) {
+        // Wrap exceptions from HTTP to make them clearer
+        uassertStatusOKWithContext(e.toStatus(),
+                                   "Failed to retrieve ECS Tasks Metadata Credentials. Ensure "
+                                   "there is an execution role assigned to this ECS task.");
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+StatusWith<bool> SaslAWSClientConversation::step(std::string_view inputData,
+                                                 std::string* outputData) {
+    if (_step > 2) {
+        return Status(ErrorCodes::AuthenticationFailed,
+                      str::stream() << "Invalid AWS authentication step: " << _step);
+    }
+
+    _step++;
+
+    try {
+        if (_step == 1) {
+            return _firstStep(outputData);
+        }
+
+        return _secondStep(inputData, outputData);
+    } catch (...) {
+        return exceptionToStatus();
+    }
+}
+
+StatusWith<bool> SaslAWSClientConversation::_firstStep(std::string* outputData) {
+
+    *outputData = awsIam::generateClientFirst(&_clientNonce);
+
+    return false;
+}
+
+StatusWith<bool> SaslAWSClientConversation::_secondStep(std::string_view inputData,
+                                                        std::string* outputData) {
+    auto credentials = _getCredentials();
+
+    *outputData = awsIam::generateClientSecond(inputData, _clientNonce, credentials);
+
+    return true;
+}
+
+}  // namespace mongo

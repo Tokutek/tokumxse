@@ -1,0 +1,54 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of drop database coordinator persisted documents.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/global_catalog/type_collection.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+enums:
+    DropDatabaseCoordinatorPhase:
+        description: "The current phase of a drop database coordinator."
+        type: string
+        values:
+            kUnset: "unset"
+            kDrop: "drop"
+
+types:
+    CollectionInfo:
+        description: "Information of the collection to drop."
+        bson_serialization_type: object
+        cpp_type: CollectionType
+        serializer: "mongo::CollectionType::toBSON"
+        deserializer: "mongo::CollectionType"
+        is_view: false
+
+structs:
+    DropDatabaseCoordinatorDocument:
+        description: "Represents a drop database operation on the coordinator shard."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                type: DropDatabaseCoordinatorPhase
+                default: kUnset
+            collInfo:
+                description: "Sharded/Unsplittable collection currently being dropped."
+                type: CollectionInfo
+                optional: true
+            collChangeStreamsNotifier:
+                type: shard_id
+                description:
+                    "The identity of the Shard that will generate the op log entries about the sharded/unsplittable collection being dropped
+                    (which drive the behavior of change stream readers V2)."
+                optional: true

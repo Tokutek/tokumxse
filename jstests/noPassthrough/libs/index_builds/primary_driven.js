@@ -1,0 +1,2654 @@
+/**
+ * Test library for resumable primary-driven index builds.
+ *
+ * Typical usage:
+ *
+ *   import {
+ *       PrimaryDrivenResumableIndexBuildTest,
+ *       PdibPhase,
+ *   } from "jstests/noPassthrough/libs/index_builds/primary_driven.js";
+ *
+ *   const rst = PrimaryDrivenResumableIndexBuildTest.setUp();
+ *
+ *   PrimaryDrivenResumableIndexBuildTest.run(rst, {phase: PdibPhase.SCAN});
+ *   PrimaryDrivenResumableIndexBuildTest.run(rst, {phase: PdibPhase.LOAD});
+ *   PrimaryDrivenResumableIndexBuildTest.run(rst, {phase: PdibPhase.DRAIN});
+ *
+ *   PrimaryDrivenResumableIndexBuildTest.tearDown(rst);
+ *
+ * One run() call exercises all three positions (beginning, middle, end) of the given phase,
+ * dropping and re-creating the test collection between positions.
+ */
+
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_builds/index_build.js";
+import {
+    findOtelFilesWithSuffix,
+    otelFileExportParams,
+} from "jstests/noPassthrough/observability/libs/otel_metrics_file_export_helpers.js";
+
+/**
+ * Which phase of the primary-driven index build to pause at before forcing a resume via step-up.
+ *
+ * @enum {string}
+ */
+export const PdibPhase = Object.freeze({
+    SCAN: "scan",
+    LOAD: "load",
+    DRAIN: "drain",
+});
+
+/**
+ * Where within a phase the build should be paused before forcing a resume.
+ *
+ * @enum {string}
+ */
+export const PdibPosition = Object.freeze({
+    BEGINNING: "beginning",
+    MIDDLE: "middle",
+    END: "end",
+});
+
+/**
+ * What to do with the old primary after each step-up.
+ *
+ * @enum {string}
+ */
+export const PdibFailoverMode = Object.freeze({
+    NO_RESTART: "noRestart", // Leave it running; it becomes a secondary in-process.
+    CLEAN_RESTART: "cleanRestart", // SIGTERM + restart.
+    UNCLEAN_RESTART: "uncleanRestart", // SIGKILL + restart.
+});
+
+const ALL_POSITIONS = [PdibPosition.BEGINNING, PdibPosition.MIDDLE, PdibPosition.END];
+
+// Each entry maps a phase to the fail point that pauses it and the log ID that fires when the fail
+// point is hit. matchKey is the name of the array field in the fail-point data that the server
+// compares against ("buildUUIDs" or "indexNames").
+const PHASE_FAIL_POINTS = {
+    [PdibPhase.SCAN]: {
+        failPointName: "hangIndexBuildDuringCollectionScanPhaseBeforeInsertion",
+        logId: 20386,
+        matchKey: "buildUUIDs",
+    },
+    [PdibPhase.LOAD]: {
+        failPointName: "hangIndexBuildDuringBulkLoadPhase",
+        logId: 4924400,
+        matchKey: "indexNames",
+    },
+    [PdibPhase.DRAIN]: {
+        failPointName: "hangIndexBuildDuringDrainWritesPhase",
+        logId: 4841800,
+        matchKey: "indexNames",
+    },
+};
+
+const DEFAULT_DOC_COUNT = 3_000;
+const DEFAULT_INDEX_NAME = "pdib_resumable_idx";
+const DEFAULT_SIDE_WRITES_COUNT = 8;
+// We always build three indexes in a single createIndexes call so that PdibPosition can pick
+// "first/middle/last" index for the per-phase fail points whose matchKey is `indexNames`.
+const DEFAULT_INDEX_COUNT = 3;
+// The document fields present in every seeded doc. Each is covered by exactly one index below:
+// `a` by the unique index, `b` by the wildcard, `c` by the standard index.
+const DEFAULT_INDEX_KEYS = ["a", "b", "c"];
+// The three index specs built in one createIndexes call, in the fixed order that PdibPosition maps to
+// (beginning → [0], middle → [1], end → [2]; see indexNameForPosition). Each entry is a full
+// createIndexes spec minus `name` (the test assigns the name). We deliberately mix three index
+// types so a single resume exercises all of them:
+//   [0] unique   — {a:1}; `a` is a unique scalar key.
+//   [1] wildcard — {"$**":1} projected to `b`; multikey via the two-element array `b`
+//   [2] standard — {c:1}; multikey because `c` is array-valued
+const DEFAULT_INDEX_SPECS = [
+    {key: {a: 1}, unique: true},
+    {key: {"$**": 1}, wildcardProjection: {b: 1}},
+    {key: {c: 1}},
+];
+// Per-field key pad sizes (bytes), applied to fields a/b/c in defaultDocTemplate. Different sizes
+// mean the sorters fill at different rates and spill at different points — richer coverage than
+// identical sorters spilling in lock-step. With docCount=3000 and a 1 MB / index sorter budget the
+// three indexes spill roughly 4 / 3 / 1 times. `b` is padded to 500 (half of the others' "natural"
+// size) because it holds two array elements, so the wildcard-on-`b` still indexes ~1 KB of key data
+// per document.
+const DEFAULT_PAD_BYTES = [1500, 500, 500];
+// `maxIndexBuildMemoryUsageMegabytes` is divided across all indexes in the build. With 3 indexes
+// we want each sorter to behave like the original single-index test (1 MB / index → ~10 spills
+// over 10 MB of keys), so the total is DEFAULT_INDEX_COUNT MB.
+const DEFAULT_MAX_INDEX_BUILD_MEM_MB = DEFAULT_INDEX_COUNT;
+// 100 gives ~30 checkpoints per index over the default 3k keys — plenty for "multiple writes
+// during load".
+const DEFAULT_LOAD_RESUME_STATE_WRITE_INTERVAL_KEYS = 100;
+
+const RESUME_SUCCEEDED_METRIC = "mongodb.serverStatus.indexBuilds.resume.succeeded";
+const RESUME_FAILED_METRIC = "mongodb.serverStatus.indexBuilds.resume.failed";
+
+// Server-side phase strings emitted as the `phase` attribute on index_builds.resume.succeeded.
+const RESUME_PHASE_INITIALIZED = "initialized";
+const RESUME_PHASE_SCAN = "collection scan";
+const RESUME_PHASE_LOAD = "bulk load";
+const RESUME_PHASE_DRAIN = "drain writes";
+
+// Which `phase` attributes are plausible for each (PdibPhase, PdibPosition). At "beginning" of a
+// phase the most recent checkpoint may still be from the prior phase, so we accept either.
+// "middle"/"end" should always reflect the current phase.
+const EXPECTED_RESUME_PHASES = {
+    [PdibPhase.SCAN]: {
+        [PdibPosition.BEGINNING]: [RESUME_PHASE_INITIALIZED, RESUME_PHASE_SCAN],
+        [PdibPosition.MIDDLE]: [RESUME_PHASE_SCAN],
+        [PdibPosition.END]: [RESUME_PHASE_SCAN],
+    },
+    [PdibPhase.LOAD]: {
+        [PdibPosition.BEGINNING]: [RESUME_PHASE_SCAN, RESUME_PHASE_LOAD],
+        [PdibPosition.MIDDLE]: [RESUME_PHASE_LOAD],
+        [PdibPosition.END]: [RESUME_PHASE_LOAD],
+    },
+    [PdibPhase.DRAIN]: {
+        [PdibPosition.BEGINNING]: [RESUME_PHASE_DRAIN],
+        [PdibPosition.MIDDLE]: [RESUME_PHASE_DRAIN],
+        [PdibPosition.END]: [RESUME_PHASE_DRAIN],
+    },
+};
+
+function defaultDocTemplate(i) {
+    // Each field gets a string whose length is set by `DEFAULT_PAD_BYTES`. Varying sizes mean the
+    // sorters fill at different rates and spill at different points, exercising a more realistic mix
+    // of per-index resume-state checkpoint boundaries than lock-step sorters would. The field shapes
+    // also drive the index-type coverage in DEFAULT_INDEX_SPECS:
+    //   a — scalar, and unique (the zero-padded prefix makes it distinct per document).
+    //   b — two-element array. `b` is indexed only by the {"$**":1} wildcard (the middle-position
+    //       index), so making it multi-valued gives genuine multi-element multikey coverage without
+    //       perturbing the end-position index's per-document key count.
+    //   c — single-element array. Enough to mark the {c:1} index multikey while still emitting
+    //       exactly one key per document, so the LOAD/DRAIN end-position key-count math (which
+    //       assumes ~1 key per doc for index[2]) stays intact.
+    const prefix = String(i).padStart(8, "0");
+    const pad = (n, ch = "x") => prefix + ch.repeat(n);
+    return {
+        _id: i,
+        a: pad(DEFAULT_PAD_BYTES[0]),
+        b: [pad(DEFAULT_PAD_BYTES[1], "x"), pad(DEFAULT_PAD_BYTES[1], "y")],
+        c: [pad(DEFAULT_PAD_BYTES[2])],
+    };
+}
+
+/**
+ * A document template for building the same three index types as `DEFAULT_INDEX_SPECS` (index[0]
+ * {a:1} unique, index[1] {"$**":1} on `b`, index[2] {c:1}) but with the per-field key sizes skewed
+ * so that only one of the three sorters spills to disk. With the default 3000-document count and a
+ * 3 MB (1 MB / index) budget:
+ *   a — padded to ~2 KB → ~6 MB of key data over 3000 docs, well past its 1 MB budget ⇒ SPILLS.
+ *   b — two short (prefix-only) array elements → ~tens of KB total ⇒ never spills.
+ *   c — one short array element → ~tens of KB total ⇒ never spills.
+ * This yields the mixed spilled/in-memory sorter state used by the mixed-spilling tests while
+ * preserving the field shapes the default index specs rely on (unique scalar `a`, multi-element
+ * array `b`, single-element `c`).
+ */
+export function mixedSpillingDocTemplate(i) {
+    const prefix = String(i).padStart(8, "0");
+    return {
+        _id: i,
+        a: prefix + "x".repeat(2000),
+        b: [prefix + "y", prefix + "z"],
+        c: [prefix],
+    };
+}
+
+// Number of array elements in `c`, and the padding on each, for `multiKeySpillingDocTemplate`. One
+// document therefore contributes MULTIKEY_SPILLING_KEYS_PER_DOC keys of ~1 KB each (~100 KB) to the
+// {c:1} sorter — small relative to that sorter's budget (see MULTIKEY_SPILLING_OPTIONS), so a spill
+// lands at an arbitrary key of an arbitrary document rather than at a document boundary.
+const MULTIKEY_SPILLING_KEYS_PER_DOC = 100;
+const MULTIKEY_SPILLING_ELEMENT_PAD_BYTES = 1_000;
+
+// Options that `multiKeySpillingDocTemplate` needs so that a sorter spill lands in the middle of one
+// document's keys. Spread these into the `run()` options.
+export const MULTIKEY_SPILLING_OPTIONS = Object.freeze({
+    docTemplate: multiKeySpillingDocTemplate,
+    // Split across the three indexes this is 5 MB per sorter. It must stay well above the sorter's
+    // memory-pool block cap (`operationMemoryPoolBlockMaxSizeKB`, 2 MB by default): a document's
+    // keys are allocated from that pool before they are added to the sorter, and the sorter charges
+    // itself the pool's usage, so with a budget near or below the block size the spill would trip on
+    // the first key of a document instead of part-way through it.
+    maxIndexBuildMemoryUsageMegabytes: 15,
+    // ~100 KB of {c:1} keys per document against a 5 MB sorter budget means a spill roughly every 50
+    // documents — several before the scan is paused at either the middle or the last document.
+    docCount: 300,
+});
+
+/**
+ * A document template for building the same three index types as `DEFAULT_INDEX_SPECS` (index[0]
+ * {a:1} unique, index[1] {"$**":1} on `b`, index[2] {c:1}) where each document generates many keys
+ * for index[2] — enough that a sorter spill almost always lands between two keys of the same
+ * document rather than on a document boundary. At that moment some of the document's keys are
+ * already in the sorter (or spilled) while the rest have not been added yet.
+ *
+ * Must be paired with the rest of `MULTIKEY_SPILLING_OPTIONS`; the field shapes the default index
+ * specs rely on (unique scalar `a`, multi-element array `b`, array-valued `c`) are preserved.
+ */
+export function multiKeySpillingDocTemplate(i) {
+    const prefix = String(i).padStart(8, "0");
+    const c = new Array(MULTIKEY_SPILLING_KEYS_PER_DOC);
+    for (let j = 0; j < c.length; j++) {
+        // Distinct per (document, element) so every key is its own entry in the index.
+        c[j] =
+            prefix +
+            "_" +
+            String(j).padStart(4, "0") +
+            "_" +
+            "x".repeat(MULTIKEY_SPILLING_ELEMENT_PAD_BYTES);
+    }
+    return {
+        _id: i,
+        a: prefix,
+        b: [prefix + "y", prefix + "z"],
+        c,
+    };
+}
+
+// Number of array elements each field of a multikey document carries.
+const MULTIKEY_ELEMENTS_PER_FIELD = 2;
+const MULTIKEY_WRITE_COUNT = 3;
+
+/**
+ * A document template whose indexed fields are all scalars, so that none of `DEFAULT_INDEX_SPECS`
+ * is multikey once the collection scan finishes. Pair it with `MULTIKEY_SIDE_WRITE_OPTIONS`.
+ */
+export function scalarDocTemplate(i) {
+    const prefix = String(i).padStart(8, "0");
+    return {
+        _id: i,
+        a: prefix,
+        b: prefix + "b",
+        c: prefix + "c",
+    };
+}
+
+// Array-valued documents, written while the build is paused so that draining them is the only
+// thing that can make the indexes multikey. Values are distinct per document so the unique {a:1}
+// index still holds, and they are numbers, so they never collide with `scalarDocTemplate`'s string
+// keys or with the numeric keys of the default side writes.
+function multikeyWrites(docCount) {
+    const out = new Array(MULTIKEY_WRITE_COUNT);
+    for (let i = 0; i < MULTIKEY_WRITE_COUNT; i++) {
+        const base = (docCount + DEFAULT_SIDE_WRITES_COUNT + 1 + i) * 1000;
+        const doc = {_id: `multikey_${i}`};
+        for (const key of DEFAULT_INDEX_KEYS) {
+            doc[key] = Array.from({length: MULTIKEY_ELEMENTS_PER_FIELD}, (_, j) => base + j);
+        }
+        out[i] = doc;
+    }
+    return out;
+}
+
+// The seeded document whose scalar fields an update turns into arrays. Any _id below the seeded
+// document count works; this one matches no side write.
+const MULTIKEY_UPDATE_ID = 7;
+
+// An update that makes an already-scanned document multikey. This drains differently than an
+// insert: the interceptor records the difference between the document's old and new key sets, so
+// the drain applies deletes for the scalar keys as well as inserts for the array ones.
+function multikeyUpdates(docCount) {
+    const base = (docCount + DEFAULT_SIDE_WRITES_COUNT + MULTIKEY_WRITE_COUNT + 1) * 1000;
+    const update = {};
+    for (const key of DEFAULT_INDEX_KEYS) {
+        update[key] = Array.from({length: MULTIKEY_ELEMENTS_PER_FIELD}, (_, j) => base + j);
+    }
+    return [{q: {_id: MULTIKEY_UPDATE_ID}, u: {$set: update}}, keyPreservingMultikeyUpdate()];
+}
+
+// The seeded document that an update wraps in single-element arrays.
+const MULTIKEY_KEY_PRESERVING_UPDATE_ID = 8;
+
+// An update that makes a scanned document multikey without changing its key set at all: each scalar
+// becomes a single-element array holding the same value.
+function keyPreservingMultikeyUpdate() {
+    const doc = scalarDocTemplate(MULTIKEY_KEY_PRESERVING_UPDATE_ID);
+    const update = {};
+    for (const key of DEFAULT_INDEX_KEYS) {
+        update[key] = [doc[key]];
+    }
+    return {q: {_id: MULTIKEY_KEY_PRESERVING_UPDATE_ID}, u: {$set: update}};
+}
+
+// Options for the scenario where the indexes only become multikey once the resumed build drains
+// writes made after the collection scan. The seeded documents and the primed side writes are all
+// scalar, so nothing before the failover has any multikey state to carry over. Every drain path is
+// covered: an insert of new array-valued documents, an update turning a document's scalars into
+// arrays of new values, and an update that makes a document multikey while leaving its key set
+// untouched.
+// Options for the narrower scenario where an update that leaves a document's key set untouched is
+// the *only* thing that makes the indexes multikey. It has to stand alone: multikey is a property
+// of the index, so any other multikey write in the same build would mark the index anyway and hide
+// a failure to record this one.
+export const MULTIKEY_UNCHANGED_KEYS_OPTIONS = Object.freeze({
+    docTemplate: scalarDocTemplate,
+    docCount: 1_000,
+    updatesWhilePaused: [keyPreservingMultikeyUpdate()],
+});
+
+export const MULTIKEY_SIDE_WRITE_OPTIONS = Object.freeze({
+    docTemplate: scalarDocTemplate,
+    docCount: 1_000,
+    writesWhilePaused: multikeyWrites(1_000),
+    updatesWhilePaused: multikeyUpdates(1_000),
+});
+
+function bulkInsert(coll, count, template, batchSize = 1000) {
+    let i = 0;
+    while (i < count) {
+        const bulk = coll.initializeUnorderedBulkOp();
+        const end = Math.min(i + batchSize, count);
+        for (let j = i; j < end; j++) {
+            bulk.insert(template(j));
+        }
+        assert.commandWorked(bulk.execute());
+        i = end;
+    }
+}
+
+// Position N-1 (instead of N) so the fail point still has work left when it fires; floor(N/2) for
+// the midpoint. For "beginning", iteration 0 fires before any work happens.
+function iterationFor(position, total) {
+    switch (position) {
+        case PdibPosition.BEGINNING:
+            return 0;
+        case PdibPosition.MIDDLE:
+            return Math.floor(total / 2);
+        case PdibPosition.END:
+            return Math.max(0, total - 1);
+        default:
+            throw new Error("Unknown PdibPosition: " + position);
+    }
+}
+
+function totalIterationsFor(phase, docCount, sideWritesCount) {
+    switch (phase) {
+        case PdibPhase.SCAN:
+        case PdibPhase.LOAD:
+            return docCount;
+        case PdibPhase.DRAIN:
+            return sideWritesCount;
+        default:
+            throw new Error("Unknown PdibPhase: " + phase);
+    }
+}
+
+// PdibPosition picks "which index" for fail points whose matchKey is `indexNames` (LOAD and
+// DRAIN): BEGINNING → first, MIDDLE → middle (second), END → last (third). This must be called
+// with an array of length DEFAULT_INDEX_COUNT.
+function indexNameForPosition(indexNames, position) {
+    assert.eq(indexNames.length, DEFAULT_INDEX_COUNT, "indexNameForPosition expects 3 index names");
+    switch (position) {
+        case PdibPosition.BEGINNING:
+            return indexNames[0];
+        case PdibPosition.MIDDLE:
+            return indexNames[1];
+        case PdibPosition.END:
+            return indexNames[2];
+        default:
+            throw new Error("Unknown PdibPosition: " + position);
+    }
+}
+
+export const PrimaryDrivenResumableIndexBuildTest = class {
+    /**
+     * Build and start a ReplSetTest with the OTel file exporter wired up so run() can verify
+     * index_builds.resume.* metrics. The metricsDir is stashed on the rst as `_pdibMetricsDir`;
+     * callers don't need to know where it lives. Always pair with tearDown(rst).
+     *
+     * @param {Object} [opts]
+     * @param {string} [opts.testName=jsTestName()] - Stem for the OTel metrics directory.
+     * @param {number} [opts.nodes=2] - Number of replica-set members. Use at least 3 for the
+     *     CLEAN_RESTART / UNCLEAN_RESTART failover modes, where the primary is taken down before
+     *     the secondary is stepped up: with only 2 nodes the surviving secondary can't form a
+     *     majority, so the election would fail.
+     * @returns {ReplSetTest} A started replica set with `_pdibMetricsDir` attached for use by
+     *     `run()` / `runMultiPhase()`.
+     */
+    static setUp({testName, nodes = 2} = {}) {
+        const name = testName || jsTestName();
+        const {metricsDir, otelParams} = otelFileExportParams(name);
+
+        // When graceful unplanned stepdown is not supported, fail over by checkpointing on the
+        // primary, waiting for the secondary to install that checkpoint, then killing the primary.
+        // 2 nodes is sufficient for this case.
+        if (TestData.doesNotSupportGracefulUnplannedStepdown) {
+            nodes = 2;
+        }
+
+        // Ensure every node is electable (priority 1) so the failover tests can always step up any
+        // secondary.
+        const nodeConfigs = Array.from({length: nodes}, () => ({rsConfig: {priority: 1}}));
+
+        // Slow down OTel flushes so the per-node JSONL stays under the shell cat() 16 MiB cap on
+        // long-running variants (e.g. TSAN); _readResumeMetrics only needs the latest snapshot.
+        const rstOptions = {
+            nodes: nodeConfigs,
+            // Use a large oplog so the restart failover modes can't lose a node due to it being too
+            // stale to find a sync source.
+            oplogSize: 1024,
+            nodeOptions: {setParameter: {...otelParams, openTelemetryExportIntervalMillis: 5000}},
+        };
+
+        const rst = new ReplSetTest(rstOptions);
+        rst.startSet();
+        rst.initiate();
+        rst._pdibMetricsDir = metricsDir;
+        return rst;
+    }
+
+    /**
+     * Stops the replica set started by `setUp()`.
+     *
+     * @param {ReplSetTest} rst
+     * @returns {void}
+     */
+    static tearDown(rst) {
+        rst.stopSet();
+    }
+
+    /**
+     * Run resumable PDIB tests for one phase. Iterates over `positions` (default: all three),
+     * exercising one resume per position with a freshly-seeded collection.
+     *
+     * @param {ReplSetTest} rst - Must have been constructed via `setUp()`.
+     * @param {Object} options
+     * @param {string} options.phase - One of `PdibPhase`.
+     * @param {string[]} [options.positions=ALL_POSITIONS] - Subset of `PdibPosition` values to
+     *     exercise.
+     * @param {string} [options.failoverMode=PdibFailoverMode.NO_RESTART] - What to do with the
+     *     old primary after each step-up. See `PdibFailoverMode`.
+     * @param {string} [options.dbName=jsTestName()]
+     * @param {string} [options.collName="coll"]
+     * @param {Object[]} [options.indexSpecs=DEFAULT_INDEX_SPECS] - The three index specs to build in
+     *     a single `createIndexes` call, in beginning/middle/end order. Each entry is a full
+     *     createIndexes index spec *without* `name` (the test assigns the name), e.g.
+     *     `{key: {a: 1}, unique: true}` or `{key: {"$**": 1}}`. Must have length 3.
+     * @param {Function} [options.docTemplate=defaultDocTemplate] - `(i: number) => Object`
+     *     producing the i-th document.
+     * @param {number} [options.docCount=DEFAULT_DOC_COUNT]
+     * @param {Object[]} [options.sideWrites] - Defaults to a small fixed set of side writes that
+     *     don't collide with the seeded docs.
+     * @param {Object[]} [options.postIndexBuildInserts=[]] - Optional inserts to run after each
+     *     successful resume to verify the index continues to work.
+     * @param {number} [options.maxIndexBuildMemoryUsageMegabytes=DEFAULT_MAX_INDEX_BUILD_MEM_MB]
+     *     - Server-parameter override.
+     * @param {number} [options.loadResumeStateWriteIntervalKeys=DEFAULT_LOAD_RESUME_STATE_WRITE_INTERVAL_KEYS]
+     *     - Server-parameter override.
+     * @returns {void}
+     */
+    static run(rst, options) {
+        const phase = options.phase;
+        assert(phase, "options.phase is required");
+        const positions = options.positions || ALL_POSITIONS;
+        const failoverMode = options.failoverMode || PdibFailoverMode.NO_RESTART;
+        assert(
+            Object.values(PdibFailoverMode).includes(failoverMode),
+            `options.failoverMode=${failoverMode} is not a valid PdibFailoverMode value`,
+        );
+
+        const {
+            dbName,
+            collName,
+            indexSpecs,
+            docTemplate,
+            docCount,
+            sideWrites,
+            postIndexBuildInserts,
+            writesWhilePaused,
+            updatesWhilePaused,
+            expectMultikey,
+            maxMb,
+            loadIntervalKeys,
+        } = PrimaryDrivenResumableIndexBuildTest._normalizeOptions(options);
+
+        if (phase === PdibPhase.DRAIN) {
+            assert.gt(sideWrites.length, 0, "drain writes phase requires at least one side write");
+        }
+
+        if (!PrimaryDrivenResumableIndexBuildTest._preflight(rst, dbName, "run")) {
+            return;
+        }
+
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: maxMb,
+            primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys: loadIntervalKeys,
+        });
+
+        for (const position of positions) {
+            jsTest.log.info(
+                `PrimaryDrivenResumableIndexBuildTest: phase=${phase} position=${position}`,
+            );
+            PrimaryDrivenResumableIndexBuildTest._runOne(rst, {
+                phase,
+                position,
+                failoverMode,
+                dbName,
+                collName,
+                indexSpecs,
+                docTemplate,
+                docCount,
+                sideWrites,
+                postIndexBuildInserts,
+                writesWhilePaused,
+                updatesWhilePaused,
+                expectMultikey,
+            });
+        }
+    }
+
+    /**
+     * Runs a single resumable primary-driven index build that is paused once in each phase
+     * (scan, then load, then drain) and resumed across three step-ups. The position within each
+     * phase is configurable via `options.positions`; phases not listed default to
+     * `PdibPosition.MIDDLE`. Verifies that each resume increments `index_builds.resume.succeeded`
+     * with the expected `phase` attribute and that the final index is consistent across nodes.
+     *
+     * @param {ReplSetTest} rst - Must have been constructed via `setUp()`.
+     * @param {Object} [options]
+     * @param {Object<string, string>} [options.positions={}] - Map from `PdibPhase` value to
+     *     `PdibPosition` value selecting where in each phase the build pauses. Omitted phases
+     *     default to `PdibPosition.MIDDLE`.
+     * @param {string} [options.failoverMode=PdibFailoverMode.NO_RESTART] - What to do with the
+     *     old primary after each step-up. See `PdibFailoverMode`.
+     * @param {string} [options.dbName=jsTestName()]
+     * @param {string} [options.collName="coll"]
+     * @param {Object[]} [options.indexSpecs=DEFAULT_INDEX_SPECS] - The three index specs to build in
+     *     a single `createIndexes` call, in beginning/middle/end order. Each entry is a full
+     *     createIndexes index spec *without* `name` (the test assigns the name), e.g.
+     *     `{key: {a: 1}, unique: true}` or `{key: {"$**": 1}}`. Must have length 3.
+     * @param {Function} [options.docTemplate=defaultDocTemplate]
+     * @param {number} [options.docCount=DEFAULT_DOC_COUNT]
+     * @param {Object[]} [options.sideWrites] - Must contain at least one side write so that the
+     *     DRAIN phase has work to do.
+     * @param {Object[]} [options.postIndexBuildInserts=[]]
+     * @param {number} [options.maxIndexBuildMemoryUsageMegabytes=DEFAULT_MAX_INDEX_BUILD_MEM_MB]
+     * @param {number} [options.loadResumeStateWriteIntervalKeys=DEFAULT_LOAD_RESUME_STATE_WRITE_INTERVAL_KEYS]
+     * @returns {void}
+     */
+    static runMultiPhase(rst, options = {}) {
+        const {
+            dbName,
+            collName,
+            indexSpecs,
+            docTemplate,
+            docCount,
+            sideWrites,
+            postIndexBuildInserts,
+            maxMb,
+            loadIntervalKeys,
+        } = PrimaryDrivenResumableIndexBuildTest._normalizeOptions(options);
+
+        const positions = options.positions || {};
+        const validPositions = Object.values(PdibPosition);
+        for (const [phase, position] of Object.entries(positions)) {
+            assert(
+                validPositions.includes(position),
+                `options.positions[${phase}]=${position} is not a valid PdibPosition value`,
+            );
+        }
+        const posFor = (phase) => positions[phase] || PdibPosition.MIDDLE;
+
+        const failoverMode = options.failoverMode || PdibFailoverMode.NO_RESTART;
+        assert(
+            Object.values(PdibFailoverMode).includes(failoverMode),
+            `options.failoverMode=${failoverMode} is not a valid PdibFailoverMode value`,
+        );
+
+        // Side writes are required because the `hangIndexBuildDuringDrainWritesPhase` fail point is
+        // skipped when there are no writes to drain.
+        assert.gt(
+            sideWrites.length,
+            0,
+            "runMultiPhase requires at least one side write so that the DRAIN phase has work",
+        );
+
+        if (!PrimaryDrivenResumableIndexBuildTest._preflight(rst, dbName, "runMultiPhase")) {
+            return;
+        }
+
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: maxMb,
+            primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys: loadIntervalKeys,
+        });
+
+        const indexNames = Array.from(
+            {length: DEFAULT_INDEX_COUNT},
+            (_, i) => `${DEFAULT_INDEX_NAME}_multi_phase_${i}`,
+        );
+
+        // Seed the collection and start the build on the initial primary; it hangs at
+        // hangBeforeBuildingIndex.
+        const {primary, awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp} =
+            PrimaryDrivenResumableIndexBuildTest._seedAndStart(rst, {
+                dbName,
+                collName,
+                docTemplate,
+                docCount,
+                indexSpecs,
+                indexNames,
+                sideWrites,
+            });
+
+        // Configure the SCAN fail point on the initial primary at the configured position, then
+        // release hangBeforeBuildingIndex.
+        let currentFp = PrimaryDrivenResumableIndexBuildTest._configurePhaseFailPoint(
+            primary,
+            PdibPhase.SCAN,
+            posFor(PdibPhase.SCAN),
+            buildUUID,
+            indexNames,
+            docCount,
+            sideWrites.length,
+        );
+        hangBeforeBuildingIndexFp.off();
+        PrimaryDrivenResumableIndexBuildTest._waitForPause(
+            primary,
+            PHASE_FAIL_POINTS[PdibPhase.SCAN],
+            buildUUID,
+            indexNameForPosition(indexNames, posFor(PdibPhase.SCAN)),
+        );
+
+        // Step-up sequence. After each step-up, the new primary resumes the build from the
+        // previous phase's checkpoint and (for the first two iterations) pauses again at the
+        // next phase's configured position. The final iteration has no nextPhase: the new
+        // primary resumes from DRAIN and runs to completion.
+        const stepUps = [
+            {previousPhase: PdibPhase.SCAN, nextPhase: PdibPhase.LOAD},
+            {previousPhase: PdibPhase.LOAD, nextPhase: PdibPhase.DRAIN},
+            {previousPhase: PdibPhase.DRAIN, nextPhase: null},
+        ];
+
+        let shellDrained = false;
+
+        for (const {previousPhase, nextPhase} of stepUps) {
+            // Configure the next-phase fail point on the node about to be stepped up BEFORE the
+            // step-up, so the resumed build hangs there as soon as it reaches that phase. The
+            // last iteration has no nextPhase (we want completion, not another pause).
+            const nextPrimaryNode = rst.getSecondary();
+            let nextFp = null;
+            if (nextPhase !== null) {
+                nextFp = PrimaryDrivenResumableIndexBuildTest._configurePhaseFailPoint(
+                    nextPrimaryNode,
+                    nextPhase,
+                    posFor(nextPhase),
+                    buildUUID,
+                    indexNames,
+                    docCount,
+                    sideWrites.length,
+                );
+            }
+
+            // Snapshot metrics so we can assert that this resume incremented
+            // succeeded[previousPhase] exactly once.
+            const beforeMetrics = PrimaryDrivenResumableIndexBuildTest._readResumeMetrics(
+                rst._pdibMetricsDir,
+            );
+
+            const oldPrimary = rst.getPrimary();
+            jsTest.log.info(
+                `PrimaryDrivenResumableIndexBuildTest: failover mode=${failoverMode}, stepping up ` +
+                    `${nextPrimaryNode.host} to resume from ${previousPhase}+${posFor(previousPhase)}` +
+                    (nextPhase === null
+                        ? " and complete"
+                        : ` and pause at ${nextPhase}+${posFor(nextPhase)}`),
+            );
+
+            // For restart modes, wait for the index build resume state to replicate to secondaries
+            // before shutting down the primary. Container writes (including resume state) replicate
+            // asynchronously, so without this the stepped-up node could win the election without
+            // the resume state, preventing it from resuming the build.
+            if (
+                failoverMode === PdibFailoverMode.UNCLEAN_RESTART ||
+                failoverMode === PdibFailoverMode.CLEAN_RESTART
+            ) {
+                rst.awaitReplication();
+            }
+
+            // Step up first so the state change interrupts the old primary's build thread at its
+            // fail point. If we released `currentFp` first, the build would simply continue past
+            // the iteration on the old primary and could complete before we ever stepped up.
+            const newPrimary = PrimaryDrivenResumableIndexBuildTest._failover(
+                rst,
+                oldPrimary,
+                nextPrimaryNode,
+                failoverMode,
+            );
+
+            // Release the current fail point (cleanup; the build thread on the old primary has
+            // already exited due to the state change). For restart modes the old mongod was
+            // recycled, so its in-memory fail point is already gone and the handle's connection
+            // is stale — skip. When graceful unplanned stepdown isn't supported the failover always
+            // kills the old primary (see `_failOverWithCheckpointInstall`), so skip in that case
+            // too.
+            if (!PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary(failoverMode)) {
+                currentFp.off();
+            }
+
+            if (!shellDrained) {
+                // The parallel shell that called createIndexes against the very first primary
+                // returns InterruptedDueToReplStateChange after the first step-down. Drain it
+                // once so it doesn't outlive the test.
+                awaitCreateIndexes({checkExitSuccess: false});
+                shellDrained = true;
+            }
+
+            if (nextPhase !== null) {
+                PrimaryDrivenResumableIndexBuildTest._waitForPause(
+                    newPrimary,
+                    PHASE_FAIL_POINTS[nextPhase],
+                    buildUUID,
+                    indexNameForPosition(indexNames, posFor(nextPhase)),
+                );
+            } else {
+                jsTest.log.info(
+                    `PrimaryDrivenResumableIndexBuildTest: waiting for build ${buildUUID} to ` +
+                        `complete on ${newPrimary.host}`,
+                );
+                PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+                    newPrimary,
+                    dbName,
+                    collName,
+                    indexNames,
+                    buildUUID,
+                );
+            }
+
+            PrimaryDrivenResumableIndexBuildTest._verifyResumeMetric(
+                rst._pdibMetricsDir,
+                beforeMetrics,
+                EXPECTED_RESUME_PHASES[previousPhase][posFor(previousPhase)],
+            );
+
+            currentFp = nextFp;
+        }
+
+        // Each step-up's resume metric was already verified in the loop above, so no expectedPhases
+        // here.
+        PrimaryDrivenResumableIndexBuildTest._verifyResumedBuild(rst, {
+            dbName,
+            collName,
+            indexNames,
+            postIndexBuildInserts,
+        });
+    }
+
+    /**
+     * Drives a resume where the node that drains a write is not the node that commits the build,
+     * by failing over twice.
+     *
+     * @param {ReplSetTest} rst - Must have been constructed via `setUp({nodes: 3})`: the second
+     *     step-up has to land on a node that never received the write, which rules out the first
+     *     primary.
+     * @param {Object} options - As for `run()`, minus `phase`/`position`/`failoverMode`.
+     * @returns {void}
+     */
+    static runAcrossTwoFailovers(rst, options = {}) {
+        const {
+            dbName,
+            collName,
+            indexSpecs,
+            docTemplate,
+            docCount,
+            sideWrites,
+            postIndexBuildInserts,
+            writesWhilePaused,
+            updatesWhilePaused,
+            expectMultikey,
+            maxMb,
+            loadIntervalKeys,
+        } = PrimaryDrivenResumableIndexBuildTest._normalizeOptions(options);
+
+        if (TestData.doesNotSupportGracefulUnplannedStepdown) {
+            jsTest.log.info(
+                "PrimaryDrivenResumableIndexBuildTest: skipping runAcrossTwoFailovers because this " +
+                    "configuration runs with two nodes and kill-based failover",
+            );
+            return;
+        }
+
+        assert.gte(
+            rst.nodes.length,
+            3,
+            "runAcrossTwoFailovers requires a 3-node set so the second step-up can pick a node " +
+                "that never received the write; use setUp({nodes: 3})",
+        );
+        assert.gt(sideWrites.length, 0, "the drain phase fail point needs side writes to count");
+
+        if (
+            !PrimaryDrivenResumableIndexBuildTest._preflight(rst, dbName, "runAcrossTwoFailovers")
+        ) {
+            return;
+        }
+
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: maxMb,
+            primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys: loadIntervalKeys,
+        });
+
+        const indexNames = Array.from(
+            {length: DEFAULT_INDEX_COUNT},
+            (_, i) => `${DEFAULT_INDEX_NAME}_two_failovers_${i}`,
+        );
+
+        const {primary, awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp} =
+            PrimaryDrivenResumableIndexBuildTest._seedAndStart(rst, {
+                dbName,
+                collName,
+                docTemplate,
+                docCount,
+                indexSpecs,
+                indexNames,
+                sideWrites,
+            });
+
+        const position = PdibPosition.MIDDLE;
+        const phaseFp = PrimaryDrivenResumableIndexBuildTest._configurePhaseFailPoint(
+            primary,
+            PdibPhase.DRAIN,
+            position,
+            buildUUID,
+            indexNames,
+            docCount,
+            sideWrites.length,
+        );
+        hangBeforeBuildingIndexFp.off();
+        PrimaryDrivenResumableIndexBuildTest._waitForPause(
+            primary,
+            PHASE_FAIL_POINTS[PdibPhase.DRAIN],
+            buildUUID,
+            indexNameForPosition(indexNames, position),
+        );
+
+        PrimaryDrivenResumableIndexBuildTest._applyWritesWhilePaused(rst, {
+            primary,
+            dbName,
+            collName,
+            writesWhilePaused,
+            updatesWhilePaused,
+        });
+
+        // Arm the post-drain pause on the second primary before stepping it up, so it stops as soon
+        // as it has drained -- and therefore consumed -- those records.
+        const secondPrimary = rst.getSecondary();
+        const afterFirstDrainFp = configureFailPoint(
+            secondPrimary,
+            "hangAfterIndexBuildFirstDrain",
+        );
+
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: first step-up to ${secondPrimary.host}, which ` +
+                "will drain the writes and stop before committing",
+        );
+        PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            primary,
+            secondPrimary,
+            PdibFailoverMode.NO_RESTART,
+        );
+        if (!PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary()) {
+            phaseFp.off();
+        }
+        awaitCreateIndexes({checkExitSuccess: false});
+
+        checkLog.containsJson(secondPrimary, 20666, {
+            buildUUID: function (uuid) {
+                return uuid && uuid.uuid && uuid.uuid["$uuid"] === buildUUID;
+            },
+        });
+
+        // Everything the drain learned now lives only in what it persisted; step up a node that was
+        // a secondary throughout, so it has neither the records nor the second primary's memory.
+        const thirdPrimary = rst.getSecondaries().find((node) => node.host !== primary.host);
+        assert(thirdPrimary, "expected a secondary other than the original primary");
+
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: second step-up to ${thirdPrimary.host}, which ` +
+                "never saw the writes and must commit from the persisted state alone",
+        );
+        PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            secondPrimary,
+            thirdPrimary,
+            PdibFailoverMode.NO_RESTART,
+        );
+        if (!PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary()) {
+            afterFirstDrainFp.off();
+        }
+
+        PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+            thirdPrimary,
+            dbName,
+            collName,
+            indexNames,
+            buildUUID,
+        );
+
+        PrimaryDrivenResumableIndexBuildTest._verifyResumedBuild(rst, {
+            dbName,
+            collName,
+            indexNames,
+            postIndexBuildInserts,
+            expectMultikey,
+        });
+    }
+
+    /**
+     * Drives a single end-to-end "sorter orphan cleanup" scenario for a primary-driven index build.
+     *
+     * A single-index build is started and paused at `hangAfterIndexBuildSpillBeforeStatePersisted`,
+     * which is after the sorter spills to disk but before the metadata about that spill is
+     * persisted. Then, after failover, the new primary cleans up these orphaned sorter entries.
+     *
+     * `skipSpills` selects which branch of `deleteSorterEntriesOutsideRanges` is exercised:
+     *   - `skipSpills: 0` — the first spill is orphaned so all sorter entries are deleted and the
+     *     scan restarts from the beginning.
+     *   - `skipSpills: 1` — the first spill persists its ranges normally and the second spill is
+     *     orphaned, so keys outside the persisted range are deleted.
+     *
+     * Requires a 3-node set (see `_failover`'s UNCLEAN_RESTART path).
+     *
+     * @param {ReplSetTest} rst - Must have been constructed via `setUp({nodes: 3})`.
+     * @param {Object} options
+     * @param {number} options.skipSpills - Spills to let persist before the orphaning spill: 0
+     *     exercises the "no persisted ranges" branch, 1 the "persisted ranges" branch.
+     * @param {string} [options.collName="coll"]
+     * @returns {void}
+     */
+    static runSorterOrphanCleanup(rst, {skipSpills, collName = "coll"}) {
+        assert(
+            skipSpills === 0 || skipSpills === 1,
+            `skipSpills must be 0 or 1, got ${skipSpills}`,
+        );
+        assert.gte(
+            rst.nodes.length,
+            TestData.doesNotSupportGracefulUnplannedStepdown ? 2 : 3,
+            "runSorterOrphanCleanup requires a 3-node set, or 2-node set when unconditional " +
+                "stepdown is not supported)",
+        );
+
+        if (
+            !PrimaryDrivenResumableIndexBuildTest._featureFlagsEnabled(
+                rst.getPrimary().getDB(jsTestName()),
+            )
+        ) {
+            jsTest.log.info(
+                "PrimaryDrivenResumableIndexBuildTest: skipping runSorterOrphanCleanup because the " +
+                    "primary-driven index build feature flags are disabled",
+            );
+            return;
+        }
+
+        const docCount = 3_000;
+        const indexName = "pdib_orphan_a";
+        const padBytes = 1500;
+        const docTemplate = (i) => ({_id: i, a: String(i).padStart(8, "0") + "x".repeat(padBytes)});
+
+        // Tight memory limit so the first iterations spill quickly.
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: 1,
+            primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys: 100,
+        });
+
+        const dbName = jsTestName();
+        const primary = rst.getPrimary();
+        const coll = primary.getDB(dbName).getCollection(collName);
+        coll.drop();
+        bulkInsert(coll, docCount, docTemplate);
+        rst.awaitReplication();
+
+        // Pause the build in the window where a spill's data is committed but its ranges are not.
+        // `{skip: skipSpills}` selects which spill is orphaned (see method docstring).
+        const hangBeforeBuildingIndexFp = configureFailPoint(primary, "hangBeforeBuildingIndex");
+        const orphanFp = configureFailPoint(
+            primary,
+            "hangAfterIndexBuildSpillBeforeStatePersisted",
+            {},
+            {skip: skipSpills},
+        );
+
+        // Kick off the build in a parallel shell.
+        const awaitCreateIndexes = startParallelShell(
+            funWithArgs(
+                function (dbName, collName, indexName) {
+                    db.getSiblingDB(dbName).runCommand({
+                        createIndexes: collName,
+                        indexes: [{key: {a: 1}, name: indexName}],
+                    });
+                },
+                dbName,
+                collName,
+                indexName,
+            ),
+            primary.port,
+        );
+
+        // Wait for the build to register, then extract its buildUUID.
+        let indexes;
+        assert.soonNoExcept(function () {
+            indexes = IndexBuildTest.assertIndexes(coll, 2, ["_id_"], [indexName], {
+                includeBuildUUIDs: true,
+            });
+            return true;
+        });
+        const buildUUID = extractUUIDFromObject(indexes[indexName].buildUUID);
+
+        // Wait for the build to reach `hangBeforeBuildingIndex` so the fail point is definitely
+        // armed before the build progresses into scan/spill.
+        checkLog.containsJson(primary, [4940900, 10978300], {
+            buildUUID: function (uuid) {
+                return uuid && uuid.uuid && uuid.uuid["$uuid"] === buildUUID;
+            },
+        });
+
+        rst.awaitLastOpCommitted();
+        hangBeforeBuildingIndexFp.off();
+
+        jsTest.log.info(
+            "PrimaryDrivenResumableIndexBuildTest: waiting for " +
+                `hangAfterIndexBuildSpillBeforeStatePersisted (skipSpills=${skipSpills})`,
+        );
+        orphanFp.wait();
+
+        // Wait for the secondary to replicate the orphaned spill writes before we uncleanly shut
+        // down the primary. The spill's container writes replicate asynchronously, so without this
+        // the stepped-up node could win the election without them, leaving the resumed build with
+        // no orphans to clean up.
+        rst.awaitReplication();
+
+        // Uncleanly shut down the primary, step up the secondary, and then restart the old primary.
+        const secondary = rst.getSecondary();
+        const newPrimary = PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            primary,
+            secondary,
+            PdibFailoverMode.UNCLEAN_RESTART,
+        );
+
+        awaitCreateIndexes({checkExitSuccess: false});
+        PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+            newPrimary,
+            dbName,
+            collName,
+            [indexName],
+            buildUUID,
+        );
+
+        checkLog.containsJson(newPrimary, 12784900, {
+            numDeleted: function (numDeleted) {
+                return numDeleted > 0;
+            },
+        });
+        checkLog.containsJson(newPrimary, 12500800, {phase: "collection scan"});
+
+        rst.awaitReplication();
+        for (const node of rst.nodes) {
+            const nodeColl = node.getDB(dbName).getCollection(collName);
+            IndexBuildTest.assertIndexes(nodeColl, 2, ["_id_", indexName]);
+            assert.commandWorked(nodeColl.validate());
+        }
+        rst.checkReplicatedDataHashes();
+    }
+
+    /**
+     * Drives a resume for a build that has no persisted metadata.
+     *
+     * The build is paused at `hangBeforeBuildingIndex`, at which point it has replicated
+     * `startIndexBuild` but has not yet written any metadata about its state. On step-up, the new
+     * primary synthesizes an "initialized" state and resumes the build from that point.
+     *
+     * @param {ReplSetTest} rst - Must have been constructed via `setUp()`; use `setUp({nodes: 3})`
+     *     for the restart failover modes.
+     * @param {Object} [options]
+     * @param {string} [options.failoverMode=PdibFailoverMode.NO_RESTART] - What to do with the old
+     *     primary after the step-up. See `PdibFailoverMode`.
+     * @param {string} [options.dbName=jsTestName()]
+     * @param {string} [options.collName="coll"]
+     * @param {Object[]} [options.indexSpecs=DEFAULT_INDEX_SPECS] - The three index specs to build in
+     *     a single `createIndexes` call. Must have length 3.
+     * @param {Function} [options.docTemplate=defaultDocTemplate]
+     * @param {number} [options.docCount=DEFAULT_DOC_COUNT]
+     * @param {Object[]} [options.sideWrites] - Writes issued while the build is paused, so the
+     *     resumed build has side-table entries to drain on top of its restarted scan.
+     * @param {Object[]} [options.postIndexBuildInserts=[]]
+     * @param {number} [options.maxIndexBuildMemoryUsageMegabytes=DEFAULT_MAX_INDEX_BUILD_MEM_MB]
+     * @param {number} [options.loadResumeStateWriteIntervalKeys=DEFAULT_LOAD_RESUME_STATE_WRITE_INTERVAL_KEYS]
+     * @returns {void}
+     */
+    static runSynthesizedResumeState(rst, options = {}) {
+        const failoverMode = options.failoverMode || PdibFailoverMode.NO_RESTART;
+        assert(
+            Object.values(PdibFailoverMode).includes(failoverMode),
+            `options.failoverMode=${failoverMode} is not a valid PdibFailoverMode value`,
+        );
+
+        const {
+            dbName,
+            collName,
+            indexSpecs,
+            docTemplate,
+            docCount,
+            sideWrites,
+            postIndexBuildInserts,
+            maxMb,
+            loadIntervalKeys,
+        } = PrimaryDrivenResumableIndexBuildTest._normalizeOptions(options);
+
+        if (
+            !PrimaryDrivenResumableIndexBuildTest._preflight(
+                rst,
+                dbName,
+                "runSynthesizedResumeState",
+            )
+        ) {
+            return;
+        }
+
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: maxMb,
+            primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys: loadIntervalKeys,
+        });
+
+        const indexNames = Array.from(
+            {length: DEFAULT_INDEX_COUNT},
+            (_, i) => `${DEFAULT_INDEX_NAME}_synthesized_${i}`,
+        );
+
+        // Seed the collection and start the build; it parks at hangBeforeBuildingIndex, which is
+        // before any resume state is written. No per-phase fail point is configured: this scenario
+        // is exactly "fail over before the build's phases begin".
+        const {primary, awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp} =
+            PrimaryDrivenResumableIndexBuildTest._seedAndStart(rst, {
+                dbName,
+                collName,
+                docTemplate,
+                docCount,
+                indexSpecs,
+                indexNames,
+                sideWrites,
+            });
+
+        const beforeMetrics = PrimaryDrivenResumableIndexBuildTest._readResumeMetrics(
+            rst._pdibMetricsDir,
+        );
+
+        // Wait for the index build table's creation (and the side writes) to reach the secondary
+        // before the failover: the stepped-up node needs the registry entry and the ident to attempt
+        // a resume at all. The build thread is parked, so nothing new accumulates behind us.
+        rst.awaitReplication();
+
+        jsTest.log.info(
+            "PrimaryDrivenResumableIndexBuildTest: triggering resume with no persisted resume " +
+                `state via failover mode=${failoverMode}`,
+        );
+        const newPrimary = PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            primary,
+            rst.getSecondary(),
+            failoverMode,
+        );
+
+        // Release the old primary's fail point. `hangBeforeBuildingIndex` uses an uninterruptible
+        // pauseWhileSet(), so unlike the per-phase fail points the step-down does not free the build
+        // thread on its own. For restart modes the old mongod was recycled, so the in-memory fail
+        // point (and the handle's connection) is already gone — skip.
+        if (!PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary(failoverMode)) {
+            hangBeforeBuildingIndexFp.off();
+        }
+
+        awaitCreateIndexes({checkExitSuccess: false});
+
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: waiting for build ${buildUUID} to complete on ` +
+                `${newPrimary.host}`,
+        );
+        PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+            newPrimary,
+            dbName,
+            collName,
+            indexNames,
+            buildUUID,
+        );
+
+        // The resume state was synthesized from an empty index build table (log 12500501 is only
+        // emitted by synthesizeResumeIndexInfo), and the build restarted at the initialized phase.
+        checkLog.containsJson(newPrimary, 12500501, {
+            buildUUID: function (uuid) {
+                return uuid && uuid.uuid && uuid.uuid["$uuid"] === buildUUID;
+            },
+            phase: RESUME_PHASE_INITIALIZED,
+        });
+        checkLog.containsJson(newPrimary, 12500800, {
+            buildUUID: function (uuid) {
+                return uuid && uuid.uuid && uuid.uuid["$uuid"] === buildUUID;
+            },
+            phase: RESUME_PHASE_INITIALIZED,
+        });
+
+        PrimaryDrivenResumableIndexBuildTest._verifyResumedBuild(rst, {
+            dbName,
+            collName,
+            indexNames,
+            beforeMetrics,
+            expectedPhases: [RESUME_PHASE_INITIALIZED],
+            postIndexBuildInserts,
+        });
+    }
+
+    /**
+     * @param {DB} db
+     * @returns {boolean} True iff `featureFlagContainerWrites`, `featureFlagPrimaryDrivenIndexBuilds` and
+     *     `featureFlagResumablePrimaryDrivenIndexBuilds` are enabled.
+     */
+    static _featureFlagsEnabled(db) {
+        return (
+            FeatureFlagUtil.isPresentAndEnabled(db, "ContainerWrites") &&
+            FeatureFlagUtil.isPresentAndEnabled(db, "PrimaryDrivenIndexBuilds") &&
+            FeatureFlagUtil.isPresentAndEnabled(db, "ResumablePrimaryDrivenIndexBuilds")
+        );
+    }
+
+    /**
+     * Applies `setParameter` to every node in `rst`.
+     *
+     * `setParameter` overrides applied here are stashed on `rst._pdibIndexBuildSettings` so that
+     * they can be re-applied later.
+     *
+     * @param {ReplSetTest} rst
+     * @param {Object} params - Key/value pairs forwarded as `setParameter` arguments.
+     * @returns {void}
+     */
+    static _setIndexBuildSettings(rst, params) {
+        for (const node of rst.nodes) {
+            assert.commandWorked(node.adminCommand({setParameter: 1, ...params}));
+        }
+        rst._pdibIndexBuildSettings = params;
+    }
+
+    /**
+     * Defaults to a small handful of side writes so drain has work to do even when callers don't
+     * supply any. Keys are well outside the `docCount` range so they never collide with seeded
+     * docs.
+     *
+     * @param {number} docCount
+     * @returns {Object[]} A fixed-size array of side-write documents.
+     */
+    static _defaultSideWrites(docCount) {
+        const out = new Array(DEFAULT_SIDE_WRITES_COUNT);
+        for (let i = 0; i < DEFAULT_SIDE_WRITES_COUNT; i++) {
+            const v = docCount + 1 + i;
+            // Each side-write `a` value is distinct (docCount+1 .. docCount+DEFAULT_SIDE_WRITES_COUNT)
+            // and is a number, so it never collides with the unique {a:1} index's string keys from
+            // defaultDocTemplate — the unique constraint still holds as these drain.
+            const doc = {_id: v};
+            for (const key of DEFAULT_INDEX_KEYS) {
+                doc[key] = v;
+            }
+            out[i] = doc;
+        }
+        return out;
+    }
+
+    /**
+     * Resolves the collection/index/server-parameter options to their defaults.
+     *
+     * Scenario-specific options (`phase`, `positions`, `failoverMode`, ...) are left to the caller.
+     *
+     * @param {Object} options - The caller's raw options object.
+     * @returns {{dbName: string, collName: string, indexSpecs: Object[], docTemplate: Function,
+     *     docCount: number, sideWrites: Object[], postIndexBuildInserts: Object[], maxMb: number,
+     *     loadIntervalKeys: number}}
+     */
+    static _normalizeOptions(options) {
+        const indexSpecs = options.indexSpecs || DEFAULT_INDEX_SPECS;
+        assert.eq(
+            indexSpecs.length,
+            DEFAULT_INDEX_COUNT,
+            `options.indexSpecs must have length ${DEFAULT_INDEX_COUNT}`,
+        );
+        const docCount = options.docCount || DEFAULT_DOC_COUNT;
+        return {
+            dbName: options.dbName || jsTestName(),
+            collName: options.collName || "coll",
+            indexSpecs,
+            docTemplate: options.docTemplate || defaultDocTemplate,
+            docCount,
+            sideWrites:
+                options.sideWrites ||
+                PrimaryDrivenResumableIndexBuildTest._defaultSideWrites(docCount),
+            postIndexBuildInserts: options.postIndexBuildInserts || [],
+            writesWhilePaused: options.writesWhilePaused || [],
+            updatesWhilePaused: options.updatesWhilePaused || [],
+            expectMultikey: options.expectMultikey || false,
+            maxMb: options.maxIndexBuildMemoryUsageMegabytes || DEFAULT_MAX_INDEX_BUILD_MEM_MB,
+            loadIntervalKeys:
+                options.loadResumeStateWriteIntervalKeys ||
+                DEFAULT_LOAD_RESUME_STATE_WRITE_INTERVAL_KEYS,
+        };
+    }
+
+    /**
+     * Checks the preconditions every scenario shares: the feature flags are on, the set is big
+     * enough, and `setUp()` wired up the OTel exporter.
+     *
+     * @param {ReplSetTest} rst
+     * @param {string} dbName - Database used for the feature-flag lookup.
+     * @param {string} caller - Entry-point name, for the skip message.
+     * @returns {boolean} False iff the scenario should be skipped because the primary-driven index
+     *     build feature flags are disabled. Throws if the fixture itself is misconfigured.
+     */
+    static _preflight(rst, dbName, caller) {
+        if (
+            !PrimaryDrivenResumableIndexBuildTest._featureFlagsEnabled(
+                rst.getPrimary().getDB(dbName),
+            )
+        ) {
+            jsTest.log.info(
+                `PrimaryDrivenResumableIndexBuildTest: skipping ${caller} because ` +
+                    "featureFlagContainerWrites or " +
+                    "featureFlagPrimaryDrivenIndexBuilds or " +
+                    "featureFlagResumablePrimaryDrivenIndexBuilds is disabled",
+            );
+            return false;
+        }
+        assert.gte(
+            rst.nodes.length,
+            2,
+            "PrimaryDrivenResumableIndexBuildTest requires a replica set with >= 2 nodes",
+        );
+        assert(
+            rst._pdibMetricsDir,
+            "rst must be constructed via PrimaryDrivenResumableIndexBuildTest.setUp() so the OTel " +
+                "exporter is configured for index_builds.resume.* metric verification",
+        );
+        return true;
+    }
+
+    /**
+     * Re-seeds the test collection on the current primary and starts the index build, leaving it
+     * paused at `hangBeforeBuildingIndex` with the side-writes table primed. See `_startBuild` for
+     * why the fail-point handle is returned rather than released here.
+     *
+     * @param {ReplSetTest} rst
+     * @param {Object} opts
+     * @param {string} opts.dbName
+     * @param {string} opts.collName
+     * @param {Function} opts.docTemplate - `(i: number) => Object`.
+     * @param {number} opts.docCount
+     * @param {Object[]} opts.indexSpecs - All three index specs in build order.
+     * @param {string[]} opts.indexNames
+     * @param {Object[]} opts.sideWrites
+     * @returns {{primary: Mongo, coll: DBCollection, awaitCreateIndexes: Function,
+     *     buildUUID: string, hangBeforeBuildingIndexFp: Object}}
+     */
+    static _seedAndStart(
+        rst,
+        {dbName, collName, docTemplate, docCount, indexSpecs, indexNames, sideWrites},
+    ) {
+        const primary = rst.getPrimary();
+        const coll = primary.getDB(dbName).getCollection(collName);
+        coll.drop();
+        bulkInsert(coll, docCount, docTemplate);
+        rst.awaitReplication();
+
+        const started = PrimaryDrivenResumableIndexBuildTest._startBuild(
+            rst,
+            dbName,
+            coll,
+            indexSpecs,
+            indexNames,
+            sideWrites,
+        );
+        return {primary, coll, ...started};
+    }
+
+    /**
+     * Post-resume verification shared by every scenario: waits for replication, asserts every named
+     * index exists and validates on all nodes, optionally checks the resume metric moved for one of
+     * `expectedPhases`, applies `postIndexBuildInserts` and re-verifies, then drops the indexes so
+     * the next scenario starts clean (the collection is left in place).
+     *
+     * Callers must already have waited for the build to finish (see `_waitForBuildOutcome`), which
+     * also lets them run scenario-specific log assertions first.
+     *
+     * @param {ReplSetTest} rst
+     * @param {Object} opts
+     * @param {string} opts.dbName
+     * @param {string} opts.collName
+     * @param {string[]} opts.indexNames
+     * @param {Object} [opts.beforeMetrics] - The `_readResumeMetrics()` snapshot taken before the
+     *     resume. Required when `expectedPhases` is set.
+     * @param {string[]} [opts.expectedPhases] - When set, asserts exactly one resume-succeeded phase
+     *     attribute incremented and that it is one of these. Omit when the caller verifies the
+     *     metric itself (e.g. `runMultiPhase`, which checks it per step-up).
+     * @param {Object[]} [opts.postIndexBuildInserts=[]]
+     * @returns {void}
+     */
+    static _verifyResumedBuild(
+        rst,
+        {
+            dbName,
+            collName,
+            indexNames,
+            beforeMetrics,
+            expectedPhases,
+            postIndexBuildInserts = [],
+            expectMultikey = false,
+        },
+    ) {
+        rst.awaitReplication();
+        PrimaryDrivenResumableIndexBuildTest._verifyIndexAcrossNodes(
+            rst,
+            dbName,
+            collName,
+            indexNames,
+            expectMultikey,
+        );
+
+        if (expectedPhases) {
+            assert(
+                beforeMetrics,
+                "_verifyResumedBuild requires beforeMetrics when expectedPhases is set",
+            );
+            PrimaryDrivenResumableIndexBuildTest._verifyResumeMetric(
+                rst._pdibMetricsDir,
+                beforeMetrics,
+                expectedPhases,
+            );
+        }
+
+        if (postIndexBuildInserts.length > 0) {
+            assert.commandWorked(
+                rst
+                    .getPrimary()
+                    .getDB(dbName)
+                    .getCollection(collName)
+                    .insert(postIndexBuildInserts),
+            );
+            rst.awaitReplication();
+            PrimaryDrivenResumableIndexBuildTest._verifyIndexAcrossNodes(
+                rst,
+                dbName,
+                collName,
+                indexNames,
+                expectMultikey,
+            );
+        }
+
+        for (const name of indexNames) {
+            assert.commandWorked(
+                rst.getPrimary().getDB(dbName).getCollection(collName).dropIndex(name),
+            );
+        }
+    }
+
+    /**
+     * Drives the window between a node accepting writes and a build it resumes setting itself up.
+     *
+     * Pauses a build in `options.phase`, fails over so the build is resumed elsewhere, holds the
+     * resumed build before it sets itself up, and calls `options.writesInWindow(db)` there. Then
+     * releases it and waits for the build to commit on every node.
+     *
+     * No phase re-derives keys for records it has already processed, so anything written in the
+     * window only reaches the index through the pending interceptor for the build.
+     *
+     * @param {ReplSetTest} rst - From `setUp()`.
+     * @param {Object} options - As for `run()`, plus:
+     * @param {Function} options.writesInWindow - `(db: DB, collName: string) => void`
+     * @param {string} [options.phase=PdibPhase.DRAIN] - One of `PdibPhase`.
+     * @param {string} [options.position=PdibPosition.BEGINNING] - One of `PdibPosition`. For the
+     *     scan phase use MIDDLE or END, so the records the window writes touch have already been
+     *     scanned and a resumed scan will not revisit them.
+     * @returns {Object} `{newPrimary, indexNames}`. The old primary is not returned: failover
+     *     modes that restart it replace its connection, so callers should reach the other nodes
+     *     through `rst.nodes`.
+     */
+    static runWithWritesBeforeResumeSetup(rst, options) {
+        const {dbName, collName, indexSpecs, docTemplate, docCount, sideWrites, maxMb} =
+            PrimaryDrivenResumableIndexBuildTest._normalizeOptions(options);
+        assert(options.writesInWindow, "options.writesInWindow is required");
+        const phase = options.phase || PdibPhase.DRAIN;
+        const position = options.position || PdibPosition.BEGINNING;
+        if (phase === PdibPhase.DRAIN) {
+            assert.gt(sideWrites.length, 0, "the drain phase requires at least one side write");
+        }
+        if (!PrimaryDrivenResumableIndexBuildTest._preflight(rst, dbName, "window")) {
+            return null;
+        }
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: maxMb,
+        });
+
+        // The phase is part of the name so that indexes left by an earlier scenario on the
+        // same collection cannot satisfy this run's completion check.
+        const indexNames = indexSpecs.map((_, i) => `${DEFAULT_INDEX_NAME}_${phase}_win_${i}`);
+        const {primary, awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp} =
+            PrimaryDrivenResumableIndexBuildTest._seedAndStart(rst, {
+                dbName,
+                collName,
+                docTemplate,
+                docCount,
+                indexSpecs,
+                indexNames,
+                sideWrites,
+            });
+
+        const phaseFp = PrimaryDrivenResumableIndexBuildTest._configurePhaseFailPoint(
+            primary,
+            phase,
+            position,
+            buildUUID,
+            indexNames,
+            docCount,
+            sideWrites.length,
+        );
+        hangBeforeBuildingIndexFp.off();
+        phaseFp.wait();
+
+        // Hold the resumed build before it sets itself up. Matched on this build so the build the
+        // secondary runs for itself is not held too, which would stop it applying oplog entries.
+        const nextPrimary = rst.getSecondary();
+        const heldResume = configureFailPoint(nextPrimary, "hangBeforeInitializingIndexBuild", {
+            buildUUIDs: [buildUUID],
+        });
+
+        const newPrimary = PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            primary,
+            nextPrimary,
+            options.failoverMode || PdibFailoverMode.NO_RESTART,
+        );
+        try {
+            awaitCreateIndexes();
+        } catch (e) {
+            jsTest.log.info("Ignoring index build shell failure after failover", {error: e});
+        }
+
+        // Release the phase fail point so it cannot pause a later build on this node. The build
+        // thread on the old primary has already exited due to the state change. For restart modes
+        // the old mongod was recycled, so its in-memory fail point is already gone and the handle's
+        // connection is stale; when graceful unplanned stepdown isn't supported the failover always
+        // kills the old primary, so skip in both cases.
+        if (
+            !PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary(
+                options.failoverMode || PdibFailoverMode.NO_RESTART,
+            )
+        ) {
+            phaseFp.off();
+        }
+
+        heldResume.wait();
+        // Release the build even if the callback throws, so a failing assertion is not buried by
+        // a teardown hang on the still-paused build thread.
+        try {
+            options.writesInWindow(newPrimary.getDB(dbName), collName);
+        } finally {
+            heldResume.off();
+        }
+
+        PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+            newPrimary,
+            dbName,
+            collName,
+            indexNames,
+            buildUUID,
+        );
+        rst.awaitReplication();
+
+        return {newPrimary, indexNames};
+    }
+
+    /**
+     * Drives the case where a step-up cannot create a pending interceptor for a build it would
+     * resume.
+     *
+     * Pauses a build in its drain phase, arms `failToCreatePendingInterceptorsOnStepUp` on the node
+     * about to be stepped up, and fails over. Without one, writes accepted since then produced no
+     * index keys and no side writes, so resuming would commit an index missing them and the build
+     * must be aborted instead. Asserts that outcome and that no partial index is left behind.
+     *
+     * @param {ReplSetTest} rst - From `setUp()`.
+     * @param {Object} options - As for `run()`.
+     * @returns {Object} `{newPrimary, indexNames}`
+     */
+    static runWithoutPendingInterceptors(rst, options) {
+        const {dbName, collName, indexSpecs, docTemplate, docCount, sideWrites, maxMb} =
+            PrimaryDrivenResumableIndexBuildTest._normalizeOptions(options);
+        if (!PrimaryDrivenResumableIndexBuildTest._preflight(rst, dbName, "noPendingInterceptor")) {
+            return null;
+        }
+        PrimaryDrivenResumableIndexBuildTest._setIndexBuildSettings(rst, {
+            maxIndexBuildMemoryUsageMegabytes: maxMb,
+        });
+
+        const indexNames = indexSpecs.map((_, i) => `${DEFAULT_INDEX_NAME}_nopending_${i}`);
+        const {primary, awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp} =
+            PrimaryDrivenResumableIndexBuildTest._seedAndStart(rst, {
+                dbName,
+                collName,
+                docTemplate,
+                docCount,
+                indexSpecs,
+                indexNames,
+                sideWrites,
+            });
+
+        const phaseFp = PrimaryDrivenResumableIndexBuildTest._configurePhaseFailPoint(
+            primary,
+            PdibPhase.DRAIN,
+            PdibPosition.BEGINNING,
+            buildUUID,
+            indexNames,
+            docCount,
+            sideWrites.length,
+        );
+        hangBeforeBuildingIndexFp.off();
+        phaseFp.wait();
+
+        const nextPrimary = rst.getSecondary();
+        const failToCreateFp = configureFailPoint(
+            nextPrimary,
+            "failToCreatePendingInterceptorsOnStepUp",
+        );
+
+        const newPrimary = PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            primary,
+            nextPrimary,
+            options.failoverMode || PdibFailoverMode.NO_RESTART,
+        );
+        try {
+            awaitCreateIndexes();
+        } catch (e) {
+            jsTest.log.info("Ignoring index build shell failure after failover", {error: e});
+        }
+
+        // Release the phase fail point so it cannot pause a later build on this node. The build
+        // thread on the old primary has already exited due to the state change. For restart modes
+        // the old mongod was recycled, so its in-memory fail point is already gone and the handle's
+        // connection is stale; when graceful unplanned stepdown isn't supported the failover always
+        // kills the old primary, so skip in both cases.
+        if (
+            !PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary(
+                options.failoverMode || PdibFailoverMode.NO_RESTART,
+            )
+        ) {
+            phaseFp.off();
+        }
+
+        const outcome = PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+            newPrimary,
+            dbName,
+            collName,
+            indexNames,
+            buildUUID,
+            {expectAbort: true},
+        );
+        assert.eq(
+            "aborted_after_resume_failure",
+            outcome,
+            `build ${buildUUID} must be aborted when it has no pending interceptor`,
+        );
+        failToCreateFp.off();
+        rst.awaitReplication();
+
+        // An aborted build must not leave any of its indexes behind on any node.
+        for (const node of rst.nodes) {
+            const built = node
+                .getDB(dbName)
+                .getCollection(collName)
+                .getIndexes()
+                .map((idx) => idx.name);
+            for (const name of indexNames) {
+                assert(!built.includes(name), `${node.host}: ${name} must not exist`, {built});
+            }
+        }
+
+        return {newPrimary, indexNames};
+    }
+
+    /**
+     * Runs one (phase, position) resume scenario: seeds the collection, starts and pauses the
+     * build, steps up the secondary, and asserts the resumed build completes with consistent
+     * indexes across nodes.
+     *
+     * @param {ReplSetTest} rst
+     * @param {Object} opts
+     * @param {string} opts.phase - One of `PdibPhase`.
+     * @param {string} opts.position - One of `PdibPosition`.
+     * @param {string} opts.failoverMode - One of `PdibFailoverMode`.
+     * @param {string} opts.dbName
+     * @param {string} opts.collName
+     * @param {Object[]} opts.indexSpecs - All three index specs in build order.
+     * @param {Function} opts.docTemplate - `(i: number) => Object`.
+     * @param {number} opts.docCount
+     * @param {Object[]} opts.sideWrites
+     * @param {Object[]} opts.postIndexBuildInserts
+     * @returns {void}
+     */
+    static _runOne(rst, opts) {
+        const {
+            phase,
+            position,
+            failoverMode,
+            dbName,
+            collName,
+            indexSpecs,
+            docTemplate,
+            docCount,
+            sideWrites,
+            postIndexBuildInserts,
+            writesWhilePaused,
+            updatesWhilePaused,
+            expectMultikey,
+        } = opts;
+
+        const indexNameStem = `${DEFAULT_INDEX_NAME}_${phase.replace(/\s+/g, "_")}_${position}`;
+        const indexNames = Array.from(
+            {length: DEFAULT_INDEX_COUNT},
+            (_, i) => `${indexNameStem}_${i}`,
+        );
+        const fpInfo = PHASE_FAIL_POINTS[phase];
+
+        // Seed the collection and start the build under hangBeforeBuildingIndex so we can prime the
+        // side writes table before the build's actual phases begin.
+        const {primary, awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp} =
+            PrimaryDrivenResumableIndexBuildTest._seedAndStart(rst, {
+                dbName,
+                collName,
+                docTemplate,
+                docCount,
+                indexSpecs,
+                indexNames,
+                sideWrites,
+            });
+
+        // Configure the phase fail point on the current primary BEFORE releasing the
+        // hangBeforeBuildingIndex fail point: otherwise the build can race past the per-phase
+        // iteration before the per-phase fail point is set, most importantly for SCAN+BEGINNING
+        // (iteration 0). For LOAD/DRAIN the fail point is keyed on the position-selected index.
+        const phaseFp = PrimaryDrivenResumableIndexBuildTest._configurePhaseFailPoint(
+            primary,
+            phase,
+            position,
+            buildUUID,
+            indexNames,
+            docCount,
+            sideWrites.length,
+        );
+
+        // Now release hangBeforeBuildingIndex; the build progresses into the scan and will hit the
+        // per-phase fail point we just set.
+        hangBeforeBuildingIndexFp.off();
+
+        PrimaryDrivenResumableIndexBuildTest._waitForPause(
+            primary,
+            fpInfo,
+            buildUUID,
+            indexNameForPosition(indexNames, position),
+        );
+
+        PrimaryDrivenResumableIndexBuildTest._applyWritesWhilePaused(rst, {
+            primary,
+            dbName,
+            collName,
+            writesWhilePaused,
+            updatesWhilePaused,
+        });
+
+        // Snapshot the index_builds.resume.* counters before stepdown so we can assert the resume
+        // of *this* build incremented succeeded[<phase>] and didn't bump failed.
+        const beforeMetrics = PrimaryDrivenResumableIndexBuildTest._readResumeMetrics(
+            rst._pdibMetricsDir,
+        );
+
+        // For restart modes, wait for the index build resume state to replicate to secondaries
+        // before shutting down the primary. Container writes (including resume state) replicate
+        // asynchronously, so without this the stepped-up node could win the election without
+        // the resume state, preventing it from resuming the build.
+        if (
+            failoverMode === PdibFailoverMode.UNCLEAN_RESTART ||
+            failoverMode === PdibFailoverMode.CLEAN_RESTART
+        ) {
+            rst.awaitReplication();
+        }
+
+        // Step the secondary up. rst.stepUp() requests an election with a higher term, which
+        // forces the old primary to step down even while its build thread is paused at our fail
+        // point. This is more deterministic than replSetStepDown + waiting for the secondary to
+        // win an election. The awaiter on the parallel shell will receive
+        // InterruptedDueToReplStateChange.
+        //
+        // We must step up before releasing `phaseFp`. Step-up interrupts the build thread via the
+        // replication state change; if we instead released the fail point first, the build would
+        // simply continue past its current iteration on the old primary and could complete the
+        // entire build before we ever step up.
+        const oldPrimary = primary;
+        const secondary = rst.getSecondary();
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: triggering resume via failover mode=${failoverMode}`,
+        );
+        const newPrimary = PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            oldPrimary,
+            secondary,
+            failoverMode,
+        );
+
+        // Release the now-stepped-down primary's fail point (cleanup; the build thread has already
+        // exited due to the state change). For restart modes the old mongod was recycled, so its
+        // in-memory fail point is already gone and the handle's connection is stale — skip. When
+        // graceful unplanned stepdown is not supported the old primary is always stopped during
+        // failover (see `_failOverWithCheckpointInstall`), so its fail point is gone too — skip
+        // there as well.
+        if (!PrimaryDrivenResumableIndexBuildTest.failoverStopsOldPrimary(failoverMode)) {
+            phaseFp.off();
+        }
+
+        // The shell's createIndexes call against the (now stepped-down) primary returns
+        // InterruptedDueToReplStateChange. Don't enforce shell success.
+        awaitCreateIndexes({checkExitSuccess: false});
+
+        // Watch for either success (log 20663) or the resume-failure-then-abort path (log 11130400)
+        // so a broken resume code path fails fast with a clear message instead of hanging on
+        // checkLog's 10-minute default timeout.
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: waiting for build ${buildUUID} to complete on new primary`,
+        );
+        PrimaryDrivenResumableIndexBuildTest._waitForBuildOutcome(
+            newPrimary,
+            dbName,
+            collName,
+            indexNames,
+            buildUUID,
+        );
+
+        // Verify the indexes across nodes and that the OTel resume counters moved correctly:
+        // exactly one phase attribute on succeeded incremented, that phase is in the expected set
+        // for this (PdibPhase, PdibPosition), and failed didn't move.
+        PrimaryDrivenResumableIndexBuildTest._verifyResumedBuild(rst, {
+            dbName,
+            collName,
+            indexNames,
+            beforeMetrics,
+            expectedPhases: EXPECTED_RESUME_PHASES[phase][position],
+            postIndexBuildInserts,
+            expectMultikey,
+        });
+    }
+
+    /**
+     * Applies `writesWhilePaused` / `updatesWhilePaused` against the paused build's primary.
+     *
+     * Writes issued here land after the collection scan's snapshot and while the build thread is
+     * parked, so the paused primary never applies them: a resumed build is what drains them.
+     * Gating on the fail point (rather than on currentOp) is what keeps that ordering
+     * deterministic. Majority write concern plus awaitReplication guarantee that whichever node is
+     * stepped up next already has them.
+     *
+     * @param {ReplSetTest} rst
+     * @param {Object} opts
+     * @param {Mongo} opts.primary - The node the build is paused on.
+     * @param {string} opts.dbName
+     * @param {string} opts.collName
+     * @param {Object[]} [opts.writesWhilePaused] - Documents to insert.
+     * @param {Object[]} [opts.updatesWhilePaused] - Update statements, as `{q, u}`.
+     * @returns {void}
+     */
+    static _applyWritesWhilePaused(
+        rst,
+        {primary, dbName, collName, writesWhilePaused, updatesWhilePaused},
+    ) {
+        const hasWrites = writesWhilePaused && writesWhilePaused.length > 0;
+        const hasUpdates = updatesWhilePaused && updatesWhilePaused.length > 0;
+        if (hasWrites) {
+            const res = assert.commandWorked(
+                primary.getDB(dbName).runCommand({
+                    insert: collName,
+                    documents: writesWhilePaused,
+                    writeConcern: {w: "majority"},
+                }),
+            );
+            assert.eq(
+                res.n,
+                writesWhilePaused.length,
+                "every writesWhilePaused document must have been inserted",
+                {res},
+            );
+        }
+        if (hasUpdates) {
+            const res = assert.commandWorked(
+                primary.getDB(dbName).runCommand({
+                    update: collName,
+                    updates: updatesWhilePaused,
+                    writeConcern: {w: "majority"},
+                }),
+            );
+            // A no-op update would leave the scenario silently untested, so require every one of
+            // them to have matched and changed a document.
+            assert.eq(
+                res.nModified,
+                updatesWhilePaused.length,
+                "every updatesWhilePaused statement must have modified a document",
+                {res},
+            );
+        }
+        if (hasWrites || hasUpdates) {
+            rst.awaitReplication();
+        }
+    }
+
+    /**
+     * Configures the phase fail point on `node` for `(phase, position)`. Returns the fail-point
+     * handle so the caller can `.off()` it when done.
+     *
+     * @param {Mongo} node
+     * @param {string} phase - One of `PdibPhase`.
+     * @param {string} position - One of `PdibPosition`.
+     * @param {string} buildUUID
+     * @param {string[]} indexNames
+     * @param {number} docCount
+     * @param {number} sideWritesCount
+     * @returns {Object} Fail-point handle returned by `configureFailPoint()`.
+     */
+    static _configurePhaseFailPoint(
+        node,
+        phase,
+        position,
+        buildUUID,
+        indexNames,
+        docCount,
+        sideWritesCount,
+    ) {
+        const fpInfo = PHASE_FAIL_POINTS[phase];
+        const totalIters = totalIterationsFor(phase, docCount, sideWritesCount);
+        const iteration = iterationFor(position, totalIters);
+        const fpData = {iteration: NumberLong(iteration)};
+        if (fpInfo.matchKey === "buildUUIDs") {
+            fpData.buildUUIDs = [buildUUID];
+        } else {
+            fpData.indexNames = [indexNameForPosition(indexNames, position)];
+        }
+        return configureFailPoint(node, fpInfo.failPointName, fpData);
+    }
+
+    /**
+     * Polls the primary's log until the phase fail point's expected log line is observed.
+     *
+     * @param {Mongo} primary
+     * @param {Object} fpInfo - An entry of `PHASE_FAIL_POINTS`.
+     * @param {string} fpInfo.failPointName
+     * @param {number} fpInfo.logId
+     * @param {string} fpInfo.matchKey - `"buildUUIDs"` or `"indexNames"`.
+     * @param {string} buildUUID
+     * @param {string} indexName
+     * @returns {void}
+     */
+    static _waitForPause(primary, fpInfo, buildUUID, indexName) {
+        if (fpInfo.matchKey === "buildUUIDs") {
+            checkLog.containsJson(primary, fpInfo.logId, {
+                buildUUID: function (uuid) {
+                    return uuid && uuid.uuid && uuid.uuid["$uuid"] === buildUUID;
+                },
+            });
+        } else {
+            checkLog.containsJson(primary, fpInfo.logId, {index: indexName});
+        }
+    }
+
+    /**
+     * Forces a checkpoint on the primary, waits for the secondary to install it, then kills the
+     * primary so the secondary steps up. The build is paused at its phase fail point, so no writes
+     * accumulate after the checkpoint. The old primary is always SIGKILLed. Returns the new primary
+     * (the stepped-up secondary).
+     */
+    static _failOverWithCheckpointInstall(rst, {unclean = false} = {}) {
+        const oldPrimary = rst.getPrimary();
+        const secondary = rst.getSecondary();
+
+        // Force a checkpoint on the primary and block until the secondary installs it.
+        PrimaryDrivenResumableIndexBuildTest._awaitCheckpointInstalled(oldPrimary, secondary);
+
+        rst.stop(
+            oldPrimary,
+            9 /* SIGKILL */,
+            {allowedExitCode: MongoRunner.EXIT_SIGKILL},
+            {
+                forRestart: true,
+            },
+        );
+
+        jsTest.log.info(
+            "PrimaryDrivenResumableIndexBuildTest: killed primary; waiting for secondary to step up",
+            {secondary: secondary.host, requestedUnclean: unclean},
+        );
+        assert.soon(() => {
+            try {
+                return secondary.adminCommand({hello: 1}).isWritablePrimary;
+            } catch (e) {
+                return false;
+            }
+        }, `secondary ${secondary.host} did not step up after the primary was stopped`);
+
+        // Restart the old primary so it rejoins as a secondary (keeps the set at two live nodes).
+        const restartedNode = rst.start(oldPrimary, {}, /*restart=*/ true);
+        if (rst._pdibIndexBuildSettings) {
+            assert.commandWorked(
+                restartedNode.adminCommand({setParameter: 1, ...rst._pdibIndexBuildSettings}),
+            );
+        }
+        rst.awaitSecondaryNodes();
+        return secondary;
+    }
+
+    /**
+     * Forces a checkpoint on `primary`, then waits until `secondary` installs that checkpoint.
+     *
+     * "Drained" means the secondary has adopted a checkpoint at least as new as the primary's last
+     * stable checkpoint after the fsync. In the frozen case (a paused build's open transaction pins
+     * the stable timestamp) the fsync produces no newer checkpoint and the secondary is already
+     * there, so this returns immediately. We also accept the secondary installing any newer
+     * checkpoint than before the fsync (it's actively draining), and cap the wait so a missed
+     * signal proceeds rather than hangs.
+     */
+    static _awaitCheckpointInstalled(primary, secondary) {
+        const adoptedBefore = PrimaryDrivenResumableIndexBuildTest._checkpointTs(
+            secondary,
+            "standbyLastAdoptedCheckpointTimestamp",
+        );
+        assert.commandWorked(primary.adminCommand({fsync: 1}));
+        const target = PrimaryDrivenResumableIndexBuildTest._readPrimaryCheckpointTs(primary);
+        const haveTarget = timestampCmp(target, Timestamp(0, 0)) > 0;
+        jsTest.log.info(
+            "PrimaryDrivenResumableIndexBuildTest: forced checkpoint on primary; waiting for secondary " +
+                "to drain its ingest tables",
+            {secondary: secondary.host, adoptedBefore, primaryCheckpointTimestamp: target},
+        );
+        const deadline = Date.now() + 2 * 60 * 1000;
+        let lastLogged = Date.now();
+        for (;;) {
+            const adopted = PrimaryDrivenResumableIndexBuildTest._checkpointTs(
+                secondary,
+                "standbyLastAdoptedCheckpointTimestamp",
+            );
+            // Done if the secondary reached the primary's post-fsync checkpoint (instant in the
+            // frozen case -- the checkpoint didn't advance and the secondary is already there), or it
+            // installed any newer checkpoint than before the fsync.
+            if (
+                (haveTarget && timestampCmp(adopted, target) >= 0) ||
+                timestampCmp(adopted, adoptedBefore) > 0
+            ) {
+                jsTest.log.info(
+                    "PrimaryDrivenResumableIndexBuildTest: secondary adopted checkpoint",
+                    {secondary: secondary.host, adopted, primaryCheckpointTimestamp: target},
+                );
+                return;
+            }
+            if (Date.now() >= deadline) {
+                jsTest.log.info(
+                    "PrimaryDrivenResumableIndexBuildTest: secondary did not visibly advance within " +
+                        "the timeout; treating it as already drained and proceeding",
+                    {
+                        secondary: secondary.host,
+                        adopted,
+                        primaryCheckpointTimestamp: target,
+                        adoptedBefore,
+                    },
+                );
+                return;
+            }
+            if (Date.now() - lastLogged >= 30 * 1000) {
+                jsTest.log.info(
+                    "PrimaryDrivenResumableIndexBuildTest: still waiting for secondary to drain",
+                    {
+                        secondary: secondary.host,
+                        adopted,
+                        primaryCheckpointTimestamp: target,
+                        adoptedBefore,
+                    },
+                );
+                lastLogged = Date.now();
+            }
+            sleep(500);
+        }
+    }
+
+    /**
+     * Reads the primary's last stable checkpoint timestamp. That field is best-effort, so retries
+     * briefly; returns Timestamp(0, 0) if it never appears.
+     */
+    static _readPrimaryCheckpointTs(primary) {
+        for (let i = 0; i < 40; i++) {
+            const ts = PrimaryDrivenResumableIndexBuildTest._checkpointTs(
+                primary,
+                "primaryCheckpointTimestamp",
+            );
+            if (timestampCmp(ts, Timestamp(0, 0)) > 0) {
+                return ts;
+            }
+            sleep(50);
+        }
+        return Timestamp(0, 0);
+    }
+
+    static _checkpointTs(node, field) {
+        const standby = assert.commandWorked(node.adminCommand({serverStatus: 1})).standby;
+        return (standby && standby[field]) || Timestamp(0, 0);
+    }
+
+    /**
+     * Fails over to the replica set's secondary, returning the new primary.
+     */
+    static failover(rst) {
+        return PrimaryDrivenResumableIndexBuildTest._failover(
+            rst,
+            rst.getPrimary(),
+            rst.getSecondary(),
+            PdibFailoverMode.NO_RESTART,
+        );
+    }
+
+    /**
+     * Returns whether a failover in `failoverMode` stops the old primary, in which case its
+     * in-memory fail points are gone and connections to it are stale.
+     */
+    static failoverStopsOldPrimary(failoverMode = PdibFailoverMode.NO_RESTART) {
+        return (
+            failoverMode !== PdibFailoverMode.NO_RESTART ||
+            (TestData.doesNotSupportGracefulUnplannedStepdown &&
+                TestData.doesNotSupportGracefulPlannedStepdown)
+        );
+    }
+
+    /**
+     * Fails over from `oldPrimary` to `nextPrimaryNode` via replSetStepDown, leaving the old
+     * primary running as a secondary. Any other secondaries are frozen for the duration so that
+     * `nextPrimaryNode` is the only candidate, and every node is unfrozen afterwards so later
+     * failovers can step any of them up. Returns the new primary.
+     */
+    static _failOverWithStepDown(rst, oldPrimary, nextPrimaryNode) {
+        const otherSecondaries = rst.nodes.filter(
+            (node) => node.host !== oldPrimary.host && node.host !== nextPrimaryNode.host,
+        );
+        for (const node of otherSecondaries) {
+            assert.commandWorked(node.adminCommand({replSetFreeze: ReplSetTest.kForeverSecs}));
+        }
+
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: issuing replSetStepDown on ${oldPrimary.host}`,
+            {nextPrimary: nextPrimaryNode.host},
+        );
+        assert.commandWorked(
+            oldPrimary.adminCommand({
+                replSetStepDown: ReplSetTest.kForeverSecs,
+                secondaryCatchUpPeriodSecs: 60,
+            }),
+        );
+        rst.awaitNodesAgreeOnPrimary(undefined, rst.nodes, nextPrimaryNode);
+        assert.eq(rst.getPrimary().host, nextPrimaryNode.host);
+
+        for (const node of [oldPrimary, ...otherSecondaries]) {
+            assert.commandWorked(node.adminCommand({replSetFreeze: 0}));
+        }
+        return nextPrimaryNode;
+    }
+
+    /**
+     * Triggers a failover according to `failoverMode`.
+     *
+     * The restart modes require a 3-node (or larger) replica set so the surviving secondary can win
+     * the election while the old primary is down — a 2-node set has no quorum once the primary is
+     * gone.
+     *
+     * @param {ReplSetTest} rst
+     * @param {Mongo} oldPrimary - The node currently serving as primary, to be displaced.
+     * @param {Mongo} nextPrimaryNode - The secondary to step up.
+     * @param {string} failoverMode - One of `PdibFailoverMode`.
+     * @returns {Mongo} The new primary (may be a fresh connection if a restart was involved).
+     */
+    static _failover(rst, oldPrimary, nextPrimaryNode, failoverMode) {
+        if (TestData.doesNotSupportGracefulUnplannedStepdown) {
+            if (
+                failoverMode === PdibFailoverMode.NO_RESTART &&
+                !TestData.doesNotSupportGracefulPlannedStepdown
+            ) {
+                return PrimaryDrivenResumableIndexBuildTest._failOverWithStepDown(
+                    rst,
+                    oldPrimary,
+                    nextPrimaryNode,
+                );
+            }
+            return PrimaryDrivenResumableIndexBuildTest._failOverWithCheckpointInstall(rst, {
+                unclean: failoverMode === PdibFailoverMode.UNCLEAN_RESTART,
+            });
+        }
+
+        if (failoverMode === PdibFailoverMode.NO_RESTART) {
+            return rst.stepUp(nextPrimaryNode);
+        }
+
+        // Fail fast on misconfiguration: with only 2 nodes, the surviving secondary can't reach
+        // majority after we stop the primary, so `replSetStepUp` would hang in the retry loop.
+        assert.gte(
+            rst.nodes.length,
+            3,
+            `failoverMode=${failoverMode} requires a replica set with >= 3 nodes; use setUp({nodes: 3})`,
+        );
+
+        const signal =
+            failoverMode === PdibFailoverMode.CLEAN_RESTART ? 15 /*SIGTERM*/ : 9; /*SIGKILL*/
+        const stopOpts =
+            failoverMode === PdibFailoverMode.UNCLEAN_RESTART
+                ? {allowedExitCode: MongoRunner.EXIT_SIGKILL}
+                : {};
+        // 1. Stop the old primary before the step-up.
+        rst.stop(oldPrimary, signal, stopOpts, {forRestart: true});
+
+        // 2. Step up the surviving secondary. We can't use `rst.stepUp(...)` here because, even
+        //    with `awaitReplicationBeforeStepUp: false`, it follows the `replSetStepUp` command
+        //    with `awaitNodesAgreeOnPrimary(this.nodes, ...)`, which hangs waiting for the down
+        //    node we just shut down. Send the command directly and poll for `isWritablePrimary`
+        //    against the candidate.
+        jsTest.log.info(
+            `PrimaryDrivenResumableIndexBuildTest: issuing replSetStepUp on ${nextPrimaryNode.host}`,
+        );
+        assert.soonNoExcept(() => {
+            const res = nextPrimaryNode.adminCommand({replSetStepUp: 1});
+            return res.ok === 1;
+        }, `replSetStepUp on ${nextPrimaryNode.host} did not succeed`);
+        assert.soon(() => {
+            try {
+                return nextPrimaryNode.adminCommand({hello: 1}).isWritablePrimary;
+            } catch (e) {
+                return false;
+            }
+        }, `${nextPrimaryNode.host} did not become writable primary`);
+        const newPrimary = nextPrimaryNode;
+
+        // 3. Restart the old primary; it rejoins as a secondary.
+        const restartedNode = rst.start(oldPrimary, {}, /*restart=*/ true);
+
+        // Re-apply runtime setParameter overrides.
+        if (rst._pdibIndexBuildSettings) {
+            assert.commandWorked(
+                restartedNode.adminCommand({setParameter: 1, ...rst._pdibIndexBuildSettings}),
+            );
+        }
+
+        // Wait for the restarted node to reach SECONDARY so subsequent getSecondary() /
+        // replSetStepUp calls don't race a node still in STARTUP / RECOVERING.
+        rst.awaitSecondaryNodes();
+
+        return newPrimary;
+    }
+
+    /**
+     * Starts a primary-driven index build in a parallel shell, hangs at hangBeforeBuildingIndex,
+     * primes the side-writes table, then releases. Returns {awaitCreateIndexes, buildUUID}. The
+     * parallel shell's createIndexes is *expected* to be interrupted by step-down, so the caller
+     * should drain its awaiter with `{checkExitSuccess: false}`.
+     *
+     * TODO (SERVER-127026): Deduplicate with `ResumableIndexBuildTest.createIndexesWithSideWrites`.
+     *
+     * @param {ReplSetTest} rst
+     * @param {string} dbName
+     * @param {DBCollection} coll
+     * @param {Object[]} indexSpecs
+     * @param {string[]} indexNames
+     * @param {Object[]} sideWrites
+     * @returns {{awaitCreateIndexes: Function, buildUUID: string, hangBeforeBuildingIndexFp: Object}}
+     *     The caller releases `hangBeforeBuildingIndexFp` after configuring the per-phase fail
+     *     point, and drains `awaitCreateIndexes` with `{checkExitSuccess: false}` because
+     *     step-down will interrupt it.
+     * @see ResumableIndexBuildTest.createIndexesWithSideWrites
+     */
+    static _startBuild(rst, dbName, coll, indexSpecs, indexNames, sideWrites) {
+        assert.eq(indexSpecs.length, DEFAULT_INDEX_COUNT, "_startBuild expects 3 index specs");
+        assert.eq(indexNames.length, DEFAULT_INDEX_COUNT, "_startBuild expects 3 index names");
+        const primary = rst.getPrimary();
+        const fp = configureFailPoint(primary, "hangBeforeBuildingIndex");
+
+        // Each spec is a full createIndexes index doc minus `name` (e.g. {key: {a: 1}, unique: true}
+        // or {key: {"$**": 1}}); the test supplies the name. Spread it so per-index options such as
+        // `unique` (and any wildcard projection) flow through to the command.
+        const indexesArg = indexSpecs.map((spec, i) => ({...spec, name: indexNames[i]}));
+
+        const awaitCreateIndexes = startParallelShell(
+            funWithArgs(
+                function (dbName, collName, indexes) {
+                    // Don't assert.commandWorked: stepdown is expected to interrupt this.
+                    db.getSiblingDB(dbName).runCommand({
+                        createIndexes: collName,
+                        indexes: indexes,
+                    });
+                },
+                dbName,
+                coll.getName(),
+                indexesArg,
+            ),
+            primary.port,
+        );
+
+        // Wait for the build to register so we can extract its buildUUID.
+        let indexes;
+        assert.soonNoExcept(function () {
+            indexes = IndexBuildTest.assertIndexes(
+                coll,
+                DEFAULT_INDEX_COUNT + 1,
+                ["_id_"],
+                indexNames,
+                {
+                    includeBuildUUIDs: true,
+                },
+            );
+            return true;
+        });
+        const buildUUID = extractUUIDFromObject(indexes[indexNames[0]].buildUUID);
+
+        // Wait for the build to reach hangBeforeBuildingIndex on the primary.
+        checkLog.containsJson(primary, [4940900, 10978300], {
+            buildUUID: function (uuid) {
+                return uuid && uuid.uuid && uuid.uuid["$uuid"] === buildUUID;
+            },
+        });
+
+        // Prime the side-writes table while the build is paused.
+        if (sideWrites.length > 0) {
+            assert.commandWorked(coll.insert(sideWrites));
+        }
+
+        // Wait for the last op to be committed so establishing the majority read cursor doesn't
+        // race with step-down.
+        rst.awaitLastOpCommitted();
+
+        // Return the hangBeforeBuildingIndex fail point so the caller can release it AFTER
+        // configuring the per-phase fail point. Releasing here would race the build past iteration
+        // 0 of the collection scan before the per-phase fail point is set, causing the
+        // SCAN+BEGINNING case to complete without ever hitting the per-phase fail point.
+        return {awaitCreateIndexes, buildUUID, hangBeforeBuildingIndexFp: fp};
+    }
+
+    /**
+     * Waits for the resumed index build to complete or abort on the new primary; throws on abort.
+     *
+     * Completion: all `indexNames` are ready in `listIndexes`.
+     *
+     * Abort requires a positive signal — either the build was previously seen in-progress via
+     * `listIndexes({includeBuildUUIDs: true})` and has since disappeared, OR abort log 11130400
+     * for this `buildUUID` is in the global log. Without it, the post-step-up window where the
+     * resumed build is not yet registered would be misread as an abort.
+     *
+     * Log 20663 is not used as the completion signal: the success line can roll out before the
+     * first poll under verbose step-up traffic, causing a spurious timeout.
+     *
+     * @param {Mongo} newPrimary
+     * @param {string} dbName
+     * @param {string} collName
+     * @param {string[]} indexNames - Names of the indexes the build is creating.
+     * @param {string} buildUUID
+     * @param {Object} [opts]
+     * @param {number} [opts.timeoutMs=300000]
+     * @param {boolean} [opts.expectAbort=false] - Accept an abort as the outcome instead of
+     *     failing on it.
+     * @returns {string} `"completed"` or `"aborted_after_resume_failure"`.
+     */
+    static _waitForBuildOutcome(
+        newPrimary,
+        dbName,
+        collName,
+        indexNames,
+        buildUUID,
+        {timeoutMs = 300_000, expectAbort = false} = {},
+    ) {
+        const coll = newPrimary.getDB(dbName).getCollection(collName);
+        const uuidStr = `"$uuid":"${buildUUID}"`;
+        let outcome = null;
+        let observedInProgress = false;
+        assert.soon(
+            () => {
+                let specs;
+                try {
+                    specs = coll.getIndexes({includeBuildUUIDs: true});
+                } catch (e) {
+                    // listIndexes can transiently fail during step-up / state transitions; retry.
+                    return false;
+                }
+                // Both from one listIndexes: with separate calls a build can abort in between,
+                // which reads as completed. In-progress entries are {spec, buildUUID}.
+                const inProgress = specs.some(
+                    (idx) => idx.buildUUID && extractUUIDFromObject(idx.buildUUID) === buildUUID,
+                );
+                const ready = new Set(specs.filter((idx) => !idx.buildUUID).map((idx) => idx.name));
+                if (inProgress) {
+                    observedInProgress = true;
+                    return false;
+                }
+                if (indexNames.every((name) => ready.has(name))) {
+                    outcome = "completed";
+                    return true;
+                }
+                // Not in progress and not ready: only conclude abort with a positive signal,
+                // otherwise keep polling (see method docstring).
+                if (observedInProgress) {
+                    outcome = "aborted_after_resume_failure";
+                    return true;
+                }
+                const lines = checkLog.getGlobalLog(newPrimary) ?? [];
+                if (lines.some((l) => l.includes('"id":11130400,') && l.includes(uuidStr))) {
+                    outcome = "aborted_after_resume_failure";
+                    return true;
+                }
+                return false;
+            },
+            () =>
+                `timed out waiting for build ${buildUUID} to complete or abort on ${newPrimary.host}`,
+            timeoutMs,
+            1000,
+        );
+        if (outcome === "aborted_after_resume_failure" && !expectAbort) {
+            // Opportunistically include log 11130400 details if its line is still available —
+            // purely informational, the assertion fires either way.
+            const lines = checkLog.getGlobalLog(newPrimary) ?? [];
+            const abortLine = lines.find(
+                (line) => line.includes('"id":11130400,') && line.includes(uuidStr),
+            );
+            const extra = abortLine ? ` Abort log: ${abortLine}` : "";
+            assert(
+                false,
+                `index build ${buildUUID} was aborted on the new primary instead of resumed. ` +
+                    `The resume code path likely failed; check log 12500301 for the ` +
+                    `underlying error.${extra}`,
+            );
+        }
+        return outcome;
+    }
+
+    /**
+     * Asserts every named index exists and validates cleanly on every node, and that replicated
+     * data hashes match.
+     *
+     * @param {ReplSetTest} rst
+     * @param {string} dbName
+     * @param {string} collName
+     * @param {string[]} indexNames
+     * @returns {void}
+     */
+    static _verifyIndexAcrossNodes(rst, dbName, collName, indexNames, expectMultikey = false) {
+        // Run validate on every node first, then assert if any of them are not valid.
+        const results = [];
+        for (const node of rst.nodes) {
+            const coll = node.getDB(dbName).getCollection(collName);
+            IndexBuildTest.assertIndexes(coll, DEFAULT_INDEX_COUNT + 1, ["_id_", ...indexNames]);
+            results.push({host: node.host, res: assert.commandWorked(coll.validate())});
+        }
+
+        if (expectMultikey) {
+            for (const {host, res} of results) {
+                for (const name of indexNames) {
+                    assert(
+                        res.indexDetails && res.indexDetails[name],
+                        `validate on ${host} reported no details for index ${name}`,
+                        {res},
+                    );
+                    assert(
+                        res.indexDetails[name].isMultikey,
+                        `index ${name} on ${host} must be multikey`,
+                        {indexDetails: res.indexDetails[name]},
+                    );
+                }
+            }
+        }
+        const failures = results.filter(({res}) => !res.valid);
+        assert.eq(
+            failures.length,
+            0,
+            `validation failed on ${failures.length}/${results.length} node(s):\n` +
+                results.map(({host, res}) => `  ${host}: ${tojson(res)}`).join("\n"),
+        );
+        rst.checkReplicatedDataHashes();
+    }
+
+    /**
+     * Reads the OTel JSONL exporter files in `metricsDir` and returns the current totals for
+     * index_builds.resume.* counters as:
+     *   {succeeded: {<phase>: <count>, ...}, failed: <count>}
+     *
+     * Unlike getLatestMetrics() in otel_file_export_helpers.js, this preserves the `phase`
+     * attribute on succeeded so we can verify the per-phase breakdown. The OTel file exporter
+     * writes a fresh snapshot of every counter on each flush, so within a single file we MUST take
+     * only the latest record (the cumulative value from that node). Across files we SUM, because
+     * each file is a separate node's metrics and a step-up resume on node B is not reflected in
+     * node A's counter.
+     *
+     * TODO (SERVER-127030): Use getLatestMetrics or equivalent and remove this function.
+     *
+     * @param {string} metricsDir
+     * @returns {{succeeded: Object<string, number>, failed: number}} Per-phase succeeded totals
+     *     (keyed by the `phase` attribute) and the cluster-wide failed total, summed across
+     *     per-node files.
+     */
+    static _readResumeMetrics(metricsDir) {
+        const result = {succeeded: {}, failed: 0};
+        const files = findOtelFilesWithSuffix(metricsDir);
+        for (const file of files) {
+            const content = cat(file.name);
+            if (!content || !content.trim()) continue;
+            // Read the last fully-formed JSON line in the file. The exporter appends one record per
+            // flush; the last record is the most recent cumulative snapshot. (The very last line
+            // can be cut off mid-write, in which case we fall back to the previous one.)
+            const lines = content.trim().split("\n");
+            let record = null;
+            for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i].trim();
+                if (!line) continue;
+                try {
+                    record = JSON.parse(line);
+                    break;
+                } catch (e) {
+                    // Try the previous line.
+                }
+            }
+            for (const resourceMetric of record?.resourceMetrics ?? []) {
+                for (const scopeMetric of resourceMetric?.scopeMetrics ?? []) {
+                    for (const metric of scopeMetric?.metrics ?? []) {
+                        if (
+                            metric.name !== RESUME_SUCCEEDED_METRIC &&
+                            metric.name !== RESUME_FAILED_METRIC
+                        ) {
+                            continue;
+                        }
+                        for (const dp of metric.sum?.dataPoints ?? []) {
+                            const value = Number(dp.asInt ?? dp.asDouble ?? 0);
+                            if (metric.name === RESUME_FAILED_METRIC) {
+                                // Sum across nodes (per-file): each file is a separate node's
+                                // counter, and we want the cluster-wide total.
+                                result.failed += value;
+                                continue;
+                            }
+                            // succeeded counter: split by phase attribute and sum across nodes
+                            // (per-file) for the same phase.
+                            let phase = null;
+                            for (const kv of dp.attributes ?? []) {
+                                if (kv.key === "phase") {
+                                    phase = kv.value?.stringValue;
+                                    break;
+                                }
+                            }
+                            if (phase === null) continue;
+                            result.succeeded[phase] = (result.succeeded[phase] ?? 0) + value;
+                        }
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Asserts the resume counters moved as expected after a single resume:
+     *   - failed counter unchanged
+     *   - exactly one phase attribute on the succeeded counter incremented by 1
+     *   - that phase is in `expectedPhases`
+     *
+     * Uses assert.soon because the OTel file exporter flushes periodically, so the metric may not
+     * be on disk immediately after the resume completes.
+     *
+     * @param {string} metricsDir
+     * @param {{succeeded: Object<string, number>, failed: number}} before - The snapshot returned
+     *     by `_readResumeMetrics()` before the resume.
+     * @param {string[]} expectedPhases - Server-side phase strings any one of which is acceptable
+     *     for the observed increment.
+     * @returns {void}
+     */
+    static _verifyResumeMetric(metricsDir, before, expectedPhases) {
+        let last = before;
+        assert.soon(
+            () => {
+                last = PrimaryDrivenResumableIndexBuildTest._readResumeMetrics(metricsDir);
+                if (last.failed !== before.failed) return true; // fail fast below
+                for (const phase of Object.keys(last.succeeded)) {
+                    const delta = (last.succeeded[phase] ?? 0) - (before.succeeded[phase] ?? 0);
+                    if (delta > 0) return true;
+                }
+                return false;
+            },
+            () =>
+                `Timed out waiting for resume metric increment. before=${tojson(before)} last=${tojson(last)}` +
+                ` expectedPhases=${tojson(expectedPhases)}`,
+            30_000,
+            200,
+            {runHangAnalyzer: false},
+        );
+
+        assert.eq(
+            last.failed,
+            before.failed,
+            `${RESUME_FAILED_METRIC} unexpectedly incremented. before=${tojson(before)} after=${tojson(last)}`,
+        );
+
+        const incremented = [];
+        let totalDelta = 0;
+        for (const phase of Object.keys(last.succeeded)) {
+            const delta = (last.succeeded[phase] ?? 0) - (before.succeeded[phase] ?? 0);
+            if (delta > 0) {
+                incremented.push({phase, delta});
+                totalDelta += delta;
+            }
+        }
+        assert.eq(
+            totalDelta,
+            1,
+            `Expected exactly one ${RESUME_SUCCEEDED_METRIC} increment, got ${tojson(incremented)}`,
+        );
+        const observedPhase = incremented[0].phase;
+        assert(
+            expectedPhases.includes(observedPhase),
+            `${RESUME_SUCCEEDED_METRIC} incremented for phase=${observedPhase}, ` +
+                `expected one of ${tojson(expectedPhases)}`,
+        );
+    }
+};

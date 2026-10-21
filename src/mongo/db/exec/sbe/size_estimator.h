@@ -1,0 +1,207 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/values/value_size.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/interval/interval.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/string_listset.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+
+/**
+ * Contains a set of functions for shallow estimating the size of allocated on the heap objects
+ * in a given container. The functions do not take account of the size of the given container, only
+ * its values allocated on the heap.
+ * They are used to calculate compile-time size of an SBE tree.
+ */
+namespace mongo::sbe::size_estimator {
+
+size_t estimate(const IndexBounds& indexBounds);
+size_t estimate(const OrderedIntervalList& list);
+size_t estimate(const Interval& interval);
+size_t estimate(const IndexSeekPoint& indexSeekPoint);
+
+inline size_t estimate(const std::unique_ptr<PlanStage>& planStage) {
+    return planStage->estimateCompileTimeSize();
+}
+
+inline size_t estimate(const std::unique_ptr<EExpression>& expr) {
+    return expr->estimateSize();
+}
+
+inline size_t estimate(value::TypeTags tag, value::Value val) {
+    size_t size = value::getApproximateSize(tag, val);
+    return std::max(static_cast<size_t>(0), size - sizeof(tag) - sizeof(val));
+}
+
+inline size_t estimate(const std::string& str) {
+    return sizeof(std::string::value_type) * str.capacity();
+}
+
+inline size_t estimate(const BSONObj& bson) {
+    return bson.objsize();
+}
+
+size_t estimate(const IndexBoundsChecker& checker);
+
+// Calculate sizes of heap-allocated values only. Therefore, sizes of scalar values are always 0.
+template <typename S, std::enable_if_t<std::is_scalar_v<S>, bool> = true>
+inline size_t estimate(S) {
+    return 0;
+}
+
+inline size_t estimate(std::string_view str) {
+    return 0;
+}
+
+inline size_t estimate(const AggExprPair& expr) {
+    size_t size = 0;
+    if (expr.init) {
+        size += expr.init->estimateSize();
+    }
+    size += expr.agg->estimateSize();
+    return size;
+}
+
+inline size_t estimate(const BlockAggExprTuple& tuple) {
+    size_t size = 0;
+
+    if (tuple.init) {
+        size += tuple.init->estimateSize();
+    }
+
+    if (tuple.blockAgg) {
+        size += tuple.blockAgg->estimateSize();
+    }
+
+    size += tuple.agg->estimateSize();
+
+    return size;
+}
+
+// Calculate the size of a SpecificStats's derived class.
+// We need a template argument here rather than passing const SpecificStats&
+// as we need to know the exact type to properly compute the size of the object.
+template <typename S, std::enable_if_t<std::is_base_of_v<SpecificStats, S>, bool> = true>
+inline size_t estimate(const S& stats) {
+    return stats.estimateObjectSizeInBytes() - sizeof(S);
+}
+
+template <typename A, typename B>
+inline size_t estimate(const std::pair<A, B>& pair) {
+    return estimate(pair.first) + estimate(pair.second);
+}
+
+// Calculate the size of the inlined vector's elements.
+template <typename T, size_t N, typename A>
+size_t estimate(const absl::InlinedVector<T, N, A>& vector) {
+    size_t size = 0;
+    // Calculate size of the value only if the values are not inlined.
+    if (vector.capacity() > N) {
+        size += vector.capacity() * sizeof(T);
+    }
+
+    for (const auto& elem : vector) {
+        size += estimate(elem);
+    }
+
+    return size;
+}
+
+// Calculate the size of the vector's elements.
+template <typename T, typename A>
+size_t estimate(const std::vector<T, A>& vector) {
+    size_t size = vector.capacity() * sizeof(T);
+
+    for (const auto& elem : vector) {
+        size += estimate(elem);
+    }
+
+    return size;
+}
+
+// Overload of 'estimate' function for std::vector<bool> since
+// the latter is often an optimized specialization of std::vector for bool
+// and it might fail to match against ordinary 'size_t estimate(const std::vector<T, A>&)'.
+inline size_t estimate(const std::vector<bool>& vec) {
+    return vec.capacity() * sizeof(bool);
+}
+
+template <typename T, typename A>
+size_t estimateContainerOnly(const std::vector<T, A>& vector) {
+    return vector.capacity() * sizeof(T);
+}
+
+template <typename K, typename V, typename... Args>
+size_t estimate(const absl::flat_hash_map<K, V, Args...>& map) {
+    // The estimation is based on the memory usage of absl::flat_hash_map
+    // documented in https://abseil.io/docs/cpp/guides/container:
+    // The container uses O((sizeof(std::pair<const K, V>) + 1) * bucket_count()) bytes.
+    // The tests with a custom allocator showed that actual memory usage was
+    // (sizeof(std::pair<const K, V>) + 1) * bucket_count() + C,
+    // where C was equal to 17 for non-empty containers on x64 platform
+    // and 0 for empty containers.
+    constexpr size_t kEstimatedConstantPayload = 17;
+    size_t bucketSize = sizeof(std::pair<const K, V>) + 1;
+    size_t size = map.bucket_count() * bucketSize;
+    size += map.empty() ? 0 : kEstimatedConstantPayload;
+
+    for (auto&& [key, val] : map) {
+        size += estimate(key);
+        size += estimate(val);
+    }
+
+    return size;
+}
+
+template <class BufferAllocator>
+size_t estimate(const BasicBufBuilder<BufferAllocator>& ba) {
+    return static_cast<size_t>(ba.capacity());
+}
+
+inline size_t estimate(const value::MaterializedRow& row) {
+    size_t size = 0;
+    for (size_t idx = 0; idx < row.size(); ++idx) {
+        auto [tag, val] = row.getViewOfValue(idx);
+        size += estimate(tag, val);
+    }
+    return size;
+}
+
+template <size_t N>
+inline size_t estimate(const value::FixedSizeRow<N>& row) {
+    size_t size = 0;
+    for (size_t idx = 0; idx < N; ++idx) {
+        auto [tag, val] = row.getViewOfValue(idx);
+        size += estimate(tag, val);
+    }
+    return size;
+}
+
+inline size_t estimate(const StringListSet& vec) {
+    size_t size = size_estimator::estimate(vec.getUnderlyingVector());
+    size += size_estimator::estimate(vec.getUnderlyingMap());
+    return size;
+}
+}  // namespace mongo::sbe::size_estimator

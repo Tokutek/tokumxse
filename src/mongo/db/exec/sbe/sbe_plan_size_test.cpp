@@ -1,0 +1,325 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
+#include "mongo/db/exec/sbe/stages/and_hash.h"
+#include "mongo/db/exec/sbe/stages/branch.h"
+#include "mongo/db/exec/sbe/stages/bson_scan.h"
+#include "mongo/db/exec/sbe/stages/co_scan.h"
+#include "mongo/db/exec/sbe/stages/fetch.h"
+#include "mongo/db/exec/sbe/stages/filter.h"
+#include "mongo/db/exec/sbe/stages/hash_agg.h"
+#include "mongo/db/exec/sbe/stages/hash_agg_accumulator.h"
+#include "mongo/db/exec/sbe/stages/hash_join.h"
+#include "mongo/db/exec/sbe/stages/ix_scan.h"
+#include "mongo/db/exec/sbe/stages/limit_skip.h"
+#include "mongo/db/exec/sbe/stages/loop_join.h"
+#include "mongo/db/exec/sbe/stages/merge_join.h"
+#include "mongo/db/exec/sbe/stages/project.h"
+#include "mongo/db/exec/sbe/stages/scan.h"
+#include "mongo/db/exec/sbe/stages/sort.h"
+#include "mongo/db/exec/sbe/stages/sorted_merge.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/stages/union.h"
+#include "mongo/db/exec/sbe/stages/unique.h"
+#include "mongo/db/exec/sbe/stages/unwind.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/uuid.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+
+namespace mongo::sbe {
+
+class PlanSizeTest : public unittest::Test {
+public:
+    void setUp() override {
+        _slotIdGenerator = std::make_unique<value::SlotIdGenerator>();
+    }
+
+    void tearDown() override {
+        _slotIdGenerator.reset();
+    }
+
+    value::SlotId generateSlotId() {
+        return _slotIdGenerator->generate();
+    }
+
+    static std::unique_ptr<PlanStage> mockS() {
+        return makeS<CoScanStage>(kEmptyPlanNodeId);
+    }
+
+    value::SlotVector mockSV() {
+        return makeSV(generateSlotId());
+    }
+
+    std::unique_ptr<EExpression> mockE() {
+        return makeE<EConstant>(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1));
+    }
+
+    /**
+     * PlanSize is planform-dependent so here we just assert that the size is a reasonable number:
+     * bigger then zero and not too big.
+     * A too big number might mean unwanted wrapping around on unsigned integer.
+     */
+    void assertPlanSize(const PlanStage& stage) {
+        size_t size = stage.estimateCompileTimeSize();
+        ASSERT_LT(0ul, size);
+        ASSERT_GT(10000ul, size);
+    }
+
+private:
+    std::unique_ptr<value::SlotIdGenerator> _slotIdGenerator;
+};
+
+TEST_F(PlanSizeTest, AndHash) {
+    auto stage = makeS<AndHashStage>(mockS(),
+                                     mockS(),
+                                     mockSV(),
+                                     makeSV(),
+                                     mockSV(),
+                                     makeSV(),
+                                     generateSlotId(),
+                                     nullptr /* yieldPolicy */,
+                                     kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Branch) {
+    auto stage = makeS<BranchStage>(
+        mockS(), mockS(), mockE(), mockSV(), mockSV(), mockSV(), kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, BsonScan) {
+    auto stage = makeS<BSONScanStage>(std::vector<BSONObj>{},
+                                      generateSlotId(),
+                                      kEmptyPlanNodeId,
+                                      std::vector<std::string>{2},
+                                      mockSV());
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, CoScan) {
+    auto stage = makeS<CoScanStage>(kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Filter) {
+    auto stage = makeS<FilterStage<true>>(mockS(), mockE(), kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, HashAgg) {
+    auto stage = makeS<HashAggStage>(
+        mockS(),
+        mockSV(),
+        makeHashAggAccumulatorList(std::make_unique<CompiledHashAggAccumulator>(
+                                       generateSlotId(), generateSlotId(), mockE(), mockE()),
+                                   std::make_unique<ArithmeticAverageHashAggAccumulatorTerminal>(
+                                       generateSlotId(), generateSlotId(), mockE(), boost::none)),
+        true,
+        generateSlotId(),
+        false,
+        nullptr /* yieldPolicy */,
+        kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, HashJoin) {
+    auto stage = makeS<HashJoinStage>(mockS(),
+                                      mockS(),
+                                      mockSV(),
+                                      makeSV(),
+                                      mockSV(),
+                                      makeSV(),
+                                      generateSlotId(),
+                                      true /* allowDiskUse */,
+                                      nullptr /* yieldPolicy */,
+                                      kEmptyPlanNodeId,
+                                      boost::none);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, SimpleIndexScanStage) {
+    auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
+    auto stage = makeS<SimpleIndexScanStage>(collUuid,
+                                             DatabaseName(),
+                                             std::string_view(),
+                                             true,
+                                             generateSlotId(),
+                                             generateSlotId(),
+                                             generateSlotId(),
+                                             generateSlotId(),
+                                             IndexKeysInclusionSet(1),
+                                             mockSV(),
+                                             makeE<EVariable>(generateSlotId()),
+                                             makeE<EVariable>(generateSlotId()),
+                                             nullptr,
+                                             kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, GenericIndexScanStage) {
+    auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
+    GenericIndexScanStageParams params{makeE<EVariable>(generateSlotId()),
+                                       {},
+                                       1,
+                                       key_string::Version{0},
+                                       Ordering::allAscending()};
+    auto stage = makeS<GenericIndexScanStage>(collUuid,
+                                              DatabaseName(),
+                                              std::string_view(),
+                                              std::move(params),
+                                              generateSlotId(),
+                                              generateSlotId(),
+                                              generateSlotId(),
+                                              generateSlotId(),
+                                              IndexKeysInclusionSet(1),
+                                              mockSV(),
+                                              nullptr,
+                                              kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, LimitSkip) {
+    auto stage = makeS<LimitSkipStage>(mockS(),
+                                       makeE<EConstant>(value::TypeTags::NumberInt64, 200),
+                                       makeE<EConstant>(value::TypeTags::NumberInt64, 300),
+                                       kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, LoopJoin) {
+    auto stage =
+        makeS<LoopJoinStage>(mockS(), mockS(), makeSV(), makeSV(), nullptr, kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, MergeJoin) {
+    std::vector<value::SortDirection> sortDirs(1, value::SortDirection::Ascending);
+    auto stage = makeS<MergeJoinStage>(mockS(),
+                                       mockS(),
+                                       mockSV(),
+                                       mockSV(),
+                                       mockSV(),
+                                       mockSV(),
+                                       std::move(sortDirs),
+                                       kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Project) {
+    auto stage = makeProjectStage(
+        mockS(), kEmptyPlanNodeId, generateSlotId(), mockE(), generateSlotId(), mockE());
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Scan) {
+    auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
+    auto stage = makeS<sbe::ScanStage>(collUuid,
+                                       DatabaseName(),
+                                       generateSlotId() /* recordSlot */,
+                                       generateSlotId() /* recordIdSlot */,
+                                       generateSlotId() /* snapshotIdSlot */,
+                                       generateSlotId() /* indexIdSlot */,
+                                       generateSlotId() /* indexKeySlot */,
+                                       generateSlotId() /* indexKeyPatternSlot */,
+                                       std::vector<std::string>{"field"} /* scanFieldNames */,
+                                       mockSV() /* scanFieldSlots */,
+                                       generateSlotId() /* minRecordIdSlot */,
+                                       generateSlotId() /* maxRecordIdSlot */,
+                                       true /* forward */,
+                                       nullptr /* yieldPolicy */,
+                                       kEmptyPlanNodeId /* nodeId */,
+                                       nullptr /* scanOpenCallback */);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Sort) {
+    auto stage =
+        makeS<SortStage>(mockS(),
+                         mockSV(),
+                         std::vector<value::SortDirection>{value::SortDirection::Ascending},
+                         mockSV(),
+                         nullptr /*limit*/,
+                         204857600,
+                         false,
+                         nullptr /* yieldPolicy */,
+                         kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, SortedMerge) {
+    std::vector<value::SortDirection> sortDir{value::SortDirection::Ascending};
+    const size_t numSlots = 4;
+
+    PlanStage::Vector inputScans;
+    std::vector<value::SlotVector> inputSlots;
+    std::vector<value::SlotVector> inputKeys;
+    std::vector<value::SlotVector> inputVals;
+    for (size_t i = 0; i < numSlots; ++i) {
+        inputScans.push_back(mockS());
+        inputKeys.push_back(mockSV());
+        inputVals.push_back(mockSV());
+    }
+
+    auto stage = makeS<SortedMergeStage>(std::move(inputScans),
+                                         std::move(inputKeys),
+                                         std::move(sortDir),
+                                         std::move(inputVals),
+                                         mockSV(),
+                                         kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Union) {
+    auto scanStages = makeSs(mockS(), mockS());
+    std::vector<value::SlotVector> scanInputVals{mockSV(), mockSV()};
+    auto stage = makeS<UnionStage>(
+        std::move(scanStages), std::move(scanInputVals), mockSV(), kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Unique) {
+    auto stage = makeS<UniqueStage>(mockS(), mockSV(), kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Unwind) {
+    auto stage = makeS<UnwindStage>(
+        mockS(), generateSlotId(), generateSlotId(), generateSlotId(), false, kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, Fetch) {
+    auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
+    auto fetchState = std::make_shared<FetchStageState>(generateSlotId(),
+                                                        generateSlotId(),
+                                                        generateSlotId(),
+                                                        generateSlotId(),
+                                                        generateSlotId(),
+                                                        generateSlotId(),
+                                                        generateSlotId(),
+                                                        StringListSet({}),
+                                                        value::SlotVector(),
+                                                        FetchCallbacks());
+    auto stage = makeS<FetchStage>(
+        mockS(), collUuid, DatabaseName(), fetchState, nullptr, kEmptyPlanNodeId, true);
+    assertPlanSize(*stage);
+}
+}  // namespace mongo::sbe

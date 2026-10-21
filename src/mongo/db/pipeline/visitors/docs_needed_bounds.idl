@@ -1,0 +1,35 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/pipeline/visitors/docs_needed_bounds.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+types:
+    DocsNeededSingleConstraint:
+        bson_serialization_type: any
+        description: >-
+            Constraint that indicates the upper or lower limit of number of documents needed to scan in
+            order to satisfy a query. The value will one of "Unknown", "NeedAll", or a discrete
+            value (long long).
+        cpp_type: ::mongo::docs_needed_bounds::DocsNeededConstraint
+        serializer: ::mongo::docs_needed_bounds::serializeDocsNeededConstraint
+        deserializer: ::mongo::docs_needed_bounds::parseDocsNeededConstraintFromBSON
+        is_view: false
+
+structs:
+    DocsNeededBounds:
+        description: A struct to hold the minimum and maximum bounds for one query.
+        strict: true
+        fields:
+            minBounds:
+                description: The minimum bounds for how many documents are needed to satisfy the query.
+                type: DocsNeededSingleConstraint
+            maxBounds:
+                description: The maximum bounds for how many documents are needed to satisfy the equery.
+                type: DocsNeededSingleConstraint

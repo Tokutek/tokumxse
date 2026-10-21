@@ -1,0 +1,94 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::otel::metrics"
+
+server_parameters:
+    openTelemetryMetricsDirectory:
+        description: Enable OpenTelemetry with metrics file exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryMetricsDirectory
+        cpp_vartype: std::string
+        redact: false
+    # HTTP exporter can be easier to use for local testing using Jaeger.
+    # Set this parameter to the port used by your local trace collector.
+    # Example:
+    #     --openTelemetryHttpEndpoint="http://localhost:4318/v1/traces"
+    openTelemetryMetricsHttpEndpoint:
+        description: Enable OpenTelemetry with metrics HTTP exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryMetricsHttpEndpoint
+        cpp_vartype: std::string
+        redact: false
+    openTelemetryMetricsCompression:
+        description: >-
+            Compression type for exporting OTel metrics. Valid options are ["none", "gzip"]. Default
+            is "none". Values other than "none" are only supported for HTTP exporter.
+        set_at: startup
+        cpp_varname: gOpenTelemetryMetricsCompression
+        cpp_vartype: std::string
+        redact: false
+        default: none
+    openTelemetryMetricsHttpExportHeaders:
+        description: >-
+            A BSON document containing custom headers to send with each metrics export request.
+            The field name is the header name and the value is either a string or an array of
+            strings, representing the header value(s).
+            Translates W3C Baggage literals to avoid parsing conflicts on the command line;
+            for example, '{MyCommaValue: the%2Cvalue}' will be decoded as 'the,value'.
+            See https://www.w3.org/TR/baggage/ for more information.
+            Only applies to the HTTP exporter; ignored for file and Prometheus exporters.
+            These headers are merged with any headers already configured via the
+            OTEL_EXPORTER_OTLP_HEADERS or OTEL_EXPORTER_OTLP_METRICS_HEADERS environment variables.
+        set_at: startup
+        cpp_class:
+            name: OpenTelemetryMetricsHttpExportHeaders
+            override_set: true
+        redact: true
+    openTelemetryPrometheusMetricsPath:
+        description: >-
+            Enable OpenTelemetry with metrics exported in prometheus format to the provided file
+            path. If both openTelemetryPrometheusMetricsPath and
+            openTelemetryPrometheusMetricsDirectory are set, this parameter takes precedence. Note 
+            that sometimes there will be temporary files created with a ".tmp" extension alongside 
+            the metrics file, but unlike the metrics file these are only transiently present.
+        set_at: startup
+        cpp_varname: gOpenTelemetryPrometheusMetricsPath
+        cpp_vartype: std::string
+        redact: false
+    openTelemetryPrometheusMetricsDirectory:
+        description: >-
+            Enable OpenTelemetry with metrics exported in prometheus format to a file in the
+            provided directory. The file will have the name "mongodb-prometheus-metrics.txt".
+            Prefer openTelemetryPrometheusMetricsPath, which accepts the full file path directly;
+            if both are set, openTelemetryPrometheusMetricsPath takes precedence.
+            Note that sometimes there will be temporary files created with a ".tmp" extension, but
+            unlike the metrics file these are only transiently present.
+        set_at: startup
+        cpp_varname: gOpenTelemetryPrometheusMetricsDirectory
+        cpp_vartype: std::string
+        redact: false
+    openTelemetryPrometheusFileExportMaxConsecutiveFailures:
+        description: >-
+            The maximum number of allowed consecutive export failures before the process is
+            terminated.
+        set_at: startup
+        cpp_varname: gOpenTelemetryPrometheusFileExportMaxConsecutiveFailures
+        cpp_vartype: int
+        redact: false
+        default: 10
+    openTelemetryExportIntervalMillis:
+        description: The time interval between two consecutive exports.
+        set_at: startup
+        cpp_varname: gOpenTelemetryExportIntervalMillis
+        cpp_vartype: int
+        redact: false
+        default: 1000
+    openTelemetryExportTimeoutMillis:
+        description: The timeout of an export.
+        set_at: startup
+        cpp_varname: gOpenTelemetryExportTimeoutMillis
+        cpp_vartype: int
+        redact: false
+        default: 500

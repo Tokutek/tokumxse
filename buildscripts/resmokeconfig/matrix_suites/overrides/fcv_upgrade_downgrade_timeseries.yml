@@ -1,0 +1,19 @@
+# Overrides for suites that perform timeseries upgrade/downgrade in background
+#
+# TODO SERVER-120439 remove this overrides and their usages once 9.0 becomes last LTS and
+# we will not perform anymore timeseries transformation during FCV upgrade/downgrade
+
+- name: exclude_tags
+  value:
+    exclude_with_any_tags:
+      # timeseries upgrade/downgrade cause getMore requests over timeseries collections
+      # to be interrupted with InterruptedDueToTimeseriesUpgradeDowngrade error.
+      # getMore requests are not idempotent and thus can't be retried.
+      - requires_getmore
+      # non retryable write commands can't be retry when
+      # they fail with InterruptedDueToTimeseriesUpgradeDowngrade error.
+      - requires_non_retryable_writes
+      # multi updates are not retryable (e.g. updateMany, deleteMany) thus they can't be retry when
+      # they fail with InterruptedDueToTimeseriesUpgradeDowngrade error.
+      # TODO SPM-1153 remove this tag
+      - requires_multi_updates

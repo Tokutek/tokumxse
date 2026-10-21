@@ -1,0 +1,432 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/memory_tracking/memory_usage_tracker.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace expression_evaluation_test {
+using namespace std::literals::string_view_literals;
+
+namespace {
+
+auto parse(const std::string& expressionName, ImplicitValue operand) {
+    auto pair =
+        std::pair{std::make_unique<ExpressionContextForTest>(), boost::intrusive_ptr<Expression>{}};
+    VariablesParseState vps = pair.first->variablesParseState;
+    Value operandValue = operand;
+    const BSONObj obj = BSON(expressionName << operandValue);
+    pair.second = Expression::parseExpression(pair.first.get(), obj, vps);
+    return pair;
+}
+
+auto eval(const std::string& expressionName,
+          ImplicitValue input,
+          ImplicitValue find,
+          ImplicitValue replacement) {
+    auto [expCtx, expression] = parse(
+        expressionName, Document{{"input", input}, {"find", find}, {"replacement", replacement}});
+    return std::pair{std::move(expCtx),
+                     expression->evaluate({}, &expression->getExpressionContext()->variables)};
+}
+
+auto replaceOne(ImplicitValue input, ImplicitValue find, ImplicitValue replacement) {
+    return eval("$replaceOne", input, find, replacement);
+}
+
+auto replaceAll(ImplicitValue input, ImplicitValue find, ImplicitValue replacement) {
+    return eval("$replaceAll", input, find, replacement);
+}
+
+}  // namespace
+
+TEST(ExpressionEvaluateReplaceTest, ExpectsStringsOrNullish) {
+    // If any argument is non-string non-nullish, it's an error.
+    ASSERT_THROWS(replaceOne(1, BSONNULL, BSONNULL).second, AssertionException);
+    ASSERT_THROWS(replaceOne(BSONNULL, 1, BSONNULL).second, AssertionException);
+    ASSERT_THROWS(replaceOne(BSONNULL, BSONNULL, 1).second, AssertionException);
+
+    ASSERT_THROWS(replaceAll(1, BSONNULL, BSONNULL).second, AssertionException);
+    ASSERT_THROWS(replaceAll(BSONNULL, 1, BSONNULL).second, AssertionException);
+    ASSERT_THROWS(replaceAll(BSONNULL, BSONNULL, 1).second, AssertionException);
+
+    ASSERT_THROWS(replaceOne(1, ""sv, ""sv).second, AssertionException);
+    ASSERT_THROWS(replaceOne(""sv, 1, ""sv).second, AssertionException);
+    ASSERT_THROWS(replaceOne(""sv, ""sv, 1).second, AssertionException);
+
+    ASSERT_THROWS(replaceAll(1, ""sv, ""sv).second, AssertionException);
+    ASSERT_THROWS(replaceAll(""sv, 1, ""sv).second, AssertionException);
+    ASSERT_THROWS(replaceAll(""sv, ""sv, 1).second, AssertionException);
+
+    ASSERT_THROWS(replaceOne(1, BSONRegEx(), ""sv).second, AssertionException);
+    ASSERT_THROWS(replaceOne(""sv, BSONRegEx(), 1).second, AssertionException);
+
+    ASSERT_THROWS(replaceAll(1, BSONRegEx(), ""sv).second, AssertionException);
+    ASSERT_THROWS(replaceAll(""sv, BSONRegEx(), 1).second, AssertionException);
+}
+
+TEST(ExpressionEvaluateReplaceTest, HandlesNullish) {
+    // If any argument is nullish, the result is null.
+    ASSERT_VALUE_EQ(replaceOne(BSONNULL, ""sv, ""sv).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceOne(""sv, BSONNULL, ""sv).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceOne(""sv, ""sv, BSONNULL).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceOne(BSONNULL, BSONRegEx(), ""sv).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceOne(""sv, BSONRegEx(), BSONNULL).second, Value(BSONNULL));
+
+    ASSERT_VALUE_EQ(replaceAll(BSONNULL, ""sv, ""sv).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceAll(""sv, BSONNULL, ""sv).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceAll(""sv, ""sv, BSONNULL).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceAll(BSONNULL, BSONRegEx(), ""sv).second, Value(BSONNULL));
+    ASSERT_VALUE_EQ(replaceAll(""sv, BSONRegEx(), BSONNULL).second, Value(BSONNULL));
+}
+
+TEST(ExpressionEvaluateReplaceTest, ReplacesNothingWhenNoMatches) {
+    // When there are no matches, the result is the input, unchanged.
+    ASSERT_VALUE_EQ(replaceOne(""sv, "x"sv, "y"sv).second, Value(""sv));
+    ASSERT_VALUE_EQ(replaceOne("a"sv, "x"sv, "y"sv).second, Value("a"sv));
+    ASSERT_VALUE_EQ(replaceOne("abcd"sv, "x"sv, "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceOne("abcd"sv, "xyz"sv, "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyyz"sv, "xyz"sv, "y"sv).second, Value("xyyz"sv));
+
+    ASSERT_VALUE_EQ(replaceOne(""sv, BSONRegEx("x"), "y"sv).second, Value(""sv));
+    ASSERT_VALUE_EQ(replaceOne("a"sv, BSONRegEx("x"), "y"sv).second, Value("a"sv));
+    ASSERT_VALUE_EQ(replaceOne("abcd"sv, BSONRegEx("xyz"), "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceOne("abcd"sv, BSONRegEx("xyz"), "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyyz"sv, BSONRegEx("xyz"), "y"sv).second, Value("xyyz"sv));
+
+    ASSERT_VALUE_EQ(replaceAll(""sv, "x"sv, "y"sv).second, Value(""sv));
+    ASSERT_VALUE_EQ(replaceAll("a"sv, "x"sv, "y"sv).second, Value("a"sv));
+    ASSERT_VALUE_EQ(replaceAll("abcd"sv, "x"sv, "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceAll("abcd"sv, "xyz"sv, "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyyz"sv, "xyz"sv, "y"sv).second, Value("xyyz"sv));
+
+    ASSERT_VALUE_EQ(replaceAll(""sv, BSONRegEx("x"), "y"sv).second, Value(""sv));
+    ASSERT_VALUE_EQ(replaceAll("a"sv, BSONRegEx("x"), "y"sv).second, Value("a"sv));
+    ASSERT_VALUE_EQ(replaceAll("abcd"sv, BSONRegEx("xyz"), "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceAll("abcd"sv, BSONRegEx("xyz"), "y"sv).second, Value("abcd"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyyz"sv, BSONRegEx("xyz"), "y"sv).second, Value("xyyz"sv));
+}
+
+TEST(ExpressionEvaluateReplaceTest, ReplacesOnlyMatch) {
+    ASSERT_VALUE_EQ(replaceOne(""sv, ""sv, "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("x"sv, "x"sv, "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyz"sv, "xyz"sv, "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("..xyz.."sv, "xyz"sv, "abc"sv).second, Value("..abc.."sv));
+    ASSERT_VALUE_EQ(replaceOne("..xyz"sv, "xyz"sv, "abc"sv).second, Value("..abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyz.."sv, "xyz"sv, "abc"sv).second, Value("abc.."sv));
+
+    ASSERT_VALUE_EQ(replaceOne(""sv, BSONRegEx(""), "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("x"sv, BSONRegEx("x"), "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyz"sv, BSONRegEx("xyz"), "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("..xyz.."sv, BSONRegEx("xyz"), "abc"sv).second, Value("..abc.."sv));
+    ASSERT_VALUE_EQ(replaceOne("..xyz"sv, BSONRegEx("xyz"), "abc"sv).second, Value("..abc"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyz.."sv, BSONRegEx("xyz"), "abc"sv).second, Value("abc.."sv));
+
+    ASSERT_VALUE_EQ(replaceAll(""sv, ""sv, "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("x"sv, "x"sv, "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyz"sv, "xyz"sv, "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("..xyz.."sv, "xyz"sv, "abc"sv).second, Value("..abc.."sv));
+    ASSERT_VALUE_EQ(replaceAll("..xyz"sv, "xyz"sv, "abc"sv).second, Value("..abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyz.."sv, "xyz"sv, "abc"sv).second, Value("abc.."sv));
+
+    ASSERT_VALUE_EQ(replaceAll(""sv, BSONRegEx(""), "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("x"sv, BSONRegEx("x"), "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyz"sv, BSONRegEx("xyz"), "abc"sv).second, Value("abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("..xyz.."sv, BSONRegEx("xyz"), "abc"sv).second, Value("..abc.."sv));
+    ASSERT_VALUE_EQ(replaceAll("..xyz"sv, BSONRegEx("xyz"), "abc"sv).second, Value("..abc"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyz.."sv, BSONRegEx("xyz"), "abc"sv).second, Value("abc.."sv));
+}
+
+TEST(ExpressionReplaceOneTest, ReplacesFirstMatchOnly) {
+    ASSERT_VALUE_EQ(replaceOne("."sv, ""sv, "abc"sv).second, Value("abc."sv));
+    ASSERT_VALUE_EQ(replaceOne(".."sv, ""sv, "abc"sv).second, Value("abc.."sv));
+    ASSERT_VALUE_EQ(replaceOne(".."sv, "."sv, "abc"sv).second, Value("abc."sv));
+    ASSERT_VALUE_EQ(replaceOne("abc->defg->hij"sv, "->"sv, "."sv).second, Value("abc.defg->hij"sv));
+
+    ASSERT_VALUE_EQ(replaceOne("."sv, BSONRegEx(""), "abc"sv).second, Value("abc."sv));
+    ASSERT_VALUE_EQ(replaceOne(".."sv, BSONRegEx(""), "abc"sv).second, Value("abc.."sv));
+    ASSERT_VALUE_EQ(replaceOne(".."sv, BSONRegEx("[.]"), "abc"sv).second, Value("abc."sv));
+    ASSERT_VALUE_EQ(replaceOne("abc->defg->hij"sv, BSONRegEx("->"), "."sv).second,
+                    Value("abc.defg->hij"sv));
+}
+
+TEST(ExpressionReplaceAllTest, ReplacesAllMatches) {
+    ASSERT_VALUE_EQ(replaceAll("."sv, ""sv, "abc"sv).second, Value("abc.abc"sv));
+    ASSERT_VALUE_EQ(replaceAll(".."sv, ""sv, "abc"sv).second, Value("abc.abc.abc"sv));
+    ASSERT_VALUE_EQ(replaceAll(".."sv, "."sv, "abc"sv).second, Value("abcabc"sv));
+    ASSERT_VALUE_EQ(replaceAll("abc->defg->hij"sv, "->"sv, "."sv).second, Value("abc.defg.hij"sv));
+
+    ASSERT_VALUE_EQ(replaceAll("."sv, BSONRegEx(""), "abc"sv).second, Value("abc.abc"sv));
+    ASSERT_VALUE_EQ(replaceAll(".."sv, BSONRegEx(""), "abc"sv).second, Value("abc.abc.abc"sv));
+    ASSERT_VALUE_EQ(replaceAll(".."sv, BSONRegEx("[.]"), "abc"sv).second, Value("abcabc"sv));
+    ASSERT_VALUE_EQ(replaceAll("abc->defg->hij"sv, BSONRegEx("->"), "."sv).second,
+                    Value("abc.defg.hij"sv));
+}
+
+TEST(ExpressionEvaluateReplaceTest, DoesNotReplaceInTheReplacement) {
+    ASSERT_VALUE_EQ(replaceOne("a.b.c"sv, "."sv, ".."sv).second, Value("a..b.c"sv));
+    ASSERT_VALUE_EQ(replaceAll("a.b.c"sv, "."sv, ".."sv).second, Value("a..b..c"sv));
+
+    ASSERT_VALUE_EQ(replaceOne("a.b.c"sv, BSONRegEx("[.]"), ".."sv).second, Value("a..b.c"sv));
+    ASSERT_VALUE_EQ(replaceAll("a.b.c"sv, BSONRegEx("[.]"), ".."sv).second, Value("a..b..c"sv));
+}
+
+TEST(ExpressionEvaluateReplaceTest, DoesNotNormalizeUnicode) {
+    std::string_view combiningAcute = "́"sv;
+    std::string_view combinedAcuteE = "é"sv;
+    ASSERT_EQ(combinedAcuteE[0], 'e');
+    ASSERT_EQ(combinedAcuteE.substr(1), combiningAcute);
+
+    std::string_view precomposedAcuteE = "é";
+    ASSERT_NOT_EQUALS(precomposedAcuteE[0], 'e');
+
+    // If the input has combining characters, you can match and replace the base letter.
+    ASSERT_VALUE_EQ(replaceOne(combinedAcuteE, "e"sv, "a"sv).second, Value("á"sv));
+    ASSERT_VALUE_EQ(replaceAll(combinedAcuteE, "e"sv, "a"sv).second, Value("á"sv));
+    ASSERT_VALUE_EQ(replaceOne(combinedAcuteE, BSONRegEx("e"), "a"sv).second, Value("á"sv));
+    ASSERT_VALUE_EQ(replaceAll(combinedAcuteE, BSONRegEx("e"), "a"sv).second, Value("á"sv));
+
+    // If the input has precomposed characters, you can't replace the base letter.
+    ASSERT_VALUE_EQ(replaceOne(precomposedAcuteE, "e"sv, "x"sv).second, Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceAll(precomposedAcuteE, "e"sv, "x"sv).second, Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceOne(precomposedAcuteE, BSONRegEx("e"), "x"sv).second,
+                    Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceAll(precomposedAcuteE, BSONRegEx("e"), "x"sv).second,
+                    Value(precomposedAcuteE));
+
+    // Precomposed characters and combined forms can't match each other.
+    ASSERT_VALUE_EQ(replaceOne(precomposedAcuteE, combinedAcuteE, "x"sv).second,
+                    Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceAll(precomposedAcuteE, combinedAcuteE, "x"sv).second,
+                    Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceOne(combinedAcuteE, precomposedAcuteE, "x"sv).second,
+                    Value(combinedAcuteE));
+    ASSERT_VALUE_EQ(replaceAll(combinedAcuteE, precomposedAcuteE, "x"sv).second,
+                    Value(combinedAcuteE));
+    ASSERT_VALUE_EQ(replaceOne(precomposedAcuteE, BSONRegEx(combinedAcuteE), "x"sv).second,
+                    Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceAll(precomposedAcuteE, BSONRegEx(combinedAcuteE), "x"sv).second,
+                    Value(precomposedAcuteE));
+    ASSERT_VALUE_EQ(replaceOne(combinedAcuteE, BSONRegEx(precomposedAcuteE), "x"sv).second,
+                    Value(combinedAcuteE));
+    ASSERT_VALUE_EQ(replaceAll(combinedAcuteE, BSONRegEx(precomposedAcuteE), "x"sv).second,
+                    Value(combinedAcuteE));
+}
+
+TEST(ExpressionEvaluateReplaceTest, ReplacesWithVariableRegExPattern) {
+    ASSERT_VALUE_EQ(replaceOne("xyz"sv, BSONRegEx("x*"), "a"sv).second, Value("ayz"sv));
+    ASSERT_VALUE_EQ(replaceOne("abcdefghij"sv, BSONRegEx("...."), "<-->"sv).second,
+                    Value("<-->efghij"sv));
+    ASSERT_VALUE_EQ(replaceOne("xyzxx"sv, BSONRegEx("x+"), "abc"sv).second, Value("abcyzxx"sv));
+    ASSERT_VALUE_EQ(replaceOne("abc->defg->hij"sv, BSONRegEx(".*"), "a"sv).second, Value("a"sv));
+
+    ASSERT_VALUE_EQ(replaceAll("xyz"sv, BSONRegEx("x*"), "a"sv).second, Value("aayaza"sv));
+    ASSERT_VALUE_EQ(replaceAll("abcdefghij"sv, BSONRegEx("...."), "<-->"sv).second,
+                    Value("<--><-->ij"sv));
+    ASSERT_VALUE_EQ(replaceAll("xyzxx"sv, BSONRegEx("x+"), "abc"sv).second, Value("abcyzabc"sv));
+    ASSERT_VALUE_EQ(replaceAll("abc->defg->hij"sv, BSONRegEx(".*"), "a"sv).second, Value("aa"sv));
+}
+
+TEST(ExpressionEvaluateReplaceTest, TracksOutputMemoryAndReleasesAfterEvaluation) {
+    auto [expCtx, expression] = parse(
+        "$replaceAll", Document{{"input", "aaaa"sv}, {"find", ""sv}, {"replacement", "XY"sv}});
+
+    SimpleMemoryUsageTracker tracker{MemoryUsageLimit{1024}};
+    EvaluationContext ctx{.tracker = &tracker};
+
+    ASSERT_VALUE_EQ(expression->evaluate({}, &expCtx->variables, ctx), Value("XYaXYaXYaXYaXY"sv));
+
+    ASSERT_EQ(tracker.inUseTrackedMemoryBytes(), 0);
+    ASSERT_GT(tracker.peakTrackedMemoryBytes(), 0);
+}
+
+TEST(ExpressionEvaluateReplaceTest, ThrowsExceededMemoryLimitWhenNonEmptyFindGrowsOutput) {
+    auto [expCtx, expression] = parse("$replaceAll",
+                                      Document{{"input", std::string(1000, 'a')},
+                                               {"find", "a"sv},
+                                               {"replacement", std::string(100, 'X')}});
+
+    // Two-level tracker: a stage tracker with a generous local limit reporting into the
+    // operation-wide tracker, which carries the small cap that the growing output exceeds.
+    const int64_t limit = 256;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker tracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &tracker};
+
+    try {
+        expression->evaluate({}, &expCtx->variables, ctx);
+        FAIL("Expected ExceededMemoryLimit to be thrown");
+    } catch (const AssertionException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::ExceededMemoryLimit);
+        ASSERT_STRING_CONTAINS(ex.reason(), "$replaceAll");
+    }
+
+    // The MemoryUsageToken fired on unwind, so the operation-wide tracker is left balanced.
+    ASSERT_EQ(operationTracker.inUseTrackedMemoryBytes(), 0);
+    ASSERT_GT(operationTracker.peakTrackedMemoryBytes(), limit);
+}
+
+TEST(ExpressionEvaluateReplaceTest, ThrowsExceededMemoryLimitWhenQueryLimitExceeded) {
+    auto [expCtx, expression] = parse("$replaceAll",
+                                      Document{{"input", std::string(1000, 'a')},
+                                               {"find", ""sv},
+                                               {"replacement", std::string(100, 'X')}});
+
+    // The operation-wide tracker holds the small cap; the stage tracker reporting into it has a
+    // generous local limit, so the throw must come from the per-operation cap via the base chain
+    // rollup, not the local stage limit.
+    const int64_t limit = 256;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    try {
+        expression->evaluate({}, &expCtx->variables, ctx);
+        FAIL("Expected ExceededMemoryLimit to be thrown");
+    } catch (const AssertionException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::ExceededMemoryLimit);
+        ASSERT_STRING_CONTAINS(ex.reason(), "$replaceAll");
+    }
+}
+
+TEST(ExpressionEvaluateReplaceTest, ManySmallReplacementsCollectivelyExceedingLimitStillThrow) {
+    // Many small matches, none individually near the limit, must still trip it once accumulated
+    // output growth crosses it.
+    auto [expCtx, expression] =
+        parse("$replaceAll",
+              Document{{"input", std::string(2000, 'a')}, {"find", "a"sv}, {"replacement", "b"sv}});
+
+    const int64_t limit = 512;  // Well under the ~2000 bytes of total output growth.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expression->evaluate({}, &expCtx->variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
+TEST(ExpressionEvaluateReplaceTest, SingleOversizedReplacementThrowsImmediately) {
+    // A single match whose replacement alone is larger than the whole limit must be caught
+    // immediately.
+    auto [expCtx, expression] =
+        parse("$replaceAll",
+              Document{{"input", "a"sv}, {"find", "a"sv}, {"replacement", std::string(1024, 'x')}});
+
+    const int64_t limit = 8;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expression->evaluate({}, &expCtx->variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST(ExpressionEvaluateReplaceTest, ManySmallRegexReplacementsCollectivelyExceedLimit) {
+    // Exercises the regex-'find' code path (replaceAllOpRegEx in evaluate_regex.cpp): many small
+    // matches, none individually near the limit, must still trip it once accumulated.
+    auto [expCtx, expression] = parse("$replaceAll",
+                                      Document{{"input", std::string(2000, 'a')},
+                                               {"find", BSONRegEx("a")},
+                                               {"replacement", "b"sv}});
+
+    const int64_t limit = 512;  // Well under the ~2000 bytes of total output growth.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expression->evaluate({}, &expCtx->variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
+TEST(ExpressionEvaluateReplaceTest, SingleOversizedRegexReplacementThrowsImmediately) {
+    // Exercises the regex-'find' code path (replaceAllOpRegEx in evaluate_regex.cpp): a single
+    // match whose replacement alone is larger than the whole limit must be caught immediately.
+    auto [expCtx, expression] = parse("$replaceAll",
+                                      Document{{"input", "a"sv},
+                                               {"find", BSONRegEx("a")},
+                                               {"replacement", std::string(1024, 'x')}});
+
+    const int64_t limit = 8;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expression->evaluate({}, &expCtx->variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+}
+
+TEST(ExpressionEvaluateReplaceTest, FallbackTrackerWithinLimitDoesNotThrow) {
+    auto [expCtx, expression] = parse("$replaceAll",
+                                      Document{{"input", std::string(1000, 'a')},
+                                               {"find", ""sv},
+                                               {"replacement", std::string(100, 'X')}});
+
+    const int64_t limit = 10 * 1024 * 1024;
+    // Disable expression tracking so the fallback is standalone and enforces the per-expression
+    // cap.
+    unittest::ServerParameterGuard exprFlag{"featureFlagExpressionMemoryTracking", false};
+    unittest::ServerParameterGuard limitGuard{"internalQueryMaxSingleExpressionMemoryUsageBytes",
+                                              limit};
+
+    // Within the configured limit, evaluation succeeds and charges the fallback tracker.
+    EvaluationContext ctx{};
+    ASSERT_DOES_NOT_THROW(expression->evaluate({}, &expCtx->variables, ctx));
+
+    auto& tracker = expCtx->getExpressionFallbackTracker();
+    ASSERT_GT(tracker.peakTrackedMemoryBytes(), 0);
+    ASSERT_LT(tracker.peakTrackedMemoryBytes(), limit);
+    ASSERT_EQ(tracker.inUseTrackedMemoryBytes(), 0);
+}
+
+TEST(ExpressionEvaluateReplaceTest, FallbackTrackerEnforcesLimit) {
+    auto [expCtx, expression] = parse("$replaceAll",
+                                      Document{{"input", std::string(1000, 'a')},
+                                               {"find", ""sv},
+                                               {"replacement", std::string(100, 'X')}});
+
+    const int64_t limit = 8;
+    // Disable expression tracking so the fallback is standalone and enforces the per-expression
+    // cap.
+    unittest::ServerParameterGuard exprFlag{"featureFlagExpressionMemoryTracking", false};
+    unittest::ServerParameterGuard limitGuard{"internalQueryMaxSingleExpressionMemoryUsageBytes",
+                                              limit};
+
+    EvaluationContext ctx{};
+    try {
+        expression->evaluate({}, &expCtx->variables, ctx);
+        FAIL("Expected ExceededMemoryLimit to be thrown");
+    } catch (const AssertionException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::ExceededMemoryLimit);
+        ASSERT_STRING_CONTAINS(ex.reason(), "$replaceAll");
+    }
+
+    auto& tracker = expCtx->getExpressionFallbackTracker();
+    ASSERT_EQ(tracker.inUseTrackedMemoryBytes(), 0);
+    ASSERT_GT(tracker.peakTrackedMemoryBytes(), limit);
+}
+
+}  // namespace expression_evaluation_test
+}  // namespace mongo

@@ -1,0 +1,247 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/global_catalog/type_collection_common_types_gen.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection_metadata.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/metadata_manager.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/scoped_collection_metadata.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/sharding_environment/shard_server_test_fixture.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
+
+class CollectionMetadataFilteringTest : public ShardServerTestFixture {
+protected:
+    void setUp() override {
+        ShardServerTestFixture::setUp();
+    }
+
+    /**
+     * Prepares the CSS for 'kNss' and the standalone '_manager' to have their metadata be a history
+     * array populated as follows:
+     *  chunk1 - [min, -100)
+     *  chunk2 - [100, 0)
+     *  chunk3 - [0, 100)
+     *  chunk4 - [100, max)
+     *
+     * and the history:
+     *  time (now,75) shard0(chunk1, chunk3) shard1(chunk2, chunk4)
+     *  time (75,25) shard0(chunk2, chunk4) shard1(chunk1, chunk3)
+     *  time (25,0) - no history
+     */
+    CollectionMetadata prepareTestData(
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields = boost::none) {
+        const UUID uuid = UUID::gen();
+        const OID epoch = OID::gen();
+        const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
+
+        auto rt = RoutingTableHistory::makeNew(
+            kNss,
+            uuid,
+            shardKeyPattern.getKeyPattern(),
+            false, /* unsplittable */
+            nullptr,
+            false,
+            epoch,
+            Timestamp(1, 1),
+            timeseriesFields,
+            boost::none /* reshardingFields */,
+            true,
+            [&] {
+                ChunkVersion version({epoch, Timestamp(1, 1)}, {1, 0});
+
+                ChunkType chunk1(uuid,
+                                 {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << -100)},
+                                 version,
+                                 {"0"});
+                chunk1.setOnCurrentShardSince(Timestamp(75, 0));
+                chunk1.setHistory({ChunkHistory(*chunk1.getOnCurrentShardSince(), ShardId("0")),
+                                   ChunkHistory(Timestamp(25, 0), ShardId("1"))});
+                version.incMinor();
+
+                ChunkType chunk2(uuid, {BSON("_id" << -100), BSON("_id" << 0)}, version, {"1"});
+                chunk2.setOnCurrentShardSince(Timestamp(75, 0));
+                chunk2.setHistory({ChunkHistory(*chunk2.getOnCurrentShardSince(), ShardId("1")),
+                                   ChunkHistory(Timestamp(25, 0), ShardId("0"))});
+                version.incMinor();
+
+                ChunkType chunk3(uuid, {BSON("_id" << 0), BSON("_id" << 100)}, version, {"0"});
+                chunk3.setOnCurrentShardSince(Timestamp(75, 0));
+                chunk3.setHistory({ChunkHistory(*chunk3.getOnCurrentShardSince(), ShardId("0")),
+                                   ChunkHistory(Timestamp(25, 0), ShardId("1"))});
+                version.incMinor();
+
+                ChunkType chunk4(uuid,
+                                 {BSON("_id" << 100), shardKeyPattern.getKeyPattern().globalMax()},
+                                 version,
+                                 {"1"});
+                chunk4.setOnCurrentShardSince(Timestamp(75, 0));
+                chunk4.setHistory({ChunkHistory(*chunk4.getOnCurrentShardSince(), ShardId("1")),
+                                   ChunkHistory(Timestamp(25, 0), ShardId("0"))});
+                version.incMinor();
+
+                return std::vector<ChunkType>{chunk1, chunk2, chunk3, chunk4};
+            }());
+
+        CurrentChunkManager cm(makeStandaloneRoutingTableHistory(std::move(rt)));
+        ASSERT_EQ(4, cm.numChunks());
+
+        {
+            auto scopedCsr = CollectionShardingRuntime::acquireExclusive(operationContext(), kNss);
+            scopedCsr->setCollectionMetadata(operationContext(),
+                                             CollectionMetadata(cm, ShardId("0")));
+        }
+
+        _manager = std::make_shared<MetadataManager>(
+            getServiceContext(), kNss, CollectionMetadata(cm, ShardId("0")));
+
+        return CollectionMetadata(std::move(cm), ShardId("0"));
+    }
+
+    std::shared_ptr<MetadataManager> _manager;
+};
+
+// Verifies that right set of documents is visible
+TEST_F(CollectionMetadataFilteringTest, FilterDocumentsInTheFuture) {
+    const auto metadata{prepareTestData()};
+
+    const auto testFilterFn = [](const ScopedCollectionFilter& collectionFilter) {
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << -500)));
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << 50)));
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << -50)));
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << 500)));
+    };
+
+    BSONObj readConcern =
+        BSON("readConcern" << BSON("level" << "snapshot"
+                                           << "atClusterTime" << Timestamp(100, 0)));
+
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto scopedCss =
+        CollectionShardingState::assertCollectionLockedAndAcquire(operationContext(), kNss);
+    testFilterFn(scopedCss->getOwnershipFilter(
+        operationContext(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup));
+}
+
+// Verifies that a different set of documents is visible for a timestamp in the past
+TEST_F(CollectionMetadataFilteringTest, FilterDocumentsInThePast) {
+    const auto metadata{prepareTestData()};
+
+    const auto testFilterFn = [](const ScopedCollectionFilter& collectionFilter) {
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << -500)));
+        ASSERT_FALSE(collectionFilter.keyBelongsToMe(BSON("_id" << 50)));
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << -50)));
+        ASSERT_TRUE(collectionFilter.keyBelongsToMe(BSON("_id" << 500)));
+    };
+
+    BSONObj readConcern =
+        BSON("readConcern" << BSON("level" << "snapshot"
+                                           << "atClusterTime" << Timestamp(50, 0)));
+
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto scopedCss =
+        CollectionShardingState::assertCollectionLockedAndAcquire(operationContext(), kNss);
+    testFilterFn(scopedCss->getOwnershipFilter(
+        operationContext(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup));
+}
+
+// Verifies that when accessing too far into the past we get the stale error
+TEST_F(CollectionMetadataFilteringTest, FilterDocumentsTooFarInThePastThrowsStaleChunkHistory) {
+    const auto metadata{prepareTestData()};
+
+    const auto testFilterFn = [](const ScopedCollectionFilter& collectionFilter) {
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << -500)),
+                           AssertionException,
+                           ErrorCodes::StaleChunkHistory);
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << 50)),
+                           AssertionException,
+                           ErrorCodes::StaleChunkHistory);
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << -50)),
+                           AssertionException,
+                           ErrorCodes::StaleChunkHistory);
+        ASSERT_THROWS_CODE(collectionFilter.keyBelongsToMe(BSON("_id" << 500)),
+                           AssertionException,
+                           ErrorCodes::StaleChunkHistory);
+    };
+
+    BSONObj readConcern =
+        BSON("readConcern" << BSON("level" << "snapshot"
+                                           << "atClusterTime" << Timestamp(10, 0)));
+
+    auto&& readConcernArgs = repl::ReadConcernArgs::get(operationContext());
+    ASSERT_OK(readConcernArgs.initialize(readConcern["readConcern"]));
+
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto scopedCss =
+        CollectionShardingState::assertCollectionLockedAndAcquire(operationContext(), kNss);
+    testFilterFn(scopedCss->getOwnershipFilter(
+        operationContext(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup));
+}
+
+}  // namespace
+}  // namespace mongo

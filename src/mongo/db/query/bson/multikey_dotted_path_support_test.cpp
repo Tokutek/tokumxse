@@ -1,0 +1,650 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/bson/multikey_dotted_path_support.h"
+
+#include "mongo/base/string_data_comparator.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonelement_comparator.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+// IWYU pragma: no_include "boost/container/detail/flat_tree.hpp"
+
+
+namespace mongo {
+namespace {
+
+namespace mdps = ::mongo::multikey_dotted_path_support;
+
+void dumpBSONElementSet(const BSONElementSet& elements, StringBuilder* sb) {
+    *sb << "[ ";
+    bool firstIteration = true;
+    for (auto&& elem : elements) {
+        if (!firstIteration) {
+            *sb << ", ";
+        }
+        *sb << "'" << elem << "'";
+        firstIteration = false;
+    }
+    *sb << " ]";
+}
+
+void assertBSONElementSetsAreEqual(const std::vector<BSONObj>& expectedObjs,
+                                   const BSONElementSet& actualElements) {
+    BSONElementSet expectedElements;
+    for (auto&& obj : expectedObjs) {
+        expectedElements.insert(obj.firstElement());
+    }
+
+    if (expectedElements.size() != actualElements.size()) {
+        StringBuilder sb;
+        sb << "Expected set to contain " << expectedElements.size()
+           << " element(s), but actual set contains " << actualElements.size()
+           << " element(s); Expected set: ";
+        dumpBSONElementSet(expectedElements, &sb);
+        sb << ", Actual set: ";
+        dumpBSONElementSet(actualElements, &sb);
+        FAIL(sb.str());
+    }
+
+    // We do our own comparison of the two BSONElementSets because BSONElement::operator== considers
+    // the field name.
+    auto expectedIt = expectedElements.begin();
+    auto actualIt = actualElements.begin();
+
+
+    BSONElementComparator eltCmp(BSONElementComparator::FieldNamesMode::kIgnore,
+                                 &simpleStringDataComparator);
+    for (size_t i = 0; i < expectedElements.size(); ++i) {
+        if (eltCmp.evaluate(*expectedIt != *actualIt)) {
+            StringBuilder sb;
+            sb << "Element '" << *expectedIt << "' doesn't have the same value as element '"
+               << *actualIt << "'; Expected set: ";
+            dumpBSONElementSet(expectedElements, &sb);
+            sb << ", Actual set: ";
+            dumpBSONElementSet(actualElements, &sb);
+            FAIL(sb.str());
+        }
+
+        ++expectedIt;
+        ++actualIt;
+    }
+}
+
+void dumpArrayComponents(const MultikeyComponents& arrayComponents, StringBuilder* sb) {
+    *sb << "[ ";
+    bool firstIteration = true;
+    for (const auto pos : arrayComponents) {
+        if (!firstIteration) {
+            *sb << ", ";
+        }
+        *sb << pos;
+        firstIteration = false;
+    }
+    *sb << " ]";
+}
+
+void assertArrayComponentsAreEqual(const MultikeyComponents& expectedArrayComponents,
+                                   const MultikeyComponents& actualArrayComponents) {
+    if (expectedArrayComponents != actualArrayComponents) {
+        StringBuilder sb;
+        sb << "Expected: ";
+        dumpArrayComponents(expectedArrayComponents, &sb);
+        sb << ", Actual: ";
+        dumpArrayComponents(actualArrayComponents, &sb);
+        FAIL(sb.str());
+    }
+}
+
+std::pair<BSONObj, std::string> makeDeeplyNestedObjAndDottedPath(size_t depth) {
+    BSONObj obj = BSON("a" << 1);
+    std::string path = "a";
+    path.reserve(depth * 2 + 1);
+    for (uint32_t i = 0; i < depth; ++i) {
+        obj = BSON("a" << obj);
+        path.insert(0, "a.");
+    }
+    return std::make_pair(std::move(obj), std::move(path));
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithScalarValue) {
+    BSONObj obj = BSON("a" << BSON("b" << 1));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedMaxDepthObjectWithScalarValue) {
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    auto [obj, dottedPath] = makeDeeplyNestedObjAndDottedPath(BSONDepth::getMaxAllowableDepth());
+    mdps::extractAllElementsAlongPath(
+        obj, dottedPath, actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+DEATH_TEST_REGEX(ExtractAllElementsAlongPathDeathTest, ExceedsMaxDepth, "Tripwire.*11177100") {
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    auto [obj, dottedPath] =
+        makeDeeplyNestedObjAndDottedPath(std::numeric_limits<BSONDepthIndex>::max() + 1);
+    mdps::extractAllElementsAlongPath(
+        obj, dottedPath, actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithEmptyArrayValue) {
+    BSONObj obj = BSON("a" << BSON("b" << BSONArrayBuilder().arr()));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual(std::vector<BSONObj>{}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithEmptyArrayValueAndExpandParamIsFalse) {
+    BSONObj obj(fromjson("{a: {b: []}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSONArray())}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithSingletonArrayValue) {
+    BSONObj obj = BSON("a" << BSON("b" << BSON_ARRAY(1)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithSingletonArrayValueAndExpandParamIsFalse) {
+    BSONObj obj(fromjson("{a: {b: {c: [3]}}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSON_ARRAY(3))}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, NestedObjectWithArrayValue) {
+    BSONObj obj = BSON("a" << BSON("b" << BSON_ARRAY(1 << 2 << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1), BSON("" << 2), BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual({1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, ObjectWithArrayOfSubobjectsWithScalarValue) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(BSON("b" << 1) << BSON("b" << 2) << BSON("b" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1), BSON("" << 2), BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, ObjectWithArrayOfSubobjectsWithArrayValues) {
+    BSONObj obj =
+        BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(1 << 2)) << BSON("b" << BSON_ARRAY(2 << 3))
+                                                               << BSON("b" << BSON_ARRAY(3 << 1))));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1), BSON("" << 2), BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual({0U, 1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath,
+     ObjectWithArrayOfSubobjectsWithArrayValuesButNotExpandingTrailingArrayValues) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(BSON("b" << BSON_ARRAY(1)) << BSON("b" << BSON_ARRAY(2))
+                                                                    << BSON("b" << BSON_ARRAY(3))));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual(
+        {BSON("" << BSON_ARRAY(1)), BSON("" << BSON_ARRAY(2)), BSON("" << BSON_ARRAY(3))},
+        actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesNotExpandArrayWithinTrailingArray) {
+    BSONObj obj = BSON("a" << BSON("b" << BSON_ARRAY(BSON_ARRAY(1 << 2) << BSON_ARRAY(3 << 4))));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSON_ARRAY(1 << 2)), BSON("" << BSON_ARRAY(3 << 4))},
+                                  actualElements);
+    assertArrayComponentsAreEqual({1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, ObjectWithTwoDimensionalArrayOfSubobjects) {
+    // Does not expand the array within the array.
+    BSONObj obj = fromjson("{a: [[{b: 0}, {b: 1}], [{b: 2}, {b: 3}]]}");
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, ObjectWithDiverseStructure) {
+    BSONObj obj = fromjson(
+        "{a: ["
+        "     {b: 0},"
+        "     [{b: 1}, {b: {c: -1}}],"
+        "     'no b here!',"
+        "     {b: [{c: -2}, 'no c here!']},"
+        "     {b: {c: [-3, -4]}}"
+        "]}");
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << -2), BSON("" << -3), BSON("" << -4)}, actualElements);
+    assertArrayComponentsAreEqual({0U, 1U, 2U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, AcceptsNumericFieldNames) {
+    BSONObj obj = BSON("a" << BSON("0" << 1));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.0", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, UsesNumericFieldNameToExtractElementFromArray) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("0" << 2)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.0", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, TreatsNegativeIndexAsFieldName) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("-1" << 2) << BSON("b" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.-1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, ExtractsNoValuesFromOutOfBoundsIndex) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("b" << 2) << BSON("10" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.10", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesNotTreatHexStringAsIndexSpecification) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("0x2" << 2) << BSON("NOT THIS ONE" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.0x2", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesNotAcceptLeadingPlusAsArrayIndex) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("+2" << 2) << BSON("NOT THIS ONE" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.+2", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesNotAcceptTrailingCharactersForArrayIndex) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("2xyz" << 2) << BSON("NOT THIS ONE" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.2xyz", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesNotAcceptNonDigitsForArrayIndex) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("2x4" << 2) << BSON("NOT THIS ONE" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.2x4", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath,
+     DoesExtractNestedValuesFromWithinArraysTraversedWithPositionalPaths) {
+    BSONObj obj = BSON("a" << BSON_ARRAY(1 << BSON("2" << 2) << BSON("target" << 3)));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.2.target", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesExpandMultiplePositionalPathSpecifications) {
+    BSONObj obj(fromjson("{a: [[{b: '(0, 0)'}, {b: '(0, 1)'}], [{b: '(1, 0)'}, {b: '(1, 1)'}]]}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.1.0.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << "(1, 0)")}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesAcceptNumericInitialField) {
+    BSONObj obj = BSON("a" << 1 << "0" << 2);
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "0", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, DoesExpandArrayFoundAfterPositionalSpecification) {
+    BSONObj obj(fromjson("{a: [[{b: '(0, 0)'}, {b: '(0, 1)'}], [{b: '(1, 0)'}, {b: '(1, 1)'}]]}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.1.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << "(1, 0)"), BSON("" << "(1, 1)")}, actualElements);
+    assertArrayComponentsAreEqual({1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, PositionalElementsNotConsideredArrayComponents) {
+    BSONObj obj(fromjson("{a: [{b: [1, 2]}]}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.0.b.1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, TrailingArrayIsExpandedEvenIfPositional) {
+    BSONObj obj(fromjson("{a: {b: [0, [1, 2]]}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 1), BSON("" << 2)}, actualElements);
+    assertArrayComponentsAreEqual({2U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, PositionalTrailingArrayNotExpandedIfExpandParameterIsFalse) {
+    BSONObj obj(fromjson("{a: {b: [0, [1, 2]]}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = false;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.1", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << BSON_ARRAY(1 << 2))}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, MidPathEmptyArrayIsConsideredAnArrayComponent) {
+    BSONObj obj(fromjson("{a: [{b: []}]}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual(std::vector<BSONObj>{}, actualElements);
+    assertArrayComponentsAreEqual({0U, 1U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPath, MidPathSingletonArrayIsConsideredAnArrayComponent) {
+    BSONObj obj(fromjson("{a: {b: [{c: 3}]}}"));
+
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual({1U}, actualArrayComponents);
+}
+
+TEST(ExtractElementAtPathOrArrayAlongPath, FieldWithDotsDontHideNestedObjects) {
+    BSONObj obj(fromjson("{b: {c: 'foo'}, \"b.c\": 'bar'}"));
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPath(
+        obj, "b.c", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    assertBSONElementSetsAreEqual({BSON("c" << "foo")}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPathLegacy, FieldWithDotsMatchedDirectly) {
+    // Legacy behavior: fields with literal dots are matched before traversing.
+    BSONObj obj(fromjson("{\"a.b\": 'literal', a: {b: 'nested'}}"));
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    // Legacy: finds the literal field "a.b" first.
+    assertBSONElementSetsAreEqual({BSON("" << "literal")}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPathLegacy, FieldWithDotsNotPresentFallsBackToNested) {
+    // When the literal field doesn't exist, legacy falls back to nested traversal.
+    BSONObj obj(fromjson("{a: {b: 'nested'}}"));
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    // No literal field, so it finds nested.
+    assertBSONElementSetsAreEqual({BSON("" << "nested")}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPathLegacy, CompareWithCurrent) {
+    // Direct comparison: legacy vs current behavior with both fields present.
+    BSONObj obj(fromjson("{\"a.b.c\": 'literal', a: {b: {c: 'nested'}}}"));
+
+    BSONElementSet legacyElements;
+    BSONElementSet currentElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents legacyArrayComponents;
+    MultikeyComponents currentArrayComponents;
+
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(
+        obj, "a.b.c", legacyElements, expandArrayOnTrailingField, &legacyArrayComponents);
+    mdps::extractAllElementsAlongPath(
+        obj, "a.b.c", currentElements, expandArrayOnTrailingField, &currentArrayComponents);
+
+    // Legacy finds literal field.
+    assertBSONElementSetsAreEqual({BSON("" << "literal")}, legacyElements);
+    // Current finds nested field.
+    assertBSONElementSetsAreEqual({BSON("" << "nested")}, currentElements);
+}
+
+TEST(ExtractAllElementsAlongPathLegacy, MultipleDotsInFieldName) {
+    BSONObj obj(
+        fromjson("{\"field.with.many.dots\": 'value', field: {with: {many: {dots: 'nested'}}}}"));
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(obj,
+                                                              "field.with.many.dots",
+                                                              actualElements,
+                                                              expandArrayOnTrailingField,
+                                                              &actualArrayComponents);
+
+    // Legacy behavior: matches the literal field name first.
+    assertBSONElementSetsAreEqual({BSON("" << "value")}, actualElements);
+    assertArrayComponentsAreEqual(MultikeyComponents{}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPathLegacy, ArraysStillDetected) {
+    // Ensure array detection still works with legacy path.
+    BSONObj obj(fromjson("{\"a.b\": [1, 2, 3]}"));
+    BSONElementSet actualElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents actualArrayComponents;
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(
+        obj, "a.b", actualElements, expandArrayOnTrailingField, &actualArrayComponents);
+
+    // Array should be expanded.
+    assertBSONElementSetsAreEqual({BSON("" << 1), BSON("" << 2), BSON("" << 3)}, actualElements);
+    assertArrayComponentsAreEqual({0U}, actualArrayComponents);
+}
+
+TEST(ExtractAllElementsAlongPathLegacy, NoDotsInPath) {
+    // When path has no dots, both behaviors should be identical.
+    BSONObj obj(fromjson("{simple: 'value'}"));
+    BSONElementSet legacyElements;
+    BSONElementSet currentElements;
+    const bool expandArrayOnTrailingField = true;
+    MultikeyComponents legacyArrayComponents;
+    MultikeyComponents currentArrayComponents;
+
+    mdps::extractAllElementsAlongPathLegacy_forValidationOnly(
+        obj, "simple", legacyElements, expandArrayOnTrailingField, &legacyArrayComponents);
+    mdps::extractAllElementsAlongPath(
+        obj, "simple", currentElements, expandArrayOnTrailingField, &currentArrayComponents);
+
+    // Both should find the same element.
+    assertBSONElementSetsAreEqual({BSON("" << "value")}, legacyElements);
+    assertBSONElementSetsAreEqual({BSON("" << "value")}, currentElements);
+}
+
+}  // namespace
+}  // namespace mongo

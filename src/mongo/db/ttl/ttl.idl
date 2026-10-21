@@ -1,0 +1,102 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo
+    cpp_includes:
+        - "mongo/db/ttl/ttl.h"
+        - "mongo/db/ttl/ttl_monitor.h"
+    mod_visibility: private
+server_parameters:
+    ttlMonitorEnabled:
+        description: "Enable the TTL monitor."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: ttlMonitorEnabled
+        default: true
+        redact: false
+
+    ttlMonitorSleepSecs:
+        description: "Period of TTL monitor thread (used for testing)."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: ttlMonitorSleepSecs
+        on_update: "TTLMonitor::onUpdateTTLMonitorSleepSeconds"
+        default: 60
+        validator:
+            gt: 0
+        redact: false
+
+    ttlMonitorBatchDeletes:
+        description:
+            "When enabled, the TTLMonitor batches TTL deletions and also removes expired documents
+            more fairly among the TTL indexes. When disabled, it falls back to legacy
+            doc-by-document deletions."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: ttlMonitorBatchDeletes
+        default: true
+        redact: false
+
+    ttlMonitorSubPassTargetSecs:
+        description:
+            "Limits (approximately) the amount of time spent iterating over a set TTL indexes where
+            expired documents remain. Additionally, the frequency at which we refresh the view of
+            TTL indexes within a pass where documents remain. 0 means each TTL index will be
+            iterated over once before the sub-pass completes. Only applicable when
+            'ttlMonitorBatchDeletes' is true."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: ttlMonitorSubPassTargetSecs
+        default: 60
+        validator:
+            gte: 0
+        redact: false
+
+    ttlIndexDeleteTargetTimeMS:
+        description:
+            "Limits (approximately) the time, in milliseconds, spent performing a batched delete
+            pass over a given TTL index. 0 means unlimited. Only applicable when
+            'ttlMonitorBatchDeletes' is true."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: ttlIndexDeleteTargetTimeMS
+        default: 1000
+        validator:
+            gte: 0
+        redact: false
+
+    ttlIndexDeleteTargetDocs:
+        description:
+            "Limits (approximately) the number of expired documents removed from a TTL index over a
+            batched delete. 0 means unlimited. Only applicable when 'ttlMonitorBatchDeletes' is
+            true."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: ttlIndexDeleteTargetDocs
+        default: 50000
+        validator:
+            gte: 0
+        redact: false
+
+    ttlMonitorMaxMetadataRecoveryThreads:
+        description:
+            "Limits the maximum size of the thread pool the TTLMonitor uses to recover sharding
+            metadata."
+        set_at: [startup]
+        cpp_vartype: Atomic<int>
+        cpp_varname: ttlMonitorMaxMetadataRecoveryThreads
+        default: 5
+        validator:
+            gte: 1
+        redact: false
+
+    ttlMonitorBackgroundOperation:
+        description:
+            "Switches the TTL monitor from being non-deprioritizable to a background task when the
+            server is overloaded. Should only be used if config.system.sessions is small."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: ttlMonitorBackgroundOperation
+        default: false
+        redact: false

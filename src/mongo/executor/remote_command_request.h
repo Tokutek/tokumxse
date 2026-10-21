@@ -1,0 +1,178 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/otel/telemetry_context.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <iosfwd>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace executor {
+
+struct [[MONGO_MOD_PUBLIC]] RemoteCommandRequest {
+
+    // Indicates that there is no timeout for the request to complete
+    static constexpr Milliseconds kNoTimeout{-1};
+    static constexpr Date_t kNoDeadline{Date_t::max()};
+
+    // Type to represent the internal id of this request
+    typedef uint64_t RequestId;
+
+    struct Options {
+        Milliseconds timeout = kNoTimeout;
+        bool fireAndForget = false;
+        bool isKillOp = false;
+        boost::optional<UUID> operationKey = boost::none;
+
+        // When set, the telemetry context is carried on the request so that the transport layer can
+        // attach an OpMsg telemetry section to egress messages on capable peers.
+        std::shared_ptr<otel::TelemetryContext> telemetryContext;
+    };
+
+    RemoteCommandRequest();
+
+    /** Preferred constructor. */
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         const BSONObj& metadata,
+                         OperationContext* opCtx,
+                         const Options& options);
+
+    /** Preferred constructor when there is no metadata. */
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         OperationContext* opCtx,
+                         const Options& options);
+
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         const BSONObj& metadataObj,
+                         OperationContext* opCtx,
+                         Milliseconds timeoutMillis = kNoTimeout,
+                         bool fireAndForget = false,
+                         boost::optional<UUID> operationKey = boost::none);
+
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         const BSONObj& metadataObj,
+                         OperationContext* opCtx,
+                         bool fireAndForget,
+                         boost::optional<UUID> operationKey = boost::none)
+        : RemoteCommandRequest(target,
+                               dbName,
+                               cmdObj,
+                               metadataObj,
+                               opCtx,
+                               {.fireAndForget = fireAndForget, .operationKey = operationKey}) {}
+
+
+    RemoteCommandRequest(const HostAndPort& target,
+                         const DatabaseName& dbName,
+                         const BSONObj& cmdObj,
+                         OperationContext* opCtx,
+                         Milliseconds timeoutMillis = kNoTimeout,
+                         bool fireAndForget = false,
+                         boost::optional<UUID> operationKey = boost::none)
+        : RemoteCommandRequest(target,
+                               dbName,
+                               cmdObj,
+                               opCtx,
+                               {.timeout = timeoutMillis,
+                                .fireAndForget = fireAndForget,
+                                .operationKey = operationKey}) {}
+
+    /**
+     * Conversion function that performs the RemoteCommandRequest conversion into OpMsgRequest
+     */
+    explicit operator OpMsgRequest() const;
+
+    std::string toString() const;
+
+    bool operator==(const RemoteCommandRequest& rhs) const;
+    bool operator!=(const RemoteCommandRequest& rhs) const;
+
+    [[MONGO_MOD_PUBLIC]] friend std::ostream& operator<<(std::ostream& os,
+                                                         const RemoteCommandRequest& response) {
+        return (os << response.toString());
+    }
+
+    // Internal id of this request. Not interpreted and used for tracing purposes only.
+    RequestId id;
+
+    HostAndPort target;
+
+    DatabaseName dbname;
+    BSONObj cmdObj;
+    BSONObj metadata{rpc::makeEmptyMetadata()};
+
+    // OperationContext is added to each request to allow OP_Command metadata attachment access to
+    // the Client object. The OperationContext is only accessed on the thread that calls
+    // NetworkInterface::startCommand. It is not safe to access from a thread that does not own the
+    // OperationContext in the general case. OperationContext should be non-null on
+    // NetworkInterfaces that do user work (i.e. reads, and writes) so that audit and client
+    // metadata is propagated. It is allowed to be null if used on NetworkInterfaces without
+    // metadata attachment (i.e., replication).
+    OperationContext* opCtx{nullptr};
+
+    Milliseconds timeout = kNoTimeout;
+    Date_t deadline = kNoDeadline;
+    boost::optional<ErrorCodes::Error> timeoutCode;
+
+    bool fireAndForget = false;
+
+    bool isKillOp = false;
+
+    boost::optional<UUID> operationKey;
+
+    // When false, the network interface will refrain from enforcing the 'timeout' for this request,
+    // but will still pass the timeout on as maxTimeMSOpOnly.
+    bool enforceLocalTimeout = true;
+
+    // Time when the request was scheduled.
+    boost::optional<Date_t> dateScheduled;
+
+    transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
+
+    // Telemetry context to propagate to the transport layer. Set by callers that have already
+    // created a child TelemetryContext (e.g. AsyncRequestsSender). The transport layer converts
+    // this to an OpMsg telemetry section when the target supports it (wire version >= 9.0).
+    std::shared_ptr<otel::TelemetryContext> telemetryContext;
+
+private:
+    /**
+     * Sets 'timeout' to the min of the current 'timeout' value and the remaining time on the OpCtx.
+     * If the remaining time is less than the provided 'timeout', remembers the timeout error code
+     * from the opCtx to use later if the timeout is indeed triggered.  This is important so that
+     * timeouts that are a direct result of a user-provided maxTimeMS return MaxTimeMSExpired rather
+     * than NetworkInterfaceExceededTimeLimit.
+     */
+    void _updateTimeoutFromOpCtxDeadline(const OperationContext* opCtx);
+};
+
+}  // namespace executor
+}  // namespace mongo

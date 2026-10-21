@@ -1,0 +1,122 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_evergreen_retry",
+    srcs = [
+        "__init__.py",
+        "test_evergreen_retry.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+        dependency(
+            "evergreen-py",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_download_utils",
+    srcs = [
+        "__init__.py",
+        "test_download_utils.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+        dependency(
+            "boto3",
+            group = "aws",
+        ),
+        dependency(
+            "botocore",
+            group = "aws",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_fileops",
+    srcs = [
+        "__init__.py",
+        "test_fileops.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+    ],
+)
+
+py_test(
+    name = "test_read_config",
+    srcs = [
+        "__init__.py",
+        "test_read_config.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_taskname",
+    srcs = [
+        "__init__.py",
+        "test_taskname.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+    ],
+)
+
+py_test(
+    name = "test_testname",
+    srcs = [
+        "__init__.py",
+        "test_testname.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+    ],
+)
+
+py_test(
+    name = "test_teststats",
+    srcs = [
+        "__init__.py",
+        "test_teststats.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_time",
+    srcs = [
+        "__init__.py",
+        "test_time.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/util",
+    ],
+)

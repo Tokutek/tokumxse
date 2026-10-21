@@ -1,165 +1,470 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
 
-#define	WT_SIZET_FMT	"zu"			/* size_t format string */
+#pragma once
 
-/* Add GCC-specific attributes to types and function declarations. */
-#define	WT_COMPILER_TYPE_ALIGN(x)	__attribute__((aligned(x)))
+#include <assert.h>
 
-#define	WT_PACKED_STRUCT_BEGIN(name)					\
-	struct __attribute__ ((__packed__)) name {
-#define	WT_PACKED_STRUCT_END						\
-	};
+#define WT_PTRDIFFT_FMT "td" /* ptrdiff_t format string */
+#define WT_SIZET_FMT "zu"    /* size_t format string */
+
+/* GCC-specific attributes. */
+#define WT_PACKED_STRUCT_BEGIN(name)             \
+    /* NOLINTNEXTLINE(misc-macro-parentheses) */ \
+    struct __attribute__((__packed__)) name {
+#define WT_PACKED_STRUCT_END \
+    }                        \
+    ;
 
 /*
- * Attribute are only permitted on function declarations, not definitions.
- * This macro is a marker for function definitions that is rewritten by
- * dist/s_prototypes to create extern.h.
+ * Attribute are only permitted on function declarations, not definitions. This macro is a marker
+ * for function definitions that is rewritten by dist/s_prototypes to create extern.h.
  */
-#define	WT_GCC_FUNC_ATTRIBUTE(x)
-#define	WT_GCC_FUNC_DECL_ATTRIBUTE(x) __attribute__(x)
+#define WT_GCC_FUNC_ATTRIBUTE(x)
+#define WT_GCC_FUNC_DECL_ATTRIBUTE(x) __attribute__(x)
+
+#ifdef __cplusplus
+#define WT_THREAD_LOCAL thread_local
+#else
+#define WT_THREAD_LOCAL _Thread_local
+#endif
 
 /*
- * Atomic writes:
- *
- * WiredTiger requires pointers (void *) and some variables to be read/written
- * atomically, that is, in a single cycle.  This is not write ordering -- to be
- * clear, the requirement is that no partial value can ever be read or written.
- * For example, if 8-bits of a 32-bit quantity were written, then the rest of
- * the 32-bits were written, and another thread of control was able to read the
- * memory location after the first 8-bits were written and before the subsequent
- * 24-bits were written, WiredTiger would break.   Or, if two threads of control
- * attempt to write the same location simultaneously, the result must be one or
- * the other of the two values, not some combination of both.
- *
- * To reduce memory requirements, we use a 32-bit type on 64-bit machines, which
- * is OK if the compiler doesn't accumulate two adjacent 32-bit variables into a
- * single 64-bit write, that is, there needs to be a single load/store of the 32
- * bits, not a load/store of 64 bits, where the 64 bits is comprised of two
- * adjacent 32-bit locations.  The problem is when two threads are cooperating
- * (thread X finds 32-bits set to 0, writes in a new value, flushes memory;
- * thread Y reads 32-bits that are non-zero, does some operation, resets the
- * memory location to 0 and flushes).   If thread X were to read the 32 bits
- * adjacent to a different 32 bits, and write them both, the two threads could
- * race.  If that can happen, you must increase the size of the memory type to
- * a type guaranteed to be written atomically in a single cycle, without writing
- * an adjacent memory location.
- *
- * WiredTiger additionally requires atomic writes for 64-bit memory locations,
- * and so cannot run on machines with a 32-bit memory bus.
- *
- * We don't depend on writes across cache lines being atomic, and to make sure
- * that never happens, we check address alignment: we know of no architectures
- * with cache lines other than a multiple of 4 bytes in size, so aligned 4-byte
- * accesses will always be in a single cache line.
- *
- * Atomic writes are often associated with memory barriers, implemented by the
- * WT_READ_BARRIER and WT_WRITE_BARRIER macros.  WiredTiger's requirement as
- * described by the Solaris membar_enter description:
- *
- *	No stores from after the memory barrier will reach visibility and
- *	no loads from after the barrier will be resolved before the lock
- *	acquisition reaches global visibility
- *
- * In other words, the WT_WRITE_BARRIER macro must ensure that memory stores by
- * the processor, made before the WT_WRITE_BARRIER call, be visible to all
- * processors in the system before any memory stores by the processor, made
- * after the WT_WRITE_BARRIER call, are visible to any processor.  The
- * WT_READ_BARRIER macro ensures that all loads before the barrier are complete
- * before any loads after the barrier.  The compiler cannot reorder or cache
- * values across a barrier.
- *
- * Lock and unlock operations imply both read and write barriers.  In other
- * words, barriers are not required for values protected by locking.
- *
- * Data locations may also be marked volatile, forcing the compiler to re-load
- * the data on each access.  This is a weaker semantic than barriers provide,
- * only ensuring that the compiler will not cache values.  It makes no ordering
- * guarantees and may have no effect on systems with weaker cache guarantees.
- *
- * In summary, locking > barriers > volatile.
- *
- * To avoid locking shared data structures such as statistics and to permit
- * atomic state changes, we rely on the WT_ATOMIC_ADD and WT_ATOMIC_CAS
- * (compare and swap) operations.
- *
- * Note that we avoid __sync_bool_compare_and_swap due to problems with
- * optimization with some versions of clang.  See
+ * For details on the hardware requirements of WiredTiger see the portability documentation. For
+ * details on concurrency primitive usage in WiredTiger see the architecture guide page "WiredTiger
+ * concurrency management".
+ */
+
+/*
+ * We've hit optimization bugs with Clang 3.5 in the past when using the atomic builtins. See
  * http://llvm.org/bugs/show_bug.cgi?id=21499 for details.
  */
-#define	__WT_ATOMIC_ADD(v, val, n)					\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)), __sync_add_and_fetch(&(v), val))
-#define	__WT_ATOMIC_FETCH_ADD(v, val, n)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)), __sync_fetch_and_add(&(v), val))
-#define	__WT_ATOMIC_CAS(v, old, new, n)					\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	__sync_val_compare_and_swap(&(v), old, new) == (old))
-#define	__WT_ATOMIC_CAS_VAL(v, old, new, n)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	__sync_val_compare_and_swap(&(v), old, new))
-#define	__WT_ATOMIC_STORE(v, val, n)					\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	__sync_lock_test_and_set(&(v), val))
-#define	__WT_ATOMIC_SUB(v, val, n)					\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)), __sync_sub_and_fetch(&(v), val))
-
-#define	WT_ATOMIC_ADD1(v, val)		__WT_ATOMIC_ADD(v, val, 1)
-#define	WT_ATOMIC_FETCH_ADD1(v, val)	__WT_ATOMIC_FETCH_ADD(v, val, 1)
-#define	WT_ATOMIC_CAS1(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 1)
-#define	WT_ATOMIC_CAS_VAL1(v, old, new)	__WT_ATOMIC_CAS_VAL(v, old, new, 1)
-#define	WT_ATOMIC_STORE1(v, val)	__WT_ATOMIC_STORE(v, val, 1)
-#define	WT_ATOMIC_SUB1(v, val)		__WT_ATOMIC_SUB(v, val, 1)
-
-#define	WT_ATOMIC_ADD2(v, val)		__WT_ATOMIC_ADD(v, val, 2)
-#define	WT_ATOMIC_FETCH_ADD2(v, val)	__WT_ATOMIC_FETCH_ADD(v, val, 2)
-#define	WT_ATOMIC_CAS2(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 2)
-#define	WT_ATOMIC_CAS_VAL2(v, old, new)	__WT_ATOMIC_CAS_VAL(v, old, new, 2)
-#define	WT_ATOMIC_STORE2(v, val)	__WT_ATOMIC_STORE(v, val, 2)
-#define	WT_ATOMIC_SUB2(v, val)		__WT_ATOMIC_SUB(v, val, 2)
-
-#define	WT_ATOMIC_ADD4(v, val)		__WT_ATOMIC_ADD(v, val, 4)
-#define	WT_ATOMIC_FETCH_ADD4(v, val)	__WT_ATOMIC_FETCH_ADD(v, val, 4)
-#define	WT_ATOMIC_CAS4(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 4)
-#define	WT_ATOMIC_CAS_VAL4(v, old, new)	__WT_ATOMIC_CAS_VAL(v, old, new, 4)
-#define	WT_ATOMIC_STORE4(v, val)	__WT_ATOMIC_STORE(v, val, 4)
-#define	WT_ATOMIC_SUB4(v, val)		__WT_ATOMIC_SUB(v, val, 4)
-
-#define	WT_ATOMIC_ADD8(v, val)		__WT_ATOMIC_ADD(v, val, 8)
-#define	WT_ATOMIC_FETCH_ADD8(v, val)	__WT_ATOMIC_FETCH_ADD(v, val, 8)
-#define	WT_ATOMIC_CAS8(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 8)
-#define	WT_ATOMIC_CAS_VAL8(v, old, new)	__WT_ATOMIC_CAS_VAL(v, old, new, 8)
-#define	WT_ATOMIC_STORE8(v, val)	__WT_ATOMIC_STORE(v, val, 8)
-#define	WT_ATOMIC_SUB8(v, val)		__WT_ATOMIC_SUB(v, val, 8)
+#if defined(__clang__) && defined(__clang_major__) && defined(__clang_minor__) && \
+  (((__clang_major__ == 3) && (__clang_minor__ <= 5)) || (__clang_major__ < 3))
+#error "Clang versions 3.5 and earlier are unsupported by WiredTiger"
+#endif
 
 /* Compile read-write barrier */
-#define	WT_BARRIER() __asm__ volatile("" ::: "memory")
-
-/* Pause instruction to prevent excess processor bus usage */
-#define	WT_PAUSE() __asm__ volatile("pause\n" ::: "memory")
+#define WT_COMPILER_BARRIER() __asm__ volatile("" ::: "memory")
 
 #if defined(x86_64) || defined(__x86_64__)
-#define	WT_FULL_BARRIER() do {						\
-	__asm__ volatile ("mfence" ::: "memory");			\
-} while (0)
-#define	WT_READ_BARRIER() do {						\
-	__asm__ volatile ("lfence" ::: "memory");			\
-} while (0)
-#define	WT_WRITE_BARRIER() do {						\
-	__asm__ volatile ("sfence" ::: "memory");			\
-} while (0)
+/* Pause instruction to prevent excess processor bus usage */
+#define WT_PAUSE() __asm__ volatile("pause\n" ::: "memory")
+#define WT_FULL_BARRIER()                        \
+    do {                                         \
+        __asm__ volatile("mfence" ::: "memory"); \
+    } while (0)
+/* We only need compiler barriers on x86 due to Total Store Ordering (TSO). */
+#define WT_ACQUIRE_BARRIER() WT_COMPILER_BARRIER()
+#define WT_RELEASE_BARRIER() WT_COMPILER_BARRIER()
 
-#elif defined(i386) || defined(__i386__)
-#define	WT_FULL_BARRIER() do {						\
-	__asm__ volatile ("lock; addl $0, 0(%%esp)" ::: "memory");	\
-} while (0)
-#define	WT_READ_BARRIER()	WT_FULL_BARRIER()
-#define	WT_WRITE_BARRIER()	WT_FULL_BARRIER()
+#elif defined(__mips64el__) || defined(__mips__) || defined(__mips64__) || defined(__mips64)
+#define WT_PAUSE() __asm__ volatile("pause\n" ::: "memory")
+#define WT_FULL_BARRIER()                                                                  \
+    do {                                                                                   \
+        __asm__ volatile("sync; ld $0, %0" ::"m"(*(long *)0xffffffff80000000) : "memory"); \
+    } while (0)
+#define WT_ACQUIRE_BARRIER() WT_FULL_BARRIER()
+#define WT_RELEASE_BARRIER() WT_FULL_BARRIER()
 
+#elif defined(__PPC64__) || defined(PPC64)
+/* ori 0,0,0 is the PPC64 noop instruction */
+#define WT_PAUSE() __asm__ volatile("ori 0,0,0" ::: "memory")
+#define WT_FULL_BARRIER()                      \
+    do {                                       \
+        __asm__ volatile("sync" ::: "memory"); \
+    } while (0)
+
+/*
+ * TODO: ISA 2.07 Elemental Memory Barriers would be better, specifically mbll, and mbss, but they
+ * are not supported by POWER 8.
+ */
+#define WT_ACQUIRE_BARRIER()                     \
+    do {                                         \
+        __asm__ volatile("lwsync" ::: "memory"); \
+    } while (0)
+#define WT_RELEASE_BARRIER()                     \
+    do {                                         \
+        __asm__ volatile("lwsync" ::: "memory"); \
+    } while (0)
+
+#elif defined(__aarch64__)
+/*
+ * Use an isb instruction here to be closer to the original x86 pause instruction. The yield
+ * instruction that was previously here is a nop that is intended to provide a hint that a
+ * thread in a SMT system could yield. This is different from the x86 pause instruction
+ * which delays execution by O(100) cycles. The isb will typically delay execution by about
+ * 50 cycles so it's a reasonable alternative.
+ */
+#define WT_PAUSE() __asm__ volatile("isb" ::: "memory")
+
+/*
+ * ARM offers three barrier types:
+ *   isb - instruction synchronization barrier
+ *   dmb - data memory barrier
+ *   dsb - data synchronization barrier
+ *
+ * To implement memory barriers for WiredTiger, we need at-least the dmb. dmb are sufficient to
+ * guarantee the ordering described above. We don't want to use dsbs because they provide a much
+ * stronger guarantee of completion which isn't required. Additionally, dsbs synchronize other
+ * system activities such as tlb and cache maintenance instructions which is not required in this
+ * case.
+ *
+ * A shareability domain of inner-shareable is selected because all the entities participating in
+ * the ordering requirements are CPUs and ordering with respect to other devices or memory-types
+ * isn't required.
+ */
+#define WT_FULL_BARRIER()                         \
+    do {                                          \
+        __asm__ volatile("dmb ish" ::: "memory"); \
+    } while (0)
+#define WT_ACQUIRE_BARRIER()                        \
+    do {                                            \
+        __asm__ volatile("dmb ishld" ::: "memory"); \
+    } while (0)
+/*
+ * In order to achieve release semantics we need two arm barrier instructions. Firstly dmb ishst
+ * which gives us StoreStore, secondly a dmb ishld which gives us LoadLoad, LoadStore.
+ *
+ * This is sufficient for the release semantics which is StoreStore, LoadStore. We could issue a
+ * single dmb ish here but that is more expensive because it adds a StoreLoad barrier which is the
+ * most expensive reordering to prevent.
+ */
+#define WT_RELEASE_BARRIER() __asm__ volatile("dmb ishst; dmb ishld" ::: "memory");
+
+#elif defined(__s390x__)
+#define WT_PAUSE() __asm__ volatile("lr 0,0" ::: "memory")
+#define WT_FULL_BARRIER()                            \
+    do {                                             \
+        __asm__ volatile("bcr 15,0\n" ::: "memory"); \
+    } while (0)
+#define WT_ACQUIRE_BARRIER() WT_FULL_BARRIER()
+#define WT_RELEASE_BARRIER() WT_FULL_BARRIER()
+
+#elif defined(__sparc__)
+#define WT_PAUSE() __asm__ volatile("rd %%ccr, %%g0" ::: "memory")
+
+#define WT_FULL_BARRIER()                                   \
+    do {                                                    \
+        __asm__ volatile("membar #StoreLoad" ::: "memory"); \
+    } while (0)
+
+/* On UltraSparc machines, TSO is used, and so there is no need for membar. */
+#define WT_ACQUIRE_BARRIER() WT_COMPILER_BARRIER()
+#define WT_RELEASE_BARRIER() WT_COMPILER_BARRIER()
+
+#elif defined(__riscv) && (__riscv_xlen == 64)
+
+/*
+ * There is a `pause` instruction which has been recently adopted for RISC-V but it does not appear
+ * that compilers support it yet. See:
+ *
+ * https://riscv.org/announcements/2021/02/
+ *    risc-v-international-unveils-fast-track-architecture-
+ *    extension-process-and-ratifies-zihintpause-extension
+ *
+ * Once compiler support is ready, this can and should be replaced with `pause` to enable more
+ * efficient spin locks.
+ */
+#define WT_PAUSE() __asm__ volatile("nop" ::: "memory")
+
+/*
+ * The RISC-V fence instruction is documented here:
+ *
+ * https://five-embeddev.com/riscv-isa-manual/latest/memory.html#sec:mm:fence
+ *
+ * On RISC-V, the fence instruction takes explicit flags that indicate the predecessor and successor
+ * sets.
+ */
+#define WT_FULL_BARRIER()                              \
+    do {                                               \
+        __asm__ volatile("fence rw, rw" ::: "memory"); \
+    } while (0)
+#define WT_ACQUIRE_BARRIER()                          \
+    do {                                              \
+        __asm__ volatile("fence r, rw" ::: "memory"); \
+    } while (0)
+#define WT_RELEASE_BARRIER()                          \
+    do {                                              \
+        __asm__ volatile("fence rw, w" ::: "memory"); \
+    } while (0)
+
+#elif defined(__loongarch64)
+#define WT_PAUSE() __asm__ volatile("nop\n" ::: "memory")
+#define WT_FULL_BARRIER()                        \
+    do {                                         \
+        __asm__ volatile("dbar 0" ::: "memory"); \
+    } while (0)
+#define WT_ACQUIRE_BARRIER() WT_FULL_BARRIER()
+#define WT_RELEASE_BARRIER() WT_FULL_BARRIER()
 #else
-#error "No write barrier implementation for this hardware"
+#error "No barrier implementation for this hardware"
 #endif
+
+/*
+ * This macro is for internal use within this document only. For all other cases, please use
+ * __wt_atomic_load_<type>_acquire(...)
+ *
+ * The below assembly implements the read-acquire semantic. Acquire semantics prevent memory
+ * reordering of the read-acquire with any load or store that follows it in program order.
+ *
+ * The if branches get removed at compile time as the sizeof instruction evaluates at compile time.
+ * The inline assembly results in a loss of type checking, to circumvent this we utilize an
+ * unreachable if (0) block which contains the direct assignment. This forces the compiler to
+ * type check. We also statically assert that both types match in size to avoid potential loss
+ * of sign when loading from a smaller type to a larger type.
+ *
+ * Depending on the size of the given type we choose the appropriate ldapr variant, additionally the
+ * W register variants are used if possible which map to the lower word of the associated X
+ * register. Finally the "Q" constraint is used for the given input operand, this instructs the
+ * compiler to generate offset free ldapr instructions. ldapr instructions, prior to version
+ * RCpc 3, don't support offsets.
+ *
+ * The flag HAVE_RCPC is determined by the build system, if this macro is removed in the future be
+ * sure to remove that part of the compilation.
+ */
+#if defined(HAVE_RCPC) && !defined(TSAN_BUILD)
+#define ACQUIRE_READ(v, val)                                                                       \
+    do {                                                                                           \
+        if (0) {                                                                                   \
+            static_assert(sizeof((v)) == sizeof((val)), "sizes of provided variables must match"); \
+            (v) = (val);                                                                           \
+        }                                                                                          \
+        if (sizeof((val)) == 1) {                                                                  \
+            __asm__ volatile("ldaprb %w0, %1" : "=r"(v) : "Q"(val));                               \
+        } else if (sizeof((val)) == 2) {                                                           \
+            __asm__ volatile("ldaprh %w0, %1" : "=r"(v) : "Q"(val));                               \
+        } else if (sizeof((val)) == 4) {                                                           \
+            __asm__ volatile("ldapr %w0, %1" : "=r"(v) : "Q"(val));                                \
+        } else if (sizeof((val)) == 8) {                                                           \
+            __asm__ volatile("ldapr %x0, %1" : "=r"(v) : "Q"(val));                                \
+        }                                                                                          \
+    } while (0)
+#else
+#define ACQUIRE_READ(v, val) (v) = __atomic_load_n(&(val), __ATOMIC_ACQUIRE)
+#endif
+
+/*
+ * This macro is for internal use within this document only. For all other cases, please use
+ * __wt_atomic_store_<type>_release(...)
+ *
+ * Write to a memory location using the ARM stlr instruction. This is also known as a write-release
+ * operation, and has the following semantics: Release semantics prevent memory reordering of
+ * the write-release with any read or write operation that precedes it in program order.
+ *
+ * Usage of this macro should be paired with an associated WT_ACQUIRE_READ. As with the acquire
+ * version we avoid type checking loss by defining an unreachable if block, we also guard
+ * against misuse by statically asserting that the destination is the same size as the value
+ * being written.
+ */
+#if defined(HAVE_RCPC) && !defined(TSAN_BUILD)
+#define RELEASE_WRITE(v, val)                                                                      \
+    do {                                                                                           \
+        if (0) {                                                                                   \
+            static_assert(sizeof((v)) == sizeof((val)), "sizes of provided variables must match"); \
+            (v) = (val);                                                                           \
+        }                                                                                          \
+        if (sizeof((v)) == 1) {                                                                    \
+            __asm__ volatile("stlrb %w1, %0" : "=Q"(v) : "r"(val));                                \
+        } else if (sizeof((v)) == 2) {                                                             \
+            __asm__ volatile("stlrh %w1, %0" : "=Q"(v) : "r"(val));                                \
+        } else if (sizeof((v)) == 4) {                                                             \
+            __asm__ volatile("stlr %w1, %0" : "=Q"(v) : "r"(val));                                 \
+        } else if (sizeof((v)) == 8) {                                                             \
+            __asm__ volatile("stlr %x1, %0" : "=Q"(v) : "r"(val));                                 \
+        }                                                                                          \
+    } while (0)
+#else
+#define RELEASE_WRITE(v, val) __atomic_store_n(&(v), (val), __ATOMIC_RELEASE)
+#endif
+
+/*
+ * This macro is for internal use within this document only. For all other cases, please use
+ * __wt_atomic_cas_<type>(...)
+ */
+#define ATOMIC_CAS(ptr, oldp, newv) \
+    __atomic_compare_exchange_n(ptr, oldp, newv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define ATOMIC_CAS_RELAXED(ptr, oldp, newv) \
+    __atomic_compare_exchange_n(ptr, oldp, newv, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
+
+#define WT_ATOMIC_FUNC_STORE_LOAD(suffix, _type)                                           \
+    static inline _type __wt_atomic_load_##suffix##_relaxed(_type *vp)                     \
+    {                                                                                      \
+        return (__atomic_load_n(vp, __ATOMIC_RELAXED));                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_relaxed(_type *vp, _type v)            \
+    {                                                                                      \
+        __atomic_store_n(vp, v, __ATOMIC_RELAXED);                                         \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_acquire(_type *vp)                     \
+    {                                                                                      \
+        _type result;                                                                      \
+        ACQUIRE_READ(result, *(vp));                                                       \
+        return (result);                                                                   \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_release(_type *vp, _type v)            \
+    {                                                                                      \
+        RELEASE_WRITE(*(vp), v);                                                           \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix(_type *vp)                               \
+    {                                                                                      \
+        return (__atomic_load_n(vp, __ATOMIC_SEQ_CST));                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix(_type *vp, _type v)                      \
+    {                                                                                      \
+        __atomic_store_n(vp, v, __ATOMIC_SEQ_CST);                                         \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_v_relaxed(volatile _type *vp)          \
+    {                                                                                      \
+        return (__atomic_load_n(vp, __ATOMIC_RELAXED));                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_v_relaxed(volatile _type *vp, _type v) \
+    {                                                                                      \
+        __atomic_store_n(vp, v, __ATOMIC_RELAXED);                                         \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_v_acquire(volatile _type *vp)          \
+    {                                                                                      \
+        _type result;                                                                      \
+        ACQUIRE_READ(result, *(vp));                                                       \
+        return (result);                                                                   \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_v_release(volatile _type *vp, _type v) \
+    {                                                                                      \
+        RELEASE_WRITE(*(vp), v);                                                           \
+    }                                                                                      \
+    static inline _type __wt_atomic_load_##suffix##_v(volatile _type *vp)                  \
+    {                                                                                      \
+        return (__atomic_load_n(vp, __ATOMIC_SEQ_CST));                                    \
+    }                                                                                      \
+    static inline void __wt_atomic_store_##suffix##_v(volatile _type *vp, _type v)         \
+    {                                                                                      \
+        __atomic_store_n(vp, v, __ATOMIC_SEQ_CST);                                         \
+    }
+
+#define WT_ATOMIC_CAS_FUNC(suffix, _type)                                                      \
+    static inline bool __wt_atomic_cas_##suffix(_type *vp, _type old, _type newv)              \
+    {                                                                                          \
+        return (ATOMIC_CAS(vp, &old, newv));                                                   \
+    }                                                                                          \
+    static inline bool __wt_atomic_cas_##suffix##_relaxed(_type *vp, _type old, _type newv)    \
+    {                                                                                          \
+        return (ATOMIC_CAS_RELAXED(vp, &old, newv));                                           \
+    }                                                                                          \
+    static inline bool __wt_atomic_cas_##suffix##_v(volatile _type *vp, _type old, _type newv) \
+    {                                                                                          \
+        return (ATOMIC_CAS(vp, &old, newv));                                                   \
+    }                                                                                          \
+    static inline bool __wt_atomic_cas_##suffix##_v_relaxed(                                   \
+      volatile _type *vp, _type old, _type newv)                                               \
+    {                                                                                          \
+        return (ATOMIC_CAS_RELAXED(vp, &old, newv));                                           \
+    }
+
+#define WT_ATOMIC_FUNC(suffix, _type)                                                     \
+    static inline _type __wt_atomic_add_##suffix(_type *vp, _type v)                      \
+    {                                                                                     \
+        return (__atomic_add_fetch(vp, v, __ATOMIC_SEQ_CST));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_add_##suffix##_relaxed(_type *vp, _type v)            \
+    {                                                                                     \
+        return (__atomic_add_fetch(vp, v, __ATOMIC_RELAXED));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_fetch_add_##suffix(_type *vp, _type v)                \
+    {                                                                                     \
+        return (__atomic_fetch_add(vp, v, __ATOMIC_SEQ_CST));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_sub_##suffix(_type *vp, _type v)                      \
+    {                                                                                     \
+        return (__atomic_sub_fetch(vp, v, __ATOMIC_SEQ_CST));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_sub_##suffix##_relaxed(_type *vp, _type v)            \
+    {                                                                                     \
+        return (__atomic_sub_fetch(vp, v, __ATOMIC_RELAXED));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_add_##suffix##_v(volatile _type *vp, _type v)         \
+    {                                                                                     \
+        return (__atomic_add_fetch(vp, v, __ATOMIC_SEQ_CST));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_add_##suffix##_v_relaxed(volatile _type *vp, _type v) \
+    {                                                                                     \
+        return (__atomic_add_fetch(vp, v, __ATOMIC_RELAXED));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_fetch_add_##suffix##_v(volatile _type *vp, _type v)   \
+    {                                                                                     \
+        return (__atomic_fetch_add(vp, v, __ATOMIC_SEQ_CST));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_sub_##suffix##_v(volatile _type *vp, _type v)         \
+    {                                                                                     \
+        return (__atomic_sub_fetch(vp, v, __ATOMIC_SEQ_CST));                             \
+    }                                                                                     \
+    static inline _type __wt_atomic_sub_##suffix##_v_relaxed(volatile _type *vp, _type v) \
+    {                                                                                     \
+        return (__atomic_sub_fetch(vp, v, __ATOMIC_RELAXED));                             \
+    }                                                                                     \
+    WT_ATOMIC_CAS_FUNC(suffix, _type)                                                     \
+    WT_ATOMIC_FUNC_STORE_LOAD(suffix, _type)
+
+WT_ATOMIC_FUNC(uint8, uint8_t)
+WT_ATOMIC_FUNC(uint16, uint16_t)
+WT_ATOMIC_FUNC(uint32, uint32_t)
+WT_ATOMIC_FUNC(uint64, uint64_t)
+WT_ATOMIC_FUNC(int8, int8_t)
+WT_ATOMIC_FUNC(int16, int16_t)
+WT_ATOMIC_FUNC(int32, int32_t)
+WT_ATOMIC_FUNC(int64, int64_t)
+WT_ATOMIC_FUNC(size, size_t)
+
+WT_ATOMIC_FUNC_STORE_LOAD(bool, bool)
+WT_ATOMIC_FUNC_STORE_LOAD(uintmax, uintmax_t)
+
+/*
+ * __wt_atomic_load_double_relaxed --
+ *     Atomically read a double variable.
+ */
+static inline double
+__wt_atomic_load_double_relaxed(double *vp)
+{
+    double value;
+    __atomic_load(vp, &value, __ATOMIC_RELAXED);
+    return (value);
+}
+
+/*
+ * __wt_atomic_store_double_relaxed --
+ *     Atomically set a double variable.
+ */
+static inline void
+__wt_atomic_store_double_relaxed(double *vp, double v)
+{
+    __atomic_store(vp, &v, __ATOMIC_RELAXED);
+}
+
+#define __wt_atomic_load_enum_relaxed(vp) __atomic_load_n(vp, __ATOMIC_RELAXED)
+#define __wt_atomic_load_enum_acquire(vp) __atomic_load_n(vp, __ATOMIC_ACQUIRE)
+#define __wt_atomic_store_enum_relaxed(vp, v) __atomic_store_n(vp, v, __ATOMIC_RELAXED)
+#define __wt_atomic_store_enum_release(vp, v) __atomic_store_n(vp, v, __ATOMIC_RELEASE)
+
+#define __wt_atomic_load_ptr_relaxed(vp) __atomic_load_n(vp, __ATOMIC_RELAXED)
+#define __wt_atomic_load_ptr_acquire(vp) __atomic_load_n(vp, __ATOMIC_ACQUIRE)
+#define __wt_atomic_store_ptr_relaxed(vp, v) __atomic_store_n(vp, v, __ATOMIC_RELAXED)
+#define __wt_atomic_store_ptr_release(vp, v) __atomic_store_n(vp, v, __ATOMIC_RELEASE)
+
+/*
+ * __wt_atomic_cas_ptr --
+ *     Pointer compare and swap.
+ */
+static inline bool
+__wt_atomic_cas_ptr(void *vp, void *old, void *newv)
+{
+    return (ATOMIC_CAS((void **)vp, &old, newv));
+}
+
+#define __wt_atomic_and_generic_relaxed(vp, v) __atomic_and_fetch(vp, v, __ATOMIC_RELAXED)
+#define __wt_atomic_or_generic_relaxed(vp, v) __atomic_or_fetch(vp, v, __ATOMIC_RELAXED)
+#define __wt_atomic_load_generic_relaxed(vp) __atomic_load_n(vp, __ATOMIC_RELAXED)
+#define __wt_atomic_store_generic_relaxed(vp, v) __atomic_store_n(vp, v, __ATOMIC_RELAXED)

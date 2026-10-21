@@ -1,0 +1,205 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/storage/damage_vector.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/util/modules.h"
+
+#include <functional>
+#include <vector>
+
+/**
+ * These functions are intended for low-level operations which need precise control over how a write
+ * is replicated, but are temporarily public because they currently are widely used in tests for
+ * simple CRUD operations. If possible, prefer to use DBHelpers over calling these functions.
+ */
+namespace mongo::collection_internal {
+
+using OnRecordInsertedFn = std::function<Status(const RecordId& loc)>;
+
+
+enum class [[MONGO_MOD_NEEDS_REPLACEMENT]] StoreDeletedDoc { Off, On };
+
+enum class [[MONGO_MOD_NEEDS_REPLACEMENT]] RetryableWrite { kYes, kNo };
+
+/**
+ * Constants used for the opDiff argument in updateDocument and updateDocumentWithDamages.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+constexpr const BSONObj* kUpdateAllIndexes = nullptr;
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+constexpr const BSONObj* kUpdateNoIndexes = &BSONObj::kEmptyObject;
+
+/**
+ * Inserts a document into the record store for a bulk loader that manages the index building. The
+ * bulk loader is notified with the RecordId of the document inserted into the RecordStore through
+ * the 'OnRecordInsertedFn' callback.
+ *
+ * When 'replicatedRecordId' is provided, the document is inserted with the replicatedRecordId as
+ * the recordId.
+ *
+ * NOTE: It is up to caller to commit the indexes.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+Status insertDocumentForBulkLoader(OperationContext* opCtx,
+                                   const CollectionPtr& collection,
+                                   const BSONObj& doc,
+                                   RecordId replicatedRecordId,
+                                   const OnRecordInsertedFn& onRecordInserted);
+
+/**
+ * Inserts all documents inside one WUOW.
+ * Caller should ensure vector is appropriately sized for this.
+ * If any errors occur (including WCE), caller should retry documents individually.
+ *
+ * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+Status insertDocuments(OperationContext* opCtx,
+                       const CollectionPtr& collection,
+                       std::vector<InsertStatement>::const_iterator begin,
+                       std::vector<InsertStatement>::const_iterator end,
+                       OpDebug* opDebug,
+                       bool fromMigrate = false);
+
+/**
+ * Does NOT modify the doc before inserting (i.e. will not add an _id field for documents that are
+ * missing it)
+ *
+ * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+Status insertDocument(OperationContext* opCtx,
+                      const CollectionPtr& collection,
+                      const InsertStatement& doc,
+                      OpDebug* opDebug,
+                      bool fromMigrate = false);
+
+/**
+ * Updates the document @ oldLocation with newDoc.
+ *
+ * If the document fits in the old space, it is put there; if not, it is moved.
+ *
+ *'args.updatedDoc' is set to the updated version of the document with damages applied, on success
+ *'opDiff' is optional. If set to kUpdateAllIndexes, all the indexes are updated. If it is set to
+ *   kUpdateNoIndexes, no indexes are updated. Otherwise, it is the precomputed difference between
+ *   'oldDoc' and 'newDoc', used to determine which indexes need to be updated.
+ * 'indexesAffected' is optional. When not null, will be set to whether any indexes were updated
+ * 'opDebug' is argument. When not null, will be used to record operation statistics.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+void updateDocument(OperationContext* opCtx,
+                    const CollectionPtr& collection,
+                    const RecordId& oldLocation,
+                    const Snapshotted<BSONObj>& oldDoc,
+                    const BSONObj& newDoc,
+                    const BSONObj* opDiff,
+                    bool* indexesAffected,
+                    OpDebug* opDebug,
+                    CollectionUpdateArgs* args);
+
+/**
+ * Illegal to call if collection->updateWithDamagesSupported() returns false.
+ * Sets 'args.updatedDoc' to the updated version of the document with damages applied, on success.
+ * Returns the contents of the updated document.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+StatusWith<BSONObj> updateDocumentWithDamages(OperationContext* opCtx,
+                                              const CollectionPtr& collection,
+                                              const RecordId& loc,
+                                              const Snapshotted<BSONObj>& oldDoc,
+                                              const char* damageSource,
+                                              const DamageVector& damages,
+                                              const BSONObj* opDiff,
+                                              bool* indexesAffected,
+                                              OpDebug* opDebug,
+                                              CollectionUpdateArgs* args,
+                                              const SeekableRecordCursor* cursor);
+
+/**
+ * Deletes the document with the given RecordId from the collection. For a description of the
+ * parameters, see the overloaded function below.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+void deleteDocument(OperationContext* opCtx,
+                    const CollectionPtr& collection,
+                    StmtId stmtId,
+                    const RecordId& loc,
+                    OpDebug* opDebug,
+                    bool fromMigrate = false,
+                    bool noWarn = false,
+                    StoreDeletedDoc storeDeletedDoc = StoreDeletedDoc::Off,
+                    CheckRecordId checkRecordId = CheckRecordId::Off,
+                    RetryableWrite retryableWrite = RetryableWrite::kNo);
+
+/**
+ * Deletes the document from the collection.
+ *
+ * @param doc: the document to be deleted.
+ * @param fromMigrate: indicates whether the delete was induced by a chunk migration, and so should
+ * be ignored by the user as an internal maintenance operation and not a real delete.
+ * @param loc: key to uniquely identify a record in a collection.
+ * @param opDebug: Optional argument. When not null, will be used to record operation statistics.
+ * @param noWarn: if unindexing the record causes an error, if noWarn is true the error will not be
+ * logged.
+ * @param storeDeletedDoc: whether to store the document deleted in the oplog.
+ * @param checkRecordId: whether to confirm the recordId matches the record we are removing when
+ * unindexing.
+ * @param retryableWrite: whether it's a retryable write, @see write_stage_common::isRetryableWrite
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+void deleteDocument(OperationContext* opCtx,
+                    const CollectionPtr& collection,
+                    Snapshotted<BSONObj> doc,
+                    StmtId stmtId,
+                    const RecordId& loc,
+                    OpDebug* opDebug,
+                    bool fromMigrate = false,
+                    bool noWarn = false,
+                    StoreDeletedDoc storeDeletedDoc = StoreDeletedDoc::Off,
+                    CheckRecordId checkRecordId = CheckRecordId::Off,
+                    RetryableWrite retryableWrite = RetryableWrite::kNo);
+
+/**
+ * Truncates a clustered collection from 'minRecordId' to 'maxRecordId' inclusive. 'bytesDeleted'
+ * and 'docsDeleted' are estimates of the bytes and documents that will be truncated within the
+ * provided range.
+ *
+ * Typically used on Primary to truncate a range in a collection and replicate the truncate
+ * operation to Secondaries through the oplog. To make oplog application safe and efficient, callers
+ * should only truncate up to a known RecordId, not an arbitrarily large non existing
+ * RecordId.
+ *
+ * Also supports unreplicated truncates to maintain backwards compatibility on platforms where
+ * `shouldReplicateRangeTruncates()` returns false. Requires explicitly disabling replication
+ * using an UnreplicatedWritesBlock RAII object in scope before calling `truncateRange()`.
+ *
+ * Returns the optime of the oplog entry created for the truncate operation.
+ * Returns a null optime if oplog was not modified.
+ *
+ * 'shouldValidateRecordIdRange' controls whether truncateRange applies internal safety checks to
+ * the provided bounds. It should be left as 'true' in normal operation; 'false' is reserved for
+ * narrowly scoped internal cases (such as startup recovery) where the caller guarantees the range
+ * is safe to truncate.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]]
+repl::OpTime truncateRange(OperationContext* opCtx,
+                           const CollectionPtr& collection,
+                           const RecordId& minRecordId,
+                           const RecordId& maxRecordId,
+                           int64_t bytesDeleted,
+                           int64_t docsDeleted,
+                           bool shouldValidateRecordIdRange = true);
+}  // namespace mongo::collection_internal

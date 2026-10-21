@@ -1,0 +1,164 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+imports:
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+global:
+    cpp_namespace: mongo
+    mod_visibility: needs_replacement
+
+structs:
+    ShardedClusterCardinalityParam:
+        description: >-
+            Cluster parameter for the number of shards in a sharded cluster. Used to allow or disallow
+            direct writes to the cluster.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            hasTwoOrMoreShards:
+                description: >-
+                    Whether there are or have been two or more shards in the cluster. Shards should disallow
+                    direct writes if set to true.
+                type: bool
+                default: false
+
+    AddOrRemoveShardInProgressParam:
+        description: >-
+            Reflects whether there is a sharding topology change (e.g. addShard, removeShard) currently
+            ongoing.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            inProgress:
+                description: "True when there's an ongoing sharding topology change. False otherwise."
+                type: bool
+                default: false
+
+    ConfigServerReadPreferenceForCatalogQueriesParam:
+        description: >-
+            Cluster parameter to always use nearest as the read preference for catalog queries targeting
+            the config server.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            mustAlwaysUseNearest:
+                description: >-
+                    When true, catalog queries targeting the config server will always use nearest as read
+                    preference. Otherwise, the read preference for all those queries is chosen depending on
+                    whether the cluster has a config shard (primaryPreferred) or not (nearest).
+                type: bool
+                default: false
+
+    OnlyTargetDataOwningShardsForMultiWritesParam:
+        description: >-
+            Cluster parameter determining if multi-write operations should target only shards owning
+            data instead of broadcasting to all shards.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            enabled:
+                description: >-
+                    If true, multi-write operations will only target shards that own the data,
+                    honoring the sharding protocol, instead of broadcasting to all shards.
+                type: bool
+                default: false
+
+    PlacementHistoryInitializationInProgressParam:
+        description: >-
+            Reflects whether the config server is currently managing a request to initialize the content of config.placementHistory.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            inProgress:
+                description: "True when there's an ongoing operation to initialize config.placementHistory, False otherwise."
+                type: bool
+                default: false
+
+    DDLLockOptimisticRecoveryWaitTimeoutParam:
+        description: >-
+            Cluster parameter to define a time to wait to recover DDL coordinators during acquiring
+            a DDL lock before checking if the node is still a primary.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            timeInMs:
+                description: >-
+                    Number of milliseconds to wait for recovery of the DDL coordinators before
+                    double checkingif the node is still a primary.
+                type: milliseconds
+                default: 100
+
+server_parameters:
+    shardedClusterCardinalityForDirectConns:
+        description: >-
+            Cluster parameter for the number of shards in a sharded cluster. Used to allow or
+            disallow direct writes to the cluster.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: ShardedClusterCardinalityParam
+        cpp_varname: shardedClusterCardinalityForDirectConns
+        redact: false
+
+    addOrRemoveShardInProgress:
+        description: >-
+            Reflects whether there is a sharding topology change (e.g. addShard, removeShard) currently
+            ongoing.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: AddOrRemoveShardInProgressParam
+        cpp_varname: addOrRemoveShardInProgress
+        redact: false
+        condition:
+            min_fcv: 8.0
+
+    configServerReadPreferenceForCatalogQueries:
+        description: >-
+            Cluster parameter to always use nearest as the read preference for catalog queries targeting
+            the config server.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: ConfigServerReadPreferenceForCatalogQueriesParam
+        cpp_varname: configServerReadPreferenceForCatalogQueries
+        redact: false
+        condition:
+            min_fcv: 8.0
+
+    onlyTargetDataOwningShardsForMultiWrites:
+        description: >-
+            Cluster parameter determining if multi-write operations should target only shards owning
+            data instead of broadcasting to all shards.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: OnlyTargetDataOwningShardsForMultiWritesParam
+        cpp_varname: onlyTargetDataOwningShardsForMultiWrites
+        redact: false
+        condition:
+            min_fcv: 8.2
+
+    placementHistoryInitializationInProgress:
+        description: >-
+            Reflects whether the config server is currently managing a request to initialize the content of config.placementHistory.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: PlacementHistoryInitializationInProgressParam
+        cpp_varname: placementHistoryInitializationInProgress
+        redact: false
+        condition:
+            min_fcv: 8.3
+
+    ddlLockOptimisticRecoveryWaitTimeout:
+        description: >-
+            Cluster parameter to define a time to wait to recover DDL coordinators during acquiring a
+             DDL lock before checking if the node is still a primary.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: DDLLockOptimisticRecoveryWaitTimeoutParam
+        cpp_varname: DDLLockOptimisticRecoveryWaitTimeout
+        redact: false

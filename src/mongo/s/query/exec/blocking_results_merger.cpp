@@ -1,0 +1,221 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/s/query/exec/blocking_results_merger.h"
+
+#include "mongo/db/curop.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/s/query/exec/next_high_watermark_determining_strategy.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+
+BlockingResultsMerger::BlockingResultsMerger(OperationContext* opCtx,
+                                             AsyncResultsMergerParams&& armParams,
+                                             std::shared_ptr<executor::TaskExecutor> executor,
+                                             std::unique_ptr<ResourceYielder> resourceYielder)
+    : _tailableMode(armParams.getTailableMode().value_or(TailableModeEnum::kNormal)),
+      _executor(executor),
+      _arm(AsyncResultsMerger::create(opCtx, std::move(executor), std::move(armParams))),
+      _resourceYielder(std::move(resourceYielder)) {}
+
+BlockingResultsMerger::~BlockingResultsMerger() = default;
+
+const AsyncResultsMergerParams& BlockingResultsMerger::asyncResultsMergerParams() const {
+    return _arm->params();
+}
+
+void BlockingResultsMerger::recognizeControlEvents() {
+    _arm->setNextHighWaterMarkDeterminingStrategy(
+        NextHighWaterMarkDeterminingStrategyFactory::createForChangeStream(
+            _arm->getCompareWholeSortKey(), true /* recognizeControlEvents */));
+}
+
+StatusWith<stdx::cv_status> BlockingResultsMerger::doWaiting(
+    OperationContext* opCtx, const std::function<StatusWith<stdx::cv_status>()>& waitFn) noexcept {
+
+    if (_resourceYielder) {
+        try {
+            // The BRM interface returns Statuses. Be sure we respect that here.
+            _resourceYielder->yield(opCtx);
+        } catch (const DBException& e) {
+            return e.toStatus();
+        }
+    }
+
+    boost::optional<StatusWith<stdx::cv_status>> result;
+    try {
+        // Record the time spent waiting for remotes. If remote-wait recording is not enabled in
+        // CurOp, this will have no effect.
+        CurOp::get(opCtx)->startRemoteOpWaitTimer();
+        ON_BLOCK_EXIT([&] { CurOp::get(opCtx)->stopRemoteOpWaitTimer(); });
+
+        // This shouldn't throw, but we cannot enforce that.
+        result = waitFn();
+    } catch (const DBException&) {
+        MONGO_UNREACHABLE_TASSERT(9993800);
+    }
+
+    if (_resourceYielder) {
+        try {
+            _resourceYielder->unyield(opCtx);
+        } catch (const DBException& e) {
+            return e.toStatus();
+        }
+    }
+
+    return *result;
+}
+
+StatusWith<ClusterQueryResult> BlockingResultsMerger::awaitNextWithTimeout(
+    OperationContext* opCtx) {
+    tassert(11052317,
+            "Expected tailable awaitData cursor mode",
+            _tailableMode == TailableModeEnum::kTailableAndAwaitData);
+    // If we should wait for inserts and the ARM is not ready, we don't block. Fall straight through
+    // to the return statement.
+    while (!_arm->ready() && awaitDataState(opCtx).shouldWaitForInserts) {
+        auto nextEventStatus = getNextEvent();
+        if (!nextEventStatus.isOK()) {
+            return nextEventStatus.getStatus();
+        }
+        auto event = nextEventStatus.getValue();
+
+        const auto waitStatus = doWaiting(opCtx, [this, opCtx, &event]() {
+            // Time that an awaitData cursor spends waiting for new results is not counted as
+            // execution time, so we pause the CurOp timer.
+            CurOp::get(opCtx)->pauseTimer();
+            ON_BLOCK_EXIT([&] { CurOp::get(opCtx)->resumeTimer(); });
+
+            return _executor->waitForEvent(
+                opCtx, event, awaitDataState(opCtx).waitForInsertsDeadline);
+        });
+
+        if (!waitStatus.isOK()) {
+            return waitStatus.getStatus();
+        }
+        // Swallow timeout errors for tailable awaitData cursors, stash the event that we were
+        // waiting on, and return EOF.
+        if (waitStatus == stdx::cv_status::timeout) {
+            _leftoverEventFromLastTimeout = std::move(event);
+            return ClusterQueryResult{};
+        }
+    }
+
+    // We reach this point either if the ARM is ready, or if the ARM is !ready and we are in
+    // kInitialFind or kGetMoreWithAtLeastOneResultInBatch ExecContext. In the latter case, we
+    // return EOF immediately rather than blocking for further results.
+    return _arm->ready() ? _arm->nextReady() : ClusterQueryResult{};
+}
+
+StatusWith<ClusterQueryResult> BlockingResultsMerger::blockUntilNext(OperationContext* opCtx) {
+    while (!_arm->ready()) {
+        auto nextEventStatus = _arm->nextEvent();
+        if (!nextEventStatus.isOK()) {
+            return nextEventStatus.getStatus();
+        }
+        auto event = nextEventStatus.getValue();
+
+        // Block until there are further results to return.
+        auto status = doWaiting(
+            opCtx, [this, opCtx, &event]() { return _executor->waitForEvent(opCtx, event); });
+
+        if (!status.isOK()) {
+            return status.getStatus();
+        }
+
+        // We have not provided a deadline, so if the wait returns without interruption, we do not
+        // expect to have timed out.
+        tassert(11052318,
+                "Expected to not have timed out",
+                status.getValue() == stdx::cv_status::no_timeout);
+    }
+
+    return _arm->nextReady();
+}
+
+StatusWith<ClusterQueryResult> BlockingResultsMerger::next(OperationContext* opCtx) {
+    CurOp::get(opCtx)->ensureRecordRemoteOpWait();
+
+    // Non-tailable and tailable non-awaitData cursors always block until ready(). AwaitData
+    // cursors wait for ready() only until a specified time limit is exceeded.
+    return (_tailableMode == TailableModeEnum::kTailableAndAwaitData ? awaitNextWithTimeout(opCtx)
+                                                                     : blockUntilNext(opCtx));
+}
+
+Status BlockingResultsMerger::releaseMemory() {
+    return _arm->releaseMemory();
+}
+
+StatusWith<executor::TaskExecutor::EventHandle> BlockingResultsMerger::getNextEvent() {
+    // If we abandoned a previous event due to a mongoS-side timeout, wait for it first.
+    if (_leftoverEventFromLastTimeout) {
+        tassert(11052319,
+                "Expected tailable awaitData cursor mode",
+                _tailableMode == TailableModeEnum::kTailableAndAwaitData);
+        // If we have an outstanding event from last time, then we might have to manually schedule
+        // some getMores for the cursors. If a remote response came back while we were between
+        // getMores (from the user to mongos), the response may have been an empty batch, and the
+        // ARM would not be able to ask for the next batch immediately since it is not attached to
+        // an OperationContext. Now that we have a valid OperationContext, we schedule the getMores
+        // ourselves.
+        Status getMoreStatus = _arm->scheduleGetMores();
+        if (!getMoreStatus.isOK()) {
+            return getMoreStatus;
+        }
+
+        // Return the leftover event and clear '_leftoverEventFromLastTimeout'.
+        auto event = std::move(_leftoverEventFromLastTimeout);
+        _leftoverEventFromLastTimeout = executor::TaskExecutor::EventHandle();
+        return event;
+    }
+
+    return _arm->nextEvent();
+}
+
+void BlockingResultsMerger::kill(OperationContext* opCtx) {
+    static StaticImmortal<logv2::SeveritySuppressor> logSeverity{
+        Seconds{1}, logv2::LogSeverity::Warning(), logv2::LogSeverity::Debug(2)};
+
+    auto future = _arm->kill(opCtx);
+
+    // Wait via the opCtx rather than a plain '.wait()'. The opCtx-based wait polls the baton, which
+    // is required because AsioNetworkingBaton::waitUntil schedules timer cancellation via
+    // '.thenRunOn(baton)'. If the ARM has a pending retry delay, the baton must be run for
+    // '_cancellationSource.cancel()' to actually cancel the timer and allow the retry callback to
+    // fire and complete the kill.
+    // Use 'runWithoutInterruptionExceptAtGlobalShutdown()' because 'kill()' is called from
+    // destructors where the opCtx may already be interrupted — a plain '.get(opCtx)' would throw
+    // before polling the baton, and throwing from a destructor would terminate the process.
+    opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
+        try {
+            future.get(opCtx);
+        } catch (const DBException& ex) {
+            // Shutdown errors are expected here, so we do not log them.
+            if (!ex.isA<ErrorCategory::ShutdownError>()) {
+                LOGV2_DEBUG(12562100,
+                            (*logSeverity)().toInt(),
+                            "Caught an unexpected exception while terminating results merger",
+                            "error"_attr = ex.toStatus());
+            }
+        } catch (const std::exception& ex) {
+            LOGV2_DEBUG(12562101,
+                        (*logSeverity)().toInt(),
+                        "Caught an unexpected default exception while terminating results merger",
+                        "error"_attr = ex.what());
+        }
+    });
+
+    // Unless the wait above threw (global shutdown), kill() is complete and _remoteResponses is
+    // final: drain whatever callbacks queued after AsyncResultsMerger::kill()'s one-shot drain.
+    _arm->drainAdditionalTransactionParticipantsAfterKill(opCtx);
+}
+
+}  // namespace mongo

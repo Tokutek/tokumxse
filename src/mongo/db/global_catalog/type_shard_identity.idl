@@ -1,0 +1,36 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/client/connection_string.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ShardIdentity:
+        description: "Contains all the information needed to identify a shard and lookup the shard identity document from storage"
+        strict: false
+        fields:
+            shardName:
+                description: "The name of the shard"
+                type: string
+            clusterId:
+                description: "The unique identifier of the cluster"
+                type: objectid
+            configsvrConnectionString:
+                description: "Connection string to the config server"
+                type: connection_string
+            deferShardingInitialization:
+                description: "If true, the writing of shard identity does not imply sharding initializations"
+                type: bool
+                optional: true
+            uuid:
+                description:
+                    "A unique identifier for this shard. Should generally not be exposed to end user through command responses.
+                    The field is optional for backward compatibility."
+                type: uuid
+                optional: true

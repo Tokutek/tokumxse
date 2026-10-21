@@ -1,0 +1,224 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry_helpers.h"
+#include "mongo/db/storage/devnull/devnull_kv_engine.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
+
+#include <string_view>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+namespace {
+
+class IndexCatalogEntryMock : public IndexCatalogEntry {
+public:
+    explicit IndexCatalogEntryMock(IndexDescriptor* descriptor) : _descriptor(descriptor) {}
+
+    const std::string& getIdent() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    std::shared_ptr<Ident> getSharedIdent() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    void setIdent(std::shared_ptr<Ident> newIdent) override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    IndexDescriptor* descriptor() override {
+        return _descriptor;
+    }
+
+    const IndexDescriptor* descriptor() const override {
+        return _descriptor;
+    }
+
+    IndexAccessMethod* accessMethod() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    void setAccessMethod(std::unique_ptr<IndexAccessMethod> accessMethod) override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    std::shared_ptr<IndexBuildInterceptor> indexBuildInterceptor() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    void setIndexBuildInterceptor(std::shared_ptr<IndexBuildInterceptor> interceptor) override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    const Ordering& ordering() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    const MatchExpression* getFilterExpression() const override {
+        return nullptr;
+    }
+
+    const CollatorInterface* getCollator() const override {
+        return nullptr;
+    }
+
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    void setIsReady(bool newIsReady) override {
+        MONGO_UNIMPLEMENTED;
+    }
+    void setIsFrozen(bool newIsFrozen) override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    bool isMultikey(OperationContext* opCtx, const CollectionPtr& collection) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    MultikeyPaths getMultikeyPaths(OperationContext* opCtx,
+                                   const CollectionPtr& collection) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    void setMultikey(OperationContext* opCtx,
+                     const CollectionPtr& coll,
+                     const KeyStringSet& multikeyMetadataKeys,
+                     const MultikeyPaths& multikeyPaths) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    void setMultikeyForApplyOps(OperationContext* opCtx,
+                                const CollectionPtr& coll,
+                                const KeyStringSet& multikeyMetadataKeys,
+                                const MultikeyPaths& multikeyPaths) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    void forceSetMultikey(OperationContext* opCtx,
+                          const CollectionPtr& coll,
+                          bool isMultikey,
+                          const MultikeyPaths& multikeyPaths) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    bool isReady() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    bool isFrozen() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    bool shouldValidateDocument() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    const UpdateIndexData& getIndexedPaths() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    std::unique_ptr<const IndexCatalogEntry> getNormalizedEntry(
+        OperationContext* opCtx, const CollectionPtr& coll) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+
+    std::unique_ptr<const IndexCatalogEntry> cloneWithDifferentDescriptor(
+        IndexDescriptor) const final {
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    IndexDescriptor* _descriptor;
+};
+
+std::unique_ptr<IndexDescriptor> makeIndexDescriptor(std::string_view indexName,
+                                                     BSONObj keyPattern,
+                                                     BSONObj wildcardProjection) {
+    auto indexSpec = BSON(IndexDescriptor::kIndexVersionFieldName
+                          << 2 << IndexDescriptor::kIndexNameFieldName << indexName
+                          << IndexDescriptor::kKeyPatternFieldName << keyPattern);
+    if (!wildcardProjection.isEmpty()) {
+        indexSpec = indexSpec.addFields(
+            BSON(IndexDescriptor::kWildcardProjectionFieldName << wildcardProjection));
+    }
+    const auto& accessMethodName = IndexNames::findPluginName(keyPattern);
+    return std::make_unique<IndexDescriptor>(accessMethodName, std::move(indexSpec));
+}
+
+}  // namespace
+
+TEST(IndexCatalogEntryTest, computeUpdateIndexDataForCompoundWildcardIndex) {
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test"sv);
+    auto uuid = UUID::gen();
+    DevNullKVEngine engine{};
+    RecoveryUnitNoop ru{};
+
+    auto indexDescriptor = makeIndexDescriptor(
+        "wildcardIndex", BSON("a" << 1 << "b" << 1 << "$**" << 1), BSON("c" << 1 << "_id" << 1));
+
+    auto sortedDataInterface = engine.getSortedDataInterface(nullptr,
+                                                             ru,
+                                                             nss,
+                                                             uuid,
+                                                             "wildcardIndent",
+                                                             indexDescriptor->toIndexConfig(),
+                                                             KeyFormat::Long);
+
+    ASSERT_EQ(IndexNames::WILDCARD, indexDescriptor->getAccessMethodName());
+
+    IndexCatalogEntryMock indexCatalogEntry{indexDescriptor.get()};
+
+    WildcardAccessMethod accessMethod{&indexCatalogEntry, std::move(sortedDataInterface)};
+    UpdateIndexData outData{};
+    index_catalog_helpers::computeUpdateIndexData(&indexCatalogEntry, &accessMethod, &outData);
+
+    // Asserting that expected fields are included.
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"a"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"b"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"c"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"_id"sv}));
+
+    // Asserting that unexpected fields are not included.
+    ASSERT_FALSE(outData.mightBeIndexed(FieldRef{"d"sv}));
+    ASSERT_FALSE(outData.mightBeIndexed(FieldRef{"$**"sv}));
+}
+
+TEST(IndexCatalogEntryTest, computeUpdateIndexDataForCompoundWildcardIndex_ExcludeCase) {
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test"sv);
+    auto uuid = UUID::gen();
+    DevNullKVEngine engine{};
+    RecoveryUnitNoop ru{};
+
+    auto indexDescriptor = makeIndexDescriptor(
+        "wildcardIndex", BSON("a" << 1 << "b" << 1 << "$**" << 1), BSON("c" << 0));
+
+    auto sortedDataInterface = engine.getSortedDataInterface(nullptr,
+                                                             ru,
+                                                             nss,
+                                                             uuid,
+                                                             "wildcardIndent",
+                                                             indexDescriptor->toIndexConfig(),
+                                                             KeyFormat::Long);
+
+    ASSERT_EQ(IndexNames::WILDCARD, indexDescriptor->getAccessMethodName());
+
+    IndexCatalogEntryMock indexCatalogEntry{indexDescriptor.get()};
+
+    WildcardAccessMethod accessMethod{&indexCatalogEntry, std::move(sortedDataInterface)};
+    UpdateIndexData outData{};
+    index_catalog_helpers::computeUpdateIndexData(&indexCatalogEntry, &accessMethod, &outData);
+
+    // When wildcardProjection has exclusion, everything is "indexed", since we don't know for sure,
+    // which fields are indexed.
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"a"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"b"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"c"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"d"sv}));
+    ASSERT_TRUE(outData.mightBeIndexed(FieldRef{"_id"sv}));
+}
+
+}  // namespace mongo

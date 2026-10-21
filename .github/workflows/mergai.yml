@@ -1,0 +1,1783 @@
+name: mergai
+
+on:
+  # Manual entry point: start a new merge of an upstream commit.
+  workflow_dispatch:
+    inputs:
+      merge-pick:
+        description: "Commit hash to merge (bypasses the gate). Empty -> pick per MERGAI_MERGE_PICK_MODE (gate/ai/next; default gate)."
+        required: false
+        type: string
+      mergai-ref:
+        description: "MergAI git ref (branch/tag/commit). Empty -> MERGAI_REF repo variable, else master."
+        required: false
+        type: string
+        default: ""
+      mergai-agent:
+        description: "AI agent to use for merge/describe/resolve (e.g., claude-cli:claude-opus-4-5)"
+        required: false
+        type: string
+  # Finalize entry point: when a mergai review PR is merged.
+  pull_request:
+    types: [closed]
+    branches:
+      - "mergai/*/conflict"
+      - "mergai/*/main"
+  # CI auto-fix entry point: fires when a watched workflow completes on a
+  # mergai/* branch.
+  workflow_run:
+    workflows: ["format", "clang-tidy", "build-and-test"]
+    types: [completed]
+    branches:
+      - "mergai/**"
+  # Comment entry points on a mergai PR:
+  #   * `/mergai review fix`   -> review-handle, address review threads.
+  #   * `/mergai rebase`       -> rebase-handle, rebase the branch onto its base.
+  #   * `/mergai fast-forward` -> fast-forward-handle, rebase if needed then
+  #                               fast-forward the base branch onto the head.
+  issue_comment:
+    types: [created]
+  # Review-handling entry point: a review submitted as "Changes requested".
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  trigger-merge:
+    # 'ai' environment carries the AI-agent secrets. Ungated:
+    # workflow_dispatch is inherently trusted (only write-access actors can
+    # dispatch), so no approval is required. Repo settings restrict this
+    # environment's deployment branches to master + mergai/**.
+    environment: ai
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          # The AI agent runs in this checkout. Do NOT persist the checkout
+          # credential into .git/config, so a misbehaving or prompt-injected
+          # agent cannot read or reuse it to push. Deterministic pushes
+          # authenticate via the credential helper configured in setup
+          # (GH_TOKEN in the parent process environment).
+          persist-credentials: false
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # TODO: Add team membership check once GitHub App with Organization Members read permission is available
+      # - name: Check team authorization
+      #   env:
+      #     GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      #   run: |
+      #     echo "Checking if ${{ github.actor }} is a member of percona/dev-psmdb team..."
+      #     if ! gh api "/orgs/percona/teams/dev-psmdb/memberships/${{ github.actor }}" --silent 2>/dev/null; then
+      #       echo "::error::User ${{ github.actor }} is not authorized to trigger this workflow. Must be a member of percona/dev-psmdb team."
+      #       exit 1
+      #     fi
+      #     echo "User ${{ github.actor }} is authorized"
+
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "true"
+          setup-gemini: "true"
+          setup-claude: "true"
+          setup-mergai: "true"
+          gcp-credentials: ${{ secrets.GCP_CREDENTIALS }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ inputs['mergai-ref'] || vars.MERGAI_REF || 'master' }}
+          # Do not put the write token in the job environment: this job runs the
+          # AI agent (describe/resolve). The token is scoped to the "publish"
+          # step instead, so it is never reachable while the agent runs.
+          export-github-token: "false"
+
+      # Determine the commit to merge to. Precedence:
+      #   1. an explicit merge-pick input -> use it, bypassing the gate (the
+      #      manual "force this merge" path);
+      #   2. else the MERGAI_MERGE_PICK_MODE repository variable (not a secret),
+      #      one of three values:
+      #        * "ai"   -> the agent chooses the boundary within the gate's
+      #                    candidate window (uses AI tokens, hence in this
+      #                    `ai` job); honors the gate.
+      #        * "next" -> raw `merge-pick --next`: the first prioritized strategy
+      #                    match, with NO gate and NO window cap.
+      #        * "gate" -> gate-respecting deterministic pick (windowed). This is
+      #                    the default for an unset/any-other value.
+      # "ai" and "gate" honor the merge gate: when it is closed (or nothing to
+      # merge) they print nothing, so MERGE_PICK is empty and the merge steps
+      # below are skipped. "next" ignores the gate. To merge regardless of the
+      # gate, dispatch with an explicit merge-pick input.
+      #
+      # Every path passes --record, so `merge-pick` writes the chosen pick's
+      # metadata (type + sha + strategy + human summary, and -- when run_link is
+      # enabled in .mergai/config.yml -- the URL of this trigger-merge run,
+      # captured from the Actions environment) to a state file that `mergai
+      # context init` reads and attaches to the note as `merge_pick`. That
+      # metadata then renders into the PR description (with a "Triggered by"
+      # link back to this run) and survives finalize -- no reasoning/summary is
+      # threaded back through the shell here.
+      - name: Determine merge pick
+        id: pick
+        env:
+          MERGE_PICK_MODE: ${{ vars.MERGAI_MERGE_PICK_MODE }}
+          INPUT_PICK: ${{ inputs['merge-pick'] }}
+        run: |
+          MERGE_PICK=""
+          if [ -n "$INPUT_PICK" ]; then
+            echo "Using explicit merge-pick input (gate bypassed): $INPUT_PICK"
+            # Record as a manual pick, attributing it to the dispatcher.
+            MERGE_PICK=$(mergai fork merge-pick --manual "$INPUT_PICK" \
+              --actor "$GITHUB_ACTOR" --record)
+          else
+            case "$MERGE_PICK_MODE" in
+              ai)
+                echo "Merge-pick mode: ai (gate-respecting)"
+                # --json carries the sha for capture; --record persists the
+                # agent's reasoning as the pick summary. Capture first, then
+                # parse: a closed gate prints nothing, so piping straight into
+                # jq would feed it empty input.
+                PICK_JSON=$(mergai fork merge-pick --ai --json --record)
+                if [ -n "$PICK_JSON" ]; then
+                  MERGE_PICK=$(printf '%s' "$PICK_JSON" | jq -r '.sha // empty')
+                fi
+                ;;
+              next)
+                echo "Merge-pick mode: next (raw strategy pick; ignores the gate)"
+                MERGE_PICK=$(mergai fork merge-pick --next --record)
+                ;;
+              *)
+                echo "Merge-pick mode: gate (gate-respecting deterministic)"
+                MERGE_PICK=$(mergai fork merge-pick --gate --record)
+                ;;
+            esac
+          fi
+          echo "MERGE_PICK=$MERGE_PICK" >> "$GITHUB_ENV"
+          echo "pick=$MERGE_PICK" >> "$GITHUB_OUTPUT"
+          if [ -z "$MERGE_PICK" ]; then
+            echo "No merge pick (merge gate closed or nothing to merge); skipping merge."
+          else
+            echo "Merge pick: $MERGE_PICK"
+            git show --stat "$MERGE_PICK"
+            # Surface the recorded pick metadata in the job summary. mergai
+            # renders it from the same recorded pick that `context init`
+            # attaches to the note and that ends up in the PR description.
+            mergai fork show-pick --format markdown >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Initialize merge context with commit SHA and target branch info. This
+      # also reads .cache/mergai/merge_pick.json (written above) and attaches
+      # the pick metadata to the note as `merge_pick`.
+      - name: mergai context init
+        if: steps.pick.outputs.pick != ''
+        run: mergai context init "$MERGE_PICK"
+
+      # Early-fail if a merge for this commit is already underway: any mergai
+      # branch (main/conflict/solution/semantic) for $MERGE_PICK means another
+      # trigger-merge run already started it. Abort rather than race it. This
+      # also covers the window the periodic-merge workflow can't see (a run
+      # dispatched but not yet far enough to have created a branch, no PR yet).
+      - name: Fail if a merge for this commit is already in progress
+        if: steps.pick.outputs.pick != ''
+        run: |
+          if [ -n "$(mergai branch list --sha "$MERGE_PICK" -q)" ]; then
+            echo "::error::mergai branches already exist for $MERGE_PICK - merge already in progress"
+            mergai branch list --sha "$MERGE_PICK"
+            exit 1
+          fi
+
+      # Agent phase: runs the AI agent (describe via `mergai merge`, and
+      # `mergai resolve` on conflicts) and prepares branches locally. This step
+      # has NO GitHub write token in its environment (setup was called with
+      # export-github-token: false), so a misbehaving or prompt-injected agent
+      # has no reachable credential to push with. All remote writes happen in
+      # the separate "publish" step below. The merge outcome is recorded as an
+      # output so publish knows which branches to push.
+      - name: merge
+        id: merge
+        if: steps.pick.outputs.pick != ''
+        env:
+          MERGAI_AGENT: ${{ inputs['mergai-agent'] }}
+        run: |
+          # Fetch and merge notes from remote (read-only; public repo)
+          mergai notes update
+
+          # Build merge command with optional agent
+          MERGE_CMD="mergai merge"
+          RESOLVE_CMD="mergai resolve -y"
+          if [ -n "$MERGAI_AGENT" ]; then
+            MERGE_CMD="$MERGE_CMD --agent \"$MERGAI_AGENT\""
+            RESOLVE_CMD="$RESOLVE_CMD --agent \"$MERGAI_AGENT\""
+          fi
+
+          # Attempt merge; exit code 0 = success, 1 = conflicts. Only local
+          # commits/branch-creates happen here -- pushing is deferred to publish.
+          if eval $MERGE_CMD; then
+            echo "Merge successful. Committing merge."
+            mergai commit merge              # Create merge commit with note attached
+            mergai branch create main        # Create and checkout main working branch
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge conflict detected. Processing with resolution."
+            mergai commit conflict           # Commit conflict state with markers
+            mergai branch create conflict    # Create branch with conflict markers
+            mergai branch create solution    # Create branch for AI solution
+            eval $RESOLVE_CMD                # Run AI conflict resolution
+            mergai commit solution           # Commit resolved files with note
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish phase: the ONLY step given the write token. The agent has run
+      # and exited in the previous step, so the token is never reachable by it.
+      # Pushes authenticate via the setup credential helper (GH_TOKEN in this
+      # step's environment); PR creation uses gh (also GH_TOKEN).
+      - name: publish
+        if: steps.merge.outputs.result != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ "${{ steps.merge.outputs.result }}" = "success" ]; then
+            mergai branch push main          # Push main branch to origin
+            mergai notes push                # Push mergai notes to remote
+            mergai pr --repo "$GITHUB_REPOSITORY" create main --skip-commit-list-on-failure
+          else
+            mergai branch push solution      # Push solution branch
+            mergai branch push conflict      # Push conflict branch
+            mergai notes push                # Push mergai notes to remote
+            mergai pr --repo "$GITHUB_REPOSITORY" create solution --skip-commit-list-on-failure
+          fi
+
+  solution-merged:
+    # No deployment environment: this job needs no AI/RBE secrets (only the
+    # repo-level App token) and the trigger is inherently trusted -- a
+    # pull_request with merged==true means a write-access actor merged it.
+    # Solution PRs (textual conflict resolution) merge into the conflict
+    # branch. Semantic PRs merge into main and are handled by `semantic-merged`.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.merged == true
+      && endsWith(github.event.pull_request.base.ref, '/conflict')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "false"
+          setup-gemini: "false"
+          setup-mergai: "true"
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+
+      # Finalize after solution PR is merged into conflict branch
+      - name: Finalize
+        run: |
+          mergai notes update              # Fetch and merge notes from remote
+          mergai context init              # Rebuild context from commit notes
+          mergai branch create main        # Create main working branch
+          mergai commit sync               # Sync manual commits to notes
+          mergai finalize                  # Finalize into final merge commit
+          mergai branch push main          # Push main branch to origin
+          mergai notes push                # Push mergai notes to remote
+          # --skip-commit-list-on-failure retries without the merged-commit
+          # table if the body exceeds GitHub's 65,536 character limit.
+          mergai pr --repo "$GITHUB_REPOSITORY" create main --skip-commit-list-on-failure
+
+  semantic-merged:
+    # No deployment environment: needs no AI/RBE secrets (only the repo-level
+    # App token) and the trigger is inherently trusted (pull_request
+    # merged==true => merged by a write-access actor).
+    # Semantic PRs merge into the main branch.
+    # Once merged, run finalize and then force-push main.
+    # The main PR (main -> target) already exists and updates itself,
+    # so nothing is created here.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.merged == true
+      && endsWith(github.event.pull_request.base.ref, '/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      - name: Checkout main branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "false"
+          setup-gemini: "false"
+          setup-mergai: "true"
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+
+      # Run finalize and force-push main branch.
+      - name: Finalize semantic fixes into the merge commit
+        run: |
+          mergai notes update              # Fetch and merge notes from remote
+          mergai context init              # Rebuild context from commit notes
+          mergai commit sync               # Record any manual commits in notes
+          mergai finalize                  # Fold semantic fixes into the merge commit
+          mergai branch push main --force  # main was rewritten by finalize
+          mergai notes push                # Push mergai notes to remote
+          # Refresh the main PR description so it now includes the merged-in
+          # solutions (the semantic fixes), which the merge notice points to.
+          mergai pr --repo "$GITHUB_REPOSITORY" update main \
+            || echo "::warning::'mergai pr update main' failed"
+
+      # Close the loop on the main PR: the semantic (solution) PR has been
+      # merged and finalized into the merge commit. Mirrors the one-time
+      # pointer the ci-handle job posts when the semantic PR opens.
+      - name: Comment on the main PR that the solution PR was merged
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          SEMANTIC_PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Resolves the main PR from the note context loaded by Finalize above;
+          # --allow-missing makes a missing main PR a warning, not a failure.
+          mergai pr --repo "$GITHUB_REPOSITORY" comment main --allow-missing \
+            --body "PR #${SEMANTIC_PR} merged. See the PR comment for details."
+
+  # Drive the CI auto-fix / finalize loop as a gated state
+  # machine. On every watched workflow completion for a mergai/* branch we ask
+  # `mergai ci status --state` whether the *whole* watched set for the current
+  # HEAD is done, then:
+  #   * in-progress / none -> no-op (a later completion finalizes the set);
+  #   * failure            -> `mergai ci fix all` (+ post explanation comment),
+  #                           push notes. Where the fix lands is branch-aware:
+  #                             - solution/semantic branches: commit inline and
+  #                               push (the open PR is the review surface);
+  #                             - main branch: the failure is a *semantic
+  #                               conflict* (clean merge that doesn't build), so
+  #                               the fix is relocated onto a `semantic` branch
+  #                               + PR (base main) for review.
+  #   * success            -> no-op. Nothing is folded on green: folding the
+  #                           review commits into the merge commit is a
+  #                           finalize-only step that runs after a human merges
+  #                           the review PR, so an open PR's commits (e.g. the
+  #                           resolve commit) survive for review.
+  # Reacting to each completion individually would either fire before the set
+  # is green or fire once per workflow; gating on the aggregate state makes
+  # the loop converge.
+  #
+  # The state machine is split into two jobs so the secret-bearing half only
+  # runs when there is work to do:
+  #   * ci-gate   - read-only. Computes the aggregate state with the default
+  #                 GITHUB_TOKEN; needs no AI tokens, no GitHub App token, and
+  #                 no deployment environment. Runs on every completion.
+  #   * ci-handle - carries the AI-agent secrets via the `ai` environment.
+  #                 Gated on ci-gate's state == failure, so in-progress/none/
+  #                 success completions never spin it up (and never touch the
+  #                 AI-secret path). success is a no-op now that folding into
+  #                 the merge commit is finalize-only.
+  ci-gate:
+    # Only react to watched-workflow completions. The workflow also fires on
+    # workflow_dispatch and pull_request (for other jobs); without this guard
+    # ci-gate would run on those too, since the mergai/* branch filter on the
+    # workflow_run trigger only constrains workflow_run events. The branch
+    # filter itself stays on the trigger.
+    #
+    # Same-repo guard: the `mergai/**` branch filter alone is not a trust
+    # boundary -- a fork PR can name its head branch `mergai/...`, and when its
+    # format/clang-tidy run (pull_request) completes it emits a workflow_run
+    # whose head_branch matches. Requiring head_repository == this repo ensures
+    # the watched run came from a same-repo (write-access) branch, so an external
+    # fork cannot reach ci-gate/ci-handle (the secret-bearing `ai` path).
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # mergai ci status -> get_workflow_runs
+      contents: read # checkout
+      pull-requests: read # read PR labels (mergai-skip-ci-fix)
+      security-events: read # mergai ci status -> classify clang-tidy via code-scanning analyses
+      statuses: write # publish the ci-gate commit status on the PR head
+    # Serialize completions for the same branch so two near-simultaneous
+    # workflow_run events can't each observe the other as in-progress and both
+    # no-op (a deadlock). The last-queued gate sees the full set done. This
+    # serialization belongs on the gate - it is what observes the aggregate
+    # state; the downstream handle just acts on the gate's verdict.
+    concurrency:
+      group: ci-handle-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    outputs:
+      state: ${{ steps.gate.outputs.state }}
+      skip_ci_fix: ${{ steps.skip-label.outputs.skip_ci_fix }}
+    steps:
+      # Publish a per-watched-workflow ci-gate status up front, so the PR shows
+      # THIS gate run as in-progress for the workflow that triggered it (e.g.
+      # "mergai / ci-gate (clang-tidy)") while it runs. Each watched workflow
+      # gets its own status context, so the gate runs triggered by different
+      # completions no longer overwrite each other or leave the check pointing
+      # at a finished run while a newer one is still going -- you can see the
+      # gate finished for one workflow and is still in-progress for another. The
+      # "Report ci-gate status" step below resolves this pending status. (Only
+      # ci-gate is split per workflow; ci-handle stays a single context.)
+      - name: Mark ci-gate in-progress for this watched workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / ci-gate ($WF_NAME)" \
+            -f target_url="$RUN_URL" \
+            -f description="processing $WF_NAME completion" \
+            || echo "::warning::could not publish pending ci-gate status"
+
+      # Checkout with the default token: the gate only reads workflow-run
+      # status and the watched set from .mergai/config.yml - no writes, so no
+      # GitHub App token needed.
+      - name: Checkout PR branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "false"
+          setup-gemini: "false"
+          setup-claude: "false"
+          setup-mergai: "true"
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+
+      # Gate: reduce the latest run of each watched workflow for the current
+      # HEAD to a single token (in-progress|success|failure|none). Exit code is
+      # always 0; the decision is on stdout and exposed as a job output.
+      - name: Gate on watched workflow completion
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          STATE=$(mergai ci status --state)
+          echo "Watched-workflow gate state for HEAD: $STATE"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
+      # Opt-out switch: a human can attach the `mergai-skip-ci-fix` label to the
+      # PR for the head branch to suppress the AI auto-fixer. We resolve the PR
+      # from head_branch and read its labels live (the label is typically added
+      # after the PR opens, so the workflow_run payload can't be trusted for it).
+      # When set, ci-handle is gated off below, so the `ai` job never
+      # spins up. Removing the label lets the next watched-workflow completion
+      # resume auto-fixing. Failures here fall through to skip_ci_fix=false so a
+      # transient API error never silently disables fixing.
+      - name: Check for mergai-skip-ci-fix label
+        id: skip-label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          LABELS=$(gh pr list --head "$HEAD_BRANCH" --state open \
+            --json labels --jq '.[0].labels[].name' 2>/dev/null || echo "")
+          if echo "$LABELS" | grep -qx "mergai-skip-ci-fix"; then
+            echo "mergai-skip-ci-fix present on PR for $HEAD_BRANCH; CI auto-fix suppressed"
+            echo "skip_ci_fix=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No mergai-skip-ci-fix label; CI auto-fix may proceed"
+            echo "skip_ci_fix=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Resolve the per-watched-workflow "mergai / ci-gate (<workflow>)" check
+      # published as pending at the top of this job. workflow_run jobs are
+      # invisible on the PR by default, so we publish a commit status on the PR
+      # head SHA. The status STATE reflects whether THIS JOB executed cleanly --
+      # NOT the gate's verdict about the watched workflows: ci-gate is green
+      # whenever it ran, even when it decides the watched CI failed (that verdict
+      # is surfaced in the description). The context is scoped to the triggering
+      # workflow so parallel gate runs don't overwrite each other. target_url
+      # deep-links to this run.
+      - name: Report ci-gate status on the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          JOB_STATUS: ${{ job.status }}
+          GATE_STATE: ${{ steps.gate.outputs.state }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          case "$JOB_STATUS" in
+            success) STATE=success ;;
+            cancelled) STATE=error ;;
+            *) STATE=failure ;;
+          esac
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="$STATE" \
+            -f context="mergai / ci-gate ($WF_NAME)" \
+            -f target_url="$RUN_URL" \
+            -f description="gate: ${GATE_STATE:-unknown}" \
+            || echo "::warning::could not publish ci-gate status"
+
+  ci-handle:
+    needs: ci-gate
+    # Only failure reaches the privileged job; in-progress/none/success simply
+    # fall through here. success no longer folds anything into the merge commit
+    # (that is finalize-only, after a human merges the review PR), so it is a
+    # no-op.
+    # The `mergai-skip-ci-fix` label on the PR suppresses the auto-fixer
+    # entirely: with it set, even a failure is a no-op and this `ai` job never
+    # starts.
+    # The same-repo guard is repeated here (not just inherited via ci-gate) as
+    # defense in depth: it keeps the ungated `ai` environment unreachable by a
+    # fork-triggered workflow_run even if ci-gate's own guard regresses.
+    if: >-
+      needs.ci-gate.outputs.state == 'failure'
+      && needs.ci-gate.outputs.skip_ci_fix != 'true'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+    # Serialize handle jobs for the same branch. Each watched-workflow
+    # completion enqueues its own ci-handle, so two can start close together and
+    # race on `git push` / `mergai notes push`. `cancel-in-progress: false`
+    # queues the later one instead of cancelling a fix mid-push; its handle-time
+    # re-check then sees the first one's pushed result and no-ops.
+    concurrency:
+      group: ci-handle-exec-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    environment: ai
+    runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN is used only to publish the ci-handle commit
+    # status (below); all real work uses the scoped GitHub App tokens. Restrict
+    # it to statuses:write accordingly.
+    permissions:
+      statuses: write # publish the ci-handle commit status on the PR head
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+    steps:
+      # Publish the "mergai / ci-handle" check as pending up front. The auto-fix
+      # agent can run for a while, and the "Report ci-handle status" step only
+      # publishes when the job ends -- without this, ci-handle is invisible in
+      # the PR checks section while it runs. This pending status is resolved by
+      # that final step. Uses the default GITHUB_TOKEN (statuses:write), so it
+      # runs before the GitHub App tokens are created.
+      - name: Mark ci-handle in-progress on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / ci-handle" \
+            -f target_url="$RUN_URL" \
+            -f description="handle: running" \
+            || echo "::warning::could not publish pending ci-handle status"
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Read-only token for the steps that run the AI agent (`mergai ci fix`
+      # reads CI logs/artifacts). Even if the agent recovers this token from the
+      # environment, it cannot write. The write token (app-token) is scoped to
+      # the push/comment steps only.
+      - name: Create read-only GitHub App token
+        id: app-token-ro
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+          permission-actions: read
+          # `mergai ci fix` reads clang-tidy SARIF via the code-scanning API,
+          # which requires security_events read.
+          permission-security-events: read
+
+      # -----------------------------------------------------------------------
+      # Why we trust github.event.workflow_run.head_branch / head_sha here
+      # -----------------------------------------------------------------------
+      # A workflow_run event carries head_branch/head_sha describing what the
+      # completed workflow ran against. How those are populated depends on the
+      # triggering event:
+      #
+      #   * format, clang-tidy  -> triggered by `pull_request`. The run executes
+      #     in the PR head context, so head_branch = the PR source branch
+      #     (mergai/.../solution or mergai/.../main) and head_sha = the PR head.
+      #
+      #   * build-and-test      -> triggered by `pull_request_target`. By design
+      #     this event runs in the BASE branch context (that is how it exposes
+      #     secrets safely). The documented behavior is that head_branch/head_sha
+      #     point at the PR BASE for *fork* PRs.
+      #
+      # Classic failure mode (fork PRs): on a build-and-test completion you would
+      # check out the base (conflict) branch and commit a "fix" on the wrong
+      # branch, and the gate could never reconcile the solution-branch SHA with
+      # the base SHA.
+      #
+      # That failure mode does NOT apply to mergai PRs: mergai's head branches
+      # (mergai/.../solution, mergai/.../main) live in the SAME repo as the base,
+      # and for same-repo PRs GitHub reports the real PR head ref for
+      # pull_request_target too. Verified on live PRs -- format, clang-tidy and
+      # build-and-test all report the identical head_branch and head_sha for a
+      # given PR commit. So gating on "latest run per watched workflow whose
+      # head_sha == HEAD" is correct, and checking out head_branch lands on the
+      # right (head) branch.
+      #
+      # We gate via `get_workflow_runs(branch=...)` (what `mergai ci status`
+      # uses), NOT the commit Checks API: the Checks API on the PR head SHA
+      # surfaces only mergai-bot's own jobs, not the watched workflows.
+      #
+      # If mergai ever opens solution/main PRs from a FORK, revisit this: resolve
+      # the PR from the run and gate on the PR head SHA instead of the event
+      # fields.
+      # -----------------------------------------------------------------------
+      - name: Checkout PR branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          # The AI agent runs in this checkout; do not leave the write token in
+          # .git/config for it to reuse. Deterministic pushes authenticate via
+          # the setup credential helper (GH_TOKEN in the parent process env).
+          persist-credentials: false
+
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "true"
+          setup-gemini: "true"
+          setup-claude: "true"
+          setup-mergai: "true"
+          gcp-credentials: ${{ secrets.GCP_CREDENTIALS }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+          # This job runs the AI agent (`mergai ci fix`). Keep the write token
+          # out of the job environment; the agent/read steps use the read-only
+          # token and the write token is scoped to the push/comment steps.
+          export-github-token: "false"
+
+      - name: Fetch and load mergai notes
+        env:
+          GH_TOKEN: ${{ steps.app-token-ro.outputs.token }}
+        run: |
+          mergai notes update
+          mergai context init
+
+      # Re-evaluate the gate at handle time. ci-gate froze its verdict into
+      # needs.ci-gate.outputs.state *before* this job runs; the branch can
+      # recover in between (e.g. a cancelled watched run is re-run and passes),
+      # so that verdict may be stale by the time this job actually runs (it can
+      # sit in the concurrency queue behind an earlier handle). Recompute the
+      # live state with the same check ci-gate uses and route the steps below
+      # off it, so a late run (or a superseded failure) becomes a clean no-op
+      # instead of a fix against a now-green branch. The job-level `if:` still
+      # gates this job on the original failure; this only suppresses acting on
+      # it.
+      - name: Re-check gate
+        id: recheck
+        env:
+          GH_TOKEN: ${{ steps.app-token-ro.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          STATE=$(mergai ci status --state)
+          # Honor a mergai-skip-ci-fix label the same way: ci-gate froze
+          # skip_ci_fix before the approval, but the label can be added during
+          # the approval wait. Re-read it live and, if present, override STATE to
+          # a non-failure sentinel so the fix/comment/push steps below no-op.
+          LABELS=$(gh pr list --head "$HEAD_BRANCH" --state open \
+            --json labels --jq '.[0].labels[].name' 2>/dev/null || echo "")
+          if echo "$LABELS" | grep -qx "mergai-skip-ci-fix"; then
+            echo "mergai-skip-ci-fix present at handle time; CI auto-fix suppressed"
+            STATE=skip
+          fi
+          echo "Live gate state at handle time: $STATE"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
+      # Any watched run for HEAD failed/cancelled. Run the fixer once here; the
+      # steps below route the result based on whether a fix commit landed and
+      # which branch CI ran on. `mergai ci fix all` resolves the failing runs
+      # from the *current* branch and commits the fix on HEAD, so we always run
+      # it on the branch CI ran on. `fix_produced`/`before` are exposed as step
+      # outputs for the routing steps.
+      - name: Apply CI fixes (state=failure)
+        id: fix
+        if: steps.recheck.outputs.state == 'failure'
+        env:
+          # Read-only: the agent runs here. `mergai ci fix all` only downloads
+          # CI artifacts/logs and commits locally; the write steps below push.
+          GH_TOKEN: ${{ steps.app-token-ro.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          before=$(git rev-parse HEAD)
+          mergai ci fix all
+          after=$(git rev-parse HEAD)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then
+            echo "No fix commit produced."
+            echo "fix_produced=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Fix commit produced ($after)."
+            echo "fix_produced=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No fix commit (e.g. an unfixable failure): `ci comment post` still
+      # publishes the recorded explanation on the run's own PR.
+      - name: Post explanation comment (no fix produced)
+        if: steps.recheck.outputs.state == 'failure' && steps.fix.outputs.fix_produced == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: mergai ci comment post
+
+      # The main branch carries the bare merge commit and is NOT a review
+      # branch. A failure here is a *semantic conflict* (a clean merge that
+      # doesn't build/pass). We must not advance main with an un-reviewed fix,
+      # so the fix commit is relocated onto a dedicated `semantic` branch and
+      # reviewed via a `semantic` PR (base = main). origin/main is never pushed here.
+      - name: Relocate fix to semantic branch (semantic conflict on */main)
+        if: steps.recheck.outputs.state == 'failure' && steps.fix.outputs.fix_produced == 'true' && endsWith(github.event.workflow_run.head_branch, '/main')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          echo "Semantic conflict on $HEAD_BRANCH; relocating the fix to a semantic branch"
+          # Move the just-produced fix commit(s) onto a fresh semantic branch.
+          # `mergai branch create semantic` derives the branch name and fails if
+          # it already exists (locally or on origin). The semantic branch must
+          # not exist at this point, so a pre-existing one is a hard error -- we
+          # let the step fail rather than replaying the fix onto a stale branch.
+          mergai branch create semantic
+          mergai branch push semantic
+          # The branch is always fresh, so this is the first (and only) PR for
+          # it. Open it, then post a one-time pointer on the main PR.
+          mergai pr --repo "$GITHUB_REPOSITORY" create semantic --skip-commit-list-on-failure
+          SEMANTIC_PR=$(mergai pr --repo "$GITHUB_REPOSITORY" number semantic)
+          mergai pr --repo "$GITHUB_REPOSITORY" comment main --allow-missing \
+            --body "One or more checks failed. PR #${SEMANTIC_PR} opened with fixes for review."
+          # Refresh the semantic PR body (the rolling fixes summary, rebuilt
+          # from the note's solutions) and post the CI-fix notice on it.
+          mergai pr --repo "$GITHUB_REPOSITORY" update semantic \
+            || echo "::warning::'mergai pr update semantic' failed"
+          mergai ci comment post --review-pr "$SEMANTIC_PR"
+
+      # solution / semantic branches are review branches: the fix rides inline
+      # as another commit and is reviewed in the existing PR. Nothing is folded
+      # here -- folding into the merge commit happens only at finalize, after
+      # the PR is merged, so the resolve commit survives.
+      - name: Push inline fix (review branch)
+        if: steps.recheck.outputs.state == 'failure' && steps.fix.outputs.fix_produced == 'true' && !endsWith(github.event.workflow_run.head_branch, '/main')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          echo "Pushing inline fix to $HEAD_BRANCH"
+          git push origin "HEAD:$HEAD_BRANCH"
+          # Refresh the PR body from the note's solutions, then post a short
+          # notification.
+          mergai pr --repo "$GITHUB_REPOSITORY" update \
+            || echo "::warning::'mergai pr update' failed"
+          mergai ci comment post
+
+      # Always push notes when a fix was attempted: ci_comments / posted markers
+      # may have changed even when no commit was produced.
+      - name: Push mergai notes
+        if: steps.recheck.outputs.state == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: mergai notes push
+
+      # Surface this job on the PR as the "mergai / ci-handle" check (see the
+      # ci-gate equivalent). The status reflects whether THIS JOB executed
+      # cleanly -- a green ci-handle means the auto-fix run finished without
+      # error, whatever it decided to do (fix, relocate, or no-op). It only
+      # appears when the job actually runs (i.e. ci-gate saw a failure).
+      - name: Report ci-handle status on the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          JOB_STATUS: ${{ job.status }}
+          HANDLE_STATE: ${{ steps.recheck.outputs.state }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          case "$JOB_STATUS" in
+            success) STATE=success ;;
+            cancelled) STATE=error ;;
+            *) STATE=failure ;;
+          esac
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="$STATE" \
+            -f context="mergai / ci-handle" \
+            -f target_url="$RUN_URL" \
+            -f description="handle: ${HANDLE_STATE:-n/a}" \
+            || echo "::warning::could not publish ci-handle status"
+
+  # Gate + surface the `/mergai review fix` request on the PR. review-handle is
+  # gated by the ai-approve environment; for the issue_comment trigger the run is
+  # attributed to the default branch, so the approval gate would be invisible on
+  # the PR (the pull_request_review trigger is already PR-associated). This
+  # ungated gate publishes a pending "mergai / review-fix" commit status on the
+  # PR head SHA so the checks section shows the job waiting for approval (the
+  # ci-gate/ci-handle idiom). It resolves the PR from whichever event fired and
+  # confirms it is a mergai PR; review-handle runs only when this gate sets
+  # proceed=true and resolves the pending check to success/failure.
+  #
+  # The issue_comment trigger fires on every PR/issue comment in the repo, so the
+  # command filter lives in `if:`; the head-branch (mergai-only) check can't be
+  # expressed for issue_comment there (no head ref in the payload) and is done in
+  # the resolve step below. pull_request_review carries the head ref, so it is
+  # scoped to mergai/* and "Changes requested" up front.
+  review-gate:
+    if: >-
+      (github.event_name == 'pull_request_review'
+        && github.event.review.state == 'changes_requested'
+        && startsWith(github.event.pull_request.head.ref, 'mergai/'))
+      || (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request != null
+        && github.event.comment.user.type != 'Bot'
+        && contains(github.event.comment.body, '/mergai review fix'))
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write # publish the "mergai / review-fix" commit status
+    outputs:
+      proceed: ${{ steps.pr.outputs.proceed }}
+      number: ${{ steps.pr.outputs.number }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      cutoff: ${{ steps.pr.outputs.cutoff }}
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Resolve the PR from whichever event fired and confirm it is a same-repo
+      # mergai PR. The issue_comment payload has no head ref, so we look it up; a
+      # fork PR (with an explanatory comment) or a non-mergai PR leaves proceed
+      # unset, so review-handle is skipped and no pending check is published.
+      # CUTOFF pins the run to the comment set as it stood when it was triggered
+      # (the review's submission time, or the comment's creation time), so a
+      # comment added while the run waits for approval can't be pulled in.
+      - name: Resolve and validate PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_review" ]; then
+            PR_NUMBER='${{ github.event.pull_request.number }}'
+            HEAD_REF='${{ github.event.pull_request.head.ref }}'
+            HEAD_SHA='${{ github.event.pull_request.head.sha }}'
+            CROSS_REPO='${{ github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}'
+            CUTOFF='${{ github.event.review.submitted_at }}'
+          else
+            PR_NUMBER='${{ github.event.issue.number }}'
+            read -r HEAD_REF HEAD_SHA CROSS_REPO < <(gh pr view "$PR_NUMBER" \
+              --json headRefName,headRefOid,isCrossRepository \
+              --jq '"\(.headRefName) \(.headRefOid) \(.isCrossRepository)"')
+            CUTOFF='${{ github.event.comment.created_at }}'
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "cutoff=$CUTOFF" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #$PR_NUMBER (head: $HEAD_REF, head_sha: $HEAD_SHA, cross_repo: $CROSS_REPO, cutoff: $CUTOFF)"
+          # Fork PRs: the head branch does not exist in this repo, so a later
+          # checkout/push would fail. Reject before publishing a pending check or
+          # queuing the secret-bearing review-handle job for approval -- a fork
+          # can name its head branch mergai/*, so the mergai check below is not a
+          # sufficient guard on its own.
+          if [ "$CROSS_REPO" = "true" ]; then
+            echo "PR #$PR_NUMBER is a fork (cross-repository) PR; /mergai review fix is not supported."
+            gh pr comment "$PR_NUMBER" --body \
+              "\`/mergai review fix\` is not supported for pull requests from forks: the head branch must live in this repository."
+            exit 0
+          fi
+          case "$HEAD_REF" in
+            mergai/*) ;;
+            *)
+              echo "PR #$PR_NUMBER is not a mergai PR; skipping."
+              exit 0 ;;
+          esac
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      # Surface the request as a pending "mergai / review-fix" check so the PR
+      # shows the job waiting while approval is pending. Resolved by review-handle.
+      - name: Publish pending status (awaiting approval)
+        if: steps.pr.outputs.proceed == 'true'
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / review-fix" \
+            -f target_url="$RUN_URL" \
+            -f description="waiting for required-reviewer approval" \
+            || echo "::warning::could not publish pending review-fix status"
+
+  # Handle code-review feedback on a mergai PR. Triggered by:
+  #   * a `/mergai review fix` comment on the PR (issue_comment), or
+  #   * a review submitted as "Changes requested" (pull_request_review).
+  # Runs the agent over the PR's unresolved review threads, commits + pushes
+  # the fixes inline on the PR branch, and posts a reply per thread. Mirrors
+  # the ci-handle routing for a review branch: the fix rides as another commit
+  # in the existing PR; nothing is folded here (that is finalize-only). Runs only
+  # after review-gate validated the request (proceed=true) and published the
+  # pending PR check; this job resolves that check to success/failure.
+  review-handle:
+    needs: review-gate
+    if: needs.review-gate.outputs.proceed == 'true'
+    # 'ai-approve' = AI-agent secrets + required-reviewer approval. The comment/
+    # review trigger fires for any user, so this stays gated: an untrusted
+    # commenter cannot start the secret-bearing job without a maintainer's
+    # approval. The CLI process_external filter is the second layer.
+    environment: ai-approve
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write # resolve the "mergai / review-fix" commit status
+    # Serialize per-PR branch-mutation runs so two near-simultaneous triggers
+    # don't race on the head branch. The group key (mergai-pr-<number>) is
+    # shared with rebase-handle so a `/mergai review fix` and a `/mergai rebase`
+    # on the same PR can't run at once and clobber each other's push.
+    # (Fast-Forward Merge is intentionally not in this group; a maintainer must
+    # avoid running `/fast-forward` while a rebase is in flight.)
+    concurrency:
+      group: mergai-pr-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Read-only token for the read/agent steps (`mergai review fix` reads the
+      # PR's review threads and, after deferring --ack, no longer writes). Even
+      # if the agent recovers this token, it cannot write. The write token
+      # (app-token) is scoped to the push / review-post steps only.
+      - name: Create read-only GitHub App token
+        id: app-token-ro
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+
+      # Approval was granted (this job is past the ai-approve gate): flip the
+      # pending "mergai / review-fix" check from "waiting for approval" to
+      # "running".
+      - name: Mark review-fix running
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ needs.review-gate.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / review-fix" \
+            -f target_url="$RUN_URL" \
+            -f description="approved; running" \
+            || echo "::warning::could not update review-fix status"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.review-gate.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          # The AI agent runs in this checkout; do not leave the write token in
+          # .git/config for it to reuse. Deterministic pushes authenticate via
+          # the setup credential helper (GH_TOKEN in the parent process env).
+          persist-credentials: false
+
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "true"
+          setup-gemini: "true"
+          setup-claude: "true"
+          setup-mergai: "true"
+          gcp-credentials: ${{ secrets.GCP_CREDENTIALS }}
+          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+          # This job runs the AI agent (`mergai review fix`). Keep the write
+          # token out of the job environment; the agent/read steps use the
+          # read-only token and the write token is scoped to the push /
+          # review-post steps.
+          export-github-token: "false"
+
+      - name: Fetch and load mergai notes
+        env:
+          GH_TOKEN: ${{ steps.app-token-ro.outputs.token }}
+        run: |
+          mergai notes update
+          mergai context init
+
+      # Generate fixes for the PR's unresolved review threads. `review fix`
+      # commits the fix on HEAD (the PR branch) and records a reply per thread
+      # on the note; it does not post replies. We detect whether a commit
+      # landed so the push step is conditional.
+      - name: Generate review fixes
+        id: review
+        env:
+          # Read-only: the agent runs here. `mergai review fix` reads the PR's
+          # review threads and commits the fix locally; --ack only *records* the
+          # acknowledgement on the note (posted later by `mergai review post`).
+          GH_TOKEN: ${{ steps.app-token-ro.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.review-gate.outputs.number }}
+          CUTOFF: ${{ needs.review-gate.outputs.cutoff }}
+        run: |
+          before=$(git rev-parse HEAD)
+          # --ack records a short acknowledgement (how many comments were found /
+          # addressed / ignored, even if none) on the note; `mergai review post`
+          # publishes it. --since pins the comment set to the trigger time (CUTOFF).
+          mergai review fix --pr-number "$PR_NUMBER" --since "$CUTOFF" --ack
+          after=$(git rev-parse HEAD)
+          if [ "$before" != "$after" ]; then
+            echo "Review fix commit produced ($after)."
+            echo "fix_produced=true" >> "$GITHUB_OUTPUT"
+            # The fix is pushed below, moving the PR head; expose the new tip so
+            # the status step resolves the check on the current PR head SHA.
+            echo "final_sha=$after" >> "$GITHUB_OUTPUT"
+          else
+            echo "No review fix commit produced."
+            echo "fix_produced=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Push the inline fix to the PR branch before posting replies, so the
+      # "Addressed in <sha>" reply points at a commit that exists on the PR.
+      - name: Push review-fix commit
+        if: steps.review.outputs.fix_produced == 'true'
+        env:
+          # Write token (scoped to this push): the setup credential helper reads
+          # GH_TOKEN, and the job environment no longer carries a token.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          HEAD_REF: ${{ needs.review-gate.outputs.head_ref }}
+        run: git push origin "HEAD:$HEAD_REF"
+
+      # Publish the recorded replies (fixed / unfixable) to their threads.
+      - name: Post review replies
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: mergai review post
+
+      # Persist the review_fix solution's git note (attached to the new commit).
+      - name: Push mergai notes
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: mergai notes push
+
+      # Resolve the pending "mergai / review-fix" check: green when the job
+      # finished cleanly (fixes pushed, or nothing to fix), red on error.
+      # Publishes on the SHA the gate posted the pending status to; when a fix was
+      # pushed the head moved, so also publish on the new tip so the PR reflects
+      # the outcome on its current head.
+      - name: Report review-fix status on the PR
+        if: always()
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ needs.review-gate.outputs.head_sha }}
+          FINAL_SHA: ${{ steps.review.outputs.final_sha }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          case "$JOB_STATUS" in
+            success)   STATE=success; DESC="review feedback addressed" ;;
+            cancelled) STATE=error;   DESC="cancelled" ;;
+            *)         STATE=failure; DESC="review-fix failed" ;;
+          esac
+          gh api "repos/$GH_REPO/statuses/$GATE_SHA" \
+            -f state="$STATE" \
+            -f context="mergai / review-fix" \
+            -f target_url="$RUN_URL" \
+            -f description="$DESC" \
+            || echo "::warning::could not publish review-fix status"
+          if [ -n "$FINAL_SHA" ] && [ "$FINAL_SHA" != "$GATE_SHA" ]; then
+            gh api "repos/$GH_REPO/statuses/$FINAL_SHA" \
+              -f state="$STATE" \
+              -f context="mergai / review-fix" \
+              -f target_url="$RUN_URL" \
+              -f description="$DESC" \
+              || echo "::warning::could not publish review-fix status on new head"
+          fi
+
+  # Gate + surface the `/mergai rebase` request on the PR. rebase-handle is gated
+  # by the push-approve environment, but issue_comment runs are attributed to the
+  # default branch, so the approval gate would be invisible in the PR's checks
+  # section. This ungated gate runs immediately and publishes a pending
+  # "mergai / rebase" commit status on the PR head SHA, so the checks section
+  # shows the job waiting for approval (the ci-gate/ci-handle idiom). It also
+  # validates the request (same-repo mergai PR); rebase-handle runs only when this
+  # gate sets proceed=true and resolves the pending check to success/failure.
+  rebase-gate:
+    # Ignore bot / GitHub App comments: rebase-handle's "could not rebase ...
+    # re-run `/mergai rebase`" comment quotes the trigger and is posted with the
+    # App token (which dispatches workflows), so without this guard it would
+    # re-trigger the gate in the same infinite loop as fast-forward-gate.
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request != null
+      && github.event.comment.user.type != 'Bot'
+      && contains(github.event.comment.body, '/mergai rebase')
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write # publish the "mergai / rebase" commit status
+    outputs:
+      proceed: ${{ steps.pr.outputs.proceed }}
+      number: ${{ steps.pr.outputs.number }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Resolve the PR (issue_comment carries no refs) and confirm it is a
+      # same-repo mergai PR. A fork PR (with an explanatory comment) or a
+      # non-mergai PR leaves proceed unset, so rebase-handle is skipped and no
+      # pending approval check is published.
+      - name: Resolve and validate PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          PR_NUMBER='${{ github.event.issue.number }}'
+          read -r HEAD_REF BASE_REF CROSS_REPO HEAD_SHA < <(gh pr view "$PR_NUMBER" \
+            --json headRefName,baseRefName,isCrossRepository,headRefOid \
+            --jq '"\(.headRefName) \(.baseRefName) \(.isCrossRepository) \(.headRefOid)"')
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #$PR_NUMBER (head: $HEAD_REF, base: $BASE_REF, cross_repo: $CROSS_REPO, head_sha: $HEAD_SHA)"
+          # Fork PRs: the head branch does not exist in this repo, so we can
+          # neither rebase it nor push it back.
+          if [ "$CROSS_REPO" = "true" ]; then
+            echo "PR #$PR_NUMBER is a fork (cross-repository) PR; /mergai rebase is not supported."
+            gh pr comment "$PR_NUMBER" --body \
+              "\`/mergai rebase\` is not supported for pull requests from forks: the head branch must live in this repository."
+            exit 0
+          fi
+          case "$HEAD_REF" in
+            mergai/*) ;;
+            *)
+              echo "PR #$PR_NUMBER is not a mergai PR; skipping."
+              exit 0 ;;
+          esac
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      # Surface the request as a pending "mergai / rebase" check so the PR shows
+      # the job waiting while approval is pending. Resolved by rebase-handle.
+      - name: Publish pending status (awaiting approval)
+        if: steps.pr.outputs.proceed == 'true'
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / rebase" \
+            -f target_url="$RUN_URL" \
+            -f description="waiting for required-reviewer approval" \
+            || echo "::warning::could not publish pending rebase status"
+
+  # Rebase a mergai PR branch onto its base branch. Triggered by a
+  # `/mergai rebase` comment on the PR. When the base branch (e.g. `master`)
+  # advances after the PR opened, the head branch is no longer fast-forwardable
+  # and `/fast-forward` fails; rebasing the mergai branch onto the current base
+  # tip restores it. The rebase preserves merge commits and mergai notes and
+  # reuses previously recorded conflict solutions, then force-pushes the branch.
+  # Runs only after rebase-gate validated the request (proceed=true) and
+  # published the pending PR check; the push-approve environment then holds this
+  # job at "waiting for approval" until a required reviewer approves, and this
+  # job resolves the pending check to success/failure.
+  rebase-handle:
+    needs: rebase-gate
+    if: needs.rebase-gate.outputs.proceed == 'true'
+    environment: push-approve
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write # resolve the "mergai / rebase" commit status
+    # Serialize per-PR branch-mutation runs. Uses the shared group key
+    # (mergai-pr-<number>, see review-handle) so a `/mergai rebase` and a review
+    # fix on the same PR can't run concurrently: both check out and push the
+    # head branch, and a rebase force-push racing a review-fix push would
+    # clobber one or the other. issue.number is always set here (issue_comment
+    # only); the pull_request.number fallback just keeps the key identical to
+    # review-handle. (Fast-Forward Merge is deliberately excluded -- a
+    # maintainer must not run `/fast-forward` while a rebase is in flight.)
+    concurrency:
+      group: mergai-pr-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Approval was granted (this job is past the push-approve gate): flip the
+      # pending "mergai / rebase" check from "waiting for approval" to "running".
+      - name: Mark rebase running
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ needs.rebase-gate.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / rebase" \
+            -f target_url="$RUN_URL" \
+            -f description="approved; running" \
+            || echo "::warning::could not update rebase status"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.rebase-gate.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # No AI tokens needed: `mergai rebase` auto-resolves only from previously
+      # recorded solutions (deterministic), so this sets up the mergai CLI alone,
+      # like solution-merged / semantic-merged.
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "false"
+          setup-gemini: "false"
+          setup-claude: "false"
+          setup-mergai: "true"
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+
+      # Rebase the branch onto the current base tip and force-push it.
+      #   1. fetch the latest base branch tip;
+      #   2. sync notes so recorded solutions can be reused during the rebase;
+      #   3. rebuild the merge context (note.json) from the branch name / notes;
+      #   4. rebase onto origin/<base> (preserves merge commits + notes);
+      #   5. push notes (--context avoids pushing rebase-orphaned notes) and
+      #      force-push the branch (type is the last path segment of the mergai
+      #      branch name: mergai/<target>-<sha>/<type>).
+      - name: Rebase onto base branch
+        id: rebase
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.rebase-gate.outputs.number }}
+          HEAD_REF: ${{ needs.rebase-gate.outputs.head_ref }}
+          BASE_REF: ${{ needs.rebase-gate.outputs.base_ref }}
+        run: |
+          set -e
+          echo "Rebasing $HEAD_REF onto $BASE_REF"
+          git fetch origin "$BASE_REF"
+          mergai notes update
+          mergai context init
+          if ! mergai rebase "origin/$BASE_REF"; then
+            mergai rebase --abort || true
+            # Post via `mergai pr comment` (not `gh`) so the comment carries the
+            # config-gated run-link footer, like every other bot comment. The PR
+            # type is auto-detected from the checked-out branch.
+            mergai pr --repo "$GITHUB_REPOSITORY" comment --allow-missing --body \
+              "\`/mergai rebase\` onto \`$BASE_REF\` could not complete automatically. Rebase locally with \`mergai notes update && mergai context init && mergai rebase origin/$BASE_REF\`, then push the branch and notes." \
+              || echo "::warning::could not post rebase-failure comment"
+            echo "::error::mergai rebase onto '$BASE_REF' could not complete automatically (unresolved conflicts)."
+            exit 1
+          fi
+          TYPE="${HEAD_REF##*/}"
+          mergai notes push --context
+          mergai branch push -f "$TYPE"
+          # The rebase rewrote the branch; expose the new tip so the status step
+          # can also resolve the check on the (now current) PR head SHA.
+          echo "final_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # The rebase advanced merge_info.target_branch_sha, so refresh the PR
+          # body (rebuilt from the current note data) to reflect the new base.
+          mergai pr --repo "$GITHUB_REPOSITORY" update \
+            || echo "::warning::'mergai pr update' failed"
+          # Post via `mergai pr comment` (not `gh`) so the comment carries the
+          # config-gated run-link footer, like every other bot comment.
+          mergai pr --repo "$GITHUB_REPOSITORY" comment --allow-missing --body \
+            "Rebased \`$HEAD_REF\` onto \`$BASE_REF\` and force-pushed the branch." \
+            || echo "::warning::could not post rebase-success comment"
+          echo "Rebase of $HEAD_REF onto $BASE_REF completed successfully"
+
+      # Resolve the pending "mergai / rebase" check: green when the rebase pushed,
+      # red otherwise. Publishes on the SHA the gate posted the pending status to;
+      # the rebase force-pushes a new head, so also publish on the new tip so the
+      # PR reflects the outcome on its current head.
+      - name: Report rebase status on the PR
+        if: always()
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ needs.rebase-gate.outputs.head_sha }}
+          FINAL_SHA: ${{ steps.rebase.outputs.final_sha }}
+          BASE_REF: ${{ needs.rebase-gate.outputs.base_ref }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          case "$JOB_STATUS" in
+            success)   STATE=success; DESC="rebased onto $BASE_REF" ;;
+            cancelled) STATE=error;   DESC="cancelled" ;;
+            *)         STATE=failure; DESC="rebase failed" ;;
+          esac
+          gh api "repos/$GH_REPO/statuses/$GATE_SHA" \
+            -f state="$STATE" \
+            -f context="mergai / rebase" \
+            -f target_url="$RUN_URL" \
+            -f description="$DESC" \
+            || echo "::warning::could not publish rebase status"
+          if [ -n "$FINAL_SHA" ] && [ "$FINAL_SHA" != "$GATE_SHA" ]; then
+            gh api "repos/$GH_REPO/statuses/$FINAL_SHA" \
+              -f state="$STATE" \
+              -f context="mergai / rebase" \
+              -f target_url="$RUN_URL" \
+              -f description="$DESC" \
+              || echo "::warning::could not publish rebase status on rebased head"
+          fi
+
+  # Gate + surface the `/mergai fast-forward` request on the PR. fast-forward-handle
+  # (below) is gated by the push-approve environment, but because this workflow is
+  # triggered by issue_comment its run is attributed to the *default branch*, so the
+  # environment approval gate would be invisible in the PR's checks section (unlike
+  # review-handle's pull_request_review path, where the run is tied to the PR head).
+  # This ungated gate job runs immediately and publishes a *pending* commit status on
+  # the PR head SHA, so the PR shows a "mergai / fast-forward" check waiting while a
+  # required reviewer approves the deployment -- the same idiom ci-gate/ci-handle use
+  # to make workflow_run jobs visible on a PR. It also does the cheap validation
+  # (open / same-repo / mergai / commenter permission) so an invalid or unauthorized
+  # request never creates an approval prompt: fast-forward-handle only runs when this
+  # gate sets proceed=true, and it resolves the pending check to success/failure.
+  fast-forward-gate:
+    # Ignore comments authored by a bot / GitHub App. The gate's own rejection
+    # ("requires write access") and fast-forward-handle's failure comment both
+    # quote the `/mergai fast-forward` trigger verbatim, and are posted with the
+    # App token -- which, unlike the default GITHUB_TOKEN, *does* dispatch new
+    # workflow runs. Without this guard each such comment re-triggers the gate,
+    # whose commenter is now the bot (no write access), so it posts the same
+    # rejection again -> an infinite loop (see PR #2095).
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request != null
+      && github.event.comment.user.type != 'Bot'
+      && contains(github.event.comment.body, '/mergai fast-forward')
+    runs-on: ubuntu-latest
+    # The status is published with the default GITHUB_TOKEN (see the status step)
+    # so it is attributed to github-actions[bot] -- matching the icon of the other
+    # mergai commit statuses (ci-gate/ci-handle). Restrict the token accordingly;
+    # all other calls in this job use the GitHub App token.
+    permissions:
+      statuses: write # publish the "mergai / fast-forward" commit status
+    outputs:
+      proceed: ${{ steps.pr.outputs.proceed }}
+      number: ${{ steps.pr.outputs.number }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Resolve the PR (the issue_comment payload carries none of its refs) and
+      # confirm it is an open, same-repo mergai PR whose commenter may merge. Any
+      # failing check leaves proceed unset (fast-forward-handle is skipped) with an
+      # explanatory comment, and no pending approval check is published.
+      - name: Resolve and validate PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          PR_NUMBER='${{ github.event.issue.number }}'
+          read -r HEAD_REF BASE_REF STATE CROSS_REPO HEAD_SHA < <(gh pr view "$PR_NUMBER" \
+            --json headRefName,baseRefName,state,isCrossRepository,headRefOid \
+            --jq '"\(.headRefName) \(.baseRefName) \(.state) \(.isCrossRepository) \(.headRefOid)"')
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR #$PR_NUMBER (head: $HEAD_REF, base: $BASE_REF, state: $STATE, cross_repo: $CROSS_REPO, head_sha: $HEAD_SHA)"
+          # Only open PRs can be fast-forwarded.
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR #$PR_NUMBER is not open (state: $STATE); skipping."
+            gh pr comment "$PR_NUMBER" --body \
+              "\`/mergai fast-forward\` skipped: the pull request is not open (state: $STATE)."
+            exit 0
+          fi
+          # Fork PRs: the head branch does not exist in this repo, so we can
+          # neither rebase it nor push it back.
+          if [ "$CROSS_REPO" = "true" ]; then
+            echo "PR #$PR_NUMBER is a fork (cross-repository) PR; not supported."
+            gh pr comment "$PR_NUMBER" --body \
+              "\`/mergai fast-forward\` is not supported for pull requests from forks: the head branch must live in this repository."
+            exit 0
+          fi
+          # Only mergai branches carry the note context the rebase step needs.
+          case "$HEAD_REF" in
+            mergai/*) ;;
+            *)
+              echo "PR #$PR_NUMBER is not a mergai PR; skipping."
+              gh pr comment "$PR_NUMBER" --body \
+                "\`/mergai fast-forward\` only handles mergai PRs (it can rebase the mergai branch before fast-forwarding). For a regular branch, use \`/fast-forward\`."
+              exit 0 ;;
+          esac
+          # Defense-in-depth permission check (the push-approve environment on
+          # fast-forward-handle is the primary trust boundary). Only write/maintain/
+          # admin collaborators may advance the protected base ref, so an
+          # unauthorized comment never even creates an approval prompt.
+          LEVEL=$(gh api "repos/$GH_REPO/collaborators/$ACTOR/permission" --jq '.permission')
+          echo "Commenter $ACTOR permission: $LEVEL"
+          case "$LEVEL" in
+            admin|maintain|write) ;;
+            *)
+              echo "::error::User $ACTOR does not have permission to merge (permission: $LEVEL)"
+              gh pr comment "$PR_NUMBER" --body \
+                "\`/mergai fast-forward\` requires write access: @$ACTOR does not have permission to merge."
+              exit 0 ;;
+          esac
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      # Surface the request on the PR as a pending "mergai / fast-forward" check so
+      # its checks section shows the job waiting while approval is pending. Resolved
+      # by fast-forward-handle once it runs.
+      - name: Publish pending status (awaiting approval)
+        if: steps.pr.outputs.proceed == 'true'
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / fast-forward" \
+            -f target_url="$RUN_URL" \
+            -f description="waiting for required-reviewer approval" \
+            || echo "::warning::could not publish pending fast-forward status"
+
+  # Fast-forward a mergai PR's base branch to the PR head, rebasing first when
+  # the base has advanced. Runs only after fast-forward-gate validated the request
+  # (proceed=true) and published the pending PR check. The mergai-aware counterpart
+  # to the standalone `/fast-forward` (see fast-forward.yml): a plain fast-forward
+  # fails once the base branch moves past the point the mergai branch was cut from,
+  # because the head is no longer a descendant of the base. Rather than make a
+  # maintainer run `/mergai rebase` and then `/fast-forward` as two round-trips, this
+  # handler does both in one shot -- it rebases the mergai branch onto the current
+  # base tip (deterministically, reusing recorded conflict solutions, exactly like
+  # rebase-handle) and then fast-forwards the base onto the rebased head.
+  #
+  # Trust model mirrors the standalone fast-forward: advancing the protected base
+  # ref is gated by the 'push-approve' environment (a required reviewer approves the
+  # deployment) -- visible on the PR via the gate's pending check -- and the gate's
+  # permission check is the second layer. This job resolves the pending check to
+  # success/failure.
+  fast-forward-handle:
+    needs: fast-forward-gate
+    if: needs.fast-forward-gate.outputs.proceed == 'true'
+    environment: push-approve
+    runs-on: ubuntu-latest
+    # Commit statuses are published with the default GITHUB_TOKEN (github-actions[bot])
+    # to match the other mergai statuses' icon; all real work uses the App token.
+    permissions:
+      statuses: write # publish the "mergai / fast-forward" commit status
+    # Share the per-PR branch-mutation lock with rebase-handle / review-handle:
+    # this job rebases and force-pushes the head branch just like rebase-handle,
+    # so it must not run concurrently with a `/mergai rebase` or `/mergai review
+    # fix` on the same PR. (The standalone Fast-Forward Merge workflow stays out
+    # of this group -- it never mutates the head branch -- so a maintainer must
+    # still avoid running `/fast-forward` while a rebase is in flight.)
+    concurrency:
+      group: mergai-pr-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          private-key: ${{ secrets.PSMDB_BOT_GH_APP_PRIVATE_KEY }}
+
+      # Approval was granted (this job is past the push-approve gate): flip the
+      # pending "mergai / fast-forward" PR check from "waiting for approval" to
+      # "running" so the PR reflects that the work has started.
+      - name: Mark fast-forward running
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ needs.fast-forward-gate.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" \
+            -f state="pending" \
+            -f context="mergai / fast-forward" \
+            -f target_url="$RUN_URL" \
+            -f description="approved; running" \
+            || echo "::warning::could not update fast-forward status"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.fast-forward-gate.outputs.head_ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # No AI tokens needed: the rebase (when required) auto-resolves only from
+      # previously recorded solutions (deterministic), like rebase-handle.
+      - name: Setup workflow environment
+        uses: ./.github/actions/setup-mergai-workflow
+        with:
+          setup-gcp: "false"
+          setup-gemini: "false"
+          setup-claude: "false"
+          setup-mergai: "true"
+          github-app-token: ${{ steps.app-token.outputs.token }}
+          github-app-id: ${{ secrets.PSMDB_BOT_GH_APP_ID }}
+          mergai-ref: ${{ vars.MERGAI_REF || 'master' }}
+
+      # Fast-forward the base branch onto the PR head, rebasing first when the
+      # base has moved past the mergai branch.
+      #   1. fetch the current base and head tips;
+      #   2. load notes/context (needed for the rebase, and so the
+      #      `mergai pr comment` calls can resolve the PR from the note);
+      #   3. if origin/<base> is already an ancestor of origin/<head>, no rebase
+      #      is needed -- fast-forward straight away;
+      #   4. otherwise rebase the mergai branch onto origin/<base> (reusing
+      #      recorded solutions, preserving merge commits + notes), push the notes
+      #      and force-push the branch, then refresh the PR body;
+      #   5. fast-forward the base branch to the (possibly rebased) head tip with
+      #      --ff-only and push it.
+      - name: Fast-forward (rebase if needed)
+        id: ff
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.fast-forward-gate.outputs.number }}
+          HEAD_REF: ${{ needs.fast-forward-gate.outputs.head_ref }}
+          BASE_REF: ${{ needs.fast-forward-gate.outputs.base_ref }}
+        run: |
+          set -e
+          echo "Fast-forwarding $BASE_REF to $HEAD_REF (rebasing first if needed)"
+          git fetch origin "$BASE_REF"
+          git fetch origin "$HEAD_REF"
+
+          # Needed for the rebase below, and so the `mergai pr comment` calls in
+          # the success/failure steps can resolve the PR from the note context.
+          mergai notes update
+          mergai context init
+
+          if git merge-base --is-ancestor "origin/$BASE_REF" "origin/$HEAD_REF"; then
+            echo "Base ($BASE_REF) is already an ancestor of head ($HEAD_REF); no rebase needed."
+            FF_SHA=$(git rev-parse "origin/$HEAD_REF")
+          else
+            echo "Base ($BASE_REF) has advanced beyond head ($HEAD_REF); rebasing onto it first."
+            git checkout "$HEAD_REF"
+            if ! mergai rebase "origin/$BASE_REF"; then
+              mergai rebase --abort || true
+              # Record the reason so the failure step posts rebase-specific
+              # guidance (outputs written before a failing exit are still captured).
+              echo "reason=rebase" >> "$GITHUB_OUTPUT"
+              echo "::error::mergai rebase onto '$BASE_REF' could not complete automatically (unresolved conflicts)."
+              exit 1
+            fi
+            TYPE="${HEAD_REF##*/}"
+            mergai notes push --context
+            mergai branch push -f "$TYPE"
+            # The rebase advanced merge_info.target_branch_sha; refresh the PR body.
+            mergai pr --repo "$GITHUB_REPOSITORY" update \
+              || echo "::warning::'mergai pr update' failed"
+            FF_SHA=$(git rev-parse HEAD)
+            # Let the success comment report that a rebase was needed.
+            echo "rebased=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Fast-forward the base branch to the head tip by pushing the head SHA
+          # straight to the base ref. A non-force push is accepted by the remote
+          # only when it is a genuine fast-forward (origin/<base> is an ancestor
+          # of the head tip -- guaranteed above by the ancestor check or by the
+          # rebase), so this enforces --ff-only semantics AND avoids a local
+          # `git checkout <base>`: `mergai fork init` adds an `upstream` remote,
+          # so a bare `git checkout master` matches multiple remote-tracking
+          # branches (origin/master + upstream/master) and fails with exit 128.
+          git push origin "$FF_SHA:refs/heads/$BASE_REF"
+          # Expose the tip we fast-forwarded to so the status step can also
+          # resolve the check on the rebased head when the head SHA changed.
+          echo "final_sha=$FF_SHA" >> "$GITHUB_OUTPUT"
+          echo "Fast-forwarded $BASE_REF to $FF_SHA ($HEAD_REF)."
+
+      # Confirm the fast-forward on the PR. A successful fast-forward merges (and
+      # closes) the PR, so the comment targets it via `mergai pr comment
+      # --pr-number` (which resolves a PR regardless of state, unlike the default
+      # open-PR lookup) -- keeping mergai's run-link footer. The wording reflects
+      # whether a rebase was needed first.
+      - name: Post success comment
+        if: success()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.fast-forward-gate.outputs.number }}
+          BASE_REF: ${{ needs.fast-forward-gate.outputs.base_ref }}
+          HEAD_REF: ${{ needs.fast-forward-gate.outputs.head_ref }}
+          REBASED: ${{ steps.ff.outputs.rebased }}
+        run: |
+          if [ "$REBASED" = "true" ]; then
+            BODY="Fast-forwarded \`$HEAD_REF\` into \`$BASE_REF\` (rebased onto \`$BASE_REF\` first)."
+          else
+            BODY="Fast-forwarded \`$HEAD_REF\` into \`$BASE_REF\`."
+          fi
+          mergai pr --repo "$GITHUB_REPOSITORY" comment --pr-number "$PR_NUMBER" \
+            --allow-missing --body "$BODY" \
+            || echo "::warning::could not post fast-forward success comment"
+
+      # Explain the failure. A rebase-conflict failure (reason=rebase) gets
+      # actionable recovery instructions; any other failure (e.g. the base raced
+      # ahead so the --ff-only push was rejected) gets a generic pointer. A failed
+      # fast-forward leaves the PR open, but we still target it by --pr-number for
+      # consistency with the success path (both carry mergai's run-link footer).
+      - name: Post failure comment
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.fast-forward-gate.outputs.number }}
+          BASE_REF: ${{ needs.fast-forward-gate.outputs.base_ref }}
+          HEAD_REF: ${{ needs.fast-forward-gate.outputs.head_ref }}
+          REASON: ${{ steps.ff.outputs.reason }}
+        run: |
+          if [ "$REASON" = "rebase" ]; then
+            BODY="\`/mergai fast-forward\` could not rebase \`$HEAD_REF\` onto \`$BASE_REF\` automatically. Rebase locally with \`mergai notes update && mergai context init && mergai rebase origin/$BASE_REF\`, then push the branch and notes and re-run \`/mergai fast-forward\`."
+          else
+            BODY="\`/mergai fast-forward\` of \`$BASE_REF\` onto \`$HEAD_REF\` failed. See the workflow run for details."
+          fi
+          mergai pr --repo "$GITHUB_REPOSITORY" comment --pr-number "$PR_NUMBER" \
+            --allow-missing --body "$BODY" \
+            || echo "::warning::could not post fast-forward failure comment"
+
+      # Resolve the pending "mergai / fast-forward" check on the PR: green when the
+      # fast-forward succeeded, red otherwise. Publishes on the SHA the gate posted
+      # the pending status to; if a rebase moved the head, also publishes on the new
+      # tip so a still-open PR reflects the outcome on its current head.
+      - name: Report fast-forward status on the PR
+        if: always()
+        env:
+          # Default token so the status is attributed to github-actions[bot],
+          # matching the icon of the other mergai commit statuses.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ needs.fast-forward-gate.outputs.head_sha }}
+          FINAL_SHA: ${{ steps.ff.outputs.final_sha }}
+          BASE_REF: ${{ needs.fast-forward-gate.outputs.base_ref }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          case "$JOB_STATUS" in
+            success)   STATE=success; DESC="fast-forwarded $BASE_REF" ;;
+            cancelled) STATE=error;   DESC="cancelled" ;;
+            *)         STATE=failure; DESC="fast-forward failed" ;;
+          esac
+          gh api "repos/$GH_REPO/statuses/$GATE_SHA" \
+            -f state="$STATE" \
+            -f context="mergai / fast-forward" \
+            -f target_url="$RUN_URL" \
+            -f description="$DESC" \
+            || echo "::warning::could not publish fast-forward status"
+          if [ -n "$FINAL_SHA" ] && [ "$FINAL_SHA" != "$GATE_SHA" ]; then
+            gh api "repos/$GH_REPO/statuses/$FINAL_SHA" \
+              -f state="$STATE" \
+              -f context="mergai / fast-forward" \
+              -f target_url="$RUN_URL" \
+              -f description="$DESC" \
+              || echo "::warning::could not publish fast-forward status on rebased head"
+          fi

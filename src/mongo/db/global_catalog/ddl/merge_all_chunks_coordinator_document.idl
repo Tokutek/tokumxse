@@ -1,0 +1,51 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of the state document for the merge all chunks coordinator.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/merge_chunk_request.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+
+enums:
+    MergeAllChunksCoordinatorPhase:
+        description: "Phases for the merge all chunks coordinator."
+        type: string
+        values:
+            kUnset: "unset"
+            kCheckPreconditions: "checkPreconditions"
+            kPrecomputeChunkList: "precomputeChunkList"
+            kAcquireCriticalSection: "acquireCriticalSection"
+            kCommit: "commit"
+            kReleaseCriticalSection: "releaseCriticalSection"
+
+structs:
+    MergeAllChunksCoordinatorDocument:
+        description: "State document for the merge all chunks coordinator."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            ShardsvrMergeAllChunksOnShardRequest: ShardsvrMergeAllChunksOnShardRequest
+        fields:
+            phase:
+                type: MergeAllChunksCoordinatorPhase
+                default: kUnset
+            newChunks:
+                description: "A precomputed list with the new chunks to commit."
+                type: array # Not array<object_owned> to have more control over its creation.
+                optional: true
+            numMergedChunks:
+                type: int
+                description: "Number of chunks that will be merged"
+                optional: true
+            shardVersion:
+                type: ChunkVersion
+                description: "Latest data placement of the shard."
+                optional: true

@@ -1,0 +1,33 @@
+load("//bazel:mongo_js_rules.bzl", "all_subpackage_javascript_files", "mongo_js_library")
+
+package(default_visibility = ["//visibility:public"])
+
+mongo_js_library(
+    name = "all_javascript_files",
+    srcs = glob([
+        "*.js",
+    ]),
+)
+
+all_subpackage_javascript_files()
+
+exports_files(
+    glob([
+        "*.json",
+        "*.ini",
+        "*.yaml",
+    ]),
+)
+
+filegroup(
+    name = "timezone_info",
+    srcs = [
+        "//jstests/libs/config_files/bad_timezone_info:InvalidVersion",
+        "//jstests/libs/config_files/good_timezone_info_fat:GMT",
+        "//jstests/libs/config_files/good_timezone_info_fat/America:New_York",
+        "//jstests/libs/config_files/good_timezone_info_fat/America:Sao_Paulo",
+        "//jstests/libs/config_files/good_timezone_info_slim:GMT",
+        "//jstests/libs/config_files/good_timezone_info_slim/America:New_York",
+        "//jstests/libs/config_files/good_timezone_info_slim/America:Sao_Paulo",
+    ],
+)

@@ -1,129 +1,436 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
 
+#pragma once
+
+#define API_SESSION_PUSH(s, struct_name, func_name, dh)                                      \
+    WT_DATA_HANDLE *__olddh = (s)->dhandle;                                                  \
+    const char *__oldname;                                                                   \
+    /* If this isn't an API reentry, the name should be NULL and the counter should be 0. */ \
+    WT_ASSERT(s, (s)->name != NULL || (s)->api_call_counter == 0);                           \
+    __oldname = (s)->name;                                                                   \
+    ++(s)->api_call_counter;                                                                 \
+    (s)->dhandle = (dh);                                                                     \
+    (s)->lastop = #struct_name "." #func_name;                                               \
+    __wt_atomic_store_ptr_relaxed(&(s)->name, (s)->lastop);
+#define API_SESSION_POP(s)                                \
+    (s)->dhandle = __olddh;                               \
+    __wt_atomic_store_ptr_relaxed(&(s)->name, __oldname); \
+    --(s)->api_call_counter
+
 /* Standard entry points to the API: declares/initializes local variables. */
-#define	API_SESSION_INIT(s, h, n, cur, dh)				\
-	WT_DATA_HANDLE *__olddh = (s)->dhandle;				\
-	const char *__oldname = (s)->name;				\
-	(s)->cursor = (cur);						\
-	(s)->dhandle = (dh);						\
-	(s)->name = (s)->lastop = #h "." #n;				\
+#define API_SESSION_INIT(s, struct_name, func_name, dh)                             \
+    WT_TRACK_OP_DECL;                                                               \
+    API_SESSION_PUSH(s, struct_name, func_name, dh);                                \
+    /*                                                                              \
+     * No code before this line, otherwise error handling won't be                  \
+     * correct.                                                                     \
+     */                                                                             \
+    WT_ERR(WT_SESSION_CHECK_PANIC(s));                                              \
+    __wt_single_thread_check_start(s);                                              \
+    WT_TRACK_OP_INIT(s);                                                            \
+    /*                                                                              \
+     * Internal sessions save errors only on behalf of the application session that \
+     * spawned them; leave error information to that session.                       \
+     */                                                                             \
+    if ((s)->api_call_counter == 1 && !F_ISSET(s, WT_SESSION_INTERNAL)) {           \
+        __wt_op_timer_start(s);                                                     \
+        if ((s)->err_info.err != 0)                                                 \
+            __wt_session_reset_last_error((s));                                     \
+    }                                                                               \
+    /* Reset wait time if this isn't an API reentry. */                             \
+    if ((s)->api_call_counter == 1)                                                 \
+        (s)->cache_wait_us = 0;                                                     \
+    __wt_verbose((s), WT_VERB_API, "%s", "CALL: " #struct_name ":" #func_name)
 
-#define	API_CALL_NOCONF(s, h, n, cur, dh) do {				\
-	API_SESSION_INIT(s, h, n, cur, dh);				\
-	WT_ERR(WT_SESSION_CHECK_PANIC(s));				\
-	WT_ERR(__wt_verbose((s), WT_VERB_API, "CALL: " #h ":" #n))
+#define API_CALL_NOCONF_NOERRCLEAR(s, struct_name, func_name, dh, set_err) \
+    do {                                                                   \
+        bool __set_err = (set_err);                                        \
+    API_SESSION_INIT(s, struct_name, func_name, dh)
 
-#define	API_CALL(s, h, n, cur, dh, config, cfg) do {			\
-	const char *cfg[] =						\
-	    { WT_CONFIG_BASE(s, h##_##n), config, NULL };		\
-	API_SESSION_INIT(s, h, n, cur, dh);				\
-	WT_ERR(WT_SESSION_CHECK_PANIC(s));				\
-	WT_ERR(((config) != NULL) ?					\
-	    __wt_config_check((s),					\
-	    WT_CONFIG_REF(session, h##_##n), (config), 0) : 0);		\
-	WT_ERR(__wt_verbose((s), WT_VERB_API, "CALL: " #h ":" #n))
-
-#define	API_END(s, ret)							\
-	if ((s) != NULL) {						\
-		(s)->dhandle = __olddh;					\
-		(s)->name = __oldname;					\
-		if (F_ISSET(&(s)->txn, TXN_RUNNING) &&			\
-		    (ret) != 0 &&					\
-		    (ret) != WT_NOTFOUND &&				\
-		    (ret) != WT_DUPLICATE_KEY)				\
-			F_SET(&(s)->txn, TXN_ERROR);			\
-	}								\
-} while (0)
-
-/* An API call wrapped in a transaction if necessary. */
-#define	TXN_API_CALL(s, h, n, cur, bt, config, cfg) do {		\
-	int __autotxn = 0;						\
-	API_CALL(s, h, n, bt, cur, config, cfg);			\
-	__autotxn = !F_ISSET(&(s)->txn, TXN_AUTOCOMMIT | TXN_RUNNING);	\
-	if (__autotxn)							\
-		F_SET(&(s)->txn, TXN_AUTOCOMMIT)
-
-/* An API call wrapped in a transaction if necessary. */
-#define	TXN_API_CALL_NOCONF(s, h, n, cur, bt) do {			\
-	int __autotxn = 0;						\
-	API_CALL_NOCONF(s, h, n, cur, bt);				\
-	__autotxn = !F_ISSET(&(s)->txn, TXN_AUTOCOMMIT | TXN_RUNNING);	\
-	if (__autotxn)							\
-		F_SET(&(s)->txn, TXN_AUTOCOMMIT)
-
-/* End a transactional API call, optional retry on deadlock. */
-#define	TXN_API_END_RETRY(s, ret, retry)				\
-	API_END(s, ret);						\
-	if (__autotxn) {						\
-		if (F_ISSET(&(s)->txn, TXN_AUTOCOMMIT))			\
-			F_CLR(&(s)->txn, TXN_AUTOCOMMIT);		\
-		else if (ret == 0 && !F_ISSET(&(s)->txn, TXN_ERROR))	\
-			ret = __wt_txn_commit((s), NULL);		\
-		else {							\
-			WT_TRET(__wt_txn_rollback((s), NULL));		\
-			if ((ret == 0 || ret == WT_ROLLBACK) &&		\
-			    (retry)) {					\
-				ret = 0;				\
-				continue;				\
-			}						\
-			WT_TRET(__wt_session_reset_cursors(s));		\
-		}							\
-	}								\
-	break;								\
-} while (1)
-
-/* End a transactional API call, retry on deadlock. */
-#define	TXN_API_END(s, ret)	TXN_API_END_RETRY(s, ret, 1)
+#define API_CALL_NOCONF(s, struct_name, func_name, dh, set_err)         \
+    API_CALL_NOCONF_NOERRCLEAR(s, struct_name, func_name, dh, set_err); \
+    if ((s)->api_call_counter == 1 && !F_ISSET(s, WT_SESSION_INTERNAL)) \
+        __wt_error_log_clear_helper();
 
 /*
- * In almost all cases, API_END is returning immediately, make it simple.
- * If a session or connection method is about to return WT_NOTFOUND (some
- * underlying object was not found), map it to ENOENT, only cursor methods
- * return WT_NOTFOUND.
+ * Optimize configuration checking. If the configuration string passed into the API is empty, use
+ * NULL instead, it saves a little on every configuration lookup. The API caller's configuration
+ * string is stored in array position 1.
  */
-#define	API_END_RET(s, ret)						\
-	API_END(s, ret);						\
-	return (ret)
-#define	API_END_RET_NOTFOUND_MAP(s, ret)				\
-	API_END(s, ret);						\
-	return ((ret) == WT_NOTFOUND ? ENOENT : (ret))
+#define API_CONFIG_CHECK(s, struct_name, func_name, config, cfg)                                 \
+    if (config != NULL) {                                                                        \
+        if (((const char *)config)[0] == '\0')                                                   \
+            cfg[1] = NULL;                                                                       \
+        else                                                                                     \
+            WT_ERR(                                                                              \
+              __wt_config_check((s), WT_CONFIG_REF(s, struct_name##_##func_name), (config), 0)); \
+    }
 
-#define	CONNECTION_API_CALL(conn, s, n, config, cfg)			\
-	s = (conn)->default_session;					\
-	API_CALL(s, connection, n, NULL, NULL, config, cfg)
+#define API_CALL(s, struct_name, func_name, dh, config, cfg, set_err)                       \
+    do {                                                                                    \
+        bool __set_err = (set_err);                                                         \
+        const char *(cfg)[] = {WT_CONFIG_BASE(s, struct_name##_##func_name), config, NULL}; \
+        API_SESSION_INIT(s, struct_name, func_name, dh);                                    \
+        if ((s)->api_call_counter == 1 && !F_ISSET(s, WT_SESSION_INTERNAL))                 \
+            __wt_error_log_clear_helper();                                                  \
+    API_CONFIG_CHECK(s, struct_name, func_name, config, cfg)
 
-#define	CONNECTION_API_CALL_NOCONF(conn, s, n)				\
-	s = (conn)->default_session;					\
-	API_CALL_NOCONF(s, connection, n, NULL, NULL)
+#define API_END(s, ret)                                                                            \
+    if ((s) != NULL) {                                                                             \
+        WT_TRACK_OP_END(s);                                                                        \
+        __wt_single_thread_check_stop(s);                                                          \
+        if ((ret) != 0 && __set_err)                                                               \
+            __wt_txn_err_set(s, (ret));                                                            \
+        if ((s)->api_call_counter == 1 && !F_ISSET(s, WT_SESSION_INTERNAL)) {                      \
+            /*                                                                                     \
+             * Check that the API return value matches what is stored in the err_info struct.      \
+             *                                                                                     \
+             * When we see a mismatch:                                                             \
+             * - If the return value is zero, clear the struct (record success).                   \
+             * - If the return value is an error code and we haven't already recorded any errors,  \
+             * set the error in the struct.                                                        \
+             * - Otherwise, if we have already recorded an error and are now returning a different \
+             * error code, overwrite the err field only with the new code and keep the old         \
+             * sub-level error code and error message.                                             \
+             */                                                                                    \
+            if ((s)->err_info.err != (ret)) {                                                      \
+                if ((ret) == 0)                                                                    \
+                    __wt_session_reset_last_error(s);                                              \
+                else if ((s)->err_info.err == 0)                                                   \
+                    __wt_session_set_last_error(s, ret, WT_NONE, WT_ERROR_INFO_EMPTY);             \
+                else                                                                               \
+                    (s)->err_info.err = (ret);                                                     \
+            };                                                                                     \
+            __wt_op_timer_stop(s);                                                                 \
+        }                                                                                          \
+        /*                                                                                         \
+         * FIXME-WT-7247 Ideally we would not leave any history store cursors open when we         \
+         * return from an api call. But we cannot do a stricter check due to the way we            \
+         * nest calls to the API macros.                                                           \
+         */                                                                                        \
+        WT_ASSERT(s, (s)->api_call_counter > 1 || (s)->hs_cursor_counter <= 3);                    \
+        /*                                                                                         \
+         * No code after this line, otherwise error handling                                       \
+         * won't be correct.                                                                       \
+         */                                                                                        \
+        API_SESSION_POP(s);                                                                        \
+    }                                                                                              \
+    }                                                                                              \
+    while (0)
 
-#define	SESSION_API_CALL(s, n, config, cfg)				\
-	API_CALL(s, session, n, NULL, NULL, config, cfg)
+/* An API call wrapped in a transaction if necessary. */
+#define TXN_API_CALL(s, struct_name, func_name, dh, config, cfg)            \
+    do {                                                                    \
+        bool __autotxn = false, __update = false;                           \
+        API_CALL(s, struct_name, func_name, dh, config, cfg, true);         \
+        __autotxn = !F_ISSET((s)->txn, WT_TXN_AUTOCOMMIT | WT_TXN_RUNNING); \
+        if (__autotxn)                                                      \
+            F_SET((s)->txn, WT_TXN_AUTOCOMMIT);                             \
+        __update = !F_ISSET((s)->txn, WT_TXN_UPDATE);                       \
+        if (__update)                                                       \
+            F_SET((s)->txn, WT_TXN_UPDATE);
 
-#define	SESSION_API_CALL_NOCONF(s, n)					\
-	API_CALL_NOCONF(s, session, n, NULL, NULL)
+/* An API call wrapped in a transaction if necessary. */
+#define TXN_API_CALL_NOCONF(s, struct_name, func_name, dh)                  \
+    do {                                                                    \
+        bool __autotxn = false, __update = false;                           \
+        API_CALL_NOCONF(s, struct_name, func_name, dh, true);               \
+        __autotxn = !F_ISSET((s)->txn, WT_TXN_AUTOCOMMIT | WT_TXN_RUNNING); \
+        if (__autotxn)                                                      \
+            F_SET((s)->txn, WT_TXN_AUTOCOMMIT);                             \
+        __update = !F_ISSET((s)->txn, WT_TXN_UPDATE);                       \
+        if (__update)                                                       \
+            F_SET((s)->txn, WT_TXN_UPDATE);
 
-#define	SESSION_TXN_API_CALL(s, n, config, cfg)				\
-	TXN_API_CALL(s, session, n, NULL, NULL, config, cfg)
+/* End a transactional API call, optional retry on rollback. */
+#define TXN_API_END(s, ret, retry)                                  \
+    API_END(s, ret);                                                \
+    if (__update)                                                   \
+        F_CLR((s)->txn, WT_TXN_UPDATE);                             \
+    if (__autotxn) {                                                \
+        if (F_ISSET((s)->txn, WT_TXN_AUTOCOMMIT)) {                 \
+            F_CLR((s)->txn, WT_TXN_AUTOCOMMIT);                     \
+            if ((retry) && (ret) == WT_ROLLBACK) {                  \
+                (ret) = 0;                                          \
+                WT_STAT_CONN_DSRC_INCR(s, autocommit_update_retry); \
+                continue;                                           \
+            }                                                       \
+        } else if ((ret) == 0)                                      \
+            (ret) = __wt_txn_commit((s), NULL);                     \
+        else {                                                      \
+            if (retry)                                              \
+                WT_TRET(__wt_session_copy_values(s));               \
+            WT_TRET(__wt_txn_rollback((s), NULL, false));           \
+            if ((retry) && (ret) == WT_ROLLBACK) {                  \
+                (ret) = 0;                                          \
+                WT_STAT_CONN_DSRC_INCR(s, autocommit_update_retry); \
+                continue;                                           \
+            }                                                       \
+            WT_TRET(__wt_session_reset_cursors(s, false));          \
+        }                                                           \
+    }                                                               \
+    break;                                                          \
+    }                                                               \
+    /* !!!! This is a while(1) loop. !!!! */                        \
+    while (1)
 
-#define	CURSOR_API_CALL(cur, s, n, bt)					\
-	(s) = (WT_SESSION_IMPL *)(cur)->session;			\
-	API_CALL_NOCONF(s, cursor, n, cur,				\
-	    ((bt) == NULL) ? NULL : ((WT_BTREE *)(bt))->dhandle)
+/*
+ * In almost all cases, API_END is returning immediately, make it simple. If a session or connection
+ * method is about to return WT_NOTFOUND (some underlying object was not found), map it to ENOENT,
+ * only cursor methods return WT_NOTFOUND.
+ */
+#define API_END_RET(s, ret) \
+    API_END(s, ret);        \
+    return (ret)
 
-#define	CURSOR_UPDATE_API_CALL(cur, s, n, bt)				\
-	(s) = (WT_SESSION_IMPL *)(cur)->session;			\
-	TXN_API_CALL_NOCONF(s, cursor, n, cur,				\
-	    ((bt) == NULL) ? NULL : ((WT_BTREE *)(bt))->dhandle)
+#define API_END_STAT(s, ret, api)                   \
+    do {                                            \
+        if ((ret) != 0 && ((ret) != WT_NOTFOUND)) { \
+            WT_STAT_CONN_DSRC_INCR(s, api##_error); \
+        }                                           \
+    } while (0)
 
-#define	CURSOR_UPDATE_API_END(s, ret)					\
-	TXN_API_END(s, ret)
+#define API_RET_STAT(s, ret, api)  \
+    do {                           \
+        API_END_STAT(s, ret, api); \
+        return ((ret));            \
+    } while (0)
 
-#define	ASYNCOP_API_CALL(conn, s, n)					\
-	s = (conn)->default_session;					\
-	API_CALL_NOCONF(s, asyncop, n, NULL, NULL)
+#define API_END_RET_STAT(s, ret, api) \
+    do {                              \
+        API_END_STAT(s, ret, api);    \
+        API_END_RET(s, ret);          \
+    } while (0)
+
+#define API_END_RET_NOTFOUND_MAP(s, ret) API_END_RET(s, (ret) == WT_NOTFOUND ? ENOENT : (ret));
+
+/*
+ * Used in cases where transaction error should not be set, but the error is returned from the API.
+ * If the method is about to return WT_NOTFOUND map it to ENOENT.
+ */
+#define API_END_RET_NO_TXN_ERROR(s, ret) \
+    __set_err = false;                   \
+    API_END_RET_NOTFOUND_MAP(s, ret);
+
+#define API_USER_ENTRY(s) (s)->api_call_counter == 1
+
+/*
+ * Connection methods can run concurrently on the shared default session, so they skip the
+ * per-session API state, which assumes a single owning thread. The method's name is kept per thread
+ * instead.
+ */
+#define CONNECTION_API_CALL_NOCONF(conn, s, func_name)    \
+    s = (conn)->default_session;                          \
+    do {                                                  \
+        const char *__prev_api_name = __wt_conn_api_name; \
+        __wt_conn_api_name = "WT_CONNECTION." #func_name; \
+        WT_ERR(WT_SESSION_CHECK_PANIC(s));                \
+    __wt_verbose((s), WT_VERB_API, "%s", "CALL: WT_CONNECTION:" #func_name)
+
+#define CONNECTION_API_CALL(conn, s, func_name, config, cfg)                                \
+    s = (conn)->default_session;                                                            \
+    do {                                                                                    \
+        const char *__prev_api_name = __wt_conn_api_name;                                   \
+        const char *(cfg)[] = {WT_CONFIG_BASE(s, WT_CONNECTION_##func_name), config, NULL}; \
+        __wt_conn_api_name = "WT_CONNECTION." #func_name;                                   \
+        WT_ERR(WT_SESSION_CHECK_PANIC(s));                                                  \
+        __wt_verbose((s), WT_VERB_API, "%s", "CALL: WT_CONNECTION:" #func_name);            \
+    API_CONFIG_CHECK(s, WT_CONNECTION, func_name, config, cfg)
+
+/* Restore the name of the connection method if this call is nested. */
+#define CONNECTION_API_END(s)             \
+    __wt_conn_api_name = __prev_api_name; \
+    }                                     \
+    while (0)
+
+#define CONNECTION_API_END_RET(s, ret) \
+    CONNECTION_API_END(s);             \
+    return (ret)
+
+#define CONNECTION_API_END_RET_NOTFOUND_MAP(s, ret) \
+    CONNECTION_API_END_RET(s, (ret) == WT_NOTFOUND ? ENOENT : (ret))
+
+#define SESSION_API_CALL_PREPARE_ALLOWED(s, func_name, config, cfg, set_err) \
+    API_CALL(s, WT_SESSION, func_name, NULL, config, cfg, set_err)
+
+#define SESSION_API_CALL_PREPARE_ALLOWED_NOCONF(s, func_name) \
+    API_CALL_NOCONF(s, WT_SESSION, func_name, NULL, false)
+
+#define SESSION_API_CALL_PREPARE_NOT_ALLOWED(s, ret, func_name, config, cfg, set_err) \
+    API_CALL(s, WT_SESSION, func_name, NULL, config, cfg, set_err);                   \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_SESSION, func_name)
+
+#define SESSION_API_CALL_PREPARE_NOT_ALLOWED_NOCONF(s, ret, func_name) \
+    API_CALL_NOCONF(s, WT_SESSION, func_name, NULL, false);            \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_SESSION, func_name)
+
+#define SESSION_API_PREPARE_CHECK(s, ret, struct_name, func_name)                                \
+    do {                                                                                         \
+        if ((s)->api_call_counter == 1) {                                                        \
+            (ret) = __wt_txn_context_prepare_check(s);                                           \
+            if ((ret) != 0) {                                                                    \
+                /*                                                                               \
+                 * Don't set the error on transaction. We don't want to rollback the transaction \
+                 * because of this error.                                                        \
+                 */                                                                              \
+                __set_err = false;                                                               \
+                goto err;                                                                        \
+            }                                                                                    \
+        }                                                                                        \
+    } while (0)
+
+#define SESSION_API_CALL(s, ret, func_name, config, cfg, set_err)   \
+    API_CALL(s, WT_SESSION, func_name, NULL, config, cfg, set_err); \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_SESSION, func_name)
+
+#define SESSION_API_CALL_NOCONF(s, func_name) API_CALL_NOCONF(s, WT_SESSION, func_name, NULL, false)
+
+#define SESSION_TXN_API_CALL(s, ret, func_name, config, cfg)   \
+    TXN_API_CALL(s, WT_SESSION, func_name, NULL, config, cfg); \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_SESSION, func_name)
+
+#define CURSOR_API_CHECK_SYSTEM_OVERLOAD(s, ret)                                               \
+    do {                                                                                       \
+        if (API_USER_ENTRY(s) &&                                                               \
+          (!F_ISSET(                                                                           \
+            s, WT_SESSION_INTERNAL | WT_SESSION_CHECKPOINT | WT_SESSION_IGNORE_CACHE_SIZE))) { \
+            if (__wt_conn_load_control_read_loadshed(s)) {                                     \
+                WT_STAT_CONN_INCR(s, read_reject_count);                                       \
+                (ret) = WT_ROLLBACK;                                                           \
+                goto err;                                                                      \
+            }                                                                                  \
+        }                                                                                      \
+    } while (0)
+
+#define CURSOR_API_CALL(cur, s, ret, func_name, dh)          \
+    (s) = CUR2S(cur);                                        \
+    API_CALL_NOCONF(s, WT_CURSOR, func_name, dh, true);      \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_CURSOR, func_name); \
+    if (F_ISSET(cur, WT_CURSTD_CACHED))                      \
+    WT_ERR(__wt_cursor_cached(cur))
+
+#define CURSOR_API_CALL_CONF(cur, s, ret, func_name, config, cfg, dh) \
+    (s) = CUR2S(cur);                                                 \
+    API_CALL(s, WT_CURSOR, func_name, (dh), config, cfg, true);       \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_CURSOR, func_name);          \
+    if (F_ISSET(cur, WT_CURSTD_CACHED))                               \
+    WT_ERR(__wt_cursor_cached(cur))
+
+#define CURSOR_API_CALL_PREPARE_ALLOWED(cur, s, func_name, dh) \
+    (s) = CUR2S(cur);                                          \
+    API_CALL_NOCONF(s, WT_CURSOR, func_name, (dh), true);      \
+    if (F_ISSET(cur, WT_CURSTD_CACHED))                        \
+    WT_ERR(__wt_cursor_cached(cur))
+
+/*
+ * API_RETRYABLE and API_RETRYABLE_END are used to wrap API calls so that they are silently retried
+ * on rollback errors. Generally, these only need to be used with readonly APIs, as writable APIs
+ * have their own retry code via TXN_API_CALL. These macros may be used with *API_CALL and API_END*
+ * provided they are ordered in a balanced way.
+ */
+#define API_RETRYABLE(s) do {
+
+#define API_RETRYABLE_END(s, ret)                                                                \
+    if ((ret) != WT_ROLLBACK || F_ISSET((s)->txn, WT_TXN_RUNNING) || (s)->api_call_counter != 1) \
+        break;                                                                                   \
+    (ret) = 0;                                                                                   \
+    WT_STAT_CONN_DSRC_INCR(s, autocommit_readonly_retry);                                        \
+    }                                                                                            \
+    /* !!!! This is a while(1) loop. !!!! */                                                     \
+    while (1)
+
+#define CURSOR_REMOVE_API_CALL(cur, s, ret, dh)                                                    \
+    (s) = CUR2S(cur);                                                                              \
+    TXN_API_CALL_NOCONF(s, WT_CURSOR, remove, (dh));                                               \
+    if (API_USER_ENTRY(s) &&                                                                       \
+      (!F_ISSET(s, WT_SESSION_INTERNAL | WT_SESSION_CHECKPOINT | WT_SESSION_IGNORE_CACHE_SIZE))) { \
+        if (__wt_conn_load_control_write_loadshed(s)) {                                            \
+            WT_STAT_CONN_INCR(s, write_reject_count);                                              \
+            (ret) = WT_ROLLBACK;                                                                   \
+            goto err;                                                                              \
+        }                                                                                          \
+    }                                                                                              \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_CURSOR, remove)
+
+#define CURSOR_UPDATE_API_CALL_BTREE(cur, s, ret, func_name)                                       \
+    (s) = CUR2S(cur);                                                                              \
+    TXN_API_CALL_NOCONF(s, WT_CURSOR, func_name, ((WT_CURSOR_BTREE *)(cur))->dhandle);             \
+    if (API_USER_ENTRY(s) &&                                                                       \
+      (!F_ISSET(s, WT_SESSION_INTERNAL | WT_SESSION_CHECKPOINT | WT_SESSION_IGNORE_CACHE_SIZE))) { \
+        if (__wt_conn_load_control_write_loadshed(s)) {                                            \
+            WT_STAT_CONN_INCR(s, write_reject_count);                                              \
+            (ret) = WT_ROLLBACK;                                                                   \
+            goto err;                                                                              \
+        }                                                                                          \
+    }                                                                                              \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_CURSOR, func_name);                                       \
+    if (F_ISSET(S2C(s), WT_CONN_IN_MEMORY) && !F_ISSET(CUR2BT(cur), WT_BTREE_IGNORE_CACHE) &&      \
+      __wt_cache_full(s))                                                                          \
+        WT_ERR(WT_CACHE_FULL);
+
+#define CURSOR_UPDATE_API_CALL(cur, s, ret, func_name, dh)                                         \
+    (s) = CUR2S(cur);                                                                              \
+    TXN_API_CALL_NOCONF(s, WT_CURSOR, func_name, dh);                                              \
+    if (API_USER_ENTRY(s) &&                                                                       \
+      (!F_ISSET(s, WT_SESSION_INTERNAL | WT_SESSION_CHECKPOINT | WT_SESSION_IGNORE_CACHE_SIZE))) { \
+        if (__wt_conn_load_control_write_loadshed(s)) {                                            \
+            WT_STAT_CONN_INCR(s, write_reject_count);                                              \
+            (ret) = WT_ROLLBACK;                                                                   \
+            goto err;                                                                              \
+        }                                                                                          \
+    }                                                                                              \
+    SESSION_API_PREPARE_CHECK(s, ret, WT_CURSOR, func_name)
+
+#define CURSOR_UPDATE_API_END_RETRY(s, ret, retry) \
+    if ((ret) == WT_PREPARE_CONFLICT)              \
+        (ret) = WT_ROLLBACK;                       \
+    TXN_API_END(s, ret, retry)
+
+#define CURSOR_UPDATE_API_END(s, ret) CURSOR_UPDATE_API_END_RETRY(s, ret, true)
+
+#define CURSOR_UPDATE_API_END_RETRY_STAT(s, ret, retry, api) \
+    if ((ret) == WT_PREPARE_CONFLICT)                        \
+        (ret) = WT_ROLLBACK;                                 \
+    API_END_STAT(s, ret, api);                               \
+    TXN_API_END(s, ret, retry)
+
+#define CURSOR_UPDATE_API_END_STAT(s, ret, api) CURSOR_UPDATE_API_END_RETRY_STAT(s, ret, true, api)
+
+/*
+ * Calling certain top level APIs allows for internal repositioning of cursors to facilitate
+ * eviction of hot pages. These macros facilitate tracking when that is OK.
+ */
+#define CURSOR_REPOSITION_ENTER(c, s)                                      \
+    if (FLD_ISSET(S2C(s)->debug.flags, WT_CONN_DEBUG_CURSOR_REPOSITION) && \
+      (s)->api_call_counter == 1)                                          \
+    F_SET((c), WT_CURSTD_EVICT_REPOSITION)
+
+#define CURSOR_REPOSITION_END(c, s)                                        \
+    if (FLD_ISSET(S2C(s)->debug.flags, WT_CONN_DEBUG_CURSOR_REPOSITION) && \
+      (s)->api_call_counter == 1)                                          \
+    F_CLR((c), WT_CURSTD_EVICT_REPOSITION)
+
+/*
+ * Macros to set up APIs that use compiled configuration strings.
+ */
+#define WT_DECL_CONF(h, n, conf)  \
+    WT_CONF_API_TYPE(h, n) _conf; \
+    WT_CONF *conf = NULL
+
+#define API_CONF(session, h, n, config, conf)                                   \
+    WT_ERR(__wt_conf_compile_api_call(session, WT_CONFIG_REF(session, h##_##n), \
+      WT_CONFIG_ENTRY_##h##_##n, config, &_conf, sizeof(_conf), &conf))
+
+#define SESSION_API_CONF(session, n, cfg, conf) API_CONF(session, WT_SESSION, n, cfg, conf)
+
+/*
+ * There is currently nothing to free, so this is a placeholder for any other cleanup we need in the
+ * future.
+ */
+#define API_CONF_END(session, conf)

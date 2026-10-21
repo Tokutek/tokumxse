@@ -1,0 +1,254 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/update/document_diff_applier.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace write_ops {
+using namespace std::literals::string_view_literals;
+
+// Conservative per array element overhead. This value was calculated as 1 byte (element type) + 5
+// bytes (max string encoding of the array index encoded as string and the maximum key is 99999) + 1
+// byte (zero terminator) = 7 bytes
+[[MONGO_MOD_PUBLIC]] constexpr int kWriteCommandBSONArrayPerElementOverheadBytes = 7;
+
+[[MONGO_MOD_PUBLIC]] constexpr int kRetryableAndTxnBatchWriteBSONSizeOverhead =
+    kWriteCommandBSONArrayPerElementOverheadBytes * 2;
+
+/**
+ * Parses the 'limit' property of a delete entry, which has inverted meaning from the 'multi'
+ * property of an update.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+bool readMultiDeleteProperty(const BSONElement& limitElement);
+
+/**
+ * Writes the 'isMulti' value as a limit property.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void writeMultiDeleteProperty(bool isMulti, std::string_view fieldName, BSONObjBuilder* builder);
+
+/**
+ * Serializes the opTime fields to specified BSON builder. A 'term' field will be included only
+ * when it is intialized.
+ */
+void opTimeSerializerWithTermCheck(repl::OpTime opTime,
+                                   std::string_view fieldName,
+                                   BSONObjBuilder* bob);
+
+/**
+ * Method to deserialize the specified BSON element to opTime. This method is used by the IDL
+ * parser to generate the deserializer code.
+ */
+repl::OpTime opTimeParser(BSONElement elem);
+
+class [[MONGO_MOD_PUBLIC]] UpdateModification {
+public:
+    enum class Type { kReplacement, kModifier, kPipeline, kDelta, kTransform };
+    using TransformFunc = std::function<boost::optional<BSONObj>(const BSONObj&)>;
+
+    /**
+     * Used to indicate that a certain type of update is being passed to the constructor.
+     */
+    struct DiffOptions {
+        bool mustCheckExistenceForInsertOperations = true;
+    };
+
+    /**
+     * Tags used to disambiguate between the constructors for different update types.
+     */
+    struct ModifierUpdateTag {};
+    struct ReplacementTag {};
+    struct DeltaTag {};
+
+    // Given the 'o' field of an update oplog entry, will return an UpdateModification that can be
+    // applied. The `options` parameter will be applied only in the case a Delta update is parsed.
+    static UpdateModification parseFromOplogEntry(const BSONObj& oField,
+                                                  const DiffOptions& options);
+    static UpdateModification parseFromClassicUpdate(const BSONObj& modifiers) {
+        return UpdateModification(modifiers);
+    }
+    static UpdateModification parseFromV2Delta(const doc_diff::Diff& diff,
+                                               DiffOptions const& options) {
+        return UpdateModification(diff, DeltaTag{}, options);
+    }
+
+    UpdateModification() = default;
+    UpdateModification(BSONElement update);
+    UpdateModification(std::vector<BSONObj> pipeline);
+    UpdateModification(doc_diff::Diff, DeltaTag, DiffOptions);
+    // Creates an transform-style update. The transform function MUST preserve the _id element.
+    UpdateModification(TransformFunc transform);
+    // These constructors exists only to provide a fast-path.
+    UpdateModification(const BSONObj& update, ModifierUpdateTag);
+    UpdateModification(const BSONObj& update, ReplacementTag);
+    // If we don't know whether the update is a replacement or a modifier style update, for example
+    // while we are parsing a user request, we infer this by checking whether the first element is a
+    // $-field to distinguish modifier style updates.
+    UpdateModification(const BSONObj& update);
+
+    // 'verifierFunction' is an optional field that can be set to perform a check during diff
+    // application.
+    doc_diff::VerifierFunc verifierFunction = nullptr;
+
+    /**
+     * These methods support IDL parsing of the "u" field from the update command and OP_UPDATE.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    static UpdateModification parseFromBSON(BSONElement elem);
+
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    void serializeToBSON(std::string_view fieldName, BSONObjBuilder* bob) const;
+
+    int objsize() const;
+
+    Type type() const;
+
+    BSONObj getUpdateReplacement() const {
+        tassert(11052018, "Unexpected type", type() == Type::kReplacement);
+        return get<ReplacementUpdate>(_update).bson;
+    }
+
+    BSONObj getUpdateModifier() const {
+        tassert(11052019, "Unexpected type", type() == Type::kModifier);
+        return get<ModifierUpdate>(_update).bson;
+    }
+
+    const std::vector<BSONObj>& getUpdatePipeline() const {
+        tassert(11052020, "Unexpected type", type() == Type::kPipeline);
+        return get<PipelineUpdate>(_update);
+    }
+
+    doc_diff::Diff getDiff() const {
+        tassert(11052021, "Unexpected type", type() == Type::kDelta);
+        return get<DeltaUpdate>(_update).diff;
+    }
+
+    const TransformFunc& getTransform() const {
+        tassert(11052022, "Unexpected type", type() == Type::kTransform);
+        return get<TransformUpdate>(_update).transform;
+    }
+
+    bool mustCheckExistenceForInsertOperations() const {
+        tassert(11052023, "Unexpected type", type() == Type::kDelta);
+        return get<DeltaUpdate>(_update).options.mustCheckExistenceForInsertOperations;
+    }
+
+    std::string toString() const {
+        StringBuilder sb;
+
+        visit(OverloadedVisitor{[&sb](const ReplacementUpdate& replacement) {
+                                    sb << "{type: Replacement, update: " << replacement.bson << "}";
+                                },
+                                [&sb](const ModifierUpdate& modifier) {
+                                    sb << "{type: Modifier, update: " << modifier.bson << "}";
+                                },
+                                [&sb](const PipelineUpdate& pipeline) {
+                                    sb << "{type: Pipeline, update: " << Value(pipeline).toString()
+                                       << "}";
+                                },
+                                [&sb](const DeltaUpdate& delta) {
+                                    sb << "{type: Delta, update: " << delta.diff << "}";
+                                },
+                                [&sb](const TransformUpdate& transform) {
+                                    sb << "{type: Transform}";
+                                }},
+              _update);
+
+        return sb.str();
+    }
+
+private:
+    // Wrapper class used to avoid having a variant where multiple alternatives have the same type.
+    struct ReplacementUpdate {
+        BSONObj bson;
+    };
+    struct ModifierUpdate {
+        BSONObj bson;
+    };
+    using PipelineUpdate = std::vector<BSONObj>;
+    struct DeltaUpdate {
+        doc_diff::Diff diff;
+        DiffOptions options;
+    };
+    struct TransformUpdate {
+        TransformFunc transform;
+    };
+    std::variant<ReplacementUpdate, ModifierUpdate, PipelineUpdate, DeltaUpdate, TransformUpdate>
+        _update;
+};
+
+/**
+ * This class is IDL-looking and it abstracts the vagaries of how write errors are reported in write
+ * commands, which is not consistent across different errors.
+ *
+ * Specifically, certain errors (such as DuplicateKey, StaleConfig) store the error information
+ * inline with the write error object's BSON, whereas others place it under an errInfo field. This
+ * model doesn't fit with IDL, which does not have support for placing fields at the same level as
+ * the owning object.
+ */
+class [[MONGO_MOD_PUBLIC]] WriteError {
+public:
+    static constexpr auto kIndexFieldName = "index"sv;
+    static constexpr auto kCodeFieldName = "code"sv;
+    static constexpr auto kErrmsgFieldName = "errmsg"sv;
+    static constexpr auto kErrInfoFieldName = "errInfo"sv;
+
+    static WriteError parse(const BSONObj& obj);
+    BSONObj serialize() const;
+
+    WriteError(int32_t index, Status status);
+
+    int32_t getIndex() const {
+        return _index;
+    }
+    void setIndex(int32_t index) {
+        _index = index;
+    }
+
+    const Status& getStatus() const {
+        return _status;
+    }
+    void setStatus(const Status& status) {
+        _status = status;
+    }
+
+private:
+    int32_t _index;
+    Status _status;
+};
+
+}  // namespace write_ops
+}  // namespace mongo

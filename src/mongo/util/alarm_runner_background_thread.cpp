@@ -1,0 +1,97 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/util/alarm_runner_background_thread.h"
+
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+
+#include <algorithm>
+#include <mutex>
+
+namespace mongo {
+
+void AlarmRunnerBackgroundThread::start() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _running = true;
+    _thread = stdx::thread(&AlarmRunnerBackgroundThread::_threadRoutine, this);
+}
+
+void AlarmRunnerBackgroundThread::shutdown() {
+    std::unique_lock<std::mutex> lk(_mutex);
+    _running = false;
+    lk.unlock();
+    _condVar.notify_one();
+    _thread.join();
+
+    for (const auto& scheduler : _schedulers) {
+        scheduler->clearAllAlarmsAndShutdown();
+    }
+}
+
+std::vector<AlarmRunnerBackgroundThread::AlarmSchedulerHandle>
+AlarmRunnerBackgroundThread::_initializeSchedulers(std::vector<AlarmSchedulerHandle> schedulers) {
+    invariant(!schedulers.empty());
+
+    const auto registerHook = [this](Date_t next, const std::shared_ptr<AlarmScheduler>& which) {
+        std::unique_lock<std::mutex> lk(_mutex);
+        if (next >= _nextAlarm) {
+            return;
+        }
+
+        _nextAlarm = next;
+        _condVar.notify_one();
+    };
+
+    const auto clockSource = schedulers.front()->clockSource();
+    for (auto& scheduler : schedulers) {
+        scheduler->setAlarmRegisterHook(registerHook);
+        auto nextAlarm = scheduler->nextAlarm();
+        if (nextAlarm < _nextAlarm) {
+            _nextAlarm = nextAlarm;
+        }
+        // The thread routine uses the clock source of the first registered scheduler to wait
+        // on its condvar, so all registered schedulers must use the same clock source.
+        fassert(51046, scheduler->clockSource() == clockSource);
+    }
+
+    return schedulers;
+}
+
+void AlarmRunnerBackgroundThread::_threadRoutine() {
+    std::unique_lock<std::mutex> lk(_mutex);
+    while (_running) {
+        const auto clockSource = _schedulers.front()->clockSource();
+        const auto now = clockSource->now();
+
+        // Schedulers may try to alter our _nextAlarm/_newAlarm state as they process expired
+        // alarms that then reschedule themselves, so to eliminate any lock contention, just
+        // unlock the mutex while we process expired alarms.
+        lk.unlock();
+        for (const auto& scheduler : _schedulers) {
+            if (scheduler->nextAlarm() > now) {
+                continue;
+            }
+            scheduler->processExpiredAlarms();
+        }
+
+        // Lock the mutex while the sleep duration is computed. This will block schedulers from
+        // scheduling new alarms.
+        lk.lock();
+        auto sleepUntil = Date_t::max();
+        for (const auto& scheduler : _schedulers) {
+            sleepUntil = std::min(sleepUntil, scheduler->nextAlarm());
+        }
+
+        // Update _nextAlarm so that any schedulers that have pending new alarms see the actual
+        // time we're about to sleep for, and set _newAlarm to false before going to sleep.
+        _nextAlarm = sleepUntil;
+
+        clockSource->waitForConditionUntil(_condVar, lk, _nextAlarm, [&] {
+            return (_nextAlarm != sleepUntil || _running == false);
+        });
+    }
+}
+
+}  // namespace mongo

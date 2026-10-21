@@ -1,0 +1,299 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/exchange_spec_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/sharded_agg_helpers_targeting_policy.h"
+#include "mongo/db/pipeline/split_pipeline.h"
+#include "mongo/db/query/client_cursor/cursor_response_gen.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/query/exec/owned_remote_cursor.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace sharded_agg_helpers {
+
+struct ShardedExchangePolicy {
+    // The exchange specification that will be sent to shards as part of the aggregate command.
+    // It will be used by producers to determine how to distribute documents to consumers.
+    ExchangeSpec exchangeSpec;
+
+    // Shards that will run the consumer part of the exchange.
+    std::vector<ShardId> consumerShards;
+};
+
+struct [[MONGO_MOD_PUBLIC]] DispatchShardPipelineResults {
+    // Contains a value when the second half of the pipeline was requested to run on a specific
+    // shard.
+    boost::optional<ShardId> mergeShardId;
+
+    // Populated if this *is not* an explain, this vector represents the cursors on the remote
+    // shards.
+    std::vector<OwnedRemoteCursor> remoteCursors;
+
+    // Populated if this *is* an explain, this vector represents the results from each shard.
+    std::vector<AsyncRequestsSender::Response> remoteExplainOutput;
+
+    // The split version of the pipeline if more than one shard was targeted, otherwise
+    // boost::none.
+    boost::optional<SplitPipeline> splitPipeline;
+
+    // If the pipeline targeted a single shard, this is the pipeline to run on that shard.
+    std::unique_ptr<Pipeline> pipelineForSingleShard;
+
+    // The command object to send to the targeted shards.
+    BSONObj commandForTargetedShards;
+
+    // How many exchange producers are running the shard part of splitPipeline.
+    size_t numProducers;
+
+    // The exchange specification if the query can run with the exchange otherwise boost::none.
+    boost::optional<ShardedExchangePolicy> exchangeSpec;
+};
+
+/**
+ * If the merging pipeline is eligible for an $exchange merge optimization, returns the information
+ * required to set that up.
+ */
+boost::optional<ShardedExchangePolicy> checkIfEligibleForExchange(OperationContext* opCtx,
+                                                                  const Pipeline* mergePipeline);
+
+/**
+ * Returns true if 'pipeline' contains a $setVariableFromSubPipeline stage whose sub-pipeline has
+ * not been given an initial cursor source, i.e. the SEARCH_META metadata cursors have not been
+ * injected via injectMetaCursor(). A merge pipeline in this state cannot be executed, so this is
+ * used to assert that the metadata-cursor invariant holds.
+ */
+bool hasUnsourcedSetVariableStage(const Pipeline& pipeline);
+
+/**
+ * Used to indicate if a pipeline contains any data source requiring extra handling for targeting
+ * shards.
+ */
+enum class [[MONGO_MOD_PUBLIC]] PipelineDataSource {
+    kNormal,
+    kChangeStream,          // Indicates a pipeline has a $changeStream stage.
+    kGeneratesOwnDataOnce,  // Indicates the shards part needs to be executed on a single node.
+};
+
+/**
+ * Targets shards for the pipeline and returns a struct with the remote cursors or results, and the
+ * pipeline that will need to be executed to merge the results from the remotes. If the command is
+ * eligible for sampling, attaches a unique sample id to the request for one of the targeted shards
+ * if the collection has query sampling enabled and the rate-limited sampler successfully generates
+ * a sample id for it.
+ *
+ * Although the 'pipeline' has an 'ExpressionContext' which indicates whether this operation is an
+ * explain (and if it is an explain what the verbosity is), the caller must explicitly indicate
+ * whether it wishes to dispatch a regular aggregate command or an explain command using the
+ * explicit 'explain' parameter. The reason for this is that in some contexts, the caller wishes to
+ * dispatch a regular agg command rather than an explain command even if the top-level operation is
+ * an explain. Consider the example of an explain that contains a stage like this:
+ *
+ *     {$unionWith: {coll: "innerShardedColl", pipeline: <sub-pipeline>}}
+ *
+ * The explain works by first executing the inner and outer subpipelines in order to gather runtime
+ * statistics. While dispatching the inner pipeline, we must dispatch it not as an explain but as a
+ * regular agg command so that the runtime stats are accurate.
+ *
+ * The caller of this function must handle any stale shard version error error thrown by
+ * `dispatchShardPipeline`.
+ */
+[[MONGO_MOD_PUBLIC]] DispatchShardPipelineResults dispatchShardPipeline(
+    RoutingContext& routingCtx,
+    Document serializedCommand,
+    PipelineDataSource pipelineDataSource,
+    bool eligibleForSampling,
+    std::unique_ptr<Pipeline> pipeline,
+    boost::optional<ExplainOptions::Verbosity> explain,
+    const NamespaceString& targetedNss,
+    IncludeMetrics remoteMetricsToInclude = IncludeMetrics{},
+    ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+    boost::optional<BSONObj> readConcern = boost::none,
+    AsyncRequestsSender::ShardHostMap designatedHostsMap = {},
+    stdx::unordered_map<ShardId, BSONObj> resumeTokenMap = {},
+    std::set<ShardId> shardsToSkip = {});
+
+BSONObj createPassthroughCommandForShard(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    Document serializedCommand,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity,
+    Pipeline* pipeline,
+    boost::optional<BSONObj> readConcern,
+    boost::optional<int> overrideBatchSize,
+    IncludeMetrics remoteMetricsToInclude);
+
+BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       Document serializedCommand,
+                                       const SplitPipeline& splitPipeline,
+                                       boost::optional<ShardedExchangePolicy> exchangeSpec,
+                                       bool needsMerge,
+                                       boost::optional<ExplainOptions::Verbosity> explain,
+                                       boost::optional<BSONObj> readConcern = boost::none,
+                                       IncludeMetrics remoteMetricsToInclude = IncludeMetrics{});
+
+/**
+ * Convenience method for callers that want to do 'partitionCursors', 'injectMetaCursors', and
+ * 'addMergeCursorsSource' in order.
+ */
+void partitionAndAddMergeCursorsSource(Pipeline* pipeline,
+                                       std::vector<OwnedRemoteCursor> cursors,
+                                       boost::optional<BSONObj> shardCursorsSortSpec,
+                                       IncludeMetrics remoteMetricsToInclude);
+
+/**
+ * Targets the shards with an aggregation command built from `pipeline` and explain set to true.
+ * Returns a BSONObj of the form {"pipeline": {<pipelineExplainOutput>}}.
+ */
+BSONObj finalizePipelineAndTargetShardsForExplain(
+    std::unique_ptr<Pipeline> pipeline,
+    std::function<void(Pipeline* pipeline)> optimizePipeline = nullptr);
+
+/**
+ * Returns a set of targeted shards responsible for answering the 'shardQuery'.
+ */
+std::set<ShardId> getTargetedShards(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                    PipelineDataSource pipelineDataSource,
+                                    const boost::optional<CollectionRoutingInfo>& cri,
+                                    const BSONObj& shardQuery,
+                                    const BSONObj& collation,
+                                    const boost::optional<ShardId>& mergeShardId);
+
+void mergeExplainOutputFromShards(const std::vector<AsyncRequestsSender::Response>& shardResponses,
+                                  BSONObjBuilder* result);
+/**
+ * Appends the explain output of `dispatchResults` to `result`.
+ */
+Status appendExplainResults(DispatchShardPipelineResults&& dispatchResults,
+                            const boost::intrusive_ptr<ExpressionContext>& mergeCtx,
+                            BSONObjBuilder* result);
+
+/**
+ * Returns true if an aggregation over 'nss' must run on all shards.
+ */
+bool checkIfMustRunOnAllShards(const NamespaceString& nss, PipelineDataSource pipelineDataSource);
+
+/**
+ * Returns the PipelineDataSource given a parsed pipeline.
+ */
+PipelineDataSource getPipelineDataSource(const LiteParsedPipeline& liteParsedPipeline);
+
+/**
+ * Retrieves the desired retry policy based on whether the default writeConcern is set on 'opCtx'.
+ */
+Shard::RetryPolicy getDesiredRetryPolicy(OperationContext* opCtx);
+
+/**
+ * Prepares the given pipeline for execution. This involves:
+ * (1) Determining if the pipeline needs to have a cursor source attached.
+ * (2) If a cursor source is needed, attaching one. This may involve a local or remote cursor,
+ * depending on whether or not the pipeline's expression context permits local reads and a local
+ * read could be used to serve the pipeline. (3) Splitting the pipeline if required, and dispatching
+ * half to the shards, leaving the merging half executing in this process after attaching a
+ * $mergeCursors.
+ *
+ * Will retry on network errors and also on StaleConfig errors to avoid restarting the entire
+ * operation. Returns `pipeline`, but made-ready for execution.
+ */
+std::unique_ptr<Pipeline> preparePipelineForExecution(
+    std::unique_ptr<Pipeline> pipeline,
+    ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+    boost::optional<BSONObj> readConcern = boost::none);
+
+
+std::unique_ptr<Pipeline> finalizeAndMaybePreparePipelineForExecution(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::unique_ptr<Pipeline> pipeline,
+    bool attachCursorAfterOptimizing,
+    std::function<void(Pipeline* pipeline)> optimizePipeline = nullptr,
+    ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+    boost::optional<BSONObj> readConcern = boost::none,
+    bool shouldUseCollectionDefaultCollator = false);
+
+/**
+ * For a sharded collection, establishes remote cursors on each shard that may have results, and
+ * creates a DocumentSourceMergeCursors stage to merge the remote cursors. Returns a pipeline
+ * beginning with that DocumentSourceMergeCursors stage. Note that one of the 'remote' cursors might
+ * be this node itself.
+ *
+ * Even if the ExpressionContext indicates that this operation is explain, this function still
+ * dispatches the pipeline as a non-explain, since it must open cursors on the remote nodes and
+ * merge them with a $mergeCursors. If the caller's intent is to dispatch an explain command, it
+ * must use a different helper.
+ *
+ * Use the AggregateCommandRequest alternative for 'targetRequest' to explicitly specify command
+ * options (e.g. read concern) to the shards when establishing remote cursors. Note that doing so
+ * incurs the cost of parsing the pipeline.
+ *
+ * Use the std::pair<AggregateCommandRequest, std::unique_ptr<Pipeline>>
+ * alternative for 'targetRequest' to explicitly specify command options (e.g. read concern) to the
+ * shards when establishing remote cursors, and to pass a pipeline that has already been parsed.
+ * This is useful when the pipeline has already been parsed as it avoids the cost
+ * of parsing it again.
+ */
+std::unique_ptr<Pipeline> targetShardsAndAddMergeCursors(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::variant<std::unique_ptr<Pipeline>,
+                 AggregateCommandRequest,
+                 std::pair<AggregateCommandRequest, std::unique_ptr<Pipeline>>> targetRequest,
+    boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+    ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+    boost::optional<BSONObj> readConcern = boost::none,
+    bool shouldUseCollectionDefaultCollator = false);
+
+/**
+ * For a sharded or unsharded collection, establishes a remote cursor on only the specified shard,
+ * and creates a DocumentSourceMergeCursors stage to consume the remote cursor. Returns a pipeline
+ * beginning with that DocumentSourceMergeCursors stage.
+ *
+ * This function bypasses normal shard targeting for sharded and unsharded collections. It is
+ * especially useful for reading from unsharded collections such as config.transactions and
+ * local.oplog.rs that cannot be targeted by targetShardsAndAddMergeCursors().
+ *
+ * Note that the specified AggregateCommandRequest must not be for an explain command.
+ */
+[[MONGO_MOD_PUBLIC]] std::unique_ptr<Pipeline> runPipelineDirectlyOnSingleShard(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    AggregateCommandRequest request,
+    ShardId shardId,
+    IncludeMetrics remoteMetricsToInclude);
+
+/**
+ * Opens a $changeStream cursor on the 'config.shards' collection to watch for new shards if:
+ * - 'pipelineDataSource' is kChangeStream
+ * - change stream is not of version v2
+ * - change stream is not already running over 'config.shards' collection.
+ */
+boost::optional<RemoteCursor> openChangeStreamCursorOnConfigsvrIfNeeded(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    PipelineDataSource pipelineDataSource,
+    Timestamp startMonitoringAtTime);
+
+}  // namespace sharded_agg_helpers
+}  // namespace mongo

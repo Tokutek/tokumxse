@@ -1,0 +1,263 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "bson_template_evaluator",
+    srcs = [
+        "bson_template_evaluator.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+idl_generator(
+    name = "config_gen",
+    src = "config.idl",
+)
+
+idl_generator(
+    name = "config_engine_gen",
+    src = "config_engine.idl",
+)
+
+idl_generator(
+    name = "config_engine_wasm_gen",
+    src = "config_engine_wasm.idl",
+)
+
+idl_generator(
+    name = "deadline_monitor_gen",
+    src = "deadline_monitor.idl",
+)
+
+mongo_cc_library(
+    name = "scripting_common",
+    srcs = [
+        "dbdirectclient_factory.cpp",
+        "deadline_monitor.cpp",
+        "engine.cpp",
+        "jsexception.cpp",
+        "mongo_path_util.cpp",
+        "utils.cpp",
+        ":config_engine_gen",
+        ":config_gen",
+        ":deadline_monitor_gen",
+        "//src/mongo/scripting/mozjs/common:hex_md5.cpp",
+    ],
+    hdrs = [
+        ":config_engine_gen",
+        ":config_gen",
+    ],
+    deps = [
+        ":bson_template_evaluator",
+        "//src/mongo/client:clientdriver_minimal",
+        "//src/mongo/db:server_base",
+        "//src/mongo/scripting/mozjs/server:server_jsfiles",
+        "//src/mongo/shell:mongojs",
+    ],
+)
+
+mongo_cc_library(
+    name = "scripting",
+    copts = select({
+        "@platforms//os:windows": [
+            # The default MSVC preprocessor elides commas in some cases as a
+            # convenience, but this behavior breaks compilation of jspubtd.h.
+            # Enabling the newer preprocessor fixes the problem.
+            "/Zc:preprocessor",
+            "/wd5104",
+            "/wd5105",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        "//bazel/config:compiler_type_clang": [
+            "-Wno-dangling",
+        ],
+        "//bazel/config:compiler_type_gcc": [
+            "-Wno-dangling-pointer",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        "//bazel/config:spider_monkey_dbg_enabled": ["MONGO_SPIDERMONKEY_DBG"],
+        "//conditions:default": [],
+    }),
+    srcs_select = [{
+        "//bazel/config:js_engine_none": [
+            "scripting_none.cpp",
+        ],
+        "//conditions:default": [],
+    }],
+    deps = [
+        ":scripting_common",
+        "//src/mongo/util:buildinfo",
+    ] + select({
+        "//bazel/config:js_engine_none": [
+            ":scripting_none",
+        ],
+        "//conditions:default": [
+            "//src/mongo/client:clientdriver_network",
+            "//src/mongo/db:service_context",
+            "//src/mongo/db/auth:security_token_auth",
+            "//src/mongo/scripting/mozjs/common:mozjs_common",
+            "//src/mongo/scripting/mozjs/shell:mozjs_shell",
+            "//src/mongo/util/concurrency:spin_lock",
+            "//src/third_party/mozjs",
+        ],
+    }),
+)
+
+mongo_cc_library(
+    name = "scripting_none",
+    srcs = [
+        "engine_none.cpp",
+    ],
+    deps = [
+        ":scripting_common",
+    ],
+)
+
+mongo_cc_library(
+    name = "scripting_wasm",
+    deps = [
+        ":scripting_common",
+        "//src/mongo/scripting/mozjs/wasm:wasmtime_engine",
+        "//src/mongo/util:buildinfo",
+    ],
+)
+
+mongo_cc_library(
+    name = "scripting_server",
+    srcs = [
+        "scripting_server.cpp",
+    ],
+    deps = select({
+        "//bazel/config:js_engine_wasm_supported": [":scripting_wasm"],
+        "//bazel/config:js_engine_use_legacy": [":scripting"],
+        "//conditions:default": [":scripting_none"],
+    }),
+)
+
+mongo_cc_unit_test(
+    name = "scripting_test",
+    srcs = [
+        "bson_template_evaluator_test.cpp",
+        "deadline_monitor_test.cpp",
+    ],
+    tags = ["mongo_unittest_second_group"],
+    deps = [
+        ":scripting_common",
+        "//src/mongo/db/shard_role/lock_manager",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "scripting_engine_killop_proxy_test",
+    srcs = [
+        "//src/mongo/scripting/mozjs/shell:engine_killop_proxy_test.cpp",
+    ],
+    copts = select({
+        "@platforms//os:windows": [
+            "/Zc:preprocessor",
+            "/wd5104",
+            "/wd5105",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        "//bazel/config:spider_monkey_dbg_enabled": ["MONGO_SPIDERMONKEY_DBG"],
+        "//conditions:default": [],
+    }),
+    tags = ["mongo_unittest_sixth_group"],
+    deps = [
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/scripting/mozjs/shell:mozjs_shell",
+    ],
+)
+
+# Tests the legacy (native, in-process) MozJS engine linked directly via :scripting.
+# The legacy engine ships in the mongo shell in ALL builds — including the default
+# js_engine=wasm build — so this target must stay on the default waterfall and must not
+# be gated on js_engine_use_legacy.
+mongo_cc_unit_test(
+    name = "scripting_legacy_mozjs_test",
+    srcs = [
+        "//src/mongo/scripting/mozjs:jscustomallocator_test.cpp",
+        "//src/mongo/scripting/mozjs/shell:asan_handles_test.cpp",
+        "//src/mongo/scripting/mozjs/shell:implscope_test.cpp",
+    ],
+    copts = select({
+        "@platforms//os:windows": [
+            # See the /Zc:preprocessor comment in third_party/mozjs/BUILD.bazel
+            "/Zc:preprocessor",
+            "/wd5104",
+            "/wd5105",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        "//bazel/config:spider_monkey_dbg_enabled": ["MONGO_SPIDERMONKEY_DBG"],
+        "//conditions:default": [],
+    }),
+    tags = ["mongo_unittest_eighth_group"],
+    target_compatible_with = select({
+        "//bazel/config:js_engine_none": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":bson_template_evaluator",
+        ":scripting",
+        "//src/mongo/db:service_context_test_fixture",
+    ],
+)
+
+# Tests the legacy MozJS engine as selected by the server's engine configuration
+# (--//bazel/config:js_engine=mozjs), i.e. the same tests as scripting_legacy_mozjs_test
+# but linked through the flag-selected :scripting_server wiring, plus the module loader
+# (a legacy-only feature). Runs only on the legacy-js-engine build variant.
+mongo_cc_unit_test(
+    name = "scripting_legacy_mozjs_config_test",
+    srcs = [
+        "//src/mongo/scripting/mozjs:jscustomallocator_test.cpp",
+        "//src/mongo/scripting/mozjs/shell:asan_handles_test.cpp",
+        "//src/mongo/scripting/mozjs/shell:implscope_test.cpp",
+        # module_loader_test is a legacy-only MozJS feature (ES module loading is
+        # unsupported under the WASM engine), so it runs only in this target.
+        "//src/mongo/scripting/mozjs/shell:module_loader_test.cpp",
+    ],
+    copts = select({
+        "@platforms//os:windows": [
+            # See the /Zc:preprocessor comment in third_party/mozjs/BUILD.bazel
+            "/Zc:preprocessor",
+            "/wd5104",
+            "/wd5105",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        "//bazel/config:spider_monkey_dbg_enabled": ["MONGO_SPIDERMONKEY_DBG"],
+        "//conditions:default": [],
+    }),
+    tags = ["mongo_unittest_first_group"],
+    # Compiled against the flag-selected engine (:scripting_server), so this only
+    # builds/runs under --//bazel/config:js_engine=mozjs. Exercises the legacy engine
+    # wiring (scripting_server.cpp / config_engine_gen) that the WASM waterfall never builds.
+    target_compatible_with = select({
+        "//bazel/config:js_engine_use_legacy": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":bson_template_evaluator",
+        ":scripting_server",
+        "//src/mongo/db:service_context_test_fixture",
+    ],
+)

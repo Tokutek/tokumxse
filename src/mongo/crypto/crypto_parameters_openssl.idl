@@ -1,0 +1,29 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::crypto"
+    mod_visibility: public
+
+server_parameters:
+    opensslPrimaryDRBGReseedMaxRequests:
+        description: Max number of generate requests on the primary DRBG before it must reseed
+        set_at: startup
+        cpp_vartype: std::int32_t
+        cpp_varname: "opensslPrimaryDRBGReseedMaxRequests"
+        validator: {gt: 0}
+        default: 256 # Matches OpenSSL default
+        redact: false
+        condition:
+            preprocessor: "defined(__linux__)"
+
+    opensslPrimaryDRBGReseedMaxTime:
+        description: Max amount of time that can pass before the primary DRBG must reseed
+        set_at: startup
+        cpp_vartype: long long
+        cpp_varname: "opensslPrimaryDRBGReseedMaxTime"
+        validator: {gt: 0}
+        default: 3600 # 1 hour, matches OpenSSL default
+        redact: false
+        condition:
+            preprocessor: "defined(__linux__)"

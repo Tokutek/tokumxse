@@ -1,0 +1,25 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# ChunkTypeBase type
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+structs:
+    ChunkHistoryBase:
+        description:
+            "An element of a chunk history array. The array holds the history ordered from
+            the most recent (the index 0) to the oldest supported."
+        fields:
+            validAfter:
+                type: timestamp
+                description: The time after which this chunk is at this shard.
+            shard:
+                type: shard_id
+                description: Shard this chunk lives in, starting at the "validAfter" time.

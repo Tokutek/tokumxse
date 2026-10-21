@@ -1,0 +1,48 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    CriticalSectionBlockType:
+        description: "Type of block to be used in the critical section."
+        type: string
+        values:
+            kWrites: "Writes"
+            kReadsAndWrites: "ReadsAndWrites"
+            kUnblock: "Unblock"
+
+commands:
+    _shardsvrParticipantBlock:
+        command_name: _shardsvrParticipantBlock
+        cpp_name: ShardsvrParticipantBlock
+        description: "Internal command sent to shards to block CRUD operations"
+        strict: false
+        api_version: ""
+        namespace: concatenate_with_db
+        fields:
+            blockType:
+                type: CriticalSectionBlockType
+                optional: true
+            reason:
+                type: object
+                optional: true
+            throwIfReasonDiffers:
+                type: bool
+                description: >-
+                    If true, throw an invariant in case the collection critical section is already
+                    taken by another operation with a different reason.
+                optional: true
+            # TODO (SERVER-98118): Remove this field once 9.0 is last-lts and shards are authoritative.
+            clearShardCatalogCache:
+                type: safeBool
+                description: >-
+                    If true, the metadata from the shard catalog cache (CSS / DSS) will be cleared,
+                    forcing a refresh the next time this metadata is needed.
+                    When the shard is authoritative, it is no longer necessary to clear the metadata.
+                default: true
+        reply_type: OkReply

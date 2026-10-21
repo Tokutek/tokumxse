@@ -1,0 +1,31 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+server_parameters:
+    javascriptProtection:
+        description: "disable automatic JavaScript function marshalling"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gJavascriptProtection
+        default: false
+        redact: false
+
+    jsHeapLimitMB:
+        description: "set the js scope's heap size limit"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gJSHeapLimitMB
+        default: 1100
+        redact: false
+
+    jsUseLegacyMemoryTracking:
+        description: "fallback to use legacy memory tracking"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gJSUseLegacyMemoryTracking
+        default: false
+        redact: false

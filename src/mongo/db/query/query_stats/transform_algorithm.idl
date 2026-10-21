@@ -1,0 +1,13 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+enums:
+    TransformAlgorithm:
+        description: "The type of algorithm to be used for the transformIdentifiers field of $queryStats."
+        type: string
+        values:
+            kHmacSha256: "hmac-sha-256"
+            kNone: "none"

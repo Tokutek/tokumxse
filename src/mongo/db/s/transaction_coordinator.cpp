@@ -1,0 +1,811 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/s/transaction_coordinator.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/repl/clang_checked/mutex.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/server_transaction_coordinators_metrics.h"
+#include "mongo/db/s/single_transaction_coordinator_stats.h"
+#include "mongo/db/s/transaction_coordinator_metrics_observer.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
+#include "mongo/db/s/transaction_coordinator_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+#include "mongo/util/tick_source.h"
+
+#include <algorithm>
+#include <iterator>
+#include <mutex>
+#include <tuple>
+#include <type_traits>
+
+#include <absl/container/flat_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
+
+
+namespace mongo {
+namespace {
+
+using CommitDecision = txn::CommitDecision;
+using CoordinatorCommitDecision = txn::CoordinatorCommitDecision;
+using PrepareVoteConsensus = txn::PrepareVoteConsensus;
+using TransactionCoordinatorDocument = txn::TransactionCoordinatorDocument;
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForParticipantListWriteConcern);
+MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForDecisionWriteConcern);
+
+ExecutorFuture<void> waitForMajorityWithHangFailpoint(
+    ServiceContext* service,
+    FailPoint& failpoint,
+    const std::string& failPointName,
+    repl::OpTime opTime,
+    const LogicalSessionId& lsid,
+    const TxnNumberAndRetryCounter& txnNumberAndRetryCounter,
+    const CancellationToken& cancelToken) {
+    auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+    auto waitForWC = [service, executor, cancelToken](repl::OpTime opTime) {
+        return WaitForMajorityService::get(service)
+            .waitUntilMajorityForWrite(opTime, cancelToken)
+            .thenRunOn(executor);
+    };
+
+    if (auto sfp = failpoint.scoped(); MONGO_unlikely(sfp.isActive())) {
+        const BSONObj& data = sfp.getData();
+        LOGV2(22445,
+              "Hit {failPointName} failpoint",
+              "failPointName"_attr = failPointName,
+              "lsid"_attr = lsid,
+              "txnNumberAndRetryCounter"_attr = txnNumberAndRetryCounter);
+
+        // Run the hang failpoint asynchronously on a different thread to avoid self deadlocks.
+        return ExecutorFuture<void>(executor).then(
+            [service, &failpoint, failPointName, data, waitForWC, opTime] {
+                if (!data["useUninterruptibleSleep"].eoo()) {
+                    failpoint.pauseWhileSet();
+                } else {
+                    ThreadClient tc(failPointName, service->getService());
+                    auto opCtx = tc->makeOperationContext();
+                    failpoint.pauseWhileSet(opCtx.get());
+                }
+
+                return waitForWC(opTime);
+            });
+    }
+
+    return waitForWC(std::move(opTime));
+}
+
+void setDecisionPromise(const txn::CoordinatorCommitDecision& decision,
+                        SharedPromise<txn::CommitDecision>& promise) {
+    switch (decision.getDecision()) {
+        case CommitDecision::kCommit: {
+            promise.emplaceValue(CommitDecision::kCommit);
+            return;
+        }
+        case CommitDecision::kAbort: {
+            promise.setError(*decision.getAbortStatus());
+            return;
+        }
+    };
+    MONGO_UNREACHABLE;
+}
+
+}  // namespace
+
+TransactionCoordinator::TransactionCoordinator(
+    OperationContext* operationContext,
+    const LogicalSessionId& lsid,
+    const TxnNumberAndRetryCounter& txnNumberAndRetryCounter,
+    std::unique_ptr<txn::AsyncWorkScheduler> scheduler,
+    Date_t deadline)
+    : _serviceContext(operationContext->getServiceContext()),
+      _lsid(lsid),
+      _txnNumberAndRetryCounter(txnNumberAndRetryCounter),
+      _scheduler(std::move(scheduler)),
+      _sendPrepareScheduler(_scheduler->makeChildScheduler()),
+      _transactionCoordinatorMetricsObserver(
+          std::make_unique<TransactionCoordinatorMetricsObserver>()),
+      _deadline(deadline) {
+    invariant(_txnNumberAndRetryCounter.getTxnRetryCounter());
+}
+
+void TransactionCoordinator::start(OperationContext* operationContext) {
+    invariant(_scheduler, "TransactionCoordinator shutdown before starting");
+    invariant(_sendPrepareScheduler, "TransactionCoordinator shutdown before starting");
+
+    auto apiParams = APIParameters::get(operationContext);
+    auto kickOffCommitPF = makePromiseFuture<void>();
+    {
+        clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+        _kickOffCommitPromise = std::move(kickOffCommitPF.promise);
+    }
+
+    // Task, which will fire when the transaction's total deadline has been reached. If the 2PC
+    // sequence has not yet started, it will be abandoned altogether.
+    auto deadlineFuture =
+        _scheduler
+            ->scheduleWorkAt(_deadline,
+                             [this, self = shared_from_this()](OperationContext*) {
+                                 LOGV2_DEBUG(5047000,
+                                             1,
+                                             "TransactionCoordinator deadline reached",
+                                             "sessionId"_attr = _lsid,
+                                             "txnNumberAndRetryCounter"_attr =
+                                                 _txnNumberAndRetryCounter);
+                                 cancelIfCommitNotYetStarted();
+
+                                 // See the comments for sendPrepare about the purpose of this
+                                 // cancellation code
+                                 _sendPrepareScheduler->shutdown(
+                                     {ErrorCodes::TransactionCoordinatorReachedAbortDecision,
+                                      "Transaction exceeded deadline"});
+                             })
+            .tapError([this, self = shared_from_this()](Status s) {
+                if (_reserveKickOffCommitPromise()) {
+                    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                    _kickOffCommitPromise.setError(std::move(s));
+                }
+            });
+
+    // TODO: The duration will be meaningless after failover.
+    _updateAssociatedClient(operationContext->getClient());
+    _transactionCoordinatorMetricsObserver->onCreate(
+        ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+        _serviceContext->getTickSource(),
+        _serviceContext->getPreciseClockSource()->now());
+
+    // Two-phase commit phases chain. Once this chain executes, the 2PC sequence has completed
+    // either with success or error and the scheduled deadline task above has been joined.
+    std::move(kickOffCommitPF.future)
+        .then([this, self = shared_from_this()] {
+            return VectorClockMutable::get(_serviceContext)->waitForDurableTopologyTime();
+        })
+        .thenRunOn(_scheduler->getExecutor())
+        .then([this, self = shared_from_this()] {
+            // Persist the participants, unless they have been made durable already (which would
+            // only be the case if this coordinator was created as part of step-up recovery).
+            //  Input: _participants
+            //         _participantsDurable (optional)
+            //  Output: _participantsDurable = true
+            txn::ParticipantsList participants;
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                invariant(_participants);
+
+                _step = Step::kWritingParticipantList;
+
+                _transactionCoordinatorMetricsObserver->onStartStep(
+                    TransactionCoordinator::Step::kWritingParticipantList,
+                    TransactionCoordinator::Step::kInactive,
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+                if (_participantsDurable)
+                    return Future<repl::OpTime>::makeReady(repl::OpTime());
+                participants = *_participants;
+            }
+            return txn::persistParticipantsList(
+                *_sendPrepareScheduler, _lsid, _txnNumberAndRetryCounter, participants);
+        })
+        .then([this, self = shared_from_this()](repl::OpTime opTime) {
+            return waitForMajorityWithHangFailpoint(
+                _serviceContext,
+                hangBeforeWaitingForParticipantListWriteConcern,
+                "hangBeforeWaitingForParticipantListWriteConcern",
+                std::move(opTime),
+                _lsid,
+                _txnNumberAndRetryCounter,
+                _waitForMajorityCancellationSourceOnStepDown.token());
+        })
+        .thenRunOn(_scheduler->getExecutor())
+        .then([this, self = shared_from_this(), apiParams] {
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                _participantsDurable = true;
+            }
+
+            // Send prepare to the participants, unless this has already been done (which would only
+            // be the case if this coordinator was created as part of step-up recovery and the
+            // recovery document contained a decision).
+            //  Input: _participants, _participantsDurable
+            //         _decision (optional)
+            //  Output: _decision is set
+            txn::ParticipantsList participants;
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                invariant(_participantsDurable);
+
+                auto previousStep = _step;
+                _step = Step::kWaitingForVotes;
+
+                _transactionCoordinatorMetricsObserver->onStartStep(
+                    TransactionCoordinator::Step::kWaitingForVotes,
+                    previousStep,
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+
+                if (_decision)
+                    return Future<void>::makeReady();
+                participants = *_participants;
+            }
+
+            return txn::sendPrepare(_serviceContext,
+                                    *_sendPrepareScheduler,
+                                    _lsid,
+                                    _txnNumberAndRetryCounter,
+                                    apiParams,
+                                    participants)
+                .then([this, self = shared_from_this()](PrepareVoteConsensus consensus) mutable {
+                    boost::optional<Timestamp> commitTimestamp;
+                    {
+                        clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(
+                            _mutex);
+                        _decision = consensus.decision();
+                        if (_decision->getDecision() == CommitDecision::kCommit) {
+                            auto affectedNamespacesSet = consensus.releaseAffectedNamespaces();
+                            _affectedNamespaces.reserve(affectedNamespacesSet.size());
+                            std::move(affectedNamespacesSet.begin(),
+                                      affectedNamespacesSet.end(),
+                                      std::back_inserter(_affectedNamespaces));
+                            commitTimestamp = _decision->getCommitTimestamp();
+                        }
+                    }
+
+                    if (commitTimestamp) {
+                        LOGV2_DEBUG(22446,
+                                    3,
+                                    "Advancing cluster time to the commit timestamp",
+                                    "sessionId"_attr = _lsid,
+                                    "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
+                                    "commitTimestamp"_attr = *commitTimestamp);
+
+                        VectorClockMutable::get(_serviceContext)
+                            ->tickClusterTimeTo(LogicalTime(*commitTimestamp));
+                    }
+                });
+        })
+        .onError<ErrorCodes::TransactionCoordinatorReachedAbortDecision>(
+            [this, self = shared_from_this()](const Status& status) {
+                // Timeout happened, propagate the decision to abort the transaction to replicas
+                // and convert the internal error code to the public one.
+                LOGV2(5047001,
+                      "Transaction coordinator made abort decision",
+                      "sessionId"_attr = _lsid,
+                      "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
+                      "status"_attr = redact(status));
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                _decision = txn::PrepareVote::kAbort;
+                _decision->setAbortStatus(Status(ErrorCodes::NoSuchTransaction, status.reason()));
+            })
+        .then([this, self = shared_from_this()] {
+            // Persist the commit decision, unless this has already been done (which would only be
+            // the case if this coordinator was created as part of step-up recovery and the recovery
+            // document contained a decision).
+            //  Input: _decision
+            //         _decisionDurable (optional)
+            //  Output: _decisionDurable = true
+            txn::ParticipantsList participants;
+            txn::CoordinatorCommitDecision decision;
+            std::vector<NamespaceString> affectedNamespaces;
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                invariant(_decision);
+
+                auto previousStep = _step;
+                _step = Step::kWritingDecision;
+
+                _transactionCoordinatorMetricsObserver->onStartStep(
+                    TransactionCoordinator::Step::kWritingDecision,
+                    previousStep,
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+
+                if (_decisionDurable)
+                    return Future<repl::OpTime>::makeReady(repl::OpTime());
+                participants = *_participants;
+                decision = *_decision;
+                affectedNamespaces = _affectedNamespaces;
+            }
+
+            return txn::persistDecision(*_scheduler,
+                                        _lsid,
+                                        _txnNumberAndRetryCounter,
+                                        participants,
+                                        decision,
+                                        affectedNamespaces);
+        })
+        .then([this, self = shared_from_this()](repl::OpTime opTime) {
+            txn::CoordinatorCommitDecision decision;
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                decision = *_decision;
+            }
+            setDecisionPromise(decision, _decisionPromise);
+            return waitForMajorityWithHangFailpoint(
+                _serviceContext,
+                hangBeforeWaitingForDecisionWriteConcern,
+                "hangBeforeWaitingForDecisionWriteConcern",
+                std::move(opTime),
+                _lsid,
+                _txnNumberAndRetryCounter,
+                _waitForMajorityCancellationSourceOnStepDown.token());
+        })
+        .then([this, self = shared_from_this(), apiParams] {
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                _decisionDurable = true;
+            }
+
+            // Send the commit/abort decision to the participants.
+            //  Input: _decisionDurable
+            //  Output: (none)
+            txn::ParticipantsList participants;
+            txn::CoordinatorCommitDecision decision;
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                invariant(_decisionDurable);
+
+                auto previousStep = _step;
+                _step = Step::kWaitingForDecisionAcks;
+
+                _transactionCoordinatorMetricsObserver->onStartStep(
+                    TransactionCoordinator::Step::kWaitingForDecisionAcks,
+                    previousStep,
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+                participants = *_participants;
+                decision = *_decision;
+            }
+
+            switch (decision.getDecision()) {
+                case CommitDecision::kCommit: {
+                    return txn::sendCommit(_serviceContext,
+                                           *_scheduler,
+                                           _lsid,
+                                           _txnNumberAndRetryCounter,
+                                           apiParams,
+                                           participants,
+                                           *decision.getCommitTimestamp());
+                }
+                case CommitDecision::kAbort: {
+                    return txn::sendAbort(_serviceContext,
+                                          *_scheduler,
+                                          _lsid,
+                                          _txnNumberAndRetryCounter,
+                                          apiParams,
+                                          participants);
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            };
+        })
+        .then([this, self = shared_from_this(), apiParams] {
+            txn::CoordinatorCommitDecision decision;
+            std::vector<NamespaceString> affectedNamespaces;
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                decision = *_decision;
+                affectedNamespaces = _affectedNamespaces;
+            }
+            setDecisionPromise(decision, _decisionAcknowledgedPromise);
+
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+
+                auto previousStep = _step;
+                _step = Step::kWritingEndOfTransaction;
+
+                _transactionCoordinatorMetricsObserver->onStartStep(
+                    TransactionCoordinator::Step::kWritingEndOfTransaction,
+                    previousStep,
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+            }
+
+            // If transaction was committed, write endOfTransaction oplog entries
+            if (decision.getDecision() != CommitDecision::kCommit) {
+                return Future<void>::makeReady();
+            }
+            return txn::writeEndOfTransaction(
+                *_scheduler, _lsid, _txnNumberAndRetryCounter, affectedNamespaces);
+        })
+        .then([this, self = shared_from_this()] {
+            // Do a best-effort attempt (i.e., writeConcern w:1) to delete the coordinator's durable
+            // state.
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+
+                auto previousStep = _step;
+                _step = Step::kDeletingCoordinatorDoc;
+
+                _transactionCoordinatorMetricsObserver->onStartStep(
+                    TransactionCoordinator::Step::kDeletingCoordinatorDoc,
+                    previousStep,
+                    ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+                    _serviceContext->getTickSource(),
+                    _serviceContext->getPreciseClockSource()->now());
+            }
+            return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumberAndRetryCounter);
+        })
+        .getAsync([this, self = shared_from_this(), deadlineFuture = std::move(deadlineFuture)](
+                      Status s) mutable {
+            // Prior to initiating the shutdown phases of the TransactionCoordinator lifecycle,
+            // inform our parent service that it can remove its references to this instance. This
+            // must be done strictly after all other logic except the shutdown phases which are
+            // initiated later in this continuation.
+            {
+                clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+                auto* tcs = TransactionCoordinatorService::get(_serviceContext);
+                tcs->notifyCoordinatorFinished(self);
+            }
+
+            // Interrupt this coordinator's scheduler hierarchy and join the deadline task's future
+            // in order to guarantee that there are no more threads running within the coordinator.
+            _scheduler->shutdown(
+                {ErrorCodes::TransactionCoordinatorDeadlineTaskCanceled, "Coordinator completed"});
+
+            return std::move(deadlineFuture)
+                .getAsync([this, self = shared_from_this(), s = std::move(s)](Status) {
+                    // Notify all the listeners which are interested in the coordinator's lifecycle.
+                    _done(s);
+                });
+        });
+}
+
+void TransactionCoordinator::shutdown() {
+    invariant(_completionPromise.getFuture().isReady());
+    // Callers can't directly control when a TransactionCoordinator is destroyed (since it keeps
+    // itself alive via shared_ptrs captured in continuation chains). _scheduler may be a
+    // child scheduler of a scheduler owned by the caller, and therefore the caller may
+    // require that _scheduler is destroyed before its own scheduler. Callers can (and must) call
+    // shutdown() after waiting on onCompletion() to ensure _scheduler is destroyed at an
+    // appropriate time.
+    invariant(_sendPrepareScheduler, "TransactionCoordinator shutdown multiple times");
+    invariant(_scheduler, "TransactionCoordinator shutdown multiple times");
+
+    _sendPrepareScheduler->join();
+    _sendPrepareScheduler.reset();
+
+    _scheduler->join();
+    _scheduler.reset();
+}
+
+TransactionCoordinator::~TransactionCoordinator() {
+    invariant(_completionPromise.getFuture().isReady());
+    invariant(!_sendPrepareScheduler);
+    invariant(!_scheduler);
+}
+
+void TransactionCoordinator::runCommit(OperationContext* opCtx, std::vector<ShardId> participants) {
+    if (!_reserveKickOffCommitPromise())
+        return;
+    invariant(opCtx != nullptr);
+    invariant(opCtx->getClient() != nullptr);
+    _updateAssociatedClient(opCtx->getClient());
+
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+    _participants = std::move(participants);
+    _kickOffCommitPromise.emplaceValue();
+}
+
+void TransactionCoordinator::continueCommit(const TransactionCoordinatorDocument& doc) {
+    if (!_reserveKickOffCommitPromise())
+        return;
+
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+    _transactionCoordinatorMetricsObserver->onRecoveryFromFailover();
+
+    _participants = doc.getParticipants();
+    if (doc.getDecision()) {
+        _participantsDurable = true;
+        _decision = doc.getDecision();
+    }
+    _affectedNamespaces = doc.getAffectedNamespaces().get_value_or({});
+
+    _kickOffCommitPromise.emplaceValue();
+}
+
+SharedSemiFuture<CommitDecision> TransactionCoordinator::getDecision() const {
+    return _decisionPromise.getFuture();
+}
+
+SharedSemiFuture<void> TransactionCoordinator::onCompletion() const {
+    return _completionPromise.getFuture();
+}
+
+SharedSemiFuture<CommitDecision> TransactionCoordinator::onDecisionAcknowledged() const {
+    return _decisionAcknowledgedPromise.getFuture();
+}
+
+void TransactionCoordinator::cancelIfCommitNotYetStarted() {
+    if (!_reserveKickOffCommitPromise())
+        return;
+
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+    _kickOffCommitPromise.setError({ErrorCodes::TransactionCoordinatorCanceled,
+                                    "Transaction exceeded deadline or newer transaction started"});
+}
+
+void TransactionCoordinator::cancelForStepDown() {
+    _waitForMajorityCancellationSourceOnStepDown.cancel();
+}
+
+bool TransactionCoordinator::_reserveKickOffCommitPromise() {
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lg(_mutex);
+    if (_kickOffCommitPromiseSet)
+        return false;
+
+    _kickOffCommitPromiseSet = true;
+    return true;
+}
+
+void TransactionCoordinator::_done(Status status) {
+    // TransactionCoordinatorSteppingDown indicates the *sending* node (that is, *this* node) is
+    // stepping down. Active coordinator tasks are interrupted with this code instead of
+    // InterruptedDueToReplStateChange, because InterruptedDueToReplStateChange indicates the
+    // *receiving* node was stepping down.
+    if (status == ErrorCodes::TransactionCoordinatorSteppingDown)
+        status = Status(ErrorCodes::InterruptedDueToReplStateChange,
+                        str::stream()
+                            << "Coordinator " << _lsid << ':' << _txnNumberAndRetryCounter.toBSON()
+                            << " stopped due to: " << status.reason());
+
+    // The 'CallbackCanceled' error code may only terminate a TransactionCoordinator continuation if
+    // the coordinator is stepping down from primary while awaiting majority write concern.
+    if (status == ErrorCodes::CallbackCanceled) {
+        invariant(status.reason() ==
+                  WaitForMajorityService::waitUntilMajorityCanceledStatus().reason());
+        invariant(_waitForMajorityCancellationSourceOnStepDown.token().isCanceled());
+        status = Status(ErrorCodes::InterruptedDueToReplStateChange,
+                        str::stream()
+                            << "Coordinator " << _lsid << ':' << _txnNumberAndRetryCounter.toBSON()
+                            << " stopped due to stepDown with: " << status.reason());
+    }
+
+    LOGV2_DEBUG(22447,
+                3,
+                "Two-phase commit completed",
+                "sessionId"_attr = _lsid,
+                "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
+                "status"_attr = redact(status));
+
+    clang_checked::unique_lock<clang_checked::CheckedMutex<std::mutex>> ul(_mutex);
+
+    const auto tickSource = _serviceContext->getTickSource();
+
+    _transactionCoordinatorMetricsObserver->onEnd(
+        ServerTransactionCoordinatorsMetrics::get(_serviceContext),
+        tickSource,
+        _serviceContext->getPreciseClockSource()->now(),
+        _step,
+        _decisionDurable ? _decision : boost::none);
+
+    if (status.isOK() &&
+        (shouldLog(logv2::LogComponent::kTransaction, logv2::LogSeverity::Debug(1)) ||
+         _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats()
+                 .getTwoPhaseCommitDuration(tickSource, tickSource->getTicks()) >
+             Milliseconds(serverGlobalParams.slowMS.load()))) {
+        _logSlowTwoPhaseCommit(*_decision, _participants ? _participants->size() : 0);
+    }
+
+    // No concurrent writers exist here (_done runs after the 2PC chain completes and
+    // _scheduler is shut down), but snapshot under the lock to future-proof against
+    // refactors and satisfy static analyzers (Coverity/TSAN).
+    const auto stepSnapshot = _step;
+    const bool participantsDurableSnapshot = _participantsDurable;
+
+    ul.unlock();
+
+    if (!_decisionPromise.getFuture().isReady()) {
+        _decisionPromise.setError(status);
+    }
+    if (!_decisionAcknowledgedPromise.getFuture().isReady()) {
+        _decisionAcknowledgedPromise.setError(status);
+    }
+
+    if (!status.isOK()) {
+        const bool canceledBeforeCommitStarted =
+            status == ErrorCodes::TransactionCoordinatorCanceled && stepSnapshot == Step::kInactive;
+        if (!canceledBeforeCommitStarted && !status.isA<ErrorCategory::NotPrimaryError>() &&
+            !status.isA<ErrorCategory::ShutdownError>()) {
+            LOGV2_WARNING(12111100,
+                          "TransactionCoordinator terminating with unexpected error",
+                          "sessionId"_attr = _lsid,
+                          "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
+                          "step"_attr = toString(stepSnapshot),
+                          "participantsDurable"_attr = participantsDurableSnapshot,
+                          "error"_attr = redact(status));
+
+            // If _participantsDurable is true, the TransactionCoordinator may have already sent a
+            // prepare command to at least one participant shard. Termination with an unexpected
+            // error (other than shutdown or stepping down) in this state could leave a prepared
+            // transaction stuck until the coordinator shuts down or steps down. In such cases, we
+            // issue a fatal assertion to ensure the problem is loudly reported and allow another
+            // coordinator to continue the commit path.
+            if (participantsDurableSnapshot) {
+                LOGV2_FATAL(11353000,
+                            "TransactionCoordinator encountered an unexpected termination error.",
+                            "sessionId"_attr = _lsid,
+                            "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
+                            "error"_attr = status);
+            }
+        }
+        _completionPromise.setError(status);
+    } else {
+        _completionPromise.setFrom(_decisionPromise.getFuture().getNoThrow().getStatus());
+    }
+}
+
+void TransactionCoordinator::_logSlowTwoPhaseCommit(const txn::CoordinatorCommitDecision& decision,
+                                                    size_t numParticipants) {
+    logv2::DynamicAttributes attrs;
+
+    BSONObjBuilder parametersBuilder;
+
+    BSONObjBuilder lsidBuilder(parametersBuilder.subobjStart("lsid"));
+    _lsid.serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
+
+    parametersBuilder.append("txnNumber", _txnNumberAndRetryCounter.getTxnNumber());
+    parametersBuilder.append("txnRetryCounter", *_txnNumberAndRetryCounter.getTxnRetryCounter());
+
+    attrs.add("parameters", parametersBuilder.obj());
+
+    std::string decisionTemp;
+    switch (decision.getDecision()) {
+        case txn::CommitDecision::kCommit:
+            attrs.add("terminationCause", "committed");
+            attrs.add("commitTimestamp", decision.getCommitTimestamp()->toBSON());
+            break;
+        case txn::CommitDecision::kAbort:
+            attrs.add("terminationCause", "aborted");
+            attrs.add("terminationDetails", *decision.getAbortStatus());
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    };
+
+    attrs.add("numParticipants", numParticipants);
+
+    auto tickSource = _serviceContext->getTickSource();
+    auto curTick = tickSource->getTicks();
+    const auto& singleTransactionCoordinatorStats =
+        _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
+
+    BSONObjBuilder stepDurations;
+    stepDurations.append(
+        "writingParticipantListMicros",
+        durationCount<Microseconds>(singleTransactionCoordinatorStats.getStepDuration(
+            Step::kWritingParticipantList, tickSource, curTick)));
+    stepDurations.append(
+        "waitingForVotesMicros",
+        durationCount<Microseconds>(singleTransactionCoordinatorStats.getStepDuration(
+            Step::kWaitingForVotes, tickSource, curTick)));
+    stepDurations.append(
+        "writingDecisionMicros",
+        durationCount<Microseconds>(singleTransactionCoordinatorStats.getStepDuration(
+            Step::kWritingDecision, tickSource, curTick)));
+    stepDurations.append(
+        "waitingForDecisionAcksMicros",
+        durationCount<Microseconds>(singleTransactionCoordinatorStats.getStepDuration(
+            Step::kWaitingForDecisionAcks, tickSource, curTick)));
+    stepDurations.append(
+        "writingEndOfTransactionMicros",
+        durationCount<Microseconds>(singleTransactionCoordinatorStats.getStepDuration(
+            Step::kWritingEndOfTransaction, tickSource, curTick)));
+    stepDurations.append(
+        "deletingCoordinatorDocMicros",
+        durationCount<Microseconds>(singleTransactionCoordinatorStats.getStepDuration(
+            Step::kDeletingCoordinatorDoc, tickSource, curTick)));
+
+    attrs.add("stepDurations", stepDurations.obj());
+
+    // Total duration of the commit coordination. Logged at the end of the line for consistency
+    // with slow command logging. Note that this is reported in milliseconds while the step
+    // durations are reported in microseconds.
+    attrs.add(
+        "duration",
+        duration_cast<Milliseconds>(
+            singleTransactionCoordinatorStats.getTwoPhaseCommitDuration(tickSource, curTick)));
+
+    LOGV2(51804, "two-phase commit", attrs);
+}
+
+TransactionCoordinator::Step TransactionCoordinator::getStep() const {
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lk(_mutex);
+    return _step;
+}
+
+void TransactionCoordinator::reportState(OperationContext* opCtx, BSONObjBuilder& parent) const {
+    BSONObjBuilder doc;
+    TickSource* tickSource = _serviceContext->getTickSource();
+    TickSource::Tick currentTick = tickSource->getTicks();
+
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lk(_mutex);
+
+    BSONObjBuilder lsidBuilder(doc.subobjStart("lsid"));
+    _lsid.serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
+    doc.append("txnNumber", _txnNumberAndRetryCounter.getTxnNumber());
+    doc.append("txnRetryCounter", *_txnNumberAndRetryCounter.getTxnRetryCounter());
+
+    if (_participants) {
+        doc.append("numParticipants", static_cast<long long>(_participants->size()));
+    }
+
+    doc.append("state", toString(_step));
+
+    const auto& singleStats =
+        _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats();
+    singleStats.reportMetrics(doc, tickSource, currentTick);
+    singleStats.reportLastClient(opCtx, parent);
+
+    if (_decision)
+        doc.append("decision", _decision->toBSON());
+
+    doc.append("deadline", _deadline);
+
+    parent.append("desc", "transaction coordinator");
+    parent.append("twoPhaseCommitCoordinator", doc.obj());
+}
+
+std::string TransactionCoordinator::toString(Step step) {
+    switch (step) {
+        case Step::kInactive:
+            return "inactive";
+        case Step::kWritingParticipantList:
+            return "writingParticipantList";
+        case Step::kWaitingForVotes:
+            return "waitingForVotes";
+        case Step::kWritingDecision:
+            return "writingDecision";
+        case Step::kWaitingForDecisionAcks:
+            return "waitingForDecisionAcks";
+        case Step::kWritingEndOfTransaction:
+            return "writingEndOfTransaction";
+        case Step::kDeletingCoordinatorDoc:
+            return "deletingCoordinatorDoc";
+    }
+    MONGO_UNREACHABLE;
+}
+
+void TransactionCoordinator::_updateAssociatedClient(Client* client) {
+    clang_checked::lock_guard<clang_checked::CheckedMutex<std::mutex>> lk(_mutex);
+    _transactionCoordinatorMetricsObserver->updateLastClientInfo(client);
+}
+
+}  // namespace mongo

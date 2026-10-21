@@ -1,0 +1,83 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/document_source_change_stream_check_resumability.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+using boost::intrusive_ptr;
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+REGISTER_INTERNAL_LITE_PARSED_DOCUMENT_SOURCE(_internalChangeStreamCheckResumability,
+                                              ChangeStreamCheckResumabilityLiteParsed::parse);
+
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(_internalChangeStreamCheckResumability,
+                                                   DocumentSourceChangeStreamCheckResumability,
+                                                   ChangeStreamCheckResumabilityStageParams);
+
+ALLOCATE_DOCUMENT_SOURCE_ID(_internalChangeStreamCheckResumability,
+                            DocumentSourceChangeStreamCheckResumability::id)
+
+DocumentSourceChangeStreamCheckResumability::DocumentSourceChangeStreamCheckResumability(
+    const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token)
+    : DocumentSourceInternalChangeStreamStage(getSourceName(), expCtx),
+      _tokenFromClient(std::move(token)) {}
+
+intrusive_ptr<DocumentSourceChangeStreamCheckResumability>
+DocumentSourceChangeStreamCheckResumability::create(const intrusive_ptr<ExpressionContext>& expCtx,
+                                                    const DocumentSourceChangeStreamSpec& spec) {
+    auto resumeToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
+    return new DocumentSourceChangeStreamCheckResumability(expCtx, std::move(resumeToken));
+}
+
+intrusive_ptr<DocumentSourceChangeStreamCheckResumability>
+DocumentSourceChangeStreamCheckResumability::createFromBson(
+    BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(5467603,
+            str::stream() << "the '" << kStageName << "' object spec must be an object",
+            spec.type() == BSONType::object);
+
+    auto parsed = DocumentSourceChangeStreamCheckResumabilitySpec::parse(
+        spec.embeddedObject(), IDLParserContext("DocumentSourceChangeStreamCheckResumabilitySpec"));
+    return new DocumentSourceChangeStreamCheckResumability(expCtx,
+                                                           parsed.getResumeToken().getData());
+}
+
+std::string_view DocumentSourceChangeStreamCheckResumability::getSourceName() const {
+    return kStageName;
+}
+
+Value DocumentSourceChangeStreamCheckResumability::doSerialize(
+    const query_shape::SerializationOptions& opts) const {
+    BSONObjBuilder builder;
+    if (opts.isSerializingForExplain()) {
+        BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
+        sub.append("stage"sv, kStageName);
+        sub << "resumeToken"sv << Value(ResumeToken(_tokenFromClient).toDocument(opts));
+        sub.done();
+    } else {
+        builder.append(
+            kStageName,
+            DocumentSourceChangeStreamCheckResumabilitySpec(ResumeToken(_tokenFromClient))
+                .toBSON());
+    }
+    return Value(builder.obj());
+}
+
+}  // namespace mongo

@@ -1,0 +1,233 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/query/compiler/metadata/path_arrayness.h"
+#include "mongo/db/query/compiler/metadata/schema_type_info.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_indexability.h"
+#include "mongo/db/query/plan_cache/plan_cache_invalidator.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/platform/rwmutex.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+
+
+namespace mongo {
+
+class OperationContext;
+
+/**
+ * Query information for a particular point-in-time view of a collection.
+ *
+ * Decorates a Collection instance. Lifecycle is the same as the Collection instance.
+ */
+class [[MONGO_MOD_PUBLIC]] CollectionQueryInfo {
+public:
+    CollectionQueryInfo();
+
+    inline static const auto getCollectionQueryInfo =
+        Collection::declareDecoration<CollectionQueryInfo>();
+
+    static const CollectionQueryInfo& get(const CollectionPtr& collection) {
+        return CollectionQueryInfo::getCollectionQueryInfo(collection.get());
+    }
+    static CollectionQueryInfo& get(Collection* collection) {
+        return CollectionQueryInfo::getCollectionQueryInfo(collection);
+    }
+
+    /**
+     * Gets the PlanCache for this collection.
+     */
+    PlanCache* getPlanCache() const;
+
+    /**
+     * Gets the number of the current collection version used for Plan Cache invalidation.
+     */
+    size_t getPlanCacheInvalidatorVersion() const;
+
+    /**
+     * Gets the "indexability discriminators" used in the PlanCache for generating plan cache keys.
+     */
+    const PlanCacheIndexabilityState& getPlanCacheIndexabilityState() const;
+
+    /**
+     * Builds internal cache state based on the current state of the Collection's IndexCatalog.
+     */
+    void init(OperationContext* opCtx, Collection* coll);
+
+    /**
+     * Rebuilds cached index information. Must be called when an index is modified or an index is
+     * dropped/created.
+     *
+     * Must be called under exclusive collection lock.
+     */
+    void rebuildIndexData(OperationContext* opCtx, const Collection* coll);
+
+    /**
+     * Removes all cached query plans after ensuring that the PlanCache is uniquely owned. The
+     * PlanCache is made uniquely owned by creating a new instance and thus detaching from the
+     * shared instance.
+     */
+    void clearQueryCache(OperationContext* opCtx, const CollectionPtr& coll);
+
+    /**
+     * Removes all cached query plans without ensuring that the PlanCache is uniquely owned, only
+     * allowed when setting an index to multikey. Setting an index to multikey can only go one way
+     * and has its own concurrency handling.
+     */
+    void clearQueryCacheForSetMultikey(const CollectionPtr& coll) const;
+
+    /**
+     * Traverses the 'IndexCatalogEntry's of the Collection instance and populates a new
+     * PathArrayness instance with information from index metadata.
+     *
+     * When this runs:
+     * - DDL/startup (create collection, create/drop index, refreshEntry, repair index
+     * (forceSetMultikey())): invoked inside a WriteUnitOfWork (WUOW) that modifies the
+     * IndexCatalog. Publishing occurs at WUOW commit, atomically with the catalog change
+     *
+     * We assume this method will be called in a thread-safe manner since no other thread can
+     * observe in-flight mutations to the Collection instance cloned for copy-on-write.
+     */
+    void rebuildPathArrayness(OperationContext* opCtx, const Collection* coll);
+
+    /**
+     * Updates the PathArrayness instance in response to a multikeyness change in indexes.
+     *
+     * When this runs:
+     * - Multikey flips from write (no Collection copy-on-write): invoked under the write's WUOW and
+     * thus we do not have atomic catalog change. We ensure atomic updates to the shared
+     * PathArrayness via a WriteRarelyRWMutex. This path of code will be called rarely when an
+     * document insert or update flips  the multikeyness of indexes. This flip in multikeyness can
+     * only go in one direction, non-multikey to multikey.
+     *
+     * Const-ness: While this method modifies the 'PathArrayness' data associated with the
+     * 'CollectionQueryInfo', it can be marked as 'const' because the PathArrayness instance is
+     * marked as 'mutable'. This design ensures compatibility with
+     * 'IndexCatalogEntry::_catalogSetMultikey()' which require the method to be 'const'.
+     */
+    void updatePathArraynessForSetMultikey(const IndexDescriptor& descriptor,
+                                           const MultikeyPaths& multikeyPaths) const;
+
+    std::shared_ptr<const PathArrayness> getPathArrayness() const;
+
+    /**
+     * Rebuilds the SchemaTypeInfo from the collection's current document validator.
+     *
+     * When this runs:
+     * - At collection init/registration (see 'init').
+     * - Whenever the collection's validator is created or updated (e.g. via collMod).
+     */
+    void rebuildSchemaTypeInfo(OperationContext* opCtx, const Collection* coll);
+
+    std::shared_ptr<const SchemaTypeInfo> getSchemaTypeInfo() const;
+
+private:
+    /**
+     * Stores Clasic and SBE PlanCache-related state. Classic Plan Cache is stored per collection
+     * and represented by a mongo::PlanCache object. SBE PlanCache is stored in a process-global
+     * object, therefore, it is represented here as a PlanCacheInvalidator which knows what
+     * collection version to invalidate.
+     */
+    struct PlanCacheState {
+        PlanCacheState();
+
+        PlanCacheState(OperationContext* opCtx, const Collection* collection);
+
+        /**
+         * Clears classic and SBE cache entries with the current collection version.
+         */
+        void clearPlanCache();
+
+        // Per collection version classic plan cache.
+        PlanCache classicPlanCache;
+
+        // SBE PlanCacheInvalidator which can invalidate cache entries associated with a particular
+        // version of a collection.
+        PlanCacheInvalidator planCacheInvalidator;
+
+        // Holds computed information about the collection's indexes. Used for generating plan
+        // cache keys.
+        PlanCacheIndexabilityState planCacheIndexabilityState;
+    };
+
+    /**
+     * Wrapper around the underlying 'PathArrayness' instance. This allows us to modify the
+     * underlying 'PathArrayness' instance despite the const-ness guarantees needed by callers.
+     */
+    struct PathArraynessCollectionState {
+        PathArraynessCollectionState();
+
+        PathArraynessCollectionState(const PathArraynessCollectionState& other);
+        PathArraynessCollectionState& operator=(const PathArraynessCollectionState& other);
+
+        PathArraynessCollectionState(PathArraynessCollectionState&&) = delete;
+        PathArraynessCollectionState& operator=(PathArraynessCollectionState&&) = delete;
+
+        // Mutex to protect concurrent writers from re-assigning the pathArrayness pointer.
+        // This is going to face contention in the rare case where the multikeyness of an index is
+        // flipped in a document write transaction concurrently with a query.
+        mutable WriteRarelyRWMutex rwMutex;
+
+        // All clones of CollectionQueryInfo will initially point to the same PathArrayness
+        // instance.
+        // This needs to marked as mutable in order to be compatible with the const requirements
+        // of IndexCatalogEntryImpl::_catalogSetMultikey.
+        // While the shared_ptr may be re-assigned the PathArrayness object is immutable.
+        mutable std::shared_ptr<const PathArrayness> pathArrayness;
+    };
+
+    /**
+     * Wrapper around the SchemaTypeInfo pointer and the mutex protecting it together when
+     * collection query info is modified. Only the mutex is explicitly mutable so const can acquire
+     * a lock.
+     */
+    struct SchemaTypeInfoCollectionState {
+        SchemaTypeInfoCollectionState();
+
+        SchemaTypeInfoCollectionState(const SchemaTypeInfoCollectionState& other);
+        SchemaTypeInfoCollectionState& operator=(const SchemaTypeInfoCollectionState& other);
+
+        SchemaTypeInfoCollectionState(SchemaTypeInfoCollectionState&&) = delete;
+        SchemaTypeInfoCollectionState& operator=(SchemaTypeInfoCollectionState&&) = delete;
+
+        // Returns a snapshot of the current immutable SchemaTypeInfo. The returned shared_ptr
+        // remains valid after the read lock is released.
+        std::shared_ptr<const SchemaTypeInfo> snapshot() const;
+
+        // Replaces the current snapshot under the write lock. The supplied SchemaTypeInfo must be
+        // fully initialized and immutable; this does not advance its epoch.
+        void replace(std::shared_ptr<const SchemaTypeInfo> schemaTypeInfo);
+
+        // Publishes a new snapshot under the write lock and advances the epoch.
+        void publish(pipeline::type_system::Type rootType);
+
+    private:
+        // Mutex to protect concurrent writers from re-assigning the schemaConstraints pointer.
+        mutable WriteRarelyRWMutex rwMutex;
+
+        // All clones of CollectionQueryInfo will initially point to the same SchemaTypeInfo
+        // instance. Rebuilds publish a new immutable instance under rwMutex, allowing readers to
+        // retain a consistent snapshot.
+        std::shared_ptr<const SchemaTypeInfo> schemaConstraints;
+    };
+
+    void updatePlanCacheIndexEntries(OperationContext* opCtx, const Collection* coll);
+
+    std::shared_ptr<PlanCacheState> _planCacheState;
+
+    PathArraynessCollectionState _pathArraynessState;
+
+    SchemaTypeInfoCollectionState _schemaTypeInfoState;
+};
+
+}  // namespace mongo

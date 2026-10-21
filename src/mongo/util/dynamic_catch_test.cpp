@@ -1,0 +1,172 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/dynamic_catch.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/source_location.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <exception>
+#include <functional>
+#include <ostream>
+#include <stdexcept>
+#include <string>
+
+#include <boost/exception/diagnostic_information.hpp>
+#include <boost/exception/exception.hpp>
+#include <fmt/format.h>
+#include <fmt/ranges.h>  // IWYU pragma: keep
+
+namespace mongo {
+namespace {
+
+struct TestForeignRootException {
+    explicit TestForeignRootException(std::string what) : _what{std::move(what)} {}
+    const char* what() const noexcept {
+        return _what.c_str();
+    }
+    std::string _what;
+};
+
+class SpecificStdException : public std::exception {
+public:
+    explicit SpecificStdException(std::string what) : _what{std::move(what)} {}
+    const char* what() const noexcept override {
+        return _what.c_str();
+    }
+    std::string _what;
+};
+
+class DynamicCatchTest : public unittest::Test {
+public:
+    /** This is the type our terminate handler uses, so it gets extra testing attention. */
+    using StreamDynCatch = DynamicCatch<std::ostream&>;
+
+    struct SomeException {
+        std::string msg;
+    };
+
+    void installSomeHandlers(StreamDynCatch& dc) {
+        dc.addCatch<std::exception>(
+            [](auto&& ex, std::ostream& os) { os << "std::exception: " << redact(ex.what()); });
+        dc.addCatch<boost::exception>([](auto&& ex, std::ostream& os) {
+            os << "boost::exception: " << boost::diagnostic_information(ex);
+        });
+        dc.addCatch<DBException>(
+            [](auto&& ex, std::ostream& os) { os << "DBException::toString(): " << redact(ex); });
+        dc.addCatch<TestForeignRootException>(
+            [](auto&& ex, std::ostream& os) { os << "TestForeignRootException: " << ex.what(); });
+        dc.addCatch<SpecificStdException>(
+            [](auto&& ex, std::ostream& os) { os << "SpecificStdException: " << ex.what(); });
+    }
+};
+
+TEST_F(DynamicCatchTest, NoHandlers) {
+    try {
+        struct Uncatchable {};
+        throw Uncatchable{};
+    } catch (...) {
+        std::ostringstream os;
+        try {
+            StreamDynCatch{}.doCatch(os);
+            FAIL("expected a throw");
+        } catch (...) {
+        }
+        ASSERT_EQ(os.str(), "");
+    }
+}
+
+TEST_F(DynamicCatchTest, Nesting) {
+    // Test that later entries in the handler chain bind more tightly.
+    struct Base {};
+    struct Derived : Base {};
+    auto trial = [](const std::vector<std::function<void(StreamDynCatch&)>>& configChain) {
+        try {
+            throw Derived{};
+        } catch (...) {
+            StreamDynCatch dc;
+            for (auto&& config : configChain)
+                config(dc);
+            std::ostringstream os;
+            dc.doCatch(os);
+            return os.str();
+        }
+    };
+    auto catchDerived = [](StreamDynCatch& dc) {
+        dc.addCatch<Derived>([](auto&&, std::ostream& os) { os << "caught:Derived"; });
+    };
+    auto catchBase = [](StreamDynCatch& dc) {
+        dc.addCatch<Base>([](auto&&, std::ostream& os) { os << "caught:Base"; });
+    };
+    ASSERT_STRING_CONTAINS(trial({catchBase, catchDerived}), "caught:Derived");
+    ASSERT_STRING_CONTAINS(trial({catchDerived, catchBase}), "caught:Base");
+}
+
+TEST_F(DynamicCatchTest, RealisticScenarios) {
+    auto trial = [&](SourceLocation loc, auto&& f, std::string expected) {
+        try {
+            f();
+            invariant(false, "`f` didn't throw");
+        } catch (...) {
+            std::ostringstream os;
+            StreamDynCatch dc;
+            installSomeHandlers(dc);
+            dc.doCatch(os);
+            ASSERT_STRING_SEARCH_REGEX(os.str(), expected) << " location: " << loc;
+        }
+    };
+#define LOC MONGO_SOURCE_LOCATION()
+    trial(LOC, [] { throw TestForeignRootException{"oops"}; }, "TestForeignRootException: oops");
+    trial(LOC, [] { throw std::out_of_range{"testRange"}; }, "testRange");
+    trial(LOC, [] { throw SpecificStdException{"oops"}; }, "SpecificStdException: oops");
+    trial(LOC, [] { uasserted(ErrorCodes::UnknownError, "test"); }, "UnknownError.*test");
+#undef LOC
+}
+
+TEST_F(DynamicCatchTest, NoExtraArgs) {
+    DynamicCatch<> dc;
+    std::string capture = ">";
+    dc.addCatch<SomeException>([&](const auto& ex) { capture += fmt::format("({})", ex.msg); });
+    try {
+        throw SomeException{"oops"};
+    } catch (const SomeException&) {
+        dc.doCatch();
+    }
+    ASSERT_EQ(capture, ">(oops)");
+}
+
+TEST_F(DynamicCatchTest, MultipleArgs) {
+    std::vector<std::string> events;
+    DynamicCatch<std::vector<std::string>&, const std::string&> dc;
+    dc.addCatch<SomeException>(
+        [](const auto& ex, std::vector<std::string>& vec, const std::string& id) {
+            vec.push_back(fmt::format("{{{}:{}}}", id, ex.msg));
+        });
+    try {
+        throw SomeException{"oops"};
+    } catch (const SomeException&) {
+        dc.doCatch(events, "here");
+        dc.doCatch(events, "andHere");
+    }
+    ASSERT_EQ(fmt::format("[{}]", fmt::join(events, ",")), "[{here:oops},{andHere:oops}]");
+}
+
+DEATH_TEST_REGEX(DynamicCatchDeathDeathTest, FatalTestAssertFromStdxThread, "from stdx::thread") {
+    stdx::thread([] { ASSERT_EQ(1, 2) << "from stdx::thread"; }).join();
+}
+
+DEATH_TEST_REGEX(DynamicCatchDeathDeathTest,
+                 NoActiveException,
+                 R"re(terminate\(\) called\. No exception is active)re") {
+    std::ostringstream os;
+    DynamicCatch<std::ostream&> dc;
+    dc.doCatch(os);
+}
+
+}  // namespace
+}  // namespace mongo

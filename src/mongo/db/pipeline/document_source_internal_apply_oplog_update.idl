@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    InternalApplyOplogUpdateSpec:
+        description: $internalApplyOplogUpdate aggregation stage
+        strict: true
+        fields:
+            oplogUpdate:
+                description: An update encoded in oplog update format.
+                type: object

@@ -1,243 +1,757 @@
-Frequently Asked Questions
-==========================
+# Storage Engine API
 
-This is a list of frequently asked questions relating to storage engines, nearly
-all of which come from the mongodb-dev Google group. Many of the categories
-overlap, so please do not pay too much attention to the section titles. 
+The purpose of the Storage Engine API is to allow for pluggable storage engines in MongoDB (refer to
+the [Storage FAQ][]). This document gives a brief overview of the API, and provides pointers to
+places with more detailed documentation.
 
-**Q**: If I have a question about the storage API, what's the best way to get an answer?
-**A**: Your best bet is to post on mongodb-dev.  Everybody involved in the storage API will read the
-email.
+Third-party storage engines are integrated through self-contained modules that can be dropped into
+an existing MongoDB source tree, and will be automatically configured and included.
 
-Storage Engine API
-------------------
-**Q**: On InnoDB, row locks are not released until log sync is done. Will that be a
-problem in the API?  
-**A**: It’s not a problem with the API. A storage engine implementation could log sync at the end of
-every unit of work. The exact behavior depends on the durability behavior of the storage engine
-implementation.  Row locks will be held by MongoDB until the end of a WriteUnitOfWork (eg an
-operation on one document).
+For more context and information on how this API is used, see the
+[Catalog](../shard_role/shard_catalog/README.md).
 
-**Q**: As far as I can tell, the storage engine API allows storage engines to keep
-some context in the OperationContext's RecoveryUnit, but only for updates (there
-is no beginUnitOfWork equivalent for queries). This is presumably because of the
-history of locking inside MongoDB, but to prepare for future storage engines, it
-would be helpful to have some context that the storage engine can track across
-related read operations.  
-**A**: We agree that it would be helpful. We haven’t gotten to this yet because our
-current storage engine and isolation level don’t require this. Feel encouraged
-to suggest details.
+## Record Stores
 
-**Q**: Does the API expect committed changes from a transaction to be visible to
-others before log sync?
-**A**: The API does not require a log sync along with the commit of a unit of work.
-Changes should only be visible to the operation making the changes until those
-changes are committed, at which point the changes should be visible to all
-clients of the storage engine.
+A database contains one or more collections, each with a number of indexes, and a catalog listing
+them. All MongoDB collections are implemented with a [RecordStore](record_store.h) and indexes are
+implemented with a [SortedDataInterface](sorted_data_interface.h). By using the
+[KVEngine](kv/kv_engine.h) class, you only have to deal with the abstraction, as the
+[StorageEngineImpl](storage_engine_impl.h) implements the [StorageEngine](storage_engine.h)
+interface, using record stores for catalogs. See the
+[Catalog](../shard_role/shard_catalog/README.md) for more information.
 
-**Q**: What is the difference between storageSize and dataSize in RecordStore?
-**A**: dataSize is the size of the data stored and storageSize is the (approximate) on-disk size of
-the data and metadata.  Indices are not counted in storageSize; they are counted separately.
+### Record Identities
 
-**Q**: Is RecordStore::numRecords called frequently? Does it need to be fast?
-**A**: Yes and yes. Our Rocks implementation caches numRecords and dataSize so accessing that data
-is O(1) instead of O(n)
+A [RecordId](../record_id.h) is a unique identifier, assigned by the storage engine, for a specific
+document or entry in a record store at a given time. For storage engines based in the KVEngine, the
+record identity is fixed, but other storage engines may change it when updating a document. Note
+that changing record ids can be very expensive, as indexes map to the RecordId. A single document
+with a large array may have thousands of index entries, resulting in very expensive updates.
 
-Operation Context
------------------
-**Q**: I didn't find documentation for the transaction API, nor source code for it.
-How can I find the information for it?  
-**A**: You can find the documentation and source code for this in
-src/mongo/db/operation_context.h and src/mongo/db/operation_context_impl.cpp,
-respectively.  OperationContext contains many classes, in particular the Locker
-and RecoveryUnit, which have their own definitions.
+### Replicated Record Ids
 
-**Q**: In the RecordStore::getIterator() interface, the first parameter is a
-OperationContext "txn". I didn't find any documentation about how this context
-should be used by a specific storage implementation. I don't find it used in
-rocks implementation, nor heap1 or mmap_v1. How can I find answer to this
-question?  
-**A**: OperationContext is all of the state for an operation: the locks, the client
-information, the recovery unit, etc.  In particular, a record store
-implementation would probably access the lock state and the recovery unit.
- Storage engines are free to do whatever they need to with the OperationContext
-in order to satisfy the storage APIs.
+By default, a `RecordId` is assigned by the storage engine at insert time and is not guaranteed to
+match across replica set members. Different members may independently assign different `RecordId`s
+to the same logical document. The **Replicated Record Ids** feature changes this so that all nodes
+in a replica set use the same `RecordId` for the same document. This enables secondary oplog
+application to locate documents directly by `RecordId` rather than by `_id`-index lookup and
+provides a stable document address across the replica set.
 
-**Q**: About OperationContext "txn", does it mean states in operation context are only used by the
-storage engines to ensure the consistency inside the storage engines, and storage engine needs to
-follow no synchronization guideline because of it? To be more precise, if the same "txn" is passed
-to RecordStore::getIterator() twice, does it mean the iterator should be built from the same
-snapshot?
-**A**: Yes.
+A collection opts into this behavior when its catalog metadata has `recordIdsReplicated: true`. This
+is stored as a separate, top-level field in
+[`CatalogEntryMetaData`](https://github.com/mongodb/mongo/blob/40099d95c16656d47cd5a6a3c83c83022c94bf49/src/mongo/db/shard_role/shard_catalog/durable_catalog_entry_metadata.h)
+rather than inside `CollectionOptions`, because it is an internal-only parameter decided by the
+server at collection-creation time and cannot be specified via the `createCollection` command.
+Collections with replicated record IDs are visible via the `$listCatalog` aggregation, which
+includes `"recordIdsReplicated": true` in the `md` section of the corresponding catalog entry.
 
-**Q**: What guarantees must a storage engine provide if a document is updateRecord()'d and then
-returned by a getIterator()?  That is, do storage engines read their own writes?
-**A**: Operations should read their own writes.
+For collections with replicated record IDs, the `RecordStore` is configured with
+`allowOverwrite: false`, the same restriction applied to clustered collections. This prevents the
+storage engine from silently overwriting an existing record when an insert specifies a `RecordId`
+that is already occupied, guaranteeing record uniqueness. The write path enforces a complementary
+invariant: a caller-supplied `RecordId` must be provided if and only if the collection has
+`recordIdsReplicated: true`. Omitting or supplying a `RecordId` for the wrong collection type is a
+programming error caught by an `invariant`. See
+[`getRecordStoreOptions`](https://github.com/mongodb/mongo/blob/40099d95c16656d47cd5a6a3c83c83022c94bf49/src/mongo/db/shard_role/shard_catalog/collection_record_store_options.cpp)
+and
+[`collection_write_path.cpp`](https://github.com/mongodb/mongo/blob/40099d95c16656d47cd5a6a3c83c83022c94bf49/src/mongo/db/collection_crud/collection_write_path.cpp).
+
+The `recordIdsReplicated` setting is meaningful only within a single replica set. Different shards
+in a sharded cluster may have different `recordIdsReplicated` states for the same logical collection
+and this is not considered an inconsistency. When documents move between shards (via `moveChunk`,
+`reshardCollection`, or `movePrimary`), the recipient decides independently whether the collection
+should use replicated record IDs, and migrated documents may receive different `RecordId`s on the
+recipient even if both shards have replicated record IDs enabled. To prevent stale record IDs from
+being applied at the recipient, the `rid` field is stripped from oplog entries fetched from the
+donor during the resharding oplog fetch phase.
+
+`dbHash` supports an opt-in `includeReplicatedRecordIds: true` flag that folds the `RecordId` of
+each document into the per-document hash for collections with `recordIdsReplicated: true`. This
+allows verification that replica set members agree not only on document content but also on the
+`RecordId` assigned to each document. Without this flag, record IDs do not factor into the hash. See
+[`dbhash.cpp`](https://github.com/mongodb/mongo/blob/40099d95c16656d47cd5a6a3c83c83022c94bf49/src/mongo/db/commands/dbhash.cpp).
+
+For a full description of how record IDs are propagated through the replication pipeline see the
+[Replication README](../repl/README.md#replicated-record-ids).
+
+### Spill Tables
+
+Some operations may wish to relieve memory pressure by temporarily spilling some of their state to
+disk. The [SpillTable](spill_table.h) API provides an interface to do so which, in order to support
+isolation from non-spilling reads/writes, can use an entirely separate storage engine instance. It
+also will automatically drop the underlying table upon its destruction. Further, writes to a spill
+table will fail if the available disk space falls below a provided threshold. Note that reading
+from/writing to a spill table does not support transactionality or timestamping.
+
+## Locking and Concurrency
+
+MongoDB uses multi-granular intent locking; see the [Concurrency FAQ][]. In all cases, this will
+ensure that operations to meta-data, such as creation and deletion of record stores, are serialized
+with respect to other accesses.
+
+See the [Catalog](../shard_role/shard_catalog/README.md) and
+[Concurrency Control](../shard_role/lock_manager/README.md) for more information.
+
+## Transactions
+
+Operations use a [RecoveryUnit](recovery_unit.h), implemented by the storage engine, to provide
+transaction semantics as described below.
+
+### RecoveryUnit Lifetime
+
+Most operations create a [RecoveryUnit](recovery_unit.h) upon creation of their OperationContext
+that exists for the lifetime of the operation. Query operations that return a cursor to the client
+hold an idle recovery unit as long as that client cursor, with the operation context switching
+between its own recovery unit and that of the client cursor. User multi-statement transactions
+switch an active recovery unit onto operation contexts used to perform transaction operations.
+
+In some rare cases, operations may use more than one recovery unit at a time.
+
+### RecoveryUnit
+
+Each pluggable storage engine for MongoDB must implement `RecoveryUnit` as one of the base classes
+for the storage engine API. Typically, storage engines satisfy the `RecoveryUnit` requirements with
+some form of [snapshot isolation](#glossary) with transactions. Such transactions are called storage
+transactions elsewhere in this document, to differentiate them from the higher-level _multi-document
+transactions_ accessible to users of MongoDB. The RecoveryUnit manages the lifetime of a storage
+engine [snapshot](#glossary). MongoDB does not always explicitly open snapshots, therefore
+RecoveryUnits implicitly open snapshots on the first read or write operation.
+
+### Timestamps
+
+In MongoDB, a snapshot can be opened with or without a _timestamp_ when using a
+[ReadSource](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/storage/recovery_unit.h#L457-L483)
+that uses timestamps. The snapshot will return all data committed with a timestamp less than or
+equal to the snapshot's timestamp. No uncommitted data is visible in a snapshot, and data changes in
+storage transactions that commit after a snapshot is created, regardless of their timestamps, are
+also not visible. Generally, one uses a `RecoveryUnit` to perform transactional reads and writes by
+first configuring the `RecoveryUnit` with the desired `ReadSource` and then performing the reads and
+writes using operations on `RecordStore` or `SortedDataInterface`.
+
+### Atomicity
+
+Writes must only become visible when explicitly committed, and in that case all pending writes
+become visible atomically. Writes that are not committed before the unit of work ends must be rolled
+back. In addition to writes done directly through the Storage API, such as document updates and
+creation of record stores, other custom changes can be registered with the recovery unit.
+
+### Consistency
+
+Storage engines must ensure that atomicity and isolation guarantees span all record stores, as
+otherwise the guarantee of atomic updates on a document and all its indexes would be violated.
+
+### Isolation
+
+Storage engines must provide snapshot isolation, either through locking, through multi-version
+concurrency control (MVCC) or otherwise. The first read implicitly establishes the snapshot.
+Operations can always see all changes they make in the context of a recovery unit, but other
+operations cannot until a successful commit.
+
+### Durability
+
+Once a transaction is committed, it is not necessarily durable: if, and only if the server fails, as
+result of power loss or otherwise, the database may recover to an earlier point in time. However,
+atomicity of transactions must remain preserved. Similarly, in a replica set, a primary that becomes
+unavailable may need to roll back to an earlier state when rejoining the replica set, if its changes
+were not yet seen by a majority of nodes. The RecoveryUnit implements methods to allow operations to
+wait for their committed transactions to become durable.
+
+A transaction may become visible to other transactions as soon as it commits, and a storage engine
+may use a group commit, bundling a number of transactions to achieve durability. Alternatively, a
+storage engine may wait for durability at commit time.
+
+### Write Conflicts
+
+Systems with optimistic concurrency control (OCC) or multi-version concurrency control (MVCC) may
+find that a transaction conflicts with other transactions, that executing an operation would result
+in deadlock or violate other resource constraints. In such cases the storage engine may throw a
+WriteConflictException to signal the transient failure. MongoDB will handle the exception, abort and
+restart the transaction.
+
+### Point-in-time snapshot reads
+
+Two functions on the RecoveryUnit help storage engines implement point-in-time reads:
+`setTimestamp/setCommitTimestamp()` and `setTimestampReadSource()`. `setTimestamp()` is used by
+write transactions to label any forthcoming writes with a timestamp. Future readers can then use a
+`ReadSource` before starting any reads or writes to only see writes. The storage engine must produce
+the effect of reading from a snapshot that includes only writes with timestamps at or earlier than
+the selectSnapshot timestamp. This means that a point-in-time read may slice across prior write
+transactions by hiding only some data from a given write transaction, if that transaction had a
+different timestamp set prior to each write it did.
+
+## Classes to implement
+
+A storage engine should generally implement the following classes. See their definitions for more
+details.
+
+- [KVEngine](kv/kv_engine.h)
+- [RecordStore](record_store.h)
+- [RecoveryUnit](recovery_unit.h)
+- [SeekableRecordCursor](record_store.h)
+- [SortedDataInterface](sorted_data_interface.h)
+- [ServerStatusSection](../commands/server_status/server_status.h)
+
+[Concurrency FAQ]: http://docs.mongodb.org/manual/faq/concurrency/
+[Storage FAQ]: http://docs.mongodb.org/manual/faq/storage
+
+# WriteUnitOfWork
+
+A `WriteUnitOfWork` is the mechanism to control how writes are transactionally performed on the
+storage engine. All the writes (and reads) performed within its scope are part of the same storage
+transaction. After all writes have been staged, caller must call `commit()` in order to atomically
+commit the transaction to the storage engine. It is illegal to perform writes outside the scope of a
+WriteUnitOfWork since there would be no way to commit them. If the `WriteUnitOfWork` falls out of
+scope before `commit()` is called, the storage transaction is rolled back and all the staged writes
+are lost. Reads can be performed outside of a `WriteUnitOfWork` block; storage transactions outside
+of a `WriteUnitOfWork` are always rolled back, since there are no writes to commit.
+
+The WriteUnitOfWork has a
+[`groupOplogEntries` option](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/storage/write_unit_of_work.h#L74)
+to replicate multiple writes transactionally. This option uses the
+[`BatchedWriteContext` class](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/op_observer/batched_write_context.h#L47)
+to stage writes and to generate a single applyOps entry at commit, similar to what multi-document
+transactions do via the
+[`TransactionParticipant` class](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/transaction/transaction_participant.h#L117).
+Unlike a multi-document transaction, the applyOps entry lacks the `lsId` and the `txnNumber` fields.
+Callers must ensure that the WriteUnitOfWork does not generate more than 16MB of oplog, otherwise
+the operation will fail with `TransactionTooLarge` code.
+
+As of MongoDB 6.0, the `groupOplogEntries` mode is only used by the
+[BatchedDeleteStage](../exec/classic/batched_delete_stage.h) for efficient mass-deletes.
+
+See [WriteUnitOfWork](write_unit_of_work.h).
+
+## Lazy initialization of storage transactions
+
+Note that storage transactions on WiredTiger are not started at the beginning of a `WriteUnitOfWork`
+block. Instead, the transaction is started implicitly with the first read or write operation. To
+explicitly start a transaction, one can use `RecoveryUnit::preallocateSnapshot()`.
+
+## Changes
+
+One can register a `Change` on a `RecoveryUnit` while in a `WriteUnitOfWork`. This allows extra
+actions to be performed based on whether a `WriteUnitOfWork` commits or rolls back. These actions
+will typically update in-memory state to match what was written in the storage transaction, in a
+transactional way. Note that `Change`s are not executed until the destruction of the
+`WriteUnitOfWork`, which can be long after the storage engine committed. Two-phase locking ensures
+that all locks are held while a Change's `commit()` or `rollback()` function runs.
+
+# StorageUnavailableException
+
+`StorageUnavailableException` indicates that a storage transaction rolled back due to resource
+contention in the storage engine. This exception is the base of exceptions related to concurrency
+(`WriteConflict`) and to those related to cache pressure (`TemporarilyUnavailable` and
+`TransactionTooLargeForCache`).
+
+We recommend using the
+[writeConflictRetry](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/concurrency/exception_util.h#L231)
+helper which transparently handles all exceptions related to this error category.
+
+## WriteConflictException
+
+Writers may conflict with each other when more than one operation stages an uncommitted write to the
+same document concurrently. To force one or more of the writers to retry, the storage engine may
+throw a WriteConflictException at any point, up to and including the call to commit(). This is
+referred to as optimistic concurrency control because it allows un-contended writes to commit
+quickly. Because of this behavior, most WUOWs are enclosed in a writeConflictRetry loop that retries
+the write transaction until it succeeds, accompanied by a bounded exponential back-off.
+
+## TemporarilyUnavailableException
+
+A TemporarilyUnavailableException may be thrown inside the server to indicate that an operation
+cannot complete without blocking and must be retried. The storage engine may throw a
+TemporarilyUnavailableException (converted to a TemporarilyUnavailable error for users) when an
+operation is excessively rolled-back in the storage engine due to cache pressure or any reason that
+would prevent the operation from completing without impacting concurrent operations. The operation
+may be at fault for writing too much uncommitted data, or it may be a victim. That information is
+not exposed. However, if this error is returned, it is likely that the operation was the cause of
+the problem, rather than a victim.
+
+Before 6.0, this type of error was returned as a WriteConflict and retried indefinitely inside a
+writeConflictRetry loop. As of 6.0, MongoDB will retry the operation internally at most
+`temporarilyUnavailableMaxRetries` times, backing off for `temporarilyUnavailableBackoffBaseMs`
+milliseconds, with a linearly-increasing backoff on each attempt. After this point, the error will
+escape the handler and be returned to the client.
+
+If an operation receives a TemporarilyUnavailable error internally, a `temporarilyUnavailableErrors`
+counter will be displayed in the slow query logs and in FTDC.
+
+Notably, this behavior does not apply to multi-document transactions, which continue to return a
+WriteConflict to the client in this scenario without retrying internally.
+
+See
+[throwTemporarilyUnavailableException](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/storage/exceptions.h#L60-L65).
+
+## TransactionTooLargeForCacheException
+
+A TransactionTooLargeForCacheException may be thrown inside the server to indicate that an operation
+was rolled-back and is unlikely to ever complete because the storage engine cache is insufficient,
+even in the absence of concurrent operations. This is determined by a simple heuristic wherein,
+after a rollback, a threshold on the proportion of total dirty cache bytes the running transaction
+can represent and still be considered fullfillable is checked. The threshold can be tuned with the
+`transactionTooLargeForCacheThreshold` parameter. Setting this threshold to its maximum value (1.0)
+causes the check to be skipped and TransactionTooLargeForCacheException to be disabled.
+
+On replica sets, if an operation succeeds on a primary, it should also succeed on a secondary. It
+would be possible to convert to both TemporarilyUnavailableException and WriteConflictException, as
+if TransactionTooLargeForCacheException was disabled. But on secondaries the only difference between
+the two is the rate at which the operation is retried. Hence, TransactionTooLargeForCacheException
+is always converted to a WriteConflictException, which retries faster, to avoid stalling replication
+longer than necessary.
+
+Prior to 6.3, or when TransactionTooLargeForCacheException is disabled, multi-document transactions
+always return a WriteConflictException, which may result in drivers retrying an operation
+indefinitely. For non-multi-document operations, there is a limited number of retries on
+TemporarilyUnavailableException, but it might still be beneficial to not retry operations which are
+unlikely to complete and are disruptive for concurrent operations.
+
+# Idents
+
+An ident is a unique identifier given to a storage engine resource. Collections and indexes map
+application-layer names to storage engine idents. In WiredTiger, idents are implemented as tables
+and, each with a `.wt` file extension.
+
+Format of idents in the WiredTiger storage engine:
+
+- collection idents: `collection-<unique identifier>`
+- index idents: `index-<unique identifier>`
+- (v8.2+) the `<unique identifier>` is created by generating a new `UUID`.
+
+  - `collection-d3575067-0cd9-4239-a9e8-f6af884fc6fe`
+  - `index-a22eca47-c9e1-4df4-a043-d10e4cd45b40`
+
+Idents created in earlier versions of the server (pre v8.2) use a `<counter> + <random number>`
+combination as the `<unique identifier>` (e.g: `index-62-2245557986372974053`). Future versions of
+the server must continue to recognize both formats.
+
+Server flags that alter the form of idents (this applies to indexes as well):
+
+- `--directoryperdb`: `<db name>/collection-<unique identifier>`
+- `--wiredTigerDirectoryForIndexes`: `collection/<unique identifier>`
+- (both of the above): `<db name>/collection/<unique identifier>`
+
+# Startup Recovery
+
+There are three components to startup recovery. The first step, of course, is starting the storage
+engine. More detail about WiredTiger's startup recovery procedure can be found
+[here](wiredtiger/README.md#startup-recovery).
+
+The other two parts of storage startup recovery bring the
+[catalog](../shard_role/shard_catalog/README.md) back into a consistent state. The catalog typically
+refers to MongoDB's notion of collections and indexes, but it's important to note that storage
+engines such as WiredTiger have their own notion of a catalog.
+
+The first step of recovering the catalog is to bring MongoDB's catalog in line with the storage
+engine's. This is called reconciliation. Except for rare cases, every MongoDB collection is a
+RecordStore and a list of indexes (aka SortedDataInterface). Every record store and index maps to
+their own ident. [The WiredTiger README](wiredtiger/README.md) describes the relationship between
+creating/dropping a collection and the underlying creation/deletion of a table which justifies the
+following logic. In short, the following logic is necessary because not all storage engines can
+create and drop idents transactionally. When reconciling, every ident that is not "pointed to" by a
+MongoDB record store or index
+[gets dropped](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine_impl.cpp#L720-L734).
+A MongoDB record store that points to an ident that doesn't exist is considered
+[a fatal error](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine_impl.cpp#L737-L752).
+An index that doesn't point to an ident is
+[ignored and logged](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine_impl.cpp#L787-L799)
+because there are certain cases where the catalog entry may reference an index ident which is no
+longer present, such as when an unclean shutdown occurs before a checkpoint is taken during startup
+recovery.
+
+The second step of recovering the catalog is
+[reconciling unfinished index builds](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine_impl.cpp#L754-L758),
+that could have different outcomes:
+
+- An
+  [index build with a UUID](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine_impl.cpp#L801-L804)
+  is an unfinished two-phase build and must be restarted, unless we are
+  [resuming it](/src/mongo/db/index_builds/README.md#resumable-index-builds). This resume
+  information is stored in an internal ident written at (clean) shutdown. If we fail to resume the
+  index build, we will clean up the internal ident and restart the index build in the background.
+- An
+  [unfinished index build on standalone](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine_impl.cpp#L845-L849)
+  will be discarded (no oplog entry was ever written saying the index exists).
+
+After storage completes its recovery, control is passed to
+[replication recovery](../repl/README.md#startup-recovery). While storage recovery is responsible
+for recovering the oplog to meet durability guarantees and getting the two catalogs in sync,
+replication recovery takes responsibility for getting collection data in sync with the oplog.
+Replication starts replaying oplog from the
+[recovery timestamp](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/storage_engine.h#L553-L558).
+
+See the [WiredTiger README](wiredtiger/README.md#checkpoints) for more details.
+
+# File-System Backups
+
+Backups represent a full copy of the data files at a point-in-time. These copies of the data files
+can be used to recover data from a consistent state at an earlier time. This technique is commonly
+used after a disaster ensued in the database.
+
+The data storage requirements for backups can be large as they correlate to the size of the
+database. This can be alleviated by using a technique called incremental backups. Incremental
+backups only back up the data that has changed since the last backup.
+
+MongoDB instances used in production should have a strategy in place for capturing and restoring
+backups in the case of data loss events.
+
+[Documentation for further reading.](https://docs.mongodb.com/manual/core/backups/)
+
+# Queryable Backup (Read-Only)
+
+This is a feature provided by Ops Manager in which Ops Manager quickly and securely makes a given
+snapshot accessible over a MongoDB connection string.
+
+Queryable backups start-up quickly regardless of the snapshot's total data size. They are uniquely
+useful for restoring a small subset of data, such as a document that was accidentally deleted or
+reading out a single collection. Queryable backups allow access to the snapshot for read-only
+operations.
+
+# Checkpoints
+
+Checkpoints provide recovery points that enable the database to load a consistent snapshot of the
+data quickly during startup or after a failure. Checkpoints provide basic operation durability in
+favor of fast recovery in the event of a crash.
+
+Write-ahead logging, aka [journaling](#journaling), is used in addition to checkpointing to provide
+commit-level durability for all operations since the last checkpoint. On startup, all journaled
+writes are re-applied to the data from the last checkpoint. Without journaling, all writes between
+checkpoints would be lost.
+
+Storage engines need to
+[support checkpoints](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/storage/storage_engine.h#L235)
+for MongoDB to take advantage of this, otherwise MongoDB will act as an ephemeral data store. The
+frequency of these checkpoints is determined by the
+['storage.syncPeriodSecs' or 'syncdelay'](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/mongod_options_storage.idl#L130-L136)
+options.
+
+# Journaling
+
+MongoDB provides write durability via a persisted change log for replicated writes and persistence
+of non-replicated writes. The replicated change log and non-replicated collections in WiredTiger are
+journaled, i.e. written out to disk. The user writes themselves, however, on a --replSet server, do
+not need to be written out to disk to guarantee persistence on the server.
+
+All replicated server writes have matching change log entries representing the changes done. The
+change log is stored in the `local.oplog.rs` namespace, which is set up as a capped collection so
+that old unneeded log entries are eventually removed. Replication uses the oplog collection to copy
+data from one server to another.
+
+Durability of journaled collections and indexes is done by periodic or triggered journal flushes
+that specifically flush only journaled writes to disk. MongoDB can disable journaling, such as in
+standalone mode, so that the periodic journal flushes do not occur. Instead,
+[Checkpoints](#checkpoints), which flush all writes to disk regardless of journal settings, are
+taken whenever durability of a write is requested and journaling is disabled. Syncing only journaled
+collection entries to disk is cheaper than syncing all data writes.
+
+Data durability is essential for recovery after server shutdown. Data must be persisted to disk to
+survive process restart, either in the form of the journal or as the write itself. Server startup
+recovery will open the storage engine at the last-made data checkpoint, and all of the journaled
+writes flushed to disk will also be found even if they occurred after the last checkpoint. The
+replication layer decides what to apply of the change log (oplog collection) past the checkpoint for
+cross replica set data consistency. For example, the storage engine might recover data up to time
+T9, but the journaled oplog recovered could go up to T20, say. It is a replication level decision to
+apply (or not apply) T10 through T20.
+
+See the [WiredTiger README](wiredtiger/README.md#Cherry-picked-WT-log-Details) for more details on
+the implementation.
+
+Code Links:
+
+- [_The JournalFlusher class_](control/journal_flusher.h)
+  - Periodically and upon request flushes the journal to disk.
+
+# Fast Truncation on Internal Collections
+
+Logical deletes aren't always performant enough to keep up with inserts. To solve this, several
+internal collections use `CollectionTruncateMarkers` for fast, unreplicated and untimestamped
+[truncation](http://source.wiredtiger.com/1.4.2/classwiredtiger_1_1_session.html#a80a9ee8697a61a1ad13d893d67d981bb)
+of expired data, in lieu of logical document deletions.
+
+## CollectionTruncateMarkers
+
+CollectionTruncateMarkers are an in-memory tracking mechanism to support ranged truncates on a
+collection.
+
+A collection is broken up into a number of truncate markers. Each truncate marker tracks a range in
+the collection. Newer entries not captured by a truncate marker are tracked by an in-progress
+"partial marker".
+
+```
+                                CollectionTruncateMarkers
+               _______________________________________
+              |             |  ......   |             |   Partial Marker
+              |_____________|___________|_____________|__________
+               Oldest Marker             Newest Marker
+Min RecordId <------------------------------------------------<--- Max RecordId
 
 
-Reading & Writing
------------------
-**Q**: Are write cursors expected to see their changes in progress?
-**A**: Yes, this is currently expected. There has been some discussion about removing this
-requirement. For now we are not planning on doing so. Instead, a queryable and iterable WriteBatch
-class is being created to allow access to data which has not yet been committed.
+                    Truncate Marker
+         _______________________________________
+        | . Last Record's RecordId              |
+        | . Last Record's Wall Time             |
+        | . Bytes in Marker                     |
+        | . Number of records in Marker         |
+        |_______________________________________|
+                                               ^
+                                               |
+                                           Last Record
+                              Marks the end of the marker's range
+                        Most recent record at the time of marker creation
+```
 
-**Q**: "Read-your-writes" consistency was mentioned in Mathias's MongoWorld
-presentation, but as far as I can see, the storage engine has no way to connect
-a RecordStore::insertRecord call with a subsequent RecordStore::dataFor -- the
-latter doesn't take an OperationContext.  Is this an oversight?  
-**A**: Yes, this is an oversight.  We’ll be doing a sweep through and fixing this
-and other problems.  (FYI, as an implementation side-effect, mmapv1
-automatically provides read-your-writes, which partially explains this
-oversight.)
+A new truncate marker is created when either:
 
-**Q**: Storage engines need to support a "read-your-own-update.”  In the storage
-engine interface, which parameter/variable passes this transaction/session
-information?  
-**A**: The OperationContext “txn”, which is also called “opCtx” in some areas, has
-the information.  There are probably some places we have neglected to pass this
-in.
+1. An insert causes the in-progress "partial marker" segment to contain more than the minimum bytes
+   needed for a truncate marker.
+   - The record inserted serves as the 'last record' of the newly created marker.
+2. Partial marker expiration is supported, and an explicit call is made to transform the "partial
+   marker" into a complete truncate marker.
+   - Partial marker expiration is supported for the change stream pre-images collection and ensures
+     that expired documents in a partial marker will eventually be truncated - even if writes to the
+     namespace cease and the partial marker never meets the minimum bytes requirement.
 
-**Q**: When executing a query, if both of indexes ("btree") and record store are
-read, how do we make sure we are reading from a consistent view of them (RocksDB
-or other storage)? I didn't find any handling of that from the codes. Can you
-point me in a direction to look for this?  
-**A**: We do not handle this now, because it is not an issue with our current
-(mmapv1) storage engine. We’re discussing how to solve this. We currently store
-the information necessary to obtain a consistent view of the database in the
-RocksRecoveryUnit class, which is itself a member of the OperationContext class.
-Therefore, one possible solution would be to pass the OperationContext class to
-every method which needs a consistent view of the database. We will soon merge
-code which has comments mentioning every instance in rocks where this needs to
-be done.
+### Requirements & Properties
 
-**Q**: The RocksDB implementation of insert, update, delete methods for RecordStore add something to
-a write batch. This is fast and unlikely to fail. The real work is delayed until commit. What is the
-expected behavior when writing the write batch on commit fails because of a disk write timeout, disk
-full or other odd error? The likely error would occur on insert or update when unique index
-maintenance is done, but that has yet to be implemented.
-**A**: We’re planning on implementing operation-level retry to avoid deadlocks that might otherwise
-occur while processing a document.  An operation could probably be similarly retried in the case of
-transient errors upon commit.
+CollectionTruncateMarkers support collections that meet the following requirements:
 
-**Q**: What kind of operations might occur between prepareToYield and recoverFromYield? DDL
-including drop collection? Or just other transactions? For an index scan does prepareToYield require
-me to save the last key seen so that recover knows where to restart?
-**A**: In 2.6, DDL could occur, as could other transactions.  These methods were introduced when
-operations were scheduled through “time-slicing” with voluntary lock yielding.  They’re changing
-meaning now that yielding is gone.  We’re still figuring out what state-saving behavior we need, in
-particular for operations that mutate the results of a query.  The getMore implementation currently
-uses them as well and will probably continue to do so.
+- Insert and truncate only. No updates or individual document deletes.
+- [Clustered](../shard_role/shard_catalog/README.md#clustered-collections) with no secondary
+  indexes.
+- RecordId's in Timestamp order.
+- Deletion of content follows RecordId ordering.
+  - This is a general property of clustered capped collections.
 
-**Q**: Is there global locking for SortedDataInterface::isEmpty to prevent inserts from being done
-when the answer is being determined?
-**A**: Yes.  Any caller of isEmpty must have locks to ensure that it is still true by the time it
-acts on that information.
+Collections who use CollectionTruncateMarkers share the following properties:
 
+- Fast counts aren't expected to be accurate.
+  - Truncates don't track the count and size of documents truncated in exchange for performance
+    gains.
+  - Markers are a best effort way to keep track of the size metrics and when to truncate expired
+    data.
+- Collections aren't expected to be consistent between replica set members.
+  - Truncates are unreplicated, and nodes may truncate ranges at different times.
+- No snapshot read concern support (ex:
+  [SERVER-78296](https://jira.mongodb.org/browse/SERVER-78296)).
+  - Deleting with untimestamped, unreplicated range truncation means point-in-time reads may see
+    inconsistent data.
 
-RecoveryUnit
-------------
-**Q**: As documented I don’t understand the point of the RecoverUnit::endUnitOfWork
-nesting behavior. Can you explain where it is used or will be used?  
-**A**: The RecoveryUnit interface and the mmapv1 (current mongodb storage engine)
-implementation are both works in progress :)  We’re currently adding unit of
-work declarations and two phase locking.  The nesting behavior currently exists
-to verify that we’re adding units of work correctly and we expect to remove it
-when two phase locking is completed.
+Each collection utilizing CollectionTruncateMarkers must implement its
+[own policy](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/storage/collection_truncate_markers.h#L299-L302)
+to determine when there are excess markers and it is time for truncation.
 
-**Q**: RecoveryUnit::{beginUnitOfWork, endUnitOfWork, commitUnitOfWork} - these
-return nothing. What happens on failure? With optimistic concurrency control
-commit can fail in the normal case. In theory, someone might try to use
-optimistic CC for a RocksDB+Mongo engine.  
-**A**: We’re currently not planning these interfaces with OCC (or MVCC) in mind.
- Currently, if any of these fooUnitOfWork functions fail, we expect to roll back
-and probably retry the operation. The interfaces are rather fluid right now and
-will probably return a Status (or throw an exception) at some point. However,
-rollback should never fail.
+### In-Memory Initialization
 
+At or shortly after startup, an initial set of CollectionTruncateMarkers are created for each
+collection. The collection is either scanned or sampled to generate initial markers. Initial
+truncate markers are best effort, and may hold incorrect estimates about the number of documents and
+bytes within each marker. Eventually, once the initial truncate markers expire, per truncate marker
+metrics will converge closer to the correct values.
 
-RocksDB
--------
-**Q**: I think RocksRecoveryUnit::awaitCommit should remain in RecoveryUnit but be
-renamed to ::awaitLogSync. If force log once per second is done, then this
-blocks until the next time log is forced to disk. But I think we [should] be explicit
-about "commit" vs "forcing redo log to storage" given that many engines
-including InnoDB, RocksDB & MongoDB let commit get done without a log force.  
-**A**: We agree that these should be two separately defined pieces of functionality.
-We’re currently discussing whether or not to expose the “forcing redo log to
-storage” in the API. We also are planning on doing a renaming pass.
+### Collections that use CollectionTruncateMarkers
 
-**Q**: Why doesn't RocksRecoveryUnit::endUnitOfWork respect _defaultCommit before
-calling commitUnitOfWork?  
-**A**: _defaultCommit is a temporary boolean that should disappear once we’ve fully
-implemented rollbacks.
+- The oplog - `OplogTruncateMarkers`.
+- [Change stream pre-images collection](#pre-images-collection-truncation) -
+  `PreImagesTruncateMarkersPerNsUUID`
 
-**Q**: Why is RocksRecoveryUnit::isCommitNeeded based on size of buffered write
-batch? Isn't this supposed to return TRUE If a WAL sync is needed?  
-**A**: This is an mmapv1-specific method that will be going away.  It’s part of the
-API but will be removed soon.
+Read about the WiredTiger implementation of Oplog Truncation Markers
+[here](wiredtiger/README.md#oplog-truncation).
 
-**Q**: In RocksRecordStore::updateWithDamages() there is a comment "todo: this
-should use the merge functionality in rocks". Can you explain more about the
-motivation? Is it for atomicity, or for reducing write amplification?  
-**A**: We want to do this for speed, as it will allow us to avoid reading in data
-from rocks, updating it in memory, and writing it back. However, due to the way
-the rest of our code works, we’re not sure if this will yield much of a
-performance increase. For now, we’re focusing on getting minimal functionality
-working, but may benchmark this in the future.
+### Change Stream Collection Truncation
 
-**Q**: How do I install RocksDB?  
-**A**: https://groups.google.com/forum/#!topic/mongodb-dev/ilcHAg6JgQI
+The change stream pre-images collection that uses CollectionTruncateMarkers is named
+`config.system.preimages`.
 
-**Q**: I think RocksRecordStore::_nextId needs to be persistent. But I also think the API needs to
-support logical IDs as DiskLoc is physical today and using (int,int) for file number / offset
-implies that files are at most 2G. And I suspect that the conversion of it to a byte stream means
-that Rocks documents are not in PK order on little endian (see _makeKey).
-**A**: We're planning on pushing DiskLoc under the storage layer API (it’s really an mmapv1 data
-type) and replacing it with a 64-bit RecordID type that can be converted into whatever a storage
-engine requires.
+Expired change stream pre-images are removed by a periodic remover thread
+([ChangeStreamExpiredPreImagesRemover](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/pipeline/change_stream_expired_pre_image_remover.cpp#L65-L70).
+The remover thread:
 
-General
-=======
-**Q**: Does the storage engine allow for group commit?  
-**A**: Yes.  In fact, the mmapv1 impl does group commit.
+1. Creates the initial CollectionTruncateMarkers if they do not yet exist
+   - Lazy initialization of the initial truncate markers is imperative so writes aren't blocked on
+     startup
+2. Iterates through each truncate marker. If a marker is expired, issues a truncate of all records
+   older than the marker's last record, and removes the marker from the set.
 
-**Q**: cleanShutdown has no return value. What is to be done on an internal error
-(assert & crash)?  
-**A**: Yes, on internal error, assert and crash.
+#### Pre-Images Collection Truncation
 
-**Q**: Storage engine initialization is done in the constructor. How are errors on
-init to be returned or handled?  
-**A**: Currently all errors on storage engine init are fatal.  We assume if the
-storage engine can’t work, the database probably can’t work either.
+The change streams pre-images collection is clustered by
+[ChangeStreamPreImageId](https://github.com/mongodb/mongo/blob/r8.2.1/src/mongo/db/pipeline/change_stream_preimage.idl#L72),
+which implicitly orders pre-images first by their `'nsUUID'` (the UUID of the collection the
+pre-image is from), their `'ts'` (the timestamp associated with the pre-images oplog entry), and
+then by their `'applyOpsIndex'` (the index into the applyOps oplog entry which generated the
+pre-image, 0 if the pre-image isn't from an applyOps oplog entry).
 
-**Q**: Is Command::runAgainstRegistered() the entry point of query and update
-queries? I saw these lines:
+There is a set of CollectionTruncateMarkers for each 'nsUUID' within the pre-images collection,
+`PreImagesTruncateMarkersPerNsUUID`.
 
-    OperationContext* noTxn = NULL; // mongos doesn't use transactions SERVER-13931
-    execCommandClientBasic(noTxn, c, *client, queryOptions, ns, jsobj, anObjBuilder, false);
+A pre-image is expired if either (1) 'expireAfterSeconds' is set and the pre-image is expired by it
+or (2) its 'ts' is less than or equal to the oldest oplog entry timestamp.
 
-Are we always passing noTxn to the query? What does it mean?  
-**A**: The entry point of query and updates is assembleResponse in instance.cpp.  In
-the case you cite, the command is being invoked from mongos, which doesn’t need
-to pay attention to durability or take locks.
+`ChangeStreamExpiredPreImagesRemover` iterates over each set of `PreImagesTruncateMarkersPerNsUUID`,
+and issues a ranged truncate from the truncate marker's last record to the minimum RecordId for the
+nsUUID when there is an expired truncate marker.
 
-**Q**: From my reading of the codes, the Cloner component is the way for MongoDB to
-build a new slave from a master (called by ReplSource::resync()). If I
-understand the codes correctly, cloning always does logical copy of keys
-(reading keys one by one and insert them one by one). Two comments I have:
+#### Replication of Pre-Images Collection Truncation
 
-    1. RocksDB uses LSM, which provides a good feature that you can do physical copy
-       of the files, which should be faster. Is there a long term plan to make
-       use of it?   
-    2. If we stick on logical copy, the best practice is to tune the RocksDB in 
-       the new slave side to speed up the copy process:   
-            1. Disable WAL tune compactions  
-            2. Tune compaction to never happen   
-            3. Use vectorrep mem table   
-            4. Issue a full compaction and reopen the DB after cloning finishes.  
-We might consider to design the storage plug-in and components to use it to be  
-flexible enough to make it easy to make those future improvements when needed.  
-**A**: Offering a physical file copy for initial sync is something we're
-considering for the future, but not at this time.
+There are two modes for truncating expired change streams pre-images:
 
+- unreplicated truncates: in this mode, all nodes in a replica set perform local, unreplicated
+  truncates on the `config.system.preimages` collection. All nodes have their own
+  `ChangeStreamExpiredPreImagesRemover` thread working. No oplog entries are written for the
+  truncates.
+- replicated truncates: in this mode, the `ChangeStreamExpiredPreImagesRemover` thread only runs on
+  the current primary of the replica set. The primary writes the truncates to the oplog using
+  `truncateRange` oplog entries. These are replicated and picked up by the secondaries' oplog
+  applier.
+
+When using unreplicated truncates, every node in a replica set has its own view of the data in the
+`config.system.preimages` collection, i.e. there can be inconsistencies between the primary and the
+secondaries w.r.t. this collection. The data consistency check (`checkDBHash`) that is performed at
+replica set shutdown in testing permits these differences.
+
+When replicated truncates are used, the primary and the secondaries should always have a consistent
+view of the data in the `config.system.preimages` collection, and `checkDBHash` does not permit any
+differences between the primary and the secondaries for this collection.
+
+Which of the two modes (unreplicated or replicated truncates) is used depends on two factors:
+
+- Disaggregated storage clusters (DSC) will always use replicated truncates, as all write operations
+  need to be timestamped and shipped to the secondaries via the oplog. Unreplicated truncates will
+  not be used in this configuration.
+- On aggregated storage clusters (ASC), feature flag `featureFlagUseReplicatedTruncatesForDeletions`
+  controls if replicated truncates are used, i.e. both unreplicated and replicated truncates can be
+  used.
+
+#### Responsibility for Pre-Images Truncation
+
+When using unreplicated truncates, the pre-image truncation (`ChangeStreamExpiredPreImagesRemover`)
+is installed on every node as part of the `onConsistentDataAvailable` callback of the
+`ReplicaSetAwareInterface`. Sampling of the pre-images in `config.system.preimages` is only done
+once when the job is installed and runs for the first time.
+
+In replicated truncates mode, only the current primary executes the pre-image removal. On every
+step-up as a primary, the node installs the pre-images removal job, as part of the
+`onStepUpComplete` callback of the `ReplicaSetAwareInterface`. When a node steps down, the pre-image
+truncation job is stopped as part of the `onStepDown` callback. If a step-up or step-down happens
+while the pre-images removal job is currently executing, the current removal job iteration can fail
+with a `NotWritablePrimary` error. This is expected and does not cause problems, as the new primary
+will take over the deletions afterwards. In replicated truncates mode, sampling of the documents in
+the pre-images collection is performed on every step-up as a primary.
+
+#### Cleanup After Unclean Shutdown
+
+When using unreplicated truncates, all expired pre-images are truncated at startup after an unclean
+shutdown. WiredTiger truncate cannot guarantee a consistent view of previously truncated data on
+unreplicated, untimestamped ranges after a crash. Unlike the oplog, the change stream pre-image
+collection is not logged, does not persist any special timestamps, and it's possible that previously
+truncated documents can resurface after shutdown.
+
+### Code spelunking starting points:
+
+- [The CollectionTruncateMarkers class](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/collection_truncate_markers.h#L78)
+  - The main api for CollectionTruncateMarkers.
+- [The OplogTruncateMarkers class](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/storage/wiredtiger/wiredtiger_record_store_oplog_truncate_markers.h#L45)
+  - Oplog specific truncate markers.
+- [The PreImagesTruncateMarkersPerNsUUID class](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/change_stream_pre_images_truncate_markers_per_nsUUID.h#L62)
+  - Truncate markers for a given nsUUID captured within a pre-images collection.
+- [The PreImagesTruncateManager class](https://github.com/mongodb/mongo/blob/r8.0.15/src/mongo/db/change_stream_pre_images_truncate_manager.h#L71)
+  - Manages pre-image truncate markers.
+
+# Oplog Collection
+
+The `local.oplog.rs` collection maintains a log of all writes done on a server that should be
+replicated by other members of its replica set. All replicated writes have corresponding oplog
+entries; non-replicated collection writes do not have corresponding oplog entries. On a primary, an
+oplog entry is written in the same storage transaction as the write it logs; a secondary writes the
+oplog entry and then applies the write reflected therein in separate transactions. The oplog
+collection is only created for servers started with the `--replSet` setting. The oplog collection is
+a capped collection and therefore self-deleting per the default oplog size. The oplog can be resized
+by the user via the `replSetResizeOplog` server command.
+
+A write's persistence is guaranteed when its oplog entry reaches disk. The log is periodically
+synced to disk, i.e. [journaled](#journaling). The log can also be immediately synced to disk by an
+explicit request to fulfill the durability requirements of a particular write. For example:
+replication may need to guarantee a write survives server restart before proceeding, for
+correctness; or a user may specify a `j:true` write concern to request the same durability. The data
+write itself is not written out to disk until the next periodic [checkpoint](#checkpoints) is taken.
+The default log syncing frequency is much higher than the checkpoint default frequency because
+syncing the log to disk is cheaper than syncing everything to disk.
+
+The oplog is read by secondaries that then apply the writes therein to themselves. Secondaries can
+'fall off the oplog' if replication is too slow and the oplog capped max size is too small: the sync
+source may delete oplog entries that a secondary still needs to read. The oplog is also used on
+startup recovery to play writes forward from a checkpoint; and it is manipulated -- undone or
+reapplied -- for replication rollback.
+
+## Oplog Visibility
+
+MongoDB supports concurrent writes. This means that there are out-of-order commits and 'oplog holes'
+can momentarily exist when one write with a later timestamp commits before a concurrent write with
+an earlier timestamp. Timestamps are assigned prior to storage transaction commit. Out-of-order
+writes are supported because otherwise writes must be serialized, which would harm performance.
+
+Oplog holes must be tracked so that oplog read cursors do not miss data when reading in timestamp
+order. Unlike typical collections, the key for a document in the oplog is the timestamp itself.
+Because collection cursors return data in key order, cursors on the oplog will return documents in
+timestamp order. Oplog readers therefore fetch a timestamp guaranteed not to have holes behind it
+and use that timestamp to open a storage engine transaction that does not return entries with later
+timestamps. The following is a demonstrative example of what this oplog visibility rule prevents:
+
+Suppose there are two concurrent writers **A** and **B**. **Writer A** opens a storage transaction
+first and is assigned a commit timestamp of **T5**; then **Writer** **B** opens a transaction and
+acquires a commit timestamp **T6**. The writers are using different threads so **Writer B** happens
+to commit first. The oplog now has a 'hole' for timestamp **T5**. A reader opening a read
+transaction at this time could now see up to the **T6** write but miss the **T5** write that has not
+committed yet: the cursor would see T1, T2, T3, T4, T6. This would be a serious replica set data
+consistency problem if secondary replica set members querying the oplog of their sync source could
+unknowingly read past these holes and miss the data therein.
+
+| Op       | Action             | Result                                       |
+| -------- | ------------------ | -------------------------------------------- |
+| Writer A | open transaction   | assigned commit timestamp T5                 |
+| Writer B | open transaction   | assigned commit timestamp T6                 |
+| Writer B | commit transaction | T1,T2,T3,T4,T6 are visible to new readers    |
+| Reader X | open transaction   | gets a snapshot of T1-T4 and T6              |
+| Writer A | commit transaction | T1,T2,T3,T4,T5,T6 are visible to new readers |
+| Reader X | close transaction  | returns T1,T2,T3,T4,T6, missing T5           |
+
+The in-memory 'no holes' point of the oplog is tracked in order to avoid data inconsistency across
+replica set members. The 'oplogReadTimestamp' tracks the in-memory no holes point and is continually
+advanced as new oplog writes occur and holes disappear. Forward cursor oplog readers without a
+specified timestamp set at which to read (secondary callers) will automatically use the
+`oplogReadTimestamp` to avoid missing entries due to oplog holes. This is essential for secondary
+replica set members querying the oplog of their sync source so they do not miss any oplog entries:
+subsequent `getMores` will fetch entries as they become visible without any holes behind them.
+Backward cursor oplog readers bypass the oplog visibility rules to see the latest oplog entries,
+disregarding any oplog holes.
+
+# DiskSpaceMonitor
+
+The `DiskSpaceMonitor` is a `ServiceContext` decoration that monitors available disk space every
+second in the database path and executes registered actions when disk space falls below specified
+thresholds. The `DiskSpaceMonitor` is started during MongoDB initialization.
+
+Actions are registered with a threshold function which should return the number of threshold bytes
+and a action function. When the available disk space <= the number of threshold bytes, we perform
+the action function. Each action receives a unique ID for deregistration or to run specific actions
+as needed. Actions can be run by its unique ID (`runAction`) or collectively (`runAllActions`).
+
+An example of a use of the `DiskSpaceMonitor` is the `IndexBuildsCoordinator` registers actions to
+kill index builds when disk space is low when neither `directoryPerDb` nor `directoryForIndexes` is
+enabled.
+
+# Glossary
+
+**oplog hole**: An uncommitted oplog write that can exist with out-of-order writes when a later
+timestamped write happens to commit first. Oplog holes can exist in-memory and persisted on disk.
+
+**oplogReadTimestamp**: The timestamp used for WT forward cursor oplog reads in order to avoid
+advancing past oplog holes. Tracks in-memory oplog holes.
+
+**snapshot**: A snapshot consists of a consistent view of data in the database. When a snapshot is
+opened with a timestamp, snapshot only shows data committed with a timestamp less than or equal to
+the snapshot's timestamp.
+
+**snapshot isolation**: A guarantee that all reads in a transaction see the same consistent snapshot
+of the database. Reads with snapshot isolation are repeatable, only see committed data, and never
+return newly-committed data. The storage engine must provide concurrency control to resolve
+concurrent writes to the same data.

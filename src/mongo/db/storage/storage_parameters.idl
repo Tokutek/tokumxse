@@ -1,0 +1,266 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/bson/bson_depth.h"
+        - "mongo/db/storage/storage_options.h"
+    mod_visibility: public
+
+server_parameters:
+    # This is an alias for the 'storage.syncPeriodSecs' config, and the default is defined in the
+    # StorageGlobalParams struct to resolve a conflict between config parameter and set parameter evaluation.
+    syncdelay:
+        # In almost every situation you should not set this value and use the default setting.
+        description: >-
+            Interval in seconds between fsync operations where mongod flushes its
+            working memory to disk. By default, mongod flushes memory to disk every 60 seconds.
+        set_at: [startup, runtime]
+        cpp_varname: "storageGlobalParams.syncdelay"
+        validator:
+            gte: 0.0
+            lte: {expr: "StorageGlobalParams::kMaxSyncdelaySecs"}
+        redact: false
+
+    # This is an alias for the 'storage.journal.commitIntervalMs' config, and the default is defined in the
+    # StorageGlobalParams struct to resolve a conflict between config parameter and set parameter evaluation.
+    journalCommitInterval:
+        description: "Number of milliseconds between journal commits"
+        set_at: [startup, runtime]
+        cpp_varname: "storageGlobalParams.journalCommitIntervalMs"
+        validator:
+            gte: 1
+            lte: {expr: "StorageGlobalParams::kMaxJournalCommitIntervalMs"}
+        redact: false
+
+    takeUnstableCheckpointOnShutdown:
+        description: "Take unstable checkpoint on shutdown"
+        cpp_vartype: bool
+        cpp_varname: gTakeUnstableCheckpointOnShutdown
+        set_at: startup
+        default: false
+        redact: false
+
+    operationMemoryPoolBlockInitialSizeKB:
+        description: "Initial block size in KB for the per operation temporary object memory pool"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gOperationMemoryPoolBlockInitialSizeKB
+        default: 1
+        validator:
+            gte: 1
+        redact: false
+
+    operationMemoryPoolBlockMaxSizeKB:
+        description: "Maximum block size in KB for the per operation temporary object memory pool"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gOperationMemoryPoolBlockMaxSizeKB
+        default: 2048
+        validator:
+            gte: 1
+        redact: false
+
+    indexMaxNumGeneratedKeysPerDocument:
+        description: "Maximum number of index keys a single document is allowed to generate"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gIndexMaxNumGeneratedKeysPerDocument
+        default: 100000
+        validator:
+            gte: 200
+        redact: false
+
+    storageGlobalParams.directoryperdb:
+        description: "Read-only view of directory per db config parameter"
+        set_at: "readonly"
+        cpp_class:
+            name: StorageDirectoryPerDbParameter
+        redact: false
+
+    timeseriesValidateCompressedBuckets:
+        description: "Validate that there is no data loss before committing compressed timeseries buckets"
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gValidateTimeseriesCompression
+        default: true
+        redact: false
+
+    internalInsertMaxBatchSize:
+        description: "Maximum number of documents that we will insert in a single batch."
+        set_at: [startup, runtime]
+        cpp_varname: "internalInsertMaxBatchSize"
+        cpp_vartype: Atomic<int>
+        default: 500
+        validator:
+            gt: 0
+        redact: false
+
+    maxNumberOfBatchedOperationsInSingleOplogEntry:
+        description: >-
+            Maximum number of operations to pack into a single oplog entry, when multi-oplog
+            format for batched writes is in use. See batchedDeletesTargetBatchDocs and
+            maxNumberOfTransactionOperationsInSingleOplogEntry.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxNumberOfBatchedOperationsInSingleOplogEntry
+        default: 2147483647 # INT_MAX
+        validator: {gte: 1}
+        redact: false
+
+    maxSizeOfBatchedOperationsInSingleOplogEntryBytes:
+        description: >-
+            Maximum size (bytes) of operations to pack into a single oplog entry, when multi-oplog
+            format for batched writes is in use.
+            See batchedDeletesTargetStagedDocBytes and BSONObjMaxUserSize.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxSizeOfBatchedOperationsInSingleOplogEntryBytes
+        default: 16777216 # 16 MB
+        validator: {gte: 1}
+        redact: false
+
+    maxNumberOfInsertsBatchInsertsForRenameAcrossDatabases:
+        description: >-
+            Maximum number of inserts that cross-db collection renames can batch into one applyOps
+            oplog entry.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxNumberOfInsertsBatchInsertsForRenameAcrossDatabases
+        default: 500
+        validator: {gte: 1, lte: 16777216}
+        redact: false
+
+    maxSizeOfBatchedInsertsForRenameAcrossDatabasesBytes:
+        description: >-
+            Maximum size (bytes) of each batched applyOps oplog entry for cross-db collection renames.
+            If any one document exceeds this limit, falls back to a plain insert oplog entry for that doc.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxSizeOfBatchedInsertsForRenameAcrossDatabasesBytes
+        default:
+            4194304 # 4 MB, an arbitrary but conservative fraction of the 16 MB BSON limit. Similar
+            # in spirit to batchedDeletesTargetStagedDocBytes.
+        validator: {gte: 1, lte: 16777216}
+        redact: false
+
+    collectionSamplingLogIntervalSeconds:
+        description: "The approximate interval between log messages indicating collection sampling progress. Once interval seconds have elapsed since the last log message, a progress message will be logged after the current sample is completed. A value of zero will disable this logging."
+        set_at: [startup, runtime]
+        cpp_vartype: "Atomic<int>"
+        cpp_varname: gCollectionSamplingLogIntervalSeconds
+        deprecated_name:
+            - oplogSamplingLogIntervalSeconds
+        default: 10
+        validator: {gte: 0}
+        redact: false
+
+    allowUnsafeUntimestampedWrites:
+        description: >-
+            Allows a replica set member in standalone mode to perform unsafe untimestamped writes
+        set_at: [startup]
+        cpp_varname: gAllowUnsafeUntimestampedWrites
+        cpp_vartype: bool
+        default: false
+        redact: false
+
+    enableAutoCompaction:
+        description: "Enable auto compact at startup."
+        cpp_vartype: bool
+        cpp_varname: gEnableAutoCompaction
+        set_at: startup
+        default: false
+        redact: false
+
+    cachePressureEvictionStallThresholdProportion:
+        description: "To adjust the thread pressure sensitivity proportion in detecting cache pressure for the storage engine."
+        set_at: [startup, runtime]
+        cpp_vartype: "Atomic<double>"
+        cpp_varname: gCachePressureEvictionStallThresholdProportion
+        default: 0.95
+        validator: {gte: 0, lte: 1}
+        redact: false
+
+    cachePressureEvictionStallDetectionWindowSeconds:
+        description: "The duration of time to allow cache pressure statistics to accumulate and average."
+        set_at: [startup, runtime]
+        cpp_vartype: "Atomic<int>"
+        cpp_varname: gCachePressureEvictionStallDetectionWindowSeconds
+        default: 20
+        validator: {gte: 1}
+        redact: false
+
+    cachePressureExponentiallyDecayingMovingAverageAlphaValue:
+        description: "The alpha value used to calculate the exponentially decaying moving average of total tickets."
+        set_at: [startup, runtime]
+        cpp_vartype: "Atomic<double>"
+        cpp_varname: gCachePressureExponentiallyDecayingMovingAverageAlphaValue
+        default: 0.1
+        validator: {gte: 0, lte: 1}
+        redact: false
+
+    spillTableInsertBatchSizeBytes:
+        description: >-
+            The amount of data that a call to SpillTable::insertRecords will batch together into a
+            single storage transaction.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<long long>
+        cpp_varname: gSpillTableInsertBatchSizeBytes
+        default: 16777216 # 16 MB
+        validator:
+            gte: 0
+        redact: false
+
+    spillPath:
+        description: "The disk path of the spill engine. Defaults to the dbpath."
+        set_at: startup
+        cpp_vartype: std::string
+        cpp_varname: gSpillPath
+        redact: false
+
+feature_flags:
+    featureFlagLargeBatchedOperations:
+        description: >-
+            Enable support for replicating batched operations over multiple applyOps oplog
+            entries. Otherwise, batched operations that do not fit within a single applyOps
+            oplog entry will fail with a TransactionTooLarge error.
+            See maxNumberOfBatchedOperationsInSingleOplogEntry and
+            maxSizeOfBatchedOperationsInSingleOplogEntryBytes.
+        cpp_varname: gFeatureFlagLargeBatchedOperations
+        default: true
+        version: 8.0
+        fcv_gated: true
+    featureFlagTimeseriesDeletesSupport:
+        description: "Enable support for arbitrary deletes on time-series collections"
+        cpp_varname: feature_flags::gTimeseriesDeletesSupport
+        default: true
+        version: 7.0
+        fcv_gated: true
+    featureFlagTimeseriesUpdatesSupport:
+        description: "Enable support for arbitrary updates on time-series collections"
+        cpp_varname: feature_flags::gTimeseriesUpdatesSupport
+        default: false
+        fcv_gated: true
+    featureFlagReplicateLocalCatalogIdentifiers:
+        description: >-
+            Enable replication of local catalog identifiers across replica set nodes, ensuring the
+            _mdb_catalog and its associated storage table 'ident' mappings remain consistent.
+        cpp_varname: feature_flags::gFeatureFlagReplicateLocalCatalogIdentifiers
+        default: true
+        fcv_gated: false
+    featureFlagPrimaryDrivenIndexBuilds:
+        description: "Enable primary-driven index builds."
+        cpp_varname: feature_flags::gFeatureFlagPrimaryDrivenIndexBuilds
+        default: false
+        fcv_gated: true
+    featureFlagResumablePrimaryDrivenIndexBuilds:
+        description: "Enable resumability on primary-driven index builds."
+        cpp_varname: feature_flags::gResumablePrimaryDrivenIndexBuilds
+        default: false
+        fcv_gated: true
+    featureFlagContainerWrites:
+        description: "Enable support for container write oplog entries."
+        cpp_varname: feature_flags::gContainerWrites
+        default: false
+        fcv_gated: true

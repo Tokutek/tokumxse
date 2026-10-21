@@ -1,0 +1,101 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/virtual_collection/input_stream.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/virtual_collection_options.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/transport/named_pipe/named_pipe.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] MultiBsonStreamCursor : public SeekableRecordCursor {
+public:
+    MultiBsonStreamCursor(const VirtualCollectionOptions& vopts)
+        : _numStreams(vopts.dataSources.size()), _vopts(vopts) {
+        tassert(6968310, fmt::format("_numStreams {} <= 0", _numStreams), _numStreams > 0);
+        _streamReader = getInputStream(_vopts.dataSources[_streamIdx].url);
+    }
+
+    boost::optional<Record> next() override;
+
+    // This block of overrides are all essentially no-ops as they are for lock yielding but the
+    // external data source is read-only.
+    void save() override {}
+    void saveUnpositioned() override {}
+    bool restore(RecoveryUnit& ru, bool tolerateCappedRepositioning) override {
+        return true;
+    }
+    void detachFromOperationContext() override {}
+    void reattachToOperationContext(OperationContext* opCtx) override {}
+    void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
+
+    // Seeking is not currently supported.
+    boost::optional<Record> seekExact(const RecordId& id) override {
+        tasserted(6968300, "MultiBsonStreamCursor::seekExact is not supported");
+        return boost::none;
+    }
+
+    // Seeking is not currently supported.
+    boost::optional<Record> seek(const RecordId& start, BoundInclusion boundInclusion) override {
+        tasserted(6968320, "MultiBsonStreamCursor::seek is not supported");
+        return {};
+    }
+
+    // The size the assembly buffer starts at before any expansion, and the size of the block reads
+    // it performs at that size. See the '_bufSize' comment below for how the starting size is
+    // chosen. Exposed so that tests and benchmarks can size documents relative to these.
+    static constexpr int kInitialBufSize = 8 * 1024;
+    static constexpr int kInitialBlockReadSize = kInitialBufSize / 2;
+
+private:
+    void expandBuffer(int32_t bsonSize);
+    boost::optional<Record> nextFromCurrentStream();
+    static std::unique_ptr<InputStream<NamedPipeInput>> getInputStream(const std::string& url);
+
+    // The size in bytes of a BSON object's "size" prefix.
+    static constexpr int kSizeSize = static_cast<int>(sizeof(int32_t));
+
+    // The buffer starts small and doubles as needed to have room to read the rest of an object that
+    // spans across the half-way point. Block reads are done at offset 0 and get only half the
+    // buffer size, so worst case is the last byte of this read is the first byte of the size of the
+    // following object. (There will always be room to finish reading the size.) The buffer will
+    // never grow larger than (2 * BSONObjMaxUserSize) as that size is large enough to satisfy any
+    // stream of objects using the defined algorithm. Except when the buffer is enlarged, none of
+    // its contents are ever copied.
+    //
+    // Buffer starting size should be a power of two since BSONObjMaxUserSize is one. The smallest
+    // valid starting size in the current implementation is 8 bytes, as a half-buffer block read
+    // expects to be able to get the 4-byte size of the first BSON object. We start somewhat larger
+    // to avoid memory fragmentation, as most BSON objects will not be so tiny, however, many may be
+    // quite small. The starting size is chosen as 8K because at the time of writing the most common
+    // Linux filesystem block size is 4K, and our block read size is half the buffer size.
+    int _bufSize = kInitialBufSize;                       // current buffer size
+    int _blockReadSize = kInitialBlockReadSize;           // size of a block read
+    std::unique_ptr<char[]> _buffer{new char[_bufSize]};  // the buffer itself
+    int _bufBegin = 0;  // index of first unconsumed byte in '_buffer'
+    int _bufEnd = 0;    // index one past the last valid byte in '_buffer'
+
+    int64_t _nextRecordId = 0;  // for artificially generating the record IDs
+    int _numStreams;            // number of streams in '_vopts'
+    int _streamIdx = 0;         // index in' _vopts' of stream being consumed in '_streamReader'
+
+    // Reader for the current stream.
+    std::unique_ptr<InputStream<NamedPipeInput>> _streamReader = nullptr;
+
+    const VirtualCollectionOptions& _vopts;  // metadata containing the pipe URLs
+};
+}  // namespace mongo

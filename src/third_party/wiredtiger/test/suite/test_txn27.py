@@ -1,0 +1,117 @@
+#!/usr/bin/env python
+#
+# Public Domain 2014-present MongoDB, Inc.
+# Public Domain 2008-2014 WiredTiger, Inc.
+#
+# This is free and unencumbered software released into the public domain.
+#
+# Anyone is free to copy, modify, publish, use, compile, sell, or
+# distribute this software, either in source code form or as a compiled
+# binary, for any purpose, commercial or non-commercial, and by any
+# means.
+#
+# In jurisdictions that recognize copyright laws, the author or authors
+# of this software dedicate any and all copyright interest in the
+# software to the public domain. We make this dedication for the benefit
+# of the public at large and to the detriment of our heirs and
+# successors. We intend this dedication to be an overt act of
+# relinquishment in perpetuity of all present and future rights to this
+# software under copyright law.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+
+import wiredtiger, wttest
+from error_info_util import error_info_util
+from wiredtiger import stat
+from wtdataset import SimpleDataSet
+
+# Test that the API returning a rollback error sets the reason for the rollback.
+class test_txn27(error_info_util):
+    # statistics_log wait=0: the default log thread can reset the eviction stuck score.
+    conn_config = 'cache_size=1MB,statistics=(all),statistics_log=(wait=0)'
+
+    # The oldest-for-eviction reason needs stalled eviction progress before it fires; the
+    # newer updates/dirty-trigger check needs no such stall and can win the race instead. Locally
+    # the older check still wins, but under the slower disagg-leader-tsan hook the race tips the
+    # other way, so this test's specific reason assertion is not reliable there.
+    @wttest.skip_for_hook("disagg", "Races with the updates/dirty-trigger check under tsan slowdown.")
+    def test_rollback_reason(self):
+        uri = "table:txn27"
+
+        # Create a very basic table.
+        ds = SimpleDataSet(self, uri, 10, key_format='S', value_format='S')
+        ds.populate()
+
+        # Update key 5 in the first session.
+        session1 = self.session
+        cursor1 = session1.open_cursor(uri)
+        session1.begin_transaction()
+        cursor1[ds.key(5)] = "aaa"
+
+        # Update the same key in the second session, expect a conflict error to be produced.
+        session2 = self.conn.open_session()
+        cursor2 = session2.open_cursor(uri)
+        session2.begin_transaction()
+        cursor2.set_key(ds.key(5))
+        cursor2.set_value("bbb")
+        msg1 = '/conflict between concurrent operations/'
+        self.assertRaisesException(wiredtiger.WiredTigerError, lambda: cursor2.update(), msg1)
+        self.session = session2
+        self.assert_error_equal(wiredtiger.WT_ROLLBACK, wiredtiger.WT_WRITE_CONFLICT, "Write conflict between concurrent operations")
+
+        # Rollback the transactions, check that session2's rollback error was cleared.
+        session2.rollback_transaction()
+        self.assert_error_equal(0, wiredtiger.WT_NONE, "last API call was successful")
+        session1.rollback_transaction()
+
+        # Evict a clean page so the cache stuck timer starts when the cache first becomes stuck.
+        progress_uri = "table:txn27_progress"
+        session1.create(progress_uri, 'key_format=S,value_format=S')
+        progress_cursor = session1.open_cursor(progress_uri)
+        progress_cursor["key"] = "value"
+        progress_cursor.close()
+        session1.checkpoint()
+
+        force_clean_before = self.get_stat(stat.conn.eviction_force_clean)
+        progress_cursor = session1.open_cursor(progress_uri, None, "debug=(release_evict)")
+        # The first pass releases the checkpoint reconciliation result. The second pass reads the
+        # page back from disk and evicts it cleanly.
+        for _ in range(2):
+            progress_cursor.set_key("key")
+            self.assertEqual(0, progress_cursor.search())
+            self.assertEqual(0, progress_cursor.reset())
+        progress_cursor.close()
+        self.assertGreater(self.get_stat(stat.conn.eviction_force_clean), force_clean_before)
+
+        # Pin enough uncommitted dirty content for eviction to roll back the oldest transaction.
+        session1.begin_transaction()
+        cursor1.set_key(ds.key(1))
+        cursor1.set_value("a" * 1024)
+        self.assertEqual(0, cursor1.update())
+
+        pin_session = self.conn.open_session('ignore_cache_size=true')
+        pin_cursor = pin_session.open_cursor(uri)
+        pin_session.begin_transaction()
+        pin_cursor["pin"] = "x" * (512 * 1024)
+        pin_cursor.close()
+
+        self.assertStatGreaterSoon(
+            stat.conn.eviction_aggressive_set, 99, session=pin_session, timeout=10)
+
+        cursor1.set_key(ds.key(2))
+        cursor1.set_value("b" * 1024)
+
+        # This reason is the default reason for WT_ROLLBACK errors so we need to catch it.
+        self.assertRaisesException(wiredtiger.WiredTigerError, lambda: cursor1.update(), msg1)
+
+        # Expect the last saved error to give us the true reason for the rollback.
+        self.session = session1
+        self.assert_error_equal(wiredtiger.WT_ROLLBACK, wiredtiger.WT_OLDEST_FOR_EVICTION, "Transaction has the oldest pinned transaction ID")
+
+        pin_session.close()

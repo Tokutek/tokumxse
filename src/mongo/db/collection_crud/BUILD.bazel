@@ -1,0 +1,103 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "collection_crud",
+    srcs = [
+        "capped_collection_maintenance.cpp",
+        "collection_write_path.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:change_stream_pre_image_id_util",
+        "//src/mongo/db:shard_role_api",
+        "//src/mongo/db:write_stage_common",
+        "//src/mongo/db/op_observer:batched_write_context",
+        "//src/mongo/db/op_observer:op_observer_util",
+        "//src/mongo/db/query/query_stats",
+        "//src/mongo/db/repl:local_oplog_info",
+        "//src/mongo/db/repl:repl_coordinator_interface",
+        "//src/mongo/db/replicated_fast_count:replicated_fast_count_enabled",
+        "//src/mongo/db/replicated_fast_count:replicated_fast_count_uncommitted_changes",
+        "//src/mongo/db/shard_role/shard_catalog:document_validation",
+        "//src/mongo/db/storage:index_entry_comparison",
+        "//src/mongo/db/storage:record_store_base",
+        "//src/mongo/db/storage:storage_options",
+    ],
+)
+
+mongo_cc_library(
+    name = "container_write",
+    srcs = [
+        "container_write.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/op_observer",
+        "//src/mongo/db/rss:replicated_storage_service",
+        "//src/mongo/db/storage:container",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "db_capped_test",
+    srcs = [
+        "capped_collection_test.cpp",
+        "capped_utils_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_first_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "//src/mongo/db:service_context_d_test_fixture",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/repl:replmocks",
+        "//src/mongo/db/repl:storage_interface_impl",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_control",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "collection_crud_test",
+    srcs = [
+        "collection_write_path_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_third_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "collection_crud",
+        "//src/mongo/db:change_stream_options_manager",
+        "//src/mongo/db:change_stream_pre_images_collection_manager",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "container_write_test",
+    srcs = [
+        "container_write_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "container_write",
+        "//src/mongo/db/op_observer:op_observer_impl",
+        "//src/mongo/db/op_observer:operation_logger_impl",
+        "//src/mongo/db/repl:oplog_interface_local",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:stub_container",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)

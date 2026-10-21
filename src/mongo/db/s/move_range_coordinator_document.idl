@@ -1,0 +1,68 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of the state document for the move range coordinator.
+
+global:
+    # MoveRangeCoordinatorDocument is constructed by the data_movement command code path and
+    # is also referenced by the chunk_operation_sharding_coordinator unit tests in
+    # catalog_and_routing.global_catalog. Mark as needs_replacement (the module-public
+    # convention for IDL structs used cross-module) to allow that reach across the boundary.
+    mod_visibility: needs_replacement
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+    - "mongo/db/write_concern_options.idl"
+    - "mongo/s/request_types/move_range_request.idl"
+
+enums:
+    MoveRangeCoordinatorPhase:
+        description: "Phases for the move range coordinator."
+        type: string
+        values:
+            kUnset: "unset"
+            kMigrate: "migrate"
+            kEnterCriticalSection: "enterCriticalSection"
+            kGlobalCatalogCommit: "globalCatalogCommit"
+            kPostGlobalCatalogCommit: "postGlobalCatalogCommit"
+            kShardCatalogCommit: "shardCatalogCommit"
+            kFinalizeMigration: "finalizeMigration"
+
+structs:
+    MoveRangeCoordinatorDocument:
+        description: "State document for the move range coordinator."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            ShardsvrMoveRangeRequest: ShardsvrMoveRangeRequest
+        fields:
+            phase:
+                type: MoveRangeCoordinatorPhase
+                default: kUnset
+            # The caller's write concern is captured here so it survives the coordinator's
+            # fresh OperationContext. It is forwarded into MigrationSourceManager and from there
+            # into MigrationChunkClonerSource, where it is only consumed when the request's
+            # `secondaryThrottle` is enabled (the recipient applies it as the per-batch write
+            # concern during cloning). When `secondaryThrottle` is unset, the recipient falls
+            # back to its default internal write concern and this field is ignored. The field is
+            # deliberately stored alongside the chained request rather than inside it so that
+            # `checkIfOptionsConflict` (which compares the chained request) ignores write concern
+            # differences when joining identical concurrent requests.
+            migrationId:
+                type: uuid
+                description: "Stable identifier for the MigrationCoordinator document associated with this migration."
+            writeConcern:
+                type: WriteConcern
+                optional: true
+            donorShardVersionPreMigration:
+                type: ChunkVersion
+                optional: true
+                description: "Donor shard placement version captured before the migration."
+            changedChunks:
+                type: array<object_owned>
+                optional: true
+                description: "Chunks changed by the migration commit, in config BSON format."

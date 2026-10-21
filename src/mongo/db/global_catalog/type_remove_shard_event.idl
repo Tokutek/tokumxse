@@ -1,0 +1,20 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    RemoveShardEventType:
+        description:
+            "Stores relevant metadata on a committed removeShard operation;
+            the type is used to de/serialise the content of config.shardRemovalLog."
+        strict: false
+        fields:
+            timestamp:
+                type: timestamp
+                description: "clusterTime at which a shard was last removed from the cluster."

@@ -1,0 +1,85 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/transaction/transaction_participant.h"
+
+server_parameters:
+    maxTransactionLockRequestTimeoutMillis:
+        description: >-
+            Max number of milliseconds that any transaction lock request
+            will wait for lock acquisition. If an operation provides a greater timeout in a lock request,
+            maxTransactionLockRequestTimeoutMillis will override it. If this is set to a negative value, it
+            is inactive and nothing will be overridden.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxTransactionLockRequestTimeoutMillis
+        # 5 milliseconds will help avoid deadlocks, but will still allow fast-running metadata operations
+        # to run without aborting transactions.
+        default: 5
+        redact: false
+
+    transactionLifetimeLimitSeconds:
+        description: >-
+            Lifetime given to each transaction.
+            Transactions must eventually expire to preempt storage cache pressure immobilizing the system.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<decltype(TransactionParticipant::observeTransactionLifetimeLimitSeconds)::Argument>
+        cpp_varname: gTransactionLifetimeLimitSeconds
+        validator:
+            gte: 1
+        on_update: std::ref(TransactionParticipant::observeTransactionLifetimeLimitSeconds)
+        default: 60
+        redact: false
+
+    cachePressureQueryPeriodMilliseconds:
+        description: >-
+            Period in which to run aborts on oldest transactions under cache pressure.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<decltype(TransactionParticipant::observeCachePressureQueryPeriodMilliseconds)::Argument>
+        cpp_varname: gCachePressureQueryPeriodMilliseconds
+        validator:
+            gte: 0
+        on_update: std::ref(TransactionParticipant::observeCachePressureQueryPeriodMilliseconds)
+        default: 1000
+        redact: false
+
+    maxNumberOfTransactionOperationsInSingleOplogEntry:
+        description: >-
+            Maximum number of operations to pack into a single oplog entry, when multi-oplog
+            format for transactions is in use.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gMaxNumberOfTransactionOperationsInSingleOplogEntry
+        default: 2147483647 # INT_MAX
+        validator: {gte: 1}
+        redact: false
+
+    maxConcurrentMultiDocumentTransactions:
+        description: >-
+            Maximum number of concurrently open multi-document transactions allowed for external
+            clients on this server. When this limit is reached, new multi-document transactions
+            from external clients will be rejected with TooManyOpenTransactions. Process-internal
+            clients are exempt from this rejection. The count of currently open transactions is
+            server-wide, so process-internal transactions may still contribute to the total used
+            when enforcing this limit for external clients. A value of 0 disables the limit.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMaxConcurrentMultiDocumentTransactions
+        default: 10000
+        validator:
+            gte: 0
+        redact: false
+
+    transactionSizeLimitBytes:
+        description: >-
+            Maximum total size of operations in a multi-document transaction.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<long long>
+        cpp_varname: gTransactionSizeLimitBytes
+        default:
+            expr: std::numeric_limits<long long>::max()
+        redact: false

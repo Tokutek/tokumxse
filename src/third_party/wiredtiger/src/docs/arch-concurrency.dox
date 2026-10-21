@@ -1,0 +1,83 @@
+/*! @arch_page arch-concurrency Concurrency management
+
+WiredTiger supports multi-threaded execution: application threads may call its APIs concurrently,
+and WiredTiger utilizes internal threads for operations such as checkpointing and eviction. This
+page describes the mechanisms WiredTiger defines to safely manage concurrent access to shared memory.
+The @ref locking and @ref generations sections cover mutual exclusion and shared-object lifecycle
+management. The @ref lock-free section covers atomic operations and memory barriers used for
+synchronization without locks. The @ref volatile section covers the use of the \c volatile qualifier
+and related macros to prevent the compiler from applying optimizations that are unsafe in a
+concurrent context.
+
+@section locking Locking
+
+There are two types of locks in WiredTiger:
+ - Mutexes
+ - Read Write (RW) Locks
+
+@subsection lock-usage Lock usage
+A correctly used lock must be held when accessing any of the shared memory locations that it
+protects, unless they are known to not be accessed by any other threads (e.g. you are initializing
+some structure that hasn't been shared yet). WiredTiger sometimes deviates from this model and reads
+variables outside the context of the relevant lock. Such instances are only permitted if reading
+inconsistent data is sufficient for the use case.
+
+More details on lock hierarchy and usage can be found in the @ref arch-locking-hierarchy.
+
+@section generations Generations
+
+Shared objects, including the page index, WT_REFs, etc. have their lifecycles managed using
+the WiredTiger generations system. In general, when a reader thread accesses an object that could be
+concurrently freed, it enters a "generation". After entering that generation it accesses the object.
+A generation is a monotonically increasing integer which denotes times at which a given object must
+exist.
+
+Writer threads are then able to replace that object but cannot free it until the reader thread has
+left or released the generation. Instead the writer thread adds the object to a "stash" and it marks
+the stashed object with the generation indicating the point at which it was added to the stash. When
+no reader in the system holds a generation which is older than or equal to the stashed object's
+generation it can be freed.
+
+@section lock-free Lock-free synchronization primitives
+
+WiredTiger defines a set of APIs, such as atomic-marked accesses and standalone memory fences
+(memory barriers), and uses them in many places to ensure lock-free memory synchronization.
+Most of these interfaces are expected to behave exactly the same as their equivalents in the
+C standard library.
+
+For example:
+
+<table>
+@hrow{WiredTiger API, C standard library equivalent}
+@row{`WT_ACQUIRE_BARRIER`, `atomic_thread_fence(memory_order_acquire)`}
+@row{`WT_COMPILER_BARRIER`, `atomic_signal_fence(memory_order_seq_cst)`}
+@row{`__wt_atomic_load_<type>_<order>`, `atomic_load_explicit(<order>)`}
+@row{`__wt_atomic_cas_<type>`, `atomic_compare_exchange_strong_explicit(memory_order_seq_cst)`}
+@row{`__wt_atomic_or_generic_relaxed`, `atomic_fetch_or_explicit(memory_order_relaxed)`}
+</table>
+
+Some WiredTiger interfaces do not explicitly mirror any API from the C standard library, but can be
+implemented through a combination of C-compatible API calls. There are only two types of such
+interfaces: `WT_[READ|WRITE]_ONCE` and `WT_[ACQUIRE_READ|RELEASE_WRITE]_WITH_BARRIER`.
+
+`WT_[READ|WRITE]_ONCE` is effectively a relaxed atomic load or store, combined with a cast to `volatile`
+to prevent unsafe compiler optimizations. It is described in more detail earlier in @ref volatile.
+
+`WT_[ACQUIRE_READ|RELEASE_WRITE]_WITH_BARRIER` is a relaxed atomic load or store combined with an
+acquire or release barrier. However, note that these interfaces have been deprecated and should not
+be used in newly developed code.
+
+Given that all WiredTiger lock-free primitives behave in accordance with the C standard library
+primitives, any data races in WiredTiger constitute undefined behavior and must be avoided.
+
+@section volatile Volatile
+
+WiredTiger utilizes volatile for one reason, managing compiler optimization. Leveraging the
+definitions from "Is Parallel Programming Hard, And, If So, What Can You Do About It?", Paul E.
+McKenney, WiredTiger utilizes volatile to prevent the following type of compiler optimizations: Load
+fusing, store fusing, invented loads, invented stores and code reordering. WiredTiger defines the
+`WT_[READ|WRITE]_ONCE` macros which, if used correctly, prevent the prescribed forms of compiler optimization.
+Additionally some variables in WiredTiger are defined with the volatile keyword if it is known that
+they will be frequently accessed in a concurrent context.
+
+*/

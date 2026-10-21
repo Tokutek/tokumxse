@@ -1,0 +1,1265 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/data_type_endian.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/exec/sbe/sort_spec.h"
+#include "mongo/db/exec/sbe/values/block_interface.h"
+#include "mongo/db/exec/sbe/values/column_op.h"
+#include "mongo/db/exec/sbe/values/util.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/code_fragment.h"
+#include "mongo/db/exec/sbe/vm/vm_builtin.h"
+#include "mongo/db/exec/sbe/vm/vm_memory.h"
+#include "mongo/db/exec/sbe/vm/vm_types.h"
+#include "mongo/db/pipeline/accumulator_multi.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/allocator.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#if !defined(MONGO_CONFIG_DEBUG_BUILD)
+#define MONGO_COMPILER_ALWAYS_INLINE_OPT MONGO_COMPILER_ALWAYS_INLINE
+#else
+#define MONGO_COMPILER_ALWAYS_INLINE_OPT
+#endif
+
+namespace mongo {
+class SimpleMemoryUsageTracker;
+
+namespace sbe {
+namespace vm {
+/**
+ * This enum defines indices into an 'Array' that store state for $AccumulatorN expressions.
+ *
+ * The array contains five elements:
+ * - The element at index `kInternalArr` is the array that holds the values.
+ * - The element at index `kStartIdx` is the logical start index in the internal array. This is
+ *   used for emulating queue behaviour.
+ * - The element at index `kMaxSize` is the maximum number entries the data structure holds.
+ * - The element at index `kMemUsage` holds the current memory usage
+ * - The element at index `kMemLimit` holds the max memory limit allowed
+ * - The element at index `kIsGroupAccum` specifies if the accumulator belongs to group-by stage
+ */
+enum class AggMultiElems {
+    kInternalArr,
+    kStartIdx,
+    kMaxSize,
+    kMemUsage,
+    kMemLimit,
+    kIsGroupAccum,
+    kSizeOfArray
+};
+
+/**
+ * Less than comparison based on a sort pattern.
+ */
+struct SortPatternLess {
+    SortPatternLess(const SortSpec* sortSpec) : _sortSpec(sortSpec) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [cmpTag, cmpVal] = _sortSpec->compare(lhs.first, lhs.second, rhs.first, rhs.second);
+        uassert(5807000, "Invalid comparison result", cmpTag == value::TypeTags::NumberInt32);
+        return value::bitcastTo<int32_t>(cmpVal) < 0;
+    }
+
+private:
+    const SortSpec* _sortSpec;
+};
+
+/**
+ * Greater than comparison based on a sort pattern.
+ */
+struct SortPatternGreater {
+    SortPatternGreater(const SortSpec* sortSpec) : _sortSpec(sortSpec) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [cmpTag, cmpVal] = _sortSpec->compare(lhs.first, lhs.second, rhs.first, rhs.second);
+        uassert(5807001, "Invalid comparison result", cmpTag == value::TypeTags::NumberInt32);
+        return value::bitcastTo<int32_t>(cmpVal) > 0;
+    }
+
+private:
+    const SortSpec* _sortSpec;
+};
+
+/**
+ * Comparison based on the key of a pair of elements.
+ */
+template <typename Comp>
+struct PairKeyComp {
+    PairKeyComp(const Comp& comp) : _comp(comp) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [lPairTag, lPairVal] = lhs;
+        auto lPair = value::getArrayView(lPairVal);
+        auto lKey = lPair->getAt(0);
+
+        auto [rPairTag, rPairVal] = rhs;
+        auto rPair = value::getArrayView(rPairVal);
+        auto rKey = rPair->getAt(0);
+
+        return _comp(lKey, rKey);
+    }
+
+private:
+    const Comp _comp;
+};
+
+struct GetSortKeyAscFunctor {
+    GetSortKeyAscFunctor(CollatorInterface* collator = nullptr) : collator(collator) {}
+    std::pair<value::TypeTags, value::Value> operator()(value::TypeTags tag,
+                                                        value::Value val) const;
+    CollatorInterface* collator = nullptr;
+};
+
+struct GetSortKeyDescFunctor {
+    GetSortKeyDescFunctor(CollatorInterface* collator = nullptr) : collator(collator) {}
+    std::pair<value::TypeTags, value::Value> operator()(value::TypeTags tag,
+                                                        value::Value val) const;
+    CollatorInterface* collator = nullptr;
+};
+
+extern const value::ColumnOpInstanceWithParams<value::ColumnOpType::kNoFlags, GetSortKeyAscFunctor>
+    getSortKeyAscOp;
+
+extern const value::ColumnOpInstanceWithParams<value::ColumnOpType::kNoFlags, GetSortKeyDescFunctor>
+    getSortKeyDescOp;
+
+int32_t updateAndCheckMemUsage(value::Array* state,
+                               int32_t memUsage,
+                               int32_t memAdded,
+                               int32_t memLimit,
+                               size_t idx = static_cast<size_t>(AggMultiElems::kMemUsage));
+
+class CodeFragment;
+
+/**
+ * This enum defines indices into an 'Array' that returns the partial sum result when 'needsMerge'
+ * is requested.
+ *
+ * See 'builtinDoubleDoubleSumFinalize()' for more details.
+ */
+enum class AggPartialSumElems { kTotal, kError, kSizeOfArray };
+
+/**
+ * This enum defines indices into an 'Array' that accumulates $stdDevPop and $stdDevSamp results.
+ *
+ * The array contains 3 elements:
+ * - The element at index `kCount` keeps track of the total number of values processed
+ * - The elements at index `kRunningMean` keeps track of the mean of all the values that have been
+ * processed.
+ * - The elements at index `kRunningM2` keeps track of running M2 value (defined within:
+ * https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm)
+ * for all the values that have been processed.
+ *
+ * See 'aggStdDevImpl()'/'aggStdDev()'/'stdDevPopFinalize() / stdDevSampFinalize()' for more
+ * details.
+ */
+enum AggStdDevValueElems {
+    kCount,
+    kRunningMean,
+    kRunningM2,
+    // This is actually not an index but represents the number of elements stored
+    kSizeOfArray
+};
+
+/**
+ * This enum defines indices into an 'Array' that returns the result of accumulators that track the
+ * size of accumulated values, such as 'addToArrayCapped' and 'addToSetCapped'.
+ */
+enum class AggArrayWithSize { kValues = 0, kSizeOfValues, kLast = kSizeOfValues + 1 };
+
+/**
+ * This enum defines indices into an 'Array' that store state for $minN/$maxN/$topN/$bottomN
+ * accumulators.
+ * Element at `kValues` stores the accmulator data structure with the elements
+ * Element at `kN` stores an integer with the number of values minN/maxN should return
+ * Element at `kMemUsage`stores the size of the multiset in bytes
+ * Element at `kMemLimit`stores the maximum allowed size of the multiset in bytes
+ */
+enum class AggAccumulatorNElems { kValues = 0, kN, kMemUsage, kMemLimit, kSizeOfArray };
+
+/**
+ * Enum to specify whether to extract top or bottom N elements.
+ */
+enum class TopBottomSense { kTop, kBottom };
+
+class ByteCode {
+    // The number of bytes per stack entry.
+    static constexpr size_t sizeOfElement =
+        sizeof(bool) + sizeof(value::TypeTags) + sizeof(value::Value);
+    static_assert(sizeOfElement == 10);
+    static_assert(std::is_trivially_copyable_v<FastTuple<bool, value::TypeTags, value::Value>>);
+
+public:
+    class MakeObjImplBase;
+    struct InvokeLambdaFunctor;
+    class TopBottomArgs;
+    class TopBottomArgsDirect;
+    class TopBottomArgsFromStack;
+    class TopBottomArgsFromBlocks;
+
+    /**
+     * Ranks a value's position relative to a missing value in the MQL comparison order:
+     *
+     *   MinKey (0) < Nothing/missing/bsonUndefined (1) < any other value (2)
+     *
+     * 'bsonUndefined' shares its rank with Nothing because canonicalizeBSONType() maps both
+     * 'undefined' and 'eoo' to the same canonical type.
+     */
+    static int32_t mqlComparisonRank(value::TypeTags tag);
+
+    static void aggDoubleDoubleSumImpl(value::Array* accumulator,
+                                       value::TypeTags rhsTag,
+                                       value::Value rhsValue);
+    static value::TagValueMaybeOwned aggDoubleDoubleSumFinalizeImpl(value::Array* accumulator);
+    static void aggMergeDoubleDoubleSumsImpl(value::Array* accumulator,
+                                             value::TypeTags rhsTag,
+                                             value::Value rhsValue);
+    value::TagValueMaybeOwned builtinConvertSimpleSumToDoubleDoubleSumImpl(
+        value::TypeTags simpleSumTag, value::Value simpleSumVal);
+    static value::TagValueMaybeOwned builtinDoubleDoublePartialSumFinalizeImpl(
+        value::TypeTags fieldTag, value::Value fieldValue);
+    static value::TagValueMaybeOwned genericDiv(value::TagValueView lhs, value::TagValueView rhs);
+
+    static value::TagValueMaybeOwned builtinAddToArrayCappedImpl(
+        value::TagValueOwned accumulatorState, value::TagValueMaybeOwned newElem, int32_t sizeCap);
+
+    static value::TagValueMaybeOwned addToSetCappedImpl(value::TagValueOwned accumulatorState,
+                                                        value::TagValueMaybeOwned newElem,
+                                                        int32_t sizeCap,
+                                                        CollatorInterface* collator);
+
+    /**
+     * Moves the elements from the newArrayElements array onto the end of
+     * the accumulatorState capped array accumulator, enforcing the cap by
+     * throwing an exception if the operation would result in an accumulator state that exceeds it.
+     *
+     * Either the accumulator state or new members array may be Nothing, which gets treated as an
+     * empty array.
+     *
+     * The capped accumulator state is a two-element array, where the first element is the array
+     * value and the second element is the array value's pre-computed size. The return value is also
+     * an array with the same structure.
+     */
+    static value::TagValueMaybeOwned concatArraysAccumImpl(value::TagValueOwned accumulatorState,
+                                                           value::TagValueOwned newArrayElements,
+                                                           int64_t newArrayElementsSize,
+                                                           int32_t sizeCap);
+
+    /**
+     * Moves the elements from the newSetMembers array into the
+     * accumulatorState capped set accumulator, preserving set semantics
+     * by ignoring duplicates and enforcing the cap by throwing an exception if the operation would
+     * result in an accumulator state that exceeds it.
+     *
+     * Either the accumulator state or new members array may be Nothing, which gets treated as an
+     * empty accumlator or empty array, respectively.
+     *
+     * The capped accumulator state is a two-element array, where the first element is an 'ArraySet'
+     * and the second element is the set's pre-computed size. The return value is also an array
+     * with the same structure.
+     */
+    static value::TagValueMaybeOwned setUnionAccumImpl(value::TagValueOwned accumulatorState,
+                                                       value::TagValueOwned newSetMembers,
+                                                       int32_t sizeCap,
+                                                       CollatorInterface* collator);
+
+    ByteCode() {
+        _argStack = static_cast<uint8_t*>(::operator new(sizeOfElement * 4));
+        _argStackEnd = _argStack + sizeOfElement * 4;
+        _argStackTop = _argStack - sizeOfElement;
+    }
+
+    ~ByteCode() {
+        ::operator delete(_argStack, _argStackEnd - _argStack);
+    }
+
+    ByteCode(const ByteCode&) = delete;
+    ByteCode& operator=(const ByteCode&) = delete;
+
+    void setMemoryTracker(SimpleMemoryUsageTracker* tracker) {
+        _memoryTracker = tracker;
+    }
+
+    static std::pair<value::TypeTags, value::Value> genericInitializeDoubleDoubleSumState();
+    static void genericResetDoubleDoubleSumState(value::Array* state);
+
+    /**
+     * Runs a CodeFragment representing an arbitrary VM program that returns one slot value.
+     */
+    value::TagValueMaybeOwned run(const CodeFragment* code);
+
+    /**
+     * Runs a CodeFragment reprensenting a predicate that returns a boolean result.
+     */
+    bool runPredicate(const CodeFragment* code);
+
+    typedef std::tuple<value::Array*, value::Array*, size_t, size_t, int32_t, int32_t, bool>
+        MultiAccState;
+
+    value::TagValueView getField_test(value::TagValueView obj, std::string_view fieldStr) {
+        return getField(obj, fieldStr);
+    }
+
+private:
+    /**
+     * Executes the VM instructions of an arbitrary CodeFragment starting at 'position'.
+     */
+    void runInternal(const CodeFragment* code, int64_t position);
+
+    /**
+     * Executes the VM instructions of a CodeFragment starting at 'position' that represents a
+     * lambda function and leaves its result on the top of the stack.
+     */
+    void runLambdaInternal(const CodeFragment* code, int64_t position);
+
+    MONGO_COMPILER_NORETURN void runFailInstruction();
+
+    /**
+     * Run a usually Boolean check against the tag of the item on top of the stack and add its
+     * result to the stack as a TypeTags::Boolean value. However, if the stack item to be checked
+     * itself has a tag of TagTypes::Nothing, this instead pushes a result of TagTypes::Nothing.
+     */
+    template <typename T>
+    void runTagCheck(const uint8_t*& pcPointer, T&& predicate);
+    void runTagCheck(const uint8_t*& pcPointer, value::TypeTags tagRhs);
+
+    value::TagValueMaybeOwned genericIDiv(value::TagValueView lhs, value::TagValueView rhs);
+    value::TagValueMaybeOwned genericMod(value::TagValueView lhs, value::TagValueView rhs);
+    value::TagValueMaybeOwned genericAbs(value::TagValueView operand);
+    value::TagValueMaybeOwned genericCeil(value::TagValueView operand);
+    value::TagValueMaybeOwned genericFloor(value::TagValueView operand);
+    value::TagValueMaybeOwned genericExp(value::TagValueView operand);
+    value::TagValueMaybeOwned genericLn(value::TagValueView operand);
+    value::TagValueMaybeOwned genericLog10(value::TagValueView operand);
+    value::TagValueMaybeOwned genericSqrt(value::TagValueView operand);
+    value::TagValueMaybeOwned genericPow(value::TagValueView base, value::TagValueView exponent);
+    value::TagValueMaybeOwned genericRoundTrunc(std::string_view funcName,
+                                                Decimal128::RoundingMode roundingMode,
+                                                int32_t place,
+                                                value::TypeTags numTag,
+                                                value::Value numVal);
+    value::TagValueMaybeOwned scalarRoundTrunc(std::string_view funcName,
+                                               Decimal128::RoundingMode roundingMode,
+                                               ArityType arity);
+    value::TagValueMaybeOwned blockRoundTrunc(std::string_view funcName,
+                                              Decimal128::RoundingMode roundingMode,
+                                              ArityType arity);
+    value::TagValueOwned genericNot(value::TypeTags tag, value::Value value);
+
+    value::TagValueView getField(value::TagValueView obj, value::TagValueView field);
+
+    value::TagValueView getField(value::TagValueView obj, std::string_view fieldStr);
+
+    value::TagValueView getElement(value::TagValueView arr, value::TagValueView idx);
+
+    value::TagValueView getFieldOrElement(value::TagValueView obj, value::TagValueView field);
+
+    void traverseP(const CodeFragment* code);
+    void traverseP(const CodeFragment* code,
+                   int64_t position,
+                   bool providePosition,
+                   int64_t maxDepth);
+    void traverseP_nested(const CodeFragment* code,
+                          int64_t position,
+                          value::TypeTags tag,
+                          value::Value val,
+                          bool providePosition,
+                          int64_t maxDepth,
+                          int64_t curDepth);
+
+    void traverseF(const CodeFragment* code);
+    void traverseF(const CodeFragment* code,
+                   int64_t position,
+                   bool providePosition,
+                   bool compareArray);
+    void traverseFInArray(const CodeFragment* code,
+                          int64_t position,
+                          bool providePosition,
+                          bool compareArray);
+
+    bool runLambdaPredicate(const CodeFragment* code, int64_t position);
+    void valueBlockApplyLambda(const CodeFragment* code);
+
+
+    int32_t convertNumericToInt32(value::TagValueView v);
+
+    value::TagValueView getArraySize(value::TagValueView arr);
+
+    value::TagValueOwned aggSum(value::TagValueOwned acc, value::TagValueView field);
+
+    value::TagValueOwned aggCount(value::TagValueOwned acc);
+
+    // This is an implementation of the following algorithm:
+    // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+    void aggStdDevImpl(value::Array* accumulator, value::TagValueView rhs);
+    void aggMergeStdDevsImpl(value::Array* accumulator,
+                             value::TypeTags rhsTag,
+                             value::Value rhsValue);
+
+    value::TagValueMaybeOwned aggStdDevFinalizeImpl(value::Value fieldValue, bool isSamp);
+
+    value::TagValueOwned aggMin(value::TagValueView acc,
+                                value::TagValueView field,
+                                CollatorInterface* collator = nullptr);
+
+    value::TagValueOwned aggMax(value::TagValueView acc,
+                                value::TagValueView field,
+                                CollatorInterface* collator = nullptr);
+
+    value::TagValueMaybeOwned aggFirst(value::TypeTags accTag,
+                                       value::Value accValue,
+                                       value::TypeTags fieldTag,
+                                       value::Value fieldValue);
+
+    value::TagValueMaybeOwned aggLast(value::TypeTags accTag,
+                                      value::Value accValue,
+                                      value::TypeTags fieldTag,
+                                      value::Value fieldValue);
+
+    value::TagValueMaybeOwned genericAcos(value::TagValueView operand);
+    value::TagValueMaybeOwned genericAcosh(value::TagValueView operand);
+    value::TagValueMaybeOwned genericAsin(value::TagValueView operand);
+    value::TagValueMaybeOwned genericAsinh(value::TagValueView operand);
+    value::TagValueMaybeOwned genericAtan(value::TagValueView operand);
+    value::TagValueMaybeOwned genericAtanh(value::TagValueView operand);
+    value::TagValueMaybeOwned genericAtan2(value::TagValueView operand1,
+                                           value::TagValueView operand2);
+    value::TagValueMaybeOwned genericCos(value::TagValueView operand);
+    value::TagValueMaybeOwned genericCosh(value::TagValueView operand);
+    value::TagValueMaybeOwned genericDegreesToRadians(value::TagValueView operand);
+    value::TagValueMaybeOwned genericRadiansToDegrees(value::TagValueView operand);
+    value::TagValueMaybeOwned genericSin(value::TagValueView operand);
+    value::TagValueMaybeOwned genericSinh(value::TagValueView operand);
+    value::TagValueMaybeOwned genericTan(value::TagValueView operand);
+    value::TagValueMaybeOwned genericTanh(value::TagValueView operand);
+
+    value::TagValueMaybeOwned genericDayOfYear(value::TagValueView tzDB,
+                                               value::TagValueView date,
+                                               value::TagValueView tz);
+    value::TagValueMaybeOwned genericDayOfYear(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericDayOfMonth(value::TagValueView tzDB,
+                                                value::TagValueView date,
+                                                value::TagValueView tz);
+    value::TagValueMaybeOwned genericDayOfMonth(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericDayOfWeek(value::TagValueView tzDB,
+                                               value::TagValueView date,
+                                               value::TagValueView tz);
+    value::TagValueMaybeOwned genericDayOfWeek(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericYear(value::TagValueView tzDB,
+                                          value::TagValueView date,
+                                          value::TagValueView tz);
+    value::TagValueMaybeOwned genericYear(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericMonth(value::TagValueView tzDB,
+                                           value::TagValueView date,
+                                           value::TagValueView tz);
+    value::TagValueMaybeOwned genericMonth(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericHour(value::TagValueView tzDB,
+                                          value::TagValueView date,
+                                          value::TagValueView tz);
+    value::TagValueMaybeOwned genericHour(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericMinute(value::TagValueView tzDB,
+                                            value::TagValueView date,
+                                            value::TagValueView tz);
+    value::TagValueMaybeOwned genericMinute(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericSecond(value::TagValueView tzDB,
+                                            value::TagValueView date,
+                                            value::TagValueView tz);
+    value::TagValueMaybeOwned genericSecond(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericMillisecond(value::TagValueView tzDB,
+                                                 value::TagValueView date,
+                                                 value::TagValueView tz);
+    value::TagValueMaybeOwned genericMillisecond(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericWeek(value::TagValueView tzDB,
+                                          value::TagValueView date,
+                                          value::TagValueView tz);
+    value::TagValueMaybeOwned genericWeek(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericISOWeekYear(value::TagValueView tzDB,
+                                                 value::TagValueView date,
+                                                 value::TagValueView tz);
+    value::TagValueMaybeOwned genericISOWeekYear(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericISODayOfWeek(value::TagValueView tzDB,
+                                                  value::TagValueView date,
+                                                  value::TagValueView tz);
+    value::TagValueMaybeOwned genericISODayOfWeek(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericISOWeek(value::TagValueView tzDB,
+                                             value::TagValueView date,
+                                             value::TagValueView tz);
+    value::TagValueMaybeOwned genericISOWeek(value::TagValueView date, value::TagValueView tz);
+    value::TagValueMaybeOwned genericNewKeyString(ArityType arity,
+                                                  CollatorInterface* collator = nullptr);
+    value::TagValueMaybeOwned dateTrunc(value::TagValueView date,
+                                        TimeUnit unit,
+                                        int64_t binSize,
+                                        TimeZone timezone,
+                                        DayOfWeek startOfWeek);
+
+    template <bool IsBlockBuiltin = false>
+    bool validateDateTruncParameters(TimeUnit* unit,
+                                     int64_t* binSize,
+                                     TimeZone* timezone,
+                                     DayOfWeek* startOfWeek);
+
+    template <bool IsBlockBuiltin = false>
+    bool validateDateDiffParameters(Date_t* endDate,
+                                    TimeUnit* unit,
+                                    TimeZone* timezone,
+                                    DayOfWeek* startOfWeek);
+
+    template <bool IsBlockBuiltin = false>
+    bool validateDateAddParameters(TimeUnit* unit, int64_t* amount, TimeZone* timezone);
+
+    /**
+     * These functions contain the C++ code implementing the matching builtin function that is
+     * referenced in the function name (e.g. builtinSplit is invoked when Builtin::split is
+     * encountered).
+     */
+    value::TagValueMaybeOwned builtinSplit(ArityType arity);
+    value::TagValueMaybeOwned builtinDate(ArityType arity);
+    value::TagValueMaybeOwned builtinDateWeekYear(ArityType arity);
+    value::TagValueMaybeOwned builtinDateDiff(ArityType arity);
+    value::TagValueMaybeOwned builtinDateToParts(ArityType arity);
+    value::TagValueMaybeOwned builtinIsoDateToParts(ArityType arity);
+    value::TagValueMaybeOwned builtinDayOfYear(ArityType arity);
+    value::TagValueMaybeOwned builtinDayOfMonth(ArityType arity);
+    value::TagValueMaybeOwned builtinDayOfWeek(ArityType arity);
+    value::TagValueMaybeOwned builtinRegexMatch(ArityType arity);
+    value::TagValueMaybeOwned builtinKeepFields(ArityType arity);
+    value::TagValueMaybeOwned builtinReplaceOne(ArityType arity);
+    value::TagValueMaybeOwned builtinDropFields(ArityType arity);
+    value::TagValueMaybeOwned builtinNewArray(ArityType arity);
+    value::TagValueMaybeOwned builtinNewArrayFromRange(ArityType arity);
+    value::TagValueMaybeOwned builtinNewObj(ArityType arity);
+    value::TagValueMaybeOwned builtinNewBsonObj(ArityType arity);
+    value::TagValueMaybeOwned builtinNewKeyString(ArityType arity);
+    value::TagValueMaybeOwned builtinCollNewKeyString(ArityType arity);
+    value::TagValueMaybeOwned builtinAbs(ArityType arity);
+    value::TagValueMaybeOwned builtinCeil(ArityType arity);
+    value::TagValueMaybeOwned builtinFloor(ArityType arity);
+    value::TagValueMaybeOwned builtinTrunc(ArityType arity);
+    value::TagValueMaybeOwned builtinExp(ArityType arity);
+    value::TagValueMaybeOwned builtinLn(ArityType arity);
+    value::TagValueMaybeOwned builtinLog10(ArityType arity);
+    value::TagValueMaybeOwned builtinSqrt(ArityType arity);
+    value::TagValueMaybeOwned builtinPow(ArityType arity);
+    value::TagValueMaybeOwned builtinAddToArray(ArityType arity);
+    value::TagValueMaybeOwned builtinAddToArrayCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinMergeObjects(ArityType arity);
+    value::TagValueMaybeOwned builtinMergeObjectsForExpr(ArityType arity);
+    value::TagValueMaybeOwned builtinAddToSet(ArityType arity);
+    value::TagValueMaybeOwned builtinCollAddToSet(ArityType arity);
+    value::TagValueMaybeOwned isMemberImpl(value::TagValueView expr,
+                                           value::TagValueView arr,
+                                           CollatorInterface* collator);
+    value::TagValueMaybeOwned builtinAddToSetCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinCollAddToSetCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinSetToArray(ArityType arity);
+
+    value::TagValueMaybeOwned builtinSetUnionCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinCollSetUnionCapped(ArityType arity);
+
+    /**
+     * If the BSON type of the value at stack[0] matches the BSON type mask at stack[1] (see
+     * value::getBSONTypeMask()), returns true, else returns false. (Returns Nothing if stack[0] is
+     * Nothing or stack[1] is not a NumberInt32.)
+     */
+    value::TagValueMaybeOwned builtinTypeMatch(ArityType arity);
+
+    /**
+     * If the BSON type of the value at stack[0] matches the BSON type mask at stack[1] (see
+     * value::getBSONTypeMask()), returns stack[2] (the fill value), else returns stack[0] (the
+     * original value). (Returns Nothing if stack[0] is Nothing or stack[1] is not a NumberInt32.)
+     */
+    value::TagValueMaybeOwned builtinFillType(ArityType arity);
+
+    value::TagValueMaybeOwned builtinConvertSimpleSumToDoubleDoubleSum(ArityType arity);
+    value::TagValueMaybeOwned builtinDoubleDoubleSum(ArityType arity);
+
+    /**
+     * Invokes 'processOne(tag, val)' on the stack arguments in the range [startIdx, endIdx), where
+     * a range holding a single array is processed element-wise, while a single non-array value or
+     * multiple values are each processed directly.
+     */
+    template <typename ProcessOne>
+    void processStackRange(ArityType startIdx, ArityType endIdx, const ProcessOne& processOne) {
+        if (endIdx - startIdx == 1) {
+            auto arg = viewFromStack(startIdx);
+            if (value::isArray(arg.tag)) {
+                value::arrayForEach(arg.tag, arg.value, [&](value::TypeTags tag, value::Value val) {
+                    processOne(tag, val);
+                });
+            } else {
+                processOne(arg.tag, arg.value);
+            }
+        } else {
+            for (ArityType idx = startIdx; idx < endIdx; ++idx) {
+                auto arg = viewFromStack(idx);
+                processOne(arg.tag, arg.value);
+            }
+        }
+    }
+
+    value::TagValueMaybeOwned builtinDoubleDoubleSumFromAcc(ArityType arity);
+    template <AccumulatorMinMaxN::MinMaxSense S>
+    value::TagValueMaybeOwned builtinMinMaxNFromAcc(ArityType arity);
+    value::TagValueMaybeOwned builtinAvgFromAcc(ArityType arity);
+    // The template parameter is false for a regular DoubleDouble summation and true if merging
+    // partially computed DoubleDouble sums.
+    template <bool merging>
+    value::TagValueMaybeOwned builtinAggDoubleDoubleSum(ArityType arity);
+
+    value::TagValueMaybeOwned builtinDoubleDoubleSumFinalize(ArityType arity);
+    value::TagValueMaybeOwned builtinDoubleDoublePartialSumFinalize(ArityType arity);
+
+    // The template parameter is false for a regular std dev and true if merging partially computed
+    // standard devations.
+    template <bool merging>
+    value::TagValueMaybeOwned builtinAggStdDev(ArityType arity);
+    template <bool isSamp>
+    value::TagValueMaybeOwned builtinStdDevFromAcc(ArityType arity);
+
+    value::TagValueMaybeOwned builtinStdDevPopFinalize(ArityType arity);
+    value::TagValueMaybeOwned builtinStdDevSampFinalize(ArityType arity);
+    value::TagValueMaybeOwned builtinBitTestZero(ArityType arity);
+    value::TagValueMaybeOwned builtinBitTestMask(ArityType arity);
+    value::TagValueMaybeOwned builtinBitTestPosition(ArityType arity);
+    value::TagValueMaybeOwned builtinBsonSize(ArityType arity);
+    value::TagValueMaybeOwned builtinStrLenBytes(ArityType arity);
+    value::TagValueMaybeOwned builtinStrLenCP(ArityType arity);
+    value::TagValueMaybeOwned builtinSubstrBytes(ArityType arity);
+    value::TagValueMaybeOwned builtinSubstrCP(ArityType arity);
+    value::TagValueMaybeOwned builtinToUpper(ArityType arity);
+    value::TagValueMaybeOwned builtinToLower(ArityType arity);
+    value::TagValueMaybeOwned builtinCoerceToBool(ArityType arity);
+    value::TagValueMaybeOwned builtinCoerceToString(ArityType arity);
+    value::TagValueMaybeOwned builtinAcos(ArityType arity);
+    value::TagValueMaybeOwned builtinAcosh(ArityType arity);
+    value::TagValueMaybeOwned builtinAsin(ArityType arity);
+    value::TagValueMaybeOwned builtinAsinh(ArityType arity);
+    value::TagValueMaybeOwned builtinAtan(ArityType arity);
+    value::TagValueMaybeOwned builtinAtanh(ArityType arity);
+    value::TagValueMaybeOwned builtinAtan2(ArityType arity);
+    value::TagValueMaybeOwned builtinCos(ArityType arity);
+    value::TagValueMaybeOwned builtinCosh(ArityType arity);
+    value::TagValueMaybeOwned builtinDegreesToRadians(ArityType arity);
+    value::TagValueMaybeOwned builtinRadiansToDegrees(ArityType arity);
+    value::TagValueMaybeOwned builtinSin(ArityType arity);
+    value::TagValueMaybeOwned builtinSinh(ArityType arity);
+    value::TagValueMaybeOwned builtinTan(ArityType arity);
+    value::TagValueMaybeOwned builtinTanh(ArityType arity);
+    value::TagValueMaybeOwned builtinRand(ArityType arity);
+    value::TagValueMaybeOwned builtinRound(ArityType arity);
+    value::TagValueMaybeOwned builtinConcat(ArityType arity);
+    value::TagValueMaybeOwned builtinConcatArrays(ArityType arity);
+    value::TagValueMaybeOwned builtinZipArrays(ArityType arity);
+    value::TagValueMaybeOwned builtinTrim(ArityType arity, bool trimLeft, bool trimRight);
+    value::TagValueMaybeOwned builtinAggConcatArraysCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinConcatArraysCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinAggSetUnion(ArityType arity);
+    value::TagValueMaybeOwned builtinAggCollSetUnion(ArityType arity);
+    value::TagValueMaybeOwned builtinAggSetUnionCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinAggCollSetUnionCapped(ArityType arity);
+    value::TagValueMaybeOwned builtinIsMember(ArityType arity);
+    value::TagValueMaybeOwned builtinCollIsMember(ArityType arity);
+    value::TagValueMaybeOwned builtinIndexOfBytes(ArityType arity);
+    value::TagValueMaybeOwned builtinIndexOfCP(ArityType arity);
+    value::TagValueMaybeOwned builtinIsDayOfWeek(ArityType arity);
+    value::TagValueMaybeOwned builtinIsTimeUnit(ArityType arity);
+    value::TagValueMaybeOwned builtinIsTimezone(ArityType arity);
+    value::TagValueMaybeOwned builtinIsValidToStringFormat(ArityType arity);
+    value::TagValueMaybeOwned builtinValidateFromStringFormat(ArityType arity);
+    value::TagValueMaybeOwned builtinSetUnion(ArityType arity);
+    value::TagValueMaybeOwned builtinSetIntersection(ArityType arity);
+    value::TagValueMaybeOwned builtinSetDifference(ArityType arity);
+    value::TagValueMaybeOwned builtinSetEquals(ArityType arity);
+    value::TagValueMaybeOwned builtinSetIsSubset(ArityType arity);
+    value::TagValueMaybeOwned builtinCollSetUnion(ArityType arity);
+    value::TagValueMaybeOwned builtinCollSetIntersection(ArityType arity);
+    value::TagValueMaybeOwned builtinCollSetDifference(ArityType arity);
+    value::TagValueMaybeOwned builtinCollSetEquals(ArityType arity);
+    value::TagValueMaybeOwned builtinCollSetIsSubset(ArityType arity);
+    value::TagValueMaybeOwned builtinRunJsPredicate(ArityType arity);
+    value::TagValueMaybeOwned builtinRegexCompile(ArityType arity);
+    value::TagValueMaybeOwned builtinRegexFind(ArityType arity);
+    value::TagValueMaybeOwned builtinRegexFindAll(ArityType arity);
+    value::TagValueMaybeOwned builtinShardFilter(ArityType arity);
+    value::TagValueMaybeOwned builtinShardHash(ArityType arity);
+    value::TagValueMaybeOwned builtinExtractSubArray(ArityType arity);
+    value::TagValueMaybeOwned builtinIsArrayEmpty(ArityType arity);
+    value::TagValueMaybeOwned builtinReverseArray(ArityType arity);
+    value::TagValueMaybeOwned builtinSortArray(ArityType arity);
+    value::TagValueMaybeOwned builtinTopN(ArityType arity);
+    value::TagValueMaybeOwned builtinTop(ArityType arity);
+    value::TagValueMaybeOwned builtinBottomN(ArityType arity);
+    value::TagValueMaybeOwned builtinBottom(ArityType arity);
+    value::TagValueMaybeOwned topOrBottomImpl(ArityType arity, TopBottomSense sense);
+    value::TagValueMaybeOwned topOrBottomNImpl(ArityType arity, TopBottomSense sense);
+    value::TagValueMaybeOwned builtinDateAdd(ArityType arity);
+    value::TagValueMaybeOwned builtinHasNullBytes(ArityType arity);
+    value::TagValueMaybeOwned builtinGetRegexPattern(ArityType arity);
+    value::TagValueMaybeOwned builtinGetRegexFlags(ArityType arity);
+    value::TagValueMaybeOwned builtinHash(ArityType arity);
+    value::TagValueMaybeOwned builtinFtsMatch(ArityType arity);
+    std::pair<SortSpec*, CollatorInterface*> generateSortKeyHelper(ArityType arity);
+    value::TagValueMaybeOwned builtinGenerateSortKey(ArityType arity);
+    value::TagValueMaybeOwned builtinGenerateCheapSortKey(ArityType arity);
+    value::TagValueMaybeOwned builtinSortKeyComponentVectorGetElement(ArityType arity);
+    value::TagValueMaybeOwned builtinSortKeyComponentVectorToArray(ArityType arity);
+    value::TagValueMaybeOwned builtinMakeObj(ArityType arity, const CodeFragment* code);
+    value::TagValueMaybeOwned builtinMakeBsonObj(ArityType arity, const CodeFragment* code);
+    value::TagValueMaybeOwned builtinTsSecond(ArityType arity);
+    value::TagValueMaybeOwned builtinTsIncrement(ArityType arity);
+    value::TagValueMaybeOwned builtinDateToString(ArityType arity);
+    value::TagValueMaybeOwned builtinDateFromString(ArityType arity);
+    value::TagValueMaybeOwned builtinDateFromStringNoThrow(ArityType arity);
+    value::TagValueMaybeOwned builtinDateTrunc(ArityType arity);
+    template <bool IsAscending, bool IsLeaf>
+    value::TagValueMaybeOwned builtinGetSortKey(ArityType arity);
+    value::TagValueMaybeOwned builtinYear(ArityType arity);
+    value::TagValueMaybeOwned builtinMonth(ArityType arity);
+    value::TagValueMaybeOwned builtinHour(ArityType arity);
+    value::TagValueMaybeOwned builtinMinute(ArityType arity);
+    value::TagValueMaybeOwned builtinSecond(ArityType arity);
+    value::TagValueMaybeOwned builtinMillisecond(ArityType arity);
+    value::TagValueMaybeOwned builtinWeek(ArityType arity);
+    value::TagValueMaybeOwned builtinISOWeekYear(ArityType arity);
+    value::TagValueMaybeOwned builtinISODayOfWeek(ArityType arity);
+    value::TagValueMaybeOwned builtinISOWeek(ArityType arity);
+    value::TagValueMaybeOwned builtinObjectToArray(ArityType arity);
+    value::TagValueMaybeOwned builtinArrayToObject(ArityType arity);
+
+    /**
+     * Implementation of the builtin function 'unwindArray'. It accepts 1 argument that must be one
+     * of the SBE array types (BSONArray, Array, ArraySet, ArrayMultiSet) and returns an Array
+     * object that contains all the non-array items of the input, plus the items found in all the
+     * array items.
+     * E.g. unwindArray([ 1, ['a', ['b']], 2, [] ]) = [ 1, 'a', ['b'], 2 ]
+     */
+    value::TagValueMaybeOwned builtinUnwindArray(ArityType arity);
+    /**
+     * Implementation of the builtin function 'arrayToSet'. It accepts 1 argument that must be one
+     * of the SBE array types (BSONArray, Array, ArraySet, ArrayMultiSet) and returns an ArraySet
+     * object that contains all the non-duplicate items of the input.
+     * E.g. arrayToSet([ 1, ['a', ['b']], 2, 1]) = [ 1, ['a', ['b']], 2 ]
+     */
+    value::TagValueMaybeOwned builtinArrayToSet(ArityType arity);
+    /**
+     * Implementation of the builtin function 'collArrayToSet'. It accepts 2 arguments; the first
+     * one is the collator object to be used when performing comparisons, the second must be one of
+     * the SBE array types (BSONArray, Array, ArraySet, ArrayMultiSet). It returns an ArraySet
+     * object that contains all the non-duplicate items of the input.
+     * E.g. collArrayToSet(<case-insensitive collator>, ['a', ['a'], 'A']) = ['a', ['a']]
+     */
+    value::TagValueMaybeOwned builtinCollArrayToSet(ArityType arity);
+
+    static MultiAccState getMultiAccState(value::TagValueView state);
+
+    value::TagValueMaybeOwned builtinAggFirstNNeedsMoreInput(ArityType arity);
+    value::TagValueMaybeOwned builtinAggFirstN(ArityType arity);
+    value::TagValueMaybeOwned builtinAggFirstNMerge(ArityType arity);
+    value::TagValueMaybeOwned builtinAggFirstNFinalize(ArityType arity);
+
+    value::TagValueMaybeOwned builtinAggLastN(ArityType arity);
+    value::TagValueMaybeOwned builtinAggLastNMerge(ArityType arity);
+    value::TagValueMaybeOwned builtinAggLastNFinalize(ArityType arity);
+
+    template <TopBottomSense Sense>
+    static int32_t aggTopBottomNAdd(value::Array* state,
+                                    value::Array* array,
+                                    size_t maxSize,
+                                    int32_t memUsage,
+                                    int32_t memLimit,
+                                    ByteCode::TopBottomArgs& args);
+    int32_t aggTopNAdd(value::Array* state,
+                       value::Array* array,
+                       size_t maxSize,
+                       int32_t memUsage,
+                       int32_t memLimit,
+                       TopBottomArgs& args);
+    int32_t aggBottomNAdd(value::Array* state,
+                          value::Array* array,
+                          size_t maxSize,
+                          int32_t memUsage,
+                          int32_t memLimit,
+                          TopBottomArgs& args);
+    template <TopBottomSense>
+    value::TagValueMaybeOwned builtinAggTopBottomN(ArityType arity);
+    template <TopBottomSense Sense, bool ValueIsArray>
+    value::TagValueMaybeOwned builtinAggTopBottomNImpl(ArityType arity);
+    template <TopBottomSense>
+    value::TagValueMaybeOwned builtinAggTopBottomNArray(ArityType arity);
+    template <TopBottomSense>
+    value::TagValueMaybeOwned builtinAggTopBottomNMerge(ArityType arity);
+    value::TagValueMaybeOwned builtinAggTopBottomNFinalize(ArityType arity);
+
+    template <AccumulatorMinMaxN::MinMaxSense S>
+    value::TagValueMaybeOwned builtinAggMinMaxN(ArityType arity);
+    template <AccumulatorMinMaxN::MinMaxSense S>
+    value::TagValueMaybeOwned builtinAggMinMaxNMerge(ArityType arity);
+    template <AccumulatorMinMaxN::MinMaxSense S>
+    value::TagValueMaybeOwned builtinAggMinMaxNFinalize(ArityType arity);
+
+
+    // Block builtins
+
+    value::TagValueOwned builtinValueBlockExists(ArityType arity);
+    value::TagValueOwned builtinValueBlockIsNullish(ArityType arity);
+    value::TagValueOwned builtinValueBlockMqlComparisonRank(ArityType arity);
+    value::TagValueOwned builtinValueBlockTypeMatch(ArityType arity);
+    value::TagValueOwned builtinValueBlockIsTimezone(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockFillEmpty(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockFillEmptyBlock(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockFillType(ArityType arity);
+    template <bool less>
+    value::TagValueOwned valueBlockMinMaxImpl(value::ValueBlock* inputBlock,
+                                              value::ValueBlock* bitsetBlock);
+    template <bool less>
+    value::TagValueOwned valueBlockAggMinMaxImpl(value::TagValueOwned acc,
+                                                 value::TagValueView input,
+                                                 value::TagValueView bitset);
+    value::TagValueOwned builtinValueBlockAggMin(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggMax(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggCount(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggSum(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggDoubleDoubleSum(ArityType arity);
+
+    // Take advantage of the fact that we know we have block input, instead of looping over
+    // generalized helper functions.
+    template <TopBottomSense Sense, bool ValueIsArray>
+    value::TagValueOwned blockNativeAggTopBottomNImpl(value::TagValueOwned state,
+                                                      value::ValueBlock* bitsetBlock,
+                                                      SortSpec* sortSpec,
+                                                      size_t numKeysBlocks,
+                                                      size_t numValuesBlocks);
+
+    template <TopBottomSense Sense, bool ValueIsArray>
+    value::TagValueOwned builtinValueBlockAggTopBottomNImpl(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggTopN(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggBottomN(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggTopNArray(ArityType arity);
+    value::TagValueOwned builtinValueBlockAggBottomNArray(ArityType arity);
+
+    template <int operation>
+    value::TagValueOwned builtinBlockBlockArithmeticOperation(const value::TypeTags* bitsetTags,
+                                                              const value::Value* bitsetVals,
+                                                              value::ValueBlock* leftInputBlock,
+                                                              value::ValueBlock* rightInputBlock,
+                                                              size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinBlockBlockArithmeticOperation(value::ValueBlock* leftInputBlock,
+                                                              value::ValueBlock* rightInputBlock,
+                                                              size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinScalarBlockArithmeticOperation(const value::TypeTags* bitsetTags,
+                                                               const value::Value* bitsetVals,
+                                                               value::TagValueView scalar,
+                                                               value::ValueBlock* block,
+                                                               size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinScalarBlockArithmeticOperation(value::TagValueView scalar,
+                                                               value::ValueBlock* block,
+                                                               size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinBlockScalarArithmeticOperation(const value::TypeTags* bitsetTags,
+                                                               const value::Value* bitsetVals,
+                                                               value::ValueBlock* block,
+                                                               value::TagValueView scalar,
+                                                               size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinBlockScalarArithmeticOperation(value::ValueBlock* block,
+                                                               value::TagValueView scalar,
+                                                               size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinScalarScalarArithmeticOperation(
+        value::TagValueView leftInputScalar, value::TagValueView rightInputScalar, size_t valsNum);
+    template <int operation>
+    value::TagValueOwned builtinValueBlockArithmeticOperation(ArityType arity);
+    value::TagValueOwned builtinValueBlockAdd(ArityType arity);
+    value::TagValueOwned builtinValueBlockSub(ArityType arity);
+    value::TagValueOwned builtinValueBlockMult(ArityType arity);
+    value::TagValueOwned builtinValueBlockDiv(ArityType arity);
+
+    value::TagValueMaybeOwned builtinValueBlockDateDiff(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockDateTrunc(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockDateAdd(ArityType arity);
+
+    value::TagValueMaybeOwned builtinValueBlockRound(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockTrunc(ArityType arity);
+
+    template <class Cmp, value::ColumnOpType::Flags AddFlags = value::ColumnOpType::kNoFlags>
+    value::TagValueOwned builtinValueBlockCmpScalar(ArityType arity);
+
+    value::TagValueOwned builtinValueBlockGtScalar(ArityType arity);
+    value::TagValueOwned builtinValueBlockGteScalar(ArityType arity);
+    value::TagValueOwned builtinValueBlockEqScalar(ArityType arity);
+    value::TagValueOwned builtinValueBlockNeqScalar(ArityType arity);
+    value::TagValueOwned builtinValueBlockLtScalar(ArityType arity);
+    value::TagValueOwned builtinValueBlockLteScalar(ArityType arity);
+    value::TagValueOwned builtinValueBlockCmp3wScalar(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockCombine(ArityType arity);
+    template <int operation>
+    value::TagValueMaybeOwned builtinValueBlockLogicalOperation(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockLogicalAnd(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockLogicalOr(ArityType arity);
+    value::TagValueOwned builtinValueBlockLogicalNot(ArityType arity);
+    value::TagValueOwned builtinValueBlockNewFill(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockSize(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockNone(ArityType arity);
+    value::TagValueOwned builtinValueBlockIsMember(ArityType arity);
+    value::TagValueOwned builtinValueBlockCoerceToBool(ArityType arity);
+    value::TagValueOwned builtinValueBlockMod(ArityType arity);
+    value::TagValueOwned builtinValueBlockConvert(ArityType arity);
+    template <bool IsAscending>
+    value::TagValueMaybeOwned builtinValueBlockGetSortKey(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockGetSortKeyAsc(ArityType arity);
+    value::TagValueMaybeOwned builtinValueBlockGetSortKeyDesc(ArityType arity);
+    value::TagValueMaybeOwned builtinCellFoldValues_F(ArityType arity);
+    value::TagValueMaybeOwned builtinCellFoldValues_P(ArityType arity);
+    value::TagValueMaybeOwned builtinCellBlockGetFlatValuesBlock(ArityType arity);
+    value::TagValueMaybeOwned builtinCurrentDate(ArityType arity);
+
+    /**
+     * Dispatcher for calls to VM built-in C++ functions enumerated by enum class Builtin.
+     */
+    FastTuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f,
+                                                                   ArityType arity,
+                                                                   const CodeFragment* code);
+
+    static constexpr size_t offsetOwned = 0;
+    static constexpr size_t offsetTag = 1;
+    static constexpr size_t offsetVal = 2;
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    FastTuple<bool, value::TypeTags, value::Value> readTuple(uint8_t* ptr) const noexcept {
+        auto owned = readFromMemory<bool>(ptr + offsetOwned);
+        auto tag = readFromMemory<value::TypeTags>(ptr + offsetTag);
+        auto val = readFromMemory<value::Value>(ptr + offsetVal);
+        return {owned, tag, val};
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    void writeTuple(uint8_t* ptr, bool owned, value::TypeTags tag, value::Value val) noexcept {
+        writeToMemory(ptr + offsetOwned, owned);
+        writeToMemory(ptr + offsetTag, tag);
+        writeToMemory(ptr + offsetVal, val);
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    FastTuple<bool, value::TypeTags, value::Value> getFromStack(size_t offset, bool pop = false) {
+        auto ret = readTuple(_argStackTop - offset * sizeOfElement);
+
+        if (pop) {
+            popStack();
+        }
+
+        return ret;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    value::TagValueMaybeOwned getMaybeOwnedFromStack(size_t offset) {
+        auto [owned, tag, val] = getFromStack(offset);
+        return {owned, tag, val};
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    value::TagValueMaybeOwned getMaybeOwnedFromStack(size_t offset, bool pop) {
+        auto [owned, tag, val] = getFromStack(offset, pop);
+        return {owned && pop, tag, val};
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    value::TagValueView viewFromStack(size_t offset) const {
+        auto ret = readTuple(_argStackTop - offset * sizeOfElement);
+        return value::rawToView({ret.b, ret.c});
+    }
+
+    /**
+     * Returns the value triple at the top of the VM stack, whether the stack owned it or not. If
+     * the stack DID own it, this transfers ownership to the caller (like a move). If the stack did
+     * NOT own it, no ownership transfer occurs, so something else still owns it.
+     *
+     * If you want the caller always to own the returned value, call moveOwnedFromStack() instead.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    FastTuple<bool, value::TypeTags, value::Value> moveFromStack(size_t offset) noexcept {
+        if (MONGO_likely(offset == 0)) {
+            auto [owned, tag, val] = readTuple(_argStackTop);
+            writeToMemory(_argStackTop + offsetOwned, false);
+            return {owned, tag, val};
+        } else {
+            auto ptr = _argStackTop - offset * sizeOfElement;
+            auto [owned, tag, val] = readTuple(ptr);
+            writeToMemory(ptr + offsetOwned, false);
+            return {owned, tag, val};
+        }
+    }
+
+    /**
+     * Returns the value triple at the top of the VM stack, whether the stack owned it or not, and
+     * also causes the caller to own it and the stack not to own it. If the stack DID own it, this
+     * transfers ownership to the caller (like a move). If the stack did NOT own it, this makes a
+     * copy and gives ownership of the copy to the caller, while something else still owns the
+     * original on the top of the stack.
+     *
+     * If you do not want ownership to transfer to the caller if the stack did not already own it,
+     * call moveFromStack() instead.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    value::TagValueMaybeOwned moveMaybeOwnedFromStack(size_t offset) {
+        return value::TagValueMaybeOwned::fromRaw(moveFromStack(offset));
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    value::TagValueOwned moveOwnedFromStack(size_t offset) {
+        return moveMaybeOwnedFromStack(offset).moveToOwned();
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    void setTagToNothing(size_t offset) noexcept {
+        if (MONGO_likely(offset == 0)) {
+            writeToMemory(_argStackTop + offsetTag, value::TypeTags::Nothing);
+        } else {
+            auto ptr = _argStackTop - offset * sizeOfElement;
+            writeToMemory(ptr + offsetTag, value::TypeTags::Nothing);
+        }
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    void setStack(size_t offset, bool owned, value::TypeTags tag, value::Value val) noexcept {
+        if (MONGO_likely(offset == 0)) {
+            topStack(owned, tag, val);
+        } else {
+            writeTuple(_argStackTop - offset * sizeOfElement, owned, tag, val);
+        }
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    void pushStack(bool owned, value::TypeTags tag, value::Value val) {
+        dassert(_argStackEnd - _argStackTop >= static_cast<std::ptrdiff_t>(sizeOfElement),
+                "Invalid pushStack call leads to overflow");
+        auto localPtr = _argStackTop += sizeOfElement;
+
+        writeTuple(localPtr, owned, tag, val);
+    }
+
+    /**
+     * Overwrites the current value at the top of the stack with the value triple passed in.
+     */
+    MONGO_COMPILER_ALWAYS_INLINE void topStack(bool owned,
+                                               value::TypeTags tag,
+                                               value::Value val) noexcept {
+        writeTuple(_argStackTop, owned, tag, val);
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE void popStack() {
+        _argStackTop -= sizeOfElement;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT
+    void popAndReleaseStack() {
+        auto ret = getMaybeOwnedFromStack(0);
+        popStack();
+    }
+
+    void stackReset() noexcept {
+        _argStackTop = _argStack - sizeOfElement;
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE_OPT void allocStack(size_t size) noexcept {
+        auto newSizeDelta = size * sizeOfElement;
+        if (_argStackEnd <= _argStackTop + newSizeDelta) {
+            allocStackImpl(newSizeDelta);
+        }
+    }
+
+    void allocStackImpl(size_t newSizeDelta) noexcept;
+
+    void swapStack();
+
+    // The top entry in '_argStack', or one element before the stack when empty.
+    uint8_t* _argStackTop{nullptr};
+
+    // The byte following '_argStack's current memory block.
+    uint8_t* _argStackEnd{nullptr};
+
+    // Expression execution stack of (owned, tag, value) tuples each of 'sizeOfElement' bytes.
+    uint8_t* _argStack{nullptr};
+
+    // Some builtins track their memory usage against per-query limits. nullptr disables this.
+    SimpleMemoryUsageTracker* _memoryTracker{nullptr};
+};
+
+class ByteCode::MakeObjImplBase {
+public:
+    MONGO_COMPILER_ALWAYS_INLINE MakeObjImplBase(ByteCode& bc,
+                                                 int argsStackOffset,
+                                                 const CodeFragment* code)
+        : bc(bc), argsStackOffset(argsStackOffset), code(code) {}
+
+protected:
+    MONGO_COMPILER_ALWAYS_INLINE FastTuple<bool, value::TypeTags, value::Value> getSpec() const {
+        return bc.getFromStack(0);
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE FastTuple<bool, value::TypeTags, value::Value> getInputObject()
+        const {
+        return bc.getFromStack(1);
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE FastTuple<bool, value::TypeTags, value::Value> extractInputObject()
+        const {
+        return bc.moveFromStack(1);
+    }
+
+    MONGO_COMPILER_ALWAYS_INLINE FastTuple<bool, value::TypeTags, value::Value> getArg(
+        size_t argIdx) const {
+        return bc.getFromStack(argsStackOffset + argIdx);
+    }
+
+    // Invokes the specified lambda, passing in a view of the specified input value.
+    MONGO_COMPILER_ALWAYS_INLINE FastTuple<bool, value::TypeTags, value::Value> invokeLambda(
+        int64_t lamPos, value::TypeTags inputTag, value::Value inputVal) const {
+        // Invoke the lambda.
+        bc.pushStack(false, inputTag, inputVal);
+        bc.runLambdaInternal(code, lamPos);
+        // Move the result off the stack and return it.
+        auto outputTuple = bc.getFromStack(0);
+        bc.popStack();
+        return outputTuple;
+    }
+
+private:
+    ByteCode& bc;
+    const int argsStackOffset;
+    const CodeFragment* const code;
+};
+
+struct ByteCode::InvokeLambdaFunctor {
+    InvokeLambdaFunctor(ByteCode& bytecode, const CodeFragment* code, int64_t lamPos)
+        : bytecode(bytecode), code(code), lamPos(lamPos) {}
+
+    std::pair<value::TypeTags, value::Value> operator()(value::TypeTags tag,
+                                                        value::Value val) const {
+        // Invoke the lambda.
+        bytecode.pushStack(false, tag, val);
+        bytecode.runLambdaInternal(code, lamPos);
+        // Move the result off the stack, make sure it's owned, and return it.
+        auto result = bytecode.moveOwnedFromStack(0).releaseToRaw();
+        bytecode.popStack();
+        return result;
+    }
+
+    ByteCode& bytecode;
+    const CodeFragment* const code;
+    const int64_t lamPos;
+};
+
+class ByteCode::TopBottomArgs {
+public:
+    TopBottomArgs(TopBottomSense sense,
+                  SortSpec* sortSpec,
+                  bool decomposedKey,
+                  bool decomposedValue)
+        : _sortSpec(sortSpec),
+          _sense(sense),
+          _decomposedKey(decomposedKey),
+          _decomposedValue(decomposedValue) {}
+
+    // Add definition to vm.cpp for this method.
+    virtual ~TopBottomArgs();
+
+    bool keySortsBefore(value::TagValueView item) {
+        if (!_keyArg) {
+            return keySortsBeforeImpl(item);
+        } else {
+            auto [cmpTag, cmpVal] =
+                _sortSpec->compare(_keyArg->tag(), _keyArg->value(), item.tag, item.value);
+            if (cmpTag == value::TypeTags::NumberInt32) {
+                int32_t cmp = value::bitcastTo<int32_t>(cmpVal);
+                return _sense == TopBottomSense::kTop ? cmp < 0 : cmp > 0;
+            }
+            return false;
+        }
+    }
+
+    value::TagValueOwned getOwnedKey() {
+        if (!_keyArg) {
+            return getOwnedKeyImpl();
+        } else {
+            return _keyArg->moveToOwned();
+        }
+    }
+
+    value::TagValueOwned getOwnedValue() {
+        if (!_valueArg) {
+            return getOwnedValueImpl();
+        } else {
+            return _valueArg->moveToOwned();
+        }
+    }
+
+    SortSpec* getSortSpec() const {
+        return _sortSpec;
+    }
+    TopBottomSense getTopBottomSense() const {
+        return _sense;
+    }
+
+protected:
+    template <TopBottomSense Sense>
+    static int32_t compare(value::TagValueView leftElem, value::TagValueView rightElem) {
+        auto [cmpTag, cmpVal] =
+            value::compareValue(leftElem.tag, leftElem.value, rightElem.tag, rightElem.value);
+
+        if (cmpTag == value::TypeTags::NumberInt32) {
+            int32_t cmp = value::bitcastTo<int32_t>(cmpVal);
+            return Sense == TopBottomSense::kTop ? cmp : -cmp;
+        }
+
+        return 0;
+    }
+
+    virtual bool keySortsBeforeImpl(value::TagValueView item) = 0;
+    virtual value::TagValueOwned getOwnedKeyImpl() = 0;
+    virtual value::TagValueOwned getOwnedValueImpl() = 0;
+
+    void setDirectKeyArg(value::TagValueMaybeOwned arg) {
+        _keyArg.emplace(std::move(arg));
+    }
+
+    void setDirectValueArg(value::TagValueMaybeOwned arg) {
+        _valueArg.emplace(std::move(arg));
+    }
+
+    SortSpec* _sortSpec = nullptr;
+    TopBottomSense _sense;
+    bool _decomposedKey = false;
+    bool _decomposedValue = false;
+    boost::optional<value::TagValueMaybeOwned> _keyArg;
+    boost::optional<value::TagValueMaybeOwned> _valueArg;
+};
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

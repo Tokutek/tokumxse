@@ -1,0 +1,253 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bson_validate_gen.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/throttle_cursor.h"
+#include "mongo/db/validate/validate_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+namespace collection_validation {
+
+/**
+ * Returns a scoped object, which holds the 'validateLock' in exclusive mode for
+ * the given scope. It must only be used to coordinate validation with concurrent
+ * oplog batch applications.
+ */
+[[MONGO_MOD_PUBLIC]] Lock::ExclusiveLock obtainExclusiveValidationLock(OperationContext* opCtx);
+
+enum struct FastCountType {
+    // The size storer table created by WiredTiger.
+    legacySizeStorer,
+    // The replicated fast count collection created by the server.
+    replicated,
+    both,
+    neither,
+};
+
+std::string_view toString(FastCountType unit);
+
+/**
+ * Contains information about the collection being validated and the user provided validation
+ * options. Additionally it maintains the state of shared objects throughout the validation, such
+ * as locking, cursors, and data throttling.
+ */
+class ValidateState : public ValidationOptions {
+    ValidateState(const ValidateState&) = delete;
+    ValidateState& operator=(const ValidateState&) = delete;
+
+public:
+    ValidateState(OperationContext* opCtx, const NamespaceString& nss, ValidationOptions options);
+
+    const NamespaceString& nss() const {
+        return _nss;
+    }
+
+    /**
+     * Returns true if fast count is being validated, and the collection supports fast
+     * count.
+     *
+     * If the persistence provider uses replicated fast count, this will return true for any
+     * collection that is tracked by the replicated fast count system and is eligible to have its
+     * size and count validated.
+     *
+     * If the persistence provider does not use replicated fast count, this will return true if the
+     * collection is eligible to have its size and count validated and the parameter to enforce fast
+     * count validation is set.
+     *
+     * If the fast count type is both or neither, it will return false.
+     * TODO SERVER-128302: Validate fast count on eligible collections when the fast count type is
+     * both.
+     *
+     */
+    bool shouldEnforceFastCount(OperationContext* opCtx, FastCountType type) const;
+
+    /**
+     * Returns true if fast size is being validated, and the collection supports fast
+     * size.
+     *
+     * If the persistence provider uses replicated fast count, this will return true for any
+     * collection that is tracked by the replicated fast count system and is eligible to have its
+     * size and count validated.
+     *
+     * If the persistence provider does not use replicated fast count, this will return true if the
+     * collection is eligible to have its size and count validated and the parameter to enforce fast
+     * size validation is set.
+     *
+     * If the fast count type is both or neither, it will return false.
+     * TODO SERVER-128302: Validate fast size on eligible collections when the fast count type is
+     * both.
+     *
+     */
+    bool shouldEnforceFastSize(OperationContext* opCtx, FastCountType type) const;
+
+    /**
+     * Returns the fast count type that is detected for this node.
+     */
+    FastCountType getDetectedFastCountType(OperationContext* opCtx) const;
+
+    /**
+     * Returns true if the collection can be written to while foreground validation holds its
+     * collection X lock, so that record counts taken at different points during validation are
+     * allowed to disagree.
+     *
+     * Oplog writers only take a global IX lock, so the oplog can still be written to even during
+     * full validation despite its collection X lock. The oplog entries are also written to the
+     * change stream pre-images collection, so it is subject to the same races.
+     */
+    bool isConcurrentlyWritable() const {
+        return _nss.isOplog() || _nss.isChangeStreamPreImagesCollection();
+    }
+
+    /**
+     * Returns the fast count type that is expected for this node.
+     *
+     * If the persistence provider uses replicated fast count, returns FastCountType::replicated.
+     *
+     * If the persistence provider does not use replicated fast count, returns FastCountType::both
+     * if the replicated fast count feature flag is enabled and the oplog collection is present;
+     * otherwise, returns FastCountType::legacySizeStorer.
+     */
+    FastCountType getExpectedFastCountType(OperationContext* opCtx) const;
+
+    BSONValidateModeEnum getBSONValidateMode() const {
+        return isBSONConformanceValidation() ? BSONValidateModeEnum::kFull
+                                             : BSONValidateModeEnum::kExtended;
+    }
+
+    UUID uuid() const {
+        invariant(_uuid);
+        return *_uuid;
+    }
+
+    const CollectionPtr& getCollection() const {
+        invariant(_collection);
+        return _collection->getCollectionPtr();
+    }
+
+    const std::vector<std::string>& getIndexIdents() const {
+        return _indexIdents;
+    }
+
+    /**
+     * Map of index names to index cursors.
+     */
+    const StringMap<std::unique_ptr<SortedDataInterfaceThrottleCursor>>& getIndexCursors() const {
+        return _indexCursors;
+    }
+
+    std::shared_ptr<SeekableRecordThrottleCursor> getTraverseRecordStoreCursor() {
+        return _traverseRecordStoreCursor;
+    }
+
+    const std::unique_ptr<SeekableRecordThrottleCursor>& getSeekRecordStoreCursor() const {
+        return _seekRecordStoreCursor;
+    }
+
+    RecordId getFirstRecordId() const {
+        return _firstRecordId;
+    }
+
+    /**
+     * Saves and restores the open cursors to release snapshots and minimize cache pressure for
+     * validation.
+     *
+     * Throws on interruptions.
+     */
+    void yieldCursors(OperationContext* opCtx);
+
+    /**
+     * Obtains a collection consistent with the snapshot.
+     */
+    Status initializeCollection(OperationContext* opCtx);
+
+    /**
+     * Initializes all the cursors to be used during validation and moves the traversal record
+     * store cursor to the first record.
+     */
+    void initializeCursors(OperationContext* opCtx);
+
+private:
+    ValidateState() = delete;
+
+    /**
+     * Checks whether the replicated fast count container ident exists in the storage engine.
+     * Returns Status::OK() if the container exists and an error otherwise.
+     */
+    Status _checkReplicatedFastCountContainer(OperationContext* opCtx) const;
+
+    /**
+     * Checks if the underlying storage engine contains an internal size storer table. Returns
+     * Status::OK() if the collection exists and an error otherwise.
+     */
+    Status _checkUnreplicatedFastCountCollectionExists(OperationContext* opCtx) const;
+
+    /**
+     * Returns true if the namespace is eligible to have its fast count and size validated when the
+     * size and count is stored in the size storer.
+     */
+    bool _isNSEligibleForSizeStorerValidation() const;
+
+    // This lock needs to be obtained before the global lock. Initialise in the validation
+    // constructor. Oplog Batch Applier takes this lock in exclusive mode when applying the batch.
+    // Foreground validation waits on this lock to begin.
+    boost::optional<Lock::SharedLock> _validateLock;
+
+    // To avoid racing with shutdown/rollback, this lock must be initialized early.
+    Lock::GlobalLock _globalLock;
+
+    NamespaceString _nss;
+
+
+    // These fields are initialized by initializeCollection(), they are nullopt before then because
+    // they don't have default constructors.
+    boost::optional<CollectionAcquisition> _collection;
+    boost::optional<UUID> _uuid;
+
+    // Stores the index idents that are going to be validated.
+    std::vector<std::string> _indexIdents;
+
+    // Shared cursors to be used during validation, created in 'initializeCursors()'.
+    StringMap<std::unique_ptr<SortedDataInterfaceThrottleCursor>> _indexCursors;
+    std::shared_ptr<SeekableRecordThrottleCursor> _traverseRecordStoreCursor;
+    std::unique_ptr<SeekableRecordThrottleCursor> _seekRecordStoreCursor;
+
+    RecordId _firstRecordId;
+
+    DataThrottle _dataThrottle;
+};
+
+}  // namespace collection_validation
+}  // namespace mongo

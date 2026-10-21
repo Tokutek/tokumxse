@@ -1,0 +1,588 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/counter.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/retry_strategy.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/sharding_environment/client/shard_gen.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/sharding_environment/shard_shared_state_cache.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/command_generic_argument.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class OperationContext;
+
+class RemoteCommandTargeter;
+
+/**
+ * Presents an interface for talking to shards, regardless of whether that shard is remote or is
+ * the current (local) shard.
+ */
+class [[MONGO_MOD_PUBLIC]] Shard {
+public:
+    struct CommandResponse {
+        CommandResponse(boost::optional<HostAndPort> hostAndPort,
+                        BSONObj response,
+                        Status commandStatus,
+                        Status writeConcernStatus)
+            : hostAndPort(std::move(hostAndPort)),
+              response(std::move(response)),
+              commandStatus(std::move(commandStatus)),
+              writeConcernStatus(std::move(writeConcernStatus)) {}
+
+        /**
+         * Takes the response from running a batch write command and writes the appropriate response
+         * into batchResponse, while also returning the Status of the operation.
+         */
+        static Status processBatchWriteResponse(StatusWith<CommandResponse> response,
+                                                BatchedCommandResponse* batchResponse);
+
+        /**
+         * Returns an error status if either commandStatus or writeConcernStatus has an error.
+         */
+        static Status getEffectiveStatus(const StatusWith<CommandResponse>& swResponse);
+
+        /**
+         * Returns the list of error labels from the response. If an error status
+         * is received instead of a CommandResponse an empty vector is returned.
+         */
+        static std::vector<std::string> getErrorLabels(
+            const StatusWith<CommandResponse>& swResponse);
+
+        /**
+         * Returns the server-hinted retry backoff from the response, if present. If an error
+         * status is received instead of a CommandResponse, boost::none is returned.
+         */
+        static boost::optional<Milliseconds> getBaseBackoffMS(
+            const StatusWith<CommandResponse>& swResponse);
+
+        boost::optional<HostAndPort> hostAndPort;
+        BSONObj response;
+        Status commandStatus;
+        Status writeConcernStatus;
+    };
+
+    struct QueryResponse {
+        std::vector<BSONObj> docs;
+        repl::OpTime opTime;
+    };
+
+    enum class RetryPolicy {
+        /**
+         * Safe to retry the command if a retryable error occurs.
+         */
+        kIdempotent,
+        /**
+         * Safe to retry the command under the same conditions as `kIdempotent`,
+         * and additionally safe to retry if the command fails with CursorInvalidated.
+         */
+        kIdempotentOrCursorInvalidated,
+        /**
+         * Not safe to retry the command, except in the case of a NoPrimary error.
+         */
+        kNotIdempotent,
+        /**
+         * Not safe to retry unless the response includes a retryable error label,
+         * indicating that effective execution never began.
+         * TODO (SERVER-111380) Try to merge kNotIdempotent and kStrictlyNotIdempotent
+         */
+        kStrictlyNotIdempotent,
+        /**
+         * The command is never retried under any circumstances.
+         */
+        kNoRetry,
+    };
+
+    /**
+     * Shard specific retry strategy. An instance of this class cannot outlive the shard passed in
+     * as it internally holds a pointer to the shard.
+     *
+     * Unlike the Shard class, this type is not thread-safe when using mutating methods
+     * concurrently.
+     */
+    class RetryStrategy final : public mongo::RetryStrategy {
+    public:
+        /**
+         * Enum indicating whether the request associated with this RetryStrategy is starting a
+         * transaction or not. Transaction-initiating requests can only be retried under certain
+         * circumstances, regardless of the provided RetryPolicy.
+         */
+        enum class RequestStartTransactionState {
+            /**
+             * This request is either not initating a transaction or is not part of a transaction
+             * altogether.
+             */
+            kNotStartingTransaction,
+            /**
+             * This request is initiating a new transaction (i.e. includes startTransaction: true).
+             */
+            kStartingTransaction
+        };
+
+        /**
+         * Constructs a RetryStrategy object given a shard object and a retryPolicy.
+         * Note that, if this constructor is used, the returned instance of this class cannot
+         * outlive the shard passed in as it internally holds a pointer to the shard.
+         */
+        RetryStrategy(const Shard& shard,
+                      Shard::RetryPolicy retryPolicy,
+                      Shard::RetryStrategy::RequestStartTransactionState isStartTransaction);
+
+        /**
+         * Same as the previous constructor but will use a custom 'maxRetryAttempts' parameter
+         * instead of the default one.
+         */
+        RetryStrategy(const Shard& shard,
+                      Shard::RetryPolicy retryPolicy,
+                      std::int32_t maxRetryAttempts,
+                      Shard::RetryStrategy::RequestStartTransactionState isStartTransaction);
+
+        /**
+         * Constructs a RetryStrategy object given the connectionType and the shardState of a shard.
+         * This is useful if we don't want or can't provide a shard object, mainly for performance
+         * reasons.
+         */
+        RetryStrategy(ConnectionString::ConnectionType connectionType,
+                      ShardSharedStateCache::State& shardState,
+                      Shard::RetryPolicy retryPolicy,
+                      Shard::RetryStrategy::RequestStartTransactionState isStartTransaction);
+
+
+        bool recordFailureAndEvaluateShouldRetry(
+            Status s,
+            const boost::optional<HostAndPort>& target,
+            std::span<const std::string> errorLabels,
+            boost::optional<Milliseconds> baseBackoffMS) override;
+
+        void recordSuccess(const boost::optional<HostAndPort>& target) override;
+        void recordBackoff(Milliseconds backoff) override;
+
+        Milliseconds getNextRetryDelay() const override {
+            return _underlyingStrategy.getNextRetryDelay();
+        }
+
+        const TargetingMetadata& getTargetingMetadata() const override {
+            return _underlyingStrategy.getTargetingMetadata();
+        }
+
+        static Shard::RetryStrategy::RequestStartTransactionState extractRequestTransactionState(
+            BSONObj request) {
+            return request.getField("startTransaction").booleanSafe()
+                ? Shard::RetryStrategy::RequestStartTransactionState::kStartingTransaction
+                : Shard::RetryStrategy::RequestStartTransactionState::kNotStartingTransaction;
+        }
+
+        static Shard::RetryStrategy::RequestStartTransactionState extractRequestTransactionState(
+            const GenericArguments& args) {
+            return args.getStartTransaction().value_or(false)
+                ? Shard::RetryStrategy::RequestStartTransactionState::kStartingTransaction
+                : Shard::RetryStrategy::RequestStartTransactionState::kNotStartingTransaction;
+        }
+
+    private:
+        void _recordOperationAttempted();
+
+        RetryStrategy(AdaptiveRetryStrategy::RetryCriteria retryCriteria,
+                      AdaptiveRetryStrategy::RetryParameters parameters,
+                      ShardSharedStateCache::State& sharedState);
+
+        AdaptiveRetryStrategy _underlyingStrategy;
+        ShardSharedStateCache::Stats* _stats;
+        bool _recordedAttempted = false;
+
+        // Set when the most recent error observed was a SystemOverloadedError. Reset on any
+        // non-overload error.
+        bool _precedingErrorWasOverload = false;
+
+        // Set when the first retry due to a SystemOverloadedError is recorded. Set once and never
+        // reset.
+        bool _retriedAtLeastOnceDueToOverload = false;
+
+        // The number of retries that avoided a server that previously returned an overload error.
+        std::int64_t _numRetargets = 0;
+    };
+
+    /**
+     * A thin wrapper around Shard::RetryStrategy that keeps a shared pointer to the shard.
+     *
+     * Use when keeping a shared pointer is needed during an async operation, otherwise prefer
+     * Shard::RetryStrategy
+     */
+    class OwnerRetryStrategy final : public mongo::RetryStrategy {
+    public:
+        OwnerRetryStrategy(std::shared_ptr<Shard> shard,
+                           Shard::RetryPolicy retryPolicy,
+                           Shard::RetryStrategy::RequestStartTransactionState isStartTransaction)
+            : _underlyingStrategy{*shard, retryPolicy, isStartTransaction},
+              _stateOwner{shard->_sharedState},
+              _shardOwner{std::move(shard)} {}
+
+        OwnerRetryStrategy(std::shared_ptr<Shard> shard,
+                           Shard::RetryPolicy retryPolicy,
+                           std::int32_t maxRetryAttempts,
+                           Shard::RetryStrategy::RequestStartTransactionState isStartTransaction)
+            : _underlyingStrategy{*shard, retryPolicy, maxRetryAttempts, isStartTransaction},
+              _stateOwner{shard->_sharedState},
+              _shardOwner{std::move(shard)} {}
+
+        OwnerRetryStrategy(ConnectionString::ConnectionType connectionType,
+                           std::shared_ptr<ShardSharedStateCache::State> shardState,
+                           Shard::RetryPolicy retryPolicy,
+                           Shard::RetryStrategy::RequestStartTransactionState isStartTransaction)
+            : _underlyingStrategy{connectionType, *shardState, retryPolicy, isStartTransaction},
+              _stateOwner{std::move(shardState)} {}
+
+        bool recordFailureAndEvaluateShouldRetry(
+            Status s,
+            const boost::optional<HostAndPort>& target,
+            std::span<const std::string> errorLabels,
+            boost::optional<Milliseconds> baseBackoffMS) override {
+            return _underlyingStrategy.recordFailureAndEvaluateShouldRetry(
+                s, target, errorLabels, baseBackoffMS);
+        }
+
+        void recordSuccess(const boost::optional<HostAndPort>& target) override {
+            _underlyingStrategy.recordSuccess(target);
+        }
+
+        void recordBackoff(Milliseconds backoff) override {
+            _underlyingStrategy.recordBackoff(backoff);
+        }
+
+        Milliseconds getNextRetryDelay() const override {
+            return _underlyingStrategy.getNextRetryDelay();
+        }
+
+        const TargetingMetadata& getTargetingMetadata() const override {
+            return _underlyingStrategy.getTargetingMetadata();
+        }
+
+    private:
+        Shard::RetryStrategy _underlyingStrategy;
+        std::shared_ptr<ShardSharedStateCache::State> _stateOwner;
+        std::shared_ptr<Shard> _shardOwner;
+    };
+
+    virtual ~Shard() = default;
+
+    const ShardId& getId() const {
+        return _id;
+    }
+
+    /**
+     * Returns true if this shard object represents the config server.
+     */
+    bool isConfig() const;
+
+    /**
+     * Returns the current connection string for the shard.
+     */
+    virtual const ConnectionString& getConnString() const = 0;
+
+    /**
+     * Returns the RemoteCommandTargeter for the hosts in this shard.
+     *
+     * This is only valid to call on ShardRemote instances.
+     */
+    virtual std::shared_ptr<RemoteCommandTargeter> getTargeter() const = 0;
+
+    /**
+     * Notifies the RemoteCommandTargeter owned by the shard of a particular mode of failure for
+     * the specified host.
+     *
+     * This is only valid to call on ShardRemote instances.
+     */
+    virtual void updateReplSetMonitor(const HostAndPort& remoteHost,
+                                      const Status& remoteCommandStatus) = 0;
+
+    /**
+     * Returns a string description of this shard entry.
+     */
+    virtual std::string toString() const = 0;
+
+    /**
+     * Returns whether a server operation which failed with the given error code should be retried
+     * (i.e. is safe to retry and has the potential to succeed next time).  The 'options' argument
+     * describes whether the operation that generated the given code was idempotent, which affects
+     * which codes are safe to retry on.
+     *
+     * isRetriableError() routes to either of the static functions depending on object type.
+     */
+    static bool localIsRetriableError(const Status& code,
+                                      std::span<const std::string> errorLabels,
+                                      RetryPolicy options);
+
+    static bool remoteIsRetriableError(const Status& status,
+                                       std::span<const std::string> errorLabels,
+                                       RetryPolicy options);
+
+    virtual bool isRetriableError(const Status& status,
+                                  std::span<const std::string> errorLabels,
+                                  RetryPolicy options) const = 0;
+
+    /**
+     * Runs the specified command returns the BSON command response plus parsed out Status of this
+     * response and write concern error (if present). Retries failed operations according to the
+     * given "retryPolicy".  Retries indefinitely until/unless a non-retriable error is encountered,
+     * the maxTimeMs on the OperationContext expires, or the operation is interrupted.
+     */
+    StatusWith<CommandResponse> runCommandWithIndefiniteRetries(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const DatabaseName& dbName,
+        const BSONObj& cmdObj,
+        RetryPolicy retryPolicy);
+
+    /**
+     * Same as the other variant of runCommandWithIndefiniteRetries, but allows the operation
+     * timeout to be overriden. Runs for the lesser of the remaining time on the operation
+     * context or the specified maxTimeMS override.
+     */
+    StatusWith<CommandResponse> runCommandWithIndefiniteRetries(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const DatabaseName& dbName,
+        const BSONObj& cmdObj,
+        Milliseconds maxTimeMSOverride,
+        RetryPolicy retryPolicy);
+
+    /**
+     * Same as runCommandWithIndefiniteRetries, but will only retry failed operations up to 3
+     * times, regardless of the retryPolicy or the remaining maxTimeMs.
+     * Wherever possible this method should be avoided in favor of runCommandWithIndefiniteRetries.
+     */
+    StatusWith<CommandResponse> runCommand(OperationContext* opCtx,
+                                           const ReadPreferenceSetting& readPref,
+                                           const DatabaseName& dbName,
+                                           const BSONObj& cmdObj,
+                                           RetryPolicy retryPolicy);
+
+    /**
+     * Same as runCommandWithIndefiniteRetries, but will only retry failed operations up to 3
+     * times, regardless of the retryPolicy or the remaining maxTimeMs.
+     * Wherever possible this method should be avoided in favor of runCommandWithIndefiniteRetries.
+     */
+    StatusWith<CommandResponse> runCommand(OperationContext* opCtx,
+                                           const ReadPreferenceSetting& readPref,
+                                           const DatabaseName& dbName,
+                                           const BSONObj& cmdObj,
+                                           Milliseconds maxTimeMSOverride,
+                                           RetryPolicy retryPolicy);
+
+    /**
+     * Schedules the command to be sent to the shard asynchronously. Does not provide any guarantee
+     * on whether the command is actually sent or even scheduled successfully.
+     */
+    virtual void runFireAndForgetCommand(OperationContext* opCtx,
+                                         const ReadPreferenceSetting& readPref,
+                                         const DatabaseName& dbName,
+                                         const BSONObj& cmdObj) = 0;
+
+    /**
+     * Runs a cursor command, exhausts the cursor, and pulls all data into memory. Performs retries
+     * if the command fails in accordance with the kIdempotent RetryPolicy.
+     */
+    StatusWith<QueryResponse> runExhaustiveCursorCommand(OperationContext* opCtx,
+                                                         const ReadPreferenceSetting& readPref,
+                                                         const DatabaseName& dbName,
+                                                         const BSONObj& cmdObj,
+                                                         Milliseconds maxTimeMSOverride);
+
+    /**
+     * Synchronously runs the aggregation request, with a best effort to honor the request
+     * options. `onBatch` is a callback that will be called with the batch and resume token
+     * contained in each response. `onBatch` should return `true` to execute another getmore.
+     * Returning `false` will send a `killCursors`. If the aggregation results are exhausted,
+     * there will be no additional calls to `onBatch`.
+     *
+     * `onRetry` is a callback that will be called when the aggregation process is restarted.
+     * Depending on the retry policy, the function might restart the entire aggregation process. The
+     * `onRetry` callback is used to signal a retry so that the caller can cleanup any state
+     * affected by the `onBatch` callback.
+     *
+     * If using a retry policy other than kNoRetry, the entire aggregation may be retried after some
+     * batches have already been processed, so the onRetry callback should reset any state modified
+     * by previous invocations of onBatch.
+     */
+    Status runAggregation(
+        OperationContext* opCtx,
+        const AggregateCommandRequest& aggRequest,
+        RetryPolicy retryPolicy,
+        std::function<bool(const std::vector<BSONObj>& batch,
+                           const boost::optional<BSONObj>& postBatchResumeToken)> onBatch,
+        std::function<void(const Status&)> onRetry);
+
+    /**
+     * Synchronously run an aggregation request like runAggregation, but return a vector containing
+     * every BSON object from every batch processed during aggregation.
+     */
+    StatusWith<std::vector<BSONObj>> runAggregationWithResult(
+        OperationContext* opCtx,
+        const AggregateCommandRequest& aggRequest,
+        Shard::RetryPolicy retryPolicy);
+
+    /**
+     * Runs a write command against a shard. This is separate from runCommand, because write
+     * commands return errors in a different format than regular commands do, so checking for
+     * retriable errors must be done differently.
+     */
+    virtual BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                        Milliseconds maxTimeMS,
+                                                        const BatchedCommandRequest& batchRequest,
+                                                        const WriteConcernOptions& writeConcern,
+                                                        RetryPolicy retryPolicy) = 0;
+
+    /**
+     * Warning: This method exhausts the cursor and pulls all data into memory.
+     * Do not use other than for very small (i.e., admin or metadata) collections.
+     * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
+     *
+     * ShardRemote instances expect "readConcern" to always be kMajority, whereas ShardLocal
+     * instances expect either kLocal or kMajority.
+     */
+    StatusWith<QueryResponse> exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const repl::ReadConcernArgs& readConcern,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none,
+        const boost::optional<BSONObj>& projection = boost::none);
+
+    /**
+     * Returns false if the error is a retriable error and/or causes a replset monitor update. These
+     * errors, if from a remote call, should not be further propagated back to another server
+     * because that server will interpret them as orignating on this server rather than the one this
+     * server called.
+     */
+    static bool shouldErrorBePropagated(ErrorCodes::Error code);
+
+    /**
+     * Returns the namespace specific timeout values for operations
+     */
+    static Milliseconds getConfiguredTimeoutForOperationOnNamespace(const NamespaceString& nss);
+
+    /**
+     * Called when the value of the server parameters 'ShardRetryTokenBucketCapacity' or
+     * 'ShardRetryTokenReturnRate' changes.
+     */
+    void updateRetryBudgetRateParameters(double returnRate, double capacity);
+
+    /**
+     * Returns the retry budget instance for testing purposes.
+     */
+    AdaptiveRetryStrategy::RetryBudget& getRetryBudget_forTest() const;
+
+protected:
+    Shard(const ShardId& id, std::shared_ptr<ShardSharedStateCache::State> sharedState);
+
+    std::shared_ptr<ShardSharedStateCache::State> getSharedState() const;
+
+    /**
+     * Submits the batch request applying the specified retry policy and timeout and using the
+     * machinery provided by each implementation.
+     * Callers of this function must ensure to have configured the write concern settings
+     * accordingly to their specific semantics.
+     */
+    BatchedCommandResponse _submitBatchWriteCommand(OperationContext* opCtx,
+                                                    const BSONObj& serialisedBatchRequest,
+                                                    const DatabaseName& dbName,
+                                                    Milliseconds maxTimeMS,
+                                                    RetryPolicy retryPolicy);
+
+private:
+    StatusWith<CommandResponse> _runCommandImpl(OperationContext* opCtx,
+                                                const ReadPreferenceSetting& readPref,
+                                                const DatabaseName& dbName,
+                                                const BSONObj& cmdObj,
+                                                Milliseconds maxTimeMSOverride,
+                                                RetryPolicy retryPolicy,
+                                                std::int32_t maxRetryAttempt);
+    /**
+     * Runs the specified command against the shard backed by this object with a timeout set to
+     * the minimum of maxTimeMSOverride or the timeout of the OperationContext.
+     *
+     * The return value exposes RemoteShard's host for calls to updateReplSetMonitor.
+     *
+     * NOTE: LocalShard implementation will not return a valid host and so should be ignored.
+     */
+    virtual StatusWith<CommandResponse> _runCommand(OperationContext* opCtx,
+                                                    const ReadPreferenceSetting& readPref,
+                                                    const TargetingMetadata& targetingMetadata,
+                                                    const DatabaseName& dbname,
+                                                    Milliseconds maxTimeMSOverride,
+                                                    const BSONObj& cmdObj) = 0;
+
+    virtual RetryStrategy::Result<QueryResponse> _runExhaustiveCursorCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const DatabaseName& dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj) = 0;
+
+    virtual RetryStrategy::Result<QueryResponse> _exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const repl::ReadConcernArgs& readConcern,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none,
+        const boost::optional<BSONObj>& projection = boost::none) = 0;
+
+    // TODO(SERVER-104141): Change return type to Status
+    virtual RetryStrategy::Result<std::monostate> _runAggregation(
+        OperationContext* opCtx,
+        const TargetingMetadata& targetingMetadata,
+        const AggregateCommandRequest& aggRequest,
+        std::function<bool(const std::vector<BSONObj>& batch,
+                           const boost::optional<BSONObj>& postBatchResumeToken)> callback) = 0;
+
+    /**
+     * Identifier of the shard as obtained from the configuration data (i.e. shard0000).
+     */
+    const ShardId _id;
+    std::shared_ptr<ShardSharedStateCache::State> _sharedState;
+
+    friend class ConfigShardWrapper;
+};
+
+}  // namespace mongo

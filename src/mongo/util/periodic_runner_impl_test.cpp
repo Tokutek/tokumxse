@@ -1,0 +1,500 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/util/periodic_runner_impl.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/unittest/barrier.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source_mock.h"
+
+#include <cstddef>
+#include <mutex>
+#include <string>
+
+namespace mongo {
+
+namespace {
+
+class PeriodicRunnerImplTestNoSetup : public ServiceContextTest {
+public:
+    void setUp() override {
+        ServiceContextTest::setUp();
+        _clockSource = std::make_unique<ClockSourceMock>();
+        _runner = std::make_unique<PeriodicRunnerImpl>(getServiceContext(), _clockSource.get());
+    }
+
+    ClockSourceMock& clockSource() {
+        return *_clockSource;
+    }
+
+    PeriodicRunner& runner() {
+        return *_runner;
+    }
+
+private:
+    std::unique_ptr<ClockSourceMock> _clockSource;
+    std::unique_ptr<PeriodicRunner> _runner;
+};
+
+class PeriodicRunnerImplTest : public PeriodicRunnerImplTestNoSetup {
+public:
+    auto makeStoppedJob() {
+        PeriodicRunner::PeriodicJob job("job", [](Client* client) {}, Seconds{1}, false);
+        auto jobAnchor = runner().makeJob(std::move(job));
+        jobAnchor.start();
+        jobAnchor.stop();
+        return jobAnchor;
+    }
+};
+
+TEST_F(PeriodicRunnerImplTest, OneJobTest) {
+    int count = 0;
+    Milliseconds interval{5};
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    // Add a job, ensure that it runs once
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&count, &mutex, &cv](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                count++;
+            }
+            cv.notify_all();
+        },
+        interval,
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+
+    // Fast forward ten times, we should run all ten times.
+    for (int i = 0; i < 10; i++) {
+        clockSource().advance(interval);
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            cv.wait(lk, [&count, &i] { return count > i; });
+        }
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, OnePausableJobDoesNotRunWithoutStart) {
+    int count = 0;
+    Milliseconds interval{5};
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    // Add a job, ensure that it runs once
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&count, &mutex, &cv](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                count++;
+            }
+            cv.notify_all();
+        },
+        interval,
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    clockSource().advance(interval);
+    ASSERT_EQ(count, 0);
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, OnePausableJobRunsCorrectlyWithStart) {
+    int count = 0;
+    Milliseconds interval{5};
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    // Add a job, ensure that it runs once
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&count, &mutex, &cv](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                count++;
+            }
+            cv.notify_all();
+        },
+        interval,
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+    // Fast forward ten times, we should run all ten times.
+    for (int i = 0; i < 10; i++) {
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            cv.wait(lk, [&] { return count == i + 1; });
+        }
+        clockSource().advance(interval);
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, OnePausableJobPausesCorrectly) {
+    bool hasExecuted = false;
+    bool isPaused = false;
+    Milliseconds interval{5};
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    // Add a job, ensure that it runs once
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                // This will fail if pause does not work correctly.
+                ASSERT_FALSE(isPaused);
+                hasExecuted = true;
+            }
+            cv.notify_all();
+        },
+        interval,
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+    // Wait for the first execution.
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [&] { return hasExecuted; });
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        isPaused = true;
+        jobAnchor.pause();
+    }
+
+    // Fast forward ten times, we shouldn't run anymore. If we do, the assert inside the job will
+    // fail. (Note that even if the pausing behavior were incorrect, this is racy since tearDown()
+    // could happen before the job executes, leading the test to incorrectly succeed from time to
+    // time.)
+    for (int i = 0; i < 10; i++) {
+        clockSource().advance(interval);
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, OnePausableJobResumesCorrectly) {
+    int count = 0;
+    Milliseconds interval{5};
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&count, &mutex, &cv](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                count++;
+            }
+            cv.notify_all();
+        },
+        interval,
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+    // Wait for the first execution.
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [&] { return count == 1; });
+    }
+
+    // Reset the count before iterating to make other conditions in the test slightly simpler to
+    // follow.
+    count = 0;
+
+    int numIterationsBeforePause = 10;
+    // Fast forward ten times, we should run exactly 10 times.
+    for (int i = 0; i < numIterationsBeforePause; i++) {
+        clockSource().advance(interval);
+
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            // Wait for count to increment due to job execution.
+            cv.wait(lk, [&] { return count == i + 1; });
+        }
+    }
+
+    jobAnchor.pause();
+
+    // Fast forward ten times, we shouldn't run anymore.
+    for (int i = 0; i < 10; i++) {
+        clockSource().advance(interval);
+    }
+
+    // Make sure we didn't run anymore while paused.
+    ASSERT_EQ(count, numIterationsBeforePause);
+
+    jobAnchor.resume();
+    // Fast forward, we should run at least once.
+    clockSource().advance(interval);
+
+    // Wait for count to increase. Test will hang if resume() does not work correctly.
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [&] { return count > numIterationsBeforePause; });
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, TwoJobsTest) {
+    int countA = 0;
+    int countB = 0;
+    Milliseconds intervalA{5};
+    Milliseconds intervalB{10};
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    // Add two jobs, ensure they both run the proper number of times
+    PeriodicRunner::PeriodicJob jobA(
+        "job",
+        [&countA, &mutex, &cv](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                countA++;
+            }
+            cv.notify_all();
+        },
+        intervalA,
+        false);
+
+    PeriodicRunner::PeriodicJob jobB(
+        "job",
+        [&countB, &mutex, &cv](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                countB++;
+            }
+            cv.notify_all();
+        },
+        intervalB,
+        false);
+
+    auto jobAnchorA = runner().makeJob(std::move(jobA));
+    auto jobAnchorB = runner().makeJob(std::move(jobB));
+
+    jobAnchorA.start();
+    jobAnchorB.start();
+
+    // Fast forward and wait for both jobs to run the right number of times
+    for (int i = 0; i <= 10; i++) {
+        clockSource().advance(intervalA);
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            cv.wait(lk, [&countA, &countB, &i] { return (countA > i && countB >= i / 2); });
+        }
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, TwoJobsDontDeadlock) {
+    std::mutex mutex;
+    stdx::condition_variable cv;
+    stdx::condition_variable doneCv;
+    bool a = false;
+    bool b = false;
+
+    PeriodicRunner::PeriodicJob jobA(
+        "job",
+        [&](Client*) {
+            std::unique_lock<std::mutex> lk(mutex);
+            a = true;
+
+            cv.notify_one();
+            cv.wait(lk, [&] { return b; });
+            doneCv.notify_one();
+        },
+        Milliseconds(1),
+        false);
+
+    PeriodicRunner::PeriodicJob jobB(
+        "job",
+        [&](Client*) {
+            std::unique_lock<std::mutex> lk(mutex);
+            b = true;
+
+            cv.notify_one();
+            cv.wait(lk, [&] { return a; });
+            doneCv.notify_one();
+        },
+        Milliseconds(1),
+        false);
+
+    auto jobAnchorA = runner().makeJob(std::move(jobA));
+    auto jobAnchorB = runner().makeJob(std::move(jobB));
+
+    jobAnchorA.start();
+    jobAnchorB.start();
+
+    clockSource().advance(Milliseconds(1));
+
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        doneCv.wait(lk, [&] { return a && b; });
+
+        ASSERT(a);
+        ASSERT(b);
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, ChangingIntervalWorks) {
+    size_t timesCalled = 0;
+
+    std::mutex mutex;
+    stdx::condition_variable cv;
+
+    // Add a job, ensure that it runs once
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&](Client*) {
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                timesCalled++;
+            }
+            cv.notify_one();
+        },
+        Milliseconds(5),
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+    // Wait for the first execution.
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [&] { return timesCalled; });
+    }
+
+    jobAnchor.setPeriod(Milliseconds(10));
+    ASSERT_EQ(jobAnchor.getPeriod(), Milliseconds(10));
+
+    // if we change the period to a longer duration, that doesn't trigger a run
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        ASSERT_EQ(timesCalled, 1ul);
+    }
+
+    clockSource().advance(Milliseconds(5));
+
+    // We actually changed the period
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        ASSERT_EQ(timesCalled, 1ul);
+    }
+
+    clockSource().advance(Milliseconds(5));
+
+    // Now we hit the new cutoff
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [&] { return timesCalled == 2ul; });
+    }
+
+    clockSource().advance(Milliseconds(5));
+
+    // Haven't hit it
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        ASSERT_EQ(timesCalled, 2ul);
+    }
+
+    jobAnchor.setPeriod(Milliseconds(4));
+    ASSERT_EQ(jobAnchor.getPeriod(), Milliseconds(4));
+
+    // shortening triggers the period
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [&] { return timesCalled == 3ul; });
+    }
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, StopProperlyInterruptsOpCtx) {
+    Milliseconds interval{5};
+    unittest::Barrier barrier(2);
+    Atomic<bool> killed{false};
+
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&barrier, &killed](Client* client) {
+            stdx::condition_variable cv;
+            std::mutex mutex;
+            barrier.countDownAndWait();
+
+            try {
+                auto opCtx = client->makeOperationContext();
+                std::unique_lock<std::mutex> lk(mutex);
+                opCtx->waitForConditionOrInterrupt(cv, lk, [] { return false; });
+            } catch (const ExceptionFor<ErrorCategory::CancellationError>& e) {
+                ASSERT_EQ(e.code(), ErrorCodes::ClientMarkedKilled);
+                killed.store(true);
+                return;
+            }
+
+            MONGO_UNREACHABLE;
+        },
+        interval,
+        false);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+
+    barrier.countDownAndWait();
+
+    jobAnchor.stop();
+    ASSERT(killed.load());
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, ThrowsErrorOnceStopped) {
+    auto jobAnchor = makeStoppedJob();
+    ASSERT_THROWS_CODE_AND_WHAT(jobAnchor.start(),
+                                AssertionException,
+                                ErrorCodes::PeriodicJobIsStopped,
+                                "Attempted to start an already stopped job");
+    ASSERT_THROWS_CODE_AND_WHAT(jobAnchor.pause(),
+                                AssertionException,
+                                ErrorCodes::PeriodicJobIsStopped,
+                                "Attempted to pause an already stopped job");
+    ASSERT_THROWS_CODE_AND_WHAT(jobAnchor.resume(),
+                                AssertionException,
+                                ErrorCodes::PeriodicJobIsStopped,
+                                "Attempted to resume an already stopped job");
+    jobAnchor.stop();
+}
+
+}  // namespace
+}  // namespace mongo

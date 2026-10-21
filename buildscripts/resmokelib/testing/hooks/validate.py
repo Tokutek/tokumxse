@@ -1,0 +1,373 @@
+"""Test hook for verifying the consistency and integrity of collection and index data."""
+
+import concurrent.futures
+import logging
+import os.path
+import threading
+import time
+
+import pymongo
+import pymongo.errors
+import pymongo.mongo_client
+from pymongo.collection import Collection
+from pymongo.database import Database
+
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib.testing.fixtures.external import ExternalFixture
+from buildscripts.resmokelib.testing.fixtures.interface import build_hook_client
+from buildscripts.resmokelib.testing.fixtures.standalone import MongoDFixture
+from buildscripts.resmokelib.testing.hooks import jsfile
+
+
+class ValidateCollections(jsfile.PerClusterDataConsistencyHook):
+    """Run full validation.
+
+    This will run on all collections in all databases on every stand-alone
+    node, primary replica-set node, or primary shard node.
+    """
+
+    IS_BACKGROUND = False
+
+    def __init__(self, hook_logger, fixture, shell_options=None, use_legacy_validate=False):
+        """Initialize ValidateCollections."""
+        description = "Full collection validation"
+        js_filename = os.path.join("jstests", "hooks", "run_validate_collections.js")
+        jsfile.JSHook.__init__(
+            self, hook_logger, fixture, js_filename, description, shell_options=shell_options
+        )
+        self.use_legacy_validate = use_legacy_validate
+        self._catalog_check_js_filename = os.path.join(
+            "jstests", "hooks", "run_check_list_catalog_operations_consistency.js"
+        )
+
+    def after_test(self, test, test_report):
+        # Break the fixture down into its participant clusters if it is a MultiClusterFixture.
+        for cluster in self.fixture.get_independent_clusters():
+            self.logger.info(
+                f"Running ValidateCollections on '{cluster}' with driver URL '{cluster.get_driver_connection_url()}'"
+            )
+            hook_test_case = ValidateCollectionsTestCase.create_after_test(
+                test.logger,
+                test,
+                self,
+                self._js_filename,
+                self.use_legacy_validate,
+                self._shell_options,
+            )
+            hook_test_case.configure(cluster)
+            hook_test_case.run_dynamic_test(test_report)
+
+            hook_test_case_catalog_check = jsfile.DynamicJSTestCase.create_after_test(
+                test.logger, test, self, self._catalog_check_js_filename, self._shell_options
+            )
+            hook_test_case_catalog_check.configure(self.fixture)
+            hook_test_case_catalog_check.run_dynamic_test(test_report)
+
+
+class ValidateCollectionsTestCase(jsfile.DynamicJSTestCase):
+    """ValidateCollectionsTestCase class."""
+
+    # Maps fixture id to a Lock, serializing validation across jobs that share the same fixture
+    # (e.g. FSM workload tests with maxTestQueueSize > 1). Keyed by id(fixture) so each physical
+    # cluster gets its own lock regardless of fixture type.
+    _fixture_locks: dict[int, threading.Lock] = {}
+    _fixture_locks_mutex = threading.Lock()
+
+    @classmethod
+    def _get_fixture_lock(cls, fixture) -> threading.Lock:
+        fixture_id = id(fixture)
+        with cls._fixture_locks_mutex:
+            if fixture_id not in cls._fixture_locks:
+                cls._fixture_locks[fixture_id] = threading.Lock()
+            return cls._fixture_locks[fixture_id]
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        test_name: str,
+        description: str,
+        base_test_name: str,
+        hook,
+        js_filename: str,
+        use_legacy_validate: bool,
+        shell_options=None,
+    ):
+        super().__init__(
+            logger, test_name, description, base_test_name, hook, js_filename, shell_options
+        )
+        self.use_legacy_validate = use_legacy_validate
+        self.shell_options = shell_options
+
+    def run_test(self):
+        """Execute test hook."""
+        if self.use_legacy_validate:
+            self.logger.info(
+                "Running legacy javascript validation because use_legacy_validate is set"
+            )
+            super().run_test()
+            return
+
+        # Serialize validation across all jobs that share this fixture. This prevents concurrent
+        # ValidateCollections hooks (e.g. in FSM workload tests with maxTestQueueSize > 1) from
+        # conflicting when they write to the same cluster or interleave read/commit timestamps.
+        with self._get_fixture_lock(self.fixture):
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                    futures = []
+                    for node in self.fixture._all_mongo_d_s_t():
+                        if not isinstance(node, MongoDFixture) and not isinstance(
+                            node, ExternalFixture
+                        ):
+                            continue
+
+                        if not validate_node(
+                            node, self.shell_options, self.logger, executor, futures
+                        ):
+                            raise RuntimeError(
+                                f"Internal error while trying to validate node: {node.get_driver_connection_url()}"
+                            )
+
+                    for future in concurrent.futures.as_completed(futures):
+                        exception = future.exception()
+                        if exception is not None:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise RuntimeError(
+                                "Collection validation raised an exception."
+                            ) from exception
+                        result = future.result()
+                        if not result:
+                            raise RuntimeError("Collection validation failed.")
+
+                # Perform inter-node validation (if the running fixture provides a method to run it).
+                if getattr(self.fixture, "internode_validation", None):
+                    self.fixture.internode_validation()
+            except:
+                self.logger.exception("Uncaught exception while validating collections")
+                raise
+
+
+def validate_node(
+    node: MongoDFixture,
+    shell_options: dict,
+    logger: logging.Logger,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    futures: list,
+) -> bool:
+    try:
+        auth_options = None
+        if shell_options and "authenticationMechanism" in shell_options:
+            auth_options = shell_options
+        if config.IS_ASAN:
+            client = build_hook_client(
+                node, auth_options, pymongo.ReadPreference.PRIMARY_PREFERRED, timeout_millis=120000
+            )
+        else:
+            client = build_hook_client(node, auth_options, pymongo.ReadPreference.PRIMARY_PREFERRED)
+
+        # Skip validating collections for arbiters.
+        admin_db = client.get_database("admin")
+        ret = admin_db.command("isMaster")
+        if "arbiterOnly" in ret and ret["arbiterOnly"]:
+            logger.info(
+                f"Skipping collection validation on arbiter {node.get_driver_connection_url()}"
+            )
+            return True
+
+        # Skip fast count validation on nodes using FCBIS since FCBIS can result in inaccurate fast
+        # counts.
+        ret = admin_db.command({"getParameter": 1, "initialSyncMethod": 1})
+        skipEnforceFastCountOnValidate = False
+
+        if ret["initialSyncMethod"] == "fileCopyBased":
+            logger.info(
+                f"Skipping fast count validation against test node: {node.get_driver_connection_url()} because it uses FCBIS and fast count is expected to be incorrect."
+            )
+            skipEnforceFastCountOnValidate = True
+
+        for db_name in client.list_database_names():
+            if not validate_database(
+                client,
+                db_name,
+                shell_options,
+                skipEnforceFastCountOnValidate,
+                logger,
+                executor,
+                futures,
+            ):
+                raise RuntimeError(f"Internal error while validating database: {db_name}")
+        return True
+    except:
+        logger.exception(
+            f"Unknown exception while validating node {node.get_driver_connection_url()}"
+        )
+        return False
+
+
+def validate_database(
+    client: pymongo.mongo_client.MongoClient,
+    db_name: str,
+    shell_options: dict,
+    skipEnforceFastCountOnValidate: bool,
+    logger: logging.Logger,
+    executor: concurrent.futures.ThreadPoolExecutor,
+    futures: list,
+):
+    try:
+        db = client.get_database(db_name)
+
+        shell_options = shell_options or {}
+        test_data = shell_options.get("global_vars", {}).get("TestData", {})
+        skipEnforceFastCountOnValidate = test_data.get(
+            "skipEnforceFastCountOnValidate", skipEnforceFastCountOnValidate
+        )
+        enforceFastSizeOnValidate = test_data.get("enforceFastSizeOnValidate", False)
+        skipValidationOnNamespaceNotFound = test_data.get("skipValidationOnNamespaceNotFound", True)
+
+        validate_opts = {
+            # Run non-full validation because certain test fixtures run validate while
+            # the oplog applier is still active, and full:true can cause the oplog applier
+            # thread to encounter ObjectIsBusy errors during internal finds.
+            "full": False,
+            "checkBSONConformance": True,
+            # TODO (SERVER-24266): Always enforce fast counts, once they are always accurate
+            "enforceFastCount": not skipEnforceFastCountOnValidate,
+            "enforceFastSize": enforceFastSizeOnValidate,
+            "collHash": True,
+        }
+
+        # Don't run validate on view namespaces, include timeseries collections.
+        filter = {"type": {"$ne": "view"}}
+
+        # In a sharded cluster with in-progress validate command for the config database
+        # (i.e. on the config server), a listCommand command on a mongos or shardsvr mongod that
+        # has stale routing info may fail since a refresh would involve running read commands
+        # against the config database. The read commands are lock free so they are not blocked by
+        # the validate command and instead are subject to failing with a ObjectIsBusy error. Since
+        # this is a transient state, we shoud retry.
+        def list_collections(db: Database, filter: dict, timeout: int = 10):
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    return db.list_collection_names(filter=filter)
+                except pymongo.errors.AutoReconnect:
+                    self.logger.info("AutoReconnect exception thrown, retrying...")
+                    time.sleep(0.1)
+                except pymongo.errors.OperationFailure as ex:
+                    # Error code 314 is 'ObjectIsBusy'
+                    # https://www.mongodb.com/docs/manual/reference/error-codes/
+                    if ex.code and ex.code == 314:
+                        logger.warning(
+                            f"Received ObjectIsBusy error when trying to find collections of {db_name}, retrying..."
+                        )
+                        time.sleep(0.1)
+                        continue
+                    raise
+            raise RuntimeError(f"Timed out while trying to list collections for {db_name}")
+
+        # Try the new filter first, and if it fails with InvalidViewDefinition
+        # in multiversion environments, fall back to the old filter
+        try:
+            coll_names = list_collections(db, filter)
+            # TODO(SERVER-118882): Remove this once 9.0 becomes last LTS.
+            # Filter out system.buckets.* collections
+            # timeseries collections will be tested through their main namespace
+            coll_names = [name for name in coll_names if not name.startswith("system.buckets.")]
+        except pymongo.errors.OperationFailure as ex:
+            # Error code 182 is 'InvalidViewDefinition'
+            if ex.code and ex.code == 182:
+                logger.warning(
+                    f"Received InvalidViewDefinition error with new filter, falling back to old filter for {db_name}"
+                )
+                filter = {"$or": [{"type": "collection"}, {"type": {"$exists": False}}]}
+                coll_names = list_collections(db, filter)
+            else:
+                raise
+
+        for coll_name in coll_names:
+            futures.append(
+                executor.submit(
+                    validate_collection,
+                    db,
+                    coll_name,
+                    validate_opts,
+                    skipValidationOnNamespaceNotFound,
+                    logger,
+                )
+            )
+        return True
+    except:
+        logger.exception("Unknown exception while validating database")
+        return False
+
+
+def validate_collection(
+    db: Database,
+    coll_name: str,
+    validate_opts: dict,
+    skipValidationOnNamespaceNotFound: bool,
+    logger: logging.Logger,
+):
+    logger.info(f"Trying to validate collection {coll_name} in database {db.name}")
+
+    validate_cmd = {"validate": coll_name}
+    validate_cmd.update(validate_opts)
+    ret = db.command(validate_cmd, check=False)
+
+    ok = "ok" in ret and ret["ok"]
+    valid = "valid" in ret and ret["valid"]
+
+    if not ok or not valid:
+        if (
+            skipValidationOnNamespaceNotFound
+            and "codeName" in ret
+            and ret["codeName"] == "NamespaceNotFound"
+        ):
+            # During a 'stopStart' backup/restore on the secondary node, the actual list of
+            # collections can be out of date if ops are still being applied from the oplog.
+            # In this case we skip the collection if the ns was not found at time of
+            # validation and continue to next.
+            logger.info(
+                f"Skipping collection validation for {coll_name} since collection was not found"
+            )
+            return True
+        # TODO(SERVER-118882): Remove this once 9.0 becomes last LTS.
+        elif (
+            "codeName" in ret
+            and ret["codeName"] == "NamespaceNotFound"
+            and "errmsg" in ret
+            and "Timeseries buckets collection does not exist" in ret["errmsg"]
+        ):
+            # A legacy timeseries view exists but its corresponding bucket collection doesn't.
+            # This can happen when tests intentionally create views on non-existent buckets
+            # or drop the bucket without dropping the view. Skip validation in this case.
+            logger.info(
+                f"Skipping collection validation for {coll_name} since it is a legacy timeseries view without a bucket"
+            )
+            return True
+        elif "codeName" in ret and ret["codeName"] == "CommandNotSupportedOnView":
+            # Even though we pass a filter to getCollectionInfos() to only fetch
+            # collections, nothing is preventing the collection from being dropped and
+            # recreated as a view.
+            logger.info(f"Skipping collection validation for {coll_name} as it is a view")
+            return True
+
+        # This message needs to include "collection validation failed" to match the
+        # buildbaron search message
+        logger.info(
+            f"collection validation failed on collection {coll_name} in database {db.name} with response: {ret}"
+        )
+        dump_collection(db.get_collection(coll_name), 100, logger)
+        return False
+
+    logger.info(f"Collection validation passed on collection {coll_name} in database {db.name}")
+    return True
+
+
+def dump_collection(coll: Collection, limit: int, logger: logging.Logger):
+    logger.info("Printing indexes in: " + coll.name)
+    logger.info(coll.index_information())
+
+    logger.info("Printing the first " + str(limit) + " documents in: " + coll.name)
+    docs = coll.find().limit(limit)
+    for doc in docs:
+        logger.info(doc)

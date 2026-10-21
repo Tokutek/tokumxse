@@ -1,174 +1,203 @@
-// random.cpp
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/*    Copyright 2012 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
 
-#include "mongo/platform/random.h"
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <fstream>  // IWYU pragma: keep
+#include <memory>
 
-#include <stdio.h>
-#include <string.h>
+#ifdef _WIN32
+#include <bcrypt.h>
+#else
+#include <cerrno>
 
-#ifndef _WIN32
-#include <errno.h>
+#include <fcntl.h>
 #endif
 
 #define _CRT_RAND_S
-#include <cstdlib>
-#include <iostream>
-#include <fstream>
 
-#include "mongo/platform/basic.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H) || defined(__wasi__)
+#include <unistd.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+#ifdef _WIN32
+#define SECURE_RANDOM_BCRYPT
+#elif defined(__wasi__)
+#define SECURE_RANDOM_GETENTROPY
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__EMSCRIPTEN__)
+#define SECURE_RANDOM_URANDOM
+#elif defined(__OpenBSD__)
+#define SECURE_RANDOM_ARCFOUR
+#else
+#error "Must implement SecureRandom for platform"
+#endif
 
 namespace mongo {
 
-    // ---- PseudoRandom  -----
+namespace {
 
-    int32_t PseudoRandom::nextInt32() {
-        int32_t t = _x ^ (_x << 11);
-        _x = _y;
-        _y = _z;
-        _z = _w;
-        return _w = _w ^ (_w >> 19) ^ (t ^ (t >> 8));
+template <size_t Bytes>
+struct Buffer {
+    static constexpr size_t kArraySize = Bytes / sizeof(uint64_t);
+
+    uint64_t pop() {
+        return arr[--avail];
+    }
+    uint8_t* fillPtr() {
+        return reinterpret_cast<uint8_t*>(arr.data() + avail);
+    }
+    size_t fillSize() {
+        return sizeof(uint64_t) * (arr.size() - avail);
+    }
+    void setFilled() {
+        avail = arr.size();
     }
 
-    namespace {
-        const int32_t default_y = 362436069;
-        const int32_t default_z = 521288629;
-        const int32_t default_w = 88675123;
+    std::array<uint64_t, kArraySize> arr;
+    size_t avail = 0;
+};
+
+#if defined(SECURE_RANDOM_BCRYPT)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        // Use BCRYPT_USE_SYSTEM_PREFERRED_RNG to avoid calling BCryptOpenAlgorithmProvider.
+        // Opening a provider acquires BCrypt's internal critical section and may trigger a DLL
+        // load, which can deadlock against Windows' loader lock (LdrpDrainWorkQueue) when this
+        // runs during thread-local storage initialization on a newly created thread. Passing a
+        // NULL algorithm handle with this flag bypasses the provider machinery entirely.
+        auto ntstatus = ::BCryptGenRandom(
+            nullptr, reinterpret_cast<PUCHAR>(buf), n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (ntstatus != STATUS_SUCCESS) {
+            LOGV2_ERROR(
+                23823,
+                "Failed to generate random number from secure random object; NTSTATUS: {ntstatus}",
+                "ntstatus"_attr = ntstatus);
+            fassertFailed(28814);
+        }
+        return n;
     }
+};
+#endif  // SECURE_RANDOM_BCRYPT
 
-    PseudoRandom::PseudoRandom( int32_t seed ) {
-        _x = seed;
-        _y = default_y;
-        _z = default_z;
-        _w = default_w;
-    }
-
-
-    PseudoRandom::PseudoRandom( uint32_t seed ) {
-        _x = static_cast<int32_t>(seed);
-        _y = default_y;
-        _z = default_z;
-        _w = default_w;
-    }
-
-
-    PseudoRandom::PseudoRandom( int64_t seed ) {
-        int32_t high = seed >> 32;
-        int32_t low = seed & 0xFFFFFFFF;
-
-        _x = high ^ low;
-        _y = default_y;
-        _z = default_z;
-        _w = default_w;
-    }
-
-    int64_t PseudoRandom::nextInt64() {
-        int64_t a = nextInt32();
-        int64_t b = nextInt32();
-        return ( a << 32 ) | b;
-    }
-
-    // --- SecureRandom ----
-
-    SecureRandom::~SecureRandom() {
-    }
-
-#ifdef _WIN32
-    class WinSecureRandom : public SecureRandom {
-        virtual ~WinSecureRandom(){}
-        int64_t nextInt64() {
-            uint32_t a, b;
-            if ( rand_s(&a) ) {
-                abort();
+#if defined(SECURE_RANDOM_URANDOM)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        size_t i = 0;
+        while (i < n) {
+            ssize_t r;
+            while ((r = read(sharedFd(), buf + i, n - i)) == -1) {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    auto errSave = errno;
+                    LOGV2_ERROR(23824,
+                                "SecureRandom: read `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
+                    fassertFailed(28840);
+                }
             }
-            if ( rand_s(&b) ) {
-                abort();
-            }
-            return ( static_cast<int64_t>(a) << 32 ) | b;
+            i += r;
         }
-    };
-
-    SecureRandom* SecureRandom::create() {
-        return new WinSecureRandom();
+        return i;
     }
 
-#elif defined(__linux__) || defined(__sun) || defined(__APPLE__) || defined(__FreeBSD__)
-
-    class InputStreamSecureRandom : public SecureRandom {
-    public:
-        InputStreamSecureRandom( const char* fn ) {
-            _in = new std::ifstream( fn, std::ios::binary | std::ios::in );
-            if ( !_in->is_open() ) {
-                std::cerr << "can't open " << fn << " " << strerror(errno) << std::endl;
-                abort();
+private:
+    static constexpr const char* kFn = "/dev/urandom";
+    static int sharedFd() {
+        // Retain the urandom fd forever.
+        // Kernel ensures that concurrent `read` calls don't mingle their data.
+        // http://lkml.iu.edu//hypermail/linux/kernel/0412.1/0181.html
+        static const int fd = [] {
+            int f;
+            while ((f = open(kFn, 0)) == -1) {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    auto errSave = errno;
+                    LOGV2_ERROR(23825,
+                                "SecureRandom: open `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
+                    fassertFailed(28839);
+                }
             }
-        }
+            return f;
+        }();
+        return fd;
+    }
+};
+#endif  // SECURE_RANDOM_URANDOM
 
-        ~InputStreamSecureRandom() {
-            delete _in;
-        }
-
-        int64_t nextInt64() {
-            int64_t r;
-            _in->read( reinterpret_cast<char*>( &r ), sizeof(r) );
-            if ( _in->fail() ) {
-                abort();
+#if defined(SECURE_RANDOM_GETENTROPY)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        // WASI maps getentropy() to wasi:random/random. It requires each call to
+        // request at most 256 bytes, so we loop for larger buffers.
+        constexpr size_t kMaxChunk = 256;
+        size_t i = 0;
+        while (i < n) {
+            size_t chunk = std::min(n - i, kMaxChunk);
+            if (getentropy(buf + i, chunk) != 0) {
+                // getentropy() under WASI calls wasi:random/random, which should never
+                // fail. If it does, fassertFailed terminates the process via abort(),
+                // which is the only option since there is no errno or log infrastructure
+                // available in the WASI environment.
+                fassertFailed(11605301);
             }
-            return r;
+            i += chunk;
         }
+        return n;
+    }
+};
+#endif  // SECURE_RANDOM_GETENTROPY
 
-    private:
-        std::ifstream* _in;
-    };
+#if defined(SECURE_RANDOM_ARCFOUR)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        arc4random_buf(buf, n);
+        return n;
+    }
+};
+#endif  // SECURE_RANDOM_ARCFOUR
 
-    SecureRandom* SecureRandom::create() {
-        return new InputStreamSecureRandom( "/dev/urandom" );
+}  // namespace
+
+class SecureUrbg::State {
+public:
+    uint64_t get() {
+        if (!_buffer.avail) {
+            size_t n = _source.refill(_buffer.fillPtr(), _buffer.fillSize());
+            _buffer.avail += n / sizeof(uint64_t);
+        }
+        return _buffer.pop();
     }
 
-#elif defined(__OpenBSD__)
+private:
+    Source _source;
+    Buffer<4096> _buffer;
+};
 
-    class Arc4SecureRandom : public SecureRandom {
-    public:
-        int64_t nextInt64() {
-            int64_t value;
-            arc4random_buf(&value, sizeof(value));
-            return value;
-        }
-    };
+SecureUrbg::SecureUrbg() : _state{std::make_unique<State>()} {}
 
-    SecureRandom* SecureRandom::create() {
-        return new Arc4SecureRandom();
-    }
+SecureUrbg::~SecureUrbg() = default;
 
-#else
-
-#error Must implement SecureRandom for platform
-
-#endif
-
+uint64_t SecureUrbg::operator()() {
+    return _state->get();
 }
+
+}  // namespace mongo

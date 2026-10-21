@@ -1,0 +1,109 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ClusterServerParameter:
+        # Users of CSP (Cluster-wide Server Parameters) must create
+        # a document definition for the values used by their setting
+        # which inherits from this struct via inlined chaining.
+        description: Abstract baseclass for all cluster-wide server parameters
+        fields:
+            _id:
+                description: Unique per-feature name of this CSP
+                type: string
+                # Always present on disk, but provided as optional for command processing.
+                optional: true
+            clusterParameterTime:
+                description: >
+                    LogicalTime representing the time at which the current version of the CSP was
+                    updated. Newer versions of the CSP will have later clusterParameterTimes than older ones.
+                    In normal operation, the clusterParameterTime will increase as the CSP is updated via 
+                    setClusterParameter, but may decrease to a previously-seen value on rollback.
+                type: logicalTime
+                default: LogicalTime::kUninitialized
+
+    TestIntClusterParameterStorage:
+        description: "Storage used for testIntClusterParameter"
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            intData:
+                description: "Some int parameter"
+                type: safeInt64
+                default: 16
+
+    TestStrClusterParameterStorage:
+        description: "Storage used for testStrClusterParameter"
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            strData:
+                description: "Some string parameter"
+                type: string
+                default: '"off"'
+
+    TestBoolClusterParameterStorage:
+        description: "Storage used for testBoolClusterParameter"
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            boolData:
+                description: "Some bool parameter"
+                type: bool
+                default: 0
+
+feature_flags:
+    featureFlagClusterWideToaster:
+        description: Feature flag for testing use of feature flags with CW server params
+        cpp_varname: gFeatureFlagClusterWideToaster
+        default: false
+        fcv_gated: true
+
+server_parameters:
+    testIntClusterParameter:
+        set_at: cluster
+        description: "Test cluster parameter that is only usable if enableTestCommands=true"
+        cpp_vartype: TestIntClusterParameterStorage
+        cpp_varname: intStorage
+        test_only: true
+        redact: false
+        omit_in_ftdc: false
+
+    testStrClusterParameter:
+        set_at: cluster
+        description: "Test cluster parameter that is only usable if enableTestCommands=true"
+        cpp_vartype: TestStrClusterParameterStorage
+        cpp_varname: strStorage
+        test_only: true
+        redact: false
+        omit_in_ftdc: false
+
+    testBoolClusterParameter:
+        set_at: cluster
+        description: "Test cluster parameter that is only usable if enableTestCommands=true"
+        cpp_vartype: TestBoolClusterParameterStorage
+        cpp_varname: boolStorage
+        omit_in_ftdc: true
+        test_only: true
+        redact: false
+
+    cwspTestNeedsFeatureFlagClusterWideToaster:
+        description: "Server Parameter gated on featureFlagClusterWideToaster"
+        set_at: cluster
+        cpp_varname: gCWSPTestFeatureFlagClusterWideToaster
+        cpp_vartype: TestIntClusterParameterStorage
+        test_only: true
+        condition:
+            feature_flag: gFeatureFlagClusterWideToaster
+        redact: false
+        omit_in_ftdc: false

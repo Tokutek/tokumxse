@@ -1,0 +1,464 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/kv/kv_engine_test_harness.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+class SnapshotManagerTests : public unittest::Test, public ScopedGlobalServiceContextForTest {
+public:
+    /**
+     * Usable as an OperationContext* but owns both the Client and the OperationContext.
+     */
+    class Operation {
+    public:
+        Operation() = default;
+        Operation(ServiceContext::UniqueClient client, std::unique_ptr<RecoveryUnit> ru)
+            : _client(std::move(client)), _opCtx(_client->makeOperationContext()) {
+            shard_role_details::setRecoveryUnit(
+                _opCtx.get(), std::move(ru), WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        }
+
+
+        Operation(Operation&& other) = default;
+
+        Operation& operator=(Operation&& other) {
+            // Need to assign to _opCtx first if active. Otherwise we'd destroy _client before
+            // _opCtx.
+            _opCtx = std::move(other._opCtx);
+            _client = std::move(other._client);
+            return *this;
+        }
+
+        OperationContext& operator*() const {
+            return *_opCtx;
+        }
+
+        OperationContext* operator->() const {
+            return _opCtx.get();
+        }
+
+        OperationContext* get() const {
+            return _opCtx.get();
+        }
+
+        operator OperationContext*() const {
+            return _opCtx.get();
+        }
+
+    private:
+        ServiceContext::UniqueClient _client;
+        ServiceContext::UniqueOperationContext _opCtx;
+    };
+
+    Operation makeOperation() {
+        return Operation(getServiceContext()->getService()->makeClient(""),
+                         helper->getEngine()->newRecoveryUnit());
+    }
+
+    // Returns the timestamp before incrementing.
+    Timestamp fetchAndIncrementTimestamp() {
+        auto preImage = _counter;
+        _counter = Timestamp(_counter.getSecs() + 1, _counter.getInc());
+        return preImage;
+    }
+
+    RecordId insertRecord(OperationContext* opCtx, std::string contents = "abcd") {
+        Lock::GlobalLock globalLock(opCtx, MODE_IX);
+        auto id = rs->insertRecord(opCtx,
+                                   *shard_role_details::getRecoveryUnit(opCtx),
+                                   contents.c_str(),
+                                   contents.length() + 1,
+                                   _counter);
+        ASSERT_OK(id);
+        return id.getValue();
+    }
+
+    RecordId insertRecordAndCommit(std::string contents = "abcd") {
+        auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IX);
+        WriteUnitOfWork wuow(op);
+        auto id = insertRecord(op, contents);
+        wuow.commit();
+        return id;
+    }
+
+    void updateRecordAndCommit(RecordId id, std::string contents) {
+        auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IX);
+        WriteUnitOfWork wuow(op);
+        ASSERT_OK(shard_role_details::getRecoveryUnit(op.get())->setTimestamp(_counter));
+        ASSERT_OK(rs->updateRecord(op,
+                                   *shard_role_details::getRecoveryUnit(op.get()),
+                                   id,
+                                   contents.c_str(),
+                                   contents.length() + 1));
+        wuow.commit();
+    }
+
+    void deleteRecordAndCommit(RecordId id) {
+        auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IX);
+        WriteUnitOfWork wuow(op);
+        ASSERT_OK(shard_role_details::getRecoveryUnit(op.get())->setTimestamp(_counter));
+        rs->deleteRecord(op, *shard_role_details::getRecoveryUnit(op.get()), id);
+        wuow.commit();
+    }
+
+    /**
+     * Returns the number of records seen iterating rs using the passed-in OperationContext.
+     */
+    int itCountOn(OperationContext* opCtx) {
+        Lock::GlobalLock globalLock(opCtx, MODE_IS);
+        auto cursor = rs->getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx));
+        int count = 0;
+        while (auto record = cursor->next()) {
+            count++;
+        }
+        return count;
+    }
+
+    int itCountCommitted() {
+        auto op = makeOperation();
+        shard_role_details::getRecoveryUnit(op.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kMajorityCommitted);
+        ASSERT_OK(
+            shard_role_details::getRecoveryUnit(op.get())->majorityCommittedSnapshotAvailable());
+        return itCountOn(op);
+    }
+
+    int itCountLastApplied() {
+        auto op = makeOperation();
+        shard_role_details::getRecoveryUnit(op.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kNoOverlap);
+        return itCountOn(op);
+    }
+
+    boost::optional<Record> readRecordOn(OperationContext* op, RecordId id) {
+        Lock::GlobalLock globalLock(op, MODE_IS);
+        auto cursor = rs->getCursor(op, *shard_role_details::getRecoveryUnit(op));
+        auto record = cursor->seekExact(id);
+        if (record)
+            record->data.makeOwned();
+        return record;
+    }
+    boost::optional<Record> readRecordCommitted(RecordId id) {
+        auto op = makeOperation();
+        Lock::GlobalLock globalLock(op, MODE_IS);
+        shard_role_details::getRecoveryUnit(op.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kMajorityCommitted);
+        ASSERT_OK(
+            shard_role_details::getRecoveryUnit(op.get())->majorityCommittedSnapshotAvailable());
+        return readRecordOn(op, id);
+    }
+
+    std::string readStringCommitted(RecordId id) {
+        auto record = readRecordCommitted(id);
+        ASSERT(record);
+        return std::string(record->data.data());
+    }
+
+    boost::optional<Record> readRecordLastApplied(RecordId id) {
+        auto op = makeOperation();
+        shard_role_details::getRecoveryUnit(op.get())->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kNoOverlap);
+        return readRecordOn(op, id);
+    }
+
+    std::string readStringLastApplied(RecordId id) {
+        auto record = readRecordLastApplied(id);
+        ASSERT(record);
+        return std::string(record->data.data());
+    }
+
+    void setUp() override {
+        helper = KVHarnessHelper::create(getGlobalServiceContext());
+        engine = helper->getEngine();
+        snapshotManager = helper->getEngine()->getSnapshotManager();
+
+        auto op = makeOperation();
+        WriteUnitOfWork wuow(op);
+        const auto nss = NamespaceString::createNamespaceString_forTest("a.b");
+        const auto ident = "collection-ident";
+        RecordStore::Options options;
+        auto& provider =
+            rss::ReplicatedStorageService::get(getGlobalServiceContext()).getPersistenceProvider();
+        auto& ru = *shard_role_details::getRecoveryUnit(op.get());
+        ASSERT_OK(engine->createRecordStore(provider, ru, nss, ident, options));
+        rs = engine->getRecordStore(op, nss, ident, options, UUID::gen());
+        ASSERT(rs);
+    }
+
+    std::unique_ptr<KVHarnessHelper> helper;
+    KVEngine* engine;
+    SnapshotManager* snapshotManager;
+    std::unique_ptr<RecordStore> rs;
+    Operation snapshotOperation;
+
+private:
+    Timestamp _counter = Timestamp(1, 0);
+};
+
+}  // namespace
+
+TEST_F(SnapshotManagerTests, ConsistentIfNotSupported) {
+    if (snapshotManager)
+        return;  // This test is only for engines that DON'T support SnapshotManagers.
+
+    auto op = makeOperation();
+    auto ru = shard_role_details::getRecoveryUnit(op.get());
+    auto readSource = ru->getTimestampReadSource();
+    ASSERT(readSource != RecoveryUnit::ReadSource::kMajorityCommitted);
+    ASSERT(!ru->getPointInTimeReadTimestamp());
+}
+
+TEST_F(SnapshotManagerTests, FailsWithNoCommittedSnapshot) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto op = makeOperation();
+    auto ru = shard_role_details::getRecoveryUnit(op.get());
+    shard_role_details::getRecoveryUnit(op.get())->setTimestampReadSource(
+        RecoveryUnit::ReadSource::kMajorityCommitted);
+
+    // Before first snapshot is created.
+    EXPECT_EQ(ru->majorityCommittedSnapshotAvailable(),
+              ErrorCodes::ReadConcernMajorityNotAvailableYet);
+
+    // There is a snapshot but it isn't committed.
+    auto snap = fetchAndIncrementTimestamp();
+    EXPECT_EQ(ru->majorityCommittedSnapshotAvailable(),
+              ErrorCodes::ReadConcernMajorityNotAvailableYet);
+
+    // Now there is a committed snapshot.
+    snapshotManager->setCommittedSnapshot(snap);
+    ASSERT_OK(ru->majorityCommittedSnapshotAvailable());
+
+    // Not anymore!
+    snapshotManager->clearCommittedSnapshot();
+    EXPECT_EQ(ru->majorityCommittedSnapshotAvailable(),
+              ErrorCodes::ReadConcernMajorityNotAvailableYet);
+}
+
+TEST_F(SnapshotManagerTests, FailsAfterDropAllSnapshotsWhileYielded) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto op = makeOperation();
+    shard_role_details::getRecoveryUnit(op.get())->setTimestampReadSource(
+        RecoveryUnit::ReadSource::kMajorityCommitted);
+
+    // Hold the outer most global lock throughout the test to avoid getting snapshots abandoned when
+    // inner global locks are destructed.
+    Lock::GlobalLock globalLock(op, MODE_IS);
+
+    // Start an operation using a committed snapshot.
+    auto snap = fetchAndIncrementTimestamp();
+    snapshotManager->setCommittedSnapshot(snap);
+    ASSERT_OK(shard_role_details::getRecoveryUnit(op.get())->majorityCommittedSnapshotAvailable());
+    EXPECT_EQ(itCountOn(op), 0);  // acquires a snapshot.
+
+    // Everything still works until we abandon our snapshot.
+    snapshotManager->clearCommittedSnapshot();
+    EXPECT_EQ(itCountOn(op), 0);
+
+    // Now it doesn't.
+    shard_role_details::getRecoveryUnit(op.get())->abandonSnapshot();
+    ASSERT_THROWS_CODE(
+        itCountOn(op), AssertionException, ErrorCodes::ReadConcernMajorityNotAvailableYet);
+}
+
+TEST_F(SnapshotManagerTests, BasicFunctionality) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto snap0 = fetchAndIncrementTimestamp();
+    snapshotManager->setCommittedSnapshot(snap0);
+    EXPECT_EQ(itCountCommitted(), 0);
+
+    insertRecordAndCommit();
+
+    EXPECT_EQ(itCountCommitted(), 0);
+
+
+    auto snap1 = fetchAndIncrementTimestamp();
+
+    insertRecordAndCommit();
+    insertRecordAndCommit();
+    auto snap3 = fetchAndIncrementTimestamp();
+
+    {
+        auto op = makeOperation();
+        WriteUnitOfWork wuow(op);
+        insertRecord(op);
+        // rolling back wuow
+    }
+
+    insertRecordAndCommit();
+    auto snap4 = fetchAndIncrementTimestamp();
+
+    // If these fail, everything is busted.
+    EXPECT_EQ(itCountCommitted(), 0);
+    snapshotManager->setCommittedSnapshot(snap1);
+    EXPECT_EQ(itCountCommitted(), 1);
+    snapshotManager->setCommittedSnapshot(snap3);
+    EXPECT_EQ(itCountCommitted(), 3);
+
+    // Hold the outer most global lock throughout the remainder of the test to avoid getting
+    // snapshots abandoned when inner global locks are destructed. This op should keep its original
+    // snapshot until abandoned.
+    auto longOp = makeOperation();
+    Lock::GlobalLock globalLock(longOp, MODE_IS);
+    shard_role_details::getRecoveryUnit(longOp.get())
+        ->setTimestampReadSource(RecoveryUnit::ReadSource::kMajorityCommitted);
+    ASSERT_OK(
+        shard_role_details::getRecoveryUnit(longOp.get())->majorityCommittedSnapshotAvailable());
+    EXPECT_EQ(itCountOn(longOp), 3);
+
+    // If this fails, the snapshot contains writes that were rolled back.
+    snapshotManager->setCommittedSnapshot(snap4);
+    EXPECT_EQ(itCountCommitted(), 4);
+
+    // If this fails, longOp changed snapshots at an illegal time.
+    EXPECT_EQ(itCountOn(longOp), 3);
+
+    // If this fails, longOp didn't get a new snapshot when it should have.
+    shard_role_details::getRecoveryUnit(longOp.get())->abandonSnapshot();
+    EXPECT_EQ(itCountOn(longOp), 4);
+}
+
+TEST_F(SnapshotManagerTests, UpdateAndDelete) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto snapBeforeInsert = fetchAndIncrementTimestamp();
+
+    auto id = insertRecordAndCommit("Dog");
+    auto snapDog = fetchAndIncrementTimestamp();
+
+    updateRecordAndCommit(id, "Cat");
+    auto snapCat = fetchAndIncrementTimestamp();
+
+    deleteRecordAndCommit(id);
+    auto snapAfterDelete = fetchAndIncrementTimestamp();
+
+    snapshotManager->setCommittedSnapshot(snapBeforeInsert);
+    EXPECT_EQ(itCountCommitted(), 0);
+    ASSERT(!readRecordCommitted(id));
+
+    snapshotManager->setCommittedSnapshot(snapDog);
+    EXPECT_EQ(itCountCommitted(), 1);
+    EXPECT_EQ(readStringCommitted(id), "Dog");
+
+    snapshotManager->setCommittedSnapshot(snapCat);
+    EXPECT_EQ(itCountCommitted(), 1);
+    EXPECT_EQ(readStringCommitted(id), "Cat");
+
+    snapshotManager->setCommittedSnapshot(snapAfterDelete);
+    EXPECT_EQ(itCountCommitted(), 0);
+    ASSERT(!readRecordCommitted(id));
+}
+
+TEST_F(SnapshotManagerTests, InsertAndReadOnLastAppliedSnapshot) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto beforeInsert = fetchAndIncrementTimestamp();
+
+    auto id = insertRecordAndCommit();
+    auto afterInsert = fetchAndIncrementTimestamp();
+
+    // Not reading on the last applied timestamp returns the most recent data.
+    auto op = makeOperation();
+    auto ru = shard_role_details::getRecoveryUnit(op.get());
+    ru->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    EXPECT_EQ(itCountOn(op), 1);
+    ASSERT(readRecordOn(op, id));
+
+    deleteRecordAndCommit(id);
+    auto afterDelete = fetchAndIncrementTimestamp();
+
+    // Reading at the last applied snapshot timestamps returns data in order.
+    snapshotManager->setLastApplied(beforeInsert);
+    EXPECT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
+
+    snapshotManager->setLastApplied(afterInsert);
+    EXPECT_EQ(itCountLastApplied(), 1);
+    ASSERT(readRecordLastApplied(id));
+
+    snapshotManager->setLastApplied(afterDelete);
+    EXPECT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
+}
+
+TEST_F(SnapshotManagerTests, UpdateAndDeleteOnLocalSnapshot) {
+    if (!snapshotManager)
+        return;  // This test is only for engines that DO support SnapshotManagers.
+
+    auto beforeInsert = fetchAndIncrementTimestamp();
+
+    auto id = insertRecordAndCommit("Aardvark");
+    auto afterInsert = fetchAndIncrementTimestamp();
+
+    updateRecordAndCommit(id, "Blue spotted stingray");
+    auto afterUpdate = fetchAndIncrementTimestamp();
+
+    // Not reading on the last local timestamp returns the most recent data.
+    auto op = makeOperation();
+    auto ru = shard_role_details::getRecoveryUnit(op.get());
+    ru->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    EXPECT_EQ(itCountOn(op), 1);
+    auto record = readRecordOn(op, id);
+    EXPECT_EQ(std::string(record->data.data()), "Blue spotted stingray");
+
+    deleteRecordAndCommit(id);
+    auto afterDelete = fetchAndIncrementTimestamp();
+
+    snapshotManager->setLastApplied(beforeInsert);
+    EXPECT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
+
+    snapshotManager->setLastApplied(afterInsert);
+    EXPECT_EQ(itCountLastApplied(), 1);
+    EXPECT_EQ(readStringLastApplied(id), "Aardvark");
+
+    snapshotManager->setLastApplied(afterUpdate);
+    EXPECT_EQ(itCountLastApplied(), 1);
+    EXPECT_EQ(readStringLastApplied(id), "Blue spotted stingray");
+
+    snapshotManager->setLastApplied(afterDelete);
+    EXPECT_EQ(itCountLastApplied(), 0);
+    ASSERT(!readRecordLastApplied(id));
+}
+}  // namespace mongo

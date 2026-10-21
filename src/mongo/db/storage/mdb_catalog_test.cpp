@@ -1,0 +1,246 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/mdb_catalog.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/collection_record_store_options.h"
+#include "mongo/db/shard_role/shard_catalog/durable_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/durable_catalog_entry_metadata.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+namespace mongo {
+
+class MDBCatalogTest : public mongo::unittest::Test {
+public:
+    bool possessesAllRelevantElements(const BSONObj& expected, const BSONObj& actual) {
+        for (BSONElement elem : expected) {
+            BSONElement actualElem = actual[elem.fieldName()];
+            if (elem.type() == mongo::BSONType::object) {
+                if (actualElem.type() != mongo::BSONType::object ||
+                    !possessesAllRelevantElements(elem.Obj(), actualElem.Obj()))
+                    return false;
+            } else {
+                if (!actualElem.binaryEqual(elem))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    bool recordStoreOptionsAreMaintained(const RecordStore::Options& expected,
+                                         const RecordStore::Options& actual) {
+        if (expected.customBlockCompressor) {
+            if (!actual.customBlockCompressor)
+                return false;
+            if (expected.customBlockCompressor->compare(*(actual.customBlockCompressor)) != 0)
+                return false;
+        }
+        return expected.keyFormat == actual.keyFormat && expected.isCapped == actual.isCapped &&
+            expected.isOplog == actual.isOplog && expected.oplogMaxSize == actual.oplogMaxSize &&
+            expected.allowOverwrite == actual.allowOverwrite &&
+            expected.forceUpdateWithFullDocument == actual.forceUpdateWithFullDocument &&
+            possessesAllRelevantElements(expected.storageEngineCollectionOptions,
+                                         actual.storageEngineCollectionOptions);
+    }
+
+    std::shared_ptr<durable_catalog::CatalogEntryMetaData> parseCatalogEntryMetaDataFromCatalog(
+        const NamespaceString& nss, const BSONObj& obj) {
+        RecordId dummyId;
+        auto catalogEntry = durable_catalog::parseCatalogEntry(dummyId, obj);
+        return catalogEntry->metadata;
+    }
+
+    RecordStore::Options parseRecordStoreOptionsWithCatalog(const NamespaceString& nss,
+                                                            const BSONObj& obj) {
+        auto md = parseCatalogEntryMetaDataFromCatalog(nss, obj);
+
+        return getRecordStoreOptions(nss, md->options, md->recordIdsReplicated);
+    }
+
+
+    void testParseEquality(const char* config) {
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("testNs.foo");
+        NamespaceString nssOplog =
+            NamespaceString::createNamespaceString_forTest("local.oplog.testNs");
+        BSONObj configObj = mongo::fromjson(config);
+
+        auto expected = parseRecordStoreOptionsWithCatalog(nss, configObj);
+        auto actual = MDBCatalog::_parseRecordStoreOptions(nss, configObj);
+        ASSERT(recordStoreOptionsAreMaintained(expected, actual));
+        auto expectedOplog = parseRecordStoreOptionsWithCatalog(nssOplog, configObj);
+        auto actualOplog = MDBCatalog::_parseRecordStoreOptions(nssOplog, configObj);
+        ASSERT(recordStoreOptionsAreMaintained(expectedOplog, actualOplog));
+
+        bool expectedRecordIdsReplicated =
+            configObj.getObjectField("md").getBoolField("recordIdsReplicated");
+        bool actualRecordIdsReplicated =
+            parseCatalogEntryMetaDataFromCatalog(nss, configObj)->recordIdsReplicated;
+        EXPECT_EQ(expectedRecordIdsReplicated, actualRecordIdsReplicated);
+    }
+
+    BSONObj buildOrphanedCatalogEntryObjAndNs(const std::string& ident,
+                                              bool isClustered,
+                                              NamespaceString* nss,
+                                              std::string* ns,
+                                              UUID uuid = UUID::gen()) {
+        return MDBCatalog::_buildOrphanedCatalogEntryObjAndNs(ident, isClustered, nss, ns, uuid);
+    }
+};
+
+/**
+ * Test that MDBCatalog::_buildCatalogEntryObj is equivalent to previous implementation
+ * creating it through CollectionOptions and catalog
+ */
+TEST_F(MDBCatalogTest, BuildCatalogEntryObjAndNsEquivalence) {
+    // Standardize UUID for comparison
+    UUID uuid = UUID::gen();
+
+    // Construct expected output using CollectionOptions and catalog logic
+    CollectionOptions optionsWithUUID;
+    optionsWithUUID.uuid.emplace(uuid);
+    optionsWithUUID.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
+    std::string identNs = "test-Ident";
+    std::replace(identNs.begin(), identNs.end(), '-', '_');
+    auto expectedNss = NamespaceStringUtil::deserialize(
+        DatabaseName::kLocal, std::string(NamespaceString::kOrphanCollectionPrefix) + identNs);
+    auto expectedNs = NamespaceStringUtil::serializeForCatalog(expectedNss);
+    durable_catalog::CatalogEntryMetaData md =
+        durable_catalog::internal::createMetaDataForNewCollection(expectedNss, optionsWithUUID);
+    auto expected = durable_catalog::internal::buildRawMDBCatalogEntry(
+        "test-Ident", BSONObj(), md, expectedNss);
+
+    // Build with MDBCatalog function and compare
+    NamespaceString nss;
+    std::string ns;
+    BSONObj actual = buildOrphanedCatalogEntryObjAndNs("test-Ident", true, &nss, &ns, uuid);
+    EXPECT_EQ(expectedNss, nss);
+    EXPECT_EQ(expectedNs, ns);
+    ASSERT(possessesAllRelevantElements(expected, actual));
+}
+
+/**
+ * Test that MDBCatalog::_parseRecordStoreOptions is equivalent to previous implementation
+ * extracting it from a parsed CatalogEntry
+ */
+TEST_F(MDBCatalogTest, ParseRecordStoreOptionsEquivalence) {
+    const char simpleConfig[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"options\" : { \
+                \"clusteredIndex\" : { \
+                    \"v\" : 2, \
+                    \"key\" : {\"_id\" : 1}, \
+                    \"name\" : \"foo\", \
+                    \"unique\" : true \
+                }, \
+                \"size\" : 1048576, \
+                \"timeseries\" : { \
+                    \"timeField\" : \"tf\", \
+                    \"metaField\" : \"mf\", \
+                    \"granularity\" : \"minutes\", \
+                    \"bucketRoundingSeconds\" : 10, \
+                    \"bucketMaxSpanSeconds\" : 10000 \
+                }, \
+                \"capped\" : true, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 1}, \"doc2\" : {\"a\" : 2}} \
+            } \
+        } \
+    }";
+    const char minimalConfig[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"options\" : { \
+                \"size\" : 1024, \
+                \"capped\" : false, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 0}} \
+            } \
+        } \
+    }";
+    const char minimalConfigWithReplicatedRecordIdsEnabled[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"recordIdsReplicated\" : true, \
+            \"options\" : { \
+                \"size\" : 1024, \
+                \"capped\" : false, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 0}} \
+            } \
+        } \
+    }";
+    const char minimalConfigWithReplicatedRecordIdsDisabled[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"recordIdsReplicated\" : false, \
+            \"options\" : { \
+                \"size\" : 1024, \
+                \"capped\" : false, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 0}} \
+            } \
+        } \
+    }";
+    const char onlyclusterConfig[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"options\" : { \
+                \"clusteredIndex\" : { \
+                    \"v\" : 2, \
+                    \"key\" : {\"_id\" : 1}, \
+                    \"name\" : \"foo\", \
+                    \"unique\" : true \
+                }, \
+                \"size\" : 1048576, \
+                \"capped\" : true, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 1}, \"doc2\" : {\"a\" : 2}} \
+            } \
+        } \
+    }";
+    const char onlytsConfig[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"options\" : { \
+                \"size\" : 1048576, \
+                \"timeseries\" : { \
+                    \"timeField\" : \"tf\", \
+                    \"metaField\" : \"mf\", \
+                    \"granularity\" : \"minutes\", \
+                    \"bucketRoundingSeconds\" : 10, \
+                    \"bucketMaxSpanSeconds\" : 10000 \
+                }, \
+                \"capped\" : true, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 1}, \"doc2\" : {\"a\" : 2}} \
+            } \
+        } \
+    }";
+    const char booleanClusterConfig[] =
+        "{ \
+        \"ident\" : \"testident\", \
+        \"md\" : { \
+            \"options\" : { \
+                \"clusteredIndex\" : true, \
+                \"size\" : 1048576, \
+                \"capped\" : true, \
+                \"storageEngine\" : { \"doc1\" : {\"a\" : 1}, \"doc2\" : {\"a\" : 2}} \
+            } \
+        } \
+    }";
+
+    testParseEquality(simpleConfig);
+    testParseEquality(minimalConfig);
+    testParseEquality(minimalConfigWithReplicatedRecordIdsEnabled);
+    testParseEquality(minimalConfigWithReplicatedRecordIdsDisabled);
+    testParseEquality(onlyclusterConfig);
+    testParseEquality(onlytsConfig);
+    testParseEquality(booleanClusterConfig);
+}
+
+}  // namespace mongo

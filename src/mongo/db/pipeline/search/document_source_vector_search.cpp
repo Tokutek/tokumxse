@@ -1,0 +1,313 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/search/document_source_vector_search.h"
+
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/resolved_namespace.h"
+#include "mongo/db/pipeline/search/document_source_internal_search_id_lookup.h"
+#include "mongo/db/pipeline/search/lite_parsed_search.h"
+#include "mongo/db/pipeline/search/search_helper.h"
+#include "mongo/db/pipeline/search/vector_search_helper.h"
+#include "mongo/db/pipeline/skip_and_limit.h"
+#include "mongo/db/pipeline/stage_params_to_document_source_registry.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/search/mongot_cursor.h"
+#include "mongo/db/query/search/search_index_view_validation.h"
+#include "mongo/db/query/search/search_task_executors.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+
+using boost::intrusive_ptr;
+
+// Register the legacy parser as a fallback. This parser will be used when
+// featureFlagVectorSearchExtension is disabled or when the vector search extension has not been
+// loaded. Errors if the router sent the flag as true but the extension is not loaded.
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE_FALLBACK(
+    vectorSearch,
+    [](const NamespaceString& nss,
+       const BSONElement& spec,
+       const LiteParserOptions& options) -> std::unique_ptr<LiteParsedDocumentSource> {
+        tassert(
+            11632200,
+            "Cannot invoke fallback $vectorSearch parser: featureFlagVectorSearchExtension=true "
+            "requires extension to be loaded",
+            !search_helpers::isExtensionFlagEnabledByRouter(
+                options, feature_flags::gFeatureFlagVectorSearchExtension));
+        return VectorSearchLiteParsed::parse(nss, spec, options);
+    },
+    AllowedWithApiStrict::kNeverInVersion1,
+    &feature_flags::gFeatureFlagVectorSearchExtension);
+
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(vectorSearch,
+                                                   DocumentSourceVectorSearch,
+                                                   VectorSearchStageParams);
+
+ALLOCATE_DOCUMENT_SOURCE_ID(vectorSearch, DocumentSourceVectorSearch::id)
+
+DocumentSourceVectorSearch::DocumentSourceVectorSearch(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::shared_ptr<executor::TaskExecutor> taskExecutor,
+    BSONObj originalSpec)
+    : DocumentSource(kStageName,
+                     expCtx,
+                     [&]() -> SortPattern {
+                         SortPattern::SortPatternPart part;
+                         part.isAscending = false;
+                         part.expression = make_intrusive<ExpressionMeta>(
+                             expCtx.get(), DocumentMetadataFields::MetaType::kVectorSearchScore);
+                         return SortPattern({std::move(part)});
+                     }()),
+      _taskExecutor(taskExecutor),
+      _execStatsWrapper(std::make_shared<DSVectorSearchExecStatsWrapper>()),
+      _stageSpec(originalSpec.getOwned()) {
+    if (auto limitElem = _stageSpec.getField(kLimitFieldName)) {
+        uassert(
+            8575100, "Expected limit field to be a number in $vectorSearch", limitElem.isNumber());
+        _limit = limitElem.safeNumberLong();
+        uassert(7912700, "Expected limit to be positive", *_limit > 0);
+    }
+    if (auto filterElem = _stageSpec.getField(kFilterFieldName)) {
+        _filterExpr = uassertStatusOK(MatchExpressionParser::parse(filterElem.Obj(), expCtx));
+    }
+
+    initializeOpDebugVectorSearchMetrics();
+}
+
+void DocumentSourceVectorSearch::initializeOpDebugVectorSearchMetrics() {
+    auto& opDebug = CurOp::get(getExpCtx()->getOperationContext())->debug();
+    double numCandidatesLimitRatio = [&] {
+        if (!_limit.has_value()) {
+            return 0.0;
+        }
+
+        auto numCandidatesElem = _stageSpec.getField(kNumCandidatesFieldName);
+        if (!numCandidatesElem.isNumber()) {
+            return 0.0;
+        }
+
+        return numCandidatesElem.safeNumberLong() / static_cast<double>(*_limit);
+    }();
+    opDebug.vectorSearchMetrics =
+        OpDebug::VectorSearchMetrics{.limit = static_cast<long>(_limit.value_or(0LL)),
+                                     .numCandidatesLimitRatio = numCandidatesLimitRatio};
+}
+
+bool DocumentSourceVectorSearch::rebuildWithNewFilterForFLE(
+    std::function<BSONObj(const MatchExpression&)> fn) {
+    if (!_filterExpr) {
+        return false;
+    }
+    // It's important that we reparse the _filterExpr from the rebuilt _stageSpec, because the
+    // parsed MatchExpression holds references to BSONElements of the source BSONObj.
+    if (auto rewrittenFilter = fn(*_filterExpr); !rewrittenFilter.isEmpty()) {
+        _stageSpec = _stageSpec.removeField(kFilterFieldName)
+                         .addFields(BSON(kFilterFieldName << rewrittenFilter));
+        auto filterElem = _stageSpec.getField(kFilterFieldName);
+        tassert(12350700,
+                "Could not reparse $vectorSearch prefilter during fle rewrite",
+                filterElem.ok());
+        _filterExpr = uassertStatusOK(MatchExpressionParser::parse(filterElem.Obj(), getExpCtx()));
+        return true;
+    }
+    return false;
+}
+
+StageConstraints DocumentSourceVectorSearch::constraints(PipelineSplitState pipeState) const {
+    auto ifrCtx = getExpCtx()->getIfrContext();
+    const bool hybridSearchFlagEnabled = ifrCtx &&
+        ifrCtx->getSavedFlagValue(feature_flags::gFeatureFlagExtensionsInsideHybridSearch);
+
+    StageConstraints constraints(StreamType::kStreaming,
+                                 PositionRequirement::kFirst,
+                                 HostTypeRequirement::kTargetedShards,
+                                 DiskUseRequirement::kNoDiskUse,
+                                 FacetRequirement::kNotAllowed,
+                                 TransactionRequirement::kNotAllowed,
+                                 hybridSearchFlagEnabled ? LookupRequirement::kAllowed
+                                                         : LookupRequirement::kNotAllowed,
+                                 UnionRequirement::kAllowed,
+                                 ChangeStreamRequirement::kDenylist);
+    constraints.setConstraintsForNoInputSources();
+    // All search stages are unsupported on timeseries collections.
+    constraints.canRunOnTimeseries = false;
+    return constraints;
+}
+
+Value DocumentSourceVectorSearch::serialize(const query_shape::SerializationOptions& opts) const {
+    // For re-parseable output, strip the synthesized 'view' field — the LiteParse layer rejects
+    // it from non-internal clients, and it will be re-bound on re-parse.
+    if (opts.serializeForReparse) {
+        auto spec = _stageSpec.hasField(kViewFieldName) ? _stageSpec.removeField(kViewFieldName)
+                                                        : _stageSpec;
+        return Value(Document{{kStageName, std::move(spec)}});
+    }
+
+    if (!opts.isKeepingLiteralsUnchanged()) {
+        BSONObjBuilder builder;
+
+        // For the query shape we only care about the filter expression and 'index' field. We treat
+        // the rest of the input as a black box that we do not introspect. This allows flexibility
+        // on the mongot side to change or add parameters. Note that this may make this query shape
+        // become outdated, but will not cause server errors.
+        if (_filterExpr) {
+            builder.append(kFilterFieldName, _filterExpr->serialize(opts));
+        }
+
+        if (auto indexElem = _stageSpec.getField(kIndexFieldName)) {
+            builder.append(kIndexFieldName,
+                           opts.serializeIdentifier(indexElem.valueStringDataSafe()));
+        }
+
+        return Value(Document{{kStageName, builder.obj()}});
+    }
+
+    // We don't want router to make a remote call to mongot even though it can generate explain
+    // output.
+    if (!opts.verbosity || getExpCtx()->getInRouter()) {
+        return Value(Document{{kStageName, _stageSpec}});
+    }
+
+    // If the query is an explain that executed the query, we obtain the explain object from the
+    // TaskExecutorCursor. Otherwise, we need to obtain the explain
+    // object now.
+    // TODO SERVER-107930: Execution stats should be collected in
+    // SourceVectorSearch::getExplainOutput() and merged by the owner of the pipelines
+    // (Note: deciding when to call 'getVectorSearchExplainResponse()' may not be straightforward).
+    boost::optional<BSONObj> explainResponse;
+    if (auto wrapper = _execStatsWrapper.lock()) {
+        explainResponse = wrapper->getExecStats();
+    }
+
+    auto explainSpec = _stageSpec;
+    BSONObj explainInfo = explainResponse.value_or_eval([&] {
+        // If the request was on a view over a sharded collection, _stageSpec will include the
+        // view field. Remove it from explain output as it will be included in $_internalIdLookup
+        // and thus redundant.
+        if (explainSpec.hasField("view")) {
+            explainSpec = explainSpec.removeField("view");
+        }
+        return search_helpers::getVectorSearchExplainResponse(
+            getExpCtx(), explainSpec, _taskExecutor.get());
+    });
+
+    auto explainObj = explainSpec.addFields(BSON("explain" << opts.serializeLiteral(explainInfo)));
+
+    // Redact queryVector (embeddings field) if it exists to avoid including all
+    // embeddings values and keep explainObj data concise.
+    if (opts.isSerializingForExplain() && explainObj.hasField("queryVector")) {
+        explainObj = explainObj.addFields(BSON("queryVector" << "redacted"));
+    }
+    return Value(Document{{kStageName, explainObj}});
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceVectorSearch::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
+    mongot_cursor::throwIfNotRunningWithMongotHostConfigured(expCtx);
+
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << kStageName
+                          << " value must be an object. Found: " << typeName(elem.type()),
+            elem.type() == BSONType::object);
+
+    auto spec = elem.embeddedObject();
+
+    // Reject any user attempt to inject the security-trusted, mongod-owned fields (the mongot
+    // command name, collection UUID, and authorized view name) into the $vectorSearch spec.
+    search_helpers::validateUserSpecDoesNotOverrideTrustedFields(spec);
+
+    // Source the view from the spec if present, otherwise from expCtx. Rejection of an
+    // externally-supplied 'view' field happens at the LiteParse layer
+    // (validateInternalSearchFieldsNotSetByUser); by the time we reach createFromBson, a 'view'
+    // field on the spec is either internal-client-supplied or was synthesized by a prior parse
+    // (e.g. $rankFusion's hybrid-search reparse path).
+    boost::optional<SearchQueryViewSpec> view = search_helpers::getViewFromBSONObj(spec);
+    if (!view && (view = search_helpers::getViewFromExpCtx(expCtx))) {
+        spec = spec.addField(BSON(kViewFieldName << view->toBSON()).firstElement());
+    }
+
+    if (view) {
+        search_index_view_validation::validate(*view);
+    }
+
+    auto serviceContext = expCtx->getOperationContext()->getServiceContext();
+    return make_intrusive<DocumentSourceVectorSearch>(
+        expCtx, uassertStatusOK(executor::getMongotTaskExecutor(serviceContext)), spec.getOwned());
+}
+
+
+std::list<intrusive_ptr<DocumentSource>> DocumentSourceVectorSearch::desugar() {
+    auto executor = uassertStatusOK(
+        executor::getMongotTaskExecutor(getExpCtx()->getOperationContext()->getServiceContext()));
+
+    std::list<intrusive_ptr<DocumentSource>> desugaredPipeline = {
+        make_intrusive<DocumentSourceVectorSearch>(getExpCtx(), executor, _stageSpec.getOwned())};
+
+    search_helpers::promoteStoredSourceOrAddIdLookup(
+        getExpCtx(),
+        desugaredPipeline,
+        isStoredSource(),
+        _limit,
+        search_helpers::getViewFromBSONObj(_stageSpec));
+
+    return desugaredPipeline;
+}
+
+std::pair<DocumentSourceContainer::iterator, bool>
+DocumentSourceVectorSearch::_attemptSortAfterVectorSearchOptimization(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
+    auto isSortOnVectorSearchMeta = [](const SortPattern& sortPattern) -> bool {
+        return isSortOnSingleMetaField(sortPattern,
+                                       (1 << DocumentMetadataFields::MetaType::kVectorSearchScore));
+    };
+    auto optItr = std::next(itr);
+    if (optItr != container->end()) {
+        if (auto sortStage = dynamic_cast<DocumentSourceSort*>(optItr->get())) {
+            // A $sort stage has been found directly after this stage.
+            // $vectorSearch results are always sorted by 'vectorSearchScore',
+            // so if the $sort stage is also sorted by 'vectorSearchScore', the $sort stage
+            // is redundant and can safely be removed.
+            if (isSortOnVectorSearchMeta(sortStage->getSortPattern())) {
+                // Optimization successful.
+                container->remove(*optItr);
+                return {itr, true};  // Return the same pointer in case there are other
+                                     // optimizations to still be applied.
+            }
+        }
+    }
+
+    // Optimization not possible.
+    return {itr, false};
+}
+
+DocumentSourceContainer::iterator DocumentSourceVectorSearch::optimizeAt(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
+    // The RBR's REDUNDANT_SORT_REMOVAL rule runs before optimizeAt, so if the following $sort was
+    // already removed as redundant, this is a noop.
+    const auto&& [returnItr, optimizationSucceeded] =
+        _attemptSortAfterVectorSearchOptimization(itr, container);
+    if (optimizationSucceeded) {
+        return returnItr;
+    }
+
+    auto stageItr = std::next(itr);
+    // Only attempt to get the limit from the query if there are further stages in the pipeline.
+    if (stageItr != container->end()) {
+        // Move past the $internalSearchIdLookup stage, if it is next.
+        auto nextIdLookup = dynamic_cast<DocumentSourceInternalSearchIdLookUp*>(stageItr->get());
+        if (nextIdLookup) {
+            ++stageItr;
+        }
+        // Calculate the extracted limit without modifying the rest of the pipeline.
+        if (auto userLimit = getUserLimit(stageItr, container)) {
+            _limit = _limit ? std::min(*_limit, *userLimit) : *userLimit;
+        }
+    }
+
+    return std::next(itr);
+}
+
+}  // namespace mongo

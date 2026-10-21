@@ -1,0 +1,73 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "enabled",
+    srcs = [
+        "enabled.cpp",
+    ],
+    hdrs = [
+        "enabled.h",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/rss:replicated_storage_service",
+        "//src/mongo/db/storage:storage_options",
+        "//src/mongo/db/storage:write_unit_of_work",
+    ],
+)
+
+mongo_cc_library(
+    name = "primary_driven_index_builds",
+    srcs = [
+        "registry.cpp",
+        "util.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:audit",
+        "//src/mongo/db:index_key_validate",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/collection_crud:container_write",
+        "//src/mongo/db/index_builds:index_build_interceptor",
+        "//src/mongo/db/index_builds:index_builds_common",
+        "//src/mongo/db/index_builds:multi_index_block",
+        "//src/mongo/db/index_builds:resumable_index_builds_common",
+        "//src/mongo/db/query:collection_query_info",
+        "//src/mongo/db/query/plan_cache:join_plan_cache",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/storage:write_unit_of_work",
+        "//src/mongo/db/ttl:ttl_collection_cache",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "primary_driven_index_builds_test",
+    srcs = [
+        "enabled_test.cpp",
+        "registry_test.cpp",
+        "util_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "server-index-builds",
+    ],
+    deps = [
+        ":enabled",
+        ":primary_driven_index_builds",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db/collection_crud:container_write",
+        "//src/mongo/db/rss:replicated_storage_service",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)

@@ -1,0 +1,769 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/post_resharding_placement.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/collection_type.h"
+#include "mongo/db/shard_role/shard_catalog/database_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/scoped_collection_metadata.h"
+#include "mongo/db/shard_role/shard_catalog/snapshot_helper.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/views/view.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <functional>
+#include <memory>
+#include <utility>
+#include <variant>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * Structure used to declare all the prerequisites that the catalog needs to meet in order for an
+ * acquisition of a namespace to succeed.
+ */
+struct [[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisitionRequest {
+    /**
+     * Overload, which acquires a collection by NSS or DB/UUID, without imposing an expected
+     * relationship between NSS and UUID.
+     */
+    CollectionOrViewAcquisitionRequest(
+        NamespaceStringOrUUID nssOrUUID,
+        PlacementConcern placementConcern,
+        repl::ReadConcernArgs readConcern,
+        AcquisitionPrerequisites::OperationType operationType,
+        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView,
+        Date_t lockAcquisitionDeadline = Date_t::max())
+        : nssOrUUID(std::move(nssOrUUID)),
+          placementConcern(std::move(placementConcern)),
+          readConcern(readConcern),
+          operationType(operationType),
+          viewMode(viewMode),
+          lockAcquisitionDeadline(lockAcquisitionDeadline) {}
+
+    /**
+     * Overload, which acquires a collection by NSS/UUID combination, requiring that, if specified,
+     * the UUID of the namespace matches exactly.
+     */
+    CollectionOrViewAcquisitionRequest(
+        NamespaceString nss,
+        boost::optional<UUID> uuid,
+        PlacementConcern placementConcern,
+        repl::ReadConcernArgs readConcern,
+        AcquisitionPrerequisites::OperationType operationType,
+        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView,
+        Date_t lockAcquisitionDeadline = Date_t::max())
+        : nssOrUUID(std::move(nss)),
+          expectedUUID(std::move(uuid)),
+          placementConcern(placementConcern),
+          readConcern(readConcern),
+          operationType(operationType),
+          viewMode(viewMode),
+          lockAcquisitionDeadline(lockAcquisitionDeadline) {}
+
+    /**
+     * Overload, which acquires a collection or view by NSS or DB/UUID and infers the placement and
+     * read concerns from the OperationShardingState and ReadConcern values on the OperationContext.
+     */
+    static CollectionOrViewAcquisitionRequest fromOpCtx(
+        OperationContext* opCtx,
+        NamespaceStringOrUUID nssOrUUID,
+        AcquisitionPrerequisites::OperationType operationType,
+        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView);
+
+    static CollectionOrViewAcquisitionRequest fromOpCtx(
+        OperationContext* opCtx,
+        NamespaceString nss,
+        boost::optional<UUID> uuid,
+        AcquisitionPrerequisites::OperationType operationType,
+        AcquisitionPrerequisites::ViewMode viewMode = AcquisitionPrerequisites::kCanBeView);
+
+    NamespaceStringOrUUID nssOrUUID;
+
+    // When 'nssOrUUID' is in the NamespaceString form 'expectedUUID' may contain the expected
+    // collection UUID for that nss. When 'nssOrUUID' is in the UUID form, then 'expectedUUID' is
+    // boost::none because the 'nssOrUUID' already expresses the desired UUID.
+    boost::optional<UUID> expectedUUID;
+
+    PlacementConcern placementConcern;
+    repl::ReadConcernArgs readConcern;
+    AcquisitionPrerequisites::OperationType operationType;
+    AcquisitionPrerequisites::ViewMode viewMode;
+    Date_t lockAcquisitionDeadline;
+};
+
+struct [[MONGO_MOD_PUBLIC]] CollectionAcquisitionRequest
+    : public CollectionOrViewAcquisitionRequest {
+    /**
+     * Overload, which acquires a collection by NSS or DB/UUID, without imposing an expected
+     * relationship between NSS and UUID.
+     */
+    CollectionAcquisitionRequest(NamespaceStringOrUUID nssOrUUID,
+                                 PlacementConcern placementConcern,
+                                 repl::ReadConcernArgs readConcern,
+                                 AcquisitionPrerequisites::OperationType operationType,
+                                 Date_t lockAcquisitionDeadline = Date_t::max())
+        : CollectionOrViewAcquisitionRequest(nssOrUUID,
+                                             placementConcern,
+                                             readConcern,
+                                             operationType,
+                                             AcquisitionPrerequisites::kMustBeCollection,
+                                             lockAcquisitionDeadline) {}
+
+    /**
+     * Overload, which acquires a collection by NSS/UUID combination, requiring that, if specified,
+     * the UUID of the namespace matches exactly.
+     */
+    CollectionAcquisitionRequest(NamespaceString nss,
+                                 boost::optional<UUID> uuid,
+                                 PlacementConcern placementConcern,
+                                 repl::ReadConcernArgs readConcern,
+                                 AcquisitionPrerequisites::OperationType operationType,
+                                 Date_t lockAcquisitionDeadline = Date_t::max())
+        : CollectionOrViewAcquisitionRequest(nss,
+                                             uuid,
+                                             placementConcern,
+                                             readConcern,
+                                             operationType,
+                                             AcquisitionPrerequisites::kMustBeCollection,
+                                             lockAcquisitionDeadline) {}
+
+    /**
+     * Infers the placement and read concerns from the OperationShardingState and ReadConcern values
+     * on the OperationContext.
+     */
+    static CollectionAcquisitionRequest fromOpCtx(
+        OperationContext* opCtx,
+        NamespaceString nss,
+        AcquisitionPrerequisites::OperationType operationType,
+        boost::optional<UUID> expectedUUID = boost::none,
+        Date_t lockAcquisitionDeadline = Date_t::max());
+
+    static CollectionAcquisitionRequest fromOpCtx(
+        OperationContext* opCtx,
+        NamespaceStringOrUUID nssOrUUID,
+        AcquisitionPrerequisites::OperationType operationType,
+        Date_t lockAcquisitionDeadline = Date_t::max());
+};
+
+class CollectionOrViewAcquisition;
+
+/**
+ * A thread-unsafe ref-counted acquisition of a collection. The underlying acquisition stored inside
+ * the operation's TransactionResources is managed by this class. It will be released whenever the
+ * last reference to it is descoped. This class can be freely copied and moved around, each copy
+ * will point to the same acquisition.
+ *
+ * This class cannot be transferred to other threads/OperationContext since the pointed to resources
+ * lifetime would be held and manipulated by another thread.
+ */
+class [[MONGO_MOD_PUBLIC]] CollectionAcquisition {
+public:
+    explicit CollectionAcquisition(CollectionOrViewAcquisition&& other);
+
+    CollectionAcquisition(shard_role_details::TransactionResources& txnResources,
+                          shard_role_details::AcquiredCollection& acquiredCollection);
+
+    CollectionAcquisition(const CollectionAcquisition& other);
+    CollectionAcquisition(CollectionAcquisition&& other) noexcept;
+
+    CollectionAcquisition& operator=(const CollectionAcquisition& other);
+    CollectionAcquisition& operator=(CollectionAcquisition&& other);
+
+    ~CollectionAcquisition();
+
+    const NamespaceString& nss() const;
+
+    query_shape::CollectionType getCollectionType() const {
+        if (!exists()) {
+            return query_shape::CollectionType::kNonExistent;
+        }
+        if (getCollectionPtr()->isNewTimeseriesWithoutView()) {
+            return query_shape::CollectionType::kTimeseries;
+        }
+        return query_shape::CollectionType::kCollection;
+    }
+
+    /**
+     * Returns whether the acquisition found a collection or the collection didn't exist.
+     */
+    bool exists() const;
+
+    /**
+     * Returns the UUID of the acquired collection, but this operation is only allowed if the
+     * collection `exists()`, otherwise this method will invariant.
+     */
+    UUID uuid() const;
+
+    // Access to services associated with the specified collection top to bottom on the hierarchical
+    // stack
+
+    // Sharding catalog services
+    const ScopedCollectionDescription& getShardingDescription() const;
+    const boost::optional<ScopedCollectionFilter>& getShardingFilter() const;
+    // Post-resharding placement information.
+    // Only available when:
+    // - The collection is actively being resharded
+    // - Acquiring with write intent
+    // Represents the future collection's placement after the resharding will complete.
+    const boost::optional<PostReshardingCollectionPlacement>& getPostReshardingPlacement() const;
+    const boost::optional<DatabaseVersion>& getDatabaseVersion() const;
+    const boost::optional<ShardVersion>& getShardVersion() const;
+
+    // Local catalog services
+    const CollectionPtr& getCollectionPtr() const;
+
+private:
+    friend class ScopedLocalCatalogWriteFence;
+    // Points to the acquired resources that live on the TransactionResources opCtx decoration. The
+    // lifetime of these resources is tied to the lifetime of this CollectionAcquisition.
+    shard_role_details::TransactionResources* _txnResources;
+    shard_role_details::AcquiredCollection* _acquiredCollection;
+};
+
+/**
+ * A thread-unsafe ref-counted acquisition of a view. The underlying acquisition stored inside the
+ * operation's TransactionResources is managed by this class. It will be released whenever the last
+ * reference to it is descoped. This class can be freely copied and moved around, each copy will
+ * point to the same acquisition.
+ *
+ * This class cannot be transferred to other threads/OperationContext since the pointed to resources
+ * lifetime would be held and manipulated by another thread.
+ */
+class [[MONGO_MOD_PUBLIC]] ViewAcquisition {
+public:
+    ViewAcquisition(shard_role_details::TransactionResources& txnResources,
+                    const shard_role_details::AcquiredView& acquiredView);
+
+    ViewAcquisition(const ViewAcquisition& other);
+    ViewAcquisition(ViewAcquisition&& other) noexcept;
+
+    ViewAcquisition& operator=(const ViewAcquisition& other);
+    ViewAcquisition& operator=(ViewAcquisition&& other);
+
+    ~ViewAcquisition();
+
+    const NamespaceString& nss() const;
+
+    // StorEx services
+    const ViewDefinition& getViewDefinition() const;
+
+private:
+    // Points to the acquired resources that live on the TransactionResources opCtx decoration. The
+    // lifetime of these resources is tied to the lifetime of this ViewAcquisition.
+    shard_role_details::TransactionResources* _txnResources;
+    const shard_role_details::AcquiredView* _acquiredView;
+};
+
+class [[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisition {
+public:
+    CollectionOrViewAcquisition(CollectionAcquisition&& collection)
+        : _collectionOrViewAcquisition(std::move(collection)) {}
+
+    CollectionOrViewAcquisition(ViewAcquisition&& view)
+        : _collectionOrViewAcquisition(std::move(view)) {}
+
+    const NamespaceString& nss() const {
+        if (isCollection()) {
+            return getCollection().nss();
+        } else {
+            return getView().nss();
+        }
+    }
+
+    bool isCollection() const {
+        return holds_alternative<CollectionAcquisition>(_collectionOrViewAcquisition);
+    }
+
+    bool isView() const {
+        return holds_alternative<ViewAcquisition>(_collectionOrViewAcquisition);
+    }
+
+    const CollectionAcquisition& getCollection() const {
+        tassert(10566700,
+                "Called getCollection() on a CollectionOrViewAcquisition containing a view",
+                isCollection());
+        return get<CollectionAcquisition>(_collectionOrViewAcquisition);
+    }
+
+    const CollectionPtr& getCollectionPtr() const {
+        if (isCollection()) {
+            return getCollection().getCollectionPtr();
+        } else {
+            return CollectionPtr::null;
+        }
+    }
+
+    const ViewAcquisition& getView() const {
+        tassert(10566701,
+                "Called getView on a CollectionOrViewAcquisition containing a collection",
+                isView());
+        return get<ViewAcquisition>(_collectionOrViewAcquisition);
+    }
+
+    query_shape::CollectionType getCollectionType() const {
+        if (isView()) {
+            if (getView().getViewDefinition().timeseries())
+                return query_shape::CollectionType::kTimeseries;
+            return query_shape::CollectionType::kView;
+        }
+        return getCollection().getCollectionType();
+    }
+
+    bool collectionExists() const {
+        return isCollection() && getCollection().exists();
+    }
+
+private:
+    friend class CollectionAcquisition;
+
+    std::variant<CollectionAcquisition, ViewAcquisition, std::monostate>
+        _collectionOrViewAcquisition;
+};
+
+// Most acquisitions are on a single collection and are only of size 1.
+[[MONGO_MOD_PRIVATE]] static constexpr auto kDefaultAcquisitionContainerSize = 1;
+
+using NamespaceStringOrUUIDRequests [[MONGO_MOD_PUBLIC]] =
+    absl::InlinedVector<NamespaceStringOrUUID, kDefaultAcquisitionContainerSize>;
+using CollectionOrViewAcquisitionRequests [[MONGO_MOD_PUBLIC]] =
+    absl::InlinedVector<CollectionOrViewAcquisitionRequest, kDefaultAcquisitionContainerSize>;
+using CollectionAcquisitionRequests [[MONGO_MOD_PUBLIC]] =
+    absl::InlinedVector<CollectionAcquisitionRequest, kDefaultAcquisitionContainerSize>;
+using CollectionAcquisitions [[MONGO_MOD_PUBLIC]] =
+    absl::InlinedVector<CollectionAcquisition, kDefaultAcquisitionContainerSize>;
+using CollectionOrViewAcquisitions [[MONGO_MOD_PUBLIC]] =
+    absl::InlinedVector<CollectionOrViewAcquisition, kDefaultAcquisitionContainerSize>;
+
+using CollectionAcquisitionMap [[MONGO_MOD_PUBLIC]] =
+    absl::flat_hash_map<NamespaceString, CollectionAcquisition>;
+using CollectionOrViewAcquisitionMap [[MONGO_MOD_PUBLIC]] =
+    absl::flat_hash_map<NamespaceString, CollectionOrViewAcquisition>;
+
+/**
+ * Helpers functions that convert a vector of acquisitions into a map.
+ */
+[[MONGO_MOD_PUBLIC]] CollectionAcquisitionMap makeAcquisitionMap(
+    CollectionAcquisitions acquisitions);
+[[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisitionMap makeAcquisitionMap(
+    CollectionOrViewAcquisitions acquisitions);
+
+/**
+ * Takes into account the specified namespace acquisition requests and if they can be satisfied,
+ * adds the acquired collections to the set ot TransactionResources for the current operation.
+ *
+ * This method will acquire and 2-phase hold all the necessary hierarchical locks (Global, DB and
+ * Collection).
+ */
+[[MONGO_MOD_PUBLIC]] CollectionAcquisition acquireCollection(
+    OperationContext* opCtx, CollectionAcquisitionRequest acquisitionRequest, LockMode mode);
+
+[[MONGO_MOD_PUBLIC]] CollectionAcquisitions acquireCollections(
+    OperationContext* opCtx,
+    const CollectionAcquisitionRequests& acquisitionRequests,
+    LockMode mode);
+
+[[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisition acquireCollectionOrView(
+    OperationContext* opCtx, CollectionOrViewAcquisitionRequest acquisitionRequest, LockMode mode);
+
+[[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisitions acquireCollectionsOrViews(
+    OperationContext* opCtx,
+    const CollectionOrViewAcquisitionRequests& acquisitionRequests,
+    LockMode mode);
+
+/**
+ * Same semantics as `acquireCollectionsOrViews` above, but will not acquire or hold any of the
+ * 2-phase hierarchical locks if allowed for this operation. The conditions required for the
+ * acquisition to be lock-free are:
+ *    * The operation is not a multi-document transaction.
+ *    * The global lock is not write locked.
+ *    * No storage transaction is already open, or if it is, it has to be for a lock free operation.
+ */
+[[MONGO_MOD_PUBLIC]] CollectionAcquisition acquireCollectionMaybeLockFree(
+    OperationContext* opCtx, CollectionAcquisitionRequest acquisitionRequest);
+
+[[MONGO_MOD_PUBLIC]] CollectionAcquisitions acquireCollectionsMaybeLockFree(
+    OperationContext* opCtx, const CollectionAcquisitionRequests& acquisitionRequests);
+
+[[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisition acquireCollectionOrViewMaybeLockFree(
+    OperationContext* opCtx, CollectionOrViewAcquisitionRequest acquisitionRequest);
+
+[[MONGO_MOD_PUBLIC]] CollectionOrViewAcquisitions acquireCollectionsOrViewsMaybeLockFree(
+    OperationContext* opCtx, const CollectionOrViewAcquisitionRequests& acquisitionRequests);
+
+/**
+ * This utility is what allows modifications to the local catalog part of an acquisition for a
+ * specific collection to become visible on a previously established acquisition for that
+ * collection, before or after the end of a WUOW.
+ *
+ * The presence of ScopedLocalCatalogWriteFence on the stack renders the collection for which it was
+ * instantiated unusable within its scope. Once it goes out of scope, any changes performed to the
+ * catalog collection will be visible to:
+ *  - The transaction only, if the WUOW has not yet committed
+ *  - Any subsequent collection acquisitions, when the WUOW commits
+ *
+ * NOTE: This utility by itself does not ensure that catalog modifications which are subordinate to
+ * the placement concern (create collection is subordinate to the location of the DB primary, for
+ * example) do not conflict with placement changes (e.g. movePrimary). This is currently implemented
+ * at a higher level through the usage of DB/Collection X-locks.
+ */
+class [[MONGO_MOD_PUBLIC]] ScopedLocalCatalogWriteFence {
+public:
+    ScopedLocalCatalogWriteFence(OperationContext* opCtx, CollectionAcquisition* acquisition);
+
+    ScopedLocalCatalogWriteFence(ScopedLocalCatalogWriteFence&) = delete;
+    ScopedLocalCatalogWriteFence(ScopedLocalCatalogWriteFence&&) = delete;
+
+    ~ScopedLocalCatalogWriteFence();
+
+private:
+    static void _updateAcquiredLocalCollection(
+        OperationContext* opCtx, shard_role_details::AcquiredCollection* acquiredCollection);
+
+    OperationContext* _opCtx;
+    shard_role_details::AcquiredCollection* _acquiredCollection;
+};
+
+/**
+ * Serves as a temporary container for transaction resources which have been yielded via a call to
+ * `yieldTransactionResources`. Must never be destroyed without having been restored and the
+ * transaction resources properly committed/aborted, or disposed of.
+ */
+struct [[MONGO_MOD_PUBLIC]] YieldedTransactionResources {
+    YieldedTransactionResources(YieldedTransactionResources&&) = default;
+    YieldedTransactionResources& operator=(YieldedTransactionResources&&) = default;
+
+    YieldedTransactionResources(
+        std::unique_ptr<shard_role_details::TransactionResources> yieldedResources,
+        shard_role_details::TransactionResources::State originalState);
+
+    ~YieldedTransactionResources();
+
+    /**
+     * Releases the yielded TransactionResources, transitions the resources back to the opCtx and
+     * marks them as FAILED.
+     */
+    void transitionTransactionResourcesToFailedState(OperationContext* opCtx);
+
+    std::unique_ptr<shard_role_details::TransactionResources> _yieldedResources;
+    shard_role_details::TransactionResources::State _originalState;
+};
+
+// Forward declared so the function declaration (with [[MONGO_MOD_PUBLIC]]) appears before the
+// class's friend declaration, which cannot be annotated.
+class PreparedForYieldToken;
+
+/**
+ * This method does some preparatory work for yielding the transaction resources. This is necessary
+ * before proceeding to abandon the snapshot since holding stale CollectionPtr references is
+ * disallowed.
+ */
+[[MONGO_MOD_PUBLIC]] PreparedForYieldToken prepareForYieldingTransactionResources(
+    OperationContext* opCtx);
+
+class [[MONGO_MOD_PUBLIC]] PreparedForYieldToken {
+    PreparedForYieldToken() = default;
+    friend PreparedForYieldToken prepareForYieldingTransactionResources(OperationContext* opCtx);
+};
+
+/**
+ * This method puts the TransactionResources associated with the current OpCtx into the yielded
+ * state and then detaches them from the OpCtx, moving their ownership to the returned object.
+ *
+ * The returned object must either be properly restored by a later call to
+ * `restoreTransactionResourcesToOperationContext` or it must be
+ * `.transitionTransactionResourcesToFailedState()`d before destruction.
+ *
+ * It is not always allowed to yield the transaction resources and it is the caller's responsibility
+ * to verify a yield can be performed by calling Locker::canSaveLockState().
+ */
+[[MONGO_MOD_PUBLIC]] YieldedTransactionResources yieldTransactionResourcesFromOperationContext(
+    OperationContext* opCtx);
+[[MONGO_MOD_PUBLIC]] YieldedTransactionResources yieldTransactionResourcesFromOperationContext(
+    OperationContext* opCtx, PreparedForYieldToken);
+
+[[MONGO_MOD_PUBLIC]] void restoreTransactionResourcesToOperationContext(
+    OperationContext* opCtx, YieldedTransactionResources yieldedResourcesHolder);
+
+/**
+ * An opaque class meant for containing TransactionResources that are stashed for subsequent
+ * getMores.
+ *
+ * Usage of this class must be done via the RAII type HandleTransactionResourcesFromStasher. It will
+ * take care of restoring the TransactionResources onto the operation and stash them back once it
+ * goes out of scope.
+ */
+struct [[MONGO_MOD_PUBLIC]] StashedTransactionResources {
+    StashedTransactionResources() = default;
+
+    StashedTransactionResources(
+        std::unique_ptr<shard_role_details::TransactionResources> yieldedResources,
+        shard_role_details::TransactionResources::State originalState)
+        : _yieldedResources(std::move(yieldedResources)), _originalState(originalState) {}
+
+    StashedTransactionResources(const StashedTransactionResources&) = delete;
+    StashedTransactionResources(StashedTransactionResources&&) = default;
+
+    StashedTransactionResources& operator=(const StashedTransactionResources&) = delete;
+    StashedTransactionResources& operator=(StashedTransactionResources&&) = default;
+
+    ~StashedTransactionResources() {
+        invariant(!_yieldedResources,
+                  "Resources must be disposed or passed on to an opCtx before destroying the "
+                  "StashedTransactionResources");
+    }
+
+    /**
+     * Releases the yielded TransactionResources without transitioning them back to an opCtx. This
+     * releases all locks and acquisitions held.
+     */
+    void dispose();
+
+    std::unique_ptr<shard_role_details::TransactionResources> _yieldedResources;
+    shard_role_details::TransactionResources::State _originalState =
+        shard_role_details::TransactionResources::State::EMPTY;
+};
+
+/**
+ * Interface for supporting storing/releasing of stashed transaction resources.
+ * See ClientCursor for example implementation.
+ */
+class [[MONGO_MOD_OPEN]] TransactionResourcesStasher {
+public:
+    virtual ~TransactionResourcesStasher() = default;
+
+    /**
+     *  Releases the stashed TransactionResources to the caller.
+     */
+    virtual StashedTransactionResources releaseStashedTransactionResources() = 0;
+
+    /**
+     * Stashes the provided TransactionResources.
+     */
+    virtual void stashTransactionResources(StashedTransactionResources resources) = 0;
+};
+
+class [[MONGO_MOD_PUBLIC]] StashTransactionResourcesForDBDirect {
+public:
+    StashTransactionResourcesForDBDirect(OperationContext* opCtx);
+    ~StashTransactionResourcesForDBDirect();
+
+private:
+    OperationContext* _opCtx;
+    std::unique_ptr<shard_role_details::TransactionResources> _originalTransactionResources;
+};
+
+/**
+ * This method puts the TransactionResources associated with the current OpCtx into the stashed
+ * state and then detaches them from the OpCtx, moving their ownership to the given cursor.
+ */
+[[MONGO_MOD_PUBLIC]] void stashTransactionResourcesFromOperationContext(
+    OperationContext* opCtx, TransactionResourcesStasher* stasher);
+
+/**
+ * An RAII class that handles restoration of the TransactionResources onto the OperationContext from
+ * a TransactionResourcesStasher.
+ *
+ * This class automatically handles stashing and unstashing the resources onto the
+ * TransactionResourcesStasher as long as the TransactionResources aren't in the FAILED
+ * state. If the operation has failed and the resources have to be released the user must
+ * dismissRestoredResources() in order to release them and not stash them into the stasher.
+ */
+class [[MONGO_MOD_PUBLIC]] HandleTransactionResourcesFromStasher {
+public:
+    HandleTransactionResourcesFromStasher(OperationContext* opCtx,
+                                          TransactionResourcesStasher* stasher);
+    ~HandleTransactionResourcesFromStasher();
+
+    /**
+     * Marks the current TransactionResources as FAILED and releases all resources. After calling
+     * this method the transactions won't be stashed back into the ClientCursor.
+     */
+    void dismissRestoredResources();
+
+private:
+    OperationContext* _opCtx;
+    TransactionResourcesStasher* _stasher;
+    std::unique_ptr<shard_role_details::TransactionResources> _originalTransactionResources;
+};
+
+/**
+ * An RAII class that handles stashing and restoration of the TransactionResources onto the
+ * OperationContext in between an internal multi-document transaction. The parent operation,
+ * resposible to instanciate the multi-document transaction, must use this class if acquisitions are
+ * still in scope before the transaction starts. This is necessary because TransactionParticipant
+ * will
+ * - Take ownership of the locker in case of yield
+ * - Assume it can destroy the locker in case of abort
+ * Destroying the locker requires
+ * - No locks are held
+ * - All the 2-phase locks can be released
+ * As long as the parent operation holds active transaction resources, the locker cannot be
+ * destroyed and the node will crash.
+ * Class usage:
+ * - The caller must explictly call `restoreOnCommit` to signal this class to restore the resources
+ * to safely continue the parent operation.
+ * - In case not called, this class will assume the transaction has aborted and will restore the
+ * TransactionResources as FAILED, leaving them unlocked.
+ */
+class [[MONGO_MOD_PUBLIC]] StashTransactionResourcesForMultiDocumentTransaction {
+public:
+    StashTransactionResourcesForMultiDocumentTransaction(OperationContext* opCtx);
+    ~StashTransactionResourcesForMultiDocumentTransaction();
+
+    void restoreOnCommit();
+    void restoreOnAbort();
+
+private:
+    OperationContext* _opCtx;
+    StashedTransactionResources _stashedResources;
+    bool _restored = false;
+    bool _stashed = false;
+};
+
+namespace shard_role_details {
+
+class [[MONGO_MOD_FILE_PRIVATE]] SnapshotAttempt {
+public:
+    SnapshotAttempt(OperationContext* opCtx,
+                    const NamespaceStringOrUUIDRequests& acquisitionRequests)
+        : _opCtx{opCtx}, _acquisitionRequests(acquisitionRequests) {}
+
+    ~SnapshotAttempt();
+
+    void snapshotInitialState();
+
+    // Returns the read source and node role after potentially changing the read source.
+    // Must only be called when no snapshot is open yet.
+    SnapshotHelper::ReadSourceInfo changeReadSourceForSecondaryReads();
+
+    // Computes what read source and node role should be used for secondary reads without
+    // modifying the recovery unit. Must only be called when a snapshot is already open.
+    SnapshotHelper::ReadSourceInfo getRequiredReadSourceForSecondaryReads();
+
+    void openStorageSnapshot();
+
+    [[nodiscard]] std::shared_ptr<const CollectionCatalog> getConsistentCatalog();
+
+private:
+    OperationContext* _opCtx;
+    const NamespaceStringOrUUIDRequests& _acquisitionRequests;
+    bool _openedSnapshot = false;
+    bool _successful = false;
+    boost::optional<long long> _replTermBeforeSnapshot;
+    boost::optional<std::shared_ptr<const CollectionCatalog>> _catalogBeforeSnapshot;
+};
+
+/*
+ * Checks that, when in multi-document transaction, local catalog stashed by the transaction and the
+ * CollectionPtr it obtained are valid to be used for a request that attached
+ */
+[[MONGO_MOD_PRIVATE]] void checkLocalCatalogIsValidForUntrackedShardVersion(
+    OperationContext* opCtx,
+    const CollectionCatalog& stashedCatalog,
+    const CollectionPtr& collectionPtr,
+    const NamespaceString& nss);
+
+/*
+ * Check that the collection uuid on the sharding catalog and the local catalog match.
+ */
+[[MONGO_MOD_PRIVATE]] void checkShardingAndLocalCatalogCollectionUUIDMatch(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ShardVersion& requestedShardVersion,
+    const ScopedCollectionDescription& shardingCollectionDescription,
+    const CollectionPtr& collectionPtr);
+
+}  // namespace shard_role_details
+
+/*
+ * Anything under this namespace does not have any knowledge of sharding and doesn't take locks
+ */
+namespace shard_role_nocheck {
+
+/**
+ * Please read the comments on AcquisitionPrerequisites::kLocalCatalogOnlyWithPotentialDataLoss for
+ * more information on the semantics of this acquisition.
+ */
+[[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]]
+CollectionAcquisition acquireCollectionForLocalCatalogOnlyWithPotentialDataLoss(
+    OperationContext* opCtx, const NamespaceString& nss, LockMode mode);
+
+/**
+ * Acquire a collection but without establishing consistent catalog with the read timestamp - it
+ * will present the latest catalog, which might not be the one corresponding to the read timestamp.
+ * This acquisition is sharding-unaware, meaning it will present the collection as unsharded, and
+ * will allow reading from orphaned documents.
+ *
+ * IMPORTANT: To be used only by IndexBuildsCoordinator.
+ * TODO SERVER-109542: Remove this.
+ */
+[[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]]
+CollectionAcquisition acquireLocalCollectionNoConsistentCatalog(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nsOrUUID,
+    AcquisitionPrerequisites::OperationType operationType,
+    LockMode lockMode);
+
+/*
+ * Resolve the collection namespace without acquiring a collection. Does not lock the namespace or
+ * provide shard version checks. Ensures the resolution is done on the latest catalog, and in case
+ * the UUID is pending commit, waits until it is committed and published. Only use to run quick
+ * prechecks before executing code that will eventually acquire the collections, or for
+ * authorization checks.
+ *
+ * Throws NamespaceNotFound if the UUID is not found.
+ */
+[[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]]
+NamespaceString resolveNssWithoutAcquisitionAtLatest(OperationContext* opCtx,
+                                                     const DatabaseName& dbName,
+                                                     const UUID& uuid);
+
+/*
+ * Lookup the collection namespace without acquiring a collection. Does not lock the namespace or
+ * provide shard version checks. If there is a stashed catalog, it will be used. If the UUID is
+ * pending commit, the pre-commit state will be used. Only use to run quick prechecks before
+ * executing code that will eventually acquire the collections, or for authorization checks.
+ *
+ * Returns boost::none if the UUID is not found.
+ */
+[[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]]
+boost::optional<NamespaceString> lookupNssWithoutAcquisition(OperationContext* opCtx,
+                                                             const UUID& uuid);
+
+/**
+ * Iterates every entry in the durable catalog (_mdb_catalog), calling 'visitor' for each one.
+ *
+ * The caller must hold at least a global IS lock for the duration of the iteration.
+ *
+ * Handles read-source management internally: on secondaries with rc:local the read source is
+ * set to kLastApplied before iterating, ensuring the catalog state returned is consistent with
+ * the replication state. When a storage snapshot is already open (e.g. after a collection
+ * acquisition), the existing read source is preserved.
+ *
+ * Feature-tracking documents written by older versions are skipped automatically.
+ */
+[[MONGO_MOD_PUBLIC]] void iterateDurableCatalog(
+    OperationContext* opCtx,
+    const std::function<void(const NamespaceString& ns, const BSONObj& catalogEntry)>& visitor);
+
+
+}  // namespace shard_role_nocheck
+}  // namespace mongo

@@ -1,0 +1,26 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    InvalidFieldTypeReply:
+        description: "This reply contains a field where the type is invalid"
+        is_command_reply: true
+        fields:
+            invalidReplyField:
+                type: None
+                stability: stable
+commands:
+    replyFieldTypeInvalid:
+        description: "This command aborts because its reply field type is invalid"
+        command_name: replyFieldTypeInvalid
+        namespace: ignored
+        cpp_name: replyFieldTypeInvalid
+        strict: true
+        api_version: "1"
+        reply_type: InvalidFieldTypeReply

@@ -1,0 +1,132 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/s/range_deletion_task_tracker.h"
+
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/unittest/unittest.h"
+
+#define ASSERT_UASSERTS(STATEMENT) ASSERT_THROWS(STATEMENT, AssertionException)
+
+namespace mongo {
+
+class RangeDeletionTaskTrackerTest : public ServiceContextTest {};
+
+RangeDeletionTask createTask(UUID collectionId, ChunkRange range) {
+    RangeDeletionTask task;
+    task.setCollectionUuid(std::move(collectionId));
+    task.setRange(std::move(range));
+    return task;
+}
+
+const ChunkRange kTestRange{BSON("x" << 10), BSON("x" << 20)};
+const ChunkRange kDisjointRange{BSON("x" << 1), BSON("x" << 2)};
+const ChunkRange kLeftExactRange{BSON("x" << 10), BSON("x" << 15)};
+const ChunkRange kLeftMoreRange{BSON("x" << 5), BSON("x" << 15)};
+const ChunkRange kRightExactRange{BSON("x" << 15), BSON("x" << 20)};
+const ChunkRange kRightMoreRange{BSON("x" << 15), BSON("x" << 25)};
+const ChunkRange kCoverRange{BSON("x" << 5), BSON("x" << 25)};
+const ChunkRange kBisectRange{BSON("x" << 12), BSON("x" << 17)};
+
+std::vector<ChunkRange> getOverlappingRangeCases() {
+    std::vector<ChunkRange> ranges;
+    ranges.emplace_back(kTestRange);
+    ranges.emplace_back(kLeftExactRange);
+    ranges.emplace_back(kLeftMoreRange);
+    ranges.emplace_back(kRightExactRange);
+    ranges.emplace_back(kRightMoreRange);
+    ranges.emplace_back(kCoverRange);
+    ranges.emplace_back(kBisectRange);
+
+    std::vector<ChunkRange> refinedRanges;
+    for (const auto& range : ranges) {
+        auto min = range.getMin().addField(BSON("y" << 50).firstElement());
+        auto max = range.getMax().addField(BSON("y" << 100).firstElement());
+        refinedRanges.emplace_back(min, max);
+    }
+    ranges.insert(ranges.end(), refinedRanges.begin(), refinedRanges.end());
+    return ranges;
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, RegisterNewTask) {
+    RangeDeletionTaskTracker tasks;
+    auto task = createTask(UUID::gen(), kTestRange);
+    auto registration = tasks.registerTask(task);
+    ASSERT_EQ(registration.result, RangeDeletionTaskTracker::kRegisteredNewTask);
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, JoinExistingTask) {
+    RangeDeletionTaskTracker tasks;
+    auto task = createTask(UUID::gen(), kTestRange);
+    auto firstRegistration = tasks.registerTask(task);
+    ASSERT_EQ(firstRegistration.result, RangeDeletionTaskTracker::kRegisteredNewTask);
+    auto secondRegistration = tasks.registerTask(task);
+    ASSERT_EQ(secondRegistration.result, RangeDeletionTaskTracker::kJoinedExistingTask);
+    ASSERT_EQ(firstRegistration.task, secondRegistration.task);
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, SameRangeDifferentCollection) {
+    RangeDeletionTaskTracker tasks;
+    auto task = createTask(UUID::gen(), kTestRange);
+    auto firstRegistration = tasks.registerTask(task);
+    ASSERT_EQ(firstRegistration.result, RangeDeletionTaskTracker::kRegisteredNewTask);
+    task.setCollectionUuid(UUID::gen());
+    auto secondRegistration = tasks.registerTask(task);
+    ASSERT_EQ(secondRegistration.result, RangeDeletionTaskTracker::kRegisteredNewTask);
+    ASSERT_NE(firstRegistration.task, secondRegistration.task);
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, GetOverlappingTasks) {
+    auto collId = UUID::gen();
+    for (const auto& range : getOverlappingRangeCases()) {
+        RangeDeletionTaskTracker tasks;
+        tasks.registerTask(createTask(collId, range));
+        auto overlap = tasks.getOverlappingTasks(collId, kTestRange);
+        ASSERT_EQ(overlap.size(), 1) << range.toBSON();
+    }
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, MultipleOverlappingTasks) {
+    auto collId = UUID::gen();
+    RangeDeletionTaskTracker tasks;
+    tasks.registerTask(createTask(collId, {BSON("x" << 10), BSON("x" << 15)}));
+    tasks.registerTask(createTask(collId, {BSON("x" << 15), BSON("x" << 20)}));
+    auto overlap = tasks.getOverlappingTasks(collId, {BSON("x" << 10), BSON("x" << 20)});
+    ASSERT_EQ(overlap.size(), 2);
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, TaskCounts) {
+    RangeDeletionTaskTracker tasks;
+    ASSERT_EQ(tasks.getTaskCount(), 0);
+    ASSERT_EQ(tasks.getTaskCountForCollection(UUID::gen()), 0);
+
+    auto task = createTask(UUID::gen(), kTestRange);
+    tasks.registerTask(task);
+    ASSERT_EQ(tasks.getTaskCount(), 1);
+    ASSERT_EQ(tasks.getTaskCountForCollection(task.getCollectionUuid()), 1);
+
+    task.setRange(kDisjointRange);
+    tasks.registerTask(task);
+    ASSERT_EQ(tasks.getTaskCount(), 2);
+    ASSERT_EQ(tasks.getTaskCountForCollection(task.getCollectionUuid()), 2);
+
+    task.setCollectionUuid(UUID::gen());
+    tasks.registerTask(task);
+    ASSERT_EQ(tasks.getTaskCount(), 3);
+    ASSERT_EQ(tasks.getTaskCountForCollection(task.getCollectionUuid()), 1);
+
+    tasks.clear();
+    ASSERT_EQ(tasks.getTaskCount(), 0);
+    ASSERT_EQ(tasks.getTaskCountForCollection(task.getCollectionUuid()), 0);
+}
+
+TEST_F(RangeDeletionTaskTrackerTest, CompleteTask) {
+    RangeDeletionTaskTracker tasks;
+    auto task = createTask(UUID::gen(), kTestRange);
+    auto [registeredTask, _] = tasks.registerTask(task);
+    auto removed = tasks.removeTask(task.getCollectionUuid(), task.getRange());
+    ASSERT_EQ(tasks.getTaskCount(), 0);
+    ASSERT_EQ(removed, registeredTask);
+}
+
+}  // namespace mongo

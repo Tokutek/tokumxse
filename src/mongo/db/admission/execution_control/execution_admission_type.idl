@@ -1,0 +1,21 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of the executionAdmissionContextType field in the generic arguments.
+
+global:
+    cpp_namespace: "mongo::admission::execution_control"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ExecutionAdmissionType:
+        description: "Priority or task type to be used in the execution admission context."
+        type: string
+        values:
+            kExempt: "Exempt"
+            kLow: "Low"
+            kBackground: "Background"
+            kNonDeprioritizable: "NonDeprioritizable"

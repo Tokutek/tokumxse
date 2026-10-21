@@ -1,0 +1,43 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+enums:
+    CreateDatabaseCoordinatorPhase:
+        description: "Current create database coordinator's operation state."
+        type: string
+        values:
+            kUnset: "unset"
+            kEnterCriticalSectionOnPrimary: "enterCriticalSectionOnPrimary"
+            kCommitOnShardingCatalog: "commitOnShardingCatalog"
+            kExitCriticalSectionOnPrimary: "exitCriticalSectionOnPrimary"
+
+structs:
+    CreateDatabaseCoordinatorDocument:
+        description: "Object with necessary fields to create a database."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                type: CreateDatabaseCoordinatorPhase
+                description: "Coordinator phase."
+                default: kUnset
+            primaryShard:
+                type: shard_id
+                description: >-
+                    Resolved primary shard either from the received parameter or selected by the
+                    DDL coordinator.
+                optional: true
+            userSelectedPrimary:
+                type: bool
+                description: "If the primary shard was specified by the user."

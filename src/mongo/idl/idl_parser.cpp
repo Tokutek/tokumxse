@@ -1,0 +1,305 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/idl/idl_parser.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <span>
+#include <stack>
+#include <string>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+namespace {
+
+/**
+ * For a vector of BSONType, return a string of comma separated names.
+ *
+ * Example: "string, bool, numberDouble"
+ */
+std::string toCommaDelimitedList(std::span<const BSONType> types) {
+    str::stream builder;
+
+    for (std::size_t i = 0; i < types.size(); ++i) {
+        if (i > 0) {
+            builder << ", ";
+        }
+
+        builder << typeName(types[i]);
+    }
+
+    return builder;
+}
+
+}  // namespace
+
+constexpr std::string_view IDLParserContext::kOpMsgDollarDBDefault;
+constexpr std::string_view IDLParserContext::kOpMsgDollarDB;
+constexpr auto collectionlessAggregateCursorCol = "$cmd.aggregate"sv;
+
+bool IDLParserContext::checkAndAssertTypeSlowPath(const BSONElement& element, BSONType type) const {
+    auto elementType = element.type();
+
+    // If the type is wrong, ignore Null and Undefined values
+    if (elementType == BSONType::null || elementType == BSONType::undefined) {
+        return false;
+    }
+
+    std::string path = getElementPath(element);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(elementType) << "', expected type '" << typeName(type)
+                            << "'");
+}
+
+bool IDLParserContext::checkAndAssertBinDataTypeSlowPath(const BSONElement& element,
+                                                         BinDataType type) const {
+    bool isBinDataType = checkAndAssertType(element, BSONType::binData);
+    if (!isBinDataType) {
+        return false;
+    }
+
+    if (element.binDataType() != type) {
+        std::string path = getElementPath(element);
+        uasserted(ErrorCodes::TypeMismatch,
+                  str::stream() << "BSON field '" << path << "' is the wrong binData type '"
+                                << typeName(element.binDataType()) << "', expected type '"
+                                << typeName(type) << "'");
+    }
+
+    return true;
+}
+
+bool IDLParserContext::checkAndAssertTypes(const BSONElement& element,
+                                           std::span<const BSONType> types) const {
+    auto elementType = element.type();
+
+    auto pos = std::find(types.begin(), types.end(), elementType);
+    if (pos == types.end()) {
+        // If the type is wrong, ignore Null and Undefined values
+        if (elementType == BSONType::null || elementType == BSONType::undefined) {
+            return false;
+        }
+
+        throwBadType(element, types);
+    }
+
+    return true;
+}
+
+
+std::string IDLParserContext::getElementPath(const BSONElement& element) const {
+    return getElementPath(element.fieldNameStringData());
+}
+
+std::string IDLParserContext::getElementPath(std::string_view fieldName) const {
+    if (_predecessor == nullptr) {
+        str::stream builder;
+
+        builder << _currentField;
+
+        if (!fieldName.empty()) {
+            builder << "." << fieldName;
+        }
+
+        return builder;
+    } else {
+        std::stack<std::string_view> pieces;
+
+        if (!fieldName.empty()) {
+            pieces.push(fieldName);
+        }
+
+        pieces.push(_currentField);
+
+        const IDLParserContext* head = _predecessor;
+        while (head) {
+            pieces.push(head->_currentField);
+            head = head->_predecessor;
+        }
+
+        str::stream builder;
+
+        while (!pieces.empty()) {
+            builder << pieces.top();
+            pieces.pop();
+
+            if (!pieces.empty()) {
+                builder << ".";
+            }
+        }
+
+        return builder;
+    }
+}
+
+void IDLParserContext::throwDuplicateField(std::string_view fieldName) const {
+    std::string path = getElementPath(fieldName);
+    uasserted(ErrorCodes::IDLDuplicateField,
+              str::stream() << "BSON field '" << path << "' is a duplicate field");
+}
+
+void IDLParserContext::throwDuplicateField(const BSONElement& element) const {
+    throwDuplicateField(element.fieldNameStringData());
+}
+
+void IDLParserContext::throwMissingField(std::string_view fieldName) const {
+    std::string path = getElementPath(fieldName);
+    uasserted(ErrorCodes::IDLFailedToParse,
+              str::stream() << "BSON field '" << path << "' is missing but a required field");
+}
+
+bool isMongocryptdArgument(std::string_view arg) {
+    return arg == "jsonSchema"sv;
+}
+
+void IDLParserContext::throwUnknownField(std::string_view fieldName) const {
+    std::string path = getElementPath(fieldName);
+    if (isMongocryptdArgument(fieldName)) {
+        uasserted(
+            ErrorCodes::IDLUnknownFieldPossibleMongocryptd,
+            str::stream()
+                << "BSON field '" << path
+                << "' is an unknown field. This command may be meant for a mongocryptd process.");
+    }
+
+    uasserted(ErrorCodes::IDLUnknownField,
+              str::stream() << "BSON field '" << path << "' is an unknown field.");
+}
+
+void IDLParserContext::throwBadArrayFieldNumberSequence(std::string_view actual,
+                                                        std::string_view expected) const {
+    uasserted(
+        ErrorCodes::BadValue,
+        fmt::format("BSON array field '{}' has an invalid index field name: '{}', expected '{}'",
+                    getElementPath(std::string_view()),
+                    actual,
+                    expected));
+}
+
+void IDLParserContext::throwBadEnumValue(int enumValue) const {
+    std::string path = getElementPath(std::string_view());
+    uasserted(ErrorCodes::BadValue,
+              str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
+                            << "' is not a valid value.");
+}
+
+void IDLParserContext::throwBadEnumValue(std::string_view enumValue) const {
+    std::string path = getElementPath(std::string_view());
+    uasserted(ErrorCodes::BadValue,
+              str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
+                            << "' is not a valid value.");
+}
+
+void IDLParserContext::throwBadType(const BSONElement& element,
+                                    std::span<const BSONType> types) const {
+    std::string path = getElementPath(element);
+    std::string type_str = toCommaDelimitedList(types);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(element.type()) << "', expected types '[" << type_str
+                            << "]'");
+}
+
+std::string_view IDLParserContext::checkAndAssertCollectionName(const BSONElement& element,
+                                                                bool allowGlobalCollectionName) {
+    const bool isUUID =
+        (element.type() == BSONType::binData && element.binDataType() == BinDataType::newUUID);
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Collection name must be provided. UUID is not valid in this "
+                          << "context",
+            !isUUID);
+    if (allowGlobalCollectionName && element.isNumber()) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Invalid command format: the '" << element.fieldNameStringData()
+                              << "' field must specify a collection name or 1",
+                element.number() == 1);
+        return collectionlessAggregateCursorCol;
+    }
+    // Accepts both BSON String and Symbol for collection name per SERVER-16260.
+    // TODO SERVER-98383 remove Symbol support
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "Collection name has invalid type " << typeName(element.type()),
+            element.type() == BSONType::symbol || element.type() == BSONType::string);
+    return element.valueStringData();
+}
+
+std::variant<UUID, std::string_view> IDLParserContext::checkAndAssertCollectionNameOrUUID(
+    const BSONElement& element) {
+    if (element.type() == BSONType::binData && element.binDataType() == BinDataType::newUUID) {
+        return uassertStatusOK(UUID::parse(element));
+    } else {
+        // Ensure collection identifier is not a Command
+        return checkAndAssertCollectionName(element, false);
+    }
+}
+
+const boost::optional<TenantId>& IDLParserContext::getTenantId() const {
+    if (_tenantId || _predecessor == nullptr)
+        return _tenantId;
+
+    return _predecessor->getTenantId();
+}
+
+const SerializationContext& IDLParserContext::getSerializationContext() const {
+    return _serializationContext;
+}
+
+const boost::optional<auth::ValidatedTenancyScope>& IDLParserContext::getValidatedTenancyScope()
+    const {
+    return _validatedTenancyScope;
+}
+
+std::vector<std::string_view> transformVector(const std::vector<std::string>& input) {
+    return std::vector<std::string_view>(begin(input), end(input));
+}
+
+std::vector<std::string> transformVector(const std::vector<std::string_view>& input) {
+    std::vector<std::string> output;
+
+    output.reserve(input.size());
+
+    std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& str) {
+        return std::string{str};
+    });
+
+    return output;
+}
+
+std::vector<ConstDataRange> transformVector(const std::vector<std::vector<std::uint8_t>>& input) {
+    std::vector<ConstDataRange> output;
+
+    output.reserve(input.size());
+
+    std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& vec) {
+        return ConstDataRange(vec);
+    });
+
+    return output;
+}
+
+std::vector<std::vector<std::uint8_t>> transformVector(const std::vector<ConstDataRange>& input) {
+    std::vector<std::vector<std::uint8_t>> output;
+
+    output.reserve(input.size());
+
+    std::transform(begin(input), end(input), std::back_inserter(output), [](auto&& cdr) {
+        return std::vector<std::uint8_t>(reinterpret_cast<const uint8_t*>(cdr.data()),
+                                         reinterpret_cast<const uint8_t*>(cdr.data()) +
+                                             cdr.length());
+    });
+
+    return output;
+}
+
+}  // namespace mongo

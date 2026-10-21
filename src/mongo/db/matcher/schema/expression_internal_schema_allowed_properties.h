@@ -1,0 +1,197 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/string_map.h"
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/optional.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Match expression that matches documents whose properties meet certain requirements based on field
+ * name. Specifically, a document matches if:
+ *
+ *  - each field that matches a regular expression in '_patternProperties' also matches the
+ *    corresponding match expression; and
+ *  - any field not contained in '_properties' nor matching a pattern in '_patternProperties'
+ *    matches the '_otherwise' match expression.
+ *
+ * For example, consider the match expression
+ *
+ *  {$_internalSchemaAllowedProperties: {
+ *      properties: ["address", "phone"],
+ *      namePlaceholder: "i",
+ *      patternProperties: [
+ *          {regex: /[nN]ame/, expression: {i: {$_internalSchemaType: "string"}}},
+ *          {regex: /[aA]ddress/, expression: {i: {$_internalSchemaMinLength: 30}}}
+ *      ],
+ *      otherwise: {i: {$_internalSchemaType: 'number'}}
+ *
+ * Then, given the object
+ *
+ *   {
+ *      firstName: "juan",
+ *      lastName: "de la cruz",
+ *      middleName: ["daniel", "marcos"],
+ *      phone: 1234567890,
+ *      address: "new york, ny",
+ *      hobbies: ["programming", "c++"],
+ *      socialSecurityNumber: 123456789
+ *   }
+ *
+ * we have that
+ *
+ *  - "firstName" and "lastName" are valid, because they satisfy the pattern schema corresponding to
+ *    to the regular expression /[nN]ame/.
+ *  - "middleName" is invalid, because it doesn't satisfy the schema associated with /[nN]ame/.
+ *  - "phone" is valid, because it is listed in the "properties" section.
+ *  - "address" is invalid even though it is listed in "properties", because it fails to validate
+ *    against the pattern schema for /[aA]ddress/.
+ *  - "hobbies" is invalid because it is not contained in "properties", not matched by a regex in
+ *    "patternProperties", and does not validate against the "otherwise" schema.
+ *  - "socialSecurityNumber" is valid because it matches the schema for "otherwise".
+ *
+ *  Because there exists at least one field that is invalid, the entire document would fail to
+ *  match.
+ */
+class InternalSchemaAllowedPropertiesMatchExpression final : public MatchExpression {
+public:
+    /**
+     * A container for regular expression data. Holds a regex object, as well as the original
+     * string pattern, which is used for comparisons and serialization.
+     */
+    struct Pattern {
+        explicit Pattern(std::string_view pattern)
+            : rawRegex(pattern), regex(std::make_unique<pcre::Regex>(std::string{rawRegex})) {}
+
+        std::string_view rawRegex;
+        std::unique_ptr<pcre::Regex> regex;
+    };
+
+    /**
+     * A PatternSchema is a regular expression paired with an associated match expression, and
+     * represents a constraint in JSON Schema's "patternProperties" keyword.
+     */
+    using PatternSchema = std::pair<Pattern, std::unique_ptr<ExpressionWithPlaceholder>>;
+
+    static constexpr std::string_view kName = "$_internalSchemaAllowedProperties"sv;
+
+    explicit InternalSchemaAllowedPropertiesMatchExpression(
+        StringDataSet properties,
+        std::string_view namePlaceholder,
+        std::vector<PatternSchema> patternProperties,
+        std::unique_ptr<ExpressionWithPlaceholder> otherwise,
+        clonable_ptr<ErrorAnnotation> annotation = nullptr);
+
+    void debugString(StringBuilder& debug, int indentationLevel) const final;
+
+    bool equivalent(const MatchExpression* expr) const final;
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kOther;
+    }
+
+    void serialize(BSONObjBuilder* builder,
+                   const query_shape::SerializationOptions& opts = {},
+                   bool includePath = true) const final;
+
+    std::unique_ptr<MatchExpression> clone() const final;
+
+    std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
+        return nullptr;
+    }
+
+    size_t numChildren() const final {
+        return _patternProperties.size() + 1;
+    }
+
+    MatchExpression* getChild(size_t i) const final {
+        tassert(6400212, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+
+        if (i == 0) {
+            return _otherwise->getFilter();
+        }
+
+        return _patternProperties[i - 1].second->getFilter();
+    }
+
+    void resetChild(size_t i, MatchExpression* other) override {
+        tassert(6329408, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+
+        if (i == 0) {
+            _otherwise->resetFilter(other);
+        } else {
+            _patternProperties[i - 1].second->resetFilter(other);
+        }
+    }
+
+    MatchExpression* releaseChild(size_t i) {
+        tassert(10806401, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
+
+        if (i == 0) {
+            return _otherwise->releaseFilter();
+        } else {
+            return _patternProperties[i - 1].second->releaseFilter();
+        }
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    const StringDataSet& getProperties() const {
+        return _properties;
+    }
+
+    const std::vector<PatternSchema>& getPatternProperties() const {
+        return _patternProperties;
+    }
+
+    std::string_view getNamePlaceholder() const {
+        return _namePlaceholder;
+    }
+
+    const ExpressionWithPlaceholder* getOtherwise() const {
+        return _otherwise.get();
+    }
+
+private:
+    // The names of the properties are owned by the BSONObj used to create this match expression.
+    // Since that BSONObj must outlive this object, we can safely store std::string_view.
+    StringDataSet _properties;
+
+    // The placeholder used in both '_patternProperties' and '_otherwise'.
+    std::string_view _namePlaceholder;
+
+    std::vector<PatternSchema> _patternProperties;
+
+    std::unique_ptr<ExpressionWithPlaceholder> _otherwise;
+};
+
+}  // namespace mongo

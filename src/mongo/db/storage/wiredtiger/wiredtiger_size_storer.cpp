@@ -1,238 +1,204 @@
-// wiredtiger_size_storer.cpp
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+#include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/exceptions.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/timer.h"
+
+#include <string_view>
 
 #include <wiredtiger.h>
 
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/log.h"
-#include "mongo/util/scopeguard.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/meta/type_traits.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
-    using std::string;
+WiredTigerSizeStorer::WiredTigerSizeStorer(WiredTigerConnection* conn,
+                                           const std::string& storageUri)
+    : _conn(conn), _storageUri(storageUri), _tableId(WiredTigerUtil::genTableId()) {
+    std::string config = WiredTigerCustomizationHooks::get(getGlobalServiceContext())
+                             ->getTableCreateConfig(_storageUri);
 
-    namespace {
-        int MAGIC = 123123;
-    }
-
-    WiredTigerSizeStorer::WiredTigerSizeStorer(WT_CONNECTION* conn, const std::string& storageUri)
-            : _session(conn)
-    {
-        WT_SESSION* session = _session.getSession();
-        int ret = session->open_cursor(session, storageUri.c_str(), NULL,
-                                       "overwrite=true", &_cursor);
-        if (ret == ENOENT) {
-            // Need to create table.
-            // TODO any config options we want?
-            invariantWTOK(session->create(session, storageUri.c_str(), NULL));
-            ret = session->open_cursor(session, storageUri.c_str(), NULL,
-                                       "overwrite=true", &_cursor);
-        }
-        invariantWTOK(ret);
-
-        _magic = MAGIC;
-    }
-
-    WiredTigerSizeStorer::~WiredTigerSizeStorer() {
-        // This shouldn't be necessary, but protects us if we screw up.
-        boost::lock_guard<boost::mutex> cursorLock( _cursorMutex );
-
-        _magic = 11111;
-        _cursor->close(_cursor);
-    }
-
-    void WiredTigerSizeStorer::_checkMagic() const {
-        if ( MONGO_likely(_magic == MAGIC) )
-            return;
-        log() << "WiredTigerSizeStorer magic wrong: " << _magic;
-        invariant( _magic == MAGIC );
-    }
-
-    void WiredTigerSizeStorer::onCreate( WiredTigerRecordStore* rs,
-                                         long long numRecords, long long dataSize ) {
-        _checkMagic();
-        boost::lock_guard<boost::mutex> lk( _entriesMutex );
-        Entry& entry = _entries[rs->getURI()];
-        entry.rs = rs;
-        entry.numRecords = numRecords;
-        entry.dataSize = dataSize;
-        entry.dirty = true;
-    }
-
-    void WiredTigerSizeStorer::onDestroy( WiredTigerRecordStore* rs ) {
-        _checkMagic();
-        boost::lock_guard<boost::mutex> lk( _entriesMutex );
-        Entry& entry = _entries[rs->getURI()];
-        entry.numRecords = rs->numRecords( NULL );
-        entry.dataSize = rs->dataSize( NULL );
-        entry.dirty = true;
-        entry.rs = NULL;
-    }
-
-
-    void WiredTigerSizeStorer::storeToCache( StringData uri,
-                                             long long numRecords, long long dataSize ) {
-        _checkMagic();
-        boost::lock_guard<boost::mutex> lk( _entriesMutex );
-        Entry& entry = _entries[uri.toString()];
-        entry.numRecords = numRecords;
-        entry.dataSize = dataSize;
-        entry.dirty = true;
-    }
-
-    void WiredTigerSizeStorer::loadFromCache( StringData uri,
-                                              long long* numRecords, long long* dataSize ) const {
-        _checkMagic();
-        boost::lock_guard<boost::mutex> lk( _entriesMutex );
-        Map::const_iterator it = _entries.find( uri.toString() );
-        if ( it == _entries.end() ) {
-            *numRecords = 0;
-            *dataSize = 0;
-            return;
-        }
-        *numRecords = it->second.numRecords;
-        *dataSize = it->second.dataSize;
-    }
-
-    void WiredTigerSizeStorer::fillCache() {
-        boost::lock_guard<boost::mutex> cursorLock( _cursorMutex );
-        _checkMagic();
-
-        Map m;
-        {
-            // Seek to beginning if needed.
-            invariantWTOK(_cursor->reset(_cursor));
-
-            // Intentionally ignoring return value.
-            ON_BLOCK_EXIT(_cursor->reset, _cursor);
-
-            int cursorNextRet;
-            while ((cursorNextRet = _cursor->next(_cursor)) != WT_NOTFOUND) {
-                invariantWTOK(cursorNextRet);
-
-                WT_ITEM key;
-                WT_ITEM value;
-                invariantWTOK( _cursor->get_key(_cursor, &key ) );
-                invariantWTOK( _cursor->get_value(_cursor, &value ) );
-                std::string uriKey( reinterpret_cast<const char*>( key.data ), key.size );
-                BSONObj data( reinterpret_cast<const char*>( value.data ) );
-
-                LOG(2) << "WiredTigerSizeStorer::loadFrom " << uriKey << " -> " << data;
-
-                Entry& e = m[uriKey];
-                e.numRecords = data["numRecords"].safeNumberLong();
-                e.dataSize = data["dataSize"].safeNumberLong();
-                e.dirty = false;
-                e.rs = NULL;
-            }
-        }
-
-        boost::lock_guard<boost::mutex> lk( _entriesMutex );
-        _entries.swap(m);
-    }
-
-    void WiredTigerSizeStorer::syncCache(bool syncToDisk) {
-        boost::lock_guard<boost::mutex> cursorLock( _cursorMutex );
-        _checkMagic();
-
-        Map myMap;
-        {
-            boost::lock_guard<boost::mutex> lk( _entriesMutex );
-            for ( Map::iterator it = _entries.begin(); it != _entries.end(); ++it ) {
-                std::string uriKey = it->first;
-                Entry& entry = it->second;
-                if ( entry.rs ) {
-                    if ( entry.dataSize != entry.rs->dataSize( NULL ) ) {
-                        entry.dataSize = entry.rs->dataSize( NULL );
-                        entry.dirty = true;
-                    }
-                    if ( entry.numRecords != entry.rs->numRecords( NULL ) ) {
-                        entry.numRecords = entry.rs->numRecords( NULL );
-                        entry.dirty = true;
-                    }
-                }
-
-                if ( !entry.dirty )
-                    continue;
-                myMap[uriKey] = entry;
-            }
-        }
-
-        if (myMap.empty())
-            return; // Nothing to do.
-
-        WT_SESSION* session = _session.getSession();
-        invariantWTOK(session->begin_transaction(session, syncToDisk ? "sync=true" : ""));
-        ScopeGuard rollbacker = MakeGuard(session->rollback_transaction, session, "");
-
-        for ( Map::iterator it = myMap.begin(); it != myMap.end(); ++it ) {
-            string uriKey = it->first;
-            Entry& entry = it->second;
-
-            BSONObj data;
-            {
-                BSONObjBuilder b;
-                b.append( "numRecords", entry.numRecords );
-                b.append( "dataSize", entry.dataSize );
-                data = b.obj();
-            }
-
-            LOG(2) << "WiredTigerSizeStorer::storeInto " << uriKey << " -> " << data;
-
-            WiredTigerItem key( uriKey.c_str(), uriKey.size() );
-            WiredTigerItem value( data.objdata(), data.objsize() );
-            _cursor->set_key( _cursor, key.Get() );
-            _cursor->set_value( _cursor, value.Get() );
-            invariantWTOK( _cursor->insert(_cursor) );
-        }
-
-        invariantWTOK(_cursor->reset(_cursor));
-
-        rollbacker.Dismiss();
-        invariantWTOK(session->commit_transaction(session, NULL));
-
-        {
-            boost::lock_guard<boost::mutex> lk( _entriesMutex );
-            for (Map::iterator it = _entries.begin(); it != _entries.end(); ++it) {
-                it->second.dirty = false;
-            }
-        }
-    }
-
-
+    WiredTigerSession session(_conn);
+    invariantWTOK(session.create(_storageUri.c_str(), config.c_str()), session);
 }
+
+void WiredTigerSizeStorer::store(std::string_view uri, std::shared_ptr<SizeInfo> sizeInfo) {
+    // If the SizeInfo is still dirty, we're done.
+    if (sizeInfo->_dirty.load())
+        return;
+
+    // Ordering is important: as the entry may be flushed concurrently, set the dirty flag last.
+    std::lock_guard<std::mutex> lk(_bufferMutex);
+    auto& entry = _buffer[uri];
+    // During rollback it is possible to get a new SizeInfo. In that case clear the dirty flag,
+    // so the SizeInfo can be destructed without triggering the dirty check invariant.
+    if (entry && entry.get() != sizeInfo.get())
+        entry->_dirty.store(false);
+    entry = sizeInfo;
+    entry->_dirty.store(true);
+    LOGV2_DEBUG(22423,
+                2,
+                "WiredTigerSizeStorer::store",
+                "uri"_attr = uri,
+                "numRecords"_attr = sizeInfo->numRecords.load(),
+                "dataSize"_attr = sizeInfo->dataSize.load(),
+                "entryUseCount"_attr = entry.use_count());
+}
+
+std::shared_ptr<WiredTigerSizeStorer::SizeInfo> WiredTigerSizeStorer::load(
+    WiredTigerSession& session, std::string_view uri) const {
+    {
+        // Check if we can satisfy the read from the buffer.
+        std::lock_guard<std::mutex> bufferLock(_bufferMutex);
+        Buffer::const_iterator it = _buffer.find(uri);
+        if (it != _buffer.end())
+            return it->second ? it->second : std::make_shared<SizeInfo>();
+    }
+
+    auto cursor = session.getNewCursor(_storageUri);
+    ON_BLOCK_EXIT([&] { session.closeCursor(cursor); });
+
+    {
+        WT_ITEM key = {uri.data(), uri.size()};
+        cursor->set_key(cursor, &key);
+        int ret = cursor->search(cursor);
+        if (ret == WT_NOTFOUND)
+            return std::make_shared<SizeInfo>();
+        invariantWTOK(ret, cursor->session);
+    }
+
+    WT_ITEM value;
+    invariantWTOK(cursor->get_value(cursor, &value), cursor->session);
+    BSONObj data(reinterpret_cast<const char*>(value.data));
+
+    LOGV2_DEBUG(
+        22424, 2, "WiredTigerSizeStorer::load", "uri"_attr = uri, "data"_attr = redact(data));
+    return std::make_shared<SizeInfo>(data["numRecords"].safeNumberLong(),
+                                      data["dataSize"].safeNumberLong());
+}
+
+void WiredTigerSizeStorer::remove(std::string_view uri) {
+    std::lock_guard<std::mutex> bufferLock{_bufferMutex};
+
+    // Insert a new nullptr entry into the buffer, or set the existing one to nullptr if there
+    // already is one.
+    if (auto& sizeInfo = _buffer[uri]) {
+        sizeInfo->_dirty.store(false);
+        sizeInfo.reset();
+    }
+}
+
+void WiredTigerSizeStorer::flush(bool syncToDisk) {
+    Buffer buffer;
+    {
+        std::lock_guard<std::mutex> bufferLock(_bufferMutex);
+        _buffer.swap(buffer);
+    }
+
+    if (buffer.empty())
+        return;  // Nothing to do.
+
+    Timer t;
+
+    // We serialize flushing to disk to avoid running into write conflicts from having multiple
+    // threads try to flush at the same time.
+    std::lock_guard<std::mutex> flushLock(_flushMutex);
+
+    // When the session is destructed, it closes any cursors that remain open. Configure the session
+    // to ignore the cache size, which tells WT that this session should not take part in optional
+    // eviction. This is important for this path as it can be called by any thread which may be
+    // running a high priority operation.
+    WiredTigerSession session(_conn, nullptr, "isolation=snapshot,ignore_cache_size=true");
+
+    WT_CURSOR* cursor = session.getNewCursor(_storageUri, "overwrite=true");
+
+    {
+        // On failure, place entries back into the map, unless a newer value already exists.
+        ON_BLOCK_EXIT([this, &buffer]() {
+            if (!buffer.empty()) {
+                std::lock_guard<std::mutex> bufferLock(this->_bufferMutex);
+                for (auto& it : buffer)
+                    this->_buffer.try_emplace(it.first, it.second);
+            }
+        });
+
+        // To avoid deadlocks with cache eviction, allow the transaction to time itself out. Once
+        // the time limit has been exceeded on an operation in this transaction, WiredTiger returns
+        // WT_ROLLBACK for that operation.
+        std::string txnConfig = "operation_timeout_ms=10";
+        if (syncToDisk) {
+            txnConfig += ",sync=true";
+        }
+        WiredTigerBeginTxnBlock txnOpen(&session, txnConfig.c_str());
+
+        for (auto&& [uri, sizeInfo] : buffer) {
+            WiredTigerItem key(uri.c_str(), uri.size());
+            cursor->set_key(cursor, key.get());
+
+            int ret = 0;
+            if (!sizeInfo) {
+                LOGV2_DEBUG(
+                    3349400, 2, "WiredTigerSizeStorer::flush removing entry", "uri"_attr = uri);
+
+                ret = cursor->remove(cursor);
+                if (ret == WT_NOTFOUND) {
+                    ret = 0;
+                }
+            } else {
+                // Ordering is important here: when the store method checks if the SizeInfo
+                // is dirty and it returns true, the current values of numRecords and dataSize must
+                // still be written back. So, the required order is to clear the dirty flag first.
+                sizeInfo->_dirty.store(false);
+                auto data = BSON("numRecords" << sizeInfo->numRecords.load() << "dataSize"
+                                              << sizeInfo->dataSize.load());
+
+                LOGV2_DEBUG(22425,
+                            2,
+                            "WiredTigerSizeStorer::flush inserting/updating entry",
+                            "uri"_attr = uri,
+                            "data"_attr = redact(data));
+
+                WiredTigerItem value(data.objdata(), data.objsize());
+                cursor->set_value(cursor, value.get());
+                ret = cursor->insert(cursor);
+            }
+
+            if (ret == WT_ROLLBACK) {
+                // One of the code paths calling this function is when a session is checked back
+                // into the session cache. This could involve read-only operations which don't
+                // except write conflicts. If WiredTiger returns WT_ROLLBACK during the flush, we
+                // return an exception here and let the caller decide whether to ignore it or retry
+                // flushing.
+                throwWriteConflictException("Size storer flush received a rollback.");
+            }
+            invariantWTOK(ret, cursor->session);
+        }
+        txnOpen.done();
+        invariantWTOK(session.commit_transaction(nullptr), session);
+        buffer.clear();
+    }
+
+    LOGV2_DEBUG(22426,
+                2,
+                "WiredTigerSizeStorer::flush completed",
+                "duration"_attr = Microseconds{t.micros()});
+}
+}  // namespace mongo

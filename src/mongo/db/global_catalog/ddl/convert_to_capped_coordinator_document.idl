@@ -1,0 +1,54 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of fields/documents used by the convert to capped coordinator
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+enums:
+    ConvertToCappedCoordinatorPhase:
+        description: "Phases for the convert to capped coordinator."
+        type: string
+        values:
+            kUnset: "unset"
+            kAcquireCriticalSectionOnCoordinator: "acquireCriticalSectionOnCoordinator"
+            kDropCollectionOnShardsNotOwningData: "dropCollectionOnShardsNotOwningData"
+            kAcquireCriticalSectionOnDataShard: "acquireCriticalSectionOnDataShard"
+            kConvertCollectionToCappedOnDataShard: "convertCollectionToCappedOnDataShard"
+            kConvertCollectionToCappedOnCoordinator: "convertCollectionToCappedOnCoordinator"
+            kUpdateShardingCatalog: "updateShardingCatalog"
+            kReleaseCriticalSectionOnDataShard: "releaseCriticalSectionOnDataShard"
+            kReleaseCriticalSectionOnCoordinator: "releaseCriticalSectionOnCoordinator"
+
+structs:
+    ConvertToCappedCoordinatorDocument:
+        description: "Document for the convert to capped coordinator."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            ShardsvrConvertToCappedRequest: ShardsvrConvertToCappedRequest
+        fields:
+            phase:
+                type: ConvertToCappedCoordinatorPhase
+                default: kUnset
+            originalCollection:
+                description: "Collection entry in the sharding catalog before executing `convertToCapped`"
+                type: CollectionType
+                optional: true
+            targetUUID:
+                description: "The UUID of the newly capped collection."
+                type: uuid
+                optional: true
+            dataShard:
+                type: shard_id
+                description: >-
+                    The data shard that the collection lives on.
+                optional: true

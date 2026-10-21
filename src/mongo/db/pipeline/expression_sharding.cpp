@@ -1,0 +1,112 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/expression_sharding.h"
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/expression/evaluate_sharding.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <utility>
+
+#include <boost/container/flat_set.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+namespace mongo {
+
+Value ExpressionInternalOwningShard::evaluate(const Document& root,
+                                              Variables* variables,
+                                              const EvaluationContext& ctx) const {
+    return exec::expression::evaluate(*this, root, variables, ctx);
+}
+
+boost::intrusive_ptr<Expression> ExpressionInternalIndexKey::parse(ExpressionContext* expCtx,
+                                                                   BSONElement bsonExpr,
+                                                                   const VariablesParseState& vps) {
+    uassert(6868506,
+            str::stream() << opName << " supports an object as its argument",
+            bsonExpr.type() == BSONType::object);
+
+    BSONElement docElement;
+    BSONElement specElement;
+
+    for (auto&& bsonArgs : bsonExpr.embeddedObject()) {
+        if (bsonArgs.fieldNameStringData() == kDocField) {
+            docElement = bsonArgs;
+        } else if (bsonArgs.fieldNameStringData() == kSpecField) {
+            uassert(6868507,
+                    str::stream() << opName << " requires 'spec' argument to be an object",
+                    bsonArgs.type() == BSONType::object);
+            specElement = bsonArgs;
+        } else {
+            uasserted(6868508,
+                      str::stream() << "Unknown argument: " << bsonArgs.fieldNameStringData()
+                                    << "found while parsing" << opName);
+        }
+    }
+
+    uassert(6868509,
+            str::stream() << opName << " requires both 'doc' and 'spec' arguments",
+            !docElement.eoo() && !specElement.eoo());
+
+    return new ExpressionInternalIndexKey(expCtx,
+                                          parseOperand(expCtx, docElement, vps),
+                                          ExpressionConstant::create(expCtx, Value{specElement}));
+}
+
+ExpressionInternalIndexKey::ExpressionInternalIndexKey(ExpressionContext* expCtx,
+                                                       boost::intrusive_ptr<Expression> doc,
+                                                       boost::intrusive_ptr<Expression> spec)
+    : Expression(expCtx, {std::move(doc), std::move(spec)}),
+      _doc(_children[0]),
+      _spec(_children[1]) {
+    expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+}
+
+boost::intrusive_ptr<Expression> ExpressionInternalIndexKey::optimize() {
+    tassert(11282951, "Missing doc field", _doc);
+    tassert(11282950, "Missing spec field", _spec);
+
+    _doc = _doc->optimize();
+    _spec = _spec->optimize();
+    return this;
+}
+
+Value ExpressionInternalIndexKey::serialize(
+    const query_shape::SerializationOptions& options) const {
+    tassert(11282949, "Missing doc field", _doc);
+    tassert(11282948, "Missing spec field", _spec);
+
+    auto specExprConstant = dynamic_cast<ExpressionConstant*>(_spec.get());
+    tassert(7250400, "Failed to dynamic cast the 'spec' to 'ExpressionConstant'", specExprConstant);
+
+    // The 'spec' is always treated as a constant so do not call '_spec->serialize()' which would
+    // wrap the value in an unnecessary '$const' object.
+    return Value(DOC(opName << DOC(kDocField << _doc->serialize(options) << kSpecField
+                                             << specExprConstant->getValue())));
+}
+
+Value ExpressionInternalIndexKey::evaluate(const Document& root,
+                                           Variables* variables,
+                                           const EvaluationContext& ctx) const {
+    return exec::expression::evaluate(*this, root, variables, ctx);
+}
+
+REGISTER_STABLE_EXPRESSION(_internalOwningShard, ExpressionInternalOwningShard::parse);
+REGISTER_EXPRESSION_CONDITIONALLY(_internalIndexKey,
+                                  ExpressionInternalIndexKey::parse,
+                                  AllowedWithApiStrict::kInternal,
+                                  AllowedWithClientType::kInternal,
+                                  nullptr, /* featureFlag */
+                                  false,   /* shouldOmitDiagnosticInformation */
+                                  true);
+
+}  // namespace mongo

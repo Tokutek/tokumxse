@@ -1,0 +1,424 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/filesystem/path.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+using namespace std::literals::string_view_literals;
+
+class OperationContext;
+class ServiceContext;
+
+/**
+ * WatchdogDeathCallback is used by the watchdog component to terminate the process. It is expected
+ * to bypass MongoDB's normal shutdown process. It should not make any syscalls other then to
+ * exit/terminate the process.
+ *
+ * It is pluggable for testing purposes.
+ */
+using WatchdogDeathCallback = std::function<void(void)>;
+
+/**
+ * The OS specific implementation of WatchdogDeathCallback that kills the process.
+ */
+void watchdogTerminate();
+
+/**
+ * WatchdogCheck represents a health check that the watchdog will run periodically to ensure the
+ * machine, and process are healthy.
+ *
+ * It is pluggable for testing purposes.
+ */
+class WatchdogCheck {
+public:
+    virtual ~WatchdogCheck() = default;
+
+    /**
+     * Runs a health check against the local machine.
+     *
+     * Note: It should throw exceptions on unexpected errors. Exceptions will result in a call to
+     * WatchdogDeathCallback.
+     */
+    virtual void run(OperationContext* opCtx) = 0;
+
+    /**
+     * Returns a description for the watchdog check to log to the log file.
+     */
+    virtual std::string getDescriptionForLogging() = 0;
+};
+
+/**
+ * Do a health check for a given directory. This health check is done by reading, and writing to a
+ * file with direct I/O.
+ */
+class DirectoryCheck : public WatchdogCheck {
+public:
+    static constexpr std::string_view kProbeFileName = "watchdog_probe_"sv;
+    static constexpr std::string_view kProbeFileNameExt = ".txt"sv;
+
+public:
+    DirectoryCheck(const boost::filesystem::path& directory) : _directory(directory) {}
+
+    void run(OperationContext* opCtx) final;
+
+    std::string getDescriptionForLogging() final;
+
+private:
+    boost::filesystem::path _directory;
+};
+
+/**
+ * Runs a callback on a periodic basis. The specified time period is the time delay between
+ * invocations.
+ *
+ * Example:
+ * - callback
+ * - sleep(period)
+ * - callback
+ */
+class [[MONGO_MOD_OPEN]] WatchdogPeriodicThread {
+public:
+    WatchdogPeriodicThread(Milliseconds period, std::string_view threadName);
+    virtual ~WatchdogPeriodicThread() = default;
+
+    /**
+     * Starts the periodic thread.
+     */
+    void start();
+
+    /**
+     * Updates the period the thread runs its task.
+     *
+     * Period changes take affect immediately.
+     */
+    void setPeriod(Milliseconds period);
+
+    /**
+     * Shutdown the periodic thread. After it is shutdown, it cannot be started.
+     */
+    void shutdown();
+
+protected:
+    /**
+     * Do one iteration of work.
+     */
+    virtual void run(OperationContext* opCtx) = 0;
+
+    /**
+     * Provides an opportunity for derived classes to initialize state.
+     *
+     * This method is called at two different times:
+     * 1. First time a thread is started.
+     * 2. When a thread goes from disabled to enabled. Specifically, a user calls setPeriod(-1)
+     *    followed by setPeriod(> 0).
+     *
+     */
+    virtual void resetState() = 0;
+
+private:
+    /**
+     * Main thread loop
+     */
+    void doLoop();
+
+private:
+    /**
+     * Private enum to track state.
+     *
+     *   +----------------------------------------------------------------+
+     *   |                                                                v
+     * +-------------+     +----------+     +--------------------+     +-------+
+     * | kNotStarted | --> | kStarted | --> | kShutdownRequested | --> | kDone |
+     * +-------------+     +----------+     +--------------------+     +-------+
+     */
+    enum class State {
+        /**
+         * Initial state. Either start() or shutdown() can be called next.
+         */
+        kNotStarted,
+
+        /**
+         * start() has been called. shutdown() should be called next.
+         */
+        kStarted,
+
+        /**
+         * shutdown() has been called, and the thread is in progress of shutting down.
+         */
+        kShutdownRequested,
+
+        /**
+         * PeriodicThread has been shutdown.
+         */
+        kDone,
+    };
+
+    // State of PeriodicThread
+    State _state{State::kNotStarted};
+
+    // Thread period
+    Milliseconds _period;
+
+    // if true, then call run() otherwise just let the thread idle,
+    bool _enabled;
+
+    // Name of thread for logging purposes
+    std::string _threadName;
+
+    // The thread
+    stdx::thread _thread;
+
+    // Lock to protect _state and control _thread
+    std::mutex _mutex;
+    stdx::condition_variable _condvar;
+};
+
+/**
+ * Periodic background thread to run watchdog checks.
+ */
+class WatchdogCheckThread : public WatchdogPeriodicThread {
+public:
+    WatchdogCheckThread(std::vector<std::unique_ptr<WatchdogCheck>> checks, Milliseconds period);
+
+    /**
+     * Returns the current generation number of the checks.
+     *
+     * Incremented after each check is run.
+     */
+    std::int64_t getGeneration();
+
+    /**
+     * Sets _shouldRunChecks.
+     */
+    void setShouldRunChecks(bool shouldRunChecks);
+
+private:
+    void run(OperationContext* opCtx) final;
+    void resetState() final;
+
+private:
+    // Vector of checks to run
+    std::vector<std::unique_ptr<WatchdogCheck>> _checks;
+
+    // A counter that is incremented for each watchdog check completed, and monitored to ensure it
+    // does not remain at the same value for too long.
+    Atomic<long long> _checkGeneration{0};
+
+    // If _shouldRunChecks is false, make each check a no-op.
+    Atomic<bool> _shouldRunChecks{true};
+};
+
+/**
+ * Periodic background thread to ensure watchdog checks run periodically.
+ */
+class WatchdogMonitorThread : public WatchdogPeriodicThread {
+public:
+    WatchdogMonitorThread(WatchdogCheckThread* checkThread,
+                          WatchdogDeathCallback callback,
+                          Milliseconds period);
+
+    /**
+     * Returns the current generation number of the monitor.
+     *
+     * Incremented after each round of monitoring is run.
+     */
+    std::int64_t getGeneration();
+
+private:
+    void run(OperationContext* opCtx) final;
+    void resetState() final;
+
+private:
+    // Callback function to call when watchdog gets stuck
+    const WatchdogDeathCallback _callback;
+
+    // Watchdog check thread to query
+    WatchdogCheckThread* _checkThread;
+
+    // A counter that is incremented for each watchdog monitor run is completed.
+    Atomic<long long> _monitorGeneration{0};
+
+    // The last seen _checkGeneration value
+    std::int64_t _lastSeenGeneration{-1};
+};
+
+/**
+ * An interface for using the watchdog monitor.
+ */
+class WatchdogMonitorInterface {
+public:
+    WatchdogMonitorInterface() = default;
+    virtual ~WatchdogMonitorInterface() = default;
+
+    static WatchdogMonitorInterface* get(ServiceContext* service);
+    static WatchdogMonitorInterface* get(OperationContext* ctx);
+    static WatchdogMonitorInterface* getGlobalWatchdogMonitorInterface();
+
+    static void set(ServiceContext* service,
+                    std::unique_ptr<WatchdogMonitorInterface> watchdogMonitorInterface);
+
+    /**
+     * Starts the watchdog threads.
+     */
+    virtual void start() = 0;
+
+    /**
+     * Updates the watchdog monitor period. The goal is to detect a failure in the time of the
+     * period.
+     *
+     * Does nothing if watchdog is not started. If watchdog was started, it changes the monitor
+     * period, but not the check period.
+     *
+     * Accepts Milliseconds for testing purposes while the setParameter only works with seconds.
+     */
+    virtual void setPeriod(Milliseconds duration) = 0;
+
+    /**
+     * Shutdown the watchdog.
+     */
+    virtual void shutdown() = 0;
+
+    /**
+     * Returns the current generation number of the checks.
+     *
+     * Incremented after each round of checks is run.
+     */
+    virtual std::int64_t getCheckGeneration() = 0;
+
+    /**
+     * Returns the current generation number of the checks.
+     *
+     * Incremented after each round of checks is run.
+     */
+    virtual std::int64_t getMonitorGeneration() = 0;
+
+    /**
+     * Pauses the watchdog checks by making each check a no-op.
+     */
+    virtual void pauseChecks() = 0;
+
+    /**
+     * Unpauses the watchdog checks
+     */
+    virtual void unpauseChecks() = 0;
+
+    /**
+     * Gets whether checks are paused or not. For testing purposes only.
+     */
+    [[MONGO_MOD_PUBLIC]] virtual bool getShouldRunChecks_forTest() = 0;
+};
+
+
+/**
+ * WatchdogMonitor
+ *
+ * The Watchdog is a pair of dedicated threads that try to figure out if a process is hung
+ * and terminate if it is. The worst case scenario in a distributed system is a process that appears
+ * to work but does not actually work.
+ *
+ * The watchdog is not designed to detect all the different ways the process is hung. It's goal is
+ * to detect if the storage system is stuck, and to terminate the process if it is stuck.
+ *
+ * Threads:
+ * WatchdogCheck - runs file system checks
+ * WatchdogMonitor - verifies that WatchdogCheck continue to make timely progress. If WatchdogCheck
+ *                   fails to make process, WatchdogMonitor calls a callback. The callback is not
+ *                   expected to do any I/O and minimize the system calls it makes.
+ */
+class WatchdogMonitor final : public WatchdogMonitorInterface {
+public:
+    /**
+     * Create the watchdog with specified period.
+     *
+     * checkPeriod - how often to run the checks
+     * monitorPeriod - how often to run the monitor, must be >= checkPeriod
+     */
+    WatchdogMonitor(std::vector<std::unique_ptr<WatchdogCheck>> checks,
+                    Milliseconds checkPeriod,
+                    Milliseconds monitorPeriod,
+                    WatchdogDeathCallback callback);
+
+    ~WatchdogMonitor() override = default;
+
+    void start() override;
+
+    void setPeriod(Milliseconds duration) override;
+
+    void shutdown() override;
+
+    std::int64_t getCheckGeneration() override;
+
+    std::int64_t getMonitorGeneration() override;
+
+    void pauseChecks() override;
+
+    void unpauseChecks() override;
+
+    bool getShouldRunChecks_forTest() override;
+
+private:
+    /**
+     * Private enum to track state.
+     *
+     *   +----------------------------------------------------------------+
+     *   |                                                                v
+     * +-------------+     +----------+     +--------------------+     +-------+
+     * | kNotStarted | --> | kStarted | --> | kShutdownRequested | --> | kDone |
+     * +-------------+     +----------+     +--------------------+     +-------+
+     */
+    enum class State {
+        /**
+         * Initial state. Either start() or shutdown() can be called next.
+         */
+        kNotStarted,
+
+        /**
+         * start() has been called. shutdown() should be called next.
+         */
+        kStarted,
+
+        /**
+         * shutdown() has been called, and the background threads are in progress of shutting down.
+         */
+        kShutdownRequested,
+
+        /**
+         * Watchdog has been shutdown.
+         */
+        kDone,
+    };
+
+    // Lock to protect _state and control _thread
+    std::mutex _mutex;
+
+    // State of watchdog
+    State _state{State::kNotStarted};
+
+    // Fixed period for running the checks.
+    Milliseconds _checkPeriod;
+
+    // WatchdogCheck Thread - runs checks
+    WatchdogCheckThread _watchdogCheckThread;
+
+    // WatchdogMonitor Thread - watches _watchdogCheckThread
+    WatchdogMonitorThread _watchdogMonitorThread;
+};
+
+}  // namespace mongo

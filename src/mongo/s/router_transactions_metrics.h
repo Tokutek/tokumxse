@@ -1,0 +1,148 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/s/router_transactions_stats_gen.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+
+namespace mongo {
+
+/**
+ * Container for router-wide multi-document transaction statistics.
+ */
+class RouterTransactionsMetrics {
+    RouterTransactionsMetrics(const RouterTransactionsMetrics&) = delete;
+    RouterTransactionsMetrics& operator=(const RouterTransactionsMetrics&) = delete;
+
+public:
+    // Cumulative metrics for a particular type of commit that a router can use.
+    struct CommitStats {
+        // Total number of times this commit was started.
+        Atomic<std::int64_t> initiated{0};
+
+        // Total number of times this commit completed successfully.
+        Atomic<std::int64_t> successful{0};
+
+        // Total commit duration of successful transactions in microseconds.
+        Atomic<std::int64_t> successfulDurationMicros{0};
+    };
+
+    RouterTransactionsMetrics() = default;
+
+    static RouterTransactionsMetrics* get(ServiceContext* service);
+    static RouterTransactionsMetrics* get(OperationContext* opCtx);
+
+    std::int64_t getCurrentOpen() const;
+    void incrementCurrentOpen();
+    void decrementCurrentOpen();
+
+    std::int64_t getCurrentActive() const;
+    void incrementCurrentActive();
+    void decrementCurrentActive();
+
+    std::int64_t getCurrentInactive() const;
+    void incrementCurrentInactive();
+    void decrementCurrentInactive();
+
+    std::int64_t getTotalStarted() const;
+    void incrementTotalStarted();
+
+    std::int64_t getTotalAborted() const;
+    void incrementTotalAborted();
+
+    std::int64_t getTotalCommitted() const;
+    void incrementTotalCommitted();
+
+    std::int64_t getTotalContactedParticipants() const;
+    void incrementTotalContactedParticipants();
+
+    std::int64_t getTotalParticipantsAtCommit() const;
+    void addToTotalParticipantsAtCommit(std::int64_t inc);
+
+    std::int64_t getTotalRequestsTargeted() const;
+    void incrementTotalRequestsTargeted();
+
+    [[MONGO_MOD_PRIVATE]] const CommitStats& getCommitTypeStats_forTest(
+        TransactionRouter::CommitType commitType) const;
+    [[MONGO_MOD_PRIVATE]] const CommitStats& getTwoPhaseCommitInternalStats_forTest() const;
+    [[MONGO_MOD_PRIVATE]] const CommitStats& getTwoPhaseCommitExternalStats_forTest() const;
+
+    void incrementCommitInitiated(TransactionRouter::CommitType commitType, bool isServerInitiated);
+    void incrementCommitSuccessful(TransactionRouter::CommitType commitType,
+                                   Microseconds durationMicros,
+                                   bool isServerInitiated);
+
+    void incrementAbortCauseMap(std::string abortCause);
+
+    /**
+     * Appends the accumulated stats to a sharded transactions stats object for reporting.
+     */
+    void updateStats(RouterTransactionsStats* stats);
+
+private:
+    /**
+     * Helper to convert a CommitStats struct into the CommitTypeStats object expected by the IDL
+     * RouterTransactionsStats class.
+     */
+    CommitTypeStats _constructCommitTypeStats(const CommitStats& stats);
+
+    // Total number of currently open transactions.
+    Atomic<std::int64_t> _currentOpen{0};
+
+    // Total number of currently active transactions.
+    Atomic<std::int64_t> _currentActive{0};
+
+    // Total number of currently inactive transactions.
+    Atomic<std::int64_t> _currentInactive{0};
+
+    // The total number of multi-document transactions started since the last server startup.
+    Atomic<std::int64_t> _totalStarted{0};
+
+    // The total number of multi-document transactions that were committed through this router.
+    Atomic<std::int64_t> _totalCommitted{0};
+
+    // The total number of multi-document transaction that were aborted by this router.
+    Atomic<std::int64_t> _totalAborted{0};
+
+    // Total number of shard participants contacted over the course of any transaction, including
+    // shards that may not be included in a final participant list.
+    Atomic<std::int64_t> _totalContactedParticipants{0};
+
+    // Total number of shard participants included in a participant list at commit.
+    Atomic<std::int64_t> _totalParticipantsAtCommit{0};
+
+    // Total number of network requests targeted by mongos as part of a transaction.
+    Atomic<std::int64_t> _totalRequestsTargeted{0};
+
+    // Structs with metrics for each type of commit a router can use.
+    CommitStats _noShardsCommitStats;
+    CommitStats _singleShardCommitStats;
+    CommitStats _singleWriteShardCommitStats;
+    CommitStats _readOnlyCommitStats;
+    CommitStats _twoPhaseCommitStats;
+    CommitStats _twoPhaseCommitInternalStats;
+    CommitStats _twoPhaseCommitExternalStats;
+    CommitStats _recoverWithTokenCommitStats;
+
+    // Mutual exclusion for _abortCauseMap
+    std::mutex _abortCauseMutex;
+
+    // Map tracking the total number of each abort cause for any multi-statement transaction that
+    // was aborted through this router.
+    std::map<std::string, std::int64_t> _abortCauseMap;
+};
+
+}  // namespace mongo

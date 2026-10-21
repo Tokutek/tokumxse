@@ -1,0 +1,658 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/ce/sampling/sampling_test_utils.h"
+
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/compiler/ce/sampling/persistent_sample_gen.h"
+#include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/idl/idl_parser.h"
+
+#include <string>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo::ce {
+
+bool dataConfigurationCoversQueryWorkload(DataConfiguration& dataConfig,
+                                          WorkloadConfiguration& workloadConfig) {
+    for (const auto& queryField : workloadConfig.queryConfig.queryFields) {
+        bool exists = false;
+        for (const auto& dataField : dataConfig.collectionFieldsConfiguration) {
+            if (queryField.fieldName == dataField.fieldName) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void initializeSamplingEstimator(DataConfiguration& configuration,
+                                 SamplingEstimatorTest& samplingEstimatorTest) {
+    // Generate data according to the provided configuration
+    std::vector<std::vector<stats::SBEValue>> allData;
+    generateDataBasedOnConfig(configuration, allData);
+
+    samplingEstimatorTest.setUp();
+
+    // Create vector of BSONObj according to the generated data
+    // Number of fields dictates the number of columns the collection will have.
+    auto dataBSON = SamplingEstimatorTest::createDocumentsFromSBEValue(
+        allData, configuration.collectionFieldsConfiguration);
+
+    // Populate collection
+    samplingEstimatorTest.insertDocuments(samplingEstimatorTest._kTestNss, dataBSON);
+}
+
+void SamplingEstimatorTest::insertDocuments(const NamespaceString& nss,
+                                            const std::vector<BSONObj> docs,
+                                            int batchSize) {
+    const auto coll = acquireCollection(
+        operationContext(),
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(operationContext()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    for (size_t currentInsertion = 0; currentInsertion < docs.size();) {
+        WriteUnitOfWork wuow{operationContext()};
+
+        int insertionsBeforeCommit = 0;
+        while (insertionsBeforeCommit <= batchSize && currentInsertion < docs.size()) {
+            ASSERT_OK(Helpers::insert(
+                operationContext(), coll.getCollectionPtr(), docs[currentInsertion]));
+            insertionsBeforeCommit++;
+            currentInsertion++;
+        }
+        wuow.commit();
+    }
+}
+
+std::vector<BSONObj> SamplingEstimatorTest::createDocuments(int num) {
+    std::vector<BSONObj> docs;
+    for (int i = 0; i < num; i++) {
+        BSONObj obj = BSON("_id" << i << "a" << i % 100 << "b" << i % 10 << "arr"
+                                 << BSON_ARRAY(10 << 20 << 30 << 40 << 50) << "nil" << BSONNULL
+                                 << "obj" << BSON("nil" << BSONNULL));
+        docs.push_back(obj);
+    }
+    return docs;
+}
+
+void SamplingEstimatorTest::createIndex(const BSONObj& spec) {
+    WriteUnitOfWork wuow(operationContext());
+    auto coll = acquireCollection(
+        operationContext(),
+        CollectionAcquisitionRequest(_kTestNss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(operationContext()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_X);
+    CollectionWriter collectionWriter(operationContext(), &coll);
+    IndexBuildsCoordinator::createIndexesOnEmptyCollection(
+        operationContext(), collectionWriter, {spec}, /*fromMigrate=*/false);
+    wuow.commit();
+}
+
+std::vector<BSONObj> SamplingEstimatorTest::createDocumentsFromSBEValue(
+    std::vector<std::vector<stats::SBEValue>> data,
+    std::vector<CollectionFieldConfiguration> fieldConfig) {
+    std::vector<BSONObj> docs;
+    size_t dataSize = data[0].size();
+    for (size_t i = 0; i < dataSize; i++) {
+        BSONObjBuilder builder;
+        stats::addSbeValueToBSONBuilder(stats::makeInt64Value(i), "_id", builder);
+
+        int curIdx = -1;
+        for (size_t instance = 0; instance < fieldConfig.size(); instance++) {
+            if (fieldConfig[instance].fieldPositionInCollection != (curIdx + 1)) {
+                // Add any in-between fields required
+                while (curIdx < fieldConfig[instance].fieldPositionInCollection) {
+                    // Each in-between field will be named as the next field followed by an
+                    // underscore and a number e.g., if the first user defined field is 'a' in
+                    // position 3, then this config will automatically add field 'a_0', 'a_1',
+                    // 'a_2', and then 'a'.
+                    std::string extendedName =
+                        fieldConfig[instance].fieldName + "_" + std::to_string(curIdx++);
+                    stats::addSbeValueToBSONBuilder(data[instance][i], extendedName, builder);
+                }
+            }
+            stats::addSbeValueToBSONBuilder(
+                data[instance][i], fieldConfig[instance].fieldName, builder);
+            curIdx++;
+        }
+
+        docs.push_back(builder.obj());
+    }
+    return docs;
+}
+
+size_t sampleSizeForKnobs(SamplingConfidenceIntervalEnum ci,
+                          double marginOfError,
+                          int sampleSizeOverride) {
+    unittest::ServerParameterGuard confidenceIntervalGuard{"samplingConfidenceInterval",
+                                                           std::string{idl::serialize(ci)}};
+    unittest::ServerParameterGuard marginOfErrorGuard{"samplingMarginOfError", marginOfError};
+    unittest::ServerParameterGuard sampleSizeOverrideGuard{"internalSamplingSizeOverride",
+                                                           sampleSizeOverride};
+    return SamplingEstimatorImpl::calculateSampleSize(
+        QueryKnobConfiguration{query_settings::QuerySettings{}});
+}
+
+size_t translateSampleDefToActualSampleSize(SampleSizeDef sampleSizeDef) {
+    // Translate the sample size definition to corresponding sample size.
+    switch (sampleSizeDef) {
+        case SampleSizeDef::ErrorSetting1: {
+            return sampleSizeForKnobs(SamplingConfidenceIntervalEnum::k95, 1.0);
+        }
+        case SampleSizeDef::ErrorSetting2: {
+            return sampleSizeForKnobs(SamplingConfidenceIntervalEnum::k95, 2.0);
+        }
+        case SampleSizeDef::ErrorSetting5: {
+            return sampleSizeForKnobs(SamplingConfidenceIntervalEnum::k95, 5.0);
+        }
+    }
+    MONGO_UNREACHABLE;
+}
+
+std::pair<SamplingCEMethodEnum, boost::optional<int>> iniitalizeSamplingAlgoBasedOnChunks(
+    int numOfChunks) {
+    if (numOfChunks <= 0) {
+        return {SamplingCEMethodEnum::kRandom, boost::none};
+    } else {
+        return {SamplingCEMethodEnum::kChunk, numOfChunks};
+    }
+}
+
+void createCollAndInsertDocuments(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  const std::vector<BSONObj>& docs,
+                                  bool clustered) {
+    writeConflictRetry(opCtx, "createColl", nss, [&] {
+        shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+            RecoveryUnit::ReadSource::kNoTimestamp);
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+
+        WriteUnitOfWork wunit(opCtx);
+        AutoGetDb db(opCtx, nss.dbName(), MODE_X);
+        db.ensureDbExists(opCtx);
+
+        CollectionOptions options;
+        if (clustered) {
+            options.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
+        }
+        invariant(db.getDb()->createCollection(opCtx, nss, options));
+        wunit.commit();
+    });
+
+    auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    WriteUnitOfWork wuow{opCtx};
+    ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), docs));
+    wuow.commit();
+}
+
+int evaluateMatchExpressionAgainstDataWithLimit(const std::unique_ptr<MatchExpression> expr,
+                                                const std::vector<BSONObj>& data,
+                                                boost::optional<size_t> limit) {
+    size_t resultCnt = 0, cnt = 0;
+    try {
+        for (const auto& doc : data) {
+            if (exec::matcher::matchesBSON(expr.get(), doc, nullptr)) {
+                resultCnt++;
+            }
+            cnt++;
+            if (limit && cnt >= limit) {
+                break;
+            }
+        }
+    } catch (const DBException&) {
+        std::cout << "EVALUATION FAILED" << std::endl;
+    }
+
+    return resultCnt;
+}
+
+std::vector<std::vector<std::string>> getIndexCombinations(
+    const std::vector<std::string>& candidateIndexFields, IndexCombinationTestSettings setting) {
+    switch (setting) {
+        case IndexCombinationTestSettings::kNone: {
+            return {};
+        }
+        case IndexCombinationTestSettings::kSingleFieldIdx: {
+            std::vector<std::vector<std::string>> result;
+            for (const auto& lala : candidateIndexFields) {
+                result.push_back({lala});
+            }
+            return result;
+        }
+        case IndexCombinationTestSettings::kAllIdxes: {
+            int n = candidateIndexFields.size();
+            int total = 1 << n;  // 2^n combinations
+
+            std::vector<std::vector<std::string>> result;
+
+            for (int mask = 0; mask < total; ++mask) {
+                std::vector<std::string> combination;
+                for (int i = 0; i < n; ++i) {
+                    if (mask & (1 << i)) {
+                        combination.push_back(candidateIndexFields[i]);
+                    }
+                }
+
+                if (combination.size() > 0) {
+                    result.push_back(combination);
+                }
+            }
+            return result;
+        }
+    }
+    return {};
+}
+
+std::string createIndexesAccordingToConfiguration(
+    SamplingEstimatorTest& planRankingTest,
+    std::vector<std::vector<std::string>>& indexCombinations) {
+
+    // Build any indexes.
+    std::stringstream indexCombinationString;
+    for (const auto& indexCombination : indexCombinations) {
+        BSONObjBuilder temp;
+        std::string indexName = "";
+        for (const auto& dataField : indexCombination) {
+            temp << dataField << 1;
+            if (indexName.length() > 0) {
+                indexName += "_";
+            }
+            indexName += dataField;
+        }
+        BSONObj indexSpec =
+            BSON("v" << 2 << "name" << indexName << "key" << temp.obj() << "unique" << false);
+
+        if (indexCombinationString.gcount() > 0) {
+            indexCombinationString << "-";
+        }
+        indexCombinationString << "(" << indexName << ")";
+
+        planRankingTest.createIndex(indexSpec);
+    }
+    return indexCombinationString.str();
+}
+
+std::unique_ptr<CanonicalQuery> createCanonicalQueryFromMatchExpression(
+    SamplingEstimatorTest& planRankingTest, std::unique_ptr<MatchExpression> matchExpression) {
+    auto findCommand = std::make_unique<FindCommandRequest>(planRankingTest._kTestNss);
+    auto expCtx = ExpressionContextBuilder{}
+                      .fromRequest(planRankingTest.getOperationContext(), *findCommand)
+                      .build();
+
+    auto parsedFindCmd = ParsedFindCommand::withExistingFilter(
+        expCtx,
+        expCtx->getCollator() ? expCtx->getCollator()->clone() : nullptr,
+        std::move(matchExpression),
+        std::move(findCommand),
+        ProjectionPolicies::aggregateProjectionPolicies());
+    return std::make_unique<CanonicalQuery>(
+        CanonicalQueryParams{.expCtx = expCtx, .parsedFind = std::move(parsedFindCmd.getValue())});
+}
+
+ErrorCalculationSummary runQueries(WorkloadConfiguration queryConfig,
+                                   std::vector<BSONObj>& bsonData,
+                                   const SamplingEstimatorImpl* ceSample) {
+    ErrorCalculationSummary finalResults;
+
+    // Generate queries.
+    std::vector<std::vector<std::pair<stats::SBEValue, stats::SBEValue>>> queryFieldsIntervals =
+        generateMultiFieldIntervals(queryConfig);
+
+    std::vector<std::unique_ptr<MatchExpression>> allMatchExpressionQueries =
+        createQueryMatchExpressionOnMultipleFields(queryConfig, queryFieldsIntervals);
+
+    for (const auto& expr : allMatchExpressionQueries) {
+        size_t actualCard = calculateCardinality(expr.get(), bsonData);
+        CardinalityEstimate estimatedCard = ceSample->estimateCardinality(expr.get());
+        // Store results to final structure.
+        QueryInfoAndResults queryInfoResults;
+        queryInfoResults.matchExpression = expr->toString();
+        // We store results to calculate Q-error:
+        // Q-error = max(true/est, est/true)
+        // where "est" is the estimated cardinality and "true" is the true cardinality.
+        // In practice we replace est = max(est, 1) and true = max(est, 1) to avoid
+        // divide-by-zero. Q-error = 1 indicates a perfect prediction.
+        queryInfoResults.actualCardinality = fmax(actualCard, 1.0);
+        queryInfoResults.estimatedCardinality = fmax(estimatedCard.toDouble(), 1.0);
+        finalResults.queryResults.push_back(queryInfoResults);
+        // Increment the number of executed queries.
+        ++finalResults.executedQueries;
+    }
+    return finalResults;
+}
+
+void printResult(DataConfiguration dataConfig,
+                 int sampleSize,
+                 WorkloadConfiguration queryConfig,
+                 const std::pair<SamplingCEMethodEnum, boost::optional<int>>& samplingAlgoAndChunks,
+                 ErrorCalculationSummary error) {
+    BSONObjBuilder builder;
+
+    dataConfig.addToBSONObjBuilder(builder);
+    builder << "sampleSize" << sampleSize;
+    queryConfig.addToBSONObjBuilder(builder);
+
+    std::vector<std::string> queryValuesLow;
+    std::vector<std::string> queryValuesHigh;
+    std::string matchExpression = "";
+    std::vector<double> actualCardinality;
+    std::vector<double> estimation;
+    for (auto values : error.queryResults) {
+        if (values.low.has_value()) {
+            if (values.low->getTag() == sbe::value::TypeTags::StringBig ||
+                values.low->getTag() == sbe::value::TypeTags::StringSmall) {
+                std::stringstream sslow;
+                sslow << values.low.get().getValue();
+                queryValuesLow.push_back(sslow.str());
+                std::stringstream sshigh;
+                sshigh << values.high.get().getValue();
+                queryValuesHigh.push_back(sshigh.str());
+            } else {
+                std::stringstream sslow;
+                sslow << values.low.get().getValue();
+                queryValuesLow.push_back(sslow.str());
+                std::stringstream sshigh;
+                sshigh << values.high.get().getValue();
+                queryValuesHigh.push_back(sshigh.str());
+            }
+        } else if (values.matchExpression.has_value()) {
+            matchExpression = values.matchExpression.get();
+        }
+        actualCardinality.push_back(values.actualCardinality);
+        estimation.push_back(values.estimatedCardinality);
+    }
+
+    builder << "QueryLow" << queryValuesLow;
+    builder << "QueryHigh" << queryValuesHigh;
+    builder << "QueryMatchExpression" << matchExpression;
+
+    std::stringstream ssSamplingAlgoChunks;
+    ssSamplingAlgoChunks << static_cast<int>(samplingAlgoAndChunks.first) << "-"
+                         << samplingAlgoAndChunks.second.value_or(0);
+
+    builder << "samplingAlgoChunks" << ssSamplingAlgoChunks.str();
+    builder << "numberOfChunks" << samplingAlgoAndChunks.second.value_or(0);
+    builder << "ActualCardinality" << actualCardinality;
+    builder << "Estimation" << estimation;
+
+    // NDV
+    {
+        BSONObjBuilder fieldNDVBob(builder.subobjStart("fieldNDVs"));
+        for (auto&& [fieldName, errInfo] : error.fieldNDVResults) {
+            BSONObjBuilder subBob(fieldNDVBob.subobjStart(fieldName));
+
+            std::vector<double> actualNDV;
+            std::vector<double> estimatedNDV;
+            for (auto value : errInfo) {
+                actualNDV.push_back((int)value.actualNDV);
+                estimatedNDV.push_back(value.estimatedNDV);
+            }
+            subBob << "actualNDVs" << actualNDV;
+            subBob << "estimatedNDVs" << estimatedNDV;
+        }
+    }
+
+    LOGV2(10545501, "Accuracy experiment", ""_attr = builder.obj());
+}
+
+namespace {
+// Generate data according to the provided configuration
+std::vector<BSONObj> getDataBSON(DataConfiguration dataConfig) {
+    std::vector<std::vector<mongo::stats::SBEValue>> allData;
+    generateDataBasedOnConfig(dataConfig, allData);
+    return SamplingEstimatorTest::createDocumentsFromSBEValue(
+        allData, dataConfig.collectionFieldsConfiguration);
+}
+
+// Create a new collection and insert the provided documents.
+MultipleCollectionAccessor createColl(const std::vector<BSONObj>& dataBSON,
+                                      OperationContext* opCtx) {
+    auto nss =
+        NamespaceString::createNamespaceString_forTest("SamplingCeAccuracyTest.TestCollection");
+
+    createCollAndInsertDocuments(opCtx, nss, dataBSON);
+
+    auto acquisition = acquireCollectionOrView(
+        opCtx,
+        CollectionOrViewAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+        LockMode::MODE_IX);
+    return MultipleCollectionAccessor(
+        acquisition, {}, false /* isAnySecondaryNamespaceAViewOrNotFullyLocal */);
+}
+}  // namespace
+
+void SamplingAccuracyTest::runSamplingEstimatorTestConfiguration(
+    DataConfiguration dataConfig,
+    WorkloadConfiguration queryConfig,
+    const std::vector<SampleSizeDef> sampleSizes,
+    const std::vector<std::pair<SamplingCEMethodEnum, boost::optional<int>>> samplingAlgoAndChunks,
+    bool printResults) {
+    auto dataBSON = getDataBSON(dataConfig);
+    const auto collection = createColl(dataBSON, operationContext());
+
+    for (auto samplingAlgoAndChunk : samplingAlgoAndChunks) {
+        for (auto sampleSize : sampleSizes) {
+            double actualSampleSize = translateSampleDefToActualSampleSize(sampleSize);
+
+            // Create sample from the provided collection
+            SamplingEstimatorImpl samplingEstimator(
+                operationContext(),
+                collection,
+                collection.getMainCollection()->ns(),
+                PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                actualSampleSize,
+                samplingAlgoAndChunk.first,
+                samplingAlgoAndChunk.second,
+                SamplingEstimatorTest::makeCardinalityEstimate(dataConfig.size),
+                nullptr);
+            samplingEstimator.generateSample(ce::NoProjection{});
+
+            auto error = runQueries(queryConfig, dataBSON, &samplingEstimator);
+
+            if (printResults) {
+                printResult(dataConfig, actualSampleSize, queryConfig, samplingAlgoAndChunk, error);
+            }
+        }
+    }
+}
+
+void SamplingAccuracyTest::runNDVSamplingEstimatorTestConfiguration(
+    DataConfiguration dataConfig,
+    WorkloadConfiguration queryConfig,
+    int numIters,
+    const std::vector<SampleSizeDef> sampleSizes,
+    const std::vector<std::pair<SamplingCEMethodEnum, boost::optional<int>>>
+        samplingAlgoAndChunks) {
+    // Generate data according to the provided configuration
+    const auto dataBSON = getDataBSON(dataConfig);
+    const auto collection = createColl(dataBSON, operationContext());
+
+    // Ignore $expr semantics for now.
+    absl::flat_hash_set<FieldPath> exprPaths;
+
+    for (auto samplingAlgoAndChunk : samplingAlgoAndChunks) {
+        for (auto sampleSize : sampleSizes) {
+            double actualSampleSize = translateSampleDefToActualSampleSize(sampleSize);
+
+            // Calculate estimated & actual NDV for each field.
+            ErrorCalculationSummary summary;
+            for (const auto& qf : queryConfig.queryConfig.queryFields) {
+                const auto& fieldName = qf.fieldName;
+                std::vector<NDVErrorInfo> errors;
+                for (int i = 0; i < numIters; i++) {
+                    // Create sample from the provided collection
+                    SamplingEstimatorImpl samplingEstimator(
+                        operationContext(),
+                        collection,
+                        collection.getMainCollection()->ns(),
+                        PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                        actualSampleSize,
+                        samplingAlgoAndChunk.first,
+                        samplingAlgoAndChunk.second,
+                        SamplingEstimatorTest::makeCardinalityEstimate(dataConfig.size),
+                        nullptr);
+                    samplingEstimator.generateSample(ce::NoProjection{});
+
+
+                    auto actualNDV = countNDV({{.path = fieldName}}, dataBSON);
+                    auto estimatedNDV = samplingEstimator.estimateNDV({{.path = fieldName}});
+
+                    errors.push_back({.actualNDV = actualNDV,
+                                      .estimatedNDV = fmax(estimatedNDV.toDouble(), 1.0)});
+                }
+
+                summary.fieldNDVResults.insert({fieldName, errors});
+            }
+
+            printResult(dataConfig, actualSampleSize, queryConfig, samplingAlgoAndChunk, summary);
+        }
+    }
+}
+
+SamplingEstimatorForTesting SamplingEstimatorTest::createSamplingEstimatorForTesting(
+    size_t collCard, size_t sampleSize, ce::ProjectionParams projectionParams) {
+    insertDocuments(_kTestNss, createDocuments(collCard));
+
+    auto collection =
+        acquireCollectionOrView(operationContext(),
+                                CollectionOrViewAcquisitionRequest::fromOpCtx(
+                                    operationContext(), _kTestNss, AcquisitionPrerequisites::kRead),
+                                MODE_IS);
+    auto colls = MultipleCollectionAccessor(
+        collection, {}, false /* isAnySecondaryNamespaceAViewOrNotFullyLocal */);
+
+    SamplingEstimatorForTesting samplingEstimator(operationContext(),
+                                                  colls,
+                                                  collection.nss(),
+                                                  PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                                  sampleSize,
+                                                  SamplingCEMethodEnum::kRandom,
+                                                  boost::none,
+                                                  makeCardinalityEstimate(collCard),
+                                                  nullptr);
+    samplingEstimator.generateSample(projectionParams);
+
+    return samplingEstimator;
+}
+
+IndexBounds getIndexBounds(const QueryConfiguration& queryConfig,
+                           std::vector<std::pair<stats::SBEValue, stats::SBEValue>>& intervals) {
+    ASSERT_EQUALS(queryConfig.queryFields.size(), intervals.size());
+    IndexBounds bounds;
+
+    for (size_t fieldIdx = 0; fieldIdx < queryConfig.queryFields.size(); fieldIdx++) {
+        OrderedIntervalList oil(queryConfig.queryFields[fieldIdx].fieldName);
+
+        switch (queryConfig.queryTypes[fieldIdx]) {
+            case kPoint: {
+                auto point = stats::sbeValueToBSON(intervals[fieldIdx].first, "");
+                oil.intervals.emplace_back(IndexBoundsBuilder::makePointInterval(point));
+                break;
+            }
+            case kRange: {
+                auto range = stats::sbeValuesToInterval(
+                    intervals[fieldIdx].first, "", intervals[fieldIdx].second, "");
+                oil.intervals.emplace_back(IndexBoundsBuilder::makeRangeInterval(
+                    range, BoundInclusion::kIncludeBothStartAndEndKeys));
+                break;
+            }
+        }
+        bounds.fields.push_back(oil);
+    }
+    return bounds;
+}
+
+size_t numberKeysMatch(const IndexBounds& bounds,
+                       const BSONObj& document,
+                       bool skipDuplicateMatches) {
+    size_t count = 0;
+    SamplingEstimatorImpl::forNumberKeysMatch(
+        bounds, {document}, [&](size_t cnt) { count += cnt; }, skipDuplicateMatches);
+    return count;
+}
+
+BSONObj buildPersistentSampleDoc(const UUID& collUuid,
+                                 SamplingTechniqueEnum method,
+                                 size_t sampleSize,
+                                 const std::vector<BSONObj>& docs,
+                                 boost::optional<int> numChunks,
+                                 int schemaVersion,
+                                 BSONObj overrides,
+                                 int pageNo,
+                                 size_t numDocsDiscarded) {
+    BSONObjBuilder builder;
+    // _id is required by the IDL schema. For intentionally-malformed docs (e.g. kChunk without
+    // numChunks, or sampleSize=0, used in parse-rejection tests) we can't build a valid key, so
+    // use a stand-in random _id string so the doc still has a well-formed key.
+    const bool validForKey = sampleSize > 0 &&
+        (method != SamplingTechniqueEnum::kChunk || (numChunks.has_value() && *numChunks > 0));
+    if (validForKey) {
+        builder.append("_id",
+                       makePersistentSampleId(collUuid, method, sampleSize, numChunks, pageNo));
+    } else {
+        builder.append("_id",
+                       makePersistentSampleId(collUuid,
+                                              SamplingTechniqueEnum::kRandom,
+                                              sampleSize > 0 ? sampleSize : 1,
+                                              boost::none));
+    }
+    builder.append(PersistentSampleDoc::kPageNoFieldName, pageNo);
+    builder.append(PersistentSampleDoc::kCollectionUuidFieldName, collUuid.toString());
+    builder.append(PersistentSampleDoc::kSchemaVersionFieldName, schemaVersion);
+    builder.appendDate(PersistentSampleDoc::kCreatedAtFieldName, Date_t::now());
+    builder.append(PersistentSampleDoc::kSampleSizeFieldName, static_cast<long long>(sampleSize));
+    builder.append(PersistentSampleDoc::kSamplingMethodFieldName, idlSerialize(method));
+    builder.append(PersistentSampleDoc::kNumDocsDiscardedFieldName,
+                   static_cast<long long>(numDocsDiscarded));
+    if (numChunks) {
+        builder.append(PersistentSampleDoc::kNumChunksFieldName, numChunks.value());
+    }
+    BSONArrayBuilder arr(builder.subarrayStart(PersistentSampleDoc::kDocsFieldName));
+    for (const auto& d : docs) {
+        arr.append(d);
+    }
+    arr.done();
+
+    if (overrides.isEmpty()) {
+        return builder.obj();
+    }
+    // Merge: any field in `overrides` replaces the one just built.
+    BSONObjBuilder merged;
+    const BSONObj base = builder.obj();
+    for (auto&& elem : base) {
+        if (!overrides.hasField(elem.fieldNameStringData())) {
+            merged.append(elem);
+        }
+    }
+    merged.appendElements(overrides);
+    return merged.obj();
+}
+
+BSONObj makeSizedDoc(int id, size_t sizeBytes) {
+    const size_t overhead = static_cast<size_t>(BSON("_id" << id << "pad" << "").objsize());
+    const size_t padLen = sizeBytes > overhead ? sizeBytes - overhead : 0;
+    return BSON("_id" << id << "pad" << std::string(padLen, 'x'));
+}
+
+}  // namespace mongo::ce

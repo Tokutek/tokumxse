@@ -1,0 +1,120 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/timeseries/timeseries_extended_range.h"
+
+#include "mongo/base/data_view.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::timeseries {
+
+bool dateOutsideStandardRange(Date_t date) {
+    // The latest timestamp in the standard range is when the bucket OID cannot fit into a 32 bit
+    // integer, because we cannot reliably scan the documents by OID and must indicate the bucket
+    // requires extended range support. Since OID are rounded to seconds, this maximum value is the
+    // largest 32 bit integer number of seconds since the epoch. We convert this value to
+    // milliseconds, since query routing and user specified dates have millisecond precision.
+    constexpr long long kMaxNormalRangeTimestamp = ((1LL << 31) - 1) * 1000;
+    long long timeMilliseconds = date.toMillisSinceEpoch();
+    return timeMilliseconds < 0 || timeMilliseconds > kMaxNormalRangeTimestamp;
+}
+
+// Returns the date that is out of range
+boost::optional<Date_t> bucketsHaveDateOutsideStandardRange(
+    const TimeseriesOptions& options, std::span<const InsertStatement> inserts) {
+    for (const InsertStatement& stmt : inserts) {
+        auto controlElem = stmt.doc.getField(timeseries::kBucketControlFieldName);
+        uassert(6781400,
+                "Time series bucket document is missing 'control' field",
+                controlElem.isABSONObj());
+        // BSONObj must outlive BSONElement. See BSONElement, BSONObj::getField().
+        auto controlObj = controlElem.Obj();
+        auto minElem = controlObj.getField(timeseries::kBucketControlMinFieldName);
+        uassert(6781401,
+                "Time series bucket document is missing 'control.min' field",
+                minElem.isABSONObj());
+        // As above.
+        auto minObj = minElem.Obj();
+        auto timeElem = minObj.getField(options.getTimeField());
+        uassert(6781402,
+                "Time series bucket document does not have a valid min time element",
+                timeElem && BSONType::date == timeElem.type());
+
+        auto date = timeElem.Date();
+        if (dateOutsideStandardRange(date)) {
+            return date;
+        }
+    };
+    return boost::none;
+}
+
+bool oidHasExtendedRangeTime(const OID& oid) {
+    const uint8_t highDateBits = oid.view().read<uint8_t>(0);
+    return highDateBits & 0x80;
+}
+
+bool collectionMayRequireExtendedRangeSupport(OperationContext* opCtx,
+                                              const Collection& collection) {
+    // We use a heuristic here to perform a check as quickly as possible and get the correct answer
+    // with high probability. The rough idea is that if a user has dates outside the standard range
+    // from 1970-2038, they most likely have some dates near either end of that range, i.e. between
+    // 1902-1969 or 2039-2106. Given this assumption, we can assume that at least one document in
+    // the collection should have the high bit of the timestamp portion of the OID set. If such a
+    // document exists, then the maximum OID will have this bit set. So we can just check the last
+    // document in the record store and test this high bit of it's _id.
+
+    auto* rs = collection.getRecordStore();
+    auto cursor =
+        rs->getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx), /*forward=*/false);
+    if (const auto record = cursor->next()) {
+        const auto& obj = record->data.toBson();
+        return oidHasExtendedRangeTime(obj.getField(kBucketIdFieldName).OID());
+    }
+    return false;
+}
+
+bool collectionHasTimeIndex(OperationContext* opCtx, const Collection& collection) {
+    const auto& tsOptions = collection.getTimeseriesOptions().value();
+    std::string controlMinTimeField = std::string{timeseries::kControlMinFieldNamePrefix};
+    controlMinTimeField.append(std::string{tsOptions.getTimeField()});
+    std::string controlMaxTimeField = std::string{timeseries::kControlMaxFieldNamePrefix};
+    controlMaxTimeField.append(std::string{tsOptions.getTimeField()});
+
+    auto indexCatalog = collection.getIndexCatalog();
+    // The IndexIterator is initialized lazily, so the first call to 'next' positions it to the
+    // first entry.
+    for (auto it = indexCatalog->getIndexIterator(IndexCatalog::InclusionPolicy::kReady);
+         it->more();) {
+        auto index = it->next();
+        auto desc = index->descriptor();
+        auto pattern = desc->keyPattern();
+        auto keyIt = pattern.begin();
+        std::string_view field = keyIt->fieldNameStringData();
+        if (field == controlMinTimeField || field == controlMaxTimeField) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace mongo::timeseries

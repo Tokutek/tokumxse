@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# IDL file used for benchmarking IDL parsing.
+global:
+    cpp_namespace: "mongo::idl::test"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    StringEnum10:
+        description: "An example string enum having 10 members"
+        type: string
+        values:
+            e0: "zero"
+            e1: "one"
+            e2: "two"
+            e3: "three"
+            e4: "four"
+            e5: "five"
+            e6: "six"
+            e7: "seven"
+            e8: "eight"
+            e9: "nine"
+
+structs:
+    OneArray:
+        description: "Struct containing one array field (field name is 'value')."
+        fields:
+            value: array<int>
+
+    HasStringEnum10:
+        description: "Holds enum, which can't be directly held in arrays."
+        fields:
+            e: StringEnum10
+
+    ArrayOfHasStringEnum10:
+        description: "Test of string enum parsing."
+        fields:
+            value: array<HasStringEnum10>

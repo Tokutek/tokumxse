@@ -1,0 +1,55 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    MessageSeverity:
+        description: "Severity level to log message at"
+        type: string
+        values:
+            kSevere: "severe"
+            kError: "error"
+            kWarning: "warning"
+            kInfo: "info"
+            kLog: "log"
+            kDebug: "debug"
+
+commands:
+    logMessage:
+        description: "Log a message on the server"
+        command_name: logMessage
+        namespace: type
+        api_version: ""
+        type: string
+        cpp_name: LogMessageCommand
+        strict: true
+        fields:
+            extra:
+                description: "Structured data to include with log message"
+                type: object
+                optional: true
+            severity:
+                description: "Severity of log message"
+                type: MessageSeverity
+                default: kLog
+            debugLevel:
+                description: "When using 'debug' severity, what level of debug is to be used?"
+                type: int
+                optional: true
+                validator:
+                    gte: 1
+                    lte: 5
+
+    ping:
+        description: "Parser for the 'ping' command."
+        command_name: ping
+        strict: true
+        api_version: 1
+        access_check:
+            none: true
+        namespace: ignored
+        reply_type: OkReply

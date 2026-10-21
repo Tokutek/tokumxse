@@ -1,0 +1,225 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/count_scan.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+
+namespace mongo {
+
+namespace {
+/**
+ * This function replaces field names in *replace* with those from the object
+ * *fieldNames*, preserving field ordering.  Both objects must have the same
+ * number of fields.
+ *
+ * Example:
+ *
+ *     replaceBSONKeyNames({ 'a': 1, 'b' : 1 }, { '': 'foo', '', 'bar' }) =>
+ *
+ *         { 'a' : 'foo' }, { 'b' : 'bar' }
+ */
+BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames) {
+    tassert(11051650,
+            "Expecting the same number of keys in 'replace' and 'fieldNames' documents",
+            replace.nFields() == fieldNames.nFields());
+
+    BSONObjBuilder bob;
+    auto iter = fieldNames.begin();
+
+    for (const BSONElement& el : replace) {
+        bob.appendAs(el, (*iter++).fieldNameStringData());
+    }
+
+    return bob.obj();
+}
+
+bool isCompoundWildcardIndex(const IndexDescriptor* indexDescriptor) {
+    return indexDescriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
+        indexDescriptor->keyPattern().nFields() > 1;
+}
+}  // namespace
+
+using std::unique_ptr;
+
+
+// When building the CountScan stage we take the keyPattern, index name, and multikey details from
+// the CountScanParams rather than resolving them via the IndexDescriptor, since these may differ
+// from the descriptor's contents.
+CountScan::CountScan(ExpressionContext* expCtx,
+                     CollectionAcquisition collection,
+                     CountScanParams params,
+                     WorkingSet* workingSet)
+    : RequiresIndexStage(kStageType, expCtx, collection, params.indexEntry, workingSet),
+      _workingSet(workingSet),
+      _keyPattern(std::move(params.keyPattern)),
+      _shouldDedup(params.isMultiKey || isCompoundWildcardIndex(params.indexEntry->descriptor())),
+      _startKey(std::move(params.startKey)),
+      _startKeyInclusive(params.startKeyInclusive),
+      _endKey(std::move(params.endKey)),
+      _endKeyInclusive(params.endKeyInclusive),
+      _recordIdDeduplicator(expCtx),
+      _memoryTracker(OperationMemoryUsageTracker::createSimpleMemoryUsageTrackerForStage(
+          *expCtx, loadMemoryLimit(StageMemoryLimit::CountScanStageMaxMemoryBytes))),
+      _dedupReporter(OperationMemoryUsageTracker::createDeduplicatorReporter(
+          [](int64_t deduplicatedBytes, int64_t deduplicatedRecords) {
+              countScanCounters.incrementPerDeduplication(deduplicatedBytes, deduplicatedRecords);
+          },
+          internalQueryMaxWriteToServerStatusMemoryUsageBytes.loadRelaxed())) {
+    _specificStats.indexName = params.name;
+    _specificStats.keyPattern = _keyPattern;
+    _specificStats.isMultiKey = params.isMultiKey;
+    _specificStats.multiKeyPaths = params.multikeyPaths;
+    _specificStats.isUnique = indexDescriptor()->unique();
+    _specificStats.isSetSparseByUser = indexDescriptor()->isSetSparseByUser();
+    _specificStats.isPartial = indexDescriptor()->isPartial();
+    _specificStats.indexVersion = static_cast<int>(indexDescriptor()->version());
+    _specificStats.collation = indexDescriptor()
+                                   ->infoObj()
+                                   .getObjectField(IndexDescriptor::kCollationFieldName)
+                                   .getOwned();
+
+    // endKey must be after startKey in index order since we only do forward scans.
+    dassert(_startKey.woCompare(_endKey,
+                                Ordering::make(_keyPattern),
+                                /*compareFieldNames*/ false) <= 0);
+}
+
+PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
+    if (_commonStats.isEOF)
+        return PlanStage::IS_EOF;
+
+    boost::optional<IndexKeyEntry> entry;
+    const bool needInit = !_cursor;
+
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "CountScan",
+        [&] {
+            auto& ru = *shard_role_details::getRecoveryUnit(opCtx());
+            if (needInit) {
+                // First call to work().  Perform cursor init.
+                _cursor = indexAccessMethod()->newCursor(opCtx(), ru);
+                _cursor->setEndPosition(_endKey, _endKeyInclusive);
+
+                key_string::Builder builder(
+                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion());
+                auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                    _startKey,
+                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                    true, /* forward */
+                    _startKeyInclusive,
+                    builder);
+                entry = _cursor->seek(
+                    ru, keyStringForSeek, SortedDataInterface::Cursor::KeyInclusion::kExclude);
+            } else {
+                entry = _cursor->next(ru, SortedDataInterface::Cursor::KeyInclusion::kExclude);
+            }
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            if (needInit) {
+                // Release our cursor and try again next time.
+                _cursor.reset();
+            }
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
+    }
+
+    ++_specificStats.keysExamined;
+
+    if (!entry) {
+        _commonStats.isEOF = true;
+        _cursor.reset();
+        return PlanStage::IS_EOF;
+    }
+
+    if (_shouldDedup) {
+        const uint64_t dedupBytesBefore = _recordIdDeduplicator.getApproximateSize();
+        if (!_recordIdDeduplicator.insert(entry->loc)) {
+            // *loc has been returned already
+            return PlanStage::NEED_TIME;
+        }
+        const int64_t dedupBytesAdditional =
+            static_cast<int64_t>(_recordIdDeduplicator.getApproximateSize()) -
+            static_cast<int64_t>(dedupBytesBefore);
+        _dedupReporter.add(dedupBytesAdditional);
+        _memoryTracker.add(dedupBytesAdditional);
+        _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+        uassert(12227901,
+                "CountScan stage exceeded memory limit",
+                _memoryTracker.withinMemoryLimit(opCtx()));
+    }
+
+    WorkingSetID id = _workingSet->allocate();
+    WorkingSetMember* member = _workingSet->get(id);
+    member->recordId = entry->loc;
+    _workingSet->transitionToRecordIdAndObj(id);
+    *out = id;
+    return PlanStage::ADVANCED;
+}
+
+bool CountScan::isEOF() const {
+    return _commonStats.isEOF;
+}
+
+void CountScan::doSaveStateRequiresIndex() {
+    if (_cursor)
+        _cursor->save();
+}
+
+void CountScan::doRestoreStateRequiresIndex() {
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx());
+    if (_cursor)
+        _cursor->restore(ru);
+}
+
+void CountScan::doDetachFromOperationContext() {
+    if (_cursor)
+        _cursor->detachFromOperationContext();
+}
+
+void CountScan::doReattachToOperationContext() {
+    if (_cursor)
+        _cursor->reattachToOperationContext(opCtx());
+}
+
+unique_ptr<PlanStageStats> CountScan::getStats() {
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_COUNT_SCAN);
+
+    unique_ptr<CountScanStats> countStats = std::make_unique<CountScanStats>(_specificStats);
+    countStats->keyPattern = _specificStats.keyPattern.getOwned();
+
+    countStats->startKey = replaceBSONFieldNames(_startKey, countStats->keyPattern);
+    countStats->startKeyInclusive = _startKeyInclusive;
+    countStats->endKey = replaceBSONFieldNames(_endKey, countStats->keyPattern);
+    countStats->endKeyInclusive = _endKeyInclusive;
+
+    ret->specific = std::move(countStats);
+
+    return ret;
+}
+
+const SpecificStats* CountScan::getSpecificStats() const {
+    return &_specificStats;
+}
+
+}  // namespace mongo

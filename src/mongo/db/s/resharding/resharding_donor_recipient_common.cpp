@@ -1,0 +1,520 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/s/resharding/resharding_donor_service.h"
+#include "mongo/db/s/resharding/resharding_recipient_service.h"
+#include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/shard_filtering_metadata_refresh.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/topology/sharding_state.h"
+#include "mongo/db/topology/user_write_block/replica_set_write_block_state.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
+#include "mongo/otel/traces/telemetry_context_serialization.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/future_util.h"
+#include "mongo/util/time_support.h"
+
+#include <initializer_list>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
+namespace mongo {
+namespace resharding {
+
+using DonorStateMachine = ReshardingDonorService::DonorStateMachine;
+using RecipientStateMachine = ReshardingRecipientService::RecipientStateMachine;
+
+namespace {
+MONGO_FAIL_POINT_DEFINE(reshardingInterruptAfterInsertStateMachineDocument);
+
+const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
+
+template <class StateMachine, class ReshardingDocument>
+void ensureStateDocumentInserted(OperationContext* opCtx, const ReshardingDocument& doc) {
+    try {
+        StateMachine::insertStateDocument(opCtx, doc);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+        // It's possible that the state document was already previously inserted in the following
+        // cases:
+        // 1. The document was inserted previously, but the opCtx was interrupted before the
+        // state machine was started in-memory with getOrCreate(), e.g. due to a chunk migration
+        // (see SERVER-74647)
+        // 2. Similar to the ErrorCategory::NotPrimaryError clause below, it is
+        // theoretically possible for a series of stepdowns and step-ups to lead a scenario where a
+        // stale but now re-elected primary attempts to insert the state document when another node
+        // which was primary had already done so. Again, rather than attempt to prevent replica set
+        // member state transitions during the shard version refresh, we instead swallow the
+        // DuplicateKey exception. This is safe because PrimaryOnlyService::onStepUp() will have
+        // constructed a new instance of the resharding state machine.
+        auto dupeKeyInfo = ex.extraInfo<DuplicateKeyErrorInfo>();
+        invariant(dupeKeyInfo->getDuplicatedKeyValue().binaryEqual(
+            BSON("_id" << doc.getReshardingUUID())));
+    }
+}
+
+}  // namespace
+
+template <class Service, class StateMachine, class ReshardingDocument>
+void createReshardingStateMachine(OperationContext* opCtx,
+                                  const ReshardingDocument& doc,
+                                  bool throwOnNotPrimaryError) {
+    if constexpr (std::is_same_v<Service, ReshardingRecipientService>) {
+        if (!doc.getSkipCloningAndApplying().value_or(false)) {
+            uassertStatusOK(
+                ReplicaSetWriteBlockState::get(opCtx)->checkIfIncomingReshardingAllowedToStart(
+                    opCtx));
+        }
+    }
+
+    try {
+        // Inserting the resharding state document must happen synchronously with the shard version
+        // refresh for the w:majority wait from the resharding coordinator to mean that this replica
+        // set shard cannot forget about being a participant.
+        ensureStateDocumentInserted<StateMachine>(opCtx, doc);
+
+        reshardingInterruptAfterInsertStateMachineDocument.execute([&opCtx](const BSONObj& data) {
+            // If an 'errorCode' is provided, instead throw that error directly.
+            if (auto errorCodeElem = data["errorCode"]) {
+                uasserted(ErrorCodes::Error(errorCodeElem.safeNumberInt()),
+                          "Failing createReshardingStateMachine due to failpoint");
+            }
+            opCtx->markKilled();
+        });
+
+        auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
+        auto service = registry->lookupServiceByName(Service::kServiceName);
+        StateMachine::getOrCreate(opCtx, service, doc.toBSON());
+    } catch (const ExceptionFor<ErrorCategory::NotPrimaryError>&) {
+        if (throwOnNotPrimaryError) {
+            throw;
+        }
+        // resharding::processReshardingFieldsForCollection() is called on both primary and
+        // secondary nodes as part of the shard version being refreshed. Due to the RSTL lock not
+        // being held throughout the shard version refresh, it is also possible for the node to
+        // arbitrarily step down and step up during the shard version refresh. Rather than
+        // attempt to prevent replica set member state transitions during the shard version refresh,
+        // we instead swallow the NotPrimaryError exception. This is safe because there is no work a
+        // secondary (or primary which stepped down) must do for an active resharding operation upon
+        // refreshing its shard version. The primary is solely responsible for advancing the
+        // participant state as a result of the shard version refresh.
+    }
+}
+
+template void
+createReshardingStateMachine<ReshardingDonorService, DonorStateMachine, ReshardingDonorDocument>(
+    OperationContext*, const ReshardingDonorDocument&, bool);
+template void createReshardingStateMachine<ReshardingRecipientService,
+                                           RecipientStateMachine,
+                                           ReshardingRecipientDocument>(
+    OperationContext*, const ReshardingRecipientDocument&, bool);
+
+void waitForStateDocumentMajorityCommitted(OperationContext* opCtx) {
+    waitForMajority(opCtx, opCtx->getCancellationToken()).get(opCtx);
+}
+
+namespace {
+/*
+ * Either constructs a new ReshardingDonorStateMachine with 'reshardingFields' or passes
+ * 'reshardingFields' to an already-existing ReshardingDonorStateMachine.
+ */
+void processReshardingFieldsForDonorCollection(OperationContext* opCtx,
+                                               const NamespaceString& nss,
+                                               const CollectionMetadata& metadata,
+                                               const ReshardingFields& reshardingFields) {
+    if (auto donorStateMachine = tryGetReshardingStateMachine<ReshardingDonorService,
+                                                              DonorStateMachine,
+                                                              ReshardingDonorDocument>(
+            opCtx, reshardingFields.getReshardingUUID())) {
+        donorStateMachine->get()->onReshardingFieldsChanges(opCtx, reshardingFields);
+
+        const auto coordinatorState = reshardingFields.getState();
+        if (coordinatorState == CoordinatorStateEnum::kBlockingWrites) {
+            (*donorStateMachine)->awaitCriticalSectionAcquired().wait(opCtx);
+        }
+
+        return;
+    }
+
+    // If a resharding operation is BEFORE state kPreparingToDonate, then the config.collections
+    // entry won't have yet been created for the temporary resharding collection. The
+    // DonorStateMachine refreshes the temporary resharding collection immediately after being
+    // constructed. Accordingly, we avoid constructing the DonorStateMachine until the collection
+    // entry for the temporary resharding collection is known to exist.
+    //
+    // If a resharding operation is PAST state kPreparingToDonate, but does not currently have a
+    // donor document in-memory, this means that the document will be recovered by the
+    // ReshardingDonorService. Accordingly, at time-of-recovery, the latest instance of
+    // 'reshardingFields' will be read. Return no-op.
+    if (reshardingFields.getState() != CoordinatorStateEnum::kPreparingToDonate) {
+        return;
+    }
+
+    // This could be a shard not indicated as a donor that's trying to refresh the source
+    // collection. In this case, we don't want to create a donor machine.
+    if (!metadata.currentShardHasAnyChunks()) {
+        return;
+    }
+
+    // We clear the routing information for the temporary resharding namespace to ensure this donor
+    // shard primary will refresh from the config server and see the chunk distribution for the new
+    // resharding operation.
+    auto* catalogCache = Grid::get(opCtx)->catalogCache();
+    catalogCache->invalidateCollectionEntry_LINEARIZABLE(
+        reshardingFields.getDonorFields()->getTempReshardingNss());
+
+    auto donorDoc = constructDonorDocumentFromReshardingFields(
+        VersionContext::getDecoration(opCtx), nss, metadata, reshardingFields);
+    createReshardingStateMachine<ReshardingDonorService,
+                                 DonorStateMachine,
+                                 ReshardingDonorDocument>(opCtx, donorDoc);
+}
+
+bool isCurrentShardPrimary(OperationContext* opCtx, const NamespaceString& nss) {
+    auto dbInfo = [&] {
+        // At this point of resharding execution, the coordinator is holding a DDL lock which means
+        // the DB primary is stable and we have gossiped-in the `configTime` which created that
+        // coordinator. Therefore if we force a routing cache refresh thorugh
+        // onStaleDatabaseVersion() we have the guarantee to fetch the most-up-to date DB info.
+        // primary.
+        //
+        // TODO SERVER-96115 Use the CatalogClient to fetch DB info and avoid this forced refresh
+        const auto& catalogCache = Grid::get(opCtx)->catalogCache();
+        catalogCache->onStaleDatabaseVersion(nss.dbName(), boost::none /* wantedVersion */);
+        return uassertStatusOK(catalogCache->getDatabase(opCtx, nss.dbName()));
+    }();
+    return dbInfo->getPrimary() == ShardingState::get(opCtx)->shardId();
+}
+
+/*
+ * Either constructs a new ReshardingRecipientStateMachine with 'reshardingFields' or passes
+ * 'reshardingFields' to an already-existing ReshardingRecipientStateMachine.
+ */
+void processReshardingFieldsForRecipientCollection(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const CollectionMetadata& metadata,
+                                                   const ReshardingFields& reshardingFields) {
+    if (auto recipientStateMachine = tryGetReshardingStateMachine<ReshardingRecipientService,
+                                                                  RecipientStateMachine,
+                                                                  ReshardingRecipientDocument>(
+            opCtx, reshardingFields.getReshardingUUID())) {
+        recipientStateMachine->get()->onReshardingFieldsChanges(
+            opCtx, reshardingFields, !metadata.currentShardHasAnyChunks() /* noChunksToCopy */);
+        return;
+    }
+
+    // If a resharding operation is past state kPreparingToDonate but does not currently have a
+    // recipient document in-memory, this means that the document will be recovered by the
+    // ReshardingRecipientService, and at that time the latest instance of 'reshardingFields'
+    // will be read. Return no-op.
+    //
+    // We construct the RecipientStateMachine in the kPreparingToDonate state (which is the same
+    // state as when we would construct the DonorStateMachine) so the resharding coordinator can
+    // rely on all of the state machines being constructed as part of the same state transition.
+    if (reshardingFields.getState() != CoordinatorStateEnum::kPreparingToDonate) {
+        return;
+    }
+
+    // This could be a shard not indicated as a recipient that's trying to refresh the temporary
+    // collection. In this case, we don't want to create a recipient machine.
+    if (!isCurrentShardPrimary(opCtx, nss) && !metadata.currentShardHasAnyChunks()) {
+        return;
+    }
+
+    auto recipientDoc = constructRecipientDocumentFromReshardingFields(
+        VersionContext::getDecoration(opCtx), nss, metadata, reshardingFields);
+    createReshardingStateMachine<ReshardingRecipientService,
+                                 RecipientStateMachine,
+                                 ReshardingRecipientDocument>(opCtx, recipientDoc);
+}
+
+/**
+ * Checks that presence/absence of 'donorShards' and 'recipientShards' fields in the
+ * reshardingFields are consistent with the 'state' field.
+ */
+void verifyValidReshardingFields(const ReshardingFields& reshardingFields) {
+    auto coordinatorState = reshardingFields.getState();
+
+    if (coordinatorState < CoordinatorStateEnum::kPreparingToDonate) {
+        // Prior to the state CoordinatorStateEnum::kPreparingToDonate, the source collection's
+        // config.collections entry won't have "donorFields". Additionally, the temporary resharding
+        // collection's config.collections entry won't exist yet.
+        uassert(5498100,
+                fmt::format("reshardingFields must not contain donorFields or recipientFields when"
+                            " the coordinator is in state {}. Got reshardingFields {}",
+                            idl::serialize(reshardingFields.getState()),
+                            reshardingFields.toBSON().toString()),
+                !reshardingFields.getDonorFields() && !reshardingFields.getRecipientFields());
+    } else if (coordinatorState < CoordinatorStateEnum::kCommitting) {
+        // Prior to the state CoordinatorStateEnum::kCommitting, only the source
+        // collection's config.collections entry should have donorFields, and only the
+        // temporary resharding collection's entry should have recipientFields.
+        uassert(5274201,
+                fmt::format("reshardingFields must contain exactly one of donorFields and"
+                            " recipientFields when the coordinator is in state {}. Got"
+                            " reshardingFields {}",
+                            idl::serialize(reshardingFields.getState()),
+                            reshardingFields.toBSON().toString()),
+                bool(reshardingFields.getDonorFields()) !=
+                    bool(reshardingFields.getRecipientFields()));
+    } else {
+        // At and after state CoordinatorStateEnum::kCommitting, the temporary
+        // resharding collection's config.collections entry has been removed, and so the
+        // source collection's entry should have both donorFields and recipientFields.
+        uassert(5274202,
+                fmt::format("reshardingFields must contain both donorFields and recipientFields "
+                            "when the coordinator's state is greater than or equal to "
+                            "CoordinatorStateEnum::kCommitting. Got reshardingFields {}",
+                            reshardingFields.toBSON().toString()),
+                reshardingFields.getDonorFields() && reshardingFields.getRecipientFields());
+    }
+}
+
+}  // namespace
+
+ReshardingDonorDocument constructDonorDocumentFromReshardingFields(
+    const VersionContext& vCtx,
+    const NamespaceString& nss,
+    const CollectionMetadata& metadata,
+    const ReshardingFields& reshardingFields) {
+    DonorShardContext donorCtx;
+    donorCtx.setState(DonorStateEnum::kPreparingToDonate);
+
+    auto donorDoc = ReshardingDonorDocument{
+        std::move(donorCtx), reshardingFields.getDonorFields()->getRecipientShardIds()};
+
+    auto sourceUUID = metadata.getChunkManager()->getUUID();
+    auto commonMetadata =
+        CommonReshardingMetadata(reshardingFields.getReshardingUUID(),
+                                 nss,
+                                 sourceUUID,
+                                 reshardingFields.getDonorFields()->getTempReshardingNss(),
+                                 reshardingFields.getDonorFields()->getReshardingKey().toBSON());
+    // This field is only used by the newer authoritative shards path. This branch is only executed
+    // by the legacy non-authoritative path.
+    commonMetadata.setPrimaryShardId(boost::none);
+
+    commonMetadata.setStartTime(reshardingFields.getStartTime());
+    commonMetadata.setProvenance(reshardingFields.getProvenance());
+    resharding::validatePerformVerification(vCtx, reshardingFields.getPerformVerification());
+    commonMetadata.setPerformVerification(reshardingFields.getPerformVerification());
+    if (reshardingFields.getTelemetryContext()) {
+        commonMetadata.setTelemetryContext(*reshardingFields.getTelemetryContext());
+    }
+
+    donorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
+
+    return donorDoc;
+}
+
+ReshardingRecipientDocument constructRecipientDocumentFromReshardingFields(
+    const VersionContext& vCtx,
+    const NamespaceString& nss,
+    const CollectionMetadata& metadata,
+    const ReshardingFields& reshardingFields) {
+    const auto& recipientFields = reshardingFields.getRecipientFields();
+    // The recipient state machines are created before the donor shards are prepared to donate but
+    // will remain idle until the donor shards are prepared to donate.
+    invariant(!recipientFields->getCloneTimestamp());
+
+    RecipientShardContext recipientCtx;
+    recipientCtx.setState(RecipientStateEnum::kAwaitingFetchTimestamp);
+
+    auto recipientDoc = ReshardingRecipientDocument{std::move(recipientCtx)};
+    ReshardingRecipientOptions recipientOptions(
+        recipientFields->getDonorShards(), recipientFields->getMinimumOperationDurationMillis());
+    recipientOptions.setOplogBatchTaskCount(recipientFields->getOplogBatchTaskCount());
+    recipientOptions.setRelaxed(recipientFields->getRelaxed());
+    recipientDoc.setReshardingRecipientOptions(std::move(recipientOptions));
+
+    auto sourceNss = recipientFields->getSourceNss();
+    auto sourceUUID = recipientFields->getSourceUUID();
+    auto commonMetadata = CommonReshardingMetadata(reshardingFields.getReshardingUUID(),
+                                                   sourceNss,
+                                                   sourceUUID,
+                                                   nss,
+                                                   metadata.getShardKeyPattern().toBSON());
+    // This field is only used by the newer authoritative shards path. This branch is only executed
+    // by the legacy non-authoritative path.
+    commonMetadata.setPrimaryShardId(boost::none);
+
+    commonMetadata.setStartTime(reshardingFields.getStartTime());
+    commonMetadata.setProvenance(reshardingFields.getProvenance());
+    resharding::validatePerformVerification(vCtx, reshardingFields.getPerformVerification());
+    commonMetadata.setPerformVerification(reshardingFields.getPerformVerification());
+    if (reshardingFields.getTelemetryContext()) {
+        commonMetadata.setTelemetryContext(*reshardingFields.getTelemetryContext());
+    }
+
+    ReshardingRecipientMetrics metrics;
+    metrics.setApproxDocumentsToCopy(recipientFields->getApproxDocumentsToCopy());
+    metrics.setApproxBytesToCopy(recipientFields->getApproxBytesToCopy());
+    recipientDoc.setMetrics(std::move(metrics));
+
+    recipientDoc.setCommonReshardingMetadata(std::move(commonMetadata));
+
+    if (resharding::gFeatureFlagReshardingSkipCloningAndApplyingIfApplicable.isEnabled(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        !metadata.currentShardHasAnyChunks()) {
+        recipientDoc.setSkipCloningAndApplying(true);
+    }
+    if (resharding::gFeatureFlagReshardingSkipCloningIfApplicable.isEnabled(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        !metadata.currentShardHasAnyChunks()) {
+        recipientDoc.setSkipCloning(true);
+    }
+    if (resharding::gFeatureFlagReshardingSkipBuildingIndexesIfApplicable.isEnabled(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        !metadata.currentShardHasAnyChunks()) {
+        recipientDoc.setSkipBuildingIndexes(true);
+    }
+    if (resharding::gFeatureFlagReshardingStoreOplogFetcherProgress.isEnabled(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        recipientDoc.setStoreOplogFetcherProgress(true);
+    }
+
+    return recipientDoc;
+}
+
+void processReshardingFieldsForCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const CollectionMetadata& metadata,
+                                          const ReshardingFields& reshardingFields) {
+    // Persist the config time to ensure that in case of stepdown next filtering metadata refresh on
+    // the new primary will always fetch the latest information.
+    auto* const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->getSettings().isReplSet() || replCoord->getMemberState().primary()) {
+        VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+    }
+
+    if (reshardingFields.getState() == CoordinatorStateEnum::kAborting) {
+        // The coordinator encountered an unrecoverable error, both donors and recipients should be
+        // made aware.
+        processReshardingFieldsForDonorCollection(opCtx, nss, metadata, reshardingFields);
+        processReshardingFieldsForRecipientCollection(opCtx, nss, metadata, reshardingFields);
+        return;
+    }
+
+    verifyValidReshardingFields(reshardingFields);
+
+    if (reshardingFields.getDonorFields()) {
+        processReshardingFieldsForDonorCollection(opCtx, nss, metadata, reshardingFields);
+    }
+
+    if (reshardingFields.getRecipientFields()) {
+        processReshardingFieldsForRecipientCollection(opCtx, nss, metadata, reshardingFields);
+    }
+}
+
+void clearCollectionMetadata(OperationContext* opCtx, bool scheduleAsyncRefresh) {
+    stdx::unordered_set<NamespaceString> namespacesToRefresh;
+    for (const NamespaceString& homeToReshardingDocs :
+         {NamespaceString::kDonorReshardingOperationsNamespace,
+          NamespaceString::kRecipientReshardingOperationsNamespace}) {
+        PersistentTaskStore<CommonReshardingMetadata> store(homeToReshardingDocs);
+
+        store.forEach(opCtx, BSONObj{}, [&](CommonReshardingMetadata reshardingDoc) -> bool {
+            namespacesToRefresh.insert(reshardingDoc.getSourceNss());
+            namespacesToRefresh.insert(reshardingDoc.getTempReshardingNss());
+
+            return true;
+        });
+    }
+    clearCollectionMetadata(opCtx, namespacesToRefresh, scheduleAsyncRefresh);
+}
+
+void clearCollectionMetadata(OperationContext* opCtx,
+                             stdx::unordered_set<NamespaceString> namespacesToRefresh,
+                             bool scheduleAsyncRefresh) {
+    auto* catalogCache = Grid::get(opCtx)->catalogCache();
+
+    for (const auto& nss : namespacesToRefresh) {
+        if (nss.isTemporaryReshardingCollection()) {
+            // We clear the routing information for the temporary resharding namespace to ensure all
+            // new donor shard primaries will refresh from the config server and see the chunk
+            // distribution for the ongoing resharding operation.
+            catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+        }
+
+        {
+            auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+            scopedCsr->clearCollectionMetadata(opCtx);
+        }
+
+        if (!scheduleAsyncRefresh) {
+            continue;
+        }
+
+        AsyncTry([svcCtx = opCtx->getServiceContext(), nss] {
+            ThreadClient tc("TriggerReshardingRecovery", svcCtx->getService());
+            auto opCtx = tc->makeOperationContext();
+            uassertStatusOK(FilteringMetadataCache::get(opCtx.get())
+                                ->onShardVersionMismatch(
+                                    opCtx.get(), nss, boost::none /* chunkVersionReceived */));
+        })
+            .until([](const Status& status) {
+                if (!status.isOK()) {
+                    LOGV2_WARNING(5498101,
+                                  "Error on deferred shardVersion recovery execution",
+                                  "error"_attr = redact(status));
+                }
+                return status.isOK();
+            })
+            .withBackoffBetweenIterations(kExponentialBackoff)
+            .on(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+                CancellationToken::uncancelable())
+            .getAsync([](auto) {});
+    }
+}
+
+bool isRetryableChangeStreamsMonitorError(const Status& status) {
+    return status.isA<ErrorCategory::RetriableError>() ||
+        status == ErrorCodes::FailedToSatisfyReadPreference ||
+        status.isA<ErrorCategory::CursorInvalidatedError>() || status == ErrorCodes::Interrupted ||
+        status.isA<ErrorCategory::ExceededTimeLimitError>() ||
+        status.isA<ErrorCategory::NetworkTimeoutError>() ||
+        status == ErrorCodes::ShardingStateNotInitialized;
+}
+
+}  // namespace resharding
+
+}  // namespace mongo

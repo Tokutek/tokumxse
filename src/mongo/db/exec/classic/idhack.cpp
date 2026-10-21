@@ -1,0 +1,163 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/idhack.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/classic/working_set_common.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace mongo {
+
+using std::unique_ptr;
+
+
+IDHackStage::IDHackStage(ExpressionContext* expCtx,
+                         const CanonicalQuery* query,
+                         WorkingSet* ws,
+                         CollectionAcquisition collection,
+                         const IndexCatalogEntry* entry)
+    : RequiresIndexStage(kStageType, expCtx, collection, entry, ws), _workingSet(ws) {
+    auto cmpExpr = dynamic_cast<ComparisonMatchExpressionBase*>(query->getPrimaryMatchExpression());
+    tassert(10269300, "Invalid match expression", cmpExpr);
+    _key = cmpExpr->getData().wrap("_id");
+    _specificStats.indexName = indexDescriptor()->indexName();
+    _addKeyMetadata = query->getFindCommandRequest().getReturnKey();
+}
+
+IDHackStage::IDHackStage(ExpressionContext* expCtx,
+                         const BSONObj& key,
+                         WorkingSet* ws,
+                         CollectionAcquisition collection,
+                         const IndexCatalogEntry* entry)
+    : RequiresIndexStage(kStageType, expCtx, collection, entry, ws), _workingSet(ws), _key(key) {
+    _specificStats.indexName = indexDescriptor()->indexName();
+}
+
+IDHackStage::~IDHackStage() {}
+
+bool IDHackStage::isEOF() const {
+    return _done;
+}
+
+PlanStage::StageState IDHackStage::doWork(WorkingSetID* out) {
+    if (_done) {
+        return PlanStage::IS_EOF;
+    }
+
+    WorkingSetID id = WorkingSet::INVALID_ID;
+    return handlePlanStageYield(
+        expCtx(),
+        "IDHackStage",
+        [&] {
+            // Look up the key by going directly to the index.
+            auto recordId = indexAccessMethod()->asSortedData()->findSingle(
+                opCtx(),
+                *shard_role_details::getRecoveryUnit(opCtx()),
+                collectionPtr(),
+                indexEntry(),
+                _key);
+
+            // Key not found.
+            if (recordId.isNull()) {
+                _done = true;
+                return PlanStage::IS_EOF;
+            }
+
+            ++_specificStats.keysExamined;
+            ++_specificStats.docsExamined;
+
+            // Create a new WSM for the result document.
+            id = _workingSet->allocate();
+            WorkingSetMember* member = _workingSet->get(id);
+            member->recordId = std::move(recordId);
+            _workingSet->transitionToRecordIdAndIdx(id);
+
+            const auto& coll = collectionPtr();
+            if (!_recordCursor)
+                _recordCursor = coll->getCursor(opCtx());
+
+            // Find the document associated with 'id' in the collection's record store.
+            if (!WorkingSetCommon::fetch(
+                    opCtx(), _workingSet, id, _recordCursor.get(), coll, coll->ns())) {
+                // We didn't find a document with RecordId 'id'.
+                _workingSet->free(id);
+                _commonStats.isEOF = true;
+                _done = true;
+                return IS_EOF;
+            }
+
+            return advance(id, member, out);
+        },
+        [&] {
+            // yieldHandler
+            // Restart at the beginning on retry.
+            _recordCursor.reset();
+            if (id != WorkingSet::INVALID_ID)
+                _workingSet->free(id);
+
+            *out = WorkingSet::INVALID_ID;
+        });
+}
+
+PlanStage::StageState IDHackStage::advance(WorkingSetID id,
+                                           WorkingSetMember* member,
+                                           WorkingSetID* out) {
+    tassert(11051639, "Expecting working set member to store an object", member->hasObj());
+
+    if (_addKeyMetadata) {
+        BSONObj ownedKeyObj = member->doc.value().toBson()["_id"].wrap().getOwned();
+        member->metadata().setIndexKey(IndexKeyEntry::rehydrateKey(_key, ownedKeyObj));
+    }
+
+    _done = true;
+    *out = id;
+    return PlanStage::ADVANCED;
+}
+
+void IDHackStage::doSaveStateRequiresIndex() {
+    if (_recordCursor)
+        _recordCursor->saveUnpositioned();
+}
+
+void IDHackStage::doRestoreStateRequiresIndex() {
+    if (_recordCursor) {
+        auto couldRestore = _recordCursor->restore(*shard_role_details::getRecoveryUnit(opCtx()));
+        uassert(5083800, "IDHackStage could not restore cursor", couldRestore);
+    }
+}
+
+void IDHackStage::doDetachFromOperationContext() {
+    if (_recordCursor)
+        _recordCursor->detachFromOperationContext();
+}
+
+void IDHackStage::doReattachToOperationContext() {
+    if (_recordCursor)
+        _recordCursor->reattachToOperationContext(opCtx());
+}
+
+unique_ptr<PlanStageStats> IDHackStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_IDHACK);
+    ret->specific = std::make_unique<IDHackStats>(_specificStats);
+    return ret;
+}
+
+const SpecificStats* IDHackStage::getSpecificStats() const {
+    return &_specificStats;
+}
+
+}  // namespace mongo

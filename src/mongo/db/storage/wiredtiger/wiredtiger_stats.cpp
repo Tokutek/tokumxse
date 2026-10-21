@@ -1,0 +1,196 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_stats.h"
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/util/assert_util.h"
+
+#include <cstdint>
+#include <string_view>
+
+#include <wiredtiger.h>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+namespace {
+
+void appendIfNonZero(std::string_view fieldName, int64_t value, BSONObjBuilder* builder) {
+    if (value != 0) {
+        builder->append(fieldName, value);
+    }
+}
+
+}  // namespace
+
+WiredTigerStats::WiredTigerStats(WiredTigerSession& session) {
+    WT_CURSOR* c = nullptr;
+    uassert(ErrorCodes::CursorNotFound,
+            "Unable to open statistics cursor",
+            !session.open_cursor("statistics:session", nullptr, "statistics=(fast)", &c));
+
+    ScopeGuard guard{[c] {
+        c->close(c);
+    }};
+
+    // Get all the stats
+    while (c->next(c) == 0) {
+        int32_t key;
+        invariant(c->get_key(c, &key) == 0);
+
+        uint64_t value;
+        fassert(51035, c->get_value(c, nullptr, nullptr, &value) == 0);
+
+        updateCounter(key, WiredTigerUtil::castStatisticsValue<long long>(value));
+    }
+
+    _storageEngineTime = session.getStorageEngineTime();
+}
+
+void WiredTigerStats::updateCounter(int32_t key_id, uint64_t value) {
+    switch (key_id) {
+        case WT_STAT_SESSION_BYTES_READ:
+            _bytesRead = value;
+            break;
+        case WT_STAT_SESSION_BYTES_WRITE:
+            _bytesWrite = value;
+            break;
+        case WT_STAT_SESSION_LOCK_DHANDLE_WAIT:
+            _lockDhandleWait = value;
+            break;
+        case WT_STAT_SESSION_TXN_BYTES_DIRTY:
+            _txnBytesDirty = value;
+            break;
+        case WT_STAT_SESSION_TXN_UPDATES:
+            _txnNumUpdates = value;
+            break;
+        case WT_STAT_SESSION_READ_TIME:
+            _readTime = Microseconds((int64_t)value);
+            break;
+        case WT_STAT_SESSION_WRITE_TIME:
+            _writeTime = Microseconds((int64_t)value);
+            break;
+        case WT_STAT_SESSION_LOCK_SCHEMA_WAIT:
+            _lockSchemaWait = value;
+            break;
+        case WT_STAT_SESSION_CACHE_TIME:
+            _cacheTime = Microseconds((int64_t)value);
+            break;
+        case WT_STAT_SESSION_CACHE_TIME_INTERRUPTIBLE:
+            _cacheTimeInterruptible = Microseconds((int64_t)value);
+            break;
+        case WT_STAT_SESSION_CACHE_TIME_MANDATORY:
+            _cacheTimeMandatory = Microseconds((int64_t)value);
+            break;
+        default:
+            // Ignore unknown counters that WT may add.
+            break;
+    }
+}
+
+void WiredTigerStats::appendToBsonObjBuilder(BSONObjBuilder& builder) const {
+    // Only output metrics for non-zero values
+    if (_bytesRead != 0 || _bytesWrite != 0 || _readTime.count() != 0 || _writeTime.count() != 0 ||
+        _txnBytesDirty != 0 || _txnNumUpdates != 0) {
+        BSONObjBuilder dataSection(builder.subobjStart("data"));
+        appendIfNonZero("bytesRead", _bytesRead, &dataSection);
+        appendIfNonZero("bytesWritten", _bytesWrite, &dataSection);
+        appendIfNonZero("timeReadingMicros", durationCount<Microseconds>(_readTime), &dataSection);
+        appendIfNonZero("timeWritingMicros", durationCount<Microseconds>(_writeTime), &dataSection);
+        appendIfNonZero("txnBytesDirty", _txnBytesDirty, &dataSection);
+        appendIfNonZero("txnNumUpdates", _txnNumUpdates, &dataSection);
+    }
+
+    if (_lockDhandleWait != 0 || _lockSchemaWait != 0 || _cacheTime.count() != 0 ||
+        _cacheTimeInterruptible.count() != 0 || _cacheTimeMandatory.count() != 0 ||
+        _storageEngineTime.count() != 0) {
+        BSONObjBuilder waitingSection(builder.subobjStart("timeWaitingMicros"));
+        appendIfNonZero("handleLock", _lockDhandleWait, &waitingSection);
+        appendIfNonZero("schemaLock", _lockSchemaWait, &waitingSection);
+        appendIfNonZero("cacheMicros", durationCount<Microseconds>(_cacheTime), &waitingSection);
+        appendIfNonZero("cacheInterruptibleMicros",
+                        durationCount<Microseconds>(_cacheTimeInterruptible),
+                        &waitingSection);
+        appendIfNonZero("cacheMandatoryMicros",
+                        durationCount<Microseconds>(_cacheTimeMandatory),
+                        &waitingSection);
+        appendIfNonZero("storageEngineMicros",
+                        durationCount<Microseconds>(_storageEngineTime),
+                        &waitingSection);
+    }
+}
+
+
+BSONObj WiredTigerStats::toBSON() const {
+    BSONObjBuilder builder;
+    appendToBsonObjBuilder(builder);
+    return builder.obj();
+}
+
+uint64_t WiredTigerStats::bytesRead() const {
+    return _bytesRead;
+}
+
+Microseconds WiredTigerStats::readingTime() const {
+    return Microseconds(_readTime);
+}
+
+int64_t WiredTigerStats::txnBytesDirty() const {
+    return _txnBytesDirty;
+}
+
+std::unique_ptr<StorageStats> WiredTigerStats::clone() const {
+    return std::make_unique<WiredTigerStats>(*this);
+}
+
+WiredTigerStats& WiredTigerStats::operator+=(const WiredTigerStats& other) {
+    _bytesRead += other._bytesRead;
+    _bytesWrite += other._bytesWrite;
+    _lockDhandleWait += other._lockDhandleWait;
+    _txnBytesDirty += other._txnBytesDirty;
+    _txnNumUpdates += other._txnNumUpdates;
+    _readTime += other._readTime;
+    _writeTime += other._writeTime;
+    _lockSchemaWait += other._lockSchemaWait;
+    _cacheTime += other._cacheTime;
+    _cacheTimeInterruptible += other._cacheTimeInterruptible;
+    _cacheTimeMandatory += other._cacheTimeMandatory;
+    _storageEngineTime += other._storageEngineTime;
+
+    return *this;
+}
+
+StorageStats& WiredTigerStats::operator+=(const StorageStats& other) {
+    return *this += checked_cast<const WiredTigerStats&>(other);
+}
+
+WiredTigerStats& WiredTigerStats::operator-=(const WiredTigerStats& other) {
+    _bytesRead -= other._bytesRead;
+    _bytesWrite -= other._bytesWrite;
+    _lockDhandleWait -= other._lockDhandleWait;
+    _txnBytesDirty -= other._txnBytesDirty;
+    _txnNumUpdates -= other._txnNumUpdates;
+    _readTime -= other._readTime;
+    _writeTime -= other._writeTime;
+    _lockSchemaWait -= other._lockSchemaWait;
+    _cacheTime -= other._cacheTime;
+    _cacheTimeInterruptible -= other._cacheTimeInterruptible;
+    _cacheTimeMandatory -= other._cacheTimeMandatory;
+    _storageEngineTime -= other._storageEngineTime;
+
+    return (*this);
+}
+
+StorageStats& WiredTigerStats::operator-=(const StorageStats& other) {
+    *this -= checked_cast<const WiredTigerStats&>(other);
+    return (*this);
+}
+
+}  // namespace mongo

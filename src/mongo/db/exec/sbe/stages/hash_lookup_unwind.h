@@ -1,0 +1,161 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/sbe/stages/lookup_hash_table.h"
+#include "mongo/db/exec/sbe/stages/loop_join.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::sbe {
+/**
+ * Performs a multi-key hash lookup, that is a combination of join (left or inner) and unwind
+ * operations. Rows from 'inner' and 'outer' sides can be associated with multiple keys. 'inner' and
+ * 'outer' rows are considered matching, if they match on at least one of the associated keys. The
+ * result of a lookup is each 'outer' paired with all the matched 'inner' rows one by one for that
+ * 'outer' row. For left joins, if no 'inner' rows match, Nothing value will be used.
+ *
+ * All rows from the 'inner' side are used to construct a hash table. Each 'inner' row can be
+ * associated with multiple hash table entries. To avoid space amplification, each 'inner' row is
+ * given a unique sequential id and the hash table maps keys to ids rather than rows themselves.
+ *
+ * This is a binding reflector for the 'inner' side; since the data is materialized in a hash
+ * table, stages higher in the tree cannot see any slots lower in the tree on the  'inner' side.
+ * This is _not_ the case for the 'outer' side, since it can stream data as it probes the hash
+ * table. This stage preserves all slots and order of the 'outer' side.
+ *
+ * The 'outerKeySlot' specifies the slot that contains match keys for the 'outer' row. If the
+ * 'outerKeySlot' slot contains an array, the array items will be used as match keys, otherwise the
+ * slot value itself will be used a single match key.
+ *
+ * The 'innerKeySlot' specifies the slot that contains match keys for the 'inner' row. If the
+ * 'innerKeySlot' slot contains an array, the array items will be used as match keys, otherwise the
+ * slot value itself will be used as a single match key.
+ *
+ * The 'innerProjectSlot' specifies the slot that contains the projected inner row value.
+ *
+ * An optional 'collatorSlot' can be provided to make the match predicate use a special definition
+ * for string equality. For example, this can be used to perform a case-insensitive matching on
+ * string values.
+ *
+ * An optional 'indexSlot' can be provided to get the matching index (in addition to matching
+ * document).
+ *
+ * Debug string representation:
+ *
+ *   hash_lookup_unwind [inner|left] lookupStageOutputSlot collatorSlot? indexSlot?
+ *     outer outerKeySlot outerStage
+ *     inner innerKeySlot innerProject innerStage
+ */
+class HashLookupUnwindStage final : public PlanStage {
+public:
+    HashLookupUnwindStage(std::unique_ptr<PlanStage> outer,
+                          std::unique_ptr<PlanStage> inner,
+                          value::SlotId outerKeySlot,
+                          value::SlotId innerKeySlot,
+                          value::SlotId innerProjectSlot,
+                          value::SlotId lookupStageOutputSlot,
+                          boost::optional<value::SlotId> collatorSlot,
+                          sbe::JoinType joinType,
+                          boost::optional<value::SlotId> indexSlot,
+                          PlanNodeId planNodeId,
+                          bool participateInTrialRunTracking = true);
+
+    std::unique_ptr<PlanStage> clone() const final;
+
+    void prepare(CompileCtx& ctx) final;
+    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
+    void open(bool reOpen) final;
+    PlanState getNext() final;
+    void close() final;
+
+    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
+    const SpecificStats* getSpecificStats() const final;
+    void doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                      DebugPrintInfo& debugPrintInfo) const final;
+    size_t estimateCompileTimeSize() const final;
+
+protected:
+    bool shouldOptimizeSaveState(size_t idx) const final {
+        if (idx == 0) {
+            // HashLookupUnwindStage::getNext() guarantees that the outer child's getNext() method
+            // will be called when '_outerKeyOpen' is false.
+            return !_outerKeyOpen;
+        } else {
+            // HashLookupUnwindStage::getNext() doesn't make any guarantees about the inner child.
+            return false;
+        }
+    }
+
+    void doAttachToOperationContext(OperationContext* opCtx) override;
+    void doDetachFromOperationContext() override;
+
+
+private:
+    using HashTableType = std::unordered_map<value::MaterializedRow,  // NOLINT
+                                             std::vector<size_t>,
+                                             value::MaterializedRowHasher,
+                                             value::MaterializedRowEq>;
+    using BufferType = std::vector<value::MaterializedRow>;
+    using HashKeyAccessor = value::MaterializedRowKeyAccessor<HashTableType::iterator>;
+    using BufferAccessor = value::MaterializedRowAccessor<BufferType>;
+
+    // Resets state of the hash table and miscellany. 'fromClose' == true indicates the call is from
+    // the stage's close() method, so it should also try to shrink its memory footprint.
+    void reset(bool fromClose);
+
+    PlanStage* outerChild() const {
+        return _children[0].get();
+    }
+    PlanStage* innerChild() const {
+        return _children[1].get();
+    }
+
+    const value::SlotId _outerKeySlot;
+    const value::SlotId _innerKeySlot;
+    const value::SlotId _innerProjectSlot;
+    const value::SlotId _lookupStageOutputSlot;
+    const boost::optional<value::SlotId> _collatorSlot;
+
+    value::SlotAccessor* _inOuterMatchAccessor{nullptr};
+    value::SlotAccessor* _inInnerMatchAccessor{nullptr};
+    value::SlotAccessor* _inInnerProjectAccessor{nullptr};
+
+    // Accessor for collator. Only set if collatorSlot provided during construction.
+    value::SlotAccessor* _collatorAccessor{nullptr};
+
+    // Output row of one column containing the lookup-unwind's "as" result.
+    value::MaterializedRow _lookupStageOutput;
+    value::MaterializedSingleRowAccessor _lookupStageOutputAccessor{_lookupStageOutput,
+                                                                    0 /* column */};
+
+    const boost::optional<value::SlotId> _indexSlot;
+    value::OwnedValueAccessor _lookupStageIndexAccessor;
+    int64_t _matchIndex{0};
+
+    // LookupHashTable instance holding the inner collection.
+    LookupHashTable _hashTable;
+    // Tracks whether we are already processing an outer key.
+    bool _outerKeyOpen{false};
+
+    // Left join is used if preserveNullAndEmptyArrays = true.
+    const sbe::JoinType _joinType;
+    bool _innerSideMatched{false};
+
+    void doForceSpill() final {
+        _hashTable.forceSpill();
+        _memoryTracker.value().set(_hashTable.getMemUsage());
+    };
+};  // class HashLookupUnwindStage
+}  // namespace mongo::sbe

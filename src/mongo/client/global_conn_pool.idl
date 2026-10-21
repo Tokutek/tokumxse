@@ -1,0 +1,75 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    connPoolMaxConnsPerHost:
+        description: >
+            New in version 2.6.
+
+            Available for both mongod and mongos.
+
+            Sets the maximum size of the legacy connection pools for
+            outgoing connections to other mongod instances in the global
+            connection pool. The size of a pool does not prevent the
+            creation of additional connections, but does prevent a
+            connection pool from retaining connections in excess of the
+            value of connPoolMaxConnsPerHost.
+
+            Only adjust this setting if your driver does not pool
+            connections and you're using authentication in the context of a
+            sharded cluster.
+
+        set_at:
+            - startup
+
+        cpp_vartype: int
+        cpp_varname: maxConnsPerHost
+        default: 200
+        redact: false
+
+    connPoolMaxInUseConnsPerHost:
+        description: >
+            New in version 3.6.3.
+
+            Available for both mongod and mongos.
+
+            Sets the maximum number of in-use connections at any given time
+            for for outgoing connections to other mongod instances in the
+            legacy global connection pool.
+
+            By default, the parameter is unset.
+
+        set_at:
+            - startup
+
+        cpp_vartype: int
+        cpp_varname: maxInUseConnsPerHost
+        default:
+            expr: std::numeric_limits<int>::max()
+        redact: false
+
+    globalConnPoolIdleTimeoutMinutes:
+        description: >
+            New in version 3.6.3.
+
+            Available for both mongod and mongos.
+
+            Sets the time limit that connection in the legacy global
+            connection pool can remain idle before being closed.
+
+            By default, the parameter is unset.
+
+        set_at:
+            - startup
+
+        cpp_vartype: int
+        cpp_varname: globalConnPoolIdleTimeout
+        default:
+            expr: std::numeric_limits<int>::max()
+        redact: false

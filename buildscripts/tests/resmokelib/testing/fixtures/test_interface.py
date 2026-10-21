@@ -1,0 +1,92 @@
+"""Unit tests for the resmokelib.testing.fixtures.interface module."""
+
+import logging
+import unittest
+from unittest import mock
+
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.fixtures import interface
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
+
+
+class TestFixture(unittest.TestCase):
+    def test_teardown_ok(self):
+        raising_fixture = UnitTestFixture(should_raise=False)
+        raising_fixture.teardown()
+
+    def test_teardown_raise(self):
+        raising_fixture = UnitTestFixture(should_raise=True)
+        with self.assertRaises(errors.ServerFailure):
+            raising_fixture.teardown()
+
+
+class TestGetBinaryVersion(unittest.TestCase):
+    def setUp(self):
+        self.fixture = UnitTestFixture()
+
+    def _patch_output(self, output):
+        return mock.patch(
+            "buildscripts.resmokelib.core.programs.get_binary_version_output",
+            return_value=output,
+        )
+
+    def test_parses_mongod_version(self):
+        with self._patch_output("db version v7.0.0\ngit version: abc123\n"):
+            self.assertEqual(self.fixture._get_binary_version("mongod"), "v7.0.0")
+
+    def test_parses_mongos_version(self):
+        with self._patch_output("mongos version v8.1.0-rc0\nBuild Info: {}\n"):
+            self.assertEqual(self.fixture._get_binary_version("mongos"), "v8.1.0-rc0")
+
+    def test_returns_empty_when_unparseable(self):
+        with self._patch_output("no version info here\n"):
+            self.assertEqual(self.fixture._get_binary_version("mongod"), "")
+
+    def test_returns_empty_on_error(self):
+        with mock.patch(
+            "buildscripts.resmokelib.core.programs.get_binary_version_output",
+            side_effect=RuntimeError("get_binary_version_output failed"),
+        ):
+            self.assertEqual(self.fixture._get_binary_version("mongod"), "")
+
+
+class TestFixtureTeardownHandler(unittest.TestCase):
+    def test_teardown_ok(self):
+        handler = interface.FixtureTeardownHandler(logging.getLogger("handler_unittests"))
+        # Before any teardown.
+        self.assertTrue(handler.was_successful())
+        self.assertIsNone(handler.get_error_message())
+        # Successful teardown.
+        ok_fixture = UnitTestFixture(should_raise=False)
+        handler.teardown(ok_fixture, "ok")
+        # After successful teardown.
+        self.assertTrue(handler.was_successful())
+        self.assertIsNone(handler.get_error_message())
+
+    def test_teardown_error(self):
+        handler = interface.FixtureTeardownHandler(logging.getLogger("handler_unittests"))
+        # Failing teardown.
+        ko_fixture = UnitTestFixture(should_raise=True)
+        handler.teardown(ko_fixture, "ko")
+        # After failed teardown.
+        self.assertFalse(handler.was_successful())
+        expected_msg = "Error while stopping ko: " + UnitTestFixture.ERROR_MESSAGE
+        self.assertEqual(expected_msg, handler.get_error_message())
+
+
+class UnitTestFixture(interface.Fixture):
+    ERROR_MESSAGE = "Failed"
+
+    def __init__(self, should_raise=False):
+        logger = logging.getLogger("fixture_unittests")
+        fixturelib = FixtureLib()
+        interface.Fixture.__init__(self, logger, 99, fixturelib)
+        self._should_raise = should_raise
+
+    def _do_teardown(self, finished=False, mode=None):
+        if self._should_raise:
+            raise errors.ServerFailure(self.ERROR_MESSAGE)
+
+
+if __name__ == "__main__":
+    unittest.main()

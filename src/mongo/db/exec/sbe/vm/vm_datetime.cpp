@@ -1,0 +1,401 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/vm/vm_datetime.h"
+
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+
+#include <cstdint>
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+
+bool isValidTimezone(value::TagValueView timezone, const TimeZoneDatabase* timezoneDB) {
+    if (!value::isString(timezone.tag)) {
+        return false;
+    }
+    auto timezoneStringView = value::getStringView(timezone.tag, timezone.value);
+    return timezoneStringView.empty() || timezoneDB->isTimeZoneIdentifier(timezoneStringView);
+}
+
+TimeZone getTimezone(value::TagValueView timezone, TimeZoneDatabase* timezoneDB) {
+    auto timezoneStr = value::getStringView(timezone.tag, timezone.value);
+    if (timezoneStr.empty()) {
+        return timezoneDB->utcZone();
+    } else {
+        return timezoneDB->getTimeZone(timezoneStr);
+    }
+}
+
+Date_t getDate(value::TagValueView date) {
+    switch (date.tag) {
+        case value::TypeTags::Date: {
+            return Date_t::fromMillisSinceEpoch(value::bitcastTo<int64_t>(date.value));
+        }
+        case value::TypeTags::Timestamp: {
+            return Date_t::fromMillisSinceEpoch(
+                Timestamp(value::bitcastTo<uint64_t>(date.value)).getSecs() * 1000LL);
+        }
+        case value::TypeTags::ObjectId: {
+            auto objIdBuf = value::getObjectIdView(date.value);
+            auto objId = OID::from(objIdBuf);
+            return objId.asDateT();
+        }
+        case value::TypeTags::bsonObjectId: {
+            auto objIdBuf = value::getRawPointerView(date.value);
+            auto objId = OID::from(objIdBuf);
+            return objId.asDateT();
+        }
+        default:
+            MONGO_UNREACHABLE_TASSERT(11122948);
+    }
+}
+
+bool coercibleToDate(value::TypeTags typeTag) {
+    return value::tagIn(typeTag,
+                        value::TypeTags::Date,
+                        value::TypeTags::Timestamp,
+                        value::TypeTags::ObjectId,
+                        value::TypeTags::bsonObjectId);
+}
+
+namespace {
+
+/**
+ * The dayOfYear operation used by genericDayOfOp.
+ */
+struct DayOfYear {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dayOfYear(date);
+    }
+};
+
+/**
+ * The dayOfMonth operation used by genericDayOfOp.
+ */
+struct DayOfMonth {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dayOfMonth(date);
+    }
+};
+
+/**
+ * The dayOfWeek operation used by genericDayOfOp.
+ */
+struct DayOfWeek {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dayOfWeek(date);
+    }
+};
+
+/**
+ * The year operation used by genericExtractFromDate.
+ */
+struct Year {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dateParts(date).year;
+    }
+};
+
+/**
+ * The month operation used by genericExtractFromDate.
+ */
+struct Month {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dateParts(date).month;
+    }
+};
+
+/**
+ * The hour operation used by genericExtractFromDate.
+ */
+struct Hour {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dateParts(date).hour;
+    }
+};
+
+/**
+ * The minute operation used by genericExtractFromDate.
+ */
+struct Minute {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dateParts(date).minute;
+    }
+};
+
+/**
+ * The second operation used by genericExtractFromDate.
+ */
+struct Second {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dateParts(date).second;
+    }
+};
+
+/**
+ * The millisecond operation used by genericExtractFromDate.
+ */
+struct Millisecond {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.dateParts(date).millisecond;
+    }
+};
+
+/**
+ * The week operation used by genericExtractFromDate.
+ */
+struct Week {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.week(date);
+    }
+};
+
+/**
+ * The ISOWeekYear operation used by genericExtractFromDate.
+ */
+struct ISOWeekYear {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.isoYear(date);
+    }
+};
+
+/**
+ * The ISODayOfWeek operation used by genericExtractFromDate.
+ */
+struct ISODayOfWeek {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.isoDayOfWeek(date);
+    }
+};
+
+/**
+ * The ISOWeek operation used by genericExtractFromDate.
+ */
+struct ISOWeek {
+    static void doOperation(const Date_t& date, const TimeZone& timezone, int32_t& result) {
+        result = timezone.isoWeek(date);
+    }
+};
+}  // namespace
+
+/**
+ * This is a simple date expression operation templated by the Op parameter which takes
+ * timezone string as argument
+ */
+template <typename Op>
+value::TagValueMaybeOwned genericDateExpressionAcceptingTimeZone(value::TagValueView tzDB,
+                                                                 value::TagValueView date,
+                                                                 value::TagValueView tz) {
+    // Get date.
+    if (!value::tagIn(date.tag,
+                      value::TypeTags::Date,
+                      value::TypeTags::Timestamp,
+                      value::TypeTags::ObjectId,
+                      value::TypeTags::bsonObjectId)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto dateMs = getDate(date);
+
+    if (tzDB.tag != value::TypeTags::timeZoneDB) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto timezoneDB = value::getTimeZoneDBView(tzDB.value);
+
+    // Get timezone.
+    if (!value::isString(tz.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto timezone = getTimezone(tz, timezoneDB);
+
+    int32_t result;
+    Op::doOperation(dateMs, timezone, result);
+
+    if constexpr (std::is_same<Op, ISOWeekYear>::value) {
+        // convert type to long to be compatible with classic
+        return value::TagValueMaybeOwned::numberInt64(static_cast<int64_t>(result));
+    } else {
+        return value::TagValueMaybeOwned::numberInt32(result);
+    }
+}
+
+/**
+ * This is a simple date expression operation templated by the Op parameter which takes
+ * timezone object as argument
+ */
+template <typename Op>
+value::TagValueMaybeOwned genericDateExpressionAcceptingTimeZone(value::TagValueView date,
+                                                                 value::TagValueView tz) {
+    // Get date.
+    if (!value::tagIn(date.tag,
+                      value::TypeTags::Date,
+                      value::TypeTags::Timestamp,
+                      value::TypeTags::ObjectId,
+                      value::TypeTags::bsonObjectId)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto dateMs = getDate(date);
+
+    if (!value::isTimeZone(tz.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto timezone = *value::getTimeZoneView(tz.value);
+
+    int32_t result;
+    Op::doOperation(dateMs, timezone, result);
+
+    if constexpr (std::is_same<Op, ISOWeekYear>::value) {
+        // convert type to long to be compatible with classic
+        return value::TagValueMaybeOwned::numberInt64(static_cast<int64_t>(result));
+    } else {
+        return value::TagValueMaybeOwned::numberInt32(result);
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::genericDayOfYear(value::TagValueView tzDB,
+                                                     value::TagValueView date,
+                                                     value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<DayOfYear>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericDayOfYear(value::TagValueView date,
+                                                     value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<DayOfYear>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericDayOfMonth(value::TagValueView tzDB,
+                                                      value::TagValueView date,
+                                                      value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<DayOfMonth>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericDayOfMonth(value::TagValueView date,
+                                                      value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<DayOfMonth>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericDayOfWeek(value::TagValueView tzDB,
+                                                     value::TagValueView date,
+                                                     value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<DayOfWeek>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericDayOfWeek(value::TagValueView date,
+                                                     value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<DayOfWeek>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericYear(value::TagValueView tzDB,
+                                                value::TagValueView date,
+                                                value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Year>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericYear(value::TagValueView date, value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Year>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericMonth(value::TagValueView tzDB,
+                                                 value::TagValueView date,
+                                                 value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Month>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericMonth(value::TagValueView date, value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Month>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericHour(value::TagValueView tzDB,
+                                                value::TagValueView date,
+                                                value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Hour>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericHour(value::TagValueView date, value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Hour>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericMinute(value::TagValueView tzDB,
+                                                  value::TagValueView date,
+                                                  value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Minute>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericMinute(value::TagValueView date,
+                                                  value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Minute>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericSecond(value::TagValueView tzDB,
+                                                  value::TagValueView date,
+                                                  value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Second>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericSecond(value::TagValueView date,
+                                                  value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Second>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericMillisecond(value::TagValueView tzDB,
+                                                       value::TagValueView date,
+                                                       value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Millisecond>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericMillisecond(value::TagValueView date,
+                                                       value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Millisecond>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericWeek(value::TagValueView tzDB,
+                                                value::TagValueView date,
+                                                value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Week>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericWeek(value::TagValueView date, value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<Week>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericISOWeekYear(value::TagValueView tzDB,
+                                                       value::TagValueView date,
+                                                       value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<ISOWeekYear>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericISOWeekYear(value::TagValueView date,
+                                                       value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<ISOWeekYear>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericISODayOfWeek(value::TagValueView tzDB,
+                                                        value::TagValueView date,
+                                                        value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<ISODayOfWeek>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericISODayOfWeek(value::TagValueView date,
+                                                        value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<ISODayOfWeek>(date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericISOWeek(value::TagValueView tzDB,
+                                                   value::TagValueView date,
+                                                   value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<ISOWeek>(tzDB, date, tz);
+}
+
+value::TagValueMaybeOwned ByteCode::genericISOWeek(value::TagValueView date,
+                                                   value::TagValueView tz) {
+    return genericDateExpressionAcceptingTimeZone<ISOWeek>(date, tz);
+}
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

@@ -1,0 +1,177 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+
+#include <cstdint>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+
+class DataThrottle;
+class IndexAccessMethod;
+class OperationContext;
+class SortedDataInterface;
+
+/**
+ * Cursor wrapper class that creates a cursor internally and throttles record fetching according to
+ * the DataThrottle instance passed into its constructor.
+ */
+class SeekableRecordThrottleCursor {
+public:
+    SeekableRecordThrottleCursor(OperationContext* opCtx,
+                                 const RecordStore* rs,
+                                 DataThrottle* dataThrottle,
+                                 bool forward = true);
+
+    /**
+     * (Re)creates the underlying cursor in its default starting position -- before the first record
+     * for a forward cursor, or before the last record for a reverse cursor -- so that the next call
+     * to next() returns the first record of the iteration.
+     */
+    void seekToStart(OperationContext* opCtx);
+
+    boost::optional<Record> seekExact(OperationContext* opCtx, const RecordId& id);
+
+    boost::optional<Record> next(OperationContext* opCtx);
+
+    void save() {
+        _cursor->save();
+    }
+
+    [[nodiscard]] bool isForward() const {
+        return _forward;
+    }
+
+    bool restore(RecoveryUnit& ru) {
+        return _cursor->restore(ru);
+    }
+
+    void detachFromOperationContext() {
+        _cursor->detachFromOperationContext();
+    }
+
+    void reattachToOperationContext(OperationContext* opCtx) {
+        _cursor->reattachToOperationContext(opCtx);
+    }
+
+private:
+    const RecordStore& _rs;
+    bool _forward{true};
+    std::unique_ptr<SeekableRecordCursor> _cursor;
+    DataThrottle* _dataThrottle;
+};
+
+/**
+ * Cursor wrapper class that creates a cursor internally and throttles record fetching according to
+ * the DataThrottle instance passed into its constructor.
+ */
+class SortedDataInterfaceThrottleCursor {
+public:
+    SortedDataInterfaceThrottleCursor(OperationContext* opCtx,
+                                      const SortedDataIndexAccessMethod* iam,
+                                      DataThrottle* dataThrottle);
+
+    boost::optional<IndexKeyEntry> seek(OperationContext* opCtx, std::span<const char> key);
+    boost::optional<KeyStringEntry> seekForKeyString(OperationContext* opCtx,
+                                                     std::span<const char> key);
+
+    boost::optional<IndexKeyEntry> next(OperationContext* opCtx);
+    boost::optional<KeyStringEntry> nextKeyString(OperationContext* opCtx);
+
+    void save() {
+        _cursor->save();
+    }
+
+    void restore(RecoveryUnit& ru) {
+        _cursor->restore(ru);
+    }
+
+    void detachFromOperationContext() {
+        _cursor->detachFromOperationContext();
+    }
+
+    void reattachToOperationContext(OperationContext* opCtx) {
+        _cursor->reattachToOperationContext(opCtx);
+    }
+
+    bool isRecordIdAtEndOfKeyString() const {
+        return _cursor->isRecordIdAtEndOfKeyString();
+    }
+
+    void setEndPosition(const BSONObj& key, bool inclusive) {
+        _cursor->setEndPosition(key, inclusive);
+    }
+
+private:
+    std::unique_ptr<SortedDataInterface::Cursor> _cursor;
+    DataThrottle* _dataThrottle;
+};
+
+/**
+ * Throttles the amount of data processed within a unit of time. Puts the thread to sleep via an
+ * opCtx -- so it is interruptible -- whenever the data limit set by the 'maxValidateMBperSec'
+ * server parameter is exceeded before the time unit is done.
+ */
+class DataThrottle {
+public:
+    DataThrottle(long long millisSinceEpoch, std::function<int()> maxMBperSec)
+        : _startMillis(millisSinceEpoch),
+          _bytesProcessed(0),
+          _totalElapsedTimeSec(0),
+          _totalMBProcessed(0),
+          _shouldNotThrottle(false),
+          _maxMBperSec(maxMBperSec) {}
+
+    /**
+     * If throttling is not enabled by calling turnThrottlingOff(), or if
+     * 'maxValidateMBperSec' is not a positive number, then this is a no-op.
+     *
+     * When the accumulated number of bytes processed in each second reaches or exceeds the limit
+     * set by the 'maxValidateMBperSec' server parameter, the throttle mechanism gets engaged to
+     * wait for the remainder of that second by putting the thread to sleep.
+     *
+     * In addition to throttling, while the thread is waiting, its operation context remains
+     * interruptible.
+     */
+    void awaitIfNeeded(OperationContext* opCtx, int64_t dataSize);
+
+    void turnThrottlingOff() {
+        _shouldNotThrottle = true;
+    }
+
+private:
+    // Point-in-time (milliseconds) when tracking for the current second has started.
+    int64_t _startMillis;
+
+    // Number of bytes processed in the current second being tracked by '_startMillis'. This will
+    // contain the number of bytes processed between '_startMillis' and '_startMillis + 999'.
+    uint64_t _bytesProcessed;
+
+    float _totalElapsedTimeSec;
+    float _totalMBProcessed;
+
+    // Whether the throttle should be active.
+    bool _shouldNotThrottle;
+
+    // Will return the rate to throttle. Zero or negative means turn off throttling.
+    std::function<int()> _maxMBperSec;
+};
+
+}  // namespace mongo

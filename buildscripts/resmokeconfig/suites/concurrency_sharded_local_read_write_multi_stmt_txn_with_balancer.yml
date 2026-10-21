@@ -1,0 +1,159 @@
+test_kind: fsm_workload_test
+
+selector:
+  roots:
+    - jstests/concurrency/fsm_workloads/**/*.js
+  exclude_files:
+    # Disabled due to MongoDB restrictions and/or workload restrictions
+
+    # These workloads sometimes trigger 'Could not lock auth data update lock'
+    # errors because the AuthorizationManager currently waits for only five
+    # seconds to acquire the lock for authorization documents
+
+    # uses >100MB of data, which can overwhelm test hosts
+
+    # compact can only be run against a standalone mongod
+
+    # can cause OOM kills on test hosts
+
+    # cannot createIndex after dropDatabase without sharding first
+
+    # The WTWriteConflictException failpoint is not supported on mongos.
+
+    # TODO Undenylist (SERVER-38852).
+
+    # serverStatus does not include transaction metrics on mongos.
+
+    # Uses the same transaction id across different routers, which is not allowed because when either
+    # router tries to commit, it may not know the full participant list.
+
+    # Expects reads to die with a particular error, but other errors are possible if the read is part
+    # of a transaction (e.g. ErrorCodes.LockTimeout).
+    - jstests/concurrency/fsm_workloads/query/drop_index_during_replan.js
+    - jstests/concurrency/fsm_workloads/query/drop_index_during_lookup.js
+
+    ##
+    # Denylists from concurrency_replication_multi_stmt_txn
+    ##
+
+    # Relies on having one thread observe writes from the other threads, which won't become visible
+    # once a transaction in the thread is started because it'll keep reading from the same snapshot.
+
+    ##
+    # Denylists from concurrency_sharded_multi_stmt_txn
+    ##
+
+    # Use updates that do not contain the shard key, so they are rejected before any commands are
+    # sent to participant shards, but these workloads do not fail, so the auto retry transaction logic
+    # attempts to commit, which fails because no participants have been contacted.
+    - jstests/concurrency/fsm_workloads/query/update/update_rename.js
+    - jstests/concurrency/fsm_workloads/query/update/update_rename_noindex.js
+
+    # This test runs a large number of inserts, which can cause moveCollection to take a long time
+    # to finish. This can cause the CheckMetadataConsistency hook to hit LockBusy errors.
+
+  exclude_with_any_tags:
+    - requires_standalone
+    - assumes_balancer_off
+    - assumes_against_mongod_not_mongos
+    # Sharing cursors between state functions will fail in this suite because it will attempt to use
+    # the same cursor in multiple transactions.
+    - state_functions_share_cursor
+    # These start a transaction in one state function and use it in other state functions. This suite
+    # would instead execute each state function as its own transaction.
+    - state_functions_share_transaction
+    # Are meant to test transactions with snapshot read concern.
+    - assumes_snapshot_transactions
+    # Tests which expect commands to fail and catch the error can cause transactions to abort and
+    # retry indefinitely.
+    - catches_command_failures
+    # mongos has no system.profile collection.
+    - requires_profiling
+    - does_not_support_transactions
+    - assumes_unsharded_collection
+    # Time-series collections do not support write transactions
+    - requires_timeseries
+    # We do NOT exclude all tests tagged with 'requires_getmore', but we do exclude tests tagged with
+    # the more specific 'uses_getmore_outside_of_transaction'. Tests that use a getMore are generally
+    # incompatible with suites that run background moveCollections because moveCollection's commit
+    # will drop the original collection, leading to QueryPlanKilled. However in this suite because all operations
+    # are wrapped within a txn, if a getMore fails due to QueryPlanKilled the entire txn will be
+    # retried, including the getMore.
+    # A very small number of tests run a getMore in the same state function as an operation that is
+    # incompatible with txns (such as dropDatabase or $out). When this happens, the entire state function is run
+    # outside a txn. Therefore, because the getMore will also be run outside a txn, it once again becomes
+    # incompatible with background moveCollection and the test must be excluded.
+    - uses_getmore_outside_of_transaction
+    # implicitly_retry_on_migration_in_progress.js alters find/aggregate commands
+    # so that the whole result set is returned through a single batch
+    - assumes_no_implicit_cursor_exhaustion
+
+executor:
+  archive:
+    hooks:
+      - CheckReplDBHashInBackground
+      - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
+      - ValidateCollections
+    tests: true
+  config:
+    shell_options:
+      eval: >-
+        await import("jstests/libs/override_methods/implicitly_shard_accessed_collections.js");
+        await import("jstests/libs/override_methods/implicitly_retry_crud_on_no_progress_made.js");
+        await import("jstests/libs/override_methods/implicitly_retry_on_migration_in_progress.js");
+      global_vars:
+        TestData:
+          # Reads and writes outside of transactions will not have their read or write concerns
+          # changed.
+          defaultTransactionReadConcernLevel: "local"
+          defaultTransactionWriteConcernW: 1
+          runInsideTransaction: true
+          # Neither causal consistency nor majority write concern is required because tests in this
+          # suite only read from primaries, only one node is electable in each shard, and they use
+          # transactions with "local" level read concern, which should see all applied writes,
+          # including those that have not been majority replicated.
+          runningWithCausalConsistency: false
+          runningWithSessions: true
+          traceExceptions: false
+          runningWithBalancer: true
+          implicitlyShardOnCreateCollectionOnly: true
+          shardCollectionProbability: 0.5
+
+  hooks:
+    # TODO SERVER-120162: Re-enable once all the false positive have been addressed and the test is stable.
+    # - class: CheckIdleCursors
+    - class: CheckShardFilteringMetadata
+    - class: CheckReplDBHashInBackground
+    - class: CheckReplDBHash
+    - class: CheckMetadataConsistencyInBackground
+    - class: CheckOrphansDeleted
+    - class: CheckRoutingTableConsistency
+    - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
+    - class: CleanupConcurrencyWorkloads
+  fixture:
+    class: ShardedClusterFixture
+    mongos_options:
+      set_parameters:
+        enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
+    shard_options:
+      mongod_options:
+        oplogSize: 1024
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
+        queryAnalysisWriterIntervalSecs: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
+        skipDroppingHashedShardKeyIndex: true
+        reshardingMinimumOperationDurationMillis: 0
+        failpoint.overrideDDLLockTimeout:
+          mode: alwaysOn
+          data:
+            blockTimeMS: 900000 # 15 * 60 * 1000
+    num_rs_nodes_per_shard: 3
+    num_shards: 2
+    num_mongos: 2
+    enable_balancer: true
+    random_migrations: true

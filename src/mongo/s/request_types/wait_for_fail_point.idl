@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# waitForFailPoint IDL file
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    waitForFailPoint:
+        description: "wait for a fail point to be entered a certain number of times"
+        command_name: waitForFailPoint
+        strict: false
+        namespace: type
+        api_version: ""
+        type: string
+        fields:
+            timesEntered:
+                type: safeInt64
+                description: "The target number of times the fail point has been entered."
+                optional: false

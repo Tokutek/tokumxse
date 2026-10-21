@@ -1,0 +1,217 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the internal commands sent by the resharding coordinator to shard servers.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/s/resharding/common_types.idl"
+
+structs:
+    ShardsvrReshardingDonorFetchFinalCollectionStatsResponse:
+        description: "Response for the _shardsvrReshardingDonorFetchFinalCollectionStats command."
+        is_command_reply: true
+        strict: false
+        fields:
+            documentsDelta:
+                type: safeInt64
+                description: "The change in the number of documents since the provided cloneTimestamp."
+
+    ShardsvrReshardingRecipientFetchFinalCollectionStatsResponse:
+        description: "Response for the _shardsvrReshardingRecipientFetchFinalCollectionStats command."
+        is_command_reply: true
+        strict: false
+        fields:
+            documentsDelta:
+                type: safeInt64
+                description: "The change in the number of documents during the applying phase."
+
+    ShardsvrReshardingDonorGetCloneCountResponse:
+        description: "Response for the _shardsvrReshardingDonorGetCloneCount command."
+        is_command_reply: true
+        strict: false
+        fields:
+            documentsToCopy:
+                type: safeInt64
+                description: "Number of owned documents on this donor at the clone timestamp."
+
+commands:
+    _shardsvrReshardDonorInitialize:
+        description:
+            "The internal command sent by the coordinator to donor shards to
+            initialize the resharding donor state machine."
+        command_name: _shardsvrReshardDonorInitialize
+        cpp_name: ShardsvrReshardDonorInitialize
+        type: uuid
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+        fields:
+            commonReshardingMetadata: CommonReshardingMetadata
+            recipientShards:
+                type: array<shard_id>
+                description: "The list of recipient shards participating in the resharding operation."
+
+    _shardsvrReshardingDonorStartChangeStreamsMonitor:
+        command_name: _shardsvrReshardingDonorStartChangeStreamsMonitor
+        cpp_name: ShardsvrReshardingDonorStartChangeStreamsMonitor
+        description:
+            "The internal command for making a resharding donor shard start monitoring the
+            changes in the collection being resharded between the start of
+            the cloning phase and the start of the critical section."
+        namespace: type
+        type: namespacestring
+        reply_type: OkReply
+        api_version: ""
+        strict: false
+        fields:
+            reshardingUUID:
+                type: uuid
+                description: "The UUID for the resharding operation."
+            cloneTimestamp:
+                type: timestamp
+                description: "The clone timestamp for the resharding operation."
+
+    _shardsvrReshardingDonorFetchFinalCollectionStats:
+        command_name: _shardsvrReshardingDonorFetchFinalCollectionStats
+        cpp_name: ShardsvrReshardingDonorFetchFinalCollectionStats
+        description:
+            "The internal command for querying a resharding donor shard for the changes in
+            the number of documents in the collection being resharded between the start of
+            the cloning phase and the start of the critical section."
+        namespace: type
+        type: namespacestring
+        reply_type: ShardsvrReshardingDonorFetchFinalCollectionStatsResponse
+        api_version: ""
+        strict: false
+        fields:
+            reshardingUUID:
+                type: uuid
+                description: "The UUID for the resharding operation."
+
+    _shardsvrReshardingRecipientFetchFinalCollectionStats:
+        command_name: _shardsvrReshardingRecipientFetchFinalCollectionStats
+        cpp_name: ShardsvrReshardingRecipientFetchFinalCollectionStats
+        description:
+            "The internal command for querying a resharding recipient shard for the changes in
+            the number of documents in the collection being resharded during the applying phase."
+        namespace: type
+        type: namespacestring
+        reply_type: ShardsvrReshardingRecipientFetchFinalCollectionStatsResponse
+        api_version: ""
+        strict: false
+        fields:
+            reshardingUUID:
+                type: uuid
+                description: "The UUID for the resharding operation."
+
+    _shardsvrReshardingDonorGetCloneCount:
+        command_name: _shardsvrReshardingDonorGetCloneCount
+        cpp_name: ShardsvrReshardingDonorGetCloneCount
+        description:
+            "The internal command sent by the coordinator to a resharding donor shard to count
+            the documents owned by this donor at the clone timestamp."
+        namespace: type
+        type: namespacestring
+        reply_type: ShardsvrReshardingDonorGetCloneCountResponse
+        api_version: ""
+        strict: false
+        fields:
+            reshardingUUID:
+                type: uuid
+                description: "The UUID for the resharding operation."
+            cloneTimestamp:
+                type: timestamp
+                description: "The clone timestamp for the resharding operation."
+
+    _shardsvrReshardRecipientInitialize:
+        description:
+            "The internal command sent by the coordinator to recipient shards to
+            initialize the resharding recipient state machine."
+        command_name: _shardsvrReshardRecipientInitialize
+        cpp_name: ShardsvrReshardRecipientInitialize
+        type: uuid
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+        fields:
+            commonReshardingMetadata: CommonReshardingMetadata
+            recipientOptions: ReshardingRecipientOptions
+
+    _shardsvrReshardRecipientClone:
+        description: "The internal recipient clone command."
+        command_name: _shardsvrReshardRecipientClone
+        cpp_name: ShardsvrReshardRecipientClone
+        type: uuid
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+        fields:
+            cloneTimestamp:
+                type: timestamp
+                description: "The timestamp for the snapshot read while cloning from the donors."
+            donorShards:
+                type: array<DonorShardFetchTimestamp>
+                description: "The list of donors to clone from."
+            approxCopySize:
+                type: ReshardingApproxCopySize
+                description: "Not meant to be used directly. Only use internal fields."
+
+    _shardsvrReshardDonorCriticalSectionStarted:
+        description:
+            "The internal command sent by the coordinator to donor shards to notify them that
+            the critical section has started."
+        command_name: _shardsvrReshardDonorCriticalSectionStarted
+        cpp_name: ShardsvrReshardDonorCriticalSectionStarted
+        type: uuid
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+
+    _shardsvrReshardDonorRecipientsFinishedCloning:
+        description:
+            "The internal command sent by the coordinator to donor shards to notify them that
+            all recipients have finished cloning."
+        command_name: _shardsvrReshardDonorRecipientsFinishedCloning
+        cpp_name: ShardsvrReshardDonorRecipientsFinishedCloning
+        type: uuid
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+
+    _shardsvrReshardRecipientCriticalSectionStarted:
+        description:
+            "The internal command run by coordinator against recipients to notify them that the
+            critical section has started."
+        command_name: _shardsvrReshardRecipientCriticalSectionStarted
+        cpp_name: ShardsvrReshardRecipientCriticalSectionStarted
+        type: uuid
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+
+    _shardsvrReshardCleanupStaleChunks:
+        description:
+            "Internal command meant to clean up stale chunk information from the authoritative
+            shard catalog"
+        command_name: _shardsvrReshardCleanupStaleChunks
+        cpp_name: ShardsvrReshardCleanupStaleChunks
+        type: namespacestring
+        strict: false
+        namespace: type
+        reply_type: OkReply
+        api_version: ""
+        fields:
+            oldUUID:
+                type: uuid
+                description: "Old UUID of the collection before resharding succeeded"

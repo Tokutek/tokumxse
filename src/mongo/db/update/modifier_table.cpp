@@ -1,0 +1,110 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/modifier_table.h"
+
+#include "mongo/db/update/addtoset_node.h"
+#include "mongo/db/update/arithmetic_node.h"
+#include "mongo/db/update/bit_node.h"
+#include "mongo/db/update/compare_node.h"
+#include "mongo/db/update/conflict_placeholder_node.h"
+#include "mongo/db/update/current_date_node.h"
+#include "mongo/db/update/pop_node.h"
+#include "mongo/db/update/pull_node.h"
+#include "mongo/db/update/pullall_node.h"
+#include "mongo/db/update/push_node.h"
+#include "mongo/db/update/rename_node.h"
+#include "mongo/db/update/set_node.h"
+#include "mongo/db/update/unset_node.h"
+#include "mongo/db/update/update_node.h"
+
+#include <algorithm>
+#include <array>
+#include <memory>
+#include <string_view>
+#include <utility>
+
+namespace mongo::modifiertable {
+namespace {
+using namespace std::literals::string_view_literals;
+struct OrderByName {
+    constexpr std::string_view lens(std::string_view x) const {
+        return x;
+    }
+    template <typename... T>
+    constexpr std::string_view lens(const std::pair<T...>& x) const {
+        return lens(x.first);
+    }
+
+    template <typename A, typename B>
+    constexpr bool operator()(const A& a, const B& b) const {
+        return std::less<>{}(lens(a), lens(b));
+    }
+};
+
+constexpr auto names = std::to_array<std::pair<std::string_view, ModifierType>>({
+    {"$addToSet"sv, MOD_ADD_TO_SET},
+    {"$bit"sv, MOD_BIT},
+    {"$currentDate"sv, MOD_CURRENTDATE},
+    {"$inc"sv, MOD_INC},
+    {"$max"sv, MOD_MAX},
+    {"$min"sv, MOD_MIN},
+    {"$mul"sv, MOD_MUL},
+    {"$pop"sv, MOD_POP},
+    {"$pull"sv, MOD_PULL},
+    {"$pullAll"sv, MOD_PULL_ALL},
+    {"$push"sv, MOD_PUSH},
+    {"$rename"sv, MOD_RENAME},
+    {"$set"sv, MOD_SET},
+    {"$setOnInsert"sv, MOD_SET_ON_INSERT},
+    {"$unset"sv, MOD_UNSET},
+});
+static_assert(std::is_sorted(names.begin(), names.end(), OrderByName{}), "Must be sorted by name");
+
+}  // namespace
+
+ModifierType getType(std::string_view typeStr) {
+    auto [it1, it2] = std::equal_range(names.begin(), names.end(), typeStr, OrderByName{});
+    return it1 == it2 ? MOD_UNKNOWN : it1->second;
+}
+
+std::unique_ptr<UpdateLeafNode> makeUpdateLeafNode(ModifierType modType) {
+    switch (modType) {
+        case MOD_ADD_TO_SET:
+            return std::make_unique<AddToSetNode>();
+        case MOD_BIT:
+            return std::make_unique<BitNode>();
+        case MOD_CONFLICT_PLACEHOLDER:
+            return std::make_unique<ConflictPlaceholderNode>();
+        case MOD_CURRENTDATE:
+            return std::make_unique<CurrentDateNode>();
+        case MOD_INC:
+            return std::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kAdd);
+        case MOD_MAX:
+            return std::make_unique<CompareNode>(CompareNode::CompareMode::kMax);
+        case MOD_MIN:
+            return std::make_unique<CompareNode>(CompareNode::CompareMode::kMin);
+        case MOD_MUL:
+            return std::make_unique<ArithmeticNode>(ArithmeticNode::ArithmeticOp::kMultiply);
+        case MOD_POP:
+            return std::make_unique<PopNode>();
+        case MOD_PULL:
+            return std::make_unique<PullNode>();
+        case MOD_PULL_ALL:
+            return std::make_unique<PullAllNode>();
+        case MOD_PUSH:
+            return std::make_unique<PushNode>();
+        case MOD_RENAME:
+            return std::make_unique<RenameNode>();
+        case MOD_SET:
+            return std::make_unique<SetNode>();
+        case MOD_SET_ON_INSERT:
+            return std::make_unique<SetNode>(UpdateNode::Context::kInsertOnly);
+        case MOD_UNSET:
+            return std::make_unique<UnsetNode>();
+        default:
+            return nullptr;
+    }
+}
+
+}  // namespace mongo::modifiertable

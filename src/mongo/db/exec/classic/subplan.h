@@ -1,0 +1,231 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/db/exec/classic/multi_plan.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/requires_all_indices_stage.h"
+#include "mongo/db/exec/classic/subplanning_utils.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+#include <string_view>
+#include <vector>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+class OperationContext;
+
+/**
+ * The SubplanStage is used for rooted $or queries. It plans each clause of the $or
+ * individually, and then creates an overall query plan based on the winning plan from
+ * each clause.
+ *
+ * Uses the MultiPlanStage in order to rank plans for the individual clauses.
+ *
+ * Notes on caching strategy:
+ *
+ *   --Interaction with the plan cache is done on a per-clause basis. For a given clause C,
+ *   if there is a plan in the cache for shape C, then C is planned using the index tags
+ *   obtained from the plan cache entry. If no cached plan is found for C, then a MultiPlanStage
+ *   is used to determine the best plan for the clause; unless there is a tie between multiple
+ *   candidate plans, the winner is inserted into the plan cache and used to plan subsequent
+ *   executions of C. These subsequent executions of shape C could be either as a clause in
+ *   another rooted $or query, or shape C as its own query.
+ *
+ *   --Plans for entire rooted $or queries are neither written to nor read from the plan cache.
+ */
+class SubplanStage final : public RequiresAllIndicesStage {
+public:
+    struct PlanSelectionCallbacks {
+        /**
+         * Called after plan selection is performed for an individual $or branch.
+         */
+        MultiPlanStage::OnPickBestPlan onPickPlanForBranch;
+
+        /**
+         * In some cases, the 'SubplanStage' may fall back to performing regular multi-planning for
+         * the entire query. In this case, it will call this callback rather than
+         * 'onPickPlanForBranch'.
+         */
+        MultiPlanStage::OnPickBestPlan onPickPlanWholeQuery;
+    };
+
+    SubplanStage(ExpressionContext* expCtx,
+                 CollectionAcquisition collection,
+                 WorkingSet* ws,
+                 const CanonicalQuery* cq,
+                 PlanSelectionCallbacks PlanSelectionCallbacks);
+
+    static bool canUseSubplanning(const CanonicalQuery& query);
+    static bool needsSubplanning(const CanonicalQuery& query) {
+        return query.getExpCtx()->getQueryKnobConfiguration().getPlanOrChildrenIndependently() &&
+            SubPlanningUtils::canUseSubplanning(query);
+    }
+
+    bool isEOF() const final;
+    StageState doWork(WorkingSetID* out) final;
+
+    StageType stageType() const final {
+        return STAGE_SUBPLAN;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() override;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static constexpr std::string_view kStageType = "SUBPLAN"sv;
+
+    /**
+     * Selects a plan using subplanning. First uses the query planning results from
+     * planSubqueries() and the multi plan stage to select the best plan for each branch.
+     *
+     * If this effort fails, then falls back on planning the whole query normally rather
+     * then planning $or branches independently.
+     *
+     * If 'shouldConstructClassicExecutableTree' is true, builds a classic executable tree and
+     * appends it to the stage's children. If 'shouldConstructClassicExecutableTree' is false, it
+     * means we are using the sub planner for SBE queries, and do not need to build a classic
+     * executable tree. 'shouldConstructClassicExecutableTree' is true by default.
+     *
+     * If 'yieldPolicy' is non-NULL, then all locks may be yielded in between round-robin
+     * works of the candidate plans. By default, 'yieldPolicy' is NULL and no yielding will
+     * take place.
+     *
+     * Returns a non-OK status if query planning fails. In particular, this function returns
+     * ErrorCodes::QueryPlanKilled if the query plan was killed during a yield, or
+     * ErrorCodes::MaxTimeMSExpired if the operation has exceeded its time limit.
+     */
+    Status pickBestPlan(const QueryPlannerParams& plannerParams,
+                        PlanYieldPolicy* yieldPolicy,
+                        bool shouldConstructClassicExecutableTree = true);
+
+    //
+    // For testing.
+    //
+
+    /**
+     * Returns true if the i-th branch was planned by retrieving a cached solution,
+     * otherwise returns false.
+     */
+    bool branchPlannedFromCache(size_t i) const {
+        tassert(11051620,
+                str::stream() << "Branch id " << i << " points beyond the total number of branches "
+                              << _branchPlannedFromCache.size(),
+                i < _branchPlannedFromCache.size());
+        return _branchPlannedFromCache[i];
+    }
+
+    /**
+     * Provide access to the query solution for our composite solution. Does not relinquish
+     * ownership.
+     */
+    QuerySolution* compositeSolution() const {
+        return _compositeSolution.get();
+    }
+
+    /**
+     * Extracts the best query solution. If the sub planner falls back to the multi planner,
+     * extracts the best solution from the multi planner, otherwise extracts the composite solution.
+     */
+    std::unique_ptr<QuerySolution> extractBestWholeQuerySolution() {
+        if (usesMultiplanning()) {
+            return multiPlannerStage()->extractBestSolution();
+        }
+        return std::move(_compositeSolution);
+    }
+
+    /**
+     * Returns true if the sub planner fell back to multiplanning.
+     */
+    bool usesMultiplanning() const {
+        return _usesMultiplanning;
+    }
+
+    /**
+     * Returns the strategy that selected the winning plan. Only meaningful after pickBestPlan().
+     *
+     * A rooted $or is planned per branch, and different branches can be decided differently: CBR
+     * ranks a branch when it can estimate all of its candidates, the multi-planner ranks a branch
+     * whose candidates CBR could not estimate (or every branch, when the ranker is the
+     * multi-planner), a branch with a cache entry is tagged from the cache, and a branch with a
+     * sole solution is tagged directly. There is therefore no single strategy for the operation,
+     * so this reports the highest-precedence strategy used by any branch, ordered multi-planner
+     * over CBR over a cache hit over a lone candidate.
+     *
+     * When subplanning is abandoned for the whole-query fallback, the fallback's own choice is
+     * reported instead, because that is the plan being run.
+     *
+     * TODO SERVER-131818: revisit this once CBR fully supports rooted $or. Collapsing the branches
+     * by precedence is a best-effort approximation; we likely want to report the list of per-branch
+     * strategies rather than a single one.
+     */
+    PlanSelectionStrategy planSelectionStrategy() const;
+
+    /**
+     * Returns the MultiPlan stage.
+     */
+    MultiPlanStage* multiPlannerStage() {
+        tassert(8524100,
+                "The sub planner stage should fall back to the multi planner.",
+                _usesMultiplanning);
+        return static_cast<MultiPlanStage*>(child().get());
+    }
+
+
+private:
+    /**
+     * Used as a fallback if subplanning fails. Helper for pickBestPlan().
+     */
+    Status choosePlanWholeQuery(const QueryPlannerParams& plannerParams,
+                                PlanYieldPolicy* yieldPolicy,
+                                bool shouldConstructClassicExecutableTree);
+
+    // Not owned here.
+    WorkingSet* _ws;
+
+    // Not owned here.
+    const CanonicalQuery* _query;
+
+    // If we successfully create a "composite solution" by planning each $or branch
+    // independently, that solution is owned here.
+    std::unique_ptr<QuerySolution> _compositeSolution;
+
+    // Indicates whether i-th branch of the rooted $or query was planned from a cached solution.
+    std::vector<bool> _branchPlannedFromCache;
+
+    // Callbacks to pass through to 'MultiPlanStage'.
+    PlanSelectionCallbacks _planSelectionCallbacks;
+
+    // Indicates whether the sub planner has fallen back to multi planning.
+    bool _usesMultiplanning = false;
+
+    // Indicates that per-branch planning was abandoned and a whole query plan was chosen instead,
+    // which is then what 'planSelectionStrategy()' reports on. Set only once that plan exists.
+    bool _usesWholeQueryPlan = false;
+
+    // Indicates whether at least one $or branch had more than one candidate solution and was
+    // therefore ranked by the multi-planner.
+    bool _anyBranchMultiPlanned = false;
+
+    // Indicates whether CBR estimated all of the candidates of at least one $or branch and chose
+    // that branch's winner.
+    bool _anyBranchCostBasedRanked = false;
+};
+}  // namespace mongo

@@ -1,0 +1,58 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/global_catalog/ddl/configsvr_coordinator.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+enums:
+    SetClusterParameterCoordinatorPhase:
+        description: "Current set cluster parameter state."
+        type: string
+        values:
+            kUnset: "unset"
+            kSetClusterParameter: "setClusterParameter"
+
+structs:
+    SetClusterParameterCoordinatorDocument:
+        description: "Document to store the POS state"
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ConfigsvrCoordinatorMetadata: ConfigsvrCoordinatorMetadata
+        fields:
+            phase:
+                type: SetClusterParameterCoordinatorPhase
+                description: "Coordinator phase."
+                default: kUnset
+            parameter:
+                type: object_owned
+                description: "Parameter to be set in the cluster"
+            tenantId:
+                type: tenant_id
+                description: "Tenant ID associated with parameter to be set"
+                optional: true
+            clusterParameterTime:
+                type: timestamp
+                description: "Timestamp determined at the beginning that determines the parameter time."
+                optional: true
+            previousTime:
+                type: logicalTime
+                description: >-
+                    "Expected current cluster parameter time for this parameter before the
+                    'setClusterParameter' invocation. If this current time does not match the
+                    'previousTime' persisted in the 'config.clusterParameters' collection then
+                    'setClusterParameter' will fail unless the 'parameter' value matches the current
+                    cluster parameter value."
+                optional: true
+            compatibleWithTopologyChange:
+                type: bool
+                description:
+                    "If true, this cluster parameter change can run during a topology
+                    change"
+                optional: true

@@ -1,0 +1,450 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# List describing the ActionTypes that should be created.
+# Please note that the order of the elements is not guaranteed to be the same across versions.
+# This means that the integer value assigned to each ActionType and used internally in ActionSet
+# also may change between versions.
+#
+# Actions marked "ID only" are not used for permission checks, but to identify events in logs.
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ActionType:
+        description: "test"
+        type: string
+        values:
+            addShard: "addShard"
+            advanceClusterTime: "advanceClusterTime"
+            listClusterCatalog: "listClusterCatalog"
+            allCollectionStats: "allCollectionStats"
+            analyze: "analyze"
+            analyzeShardKey: "analyzeShardKey"
+            anyAction: "anyAction" # Special ActionType that represents *all* actions
+            appendOplogNote: "appendOplogNote"
+            applicationMessage: "applicationMessage"
+            auditConfigure: "auditConfigure"
+            auditLogRotate: "auditLogRotate" # ID only
+            authCheck: "authCheck" # ID only
+            authenticate: "authenticate" # ID only
+            authSchemaUpgrade: "authSchemaUpgrade"
+            bypassDefaultMaxTimeMS: "bypassDefaultMaxTimeMS"
+            bypassDocumentValidation: "bypassDocumentValidation"
+            bypassWriteBlockingMode: "bypassWriteBlockingMode"
+            bypassReplicaSetWritesBlocking: "bypassReplicaSetWritesBlocking"
+            changeCustomData: "changeCustomData"
+            changePassword: "changePassword"
+            changeOwnPassword: "changeOwnPassword"
+            changeOwnCustomData: "changeOwnCustomData"
+            changeStream: "changeStream"
+            checkFreeMonitoringStatus: "checkFreeMonitoringStatus" # Removed (backwards compatibility)
+            checkMetadataConsistency: "checkMetadataConsistency"
+            cleanupOrphaned: "cleanupOrphaned"
+            clearJumboFlag: "clearJumboFlag"
+            cleanupStructuredEncryptionData: "cleanupStructuredEncryptionData"
+            closeAllDatabases: "closeAllDatabases" # Deprecated (backwards compatibility)
+            collMod: "collMod"
+            collStats: "collStats"
+            compact: "compact"
+            compactStructuredEncryptionData: "compactStructuredEncryptionData"
+            configureQueryAnalyzer: "configureQueryAnalyzer"
+            connPoolStats: "connPoolStats"
+            connPoolSync: "connPoolSync"
+            convertToCapped: "convertToCapped"
+            cpuProfiler: "cpuProfiler"
+            createCollection: "createCollection"
+            createDatabase: "createDatabase" # ID only
+            createIndex: "createIndex" # ID only
+            createRole: "createRole"
+            createSearchIndexes: "createSearchIndexes"
+            createUser: "createUser"
+            dbCheck: "dbCheck"
+            dbHash: "dbHash"
+            dbStats: "dbStats"
+            dropAllRolesFromDatabase: "dropAllRolesFromDatabase" # ID only
+            dropAllUsersFromDatabase: "dropAllUsersFromDatabase" # ID only
+            dropCollection: "dropCollection"
+            dropConnections: "dropConnections"
+            dropDatabase: "dropDatabase"
+            dropIndex: "dropIndex"
+            dropRole: "dropRole"
+            dropSearchIndex: "dropSearchIndex"
+            dropUser: "dropUser"
+            emptycapped: "emptycapped" # Deprecated (backwards compatibility)
+            enableProfiler: "enableProfiler"
+            enableSharding: "enableSharding"
+            eseRotateActiveKEK: "eseRotateActiveKEK"
+            exportCollection: "exportCollection"
+            find: "find"
+            flushRouterConfig: "flushRouterConfig"
+            forceUUID: "forceUUID"
+            fsync: "fsync"
+            fsyncUnlock: "fsyncUnlock" # Deprecated in favor of unlock (refer to:SERVER-89642)
+            getClusterParameter: "getClusterParameter"
+            getCmdLineOpts: "getCmdLineOpts"
+            getCompleteCollStats: "getCompleteCollStats"
+            getCompleteReplSetStatus: "getCompleteReplSetStatus"
+            getCompleteServerStatus: "getCompleteServerStatus"
+            getDatabaseVersion: "getDatabaseVersion"
+            getDefaultRWConcern: "getDefaultRWConcern"
+            getESECMKIdentifierListStatus: "getESECMKIdentifierListStatus"
+            getESERotateActiveKEKStatus: "getESERotateActiveKEKStatus"
+            getLog: "getLog"
+            getParameter: "getParameter"
+            getShardMap: "getShardMap"
+            getShardVersion: "getShardVersion"
+            getTransitionToDedicatedConfigServerStatus: "getTransitionToDedicatedConfigServerStatus"
+            getUnfilteredMetrics: "getUnfilteredMetrics"
+            grantRole: "grantRole"
+            grantPrivilegesToRole: "grantPrivilegesToRole" # ID only
+            grantRolesToRole: "grantRolesToRole" # ID only
+            grantRolesToUser: "grantRolesToUser" # ID only
+            hostInfo: "hostInfo"
+            impersonate: "impersonate"
+            importCollection: "importCollection"
+            indexStats: "indexStats"
+            inprog: "inprog"
+            insert: "insert"
+            internal: "internal" # Special action type that represents internal actions
+            invalidateUserCache: "invalidateUserCache"
+            issueDirectShardOperations: "issueDirectShardOperations"
+            killAnyCursor: "killAnyCursor"
+            killAnySession: "killAnySession"
+            killCursors: "killCursors" # Deprecated in favor of killAnyCursor
+            killop: "killop"
+            listCachedAndActiveUsers: "listCachedAndActiveUsers"
+            listCollections: "listCollections"
+            listCursors: "listCursors"
+            listDatabases: "listDatabases"
+            listExtensions: "listExtensions"
+            listIndexes: "listIndexes"
+            listSampledQueries: "listSampledQueries"
+            listSearchIndexes: "listSearchIndexes"
+            listSessions: "listSessions"
+            listShards: "listShards"
+            logApplicationMessage: "logApplicationMessage"
+            logRotate: "logRotate"
+            updateSearchIndex: "updateSearchIndex"
+            manageMetricsFiltering: "manageMetricsFiltering"
+            moveChunk: "moveChunk"
+            moveCollection: "moveCollection"
+            netstat: "netstat"
+            oidcListKeys: "oidcListKeys"
+            oidcRefreshKeys: "oidcRefreshKeys"
+            oidReset: "oidReset" # machine ID reset via the features command
+            planCacheIndexFilter: "planCacheIndexFilter" # view/update index filters
+            planCacheRead: "planCacheRead" # view contents of plan cache
+            planCacheWrite: "planCacheWrite" # clear cache, drop cache entry, pin/unpin/shun plans
+            querySettings: "querySettings" # allows to set and retrieve querySettings
+            queryStatsRead: "queryStatsRead" # view untransformed contents of queryStats store
+            queryStatsReadTransformed: "queryStatsReadTransformed" # view transformed contents of queryStats store
+            performRawDataOperations: "performRawDataOperations" # allow operations that use the rawData field
+            blockReplicaSetWrites: "blockReplicaSetWrites"
+            readBackupFile: "readBackupFile" # run $_backupFile aggregation
+            refineCollectionShardKey: "refineCollectionShardKey"
+            reIndex: "reIndex"
+            releaseMemoryAnyCursor: "releaseMemoryAnyCursor"
+            remove: "remove"
+            removeShard: "removeShard"
+            renameCollection: "renameCollection" # ID only
+            renameCollectionSameDB: "renameCollectionSameDB"
+            repairDatabase: "repairDatabase" # Deprecated (backwards compatibility)
+            repairReplicatedMetadata: "repairReplicatedMetadata"
+            replSetConfigure: "replSetConfigure"
+            replSetGetConfig: "replSetGetConfig"
+            replSetGetStatus: "replSetGetStatus"
+            replSetHeartbeat: "replSetHeartbeat"
+            replSetReconfig: "replSetReconfig" # ID only
+            replSetResizeOplog: "replSetResizeOplog"
+            replSetStateChange: "replSetStateChange"
+            reshardCollection: "reshardCollection"
+            resync: "resync"
+            revokeRole: "revokeRole"
+            revokePrivilegesFromRole: "revokePrivilegesFromRole" # ID only
+            revokeRolesFromRole: "revokeRolesFromRole" # ID only
+            revokeRolesFromUser: "revokeRolesFromUser" # ID only
+            rewriteCollection: "rewriteCollection"
+            rotateCertificates: "rotateCertificates"
+            runAsLessPrivilegedUser: "runAsLessPrivilegedUser"
+            serverStatus: "serverStatus"
+            setAuthenticationRestriction: "setAuthenticationRestriction"
+            setClusterParameter: "setClusterParameter"
+            setDefaultRWConcern: "setDefaultRWConcern"
+            setFeatureCompatibilityVersion: "setFeatureCompatibilityVersion"
+            setFreeMonitoring: "setFreeMonitoring" # Removed (backwards compatibility)
+            setParameter: "setParameter"
+            setUserWriteBlockMode: "setUserWriteBlockMode"
+            shardCollection: "shardCollection" # ID only
+            shardDrainingStatus: "shardDrainingStatus"
+            shardedDataDistribution: "shardedDataDistribution"
+            shardingState: "shardingState"
+            shutdown: "shutdown"
+            splitChunk: "splitChunk"
+            splitVector: "splitVector"
+            startBackup: "startBackup"
+            storageDetails: "storageDetails"
+            top: "top"
+            touch: "touch"
+            trafficRecord: "trafficRecord"
+            transitionFromDedicatedConfigServer: "transitionFromDedicatedConfigServer"
+            transitionToDedicatedConfigServer: "transitionToDedicatedConfigServer"
+            unlock: "unlock"
+            unshardCollection: "unshardCollection"
+            useTenant: "useTenant"
+            useUUID: "useUUID"
+            update: "update"
+            updateESECMKIdentifierList: "updateESECMKIdentifierList"
+            updateRole: "updateRole" # ID only
+            updateUser: "updateUser" # ID only
+            validate: "validate"
+            viewRole: "viewRole"
+            viewUser: "viewUser"
+            wiredtiger: "wiredtiger"
+            applyOps: "applyOps"
+            containerInsert: "containerInsert" # run "ci" ops in the applyOps command
+            containerDelete: "containerDelete" # run "cd" ops in the applyOps command
+            containerUpdate: "containerUpdate" # run "cu" ops in the applyOps command
+
+    # In 'MatchType' the extra_data field "serverlessActionTypes" is used
+    # by the AuthorizationSession while in multitenancy mode to determine
+    # whether or not an action is reasonable to be performed by a user
+    # who has been authorized via security token.
+    # See:
+    MatchType:
+        description: Resource Match Types used in describing privilege grants.
+        type: string
+        values:
+            kMatchNever:
+                description: Bottom type for resource matches, matches nothing.
+                value: "never"
+                extra_data:
+                    serverlessActionTypes: [] # Explicitly listing no action types valid.
+
+            # resource: { cluster: true }
+            kMatchClusterResource:
+                description: Matches if the resource is the cluster resource.
+                value: "cluster"
+                extra_data:
+                    serverlessActionTypes:
+                        - applyOps
+                        - bypassDefaultMaxTimeMS
+                        - killAnyCursor
+                        - killAnySession
+                        - killCursors
+                        - killop
+                        - listDatabases
+
+            # resource: { db: '', collection: 'exact' }
+            kMatchCollectionName:
+                description: Matches if the resource's collection is a particular name.
+                value: "collection"
+                extra_data:
+                    serverlessActionTypes: &actionsValidOnCollection
+                        - analyze
+                        - bypassDocumentValidation
+                        - changeStream
+                        - cleanupStructuredEncryptionData
+                        - collMod
+                        - collStats
+                        - compact
+                        - compactStructuredEncryptionData
+                        - convertToCapped
+                        - createCollection
+                        - createIndex
+                        - createSearchIndexes
+                        - dbCheck
+                        - dbHash
+                        - dbStats
+                        - dropCollection
+                        - dropIndex
+                        - dropSearchIndex
+                        - enableProfiler
+                        - exportCollection
+                        - find
+                        - importCollection
+                        - insert
+                        - killAnyCursor
+                        - killCursors
+                        - listCollections
+                        - listIndexes
+                        - listSearchIndexes
+                        - containerInsert
+                        - containerDelete
+                        - containerUpdate
+                        - updateSearchIndex
+                        - performRawDataOperations
+                        - planCacheIndexFilter
+                        - planCacheRead
+                        - planCacheWrite
+                        - reIndex
+                        - remove
+                        - renameCollection
+                        - renameCollectionSameDB
+                        - storageDetails
+                        - update
+                        - validate
+
+            # resource: { db: 'exact', collection: '' }
+            kMatchDatabaseName:
+                description: Matches if the resource's database is a particular name.
+                value: "database"
+                extra_data:
+                    serverlessActionTypes: &actionsValidOnDatabase
+                        # Actions common to collection patterns.
+                        # YAML doesn't support extending list aliases.
+                        # Make changes above, then copy here.
+                        - analyze
+                        - bypassDocumentValidation
+                        - changeStream
+                        - cleanupStructuredEncryptionData
+                        - collMod
+                        - collStats
+                        - compact
+                        - compactStructuredEncryptionData
+                        - convertToCapped
+                        - createCollection
+                        - createIndex
+                        - createSearchIndexes
+                        - dbCheck
+                        - dbHash
+                        - dbStats
+                        - dropCollection
+                        - dropIndex
+                        - dropSearchIndex
+                        - enableProfiler
+                        - exportCollection
+                        - find
+                        - importCollection
+                        - insert
+                        - killAnyCursor
+                        - killCursors
+                        - listCollections
+                        - listIndexes
+                        - listSearchIndexes
+                        - updateSearchIndex
+                        - containerInsert
+                        - containerDelete
+                        - containerUpdate
+                        - performRawDataOperations
+                        - planCacheIndexFilter
+                        - planCacheRead
+                        - planCacheWrite
+                        - reIndex
+                        - remove
+                        - renameCollection
+                        - renameCollectionSameDB
+                        - storageDetails
+                        - update
+                        - validate
+
+                        # Actions specific to the database match types.
+                        - applicationMessage
+                        - dropDatabase
+                        - viewRole
+                        - viewUser
+
+            # resource: { db: 'exact', collection: 'exact' }
+            kMatchExactNamespace:
+                description: Matches if the resource is an exact namespace.
+                value: "exact_namespace"
+                extra_data:
+                    serverlessActionTypes: *actionsValidOnCollection
+
+            # resource: { db: '', collection: '' }
+            kMatchAnyNormalResource:
+                description: Matches all databases and non-system collections.
+                value: "any_normal"
+                extra_data:
+                    serverlessActionTypes: *actionsValidOnDatabase
+
+            # resource: { anyResource: true }
+            kMatchAnyResource:
+                description: Matches absolutely anything.
+                value: "any"
+                extra_data:
+                    serverlessActionTypes: *actionsValidOnDatabase
+
+            # resource: { db: 'exact', system_buckets: 'exact' }
+            kMatchExactSystemBucketResource:
+                description: Matches a collection named "<db>.system.buckets.<collection>"
+                value: "system_buckets"
+                extra_data:
+                    serverlessActionTypes: &actionsValidOnSystemBuckets
+                        - analyze
+                        - bypassDocumentValidation
+                        - changeStream
+                        - cleanupStructuredEncryptionData
+                        - collMod
+                        - collStats
+                        - compact
+                        - compactStructuredEncryptionData
+                        - convertToCapped
+                        - createCollection
+                        - createIndex
+                        - createSearchIndexes
+                        - dbCheck
+                        - dbHash
+                        - dbStats
+                        - dropCollection
+                        - dropDatabase
+                        - dropIndex
+                        - dropSearchIndex
+                        - enableProfiler
+                        - exportCollection
+                        - find
+                        - importCollection
+                        - insert
+                        - killAnyCursor
+                        - killCursors
+                        - listCollections
+                        - listIndexes
+                        - listSearchIndexes
+                        - updateSearchIndex
+                        - performRawDataOperations
+                        - planCacheIndexFilter
+                        - planCacheRead
+                        - planCacheWrite
+                        - reIndex
+                        - remove
+                        - renameCollection
+                        - renameCollectionSameDB
+                        - storageDetails
+                        - update
+                        - validate
+                        - containerInsert
+                        - containerDelete
+                        - containerUpdate
+
+            # resource: { db: '', system_buckets: 'exact' }
+            kMatchSystemBucketInAnyDBResource:
+                description: Matches a collection named "system.buckets.<collection>" in any db
+                value: "system_buckets_in_any_db"
+                extra_data:
+                    serverlessActionTypes: *actionsValidOnSystemBuckets
+
+            # resource: { db: 'exact', system_buckets: '' }
+            kMatchAnySystemBucketInDBResource:
+                description: Matches any collection with a prefix of "system.buckets." in a specific db
+                value: "any_system_buckets_in_db"
+                extra_data:
+                    serverlessActionTypes: *actionsValidOnSystemBuckets
+
+            # resource: { db: '', system_buckets: '' }
+            kMatchAnySystemBucketResource:
+                description: Matches any collection with a prefix of "system.buckets." in any db
+                value: "any_system_buckets"
+                extra_data:
+                    serverlessActionTypes: *actionsValidOnSystemBuckets
+
+structs:
+    MatchTypeExtraData:
+        description: Extra data defined in the MatchType enum
+        fields:
+            serverlessActionTypes:
+                description: Permitted action types for the match type when in serverless mode
+                type: array<string>

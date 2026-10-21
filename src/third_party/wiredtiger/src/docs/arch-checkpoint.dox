@@ -1,0 +1,172 @@
+/*! @arch_page arch-checkpoint Checkpoint
+
+# Overview #
+
+A checkpoint is a known point in time from which WiredTiger can recover in the event of a
+crash or unexpected shutdown. Both checkpoints and @ref arch-logging "logging" provide durability guarantees. During
+recovery WiredTiger can start up from the last known checkpoint and replay the log, recovering the
+lost operations. WiredTiger checkpoints are created either via the API
+WT_SESSION::checkpoint, or internally. See @ref checkpoint-internal-callers "Internal Callers" for
+when checkpoint can be called internally by WiredTiger.
+
+A checkpoint is performed within the context of a @ref arch-snapshot "snapshot isolation" transaction, as such the
+checkpoint has a consistent view of the database from beginning to end. Typically when running a
+checkpoint the configuration \c "use_timestamp=true" is specified. This instructs WiredTiger to set
+the \c checkpoint_timestamp to be the current \c stable_timestamp. As of the latest version of
+WiredTiger the \c checkpoint_timestamp timestamp is not used as a \c read_timestamp for the
+checkpoint transaction. The \c checkpoint_timestamp is written out with the metadata information for
+the checkpoint. On startup WiredTiger will set the \c stable_timestamp internally to the timestamp
+contained in the metadata, and rollback updates which are newer to the \c stable_timestamp see:
+WT_CONNECTION::rollback_to_stable.
+
+# The checkpoint algorithm #
+
+The checkpoint algorithm can be considered as a coordinator of multiple aspects of the system. It
+relies on the @ref arch-btree "btree subsystem" for traversing in memory pages, the @ref arch-block "block manager subsystem" for
+handling on-disk blocks and the @ref arch-metadata "metadata subsystem" for constructing and interpreting the metadata
+information.
+
+A checkpoint can be broken up into the following stages:
+
+## Locking ##
+
+The first stage of checkpoint is to gather the necessary checkpoint locks. The \c checkpoint_lock has the highest precedent ensuring only one checkpoint takes place at time. Other locks
+such as, dhandle, schema and flush locks are taken throughout the checkpoint process.
+
+## Eviction ##
+
+Before the checkpoint transaction begins (pinning content), the @ref arch-eviction "eviction subsystem" is leveraged to
+reduce the dirty content in the cache. Using eviction has the benefit of taking advantage of the multi-threaded
+functionality of eviction and reduces the work required during the critical section of the
+checkpoint. The thread performing the checkpoint operation will wait for eviction to
+reach the target dirty content ratio unless no progress is made.
+
+## Prepare ##
+
+Checkpoint prepare sets up the checkpoint, it begins the checkpoint transaction, updates the global
+checkpoint state and gathers a list of handles to be checkpointed. A global schema lock wraps
+checkpoint prepare to avoid any tables being created or dropped during this phase, additionally the
+global transaction lock is taken during this process as it must modify the global transaction state,
+and to ensure the \c stable_timestamp doesn't move ahead of the snapshot taken by the checkpoint
+transaction. The connection dhandle list is walked one handle at a time, where each handle gathered
+refers to a specific btree. Additionally clean btrees, i.e. btrees without any modifications, are excluded from
+the list, with an exception for specific checkpoint configuration scenarios. See
+\ref skipping-checkpoints "Skipping checkpoints" for scenarios where btrees are skipped during
+checkpoint. Btrees included in the checkpoint list then delete earlier checkpoints when possible.
+Previous checkpoints can only be discarded if the associated blocks are no longer used.
+
+## Data files checkpoint ##
+
+Data files in this instance refer to all the user created files. The main work of checkpoint is done
+here, the array of btree's collected in the prepare stage are iterated over. For each btree, the
+tree is walked and all the dirty pages are reconciled. Clean pages are skipped to avoid unnecessary
+work. Pages made clean ahead of the checkpoint by eviction are still skipped regardless of whether
+the update written by eviction is visible to the checkpoint transaction. The checkpoint guarantees
+that a clean version of every page in the tree exists and can be written to disk. The
+@ref arch-block "block manager subsystem" is then responsible for managing the extent lists modified by the
+checkpoint (see \ref block-checkpoint) and deleting old checkpoints.
+
+ ## History store checkpoint ##
+
+The @ref arch-hs "history store" is checkpointed after the data files intentionally as during the reconciliation
+of the data files additional writes may be created in the history store and its important to include
+them in the checkpoint. The history store will follow the same checkpoint process as data files.
+
+## Flushing the files to disk ##
+
+All the btrees checkpointed and the history are flushed to disk at this stage, WiredTiger will wait
+until that process has completed to continue with the checkpoint.
+
+## Metadata checkpoint ##
+
+A new entry into the metadata file is created for every data file checkpointed, including the
+history store. As such the metadata file is the last file to be checkpointed. As WiredTiger
+maintains two checkpoints, the location of the most recent checkpoint is written to the turtle file.
+
+# Multi-threaded checkpoints #
+
+By default, WiredTiger checkpoints are single-threaded: they walk each B-tree
+one page at a time and reconcile dirty pages sequentially. Parallel checkpoints
+improve throughput by handing leaf pages off to a pool of worker threads that
+reconcile them concurrently, while the main checkpoint thread continues the tree
+walk and handles internal pages. Parallel checkpoints are enabled by setting
+the \c checkpoint_threads connection configuration option to a value greater
+than 1 when calling ::wiredtiger_open.
+
+The main checkpoint thread and the workers communicate through two queues:
+a work queue of pages to reconcile and a done queue of completed items.
+For each leaf page encountered during the B-tree walk, the main thread duplicates
+the walk position (giving the copy of its own hazard pointer), wraps it in a work
+item, and pushes it onto the work queue. Workers pick up items, reconcile the
+page, and push the result onto the done queue, posting a semaphore. Workers must
+return completed pages to the main thread via the done queue because hazard
+pointers cannot be transferred between sessions: a worker cannot release a hazard
+pointer that was acquired by the main checkpoint thread. The done queue also
+carries each worker's return code, allowing errors to propagate to the caller.
+A semaphore rather than a condition variable is used so that a post issued by a
+worker before the main thread calls wait is not lost.
+
+Internal pages are never handed to workers. Before checking whether an internal
+page is dirty, the main thread drains the done queue by waiting on the semaphore
+until every outstanding work item has completed. Only then does it reconcile the
+internal page, ensuring it can collect the correct on-disk address cookies of its
+children. The main thread releases each page's hazard pointer as it drains the
+done queue.
+
+Each worker uses its own session, since sessions are not thread-safe.
+Workers are identified by the session flags \c WT_SESSION_CHECKPOINT and
+\c WT_SESSION_CHECKPOINT_WORKER; the latter distinguishes them from the main
+checkpoint session. To produce a consistent checkpoint, each worker imports a
+private copy of the main checkpoint session's transaction snapshot before
+reconciling its first page. At the end of the checkpoint, the main thread commits
+each worker's transaction.
+
+\anchor skipping-checkpoints
+# Skipping checkpoints #
+
+It is possible that a checkpoint will be skipped. A checkpoint will be skipped when:
+ - No modifications to the database have been made since the last checkpoint.
+ - The last checkpoint timestamp is equal to the current stable timestamp.
+ - There is no available space at the end of the file.
+This logic can be overridden by forcing a checkpoint via configuration.
+
+# Checkpoint generations #
+
+The checkpoint generation indicates which iteration of checkpoint a file has undergone, at the start
+of a checkpoint the generation is incremented. Then after processing any btree its
+\c checkpoint_gen is set to the latest checkpoint generation. Checkpoint generations impact
+visibility checks within WiredTiger, essentially if a btree is behind a checkpoint, i.e. its
+checkpoint generation is less than the current checkpoint generation, then the checkpoint
+transaction id and checkpoint timestamp are included in certain visibility checks.
+This prevents eviction from evicting updates from a given btree ahead of the checkpoint.
+
+# Garbage collection #
+
+While processing a btree, checkpoint can mark pages as obsolete. Any page that has an aggregated
+stop time pair which is globally visible will no longer be required by any reader and can be marked
+as deleted. This occurs prior to the page being reconciled, allowing for the page to be removed
+during the reconciliation. However this does not mean that the deleted page is available for re-use
+as it may be referenced by older checkpoints, once the older checkpoint is deleted the page is free
+to be used. If the freed pages exist at the end of the file the file can be truncated. Otherwise
+compaction will need to be initiated to shrink the file, see: WT_SESSION::compact.
+
+A page is only discarded when every record on it is obsolete. A page that still holds a live record
+is kept, along with any obsolete records on it, until something else dirties the page and it is
+reconciled again. The \c btree_obsolete_ondisk_kv_bytes statistics, gathered by the tree walk that
+collects \c all statistics, report how many bytes of row-store key and value payload such retained
+records occupy; the mixed variant isolates pages that also hold a live record. Overflow items,
+dictionary copies and cell headers are not counted. The walk reads each page's cached image, so a page that
+checkpoint has reconciled but which remains in cache may report values the checkpoint already
+dropped: treat the total as an upper bound.
+
+\anchor checkpoint-internal-callers
+# Internal callers #
+WiredTiger may call checkpoint internally at any time. These can occur during:
+- Recovery
+- @ref arch-backup "Backup"
+- @ref arch-compact "Compaction"
+- @ref schema_alter "Schema alter"
+- Internal checkpoint thread (controlled by configuration option to ::wiredtiger_open)
+- Startup/shutdown
+
+*/

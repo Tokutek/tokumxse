@@ -1,0 +1,20 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "*chunk_migration_command*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+      - 10gen/server-cluster-scalability
+  - "sharding_catalog_manager_assign_key_range_to_zone_test.cpp":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+      - 10gen/server-cluster-scalability
+  - "sharding_catalog_manager_zone_operations.cpp":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+      - 10gen/server-cluster-scalability
+  - "*migration_blocking_operation*":
+    approvers:
+      - 10gen/server-cluster-scalability

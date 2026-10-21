@@ -1,0 +1,660 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# See builtin_roles_gen.py for schema information.
+
+roles:
+  read:
+    privileges:
+      - matchType: database
+        actions: &readRoleActions
+          - changeStream
+          - collStats
+          - dbHash
+          - dbStats
+          - find
+          - killCursors
+          - listCollections
+          - listIndexes
+          - listSearchIndexes
+          - performRawDataOperations
+          - planCacheRead
+      - matchType: exact_namespace
+        collection: "system.js"
+        actions: *readRoleActions
+
+  readWrite:
+    privileges:
+      - matchType: database
+        actions: &readWriteRoleActions
+          - *readRoleActions
+          - cleanupStructuredEncryptionData
+          - compactStructuredEncryptionData
+          - convertToCapped # db admin gets this also
+          - createCollection # db admin gets this also
+          - createIndex
+          - createSearchIndexes
+          - dropCollection
+          - dropIndex
+          - dropSearchIndex
+          - insert
+          - remove
+          - renameCollectionSameDB # db admin gets this also
+          - update
+          - updateSearchIndex
+      - matchType: exact_namespace
+        collection: "system.js"
+        actions: *readWriteRoleActions
+
+  userAdmin:
+    privileges:
+      - matchType: database
+        actions: &userAdminRoleActions
+          - changeCustomData
+          - changePassword
+          - createUser
+          - createRole
+          - dropUser
+          - dropRole
+          - grantRole
+          - revokeRole
+          - setAuthenticationRestriction
+          - viewUser
+          - viewRole
+
+  dbAdmin:
+    privileges:
+      - matchType: database
+        actions: &dbAdminRoleActions
+          - analyze
+          - bypassDocumentValidation
+          - collMod
+          - collStats # clusterMonitor gets this also
+          - compact
+          - convertToCapped # readWrite gets this also
+          - createCollection # readWrite gets this also
+          - dbStats # clusterMonitor gets this also
+          - dropCollection
+          - dropDatabase # clusterAdmin gets this also
+          - dropIndex
+          - dropSearchIndex
+          - createIndex
+          - performRawDataOperations
+          - createSearchIndexes
+          - enableProfiler
+          - listCollections
+          - listIndexes
+          - listSearchIndexes
+          - updateSearchIndex
+          - planCacheIndexFilter
+          - planCacheRead
+          - planCacheWrite
+          - reIndex
+          - renameCollectionSameDB # readWrite gets this also
+          - storageDetails
+          - validate
+
+      - matchType: database
+        tenancy: single # Not granted in multitenancy mode
+        actions: &dbAdminRoleSingleTenantActions
+          - configureQueryAnalyzer # clusterManager gets this also
+          - startBackup
+
+      - matchType: exact_namespace
+        collection: "system.profile"
+        actions:
+          - *readRoleActions
+          - convertToCapped
+          - createCollection
+          - dropCollection
+
+  dbOwner:
+    roles: [readWrite, dbAdmin, userAdmin]
+
+  enableSharding:
+    privileges:
+      - matchType: any_normal
+        actions:
+          - analyzeShardKey
+          - enableSharding
+          - moveCollection
+          - refineCollectionShardKey
+          - reshardCollection
+          - rewriteCollection
+          - unshardCollection
+      - matchType: cluster
+        actions:
+          - enableSharding
+
+  readAnyDatabase:
+    adminOnly: true
+    privileges:
+      - matchType: any_normal
+        actions: *readRoleActions
+      - matchType: cluster
+        actions:
+          - listDatabases
+      - matchType: collection
+        collection: "system.js"
+        actions: *readRoleActions
+      - matchType: any_system_buckets
+        actions: *readRoleActions
+
+  readWriteAnyDatabase:
+    adminOnly: true
+    roles:
+      - readAnyDatabase
+    privileges:
+      - matchType: any_normal
+        actions: *readWriteRoleActions
+      - matchType: collection
+        collection: "system.js"
+        actions: *readWriteRoleActions
+      - matchType: any_system_buckets
+        actions: *readWriteRoleActions
+
+  userAdminAnyDatabase:
+    adminOnly: true
+    privileges:
+      - matchType: any_normal
+        actions:
+          - *userAdminRoleActions
+          - listCachedAndActiveUsers
+      - matchType: database
+        db: "local"
+        actions: *userAdminRoleActions
+      - matchType: database
+        db: "config"
+        actions: *userAdminRoleActions
+      - matchType: cluster
+        actions:
+          - listDatabases
+          - authSchemaUpgrade
+          - invalidateUserCache
+          - viewUser
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.users"
+        actions: &readRoleAndIndexActions
+          - *readRoleActions
+          - createIndex
+          - createSearchIndexes
+          - dropIndex
+          - dropSearchIndex
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.roles"
+        actions: *readRoleAndIndexActions
+      - matchType: collection
+        collection: "system.users"
+        actions: *readRoleActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.version"
+        actions: *readRoleActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.backup_users"
+        actions: *readRoleActions
+
+  dbAdminAnyDatabase:
+    adminOnly: true
+    privileges:
+      - matchType: cluster
+        actions:
+          - listDatabases
+          - applyOps
+      - matchType: any_normal
+        actions: *dbAdminRoleActions
+      - matchType: any_normal
+        tenancy: single
+        actions: *dbAdminRoleSingleTenantActions
+      - matchType: collection
+        collection: "system.profile"
+        actions:
+          - *readRoleActions
+          - convertToCapped
+          - createCollection
+          - dropCollection
+      - matchType: any_system_buckets
+        actions: *dbAdminRoleActions
+
+  clusterMonitor:
+    adminOnly: true
+    roles:
+      - role: read
+        db: config
+      - role: read
+        db: local
+    privileges:
+      - matchType: cluster
+        actions: &clusterMonitorRoleClusterActions
+          - connPoolStats
+          - getCmdLineOpts
+          - getDefaultRWConcern # clusterManager gets this also
+          - getLog
+          - getParameter
+          - getShardMap
+          - getTransitionToDedicatedConfigServerStatus
+          - hostInfo
+          - listClusterCatalog
+          - listDatabases
+          - listExtensions # clusterManager gets this also
+          - listSampledQueries
+          - listSessions # clusterManager gets this also
+          - listShards # clusterManager gets this also
+          - netstat
+          - replSetGetConfig # clusterManager gets this also
+          - replSetGetStatus # clusterManager gets this also
+          - serverStatus
+          - shardDrainingStatus
+          - top
+          - useUUID
+          - inprog
+          - shardingState
+          - allCollectionStats
+          - shardedDataDistribution
+          - queryStatsRead
+          - queryStatsReadTransformed
+      - matchType: any_normal
+        actions: &clusterMonitorRoleDatabaseActions
+          - collStats
+          - dbStats
+          - getDatabaseVersion
+          - getShardVersion
+          - indexStats
+      - matchType: any_system_buckets
+        actions: *clusterMonitorRoleDatabaseActions
+      - matchType: database
+        db: "config"
+        actions: *clusterMonitorRoleDatabaseActions
+      - matchType: exact_namespace
+        db: "config"
+        collection: "system.sessions"
+        actions: *clusterMonitorRoleDatabaseActions
+      - matchType: database
+        db: "local"
+        actions: *clusterMonitorRoleDatabaseActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "system.replset"
+        actions: [find]
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.election"
+        actions: [find]
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.minvalid"
+        actions: [find]
+      - matchType: collection
+        collection: "system.profile"
+        actions: [find]
+
+  hostManager:
+    adminOnly: true
+    privileges:
+      - matchType: cluster
+        actions: &hostManagerRoleClusterActions
+          - applicationMessage # clusterManager gets this also
+          - auditConfigure
+          - compact
+          - connPoolSync
+          - dropConnections
+          - logRotate
+          - oidReset
+          - setParameter
+          - shutdown
+          - touch
+          - unlock
+          - flushRouterConfig # clusterManager gets this also
+          - fsync
+          - invalidateUserCache # userAdminAnyDatabase gets this also
+          - killAnyCursor
+          - killAnySession
+          - killop
+          - replSetResizeOplog
+          - resync # clusterManager gets this also
+          - trafficRecord
+          - rotateCertificates
+          - oidcListKeys
+          - oidcRefreshKeys
+      - matchType: any_normal
+        actions: &hostManagerRoleDatabaseActions
+          - killCursors
+
+  clusterManager:
+    roles:
+      - enableSharding
+      - role: read
+        db: "config"
+    adminOnly: true
+    privileges:
+      - matchType: cluster
+        actions: &clusterManagerRoleClusterActions
+          - appendOplogNote # backup gets this also
+          - applicationMessage # hostManager gets this also
+          - replSetConfigure
+          - replSetGetConfig # clusterMonitor gets this also
+          - replSetGetStatus # clusterMonitor gets this also
+          - replSetStateChange
+          - resync # hostManager gets this also
+          - addShard
+          - removeShard
+          - listExtensions # clusterMonitor gets this also
+          - listSessions # clusterMonitor gets this also
+          - listShards # clusterMonitor gets this also
+          - flushRouterConfig # hostManager gets this also
+          - cleanupOrphaned
+          - getDefaultRWConcern # clusterMonitor gets this also
+          - blockReplicaSetWrites
+          - bypassReplicaSetWritesBlocking
+          - setDefaultRWConcern
+          - setFeatureCompatibilityVersion
+          - setClusterParameter
+          - getClusterParameter
+          - querySettings
+          - checkMetadataConsistency
+          - transitionFromDedicatedConfigServer
+          - transitionToDedicatedConfigServer
+          - getTransitionToDedicatedConfigServerStatus # clusterMonitor gets this also
+          - shardDrainingStatus # clusterMonitor gets this also
+
+      - matchType: any_normal
+        actions: &clusterManagerRoleDatabaseActions
+          - analyzeShardKey # enableSharding gets this also
+          - configureQueryAnalyzer # dbAdmin gets this also
+          - clearJumboFlag
+          - splitChunk
+          - moveChunk
+          - moveCollection
+          - enableSharding
+          - splitVector
+          - refineCollectionShardKey
+          - reshardCollection
+          - unshardCollection
+          - rewriteCollection
+
+      - matchType: any_system_buckets
+        actions: *clusterManagerRoleDatabaseActions
+      - matchType: database
+        db: "config"
+        actions: *clusterManagerRoleDatabaseActions
+      - matchType: database
+        db: "local"
+        actions: *clusterManagerRoleDatabaseActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "system.replset"
+        actions: *readRoleActions
+      - matchType: any
+        actions:
+          - dbCheck
+      - matchType: exact_namespace
+        db: "local"
+        collection: "system.healthlog"
+        actions: *readRoleActions
+      - matchType: database
+        db: "config"
+        actions: &clusterManagerRoleWriteActions
+          - insert
+          - update
+          - remove
+      - matchType: database
+        db: "local"
+        actions: *clusterManagerRoleWriteActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.election"
+        actions: *clusterManagerRoleWriteActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.minvalid"
+        actions: *clusterManagerRoleWriteActions
+
+  clusterAdmin:
+    adminOnly: true
+    roles:
+      - clusterMonitor
+      - hostManager
+      - clusterManager
+    privileges:
+      - matchType: any_normal
+        actions:
+          - dropDatabase
+      - matchType: any
+        actions:
+          - importCollection
+          - exportCollection
+
+  __queryableBackup:
+    adminOnly: true
+    privileges:
+      - matchType: any
+        actions:
+          - collStats
+          - listCollections
+          - listIndexes
+          - listSearchIndexes
+      - matchType: any_normal
+        actions: &queryableBackupReadActions
+          - find
+          - startBackup
+          - performRawDataOperations
+      - matchType: any_system_buckets
+        actions: *queryableBackupReadActions
+      - matchType: cluster
+        actions:
+          - getParameter
+          - listDatabases
+          - useUUID
+      - matchType: database
+        db: "config"
+        actions: *queryableBackupReadActions
+      - matchType: database
+        db: "local"
+        actions: *queryableBackupReadActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.election"
+        actions: *queryableBackupReadActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.minvalid"
+        actions: *queryableBackupReadActions
+      - matchType: collection
+        collection: "system.js"
+        actions: *queryableBackupReadActions
+      - matchType: collection
+        collection: "system.users"
+        actions: *queryableBackupReadActions
+      - matchType: collection
+        collection: "system.profile"
+        actions: *queryableBackupReadActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.backup_users"
+        actions: *queryableBackupReadActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.roles"
+        actions: *queryableBackupReadActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.version"
+        actions: *queryableBackupReadActions
+      - matchType: exact_namespace
+        db: "config"
+        collection: "settings"
+        actions: *queryableBackupReadActions
+
+  backup:
+    adminOnly: true
+    roles:
+      - __queryableBackup
+    privileges:
+      - matchType: cluster
+        actions:
+          - appendOplogNote # For BRS
+          - readBackupFile # For oplog based migrations
+          - serverStatus # For push based initial sync
+          - setUserWriteBlockMode # For C2C replication
+      - matchType: exact_namespace
+        db: "config"
+        collection: "settings"
+        actions:
+          - insert
+          - update
+
+  restore:
+    adminOnly: true
+    privileges:
+      - matchType: cluster
+        actions:
+          - getParameter # To check authSchemaVersion
+          - forceUUID # For UUID consistency in sharded restores
+          - useUUID
+          - bypassWriteBlockingMode # For C2C replication
+          - setUserWriteBlockMode # For C2C replication
+          - applyOps # Needed by mongorestore --preserveUUID
+      - matchType: database
+        db: "local"
+        actions: &restoreRoleWriteActions
+          - bypassDocumentValidation
+          - collMod
+          - convertToCapped
+          - createCollection
+          - createIndex
+          - createSearchIndexes
+          - dropCollection
+          - insert
+          - performRawDataOperations
+          - updateSearchIndex
+      - matchType: database
+        db: "config"
+        actions: *restoreRoleWriteActions
+      - matchType: any_system_buckets
+        actions: *restoreRoleWriteActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "system.replset"
+        actions: *restoreRoleWriteActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.election"
+        actions: *restoreRoleWriteActions
+      - matchType: exact_namespace
+        db: "local"
+        collection: "replset.minvalid"
+        actions: *restoreRoleWriteActions
+      - matchType: any
+        actions:
+          - listCollections
+      - matchType: any_normal
+        actions:
+          - *restoreRoleWriteActions
+          - *userAdminRoleActions
+      - matchType: collection
+        collection: "system.js"
+        actions: *restoreRoleWriteActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "tempusers"
+        actions: [find]
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "temproles"
+        actions: [find]
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.backup_users"
+        actions: *restoreRoleWriteActions
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.version"
+        actions:
+          - *restoreRoleWriteActions
+          - find
+      - matchType: collection
+        collection: "system.users"
+        actions:
+          - *restoreRoleWriteActions
+          - find
+          - update
+          - remove
+      - matchType: exact_namespace
+        db: "admin"
+        collection: "system.roles"
+        actions:
+          - createIndex # Create index on the roles collection.
+      - matchType: collection
+        collection: "system.views"
+        actions:
+          - dropCollection
+
+  root:
+    adminOnly: true
+    roles:
+      - clusterAdmin
+      - userAdminAnyDatabase
+      - dbAdminAnyDatabase
+      - readWriteAnyDatabase
+      - backup
+      - restore
+      - directShardOperations
+    privileges:
+      - matchType: any
+        actions:
+          - validate
+      - matchType: cluster
+        actions:
+          - bypassDefaultMaxTimeMS
+          - useTenant # Specify tenant id with unsigned security token on commands
+      - matchType: exact_namespace
+        db: "config"
+        collection: "system.preimages"
+        actions:
+          - find
+          - remove
+      - matchType: exact_namespace
+        db: "config"
+        collection: "system.change_collection"
+        actions:
+          - find
+          - insert # Root user should be cautious while performing inserts.
+          - remove
+          - update
+
+  # Placeholder role with no privileges for 6.0.0.
+  # From 7.0 onwards, this method will assign the requisite
+  # privileges to write directly to shards.
+  directShardOperations:
+    adminOnly: true
+    privileges:
+      - matchType: cluster
+        actions:
+          - issueDirectShardOperations
+
+  # PREVIEW role for performing internal search operations in 8.1 .
+  # The privileges defined for this role may be further restricted
+  #  without warning in future releases.
+  # TODO: SERVER-122489
+  searchCoordinator:
+    adminOnly: true
+    roles:
+      - clusterMonitor
+      - directShardOperations
+      - readAnyDatabase
+    privileges:
+      - matchType: database
+        db: "__mdb_internal_search"
+        actions: *readWriteRoleActions
+      - matchType: cluster
+        actions:
+          - bypassDefaultMaxTimeMS
+          - fsync
+
+  # Builtin role 'admin.__system' has its privileges special cased in builtin_roles.tpl.cpp
+  __system:
+    adminOnly: true
+    privileges: []

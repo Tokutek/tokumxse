@@ -1,0 +1,16 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    replicaSetWritesBlockReason:
+        description: The reason for blocking writes on a replica set.
+        type: string
+        values:
+            kInsufficientDiskSpace: "InsufficientDiskSpace"

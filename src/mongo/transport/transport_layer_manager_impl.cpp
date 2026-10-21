@@ -1,0 +1,413 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/transport/transport_layer_manager_impl.h"
+
+#include <mutex>
+
+#ifdef __linux__
+#include <fstream>
+#include <string_view>
+#endif
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/s/load_balancer_support.h"
+#include "mongo/transport/asio/asio_session_manager.h"
+#include "mongo/transport/asio/asio_transport_layer.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/version.h"
+
+#ifdef MONGO_CONFIG_GRPC
+#include "mongo/transport/grpc/grpc_feature_flag_gen.h"
+#include "mongo/transport/grpc/grpc_transport_layer_impl.h"
+#endif
+
+#ifdef MONGO_CONFIG_CONNECTION_HANDOFF
+#include "mongo/transport/handoff/handoff_feature_flag_gen.h"
+#include "mongo/transport/handoff/handoff_session_manager.h"
+#include "mongo/transport/handoff/handoff_transport_layer.h"
+#endif
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_options.h"
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
+namespace mongo::transport {
+using namespace std::literals::string_view_literals;
+
+TransportLayerManagerImpl::TransportLayerManagerImpl(
+    std::vector<std::unique_ptr<TransportLayer>> tls, TransportLayer* defaultEgressLayer)
+    : _tls(std::move(tls)), _defaultEgressLayer(defaultEgressLayer) {
+    invariant(_defaultEgressLayer);
+    invariant(find_if(_tls.begin(), _tls.end(), [&](auto& tl) {
+                  return tl.get() == _defaultEgressLayer;
+              }) != _tls.end());
+}
+
+TransportLayerManagerImpl::TransportLayerManagerImpl(std::unique_ptr<TransportLayer> tl) {
+    _tls.push_back(std::move(tl));
+    _defaultEgressLayer = _tls[0].get();
+}
+
+// TODO Right now this and setup() leave TLs started if there's an error. In practice the server
+// exits with an error and this isn't an issue, but we should make this more robust.
+Status TransportLayerManagerImpl::start() {
+    std::lock_guard lk(_stateMutex);
+    if (_state == State::kShutdown) {
+        return Status(ErrorCodes::ShutdownInProgress,
+                      "Cannot start TransportLayerManager, shutdown already in progress");
+    }
+    invariant(std::exchange(_state, State::kStarted) == State::kSetUp);
+
+    for (auto&& tl : _tls) {
+        auto status = tl->start();
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    return Status::OK();
+}
+
+void TransportLayerManagerImpl::stopAcceptingSessions() {
+    for (auto&& tl : _tls) {
+        tl->stopAcceptingSessions();
+    }
+}
+
+void TransportLayerManagerImpl::shutdown() {
+    std::lock_guard lk(_stateMutex);
+    invariant(std::exchange(_state, State::kShutdown) != State::kShutdown);
+    for (auto&& tl : _tls) {
+        tl->shutdown();
+    }
+}
+
+Status TransportLayerManagerImpl::setup() {
+    std::lock_guard lk(_stateMutex);
+    if (_state == State::kShutdown) {
+        return Status(ErrorCodes::ShutdownInProgress,
+                      "Cannot setup TransportLayerManager, shutdown already in progress");
+    }
+    invariant(std::exchange(_state, State::kSetUp) == State::kNotInitialized);
+    for (auto&& tl : _tls) {
+        auto status = tl->setup();
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    return Status::OK();
+}
+
+void TransportLayerManagerImpl::forEach(std::function<void(TransportLayer*)> fn) {
+    for (auto&& tl : _tls) {
+        fn(tl.get());
+    }
+}
+
+void TransportLayerManagerImpl::appendStatsForServerStatus(BSONObjBuilder* bob) const {
+    for (auto&& tl : _tls) {
+        tl->appendStatsForServerStatus(bob);
+    }
+}
+
+void TransportLayerManagerImpl::appendStatsForFTDC(BSONObjBuilder& bob) const {
+    for (auto&& tl : _tls) {
+        tl->appendStatsForFTDC(bob);
+    }
+}
+
+bool shouldGRPCIngressBeEnabled() {
+#ifdef MONGO_CONFIG_GRPC
+    bool flag = feature_flags::gFeatureFlagGRPC.isEnabled();
+
+    if (!flag) {
+        return false;
+    }
+
+#ifdef MONGO_CONFIG_SSL
+    bool hasCertificateConfigured = !sslGlobalParams.sslPEMKeyFile.empty();
+#ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
+    hasCertificateConfigured |= !sslGlobalParams.sslCertificateSelector.empty();
+#endif
+
+    if (hasCertificateConfigured) {
+        return true;
+    }
+
+    LOGV2(8076800, "Unable to start ingress gRPC transport without tlsCertificateKeyFile");
+    return false;
+#else
+    LOGV2(8076801, "Unable to start ingress gRPC transport in a build without SSL enabled");
+#endif  // MONGO_CONFIG_SSL
+
+#endif  // MONGO_CONFIG_GRPC
+    return false;
+}
+
+std::unique_ptr<TransportLayerManager> TransportLayerManagerImpl::make(
+    ServiceContext* svcCtx, bool isUseGrpc, std::shared_ptr<ClientTransportObserver> observer) {
+    boost::optional<int> proxyPort;
+    boost::optional<int> priorityPort;
+    boost::optional<int> secondaryPort;
+
+    using PortMap = std::unordered_map<int, std::string_view>;
+    auto addUniquePort = [](PortMap& uniquePorts, int port, std::string_view role) {
+        auto [it, inserted] = uniquePorts.try_emplace(port, role);
+        if (!inserted) {
+            LOGV2_ERROR(11236000,
+                        "Port collision, ports must be unique.",
+                        "port"_attr = port,
+                        "role"_attr = role,
+                        "otherRole"_attr = it->second);
+            return quickExit(ExitCode::badOptions);
+        }
+    };
+
+    PortMap uniquePorts;
+    addUniquePort(uniquePorts, serverGlobalParams.port, "main"sv);
+
+    if (serverGlobalParams.secondaryPort) {
+        addUniquePort(uniquePorts, *serverGlobalParams.secondaryPort, "secondary"sv);
+        secondaryPort = serverGlobalParams.secondaryPort;
+    }
+
+    if (serverGlobalParams.clusterRole.has(ClusterRole::RouterServer)) {
+        const auto loadBalancerPort = load_balancer_support::getLoadBalancerPort();
+        if (loadBalancerPort) {
+            proxyPort = loadBalancerPort;
+            addUniquePort(uniquePorts, *loadBalancerPort, "loadbalancer"sv);
+        }
+    } else {
+        // (Ignore FCV check): The proxy port needs to be open before the FCV is set.
+        if (gFeatureFlagMongodProxyProtocolSupport.isEnabledAndIgnoreFCVUnsafe() &&
+            serverGlobalParams.proxyPort) {
+            proxyPort = *serverGlobalParams.proxyPort;
+            addUniquePort(uniquePorts, *proxyPort, "proxy"sv);
+        }
+    }
+
+    if (serverGlobalParams.priorityPort) {
+        if (!gFeatureFlagDedicatedPortForPriorityOperations.isEnabled()) {
+            LOGV2_ERROR(11438200,
+                        "Priority port support is not enabled",
+                        "priorityPort"_attr = serverGlobalParams.priorityPort);
+            quickExit(ExitCode::badOptions);
+        }
+        priorityPort = serverGlobalParams.priorityPort;
+        addUniquePort(uniquePorts, *priorityPort, "priority"sv);
+    }
+
+    // Check ingress GRPC
+#ifdef MONGO_CONFIG_GRPC
+    if (shouldGRPCIngressBeEnabled()) {
+        addUniquePort(uniquePorts, serverGlobalParams.grpcPort, "grpc"sv);
+    }
+#endif
+
+    // Check egress GRPC
+    bool useEgressGRPC = false;
+    if (isUseGrpc) {
+#ifdef MONGO_CONFIG_GRPC
+        uassert(9715900,
+                "Egress GRPC for search is not enabled",
+                feature_flags::gEgressGrpcForSearch.isEnabled());
+        useEgressGRPC = true;
+#else
+        LOGV2_ERROR(
+            10049101,
+            "useGRPCForSearch is only supported on Linux platforms built with TLS support.");
+        quickExit(ExitCode::badOptions);
+#endif
+    }
+
+    return transport::TransportLayerManagerImpl::createWithConfig(&serverGlobalParams,
+                                                                  svcCtx,
+                                                                  useEgressGRPC,
+                                                                  std::move(proxyPort),
+                                                                  std::move(priorityPort),
+                                                                  std::move(observer),
+                                                                  std::move(secondaryPort));
+}
+
+std::unique_ptr<TransportLayerManager>
+TransportLayerManagerImpl::makeDefaultEgressTransportLayer() {
+    transport::AsioTransportLayer::Options opts(&serverGlobalParams);
+    opts.mode = transport::AsioTransportLayer::Options::kEgress;
+    opts.ipList.clear();
+
+    return std::make_unique<TransportLayerManagerImpl>(
+        std::make_unique<transport::AsioTransportLayer>(opts, nullptr));
+}
+
+std::unique_ptr<TransportLayerManager> TransportLayerManagerImpl::createWithConfig(
+    const ServerGlobalParams* config,
+    ServiceContext* svcCtx,
+    bool useEgressGRPC,
+    boost::optional<int> loadBalancerPort,
+    boost::optional<int> priorityPort,
+    std::shared_ptr<ClientTransportObserver> observer,
+    boost::optional<int> secondaryPort) {
+
+    std::vector<std::unique_ptr<TransportLayer>> retVector;
+    std::vector<std::shared_ptr<ClientTransportObserver>> observers;
+    if (observer) {
+        observers.push_back(std::move(observer));
+    }
+
+    {
+        AsioTransportLayer::Options opts(config);
+        opts.loadBalancerPort = std::move(loadBalancerPort);
+        opts.priorityPort = std::move(priorityPort);
+        opts.secondaryPort = std::move(secondaryPort);
+
+        auto sm = std::make_unique<AsioSessionManager>(svcCtx, observers);
+        auto tl = std::make_unique<AsioTransportLayer>(opts, std::move(sm));
+        retVector.push_back(std::move(tl));
+    }
+
+#ifdef MONGO_CONFIG_CONNECTION_HANDOFF
+    // TODO(SERVER-130054): s2n-tls cannot initialize against an OpenSSL 1.x FIPS-capable libcrypto
+    // when FIPS is active (s2n_fips.c only supports OpenSSL 3.x FIPS). Skip HandoffTransportLayer
+    // entirely in that configuration.
+    bool inFIPSMode = false;
+#if defined(OPENSSL_FIPS)
+    inFIPSMode = sslGlobalParams.sslFIPSMode;
+#endif
+    if (feature_flags::gFeatureFlagTLSConnectionHandoff.isEnabled()) {
+        if (!inFIPSMode) {
+            retVector.push_back(
+                std::make_unique<HandoffTransportLayer>(HandoffTransportLayer::Params{
+                    .socketPrefix = config->proxySocketPrefix.empty() ? config->socket
+                                                                      : config->proxySocketPrefix,
+                    .port = config->port,
+                    .socketGroupID = config->proxySocketGid,
+                    .listenBacklog = serverGlobalParams.listenBacklog
+                        ? *serverGlobalParams.listenBacklog
+                        : ProcessInfo::getDefaultListenBacklog(),
+                    .sessionManager = std::make_unique<HandoffSessionManager>(svcCtx),
+                }));
+        } else {
+            LOGV2_WARNING(
+                12995201,
+                "TLS connection handoff disabled: Session handoff is not supported in FIPS mode");
+        }
+    }
+#endif
+
+#ifdef MONGO_CONFIG_GRPC
+    using GRPCTL = grpc::GRPCTransportLayerImpl;
+    grpc::GRPCTransportLayer::Options opts(*config);
+    opts.enableIngress = shouldGRPCIngressBeEnabled();
+    opts.enableEgress = useEgressGRPC;
+
+    if (opts.enableIngress || opts.enableEgress) {
+        BSONObjBuilder bob;
+        auto versionString =
+            VersionInfoInterface::instance(VersionInfoInterface::NotEnabledAction::kFallback)
+                .version();
+        uassertStatusOK(ClientMetadata::serialize(
+            "MongoDB Internal Client", versionString, config->binaryName + "-GRPCClient", &bob));
+        auto metadataDoc = bob.obj();
+
+        opts.clientMetadata = metadataDoc.getObjectField(kMetadataDocumentName).getOwned();
+
+        retVector.push_back(
+            GRPCTL::createWithConfig(svcCtx, std::move(opts), std::move(observers)));
+    }
+#endif
+
+    auto egress = retVector[0].get();
+    return std::make_unique<TransportLayerManagerImpl>(std::move(retVector), egress);
+}
+
+#ifdef MONGO_CONFIG_SSL
+Status TransportLayerManagerImpl::rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                                                     bool asyncOCSPStaple) {
+    std::vector<std::string_view> successfulRotations;
+    for (auto&& tl : _tls) {
+        if (auto status = tl->rotateCertificates(manager, asyncOCSPStaple); !status.isOK()) {
+            LOGV2_INFO(8074101,
+                       "Failed to rotate certificates for transport layer",
+                       "transportLayer"_attr = tl->getNameForLogging(),
+                       "status"_attr = status);
+            StringBuilder failureMessage;
+            failureMessage << "Certificate rotation failed. " << status.reason();
+
+            if (successfulRotations.size() > 0) {
+                failureMessage << " Before rotation failed for " << tl->getNameForLogging()
+                               << ", other transport layer(s) succeeded and are currently "
+                                  "using rotated certificates: [ ";
+                for (std::string_view s : successfulRotations) {
+                    failureMessage << s << " ";
+                }
+                failureMessage << "]";
+            }
+
+            return status.withContext(failureMessage.str());
+        } else {
+            successfulRotations.push_back(tl->getNameForLogging());
+            LOGV2_INFO(8074102,
+                       "Successfully rotated certificates for transport layer",
+                       "transportLayer"_attr = tl->getNameForLogging());
+        }
+    }
+    return Status::OK();
+}
+#endif
+
+bool TransportLayerManagerImpl::hasActiveSessions() const {
+    return std::any_of(_tls.cbegin(), _tls.cend(), [](const auto& tl) {
+        auto sm = tl->getSessionManager();
+        return sm && (sm->numOpenSessions() > 0);
+    });
+}
+
+void TransportLayerManagerImpl::checkMaxOpenSessionsAtStartup() const {
+#ifdef __linux__
+    // Check if vm.max_map_count is high enough, as per SERVER-51233
+    std::size_t maxConns = std::accumulate(
+        _tls.cbegin(), _tls.cend(), std::size_t{0}, [&](std::size_t acc, const auto& tl) {
+            if (!tl->getSessionManager())
+                return size_t{0};
+            return std::clamp(tl->getSessionManager()->maxOpenSessions(),
+                              std::size_t{0},
+                              std::numeric_limits<std::size_t>::max() - acc);
+        });
+
+    std::size_t requiredMapCount = 2 * maxConns;
+
+    std::fstream f("/proc/sys/vm/max_map_count", std::ios_base::in);
+    std::size_t val;
+    f >> val;
+
+    if (val < requiredMapCount) {
+        LOGV2_WARNING_OPTIONS(5123300,
+                              {logv2::LogTag::kStartupWarnings},
+                              "vm.max_map_count is too low",
+                              "currentValue"_attr = val,
+                              "recommendedMinimum"_attr = requiredMapCount,
+                              "maxConns"_attr = maxConns);
+    }
+#endif
+}
+
+void TransportLayerManagerImpl::endAllSessions(Client::TagMask tags) {
+    std::for_each(_tls.cbegin(), _tls.cend(), [&](const auto& tl) {
+        if (auto sm = tl->getSessionManager(); sm)
+            sm->endAllSessions(tags);
+    });
+}
+
+}  // namespace mongo::transport

@@ -1,0 +1,613 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/hashagg_base.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/code_fragment.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/pipeline/accumulator_multi.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+class CollatorInterface;
+
+namespace sbe {
+/**
+ * Base class for the executable accumulator operators used by SBE's HashAggStage.
+ */
+class HashAggAccumulator {
+public:
+    HashAggAccumulator(value::SlotId outSlot, value::SlotId spillSlot)
+        : _outSlot(outSlot), _spillSlot(spillSlot) {}
+
+    virtual ~HashAggAccumulator() = default;
+
+    virtual std::unique_ptr<HashAggAccumulator> clone() const = 0;
+
+    value::SlotId getOutSlot() const {
+        return _outSlot;
+    }
+
+    value::SlotId getSpillSlot() const {
+        return _spillSlot;
+    }
+
+    /**
+     * Must be called at least once before executing any initialize, accumulate, or finalize
+     * operations.
+     */
+    virtual void prepare(CompileCtx& ctx, value::SlotAccessor* accumulatorAccessor) = 0;
+
+    /**
+     * Must be called at least once before executing an merge operations.
+     */
+    virtual void prepareForMerge(CompileCtx& ctx, value::SlotAccessor* accumulatorAccessor) = 0;
+
+    /**
+     * Updates the 'accumulatorState' accessor to set the accumulator to its initial state, in which
+     * a 'finalize()' call will produce the output expected from accumulating an exmpty list. Must
+     * be called before executing any accumulate or merge operations.
+     */
+    virtual void initialize(vm::ByteCode& bytecode,
+                            value::AssignableSlotAccessor& accumulatorState) const = 0;
+
+    /**
+     * Reads the current accumulator state and a new value and writes out the updated accumulator
+     * state---based on the new value---to the 'accumulatorState' accessor.
+     *
+     * The sources of the input accumulator state and input value are defined by the child
+     * implementations of this method.
+     */
+    virtual void accumulate(vm::ByteCode& bytecode,
+                            value::AssignableSlotAccessor& accumulatorState) const = 0;
+
+    /**
+     * Reads the current accumulator state, updates the accumulator's state with the recovered state
+     * of an accumulator that was spilled to disk, and writes the updated state to the
+     * 'accumulatorState' accessor.
+     *
+     * The sources of the input accumulator state and input recovered state are defined by the child
+     * implementations of this method.
+     */
+    virtual void merge(vm::ByteCode& bytecode,
+                       value::MaterializedSingleRowAccessor& accumulatorState) const = 0;
+
+    /**
+     * Computes the final accumulation result based on the values added with `accumulate()` so far
+     * and saves it to the `accumulatorState` accessor.
+     */
+    virtual void finalize(vm::ByteCode& bytecode,
+                          value::AssignableSlotAccessor& accumulatorState) const = 0;
+
+    virtual size_t estimateSize() const = 0;
+
+    /**
+     * Returns a developer-readable representation of the accumulator's intialization expression if
+     * it has one, std::none otherwise.
+     */
+    virtual boost::optional<std::vector<DebugPrinter::Block>> debugPrintInitialize() const = 0;
+
+    /**
+     * Returns a developer-readable reprsentation of the accumulator's accumulation expression. When
+     * accumulation is computed by the SBE VM, this representation will be an ABT expression. In
+     * other cases, it will be a keyword that will uniquely identify the execution method.
+     */
+    virtual std::vector<DebugPrinter::Block> debugPrintAccumulate() const = 0;
+
+    /**
+     * Returns a developer-readable reprsentation of the accumulator's merge expression. When
+     * merging is computed by the SBE VM, this representation will be an ABT expression. In other
+     * cases, it will be a keyword that will uniquely identify the execution method.
+     */
+    virtual std::vector<DebugPrinter::Block> debugPrintMerge() const = 0;
+
+    virtual void debugPrintCode(std::vector<DebugPrinter::Block>& blocks) const = 0;
+
+protected:
+    /**
+     * The slot that stores the accumulator's state and usually also stores its final value.
+     * Accumulator implementations do not reference this slot, but it is stored with the accumulator
+     * for the HashAggStage to use.
+     */
+    value::SlotId _outSlot;
+
+    /**
+     * The slot that stores the recovered state of a spilled accumulator after reading it from disk.
+     * Accumulator implementations do not reference this slot, but it is stored with the accumulator
+     * for the HashAggStage to use.
+     */
+    value::SlotId _spillSlot;
+};
+
+/**
+ * A general-purpose accumulator whose behavior is specified by initialize, accumulate, and merge
+ * expressions, which are defined with ABT and execute in the SBE VM.
+ */
+class CompiledHashAggAccumulator : public HashAggAccumulator {
+public:
+    CompiledHashAggAccumulator(value::SlotId outSlot,
+                               value::SlotId spillSlot,
+                               std::unique_ptr<EExpression> accumulatorExpr,
+                               std::unique_ptr<EExpression> mergingExpr,
+                               std::unique_ptr<EExpression> optionalInitializerExpression = {})
+        : HashAggAccumulator(outSlot, spillSlot),
+          _accumulatorExpr(std::move(accumulatorExpr)),
+          _mergingExpr(std::move(mergingExpr)),
+          _optionalInitializerExpr(std::move(optionalInitializerExpression)) {}
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<CompiledHashAggAccumulator>(
+            _outSlot,
+            _spillSlot,
+            _accumulatorExpr->clone(),
+            _mergingExpr->clone(),
+            _optionalInitializerExpr ? _optionalInitializerExpr->clone() : nullptr);
+    };
+
+    void prepare(CompileCtx& ctx, value::SlotAccessor* accumulatorAccessor) final;
+
+    void prepareForMerge(CompileCtx& ctx, value::SlotAccessor* accumulatorAccessor) final;
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void accumulate(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final {
+        accumulatorState.reset(bytecode.run(_accumulatorCode.get()));
+    };
+
+    void merge(vm::ByteCode& bytecode,
+               value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    void finalize(vm::ByteCode&, value::AssignableSlotAccessor&) const final {};
+
+    size_t estimateSize() const final;
+
+    boost::optional<std::vector<DebugPrinter::Block>> debugPrintInitialize() const final;
+    std::vector<DebugPrinter::Block> debugPrintAccumulate() const final;
+    std::vector<DebugPrinter::Block> debugPrintMerge() const final;
+
+    void debugPrintCode(std::vector<DebugPrinter::Block>& blocks) const final {
+        PlanStage::debugPrintBytecode(blocks, _accumulatorCode, "ACCUMULATE" /*title*/);
+        PlanStage::debugPrintBytecode(blocks, _mergingCode, "MERGE" /*title*/);
+        PlanStage::debugPrintBytecode(blocks, _optionalInitializerCode, "INIT" /**/);
+    }
+
+private:
+    /**
+     * An EExpression program that
+     *   1. reads the current accumulator state,
+     *.  2. reads a value and transforms it as necessary to produce a desired accumulator input, and
+     *.  3. produces the updated accumulator state.
+     *
+     * In normal use, the input accumulator state will be read from a slot that is bound to the
+     * accumulatorState' accessor used as the destination for initialize, accumulate, and merge
+     * operations.
+     *
+     * The program is compiled to a 'CodeFragment' as part of the 'prepare()' step.
+     */
+    std::unique_ptr<EExpression> _accumulatorExpr;
+    std::unique_ptr<vm::CodeFragment> _accumulatorCode;
+
+    /**
+     * An EExpression program that
+     *   1. reads the current accumulator state,
+     *.  2. reads the recovered state from a previously spilled accumulator, and
+     *.  3. produces the updated accumulator state.
+     *
+     * In normal use, the input accumulator state will be read from a slot that is bound to the
+     * 'accumulatorState' accessor used as the destination for initialize, accumulate, and merge
+     * operations, and the recovered state will be read from the '_spillSlot' input.
+     *
+     * The program is compiled to a 'CodeFragment' as part of the 'prepareForMerge()' step.
+     */
+    std::unique_ptr<EExpression> _mergingExpr;
+    std::unique_ptr<vm::CodeFragment> _mergingCode;
+
+    /**
+     * An EExpression program that produces a value appropriate for an accumulator that has not yet
+     * processed any input values.
+     *
+     * This expression may be null. When it is non-null, it is compiled to a 'CodeFragment' as part
+     * of the 'prepareForMerge()' step.
+     */
+    std::unique_ptr<EExpression> _optionalInitializerExpr;
+    std::unique_ptr<vm::CodeFragment> _optionalInitializerCode;
+};
+
+/**
+ * A base class for accumulators whose accumulate, merge, and finalize operations are implemented
+ * natively instead of executing on the SBE VM.
+ */
+class SinglePurposeHashAggAccumulator : public HashAggAccumulator {
+public:
+    SinglePurposeHashAggAccumulator(value::SlotId outSlot,
+                                    value::SlotId spillSlot,
+                                    std::unique_ptr<EExpression> transformExpr,
+                                    boost::optional<value::SlotId> collatorSlot)
+        : HashAggAccumulator(outSlot, spillSlot), _transformExpr(std::move(transformExpr)) {}
+
+    void prepare(CompileCtx& ctx, value::SlotAccessor* accumulatorAccessor) final;
+
+    void prepareForMerge(CompileCtx& ctx, value::SlotAccessor* accumulatorAccessor) final;
+
+    void accumulate(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void merge(vm::ByteCode& bytecode,
+               value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    void finalize(vm::ByteCode&, value::AssignableSlotAccessor& accumulatorState) const override;
+
+    size_t estimateSize() const override;
+
+    boost::optional<std::vector<DebugPrinter::Block>> debugPrintInitialize() const final;
+    std::vector<DebugPrinter::Block> debugPrintAccumulate() const final;
+    std::vector<DebugPrinter::Block> debugPrintMerge() const final;
+
+    void debugPrintCode(std::vector<DebugPrinter::Block>& blocks) const final {
+        /*no bytecode to print*/
+    }
+
+protected:
+    /**
+     * Child implementations of this class can override this method to perform any follow-on
+     * preparation that may be necessary after 'SinglePurposeHashAggAccumulator::prepare()'
+     * finishes.
+     */
+    virtual void singlePurposePrepare(CompileCtx& ctx) {}
+
+    /**
+     * Child implementations of this class must override this method to accept an input value as an
+     * (owned, type tag, value) pair and update the accumulator state stored in the
+     * 'accumulatorState' accessor to incorporate the new value.
+     */
+    virtual void accumulateTransformedValue(
+        value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accumulatorState) const = 0;
+
+    /**
+     * Child implementations of this class must override this method to accept the recovered state
+     * of a spilled accumulator as a (type tag, value pair) and merge it into the saved state in the
+     * 'accumulatorState' accessor.
+     */
+    virtual void mergeRecoveredState(
+        value::TagValueMaybeOwned recoveredState,
+        value::MaterializedSingleRowAccessor& accumulatorState) const = 0;
+
+    /**
+     * Child implementations of this class must override this method to accept the accumulator state
+     * as a (type tag, value) pair and write the final result of the accumulation to the
+     * 'result' accessor.
+     */
+    virtual void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                          value::AssignableSlotAccessor& result) const = 0;
+
+    /**
+     * Child implementations of this class must override this method to provide a unique name that
+     * will identify the implementation in diagostic descriptions of HashAggStages.
+     */
+    virtual std::string getDebugName() const = 0;
+
+    /**
+     * An EExpression program that reads a value and transforms it as necessary to produce a desired
+     * accumulator input. Although a single-purpose accumulator does not use the VM to compute the
+     * accumulation function, it still uses this program to produce the accumulator inputs.
+     */
+    std::unique_ptr<EExpression> _transformExpr;
+
+private:
+    /**
+     * The '_transformExpr' program is compiled to a 'CodeFragment' as part of the 'prepare()' step.
+     */
+    std::unique_ptr<vm::CodeFragment> _transformCode;
+
+    /**
+     * An EExpression program that reads the recovered state from a previously spilled accumulator.
+     * In normal use, the recovered state will be read from the '_spillSlot' input.
+     * The program is compiled to a 'CodeFragment' as part of the 'prepareForMerge()' step.
+     */
+    std::unique_ptr<EExpression> _recoverSpilledStateExpr;
+    std::unique_ptr<vm::CodeFragment> _recoverSpilledStateCode;
+};
+
+/**
+ * Base class for the single-purpose implementation of the $avg accumulator.
+ */
+class ArithmeticAverageHashAggAccumulatorBase : public SinglePurposeHashAggAccumulator {
+public:
+    using SinglePurposeHashAggAccumulator::SinglePurposeHashAggAccumulator;
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+protected:
+    void accumulateTransformedValue(value::TagValueMaybeOwned field,
+                                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void mergeRecoveredState(value::TagValueMaybeOwned recoveredState,
+                             value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    std::string getDebugName() const final {
+        return "_internalArithmeticAverage";
+    }
+};
+
+/**
+ * Single-purpose implementation of the $avg accumulator for when the desired output is the final
+ * result of the $avg expression.
+ */
+class ArithmeticAverageHashAggAccumulatorTerminal : public ArithmeticAverageHashAggAccumulatorBase {
+public:
+    using ArithmeticAverageHashAggAccumulatorBase::ArithmeticAverageHashAggAccumulatorBase;
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<ArithmeticAverageHashAggAccumulatorTerminal>(
+            _outSlot, _spillSlot, _transformExpr->clone(), boost::none);
+    }
+
+protected:
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+};
+
+/**
+ * Single-purpose implementation of the $avg accumulator for use by shards producing results for a
+ * merge operation, in which case the desired output is not the final result but instead an array
+ * containing the separated count and sum values (i.e., the partial aggregate).
+ */
+class ArithmeticAverageHashAggAccumulatorPartial : public ArithmeticAverageHashAggAccumulatorBase {
+public:
+    using ArithmeticAverageHashAggAccumulatorBase::ArithmeticAverageHashAggAccumulatorBase;
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<ArithmeticAverageHashAggAccumulatorPartial>(
+            _outSlot, _spillSlot, _transformExpr->clone(), boost::none);
+    }
+
+protected:
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+};
+
+class AddToSetHashAggAccumulator : public SinglePurposeHashAggAccumulator {
+public:
+    AddToSetHashAggAccumulator(value::SlotId outSlot,
+                               value::SlotId spillSlot,
+                               std::unique_ptr<EExpression> transformExpr,
+                               boost::optional<value::SlotId> collatorSlot,
+                               int64_t sizeCap)
+        : SinglePurposeHashAggAccumulator(
+              outSlot, spillSlot, std::move(transformExpr), collatorSlot),
+          _collatorSlot(collatorSlot),
+          _sizeCap(sizeCap) {}
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<AddToSetHashAggAccumulator>(
+            _outSlot, _spillSlot, _transformExpr->clone(), _collatorSlot, _sizeCap);
+    }
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+protected:
+    void singlePurposePrepare(CompileCtx& ctx) final;
+
+    void accumulateTransformedValue(value::TagValueMaybeOwned field,
+                                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void mergeRecoveredState(value::TagValueMaybeOwned recoveredState,
+                             value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+
+    std::string getDebugName() const final {
+        return "_internalAddToSet";
+    }
+
+private:
+    boost::optional<value::SlotId> _collatorSlot;
+    value::SlotAccessor* _collatorAccessor = nullptr;
+
+    int64_t _sizeCap;
+};
+
+class PushHashAggAccumulator : public SinglePurposeHashAggAccumulator {
+public:
+    PushHashAggAccumulator(value::SlotId outSlot,
+                           value::SlotId spillSlot,
+                           std::unique_ptr<EExpression> transformExpr,
+                           boost::optional<value::SlotId> collatorSlot,
+                           int64_t sizeCap)
+        : SinglePurposeHashAggAccumulator(
+              outSlot, spillSlot, std::move(transformExpr), collatorSlot),
+          _sizeCap(sizeCap) {}
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<PushHashAggAccumulator>(
+            _outSlot, _spillSlot, _transformExpr->clone(), boost::none, _sizeCap);
+    }
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+protected:
+    void accumulateTransformedValue(value::TagValueMaybeOwned field,
+                                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void mergeRecoveredState(value::TagValueMaybeOwned recoveredState,
+                             value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+
+    std::string getDebugName() const final {
+        return "_internalPush";
+    }
+
+private:
+    int64_t _sizeCap;
+};
+
+class FirstHashAggAccumulator : public SinglePurposeHashAggAccumulator {
+public:
+    using SinglePurposeHashAggAccumulator::SinglePurposeHashAggAccumulator;
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<FirstHashAggAccumulator>(
+            _outSlot, _spillSlot, _transformExpr->clone(), boost::none);
+    }
+
+protected:
+    void accumulateTransformedValue(value::TagValueMaybeOwned field,
+                                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void mergeRecoveredState(value::TagValueMaybeOwned recoveredState,
+                             value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+
+    std::string getDebugName() const final {
+        return "_internalFirst";
+    }
+};
+
+/**
+ * Base class for the single-purpose implementation of the $count accumulator.
+ */
+class CountHashAggAccumulatorBase : public SinglePurposeHashAggAccumulator {
+public:
+    using SinglePurposeHashAggAccumulator::SinglePurposeHashAggAccumulator;
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+protected:
+    void accumulateTransformedValue(value::TagValueMaybeOwned field,
+                                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void mergeRecoveredState(value::TagValueMaybeOwned recoveredState,
+                             value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    std::string getDebugName() const final {
+        return "_internalCount";
+    }
+};
+
+/**
+ * Single-purpose implementation of the $count accumulator for when the desired output is the final
+ * result of the $count expression.
+ */
+class CountHashAggAccumulatorTerminal : public CountHashAggAccumulatorBase {
+public:
+    using CountHashAggAccumulatorBase::CountHashAggAccumulatorBase;
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<CountHashAggAccumulatorTerminal>(
+            _outSlot, _spillSlot, _transformExpr->clone(), boost::none);
+    }
+
+protected:
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+};
+
+/**
+ * Single-purpose implementation of the $count accumulator for use by shards producing results for a
+ * merge operation, in which case the desired output is not the final result but instead an array
+ * containing a serialized DoubleDoubleSum (i.e., the partial aggregate).
+ */
+class CountHashAggAccumulatorPartial : public CountHashAggAccumulatorBase {
+public:
+    using CountHashAggAccumulatorBase::CountHashAggAccumulatorBase;
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<CountHashAggAccumulatorPartial>(
+            _outSlot, _spillSlot, _transformExpr->clone(), boost::none);
+    }
+
+protected:
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+};
+
+/**
+ * Single-purpose implementation of the $minN/$maxN accumulators.
+ */
+template <AccumulatorMinMaxN::MinMaxSense S>
+class MinMaxNHashAggAccumulator : public SinglePurposeHashAggAccumulator {
+public:
+    MinMaxNHashAggAccumulator(value::SlotId outSlot,
+                              value::SlotId spillSlot,
+                              std::unique_ptr<EExpression> transformExpr,
+                              boost::optional<value::SlotId> collatorSlot,
+                              int64_t maxSize,
+                              int32_t memLimit)
+        : SinglePurposeHashAggAccumulator(
+              outSlot, spillSlot, std::move(transformExpr), collatorSlot),
+          _collatorSlot(collatorSlot),
+          _maxSize(maxSize),
+          _memLimit(memLimit) {}
+
+    std::unique_ptr<HashAggAccumulator> clone() const final {
+        return std::make_unique<MinMaxNHashAggAccumulator<S>>(
+            _outSlot, _spillSlot, _transformExpr->clone(), _collatorSlot, _maxSize, _memLimit);
+    }
+
+    void initialize(vm::ByteCode& bytecode,
+                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+protected:
+    void singlePurposePrepare(CompileCtx& ctx) final;
+
+    void accumulateTransformedValue(value::TagValueMaybeOwned field,
+                                    value::AssignableSlotAccessor& accumulatorState) const final;
+
+    void mergeRecoveredState(value::TagValueMaybeOwned recoveredState,
+                             value::MaterializedSingleRowAccessor& accumulatorState) const final;
+
+    void finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                  value::AssignableSlotAccessor& result) const final;
+
+    std::string getDebugName() const final {
+        return S == AccumulatorMinMaxN::MinMaxSense::kMin ? "_internalMinN" : "_internalMaxN";
+    }
+
+private:
+    CollatorInterface* getCollator() const;
+
+    boost::optional<value::SlotId> _collatorSlot;
+    value::SlotAccessor* _collatorAccessor = nullptr;
+    int64_t _maxSize;
+    int32_t _memLimit;
+    mutable int32_t _memUsage{};
+};
+
+using MinNHashAggAccumulator = MinMaxNHashAggAccumulator<AccumulatorMinMaxN::MinMaxSense::kMin>;
+using MaxNHashAggAccumulator = MinMaxNHashAggAccumulator<AccumulatorMinMaxN::MinMaxSense::kMax>;
+
+namespace size_estimator {
+inline size_t estimate(const std::unique_ptr<HashAggAccumulator>& accumulator) {
+    return accumulator->estimateSize();
+}
+}  // namespace size_estimator
+}  // namespace sbe
+}  // namespace mongo

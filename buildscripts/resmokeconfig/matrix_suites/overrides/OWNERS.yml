@@ -1,0 +1,96 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/mongo-default-approvers
+  - "bulk_write.yml":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "change_streams*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "multiplan_single_solutions.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "networking.yml":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "qemp_ifr_batch1.yml":
+    approvers:
+      - 10gen/query-execution
+  - "qemp_ifr_no_nlm_transform.yml":
+    approvers:
+      - 10gen/query-execution
+  - "query_settings.yml":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "*query_shape_hash_stability*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "repeat_queries.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "always_replan.yml":
+    approvers:
+      - 10gen/query-optimization
+      - 10gen/query-execution
+  - "*legacy_timeseries.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "stepdown_primary_change_streams.yml":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "injected_catalog_metadata.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "*rate_limiter*.yml":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "fcv_upgrade_downgrade.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "fcv_upgrade_downgrade_timeseries.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "fcv_upgrade_downgrade_primary_step_down_overrides.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "*primary_driven_index_builds.yml":
+    approvers:
+      - 10gen/server-index-builds
+  - "replica_sets_kill_secondary.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "execution_control_params.yml":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "priority_ports.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "retryable_writes.yml":
+    approvers:
+      - 10gen/server-transactions
+  - "check_system_buckets_hook.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "no_causal_consistency.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "drop_config_cache_collections_hook.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "kill_primary.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "replica_sets_stepdown_selector.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "minimum_batch_size.yml":
+    approvers:
+      - 10gen/query-execution
+  - "encryption.yml":
+    approvers:
+      - 10gen/server-security
+  - "with_mongot_extension*":
+    approvers:
+      - 10gen/query-integration-extensions-api

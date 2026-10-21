@@ -1,43 +1,146 @@
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/replication_coordinator.h"
+
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
 
-    ReplicationCoordinator::ReplicationCoordinator() {}
-    ReplicationCoordinator::~ReplicationCoordinator() {}
 
-    // TODO(dannenberg) remove when master slave is removed
-    const char *replAllDead = 0;
+namespace {
+const auto getReplicationCoordinator =
+    ServiceContext::declareDecoration<std::unique_ptr<ReplicationCoordinator>>();
+}
 
-} // namespace repl
-} // namespace mongo
+ReplicationCoordinator::ReplicationCoordinator() {}
+ReplicationCoordinator::~ReplicationCoordinator() {}
+
+ReplicationCoordinator* ReplicationCoordinator::get(ServiceContext* service) {
+    return getReplicationCoordinator(service).get();
+}
+
+ReplicationCoordinator* ReplicationCoordinator::get(ServiceContext& service) {
+    return getReplicationCoordinator(service).get();
+}
+
+ReplicationCoordinator* ReplicationCoordinator::get(OperationContext* ctx) {
+    return get(ctx->getClient()->getServiceContext());
+}
+
+
+void ReplicationCoordinator::set(ServiceContext* service,
+                                 std::unique_ptr<ReplicationCoordinator> replCoord) {
+    auto& coordinator = getReplicationCoordinator(service);
+    coordinator = std::move(replCoord);
+}
+
+bool ReplicationCoordinator::isOplogDisabledFor(OperationContext* opCtx,
+                                                const NamespaceString& nss) const {
+    if (!getSettings().isReplSet()) {
+        return true;
+    }
+
+    if (!opCtx->writesAreReplicated()) {
+        return true;
+    }
+
+    if (ReplicationCoordinator::isOplogDisabledForNS(nss)) {
+        return true;
+    }
+
+    // Magic restore performs writes to replicated collections (e.g in the config DB) that we don't
+    // want replicated via the oplog.
+    if (storageGlobalParams.magicRestore) {
+        return true;
+    }
+
+    fassert(28626, shard_role_details::getRecoveryUnit(opCtx));
+
+    return false;
+}
+
+void ReplicationCoordinator::setOldestTimestamp(const Timestamp& timestamp) {
+    getServiceContext()->getStorageEngine()->setOldestTimestamp(timestamp, false /*force*/);
+}
+
+bool ReplicationCoordinator::isOplogDisabledForNS(const NamespaceString& nss) {
+    if (!nss.isReplicated()) {
+        return true;
+    }
+
+    return false;
+}
+
+bool ReplicationCoordinator::isInInitialSyncOrRollback() const {
+    if (!getSettings().isReplSet()) {
+        return false;
+    }
+
+    const auto memberState = getMemberState();
+    return memberState.startup2() || memberState.rollback();
+}
+
+bool ReplicationCoordinator::shouldUseEmptyOplogBatchToPropagateCommitPoint(
+    OpTime clientOpTime) const {
+    if (!repl::allowEmptyOplogBatchesToPropagateCommitPoint) {
+        return false;
+    }
+
+    // For getMore operations with a last committed opTime, we should not wait if our
+    // lastCommittedOpTime has progressed past the client's lastCommittedOpTime. In that case,
+    // we will return early so that we can inform the client of the new lastCommittedOpTime
+    // immediately.
+    return clientOpTime < getLastCommittedOpTime();
+}
+
+bool ReplicationCoordinator::shouldParkHelloAwaitingTopologyChange(
+    const TopologyVersion& currentTopologyVersion,
+    const boost::optional<TopologyVersion>& clientTopologyVersion,
+    std::int64_t lastHorizonTopologyChange) {
+    if (!clientTopologyVersion) {
+        // The client is not using awaitable hello so we respond immediately.
+        return false;
+    }
+    if (clientTopologyVersion->getProcessId() != currentTopologyVersion.getProcessId()) {
+        // Getting a different process id indicates that the server has restarted so we return
+        // immediately with the updated process id.
+        return false;
+    }
+    auto clientCounter = clientTopologyVersion->getCounter();
+    auto serverCounter = currentTopologyVersion.getCounter();
+    uassert(31382,
+            str::stream() << "Received a topology version with counter: " << clientCounter
+                          << " which is greater than the server topology version counter: "
+                          << serverCounter,
+            clientCounter <= serverCounter);
+    if (clientCounter < serverCounter) {
+        uassert(ErrorCodes::SplitHorizonChange,
+                "Stale horizon detected, we have since received a reconfig that changed the "
+                "horizon mappings.",
+                clientCounter >= lastHorizonTopologyChange);
+        // The received hello command contains a stale topology version so we respond
+        // immediately with a more current topology version.
+        return false;
+    }
+    return true;
+}
+
+}  // namespace repl
+}  // namespace mongo

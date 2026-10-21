@@ -1,0 +1,180 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/global_catalog/type_mongos.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/analyze_shard_key_common_gen.h"
+#include "mongo/s/analyze_shard_key_documents_gen.h"
+#include "mongo/s/analyze_shard_key_role.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace analyze_shard_key {
+
+/**
+ * Keeps track of all samplers in the cluster and assigns sample rates to each sampler based on its
+ * view of the query distribution across the samplers.
+ *
+ * On a sharded cluster, a sampler is any mongos or shardsvr mongod (that has acted as a
+ * router) in the cluster, and the coordinator is the config server's primary mongod. On a
+ * standalone replica set, a sampler is any mongod in the set and the coordinator is the primary
+ * mongod.
+ */
+class QueryAnalysisCoordinator : public ReplicaSetAwareService<QueryAnalysisCoordinator> {
+public:
+    using CollectionQueryAnalyzerConfigurationMap =
+        stdx::unordered_map<NamespaceString, CollectionQueryAnalyzerConfiguration>;
+    /**
+     * Stores the last ping time and the last exponential moving average number of queries executed
+     * per second for a sampler.
+     */
+    class Sampler {
+    public:
+        Sampler(std::string name, Date_t lastPingTime)
+            : _name(name), _lastPingTime(lastPingTime) {};
+
+        std::string getName() const {
+            return _name;
+        }
+
+        Date_t getLastPingTime() const {
+            return _lastPingTime;
+        }
+
+        boost::optional<double> getLastNumQueriesExecutedPerSecond() const {
+            return _lastNumQueriesExecutedPerSecond;
+        }
+
+        void setLastPingTime(Date_t pingTime);
+
+        void setLastNumQueriesExecutedPerSecond(double numQueries);
+        void resetLastNumQueriesExecutedPerSecond();
+
+    private:
+        std::string _name;
+        Date_t _lastPingTime;
+        boost::optional<double> _lastNumQueriesExecutedPerSecond;
+    };
+
+    QueryAnalysisCoordinator() = default;
+
+    /**
+     * Obtains the service-wide QueryAnalysisCoordinator instance.
+     */
+    static QueryAnalysisCoordinator* get(OperationContext* opCtx);
+    static QueryAnalysisCoordinator* get(ServiceContext* serviceContext);
+
+    void onStartup(OperationContext* opCtx) final;
+
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+
+    /**
+     * Creates, updates and deletes the configuration for the collection with the given
+     * config.queryAnalyzers document.
+     */
+    void onConfigurationInsert(const QueryAnalyzerDocument& doc);
+    void onConfigurationUpdate(const QueryAnalyzerDocument& doc);
+    void onConfigurationDelete(const QueryAnalyzerDocument& doc);
+
+    /**
+     * On a sharded cluster, creates, updates and deletes the sampler for the mongos with the given
+     * config.mongos document.
+     */
+    virtual void onSamplerInsert(const MongosType& doc);
+    virtual void onSamplerUpdate(const MongosType& doc);
+    virtual void onSamplerDelete(const MongosType& doc);
+
+    /**
+     * Given the average number of queries that a sampler executes, returns the new query analyzer
+     * configurations for the sampler.
+     */
+    std::vector<CollectionQueryAnalyzerConfiguration> getNewConfigurationsForSampler(
+        OperationContext* opCtx, std::string_view samplerName, double numQueriesExecutedPerSecond);
+
+
+    CollectionQueryAnalyzerConfigurationMap getConfigurationsForTest() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return _configurations;
+    }
+
+    void clearConfigurationsForTest() {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _configurations.clear();
+    }
+
+    StringMap<Sampler> getSamplersForTest() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return _samplers;
+    }
+
+    void clearSamplersForTest() {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _samplers.clear();
+    }
+
+private:
+    bool shouldRegisterReplicaSetAwareService() const final;
+
+    /**
+     * On a standalone replica set, creates, updates and removes samplers based on the current
+     * replica set configuration.
+     */
+    void onSetCurrentConfig(OperationContext* opCtx) final;
+
+    void onConsistentDataAvailable(OperationContext* opCtx,
+                                   bool isMajority,
+                                   bool isRollback) final {}
+
+    void onShutdown() final {}
+
+    void onStepUpComplete(OperationContext* opCtx, long long term) final {}
+
+    void onStepDown() final {}
+
+    void onRollbackBegin() final {}
+
+    void onBecomeArbiter() final {}
+
+    inline std::string getServiceName() const final {
+        return "QueryAnalysisCoordinator";
+    }
+
+    /**
+     * Returns the minimum last ping time for a sampler to be considered as active.
+     */
+    Date_t _getMinLastPingTime();
+    Date_t _getMinLastPingTime(Date_t now);
+
+    mutable std::mutex _mutex;
+
+    CollectionQueryAnalyzerConfigurationMap _configurations;
+    StringMap<Sampler> _samplers;
+};
+
+class QueryAnalysisCoordinatorFactory {
+public:
+    QueryAnalysisCoordinatorFactory() = default;
+    virtual ~QueryAnalysisCoordinatorFactory() = default;
+    virtual QueryAnalysisCoordinator* getQueryAnalysisCoordinator(OperationContext* opCtx) {
+        return QueryAnalysisCoordinator::get(opCtx);
+    }
+};
+}  // namespace analyze_shard_key
+}  // namespace mongo

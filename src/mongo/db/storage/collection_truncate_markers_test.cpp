@@ -1,0 +1,1224 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/collection_truncate_markers.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/storage/storage_engine_test_fixture.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <string>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+
+class CollectionMarkersTest : public StorageEngineTest {
+public:
+    explicit CollectionMarkersTest(Options options = {}) : StorageEngineTest(std::move(options)) {}
+
+    struct RecordIdAndWall {
+        RecordId recordId;
+        Date_t wallTime;
+    };
+    std::vector<RecordIdAndWall> insertElementsWithCollectionMarkerUpdate(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        CollectionTruncateMarkers& testMarkers,
+        int numElements,
+        int dataLength) {
+        std::vector<RecordIdAndWall> records;
+        AutoGetCollection coll(opCtx, nss, MODE_IX);
+        const auto insertedData = std::string(dataLength, 'a');
+        WriteUnitOfWork wuow(opCtx);
+        for (int i = 0; i < numElements; i++) {
+            auto now = Date_t::now();
+            auto ts = Timestamp(now);
+            auto recordIdStatus =
+                coll->getRecordStore()->insertRecord(opCtx,
+                                                     *shard_role_details::getRecoveryUnit(opCtx),
+                                                     insertedData.data(),
+                                                     insertedData.length(),
+                                                     ts);
+            ASSERT_OK(recordIdStatus);
+            auto recordId = recordIdStatus.getValue();
+            testMarkers.updateCurrentMarkerAfterInsertOnCommit(opCtx,
+                                                               insertedData.length(),
+                                                               recordId,
+                                                               now,
+                                                               1,
+                                                               /*oplogSamplingAsyncEnabled*/ false);
+            records.push_back(RecordIdAndWall{std::move(recordId), std::move(now)});
+        }
+        wuow.commit();
+        return records;
+    }
+
+    RecordIdAndWall insertElementWithCollectionMarkerUpdate(OperationContext* opCtx,
+                                                            const NamespaceString& nss,
+                                                            CollectionTruncateMarkers& testMarkers,
+                                                            int dataLength) {
+        auto records =
+            insertElementsWithCollectionMarkerUpdate(opCtx, nss, testMarkers, 1, dataLength);
+        return records.front();
+    }
+
+    RecordId insertWithSpecificTimestampAndRecordId(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    CollectionTruncateMarkers& testMarkers,
+                                                    int dataLength,
+                                                    Timestamp timestampToUse,
+                                                    const RecordId& recordId) {
+        AutoGetCollection coll(opCtx, nss, MODE_IX);
+        const auto insertedData = std::string(dataLength, 'a');
+        WriteUnitOfWork wuow(opCtx);
+        auto recordIdStatus =
+            coll->getRecordStore()->insertRecord(opCtx,
+                                                 *shard_role_details::getRecoveryUnit(opCtx),
+                                                 recordId,
+                                                 insertedData.data(),
+                                                 insertedData.length(),
+                                                 timestampToUse);
+        ASSERT_OK(recordIdStatus);
+        EXPECT_EQ(recordIdStatus.getValue(), recordId);
+        auto now = Date_t::fromMillisSinceEpoch(timestampToUse.asInt64());
+        testMarkers.updateCurrentMarkerAfterInsertOnCommit(
+            opCtx, insertedData.length(), recordId, now, 1, /*oplogSamplingAsyncEnabled*/ false);
+        wuow.commit();
+        return recordId;
+    }
+
+    void insertElements(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        int dataLength,
+                        int numElements,
+                        Timestamp timestampToUse) {
+        AutoGetCollection coll(opCtx, nss, MODE_X);
+        const auto correctedSize = dataLength - BSON("x" << "").objsize();
+        invariant(correctedSize >= 0);
+        const auto objToInsert = BSON("x" << std::string(correctedSize, 'a'));
+        WriteUnitOfWork wuow(opCtx);
+        for (int i = 0; i < numElements; i++) {
+            auto recordIdStatus =
+                coll->getRecordStore()->insertRecord(opCtx,
+                                                     *shard_role_details::getRecoveryUnit(opCtx),
+                                                     objToInsert.objdata(),
+                                                     objToInsert.objsize(),
+                                                     timestampToUse);
+            ASSERT_OK(recordIdStatus);
+        }
+        wuow.commit();
+    }
+
+    // returns total bytes and total records in the collection
+    std::tuple<size_t, size_t> createPopulatedCollection(const NamespaceString& collNs,
+                                                         Timestamp timestamp = Timestamp(1, 0)) {
+        static constexpr size_t kNumRounds = 200;
+        static constexpr size_t kElementSize = 15;
+
+        size_t totalBytes = 0;
+        size_t totalRecords = 0;
+
+        auto opCtx = getClient()->makeOperationContext();
+        createCollection(opCtx.get(), collNs);
+        // Add documents of various sizes
+        for (size_t round = 0; round < kNumRounds; round++) {
+            for (size_t numBytes = kElementSize; numBytes < kElementSize * 2; numBytes++) {
+                insertElements(opCtx.get(), collNs, numBytes, 1, timestamp);
+                totalRecords++;
+                totalBytes += numBytes;
+            }
+        }
+        EXPECT_EQ(totalBytes, 66'000);
+        EXPECT_EQ(totalRecords, 3'000);
+        return {totalBytes, totalRecords};
+    }
+};
+
+class TestCollectionMarkersWithPartialExpiration final
+    : public CollectionTruncateMarkersWithPartialExpiration {
+public:
+    TestCollectionMarkersWithPartialExpiration(int64_t minBytesPerMarker)
+        : CollectionTruncateMarkersWithPartialExpiration(
+              {},
+              RecordId{},
+              Date_t{},
+              0 /* leftoverRecordsCount */,
+              0 /* leftoverRecordsBytes */,
+              minBytesPerMarker,
+              Microseconds(0),
+              CollectionTruncateMarkers::MarkersCreationMethod::EmptyCollection) {};
+
+    void setExpirePartialMarker(bool value) {
+        _expirePartialMarker = value;
+    }
+
+    void testUpdateCurrentMarker(int64_t bytesAdded,
+                                 const RecordId& highestRecordId,
+                                 Date_t highestWallTime,
+                                 int64_t numRecordsAdded,
+                                 bool oplogSamplingAsyncEnabled) {
+        updateCurrentMarker(bytesAdded,
+                            highestRecordId,
+                            highestWallTime,
+                            numRecordsAdded,
+                            oplogSamplingAsyncEnabled);
+    }
+
+    const std::deque<Marker>& getMarkersForTest() const {
+        return getMarkers();
+    }
+
+private:
+    bool _expirePartialMarker = false;
+
+    bool _hasExcessMarkers(OperationContext* opCtx) const override {
+        return !getMarkers().empty();
+    }
+
+    bool _hasPartialMarkerExpired(OperationContext* opCtx,
+                                  const RecordId& highestSeenRecordId,
+                                  const Date_t& highestSeenWallTime) const override {
+        return _expirePartialMarker;
+    }
+};
+
+class TestCollectionMarkers final : public CollectionTruncateMarkers {
+public:
+    TestCollectionMarkers(int64_t minBytesPerMarker)
+        : CollectionTruncateMarkers(
+              {},
+              0 /* leftoverRecordsCount */,
+              0 /* leftoverRecordsBytes */,
+              minBytesPerMarker,
+              Microseconds(0),
+              CollectionTruncateMarkers::MarkersCreationMethod::EmptyCollection,
+              true /* initialSamplingFinished */) {};
+
+private:
+    bool _hasExcessMarkers(OperationContext* opCtx) const override {
+        return !getMarkers().empty();
+    }
+};
+
+template <typename T>
+void normalTest(CollectionMarkersTest* fixture, std::string collectionName) {
+    auto testMarkers = std::make_shared<T>(1);
+
+    auto opCtx = fixture->getClient()->makeOperationContext();
+
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", collectionName);
+    fixture->createCollection(opCtx.get(), collNs);
+
+    static constexpr auto dataLength = 4;
+    auto [insertedRecordId, now] = fixture->insertElementWithCollectionMarkerUpdate(
+        opCtx.get(), collNs, *testMarkers, dataLength);
+
+    auto marker = testMarkers->peekOldestMarkerIfNeeded(opCtx.get());
+    ASSERT_TRUE(marker);
+    EXPECT_EQ(marker->lastRecord, insertedRecordId);
+    EXPECT_EQ(marker->bytes, dataLength);
+    EXPECT_EQ(marker->wallTime, now);
+    EXPECT_EQ(marker->records, 1);
+
+    testMarkers->popOldestMarker();
+
+    EXPECT_FALSE(testMarkers->peekOldestMarkerIfNeeded(opCtx.get()));
+};
+
+TEST_F(CollectionMarkersTest, NormalUsage) {
+    normalTest<TestCollectionMarkers>(this, "coll");
+    normalTest<TestCollectionMarkersWithPartialExpiration>(this, "partial_coll");
+}
+
+TEST_F(CollectionMarkersTest, NormalCollectionPartialMarkerUsage) {
+    auto testMarkers = std::make_shared<TestCollectionMarkersWithPartialExpiration>(100);
+
+    auto opCtx = getClient()->makeOperationContext();
+
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    createCollection(opCtx.get(), collNs);
+
+    static constexpr auto dataLength = 4;
+    auto [insertedRecordId, now] =
+        insertElementWithCollectionMarkerUpdate(opCtx.get(), collNs, *testMarkers, dataLength);
+
+    EXPECT_FALSE(testMarkers->peekOldestMarkerIfNeeded(opCtx.get()));
+
+    testMarkers->setExpirePartialMarker(false);
+    testMarkers->createPartialMarkerIfNecessary(opCtx.get());
+    EXPECT_FALSE(testMarkers->peekOldestMarkerIfNeeded(opCtx.get()));
+
+    testMarkers->setExpirePartialMarker(true);
+    testMarkers->createPartialMarkerIfNecessary(opCtx.get());
+    auto marker = testMarkers->peekOldestMarkerIfNeeded(opCtx.get());
+    ASSERT_TRUE(marker);
+
+    EXPECT_EQ(marker->lastRecord, insertedRecordId);
+    EXPECT_EQ(marker->bytes, dataLength);
+    EXPECT_EQ(marker->wallTime, now);
+    EXPECT_EQ(marker->records, 1);
+}
+
+// Insert records into a collection and verify the number of markers that are created.
+template <typename T>
+void createNewMarkerTest(CollectionMarkersTest* fixture, std::string collectionName) {
+    auto testMarkers = std::make_shared<T>(100);
+
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", collectionName);
+    {
+        auto opCtx = fixture->getClient()->makeOperationContext();
+        fixture->createCollection(opCtx.get(), collNs);
+    }
+
+    {
+        auto opCtx = fixture->getClient()->makeOperationContext();
+
+        EXPECT_EQ(0U, testMarkers->numMarkers());
+        EXPECT_LT(0, testMarkers->minBytesPerMarker());
+
+        // Inserting a record smaller than 'minBytesPerMarker' shouldn't create a new collection
+        // marker.
+        auto insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 99, Timestamp(1, 1), RecordId(1, 1));
+        EXPECT_EQ(insertedRecordId, RecordId(1, 1));
+        EXPECT_EQ(0U, testMarkers->numMarkers());
+        EXPECT_EQ(1, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(99, testMarkers->currentBytes_forTest());
+        EXPECT_LT(0, testMarkers->minBytesPerMarker());
+
+        // Inserting another record such that their combined size exceeds 'minBytesPerMarker' should
+        // cause a new marker to be created.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 51, Timestamp(1, 2), RecordId(1, 2));
+        EXPECT_EQ(insertedRecordId, RecordId(1, 2));
+        EXPECT_EQ(1U, testMarkers->numMarkers());
+        EXPECT_EQ(0, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, testMarkers->currentBytes_forTest());
+        EXPECT_LT(0, testMarkers->minBytesPerMarker());
+
+        // Inserting a record such that the combined size of this record and the previously inserted
+        // one exceed 'minBytesPerMarker' shouldn't cause a new marker to be created because we've
+        // started filling a new marker.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 50, Timestamp(1, 3), RecordId(1, 3));
+        EXPECT_EQ(insertedRecordId, RecordId(1, 3));
+        EXPECT_EQ(1U, testMarkers->numMarkers());
+        EXPECT_EQ(1, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, testMarkers->currentBytes_forTest());
+        EXPECT_LT(0, testMarkers->minBytesPerMarker());
+
+        // Inserting a record such that the combined size of this record and the previously inserted
+        // one is exactly equal to 'minBytesPerMarker' should cause a new marker to be created.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 50, Timestamp(1, 4), RecordId(1, 4));
+        EXPECT_EQ(insertedRecordId, RecordId(1, 4));
+        EXPECT_EQ(2U, testMarkers->numMarkers());
+        EXPECT_EQ(0, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, testMarkers->currentBytes_forTest());
+        EXPECT_LT(0, testMarkers->minBytesPerMarker());
+
+        // Inserting a single record that exceeds 'minBytesPerMarker' should cause a new marker to
+        // be created.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 101, Timestamp(1, 5), RecordId(1, 5));
+        EXPECT_EQ(insertedRecordId, RecordId(1, 5));
+        EXPECT_EQ(3U, testMarkers->numMarkers());
+        EXPECT_EQ(0, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, testMarkers->currentBytes_forTest());
+        EXPECT_LT(0, testMarkers->minBytesPerMarker());
+    }
+}
+
+TEST_F(CollectionMarkersTest, CreateNewMarker) {
+    createNewMarkerTest<TestCollectionMarkers>(this, "coll");
+    createNewMarkerTest<TestCollectionMarkersWithPartialExpiration>(this, "partial_coll");
+}
+
+CollectionTruncateMarkers::RecordIdAndWallTime getIdAndWallTime(const Record& record) {
+    return {record.id, Date_t::now()};
+}
+
+// Verify that a collection marker isn't created if it would cause the logical representation of the
+// records to not be in increasing order.
+template <typename T>
+void ascendingOrderTest(CollectionMarkersTest* fixture, std::string collectionName) {
+    auto testMarkers = std::make_shared<T>(100);
+
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", collectionName);
+    {
+        auto opCtx = fixture->getClient()->makeOperationContext();
+        fixture->createCollection(opCtx.get(), collNs);
+    }
+
+    {
+        auto opCtx = fixture->getClient()->makeOperationContext();
+
+        EXPECT_EQ(0U, testMarkers->numMarkers());
+        auto insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 50, Timestamp(2, 2), RecordId(2, 2));
+        EXPECT_EQ(insertedRecordId, RecordId(2, 2));
+        EXPECT_EQ(0U, testMarkers->numMarkers());
+        EXPECT_EQ(1, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, testMarkers->currentBytes_forTest());
+
+        // Inserting a record that has a smaller RecordId than the previously inserted record should
+        // be able to create a new marker when no markers already exist.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 50, Timestamp(2, 1), RecordId(2, 1));
+        EXPECT_EQ(insertedRecordId, RecordId(2, 1));
+        EXPECT_EQ(1U, testMarkers->numMarkers());
+        EXPECT_EQ(0, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, testMarkers->currentBytes_forTest());
+
+        // However, inserting a record that has a smaller RecordId than most recently created
+        // marker's last record shouldn't cause a new marker to be created, even if the size of the
+        // inserted record exceeds 'minBytesPerMarker'.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 100, Timestamp(1, 1), RecordId(1, 1));
+        EXPECT_EQ(insertedRecordId, RecordId(1, 1));
+        EXPECT_EQ(1U, testMarkers->numMarkers());
+        EXPECT_EQ(1, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(100, testMarkers->currentBytes_forTest());
+
+        // Inserting a record that has a larger RecordId than the most recently created marker's
+        // last record should then cause a new marker to be created.
+        insertedRecordId = fixture->insertWithSpecificTimestampAndRecordId(
+            opCtx.get(), collNs, *testMarkers, 50, Timestamp(2, 3), RecordId(2, 3));
+        EXPECT_EQ(insertedRecordId, RecordId(2, 3));
+        EXPECT_EQ(2U, testMarkers->numMarkers());
+        EXPECT_EQ(0, testMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, testMarkers->currentBytes_forTest());
+    }
+}
+
+TEST_F(CollectionMarkersTest, AscendingOrder) {
+    ascendingOrderTest<TestCollectionMarkers>(this, "coll");
+    ascendingOrderTest<TestCollectionMarkersWithPartialExpiration>(this, "partial_coll");
+}
+
+// Test that initial marker creation works as expected when performing a scanning marker creation.
+TEST_F(CollectionMarkersTest, ScanningMarkerCreation) {
+    static constexpr auto kNumElements = 51;
+    static constexpr auto kElementSize = 15;
+    static constexpr auto kMinBytes = (kElementSize * 2) - 1;
+
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    {
+        auto opCtx = getClient()->makeOperationContext();
+        createCollection(opCtx.get(), collNs);
+        insertElements(opCtx.get(), collNs, kElementSize, kNumElements, Timestamp(1, 0));
+    }
+
+    {
+        auto opCtx = getClient()->makeOperationContext();
+
+        AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+
+        auto iterator = CollectionTruncateMarkers::makeIterator(
+            opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+        auto result = CollectionTruncateMarkers::createMarkersByScanning(
+            opCtx.get(), *iterator, kMinBytes, getIdAndWallTime, curTimeMicros64());
+        EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+        EXPECT_GE(result.timeTaken, Microseconds(0));
+        EXPECT_EQ(result.leftoverRecordsBytes, kElementSize);
+        EXPECT_EQ(result.leftoverRecordsCount, 1);
+        EXPECT_EQ(result.markers.size(), 51 / 2);
+        for (const auto& marker : result.markers) {
+            EXPECT_EQ(marker.bytes, kElementSize * 2);
+            EXPECT_EQ(marker.records, 2);
+        }
+    }
+}
+
+// Test that initial marker creation works as expected when using sampling
+TEST_F(CollectionMarkersTest, SamplingMarkerCreation) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    auto [totalBytes, totalRecords] = createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+
+    static constexpr auto kNumMarkers = 15;
+    auto kMinBytesPerMarker = totalBytes / kNumMarkers;
+    auto kRecordsPerMarker = totalRecords / kNumMarkers;
+
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result = CollectionTruncateMarkers::createFromCollectionIterator(
+        opCtx.get(), *iterator, kMinBytesPerMarker, getIdAndWallTime);
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::Sampling);
+    EXPECT_GE(result.timeTaken, Microseconds(0));
+    const auto& firstMarker = result.markers.front();
+    auto recordCount = firstMarker.records;
+    auto recordBytes = firstMarker.bytes;
+    EXPECT_EQ(result.leftoverRecordsBytes, totalBytes % kMinBytesPerMarker);
+    EXPECT_EQ(result.leftoverRecordsCount, totalRecords % kRecordsPerMarker);
+    EXPECT_GT(recordCount, 0);
+    EXPECT_GT(recordBytes, 0);
+    EXPECT_EQ(result.markers.size(), kNumMarkers);
+    for (const auto& marker : result.markers) {
+        EXPECT_EQ(marker.bytes, recordBytes);
+        EXPECT_EQ(marker.records, recordCount);
+    }
+
+    EXPECT_EQ(recordBytes * kNumMarkers + result.leftoverRecordsBytes, totalBytes);
+    EXPECT_EQ(recordCount * kNumMarkers + result.leftoverRecordsCount, totalRecords);
+}
+
+// Test that initial marker creation works as expected under the 'kScanOnly' policy.
+// Uses same collection setup as SamplingMarkerCreation but with sampling ruled out
+TEST_F(CollectionMarkersTest, DisableSamplingMarkerCreation) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    auto [totalBytes, totalRecords] = createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+
+    static constexpr auto kNumMarkers = 15;
+    auto kMinBytesPerMarker = totalBytes / kNumMarkers;
+
+    auto iteratorForce = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result = CollectionTruncateMarkers::createFromCollectionIterator(
+        opCtx.get(),
+        *iteratorForce,
+        kMinBytesPerMarker,
+        getIdAndWallTime,
+        CollectionTruncateMarkers::MarkersCreationPolicy::kScanOnly);
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+    EXPECT_GE(result.timeTaken, Microseconds(0));
+
+    auto iteratorBaseline = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+    auto baseline = CollectionTruncateMarkers::createMarkersByScanning(
+        opCtx.get(), *iteratorBaseline, kMinBytesPerMarker, getIdAndWallTime, curTimeMicros64());
+
+    ASSERT_EQ(result.markers.size(), baseline.markers.size());
+    EXPECT_EQ(result.leftoverRecordsBytes, baseline.leftoverRecordsBytes);
+    EXPECT_EQ(result.leftoverRecordsCount, baseline.leftoverRecordsCount);
+    for (size_t i = 0; i < result.markers.size(); ++i) {
+        EXPECT_EQ(result.markers[i].bytes, baseline.markers[i].bytes);
+        EXPECT_EQ(result.markers[i].records, baseline.markers[i].records);
+        EXPECT_EQ(result.markers[i].lastRecord, baseline.markers[i].lastRecord);
+    }
+
+    int64_t markerBytesSum = 0;
+    int64_t markerRecordsSum = 0;
+    for (const auto& marker : result.markers) {
+        markerBytesSum += marker.bytes;
+        markerRecordsSum += marker.records;
+    }
+    EXPECT_EQ(markerBytesSum + result.leftoverRecordsBytes, totalBytes);
+    EXPECT_EQ(markerRecordsSum + result.leftoverRecordsCount, totalRecords);
+}
+
+// Test that initial marker creation works as expected under the 'kScanOnly' policy.
+// Uses uniform record sizes so each marker spans three records and the tail is a two-record
+// partial.
+TEST_F(CollectionMarkersTest, DisableSamplingMarkerCreationSpecificValues) {
+    static constexpr auto kRecordsPerMarker = 3;
+    static constexpr auto kElementSize = 24;
+    static constexpr auto kMinBytes = (kElementSize * kRecordsPerMarker) - 1;
+    static constexpr auto kNumElements = 35;
+
+    static constexpr auto kExpectedMarkers = kNumElements / kRecordsPerMarker;
+    static constexpr auto kLeftoverRecords = kNumElements % kRecordsPerMarker;
+    static constexpr auto kLeftoverBytes = kLeftoverRecords * kElementSize;
+
+    auto collNs =
+        NamespaceString::createNamespaceString_forTest("test", "coll_force_scan_specific");
+    {
+        auto opCtx = getClient()->makeOperationContext();
+        createCollection(opCtx.get(), collNs);
+        insertElements(opCtx.get(), collNs, kElementSize, kNumElements, Timestamp(1, 0));
+    }
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result = CollectionTruncateMarkers::createFromCollectionIterator(
+        opCtx.get(),
+        *iterator,
+        kMinBytes,
+        getIdAndWallTime,
+        CollectionTruncateMarkers::MarkersCreationPolicy::kScanOnly);
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+    EXPECT_GE(result.timeTaken, Microseconds(0));
+    EXPECT_EQ(result.leftoverRecordsBytes, kLeftoverBytes);
+    EXPECT_EQ(result.leftoverRecordsCount, kLeftoverRecords);
+    EXPECT_EQ(result.markers.size(), kExpectedMarkers);
+    for (const auto& marker : result.markers) {
+        EXPECT_EQ(marker.bytes, kElementSize * kRecordsPerMarker);
+        EXPECT_EQ(marker.records, kRecordsPerMarker);
+    }
+}
+
+// The size-based heuristic only applies under 'kAuto': a restrictive policy must be honoured,
+// whichever way the heuristic would have leaned.
+TEST_F(CollectionMarkersTest, ComputeInitialCreationMethodHonoursPolicy) {
+    static constexpr int64_t kMinBytesPerMarker = 100;
+    static constexpr int64_t kDataSize = 10000;
+
+    // The heuristic samples once numRecords reaches
+    // kMinSampleRatioForRandCursor (20) * kRandomSamplesPerMarker (10) * (dataSize/minBytes).
+    static constexpr int64_t kSamplingThreshold = 20 * 10 * (kDataSize / kMinBytesPerMarker);
+    static constexpr int64_t kFewRecords = 100;
+    static constexpr int64_t kManyRecords = kSamplingThreshold + 1;
+
+    using MarkersCreationMethod = CollectionTruncateMarkers::MarkersCreationMethod;
+    using MarkersCreationPolicy = CollectionTruncateMarkers::MarkersCreationPolicy;
+
+    // Too few records to be worth sampling: scanning unless scanning is disabled.
+    EXPECT_EQ(MarkersCreationMethod::Scanning,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  kFewRecords, kDataSize, kMinBytesPerMarker));
+    EXPECT_EQ(MarkersCreationMethod::Sampling,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  kFewRecords, kDataSize, kMinBytesPerMarker, MarkersCreationPolicy::kSampleOnly));
+
+    // Enough records to sample: sampling unless sampling is disabled.
+    EXPECT_EQ(MarkersCreationMethod::Sampling,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  kManyRecords, kDataSize, kMinBytesPerMarker));
+    EXPECT_EQ(MarkersCreationMethod::Scanning,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  kManyRecords, kDataSize, kMinBytesPerMarker, MarkersCreationPolicy::kScanOnly));
+}
+
+// 'EmptyCollection' is always chosen for an empty collection, whatever the policy.
+TEST_F(CollectionMarkersTest, ComputeInitialCreationMethodEmptyCollection) {
+    using MarkersCreationMethod = CollectionTruncateMarkers::MarkersCreationMethod;
+    using MarkersCreationPolicy = CollectionTruncateMarkers::MarkersCreationPolicy;
+
+    EXPECT_EQ(MarkersCreationMethod::EmptyCollection,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  0 /* numRecords */, 0 /* dataSize */, 100 /* minBytesPerMarker */));
+
+    EXPECT_EQ(
+        MarkersCreationMethod::EmptyCollection,
+        CollectionTruncateMarkers::computeInitialCreationMethod(0 /* numRecords */,
+                                                                0 /* dataSize */,
+                                                                100 /* minBytesPerMarker */,
+                                                                MarkersCreationPolicy::kScanOnly));
+}
+
+// Size storer values that disagree don't stop the policy's method from being selected; sampling
+// itself handles the degenerate estimates.
+TEST_F(CollectionMarkersTest, ComputeInitialCreationMethodInconsistentSizeStorer) {
+    using MarkersCreationMethod = CollectionTruncateMarkers::MarkersCreationMethod;
+    using MarkersCreationPolicy = CollectionTruncateMarkers::MarkersCreationPolicy;
+
+    EXPECT_EQ(MarkersCreationMethod::Sampling,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  100 /* numRecords */,
+                  0 /* dataSize */,
+                  100 /* minBytesPerMarker */,
+                  MarkersCreationPolicy::kSampleOnly));
+
+    EXPECT_EQ(MarkersCreationMethod::Sampling,
+              CollectionTruncateMarkers::computeInitialCreationMethod(
+                  0 /* numRecords */,
+                  10000 /* dataSize */,
+                  100 /* minBytesPerMarker */,
+                  MarkersCreationPolicy::kSampleOnly));
+}
+
+// When scanning isn't allowed, a failed sampling attempt starts with no markers instead of falling
+// back to a scan.
+TEST_F(CollectionMarkersTest, SamplingWithoutFallbackScanningReturnsEmptyCollection) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll_no_fallback");
+    {
+        auto opCtx = getClient()->makeOperationContext();
+        createCollection(opCtx.get(), collNs);
+    }
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result =
+        CollectionTruncateMarkers::createMarkersBySampling(opCtx.get(),
+                                                           *iterator,
+                                                           100 /* minBytesPerMarker */,
+                                                           getIdAndWallTime,
+                                                           /*allowFallbackScanning*/ false,
+                                                           curTimeMicros64());
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::EmptyCollection);
+    EXPECT_TRUE(result.markers.empty());
+    EXPECT_EQ(result.leftoverRecordsCount, 0);
+    EXPECT_EQ(result.leftoverRecordsBytes, 0);
+}
+
+// A size storer claiming records for an empty collection gets sampling past its size checks, so it
+// fails once it looks for the earliest recordId. With scanning allowed, it falls back to a scan.
+TEST_F(CollectionMarkersTest, SamplingFailureFallsBackToScanning) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll_sampling_fallback");
+    {
+        auto opCtx = getClient()->makeOperationContext();
+        createCollection(opCtx.get(), collNs);
+    }
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    coll->getRecordStore()->updateStatsAfterRepair(1000 /* numRecords */, 10000 /* dataSize */);
+
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result = CollectionTruncateMarkers::createMarkersBySampling(opCtx.get(),
+                                                                     *iterator,
+                                                                     100 /* minBytesPerMarker */,
+                                                                     getIdAndWallTime,
+                                                                     /*allowFallbackScanning*/ true,
+                                                                     curTimeMicros64());
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+    // The scan finds the collection genuinely empty and repairs the size storer.
+    EXPECT_TRUE(result.markers.empty());
+    EXPECT_EQ(result.leftoverRecordsCount, 0);
+    EXPECT_EQ(result.leftoverRecordsBytes, 0);
+}
+
+// The same mid-sampling failure with scanning disallowed starts with no markers instead, seeding
+// the partial marker with the size storer's counts.
+TEST_F(CollectionMarkersTest, SamplingFailureWithoutFallbackScanningReturnsEmptyCollection) {
+    auto collNs =
+        NamespaceString::createNamespaceString_forTest("test", "coll_sampling_fallback_none");
+    {
+        auto opCtx = getClient()->makeOperationContext();
+        createCollection(opCtx.get(), collNs);
+    }
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    coll->getRecordStore()->updateStatsAfterRepair(1000 /* numRecords */, 10000 /* dataSize */);
+
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result =
+        CollectionTruncateMarkers::createMarkersBySampling(opCtx.get(),
+                                                           *iterator,
+                                                           100 /* minBytesPerMarker */,
+                                                           getIdAndWallTime,
+                                                           /*allowFallbackScanning*/ false,
+                                                           curTimeMicros64());
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::EmptyCollection);
+    EXPECT_TRUE(result.markers.empty());
+    // Nothing repairs the size storer here, so its counts carry into the partial marker.
+    EXPECT_EQ(result.leftoverRecordsCount, 1000);
+    EXPECT_EQ(result.leftoverRecordsBytes, 10000);
+}
+
+// A size storer reporting no data for a collection that has records is degenerate, so sampling
+// gives up rather than estimating from it. With scanning disallowed, the existing records are left
+// out of the initial markers.
+TEST_F(CollectionMarkersTest, SamplingWithInconsistentSizeStorerReturnsEmptyCollection) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll_inconsistent_size");
+    auto [_, totalRecords] = createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    coll->getRecordStore()->updateStatsAfterRepair(totalRecords, 0 /* dataSize */);
+
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    auto result =
+        CollectionTruncateMarkers::createMarkersBySampling(opCtx.get(),
+                                                           *iterator,
+                                                           100 /* minBytesPerMarker */,
+                                                           getIdAndWallTime,
+                                                           /*allowFallbackScanning*/ false,
+                                                           curTimeMicros64());
+
+    EXPECT_EQ(result.methodUsed, CollectionTruncateMarkers::MarkersCreationMethod::EmptyCollection);
+    EXPECT_TRUE(result.markers.empty());
+    EXPECT_EQ(result.leftoverRecordsCount, static_cast<int64_t>(totalRecords));
+    EXPECT_EQ(result.leftoverRecordsBytes, 0);
+}
+
+// Test that Oplog sampling progress is logged.
+TEST_F(CollectionMarkersTest, OplogSamplingLogging) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    auto [totalBytes, _] = createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), nullptr, boost::none);
+
+    static constexpr auto kNumMarkers = 15;
+    auto kMinBytesPerMarker = totalBytes / kNumMarkers;
+
+    TickSourceMock mockTickSource;
+    mockTickSource.setAdvanceOnRead(Milliseconds{500});
+    unittest::LogCaptureGuard logs;
+    CollectionTruncateMarkers::createMarkersBySampling(opCtx.get(),
+                                                       *iterator,
+                                                       kMinBytesPerMarker,
+                                                       getIdAndWallTime,
+                                                       /*allowFallbackScanning*/ true,
+                                                       curTimeMicros64(),
+                                                       &mockTickSource);
+    logs.stop();
+    EXPECT_GT(logs.countTextContaining("Collection sampling progress"), 0);
+    EXPECT_EQ(logs.countTextContaining("Collection sampling complete"), 1);
+}
+
+// Test that cursors will yield periodically, and (since the yield drops the snapshot) that the
+// cursor doesn't "see" new records.
+TEST_F(CollectionMarkersTest, CursorYieldsAndIgnoresNewRecords) {
+    TickSourceMock mockTickSource;
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    auto [_, initialRecords] = createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), &mockTickSource, Milliseconds(10));
+
+    Atomic<bool> hasYielded(false);
+    stdx::thread yieldNotifier([this, &collNs, &hasYielded] {
+        ThreadClient client(getServiceContext()->getService());
+        auto innerOpCtx = cc().makeOperationContext();
+        // We won't be able to acquire the write lock until the read yields.
+        insertElements(
+            innerOpCtx.get(), collNs, /*dataLength=*/100, /*numElements=*/10, Timestamp(1, 0));
+        hasYielded.store(true);
+    });
+
+    EXPECT_FALSE(hasYielded.load());
+
+    size_t seenRecords = 0;
+    while (!hasYielded.load()) {
+        mockTickSource.advance(Milliseconds(11));
+        // Have a real sleep so that the yield thread has a chance to catch up.
+        opCtx->sleepFor(Milliseconds(1));
+        if (iterator->getNext()) {
+            ++seenRecords;
+        }
+    }
+    yieldNotifier.join();
+
+    while (iterator->getNext()) {
+        ++seenRecords;
+    }
+
+    EXPECT_EQ(seenRecords, initialRecords);
+    EXPECT_LT(static_cast<long long>(seenRecords), coll->getRecordStore()->numRecords());
+}
+
+// Test that random cursors will yield periodically. Since random cursors will see records added
+// after they were created due to the yield, we only care that it can continue to sample.
+TEST_F(CollectionMarkersTest, CursorYieldWithRandomCursor) {
+    TickSourceMock mockTickSource;
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), &mockTickSource, Milliseconds(10));
+
+    Atomic<bool> hasYielded(false);
+    stdx::thread yieldNotifier([this, &collNs, &hasYielded] {
+        ThreadClient client(getServiceContext()->getService());
+        auto innerOpCtx = cc().makeOperationContext();
+        // We won't be able to acquire the write lock until the read yields.
+        insertElements(
+            innerOpCtx.get(), collNs, /*dataLength=*/100, /*numElements=*/10, Timestamp(1, 0));
+        hasYielded.store(true);
+    });
+
+    EXPECT_FALSE(hasYielded.load());
+
+    while (!hasYielded.load()) {
+        mockTickSource.advance(Milliseconds(11));
+        // Have a real sleep so that the yield thread has a chance to catch up.
+        opCtx->sleepFor(Milliseconds(1));
+        ASSERT(iterator->getNextRandom());
+    }
+    yieldNotifier.join();
+
+    for (int i = 0; i < 1000; i++) {
+        ASSERT(iterator->getNextRandom());
+    }
+}
+
+// Test that yielding handles the collection being truncated from underneath it.
+TEST_F(CollectionMarkersTest, CursorYieldSerialCursorHandlesTruncate) {
+    TickSourceMock mockTickSource;
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    auto [_, initialRecords] = createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), &mockTickSource, Milliseconds(10));
+
+    Atomic<bool> hasYielded(false);
+    stdx::thread yieldNotifier([this, &collNs, &hasYielded] {
+        ThreadClient client(getServiceContext()->getService());
+        auto innerOpCtx = cc().makeOperationContext();
+        auto opCtx = innerOpCtx.get();
+
+        // We won't be able to acquire the write lock until the read yields.
+        AutoGetCollection coll(opCtx, collNs, MODE_X);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(
+            coll->getRecordStore()->truncate(opCtx, *shard_role_details::getRecoveryUnit(opCtx)));
+        wuow.commit();
+        hasYielded.store(true);
+    });
+
+    EXPECT_FALSE(hasYielded.load());
+
+    size_t seenRecords = 0;
+    while (!hasYielded.load()) {
+        mockTickSource.advance(Milliseconds(11));
+        // Have a real sleep so that the yield thread has a chance to catch up.
+        opCtx->sleepFor(Milliseconds(1));
+        if (iterator->getNext()) {
+            ++seenRecords;
+        }
+    }
+    yieldNotifier.join();
+
+    while (iterator->getNext()) {
+        ++seenRecords;
+    }
+
+    // Since we truncated we won't see later records
+    EXPECT_LT(seenRecords, initialRecords);
+}
+
+// Test that yielding a random cursor handles the collection being truncated from underneath it.
+TEST_F(CollectionMarkersTest, CursorYieldRandomCursorHandlesTruncate) {
+    TickSourceMock mockTickSource;
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), &mockTickSource, Milliseconds(10));
+
+    Atomic<bool> hasYielded(false);
+    stdx::thread yieldNotifier([this, &collNs, &hasYielded] {
+        ThreadClient client(getServiceContext()->getService());
+        auto innerOpCtx = cc().makeOperationContext();
+        auto opCtx = innerOpCtx.get();
+
+        // We won't be able to acquire the write lock until the read yields.
+        AutoGetCollection coll(opCtx, collNs, MODE_X);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(
+            coll->getRecordStore()->truncate(opCtx, *shard_role_details::getRecoveryUnit(opCtx)));
+        wuow.commit();
+        hasYielded.store(true);
+    });
+
+    // When we truncate underneath the random cursor it will return nullopt.
+    EXPECT_FALSE(hasYielded.load());
+    while (iterator->getNextRandom()) {
+        mockTickSource.advance(Milliseconds(11));
+        // Have a real sleep so that the yield thread has a chance to catch up.
+        opCtx->sleepFor(Milliseconds(1));
+    }
+    EXPECT_TRUE(hasYielded.load());
+    yieldNotifier.join();
+}
+
+// Test that sampling handles the collection being truncated from underneath us.
+TEST_F(CollectionMarkersTest, SamplingWorksWithTruncate) {
+    TickSourceMock mockTickSource;
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    // 0ms yield interval means sample every next()
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), &mockTickSource, {Milliseconds(0)});
+
+    // Synchronize to avoid sampling the collection before the yield thread is ready.
+    std::mutex waitingMutex;
+    std::unique_lock waitingLock(waitingMutex);
+    stdx::condition_variable waitingCv;
+
+    Atomic<bool> hasYielded(false);
+    stdx::thread yieldNotifier([this, &collNs, &hasYielded, &waitingCv, &waitingMutex] {
+        ThreadClient client(getServiceContext()->getService());
+        auto innerOpCtx = cc().makeOperationContext();
+        auto opCtx = innerOpCtx.get();
+
+        {
+            std::unique_lock readyLock(waitingMutex);
+        }
+        waitingCv.notify_one();
+
+        // We won't be able to acquire the write lock until the read yields.
+        AutoGetCollection coll(opCtx, collNs, MODE_X);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(
+            coll->getRecordStore()->truncate(opCtx, *shard_role_details::getRecoveryUnit(opCtx)));
+        wuow.commit();
+        hasYielded.store(true);
+    });
+
+    waitingCv.wait(waitingLock);
+    opCtx->sleepFor(Milliseconds{1});
+
+    // When we truncate underneath the random cursor it will return nullopt.
+    EXPECT_FALSE(hasYielded.load());
+
+    CollectionTruncateMarkers::createMarkersBySampling(opCtx.get(),
+                                                       *iterator,
+                                                       1,
+                                                       getIdAndWallTime,
+                                                       /*allowFallbackScanning*/ true,
+                                                       curTimeMicros64());
+
+    EXPECT_TRUE(hasYielded.load());
+    yieldNotifier.join();
+}
+
+// Test that scanning handles the collection being truncated from underneath us.
+TEST_F(CollectionMarkersTest, ScanningWorksWithTruncate) {
+    TickSourceMock mockTickSource;
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    createPopulatedCollection(collNs);
+
+    auto opCtx = getClient()->makeOperationContext();
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    // 0ms yield interval means sample every next()
+    auto iterator = CollectionTruncateMarkers::makeIterator(
+        opCtx.get(), coll->getRecordStore(), &mockTickSource, {Milliseconds(0)});
+
+    // Synchronize to avoid scanning the collection before the yield thread is ready.
+    std::mutex waitingMutex;
+    std::unique_lock waitingLock(waitingMutex);
+    stdx::condition_variable waitingCv;
+
+    Atomic<bool> hasYielded(false);
+    stdx::thread yieldNotifier([this, &collNs, &hasYielded, &waitingCv, &waitingMutex] {
+        ThreadClient client(getServiceContext()->getService());
+        auto innerOpCtx = cc().makeOperationContext();
+        auto opCtx = innerOpCtx.get();
+
+        {
+            std::unique_lock readyLock(waitingMutex);
+        }
+        waitingCv.notify_one();
+
+        // We won't be able to acquire the write lock until the read yields.
+        AutoGetCollection coll(opCtx, collNs, MODE_X);
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(
+            coll->getRecordStore()->truncate(opCtx, *shard_role_details::getRecoveryUnit(opCtx)));
+        wuow.commit();
+        hasYielded.store(true);
+    });
+
+    waitingCv.wait(waitingLock);
+    opCtx->sleepFor(Milliseconds{1});
+
+    // When we truncate underneath the random cursor it will return nullopt.
+    EXPECT_FALSE(hasYielded.load());
+
+    CollectionTruncateMarkers::createMarkersByScanning(
+        opCtx.get(), *iterator, /*estimatedBytesPerMarker=*/1, getIdAndWallTime, curTimeMicros64());
+
+    EXPECT_TRUE(hasYielded.load());
+    yieldNotifier.join();
+}
+
+void checkMarker(const RecordId& expected,
+                 OperationContext* opCtx,
+                 RecordStore& rs,
+                 RecordId pin,
+                 Date_t expiryTime) {
+    auto marker = CollectionTruncateMarkers::newestExpiredRecord(opCtx, rs, pin, expiryTime);
+    // the first three of these are always the same regardless of the record store contents:
+    EXPECT_EQ(0, marker->records);
+    EXPECT_EQ(0, marker->bytes);
+    EXPECT_EQ(expiryTime, marker->wallTime);
+    // this is the assertion that might ever fail, so add some info about the other inputs
+    EXPECT_EQ(expected, marker->lastRecord) << " with expiry=" << expiryTime << " and pin=" << pin;
+}
+
+TEST_F(CollectionMarkersTest, TimeBasedMarkerConstruction) {
+    auto collNs = NamespaceString::createNamespaceString_forTest("test", "coll");
+    auto opCtx = getClient()->makeOperationContext();
+    createCollection(opCtx.get(), collNs);
+    std::vector<RecordIdAndWall> elements;
+    std::vector<RecordId> pins;  // representing one second after each element
+    Date_t wallTime = Date_t::now();
+    // no truncatable record if oplog is empty
+    {
+        AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+        EXPECT_FALSE(CollectionTruncateMarkers::newestExpiredRecord(
+            opCtx.get(), *coll->getRecordStore(), RecordId(), wallTime));
+        Timestamp ts(durationCount<Seconds>(wallTime.toDurationSinceEpoch()), 0);
+        EXPECT_FALSE(CollectionTruncateMarkers::newestExpiredRecord(
+            opCtx.get(), *coll->getRecordStore(), RecordId(ts.getSecs(), 0), wallTime));
+    }
+    // for this test we need real sequence numbers
+    {
+        AutoGetCollection coll(opCtx.get(), collNs, MODE_IX);
+        RecordStore& rs = *coll->getRecordStore();
+        const auto insertedData = std::string(50, 'a');
+        WriteUnitOfWork wuow(opCtx.get());
+        for (size_t i = 0; i < 20; ++i) {
+            Timestamp ts(durationCount<Seconds>(wallTime.toDurationSinceEpoch()), 0);
+            RecordId recordId = RecordId(ts.getSecs(), 0);
+            auto recordIdStatus = rs.insertRecord(opCtx.get(),
+                                                  *shard_role_details::getRecoveryUnit(opCtx.get()),
+                                                  recordId,
+                                                  insertedData.data(),
+                                                  insertedData.length(),
+                                                  ts);
+            ASSERT_OK(recordIdStatus);
+            EXPECT_EQ(recordId, recordIdStatus.getValue());
+            elements.emplace_back(recordId, wallTime);
+            pins.emplace_back(RecordId(ts.getSecs() + 1, 0));
+            wallTime += Seconds(2);
+        }
+        wuow.commit();
+    }
+    AutoGetCollection coll(opCtx.get(), collNs, MODE_IS);
+    RecordStore& rs = *coll->getRecordStore();
+    // first, check when expiry time is the limiting factor, with and without pins
+    for (size_t i = 1; i < elements.size(); ++i) {
+        const RecordIdAndWall& element = elements.at(i);
+        RecordId expected = element.recordId;
+        // don't completely empty out the oplog! instead, test that looking up the newest wall time
+        // returns the second-newest recordId.
+        if (expected == elements.back().recordId) {
+            expected = elements[elements.size() - 2].recordId;
+        }
+        // exact match with no pin limit
+        checkMarker(expected, opCtx.get(), rs, RecordId::maxLong(), element.wallTime);
+        // in between records with no pin limit should match older record,
+        // and expiry time newer than newest record should match newest record
+        checkMarker(expected, opCtx.get(), rs, RecordId::maxLong(), element.wallTime + Seconds(1));
+        // check various pins when the expiry time is the limiting factor
+        // pin equal to expiry is covered below with pin-limited truncation
+        // note that pins require one unpinned entry to be retained, so don't start j equal to i
+        for (size_t j = i + 1; j < elements.size(); ++j) {
+            checkMarker(expected, opCtx.get(), rs, elements.at(j).recordId, element.wallTime);
+            checkMarker(expected, opCtx.get(), rs, pins.at(j), element.wallTime);
+            checkMarker(
+                expected, opCtx.get(), rs, elements.at(j).recordId, element.wallTime + Seconds(1));
+            checkMarker(expected, opCtx.get(), rs, pins.at(j), element.wallTime + Seconds(1));
+        }
+    }
+    // check various expiry times when pin is the limiting factor (or pin and expiry retain equally)
+    for (size_t i = 1; i < elements.size(); ++i) {
+        for (int j = 0; j < 4; ++j) {
+            // don't truncate the mayTruncateUpTo point if the pin is an exact match for an entry
+            checkMarker(elements.at(i - 1).recordId,
+                        opCtx.get(),
+                        rs,
+                        elements.at(i).recordId,
+                        elements.at(i).wallTime + Seconds(j));
+            // leave an entry before the mayTruncateUpTo point if the pin has no exact match
+            checkMarker(elements.at(i - 1).recordId,
+                        opCtx.get(),
+                        rs,
+                        pins.at(i),
+                        elements.at(i).wallTime + Seconds(j));
+        }
+    }
+    // corner cases not covered in the above for loops:
+    // no truncatable record if mayTruncateUpTo is null (RecordId(0)), regardless of expiry
+    EXPECT_FALSE(CollectionTruncateMarkers::newestExpiredRecord(
+        opCtx.get(), rs, RecordId(), wallTime + Seconds(100)));
+    // no truncatable record if expiry time is older than oldest record
+    EXPECT_FALSE(CollectionTruncateMarkers::newestExpiredRecord(
+        opCtx.get(), rs, RecordId::maxLong(), elements.at(0).wallTime - Seconds(1)));
+    // no truncatable record if oplog is all pinned
+    EXPECT_FALSE(CollectionTruncateMarkers::newestExpiredRecord(
+        opCtx.get(), rs, elements.at(0).recordId, wallTime + Seconds(25)));
+    // no truncatable record if all but one oplog entry is pinned, but not as an exact match
+    EXPECT_FALSE(CollectionTruncateMarkers::newestExpiredRecord(
+        opCtx.get(), rs, pins.at(0), wallTime + Seconds(25)));
+}
+
+// Test that we create a partial marker at the highest recordId if it's not covered by a previously
+// created marker, even if the counters are zero. This ensures that we have a marker that
+// covers the position of the highest record.
+TEST_F(CollectionMarkersTest,
+       CreatesPartialMarkerWhenCountersZeroButHighestRecordIdAheadOfLastMarker) {
+    auto opCtx = getClient()->makeOperationContext();
+
+    // Make the minimum small so we hit it quickly.
+    auto testMarkers =
+        std::make_shared<TestCollectionMarkersWithPartialExpiration>(/*minBytesPerMarker*/ 1);
+
+    const Date_t wallA = Date_t::now() + Milliseconds(1000);
+    const Date_t wallB = Date_t::now() + Milliseconds(2000);
+    const RecordId recordA(10);
+    const RecordId recordB(20);
+
+    testMarkers->testUpdateCurrentMarker(/*bytesAdded*/ 1,
+                                         /*highestRecordId*/ recordA,
+                                         /*highestWallTime*/ wallA,
+                                         /*numRecordsAdded*/ 1,
+                                         /*oplogSamplingAsyncEnabled*/ false);
+
+    // Assert that we should have created a marker here.
+    ASSERT_EQ(testMarkers->getMarkersForTest().size(), 1UL);
+    EXPECT_EQ(testMarkers->getMarkersForTest().back().lastRecord, recordA);
+
+    // Advance _highestRecordId to B without adding any more bytes/records.
+    testMarkers->testUpdateCurrentMarker(/*bytesAdded*/ 0,
+                                         /*highestRecordId*/ recordB,
+                                         /*highestWallTime*/ wallB,
+                                         /*numRecordsAdded*/ 0,
+                                         /*oplogSamplingAsyncEnabled*/ false);
+
+    // We should not have created another marker here since counters are zero and we didn't call
+    // create partial marker if needed.
+    ASSERT_EQ(testMarkers->getMarkersForTest().size(), 1UL);
+    EXPECT_EQ(testMarkers->getMarkersForTest().back().lastRecord, recordA);
+
+    // Expire the partial marker and call to create a new one if needed which should trigger partial
+    // marker creation that covers B.
+    testMarkers->setExpirePartialMarker(true);
+    testMarkers->createPartialMarkerIfNecessary(opCtx.get());
+
+    // We should have created a new partial marker with zero counters.
+    ASSERT_EQ(testMarkers->getMarkersForTest().size(), 2UL);
+    EXPECT_EQ(testMarkers->getMarkersForTest().back().lastRecord, recordB);
+    EXPECT_EQ(testMarkers->getMarkersForTest().back().bytes, 0);
+    EXPECT_EQ(testMarkers->getMarkersForTest().back().records, 0);
+}
+}  // namespace mongo

@@ -1,0 +1,67 @@
+test_kind: js_test
+
+selector:
+  roots:
+    - jstests/core/**/*.js
+
+  exclude_files:
+    # The following tests check $indexStats and are not expecting to see implicitly created indexes.
+    - jstests/core/timeseries/ddl/timeseries_index_stats.js
+    # The following tests already create some of the indexes we would create implicitly, and may
+    # therefore fail spuriously.
+    - jstests/core/index/wildcard/wildcard_index_minmax.js
+    - jstests/core/index/wildcard/compound_wildcard_index_hint.js
+    # This test expects a certain number of indexes at the start.
+    - jstests/core/administrative/check_shard_index.js
+    # This test checks explain, and creating an implicit index results in the following failure:
+    # "IndexOptionsConflict" that generates an unexpected plan.
+    - jstests/core/query/or_use_clustered_collection.js
+    # Latency histogram statistics are affected by the creation of an implicit index.
+    - jstests/core/query/top/top.js
+    # Multiplanner does not always choose the same plan when the wildcard indexes are considered.
+    - jstests/core/query/or/or_to_in.js
+    # Fails because the test creates a wildcard index that results in an IndexOptionsConflict error
+    # because the index already exists.
+    - jstests/core/catalog/list_catalog_stage_consistency.js
+    - jstests/core/index/index_count_scan.js
+    # Asserts per-index access counts.
+    - jstests/core/index/index_stats.js
+    - jstests/core/query/find/finda.js
+
+  exclude_with_any_tags:
+    # This suite implicitly creates compound wildcard indexes.
+    - assumes_no_implicit_index_creation
+    # This suite has a replica set fixture.
+    - assumes_standalone_mongod
+    # The rename command is not compatibile with auto-created indexes since it will try to copy over
+    # existing indexes and get an error for a duplicate index.
+    - uses_rename
+    # Creating indexes implicitly may result in unexpected profiler entries which cause tests to
+    # fail spuriously.
+    - requires_profiling
+    - uses_transactions
+    - wildcard_indexes_incompatible
+    # Tests that run explain may fail if an implicitly created index is chosen by multiplanning.
+    - uses_explain
+
+executor:
+  archive:
+    hooks:
+      - ValidateCollections
+  config:
+    shell_options:
+      eval: >-
+        globalThis.testingReplication = true;
+        await import("jstests/libs/override_methods/query/implicit_wildcard_indexes.js");
+  hooks:
+    - class: ValidateCollections
+    - class: CleanEveryN
+      n: 20
+  fixture:
+    # Use a replica set fixture so that we can run the transactions tests as well.
+    class: ReplicaSetFixture
+    mongod_options:
+      oplogSize: 1024
+      set_parameters:
+        enableTestCommands: true
+    num_nodes: 1

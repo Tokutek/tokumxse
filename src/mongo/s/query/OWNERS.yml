@@ -1,0 +1,22 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/query
+  - "OWNERS.yml":
+    approvers:
+      - 10gen/query-execution-staff-leads
+      - 10gen/query-optimization-staff-leads
+      - 10gen/query-integration-staff-leads
+  - "document_source_visitor_docs_needed_bounds*":
+    approvers:
+      - 10gen/query-integration-search
+  - "shard_key_pattern_query_util*":
+    approvers:
+      - 10gen/query-optimization
+  - "shard_targeting_collation_helpers*":
+    approvers:
+      - 10gen/query-optimization
+  - "shard_targeting_helpers*":
+    approvers:
+      - 10gen/query-optimization

@@ -1,0 +1,11 @@
+WiredTiger 12.0.0: (November 15, 2024)
+
+This is version 12.0.0 of WiredTiger.
+
+Instructions for configuring, building, and installing WiredTiger are available online.
+
+    For Linux, MacOS, and other POSIX systems:
+    https://source.wiredtiger.com/develop/build-posix.html
+
+    For Windows:
+    https://source.wiredtiger.com/develop/build-windows.html

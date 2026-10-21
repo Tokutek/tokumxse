@@ -1,0 +1,94 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    StatsBucket:
+        description: "Histogram bucket"
+        fields:
+            boundaryCount:
+                type: double
+            rangeCount:
+                type: double
+            rangeDistincts:
+                type: double
+            cumulativeCount:
+                type: double
+            cumulativeDistincts:
+                type: double
+
+    StatsHistogram:
+        description: "MaxDiff Histogram"
+        fields:
+            buckets:
+                type: array<StatsBucket>
+            bounds:
+                type: array<IDLAnyType>
+
+    TypeTag:
+        description: "SBE types and their corresponding frequencies in the histogram"
+        fields:
+            typeName:
+                type: string
+            count:
+                type: long
+
+    StatsArrayHistogram:
+        description: "Array Histogram"
+        fields:
+            minHistogram:
+                type: StatsHistogram
+            maxHistogram:
+                type: StatsHistogram
+            uniqueHistogram:
+                type: StatsHistogram
+            typeCount:
+                type: array<TypeTag>
+
+    Statistics:
+        description: "Serialized representation of data statistics for a key path"
+        fields:
+            documents:
+                type: double
+            sampleRate:
+                type: double
+                validator: {gte: 0.0, lte: 1.0}
+            trueCount:
+                type: long
+            falseCount:
+                type: long
+            nanCount:
+                type: long
+            emptyArrayCount:
+                type: long
+            typeCount:
+                type: array<TypeTag>
+            scalarHistogram:
+                type: StatsHistogram
+            arrayStatistics:
+                type: StatsArrayHistogram
+                optional: true
+
+    StatsPath:
+        description: "Key path to statstics"
+        fields:
+            _id:
+                type: string
+            statistics:
+                type: Statistics
+
+    InternalConstructStatsAccumulatorParams:
+        description: "Schema for the $_internalConstructStats accumulator"
+        fields:
+            val:
+                type: string
+            sampleRate:
+                type: double
+                default: 1.0
+            numberBuckets:
+                type: int

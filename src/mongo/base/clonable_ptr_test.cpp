@@ -1,0 +1,858 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/clonable_ptr.h"
+
+#include "mongo/unittest/unittest.h"
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <tuple>
+
+
+namespace {
+
+template <typename Test>
+void runSyntaxTest(Test&& t) {
+    if (false)
+        t();
+}
+
+// These testing helper classes model various kinds of class which should be compatible with
+// `mongo::clonable_ptr`.  The basic use cases satisfied by each class are described in each class's
+// documentation.
+
+// This class models the `Clonable` concept, and is used to test the simple case of `clonable_ptr`.
+class ClonableTest {
+private:
+    std::string data =
+        "This is the string data which is stored to make Functor Clonable need a complicated copy "
+        "ctor.";
+
+public:
+    std::unique_ptr<ClonableTest> clone() const {
+        return std::make_unique<ClonableTest>();
+    }
+};
+
+/**
+ * Uses a stateful cloning function provided by the `getCloningFunction` static member.
+ * This stateful `CloneFactory<FunctorClonable>` must be passed to constructors of the
+ * `cloning_ptr`.
+ */
+class FunctorClonable {
+public:
+    using CloningFunctionType =
+        std::function<std::unique_ptr<FunctorClonable>(const FunctorClonable&)>;
+
+    static CloningFunctionType getCloningFunction() {
+        return [](const FunctorClonable& c) {
+            return std::make_unique<FunctorClonable>(c);
+        };
+    }
+
+private:
+    std::string _data = "xxx";
+};
+
+
+// This class uses a stateful cloning function provided by the `getCloningFunction` static member.
+// This stateful `CloneFactory<FunctorWithDynamicStateClonable>` must be passed to constructors of
+// the `cloning_ptr`.  The `CloneFactory` for this type dynamically updates its internal state.
+// This is used to test cloning of objects that have dynamically changing clone factories.
+class FunctorWithDynamicStateClonable {
+public:
+    FunctorWithDynamicStateClonable() = default;
+    explicit FunctorWithDynamicStateClonable(std::string s) : _data{std::move(s)} {}
+    FunctorWithDynamicStateClonable(const FunctorWithDynamicStateClonable&) = delete;
+
+    using CloningFunctionType = std::function<std::unique_ptr<FunctorWithDynamicStateClonable>(
+        const FunctorWithDynamicStateClonable&)>;
+
+    static CloningFunctionType getCloningFunction() {
+        return [calls = 0](const FunctorWithDynamicStateClonable& c) mutable {
+            return std::make_unique<FunctorWithDynamicStateClonable>(
+                fmt::format("{}{}", c._data, ++calls));
+        };
+    }
+
+private:
+    std::string _data = "xxx";
+};
+
+// This class models `Clonable`, with a return from clone which is
+// `Constructible<std::unique_ptr<RawPointerClonable>>` but isn't
+// `std::unique_ptr<RawPointerClonable>`.  This is used to test that the `clonable_ptr` class does
+// not expect `RawPointerClonable::clone() const` to return a model of
+// `UniquePtr<RawPointerClonable>`
+class RawPointerClonable {
+public:
+    RawPointerClonable* clone() const {
+        return new RawPointerClonable;
+    }
+};
+
+// This class models `Clonable`, with a return from clone which is
+// `Constructible<std::unique_ptr<UniquePtrClonable>>` because it is
+// `std::unique_ptr<UniquePtrClonable>`.  This is used to test that the `clonable_ptr` class can
+// use a `UniquePtrClonable::clone() const` that returns a model of
+// `UniquePtr<UniquePtrClonable>`
+class UniquePtrClonable {
+public:
+    std::unique_ptr<UniquePtrClonable> clone() const {
+        return std::make_unique<UniquePtrClonable>();
+    }
+};
+
+TEST(ClonablePtrTest, syntax_smoke_test) {
+// TODO: Either add a compressed pair type for optimization, or wait for MSVC to get this feature by
+//       default.  MSVC doesn't make its tuple compressed, which causes this test to fail on MSVC.
+#ifndef _MSC_VER
+    {
+        mongo::clonable_ptr<ClonableTest> p;
+
+        p = std::make_unique<ClonableTest>();
+
+        mongo::clonable_ptr<ClonableTest> p2 = p;
+
+        ASSERT_TRUE(p != p2);
+
+        static_assert(sizeof(p) == sizeof(ClonableTest*),
+                      "`mongo::clonable_ptr< T >` should be `sizeof` a pointer when there is no "
+                      "CloneFactory");
+    }
+#endif
+
+    {
+        using Ptr = mongo::clonable_ptr<FunctorClonable, FunctorClonable::CloningFunctionType>;
+        Ptr p1{nullptr, FunctorClonable::getCloningFunction()};
+        p1 = std::make_unique<FunctorClonable>();
+
+        Ptr p2 = p1;
+        ASSERT_NE(p1, p2);
+
+        Ptr p3{nullptr, FunctorClonable::getCloningFunction()};
+        p3 = std::make_unique<FunctorClonable>();
+        ASSERT_NE(p1, p3);
+        ASSERT_NE(p2, p3);
+    }
+}
+
+// These tests check that all expected valid syntactic forms of use for the
+// `mongo::clonable_ptr<Clonable>` are valid.  These tests assert nothing but provide a single
+// unified place to check the syntax of this component.  Build failures in these parts indicate that
+// a change to the component has broken an expected valid syntactic usage.  Any expected valid usage
+// which is not in this list should be added.
+namespace SyntaxTests {
+template <typename Clonable>
+void construction() {
+    // Test default construction
+    {
+        mongo::clonable_ptr<Clonable>{};
+    }
+
+    // Test construction from a nullptr
+    {
+        mongo::clonable_ptr<Clonable>{nullptr};
+    }
+
+    // Test move construction.
+    {
+        std::ignore = mongo::clonable_ptr<Clonable>{mongo::clonable_ptr<Clonable>{}};
+    }
+
+    // Test copy construction.
+    {
+        mongo::clonable_ptr<Clonable> a;
+        mongo::clonable_ptr<Clonable> b{a};
+    }
+
+    // Test move assignment.
+    {
+        mongo::clonable_ptr<Clonable> a;
+        a = mongo::clonable_ptr<Clonable>{};
+    }
+
+    // Test copy assignment.
+    {
+        mongo::clonable_ptr<Clonable> a;
+        mongo::clonable_ptr<Clonable> b;
+        b = a;
+    }
+
+    // Test unique pointer construction
+    {
+        mongo::clonable_ptr<Clonable>{std::make_unique<Clonable>()};
+    }
+
+    // Test unique pointer construction (conversion)
+    {
+        auto acceptor = [](const mongo::clonable_ptr<Clonable>&) {
+        };
+        acceptor(std::make_unique<Clonable>());
+    }
+
+    // Test non-conversion pointer construction
+    {
+        static_assert(!std::is_convertible<Clonable*, mongo::clonable_ptr<Clonable>>::value);
+    }
+
+    // Test conversion unique pointer construction
+    {
+        static_assert(
+            std::is_convertible<std::unique_ptr<Clonable>, mongo::clonable_ptr<Clonable>>::value);
+    }
+}
+
+// Tests that syntactic forms that require augmented construction are proper
+template <typename Clonable, typename CloneFactory>
+void augmentedConstruction() {
+    using mongo::clonable_ptr;
+    auto cf = []() -> decltype(auto) {
+        return Clonable::getCloningFunction();
+    };
+
+    // Test default construction
+    static_assert(std::is_default_constructible_v<clonable_ptr<Clonable, CloneFactory>>);
+
+    // Test Clone Factory construction
+    (void)clonable_ptr<Clonable, CloneFactory>{nullptr, cf()};
+
+    // Test construction from a nullptr with factory
+    (void)clonable_ptr<Clonable, CloneFactory>{nullptr, cf()};
+
+    // Test initialization of a raw Clonable pointer with factory, using reset.
+    {
+        clonable_ptr<Clonable, CloneFactory> p{nullptr, cf()};
+        p.reset(static_cast<Clonable*>(nullptr));
+    }
+
+    // Test move construction.
+    (void)clonable_ptr<Clonable, CloneFactory>{clonable_ptr<Clonable, CloneFactory>{nullptr, cf()}};
+
+    // Test copy construction.
+    {
+        mongo::clonable_ptr<Clonable, CloneFactory> a{nullptr, cf()};
+        auto b{a};
+    }
+
+    // Test augmented copy construction.
+    {
+        mongo::clonable_ptr<Clonable, CloneFactory> a{nullptr, cf()};
+        mongo::clonable_ptr<Clonable, CloneFactory> b{a, cf()};
+    }
+
+    // Test move assignment.
+    {
+        mongo::clonable_ptr<Clonable, CloneFactory> a{nullptr, cf()};
+        a = mongo::clonable_ptr<Clonable, CloneFactory>{nullptr, cf()};
+    }
+
+    // Test copy assignment.
+    {
+        mongo::clonable_ptr<Clonable, CloneFactory> a{nullptr, cf()};
+        mongo::clonable_ptr<Clonable, CloneFactory> b{nullptr, cf()};
+        b = a;
+    }
+
+    // Test unique pointer construction
+    {
+        mongo::clonable_ptr<Clonable, CloneFactory>{std::make_unique<Clonable>(), cf()};
+    }
+
+    // Test augmented unique pointer construction
+    {
+        mongo::clonable_ptr<Clonable, CloneFactory>{std::make_unique<Clonable>(), cf()};
+    }
+
+    // Test non-conversion pointer construction
+    static_assert(!std::is_convertible_v<mongo::clonable_ptr<Clonable, CloneFactory>, Clonable*>);
+
+    // Test non-conversion from factory
+    static_assert(
+        !std::is_convertible_v<mongo::clonable_ptr<Clonable, CloneFactory>, CloneFactory>);
+}
+
+template <typename Clonable>
+void pointerOperations() {
+    mongo::clonable_ptr<Clonable> a;
+
+    // Test `.get()` functionality:
+    {
+        Clonable* p = a.get();
+        (void)p;
+    }
+
+    // Test `->` functionality
+    {
+        // We don't actually want to call the dtor, but we want the compiler to check that we
+        // have.
+        if (false) {
+            a->~Clonable();
+        }
+    }
+
+    // Test `*` functionality
+    Clonable& r = *a;
+    (void)r;
+
+    // Test reset functionality
+    {
+        a.reset();
+        a.reset(nullptr);
+        a.reset(new Clonable);
+    }
+}
+
+template <typename Clonable>
+void equalityOperations() {
+    mongo::clonable_ptr<Clonable> a;
+    mongo::clonable_ptr<Clonable> b;
+
+    std::unique_ptr<Clonable> ua;
+
+    // Test equality expressions
+    {
+        (void)(a == a);
+        (void)(a == b);
+        (void)(b == a);
+
+        (void)(nullptr == a);
+        (void)(a == nullptr);
+    }
+
+    // Test inequality expressions
+    {
+        (void)(a != a);
+        (void)(a != b);
+        (void)(b != a);
+
+        (void)(nullptr == a);
+        (void)(a == nullptr);
+    }
+}
+}  // namespace SyntaxTests
+
+TEST(ClonablePtrSyntaxTests, construction) {
+    runSyntaxTest(SyntaxTests::construction<ClonableTest>);
+    runSyntaxTest(SyntaxTests::construction<RawPointerClonable>);
+    runSyntaxTest(SyntaxTests::construction<UniquePtrClonable>);
+}
+
+TEST(ClonablePtrSyntaxTests, augmentedConstruction) {
+    runSyntaxTest(
+        SyntaxTests::augmentedConstruction<FunctorClonable, FunctorClonable::CloningFunctionType>);
+    runSyntaxTest(
+        SyntaxTests::augmentedConstruction<FunctorWithDynamicStateClonable,
+                                           FunctorWithDynamicStateClonable::CloningFunctionType>);
+}
+
+TEST(ClonablePtrSyntaxTests, pointerOperations) {
+    runSyntaxTest(SyntaxTests::pointerOperations<ClonableTest>);
+    runSyntaxTest(SyntaxTests::pointerOperations<RawPointerClonable>);
+    runSyntaxTest(SyntaxTests::pointerOperations<UniquePtrClonable>);
+}
+
+TEST(ClonablePtrSyntaxTests, equalityOperations) {
+    runSyntaxTest(SyntaxTests::equalityOperations<ClonableTest>);
+    runSyntaxTest(SyntaxTests::equalityOperations<RawPointerClonable>);
+    runSyntaxTest(SyntaxTests::equalityOperations<UniquePtrClonable>);
+}
+
+namespace BehaviorTests {
+class DetectDestruction {
+public:
+    static int activeCount;
+
+    static void resetCount() {
+        activeCount = 0;
+    }
+
+    ~DetectDestruction() {
+        --activeCount;
+    }
+
+    DetectDestruction(const DetectDestruction&) {
+        ++activeCount;
+    }
+
+    DetectDestruction& operator=(const DetectDestruction&) = delete;
+
+    DetectDestruction(DetectDestruction&&) = delete;
+    DetectDestruction& operator=(DetectDestruction&&) = delete;
+
+    DetectDestruction() {
+        ++activeCount;
+    }
+
+    std::unique_ptr<DetectDestruction> clone() const {
+        return std::make_unique<DetectDestruction>(*this);
+    }
+};
+
+int DetectDestruction::activeCount = 0;
+
+struct DestructionGuard {
+    DestructionGuard(const DestructionGuard&) = delete;
+    DestructionGuard& operator=(const DestructionGuard&) = delete;
+
+    DestructionGuard() {
+        DetectDestruction::resetCount();
+    }
+
+    ~DestructionGuard() {
+        ASSERT_EQ(DetectDestruction::activeCount, 0);
+    }
+};
+
+TEST(ClonablePtrTest, basic_construction_test) {
+    // Do not default construct the object
+    {
+        DestructionGuard check;
+        mongo::clonable_ptr<DetectDestruction> p;
+        ASSERT_EQ(DetectDestruction::activeCount, 0);
+    }
+
+    // Do not make unnecessary copies of the object from unique_ptr
+    {
+        DestructionGuard check;
+        mongo::clonable_ptr<DetectDestruction> p{std::make_unique<DetectDestruction>()};
+        ASSERT_EQ(DetectDestruction::activeCount, 1);
+    }
+    {
+        DestructionGuard check;
+        mongo::clonable_ptr<DetectDestruction> p = std::make_unique<DetectDestruction>();
+        ASSERT_EQ(DetectDestruction::activeCount, 1);
+    }
+
+    // Two separate constructions are unlinked
+    {
+        DestructionGuard check;
+
+        mongo::clonable_ptr<DetectDestruction> p1{std::make_unique<DetectDestruction>()};
+        ASSERT_EQ(DetectDestruction::activeCount, 1);
+
+        {
+            mongo::clonable_ptr<DetectDestruction> p2{std::make_unique<DetectDestruction>()};
+            ASSERT_EQ(DetectDestruction::activeCount, 2);
+        }
+        ASSERT_EQ(DetectDestruction::activeCount, 1);
+    }
+
+    // Two separate constructions can have opposite order and be unlinked
+    {
+        DestructionGuard check;
+
+        auto p1 = std::make_unique<mongo::clonable_ptr<DetectDestruction>>(
+            std::make_unique<DetectDestruction>());
+        ASSERT_EQ(DetectDestruction::activeCount, 1);
+
+        auto p2 = std::make_unique<mongo::clonable_ptr<DetectDestruction>>(
+            std::make_unique<DetectDestruction>());
+        ASSERT_EQ(DetectDestruction::activeCount, 2);
+
+        p1.reset();
+        ASSERT_EQ(DetectDestruction::activeCount, 1);
+
+        p2.reset();
+        ASSERT_EQ(DetectDestruction::activeCount, 0);
+    }
+}
+
+// TODO: Bring in an "equivalence class for equality predicate testing" framework.
+// Equals and Not Equals need to be tested independently -- It is not valid to assume that equals
+// and not equals are correctly implemented as complimentary predicates.  Equality must be
+// reflexive, symmetric and transitive.  This requres several instances that all have the same
+// value.  Simply testing "2 == 2" and "3 != 2" is insufficient.  Every combination of position and
+// equality must be tested to come out as expected.
+//
+// Consider that with equality it is important to make sure that `a == b` has the same meaning as `b
+// == a`.  It is also necessary to check that `a == b` and `b == c` and `a == c` is true, when all
+// three are equal, and to do so in reverse: `b == a` and `c == b` and `c == a`.  Further, the
+// relationships above have to hold for multiple cases.  Similar cases need to be tested for
+// inequality.
+//
+// Further, equality is an incredibly important operation to test completely and thoroughly --
+// besides being a critical element in code using any value modeling type, it also is the keystone
+// in any testing schedule for a copyable and movable value type.  Almost all testing of behavior
+// relies upon being able to detect fundamental differences in value.  In order to provide this
+// correctly, we provide a full battery of tests for equality in all mathematically relevant
+// situations.  For this equality testing schedule to be correct, we require a mechanism to
+// initialize objects (and references to those objects) which have predictable value.  These
+// predictable values are then used to test known equality expressions for the correct evaluation.
+//
+// All other tests can then just use equality to verify that an object is in the desired state.
+// This greatly simplifies testing and also makes tests more precise.
+TEST(ClonablePtrTest, basicEqualityTest) {
+    DestructionGuard check;
+
+    mongo::clonable_ptr<DetectDestruction> n1;
+    mongo::clonable_ptr<DetectDestruction> n2;
+    mongo::clonable_ptr<DetectDestruction> n3;
+
+    mongo::clonable_ptr<DetectDestruction> a = std::make_unique<DetectDestruction>();
+    mongo::clonable_ptr<DetectDestruction> b = std::make_unique<DetectDestruction>();
+    mongo::clonable_ptr<DetectDestruction> c = std::make_unique<DetectDestruction>();
+
+    const mongo::clonable_ptr<DetectDestruction>& ap = a;
+    const mongo::clonable_ptr<DetectDestruction>& bp = b;
+    const mongo::clonable_ptr<DetectDestruction>& cp = c;
+    const mongo::clonable_ptr<DetectDestruction>& ap2 = a;
+    const mongo::clonable_ptr<DetectDestruction>& bp2 = b;
+    const mongo::clonable_ptr<DetectDestruction>& cp2 = c;
+
+    // Equals operator
+
+    // Identity checks
+
+    ASSERT(n1 == n1);
+    ASSERT(n2 == n2);
+    ASSERT(n3 == n3);
+
+    ASSERT(a == a);
+    ASSERT(b == b);
+    ASSERT(c == c);
+
+    // Same value checks.  (Because unique pointers should never be the same value, we have to use
+    // references.)
+
+    ASSERT(n1 == n2);
+    ASSERT(n1 == n3);
+
+    ASSERT(n2 == n1);
+    ASSERT(n2 == n3);
+
+    ASSERT(n3 == n1);
+    ASSERT(n3 == n2);
+
+    ASSERT(a == ap);
+    ASSERT(a == ap2);
+    ASSERT(ap == a);
+    ASSERT(ap == ap2);
+    ASSERT(ap2 == a);
+    ASSERT(ap2 == ap);
+
+    ASSERT(b == bp);
+    ASSERT(b == bp2);
+    ASSERT(bp == b);
+    ASSERT(bp == bp2);
+    ASSERT(bp2 == b);
+    ASSERT(bp2 == bp);
+
+    ASSERT(c == cp);
+    ASSERT(c == cp2);
+    ASSERT(cp == c);
+    ASSERT(cp == cp2);
+    ASSERT(cp2 == c);
+    ASSERT(cp2 == cp);
+
+    // Different value checks:
+
+    ASSERT(!(a == n1));
+    ASSERT(!(b == n1));
+    ASSERT(!(c == n1));
+    ASSERT(!(a == n2));
+    ASSERT(!(b == n2));
+    ASSERT(!(c == n2));
+
+    ASSERT(!(n1 == a));
+    ASSERT(!(n1 == b));
+    ASSERT(!(n1 == c));
+    ASSERT(!(n2 == a));
+    ASSERT(!(n2 == b));
+    ASSERT(!(n2 == c));
+
+    ASSERT(!(a == b));
+    ASSERT(!(a == c));
+
+    ASSERT(!(b == a));
+    ASSERT(!(b == c));
+
+    ASSERT(!(c == a));
+    ASSERT(!(c == b));
+
+    // Not Equals operator
+
+    // Identity checks
+
+    ASSERT(!(n1 != n1));
+    ASSERT(!(n2 != n2));
+    ASSERT(!(n3 != n3));
+
+    ASSERT(!(a != a));
+    ASSERT(!(b != b));
+    ASSERT(!(c != c));
+
+    // Same value checks.  (Because unique pointers should never be the same value, we have to use
+    // references.)
+
+    ASSERT(!(n1 != n2));
+    ASSERT(!(n1 != n3));
+
+    ASSERT(!(n2 != n1));
+    ASSERT(!(n2 != n3));
+
+    ASSERT(!(n3 != n1));
+    ASSERT(!(n3 != n2));
+
+    ASSERT(!(a != ap));
+    ASSERT(!(a != ap2));
+    ASSERT(!(ap != a));
+    ASSERT(!(ap != ap2));
+    ASSERT(!(ap2 != a));
+    ASSERT(!(ap2 != ap));
+
+    ASSERT(!(b != bp));
+    ASSERT(!(b != bp2));
+    ASSERT(!(bp != b));
+    ASSERT(!(bp != bp2));
+    ASSERT(!(bp2 != b));
+    ASSERT(!(bp2 != bp));
+
+    ASSERT(!(c != cp));
+    ASSERT(!(c != cp2));
+    ASSERT(!(cp != c));
+    ASSERT(!(cp != cp2));
+    ASSERT(!(cp2 != c));
+    ASSERT(!(cp2 != cp));
+
+    // Different value checks:
+
+    ASSERT(a != n1);
+    ASSERT(b != n1);
+    ASSERT(c != n1);
+    ASSERT(a != n2);
+    ASSERT(b != n2);
+    ASSERT(c != n2);
+
+    ASSERT(n1 != a);
+    ASSERT(n1 != b);
+    ASSERT(n1 != c);
+    ASSERT(n2 != a);
+    ASSERT(n2 != b);
+    ASSERT(n2 != c);
+
+    ASSERT(a != b);
+    ASSERT(a != c);
+
+    ASSERT(b != a);
+    ASSERT(b != c);
+
+    ASSERT(c != a);
+    ASSERT(c != b);
+}
+
+// TODO: all other forms of equality with other types (`std::nullptr_t` and `std::unique_ptr< T >`)
+// need testing still.
+
+TEST(ClonablePtrTest, ownershipStabilityTest) {
+    {
+        DestructionGuard check;
+
+        auto ptr_init = std::make_unique<DetectDestruction>();
+        const auto* rp = ptr_init.get();
+
+        mongo::clonable_ptr<DetectDestruction> cp = std::move(ptr_init);
+
+        ASSERT(rp == cp.get());
+
+        mongo::clonable_ptr<DetectDestruction> cp2 = std::move(cp);
+
+        ASSERT(rp == cp2.get());
+
+        mongo::clonable_ptr<DetectDestruction> cp3;
+
+        ASSERT(nullptr == cp3);
+
+        cp3 = std::move(cp2);
+
+        ASSERT(rp == cp3.get());
+    }
+
+    {
+        auto ptr_init = std::make_unique<DetectDestruction>();
+        const auto* rp = ptr_init.get();
+
+        mongo::clonable_ptr<DetectDestruction> cp{std::move(ptr_init)};
+
+        ASSERT(rp == cp.get());
+
+        mongo::clonable_ptr<DetectDestruction> cp2 = std::move(cp);
+
+        ASSERT(rp == cp2.get());
+
+        mongo::clonable_ptr<DetectDestruction> cp3;
+
+        ASSERT(nullptr == cp3.get());
+
+        cp3 = std::move(cp2);
+
+        ASSERT(rp == cp3.get());
+    }
+}
+
+class ClonableObject {
+private:
+    int value = 0;
+
+public:
+    // ClonableObject( const ClonableObject & ) { abort(); }
+    ClonableObject() = default;
+    explicit ClonableObject(const int v) : value(v) {}
+
+    std::unique_ptr<ClonableObject> clone() const {
+        return std::make_unique<ClonableObject>(*this);
+    }
+
+    auto make_equality_lens() const -> decltype(std::tie(this->value)) {
+        return std::tie(value);
+    }
+};
+
+bool operator==(const ClonableObject& lhs, const ClonableObject& rhs) {
+    return lhs.make_equality_lens() == rhs.make_equality_lens();
+}
+
+bool operator!=(const ClonableObject& lhs, const ClonableObject& rhs) {
+    return !(lhs == rhs);
+}
+
+TEST(ClonablePtrTest, noObjectCopySemanticTest) {
+    mongo::clonable_ptr<ClonableObject> p;
+
+    mongo::clonable_ptr<ClonableObject> p2 = p;
+    ASSERT(p == p2);
+
+    mongo::clonable_ptr<ClonableObject> p3;
+
+    p3 = p;
+    ASSERT(p == p3);
+}
+
+TEST(ClonablePtrTest, objectCopySemanticTest) {
+    mongo::clonable_ptr<ClonableObject> p = std::make_unique<ClonableObject>(1);
+    mongo::clonable_ptr<ClonableObject> q = std::make_unique<ClonableObject>(2);
+    ASSERT(p != q);
+    ASSERT(*p != *q);
+
+    mongo::clonable_ptr<ClonableObject> p2 = p;
+    ASSERT(p != p2);
+    ASSERT(*p == *p2);
+
+    mongo::clonable_ptr<ClonableObject> q2 = q;
+    ASSERT(q2 != q);
+    ASSERT(q2 != p);
+    ASSERT(q2 != p2);
+    ASSERT(*q2 == *q);
+
+    q2 = p2;
+    ASSERT(q2 != q);
+    ASSERT(q2 != p);
+    ASSERT(q2 != p2);
+    ASSERT(*q2 == *p2);
+}
+
+class Interface {
+public:
+    virtual ~Interface() = default;
+    virtual void consumeText(const std::string& message) = 0;
+    virtual std::string produceText() = 0;
+
+    std::unique_ptr<Interface> clone() const {
+        return std::unique_ptr<Interface>{this->clone_impl()};
+    }
+
+private:
+    virtual Interface* clone_impl() const = 0;
+};
+
+class GeneratorImplementation : public Interface {
+private:
+    const std::string root;
+    int generation = 0;
+
+    GeneratorImplementation* clone_impl() const override {
+        return new GeneratorImplementation{*this};
+    }
+
+public:
+    explicit GeneratorImplementation(const std::string& m) : root(m) {}
+
+    void consumeText(const std::string&) override {}
+
+    std::string produceText() override {
+        return root + std::to_string(++generation);
+    }
+};
+
+class StorageImplementation : public Interface {
+private:
+    std::string store;
+
+    StorageImplementation* clone_impl() const override {
+        return new StorageImplementation{*this};
+    }
+
+public:
+    void consumeText(const std::string& m) override {
+        store = m;
+    }
+    std::string produceText() override {
+        return store;
+    }
+};
+
+
+TEST(ClonablePtrSimpleTest, simpleUsageExample) {
+    mongo::clonable_ptr<Interface> source;
+    mongo::clonable_ptr<Interface> sink;
+
+    mongo::clonable_ptr<Interface> instance = std::make_unique<StorageImplementation>();
+
+    sink = instance;
+
+    ASSERT(instance.get() != sink.get());
+
+    instance = std::make_unique<GeneratorImplementation>("base message");
+
+
+    source = std::move(instance);
+
+
+    sink->consumeText(source->produceText());
+}
+
+}  // namespace BehaviorTests
+
+// Verify that clonable_ptr can be used with forward-declared (incomplete) types. This is needed
+// when a class holds clonable_ptr members pointing to itself (recursive data structures).
+namespace IncompleteTypeTests {
+class SelfReferential;
+
+// These declarations must compile with SelfReferential still incomplete.
+struct ContainsSelf {
+    mongo::clonable_ptr<SelfReferential> child;
+};
+
+class SelfReferential {
+public:
+    virtual ~SelfReferential() = default;
+    virtual std::unique_ptr<SelfReferential> clone() const {
+        return std::make_unique<SelfReferential>(*this);
+    }
+    mongo::clonable_ptr<SelfReferential> next;
+};
+
+TEST(ClonablePtrTest, incompleteTypeDeclaration) {
+    SelfReferential a;
+    a.next = std::make_unique<SelfReferential>();
+    // Copy is valid here: SelfReferential is complete and has clone().
+    SelfReferential b = a;
+    ASSERT_NE(a.next.get(), b.next.get());
+    ASSERT_NE(a.next, nullptr);
+    ASSERT_NE(b.next, nullptr);
+}
+}  // namespace IncompleteTypeTests
+
+}  // namespace

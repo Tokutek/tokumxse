@@ -1,0 +1,173 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/auth/security_key.h"
+
+#include "mongo/base/status_with.h"
+#include "mongo/db/auth/auth_name.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/security_file.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/unittest/unittest.h"
+
+#include <array>
+#include <cstddef>
+#include <initializer_list>
+#include <memory>
+#include <ostream>
+#include <set>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/filesystem/file_status.hpp>
+#include <boost/filesystem/fstream.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+class TestFile {
+    TestFile(TestFile&) = delete;
+    TestFile& operator=(TestFile&) = delete;
+
+public:
+    TestFile(std::string_view contents, bool fixPerms = true)
+        : _path(boost::filesystem::unique_path()) {
+        boost::filesystem::ofstream stream(_path, std::ios_base::out | std::ios_base::trunc);
+        ASSERT_TRUE(stream.good());
+
+        stream.write(contents.data(), contents.size());
+        stream.close();
+        if (fixPerms) {
+            const auto perms = boost::filesystem::owner_read | boost::filesystem::owner_write;
+            boost::filesystem::permissions(_path, perms);
+        }
+    }
+
+    ~TestFile() {
+        ASSERT_TRUE(boost::filesystem::remove(_path));
+    }
+
+    const boost::filesystem::path& path() const {
+        return _path;
+    }
+
+private:
+    boost::filesystem::path _path;
+};
+
+struct TestCase {
+    enum class FailureMode { Success, Permissions, Parsing, SecurityKeyConstraint };
+
+    TestCase(std::string_view contents_,
+             std::initializer_list<std::string> expected_,
+             FailureMode mode_ = FailureMode::Success)
+        : fileContents(std::string{contents_}), expected(expected_), mode(mode_) {}
+
+    std::string fileContents;
+    std::vector<std::string> expected;
+    FailureMode mode = FailureMode::Success;
+};
+
+std::string_view longKeyMaker() {
+    static const auto longKey = [] {
+        std::array<char, 1026> ret;
+        ret.fill('a');
+        return ret;
+    }();
+    return std::string_view(longKey.data(), longKey.size());
+}
+
+std::initializer_list<TestCase> testCases = {
+    // Our good ole insecure key
+    {"foop de doop", {"foopdedoop"}},
+
+    // Basic whitespace stripping gets done correctly
+    {"foop\nde\ndoop", {"foopdedoop"}},
+
+    // A more complex base64 character set key
+    {"G92sqe/Y9Nn92fU1M8Q=cIKI", {"G92sqe/Y9Nn92fU1M8Q=cIKI"}},
+
+    // A more complex base64 character set key with a ludicrous amount of whitespace
+    {"G 9\n2\ts\rq\ne\n/\tY   9\rN\nn\r\n9\n2fU1M8Q=cIKI", {"G92sqe/Y9Nn92fU1M8Q=cIKI"}},
+
+    // A more complex base64 character set key with YAML escaped whitespace in it
+    {"\"G 9\\n2\\ts\\rq\\ne\\n/\\tY   9\\rN\\nn\\r\\n9\\n2fU1M8Q=cIKI\"",
+     {"G92sqe/Y9Nn92fU1M8Q=cIKI"}},
+
+    // An array of keys with ludicrous embedded whitespace in one (use the leading '-' array
+    // YAML format)
+    {"- \"foop de doop\"\n- \"G 9\\n2\\ts\\rq\\ne\\n/\\tY   9\\rN\\nn\\r\\n9\\n2fU1M8Q=cIKI\"",
+     {"foopdedoop", "G92sqe/Y9Nn92fU1M8Q=cIKI"}},
+
+    // An array of keys with the JSON-like YAML array format
+    {"[ \"foop de doop\", \"other key\" ]", {"foopdedoop", "otherkey"}},
+
+    // An empty file doesn't parse correctly
+    {"", {}, TestCase::FailureMode::Parsing},
+
+    // An empty array doesn't parse correctly
+    {"[]", {}, TestCase::FailureMode::Parsing},
+
+    // Invalid base64 characters don't parse correctly
+    {"*xjy23`~/?", {}, TestCase::FailureMode::Parsing},
+
+    // Raw binary data shouldn't parse correctly
+    {"\x20\xfe\x04\x56\0\x34 foop de doop", {}, TestCase::FailureMode::Parsing},
+
+    // A file with bad permissions doesn't parse correctly
+    {"", {}, TestCase::FailureMode::Permissions},
+
+    // These two keys should pass the security file parsing, but fail loading them as
+    // security keys because they are too short or two long
+    {"abc", {"abc"}, TestCase::FailureMode::SecurityKeyConstraint},
+    {longKeyMaker(), {std::string{longKeyMaker()}}, TestCase::FailureMode::SecurityKeyConstraint}};
+
+TEST(SecurityFile, Test) {
+    for (const auto& testCase : testCases) {
+        TestFile file(testCase.fileContents, testCase.mode != TestCase::FailureMode::Permissions);
+
+        auto swKeys = readSecurityFile(file.path().string());
+        if (testCase.mode == TestCase::FailureMode::Success ||
+            testCase.mode == TestCase::FailureMode::SecurityKeyConstraint) {
+            ASSERT_OK(swKeys.getStatus());
+        } else {
+            ASSERT_NOT_OK(swKeys.getStatus());
+            continue;
+        }
+
+        auto keys = std::move(swKeys.getValue());
+        ASSERT_EQ(keys.size(), testCase.expected.size());
+        for (size_t i = 0; i < keys.size(); i++) {
+            ASSERT_EQ(keys.at(i), testCase.expected.at(i));
+        }
+    }
+}
+
+TEST(SecurityKey, Test) {
+    User user(std::make_unique<UserRequestGeneral>(UserName("__system", "local"), boost::none));
+    auto userHandle = std::make_shared<UserHandle>(std::move(user));
+    internalSecurity.setUser(userHandle);
+
+    for (const auto& testCase : testCases) {
+        TestFile file(testCase.fileContents, testCase.mode != TestCase::FailureMode::Permissions);
+
+        if (testCase.mode == TestCase::FailureMode::Success) {
+            ASSERT_TRUE(setUpSecurityKey(file.path().string(), ClusterAuthMode::keyFile()));
+        } else {
+            ASSERT_FALSE(setUpSecurityKey(file.path().string(), ClusterAuthMode::keyFile()));
+        }
+    }
+}
+
+}  // namespace
+}  // namespace mongo

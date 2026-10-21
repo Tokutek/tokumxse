@@ -1,0 +1,22 @@
+load("//bazel:mongo_js_rules.bzl", "all_subpackage_javascript_files", "mongo_js_library")
+
+package(default_visibility = ["//visibility:public"])
+
+mongo_js_library(
+    name = "all_javascript_files",
+    srcs = glob([
+        "*.js",
+    ]),
+)
+
+mongo_js_library(
+    name = "timeseries_writes_util",
+    srcs = ["timeseries_writes_util.js"],
+)
+
+mongo_js_library(
+    name = "viewless_timeseries_util",
+    srcs = ["viewless_timeseries_util.js"],
+)
+
+all_subpackage_javascript_files()

@@ -1,0 +1,140 @@
+# Composite action that provides a unified setup for mergai workflows.
+# It supports modular configuration via boolean flags, allowing workflows
+# to enable only the components they need (GCP, Gemini, mergai).
+name: "mergai Workflow Setup"
+description: "Parameterized setup for mergai workflows with optional components"
+
+inputs:
+  # --- Optional component flags (enable/disable specific setup steps) ---
+  setup-gcp:
+    description: "Setup GCP credentials"
+    required: false
+    default: "false"
+  setup-gemini:
+    description: "Install gemini-cli"
+    required: false
+    default: "false"
+  setup-claude:
+    description: "Install Claude CLI"
+    required: false
+    default: "false"
+  setup-mergai:
+    description: "Setup mergai tool and run fork init"
+    required: false
+    default: "true" # Enabled by default since this is the primary purpose
+
+  # --- Credentials and configuration ---
+  gcp-credentials:
+    description: "Base64 encoded GCP credentials (required if setup-gcp: true)"
+    required: false
+    default: ""
+  github-app-token:
+    description: "GitHub App token for git config"
+    required: true
+  github-app-id:
+    description: "GitHub App ID for constructing bot email"
+    required: true
+  export-github-token:
+    description: >-
+      Export GH_TOKEN/GITHUB_TOKEN to the job environment (GITHUB_ENV). Set to
+      "false" for jobs that run the AI agent so no write token is reachable (via
+      the environment) during agent execution; those jobs scope the token to
+      their push steps instead.
+    required: false
+    default: "true"
+  mergai-ref:
+    description: "MergAI git ref to checkout"
+    required: false
+    default: "master"
+  claude-api-key:
+    description: "Anthropic API key for Claude CLI (required if setup-claude: true)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # Decode and store GCP service account key for Google Cloud SDK authentication.
+    # The key is written to a temp file with restricted permissions (600).
+    - name: Write GCP credentials
+      if: inputs.setup-gcp == 'true'
+      shell: bash
+      run: |
+        echo '${{ inputs.gcp-credentials }}' | base64 -d > $RUNNER_TEMP/gcp-key.json
+        chmod 600 $RUNNER_TEMP/gcp-key.json
+        echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-key.json" >> $GITHUB_ENV
+
+    # Install Node.js 22 for npm-based CLI tools (gemini-cli, claude-cli).
+    - name: Install Node
+      if: inputs.setup-gemini == 'true' || inputs.setup-claude == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Install gemini-cli
+      if: inputs.setup-gemini == 'true'
+      shell: bash
+      run: |
+        npm install -g @google/gemini-cli
+
+    # Install Anthropic's Claude Code CLI tool globally via npm.
+    # Validates API key, installs the CLI, and exports the environment variable.
+    - name: Install claude-cli
+      if: inputs.setup-claude == 'true'
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.claude-api-key }}" ]; then
+          echo "::error::CLAUDE_API_KEY secret is required when setup-claude is true"
+          exit 1
+        fi
+        npm install -g @anthropic-ai/claude-code
+        echo "ANTHROPIC_API_KEY=${{ inputs.claude-api-key }}" >> $GITHUB_ENV
+
+    # Configure git for automated commits by the psmdb-bot.
+    # - Exports GITHUB_TOKEN/GH_TOKEN job-wide only when export-github-token is
+    #   true (agent jobs disable it and scope the token to their push steps)
+    # - Uses GitHub App identity format for the bot email
+    # - Enables diff3 conflict style for better merge conflict resolution
+    # - Configures git notes display for mergai markers (used for tracking)
+    - name: Setup git credentials
+      shell: bash
+      run: |
+        # Export the token job-wide unless the caller opts out (agent jobs do,
+        # so the write token is not reachable while the agent runs; they scope
+        # it to their push steps instead).
+        if [ "${{ inputs.export-github-token }}" = "true" ]; then
+          echo "GITHUB_TOKEN=${{ inputs.github-app-token }}" >> $GITHUB_ENV
+          echo "GH_TOKEN=${{ inputs.github-app-token }}" >> $GITHUB_ENV
+        fi
+        git config user.name "psmdb-bot[bot]"
+        git config user.email "${{ inputs.github-app-id }}+psmdb-bot[bot]@users.noreply.github.com"
+        git config merge.conflictstyle diff3
+        git config notes.displayRef refs/notes/mergai-marker
+        # Authenticate git pushes from the *process environment* (GH_TOKEN) via a
+        # no-fallback credential helper: a push succeeds only for a step whose
+        # environment carries the token. Combined with `persist-credentials:
+        # false` on the agent checkouts (no token on disk) and mergai stripping
+        # the token from the agent subprocess, the AI agent can never push -- its
+        # empty GH_TOKEN yields an empty password. Only steps that explicitly set
+        # GH_TOKEN/GITHUB_TOKEN (the deterministic push/PR steps) authenticate.
+        # The empty first helper resets any inherited helper (no stored-login
+        # fallback).
+        git config --global credential.https://github.com.helper ""
+        git config --global --add credential.https://github.com.helper '!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "${GH_TOKEN:-$GITHUB_TOKEN}"; }; f'
+
+    # Install the mergai CLI tool using the dedicated setup action.
+    # Supports checking out a specific ref (branch/tag/commit) for testing.
+    - name: Setup mergai
+      if: inputs.setup-mergai == 'true'
+      uses: ./.github/actions/setup-mergai
+      with:
+        token: ${{ inputs.github-app-token }}
+        ref: ${{ inputs.mergai-ref }}
+
+    # Initialize the fork configuration for mergai operations.
+    # This sets up the necessary tracking between upstream and fork repos.
+    - name: mergai fork init
+      if: inputs.setup-mergai == 'true'
+      shell: bash
+      run: |
+        mergai fork init

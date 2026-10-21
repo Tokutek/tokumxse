@@ -1,0 +1,74 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+    - "mongo/db/global_catalog/type_namespace_placement.idl"
+
+structs:
+    ConfigsvrGetHistoricalPlacementResponse:
+        description: "Response for the _configsvrGetHistoricalPlacement command"
+        strict: false
+        is_command_reply: true
+        fields:
+            historicalPlacement: HistoricalPlacement
+
+commands:
+    clusterResetPlacementHistory:
+        command_name: resetPlacementHistory
+        cpp_name: ClusterResetPlacementHistory
+        description:
+            "Admin command to reinitialize the content of config.placementHistory
+            based on the current state of the Sharding catalog."
+        namespace: ignored
+        api_version: ""
+        strict: false
+
+    _configsvrResetPlacementHistory:
+        command_name: _configsvrResetPlacementHistory
+        cpp_name: ConfigsvrResetPlacementHistory
+        description: "Definition of the resetPlacementHistory command called
+            from routers on the config server."
+        namespace: ignored
+        api_version: ""
+        strict: false
+
+    _configsvrGetHistoricalPlacement:
+        command_name: _configsvrGetHistoricalPlacement
+        cpp_name: ConfigsvrGetHistoricalPlacement
+        description:
+            "Internal command to retrieve the list of shard IDs hosting data for the
+            namespace/cluster being targeted at a specific point in time"
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        fields:
+            at:
+                type: timestamp
+                description: "The requested point in time"
+                optional: false
+            targetWholeCluster:
+                type: bool
+                description:
+                    "When true, the command retrieves placement information concerning
+                    the whole cluster (ignoring the namespace parameter)"
+                default: false
+            checkIfPointInTimeIsInFuture:
+                type: bool
+                description:
+                    "When true, verifies that the supplied 'at' cluster time is not in
+                    the future relative to the current config time"
+                default: true
+            ignoreRemovedShards:
+                type: bool
+                description:
+                    "When true, ignores the shards that have been removed from the system and finds
+                    the earliest point in time at or after 'at', at which the collection/database/databases
+                    was allocated to a shard set of which at least one shard has not been removed
+                    from the system (returned in attribute 'openCursorAt')."

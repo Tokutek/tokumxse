@@ -1,0 +1,235 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+std::pair<SortSpec*, CollatorInterface*> ByteCode::generateSortKeyHelper(ArityType arity) {
+    tassert(11080009, "Unexpected arity value", arity == 2 || arity == 3);
+
+    auto ssView = viewFromStack(0);
+    auto objView = viewFromStack(1);
+    if (ssView.tag != value::TypeTags::sortSpec || !value::isObject(objView.tag)) {
+        return {nullptr, nullptr};
+    }
+
+    CollatorInterface* collator{nullptr};
+    if (arity == 3) {
+        auto collatorView = viewFromStack(2);
+        if (collatorView.tag != value::TypeTags::collator) {
+            return {nullptr, nullptr};
+        }
+        collator = value::getCollatorView(collatorView.value);
+    }
+
+    auto ss = value::getSortSpecView(ssView.value);
+    return {ss, collator};
+}
+
+value::TagValueMaybeOwned ByteCode::builtinGenerateCheapSortKey(ArityType arity) {
+    auto [sortSpec, collator] = generateSortKeyHelper(arity);
+    if (!sortSpec) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    // We "move" the object argument into the sort spec.
+    auto sortKeyComponentVector =
+        sortSpec->generateSortKeyComponentVector(moveMaybeOwnedFromStack(1), collator);
+
+    return {false,
+            value::TypeTags::sortKeyComponentVector,
+            value::bitcastFrom<value::SortKeyComponentVector*>(sortKeyComponentVector)};
+}
+
+value::TagValueMaybeOwned ByteCode::builtinGenerateSortKey(ArityType arity) {
+    auto [sortSpec, collator] = generateSortKeyHelper(arity);
+    if (!sortSpec) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto objView = viewFromStack(1);
+    auto bsonObj = [objTag = objView.tag, objVal = objView.value]() {
+        if (objTag == value::TypeTags::bsonObject) {
+            return BSONObj{value::bitcastTo<const char*>(objVal)};
+        } else if (objTag == value::TypeTags::Object) {
+            BSONObjBuilder objBuilder;
+            bson::convertToBsonObj(objBuilder, value::getObjectView(objVal));
+            return objBuilder.obj();
+        } else {
+            MONGO_UNREACHABLE_TASSERT(5037004);
+        }
+    }();
+
+    return {true,
+            value::TypeTags::keyString,
+            value::makeKeyString(sortSpec->generateSortKey(bsonObj, collator)).second};
+}
+
+value::TagValueMaybeOwned ByteCode::builtinSortKeyComponentVectorGetElement(ArityType arity) {
+    tassert(11080008, "Unexpected arity value", arity == 2);
+
+    auto sortVec = viewFromStack(0);
+    auto idx = viewFromStack(1);
+    if (sortVec.tag != value::TypeTags::sortKeyComponentVector ||
+        idx.tag != value::TypeTags::NumberInt32) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto* sortObj = value::getSortKeyComponentVectorView(sortVec.value);
+    const auto idxInt32 = value::bitcastTo<int32_t>(idx.value);
+
+    tassert(11086803,
+            "Unexpected idx parameter value",
+            idxInt32 >= 0 && static_cast<size_t>(idxInt32) < sortObj->elts.size());
+    auto [outTag, outVal] = sortObj->elts[idxInt32];
+    return {false, outTag, outVal};
+}
+
+value::TagValueMaybeOwned ByteCode::builtinSortKeyComponentVectorToArray(ArityType arity) {
+    tassert(11080007, "Unexpected arity value", arity == 1);
+
+    auto sortVecView = viewFromStack(0);
+    if (sortVecView.tag != value::TypeTags::sortKeyComponentVector) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto* sortVec = value::getSortKeyComponentVectorView(sortVecView.value);
+
+    if (sortVec->elts.size() == 1) {
+        auto [tag, val] = sortVec->elts[0];
+        auto [copyTag, copyVal] = value::copyValue(tag, val);
+        return {true, copyTag, copyVal};
+    } else {
+        value::TagValueOwned arr = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto array = value::getArrayView(arr.value());
+        array->reserve(sortVec->elts.size());
+        for (size_t i = 0; i < sortVec->elts.size(); ++i) {
+            auto [tag, val] = sortVec->elts[i];
+            auto [copyTag, copyVal] = value::copyValue(tag, val);
+            array->push_back_raw(copyTag, copyVal);
+        }
+        return std::move(arr);
+    }
+}
+
+template <bool IsAscending, bool IsLeaf>
+std::pair<value::TypeTags, value::Value> builtinGetSortKeyImpl(value::TypeTags inputTag,
+                                                               value::Value inputVal,
+                                                               CollatorInterface* collator) {
+    if (!value::isArray(inputTag)) {
+        // If 'input' is not an array, return 'fillEmpty(input, null)'.
+        if (inputTag != value::TypeTags::Nothing) {
+            return {inputTag, inputVal};
+        } else {
+            return {value::TypeTags::Null, 0};
+        }
+    }
+
+    value::ArrayEnumerator arrayEnum(inputTag, inputVal);
+    if (arrayEnum.atEnd()) {
+        // If 'input' is an empty array, return Undefined or Null depending on whether 'IsLeaf'
+        // is true or false.
+        if constexpr (IsLeaf) {
+            return {sbe::value::TypeTags::bsonUndefined, 0};
+        } else {
+            return {sbe::value::TypeTags::Null, 0};
+        }
+    }
+
+    auto [accTag, accVal] = arrayEnum.getViewOfValue();
+    arrayEnum.advance();
+
+    // If we reach here, then 'input' is a non-empty array. Loop over the elements and find
+    // the minimum element (if IsAscending is true) or the maximum element (if IsAscending
+    // is false) and return it.
+    while (!arrayEnum.atEnd()) {
+        auto [itemTag, itemVal] = arrayEnum.getViewOfValue();
+        auto [tag, val] = value::compare3way(itemTag, itemVal, accTag, accVal, collator);
+
+        if (tag == value::TypeTags::Nothing) {
+            // The comparison returns Nothing if one of the arguments is Nothing or if a sort order
+            // cannot be determined: bail out immediately and return Null.
+            return {sbe::value::TypeTags::Null, 0};
+        }
+
+        if (tag == value::TypeTags::NumberInt32) {
+            int32_t cmp = value::bitcastTo<int32_t>(val);
+
+            if ((IsAscending && cmp < 0) || (!IsAscending && cmp > 0)) {
+                accTag = itemTag;
+                accVal = itemVal;
+            }
+        }
+
+        arrayEnum.advance();
+    }
+
+    return {accTag, accVal};
+}
+
+template <bool IsAscending, bool IsLeaf>
+value::TagValueMaybeOwned ByteCode::builtinGetSortKey(ArityType arity) {
+    tassert(11080006, "Unexpected arity value", arity == 1 || arity == 2);
+
+    CollatorInterface* collator = nullptr;
+    if (arity == 2) {
+        auto collView = viewFromStack(1);
+        if (collView.tag == value::TypeTags::collator) {
+            collator = value::getCollatorView(collView.value);
+        }
+    }
+
+    auto [inputOwned, inputTag, inputVal] = getFromStack(0);
+
+    // If the argument is an array, find out the min/max value and place it in the stack. If it
+    // is Nothing or another simple type, treat it as the return value.
+    if (!value::isArray(inputTag)) {
+        if (inputTag != value::TypeTags::Nothing) {
+            return moveMaybeOwnedFromStack(0);
+        } else {
+            return value::TagValueMaybeOwned::null();
+        }
+    }
+
+    auto [resultTag, resultVal] =
+        builtinGetSortKeyImpl<IsAscending, IsLeaf>(inputTag, inputVal, collator);
+
+    // If the array is owned by the stack, make a copy of the item, or it will become invalid after
+    // the caller clears the array from it.
+    if (inputOwned) {
+        auto [copyTag, copyVal] = value::copyValue(resultTag, resultVal);
+        return {true, copyTag, copyVal};
+    } else {
+        return {false, resultTag, resultVal};
+    }
+}
+template value::TagValueMaybeOwned ByteCode::builtinGetSortKey<false, false>(ArityType arity);
+template value::TagValueMaybeOwned ByteCode::builtinGetSortKey<false, true>(ArityType arity);
+template value::TagValueMaybeOwned ByteCode::builtinGetSortKey<true, false>(ArityType arity);
+template value::TagValueMaybeOwned ByteCode::builtinGetSortKey<true, true>(ArityType arity);
+
+std::pair<value::TypeTags, value::Value> GetSortKeyAscFunctor::operator()(value::TypeTags tag,
+                                                                          value::Value val) const {
+    auto [skTag, skVal] = builtinGetSortKeyImpl<true, true>(tag, val, collator);
+    return value::copyValue(skTag, skVal);
+}
+
+std::pair<value::TypeTags, value::Value> GetSortKeyDescFunctor::operator()(value::TypeTags tag,
+                                                                           value::Value val) const {
+    auto [skTag, skVal] = builtinGetSortKeyImpl<false, true>(tag, val, collator);
+    return value::copyValue(skTag, skVal);
+}
+
+const value::ColumnOpInstanceWithParams<value::ColumnOpType::kNoFlags, GetSortKeyAscFunctor>
+    getSortKeyAscOp =
+        value::makeColumnOpWithParams<value::ColumnOpType::kNoFlags, GetSortKeyAscFunctor>();
+
+const value::ColumnOpInstanceWithParams<value::ColumnOpType::kNoFlags, GetSortKeyDescFunctor>
+    getSortKeyDescOp =
+        value::makeColumnOpWithParams<value::ColumnOpType::kNoFlags, GetSortKeyDescFunctor>();
+
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

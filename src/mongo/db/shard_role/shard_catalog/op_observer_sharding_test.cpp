@@ -1,0 +1,225 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/global_catalog/type_collection_common_types_gen.h"
+#include "mongo/db/global_catalog/type_database_gen.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_util.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/s/migration_chunk_cloner_source_op_observer.h"
+#include "mongo/db/s/migration_source_manager.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_metadata.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/sharding_environment/shard_server_test_fixture.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+const NamespaceString kTestNss =
+    NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
+const NamespaceString kUnshardedNss =
+    NamespaceString::createNamespaceString_forTest("TestDB", "UnshardedColl");
+
+void setCollectionFilteringMetadata(OperationContext* opCtx, CollectionMetadata metadata) {
+    CollectionShardingRuntime::acquireExclusive(opCtx, kTestNss)
+        ->setCollectionMetadata(opCtx, std::move(metadata));
+}
+
+class DocumentKeyStateTest : public ShardServerTestFixture {
+protected:
+    void setUp() override {
+        ShardServerTestFixture::setUp();
+
+        Lock::GlobalWrite globalLock(operationContext());
+        bool justCreated = false;
+        auto databaseHolder = DatabaseHolder::get(operationContext());
+        auto db = databaseHolder->openDb(operationContext(), kTestNss.dbName(), &justCreated);
+        ASSERT_TRUE(db);
+        ASSERT_TRUE(justCreated);
+
+        createTestCollection(operationContext(), kTestNss);
+        createTestCollection(operationContext(), kUnshardedNss);
+    }
+
+    /**
+     * Constructs a CollectionMetadata suitable for refreshing a CollectionShardingState. The only
+     * salient detail is the argument `keyPattern` which, defining the shard key, selects the fields
+     * that will be extracted from the document to the document key.
+     */
+    static CollectionMetadata makeAMetadata(BSONObj const& keyPattern) {
+        const UUID uuid = UUID::gen();
+        const OID epoch = OID::gen();
+        auto range = ChunkRange(BSON("key" << MINKEY), BSON("key" << MAXKEY));
+        auto chunk = ChunkType(uuid,
+                               std::move(range),
+                               ChunkVersion({epoch, Timestamp(1, 1)}, {1, 0}),
+                               ShardId("other"));
+        auto rt = RoutingTableHistory::makeNew(kTestNss,
+                                               uuid,
+                                               KeyPattern(keyPattern),
+                                               false, /* unsplittable */
+                                               nullptr,
+                                               false,
+                                               epoch,
+                                               Timestamp(1, 1),
+                                               boost::none /* timeseriesFields */,
+                                               boost::none /* reshardingFields */,
+
+                                               true,
+                                               {std::move(chunk)});
+
+        return CollectionMetadata(
+            PointInTimeChunkManager(makeStandaloneRoutingTableHistory(std::move(rt)),
+                                    Timestamp(100, 0)),
+            ShardId("this"));
+    }
+};
+
+TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateUnsharded) {
+    const auto metadata{CollectionMetadata::UNTRACKED()};
+    setCollectionFilteringMetadata(operationContext(), metadata);
+
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kTestNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kTestNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+
+    auto doc = BSON("key3" << "abc"
+                           << "key" << 3 << "_id"
+                           << "hello"
+                           << "key2" << true);
+
+    // Check that an order for deletion from an unsharded collection extracts just the "_id" field
+    ASSERT_BSONOBJ_EQ(getDocumentKey(acq.getCollectionPtr(), doc).getShardKeyAndId(),
+                      BSON("_id" << "hello"));
+}
+
+TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithoutIdInShardKey) {
+    // Push a CollectionMetadata with a shard key not including "_id"...
+    const auto metadata{makeAMetadata(BSON("key" << 1 << "key3" << 1))};
+    setCollectionFilteringMetadata(operationContext(), metadata);
+
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kTestNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kTestNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+
+    // The order of fields in `doc` deliberately does not match the shard key
+    auto doc = BSON("key3" << "abc"
+                           << "key" << 100 << "_id"
+                           << "hello"
+                           << "key2" << true);
+
+    // Verify the shard key is extracted, in correct order, followed by the "_id" field.
+    ASSERT_BSONOBJ_EQ(getDocumentKey(acq.getCollectionPtr(), doc).getShardKeyAndId(),
+                      BSON("key" << 100 << "key3"
+                                 << "abc"
+                                 << "_id"
+                                 << "hello"));
+}
+
+TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdInShardKey) {
+    // Push a CollectionMetadata with a shard key that does have "_id" in the middle...
+    const auto metadata{makeAMetadata(BSON("key" << 1 << "_id" << 1 << "key2" << 1))};
+    setCollectionFilteringMetadata(operationContext(), metadata);
+
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kTestNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kTestNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+
+    // The order of fields in `doc` deliberately does not match the shard key
+    auto doc = BSON("key2" << true << "key3"
+                           << "abc"
+                           << "_id"
+                           << "hello"
+                           << "key" << 100);
+
+    // Verify the shard key is extracted with "_id" in the right place.
+    ASSERT_BSONOBJ_EQ(getDocumentKey(acq.getCollectionPtr(), doc).getShardKeyAndId(),
+                      BSON("key" << 100 << "_id"
+                                 << "hello"
+                                 << "key2" << true));
+}
+
+TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdHashInShardKey) {
+    // Push a CollectionMetadata with a shard key "_id", hashed.
+    const auto metadata{makeAMetadata(BSON("_id" << "hashed"))};
+    setCollectionFilteringMetadata(operationContext(), metadata);
+
+    ScopedSetShardRole scopedSetShardRole{operationContext(),
+                                          kTestNss,
+                                          ShardVersionFactory::make(metadata) /* shardVersion */,
+                                          boost::none /* databaseVersion */};
+    auto acq = acquireCollection(operationContext(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     operationContext(), kTestNss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+
+    auto doc = BSON("key2" << true << "_id"
+                           << "hello"
+                           << "key" << 100);
+
+    // Verify the shard key is extracted with "_id" in the right place, not hashed.
+    ASSERT_BSONOBJ_EQ(getDocumentKey(acq.getCollectionPtr(), doc).getShardKeyAndId(),
+                      BSON("_id" << "hello"));
+}
+
+
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,19 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+load("//bazel:mongo_js_rules.bzl", "all_subpackage_javascript_files", "mongo_js_library")
+
+package(default_visibility = ["//visibility:public"])
+
+mongo_js_library(
+    name = "all_javascript_files",
+    srcs = glob([
+        "*.js",
+    ]),
+)
+
+all_subpackage_javascript_files()
+
+py_binary(
+    name = "otel_http_server",
+    srcs = ["otel_http_server.py"],
+    main = "otel_http_server.py",
+)

@@ -1,0 +1,171 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+idl_generator(
+    name = "execution_control_parameters_gen",
+    src = "execution_control_parameters.idl",
+)
+
+idl_generator(
+    name = "throughput_probing_gen",
+    src = "throughput_probing.idl",
+)
+
+idl_generator(
+    name = "execution_control_heuristic_parameters_gen",
+    src = "execution_control_heuristic_parameters.idl",
+)
+
+idl_generator(
+    name = "execution_admission_type_gen",
+    src = "execution_admission_type.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "execution_control_stats",
+    srcs = [
+        "execution_control_stats.cpp",
+    ],
+    hdrs = [
+        "execution_control_stats.h",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "ticketing_system",
+    srcs = [
+        "execution_control_parameters_gen",
+        "throughput_probing.cpp",
+        "throughput_probing_gen",
+        "ticketing_system.cpp",
+    ],
+    no_undefined_ref_DO_NOT_USE = False,
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/admission:app_name_exemption_matcher",
+        "//src/mongo/db/admission/ticketing:ticketholder",
+        "//src/mongo/db/commands:test_commands_enabled",
+        "//src/mongo/util:processinfo",
+    ],
+)
+
+mongo_cc_library(
+    name = "in_progress_time_accumulator",
+    hdrs = [
+        "in_progress_time_accumulator.h",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "execution_admission_context",
+    srcs = [
+        "execution_admission_context.cpp",
+        "execution_control_heuristic_parameters_gen",
+    ],
+    deps = [
+        ":execution_control_stats",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/admission/ticketing:admission_context",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "in_progress_time_accumulator_test",
+    srcs = [
+        "in_progress_time_accumulator_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        ":in_progress_time_accumulator",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "execution_control_stats_test",
+    srcs = [
+        "execution_control_stats_test.cpp",
+    ],
+    tags = ["mongo_unittest_first_group"],
+    deps = [
+        ":execution_control_stats",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "execution_admission_context_test",
+    srcs = [
+        "execution_admission_context_test.cpp",
+    ],
+    tags = ["mongo_unittest_fifth_group"],
+    deps = [
+        ":execution_admission_context",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/transport:transport_layer_mock",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "ticketing_system_test",
+    srcs = [
+        "ticketing_system_test.cpp",
+    ],
+    tags = ["mongo_unittest_eighth_group"],
+    deps = [
+        ":execution_admission_context",
+        ":ticketing_system",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db/admission/ticketing:ticketholder",
+        "//src/mongo/unittest",
+        "//src/mongo/util:mock_periodic_runner",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "throughput_probing_test",
+    srcs = [
+        "throughput_probing_test.cpp",
+    ],
+    tags = ["mongo_unittest_sixth_group"],
+    deps = [
+        ":ticketing_system",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db:shard_role_api",
+        "//src/mongo/db/admission/ticketing:ticketholder",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/transport:transport_layer_common",
+        "//src/mongo/unittest",
+        "//src/mongo/util:mock_periodic_runner",
+    ],
+)
+
+# TODO(SERVER-96853): Remove cycle created by moving //src/mongo/db:execution_admission_context.h to //src/mongo/db/admission/execution_control:execution_admission_context
+filegroup(
+    name = "execution_admission_context_hdrs",
+    srcs = [
+        ":execution_admission_context.h",
+        ":execution_control_stats.h",
+    ],
+)

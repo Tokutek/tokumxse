@@ -1,0 +1,18 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "resmoke_proxy",
+    srcs = [
+        "__init__.py",
+        "resmoke_proxy.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts:resmoke",
+        dependency(
+            "inject",
+            group = "evergreen",
+        ),
+    ],
+)

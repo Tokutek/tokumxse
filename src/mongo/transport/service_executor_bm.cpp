@@ -1,0 +1,174 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/transport/service_executor.h"
+
+#include "mongo/base/status.h"
+#include "mongo/db/service_context.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/transport/service_executor_synchronous.h"
+#include "mongo/unittest/barrier.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/processinfo.h"
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#include <benchmark/benchmark.h>
+// IWYU pragma: no_include "cxxabi.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kTest
+
+namespace mongo::transport {
+namespace {
+
+/**
+ * ASAN can't handle the # of threads the benchmark creates (SERVER-73168).
+ * With sanitizers, run this in a diminished "correctness check" mode.
+ */
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+const auto kMaxThreads = 1;
+const auto kMaxChainSize = 1;
+#else
+/** 2x to benchmark the case of more threads than cores for curiosity's sake. */
+const auto kMaxThreads = 2 * ProcessInfo::getNumLogicalCores();
+const auto kMaxChainSize = 64;
+#endif
+
+struct Notification {
+    void set() {
+        std::unique_lock lk{mu};
+        notified = true;
+        cv.notify_all();
+    }
+
+    void get() {
+        std::unique_lock lk{mu};
+        cv.wait(lk, [&] { return notified; });
+    }
+
+    std::mutex mu;
+    stdx::condition_variable cv;
+    bool notified = false;
+};
+
+class ServiceExecutorSynchronousBm : public benchmark::Fixture {
+public:
+    void firstSetup() {
+        auto service = ServiceContext::make();
+        sc = service.get();
+        setGlobalServiceContext(std::move(service));
+        (void)executor()->start();
+    }
+
+    ServiceExecutorSynchronous* executor() {
+        return ServiceExecutorSynchronous::get(sc);
+    }
+
+    void lastTearDown() {
+        unittest::MinimumLoggedSeverityGuard suppressNetworkInfoGuard{
+            logv2::LogComponent::kNetwork, logv2::LogSeverity::Warning()};
+        (void)executor()->shutdown(Hours{1});
+        setGlobalServiceContext({});
+    }
+
+    void SetUp(benchmark::State& state) override {
+        std::lock_guard lk{mu};
+        if (nThreads++)
+            return;
+        firstSetup();
+    }
+
+    void TearDown(benchmark::State& state) override {
+        std::lock_guard lk{mu};
+        if (--nThreads)
+            return;
+        lastTearDown();
+    }
+
+    void runOnExec(ServiceExecutor::TaskRunner* taskRunner, ServiceExecutor::Task task) {
+        taskRunner->schedule(std::move(task));
+    }
+
+    std::mutex mu;
+    int nThreads = 0;
+    ServiceContext* sc;
+};
+
+BENCHMARK_DEFINE_F(ServiceExecutorSynchronousBm, ScheduleTask)(benchmark::State& state) {
+    for (auto _ : state) {
+        auto runner = executor()->makeTaskRunner();
+        runOnExec(&*runner, [](Status) {});
+    }
+}
+
+/** A simplified ChainedSchedule with only one task. */
+BENCHMARK_DEFINE_F(ServiceExecutorSynchronousBm, ScheduleAndWait)(benchmark::State& state) {
+    for (auto _ : state) {
+        auto runner = executor()->makeTaskRunner();
+        Notification done;
+        runOnExec(&*runner, [&](Status) { done.set(); });
+        done.get();
+    }
+}
+
+BENCHMARK_DEFINE_F(ServiceExecutorSynchronousBm, ChainedSchedule)(benchmark::State& state) {
+    int chainDepth = state.range(0);
+    struct LoopState {
+        std::shared_ptr<ServiceExecutor::TaskRunner> runner;
+        Notification done;
+        unittest::Barrier startingLine{2};
+    };
+    LoopState* loopStatePtr = nullptr;
+    std::function<void(Status)> chainedTask = [&](Status) {
+        loopStatePtr->done.set();
+    };
+    for (int step = 0; step != chainDepth; ++step)
+        chainedTask = [this, chainedTask, &loopStatePtr](Status) {
+            runOnExec(&*loopStatePtr->runner, chainedTask);
+        };
+
+    // The first scheduled task starts the worker thread. This test is
+    // specifically measuring the per-task schedule and run overhead. So startup
+    // costs are moved outside the loop. But it's tricky because that started
+    // thread will die if its task returns without scheduling a successor task.
+    // So we start the worker thread with a task that will pause until the
+    // benchmark loop resumes it.
+    for (auto _ : state) {
+        state.PauseTiming();
+        LoopState loopState{
+            executor()->makeTaskRunner(),
+            {},
+        };
+        loopStatePtr = &loopState;
+        runOnExec(&*loopStatePtr->runner, [&](Status s) {
+            loopState.startingLine.countDownAndWait();
+            runOnExec(&*loopStatePtr->runner, chainedTask);
+        });
+        state.ResumeTiming();
+        loopState.startingLine.countDownAndWait();
+        loopState.done.get();
+    }
+}
+
+BENCHMARK_DEFINE_F(ServiceExecutorSynchronousBm, DummyBenchmark)(benchmark::State& state) {
+    for (auto _ : state) {
+    }
+}
+
+#if !__has_feature(address_sanitizer) && !__has_feature(thread_sanitizer)
+BENCHMARK_REGISTER_F(ServiceExecutorSynchronousBm, ScheduleTask)->ThreadRange(1, kMaxThreads);
+BENCHMARK_REGISTER_F(ServiceExecutorSynchronousBm, ScheduleAndWait)->ThreadRange(1, kMaxThreads);
+BENCHMARK_REGISTER_F(ServiceExecutorSynchronousBm, ChainedSchedule)
+    ->Range(1, kMaxChainSize)
+    ->ThreadRange(1, kMaxThreads);
+#else
+BENCHMARK_REGISTER_F(ServiceExecutorSynchronousBm, DummyBenchmark);
+#endif
+
+
+}  // namespace
+}  // namespace mongo::transport

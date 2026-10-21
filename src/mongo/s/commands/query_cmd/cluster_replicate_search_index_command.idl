@@ -1,0 +1,27 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    replicateSearchIndexCommand:
+        command_name: replicateSearchIndexCommand
+        cpp_name: ReplicateSearchIndex
+        description: >-
+            This test-only command is used by server mongot e2e testing infrastructure to replicate a search index command on all 
+            shards so they may forward said command to their coupled mongot. This is only required
+            for testing search index commands. Please see src/mongo/db/query/search/search_index_command_testing_helper.h 
+            for more details.
+        namespace: concatenate_with_db
+        api_version: ""
+        strict: true
+        fields:
+            userCmd:
+                description: "The original user search index command request."
+                type: object
+                optional: false

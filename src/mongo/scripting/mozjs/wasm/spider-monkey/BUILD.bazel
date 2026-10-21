@@ -1,0 +1,7 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "spider-monkey-repository",
+    "spider-monkey-sha256sum",
+    "spider-monkey-version",
+])

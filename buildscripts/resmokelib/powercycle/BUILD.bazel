@@ -1,0 +1,26 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "powercycle",
+    srcs = glob(["**/*.py"]),  # TODO: tighten this down
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "psutil",
+            group = "build-metrics",
+        ),
+        dependency(
+            "pymongo",
+            group = "core",
+        ),
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+    ],
+)

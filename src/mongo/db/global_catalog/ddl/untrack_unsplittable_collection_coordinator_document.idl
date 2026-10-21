@@ -1,0 +1,38 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+enums:
+    UntrackUnsplittableCollectionCoordinatorPhase:
+        description: "Current operation state"
+        type: string
+        values:
+            kUnset: "unset"
+            kEnterCriticalSection: "enterCritSec"
+            kCommit: "commit"
+            kReleaseCriticalSection: "releaseCritSec"
+
+structs:
+    UntrackUnsplittableCollectionCoordinatorDocument:
+        description: "Object with neccessary fields to untrack a collection."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                type: UntrackUnsplittableCollectionCoordinatorPhase
+                description: "Coordinator phase."
+                default: kUnset
+            optCollType:
+                type: CollectionType
+                description: "Sharding catalog entry that needs to be untracked"
+                optional: true

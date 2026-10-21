@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/versioning_protocol/database_version.h"
+
+imports:
+    - "mongo/db/versioning_protocol/database_version_base.idl"
+
+types:
+    DatabaseVersion:
+        description: ""
+        cpp_type: DatabaseVersion
+        bson_serialization_type: object
+        serializer: "mongo::DatabaseVersion::toBSON"
+        deserializer: "mongo::DatabaseVersion"
+        is_view: false

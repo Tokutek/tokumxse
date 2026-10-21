@@ -1,0 +1,70 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_helpers.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <utility>
+
+
+namespace mongo {
+
+/* ------------------------- AccumulatorMergeObjects ----------------------------- */
+
+template <>
+Value ExpressionFromAccumulator<AccumulatorMergeObjects>::evaluate(
+    const Document& root, Variables* variables, const EvaluationContext& ctx) const {
+    return evaluateAccumulator(*this, root, variables, ctx);
+}
+
+REGISTER_ACCUMULATOR(mergeObjects,
+                     genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
+REGISTER_STABLE_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
+REGISTER_STABLE_WINDOW_FUNCTION(
+    mergeObjects, (window_function::ExpressionFromAccumulator<AccumulatorMergeObjects>::parse));
+
+AccumulatorMergeObjects::AccumulatorMergeObjects(ExpressionContext* const expCtx)
+    : AccumulatorState(expCtx) {
+    _memUsageTracker.set(sizeof(*this));
+}
+
+void AccumulatorMergeObjects::reset() {
+    _memUsageTracker.set(sizeof(*this));
+    _output.reset();
+}
+
+void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) {
+    if (input.nullish()) {
+        return;
+    }
+
+    uassert(40400,
+            str::stream() << "$mergeObjects requires object inputs, but input " << input.toString()
+                          << " is of type " << typeName(input.getType()),
+            (input.getType() == BSONType::object));
+
+    FieldIterator iter = input.getDocument().fieldIterator();
+    while (iter.more()) {
+        Document::FieldPair pair = iter.next();
+        // Ignore missing values only, null and undefined are still considered.
+        if (pair.second.missing())
+            continue;
+
+        _output.setField(pair.first, std::move(pair.second));
+    }
+    _memUsageTracker.set(sizeof(*this));
+}
+
+Value AccumulatorMergeObjects::getValue(bool toBeMerged) {
+    return Value(_output.peek());
+}
+}  // namespace mongo

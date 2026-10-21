@@ -1,26 +1,24 @@
 // Test auth of the explain command.
 
-var conn = MongoRunner.runMongod({auth: ""});
-var authzErrorCode = 13;
+let conn = MongoRunner.runMongod({auth: ""});
 
-var admin = conn.getDB("admin");
+let admin = conn.getDB("admin");
 admin.createUser({user: "adminUser", pwd: "pwd", roles: ["root"]});
 admin.auth({user: "adminUser", pwd: "pwd"});
 
 var db = conn.getDB("explain_auth_db");
-var coll = db.explain_auth_coll;
+let coll = db.explain_auth_coll;
 
-assert.writeOK(coll.insert({_id: 1, a: 1}));
+assert.commandWorked(coll.insert({_id: 1, a: 1}));
 
 /**
- * Runs explains of find, count, group, remove, and update. Checks that they either succeed or
- * fail with "not authorized".
+ * Runs explains of find, count, remove, and update. Checks that they either succeed or fail with
+ * "not authorized".
  *
  * Takes as input a document 'authSpec' with the following format:
  *   {
  *      find: <bool>,
  *      count: <bool>,
- *      group: <bool>,
  *      remove: <bool>,
  *      update: <bool>
  *   }
@@ -29,13 +27,12 @@ assert.writeOK(coll.insert({_id: 1, a: 1}));
  * indicates that the explain command should not be authorized.
  */
 function testExplainAuth(authSpec) {
-    var cmdResult;
+    let cmdResult;
 
     function assertCmdResult(result, expectSuccess) {
         if (expectSuccess) {
             assert.commandWorked(result);
-        }
-        else {
+        } else {
             assert.commandFailedWithCode(result, 13);
         }
     }
@@ -48,34 +45,15 @@ function testExplainAuth(authSpec) {
     cmdResult = db.runCommand({explain: {count: coll.getName()}});
     assertCmdResult(cmdResult, authSpec.count);
 
-    // .group()
-    cmdResult = db.runCommand({
-        explain: {
-            group: {
-                ns: coll.getName(),
-                key: "a",
-                $reduce: function() { },
-                initial: { }
-            }
-        }
-    });
-    assertCmdResult(cmdResult, authSpec.group);
-
     // .remove()
     cmdResult = db.runCommand({
-        explain: {
-            delete: coll.getName(),
-            deletes: [ {q: {a: 1}, limit: 1} ]
-        }
+        explain: {delete: coll.getName(), deletes: [{q: {a: 1}, limit: 1}]},
     });
     assertCmdResult(cmdResult, authSpec.remove);
 
     // .update()
     cmdResult = db.runCommand({
-        explain: {
-            update: coll.getName(),
-            updates: [ {q: {a: 1}, u: {$set: {b: 1}}} ]
-        }
+        explain: {update: coll.getName(), updates: [{q: {a: 1}, u: {$set: {b: 1}}}]},
     });
     assertCmdResult(cmdResult, authSpec.update);
 }
@@ -83,24 +61,18 @@ function testExplainAuth(authSpec) {
 // Create some user-defined roles which we will grant to the users below.
 db.createRole({
     role: "findOnly",
-    privileges: [
-        {resource: {db: db.getName(), collection: coll.getName()}, actions: ["find"]}
-    ],
-    roles: [ ]
+    privileges: [{resource: {db: db.getName(), collection: coll.getName()}, actions: ["find"]}],
+    roles: [],
 });
 db.createRole({
     role: "updateOnly",
-    privileges: [
-        {resource: {db: db.getName(), collection: coll.getName()}, actions: ["update"]}
-    ],
-    roles: [ ]
+    privileges: [{resource: {db: db.getName(), collection: coll.getName()}, actions: ["update"]}],
+    roles: [],
 });
 db.createRole({
     role: "removeOnly",
-    privileges: [
-        {resource: {db: db.getName(), collection: coll.getName()}, actions: ["remove"]}
-    ],
-    roles: [ ]
+    privileges: [{resource: {db: db.getName(), collection: coll.getName()}, actions: ["remove"]}],
+    roles: [],
 });
 
 // Create three users:
@@ -116,31 +88,15 @@ admin.logout();
 
 // The "find" action allows explain of read operations.
 db.auth("findOnly", "pwd");
-testExplainAuth({
-    find: true,
-    count: true,
-    group: true,
-    remove: false,
-    update: false
-});
+testExplainAuth({find: true, count: true, remove: false, update: false});
 db.logout();
 
 db.auth("updateOnly", "pwd");
-testExplainAuth({
-    find: false,
-    count: false,
-    group: false,
-    remove: false,
-    update: true
-});
+testExplainAuth({find: false, count: false, remove: false, update: true});
 db.logout();
 
 db.auth("removeOnly", "pwd");
-testExplainAuth({
-    find: false,
-    count: false,
-    group: false,
-    remove: true,
-    update: false
-});
+testExplainAuth({find: false, count: false, remove: true, update: false});
 db.logout();
+
+MongoRunner.stopMongod(conn, null, {user: "adminUser", pwd: "pwd"});

@@ -1,0 +1,444 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/text_or.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/classic/filter.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/classic/working_set_common.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/sorter/file_based_spiller.h"
+#include "mongo/db/sorter/sorter_template_defs.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/spill_util.h"
+#include "mongo/util/assert_util.h"
+
+#include <iterator>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+
+namespace mongo {
+
+namespace {
+
+MemoryUsageLimit getMemoryLimit() {
+    return feature_flags::gFeatureFlagExtendedAutoSpilling.isEnabled()
+        ? loadMemoryLimit(StageMemoryLimit::TextOrStageMaxMemoryBytes)
+        : MemoryUsageLimit{std::numeric_limits<int64_t>::max()};
+}
+
+}  // namespace
+
+
+TextOrStage::TextOrStage(ExpressionContext* expCtx,
+                         size_t keyPrefixSize,
+                         WorkingSet* ws,
+                         const MatchExpression* filter,
+                         CollectionAcquisition collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection),
+      _keyPrefixSize(keyPrefixSize),
+      _ws(ws),
+      _memoryTracker(OperationMemoryUsageTracker::createSimpleMemoryUsageTrackerForStage(
+          *expCtx, getMemoryLimit())),
+      _filter(filter),
+      _idRetrying(WorkingSet::INVALID_ID) {}
+
+void TextOrStage::addChild(std::unique_ptr<PlanStage> child) {
+    _children.push_back(std::move(child));
+}
+
+void TextOrStage::addChildren(Children childrenToAdd) {
+    _children.insert(_children.end(),
+                     std::make_move_iterator(childrenToAdd.begin()),
+                     std::make_move_iterator(childrenToAdd.end()));
+}
+
+bool TextOrStage::isEOF() const {
+    return _internalState == State::kDone;
+}
+
+void TextOrStage::doSaveStateRequiresCollection() {
+    if (_recordCursor) {
+        _recordCursor->saveUnpositioned();
+    }
+}
+
+void TextOrStage::doRestoreStateRequiresCollection() {
+    if (_recordCursor) {
+        invariant(_recordCursor->restore(*shard_role_details::getRecoveryUnit(opCtx())));
+    }
+}
+
+void TextOrStage::doDetachFromOperationContext() {
+    if (_recordCursor)
+        _recordCursor->detachFromOperationContext();
+}
+
+void TextOrStage::doReattachToOperationContext() {
+    if (_recordCursor)
+        _recordCursor->reattachToOperationContext(opCtx());
+}
+
+std::unique_ptr<PlanStageStats> TextOrStage::getStats() {
+    _commonStats.isEOF = isEOF();
+
+    if (_filter) {
+        _commonStats.filter = _filter->serialize();
+    }
+
+    auto ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_TEXT_OR);
+    ret->specific = std::make_unique<TextOrStats>(_specificStats);
+
+    for (auto&& child : _children) {
+        ret->children.emplace_back(child->getStats());
+    }
+
+    return ret;
+}
+
+const SpecificStats* TextOrStage::getSpecificStats() const {
+    return &_specificStats;
+}
+
+PlanStage::StageState TextOrStage::doWork(WorkingSetID* out) {
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
+    }
+
+    PlanStage::StageState stageState = PlanStage::IS_EOF;
+
+    switch (_internalState) {
+        case State::kInit:
+            stageState = initStage(out);
+            break;
+        case State::kReadingTerms:
+            stageState = readFromChildren(out);
+            break;
+        case State::kReturningResults:
+            stageState = returnResults(out);
+            break;
+        case State::kDone:
+            // Should have been handled above.
+            MONGO_UNREACHABLE;
+            break;
+    }
+
+    return stageState;
+}
+
+PlanStage::StageState TextOrStage::initStage(WorkingSetID* out) {
+    *out = WorkingSet::INVALID_ID;
+
+    return handlePlanStageYield(
+        expCtx(),
+        "TextOrStage initStage",
+        [&] {
+            _recordCursor = collectionPtr()->getCursor(opCtx());
+            _internalState = State::kReadingTerms;
+            return PlanStage::NEED_TIME;
+        },
+        [&] {
+            // yieldHandler
+            invariant(_internalState == State::kInit);
+            _recordCursor.reset();
+        });
+}
+
+PlanStage::StageState TextOrStage::readFromChildren(WorkingSetID* out) {
+    // Check to see if there were any children added in the first place.
+    if (_children.size() == 0) {
+        _internalState = State::kDone;
+        return PlanStage::IS_EOF;
+    }
+    tassert(11051619,
+            "currentChild points past the last child in array",
+            _currentChild < _children.size());
+
+    // Either retry the last WSM we worked on or get a new one from our current child.
+    WorkingSetID id;
+    StageState childState;
+    if (_idRetrying == WorkingSet::INVALID_ID) {
+        childState = _children[_currentChild]->work(&id);
+    } else {
+        childState = ADVANCED;
+        id = _idRetrying;
+        _idRetrying = WorkingSet::INVALID_ID;
+    }
+
+    if (PlanStage::ADVANCED == childState) {
+        return addTerm(id, out);
+    } else if (PlanStage::IS_EOF == childState) {
+        // Done with this child.
+        ++_currentChild;
+
+        if (_currentChild < _children.size()) {
+            // We have another child to read from.
+            return PlanStage::NEED_TIME;
+        }
+
+        // If we're here we are done reading results.  Move to the next state.
+        if (_sorter) {
+            if (!_scores.empty()) {
+                doForceSpill();
+            }
+            _sorterIterator = _sorter->done();
+        }
+        _internalState = State::kReturningResults;
+
+        return PlanStage::NEED_TIME;
+    } else {
+        // Propagate WSID from below.
+        *out = id;
+        return childState;
+    }
+}
+
+PlanStage::StageState TextOrStage::returnResults(WorkingSetID* out) {
+    _specificStats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+
+    if (_sorter) {
+        return returnResultsSpilled(out);
+    } else {
+        return returnResultsInMemory(out);
+    }
+}
+
+PlanStage::StageState TextOrStage::returnResultsInMemory(WorkingSetID* out) {
+    if (_scores.empty()) {
+        _internalState = State::kDone;
+        return PlanStage::IS_EOF;
+    }
+
+    // Retrieve the record that contains the text score.
+    auto it = _scores.begin();
+    TextRecordData textRecordData = it->second;
+    _memoryTracker.add(-1 * (it->first.memUsage() + sizeof(TextRecordData)));
+    _scores.erase(it);
+
+    // Ignore non-matched documents.
+    if (textRecordData.score == kRejectedDocumentScore) {
+        tassert(11051618,
+                "Expecting text record with rejected document score to store no Working Set Id",
+                textRecordData.wsid == WorkingSet::INVALID_ID);
+        return PlanStage::NEED_TIME;
+    }
+
+    WorkingSetMember* wsm = _ws->get(textRecordData.wsid);
+
+    // Populate the working set member with the text score metadata and return it.
+    wsm->metadata().setTextScore(textRecordData.score);
+    *out = textRecordData.wsid;
+    return PlanStage::ADVANCED;
+}
+
+PlanStage::StageState TextOrStage::returnResultsSpilled(WorkingSetID* out) {
+    if (!_sorterIterator->more()) {
+        _internalState = State::kDone;
+        return PlanStage::IS_EOF;
+    }
+
+    auto [recordId, textRecordData] = _sorterIterator->next();
+    double score = textRecordData.score;
+    bool skip = score == kRejectedDocumentScore;
+
+    while (_sorterIterator->more() && _sorterIterator->peek() == recordId) {
+        double currentScore = _sorterIterator->next().second.score;
+        score += currentScore;
+        skip |= currentScore == kRejectedDocumentScore;
+    }
+
+    if (skip) {
+        return PlanStage::NEED_TIME;
+    }
+
+    WorkingSetMember wsm = textRecordData.document.extract();
+    wsm.metadata().setTextScore(score);
+    *out = _ws->emplace(std::move(wsm));
+    return PlanStage::ADVANCED;
+}
+
+PlanStage::StageState TextOrStage::addTerm(WorkingSetID wsid, WorkingSetID* out) {
+    WorkingSetMember* wsm = _ws->get(wsid);
+    tassert(11051617,
+            "Expecting working set member to store data from 1 or more indices",
+            wsm->getState() == WorkingSetMember::RID_AND_IDX);
+    tassert(
+        11051616, "Expecting working set member to have 1 IndexKeyDatum", 1 == wsm->keyData.size());
+    const IndexKeyDatum newKeyData = wsm->keyData.back();  // copy to keep it around.
+
+    auto [it, inserted] = _scores.try_emplace(wsm->recordId, TextRecordData{});
+    if (inserted) {
+        _memoryTracker.add(it->first.memUsage() + sizeof(TextRecordData));
+    }
+
+    TextRecordData* textRecordData = &it->second;
+
+    if (textRecordData->score == kRejectedDocumentScore) {
+        // We have already rejected this document for not matching the filter.
+        tassert(11051615,
+                "Expecting text record with rejected document score to store no Working Set Id",
+                WorkingSet::INVALID_ID == textRecordData->wsid);
+        _ws->free(wsid);
+        return NEED_TIME;
+    }
+
+    if (WorkingSet::INVALID_ID == textRecordData->wsid) {
+        // We haven't seen this RecordId before.
+        tassert(11051614, "Expecting text record to have no score", textRecordData->score == 0);
+
+        if (!Filter::passes(newKeyData.keyData, newKeyData.indexKeyPattern, _filter)) {
+            _ws->free(wsid);
+            textRecordData->score = kRejectedDocumentScore;
+            return NEED_TIME;
+        }
+
+        // Our parent expects RID_AND_OBJ members, so we fetch the document here if we haven't
+        // already.
+        const auto ret = handlePlanStageYield(
+            expCtx(),
+            "TextOrStage addTerm",
+            [&] {
+                if (!WorkingSetCommon::fetch(opCtx(),
+                                             _ws,
+                                             wsid,
+                                             _recordCursor.get(),
+                                             collectionPtr(),
+                                             collectionPtr()->ns())) {
+                    _ws->free(wsid);
+                    textRecordData->score = kRejectedDocumentScore;
+                    return NEED_TIME;
+                }
+                ++_specificStats.fetches;
+                return PlanStage::ADVANCED;
+            },
+            [&] {
+                // yieldHandler
+                wsm->makeObjOwnedIfNeeded();
+                _idRetrying = wsid;
+                *out = WorkingSet::INVALID_ID;
+            });
+
+        if (ret != PlanStage::ADVANCED) {
+            return ret;
+        }
+
+        textRecordData->wsid = wsid;
+
+        // Ensure that the BSONObj underlying the WorkingSetMember is owned in case we yield.
+        wsm->makeObjOwnedIfNeeded();
+        _memoryTracker.add(wsm->getMemUsage());
+    } else {
+        // We already have a working set member for this RecordId. Free the new WSM and retrieve the
+        // old one. Note that since we don't keep all index keys, we could get a score that doesn't
+        // match the document, but this has always been a problem.
+        // TODO (SERVER-123993): Do something to improve the situation.
+        invariant(wsid != textRecordData->wsid);
+        _ws->free(wsid);
+        wsm = _ws->get(textRecordData->wsid);
+    }
+
+    // Locate score within possibly compound key: {prefix,term,score,suffix}.
+    BSONObjIterator keyIt(newKeyData.keyData);
+    for (unsigned i = 0; i < _keyPrefixSize; i++) {
+        keyIt.next();
+    }
+
+    keyIt.next();  // Skip past 'term'.
+
+    BSONElement scoreElement = keyIt.next();
+    double documentTermScore = scoreElement.number();
+
+    // Aggregate relevance score, term keys.
+    textRecordData->score += documentTermScore;
+
+    if (!_memoryTracker.withinMemoryLimit(opCtx())) {
+        doForceSpill();
+    }
+
+    return NEED_TIME;
+}
+
+void TextOrStage::doForceSpill() {
+    if (_scores.empty()) {
+        return;
+    }
+
+    if (!_sorter) {
+        initSorter();
+    }
+
+    uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+        expCtx()->getTempDir(), internalQuerySpillingMinAvailableDiskSpaceBytes.loadRelaxed()));
+
+    size_t recordsToSpill = _scores.size();
+    auto prevMemUsage = _sorter->stats().memUsage();
+    for (auto it = _scores.begin(); it != _scores.end();) {
+        const auto& [recordId, textRecordData] = (*it);
+        SortableWorkingSetMember wsm = textRecordData.wsid != WorkingSet::INVALID_ID
+            ? _ws->extract(textRecordData.wsid)
+            : WorkingSetMember{};
+        TextRecordDataForSorter dataForSorter = {
+            std::move(wsm),
+            textRecordData.score,
+        };
+        _sorter->add(recordId, dataForSorter);
+
+        // To provide as accurate memory accounting as possible, we update the memory tracker after
+        // we add each document to the sorter, instead of updating it after the sorter is completely
+        // populated.
+        auto currMemUsage = _sorter->stats().memUsage();
+        _memoryTracker.add(currMemUsage - prevMemUsage);
+        prevMemUsage = currMemUsage;
+        _scores.erase(it++);
+    }
+    _sorter->spill();
+
+    auto spilledDataStorageIncrease =
+        _specificStats.spillingStats.updateSpillingStats(1 /*spills*/,
+                                                         _memoryTracker.inUseTrackedMemoryBytes(),
+                                                         recordsToSpill,
+                                                         _sorterStats->bytesSpilled());
+    textOrCounters.incrementPerSpilling(1 /*spills*/,
+                                        _memoryTracker.inUseTrackedMemoryBytes(),
+                                        recordsToSpill,
+                                        spilledDataStorageIncrease);
+    _memoryTracker.set(0);
+
+    if (_internalState == State::kReturningResults) {
+        _sorterIterator = _sorter->done();
+    }
+}
+
+void TextOrStage::initSorter() {
+    _memoryTracker.assertCanSpill(expCtx()->getAllowDiskUse(), "TEXT_OR");
+
+    // We disable automatic spilling inside Sorter because we manually spill after adding the whole
+    // batch to the _sorter.
+    static constexpr size_t kMaxMemoryUsageForSorter = std::numeric_limits<size_t>::max();
+
+    _sorterStats = std::make_unique<SorterFileStats>(/*sorterTracker=*/nullptr);
+    auto opts = SortOptions{}.MaxMemoryUsageBytes(kMaxMemoryUsageForSorter);
+    _sorter = Sorter<RecordId, TextRecordDataForSorter>::template make<Comparator>(
+        opts,
+        Comparator(),
+        std::make_shared<sorter::FileBasedSpiller<RecordId, TextRecordDataForSorter, Comparator>>(
+            expCtx()->getTempDir(),
+            _sorterStats.get(),
+            /*dbName=*/boost::none,
+            sorter::kLatestChecksumVersion,
+            static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load())),
+        /*settings=*/{});
+}
+
+}  // namespace mongo

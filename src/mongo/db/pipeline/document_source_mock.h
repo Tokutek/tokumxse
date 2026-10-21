@@ -1,0 +1,136 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/modules.h"
+
+#include <deque>
+#include <initializer_list>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+/**
+ * A mock DocumentSource which is useful for testing. In addition to re-spooling documents like
+ * DocumentSourceQueue, it tracks some state about which methods have been called.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] DocumentSourceMock : public DocumentSource {
+public:
+    static constexpr std::string_view kStageName = "$mock"sv;
+
+    static boost::intrusive_ptr<DocumentSourceMock> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        Document doc, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Convenience constructor that works with a vector of BSONObj or vector of Documents.
+     */
+    template <typename Doc>
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        const std::vector<Doc>& docs, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+        std::deque<GetNextResult> results;
+        for (auto&& doc : docs) {
+            results.emplace_back(Document(doc));
+        }
+        return new DocumentSourceMock(std::move(results), expCtx);
+    }
+
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        std::deque<GetNextResult> results, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        const std::initializer_list<const char*>& jsons,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    DocumentSourceMock(std::deque<GetNextResult>, const boost::intrusive_ptr<ExpressionContext>&);
+    DocumentSourceMock(std::deque<GetNextResult>,
+                       const boost::intrusive_ptr<ExpressionContext>&,
+                       SortPattern sortPattern);
+
+    Value serialize(const query_shape::SerializationOptions& opts =
+                        query_shape::SerializationOptions{}) const final {
+        // Unlike the queue, it's okay to serialize this stage for testing purposes.
+        return Value(Document{{getSourceName(), Document()}});
+    }
+
+    std::string_view getSourceName() const override;
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    void reattachSourceToOperationContext(OperationContext* opCtx) override {
+        isDetachedFromOpCtx = false;
+    }
+
+    void detachSourceFromOperationContext() override {
+        isDetachedFromOpCtx = true;
+    }
+
+    boost::intrusive_ptr<DocumentSource> optimize() {
+        isOptimized = true;
+        return this;
+    }
+
+    StageConstraints constraints(PipelineSplitState pipeState) const override {
+        return mockConstraints;
+    }
+
+    /**
+     * This stage does not modify anything.
+     */
+    GetModPathsReturn getModifiedPaths() const override {
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
+    }
+
+    /**
+     * This stage does not depend on anything.
+     */
+    DepsTracker::State getDependencies(DepsTracker* deps) const override {
+        return DepsTracker::SEE_NEXT;
+    }
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic(
+        const DistributedPlanContext* ctx) override {
+        return boost::none;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const override {}
+
+    bool isDisposed{false};
+    bool isDetachedFromOpCtx{false};
+    bool isOptimized{false};
+    StageConstraints mockConstraints;
+
+private:
+    friend boost::intrusive_ptr<exec::agg::Stage> documentSourceMockToStageFn(
+        const boost::intrusive_ptr<DocumentSource>& documentSource);
+
+    friend boost::intrusive_ptr<exec::agg::Stage> documentSourceTrackingMockToStageFn(
+        const boost::intrusive_ptr<DocumentSource>& documentSource);
+
+    std::deque<GetNextResult> _results;
+};
+
+}  // namespace mongo

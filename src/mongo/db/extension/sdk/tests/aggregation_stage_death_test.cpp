@@ -1,0 +1,497 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/exec/agg/mock_stage.h"
+#include "mongo/db/extension/host/document_source_extension_optimizable.h"
+#include "mongo/db/extension/host/query_execution_context.h"
+#include "mongo/db/extension/host_connector/adapter/host_services_adapter.h"
+#include "mongo/db/extension/host_connector/adapter/query_execution_context_adapter.h"
+#include "mongo/db/extension/public/api.h"
+#include "mongo/db/extension/sdk/aggregation_stage.h"
+#include "mongo/db/extension/sdk/distributed_plan_logic.h"
+#include "mongo/db/extension/sdk/dpl_array_container.h"
+#include "mongo/db/extension/sdk/host_portal.h"
+#include "mongo/db/extension/sdk/tests/fruits_test_stage.h"
+#include "mongo/db/extension/sdk/tests/shared_test_stages.h"
+#include "mongo/db/extension/shared/get_next_result.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/ast_node.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/distributed_plan_logic.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/dpl_array_container.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/parse_node.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/stage_descriptor.h"
+#include "mongo/db/pipeline/document_source_documents.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::extension::sdk {
+namespace {
+using namespace std::literals::string_view_literals;
+
+class AggStageErrorFixture : public unittest::Test {
+public:
+    void setUp() override {
+        // Initialize HostServices so that aggregation stages will be able to access member
+        // functions, e.g. to run assertions.
+        extension::sdk::HostServicesAPI::setHostServices(
+            &extension::host_connector::HostServicesAdapter::get());
+        _execCtx = std::make_unique<host_connector::QueryExecutionContextAdapter>(
+            std::make_unique<shared_test_stages::MockQueryExecutionContext>());
+    }
+
+    std::unique_ptr<host_connector::QueryExecutionContextAdapter> _execCtx;
+};
+class InvalidExtensionExecAggStageAdvancedState : public shared_test_stages::TransformExecAggStage {
+public:
+    extension::ExtensionGetNextResult getNext(const QueryExecutionContextHandle& expCtx,
+                                              MongoExtensionExecAggStage* execAggStage) override {
+        return {.code = extension::GetNextCode::kAdvanced};
+    }
+
+    void open() override {}
+
+    void reopen() override {}
+
+    void close() override {}
+
+    static inline std::unique_ptr<ExecAggStageBase> make() {
+        return std::make_unique<InvalidExtensionExecAggStageAdvancedState>();
+    }
+};
+
+class InvalidExtensionExecAggStagePauseExecutionState
+    : public shared_test_stages::TransformExecAggStage {
+public:
+    extension::ExtensionGetNextResult getNext(const QueryExecutionContextHandle& expCtx,
+                                              MongoExtensionExecAggStage* execAggStage) override {
+        return {.code = extension::GetNextCode::kPauseExecution,
+                .resultDocument =
+                    ExtensionBSONObj::makeAsByteBuf(BSON("$dog" << "I should not exist"))};
+    }
+
+    void open() override {}
+
+    void reopen() override {}
+
+    void close() override {}
+
+    static inline std::unique_ptr<ExecAggStageBase> make() {
+        return std::make_unique<InvalidExtensionExecAggStagePauseExecutionState>();
+    }
+};
+
+class InvalidExtensionExecAggStageEofState : public shared_test_stages::TransformExecAggStage {
+public:
+    extension::ExtensionGetNextResult getNext(const QueryExecutionContextHandle& expCtx,
+                                              MongoExtensionExecAggStage* execAggStage) override {
+        return {.code = extension::GetNextCode::kEOF,
+                .resultDocument =
+                    ExtensionBSONObj::makeAsByteBuf(BSON("$dog" << "I should not exist"))};
+    }
+
+    void open() override {}
+
+    void reopen() override {}
+
+    void close() override {}
+
+    static inline std::unique_ptr<ExecAggStageBase> make() {
+        return std::make_unique<InvalidExtensionExecAggStageEofState>();
+    }
+};
+
+class InvalidExtensionExecAggStageGetNextCode : public shared_test_stages::TransformExecAggStage {
+public:
+    extension::ExtensionGetNextResult getNext(const QueryExecutionContextHandle& expCtx,
+                                              MongoExtensionExecAggStage* execAggStage) override {
+        return {.code = static_cast<const GetNextCode>(10)};
+    }
+
+    void open() override {}
+
+    void reopen() override {}
+
+    void close() override {}
+
+    static inline std::unique_ptr<ExecAggStageBase> make() {
+        return std::make_unique<InvalidExtensionExecAggStageGetNextCode>();
+    }
+};
+
+using AggStageErrorFixtureDeathTest = AggStageErrorFixture;
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, EmptyDesugarExpansionFails, "11591602") {
+    auto emptyDesugarParseNode =
+        new ExtensionAggStageParseNodeAdapter(shared_test_stages::DesugarToEmptyParseNode::make());
+    auto handle = extension::AggStageParseNodeHandle{emptyDesugarParseNode};
+
+    [[maybe_unused]] auto expanded = handle->expand();
+}
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, DescriptorAndParseNodeNameMismatchFails, "11217602") {
+    auto descriptor = std::make_unique<ExtensionAggStageDescriptorAdapter>(
+        shared_test_stages::NameMismatchStageDescriptor::make());
+    auto handle = extension::AggStageDescriptorHandle{descriptor.get()};
+
+    BSONObj stageBson =
+        BSON(shared_test_stages::NameMismatchStageDescriptor::kStageName << BSONObj());
+    [[maybe_unused]] auto parseNodeHandle = handle->parse(stageBson);
+}
+
+DEATH_TEST(ParseNodeVTableDeathTest, InvalidParseNodeVTableFailsGetName, "517") {
+    auto vtable = sdk::ExtensionAggStageParseNodeAdapter::getVTable();
+    vtable.get_name = nullptr;
+    AggStageParseNodeAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ParseNodeVTableDeathTest, InvalidParseNodeVTableFailsGetQueryShape, "517") {
+    auto vtable = sdk::ExtensionAggStageParseNodeAdapter::getVTable();
+    vtable.get_query_shape = nullptr;
+    AggStageParseNodeAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ParseNodeVTableDeathTest, InvalidParseNodeVTableFailsExpand, "517") {
+    auto vtable = sdk::ExtensionAggStageParseNodeAdapter::getVTable();
+    vtable.expand = nullptr;
+    AggStageParseNodeAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(AstNodeVTableDeathTest, InvalidAstNodeVTableFailsGetName, "517") {
+    auto vtable = sdk::ExtensionAggStageAstNodeAdapter::getVTable();
+    vtable.get_name = nullptr;
+    AggStageAstNodeAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(AstNodeVTableDeathTest, InvalidAstNodeVTablePromote, "517") {
+    auto vtable = sdk::ExtensionAggStageAstNodeAdapter::getVTable();
+    vtable.promote = nullptr;
+    AggStageAstNodeAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(AstNodeVTableDeathTest, InvalidAstNodeVTableGetProperties, "517") {
+    auto vtable = sdk::ExtensionAggStageAstNodeAdapter::getVTable();
+    vtable.get_properties = nullptr;
+    AggStageAstNodeAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ExecAggStageVTableDeathTest, InvalidExecAggStageVTableFailsGetNext, "517") {
+    auto vtable = sdk::ExtensionExecAggStageAdapter::getVTable();
+    vtable.get_next = nullptr;
+    ExecAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ExecAggStageVTableDeathTest, InvalidExecAggStageVTableFailsSetSource, "517") {
+    auto vtable = sdk::ExtensionExecAggStageAdapter::getVTable();
+    vtable.set_source = nullptr;
+    ExecAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ExecAggStageVTableDeathTest, InvalidExecAggStageVTableFailsOpen, "517") {
+    auto vtable = sdk::ExtensionExecAggStageAdapter::getVTable();
+    vtable.open = nullptr;
+    ExecAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ExecAggStageVTableDeathTest, InvalidExecAggStageVTableFailsReopen, "517") {
+    auto vtable = sdk::ExtensionExecAggStageAdapter::getVTable();
+    vtable.reopen = nullptr;
+    ExecAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ExecAggStageVTableDeathTest, InvalidExecAggStageVTableFailsClose, "517") {
+    auto vtable = sdk::ExtensionExecAggStageAdapter::getVTable();
+    vtable.close = nullptr;
+    ExecAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(ExecAggStageVTableDeathTest, InvalidExecAggStageVTableFailsExplain, "517") {
+    auto vtable = sdk::ExtensionExecAggStageAdapter::getVTable();
+    vtable.explain = nullptr;
+    ExecAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidExtensionGetNextResultAdvanced, "519") {
+    auto invalidExtensionExecAggStageAdvancedState =
+        new extension::sdk::ExtensionExecAggStageAdapter(
+            InvalidExtensionExecAggStageAdvancedState::make());
+
+    auto handle = extension::ExecAggStageHandle{invalidExtensionExecAggStageAdvancedState};
+    [[maybe_unused]] auto getNext = handle->getNext(_execCtx.get());
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidExtensionGetNextResultPauseExecution, "519") {
+    auto invalidExtensionExecAggStagePauseExecutionState =
+        new extension::sdk::ExtensionExecAggStageAdapter(
+            InvalidExtensionExecAggStagePauseExecutionState::make());
+
+    auto handle = extension::ExecAggStageHandle{invalidExtensionExecAggStagePauseExecutionState};
+    [[maybe_unused]] auto getNext = handle->getNext(_execCtx.get());
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidExtensionGetNextResultEOF, "519") {
+    auto invalidExtensionExecAggStageEofState = new extension::sdk::ExtensionExecAggStageAdapter(
+        InvalidExtensionExecAggStageEofState::make());
+
+    auto handle = extension::ExecAggStageHandle{invalidExtensionExecAggStageEofState};
+    [[maybe_unused]] auto getNext = handle->getNext(_execCtx.get());
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidMongoExtensionGetNextResultCode, "519") {
+    ::MongoExtensionGetNextResult result = {.code =
+                                                static_cast<::MongoExtensionGetNextResultCode>(10),
+                                            .resultDocument = createEmptyByteContainer()};
+    [[maybe_unused]] auto converted = extension::ExtensionGetNextResult::makeFromApiResult(result);
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidGetNextCode, "10956804") {
+    auto invalidExtensionExecAggStageGetNextCode = new extension::sdk::ExtensionExecAggStageAdapter(
+        InvalidExtensionExecAggStageGetNextCode::make());
+
+    auto handle = extension::ExecAggStageHandle{invalidExtensionExecAggStageGetNextCode};
+    [[maybe_unused]] auto getNext = handle->getNext(_execCtx.get());
+};
+
+class TestLogicalStageCompileWithInvalidExtensionExecAggStageAdvancedState
+    : public shared_test_stages::TestLogicalStageCompile {
+public:
+    TestLogicalStageCompileWithInvalidExtensionExecAggStageAdvancedState() {}
+
+    std::unique_ptr<ExecAggStageBase> compile() const override {
+        return std::make_unique<InvalidExtensionExecAggStageAdvancedState>();
+    }
+
+    static inline std::unique_ptr<extension::sdk::LogicalAggStage> make() {
+        return std::make_unique<
+            TestLogicalStageCompileWithInvalidExtensionExecAggStageAdvancedState>();
+    }
+};
+
+class TestLogicalStageCompileWithInvalidExtensionExecAggStagePauseExecutionState
+    : public shared_test_stages::TestLogicalStageCompile {
+public:
+    TestLogicalStageCompileWithInvalidExtensionExecAggStagePauseExecutionState() {}
+
+    std::unique_ptr<ExecAggStageBase> compile() const override {
+        return std::make_unique<InvalidExtensionExecAggStagePauseExecutionState>();
+    }
+
+    static inline std::unique_ptr<extension::sdk::LogicalAggStage> make() {
+        return std::make_unique<
+            TestLogicalStageCompileWithInvalidExtensionExecAggStagePauseExecutionState>();
+    }
+};
+
+class TestLogicalStageCompileWithInvalidExtensionExecAggStageEofState
+    : public shared_test_stages::TestLogicalStageCompile {
+public:
+    TestLogicalStageCompileWithInvalidExtensionExecAggStageEofState() {}
+
+    std::unique_ptr<ExecAggStageBase> compile() const override {
+        return std::make_unique<InvalidExtensionExecAggStageEofState>();
+    }
+
+    static inline std::unique_ptr<extension::sdk::LogicalAggStage> make() {
+        return std::make_unique<TestLogicalStageCompileWithInvalidExtensionExecAggStageEofState>();
+    }
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest,
+             InvalidExtensionGetNextResultAdvancedFromCompiledExecAggStage,
+             "519") {
+    auto logicalStage = new extension::sdk::ExtensionLogicalAggStageAdapter(
+        TestLogicalStageCompileWithInvalidExtensionExecAggStageAdvancedState::make());
+    auto handle = extension::LogicalAggStageHandle{logicalStage};
+
+    auto compiledExecAggStageHandle = handle->compile();
+
+    [[maybe_unused]] auto getNext = compiledExecAggStageHandle->getNext(_execCtx.get());
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest,
+             InvalidExtensionGetNextResultPauseExecutionFromCompiledExecAggStage,
+             "519") {
+    auto logicalStage = new extension::sdk::ExtensionLogicalAggStageAdapter(
+        TestLogicalStageCompileWithInvalidExtensionExecAggStagePauseExecutionState::make());
+    auto handle = extension::LogicalAggStageHandle{logicalStage};
+
+    auto compiledExecAggStageHandle = handle->compile();
+
+    [[maybe_unused]] auto getNext = compiledExecAggStageHandle->getNext(_execCtx.get());
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest,
+             InvalidExtensionGetNextResultEOFFromCompiledExecAggStage,
+             "519") {
+    auto logicalStage = new extension::sdk::ExtensionLogicalAggStageAdapter(
+        TestLogicalStageCompileWithInvalidExtensionExecAggStageEofState::make());
+    auto handle = extension::LogicalAggStageHandle{logicalStage};
+
+    auto compiledExecAggStageHandle = handle->compile();
+
+    [[maybe_unused]] auto getNext = compiledExecAggStageHandle->getNext(_execCtx.get());
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidDPLArrayContainerVTableFailsSize, "517") {
+    auto vtable = sdk::ExtensionDPLArrayContainerAdapter::getVTable();
+    vtable.size = nullptr;
+    DPLArrayContainerAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, InvalidDPLArrayContainerVTableFailsTransfer, "517") {
+    auto vtable = sdk::ExtensionDPLArrayContainerAdapter::getVTable();
+    vtable.transfer = nullptr;
+    DPLArrayContainerAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest,
+             DPLArrayContainerExtensionToHostWrongSizeFails,
+             "11368303") {
+    auto logicalStage =
+        new sdk::ExtensionLogicalAggStageAdapter(shared_test_stages::CountingLogicalStage::make());
+    auto parseNode =
+        new sdk::ExtensionAggStageParseNodeAdapter(shared_test_stages::CountingParse::make());
+
+    std::vector<VariantDPLHandle> sdkElements;
+    sdkElements.emplace_back(extension::LogicalAggStageHandle{logicalStage});
+    sdkElements.emplace_back(extension::AggStageParseNodeHandle{parseNode});
+
+    const auto size = sdkElements.size();
+
+    auto sdkAdapter = std::make_unique<sdk::ExtensionDPLArrayContainerAdapter>(
+        sdk::DPLArrayContainer(std::move(sdkElements)));
+
+    DPLArrayContainerHandle arrayContainerHandle(sdkAdapter.release());
+
+    // Pre-allocate array with incorrect size.
+    std::vector<::MongoExtensionDPLArrayElement> sdkAbiArray{size + 1};
+    ::MongoExtensionDPLArray targetArray{size + 1, sdkAbiArray.data()};
+
+    class TestDPLArrayContainerAPI : public DPLArrayContainerAPI {
+    public:
+        TestDPLArrayContainerAPI(::MongoExtensionDPLArrayContainer* container)
+            : DPLArrayContainerAPI(container) {}
+
+        void transferInternal(::MongoExtensionDPLArray& arr) {
+            _transferInternal(arr);
+        }
+    };
+    TestDPLArrayContainerAPI testDplInternalTransfer{arrayContainerHandle.get()};
+    // Transfer should fail due to incorrectly sized array.
+    testDplInternalTransfer.transferInternal(targetArray);
+}
+
+DEATH_TEST(DistributedPlanLogicVTableDeathTest, InvalidDPLVTableFailsGetShards, "517") {
+    auto vtable = sdk::ExtensionDistributedPlanLogicAdapter::getVTable();
+    vtable.extract_shards_pipeline = nullptr;
+    DistributedPlanLogicAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(DistributedPlanLogicVTableDeathTest, InvalidDPLVTableFailsGetMerging, "517") {
+    auto vtable = sdk::ExtensionDistributedPlanLogicAdapter::getVTable();
+    vtable.extract_merging_pipeline = nullptr;
+    DistributedPlanLogicAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(DistributedPlanLogicVTableDeathTest, InvalidDPLVTableFailsGetSortPattern, "517") {
+    auto vtable = sdk::ExtensionDistributedPlanLogicAdapter::getVTable();
+    vtable.get_sort_pattern = nullptr;
+    DistributedPlanLogicAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(LogicalAggStageVTableDeathTest, NullEvaluateRulePreconditionTasserts, "517") {
+    auto vtable = sdk::ExtensionLogicalAggStageAdapter::getVTable();
+    vtable.evaluate_pipeline_rewrite_rule_precondition = nullptr;
+    LogicalAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST(LogicalAggStageVTableDeathTest, NullEvaluateRuleTransformTasserts, "517") {
+    auto vtable = sdk::ExtensionLogicalAggStageAdapter::getVTable();
+    vtable.evaluate_pipeline_rewrite_rule_transform = nullptr;
+    LogicalAggStageAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, NullRegisterStageRulesTasserts, "12201401") {
+    ::MongoExtensionHostPortalVTable vtable{
+        .register_stage_descriptor = [](const ::MongoExtensionHostPortal*,
+                                        const ::MongoExtensionAggStageDescriptor*)
+            -> ::MongoExtensionStatus* { return nullptr; },
+        .get_extension_options = [](const ::MongoExtensionHostPortal*) -> ::MongoExtensionByteView {
+            return {};
+        },
+        .register_stage_rules = nullptr,
+    };
+    sdk::HostPortalAPI::assertVTableConstraints(vtable);
+}
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest,
+             SourceStageForTransformExtensionStageBecomesInvalid,
+             "10957209") {
+    // This test verifies that if the source stage becomes invalid or is deleted,
+    // the extension stage will safely fail when trying to access it.
+    QueryTestServiceContext testCtx;
+    auto opCtx = testCtx.makeOperationContext();
+    auto expCtx = make_intrusive<ExpressionContextForTest>(
+        opCtx.get(),
+        NamespaceString::createNamespaceString_forTest("test"sv, "namespace"sv),
+        SerializationContext());
+
+    auto astNode = new sdk::ExtensionAggStageAstNodeAdapter(
+        sdk::shared_test_stages::AddFruitsToDocumentsAstNode::make());
+    auto astHandle = AggStageAstNodeHandle(astNode);
+
+    auto optimizable =
+        host::DocumentSourceExtensionOptimizable::create(expCtx, std::move(astHandle));
+
+    auto docSourcesList = DocumentSourceDocuments::createFromBson(
+        BSON("$documents" << BSON_ARRAY(BSON("sourceField" << 1))).firstElement(), expCtx);
+
+    std::vector<boost::intrusive_ptr<exec::agg::Stage>> stages;
+    for (auto& docSource : docSourcesList) {
+        stages.push_back(exec::agg::buildStage(docSource));
+    }
+
+    // Stitch stages returned from DocumentSourceDocuments::createFromBson(...) together.
+    for (size_t i = 1; i < stages.size(); ++i) {
+        exec::agg::MockStage::setSource_forTest(stages[i], stages[i - 1].get());
+    }
+
+    // Set the last stage as source for the extension stage.
+    boost::intrusive_ptr<exec::agg::Stage> extensionStage =
+        exec::agg::buildStageAndStitch(optimizable, stages.back().get());
+
+    // getNext() should work fine here because the source stage is still valid.
+    auto result = extensionStage->getNext();
+    ASSERT_TRUE(result.isAdvanced());
+
+    exec::agg::MockStage::setSource_forTest(extensionStage, nullptr);
+    // Hits tassert because the stage provided was null, clearing out our predecessor.
+    result = extensionStage->getNext();
+};
+
+DEATH_TEST_F(AggStageErrorFixtureDeathTest, NoSourceStageForTransformStage, "10957209") {
+    auto transformStage = shared_test_stages::AddFruitsToDocumentsExecStage::make();
+
+    QueryTestServiceContext testCtx;
+    auto opCtx = testCtx.makeOperationContext();
+    auto expCtx = make_intrusive<ExpressionContextForTest>(
+        opCtx.get(),
+        NamespaceString::createNamespaceString_forTest("test"sv, "namespace"sv),
+        SerializationContext());
+
+    host::QueryExecutionContext wrappedCtx(expCtx.get());
+    host_connector::QueryExecutionContextAdapter ctxAdapter(
+        std::make_unique<host::QueryExecutionContext>(expCtx.get()));
+    // Call getNext() without setting a source.
+    [[maybe_unused]] auto result = transformStage->getNext(&ctxAdapter, nullptr);
+}
+
+}  // namespace
+}  // namespace mongo::extension::sdk

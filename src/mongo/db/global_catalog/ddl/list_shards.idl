@@ -1,0 +1,30 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# listShards IDL File
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ListShardsFilter:
+        description: "The listShards filter fields"
+        strict: true
+        fields:
+            draining:
+                type: bool
+                description: "If true return only actively draining shards, if false exclude draining shards from the output"
+                optional: true
+
+    ListShardsRequest:
+        description: "The listShards command request"
+        strict: false
+        fields:
+            filter:
+                type: ListShardsFilter
+                description: "Conditions on the fields of the listShards output"
+                optional: true

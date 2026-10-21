@@ -1,0 +1,746 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/ddl/shard_key_util.h"
+#include "mongo/db/global_catalog/ddl/sharding_recovery_service.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/global_catalog/type_tags.h"
+#include "mongo/db/hierarchical_cancelable_operation_context_factory.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
+#include "mongo/db/s/resharding/donor_document_gen.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
+#include "mongo/db/s/resharding/recipient_document_gen.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/version_context.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/s/request_types/reshard_collection_gen.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+
+namespace mongo {
+namespace resharding {
+using namespace std::literals::string_view_literals;
+
+inline const Status kUserAbortReason{ErrorCodes::ReshardCollectionAborted,
+                                     "resharding aborted by user"};
+[[MONGO_MOD_PUBLIC]] inline const Status kFCVChangeAbortReason{
+    ErrorCodes::ReshardCollectionInterruptedDueToFCVChange, "resharding aborted due to FCV change"};
+inline const Status kCriticalTimeoutAbortReason{ErrorCodes::ReshardingCriticalSectionTimeout,
+                                                "resharding critical section timed out"};
+inline const Status kQuiesceAbortReason{ErrorCodes::ReshardCollectionQuiescing,
+                                        "resharding operation completed and is in quiesce"};
+
+enum [[MONGO_MOD_PUBLIC]] AbortType { kAbortWithQuiesce, kAbortSkipQuiesce };
+
+[[MONGO_MOD_NEEDS_REPLACEMENT]] constexpr auto kReshardFinalOpLogType = "reshardFinalOp"sv;
+constexpr auto kReshardProgressMarkOpLogType = "reshardProgressMark"sv;
+static const auto kReshardErrorMaxBytes = 2000;
+
+const WriteConcernOptions kMajorityWriteConcern{
+    WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(0)};
+
+inline const Status kCoordinatorAbortedError{ErrorCodes::ReshardCollectionAborted,
+                                             "Received abort from the resharding coordinator"};
+
+struct ParticipantShardsAndChunks {
+    std::vector<DonorShardEntry> donorShards;
+    std::vector<RecipientShardEntry> recipientShards;
+    std::vector<ChunkType> initialChunks;
+};
+
+/**
+ * Emplaces the 'fetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
+ * emplaced inside the boost::optional.
+ */
+template <typename ClassWithCloneTimestamp>
+void emplaceCloneTimestampIfExists(ClassWithCloneTimestamp& c,
+                                   boost::optional<Timestamp> cloneTimestamp) {
+    if (!cloneTimestamp) {
+        return;
+    }
+
+    invariant(!cloneTimestamp->isNull());
+
+    if (auto alreadyExistingCloneTimestamp = c.getCloneTimestamp()) {
+        invariant(cloneTimestamp == alreadyExistingCloneTimestamp);
+    }
+
+    c.setCloneTimestamp(*cloneTimestamp);
+}
+
+template <typename ClassWithRelaxed>
+void emplaceRelaxedIfExists(ClassWithRelaxed& c, OptionalBool relaxed) {
+    if (!relaxed.has_value()) {
+        return;
+    }
+
+    if (auto alreadyExistingRelaxed = c.getRelaxed()) {
+        uassert(ErrorCodes::BadValue,
+                "Existing and new values for relaxed are expected to be equal.",
+                relaxed == alreadyExistingRelaxed);
+    }
+
+    c.setRelaxed(relaxed);
+}
+
+template <typename ClassWithOplogBatchTaskCount>
+void emplaceOplogBatchTaskCountIfExists(ClassWithOplogBatchTaskCount& c,
+                                        boost::optional<std::int64_t> oplogBatchTaskCount) {
+    if (!oplogBatchTaskCount) {
+        return;
+    }
+
+    if (auto alreadyExistingOplogBatchTaskCount = c.getOplogBatchTaskCount()) {
+        uassert(ErrorCodes::BadValue,
+                "Existing and new values for oplogBatchTaskCount are expected to be equal.",
+                oplogBatchTaskCount == alreadyExistingOplogBatchTaskCount);
+    }
+
+    c.setOplogBatchTaskCount(*oplogBatchTaskCount);
+}
+
+template <class ReshardingDocumentWithApproxCopySize>
+void emplaceApproxBytesToCopyIfExists(ReshardingDocumentWithApproxCopySize& document,
+                                      boost::optional<ReshardingApproxCopySize> approxCopySize) {
+    if (!approxCopySize) {
+        return;
+    }
+
+    invariant(bool(document.getApproxBytesToCopy()) == bool(document.getApproxDocumentsToCopy()),
+              "Expected approxBytesToCopy and approxDocumentsToCopy to either both be set or to"
+              " both be unset");
+
+    if (auto alreadyExistingApproxBytesToCopy = document.getApproxBytesToCopy()) {
+        invariant(approxCopySize->getApproxBytesToCopy() == *alreadyExistingApproxBytesToCopy,
+                  "Expected the existing and the new values for approxBytesToCopy to be equal");
+    }
+
+    if (auto alreadyExistingApproxDocumentsToCopy = document.getApproxDocumentsToCopy()) {
+        invariant(approxCopySize->getApproxDocumentsToCopy() ==
+                      *alreadyExistingApproxDocumentsToCopy,
+                  "Expected the existing and the new values for approxDocumentsToCopy to be equal");
+    }
+
+    document.setReshardingApproxCopySizeStruct(std::move(*approxCopySize));
+}
+
+/**
+ * Emplaces the 'minFetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
+ * emplaced inside the boost::optional.
+ */
+template <class ClassWithMinFetchTimestamp>
+void emplaceMinFetchTimestampIfExists(ClassWithMinFetchTimestamp& c,
+                                      boost::optional<Timestamp> minFetchTimestamp) {
+    if (!minFetchTimestamp) {
+        return;
+    }
+
+    invariant(!minFetchTimestamp->isNull());
+
+    if (auto alreadyExistingMinFetchTimestamp = c.getMinFetchTimestamp()) {
+        invariant(minFetchTimestamp == alreadyExistingMinFetchTimestamp);
+    }
+
+    c.setMinFetchTimestamp(std::move(minFetchTimestamp));
+}
+
+/**
+ * Returns a serialized version of the originalError status. If the originalError status exceeds
+ * maxErrorBytes, truncates the status and returns it in the errmsg field of a new status with code
+ * ErrorCodes::ReshardingCollectionTruncatedError.
+ */
+BSONObj serializeAndTruncateReshardingErrorIfNeeded(Status originalError);
+
+/**
+ * Emplaces the 'abortReason' onto the ClassWithAbortReason if the reason has been emplaced inside
+ * the boost::optional. If the 'abortReason' is too large, emplaces a status with
+ * ErrorCodes::ReshardCollectionTruncatedError and a truncated version of the 'abortReason' for the
+ * errmsg.
+ */
+template <class ClassWithAbortReason>
+void emplaceTruncatedAbortReasonIfExists(ClassWithAbortReason& c,
+                                         boost::optional<Status> abortReason) {
+    if (!abortReason) {
+        return;
+    }
+
+    invariant(!abortReason->isOK());
+
+    if (auto alreadyExistingAbortReason = c.getAbortReason()) {
+        // If there already is an abortReason, don't overwrite it.
+        return;
+    }
+
+    auto truncatedAbortReasonObj = serializeAndTruncateReshardingErrorIfNeeded(abortReason.get());
+    AbortReason abortReasonStruct;
+    abortReasonStruct.setAbortReason(truncatedAbortReasonObj);
+    c.setAbortReasonStruct(std::move(abortReasonStruct));
+}
+
+/**
+ * Extract the abortReason BSONObj into a status.
+ */
+template <class ClassWithAbortReason>
+Status getStatusFromAbortReason(ClassWithAbortReason& c) {
+    invariant(c.getAbortReason());
+    auto abortReasonObj = c.getAbortReason().get();
+    BSONElement codeElement = abortReasonObj["code"];
+    BSONElement errmsgElement = abortReasonObj["errmsg"];
+    int code = codeElement.numberInt();
+    std::string errmsg;
+    if (errmsgElement.type() == BSONType::string) {
+        errmsg = errmsgElement.String();
+    } else if (!errmsgElement.eoo()) {
+        errmsg = errmsgElement.toString();
+    }
+    return Status(ErrorCodes::Error(code), errmsg, abortReasonObj);
+}
+
+/**
+ * Extracts the ShardId from each Donor/RecipientShardEntry in participantShardEntries.
+ */
+template <class T>
+std::vector<ShardId> extractShardIdsFromParticipantEntries(
+    const std::vector<T>& participantShardEntries) {
+    std::vector<ShardId> shardIds(participantShardEntries.size());
+    std::transform(participantShardEntries.begin(),
+                   participantShardEntries.end(),
+                   shardIds.begin(),
+                   [](const auto& shardEntry) { return shardEntry.getId(); });
+    return shardIds;
+}
+
+/**
+ * Extracts the ShardId from each Donor/RecipientShardEntry in participantShardEntries as a set.
+ */
+template <class T>
+std::set<ShardId> extractShardIdsFromParticipantEntriesAsSet(
+    const std::vector<T>& participantShardEntries) {
+    std::set<ShardId> shardIds;
+    std::transform(participantShardEntries.begin(),
+                   participantShardEntries.end(),
+                   std::inserter(shardIds, shardIds.end()),
+                   [](const auto& shardEntry) { return shardEntry.getId(); });
+    return shardIds;
+}
+
+/**
+ * Helper method to construct a DonorShardEntry with the fields specified.
+ */
+DonorShardEntry makeDonorShard(ShardId shardId,
+                               DonorStateEnum donorState,
+                               boost::optional<Timestamp> minFetchTimestamp = boost::none,
+                               boost::optional<Status> abortReason = boost::none);
+
+/**
+ * Helper method to construct a RecipientShardEntry with the fields specified.
+ */
+RecipientShardEntry makeRecipientShard(ShardId shardId,
+                                       RecipientStateEnum recipientState,
+                                       boost::optional<Status> abortReason = boost::none);
+
+/**
+ * Assembles the namespace string for the temporary resharding collection based on the source
+ * namespace components.
+ *
+ *      <db>.system.resharding.<existing collection's UUID>
+ * or   <db>.system.buckets.resharding.<existing collection's UUID> for a timeseries source ns.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] NamespaceString constructTemporaryReshardingNss(
+    const NamespaceString& nss, const UUID& sourceUuid);
+
+/**
+ * Asserts that there is not a hole or overlap in the chunks.
+ */
+void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
+                                      const KeyPattern& keyPattern);
+
+/**
+ * Validates resharded chunks provided with a reshardCollection cmd. Parses each BSONObj to a valid
+ * ReshardedChunk and asserts that each chunk's shardId is associated with an existing entry in
+ * the shardRegistry. Then, asserts that there is not a hole or overlap in the chunks.
+ */
+void validateReshardedChunks(const std::vector<ReshardedChunk>& chunks,
+                             OperationContext* opCtx,
+                             const KeyPattern& keyPattern);
+
+/**
+ * Selects the highest minFetchTimestamp from the list of donors.
+ *
+ * Throws if not every donor has a minFetchTimestamp.
+ */
+Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorShards);
+
+/**
+ * Asserts that there is not an overlap in the zone ranges.
+ */
+void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones);
+
+/**
+ * Create an array of resharding zones from the existing collection. This is used for forced
+ * same-key resharding.
+ */
+std::vector<ReshardingZoneType> getZonesFromExistingCollection(OperationContext* opCtx,
+                                                               const NamespaceString& sourceNss);
+
+/**
+ * Selects the zones to use when calculating participant shards and chunks for a resharding
+ * operation: 'requestedZones' if the caller supplied any, the source collection's existing zones
+ * if 'forceRedistribution' is set and no zones were supplied, or none otherwise. Throws if zones
+ * were requested for an unshardCollection operation, whose resulting collection cannot have
+ * zones.
+ */
+std::vector<ReshardingZoneType> selectZonesForParticipantShardsAndChunks(
+    OperationContext* opCtx,
+    const boost::optional<ReshardingProvenanceEnum>& provenance,
+    const boost::optional<std::vector<ReshardingZoneType>>& requestedZones,
+    bool forceRedistribution,
+    const NamespaceString& sourceNss);
+
+/**
+ * Creates a pipeline that can be serialized into a query for fetching oplog entries. `startAfter`
+ * may be `Timestamp::isNull()` to fetch from the beginning of the oplog.
+ */
+std::unique_ptr<Pipeline> createOplogFetchingPipelineForResharding(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ReshardingDonorOplogId& startAfter,
+    UUID collUUID,
+    const ShardId& recipientShard);
+
+/**
+ * Returns true if this is a "reshardProgressMark" noop oplog entry on a recipient created after
+ * oplog application has started.
+ * {
+ *   op: "n",
+ *   ns: "<database>.<collection>",
+ *   ui: <existingUUID>,
+ *   o: {msg: "Latest oplog ts from donor's cursor response"},
+ *   o2: {type: "reshardProgressMark", createdAfterOplogApplicationStarted: true},
+ *   fromMigrate: true,
+ * }
+ */
+bool isProgressMarkOplogAfterOplogApplicationStarted(const repl::OplogEntry& oplog);
+
+/**
+ * Returns true if this is a "reshardFinalOp" noop oplog entry on a donor.
+ * {
+ *   op: "n",
+ *   ns: "<database>.<collection>",
+ *   ui: <existingUUID>,
+ *   destinedRecipient: <recipientShardId>,
+ *   o: {msg: "Writes to <database>.<collection> is temporarily blocked for resharding"},
+ *   o2: {type: "reshardFinalOp", reshardingUUID: <reshardingUUID>},
+ *   fromMigrate: true,
+ * }
+ */
+bool isFinalOplog(const repl::OplogEntry& oplog);
+bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID);
+
+NamespaceString getLocalOplogBufferNamespace(UUID existingUUID, ShardId donorShardId);
+
+NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorShardId);
+
+void doNoopWrite(OperationContext* opCtx, std::string_view opStr, const NamespaceString& nss);
+
+boost::optional<Milliseconds> estimateRemainingRecipientTime(bool applyingBegan,
+                                                             int64_t bytesCopied,
+                                                             int64_t bytesToCopy,
+                                                             Milliseconds timeSpentCopying,
+                                                             int64_t oplogEntriesApplied,
+                                                             int64_t oplogEntriesFetched,
+                                                             Milliseconds timeSpentApplying);
+
+/**
+ * Looks up the StateMachine by namespace of the collection being resharded. If it does not exist,
+ * returns boost::none.
+ */
+template <class Service, class Instance>
+std::vector<std::shared_ptr<Instance>> getReshardingStateMachines(OperationContext* opCtx,
+                                                                  const NamespaceString& sourceNs) {
+    auto service =
+        checked_cast<Service*>(repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
+                                   ->lookupServiceByName(Service::kServiceName));
+    auto instances = service->getAllReshardingInstances(opCtx);
+    std::vector<std::shared_ptr<Instance>> result;
+    for (const auto& genericInstace : instances) {
+        auto instance = checked_pointer_cast<Instance>(genericInstace);
+        auto metadata = instance->getMetadata();
+        if (metadata.getSourceNss() != sourceNs) {
+            continue;
+        }
+        result.emplace_back(std::move(instance));
+    }
+    return result;
+}
+
+/**
+ * Returns true if the given resharding state document represents a completed operation that should
+ * not be tracked by the LocalReshardingOperationsRegistry.
+ *
+ * Specifically, returns true when:
+ *  - 'doc' is a ReshardingCoordinatorDocument in kQuiesced state
+ *  - 'doc' is a ReshardingDonorDocument in kDone state
+ *  - 'doc' is a ReshardingRecipientDocument in kDone state
+ *
+ * This filter is used in two contexts:
+ *  1. During resync from disk to skip registering operations whose state documents are still on
+ *     disk but represent already finished resharding operations.
+ *  2. In the ReshardingOpObserver on state document updates to detect when a resharding role has
+ *     reached its terminal state and should be unregistered from the registry.
+ */
+template <typename Document>
+bool excludeFromRegistry(const Document& doc) {
+    if constexpr (std::is_same_v<Document, ReshardingCoordinatorDocument>) {
+        if (doc.getState() == CoordinatorStateEnum::kQuiesced) {
+            return true;
+        }
+    }
+    if constexpr (std::is_same_v<Document, ReshardingDonorDocument>) {
+        if (doc.getMutableState().getState() == DonorStateEnum::kDone) {
+            return true;
+        }
+    }
+    if constexpr (std::is_same_v<Document, ReshardingRecipientDocument>) {
+        if (doc.getMutableState().getState() == RecipientStateEnum::kDone) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Validate the shardDistribution parameter in reshardCollection cmd, which should satisfy the
+ * following properties:
+ * - The shardKeyRanges should be continuous and cover the full data range.
+ * - Every shardKeyRange should be on the same key.
+ * - A shardKeyRange should either have no min/max or have a min/max pair.
+ * - All shardKeyRanges in the array should have the same min/max pattern.
+ * Not satisfying the rules above will cause an uassert failure.
+ */
+void validateShardDistribution(const std::vector<ShardKeyRange>& shardDistribution,
+                               OperationContext* opCtx,
+                               const ShardKeyPattern& keyPattern);
+
+/**
+ * Returns true if the provenance is reshardcollection.
+ */
+bool isOrdinaryReshardCollection(const boost::optional<ReshardingProvenanceEnum>& provenance);
+
+/**
+ * Returns true if the provenance is moveCollection or balancerMoveCollection.
+ */
+bool isMoveCollection(const boost::optional<ReshardingProvenanceEnum>& provenance);
+
+/**
+ * Returns true if the provenance is unshardCollection.
+ */
+bool isUnshardCollection(const boost::optional<ReshardingProvenanceEnum>& provenance);
+
+/**
+ * Returns true if the provenance is rewriteCollection.
+ */
+bool isRewriteCollection(const boost::optional<ReshardingProvenanceEnum>& provenance);
+
+/**
+ * Returns the final shard key for the operation:
+ *   - kRewriteCollection: always returns the existing source key.
+ *   - kReshardCollection on timeseries: translates userKey from user-facing field to bucket-level.
+ *   - Everything else: returns userKey unchanged.
+ */
+BSONObj computeReshardingShardKey(
+    const boost::optional<ReshardingProvenanceEnum>& provenance,
+    const ShardKeyPattern& sourceShardKey,
+    const boost::optional<TypeCollectionTimeseriesFields>& timeseriesFields,
+    const boost::optional<BSONObj>& userKey);
+
+/**
+ * Validates source collection sharding state for the given provenance.
+ */
+void validateReshardCollectionRequest(const boost::optional<ReshardingProvenanceEnum>& provenance,
+                                      bool sourceIsSharded,
+                                      const ShardKeyPattern& sourceShardKey,
+                                      const BSONObj& finalShardKey,
+                                      bool forceRedistribution);
+
+/**
+ * Helper function to create a thread pool for _markKilledExecutor member of resharding POS.
+ */
+std::shared_ptr<ThreadPool> makeThreadPoolForMarkKilledExecutor(const std::string& poolName);
+
+/**
+ * If 'performVerification' is true, asserts that both featureFlagReshardingVerification and the
+ * reshardingDocumentVerification server parameter are enabled.
+ */
+void validatePerformVerification(const boost::optional<ForwardableOperationMetadata>& fom,
+                                 OptionalBool performVerification);
+void validatePerformVerification(const VersionContext& vCtx, OptionalBool performVerification);
+
+/**
+ * Verifies that for each index spec in sourceIndexSpecs, there is an identical spec in
+ * localIndexSpecs. Field order does not matter.
+ */
+template <typename InputIterator1, typename InputIterator2>
+void verifyIndexSpecsMatch(InputIterator1 sourceIndexSpecsBegin,
+                           InputIterator1 sourceIndexSpecsEnd,
+                           InputIterator2 localIndexSpecsBegin,
+                           InputIterator2 localIndexSpecsEnd) {
+    stdx::unordered_map<std::string, BSONObj> localIndexSpecMap;
+    std::transform(localIndexSpecsBegin,
+                   localIndexSpecsEnd,
+                   std::inserter(localIndexSpecMap, localIndexSpecMap.end()),
+                   [](const auto& spec) {
+                       return std::pair(
+                           std::string{spec.getStringField(IndexDescriptor::kIndexNameFieldName)},
+                           spec);
+                   });
+
+    UnorderedFieldsBSONObjComparator bsonCmp;
+    for (auto it = sourceIndexSpecsBegin; it != sourceIndexSpecsEnd; ++it) {
+        auto spec = *it;
+        auto specName = std::string{spec.getStringField(IndexDescriptor::kIndexNameFieldName)};
+        auto localIt = localIndexSpecMap.find(specName);
+        uassert(9365601,
+                str::stream() << "Resharded collection missing source collection index: "
+                              << specName,
+                localIt != localIndexSpecMap.end());
+        uassert(9365602,
+                str::stream() << "Resharded collection created non-matching index. Source spec: "
+                              << spec << " Resharded collection spec: " << localIt->second,
+                bsonCmp.evaluate(spec == localIt->second));
+    }
+}
+
+using CollSizeEstimator =
+    std::function<boost::optional<long long>(OperationContext*, const NamespaceString&)>;
+
+ReshardingCoordinatorDocument createReshardingCoordinatorDoc(
+    OperationContext* opCtx,
+    const ConfigsvrReshardCollection& request,
+    const CollectionType& collEntry,
+    const ShardId& dbPrimary,
+    const NamespaceString& nss,
+    const bool& setProvenance,
+    CollSizeEstimator collSizeEstimator = nullptr);
+
+inline Status validateReshardBlockingWritesO2FieldType(const std::string& value) {
+    if (value != kReshardFinalOpLogType) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Expected the oplog type to be '" << kReshardFinalOpLogType
+                              << "'"};
+    }
+    return Status::OK();
+}
+
+inline Status validateReshardProgressMarkO2FieldType(const std::string& value) {
+    if (value != kReshardProgressMarkOpLogType) {
+        return {ErrorCodes::BadValue,
+                str::stream() << "Expected the oplog type to be '" << kReshardProgressMarkOpLogType
+                              << "'"};
+    }
+    return Status::OK();
+}
+
+Date_t getCurrentTime();
+
+boost::optional<ReshardingCoordinatorDocument> tryGetCoordinatorDoc(OperationContext* opCtx,
+                                                                    const UUID& reshardingUUID);
+
+/**
+ * Returns the resharding coordinator document for `reshardingUUID` from
+ * `config.reshardingOperations`. Throws if the document does not exist.
+ */
+ReshardingCoordinatorDocument getCoordinatorDoc(OperationContext* opCtx,
+                                                const UUID& reshardingUUID);
+
+/**
+ * Overload with the same result as getCoordinatorDoc(OperationContext*, UUID), but builds the
+ * underlying operation context from `opCtxFactory` and applies `fom` when present.
+ */
+ReshardingCoordinatorDocument getCoordinatorDoc(
+    const HierarchicalCancelableOperationContextFactory& opCtxFactory,
+    const boost::optional<ForwardableOperationMetadata>& fom,
+    const UUID& reshardingUUID);
+
+// Waits for majority replication of the latest opTime unless token is cancelled.
+[[nodiscard]] SemiFuture<void> waitForMajority(OperationContext* opCtx,
+                                               const CancellationToken& token);
+[[nodiscard]] SemiFuture<void> waitForMajority(
+    const CancellationToken& token, const HierarchicalCancelableOperationContextFactory& factory);
+
+
+/**
+ * Waits for the replication lag across all voting members to be below the given threshold.
+ */
+ExecutorFuture<void> waitForReplicationOnVotingMembers(
+    std::shared_ptr<executor::TaskExecutor> executor,
+    const CancellationToken& cancelToken,
+    std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory,
+    std::function<unsigned()> getMaxLagSecs);
+
+/**
+ * To be called on a primary only. Returns the amount of time between the last applied optime on the
+ * primary and the last majority committed optime.
+ */
+Milliseconds getMajorityReplicationLag(OperationContext* opCtx);
+
+// Returns the number of indexes on the given namespace or boost::none if the collection does not
+// exist.
+boost::optional<int> getIndexCount(OperationContext* opCtx,
+                                   const CollectionAcquisition& acquisition);
+
+
+/**
+ * Re-calculates the exponential moving average based on the previous average and the current value.
+ * Please refer to https://en.wikipedia.org/wiki/Exponential_smoothing for the formula. Throws
+ * an error if the smoothing factor is not greater than 0 and less than 1.
+ */
+double calculateExponentialMovingAverage(double prevAvg, double currVal, double smoothingFactor);
+
+/**
+ * Constructs a CancelableOperationContext, optionally marking it as non-deprioritizable.
+ * Used by resharding components to ensure operations within (or approaching) the critical
+ * section are not deprioritized by execution admission control.
+ *
+ * If ForwardableOperationMetadata is provided, it will be set on the new opCtx.
+ */
+CancelableOperationContext makeReshardingOperationContext(
+    const HierarchicalCancelableOperationContextFactory& factory,
+    bool nonDeprioritizable,
+    const boost::optional<ForwardableOperationMetadata>& fom = boost::none);
+
+/**
+ * Extracts the VersionContext from an optional ForwardableOperationMetadata. When no VersionContext
+ * is present, falls back to a default derived from the current global FCV: uses v8.3 when the
+ * cluster is at v8.3 (or upgrading from v8.3 to v9.0), or uses v8.0 when the cluster is at v8.0 (or
+ * upgrading from v8.0 to v9.0).
+ *
+ * NOTE: The returned VersionContext is tied to the lifetime of the resharding coordinator.
+ * Using it after the resharding coordinator has finished is incorrect, as it won't serialize with
+ * setFCV.
+ *
+ * TODO (SERVER-99655): Update comment to reflect that ForwadableOpMetadata should always have a
+ * pinned FCV when this function is called.
+ */
+VersionContext getVersionContextOrDefault(const boost::optional<ForwardableOperationMetadata>& fom);
+
+/**
+ * Returns true if 'flag' is enabled for the FCV pinned in 'fom'. When 'fom' is absent or carries
+ * no VersionContext, falls back to default defined in getVersionContextOrDefault.
+ */
+bool isEnabledWithPinnedVersion(const boost::optional<ForwardableOperationMetadata>& fom,
+                                const FCVGatedFeatureFlag& flag);
+
+/**
+ * Returns true if 'fcv' matches the FCV snapshotted in 'metadata' when the resharding operation
+ * started. Coordinator documents written before the startingFCV field existed are treated as
+ * matching kLastLTS and kLastContinuous, since they can only have been created on an older binary.
+ */
+bool isFCVTheSame(const CommonReshardingMetadata& metadata,
+                  const multiversion::FeatureCompatibilityVersion& fcv);
+
+/**
+ * Returns the FCV snapshotted in 'metadata' as a human readable string, or "uninitialized" if the
+ * document does not have one.
+ */
+std::string getStartingFCVString(const CommonReshardingMetadata& metadata);
+
+/**
+ * Chooses the index hint for the covered clone-count aggregation run against a donor's source
+ * collection.
+ */
+boost::optional<BSONObj> determineCloneCountHint(OperationContext* opCtx,
+                                                 const CollectionPtr& collection,
+                                                 const boost::optional<BSONObj>& shardKeyPattern);
+
+template <typename F>
+auto withCriticalSectionForTempCollection(OperationContext* opCtx,
+                                          const NamespaceString& tempNss,
+                                          const BSONObj& critSecReason,
+                                          bool mustClearCollectionMetadata,
+                                          F&& f) {
+    ShardingRecoveryService::get(opCtx)->acquireRecoverableCriticalSectionBlockWrites(
+        opCtx,
+        tempNss,
+        critSecReason,
+        ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter(),
+        mustClearCollectionMetadata);
+    ShardingRecoveryService::get(opCtx)->promoteRecoverableCriticalSectionToBlockAlsoReads(
+        opCtx,
+        tempNss,
+        critSecReason,
+        ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter());
+    auto customAction =
+        [&]() -> std::unique_ptr<ShardingRecoveryService::BeforeReleasingCustomAction> {
+        if (mustClearCollectionMetadata) {
+            return std::make_unique<ShardingRecoveryService::FilteringMetadataClearer>();
+        } else {
+            return std::make_unique<ShardingRecoveryService::NoCustomAction>();
+        }
+    }();
+    if constexpr (std::is_same_v<void, std::invoke_result_t<F&>>) {
+        std::forward<F>(f)();
+        ShardingRecoveryService::get(opCtx)->releaseRecoverableCriticalSection(
+            opCtx,
+            tempNss,
+            critSecReason,
+            ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter(),
+            *customAction);
+    } else {
+        auto result = std::forward<F>(f)();
+        ShardingRecoveryService::get(opCtx)->releaseRecoverableCriticalSection(
+            opCtx,
+            tempNss,
+            critSecReason,
+            ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter(),
+            *customAction);
+        return result;
+    }
+}
+
+}  // namespace resharding
+}  // namespace mongo

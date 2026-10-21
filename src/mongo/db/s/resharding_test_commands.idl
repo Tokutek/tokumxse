@@ -1,0 +1,57 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+commands:
+    _shardsvrReshardingStepDown:
+        command_name: _shardsvrReshardingStepDown
+        cpp_name: ShardsvrReshardingStepDown
+        description:
+            "Test-only internal command to step down and step up all resharding
+            PrimaryOnlyServices on this shard. Steps down in order: coordinator,
+            donor, recipient; then steps up in the same order."
+        namespace: ignored
+        api_version: ""
+        strict: false
+
+    testReshardCloneCollection:
+        command_name: testReshardCloneCollection
+        description: "The 'testReshardCloneCollection' command."
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        fields:
+            atClusterTime:
+                description: "The snapshot time to clone the collection from the donor shards at."
+                type: timestamp
+            outputNs:
+                description: "The namespace to write the cloned contents into."
+                type: namespacestring
+            shardKey:
+                description: "The new shard key pattern."
+                type: object
+            shardId:
+                description: >-
+                    "The recipient shard to act as when cloning the collection from the donor shards."
+                type: shard_id
+            uuid:
+                description: "The source collection's UUID."
+                type: uuid
+            reshardingUUID:
+                description: "The unique identifier for the resharding run."
+                optional: true
+                type: uuid
+            relaxed:
+                description: >-
+                    "Runs the cloner aggregation without specifying a collection
+                    uuid to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards."
+                type: bool
+                default: false

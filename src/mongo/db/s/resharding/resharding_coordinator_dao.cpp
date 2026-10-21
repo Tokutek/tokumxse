@@ -1,0 +1,381 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/s/resharding/resharding_coordinator_dao.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document_internal.h"
+#include "mongo/db/global_catalog/ddl/sharding_catalog_manager.h"
+#include "mongo/db/s/resharding/resharding_coordinator_service_util.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
+
+#include <cstdint>
+#include <memory>
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
+namespace mongo {
+namespace resharding {
+
+namespace {
+BSONObj executeConfigRequest(OperationContext* opCtx, const BatchedCommandRequest& request) {
+    DBDirectClient client(opCtx);
+    BSONObj result;
+    client.runCommand(request.getNS().dbName(), request.toBSON(), result);
+    return result;
+};
+
+void verifyUpdateResult(const BatchedCommandRequest& request, const BSONObj& result) {
+    auto numDocsMatched = result.getIntField("n");
+    uassert(10323900,
+            str::stream() << "Expected to match " << 1 << " docs, but only matched "
+                          << numDocsMatched << " for write request " << request.toString(),
+            1 == numDocsMatched);
+}
+
+ReshardingCoordinatorDocument buildAndExecuteRequest(OperationContext* opCtx,
+                                                     std::unique_ptr<DaoStorageClient> client,
+                                                     const UUID& reshardingUUID,
+                                                     BSONObjBuilder& bob) {
+    auto request =
+        BatchedCommandRequest::buildUpdateOp(NamespaceString::kConfigReshardingOperationsNamespace,
+                                             BSON("_id" << reshardingUUID),
+                                             bob.obj(),
+                                             false,  // upsert
+                                             false   // multi
+        );
+    client->alterState(opCtx, request);
+    return client->readState(opCtx, reshardingUUID);
+}
+
+boost::optional<std::string_view> getTimedPhaseFieldNameFor(CoordinatorStateEnum coordinatorPhase) {
+    switch (coordinatorPhase) {
+        case CoordinatorStateEnum::kCloning:
+            return ReshardingCoordinatorMetrics::kDocumentCopyFieldName;
+        case CoordinatorStateEnum::kApplying:
+            return ReshardingCoordinatorMetrics::kOplogApplicationFieldName;
+        default:
+            return boost::none;
+    }
+    MONGO_UNREACHABLE;
+}
+
+boost::optional<std::string> getTimedPhaseStartFieldFor(CoordinatorStateEnum coordinatorPhase) {
+    auto timedPhase = getTimedPhaseFieldNameFor(coordinatorPhase);
+    if (!timedPhase) {
+        return boost::none;
+    }
+    return resharding_metrics::getIntervalStartFieldName<ReshardingCoordinatorDocument>(
+        *timedPhase);
+}
+
+boost::optional<std::string> getTimedPhaseEndFieldFor(CoordinatorStateEnum coordinatorPhase) {
+    auto timedPhase = getTimedPhaseFieldNameFor(coordinatorPhase);
+    if (!timedPhase) {
+        return boost::none;
+    }
+    return resharding_metrics::getIntervalEndFieldName<ReshardingCoordinatorDocument>(*timedPhase);
+}
+}  // namespace
+
+void DaoStorageClientImpl::alterState(OperationContext* opCtx,
+                                      const BatchedCommandRequest& request) {
+
+    auto result = executeConfigRequest(opCtx, request);
+    uassertStatusOK(getStatusFromWriteCommandReply(result));
+    verifyUpdateResult(request, result);
+}
+
+ReshardingCoordinatorDocument DaoStorageClientImpl::readState(OperationContext* opCtx,
+                                                              const UUID& reshardingUUID) {
+    return getCoordinatorDoc(opCtx, reshardingUUID);
+}
+
+void TransactionalDaoStorageClientImpl::alterState(OperationContext* opCtx,
+                                                   const BatchedCommandRequest& request) {
+    auto result = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+        opCtx, request.getNS(), request, _txnNumber);
+    verifyUpdateResult(request, result);
+}
+
+ReshardingCoordinatorDocument TransactionalDaoStorageClientImpl::readState(
+    OperationContext* opCtx, const UUID& reshardingUUID) {
+    auto result = ShardingCatalogManager::get(opCtx)->findOneConfigDocumentInTxn(
+        opCtx,
+        NamespaceString::kConfigReshardingOperationsNamespace,
+        _txnNumber,
+        BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName << reshardingUUID));
+    uassert(10323901,
+            str::stream() << "Could not find the coordinator document for the resharding operation "
+                          << reshardingUUID.toString(),
+            result.has_value() && !result->isEmpty());
+    return ReshardingCoordinatorDocument::parse(*result,
+                                                IDLParserContext("ReshardingCoordinatorDocument"));
+}
+
+CoordinatorStateEnum ReshardingCoordinatorDao::getPhase(OperationContext* opCtx,
+                                                        boost::optional<TxnNumber> txnNumber) {
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    return client->readState(opCtx, _reshardingUUID).getState();
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::transitionToPreparingToDonatePhase(
+    OperationContext* opCtx,
+    resharding::ParticipantShardsAndChunks shardsAndChunks,
+    boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kInitializing);
+
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+        setBuilder.append(ReshardingCoordinatorDocument::kStateFieldName,
+                          idl::serialize(CoordinatorStateEnum::kPreparingToDonate));
+
+        BSONArrayBuilder donorShards(
+            setBuilder.subarrayStart(ReshardingCoordinatorDocument::kDonorShardsFieldName));
+        for (const auto& donorShard : shardsAndChunks.donorShards) {
+            donorShards.append(donorShard.toBSON());
+        }
+        donorShards.doneFast();
+
+        BSONArrayBuilder recipientShards(
+            setBuilder.subarrayStart(ReshardingCoordinatorDocument::kRecipientShardsFieldName));
+        for (const auto& recipientShard : shardsAndChunks.recipientShards) {
+            recipientShards.append(recipientShard.toBSON());
+        }
+        recipientShards.doneFast();
+
+        setBuilder.doneFast();
+
+        // Remove the presetReshardedChunks and zones from the coordinator document to reduce
+        // the possibility of the document reaching the BSONObj size constraint.
+        BSONObjBuilder unsetBuilder(updateBuilder.subobjStart("$unset"));
+        unsetBuilder.append(ReshardingCoordinatorDocument::kPresetReshardedChunksFieldName, "");
+        unsetBuilder.append(ReshardingCoordinatorDocument::kZonesFieldName, "");
+        unsetBuilder.doneFast();
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::transitionToCloningPhase(
+    OperationContext* opCtx,
+    Date_t now,
+    Timestamp cloneTimestamp,
+    ReshardingApproxCopySize approxCopySize,
+    boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kPreparingToDonate);
+
+    // We know these values exist, so doc will contain these fields after the function calls.
+    resharding::emplaceApproxBytesToCopyIfExists(doc, std::move(approxCopySize));
+    resharding::emplaceCloneTimestampIfExists(doc, std::move(cloneTimestamp));
+
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+
+        // Always update the state field.
+        setBuilder.append(ReshardingCoordinatorDocument::kStateFieldName,
+                          idl::serialize(CoordinatorStateEnum::kCloning));
+        setBuilder.append(ReshardingCoordinatorDocument::kCloneTimestampFieldName,
+                          *doc.getCloneTimestamp());
+        setBuilder.append(ReshardingCoordinatorDocument::kApproxBytesToCopyFieldName,
+                          *doc.getApproxBytesToCopy());
+        setBuilder.append(ReshardingCoordinatorDocument::kApproxDocumentsToCopyFieldName,
+                          *doc.getApproxDocumentsToCopy());
+
+        // Update cloning metrics.
+        setBuilder.append(*getTimedPhaseStartFieldFor(CoordinatorStateEnum::kCloning), now);
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::updateNumberOfDocsToCopy(
+    OperationContext* opCtx,
+    const std::map<ShardId, int64_t>& documentsToCopy,
+    boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kCloning);
+
+    BSONObjBuilder updateBuilder = _documentsCopyUpdateBuilder(
+        doc, documentsToCopy, DonorShardEntry::kDocumentsToCopyFieldName);
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::transitionToBlockingWritesPhase(
+    OperationContext* opCtx,
+    Date_t now,
+    Date_t criticalSectionExpireTime,
+    boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kApplying);
+
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+
+        setBuilder.append(ReshardingCoordinatorDocument::kStateFieldName,
+                          idl::serialize(CoordinatorStateEnum::kBlockingWrites));
+
+        setBuilder.append(*getTimedPhaseEndFieldFor(CoordinatorStateEnum::kApplying), now);
+
+        setBuilder.append(ReshardingCoordinatorDocument::kCriticalSectionExpiresAtFieldName,
+                          criticalSectionExpireTime);
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::updateNumberOfDocsCopiedFinal(
+    OperationContext* opCtx,
+    const std::map<ShardId, int64_t>& documentsCopiedFinal,
+    boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kBlockingWrites);
+
+    BSONObjBuilder updateBuilder = _documentsCopyUpdateBuilder(
+        doc, documentsCopiedFinal, DonorShardEntry::kDocumentsFinalFieldName);
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::updateRecipientDocumentsFinal(
+    OperationContext* opCtx,
+    const std::map<ShardId, int64_t>& recipientDocumentsFinal,
+    boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kBlockingWrites);
+
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+
+        for (size_t i = 0; i < doc.getRecipientShards().size(); i++) {
+            const auto& shardId = doc.getRecipientShards().at(i).getId();
+            auto it = recipientDocumentsFinal.find(shardId);
+            if (it != recipientDocumentsFinal.end()) {
+                int64_t documentsFinal = it->second;
+                setBuilder.append(
+                    std::string{ReshardingCoordinatorDocument::kRecipientShardsFieldName} + "." +
+                        std::to_string(i) + "." +
+                        std::string{RecipientShardEntry::kDocumentsFinalFieldName},
+                    documentsFinal);
+            }
+        }
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::transitionToApplyingPhase(
+    OperationContext* opCtx, Date_t now, boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    invariant(doc.getState() == CoordinatorStateEnum::kCloning);
+
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+
+        // Always update the state field.
+        setBuilder.append(ReshardingCoordinatorDocument::kStateFieldName,
+                          idl::serialize(CoordinatorStateEnum::kApplying));
+
+        // Update applying metrics.
+        setBuilder.append(*getTimedPhaseEndFieldFor(CoordinatorStateEnum::kCloning), now);
+        setBuilder.append(*getTimedPhaseStartFieldFor(CoordinatorStateEnum::kApplying), now);
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::transitionToAbortingPhase(
+    OperationContext* opCtx, Date_t now, Status abortReason, boost::optional<TxnNumber> txnNumber) {
+
+    auto client = _clientFactory->createDaoStorageClient(txnNumber);
+    auto doc = client->readState(opCtx, _reshardingUUID);
+    // Participants are not aware of resharding until after the Initializing phase, so the
+    // coordinator will clean itself up and immediately move to Done instead of going through
+    // Aborting.
+    invariant(doc.getState() > CoordinatorStateEnum::kInitializing &&
+              doc.getState() < CoordinatorStateEnum::kAborting);
+
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+
+        setBuilder.append(ReshardingCoordinatorDocument::kStateFieldName,
+                          idl::serialize(CoordinatorStateEnum::kAborting));
+
+        setBuilder.append(ReshardingCoordinatorDocument::kAbortReasonFieldName,
+                          resharding::serializeAndTruncateReshardingErrorIfNeeded(abortReason));
+
+        if (auto endingTimedPhaseFieldName = getTimedPhaseEndFieldFor(doc.getState())) {
+            setBuilder.append(*endingTimedPhaseFieldName, now);
+        }
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+BSONObjBuilder ReshardingCoordinatorDao::_documentsCopyUpdateBuilder(
+    const ReshardingCoordinatorDocument& doc,
+    const std::map<ShardId, int64_t>& documents,
+    std::string_view numberOfDocsFieldName) {
+    BSONObjBuilder updateBuilder;
+    {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+
+        for (size_t i = 0; i < doc.getDonorShards().size(); i++) {
+            const auto& shardId = doc.getDonorShards().at(i).getId();
+            auto it = documents.find(shardId);
+            if (it != documents.end()) {
+                int64_t numberOfDocuments = it->second;
+                setBuilder.append(
+                    std::string{ReshardingCoordinatorDocument::kDonorShardsFieldName} + "." +
+                        std::to_string(i) + "." + std::string{numberOfDocsFieldName},
+                    numberOfDocuments);
+            }
+        }
+    }
+    return updateBuilder;
+}
+
+ReshardingCoordinatorDocument ReshardingCoordinatorDao::updateSession(
+    OperationContext* opCtx, const boost::optional<CoordinatorSession>& newSession) {
+    auto client = _clientFactory->createDaoStorageClient(boost::none);
+
+    BSONObjBuilder updateBuilder;
+    if (newSession) {
+        BSONObjBuilder setBuilder(updateBuilder.subobjStart("$set"));
+        setBuilder.append(ReshardingCoordinatorDocument::kSessionFieldName, newSession->toBSON());
+    } else {
+        // If no session is provided, the session is being released back to the pool. Clear it
+        // from the coordinator document to prevent a double-release in the event of a failover.
+        BSONObjBuilder unsetBuilder(updateBuilder.subobjStart("$unset"));
+        unsetBuilder.append(ReshardingCoordinatorDocument::kSessionFieldName, 1);
+    }
+
+    return buildAndExecuteRequest(opCtx, std::move(client), _reshardingUUID, updateBuilder);
+}
+
+}  // namespace resharding
+}  // namespace mongo

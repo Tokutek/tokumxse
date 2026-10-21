@@ -1,117 +1,163 @@
-/**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include "mongo/base/string_data.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/str.h"
+
+#include <compare>
+#include <cstddef>
+#include <string>
 
 namespace mongo {
+/**
+ * A KeyPattern is an expression describing a transformation of a document into a
+ * document key.  Document keys are used to store documents in indices and to target
+ * sharded queries.
+ *
+ * The root field names of KeyPatterns are always (potentially-dotted) paths, and the values of
+ * the fields describe the type of indexing over the found elements.
+ *
+ * Examples:
+ *    { a : 1 }
+ *    { a : 1 , b  : -1 }
+ *    { a : "hashed" }
+ */
+class [[MONGO_MOD_PUBLIC]] KeyPattern {
+public:
+    /**
+     * Is the provided key pattern ordered increasing or decreasing or not?
+     */
+    static bool isOrderedKeyPattern(const BSONObj& pattern);
 
     /**
-     * A KeyPattern is an expression describing a transformation of a document into a
-     * document key.  Document keys are used to store documents in indices and to target
-     * sharded queries.
+     * Does the provided key pattern hash its keys?
+     */
+    static bool isHashedKeyPattern(const BSONObj& pattern);
+
+    /**
+     * Constructs a new key pattern based on a BSON document.
+     * Used as an interface to the IDL parser.
+     */
+    static KeyPattern fromBSON(const BSONObj& pattern) {
+        return KeyPattern(pattern.getOwned());
+    }
+
+    /**
+     * Constructs a new key pattern based on a BSON document.
+     */
+    KeyPattern(const BSONObj& pattern);
+
+    explicit KeyPattern() = default;
+
+    bool operator==(const KeyPattern& other) const {
+        return toBSON().woCompare(other.toBSON()) == 0;
+    }
+
+    std::strong_ordering operator<=>(const KeyPattern& other) const {
+        return toBSON().woCompare(other.toBSON()) <=> 0;
+    }
+
+    /**
+     * Returns a BSON representation of this KeyPattern.
+     */
+    const BSONObj& toBSON() const {
+        return _pattern;
+    }
+
+    BSONObj serializeForIDL(const query_shape::SerializationOptions& options = {}) const {
+        BSONObjBuilder bob;
+        for (const auto& e : _pattern) {
+            bob.appendAs(e, options.serializeIdentifier(e.fieldNameStringData()));
+        }
+        return bob.obj();
+    }
+
+    /**
+     * Returns a string representation of this KeyPattern.
+     */
+    std::string toString() const {
+        return str::stream() << *this;
+    }
+
+    /**
+     * Returns a string representation of this BSONObj keypattern.
+     */
+    static std::string toString(const BSONObj& keyPattern) {
+        StringBuilder sb;
+        return _addToStringBuilder(sb, keyPattern).str();
+    }
+
+    /**
+     * Writes to 'sb' a string representation of this KeyPattern.
+     */
+    friend StringBuilder& operator<<(StringBuilder& sb, const KeyPattern& keyPattern);
+    friend StackStringBuilder& operator<<(StackStringBuilder& sb, const KeyPattern& keyPattern);
+
+
+    /* Takes a BSONObj whose field names are a prefix of the fields in this keyPattern, and
+     * outputs a new bound with MinKey values appended to match the fields in this keyPattern
+     * (or MaxKey values for descending -1 fields). This is useful in sharding for
+     * calculating chunk boundaries when tag ranges are specified on a prefix of the actual
+     * shard key, or for calculating index bounds when the shard key is a prefix of the actual
+     * index used.
      *
-     * The root field names of KeyPatterns are always (potentially-dotted) paths, and the values of
-     * the fields describe the type of indexing over the found elements.
+     * @param makeUpperInclusive If true, then MaxKeys instead of MinKeys will be appended, so
+     * that the output bound will compare *greater* than the bound being extended (note that
+     * -1's in the keyPattern will swap MinKey/MaxKey vals. See examples).
+     *
+     * IMPORTANT: When extending the upper bound of the last chunk (where the bound is the
+     * global max, i.e., all fields are MaxKey), callers MUST pass makeUpperInclusive=true.
+     * Otherwise, trailing fields are padded with MinKey, producing a bound that compares
+     * *lower* than the original all-MaxKey bound. This causes index scans to miss documents
+     * whose shard key fields are MaxKey. Use isGlobalMax() to detect this case. Additionally,
+     * callers performing index scans should use BoundInclusion::kIncludeBothStartAndEndKeys
+     * when the max bound is the global max so that documents at the exact MaxKey boundary are
+     * not excluded by the default exclusive upper bound. See SERVER-121533.
      *
      * Examples:
-     *    { a : 1 }
-     *    { a : 1 , b  : -1 }
-     *    { a : "hashed" }
+     * If this keyPattern is {a : 1}
+     *   extendRangeBound( {a : 55}, false) --> {a : 55}
+     *
+     * If this keyPattern is {a : 1, b : 1}
+     *   extendRangeBound( {a : 55}, false) --> {a : 55, b : MinKey}
+     *   extendRangeBound( {a : 55}, true ) --> {a : 55, b : MaxKey}
+     *
+     * If this keyPattern is {a : 1, b : -1}
+     *   extendRangeBound( {a : 55}, false) --> {a : 55, b : MaxKey}
+     *   extendRangeBound( {a : 55}, true ) --> {a : 55, b : MinKey}
      */
-    class KeyPattern {
-    public:
+    BSONObj extendRangeBound(const BSONObj& bound, bool makeUpperInclusive) const;
 
-        /**
-         * Is the provided key pattern the index over the ID field?
-         * The always required ID index is always {_id: 1} or {_id: -1}.
-         */
-        static bool isIdKeyPattern(const BSONObj& pattern);
+    BSONObj globalMin() const;
 
-        /**
-         * Is the provided key pattern ordered increasing or decreasing or not?
-         */
-        static bool isOrderedKeyPattern(const BSONObj& pattern);
+    BSONObj globalMax() const;
 
-        /**
-         * Does the provided key pattern hash its keys?
-         */
-        static bool isHashedKeyPattern(const BSONObj& pattern);
+    size_t getApproximateSize() const;
 
-        /**
-         * Constructs a new key pattern based on a BSON document
-         */
-        KeyPattern(const BSONObj& pattern);
+    /**
+     * Returns true if every field in 'bound' is MaxKey. The bound may be a prefix of the
+     * pattern (fewer fields), in which case it is still considered a global max if all present
+     * fields are MaxKey. An empty bound returns false.
+     *
+     * This is used to detect the upper bound of the last chunk in a sharded collection, where
+     * callers need to adjust extendRangeBound() and BoundInclusion behavior to avoid excluding
+     * documents whose shard key is exactly MaxKey. See SERVER-121533.
+     */
+    bool isGlobalMax(const BSONObj& bound) const;
 
-        /**
-         * Returns a BSON representation of this KeyPattern.
-         */
-        const BSONObj& toBSON() const { return _pattern; }
+private:
+    template <typename SB>
+    static SB& _addToStringBuilder(SB& sb, const BSONObj& pattern);
+    BSONObj _pattern;
+};
 
-        /**
-         * Returns a string representation of this KeyPattern
-         */
-        std::string toString() const{ return toBSON().toString(); }
-
-
-        /* Takes a BSONObj whose field names are a prefix of the fields in this keyPattern, and
-         * outputs a new bound with MinKey values appended to match the fields in this keyPattern
-         * (or MaxKey values for descending -1 fields). This is useful in sharding for
-         * calculating chunk boundaries when tag ranges are specified on a prefix of the actual
-         * shard key, or for calculating index bounds when the shard key is a prefix of the actual
-         * index used.
-         *
-         * @param makeUpperInclusive If true, then MaxKeys instead of MinKeys will be appended, so
-         * that the output bound will compare *greater* than the bound being extended (note that
-         * -1's in the keyPattern will swap MinKey/MaxKey vals. See examples).
-         *
-         * Examples:
-         * If this keyPattern is {a : 1}
-         *   extendRangeBound( {a : 55}, false) --> {a : 55}
-         *
-         * If this keyPattern is {a : 1, b : 1}
-         *   extendRangeBound( {a : 55}, false) --> {a : 55, b : MinKey}
-         *   extendRangeBound( {a : 55}, true ) --> {a : 55, b : MaxKey}
-         *
-         * If this keyPattern is {a : 1, b : -1}
-         *   extendRangeBound( {a : 55}, false) --> {a : 55, b : MaxKey}
-         *   extendRangeBound( {a : 55}, true ) --> {a : 55, b : MinKey}
-         */
-        BSONObj extendRangeBound( const BSONObj& bound , bool makeUpperInclusive ) const;
-
-        BSONObj globalMin() const;
-
-        BSONObj globalMax() const;
-
-    private:
-        BSONObj _pattern;
-    };
-
-} // namespace mongo
+}  // namespace mongo

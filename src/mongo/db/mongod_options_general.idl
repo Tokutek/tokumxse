@@ -1,0 +1,119 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/global_settings.h"
+        - "mongo/db/mongod_options_general.h"
+        - "mongo/util/landlock/landlock.h"
+    configs:
+        section: "General options"
+        initializer:
+            register: addMongodGeneralOptions
+
+server_parameters:
+    "clusterIpSourceAllowlist":
+        description: "Network CIDR specification of permitted origin for `__system` access"
+        set_at: runtime
+        cpp_class:
+            name: AllowListedClusterNetworkSetting
+            override_set: true
+        redact: false
+
+configs:
+    auth:
+        description: "Run with security"
+        arg_vartype: Switch
+        source: [cli, ini]
+        conflicts: noauth
+    "security.clusterIpSourceAllowlist":
+        description: "Network CIDR specification of permitted origin for `__system` access"
+        short_name: clusterIpSourceAllowlist
+        deprecated_name: "security.clusterIpSourceWhitelist"
+        deprecated_short_name: clusterIpSourceWhitelist
+        arg_vartype: StringVector
+        source: [cli, ini, yaml]
+        duplicate_behavior: append
+    "security.authorization":
+        description: >-
+            How the database behaves with respect to authorization of clients.
+            Options are "disabled", which means that authorization checks are not
+            performed, and "enabled" which means that a client cannot perform actions it is
+            not authorized to do.
+        arg_vartype: String
+        source: yaml
+        validator:
+            callback: validateSecurityAuthorizationSetting
+    profile:
+        description: "0=off 1=slow, 2=all"
+        arg_vartype: Int
+        source: [cli, ini]
+    "operationProfiling.mode":
+        description: "(off/slowOp/all)"
+        arg_vartype: String
+        source: yaml
+        validator:
+            callback: validateOperationProfilingModeSetting
+    cpu:
+        description: "Periodically show cpu and iowait utilization"
+        arg_vartype: Switch
+        source: [cli, ini]
+    sysinfo:
+        description: "Print some diagnostic system information"
+        arg_vartype: Switch
+        source: [cli, ini]
+    noscripting:
+        description: "Disable scripting engine"
+        arg_vartype: Switch
+        source: [cli, ini]
+    "security.javascriptEnabled":
+        description: "Enable javascript execution"
+        arg_vartype: Bool
+        source: yaml
+    notablescan:
+        description: "Do not allow table scans"
+        arg_vartype: Switch
+        source: [cli, ini]
+    shutdown:
+        description: "Kill a running server (for init scripts)"
+        arg_vartype: Switch
+        source: [cli, ini]
+        condition:
+            preprocessor: "defined(__linux__)"
+    "net.proxyPort":
+        description: >-
+            The port that accepts connections with a proxy protocol header. Access to this port
+            MUST be restricted to trusted hosts (the load balancer or reverse proxy).
+        short_name: proxyPort
+        arg_vartype: Int
+        source: [cli, yaml]
+        validator: {gte: 1, lte: 65535}
+    "security.landlock.mode":
+        description: >-
+            Landlock self-sandboxing mode, restricting the server's filesystem access at
+            startup to a least-privilege set of paths. Alternatives are 'enforce' (refuse to
+            start when the running kernel cannot enforce the sandbox), 'bestEffort' (start
+            unsandboxed when it cannot) and 'disabled' (skip Landlock entirely). Linux only.
+        short_name: landlockMode
+        arg_vartype: String
+        default: "disabled"
+        source: [cli, yaml]
+        condition:
+            preprocessor: "defined(__linux__)"
+    "security.landlock.additionalPathRules":
+        description: >-
+            Additional filesystem hierarchies to permit under the Landlock sandbox, for paths
+            the server cannot derive from its own configuration. Each entry is
+            '<access>:<path>', where <access> is 'r' for read or 'rw' for read and write, and
+            <path> is absolute; the grant covers everything beneath it. Give one entry per
+            YAML list element, or repeat this option once per rule on the command line;
+            entries from both sources accumulate. Linux only.
+        short_name: landlockAdditionalPathRules
+        arg_vartype: StringVector
+        duplicate_behavior: append
+        source: [cli, yaml]
+        validator:
+            callback: validateLandlockAdditionalPathRules
+        condition:
+            preprocessor: "defined(__linux__)"

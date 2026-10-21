@@ -1,0 +1,350 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/get_executor_deferred_engine_choice_lowering.h"
+
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/classic/count.h"
+#include "mongo/db/exec/classic/multi_plan.h"
+#include "mongo/db/exec/runtime_planners/planner_types.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/sbe_pushdown.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/engine_selection.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_stats/plan_shape_counters/plan_shape_counters.h"
+#include "mongo/db/query/query_stats/query_stats.h"
+#include "mongo/db/query/stage_builder/classic_stage_builder.h"
+#include "mongo/db/query/stage_builder/sbe/builder.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::exec_deferred_engine_choice {
+
+namespace {
+/*
+ * This class takes information about the query and planning results, and outputs an executor when
+ * `lower` is called. In `lower`, the plan ranking result is analyzed, the execution engine is
+ * chosen, and then stage builders for the chosen engine are called.
+ */
+class ExecConstructor {
+public:
+    ExecConstructor(std::unique_ptr<CanonicalQuery> cq,
+                    PlanRankingResult rankingResult,
+                    OperationContext* opCtx,
+                    const MultipleCollectionAccessor& collections,
+                    PlanYieldPolicy::YieldPolicy yieldPolicy,
+                    Pipeline* pipeline)
+        : _cq(std::move(cq)),
+          _rankingResult(std::move(rankingResult)),
+          _opCtx(opCtx),
+          _collections(collections),
+          _yieldPolicy(std::move(yieldPolicy)),
+          _pipeline(pipeline) {}
+
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> lower() {
+        if (_rankingResult.usedIdhack) {
+            // Idhack always uses the classic engine.
+            tassert(11974305,
+                    "Expected no query solution for idhack queries.",
+                    _rankingResult.solutions.empty());
+            return makeClassicExecutor(nullptr /* solution */);
+        } else {
+            tassert(11974304,
+                    "Expected 1 query solutions for non-idhack queries",
+                    _rankingResult.solutions.size() == 1);
+        }
+
+        auto solution = std::move(_rankingResult.solutions[0]);
+        tassert(11974310, "Expected a non-null query solution for non-idhack queries", solution);
+
+        // TODO SERVER-130428 remove `internalQueryEnablePlanShapeAnalysis`
+        // Only collect plan shape stats for the top-level query. For example we do not collect
+        // the metrics for the foreign side of a $lookup.
+        const bool inTopLevelQuery = _cq->getExpCtxRaw()->getSubPipelineDepth() == 0;
+        if (internalQueryEnablePlanShapeAnalysis.load() && inTopLevelQuery) {
+            auto& opDebug = CurOp::get(_opCtx)->debug();
+            // Gate on shouldRequestRemoteMetrics, which checks if metrics are requested by
+            // mongos or if the local query stats key exists.
+            if (query_stats::shouldRequestRemoteMetrics(opDebug)) {
+                plan_shape_counters::analyzePlanShapeForCounters(*solution).addTo(
+                    opDebug.getAdditiveMetrics().planShapeCounts);
+            }
+        }
+
+        tassert(9735001,
+                "Expected engine selection to be performed during planning",
+                _rankingResult.engineSelection.has_value());
+        const auto engine = *_rankingResult.engineSelection;
+        const bool fromSbeCandidate = _rankingResult.execState &&
+            _rankingResult.execState->peekExecState<SbeExecState>() != nullptr;
+        return engine == EngineChoice::kClassic
+            ? makeClassicExecutor(std::move(solution))
+            : makeSbePlanExecutor(std::move(solution), fromSbeCandidate);
+    }
+
+private:
+    QueryPlannerParams* plannerParams() {
+        return _rankingResult.plannerParams.get();
+    }
+
+    MultiPlanStage* peekMps() {
+        return const_cast<MultiPlanStage*>(std::as_const(*this).peekMps());
+    }
+
+    const MultiPlanStage* peekMps() const {
+        if (!_rankingResult.execState) {
+            return nullptr;
+        }
+        auto classicExecState = _rankingResult.execState->peekExecState<ClassicExecState>();
+        if (!classicExecState) {
+            return nullptr;
+        }
+        const PlanStage* planStage = classicExecState->root.get();
+        if (!planStage || planStage->stageType() != STAGE_MULTI_PLAN) {
+            return nullptr;
+        }
+        return static_cast<const MultiPlanStage*>(planStage);
+    }
+
+    std::unique_ptr<MultiPlanStage> extractMps() {
+        if (!_rankingResult.execState) {
+            return nullptr;
+        }
+        auto classicExecState = _rankingResult.execState->peekExecState<ClassicExecState>();
+        if (!classicExecState) {
+            return nullptr;
+        }
+        auto& planStage = classicExecState->root;
+        if (!planStage || planStage->stageType() != STAGE_MULTI_PLAN) {
+            return nullptr;
+        }
+        return std::unique_ptr<MultiPlanStage>(static_cast<MultiPlanStage*>(planStage.release()));
+    }
+
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeSbePlanExecutor(
+        std::unique_ptr<QuerySolution> solution, bool fromCandidate) {
+        // Remove any stages from `pipeline` that will be pushed down to SBE.
+        finalizePipelineStages(_pipeline, _cq.get());
+        const auto* expCtx = _cq->getExpCtxRaw();
+        auto remoteCursors = expCtx->getExplain()
+            ? nullptr
+            : search_helpers::getSearchRemoteCursors(_cq->cqPipeline());
+        auto remoteExplains = expCtx->getExplain()
+            ? search_helpers::getSearchRemoteExplains(expCtx, _cq->cqPipeline())
+            : nullptr;
+        auto nss = _cq->nss();
+        tassert(11742306,
+                "Solution must be present if cachedPlanHash is present: ",
+                solution != nullptr || !_rankingResult.cachedPlanHash.has_value());
+
+        // If we already have a plan that has been created and partially executed, reuse it.
+        // Otherwise, build the plan from scratch and prepare it.
+        if (fromCandidate) {
+            auto execState = _rankingResult.execState->extractExecState<SbeExecState>();
+            execState.sbeCandidate.solution = std::move(solution);
+            return plan_executor_factory::make(_opCtx,
+                                               std::move(_cq),
+                                               std::move(execState.sbeCandidate),
+                                               _collections,
+                                               _rankingResult.plannerParams->providedOptions,
+                                               std::move(nss),
+                                               std::move(execState.sbeYieldPolicy),
+                                               std::move(remoteCursors),
+                                               std::move(remoteExplains),
+                                               _rankingResult.cachedPlanHash,
+                                               _rankingResult.planSelectionStrategy);
+        }
+
+        auto sbeYieldPolicy =
+            PlanYieldPolicySBE::make(_opCtx, _yieldPolicy, _collections, _cq->nss());
+        auto sbePlanAndData = stage_builder::buildSlotBasedExecutableTree(
+            _opCtx, _collections, *_cq, *solution, sbeYieldPolicy.get());
+
+        if (_rankingResult.plannerParams->replanningData) {
+            sbePlanAndData.second.replanReason =
+                _rankingResult.plannerParams->replanningData->replanReason;
+        }
+        // The deferred get_executor path does not support the SBE plan cache.
+        static const bool preparingFromSbeCache = false;
+        stage_builder::prepareSlotBasedExecutableTree(_opCtx,
+                                                      sbePlanAndData.first.get(),
+                                                      &sbePlanAndData.second,
+                                                      *_cq.get(),
+                                                      _collections,
+                                                      sbeYieldPolicy.get(),
+                                                      preparingFromSbeCache,
+                                                      remoteCursors.get());
+
+        // Count queries are not supported in SBE
+        buildRejectedExecutableTreesForExplain(solution.get(), false /*isCountQuery*/);
+
+        static const bool isFromSbePlanCache = false;
+        return plan_executor_factory::make(_opCtx,
+                                           std::move(_cq),
+                                           std::move(solution),
+                                           std::move(sbePlanAndData),
+                                           _collections,
+                                           plannerParams()->providedOptions,
+                                           std::move(nss),
+                                           std::move(sbeYieldPolicy),
+                                           isFromSbePlanCache,
+                                           _rankingResult.cachedPlanHash,
+                                           false /*usedJoinOpt*/,
+                                           {} /*rejectedJoinPlans*/,
+                                           std::move(remoteCursors),
+                                           std::move(remoteExplains),
+                                           extractMps(),
+                                           std::move(_rankingResult.maybeExplainData),
+                                           _rankingResult.planSelectionStrategy);
+    }
+
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeClassicExecutor(
+        std::unique_ptr<QuerySolution> solution) {
+        auto expCtx = _cq->getExpCtx();
+        auto nss = [&]() {
+            if (_collections.hasMainCollection()) {
+                return _collections.getMainCollection()->ns();
+            } else {
+                tassert(11742309, "Expected non-null canonical query", _cq.get());
+                const auto nssOrUuid = _cq->getFindCommandRequest().getNamespaceOrUUID();
+                return nssOrUuid.isNamespaceString() ? nssOrUuid.nss() : NamespaceString::kEmpty;
+            }
+        }();
+
+        std::unique_ptr<WorkingSet> workingSet;
+        std::unique_ptr<PlanStage> planStage;
+        if (_rankingResult.execState) {
+            // If the QuerySolution was extracted from a multiplan stage, restore it so the MPS
+            // won't have a null QuerySolution when explain is run.
+            if (auto mps = peekMps(); mps && mps->bestSolution() == nullptr) {
+                mps->restoreBestSolution(std::move(solution));
+            }
+            auto execState = _rankingResult.execState->extractExecState<ClassicExecState>();
+            workingSet = std::move(execState.workingSet);
+            planStage = std::move(execState.root);
+        } else {
+            workingSet = std::make_unique<WorkingSet>();
+            if (!_rankingResult.maybeExplainData.has_value()) {
+                _rankingResult.maybeExplainData.emplace();
+            }
+            planStage = stage_builder::buildClassicExecutableTree(
+                _opCtx,
+                _collections.getMainCollectionPtrOrAcquisition(),
+                *_cq,
+                *solution,
+                workingSet.get(),
+                &_rankingResult.maybeExplainData->planStageQsnMap);
+        }
+
+        const auto* solutionPtr = [&]() -> const QuerySolution* {
+            if (auto* mps = peekMps()) {
+                return mps->bestSolution();
+            }
+            return solution.get();
+        }();
+
+        if (const auto* countStage = dynamic_cast<const CountStage*>(planStage.get())) {
+            buildRejectedExecutableTreesForExplain(
+                solutionPtr, true, countStage->getLimit(), countStage->getSkip());
+        } else {
+            buildRejectedExecutableTreesForExplain(solutionPtr, false /*isCountQuery*/);
+        }
+
+        return plan_executor_factory::make(
+            _opCtx,
+            std::move(workingSet),
+            std::move(planStage),
+            std::move(solution),
+            std::move(_cq),
+            expCtx,
+            _collections.getMainCollectionAcquisition(),
+            _rankingResult.plannerParams->providedOptions,
+            std::move(nss),
+            _yieldPolicy,
+            _rankingResult.cachedPlanHash,
+            _rankingResult.plannerParams->replanningData.has_value()
+                ? boost::make_optional<std::string>(
+                      std::move(_rankingResult.plannerParams->replanningData->replanReason))
+                : boost::none,
+            std::move(_rankingResult.maybeExplainData),
+            _rankingResult.planSelectionStrategy);
+    }
+
+    void buildRejectedExecutableTreesForExplain(const QuerySolution* solution,
+                                                const bool isCountQuery,
+                                                const long long countLimit = 0,
+                                                const long long countSkip = 0) {
+        if (!_rankingResult.maybeExplainData || !_cq->getExplain()) {
+            return;
+        }
+
+        _rankingResult.maybeExplainData->workingSetForRejectedPlansExplain =
+            std::make_unique<WorkingSet>();
+        stage_builder::PlanStageToQsnMap planStageToQsnMap;
+        for (auto&& solutionWithPlanStage :
+             _rankingResult.maybeExplainData->rejectedPlansWithStages) {
+            if (!solutionWithPlanStage.planStage) {
+                // If planStage is not already built, build it. This will be the case for CBR
+                // rejected plans that are not multi-planned.
+                auto execTree = stage_builder::buildClassicExecutableTree(
+                    _opCtx,
+                    _collections.getMainCollectionPtrOrAcquisition(),
+                    *_cq,
+                    *solutionWithPlanStage.solution,
+                    _rankingResult.maybeExplainData->workingSetForRejectedPlansExplain.get(),
+                    &planStageToQsnMap);
+                solutionWithPlanStage.planStage = std::move(execTree);
+            }
+            if (isCountQuery) {
+                tassert(11960602,
+                        "Expected rejected plan to not have CountStage as root",
+                        solutionWithPlanStage.planStage->stageType() != STAGE_COUNT);
+
+                // Wrap the rejected plan's root stage in a CountStage to reflect the actual
+                // execution.
+                solutionWithPlanStage.planStage = std::make_unique<CountStage>(
+                    _cq->getExpCtxRaw(),
+                    countLimit,
+                    countSkip,
+                    _rankingResult.maybeExplainData->workingSetForRejectedPlansExplain.get(),
+                    solutionWithPlanStage.planStage.release());
+            }
+        }
+        for (auto& mapping : planStageToQsnMap) {
+            _rankingResult.maybeExplainData->planStageQsnMap.emplace(std::move(mapping));
+        }
+    }
+
+    std::unique_ptr<CanonicalQuery> _cq;
+    PlanRankingResult _rankingResult;
+    OperationContext* _opCtx;
+    const MultipleCollectionAccessor& _collections;
+    PlanYieldPolicy::YieldPolicy _yieldPolicy;
+    Pipeline* _pipeline;
+};
+
+}  // namespace
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> lowerPlanRankingResult(
+    std::unique_ptr<CanonicalQuery> cq,
+    PlanRankingResult rankingResult,
+    OperationContext* opCtx,
+    const MultipleCollectionAccessor& collections,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    Pipeline* pipeline) {
+    return ExecConstructor(std::move(cq),
+                           std::move(rankingResult),
+                           opCtx,
+                           collections,
+                           std::move(yieldPolicy),
+                           pipeline)
+        .lower();
+}
+
+}  // namespace mongo::exec_deferred_engine_choice

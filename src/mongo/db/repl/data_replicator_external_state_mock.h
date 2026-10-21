@@ -1,0 +1,175 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/last_vote.h"
+#include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_buffer.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+
+namespace mongo {
+namespace repl {
+
+class ReplicationCoordinator;
+
+/**
+ * Data replicator external state implementation for testing.
+ */
+
+class [[MONGO_MOD_PARENT_PRIVATE]] DataReplicatorExternalStateMock
+    : public DataReplicatorExternalState {
+public:
+    DataReplicatorExternalStateMock();
+
+    executor::TaskExecutor* getTaskExecutor() const override;
+    std::shared_ptr<executor::TaskExecutor> getSharedTaskExecutor() const override;
+
+    OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
+
+    void processMetadata(const rpc::ReplSetMetadata& metadata,
+                         const rpc::OplogQueryMetadata& oqMetadata) override;
+
+    ChangeSyncSourceAction shouldStopFetching(const HostAndPort& source,
+                                              const rpc::ReplSetMetadata& replMetadata,
+                                              const rpc::OplogQueryMetadata& oqMetadata,
+                                              const OpTime& previousOpTimeFetched,
+                                              const OpTime& lastOpTimeFetched) const override;
+
+    ChangeSyncSourceAction shouldStopFetchingOnError(
+        const HostAndPort& source, const OpTime& lastOpTimeFetched) const override;
+
+    std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
+
+    std::unique_ptr<OplogApplier> makeOplogApplier(
+        OplogBuffer* oplogBuffer,
+        OplogApplier::Observer* observer,
+        ReplicationConsistencyMarkers* consistencyMarkers,
+        StorageInterface* storageInterface,
+        const OplogApplier::Options& options,
+        ThreadPool* workerPool) final;
+
+    StatusWith<ReplSetConfig> getCurrentConfig() const override;
+
+    StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) const override;
+
+    Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) override;
+
+    StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx) const override;
+
+    JournalListener* getReplicationJournalListener() override;
+
+    void setCurrentTerm(long long newTerm) {
+        std::lock_guard<std::mutex> lk(_mutex);
+        currentTerm = newTerm;
+    }
+
+    long long getCurrentTerm() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return currentTerm;
+    }
+
+    void setLastCommittedOpTime(OpTime newOpTime) {
+        std::lock_guard<std::mutex> lk(_mutex);
+        lastCommittedOpTime = newOpTime;
+    }
+
+    void setShouldStopFetchingResult(ChangeSyncSourceAction result) {
+        std::lock_guard<std::mutex> lk(_mutex);
+        shouldStopFetchingResult = result;
+    }
+
+    void setReplSetConfigResult(StatusWith<ReplSetConfig> config) {
+        std::lock_guard<std::mutex> lk(_mutex);
+        replSetConfigResult = config;
+    }
+
+    bool getIsPrimary() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return replMetadataProcessed.getIsPrimary();
+    }
+
+    bool getHasPrimaryIndex() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return oqMetadataProcessed.hasPrimaryIndex();
+    }
+
+    bool getMetadataWasProcessed() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return metadataWasProcessed;
+    }
+
+    HostAndPort getLastSyncSourceChecked() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return lastSyncSourceChecked;
+    }
+
+    OpTime getSyncSourceLastOpTime() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return syncSourceLastOpTime;
+    }
+
+    bool getSyncSourceHasSyncSource() const {
+        std::lock_guard<std::mutex> lk(_mutex);
+        return syncSourceHasSyncSource;
+    }
+
+    // Task executor.
+    std::shared_ptr<executor::TaskExecutor> taskExecutor = nullptr;
+
+    // Override to change applyOplogBatch behavior.
+    using ApplyOplogBatchFn = std::function<StatusWith<OpTime>(
+        OperationContext*, std::vector<OplogEntry>, OplogApplier::Observer*)>;
+    ApplyOplogBatchFn applyOplogBatchFn;
+
+private:
+    mutable std::mutex _mutex;
+
+    // Returned by shouldStopFetching.
+    ChangeSyncSourceAction shouldStopFetchingResult = ChangeSyncSourceAction::kContinueSyncing;
+
+    // Returned by getCurrentTermAndLastCommittedOpTime.
+    long long currentTerm = OpTime::kUninitializedTerm;
+    OpTime lastCommittedOpTime;
+
+    // Set by processMetadata.
+    rpc::ReplSetMetadata replMetadataProcessed;
+    rpc::OplogQueryMetadata oqMetadataProcessed;
+    bool metadataWasProcessed = false;
+
+    // Set by shouldStopFetching.
+    mutable HostAndPort lastSyncSourceChecked;
+    mutable OpTime syncSourceLastOpTime;
+    mutable bool syncSourceHasSyncSource = false;
+
+    StatusWith<ReplSetConfig> replSetConfigResult = ReplSetConfig();
+};
+
+
+}  // namespace repl
+}  // namespace mongo

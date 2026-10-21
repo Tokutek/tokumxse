@@ -1,0 +1,45 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/topology/user_write_block/replica_set_writes_block_reason.idl"
+
+structs:
+    BlockReplicaSetWritesRequest:
+        description: "blockReplicaSetWrites command request"
+        strict: true
+        fields:
+            enabled:
+                description: "If true, disables writes. If false, enables."
+                type: bool
+            allowDeletions:
+                description:
+                    "If true, allow deletions. If false, disables. Required when enabling the
+                    block (enabled: true) and disallowed when disabling it (enabled: false). An
+                    enabled request with the same reason may update this setting on an active block."
+                type: bool
+                optional: true
+            reason:
+                description:
+                    "The reason for which the writes are being blocked on the shard. Once writes
+                    are blocked with a specific reason, subsequent attempts to block or unblock
+                    writes with a different reason will fail. To unblock writes, the same reason
+                    that was used to enable blocking must be specified."
+                type: replicaSetWritesBlockReason
+
+commands:
+    block_replica_set_writes:
+        description: "Set whether preventing writes due to insufficient disk space is enabled."
+        api_version: ""
+        namespace: ignored
+        command_name: blockReplicaSetWrites
+        cpp_name: blockReplicaSetWrites
+        reply_type: OkReply
+        strict: true
+        chained_structs:
+            BlockReplicaSetWritesRequest: BlockReplicaSetWritesRequest

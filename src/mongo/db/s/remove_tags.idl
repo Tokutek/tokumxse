@@ -1,0 +1,19 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _configsvrRemoveTags:
+        command_name: _configsvrRemoveTags
+        cpp_name: ConfigsvrRemoveTags
+        description: "internal _configsvrRemoveTags command for config server"
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        mod_visibility: public

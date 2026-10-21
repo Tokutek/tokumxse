@@ -1,0 +1,16 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo::unittest"
+    configs:
+        source: cli
+        initializer:
+            register: addBenchmarkOptions
+
+configs:
+    verbose:
+        description: "Log more verbose output.  Specify one or more 'v's to increase verbosity."
+        arg_vartype: String
+        implicit: v

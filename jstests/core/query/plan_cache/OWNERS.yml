@@ -1,0 +1,8 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/query-optimization
+  - "*pbt*":
+    approvers:
+      - 10gen/query-property-based-testing

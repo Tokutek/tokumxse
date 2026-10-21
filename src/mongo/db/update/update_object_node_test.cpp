@@ -1,0 +1,2894 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/update_object_node.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/mutable_bson_test_utils.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/update/conflict_placeholder_node.h"
+#include "mongo/db/update/rename_node.h"
+#include "mongo/db/update/update_array_node.h"
+#include "mongo/db/update/update_node_test_fixture.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string_view>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+using UpdateObjectNodeTest = UpdateTestFixture;
+using unittest::assertGet;
+
+TEST(SimpleUpdateObjectNodeTest, InvalidPathFailsToParse) {
+    auto update = fromjson("{$set: {'': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"][""],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::EmptyFieldName);
+    ASSERT_EQ(result.getStatus().reason(), "An empty update path is not valid.");
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidIncPathParsesSuccessfully) {
+    auto update = fromjson("{$inc: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_INC,
+                                              update["$inc"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidMulPathParsesSuccessfully) {
+    auto update = fromjson("{$mul: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_MUL,
+                                              update["$mul"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidRenamePathParsesSuccessfully) {
+    auto update = fromjson("{$rename: {'a.b': 'c.d'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_RENAME,
+                                              update["$rename"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    // There should be a ConflictPlaceHolderNode along the "a.b" path.
+    auto aChild = dynamic_cast<UpdateObjectNode*>(root.getChild("a"));
+    ASSERT(aChild);
+
+    auto bChild = dynamic_cast<ConflictPlaceholderNode*>(aChild->getChild("b"));
+    ASSERT(bChild);
+
+    // There should be a RenameNode along the "c.d" path.
+    auto cChild = dynamic_cast<UpdateObjectNode*>(root.getChild("c"));
+    ASSERT(cChild);
+
+    auto dChild = dynamic_cast<RenameNode*>(cChild->getChild("d"));
+    ASSERT(dChild);
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidSetPathParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidUnsetPathParsesSuccessfully) {
+    auto update = fromjson("{$unset: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_UNSET,
+                                              update["$unset"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidAddToSetPathParsesSuccessfully) {
+    auto update = fromjson("{$addToSet: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_ADD_TO_SET,
+                                              update["$addToSet"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidPopPathParsesSuccessfully) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_POP,
+                                              update["$pop"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidMaxPathParsesSuccessfully) {
+    auto update = fromjson("{$max: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_MAX,
+                                              update["$max"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidMinPathParsesSuccessfully) {
+    auto update = fromjson("{$min: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_MIN,
+                                              update["$min"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidCurrentDatePathParsesSuccessfully) {
+    auto update = fromjson("{$currentDate: {'a.b': true}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_CURRENTDATE,
+                                              update["$currentDate"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidSetOnInsertPathParsesSuccessfully) {
+    auto update = fromjson("{$setOnInsert: {'a.b': true}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET_ON_INSERT,
+                                              update["$setOnInsert"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ValidPushParsesSuccessfully) {
+    auto update = fromjson("{$push: {'a.b': {$each: [0, 1], $sort: 1, $position: 0, $slice: 10}}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_PUSH,
+                                              update["$push"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, MultiplePositionalElementsFailToParse) {
+    auto update = fromjson("{$set: {'a.$.b.$': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$.b.$"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Too many positional (i.e. '$') elements found in path 'a.$.b.$'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, ParsingSetsPositionalTrue) {
+    auto update = fromjson("{$set: {'a.$.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_OK(result);
+    ASSERT_TRUE(result.getValue());
+}
+
+TEST(SimpleUpdateObjectNodeTest, ParsingSetsPositionalFalse) {
+    auto update = fromjson("{$set: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_OK(result);
+    ASSERT_FALSE(result.getValue());
+}
+
+TEST(SimpleUpdateObjectNodeTest, PositionalElementFirstPositionFailsToParse) {
+    auto update = fromjson("{$set: {'$': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["$"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Cannot have positional (i.e. '$') element in the first position in path '$'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, TwoModifiersOnSameFieldFailToParse) {
+    auto update = fromjson("{$set: {a: 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'a' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, TwoModifiersOnDifferentFieldsParseSuccessfully) {
+    auto update = fromjson("{$set: {a: 5, b: 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, TwoModifiersWithSameDottedPathFailToParse) {
+    auto update = fromjson("{$set: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.b' would create a conflict at 'a.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, FirstModifierPrefixOfSecondFailToParse) {
+    auto update = fromjson("{$set: {a: 5, 'a.b': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.b' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, FirstModifierDottedPrefixOfSecondFailsToParse) {
+    auto update = fromjson("{$set: {'a.b': 5, 'a.b.c': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.b.c"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.b.c' would create a conflict at 'a.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, SecondModifierPrefixOfFirstFailsToParse) {
+    auto update = fromjson("{$set: {'a.b': 5, a: 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'a' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, SecondModifierDottedPrefixOfFirstFailsToParse) {
+    auto update = fromjson("{$set: {'a.b.c': 5, 'a.b': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.b' would create a conflict at 'a.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, ModifiersWithCommonPrefixParseSuccessfully) {
+    auto update = fromjson("{$set: {'a.b': 5, 'a.c': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ModifiersWithCommonDottedPrefixParseSuccessfully) {
+    auto update = fromjson("{$set: {'a.b.c': 5, 'a.b.d': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, ModifiersWithCommonPrefixDottedSuffixParseSuccessfully) {
+    auto update = fromjson("{$set: {'a.b.c': 5, 'a.d.e': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.d.e"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, TwoModifiersOnSamePositionalFieldFailToParse) {
+    auto update = fromjson("{$set: {'a.$': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$' would create a conflict at 'a.$'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, PositionalFieldsWithDifferentPrefixesParseSuccessfully) {
+    auto update = fromjson("{$set: {'a.$': 5, 'b.$': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["b.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, PositionalAndNonpositionalFieldWithCommonPrefixParseSuccessfully) {
+    auto update = fromjson("{$set: {'a.$': 5, 'a.0': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.0"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, TwoModifiersWithSamePositionalDottedPathFailToParse) {
+    auto update = fromjson("{$set: {'a.$.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$.b' would create a conflict at 'a.$.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, FirstModifierPositionalPrefixOfSecondFailsToParse) {
+    auto update = fromjson("{$set: {'a.$': 5, 'a.$.b': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$.b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$.b' would create a conflict at 'a.$'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, SecondModifierPositionalPrefixOfFirstFailsToParse) {
+    auto update = fromjson("{$set: {'a.$.b': 5, 'a.$': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$' would create a conflict at 'a.$'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, FirstModifierFieldPrefixOfSecondParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a': 5, 'ab': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["ab"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, SecondModifierFieldPrefixOfSecondParsesSuccessfully) {
+    auto update = fromjson("{$set: {'ab': 5, 'a': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["ab"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(SimpleUpdateObjectNodeTest, IdentifierWithoutArrayFilterFailsToParse) {
+    auto update = fromjson("{$set: {'a.$[i]': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$[i]"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "No array filter found for identifier 'i' in path 'a.$[i]'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, IdentifierInMiddleOfPathWithoutArrayFilterFailsToParse) {
+    auto update = fromjson("{$set: {'a.$[i].b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$[i].b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "No array filter found for identifier 'i' in path 'a.$[i].b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, EmptyIdentifierParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[]': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_TRUE(foundIdentifiers.empty());
+}
+
+TEST(SimpleUpdateObjectNodeTest, EmptyIdentifierInMiddleOfPathParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[].b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[].b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_TRUE(foundIdentifiers.empty());
+}
+
+TEST(SimpleUpdateObjectNodeTest, IdentifierWithArrayFilterParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[i]': 5}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+}
+
+TEST(SimpleUpdateObjectNodeTest, IdentifierWithArrayFilterInMiddleOfPathParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[i].b': 5}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i].b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+}
+
+TEST(SimpleUpdateObjectNodeTest, IdentifierInFirstPositionFailsToParse) {
+    auto update = fromjson("{$set: {'$[i]': 5}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["$[i]"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Cannot have array filter identifier (i.e. '$[<id>]') element in the first position "
+              "in path '$[i]'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, IdentifierInFirstPositionWithSuffixFailsToParse) {
+    auto update = fromjson("{$set: {'$[i].a': 5}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["$[i].a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Cannot have array filter identifier (i.e. '$[<id>]') element in the first position "
+              "in path '$[i].a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, CreateObjectNodeInSamePositionAsArrayNodeFailsToParse) {
+    auto update = fromjson("{$set: {'a.$[i]': 5, 'a.0': 6}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.0"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.0' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, CreateArrayNodeInSamePositionAsObjectNodeFailsToParse) {
+    auto update = fromjson("{$set: {'a.0': 5, 'a.$[i]': 6}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.0"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$[i]"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$[i]' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, CreateLeafNodeInSamePositionAsArrayNodeFailsToParse) {
+    auto update = fromjson("{$set: {'a.$[i]': 5, a: 6}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'a' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, CreateArrayNodeInSamePositionAsLeafNodeFailsToParse) {
+    auto update = fromjson("{$set: {a: 5, 'a.$[i]': 6}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$[i]"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$[i]' would create a conflict at 'a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, CreateTwoChildrenOfArrayNodeParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[i]': 5, 'a.$[j]': 6}}");
+    auto arrayFilterI = fromjson("{i: 0}");
+    auto arrayFilterJ = fromjson("{j: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+    auto parsedFilterI = assertGet(MatchExpressionParser::parse(arrayFilterI, expCtx));
+    auto parsedFilterJ = assertGet(MatchExpressionParser::parse(arrayFilterJ, expCtx));
+
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterI)));
+    arrayFilters["j"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterJ)));
+
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[j]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 2U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    ASSERT_TRUE(foundIdentifiers.find("j") != foundIdentifiers.end());
+}
+
+TEST(SimpleUpdateObjectNodeTest, ConflictAtArrayNodeChildFailsToParse) {
+    auto update1 = fromjson("{$set: {'a.$[i]': 5}}");
+    auto update2 = fromjson("{$set: {'a.$[i]': 6}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update1["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update2["$set"]["a.$[i]"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$[i]' would create a conflict at 'a.$[i]'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, ConflictThroughArrayNodeChildFailsToParse) {
+    auto update = fromjson("{$set: {'a.$[i].b': 5, 'a.$[i].b.c': 6}}");
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i].b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_SET,
+                                                  update["$set"]["a.$[i].b.c"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Updating the path 'a.$[i].b.c' would create a conflict at 'a.$[i].b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, NoConflictDueToDifferentArrayNodeChildrenParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[i].b': 5, 'a.$[j].b.c': 6}}");
+    auto arrayFilterI = fromjson("{i: 0}");
+    auto arrayFilterJ = fromjson("{j: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilterI = assertGet(MatchExpressionParser::parse(arrayFilterI, expCtx));
+    auto parsedFilterJ = assertGet(MatchExpressionParser::parse(arrayFilterJ, expCtx));
+
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterI)));
+    arrayFilters["j"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterJ)));
+
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i].b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 1U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[j].b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 2U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    ASSERT_TRUE(foundIdentifiers.find("j") != foundIdentifiers.end());
+}
+
+TEST(SimpleUpdateObjectNodeTest, MultipleArrayNodesAlongPathParsesSuccessfully) {
+    auto update = fromjson("{$set: {'a.$[i].$[j].$[i]': 5}}");
+    auto arrayFilterI = fromjson("{i: 0}");
+    auto arrayFilterJ = fromjson("{j: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+    auto parsedFilterI = assertGet(MatchExpressionParser::parse(arrayFilterI, expCtx));
+    auto parsedFilterJ = assertGet(MatchExpressionParser::parse(arrayFilterJ, expCtx));
+
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterI)));
+    arrayFilters["j"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterJ)));
+
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.$[i].$[j].$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_EQ(foundIdentifiers.size(), 2U);
+    ASSERT_TRUE(foundIdentifiers.find("i") != foundIdentifiers.end());
+    ASSERT_TRUE(foundIdentifiers.find("j") != foundIdentifiers.end());
+}
+
+/**
+ * Used to test if the fields in an input UpdateObjectNode match an expected set of fields.
+ */
+static bool fieldsMatch(const std::vector<std::string>& expectedFields,
+                        const UpdateInternalNode& node) {
+    for (const std::string& fieldName : expectedFields) {
+        if (!node.getChild(fieldName)) {
+            return false;
+        }
+    }
+
+    // There are no expected fields that aren't in the UpdateInternalNode. There is no way to check
+    // if UpdateInternalNodes contains any fields that are not in the expected set, because the
+    // UpdateInternalNodes API does not expose its list of child fields in any way other than
+    // getChild().
+    return true;
+}
+
+TEST(SimpleUpdateObjectNodeTest, DistinctFieldsMergeCorrectly) {
+    auto setUpdate1 = fromjson("{$set: {'a': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'ab': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["ab"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch(std::vector<std::string>{"a", "ab"}, *mergedRootNode));
+}
+
+TEST(SimpleUpdateObjectNodeTest, NestedMergeSucceeds) {
+    auto setUpdate1 = fromjson("{$set: {'a.c': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.d': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch({"a"}, *mergedRootNode));
+
+    ASSERT_TRUE(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(mergedRootNode->getChild("a")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*mergedRootNode->getChild("a")) == typeid(UpdateObjectNode&));
+    auto aNode = static_cast<UpdateObjectNode*>(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(fieldsMatch({"c", "d"}, *aNode));
+}
+
+TEST(SimpleUpdateObjectNodeTest, DoublyNestedMergeSucceeds) {
+    auto setUpdate1 = fromjson("{$set: {'a.b.c': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.b.d': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.b.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch({"a"}, *mergedRootNode));
+
+    ASSERT_TRUE(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(mergedRootNode->getChild("a")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*mergedRootNode->getChild("a")) == typeid(UpdateObjectNode&));
+    auto aNode = static_cast<UpdateObjectNode*>(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(fieldsMatch({"b"}, *aNode));
+
+    ASSERT_TRUE(aNode->getChild("b"));
+    ASSERT_TRUE(aNode->getChild("b")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*aNode->getChild("b")) == typeid(UpdateObjectNode&));
+    auto bNode = static_cast<UpdateObjectNode*>(aNode->getChild("b"));
+    ASSERT_TRUE(fieldsMatch({"c", "d"}, *bNode));
+}
+
+TEST(SimpleUpdateObjectNodeTest, FieldAndPositionalMergeCorrectly) {
+    auto setUpdate1 = fromjson("{$set: {'a.b': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch(std::vector<std::string>{"a"}, *mergedRootNode));
+
+    ASSERT_TRUE(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(mergedRootNode->getChild("a")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*mergedRootNode->getChild("a")) == typeid(UpdateObjectNode&));
+    auto aNode = static_cast<UpdateObjectNode*>(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(aNode->getChild("$"));
+    ASSERT_TRUE(fieldsMatch({"b"}, *aNode));
+}
+
+TEST(SimpleUpdateObjectNodeTest, MergeThroughPositionalSucceeds) {
+    auto setUpdate1 = fromjson("{$set: {'a.$.b': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$.c': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch({"a"}, *mergedRootNode));
+
+    ASSERT_TRUE(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(mergedRootNode->getChild("a")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*mergedRootNode->getChild("a")) == typeid(UpdateObjectNode&));
+    auto aNode = static_cast<UpdateObjectNode*>(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(fieldsMatch({}, *aNode));
+
+    ASSERT_TRUE(aNode->getChild("$"));
+    ASSERT_TRUE(aNode->getChild("$")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*aNode->getChild("$")) == typeid(UpdateObjectNode&));
+    auto positionalNode = static_cast<UpdateObjectNode*>(aNode->getChild("$"));
+    ASSERT_TRUE(fieldsMatch({"b", "c"}, *positionalNode));
+}
+
+TEST(SimpleUpdateObjectNodeTest, TopLevelConflictFails) {
+    auto setUpdate1 = fromjson("{$set: {'a': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, NestedConflictFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.b': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.b': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, LeftPrefixMergeFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.b': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.b.c': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, RightPrefixMergeFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.b.c': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.b': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, LeftPrefixMergeThroughPositionalFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.$.c': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$.c.d': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$.c.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.$.c'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, RightPrefixMergeThroughPositionalFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.$.c.d': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$.c': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$.c.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.$.c'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, MergeWithConflictingPositionalFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.$': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.$'");
+}
+
+DEATH_TEST_REGEX(UpdateObjectNodeDeathTest,
+                 MergingArrayNodesWithDifferentArrayFiltersFails,
+                 "Invariant failure.*leftNode._arrayFilters == &rightNode._arrayFilters") {
+    auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$[j]': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto arrayFilterI = fromjson("{i: 0}");
+    auto arrayFilterJ = fromjson("{j: 0}");
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters1;
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters2;
+    auto parsedFilterI = assertGet(MatchExpressionParser::parse(arrayFilterI, expCtx));
+    auto parsedFilterJ = assertGet(MatchExpressionParser::parse(arrayFilterJ, expCtx));
+    arrayFilters1["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterI)));
+    arrayFilters2["j"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterJ)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters1,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$[j]"],
+                                              expCtx,
+                                              arrayFilters2,
+                                              foundIdentifiers));
+
+    UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+}
+
+TEST(SimpleUpdateObjectNodeTest, MergingArrayNodeWithObjectNodeFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.b': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto arrayFilter = fromjson("{i: 0}");
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, MergingArrayNodeWithLeafNodeFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto arrayFilter = fromjson("{i: 0}");
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, MergingTwoArrayNodesSucceeds) {
+    auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$[j]': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto arrayFilterI = fromjson("{i: 0}");
+    auto arrayFilterJ = fromjson("{j: 0}");
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+
+    auto parsedFilterI = assertGet(MatchExpressionParser::parse(arrayFilterI, expCtx));
+    auto parsedFilterJ = assertGet(MatchExpressionParser::parse(arrayFilterJ, expCtx));
+
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterI)));
+    arrayFilters["j"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilterJ)));
+
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$[i]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$[j]"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch({"a"}, *mergedRootNode));
+
+    ASSERT_TRUE(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(mergedRootNode->getChild("a")->type == UpdateNode::Type::Array);
+    ASSERT_TRUE(typeid(*mergedRootNode->getChild("a")) == typeid(UpdateArrayNode&));
+    auto aNode = static_cast<UpdateArrayNode*>(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(fieldsMatch({"i", "j"}, *aNode));
+}
+
+TEST(SimpleUpdateObjectNodeTest, MergeConflictThroughArrayNodesFails) {
+    auto setUpdate1 = fromjson("{$set: {'a.$[i].b.c': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$[i].b': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto arrayFilter = fromjson("{i: 0}");
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$[i].b.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$[i].b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    std::unique_ptr<UpdateNode> result;
+    ASSERT_THROWS_CODE_AND_WHAT(
+        result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
+        AssertionException,
+        ErrorCodes::ConflictingUpdateOperators,
+        "Update created a conflict at 'root.a.$[i].b'");
+}
+
+TEST(SimpleUpdateObjectNodeTest, NoMergeConflictThroughArrayNodesSucceeds) {
+    auto setUpdate1 = fromjson("{$set: {'a.$[i].b': 5}}");
+    auto setUpdate2 = fromjson("{$set: {'a.$[i].c': 6}}");
+    FieldRef fakeFieldRef("root");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto arrayFilter = fromjson("{i: 0}");
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    arrayFilters["i"] = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode setRoot1, setRoot2;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot1,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate1["$set"]["a.$[i].b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&setRoot2,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate2["$set"]["a.$[i].c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    auto result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef);
+    ASSERT_TRUE(result);
+
+    ASSERT_TRUE(result->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*result) == typeid(UpdateObjectNode&));
+    auto mergedRootNode = static_cast<UpdateObjectNode*>(result.get());
+    ASSERT_TRUE(fieldsMatch({"a"}, *mergedRootNode));
+
+    ASSERT_TRUE(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(mergedRootNode->getChild("a")->type == UpdateNode::Type::Array);
+    ASSERT_TRUE(typeid(*mergedRootNode->getChild("a")) == typeid(UpdateArrayNode&));
+    auto aNode = static_cast<UpdateArrayNode*>(mergedRootNode->getChild("a"));
+    ASSERT_TRUE(fieldsMatch({"i"}, *aNode));
+
+    ASSERT_TRUE(aNode->getChild("i"));
+    ASSERT_TRUE(aNode->getChild("i")->type == UpdateNode::Type::Object);
+    ASSERT_TRUE(typeid(*aNode->getChild("i")) == typeid(UpdateObjectNode&));
+    auto iNode = static_cast<UpdateObjectNode*>(aNode->getChild("i"));
+    ASSERT_TRUE(fieldsMatch({"b", "c"}, *iNode));
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyCreateField) {
+    auto setUpdate = fromjson("{$set: {b: 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 5}"));
+    addIndexedPath("b");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: 5, b: 6}"), doc);
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {b: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{b}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyExistingField) {
+    auto setUpdate = fromjson("{$set: {a: 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 5}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: 6}"), doc);
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {a: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
+    auto setUpdate = fromjson("{$set: {a: 5, b: 6, c: 7, d: 8}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 0, c: 0}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 5, c: 7, b: 6, d: 8}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {a: 5, c: 7}, i: {b: 6, d: 8}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c, d}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
+    auto setUpdate = fromjson("{$set: {'a.b': 6, 'a.c': 7, 'b.d': 8, 'b.e': 9}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b.e"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: {b: 5, c: 5}, b: {d: 5, e: 5}}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: 6, c: 7}}, sb: {u: {d: 8, e: 9}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c, b.d, b.e}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
+    auto setUpdate = fromjson("{$set: {'a.b': 6, 'a.c': 7, 'b.d': 8, 'b.e': 9}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b.e"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{z: 0}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: 6, c: 7}, b: {d: 8, e: 9}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {b: 6, c: 7}, b: {d: 8, e: 9}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c, b.d, b.e}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
+    auto setUpdate = fromjson("{$set: {'a.b.c.d': 6, 'a.b.c.e': 7, 'a.f': 8}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b.c.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b.c.e"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.f"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{z: 0}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{z: 0, a: {b: {c: {d: 6, e: 7}}, f: 8}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {b: {c: {d: 6, e: 7}}, f: 8}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c.d, a.b.c.e, a.f}");
+}
+
+TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
+    auto setUpdate = fromjson("{$set: {a: 5, d: 6, c: 7, b: 8, z: 9}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["z"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{z: 0, a: 0}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{z: 9, a: 5, b: 8, c: 7, d: 6}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {a: 5, z: 9}, i: {b: 8, c: 7, d: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c, d, z}");
+}
+
+TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
+    auto setUpdate = fromjson("{$set: {abc: 5, cba: 6}}");
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    expCtx->setCollator(std::move(collator));
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["abc"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["cba"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{}"));
+    addIndexedPath("abc");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{abc: 5, cba: 6}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {abc: 5, cba: 6}}}"));
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyNoop) {
+    auto setUpdate = fromjson("{$set: {a: 5, b: 6, c: 7}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 5, b: 6, c: 7}"));
+    addIndexedPath("a");
+    addIndexedPath("b");
+    addIndexedPath("c");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
+    auto setUpdate = fromjson("{$set: {a: 5, b: 6, c: 7}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 5, b: 0, c: 7}"));
+    addIndexedPath("a");
+    addIndexedPath("b");
+    addIndexedPath("c");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 5, b: 6, c: 7}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {u: {b: 6}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b, c}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyBlockingElement) {
+    auto setUpdate = fromjson("{$set: {'a.b': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    addIndexedPath("a");
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
+                                AssertionException,
+                                ErrorCodes::PathNotViable,
+                                "Cannot create field 'b' in element {a: 0}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
+    auto setUpdate = fromjson("{$set: {'a.b': 5, b: 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    addIndexedPath("a");
+    setFromOplogApplication(true);
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: 0, b: 6}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {b: 6}}}"));
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
+    auto setUpdate = fromjson("{$set: {'a.$': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{}"));
+    addIndexedPath("a");
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::BadValue,
+        "The positional operator did not find the match needed from the query.");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyMergePositionalChild) {
+    auto setUpdate = fromjson("{$set: {'a.0.b': 5, 'a.$.c': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
+    setMatchedField("0");
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
+    auto setUpdate = fromjson("{$set: {'a.2': 5, 'a.1.b': 6, 'a.0': 7, 'a.$.c': 8}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.2"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.1.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{}"));
+    setMatchedField("1");
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 7, '1': {b: 6, c: 8}, '2': 5}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {'0': 7, '1': {b: 6, c: 8}, '2': 5}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1.b, a.1.c, a.2}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
+    auto setUpdate = fromjson("{$set: {'a.0': 5, 'a.$': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{}"));
+    setMatchedField("0");
+    addIndexedPath("a");
+    ASSERT_EQUALS(getModifiedPaths(), "{}");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
+                                AssertionException,
+                                ErrorCodes::ConflictingUpdateOperators,
+                                "Update created a conflict at 'a.0'");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
+    auto setUpdate = fromjson("{$set: {'a.0': 5, 'a.2': 6, 'a.$': 7}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.2"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{}"));
+    setMatchedField("1");
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 5, '1': 7, '2': 6}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {'0': 5, '1': 7, '2': 6}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1, a.2}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyPositionalChildLast) {
+    auto setUpdate = fromjson("{$set: {'a.$': 5, 'a.0': 6, 'a.1': 7}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.1"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{}"));
+    setMatchedField("2");
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {'0': 6, '1': 7, '2': 5}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {i: {a: {'0': 6, '1': 7, '2': 5}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0, a.1, a.2}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
+    auto setUpdate = fromjson("{$set: {'a.0.b': 5, 'a.$.c': 6}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
+    setMatchedField("0");
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
+
+    mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}]}"));
+    resetApplyParams();
+    setMatchedField("0");
+    addIndexedPath("a");
+    result = root.apply(getApplyParams(doc2.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}]}"), doc2.getObject());
+    ASSERT_TRUE(doc2.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
+    auto setUpdate = fromjson("{$set: {'a.0.b': 5, 'a.$.c': 6, 'a.1.d': 7}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.0.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.$.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.1.d"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
+    setMatchedField("0");
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 6}, {c: 0, d: 7}]}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(
+        fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5, c: 6}}, s1: {u: {d: 7}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.0.c, a.1.d}");
+
+    mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
+    resetApplyParams();
+    setMatchedField("1");
+    addIndexedPath("a");
+    result = root.apply(getApplyParams(doc2.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [{b: 5, c: 0}, {c: 6, d: 7}]}"), doc2.getObject());
+    ASSERT_TRUE(doc2.isInPlaceModeEnabled());
+
+    assertOplogEntry(
+        fromjson("{$v: 2, diff: {sa: {a: true, s0: {u: {b: 5}}, s1: {u: {c: 6, d: 7}}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b, a.1.c, a.1.d}");
+}
+
+/**
+ * The leading zero case is interesting, because if we try to look up an array element by the index
+ * string, a leading zero will cause the lookup to fail. That is, even if 'element' is an array,
+ * element["02"] will not find the element with subscript 2.
+ */
+TEST_F(UpdateObjectNodeTest, ApplyToArrayByIndexWithLeadingZero) {
+    auto setUpdate = fromjson("{$set: {'a.02': 2}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.02"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: [0, 0, 0, 0, 0]}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [0, 0, 2, 0, 0]}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, u2: 2}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.02}");
+}
+
+/**
+ * This test mimics a failure we saw in SERVER-29762. The failure occurred when the 'a.10' update
+   (which was applied first) padded the empty array to have 10 elements, but the new padding
+   elements did not have field names to match their array indexes. As a result, the 'a.2' update
+   failed.
+ */
+TEST_F(UpdateObjectNodeTest, ApplyMultipleArrayUpdates) {
+    auto setUpdate = fromjson("{$set: {'a.2': 2, 'a.10': 10}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.2"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.10"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: []}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{a: [null, null, 2, null, null, null, null, null, null, null, 10]}"),
+        doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, u2: 2, u10: 10}}}"));
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyMultipleUpdatesToDocumentInArray) {
+    auto setUpdate = fromjson("{$set: {'a.2.b': 1, 'a.2.c': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.2.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.2.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: []}"));
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [null, null, {b: 1, c: 1}]}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {a: true, u2: {b: 1, c: 1}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
+}
+
+TEST_F(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
+    auto setUpdate = fromjson("{$set: {'a.b': 3}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
+                                AssertionException,
+                                ErrorCodes::PathNotViable,
+                                "Cannot create field 'b' in element {a: [ { b: 1 }, { b: 2 } ]}");
+}
+
+TEST_F(UpdateObjectNodeTest, SetAndPopModifiersWithCommonPrefixApplySuccessfully) {
+    auto update = fromjson("{$set: {'a.b': 5}, $pop: {'a.c': -1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_POP,
+                                              update["$pop"]["a.c"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    mutablebson::Document doc(fromjson("{a: {b: 3, c: [1, 2, 3, 4]}}"));
+    auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 5, c: [2, 3, 4]}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: 5, c: [ 2, 3, 4 ]}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b, a.c}");
+}
+
+TEST(SimpleParseRenameTest, RenameToStringWithEmbeddedNullFails) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+
+    {
+        const auto embeddedNull = "a\0b"sv;
+        auto update = BSON("$rename" << BSON("a.b" << embeddedNull));
+
+        UpdateObjectNode root;
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
+    }
+
+    {
+        const auto singleNullByte = "\0"sv;
+        auto update = BSON("$rename" << BSON("a.b" << singleNullByte));
+
+        UpdateObjectNode root;
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
+    }
+
+    {
+        const auto leadingNullByte = "\0bbbb"sv;
+        auto update = BSON("$rename" << BSON("a.b" << leadingNullByte));
+
+        UpdateObjectNode root;
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
+    }
+
+    {
+        const auto trailingNullByte = "bbbb\0"sv;
+        auto update = BSON("$rename" << BSON("a.b" << trailingNullByte));
+
+        UpdateObjectNode root;
+        ASSERT_THROWS_CODE_AND_WHAT(
+            UpdateObjectNode::parseAndMerge(&root,
+                                            modifiertable::ModifierType::MOD_RENAME,
+                                            update["$rename"]["a.b"],
+                                            expCtx,
+                                            arrayFilters,
+                                            foundIdentifiers),
+            AssertionException,
+            9867600,
+            "Field name can't contain null bytes");
+    }
+}
+
+TEST(SimpleParseRenameTest, RenameToNonUpdatablePathFails) {
+    auto update = fromjson("{$rename: {'a': 'b.'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::EmptyFieldName);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The update path 'b.' contains an empty field name, which is not allowed.");
+}
+
+TEST(SimpleParseRenameTest, RenameFromNonUpdatablePathFails) {
+    auto update = fromjson("{$rename: {'.a': 'b'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"][".a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::EmptyFieldName);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The update path '.a' contains an empty field name, which is not allowed.");
+}
+
+TEST(SimpleParseRenameTest, RenameToNonStringPathFails) {
+    auto update = fromjson("{$rename: {'a': 5}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "The 'to' field for $rename must be a string: a: 5");
+}
+
+/**
+ * This test, RenameUpwardFails, and RenameDownwardFails mirror similar tests in
+ * rename_node_test.cpp. They exist to make sure that UpdateObjectNode::parseAndMerge() does not
+ * observe a conflict between the RenameNode and the dummy ConflictPlaceHolderNode (generating an
+ * "Update created a conflict" error message that does not really apply to these cases) before it
+ * observes the more specific errors in RenameNode::init().
+ */
+TEST(SimpleParseRenameTest, RenameWithSameNameFails) {
+    auto update = fromjson("{$rename: {'a': 'a'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The source and target field for $rename must differ: a: \"a\"");
+}
+
+TEST(SimpleParseRenameTest, RenameUpwardFails) {
+    auto update = fromjson("{$rename: {'b.a': 'b'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["b.a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The source and target field for $rename must not be on the same path: b.a: \"b\"");
+}
+
+TEST(SimpleParseRenameTest, RenameDownwardFails) {
+    auto update = fromjson("{$rename: {'b': 'b.a'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["b"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The source and target field for $rename must not be on the same path: b: \"b.a\"");
+}
+
+TEST(SimpleParseRenameTest, ConflictWithRenameSourceFailsToParse) {
+    auto update = fromjson("{$set: {a: 5}, $rename: {a: 'b'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'a' would create a conflict at 'a'");
+}
+
+TEST(SimpleParseRenameTest, ConflictWithRenameDestinationFailsToParse) {
+    auto update = fromjson("{$set: {b: 5}, $rename: {a: 'b'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["b"],
+                                              expCtx,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  expCtx,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'b' would create a conflict at 'b'");
+}
+
+TEST(SimpleParseArrayFilterIdentifierTest, ValidIdentifier) {
+    // create dummy expression
+    auto arrayFilter = fromjson("{i: 0}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto parsedFilter = assertGet(MatchExpressionParser::parse(arrayFilter, expCtx));
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["validIdentifier"] =
+        assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
+
+    std::set<std::string> foundIdentifiers;
+
+    auto result = UpdateObjectNode::parseArrayFilterIdentifier(
+        "$[validIdentifier]", 1, FieldRef(), arrayFilters, foundIdentifiers);
+
+    ASSERT_OK(result);
+    ASSERT_EQ(result.getValue(), "validIdentifier");
+    ASSERT_NE(foundIdentifiers.find("validIdentifier"), foundIdentifiers.end());
+}
+
+TEST(SimpleParseArrayFilterIdentifierTest, InvalidPosition) {
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters{};
+    std::set<std::string> foundIdentifiers;
+
+    auto result = UpdateObjectNode::parseArrayFilterIdentifier(
+        "$[validIdentifier]", 0, FieldRef(), arrayFilters, foundIdentifiers);
+
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "Cannot have array filter identifier (i.e. '$[<id>]') element in the first position "
+              "in path ''");
+    ASSERT_TRUE(foundIdentifiers.empty());
+}
+
+TEST(SimpleParseArrayFilterIdentifierTest, ArrayFilterNotFound) {
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters{};
+    std::set<std::string> foundIdentifiers;
+
+    auto result = UpdateObjectNode::parseArrayFilterIdentifier(
+        "$[validIdentifier]", 1, FieldRef(), arrayFilters, foundIdentifiers);
+
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "No array filter found for identifier 'validIdentifier' in path ''");
+    ASSERT_TRUE(foundIdentifiers.empty());
+}
+
+}  // namespace
+}  // namespace mongo

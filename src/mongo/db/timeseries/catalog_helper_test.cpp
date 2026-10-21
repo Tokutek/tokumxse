@@ -1,0 +1,705 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/timeseries/catalog_helper.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_catalog/drop_collection.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/timeseries/upgrade_downgrade_viewless_timeseries.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/unittest/join_thread.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
+namespace {
+
+PseudoRandom _random{SecureRandom().nextInt64()};
+
+class TimeseriesCatalogHelperTest : public CatalogTestFixture {
+public:
+    TimeseriesCatalogHelperTest() : CatalogTestFixture(Options{}.forceDisableTableLogging()) {
+        _tsOptions.setTimeField("timeField");
+        _tsOptions.setMetaField(boost::make_optional<std::string>("metaField"));
+    }
+
+    void setUp() override {
+        CatalogTestFixture::setUp();
+    }
+
+    void tearDown() override {
+        CatalogTestFixture::tearDown();
+    }
+
+    NamespaceString _mainNss = NamespaceString::createNamespaceString_forTest("db1", "coll");
+    NamespaceString _bucketsNss = NamespaceString::createNamespaceString_forTest("db1", "coll")
+                                      .makeTimeseriesBucketsNamespace();
+    NamespaceString _otherNss = NamespaceString::createNamespaceString_forTest("db1", "other");
+    TimeseriesOptions _tsOptions;
+
+    auto makeDdlCommitTimestampGuard(OperationContext* opCtx, Timestamp commitTimestamp) {
+        auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
+        invariant(recoveryUnit->getTimestampReadSource() == RecoveryUnit::ReadSource::kNoTimestamp);
+        invariant(!recoveryUnit->isActive());
+        invariant(recoveryUnit->getCommitTimestamp().isNull());
+        recoveryUnit->setCommitTimestamp(commitTimestamp);
+
+        return ScopeGuard([recoveryUnit] {
+            recoveryUnit->clearCommitTimestamp();
+            recoveryUnit->abandonSnapshot();
+        });
+    }
+
+    void createViewlessTimeseriesAt(Timestamp commitTimestamp) {
+        auto guard = makeDdlCommitTimestampGuard(operationContext(), commitTimestamp);
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", true);
+        CreateCommand cmd(_mainNss);
+        cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+        cmd.getCreateCollectionRequest().setClusteredIndex(
+            std::variant<bool, ClusteredIndexSpec>{true});
+        Lock::DBLock dbLock(operationContext(), _mainNss.dbName(), LockMode::MODE_IX);
+        repl::UnreplicatedWritesBlock unreplicated(operationContext());
+        ASSERT_OK(createCollectionForApplyOps(operationContext(),
+                                              _mainNss.dbName(),
+                                              UUID::gen(),
+                                              cmd.toBSON(),
+                                              false /* allowRenameOutOfTheWay */));
+    }
+
+    void dropViewlessTimeseriesAt(Timestamp commitTimestamp) {
+        auto guard = makeDdlCommitTimestampGuard(operationContext(), commitTimestamp);
+        DropReply reply;
+        repl::UnreplicatedWritesBlock unreplicated(operationContext());
+        ASSERT_OK(
+            dropCollection(operationContext(),
+                           _mainNss,
+                           &reply,
+                           DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
+    }
+
+    void downgradeViewlessTimeseriesAt(Timestamp commitTimestamp) {
+        auto guard = makeDdlCommitTimestampGuard(operationContext(), commitTimestamp);
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", false);
+        repl::UnreplicatedWritesBlock unreplicated(operationContext());
+        timeseries::downgradeFromViewlessTimeseries(operationContext(), _mainNss);
+    }
+
+    void upgradeViewfulTimeseriesAt(Timestamp commitTimestamp) {
+        auto guard = makeDdlCommitTimestampGuard(operationContext(), commitTimestamp);
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", true);
+        repl::UnreplicatedWritesBlock unreplicated(operationContext());
+        timeseries::upgradeToViewlessTimeseries(operationContext(), _mainNss);
+    }
+
+    void assertAcquireAt(boost::optional<Timestamp> readTimestamp,
+                         const NamespaceString& requestedNss,
+                         boost::optional<bool> expectedViewless) {
+        const bool expectedExists = expectedViewless.has_value();
+        const auto expectedNss = expectedViewless.has_value()
+            ? (*expectedViewless ? _mainNss : _bucketsNss)
+            : requestedNss;
+
+        auto client = getServiceContext()->getService()->makeClient("TimeseriesReadProbeClient");
+        auto opCtx = client->makeOperationContext();
+        auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx.get());
+        recoveryUnit->abandonSnapshot();
+        if (readTimestamp) {
+            recoveryUnit->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
+                                                 *readTimestamp);
+        } else {
+            recoveryUnit->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        }
+        recoveryUnit->getSnapshot();
+
+        auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+            opCtx.get(),
+            CollectionAcquisitionRequest::fromOpCtx(
+                opCtx.get(), requestedNss, AcquisitionPrerequisites::OperationType::kRead),
+            LockMode::MODE_IS);
+
+        ASSERT_EQ(acq.exists(), expectedExists);
+        ASSERT_EQ(acq.nss(), expectedNss);
+        ASSERT_EQ(wasTranslated, requestedNss != expectedNss);
+        if (expectedViewless) {
+            ASSERT_TRUE(acq.exists());
+            ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+            ASSERT_EQ(acq.getCollectionPtr()->isNewTimeseriesWithoutView(), *expectedViewless);
+        }
+    }
+
+protected:
+};
+
+/**
+ * Non-existent collection:
+ *
+ * acquireCollectionWithBucketsLookup should:
+ *  - return a non-existent CollectionAcquisition
+ *  - not mark wasTranslated
+ *  - not throw.
+ */
+TEST_F(TimeseriesCatalogHelperTest, acquireNonExistingCollThroughMainNss) {
+    auto opCtx = operationContext();
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_FALSE(acq.exists());
+    ASSERT_EQ(acq.nss(), _mainNss);
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireNonExistingCollThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_FALSE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_FALSE(wasTranslated);
+
+    // Using expected UUID on non existing collection must raise error
+    ASSERT_THROWS_CODE(
+        timeseries::acquireCollectionWithBucketsLookup(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(
+                opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead, UUID::gen()),
+            LockMode::MODE_IS),
+        DBException,
+        ErrorCodes::CollectionUUIDMismatch);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireCollectionThroughMainNss) {
+    auto opCtx = operationContext();
+
+    CreateCommand cmd(_mainNss);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _mainNss);
+    ASSERT_FALSE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireCollectionThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    CreateCommand cmd(_mainNss);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_FALSE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireLegacyTimeseriesThroughMainNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    // Create legacy (viewful) timeseries collection.
+    CreateCommand cmd(_mainNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_FALSE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_TRUE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireLegacyTimeseriesThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    // Create legacy (viewful) timeseries collection.
+    CreateCommand cmd(_mainNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_FALSE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_FALSE(wasTranslated);
+}
+
+// TODO SERVER-123350: Remove this test once 9.0 is last LTS.
+TEST_F(TimeseriesCatalogHelperTest, acquireBucketsCollWithoutViewThroughMainNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    // Create timeseries buckets collection only (no associated view).
+    CreateCommand cmd(_bucketsNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_FALSE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_TRUE(wasTranslated);
+}
+
+// TODO SERVER-123350: Remove this test once 9.0 is last LTS.
+TEST_F(TimeseriesCatalogHelperTest, acquireBucketsCollWithoutViewThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    // Create timeseries buckets collection only (no associated view).
+    CreateCommand cmd(_bucketsNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_FALSE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireViewlessTimeseriesThroughMainNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    CreateCommand cmd(_mainNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _mainNss);
+    ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_TRUE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireViewlessTimeseriesThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    CreateCommand cmd(_mainNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _mainNss);
+    ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_TRUE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_TRUE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireUsesPointInTimeCatalogAfterCreate) {
+    const auto createTimestamp = Timestamp(10, 1);
+    createViewlessTimeseriesAt(createTimestamp);
+
+    // Before the create, neither namespace existed.
+    assertAcquireAt(Timestamp(5, 1), _mainNss, boost::none /* expectedViewless */);
+    assertAcquireAt(Timestamp(5, 1), _bucketsNss, boost::none /* expectedViewless */);
+
+    // At and after the create, a main namespace request acquires directly while a buckets
+    // namespace request translates to the viewless collection on the main namespace.
+    assertAcquireAt(createTimestamp, _mainNss, true /* expectedViewless */);
+    assertAcquireAt(createTimestamp, _bucketsNss, true /* expectedViewless */);
+    assertAcquireAt(Timestamp(15, 1), _mainNss, true /* expectedViewless */);
+    assertAcquireAt(Timestamp(15, 1), _bucketsNss, true /* expectedViewless */);
+
+    // An untimestamped read sees the latest catalog state as well.
+    assertAcquireAt(boost::none, _mainNss, true /* expectedViewless */);
+    assertAcquireAt(boost::none, _bucketsNss, true /* expectedViewless */);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireUsesPointInTimeCatalogAfterDrop) {
+    const auto createTimestamp = Timestamp(10, 1);
+    const auto dropTimestamp = Timestamp(20, 1);
+    createViewlessTimeseriesAt(createTimestamp);
+    dropViewlessTimeseriesAt(dropTimestamp);
+
+    // The latest catalog is empty, but the collection still existed at this PIT. A main namespace
+    // request acquires directly while a buckets namespace request translates to it.
+    assertAcquireAt(Timestamp(15, 1), _mainNss, true /* expectedViewless */);
+    assertAcquireAt(Timestamp(15, 1), _bucketsNss, true /* expectedViewless */);
+
+    // At and after the drop, each origin namespace remains a non-existent lookup.
+    assertAcquireAt(dropTimestamp, _mainNss, boost::none /* expectedViewless */);
+    assertAcquireAt(dropTimestamp, _bucketsNss, boost::none /* expectedViewless */);
+    assertAcquireAt(Timestamp(25, 1), _mainNss, boost::none /* expectedViewless */);
+    assertAcquireAt(Timestamp(25, 1), _bucketsNss, boost::none /* expectedViewless */);
+    assertAcquireAt(boost::none, _mainNss, boost::none /* expectedViewless */);
+    assertAcquireAt(boost::none, _bucketsNss, boost::none /* expectedViewless */);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireUsesPointInTimeCatalogAcrossTransitions) {
+    const auto createTimestamp = Timestamp(10, 1);
+    const auto downgradeTimestamp = Timestamp(20, 1);
+    const auto upgradeTimestamp = Timestamp(30, 1);
+    createViewlessTimeseriesAt(createTimestamp);
+    downgradeViewlessTimeseriesAt(downgradeTimestamp);
+    upgradeViewfulTimeseriesAt(upgradeTimestamp);
+
+    // Before the downgrade, the PIT still sees the viewless collection on the main namespace.
+    assertAcquireAt(Timestamp(15, 1), _mainNss, true /* expectedViewless */);
+    assertAcquireAt(Timestamp(15, 1), _bucketsNss, true /* expectedViewless */);
+
+    // During the viewful interval, a main namespace request translates through the timeseries view
+    // while a buckets namespace request acquires the buckets collection directly.
+    assertAcquireAt(downgradeTimestamp, _mainNss, false /* expectedViewless */);
+    assertAcquireAt(downgradeTimestamp, _bucketsNss, false /* expectedViewless */);
+    assertAcquireAt(Timestamp(25, 1), _mainNss, false /* expectedViewless */);
+    assertAcquireAt(Timestamp(25, 1), _bucketsNss, false /* expectedViewless */);
+
+    // After the upgrade, the PIT and the latest read both see the viewless collection on the main
+    // namespace. A main namespace request acquires directly while a buckets namespace request
+    // translates to it.
+    assertAcquireAt(upgradeTimestamp, _mainNss, true /* expectedViewless */);
+    assertAcquireAt(upgradeTimestamp, _bucketsNss, true /* expectedViewless */);
+    assertAcquireAt(boost::none, _mainNss, true /* expectedViewless */);
+    assertAcquireAt(boost::none, _bucketsNss, true /* expectedViewless */);
+}
+
+/**
+ * Plain (non-timeseries) view:
+ *
+ * acquireCollectionWithBucketsLookup should resolve the view definition and, seeing it is not a
+ * timeseries view, throw CommandNotSupportedOnView when the original viewMode was
+ * MustBeCollection.
+ */
+TEST_F(TimeseriesCatalogHelperTest, acquireViewThroughMainNss) {
+    auto opCtx = operationContext();
+
+    // Create backing collection.
+    CreateCommand cmd(_otherNss);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    // Create a simple view on top of the other collection (not a time-series view).
+    {
+        CreateCommand viewCmd(_mainNss);
+        auto& req = viewCmd.getCreateCollectionRequest();
+        req.setViewOn(_otherNss.coll());
+        req.setPipeline(std::vector<mongo::BSONObj>());  // empty pipeline
+        ASSERT_OK(createCollection(opCtx, viewCmd));
+    }
+
+    ASSERT_THROWS_CODE(timeseries::acquireCollectionWithBucketsLookup(
+                           opCtx,
+                           CollectionAcquisitionRequest::fromOpCtx(
+                               opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+                           LockMode::MODE_IS),
+                       DBException,
+                       ErrorCodes::CommandNotSupportedOnView);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireViewThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    // Create backing collection.
+    CreateCommand cmd(_otherNss);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    // Create a simple view on top of the other collection (not a time-series view).
+    {
+        CreateCommand viewCmd(_mainNss);
+        auto& req = viewCmd.getCreateCollectionRequest();
+        req.setViewOn(_otherNss.coll());
+        req.setPipeline(std::vector<mongo::BSONObj>());  // empty pipeline
+        ASSERT_OK(createCollection(opCtx, viewCmd));
+    }
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_FALSE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_FALSE(wasTranslated);
+}
+/**
+ * system.buckets.* collection without timeseries options:
+ *
+ * This simulates an "invalid" buckets collection (e.g. from old versions or catalog bugs) where
+ * the name starts with system.buckets. but the collection isn't actually timeseries.
+ *
+ * acquireCollectionWithBucketsLookup called on the buckets namespace should:
+ *  - acquire that same namespace
+ *  - not treat it as timeseries
+ *  - not mark wasTranslated.
+ */
+TEST_F(TimeseriesCatalogHelperTest, acquireBucketsCollWithoutTsOptionsThroughBucketsNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    {
+        // Create backing collection.
+        FailPointEnableBlock fp("skipCreateTimeseriesBucketsWithoutOptionsCheck");
+        CreateCommand cmd(_bucketsNss);
+        ASSERT_OK(createCollection(opCtx, cmd));
+    }
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _bucketsNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_TRUE(acq.exists());
+    ASSERT_EQ(acq.nss(), _bucketsNss);
+    ASSERT_FALSE(acq.getCollectionPtr()->isTimeseriesCollection());
+    ASSERT_FALSE(acq.getCollectionPtr()->isNewTimeseriesWithoutView());
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireBucketsCollWithoutTsOptionsThroughMainNss) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    {
+        // Create backing collection.
+        FailPointEnableBlock fp("skipCreateTimeseriesBucketsWithoutOptionsCheck");
+        CreateCommand cmd(_bucketsNss);
+        ASSERT_OK(createCollection(opCtx, cmd));
+    }
+
+    auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, _mainNss, AcquisitionPrerequisites::OperationType::kRead),
+        LockMode::MODE_IS);
+
+    ASSERT_FALSE(acq.exists());
+    ASSERT_EQ(acq.nss(), _mainNss);
+    ASSERT_FALSE(wasTranslated);
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireWithUpgradeDowngrade) {
+    auto opCtx = operationContext();
+    {
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", false);
+        // Create legacy (viewful) timeseries collection.
+        CreateCommand cmd(_mainNss);
+        cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+        ASSERT_OK(createCollection(opCtx, cmd));
+    }
+    Atomic<bool> _upgradeDowngradeInBackground(true);
+    unittest::JoinThread modifierThread([&, svcCtx = getServiceContext()] {
+        ThreadClient client(svcCtx->getService());
+        auto newOpCtx = client->makeOperationContext();
+        while (_upgradeDowngradeInBackground.load()) {
+            {
+                auto guard = makeDdlCommitTimestampGuard(
+                    newOpCtx.get(),
+                    VectorClockMutable::get(newOpCtx.get())->tickClusterTime(1).asTimestamp());
+                unittest::ServerParameterGuard featureFlagController(
+                    "featureFlagCreateViewlessTimeseriesCollections", true);
+                repl::UnreplicatedWritesBlock unreplicated(newOpCtx.get());
+                timeseries::upgradeToViewlessTimeseries(newOpCtx.get(), _mainNss);
+            }
+            {
+                auto guard = makeDdlCommitTimestampGuard(
+                    newOpCtx.get(),
+                    VectorClockMutable::get(newOpCtx.get())->tickClusterTime(1).asTimestamp());
+                unittest::ServerParameterGuard featureFlagController(
+                    "featureFlagCreateViewlessTimeseriesCollections", false);
+                repl::UnreplicatedWritesBlock unreplicated(newOpCtx.get());
+                timeseries::downgradeFromViewlessTimeseries(newOpCtx.get(), _mainNss);
+            }
+        }
+    });
+    ON_BLOCK_EXIT([&] { _upgradeDowngradeInBackground.store(false); });
+    for (int i = 0; i < 10000; i++) {
+        // acquire either through main or buckets namespace
+        auto nss = _random.nextInt32(2) ? _mainNss : _bucketsNss;
+        auto [acq, wasTranslated] = timeseries::acquireCollectionWithBucketsLookup(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(
+                opCtx, nss, AcquisitionPrerequisites::OperationType::kRead),
+            LockMode::MODE_IS);
+        ASSERT_TRUE(acq.exists());
+        ASSERT_TRUE(acq.getCollectionPtr()->isTimeseriesCollection());
+    }
+}
+
+/**
+ * acquireCollectionOrViewPlusTimeseriesView acquires systemViews when working on a view or a
+ *viewful timeseries collection.
+ *
+ **/
+TEST_F(TimeseriesCatalogHelperTest, acquireTimeseriesViewOnPlainViewHasSystemViews) {
+    auto opCtx = operationContext();
+
+    // Create backing collection.
+    CreateCommand cmd(_otherNss);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    // Create a simple view on top of the other collection.
+    {
+        CreateCommand viewCmd(_mainNss);
+        auto& req = viewCmd.getCreateCollectionRequest();
+        req.setViewOn(_otherNss.coll());
+        req.setPipeline(std::vector<mongo::BSONObj>());
+        ASSERT_OK(createCollection(opCtx, viewCmd));
+    }
+
+    auto request = CollectionOrViewAcquisitionRequest::fromOpCtx(
+        opCtx, _mainNss, AcquisitionPrerequisites::kWrite);
+    auto result = timeseries::acquireCollectionOrViewPlusTimeseriesView(opCtx, request);
+
+    ASSERT_TRUE(result.target.isView());
+    ASSERT_TRUE(result.systemViews.has_value());
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireTimeseriesViewOnViewfulTimeseriesHasSystemViews) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    CreateCommand cmd(_mainNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto request = CollectionOrViewAcquisitionRequest::fromOpCtx(
+        opCtx, _mainNss, AcquisitionPrerequisites::kWrite);
+    auto result = timeseries::acquireCollectionOrViewPlusTimeseriesView(opCtx, request);
+
+    ASSERT_TRUE(result.target.collectionExists());
+    ASSERT_TRUE(result.timeseriesView.has_value());
+    ASSERT_TRUE(result.systemViews.has_value());
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireTimeseriesViewOnViewlessTimeseriesHasNoSystemViews) {
+    auto opCtx = operationContext();
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    CreateCommand cmd(_mainNss);
+    cmd.getCreateCollectionRequest().setTimeseries(_tsOptions);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto request = CollectionOrViewAcquisitionRequest::fromOpCtx(
+        opCtx, _mainNss, AcquisitionPrerequisites::kWrite);
+    auto result = timeseries::acquireCollectionOrViewPlusTimeseriesView(opCtx, request);
+
+    ASSERT_TRUE(result.target.collectionExists());
+    ASSERT_FALSE(result.timeseriesView.has_value());
+    ASSERT_FALSE(result.systemViews.has_value());
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireTimeseriesViewOnRegularCollectionHasNoSystemViews) {
+    auto opCtx = operationContext();
+
+    CreateCommand cmd(_mainNss);
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    auto request = CollectionOrViewAcquisitionRequest::fromOpCtx(
+        opCtx, _mainNss, AcquisitionPrerequisites::kWrite);
+    auto result = timeseries::acquireCollectionOrViewPlusTimeseriesView(opCtx, request);
+
+    ASSERT_TRUE(result.target.collectionExists());
+    ASSERT_FALSE(result.timeseriesView.has_value());
+    ASSERT_FALSE(result.systemViews.has_value());
+}
+
+TEST_F(TimeseriesCatalogHelperTest, acquireTimeseriesViewOnNonExistingNamespaceHasNoSystemViews) {
+    auto opCtx = operationContext();
+
+    auto request = CollectionOrViewAcquisitionRequest::fromOpCtx(
+        opCtx, _mainNss, AcquisitionPrerequisites::kWrite);
+    auto result = timeseries::acquireCollectionOrViewPlusTimeseriesView(opCtx, request);
+
+    ASSERT_FALSE(result.target.collectionExists());
+    ASSERT_FALSE(result.target.isView());
+    ASSERT_FALSE(result.timeseriesView.has_value());
+    ASSERT_FALSE(result.systemViews.has_value());
+}
+
+}  // namespace
+}  // namespace mongo

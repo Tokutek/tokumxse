@@ -1,0 +1,37 @@
+# Query related google micro-benchmarks unless run in separate dedicated suites.
+test_kind: benchmark_test
+
+selector:
+  root: bazel-bin/install/install-query_bm_test_list.txt
+  include_files:
+    # The trailing asterisk is for handling the .exe extension on Windows.
+    - bazel-bin/**/complex_query_bm*
+    - bazel-bin/**/query_bm*
+    - bazel-bin/**/point_query_bm*
+    - bazel-bin/**/plan_cache_classic_bm*
+    - bazel-bin/**/distinct_scan_bm*
+    - bazel-bin/**/shapifying_bm*
+    - bazel-bin/**/profile_filter_bm*
+    - bazel-bin/**/percentile_algo_bm*
+    - bazel-bin/**/pipeline_optimization_bm*
+    - bazel-bin/**/window_function_percentile_bm*
+    - bazel-bin/**/window_function_concat_arrays_bm*
+    - bazel-bin/**/canonical_query_bm*
+    - bazel-bin/**/query_planner_bm*
+    - bazel-bin/**/plan_cache_key_encoding_bm*
+    - bazel-bin/**/plan_shape_counters_bm*
+    - bazel-bin/**/query_settings_lookup_bm*
+    - bazel-bin/**/rate_limiting_bm*
+    - bazel-bin/**/shapifying_bm*
+    - bazel-bin/**/shapifying_insert_bm*
+    - bazel-bin/**/shapifying_update_bm*
+    - bazel-bin/**/shapifying_delete_bm*
+    - bazel-bin/**/sbe_builder_bm*
+    - bazel-bin/**/ndv_hashing_bm*
+    - bazel-bin/**/multi_bson_stream_cursor_bm*
+    - bazel-bin/**/top_k_sort_optimization_bm*
+
+executor:
+  config: {}
+  hooks:
+    - class: GenerateAndCheckPerfResults

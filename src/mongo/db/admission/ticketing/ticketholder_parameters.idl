@@ -1,0 +1,20 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo"
+
+server_parameters:
+    delinquentAcquisitionIntervalMillis:
+        description: >-
+            The interval in milliseconds after which a ticket acquisition or non-ticketed
+            execution window is considered delinquent. Controls both the queues.execution
+            delinquency counters and the metrics.query.aggregation.nonTicketed counters.
+        set_at: [startup]
+        cpp_vartype: Atomic<int32_t>
+        cpp_varname: gDelinquentAcquisitionIntervalMillis
+        default: 30
+        validator:
+            gte: 10
+        redact: false

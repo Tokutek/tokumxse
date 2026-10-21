@@ -1,0 +1,58 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    supportArbitraryClusterKeyIndex:
+        description: >-
+            Enables arbitrary cluster index key support.
+        set_at:
+            - startup
+        cpp_varname: "gSupportArbitraryClusterKeyIndex"
+        cpp_vartype: bool
+        test_only: true
+        default: false
+        redact: false
+
+structs:
+    ClusteredIndexSpec:
+        description: "The specifications for a given clusteredIndex"
+        strict: true
+        fields:
+            v:
+                description: "Index spec version"
+                type: safeInt
+                default: 2
+                stability: stable
+            key:
+                description: "Key to index on"
+                type: object_owned
+                stability: stable
+            name:
+                description: "Descriptive name for the index"
+                type: string
+                optional: true
+                stability: stable
+            unique:
+                type: safeBool
+                stability: stable
+
+    ClusteredCollectionInfo:
+        description: "Information on how a collection is clustered. For internal use only"
+        strict: true
+        fields:
+            indexSpec:
+                type: ClusteredIndexSpec
+            legacyFormat:
+                description:
+                    "Legacy format means the clustered information was specified as
+                    {clusteredIndex: true} and the cluster key defaults to _id. This should
+                    only be supported for certain internal collections (e.g: time-series
+                    buckets collections)"
+                type: safeBool

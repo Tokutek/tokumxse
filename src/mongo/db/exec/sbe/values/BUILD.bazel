@@ -1,0 +1,18 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_fuzztest")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_fuzztest(
+    name = "sbe_value_fuzz_test",
+    srcs = ["sbe_value_fuzz_test.cpp"],
+    deps = [
+        "//src/mongo/db:sbe_values",
+    ],
+)

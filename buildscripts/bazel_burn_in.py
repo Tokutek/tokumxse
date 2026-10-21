@@ -1,0 +1,586 @@
+"""Burn-in generator for bazel-based resmoke test suites.
+
+This module provides functionality to generate burn-in tests for changed test files
+using Bazel targets. It identifies tests that have been modified in a git revision,
+creates duplicate test targets with burn-in configurations (repeated execution), and
+generates Evergreen task configurations to run these burn-in tests across build variants.
+
+The two commands are:
+generate-targets: generates burn-in test targets in BUILD.bazel files for changed tests
+generate-tasks: generates Evergreen task configurations to execute burn-in tests
+
+Usage:
+    # First, generate resmoke configs:
+    bazel build //... --build_tag_filters=resmoke_config
+    bazel cquery --build_tag_filters=resmoke_config "kind(resmoke_config, //...)" \
+        --output=starlark \
+        --starlark:expr "': '.join([str(target.label).replace('@@','')] + [f.path for f in target.files.to_list()]) if target.files.to_list() else ''" > resmoke_suite_configs.yml
+
+    # Generate burn-in test targets in BUILD.bazel files:
+    python buildscripts/bazel_burn_in.py generate-targets <origin_rev>
+
+    # Generate Evergreen tasks for burn-in tests:
+    python buildscripts/bazel_burn_in.py generate-tasks <origin_rev> --outfile=generated_tasks.json
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from functools import cache
+from typing import NamedTuple
+
+import typer
+import yaml
+from git import Repo
+from shrub.v2 import BuildVariant, FunctionCall, ShrubProject, Task, TaskGroup
+from shrub.v2.command import BuiltInCommand
+from shrub.v2.task import ExistingTask
+from typing_extensions import Annotated
+
+if __name__ == "__main__" and __package__ is None:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from buildscripts.burn_in_tests import (
+    SELECTOR_FILE,
+    SUPPORTED_TEST_KINDS,
+    LocalFileChangeDetector,
+    MockFileChangeDetector,
+)
+from buildscripts.ciconfig.evergreen import parse_evergreen_file
+from buildscripts.generate_result_tasks import (
+    make_results_task,
+    make_task_group,
+    variant_cquery_flags,
+)
+from buildscripts.util import buildozer_utils as buildozer
+from buildscripts.util.read_config import read_config_file
+
+BAZEL_BURN_IN_TESTS = r"resmoke_tests_burn_in_*"
+
+
+def parse_bazel_target(target: str) -> tuple[str, str]:
+    """
+    Parse a bazel target to get the BUILD.bazel file path and target name.
+
+    Args:
+        target: Bazel target like "//buildscripts/resmokeconfig:core_config"
+
+    Returns:
+        Tuple of (build_file_path, target_name without _config suffix)
+    """
+    # Remove leading //
+    target = target.removeprefix("//")
+
+    # Split on :
+    if ":" in target:
+        package_path, target_name = target.split(":", 1)
+    else:
+        package_path = target
+        target_name = target.split("/")[-1]
+
+    # Remove _config suffix if present
+    if target_name.endswith("_config"):
+        target_name = target_name.removesuffix("_config")
+
+    # Construct BUILD.bazel path
+    package_parts = package_path.split("/")
+    build_file_path = os.path.join(*package_parts, "BUILD.bazel")
+
+    return build_file_path, target_name
+
+
+def _read_rule_from_list_comprehension(build_file: str, target_name: str) -> str | None:
+    """
+    Return the instantiated resmoke_suite_test() text for a target defined inside a
+    Starlark list comprehension that buildozer cannot reach.  Handles the pattern:
+
+        [
+            resmoke_suite_test(
+                name = suite_name,
+                config = "//path/{}.yml".format(suite_name),
+                multiversion_deps = ["//path:{}".format(multiversion)],
+                ...
+            )
+            for suite_name, multiversion in {"name1": "mv1", "name2": "mv2"}.items()
+        ]
+
+    Returns None if the target is not found in any comprehension.
+    """
+    with open(build_file) as f:
+        content = f.read()
+
+    # Find the target name as a dict key: "target_name": "mv_value"
+    key_m = re.search(r'"(' + re.escape(target_name) + r')"\s*:\s*"([^"]+)"', content)
+    if not key_m:
+        return None
+
+    suite_name_val = key_m.group(1)
+    multiversion_val = key_m.group(2)
+
+    # The for-clause appears before the dict entry in the source:
+    #   resmoke_suite_test(...) for suite_name, mv in {"name": "val", ...}.items()
+    # Find the last `for suite_name, <var> in {` that precedes our dict key.
+    for_matches = list(
+        re.finditer(r"for\s+suite_name\s*,\s*\w+\s+in\s*\{", content[: key_m.start()])
+    )
+    if not for_matches:
+        return None
+    for_pos = for_matches[-1].start()
+
+    # Find the `[` that opens the list comprehension, identified by the distinctive
+    # `[\n    resmoke_suite_test(` pattern at file scope.
+    bracket_matches = list(re.finditer(r"\[\s*\n\s*resmoke_suite_test\s*\(", content[:for_pos]))
+    if not bracket_matches:
+        return None
+    bracket_pos = bracket_matches[-1].start()
+
+    # Everything between `[` and `for suite_name` is the rule template.
+    template = content[bracket_pos + 1 : for_pos].strip()
+
+    # Instantiate: substitute `.format(suite_name)` string calls.
+    template = re.sub(
+        r'"([^"]*)"\s*\.format\s*\(\s*suite_name\s*\)',
+        lambda m: '"' + m.group(1).replace("{}", suite_name_val) + '"',
+        template,
+    )
+    # Instantiate: substitute `.format(multiversion)` string calls.
+    template = re.sub(
+        r'"([^"]*)"\s*\.format\s*\(\s*multiversion\s*\)',
+        lambda m: '"' + m.group(1).replace("{}", multiversion_val) + '"',
+        template,
+    )
+    # Instantiate: substitute the bare `suite_name` identifier used as a value
+    # (e.g. `name = suite_name`).
+    template = re.sub(r"\bsuite_name\b", f'"{suite_name_val}"', template)
+
+    return template + "\n"
+
+
+def _extract_list_attr_from_rule(rule_text: str, attr: str) -> str:
+    """
+    Extract a list attribute from rule text, returning it in the same format that
+    buildozer's `print <attr>` command uses: unquoted elements separated by spaces
+    inside square brackets, e.g. ``[--arg1 --arg2]``.
+
+    Returns ``(missing)`` when the attribute is absent, matching buildozer's behaviour.
+    """
+    m = re.search(rf"\b{re.escape(attr)}\s*=\s*(\[.*?\])", rule_text, re.DOTALL)
+    if not m:
+        return "(missing)"
+    elements = re.findall(r'"([^"]*)"', m.group(1))
+    return "[" + " ".join(elements) + "]" if elements else "(missing)"
+
+
+def create_burn_in_target(target_original: str, target_burn_in: str, test: str):
+    """ """
+    # Create the label "//jstests:foo.js" from jstests/foo.js
+    test_label = "//" + ":".join(test.rsplit("/", 1))
+
+    build_file, name_original = parse_bazel_target(target_original)
+    _, name_burn_in = parse_bazel_target(target_burn_in)
+
+    # Buildozer does not provide a convenient way to clone an entire rule, so we print the original,
+    # replace the "name" attribute, and then write it back to the BUILD.bazel.
+    # To reduce the likelihood of errors, all other edits are made using buildozer.
+    # For rules defined via Starlark list comprehensions buildozer cannot locate them by
+    # name, so we fall back to parsing the BUILD file directly.
+    try:
+        rule_original = buildozer.bd_print([target_original], ["rule"])
+    except buildozer.BuildozerRuleNotFoundError:
+        rule_original = _read_rule_from_list_comprehension(build_file, name_original)
+        if rule_original is None:
+            raise ValueError(
+                f"Rule '{name_original}' not found in {build_file} "
+                "(neither as a top-level rule nor inside a list comprehension)"
+            )
+
+    rule_new = re.sub(rf'(name\s*=\s*"){name_original}(")', rf"\1{name_burn_in}\2", rule_original)
+    with open(build_file, "a") as f:
+        f.write(rule_new)
+
+    # Try to remove the test label and move existing srcs to data to avoid duplicate
+    # uses of the same label. buildozer fails if srcs/data do not exist, which is fine.
+    # If the attribute is present, and buildozer fails for another reason, the build
+    # of the burn-in target produces a clear message why it fails.
+    try:
+        buildozer.bd_move([target_burn_in], "srcs", "data")
+    except:
+        pass
+    try:
+        buildozer.bd_remove([target_burn_in], "data", [test_label])
+    except:
+        pass
+    buildozer.bd_set([target_burn_in], "srcs", test_label)
+    buildozer.bd_set([target_burn_in], "shard_count", "1")
+
+    # Add burn-in arguments to the suite to repeat the test.
+    # rule_original always contains the full rule text (from buildozer or the BUILD-file
+    # fallback), so extract resmoke_args from it directly rather than making a second
+    # buildozer call.
+    resmoke_args_str = _extract_list_attr_from_rule(rule_original, "resmoke_args")
+
+    resmoke_args = resmoke_args_str.strip().removeprefix("[").removesuffix("]").split()
+
+    # "(missing)" is buildozer's response if an attribute is not present
+    if "(missing)" in resmoke_args:
+        resmoke_args.remove("(missing)")
+    resmoke_args.extend(
+        [
+            "--repeatTestsMax=1000",
+            "--repeatTestsMin=2",
+            "--repeatTestsSecs=600.0",
+        ]
+    )
+    resmoke_args_str = "[" + ",".join(['"' + arg + '"' for arg in resmoke_args]) + "]"
+    buildozer.bd_set([target_burn_in], "resmoke_args", resmoke_args_str)
+
+
+def _test_matches_roots(test_path: str, roots: list[str]) -> bool:
+    """Check if a test file path matches any of the selector roots patterns."""
+    from pathlib import PurePosixPath
+
+    for root in roots:
+        if root == test_path:
+            return True
+        if "*" in root or "?" in root or "[" in root:
+            if PurePosixPath(test_path).match(root):
+                return True
+    return False
+
+
+class BurnInTargetInfo(NamedTuple):
+    burn_in_target: str
+    original_target: str
+    test: str
+
+
+def get_resmoke_configs():
+    with open("resmoke_suite_configs.yml", "r") as f:
+        return yaml.safe_load(f)
+
+
+def query_targets_to_burn_in(
+    origin_rev: str, test_changed_files: str | None = None
+) -> set[BurnInTargetInfo]:
+    # Use MockFileChangeDetector if test files are provided (for testing purposes)
+    if test_changed_files:
+        changed_files = {f.strip() for f in test_changed_files.split(",")}
+        change_detector = MockFileChangeDetector(changed_files)
+    else:
+        change_detector = LocalFileChangeDetector(origin_rev)
+    tests_changed = change_detector.find_changed_tests([Repo(".")])
+
+    with open(SELECTOR_FILE, "r") as f:
+        exclusions = yaml.safe_load(f)
+
+    targets = set()
+    for config_label, config_path in get_resmoke_configs().items():
+        test_label = config_label.removeprefix("@@").removesuffix("_config")
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+
+        test_kind = config["test_kind"]
+        if test_kind not in SUPPORTED_TEST_KINDS:
+            continue
+
+        if test_label in exclusions["selector"].get(test_kind, {}).get("exclude_suites", []):
+            continue
+
+        for test in tests_changed:
+            if test in exclusions["selector"].get(test_kind, {}).get("exclude_tests", []):
+                continue
+            if not _test_matches_roots(test, (config.get("selector") or {}).get("roots") or []):
+                continue
+
+            burn_in_target = (
+                test_label
+                + "_burn_in_"
+                + test.replace("/", "_").replace("\\", "_").removeprefix("_")
+            )
+
+            targets.add(
+                BurnInTargetInfo(
+                    burn_in_target=burn_in_target, original_target=test_label, test=test
+                )
+            )
+
+    return targets
+
+
+@cache
+def get_targets_with_tag(tag: str) -> list[str]:
+    try:
+        excluded = "attr(tags, '\\bincompatible_with_bazel_remote_test(?![a-zA-Z0-9_-])', //...)"
+        query = f"attr(tags, '\\b{tag}(?![a-zA-Z0-9_-])', //...) - {excluded}"
+        result = subprocess.run(
+            ["bazel", "query", query],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to query bazel targets with tag '{tag}': {e}")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        raise
+
+
+def get_targets_matching_tag_filter(tag_filter: str) -> set[str]:
+    """Resolve a comma-separated resmoke tag filter to the set of matching targets.
+
+    Entries prefixed with '-' are negations: targets carrying that tag are excluded from
+    the union of the targets matched by the positive entries.
+    """
+    included = set()
+    excluded = set()
+    for entry in tag_filter.split(","):
+        tag = entry.strip()
+        if not tag:
+            continue
+        if tag.startswith("-"):
+            excluded.update(get_targets_with_tag(tag.removeprefix("-")))
+        else:
+            included.update(get_targets_with_tag(tag))
+    return included - excluded
+
+
+@cache
+def get_platform_compatible_targets(
+    variant_name: str, cquery_flags: tuple[str, ...], targets: tuple[str, ...]
+) -> set[str]:
+    """Filter targets to those compatible with the variant's target platform."""
+    if not targets:
+        return set()
+
+    candidate_set = "set(" + " ".join(sorted(set(targets))) + ")"
+    try:
+        result = subprocess.run(
+            ["bazel", "cquery", "--config=no-remote-exec"]
+            + list(cquery_flags)
+            + [
+                candidate_set,
+                "--output=starlark",
+                "--starlark:expr",
+                "str(target.label) + ("
+                '" INCOMPATIBLE" if "IncompatiblePlatformProvider" in providers(target)'
+                ' else " OK")',
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to cquery targets for platform compatibility on {variant_name}: {e}")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        raise
+
+    compatible = set()
+    for line in result.stdout.splitlines():
+        label, _, verdict = line.strip().rpartition(" ")
+        if verdict == "OK":
+            compatible.add(label.removeprefix("@@").removeprefix("@"))
+    return compatible
+
+
+def filter_burn_in_targets(
+    targets: set[BurnInTargetInfo], targets_with_tag: set[str], compatible_originals: set[str]
+) -> list[str]:
+    """Return the burn-in targets to run for a variant."""
+    return [
+        target.burn_in_target
+        for target in targets
+        if target.original_target in targets_with_tag
+        and target.original_target in compatible_originals
+    ]
+
+
+def make_task(targets_to_run, variant_name):
+    task = Task(
+        name=f"resmoke_tests_burn_in_{variant_name}",
+        commands=[
+            FunctionCall(
+                "execute resmoke tests via bazel",
+                {
+                    "targets": " ".join(targets_to_run),
+                    "generate_burn_in_targets": True,
+                },
+            ),
+        ],
+    )
+    return task, TaskGroup(
+        name=f"resmoke_tests_burn_in_{variant_name}-TG",
+        tasks=[task],
+        max_hosts=-1,
+        setup_task=[
+            BuiltInCommand("manifest.load", {}),
+            FunctionCall("git get project and add git tag"),
+            FunctionCall("set task expansion macros"),
+            FunctionCall("f_expansions_write"),
+            FunctionCall("kill processes"),
+            FunctionCall("cleanup environment"),
+            FunctionCall("set up venv"),
+            FunctionCall("configure evergreen api credentials"),
+            FunctionCall("set up credentials"),
+            FunctionCall("setup bazel (credentials, bazelrc)"),
+        ],
+        teardown_task=[
+            FunctionCall("s3.put bazel build events"),
+            FunctionCall("debug full disk"),
+            FunctionCall("attach bazel invocation"),
+            FunctionCall("save failed tests"),
+            FunctionCall("f_expansions_write"),
+            FunctionCall("kill processes"),
+        ],
+        setup_group_can_fail_task=True,
+    )
+
+
+app = typer.Typer(pretty_exceptions_show_locals=False)
+
+
+@app.command()
+def generate_targets(
+    origin_rev: str,
+    test_changed_files: Annotated[
+        str | None,
+        typer.Option(hidden=True, help="Comma-separated list of changed files (for testing)"),
+    ] = None,
+):
+    """Generate burn-in test targets for changed test files."""
+    os.chdir(os.environ.get("BUILD_WORKSPACE_DIRECTORY", "."))
+
+    targets = query_targets_to_burn_in(origin_rev, test_changed_files)
+    print(f"\nFound {len(targets)} burn-in targets to generate\n")
+
+    for burn_in_name, original_target, test in targets:
+        print(f"Creating: {original_target} -> {burn_in_name}")
+
+        create_burn_in_target(original_target, burn_in_name, test)
+
+
+@app.command()
+def generate_tasks(
+    origin_rev: str,
+    outfile: Annotated[str, typer.Option()],
+    test_changed_files: Annotated[
+        str | None,
+        typer.Option(hidden=True, help="Comma-separated list of changed files (for testing)"),
+    ] = None,
+):
+    os.chdir(os.environ.get("BUILD_WORKSPACE_DIRECTORY", "."))
+
+    expansions = read_config_file("../expansions.yml")
+    resmoke_disable_rbe = expansions.get("resmoke_disable_rbe", "") == "true"
+
+    targets = query_targets_to_burn_in(origin_rev, test_changed_files)
+
+    evg_conf = parse_evergreen_file(
+        expansions.get("evergreen_config_file_path", "etc/evergreen.yml")
+    )
+
+    project = {"tasks": [], "task_groups": [], "buildvariants": []}
+
+    shrub_project = ShrubProject.empty()
+
+    targets_all = set()
+
+    resmoke_tests_tasks = []
+    result_tasks = {}
+    for variant_name in evg_conf.variant_names:
+        variant = evg_conf.get_variant(variant_name)
+        if not (variant.is_required_variant() or variant.is_suggested_variant()):
+            continue
+        task = variant.get_task("resmoke_tests")
+        if task:
+            targets_with_tag = get_targets_matching_tag_filter(
+                variant.expansion("resmoke_tests_tag_filter")
+            )
+
+            _, cquery_flags, _ = variant_cquery_flags(variant, task, expansions)
+            candidate_originals = tuple(
+                target.original_target
+                for target in targets
+                if target.original_target in targets_with_tag
+            )
+            compatible_originals = get_platform_compatible_targets(
+                variant_name, tuple(cquery_flags), candidate_originals
+            )
+
+            burn_in_targets_to_run = filter_burn_in_targets(
+                targets, targets_with_tag, compatible_originals
+            )
+            if burn_in_targets_to_run:
+                targets_all.update(burn_in_targets_to_run)
+
+                build_variant = BuildVariant(name=variant.name)
+
+                burn_in_task, burn_in_task_group = make_task(burn_in_targets_to_run, variant_name)
+                resmoke_tests_tasks.append(burn_in_task)
+                build_variant.add_task_group(burn_in_task_group)
+
+                results_task_group = make_task_group(
+                    "resmoke_tests_burn_in",
+                    variant.name,
+                    targets,
+                    f"resmoke_tests_burn_in_{variant.name}",
+                    resmoke_disable_rbe=resmoke_disable_rbe,
+                )
+                result_tasks[results_task_group.name] = burn_in_targets_to_run
+                build_variant.add_task_group(results_task_group)
+
+                build_variant.display_task(
+                    display_name="burn_in_tests",
+                    execution_existing_tasks=[ExistingTask(burn_in_task.name)]
+                    + [ExistingTask(task) for task in burn_in_targets_to_run],
+                    activate=False,
+                )
+
+                shrub_project.add_build_variant(build_variant)
+
+    project = shrub_project.as_dict()
+    tasks = [
+        make_results_task(
+            target, resmoke_disable_rbe=resmoke_disable_rbe, generate_burn_in_targets=True
+        )
+        for target in targets_all
+    ] + [task.as_dict() for task in resmoke_tests_tasks]
+    project["tasks"] = tasks
+
+    for variant in project.get("buildvariants", []):
+        for task in variant.get("tasks", []):
+            task["activate"] = False
+
+            # Typical variants running resmoke tests set a variant-wide dependency. During conversion,
+            # these are not a dependency for the `resmoke_tests` task or the results tasks added here.
+            # Set an explicitly depends_on in the task group's reference to override it. Remove with SERVER-119809.
+            if task["name"] in result_tasks:
+                depends_on = [{"name": f"resmoke_tests_burn_in_{variant['name']}"}]
+                if resmoke_disable_rbe:
+                    # archive_dist_test may live on a separate compile variant; resolve it
+                    # per-variant here because Evergreen does not expand ${compile_variant}
+                    # in depends_on.variant.
+                    evg_variant = evg_conf.get_variant(variant["name"])
+                    compile_variant = evg_variant.expansion("compile_variant") or variant["name"]
+                    depends_on.append({"name": "archive_dist_test", "variant": compile_variant})
+                task["depends_on"] = depends_on
+            else:
+                task["depends_on"] = {
+                    "name": "version_burn_in_gen",
+                    "variant": "generate-tasks-for-version",
+                    "omit_generated_tasks": True,
+                }
+    for task in project["tasks"]:
+        task["exec_timeout_secs"] = 3720
+    for task_group in project.get("task_groups", []):
+        if task_group["name"] in result_tasks:
+            task_group["tasks"] = result_tasks[task_group["name"]]
+
+    with open(outfile, "w") as f:
+        f.write(json.dumps(project, indent=4))
+
+
+if __name__ == "__main__":
+    app()

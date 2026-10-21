@@ -1,248 +1,413 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-
 #include "mongo/base/status.h"
-#include "mongo/db/dbmessage.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/query/lite_parsed_query.h"
-#include "mongo/db/query/parsed_projection.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_distinct.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/compiler/logical_model/projection/projection.h"
+#include "mongo/db/query/compiler/logical_model/sort_pattern/sort_pattern.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/parsed_find_command.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 namespace mongo {
 
-    // TODO: Is this binary data really?
-    typedef std::string PlanCacheKey;
+class OperationContext;
 
-    class CanonicalQuery {
-    public:
-        /**
-         * Caller owns the pointer in 'out' if any call to canonicalize returns Status::OK().
-         *
-         * Used for legacy find through the OP_QUERY message.
-         */
-        static Status canonicalize(const QueryMessage& qm,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] CanonicalQueryParams {
+    boost::intrusive_ptr<ExpressionContext> expCtx;
+    std::variant<std::unique_ptr<ParsedFindCommand>, ParsedFindCommandParams> parsedFind;
+    std::vector<boost::intrusive_ptr<DocumentSource>> pipeline = {};
+    bool isCountLike = false;
+    bool isSearchQuery = false;
+    // True if this query comes from an aggregation command with a non-empty pipeline.
+    bool aggWithNonEmptyPipeline = false;
+};
 
-        /**
-         * Takes ownership of 'lpq'.
-         *
-         * Caller owns the pointer in 'out' if any call to canonicalize returns Status::OK().
-         *
-         * Used for finds using the find command path.
-         */
-        static Status canonicalize(LiteParsedQuery* lpq,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] CanonicalQuery {
+public:
+    // A type that encodes the notion of query shape suitable for use with the plan cache. Encodes
+    // the query's match, projection, sort, etc. potentially with some constants removed or replaced
+    // with parameter markers.
+    typedef std::string QueryShapeString;
 
-        /**
-         * For testing or for internal clients to use.
-         */
+    // A second encoding of query shape similar to 'QueryShapeString' above, except designed to work
+    // with index filters and the 'planCacheClear' command. A caller can encode a query into an
+    // 'PlanCacheCommandKey' in order to look for for matching index filters that should apply to
+    // the query, or plan cache entries to which the 'planCacheClear' command should be applied.
+    typedef std::string PlanCacheCommandKey;
 
-        /**
-         * Used for creating sub-queries from an existing CanonicalQuery.
-         *
-         * 'root' must be an expression in baseQuery.root().
-         *
-         * Does not take ownership of 'root'.
-         */
-        static Status canonicalize(const CanonicalQuery& baseQuery,
-                                   MatchExpression* root,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    CanonicalQuery(CanonicalQueryParams&& params);
 
-        static Status canonicalize(const std::string& ns,
-                                   const BSONObj& query,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    /**
+     * Deprecated factory method for creating CanonicalQuery.
+     */
+    static StatusWith<std::unique_ptr<CanonicalQuery>> make(CanonicalQueryParams&& params);
 
-        static Status canonicalize(const std::string& ns,
-                                   const BSONObj& query,
-                                   bool explain,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    /**
+     * Used for creating sub-queries from an existing CanonicalQuery, only for use by
+     * 'makeForSubplanner()'.
+     */
+    CanonicalQuery(OperationContext* opCtx, const CanonicalQuery& baseQuery, size_t i);
 
-        static Status canonicalize(const std::string& ns, 
-                                   const BSONObj& query,
-                                   long long skip,
-                                   long long limit, 
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    /**
+     * Construct a 'CanonicalQuery' for a subquery of the given query. This function should only be
+     * invoked by the subplanner. 'baseQuery' must contain a MatchExpression with rooted $or. This
+     * function returns a 'CanonicalQuery' housing a copy of the i'th child of the root.
+     */
+    static StatusWith<std::unique_ptr<CanonicalQuery>> makeForSubplanner(
+        OperationContext* opCtx, const CanonicalQuery& baseQuery, size_t i);
 
-        static Status canonicalize(const std::string& ns,
-                                   const BSONObj& query,
-                                   const BSONObj& sort,
-                                   const BSONObj& proj, 
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    /**
+     * Perform validation checks on the normalized 'root' which could not be checked before
+     * normalization - those should happen in
+     * parsed_find_command::validateAndGetAvailableMetadata().
+     */
+    static Status isValidNormalized(const MatchExpression* root);
 
-        static Status canonicalize(const std::string& ns, 
-                                   const BSONObj& query,
-                                   const BSONObj& sort,
-                                   const BSONObj& proj,
-                                   long long skip,
-                                   long long limit,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    const NamespaceString& nss() const {
+        tassert(11320903,
+                "cannot call nss() on a UUID NamespaceStringOrUUID",
+                _findCommand->getNamespaceOrUUID().isNamespaceString());
+        return _findCommand->getNamespaceOrUUID().nss();
+    }
 
-        static Status canonicalize(const std::string& ns,
-                                   const BSONObj& query,
-                                   const BSONObj& sort,
-                                   const BSONObj& proj,
-                                   long long skip,
-                                   long long limit,
-                                   const BSONObj& hint,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    //
+    // Accessors for the query
+    //
+    MatchExpression* getPrimaryMatchExpression() const {
+        return _primaryMatchExpression.get();
+    }
+    const BSONObj& getQueryObj() const {
+        return _findCommand->getFilter();
+    }
+    const FindCommandRequest& getFindCommandRequest() const {
+        return *_findCommand;
+    }
 
-        static Status canonicalize(const std::string& ns,
-                                   const BSONObj& query,
-                                   const BSONObj& sort,
-                                   const BSONObj& proj,
-                                   long long skip,
-                                   long long limit,
-                                   const BSONObj& hint,
-                                   const BSONObj& minObj,
-                                   const BSONObj& maxObj,
-                                   bool snapshot,
-                                   bool explain,
-                                   CanonicalQuery** out,
-                                   const MatchExpressionParser::WhereCallback& whereCallback =
-                                            MatchExpressionParser::WhereCallback());
+    /**
+     * Returns the projection, or nullptr if none.
+     */
+    const projection_ast::Projection* getProj() const {
+        return _proj.get_ptr();
+    }
 
-        /**
-         * Returns true if "query" describes an exact-match query on _id, possibly with
-         * the $isolated/$atomic modifier.
-         */
-        static bool isSimpleIdQuery(const BSONObj& query);
+    projection_ast::Projection* getProj() {
+        return _proj.get_ptr();
+    }
 
-        // What namespace is this query over?
-        const std::string& ns() const { return _pq->ns(); }
+    const boost::optional<SortPattern>& getSortPattern() const {
+        return _sortPattern;
+    }
 
-        //
-        // Accessors for the query
-        //
-        MatchExpression* root() const { return _root.get(); }
-        BSONObj getQueryObj() const { return _pq->getFilter(); }
-        const LiteParsedQuery& getParsed() const { return *_pq; }
-        const ParsedProjection* getProj() const { return _proj.get(); }
+    void resetSortPattern() {
+        _findCommand->setSort(BSONObj());
+        _sortPattern = boost::none;
+    }
 
-        /**
-         * Get the cache key for this canonical query.
-         */
-        const PlanCacheKey& getPlanCacheKey() const;
+    void resetDistinct() {
+        _distinct = boost::none;
+    }
 
-        // Debugging
-        std::string toString() const;
-        std::string toStringShort() const;
+    const boost::optional<CanonicalDistinct>& getDistinct() const {
+        return _distinct;
+    }
 
-        /**
-         * Validates match expression, checking for certain
-         * combinations of operators in match expression and
-         * query options in LiteParsedQuery.
-         * Since 'root' is derived from 'filter' in LiteParsedQuery,
-         * 'filter' is not validated.
-         *
-         * TODO: Move this to query_validator.cpp
-         */
-        static Status isValid(MatchExpression* root, const LiteParsedQuery& parsed);
+    CanonicalDistinct* getDistinct() {
+        return _distinct.get_ptr();
+    }
 
-        /**
-         * Returns the normalized version of the subtree rooted at 'root'.
-         *
-         * Takes ownership of 'root'.
-         */
-        static MatchExpression* normalizeTree(MatchExpression* root);
+    const CollatorInterface* getCollator() const {
+        return _expCtx->getCollator();
+    }
 
-        /**
-         * Traverses expression tree post-order.
-         * Sorts children at each non-leaf node by (MatchType, path(), cacheKey)
-         */
-        static void sortTree(MatchExpression* tree);
+    std::shared_ptr<CollatorInterface> getCollatorShared() const {
+        return _expCtx->getCollatorShared();
+    }
 
-        /**
-         * Returns a count of 'type' nodes in expression tree.
-         */
-        static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
+    /**
+     * Returns a bitset indicating what metadata has been requested in the query.
+     */
+    const QueryMetadataBitSet& metadataDeps() const {
+        return _metadataDeps;
+    }
 
-        /**
-         * Takes ownership of 'tree'.  Performs some rewriting of the query to a logically
-         * equivalent but more digestible form.
-         *
-         * TODO: This doesn't entirely belong here.  Really we'd do this while exploring
-         * solutions in an enumeration setting but given the current lack of pruning
-         * while exploring the enumeration space we do it here.
-         */
-        static MatchExpression* logicalRewrite(MatchExpression* tree);
-    private:
-        // You must go through canonicalize to create a CanonicalQuery.
-        CanonicalQuery() { }
+    /**
+     * Allows callers to request metadata in addition to that needed as part of the query.
+     */
+    void requestAdditionalMetadata(const QueryMetadataBitSet& additionalDeps) {
+        _metadataDeps |= additionalDeps;
+    }
 
-        /**
-         * Computes and stores the cache key / query shape
-         * for this query.
-         */
-        void generateCacheKey(void);
+    /**
+     * Similar to 'encodeKey()' above, but intended for use with plan cache commands rather than
+     * the plan cache itself.
+     */
+    PlanCacheCommandKey encodeKeyForPlanCacheCommand() const;
 
-        /**
-         * Takes ownership of 'root' and 'lpq'.
-         */
-        Status init(LiteParsedQuery* lpq,
-                    const MatchExpressionParser::WhereCallback& whereCallback,
-                    MatchExpression* root);
+    /**
+     * Sets this CanonicalQuery's collator, and sets the collator on this CanonicalQuery's match
+     * expression tree.
+     *
+     * This setter can be used to override the collator that was created from the query request
+     * during CanonicalQuery construction.
+     */
+    void setCollator(std::unique_ptr<CollatorInterface> collator);
 
-        boost::scoped_ptr<LiteParsedQuery> _pq;
+    void setDistinct(CanonicalDistinct&& distinct) {
+        _distinct.emplace(std::move(distinct));
+    }
 
-        // _root points into _pq->getFilter()
-        boost::scoped_ptr<MatchExpression> _root;
+    /**
+     * Serializes this CanonicalQuery to a BSON object of the following form:
+     * {
+     *   filter: <filter object>,            // empty object if there is no filter
+     *   projection: <projection object>,    // field only included if there is a projection
+     *   sort: <sort object>                 // field only included if there is a sort
+     * }
+     *
+     * This function is used for CQF explain purposes.
+     */
+    void serializeToBson(BSONObjBuilder* out) const;
 
-        boost::scoped_ptr<ParsedProjection> _proj;
+    // Debugging
+    std::string toString(bool forErrMsg = false) const;
+    std::string toStringShort(bool forErrMsg = false) const;
 
-        /**
-         * Cache key is a string-ified combination of the query and sort obfuscated
-         * for minimal user comprehension.
-         */
-        PlanCacheKey _cacheKey;
+    std::string toStringForErrorMsg() const {
+        return toString(true);
+    }
+    std::string toStringShortForErrorMsg() const {
+        return toStringShort(true);
+    }
 
-        bool _isForWrite;
-    };
+    boost::optional<ExplainOptions::Verbosity> getExplain() const {
+        tassert(11320904, "_expCtx must not be null", _expCtx);
+        return _expCtx->getExplain();
+    }
+
+    void setSbeCompatible(bool sbeCompatible) {
+        _sbeCompatible = sbeCompatible;
+    }
+
+    bool isSbeCompatible() const {
+        return _sbeCompatible;
+    }
+
+    bool isParameterized() const {
+        return !_inputParamIdToExpressionMap.empty();
+    }
+
+    const std::vector<const MatchExpression*>& getInputParamIdToMatchExpressionMap() const {
+        return _inputParamIdToExpressionMap;
+    }
+
+    bool getDisablePlanCache() const {
+        return _disablePlanCache;
+    }
+
+    boost::optional<size_t> getMaxMatchExpressionParams() const {
+        return _maxMatchExpressionParams;
+    }
+
+    bool getForceGenerateRecordId() const {
+        return _forceGenerateRecordId;
+    }
+
+    void setForceGenerateRecordId(bool value) {
+        _forceGenerateRecordId = value;
+    }
+
+    OperationContext* getOpCtx() const {
+        tassert(6508300, "'CanonicalQuery' does not have an 'ExpressionContext'", _expCtx);
+        return _expCtx->getOperationContext();
+    }
+
+    auto& getExpCtx() const {
+        return _expCtx;
+    }
+    auto getExpCtxRaw() const {
+        return _expCtx.get();
+    }
+
+    void setCqPipeline(std::vector<boost::intrusive_ptr<DocumentSource>> cqPipeline,
+                       bool containsEntirePipeline);
+
+    void clearCqPipeline();
+
+    void removeSuffixFromCqPipeline(size_t sourcesToRemove);
+
+    const std::vector<boost::intrusive_ptr<DocumentSource>>& cqPipeline() const {
+        return _cqPipeline;
+    }
+
+    std::vector<boost::intrusive_ptr<DocumentSource>>& cqPipeline() {
+        return _cqPipeline;
+    }
+
+    bool containsEntirePipeline() const {
+        return _containsEntirePipeline;
+    }
+
+    /**
+     * Returns true if the query is a count-like query, i.e. has no dependencies on inputs (see
+     * DepsTracker::hasNoRequirements()). These queries can be served without accessing the source
+     * documents (e.g. {$group: {_id: null, c: {$min: 42}}}) in which case we might be able to avoid
+     * scanning the collection and instead use COUNT_SCAN or other optimizations.
+     *
+     * Note that this applies to the find/non-pipeline portion of the query. If the count-like group
+     * is pushed down, later execution stages cannot be treated like a count. In other words, a
+     * query with a pushed-down group may be considered a count at the data access layer but not
+     * above the canonical query.
+     */
+    bool isCountLike() const {
+        return _isCountLike;
+    }
+
+    /**
+     * Add parameters for match expressions that were pushed down via '_cqPipeline'.
+     */
+    void addMatchParams(const std::vector<const MatchExpression*>& newParams) {
+        _inputParamIdToExpressionMap.insert(
+            _inputParamIdToExpressionMap.end(), newParams.begin(), newParams.end());
+    }
+
+    int numParams() {
+        return _inputParamIdToExpressionMap.size();
+    }
+
+    // Return true if the cqPipeline starts with $search or $searchMeta.
+    bool isSearchQuery() const {
+        return _isSearchQuery;
+    }
+
+    bool isExplainAndCacheIneligible() const {
+        return getExplain() && !getExpCtxRaw()->getInLookup();
+    }
+
+    void optimizeProjection() {
+        if (_proj) {
+            _proj->optimize();
+        }
+    }
+
+    /**
+     * Indicates whether this query was created specifically for the sub planner.
+     */
+    bool forSubPlanner() const {
+        return _forSubPlanner;
+    }
+
+    /**
+     * Return the solution hash for the forced plan.
+     */
+    boost::optional<int64_t> getForcedPlanSolutionHash() const {
+        return _findCommand->getForcedPlanSolutionHash();
+    }
+
+    void setAggWithNonEmptyPipeline(bool aggWithNonEmptyPipeline) {
+        _aggWithNonEmptyPipeline = aggWithNonEmptyPipeline;
+    }
+
+    bool aggWithNonEmptyPipeline() const {
+        return _aggWithNonEmptyPipeline;
+    }
+
+private:
+    void initCq(boost::intrusive_ptr<ExpressionContext> expCtx,
+                std::unique_ptr<ParsedFindCommand> parsedFind,
+                std::vector<boost::intrusive_ptr<DocumentSource>> cqPipeline,
+                bool isCountLike,
+                bool isSearchQuery,
+                bool aggWithNonEmptyPipeline,
+                bool optimizeMatchExpression);
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+    std::unique_ptr<FindCommandRequest> _findCommand;
+
+    // The match expression at the base of the query tree.
+    std::unique_ptr<MatchExpression> _primaryMatchExpression;
+
+    boost::optional<projection_ast::Projection> _proj;
+
+    boost::optional<SortPattern> _sortPattern;
+
+    boost::optional<CanonicalDistinct> _distinct;
+
+    // A query can include a post-processing pipeline here. Logically it is applied after all the
+    // other operations (filter, sort, project, skip, limit). Holds the SBE-eligible document
+    // sources.
+    //  - In the default get_executor path, this is populated before query optimization and all
+    //  stages
+    //    will be executed in SBE.
+    //  - In the deferred get_executor path, it's populated after QO (during engine selection) and
+    //  all
+    //    or some of the stages might be executed in SBE, depending on engine selection logic.
+    std::vector<boost::intrusive_ptr<DocumentSource>> _cqPipeline;
+
+    // True iff '_cqPipeline' contains all aggregation pipeline stages in the query. When
+    // '_containsEntirePipeline' is false, the output of '_cqPipeline' may need to be processed by
+    // further 'DocumentSource' stages.
+    bool _containsEntirePipeline{false};
+
+    // Keeps track of what metadata has been explicitly requested.
+    QueryMetadataBitSet _metadataDeps;
+
+    // True if this query can be executed by the SBE.
+    bool _sbeCompatible = false;
+
+    // True if this query must produce a RecordId output in addition to the BSON objects that
+    // constitute the result set of the query. Any generated query solution must not discard record
+    // ids, even if the optimizer detects that they are not going to be consumed downstream.
+    bool _forceGenerateRecordId = false;
+
+    // Tells whether plan caching is disabled.
+    bool _disablePlanCache = false;
+
+    // A map from assigned InputParamId's to parameterised MatchExpression's.
+    std::vector<const MatchExpression*> _inputParamIdToExpressionMap;
+
+    // This limits the number of MatchExpression parameters we create for the CanonicalQuery before
+    // stopping. (We actually stop at this + 1.) A value of boost::none means unlimited.
+    boost::optional<size_t> _maxMatchExpressionParams = boost::none;
+
+    // "True" for queries that after doing a scan of an index can produce an empty document and
+    // still be correct. For example, this applies to queries like [{$match: {x: 42}}, {$count:
+    // "c"}] in presence of index on "x". The stage that follows the index scan doesn't have to be
+    // $count but it must have no dependencies on the fields from the prior stages. Note, that
+    // [{$match: {x: 42}}, {$group: {_id: "$y"}}, {$count: "c"}]] is _not_ "count like" because
+    // the first $group stage needs to access field "y" and this access cannot be incorporated into
+    // the index scan.
+    bool _isCountLike = false;
+
+
+    bool _isSearchQuery = false;
+
+    bool _forSubPlanner = false;
+
+    // Value is true if this was an aggregate query with a non-empty pipeline.
+    bool _aggWithNonEmptyPipeline = false;
+};
 
 }  // namespace mongo

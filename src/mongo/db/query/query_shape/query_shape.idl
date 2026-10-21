@@ -1,0 +1,25 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo::query_shape"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    CommandNamespace:
+        description: "Representation of the cmdNs sub-object of the query shape."
+        fields:
+            db:
+                type: string
+            coll:
+                type: string
+                optional: true
+            uuid:
+                type: string
+                optional: true
+            tenantId:
+                type: string
+                optional: true

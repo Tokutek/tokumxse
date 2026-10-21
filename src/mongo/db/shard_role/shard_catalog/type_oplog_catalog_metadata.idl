@@ -1,0 +1,104 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/type_database.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+
+structs:
+    CreateDatabaseMetadataOplogEntry:
+        description: "Oplog entry format for a createDatabase metadata operation."
+        strict: false
+        fields:
+            createDatabaseMetadata:
+                type: string
+                description: "Database associated to the oplog entry"
+            db:
+                type: DatabaseType
+                description: "Database metadata entry"
+            fromClone:
+                type: bool
+                description: "Indicates whether the database metadata was created as part of a cloneAuthoritativeMetadata DDL"
+
+    DropDatabaseMetadataOplogEntry:
+        description: "Oplog entry format for a dropDatabase metadata operation"
+        strict: false
+        fields:
+            dropDatabaseMetadata:
+                type: string
+                description: "Database associated to the oplog entry"
+            dbName:
+                type: database_name
+                description: "Database name"
+
+    InvalidateAllCollectionMetadataOplogEntry:
+        description: "Oplog entry format for clearing every CSS entry, based on local CSS knowledge"
+        strict: false
+        fields:
+            invalidateAllCollectionMetadata:
+                type: safeInt
+                description: "Always 1; identifies the command"
+
+    InvalidateAllDatabaseMetadataOplogEntry:
+        description: "Oplog entry format for clearing every DSS entry, based on local DSS knowledge"
+        strict: false
+        fields:
+            invalidateAllDatabaseMetadata:
+                type: safeInt
+                description: "Always 1; identifies the command"
+
+    InvalidateCollectionMetadataOplogEntry:
+        description: "Oplog entry format for a metadata operation that triggers a CSS recovery from the durable state"
+        strict: false
+        fields:
+            invalidateCollectionMetadata:
+                type: string
+                description: "Collection name for which we are triggering the recovery"
+            forDroppedCollection:
+                type: bool
+                description: "If true, indicates the invalidation precedes a collection drop"
+                default: false
+            onlyClearIfShardDoesntOwnChunks:
+                type: bool
+                description:
+                    "If true, only nodes that own no chunks for the collection clear their in-memory
+                    state (unowned, untracked, or tracked with zero owned chunks). Used when a shard
+                    persists chunkless tracked metadata: such a node may hold a stale leftover entry
+                    and must recover it, while a node that owns chunks is kept current by its own
+                    commit path and must not be cleared."
+                default: false
+            shardVersion:
+                type: ChunkVersion
+                optional: true
+                description:
+                    "The shard placement version durably written for this collection. UNOWNED
+                    nodes always clear their in-memory metadata regardless of this value. Other
+                    nodes only use this version to decide whether to clear: when set, they clear
+                    if their known in-memory metadata is not already equivalent to this version."
+
+    UpdateCollectionMetadataOplogEntry:
+        description: "Oplog entry format for delta changes to apply to the overall CSS"
+        strict: false
+        fields:
+            updateCollectionMetadata:
+                type: string
+                description: "Collection name for which we are applying the metadata update"
+            changedChunks:
+                type: array<object_owned>
+                description: "Chunk documents inserted or updated"
+
+    SetAllowChunkOperationsOplogEntry:
+        description: "Oplog entry format to signal the change of allowChunkOperations"
+        strict: false
+        fields:
+            setAllowChunkOperations:
+                type: string
+                description: "Collection name for which we are changing allowChunkOperations"
+            allowChunkOperations:
+                type: bool
+                description: "The new value of allowChunkOperations"

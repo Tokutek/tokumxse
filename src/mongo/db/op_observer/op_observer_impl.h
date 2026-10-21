@@ -1,0 +1,325 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/operation_logger.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/transaction/transaction_operations.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+namespace repl {
+
+class ReplOperation;
+
+}  // namespace repl
+
+class OpObserverImpl : public OpObserver {
+    OpObserverImpl(const OpObserverImpl&) = delete;
+    OpObserverImpl& operator=(const OpObserverImpl&) = delete;
+
+public:
+    OpObserverImpl(std::unique_ptr<OperationLogger> operationLogger);
+    ~OpObserverImpl() override = default;
+
+    NamespaceFilters getNamespaceFilters() const final {
+        return {NamespaceFilter::kAll, NamespaceFilter::kAll};
+    }
+
+    void onCreateIndex(OperationContext* opCtx,
+                       const NamespaceString& nss,
+                       const UUID& uuid,
+                       const IndexBuildInfo& indexBuildInfo,
+                       bool fromMigrate,
+                       bool isTimeseries = false) final;
+
+    void onStartIndexBuild(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           const UUID& collUUID,
+                           const UUID& indexBuildUUID,
+                           const std::vector<IndexBuildInfo>& indexes,
+                           bool fromMigrate,
+                           bool isTimeseries = false) final;
+    void onStartIndexBuildSinglePhase(OperationContext* opCtx, const NamespaceString& nss) final;
+
+    void onCommitIndexBuild(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            const UUID& collUUID,
+                            const UUID& indexBuildUUID,
+                            const std::vector<IndexBuildInfo>& indexes,
+                            const std::vector<boost::optional<BSONObj>>& multikey,
+                            bool fromMigrate,
+                            bool isTimeseries = false) final;
+
+    void onAbortIndexBuild(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           const UUID& collUUID,
+                           const UUID& indexBuildUUID,
+                           const std::vector<IndexBuildInfo>& indexes,
+                           const Status& cause,
+                           bool fromMigrate,
+                           bool isTimeseries = false) final;
+
+    void onSetMultikeyMetadata(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const std::string& idxName,
+                               const BSONObj& multikeyPaths) final;
+
+    void onInserts(OperationContext* opCtx,
+                   const CollectionPtr& coll,
+                   std::vector<InsertStatement>::const_iterator first,
+                   std::vector<InsertStatement>::const_iterator last,
+                   const std::vector<RecordId>& recordIds,
+                   const std::vector<bool>& fromMigrate,
+                   bool defaultFromMigrate,
+                   OpStateAccumulator* opAccumulator = nullptr) final;
+
+    void onUpdate(OperationContext* opCtx,
+                  const OplogUpdateEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) final;
+    void onDelete(OperationContext* opCtx,
+                  const CollectionPtr& coll,
+                  StmtId stmtId,
+                  const BSONObj& doc,
+                  const DocumentKey& documentKey,
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) final;
+
+    void onContainerInsert(OperationContext* opCtx,
+                           std::string_view ident,
+                           int64_t key,
+                           std::span<const char> value) final;
+
+    void onContainerInsert(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const char> key,
+                           std::span<const char> value) final;
+
+    void onContainerInsert(OperationContext* opCtx,
+                           std::string_view ident,
+                           int64_t key,
+                           std::span<const std::span<const char>> vals) final;
+
+    void onContainerInsert(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const std::span<const char>> keys,
+                           std::span<const char> value) final;
+
+    void onContainerUpdate(OperationContext* opCtx,
+                           std::string_view ident,
+                           int64_t key,
+                           std::span<const char> value) final;
+
+    void onContainerUpdate(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const char> key,
+                           std::span<const char> value) final;
+
+    void onContainerDelete(OperationContext* opCtx, std::string_view ident, int64_t key) final;
+
+    void onContainerDelete(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const char> key) final;
+
+    void onContainerDelete(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const std::span<const char>> keys) final;
+
+    void onInternalOpMessage(OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             const boost::optional<UUID>& uuid,
+                             const BSONObj& msgObj,
+                             boost::optional<BSONObj> o2MsgObj,
+                             boost::optional<repl::OpTime> preImageOpTime,
+                             boost::optional<repl::OpTime> postImageOpTime,
+                             boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                             boost::optional<OplogSlot> slot,
+                             boost::optional<Date_t> wallClockTime = boost::none) final;
+    /**
+     * Enforces that 'createCollCatalogIdentifier' must be present to log the creation of a
+     * replicated collection when 'featureFlagReplicateLocalCatalogIdentifier' is enabled.
+     */
+    void onCreateCollection(
+        OperationContext* opCtx,
+        const NamespaceString& collectionName,
+        const CollectionOptions& options,
+        const BSONObj& idIndex,
+        const OplogSlot& createOpTime,
+        const boost::optional<CreateCollCatalogIdentifier>& createCollCatalogIdentifier,
+        bool fromMigrate,
+        bool isTimeseries = false,
+        bool recordIdsReplicated = false) final;
+    void onCollMod(OperationContext* opCtx,
+                   const NamespaceString& nss,
+                   const UUID& uuid,
+                   const BSONObj& collModCmd,
+                   const CollectionOptions& oldCollOptions,
+                   boost::optional<IndexCollModInfo> indexInfo,
+                   bool isTimeseries = false) final;
+    void onDropDatabase(OperationContext* opCtx,
+                        const DatabaseName& dbName,
+                        bool markFromMigrate) final;
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  const UUID& uuid,
+                                  std::uint64_t numRecords,
+                                  bool markFromMigrate,
+                                  bool isTimeseries = false) final;
+    void onDropIndex(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     const UUID& uuid,
+                     const std::string& indexName,
+                     const BSONObj& indexInfo,
+                     bool isTimeseries = false) final;
+    repl::OpTime preRenameCollection(OperationContext* opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     const UUID& uuid,
+                                     const boost::optional<UUID>& dropTargetUUID,
+                                     std::uint64_t numRecords,
+                                     bool stayTemp,
+                                     bool markFromMigrate,
+                                     bool isTimeseries = false) final;
+    void postRenameCollection(OperationContext* opCtx,
+                              const NamespaceString& fromCollection,
+                              const NamespaceString& toCollection,
+                              const UUID& uuid,
+                              const boost::optional<UUID>& dropTargetUUID,
+                              bool stayTemp) final;
+    void onRenameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            const UUID& uuid,
+                            const boost::optional<UUID>& dropTargetUUID,
+                            std::uint64_t numRecords,
+                            bool stayTemp,
+                            bool markFromMigrate,
+                            bool isTimeseries) final;
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun,
+                            bool isTimeseries) final;
+    void onTransactionStart(OperationContext* opCtx) final;
+    void onUnpreparedTransactionCommit(
+        OperationContext* opCtx,
+        const std::vector<OplogSlot>& reservedSlots,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
+        OpStateAccumulator* opAccumulator = nullptr) final;
+    void onBatchedWriteStart(OperationContext* opCtx) final;
+    void onBatchedWriteCommit(OperationContext* opCtx,
+                              WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+                              OpStateAccumulator* opAccumulator = nullptr) final;
+    void onBatchedWriteAbort(OperationContext* opCtx) final;
+    void onPreparedTransactionCommit(OperationContext* opCtx,
+                                     OplogSlot commitOplogEntryOpTime,
+                                     Timestamp commitTimestamp) noexcept final;
+
+    void preTransactionPrepare(
+        OperationContext* opCtx,
+        const std::vector<OplogSlot>& reservedSlots,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
+        Date_t wallClockTime) final {}
+
+    void onTransactionPrepare(
+        OperationContext* opCtx,
+        const std::vector<OplogSlot>& reservedSlots,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
+        size_t numberOfPrePostImagesToWrite,
+        Date_t wallClockTime,
+        OpStateAccumulator* opAccumulator = nullptr) final;
+
+    void postTransactionPrepare(OperationContext* opCtx,
+                                const std::vector<OplogSlot>& reservedSlots,
+                                const TransactionOperations& transactionOperations) final {}
+
+    void onTransactionPrepareNonPrimaryForChunkMigration(
+        OperationContext* opCtx,
+        const LogicalSessionId& lsid,
+        boost::optional<const std::vector<repl::OplogEntry>&> statements,
+        boost::optional<const repl::OpTime&> prepareOpTime) override;
+
+    void onTransactionAbort(OperationContext* opCtx,
+                            boost::optional<OplogSlot> abortOplogEntryOpTime) final;
+    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) final {}
+
+    void onCreateDatabaseMetadata(OperationContext* opCtx, const repl::OplogEntry& op) final {}
+
+    void onDropDatabaseMetadata(OperationContext* opCtx, const repl::OplogEntry& op) final {}
+
+    void onInvalidateAllCollectionMetadata(OperationContext* opCtx,
+                                           const repl::OplogEntry& op) final {}
+
+    void onInvalidateAllDatabaseMetadata(OperationContext* opCtx,
+                                         const repl::OplogEntry& op) final {}
+
+    void onInvalidateCollectionMetadata(OperationContext* opCtx, const repl::OplogEntry& op) final {
+    }
+
+    void onSetAllowChunkOperations(OperationContext* opCtx, const repl::OplogEntry& op) final {}
+
+    void onUpdateCollectionMetadata(OperationContext* opCtx, const repl::OplogEntry& op) final {}
+
+    void onTruncateRange(OperationContext* opCtx,
+                         const CollectionPtr& coll,
+                         const RecordId& minRecordId,
+                         const RecordId& maxRecordId,
+                         int64_t bytesDeleted,
+                         int64_t docsDeleted,
+                         repl::OpTime& opTime) final;
+
+    void onUpgradeDowngradeViewlessTimeseries(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              const UUID& uuid,
+                                              bool isUpgrade,
+                                              bool skipViewCreation = false) final;
+
+    void onReplicatedIdentDrop(OperationContext* opCtx,
+                               const std::string& ident,
+                               repl::OpTime& opTime) final;
+
+    void onInitReplicatedFastCount(OperationContext* opCtx,
+                                   const InitReplicatedFastCountO2& o2,
+                                   repl::OpTime& opTime) final;
+
+private:
+    std::unique_ptr<OperationLogger> _operationLogger;
+};
+
+}  // namespace mongo

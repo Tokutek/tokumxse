@@ -1,0 +1,85 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/document_source_sequential_document_cache.h"
+
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/exec/agg/mock_stage.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string>
+
+
+namespace mongo {
+namespace {
+
+// This provides access to getExpCtx(), but we'll use a different name for this test suite.
+using DocumentSourceSequentialDocumentCacheTest = AggregationContextFixture;
+
+long long defaultMaxCacheSize() {
+    // This test constructs the cache directly with no operation; the limit is a fixed
+    // startup value, so there is no OperationContext to resolve against.
+    return loadMemoryLimit(StageMemoryLimit::DocumentSourceLookupCacheSizeBytes).get(nullptr);
+}
+
+TEST_F(DocumentSourceSequentialDocumentCacheTest, ReturnsEOFOnSubsequentCallsAfterSourceExhausted) {
+    auto cache = std::make_shared<SequentialDocumentCache>(defaultMaxCacheSize());
+    auto documentSourceSequentialDocumentCache =
+        DocumentSourceSequentialDocumentCache::create(getExpCtx(), cache);
+    auto mockStage =
+        exec::agg::MockStage::createForTest({"{a: 1, b: 2}", "{a: 3, b: 4}"}, getExpCtx());
+    auto sequentialDocumentCacheStage =
+        exec::agg::buildStageAndStitch(documentSourceSequentialDocumentCache, mockStage);
+
+    ASSERT(sequentialDocumentCacheStage->getNext().isAdvanced());
+    ASSERT(sequentialDocumentCacheStage->getNext().isAdvanced());
+    ASSERT(sequentialDocumentCacheStage->getNext().isEOF());
+    ASSERT(sequentialDocumentCacheStage->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceSequentialDocumentCacheTest, ReturnsEOFAfterCacheExhausted) {
+    auto cache = std::make_shared<SequentialDocumentCache>(defaultMaxCacheSize());
+    cache->add(DOC("_id" << 0));
+    cache->add(DOC("_id" << 1));
+    cache->freeze();
+
+    auto documentSourceSequentialDocumentCache =
+        DocumentSourceSequentialDocumentCache::create(getExpCtx(), cache);
+    auto sequentialDocumentCacheStage =
+        exec::agg::buildStage(documentSourceSequentialDocumentCache);
+
+    ASSERT(cache->isServing());
+    ASSERT(sequentialDocumentCacheStage->getNext().isAdvanced());
+    ASSERT(sequentialDocumentCacheStage->getNext().isAdvanced());
+    ASSERT(sequentialDocumentCacheStage->getNext().isEOF());
+    ASSERT(sequentialDocumentCacheStage->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceSequentialDocumentCacheTest, Redaction) {
+    auto cache = std::make_shared<SequentialDocumentCache>(defaultMaxCacheSize());
+    cache->add(DOC("_id" << 0));
+    cache->add(DOC("_id" << 1));
+    auto documentCache = DocumentSourceSequentialDocumentCache::create(getExpCtx(), cache);
+    std::vector<Value> vals;
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$sequentialCache":{"maxSizeBytes":"?number","status":"kBuilding"}})",
+        redact(*documentCache, true, ExplainOptions::Verbosity::kQueryPlanner));
+
+    cache->freeze();
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$sequentialCache":{"maxSizeBytes":"?number","status":"kServing"}})",
+        redact(*documentCache, true, ExplainOptions::Verbosity::kQueryPlanner));
+
+    cache->abandon();
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$sequentialCache":{"maxSizeBytes":"?number","status":"kAbandoned"}})",
+        redact(*documentCache, true, ExplainOptions::Verbosity::kQueryPlanner));
+}
+}  // namespace
+}  // namespace mongo

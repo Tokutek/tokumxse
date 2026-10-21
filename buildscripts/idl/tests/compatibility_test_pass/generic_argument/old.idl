@@ -1,0 +1,48 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "test_types.idl"
+
+structs:
+    GenericArguments:
+        description: "Adding new generic arguments, removing an unstable generic argument should still pass"
+        is_generic_cmd_list: "arg"
+        fields:
+            genericArgument:
+                type: dummyType
+                forward_to_shards: false
+            unstableGenericArgument:
+                type: dummyType
+                forward_to_shards: false
+                stability: unstable
+            removedUnstableGenericArgument:
+                type: dummyType
+                forward_to_shards: false
+                stability: unstable
+            removedInternalGenericArgument:
+                type: dummyType
+                forward_to_shards: false
+                stability: internal
+
+    GenericReplyFields:
+        description: "Adding new generic reply fields, removing an unstable generic reply field should still pass"
+        is_generic_cmd_list: "reply"
+        fields:
+            genericReplyField:
+                type: dummyType
+                forward_from_shards: false
+            unstableGenericReplyField:
+                type: dummyType
+                forward_from_shards: false
+                stability: unstable
+            removedUnstableGenericReplyField:
+                type: dummyType
+                forward_from_shards: false
+                stability: unstable
+            removedInternalGenericReplyField:
+                type: dummyType
+                forward_from_shards: false
+                stability: internal

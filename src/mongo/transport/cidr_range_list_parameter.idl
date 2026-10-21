@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::transport"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    CIDRRangeListParameter:
+        description: "A parameter value containing a list of CIDR ranges"
+        strict: true
+        fields:
+            ranges:
+                description: "An array of CIDR ranges"
+                type: array<string>

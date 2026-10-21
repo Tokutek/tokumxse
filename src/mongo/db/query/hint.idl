@@ -1,0 +1,21 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# IDL type for index hints
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/query/hint_parser.h"
+    mod_visibility: private
+
+types:
+    indexHint:
+        bson_serialization_type: any
+        description: "Either a string index name or an object index specification."
+        cpp_type: mongo::BSONObj
+        serializer: "::mongo::serializeHintToBSON"
+        deserializer: "::mongo::parseHint"
+        # Construction uses BSONObjBuilder, which will memcpy the data, meaning the constructed
+        # BSONObj is a non-view.
+        is_view: false

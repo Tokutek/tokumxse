@@ -1,0 +1,398 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/global_catalog/ddl/refine_collection_shard_key_coordinator.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/ddl/shard_key_util.h"
+#include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
+#include "mongo/db/global_catalog/ddl/sharding_ddl_util.h"
+#include "mongo/db/global_catalog/ddl/sharding_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/repl/change_stream_oplog_notification.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/s/primary_only_service_helpers/all_shards_and_config_causality_barrier.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/commit_collection_metadata_locally.h"
+#include "mongo/db/shard_role/shard_catalog/participant_block_gen.h"
+#include "mongo/db/shard_role/shard_catalog/shard_filtering_metadata_refresh.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/sharding_environment/sharding_logging.h"
+#include "mongo/db/topology/shard_registry.h"
+#include "mongo/db/topology/sharding_state.h"
+#include "mongo/db/topology/vector_clock/vector_clock.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/logv2/log.h"
+
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+namespace {
+
+void logRefineCollectionShardKey(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 const std::string& eventStr,
+                                 const BSONObj& obj) {
+    ShardingLogging::get(opCtx)->logChange(
+        opCtx, str::stream() << "refineCollectionShardKey." << eventStr, nss, obj);
+}
+
+std::vector<ShardId> getShardsWithDataForCollection(OperationContext* opCtx,
+                                                    const NamespaceString& nss) {
+    // Do a refresh to get the latest routing information.
+    const auto cm = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getCollectionPlacementInfoWithRefresh(opCtx, nss));
+    AutoGetCollection col(opCtx, nss, MODE_IS);
+    std::set<ShardId> vecsSet;
+    cm.getAllShardIds(&vecsSet);
+    return std::vector<ShardId>(vecsSet.begin(), vecsSet.end());
+}
+
+std::vector<ShardId> getDataShardsAndDbPrimaryShard(OperationContext* opCtx,
+                                                    const NamespaceString& nss) {
+    auto shards = getShardsWithDataForCollection(opCtx, nss);
+    const auto primaryShardId = ShardingState::get(opCtx)->shardId();
+    if (std::find(shards.begin(), shards.end(), primaryShardId) == shards.end()) {
+        shards.push_back(primaryShardId);
+    }
+    return shards;
+}
+
+}  // namespace
+
+RefineCollectionShardKeyCoordinator::RefineCollectionShardKeyCoordinator(
+    ShardingCoordinatorService* service, const BSONObj& initialState)
+    : RecoverableShardingDDLCoordinator(
+          service, "RefineCollectionShardKeyCoordinator", initialState),
+      _request(_doc.getRefineCollectionShardKeyRequest()),
+      _critSecReason(BSON("command" << "refineCollectionShardKey"
+                                    << "ns"
+                                    << NamespaceStringUtil::serialize(
+                                           nss(), SerializationContext::stateDefault()))) {}
+
+void RefineCollectionShardKeyCoordinator::checkIfOptionsConflict(const BSONObj& doc) const {
+    // If we have two refine collections on the same namespace, then the arguments must be the same.
+    const auto otherDoc = RefineCollectionShardKeyCoordinatorDocument::parse(
+        doc, IDLParserContext("RefineCollectionShardKeyCoordinatorDocument"));
+
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Another refine collection with different arguments is already running for the same "
+            "namespace",
+            SimpleBSONObjComparator::kInstance.evaluate(
+                _request.toBSON() == otherDoc.getRefineCollectionShardKeyRequest().toBSON()));
+}
+
+void RefineCollectionShardKeyCoordinator::appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const {
+    cmdInfoBuilder->appendElements(_request.toBSON());
+}
+
+bool RefineCollectionShardKeyCoordinator::_mustAlwaysMakeProgress() {
+    // In phases equal or greater than kRemoteIndexValidation, always make progress means cleanup
+    // must be called to ensure migrations are re-enabled and the critical section released. In
+    // phases equal or greater than kCommit always make progress means to repeat the phases until
+    // the DDL finishes succesfully.
+    return _doc.getPhase() >= Phase::kRemoteIndexValidation;
+}
+
+
+ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token) noexcept {
+    return ExecutorFuture<void>(**executor)
+        .then([this, anchor = shared_from_this()] {
+            // Run local checks.
+            if (_doc.getPhase() < Phase::kRemoteIndexValidation) {
+                auto opCtxHolder = makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+
+                // Make sure the latest placement version is recovered as of the time of the
+                // invocation of the command.
+                uassertStatusOK(FilteringMetadataCache::get(opCtx)->onShardVersionMismatch(
+                    opCtx, nss(), boost::none));
+                {
+                    AutoGetCollection coll{
+                        opCtx,
+                        nss(),
+                        MODE_IS,
+                        auto_get_collection::Options{}
+                            .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                            .expectedUUID(_request.getCollectionUUID())};
+
+                    uassert(ErrorCodes::NamespaceNotFound,
+                            str::stream() << "RefineCollectionShardKey: collection "
+                                          << nss().toStringForErrorMsg() << " does not exists",
+                            coll);
+
+                    _doc.setUuid(coll->uuid());
+
+                    const auto scopedCsr =
+                        CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx,
+                                                                                          nss());
+                    auto metadata = scopedCsr->getCurrentMetadataIfKnown();
+                    uassert(ErrorCodes::NamespaceNotSharded,
+                            str::stream()
+                                << "Can't execute refineCollectionShardKey on unsharded collection "
+                                << nss().toStringForErrorMsg(),
+                            metadata && metadata->isSharded());
+                    _doc.setOldKey(
+                        metadata->getChunkManager()->getShardKeyPattern().getKeyPattern());
+
+                    if (auto ts = metadata->getTimeseriesFields()) {
+                        auto bucketsKey = shardkeyutil::validateAndTranslateTimeseriesShardKey(
+                            ts->getTimeseriesOptions(), _doc.getNewShardKey().toBSON());
+                        _doc.setNewShardKey(KeyPattern(bucketsKey));
+                    }
+
+                    // No need to keep going if the shard key is already refined.
+                    if (SimpleBSONObjComparator::kInstance.evaluate(
+                            _doc.getOldKey()->toBSON() == _doc.getNewShardKey().toBSON())) {
+                        uasserted(ErrorCodes::RequestAlreadyFulfilled,
+                                  str::stream() << "Collection " << nss().toStringForErrorMsg()
+                                                << " already refined");
+                    }
+                    _doc.setOldEpoch(metadata->getChunkManager()->getVersion().epoch());
+                    _doc.setOldTimestamp(metadata->getChunkManager()->getVersion().getTimestamp());
+                }
+
+                // Validate the given shard key extends the current shard key.
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "refineCollectionShardKey shard key "
+                                      << _doc.getNewShardKey().toString()
+                                      << " does not extend the current shard key "
+                                      << _doc.getOldKey()->toString(),
+                        ShardKeyPattern(_doc.getOldKey()->toBSON())
+                            .isExtendedBy(ShardKeyPattern(_doc.getNewShardKey().toBSON())));
+            }
+        })
+        .then(_buildPhaseHandler(
+            Phase::kRemoteIndexValidation,
+            [this, token, anchor = shared_from_this(), executor](auto* opCtx) {
+                // Stop migrations during most of the execution of the coordinator to guarantee a
+                // stable placement.
+                sharding_ddl_util::stopMigrations(
+                    opCtx,
+                    nss(),
+                    _request.getCollectionUUID(),
+                    [&] { return getNewSession(opCtx); },
+                    _doc.getAuthoritativeMetadataAccessLevel());
+
+                const auto& ns = nss();
+                auto opts = [&] {
+                    ShardsvrValidateShardKeyCandidate validateRequest(ns);
+                    validateRequest.setKey(_doc.getNewShardKey());
+                    validateRequest.setEnforceUniquenessCheck(_request.getEnforceUniquenessCheck());
+                    validateRequest.setDbName(DatabaseName::kAdmin);
+                    return std::make_shared<
+                        async_rpc::AsyncRPCOptions<ShardsvrValidateShardKeyCandidate>>(
+                        **executor, token, std::move(validateRequest));
+                }();
+
+                sharding::router::CollectionRouter router(opCtx, ns);
+                router.routeWithRoutingContext(
+                    "validating indexes for refineCollectionShardKey"sv,
+                    [&](OperationContext* opCtx, RoutingContext& routingCtx) {
+                        sharding_ddl_util::sendAuthenticatedVersionedCommandTargetedByRoutingTable(
+                            opCtx, opts, routingCtx, ns);
+                    });
+            }))
+        .then(_buildPhaseHandler(
+            Phase::kBlockCrud,
+            [this, token, anchor = shared_from_this(), executor](auto* opCtx) {
+                const auto shardIds = getDataShardsAndDbPrimaryShard(opCtx, nss());
+                const auto session = getNewSession(opCtx);
+                sharding_ddl_util::sendShardsvrParticipantBlockCommandToShards(
+                    opCtx,
+                    nss(),
+                    shardIds,
+                    CriticalSectionBlockTypeEnum::kReadsAndWrites,
+                    _critSecReason,
+                    _doc.getAuthoritativeMetadataAccessLevel(),
+                    session,
+                    executor,
+                    token);
+
+                // Once there are no writes in the cluster, select an epoch and a timestamp.
+                if (!_doc.getNewEpoch()) {
+                    _doc.setNewEpoch(OID::gen());
+                }
+                if (!_doc.getNewTimestamp()) {
+                    _doc.setNewTimestamp([opCtx] {
+                        VectorClock::VectorTime vt = VectorClock::get(opCtx)->getTime();
+                        return vt.clusterTime().asTimestamp();
+                    }());
+                }
+                logRefineCollectionShardKey(opCtx,
+                                            nss(),
+                                            "start",
+                                            BSON("oldKey" << _doc.getOldKey()->toBSON() << "newKey"
+                                                          << _doc.getNewShardKey().toBSON()
+                                                          << "oldEpoch" << *_doc.getOldEpoch()
+                                                          << "newEpoch" << *_doc.getNewEpoch()));
+            }))
+        .then(_buildPhaseHandler(
+            Phase::kCommit,
+            [this, token, anchor = shared_from_this(), executor](auto* opCtx) {
+                ConfigsvrCommitRefineCollectionShardKey commitRequest(nss());
+
+                CommitRefineCollectionShardKeyRequest cRCSreq(_doc.getNewShardKey(),
+                                                              *_doc.getNewEpoch(),
+                                                              *_doc.getNewTimestamp(),
+                                                              *_doc.getOldTimestamp());
+                commitRequest.setDbName(DatabaseName::kAdmin);
+                commitRequest.setCommitRefineCollectionShardKeyRequest(cRCSreq);
+                generic_argument_util::setMajorityWriteConcern(commitRequest);
+
+                auto commitResponse =
+                    Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommand(
+                        opCtx,
+                        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                        DatabaseName::kAdmin,
+                        commitRequest.toBSON(),
+                        Shard::RetryPolicy::kIdempotent);
+
+                uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(commitResponse));
+
+                if (_doc.getAuthoritativeMetadataAccessLevel() >=
+                    AuthoritativeMetadataAccessLevelEnum::kWritesAllowed) {
+                    // The DB primary shard must always know that a collection is tracked, even when
+                    // it does not own any chunks.
+                    const auto involvedShards = getDataShardsAndDbPrimaryShard(opCtx, nss());
+                    const auto session = getNewSession(opCtx);
+                    sharding_ddl_util::commitRefineCollectionShardKeyToShardCatalog(
+                        opCtx, nss(), involvedShards, session, executor, token);
+                }
+
+                // Checkpoint the configTime to ensure that, in the case of a stepdown, the new
+                // primary will start-up from a configTime that is inclusive of the metadata
+                // removable that was committed during the critical section.
+                VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+            }))
+        .then(_buildPhaseHandler(Phase::kReleaseCritSec,
+                                 [this, token, anchor = shared_from_this(), executor](auto* opCtx) {
+                                     _exitCriticalSection(opCtx, executor, token);
+                                 }))
+        .then(_buildPhaseHandler(
+            Phase::kResumeMigrations,
+            [this, token, anchor = shared_from_this(), executor](auto* opCtx) {
+                notifyChangeStreamsOnRefineCollectionShardKeyComplete(
+                    opCtx, nss(), _doc.getNewShardKey(), _doc.getOldKey().get(), *_doc.getUuid());
+                sharding_ddl_util::resumeMigrations(
+                    opCtx,
+                    nss(),
+                    boost::none,
+                    [&] { return getNewSession(opCtx); },
+                    _doc.getAuthoritativeMetadataAccessLevel());
+                logRefineCollectionShardKey(opCtx, nss(), "end", BSONObj());
+            }))
+        .then([this, anchor = shared_from_this(), executor] {
+            auto opCtxHolder = makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+
+            if (_doc.getAuthoritativeMetadataAccessLevel() ==
+                AuthoritativeMetadataAccessLevelEnum::kNone) {
+                // Refresh all shards so cache is warmed up for queries.
+                sharding_util::tellShardsToRefreshCollection(
+                    opCtx, getShardsWithDataForCollection(opCtx, nss()), nss(), **executor);
+            }
+        })
+        .onError([this, anchor = shared_from_this()](const Status& status) {
+            // Ensure migrations are re-enabled and the critical section released if we haven't
+            // committed.
+            if (!_isRetriableErrorForDDLCoordinator(status) && _doc.getPhase() < Phase::kCommit &&
+                _doc.getPhase() >= Phase::kRemoteIndexValidation) {
+                const auto opCtxHolder = makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                triggerCleanup(opCtx, status);
+                MONGO_UNREACHABLE_TASSERT(11761500);
+            }
+            return status;
+        })
+        .onCompletion([this, anchor = shared_from_this()](const Status& status) {
+            auto opCtxHolder = makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+
+            Status finalStatus =
+                status == ErrorCodes::RequestAlreadyFulfilled ? Status::OK() : status;
+
+            if (status == ErrorCodes::RequestAlreadyFulfilled) {
+                notifyChangeStreamsOnRefineCollectionShardKeyComplete(
+                    opCtx, nss(), _doc.getNewShardKey(), _doc.getOldKey().get(), *_doc.getUuid());
+            }
+            return finalStatus;
+        });
+}
+
+bool RefineCollectionShardKeyCoordinator::isInCriticalSection(Phase phase) const {
+    return phase >= Phase::kBlockCrud && phase <= Phase::kReleaseCritSec;
+}
+
+ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_cleanupOnAbort(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token,
+    const Status& status) noexcept {
+    return ExecutorFuture<void>(**executor)
+        .then([this, token, executor = executor, status, anchor = shared_from_this()] {
+            const auto opCtxHolder = makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+
+            AllShardsAndConfigCausalityBarrier barrier{**executor, token};
+            performCausalityBarrier(opCtx, barrier);
+
+            if (_doc.getPhase() >= Phase::kBlockCrud) {
+                _exitCriticalSection(opCtx, executor, token);
+            }
+
+            if (_doc.getPhase() >= Phase::kRemoteIndexValidation) {
+                sharding_ddl_util::resumeMigrations(
+                    opCtx,
+                    nss(),
+                    boost::none,
+                    [&] { return getNewSession(opCtx); },
+                    _doc.getAuthoritativeMetadataAccessLevel());
+            }
+        });
+}
+
+void RefineCollectionShardKeyCoordinator::_exitCriticalSection(
+    OperationContext* opCtx,
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+    const CancellationToken& token) {
+    const auto shardIds = getDataShardsAndDbPrimaryShard(opCtx, nss());
+    const auto session = getNewSession(opCtx);
+    sharding_ddl_util::sendShardsvrParticipantBlockCommandToShards(
+        opCtx,
+        nss(),
+        shardIds,
+        CriticalSectionBlockTypeEnum::kUnblock,
+        _critSecReason,
+        _doc.getAuthoritativeMetadataAccessLevel(),
+        session,
+        executor,
+        token);
+}
+
+}  // namespace mongo

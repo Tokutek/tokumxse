@@ -1,236 +1,249 @@
-/**
- *    Copyright (C) 2013-2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/json.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/exec/classic/index_scan.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/index_builds/index_build_test_helpers.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 /**
  * This file tests db/exec/index_scan.cpp
  */
 
+namespace mongo {
 namespace QueryStageTests {
 
-    using std::auto_ptr;
+class IndexScanBase {
+public:
+    IndexScanBase() : _client(&_opCtx) {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns());
 
-    class IndexScanBase {
-    public:
-        IndexScanBase() : _client(&_txn) {
-            OldClientWriteContext ctx(&_txn, ns());
-
-            for (int i = 0; i < numObj(); ++i) {
-                BSONObjBuilder bob;
-                bob.append("foo", i);
-                bob.append("baz", i);
-                bob.append("bar", numObj() - i);
-                _client.insert(ns(), bob.obj());
-            }
-
-            addIndex(BSON("foo" << 1));
-            addIndex(BSON("foo" << 1 << "baz" << 1));
+        for (int i = 0; i < numObj(); ++i) {
+            BSONObjBuilder bob;
+            bob.append("foo", i);
+            bob.append("baz", i);
+            bob.append("bar", numObj() - i);
+            _client.insert(nss(), bob.obj());
         }
 
-        virtual ~IndexScanBase() {
-            OldClientWriteContext ctx(&_txn, ns());
-            _client.dropCollection(ns());
+        addIndex(BSON("foo" << 1));
+        addIndex(BSON("foo" << 1 << "baz" << 1));
+    }
+
+    virtual ~IndexScanBase() {
+        _client.dropCollection(nss());
+    }
+
+    void addIndex(const BSONObj& obj) {
+        ASSERT_OK(createIndex(&_opCtx, ns(), obj));
+    }
+
+    int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
+        const auto collection = acquireCollection(
+            &_opCtx,
+            CollectionAcquisitionRequest(NamespaceString::createNamespaceString_forTest(ns()),
+                                         PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                         repl::ReadConcernArgs::get(&_opCtx),
+                                         AcquisitionPrerequisites::kRead),
+            MODE_IS);
+
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterObj, _expCtx);
+        MONGO_verify(statusWithMatcher.isOK());
+        std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
+
+        auto ws = std::make_unique<WorkingSet>();
+        auto ix = std::make_unique<IndexScan>(
+            _expCtx.get(), collection, params, ws.get(), filterExpr.get());
+
+        auto exec = plan_executor_factory::make(_expCtx,
+                                                std::move(ws),
+                                                std::move(ix),
+                                                collection,
+                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                                QueryPlannerParams::DEFAULT);
+
+        int count = 0;
+        PlanExecutor::ExecState state;
+        for (RecordId dl; PlanExecutor::ADVANCED ==
+             (state = exec->getNext(static_cast<BSONObj*>(nullptr), &dl));) {
+            ++count;
         }
+        ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
 
-        void addIndex(const BSONObj& obj) {
-            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
-        }
+        return count;
+    }
 
-        int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
-            AutoGetCollectionForRead ctx(&_txn, ns());
+    const IndexCatalogEntry* getIndex(const BSONObj& obj) {
+        const auto collection = acquireCollection(
+            &_opCtx,
+            CollectionAcquisitionRequest(NamespaceString::createNamespaceString_forTest(ns()),
+                                         PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                         repl::ReadConcernArgs::get(&_opCtx),
+                                         AcquisitionPrerequisites::kRead),
+            MODE_IS);
+        std::vector<const IndexCatalogEntry*> indexes;
+        collection.getCollectionPtr()->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
+        return indexes.empty() ? nullptr : indexes[0];
+    }
 
-            StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
-            verify(swme.isOK());
-            auto_ptr<MatchExpression> filterExpr(swme.getValue());
+    IndexScanParams makeIndexScanParams(OperationContext* opCtx, const IndexCatalogEntry* entry) {
+        const auto collection = acquireCollection(
+            &_opCtx,
+            CollectionAcquisitionRequest(NamespaceString::createNamespaceString_forTest(ns()),
+                                         PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                         repl::ReadConcernArgs::get(&_opCtx),
+                                         AcquisitionPrerequisites::kRead),
+            MODE_IS);
+        IndexScanParams params(opCtx, collection.getCollectionPtr(), entry);
+        params.bounds.isSimpleRange = true;
+        params.bounds.endKey = BSONObj();
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
+        params.direction = 1;
+        return params;
+    }
 
-            WorkingSet* ws = new WorkingSet();
+    static int numObj() {
+        return 50;
+    }
+    static const char* ns() {
+        return "unittests.IndexScan";
+    }
+    static NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest(ns());
+    }
 
-            PlanExecutor* rawExec;
-            Status status = PlanExecutor::make(&_txn,
-                                               ws,
-                                               new IndexScan(&_txn, params, ws, filterExpr.get()),
-                                               ctx.getCollection(),
-                                               PlanExecutor::YIELD_MANUAL,
-                                               &rawExec);
-            ASSERT_OK(status);
-            boost::scoped_ptr<PlanExecutor> exec(rawExec);
+protected:
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_txnPtr;
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        ExpressionContextBuilder{}
+            .opCtx(&_opCtx)
+            .ns(NamespaceString::createNamespaceString_forTest(ns()))
+            .build();
 
-            int count = 0;
-            for (RecordId dl; PlanExecutor::ADVANCED == exec->getNext(NULL, &dl); ) {
-                ++count;
-            }
+private:
+    DBDirectClient _client;
+};
 
-            return count;
-        }
+class QueryStageIXScanBasic : public IndexScanBase {
+public:
+    ~QueryStageIXScanBasic() override {}
 
-        void makeGeoData() {
-            OldClientWriteContext ctx(&_txn, ns());
+    void run() {
+        // foo <= 20
+        auto params = makeIndexScanParams(&_opCtx, this->getIndex(BSON("foo" << 1)));
+        params.bounds.startKey = BSON("" << 20);
+        params.direction = -1;
 
-            for (int i = 0; i < numObj(); ++i) {
-                double lat = double(rand()) / RAND_MAX;
-                double lng = double(rand()) / RAND_MAX;
-                _client.insert(ns(), BSON("geo" << BSON_ARRAY(lng << lat)));
-            }
-        }
+        ASSERT_EQUALS(countResults(params), 21);
+    }
+};
 
-        IndexDescriptor* getIndex(const BSONObj& obj) {
-            AutoGetCollectionForRead ctx(&_txn, ns());
-            Collection* collection = ctx.getCollection();
-            return collection->getIndexCatalog()->findIndexByKeyPattern( &_txn, obj );
-        }
+class QueryStageIXScanLowerUpper : public IndexScanBase {
+public:
+    ~QueryStageIXScanLowerUpper() override {}
 
-        static int numObj() { return 50; }
-        static const char* ns() { return "unittests.IndexScan"; }
+    void run() {
+        // 20 <= foo < 30
+        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1)));
+        params.bounds.startKey = BSON("" << 20);
+        params.bounds.endKey = BSON("" << 30);
+        params.bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
+        params.direction = 1;
 
-    protected:
-        OperationContextImpl _txn;
+        ASSERT_EQUALS(countResults(params), 10);
+    }
+};
 
-    private:
-        DBDirectClient _client;
-    };
+class QueryStageIXScanLowerUpperIncl : public IndexScanBase {
+public:
+    ~QueryStageIXScanLowerUpperIncl() override {}
 
-    class QueryStageIXScanBasic : public IndexScanBase {
-    public:
-        virtual ~QueryStageIXScanBasic() { }
+    void run() {
+        // 20 <= foo <= 30
+        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1)));
+        params.bounds.startKey = BSON("" << 20);
+        params.bounds.endKey = BSON("" << 30);
 
-        void run() {
-            // foo <= 20
-            IndexScanParams params;
-            params.descriptor = getIndex(BSON("foo" << 1));
-            params.bounds.isSimpleRange = true;
-            params.bounds.startKey = BSON("" << 20);
-            params.bounds.endKey = BSONObj();
-            params.bounds.endKeyInclusive = true;
-            params.direction = -1;
+        ASSERT_EQUALS(countResults(params), 11);
+    }
+};
 
-            ASSERT_EQUALS(countResults(params), 21);
-        }
-    };
+class QueryStageIXScanLowerUpperInclFilter : public IndexScanBase {
+public:
+    ~QueryStageIXScanLowerUpperInclFilter() override {}
 
-    class QueryStageIXScanLowerUpper : public IndexScanBase {
-    public:
-        virtual ~QueryStageIXScanLowerUpper() { }
+    void run() {
+        // 20 <= foo < 30
+        // foo == 25
+        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1)));
+        params.bounds.startKey = BSON("" << 20);
+        params.bounds.endKey = BSON("" << 30);
 
-        void run() {
-            // 20 <= foo < 30
-            IndexScanParams params;
-            params.descriptor = getIndex(BSON("foo" << 1));
-            params.bounds.isSimpleRange = true;
-            params.bounds.startKey = BSON("" << 20);
-            params.bounds.endKey = BSON("" << 30);
-            params.bounds.endKeyInclusive = false;
-            params.direction = 1;
+        ASSERT_EQUALS(countResults(params, BSON("foo" << 25)), 1);
+    }
+};
 
-            ASSERT_EQUALS(countResults(params), 10);
-        }
-    };
+class QueryStageIXScanCantMatch : public IndexScanBase {
+public:
+    ~QueryStageIXScanCantMatch() override {}
 
-    class QueryStageIXScanLowerUpperIncl : public IndexScanBase {
-    public:
-        virtual ~QueryStageIXScanLowerUpperIncl() { }
+    void run() {
+        // 20 <= foo < 30
+        // bar == 25 (not covered, should error.)
+        auto params = makeIndexScanParams(&_opCtx, getIndex(BSON("foo" << 1)));
+        params.bounds.startKey = BSON("" << 20);
+        params.bounds.endKey = BSON("" << 30);
 
-        void run() {
-            // 20 <= foo <= 30
-            IndexScanParams params;
-            params.descriptor = getIndex(BSON("foo" << 1));
-            params.bounds.isSimpleRange = true;
-            params.bounds.startKey = BSON("" << 20);
-            params.bounds.endKey = BSON("" << 30);
-            params.bounds.endKeyInclusive = true;
-            params.direction = 1;
+        ASSERT_THROWS(countResults(params, BSON("baz" << 25)), AssertionException);
+    }
+};
 
-            ASSERT_EQUALS(countResults(params), 11);
-        }
-    };
+class All : public unittest::OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("query_stage_tests") {}
 
-    class QueryStageIXScanLowerUpperInclFilter : public IndexScanBase {
-    public:
-        virtual ~QueryStageIXScanLowerUpperInclFilter() { }
+    void setupTests() override {
+        add<QueryStageIXScanBasic>();
+        add<QueryStageIXScanLowerUpper>();
+        add<QueryStageIXScanLowerUpperIncl>();
+        add<QueryStageIXScanLowerUpperInclFilter>();
+        add<QueryStageIXScanCantMatch>();
+    }
+};
 
-        void run() {
-            // 20 <= foo < 30
-            // foo == 25
-            IndexScanParams params;
-            params.descriptor = getIndex(BSON("foo" << 1));
-            params.bounds.isSimpleRange = true;
-            params.bounds.startKey = BSON("" << 20);
-            params.bounds.endKey = BSON("" << 30);
-            params.bounds.endKeyInclusive = true;
-            params.direction = 1;
+unittest::OldStyleSuiteInitializer<All> queryStageTestsAll;
 
-            ASSERT_EQUALS(countResults(params, BSON("foo" << 25)), 1);
-        }
-    };
-
-    class QueryStageIXScanCantMatch : public IndexScanBase {
-    public:
-        virtual ~QueryStageIXScanCantMatch() { }
-
-        void run() {
-            // 20 <= foo < 30
-            // bar == 25 (not covered, should error.)
-            IndexScanParams params;
-            params.descriptor = getIndex(BSON("foo" << 1));
-            params.bounds.isSimpleRange = true;
-            params.bounds.startKey = BSON("" << 20);
-            params.bounds.endKey = BSON("" << 30);
-            params.bounds.endKeyInclusive = true;
-            params.direction = 1;
-
-            ASSERT_THROWS(countResults(params, BSON("baz" << 25)), MsgAssertionException);
-        }
-    };
-
-    class All : public Suite {
-    public:
-        All() : Suite( "query_stage_tests" ) { }
-
-        void setupTests() {
-            add<QueryStageIXScanBasic>();
-            add<QueryStageIXScanLowerUpper>();
-            add<QueryStageIXScanLowerUpperIncl>();
-            add<QueryStageIXScanLowerUpperInclFilter>();
-            add<QueryStageIXScanCantMatch>();
-        }
-    };
-
-    SuiteInstance<All> queryStageTestsAll;
-
-}  // namespace
+}  // namespace QueryStageTests
+}  // namespace mongo

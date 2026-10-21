@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _shardsvrJoinMigrations:
+        command_name: _shardsvrJoinMigrations
+        cpp_name: ShardsvrJoinMigrations
+        description: "Command to synch the caller on the completion of any chunk migration activity performed by the shard (as either donor or recipient)"
+        namespace: ignored
+        api_version: ""
+        strict: false

@@ -1,130 +1,91 @@
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <vector>
-
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/hasher.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/shared_buffer_fragment.h"
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    struct TwoDIndexingParams;
-    struct S2IndexingParams;
+class CollectionPtr;
+class CollatorInterface;
 
-    namespace fts {
+namespace fts {
 
-        class FTSSpec;
+class FTSSpec;
 
-    }  // namespace fts
+}  // namespace fts
+
+/**
+ * Do not use this class or any of its methods directly.
+ *
+ * The key generation of btree-indexed expression indices is kept outside of the access method for
+ * testing and for upgrade compatibility checking.
+ *
+ * The key generators of 2d- and 2dsphere-indexed expressions are kept separate for code ownership
+ * reasons.
+ */
+class ExpressionKeysPrivate {
+public:
+    //
+    // Common
+    //
+
+    static void validateDocumentCommon(const CollectionPtr& collection,
+                                       const BSONObj& obj,
+                                       const BSONObj& keyPattern);
+
+    //
+    // FTS
+    //
+
+    static void getFTSKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                           const BSONObj& obj,
+                           const fts::FTSSpec& ftsSpec,
+                           KeyStringSet* keys,
+                           key_string::Version keyStringVersion,
+                           Ordering ordering,
+                           const boost::optional<RecordId>& id = boost::none);
+
+    //
+    // Hash
+    //
 
     /**
-     * Do not use this class or any of its methods directly.  The key generation of btree-indexed
-     * expression indices is kept outside of the access method for testing and for upgrade
-     * compatibility checking.
+     * Generates keys for hash access method.
      */
-    class ExpressionKeysPrivate {
-    public:
+    static void getHashKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                            const BSONObj& obj,
+                            const BSONObj& keyPattern,
+                            int hashVersion,
+                            bool isSetSparseByUser,
+                            const CollatorInterface* collator,
+                            KeyStringSet* keys,
+                            key_string::Version keyStringVersion,
+                            Ordering ordering,
+                            bool ignoreArraysAlongPath,
+                            const boost::optional<RecordId>& id = boost::none);
 
-        //
-        // 2d
-        //
-
-        static void get2DKeys(const BSONObj &obj,
-                              const TwoDIndexingParams& params,
-                              BSONObjSet* keys,
-                              std::vector<BSONObj>* locs);
-
-        //
-        // FTS
-        //
-
-        static void getFTSKeys(const BSONObj &obj, const fts::FTSSpec& ftsSpec, BSONObjSet* keys);
-
-        //
-        // Hash
-        //
-
-        /**
-         * Generates keys for hash access method.
-         */
-        static void getHashKeys(const BSONObj& obj,
-                                const std::string& hashedField,
-                                HashSeed seed,
-                                int hashVersion,
-                                bool isSparse,
-                                BSONObjSet* keys);
-
-        /**
-         * Hashing function used by both getHashKeys and the cursors we create.
-         * Exposed for testing in dbtests/namespacetests.cpp and
-         * so mongo/db/index_legacy.cpp can use it.
-         */
-        static long long int makeSingleHashKey(const BSONElement& e, HashSeed seed, int v);
-
-        //
-        // Haystack
-        //
-
-        /**
-         * Generates keys for haystack access method.
-         */
-        static void getHaystackKeys(const BSONObj& obj,
-                                    const std::string& geoField,
-                                    const std::vector<std::string>& otherFields,
-                                    double bucketSize,
-                                    BSONObjSet* keys);
-
-        /**
-         * Returns a hash of a BSON element.
-         * Used by getHaystackKeys and HaystackAccessMethod::searchCommand.
-         */
-        static int hashHaystackElement(const BSONElement& e, double bucketSize);
-
-        /**
-         * Joins two strings using underscore as separator.
-         * Used by getHaystackKeys and HaystackAccessMethod::searchCommand.
-         */
-        static std::string makeHaystackString(int hashedX, int hashedY);
-
-        //
-        // S2
-        //
-
-        /**
-         * Generates keys for S2 access method.
-         */
-        static void getS2Keys(const BSONObj& obj,
-                              const BSONObj& keyPattern,
-                              const S2IndexingParams& params,
-                              BSONObjSet* keys);
-    };
+    /**
+     * Hashing function used by both getHashKeys and the cursors we create.
+     * Exposed for testing in dbtests/namespacetests.cpp and
+     * so mongo/db/index_legacy.cpp can use it.
+     */
+    static long long int makeSingleHashKey(const BSONElement& e, int v);
+};
 
 }  // namespace mongo

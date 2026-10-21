@@ -1,0 +1,104 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+
+structs:
+    ConfigSvrCommitChunkMigrationResponse:
+        description: "Response of the _configsvrCommitChunkMigration command."
+        strict: false
+        is_command_reply: true
+        fields:
+            shardVersion:
+                type: ChunkVersion
+                description: "Placement information at the end of the migration."
+
+    MigratedChunkType:
+        description: "ChunkType describing a migrated chunk"
+        strict: false
+        fields:
+            lastmod: ChunkVersion
+            min: object
+            max: object
+
+    ConfigSvrCommitMoveRangeResponse:
+        description: "Response of the _configsvrCommitMoveRange command."
+        strict: false
+        is_command_reply: true
+        fields:
+            changedChunks:
+                type: array<object>
+                description: "A list with the changed chunks by the migration commit, in config BSON form."
+
+commands:
+    # TODO (SERVER-127253) Remove this command once v9.0 branches out
+    _configsvrCommitChunkMigration:
+        command_name: _configsvrCommitChunkMigration
+        cpp_name: CommitChunkMigrationRequest
+        description: "internal _configsvrCommitChunkMigration command for config server"
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        reply_type: ConfigSvrCommitChunkMigrationResponse
+        fields:
+            fromShard:
+                type: shard_id
+                description: "from shard name"
+
+            toShard:
+                type: shard_id
+                description: "to shard name"
+
+            migratedChunk:
+                type: MigratedChunkType
+                description: "ChunkType describing a migrated chunk"
+
+            fromShardCollectionVersion:
+                type: ChunkVersion
+                description: "{ shardVersionField: <version> }"
+
+            authoritative:
+                type: bool
+                description: >-
+                    Set by the MoveRangeCoordinator to request the authoritative commit path. The
+                    legacy path leaves it unset; an absent value means the legacy commit path.
+                optional: true
+
+    _configsvrCommitMoveRange:
+        command_name: _configsvrCommitMoveRange
+        cpp_name: CommitMoveRangeRequest
+        description:
+            "Internal command that commits a chunk migration to the global catalog and
+            returns the chunks it changed."
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        reply_type: ConfigSvrCommitMoveRangeResponse
+        fields:
+            fromShard:
+                type: shard_id
+                description: "Donor shard name."
+
+            toShard:
+                type: shard_id
+                description: "Recipient shard name."
+
+            migratedChunk:
+                type: MigratedChunkType
+                description: "ChunkType describing the migrated chunk."
+
+            donorShardVersionPreMigration:
+                type: ChunkVersion
+                description:
+                    "Donor shard version captured before the migration. Provides the collection
+                    generation used to validate the commit and bounds the read that rebuilds the
+                    response on idempotent retries."

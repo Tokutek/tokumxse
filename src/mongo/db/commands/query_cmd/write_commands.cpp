@@ -1,0 +1,904 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/admission/ticketing/admission_context.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/query_cmd/update_metrics.h"
+#include "mongo/db/commands/query_cmd/write_commands_common.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/exec/mutable_bson/element.h"
+#include "mongo/db/fle_crud.h"
+#include "mongo/db/local_executor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
+#include "mongo/db/query/write_ops/canonical_update.h"
+#include "mongo/db/query/write_ops/delete_request_gen.h"
+#include "mongo/db/query/write_ops/parsed_delete.h"
+#include "mongo/db/query/write_ops/single_write_result_gen.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_exec.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/collection_operation_source.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/timeseries/collection_pre_conditions_util.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_request_util.h"
+#include "mongo/db/timeseries/timeseries_write_util.h"
+#include "mongo/db/timeseries/write_ops/timeseries_write_ops.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/db/transaction/retryable_writes_stats.h"
+#include "mongo/db/transaction_validation.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
+
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+MONGO_FAIL_POINT_DEFINE(hangInsertBeforeWrite);
+MONGO_FAIL_POINT_DEFINE(hangUpdateBeforeWrite);
+
+void redactTooLongLog(mutablebson::Document* cmdObj, std::string_view fieldName) {
+    namespace mmb = mutablebson;
+    mmb::Element root = cmdObj->root();
+    mmb::Element field = root.findFirstChildNamed(fieldName);
+
+    // If the cmdObj is too large, it will be a "too big" message given by CachedBSONObj.get()
+    if (!field.ok()) {
+        return;
+    }
+
+    // Redact the log if there are more than one documents or operations.
+    if (field.countChildren() > 1) {
+        field.setValueInt(field.countChildren()).transitional_ignore();
+    }
+}
+
+bool shouldSkipOutput(OperationContext* opCtx) {
+    const WriteConcernOptions& writeConcern = opCtx->getWriteConcern();
+    return writeConcern.isUnacknowledged() &&
+        (writeConcern.syncMode == WriteConcernOptions::SyncMode::NONE ||
+         writeConcern.syncMode == WriteConcernOptions::SyncMode::UNSET);
+}
+
+/**
+ * Contains hooks that are used by 'populateReply' method.
+ */
+struct PopulateReplyHooks {
+    // Called for each 'SingleWriteResult' processed by 'populateReply' method.
+    std::function<void(const SingleWriteResult&, int)> singleWriteResultHandler;
+
+    // Called after all 'SingleWriteResult' processing is completed by 'populateReply' method.
+    // This is called as the last method.
+    std::function<void()> postProcessHandler;
+};
+
+/**
+ * Method to populate a write command reply message. It takes 'result' parameter as an input
+ * source and populate the fields of 'cmdReply'.
+ */
+template <typename CommandReplyType>
+void populateReply(OperationContext* opCtx,
+                   bool continueOnError,
+                   size_t opsInBatch,
+                   write_ops_exec::WriteResult result,
+                   CommandReplyType* cmdReply,
+                   boost::optional<PopulateReplyHooks> hooks = boost::none) {
+    invariant(cmdReply);
+
+    if (shouldSkipOutput(opCtx))
+        return;
+
+    if (continueOnError) {
+        invariant(!result.results.empty());
+        const auto& lastResult = result.results.back();
+
+        if (lastResult == ErrorCodes::StaleDbVersion ||
+            lastResult == ErrorCodes::ShardCannotRefreshDueToLocksHeld ||
+            ErrorCodes::isStaleShardVersionError(lastResult.getStatus()) ||
+            lastResult == ErrorCodes::CannotImplicitlyCreateCollection) {
+            // For ordered:false commands we need to duplicate these error results for all ops
+            // after we stopped. See handleError() in write_ops_exec.cpp for more info.
+            //
+            // Omit the reason from the duplicate unordered responses so it doesn't consume BSON
+            // object space
+            result.results.resize(opsInBatch, lastResult.getStatus().withReason(""));
+        }
+    }
+
+    long long nVal = 0;
+    std::vector<write_ops::WriteError> errors;
+    for (size_t i = 0; i < result.results.size(); ++i) {
+        if (auto error = write_ops_exec::generateError(
+                opCtx, result.results[i].getStatus(), i, errors.size())) {
+            errors.emplace_back(std::move(*error));
+            continue;
+        }
+
+        const auto& opResult = result.results[i].getValue();
+        nVal += opResult.getN();  // Always there.
+
+        // Handle custom processing of each result.
+        if (hooks && hooks->singleWriteResultHandler)
+            hooks->singleWriteResultHandler(opResult, i);
+    }
+
+    auto& replyBase = cmdReply->getWriteCommandReplyBase();
+
+    replyBase.setN(nVal);
+    if (!result.retriedStmtIds.empty()) {
+        replyBase.setRetriedStmtIds(std::move(result.retriedStmtIds));
+    }
+    if (!errors.empty()) {
+        replyBase.setWriteErrors(std::move(errors));
+    }
+
+    // writeConcernError field is handled by command processor.
+
+    {
+        // Undocumented repl fields that mongos depends on.
+        auto* replCoord = repl::ReplicationCoordinator::get(opCtx->getServiceContext());
+        if (replCoord->getSettings().isReplSet()) {
+            replyBase.setOpTime(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp());
+            replyBase.setElectionId(replCoord->getElectionId());
+        }
+    }
+
+    if (hooks && hooks->postProcessHandler)
+        hooks->postProcessHandler();
+}
+
+class CmdInsert final : public write_ops::InsertCmdVersion1Gen<CmdInsert> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    void snipForLogging(mutablebson::Document* cmdObj) const final {
+        redactTooLongLog(cmdObj, "documents");
+    }
+
+    std::string help() const final {
+        return "insert documents";
+    }
+
+    ReadWriteType getReadWriteType() const final {
+        return Command::ReadWriteType::kWrite;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    bool shouldAffectCommandCounter() const final {
+        return false;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    class Invocation final : public InvocationBaseGen {
+    public:
+        Invocation(OperationContext* opCtx,
+                   const Command* command,
+                   const OpMsgRequest& opMsgRequest)
+            : InvocationBaseGen(opCtx, command, opMsgRequest) {
+            InsertOp::validate(request());
+        }
+
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool supportsRawData() const final {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+
+        write_ops::InsertCommandReply typedRun(OperationContext* opCtx) final try {
+            // On debug builds, verify that the estimated size of the insert command is at least as
+            // large as the size of the actual, serialized insert command. This ensures that the
+            // logic which estimates the size of insert commands is correct.
+            dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
+
+            doTransactionValidationForWrites(opCtx, ns());
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                write_ops::InsertCommandReply insertReply;
+                if (auto batch = processFLEInsert(opCtx, request(), &insertReply);
+                    batch == FLEBatchResult::kProcessed) {
+                    return insertReply;
+                }
+            }
+            auto [preConditions, isTimeseriesLogicalRequest] =
+                timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+                    opCtx, ns(), request(), request().getCollectionUUID());
+
+            // An insert command always has exactly one operation; its QueryStatsMetrics index is 0.
+            auto maybeAttachQueryStatsMetrics = [&](write_ops::InsertCommandReply& reply) {
+                if (request().getIncludeQueryStatsMetrics()) {
+                    std::vector<write_ops::QueryStatsMetrics> metrics;
+                    metrics.emplace_back(0, CurOp::get(opCtx)->debug().getCursorMetrics());
+                    reply.setQueryStatsMetrics(std::move(metrics));
+                }
+            };
+
+            write_ops::InsertCommandReply insertReply;
+            if (isTimeseriesLogicalRequest) {
+                // Re-throw parsing exceptions to be consistent with CmdInsert::Invocation's
+                // constructor.
+                try {
+                    insertReply = timeseries::write_ops::performTimeseriesWrites(
+                        opCtx, request(), preConditions);
+                } catch (DBException& ex) {
+                    ex.addContext(str::stream()
+                                  << "time-series insert failed: " << ns().toStringForErrorMsg());
+                    throw;
+                }
+            } else {
+                if (hangInsertBeforeWrite.shouldFail([&](const BSONObj& data) {
+                        const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "ns"sv);
+                        return fpNss == request().getNamespace();
+                    })) {
+                    hangInsertBeforeWrite.pauseWhileSet();
+                }
+
+                auto reply = write_ops_exec::performInserts(opCtx, request(), preConditions);
+                populateReply(opCtx,
+                              !request().getWriteCommandRequestBase().getOrdered(),
+                              request().getDocuments().size(),
+                              std::move(reply),
+                              &insertReply);
+            }
+
+            maybeAttachQueryStatsMetrics(insertReply);
+            return insertReply;
+        } catch (const DBException& ex) {
+            NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
+            throw;
+        }
+
+    private:
+        void doCheckAuthorization(OperationContext* opCtx) const final try {
+            auth::checkAuthForInsertCommand(AuthorizationSession::get(opCtx->getClient()),
+                                            request().getBypassDocumentValidation(),
+                                            request());
+        } catch (const DBException& ex) {
+            NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
+            throw;
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(CmdInsert).forShard();
+
+class CmdUpdate final : public write_ops::UpdateCmdVersion1Gen<CmdUpdate> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    void snipForLogging(mutablebson::Document* cmdObj) const final {
+        redactTooLongLog(cmdObj, "updates");
+    }
+
+    std::string help() const final {
+        return "update documents";
+    }
+
+    ReadWriteType getReadWriteType() const final {
+        return Command::ReadWriteType::kWrite;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    bool shouldAffectCommandCounter() const final {
+        return false;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    class Invocation final : public InvocationBaseGen {
+    public:
+        Invocation(OperationContext* opCtx,
+                   const Command* command,
+                   const OpMsgRequest& opMsgRequest)
+            : InvocationBaseGen(opCtx, command, opMsgRequest), _commandObj(opMsgRequest.body) {
+            UpdateOp::validate(request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
+
+            invariant(_commandObj.isOwned());
+
+            // Extend the lifetime of `updates` to allow asynchronous mirroring.
+            if (auto seq = opMsgRequest.getSequence("updates"sv); seq && !seq->objs.empty()) {
+                // Current design ignores contents of `updates` array except for the first entry.
+                // Assuming identical collation for all elements in `updates`, future design could
+                // use the disjunction primitive (i.e, `$or`) to compile all queries into a single
+                // filter. Such a design also requires a sound way of combining hints.
+                // TODO (SERVER-134509): Make update commands mirror all elements in the updates
+                // array.
+                invariant(seq->objs.front().isOwned());
+                _updateOpObj = seq->objs.front();
+            } else if (auto updates = _commandObj["updates"]; updates.type() == BSONType::array) {
+                // When updates are not sent as a DocumentSequence, extract the first update object
+                // from the command body.
+                // TODO (SERVER-134509): Make update commands mirror all elements in the updates
+                // array.
+                BSONObjIterator it(updates.Obj());
+                if (it.more()) {
+                    _updateOpObj = it.next().Obj();
+                }
+            }
+        }
+
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool supportsRawData() const final {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+
+        bool getBypass() const {
+            return request().getBypassDocumentValidation();
+        }
+
+        bool supportsReadMirroring() const override {
+            return true;
+        }
+
+        void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+            auto extractQueryDetails = [](const BSONObj& update, BSONObjBuilder* bob) -> void {
+                // "filter", "sort", "hint", and "collation" fields are optional.
+                if (update.isEmpty())
+                    return;
+
+                if (update.hasField("q"))
+                    bob->append("filter", update["q"].Obj());
+                if (update.hasField("sort") && !update["sort"].Obj().isEmpty())
+                    bob->append("sort", update["sort"].Obj());
+                if (update.hasField("hint") && !update["hint"].Obj().isEmpty())
+                    bob->append("hint", update["hint"].Obj());
+                if (update.hasField("collation") && !update["collation"].Obj().isEmpty())
+                    bob->append("collation", update["collation"].Obj());
+            };
+
+            invariant(!_commandObj.isEmpty());
+
+
+            bob->append("find", _commandObj["update"].String());
+            extractQueryDetails(_updateOpObj, bob);
+            bob->append("batchSize", 1);
+            bob->append("singleBatch", true);
+
+            if (const auto& shardVersion = _commandObj.getField("shardVersion");
+                !shardVersion.eoo()) {
+                bob->append(shardVersion);
+            }
+            if (const auto& databaseVersion = _commandObj.getField("databaseVersion");
+                !databaseVersion.eoo()) {
+                bob->append(databaseVersion);
+            }
+            if (const auto& encryptionInfo = _commandObj.getField("encryptionInformation");
+                !encryptionInfo.eoo()) {
+                bob->append(encryptionInfo);
+            }
+            if (auto&& rawData = _commandObj["rawData"]) {
+                bob->append(rawData);
+            }
+        }
+
+        write_ops::UpdateCommandReply typedRun(OperationContext* opCtx) final try {
+            // On debug builds, verify that the estimated size of the update command is at least as
+            // large as the size of the actual, serialized update command. This ensures that the
+            // logic which estimates the size of update commands is correct.
+            dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
+
+            doTransactionValidationForWrites(opCtx, ns());
+
+            // Writes to system-critical collections issued remotely by internal clients should not
+            // be deprioritized:
+            // - Session collection upsert for LogicalSessionCacheRefresh.
+            // TODO (SERVER-122847): Remove this code.
+            const bool isSystemCriticalNss = (ns() == NamespaceString::kLogicalSessionsNamespace);
+            boost::optional<admission::execution_control::ScopedTaskTypeNonDeprioritizable>
+                systemCriticalTaskType;
+            if (!gExecutionControlRemoteSpecification.isEnabledUseLastLTSFCVWhenUninitialized(
+                    VersionContext::getDecoration(opCtx),
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+                isSystemCriticalNss && opCtx->getClient()->isInternalClient()) {
+                systemCriticalTaskType.emplace(opCtx);
+            }
+            // Session collection upserts from internal clients (refreshSessions) must make forward
+            // progress to prevent TooManyLogicalSessions errors under heavy write load. Since this
+            // is for internal clients it does not include loopback requests through DBDirectClient.
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+            if (isSystemCriticalNss && opCtx->getClient()->isInternalClient()) {
+                systemCriticalTaskType.reset();
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
+
+            write_ops::UpdateCommandReply updateReply;
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                return processFLEUpdate(opCtx, request());
+            }
+
+            const auto [preConditions, isTimeseriesLogicalRequest] =
+                timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+                    opCtx, ns(), request(), request().getCollectionUUID());
+
+            long long nModified = 0;
+
+            write_ops_exec::WriteResult reply;
+            // For retryable updates on time-series collections, we needs to run them in
+            // transactions to ensure the multiple writes are replicated atomically.
+            const bool isTimeseriesRetryableUpdate = isTimeseriesLogicalRequest &&
+                opCtx->isRetryableWrite() && !opCtx->inMultiDocumentTransaction();
+
+            // If the command is already wrapped by a sharding operation, atomicity is provided at
+            // that level. Do not reenter the transaction path as it will be rejected by the
+            // transaction wrapper.
+            const bool wrappedByShardingRouter = OperationShardingState::isShardingAware(opCtx);
+
+            if (isTimeseriesRetryableUpdate && !wrappedByShardingRouter) {
+                auto executor = getLocalExecutor(opCtx);
+                ON_BLOCK_EXIT([&] {
+                    // Increments the counters of retryable writes and if the command contains
+                    // retries, retried writes. This is normally done within
+                    // write_ops_exec::performUpdates. But for retryable timeseries updates, we
+                    // should handle the metrics only once at the caller since each statement will
+                    // be run as a separate update command through the internal transaction API. See
+                    // write_ops_exec::performUpdates for more details.
+                    if (opCtx->isRetryableWrite()) {
+                        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
+                    }
+                    if (!reply.retriedStmtIds.empty()) {
+                        RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
+                    }
+                });
+                write_ops_exec::runTimeseriesRetryableUpdates(
+                    opCtx, ns(), request(), preConditions, executor, &reply);
+            } else {
+                if (hangUpdateBeforeWrite.shouldFail([&](const BSONObj& data) {
+                        const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "ns"sv);
+                        return fpNss == request().getNamespace();
+                    })) {
+                    hangUpdateBeforeWrite.pauseWhileSet();
+                }
+
+                const OperationSource source = isTimeseriesLogicalRequest
+                    ? OperationSource::kTimeseriesUpdate
+                    : OperationSource::kStandard;
+                reply = write_ops_exec::performUpdates(opCtx, request(), preConditions, source);
+            }
+
+            // Tracks the upserted information. The memory of this variable gets moved in the
+            // 'postProcessHandler' and should not be accessed afterwards.
+            std::vector<write_ops::Upserted> upsertedInfoVec;
+
+            // This is populated by 'singleWriteHandler' and moved into the update reply in
+            // 'postProcessHandler'.
+            std::vector<write_ops::QueryStatsMetrics> queryStatsMetricsVec;
+
+            // Handler to process each 'SingleWriteResult'.
+            auto singleWriteHandler = [&](const SingleWriteResult& opResult, int index) {
+                nModified += opResult.getNModified();
+                if (auto idElement = opResult.getUpsertedId().firstElement())
+                    upsertedInfoVec.emplace_back(write_ops::Upserted(index, idElement));
+                if (auto queryStatsMetrics = opResult.getQueryStatsMetrics()) {
+                    queryStatsMetricsVec.emplace_back(queryStatsMetrics->getOriginalOpIndex(),
+                                                      queryStatsMetrics->getMetrics());
+                }
+            };
+
+            // Handler to do the post-processing.
+            auto postProcessHandler = [&]() {
+                updateReply.setNModified(nModified);
+                if (!upsertedInfoVec.empty())
+                    updateReply.setUpserted(std::move(upsertedInfoVec));
+                if (!queryStatsMetricsVec.empty()) {
+                    updateReply.setQueryStatsMetrics(std::move(queryStatsMetricsVec));
+                }
+            };
+
+            populateReply(opCtx,
+                          !request().getWriteCommandRequestBase().getOrdered(),
+                          request().getUpdates().size(),
+                          std::move(reply),
+                          &updateReply,
+                          PopulateReplyHooks{singleWriteHandler, postProcessHandler});
+
+            // Collect metrics.
+            // For time-series retryable updates, the metrics are already incremented when running
+            // the internal transaction. Avoids updating them twice.
+            if (!isTimeseriesRetryableUpdate) {
+                for (auto&& update : request().getUpdates()) {
+                    incrementUpdateMetrics(update.getU(),
+                                           request().getNamespace(),
+                                           _getUpdateMetrics(),
+                                           update.getArrayFilters());
+                }
+            }
+
+            return updateReply;
+        } catch (const DBException& ex) {
+            NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
+            throw;
+        }
+
+    private:
+        UpdateMetrics& _getUpdateMetrics() const {
+            return *static_cast<const CmdUpdate&>(*definition())._updateMetrics;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final try {
+            auth::checkAuthForUpdateCommand(AuthorizationSession::get(opCtx->getClient()),
+                                            request().getBypassDocumentValidation(),
+                                            request());
+        } catch (const DBException& ex) {
+            NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
+            throw;
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+            // Start the query planning timer right after parsing. In explain, there's only ever
+            // one sub-operation, so we won't create nested CurOps.
+            CurOp::get(opCtx)->beginQueryPlanningTimer();
+
+            uassert(ErrorCodes::InvalidLength,
+                    "explained write batches must be of size 1",
+                    request().getUpdates().size() == 1);
+
+            const auto [preConditions, isTimeseriesLogicalRequest] =
+                timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+                    opCtx, ns(), request(), request().getCollectionUUID());
+
+            UpdateRequest updateRequest(request().getUpdates()[0]);
+            updateRequest.setNamespaceString(preConditions.getTargetNs(ns()));
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                updateRequest.setQuery(
+                    processFLEWriteExplainD(opCtx,
+                                            write_ops::collationOf(request().getUpdates()[0]),
+                                            request(),
+                                            updateRequest.getQuery()));
+            }
+
+            updateRequest.setLegacyRuntimeConstants(request().getLegacyRuntimeConstants().value_or(
+                Variables::generateRuntimeConstants(opCtx)));
+            updateRequest.setLetParameters(request().getLet());
+            updateRequest.setBypassEmptyTsReplacement(request().getBypassEmptyTsReplacement());
+            updateRequest.setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            updateRequest.setExplain(verbosity);
+
+            write_ops_exec::explainUpdate(opCtx,
+                                          updateRequest,
+                                          &request(),
+                                          isTimeseriesLogicalRequest,
+                                          request().getSerializationContext(),
+                                          _commandObj,
+                                          preConditions,
+                                          verbosity,
+                                          result);
+        }
+
+        BSONObj _commandObj;
+
+        // Holds a shared pointer to the first entry in `updates` array.
+        BSONObj _updateOpObj;
+    };
+
+protected:
+    void doInitializeClusterRole(ClusterRole role) override {
+        write_ops::UpdateCmdVersion1Gen<CmdUpdate>::doInitializeClusterRole(role);
+        _updateMetrics.emplace(getName(), role);
+    }
+
+    // Update related command execution metrics.
+    mutable boost::optional<UpdateMetrics> _updateMetrics;
+};
+MONGO_REGISTER_COMMAND(CmdUpdate).forShard();
+
+class CmdDelete final : public write_ops::DeleteCmdVersion1Gen<CmdDelete> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    void snipForLogging(mutablebson::Document* cmdObj) const final {
+        redactTooLongLog(cmdObj, "deletes");
+    }
+
+    std::string help() const final {
+        return "delete documents";
+    }
+
+    ReadWriteType getReadWriteType() const final {
+        return Command::ReadWriteType::kWrite;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    bool shouldAffectCommandCounter() const final {
+        return false;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    class Invocation final : public InvocationBaseGen {
+    public:
+        Invocation(OperationContext* opCtx,
+                   const Command* command,
+                   const OpMsgRequest& opMsgRequest)
+            : InvocationBaseGen(opCtx, command, opMsgRequest), _commandObj(opMsgRequest.body) {
+            DeleteOp::validate(request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
+        }
+
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool supportsRawData() const final {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+
+        write_ops::DeleteCommandReply typedRun(OperationContext* opCtx) final try {
+            // On debug builds, verify that the estimated size of the deletes are at least as large
+            // as the actual, serialized size. This ensures that the logic that estimates the size
+            // of deletes for batch writes is correct.
+            dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
+
+            doTransactionValidationForWrites(opCtx, ns());
+            write_ops::DeleteCommandReply deleteReply;
+
+            // Writes to system-critical collections issued remotely by internal clients should not
+            // be deprioritized:
+            // - Session collection deletes in removeRecords.
+            // TODO (SERVER-122847): Remove this code.
+            const bool isSystemCriticalNss = (ns() == NamespaceString::kLogicalSessionsNamespace);
+            boost::optional<admission::execution_control::ScopedTaskTypeNonDeprioritizable>
+                systemCriticalTaskType;
+            if (!gExecutionControlRemoteSpecification.isEnabledUseLastLTSFCVWhenUninitialized(
+                    VersionContext::getDecoration(opCtx),
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+                isSystemCriticalNss && opCtx->getClient()->isInternalClient()) {
+                systemCriticalTaskType.emplace(opCtx);
+            }
+            // Session collection deletes from internal clients (removeRecords) must make forward
+            // progress to prevent TooManyLogicalSessions errors under heavy write load. Since this
+            // is for internal clients it does not include loopback requests through DBDirectClient.
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+            if (isSystemCriticalNss && opCtx->getClient()->isInternalClient()) {
+                systemCriticalTaskType.reset();
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
+
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                return processFLEDelete(opCtx, request());
+            }
+
+            const auto [preConditions, isTimeseriesLogicalRequest] =
+                timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+                    opCtx, ns(), request(), request().getCollectionUUID());
+
+            OperationSource source = isTimeseriesLogicalRequest ? OperationSource::kTimeseriesDelete
+                                                                : OperationSource::kStandard;
+
+
+            auto reply = write_ops_exec::performDeletes(opCtx, request(), preConditions, source);
+
+            // This is populated by 'singleWriteHandler' and moved into the delete reply in
+            // 'postProcessHandler'.
+            std::vector<write_ops::QueryStatsMetrics> queryStatsMetricsVec;
+
+            // Handler to process each 'SingleWriteResult'.
+            auto singleWriteHandler = [&](const SingleWriteResult& opResult, int /*index*/) {
+                if (auto queryStatsMetrics = opResult.getQueryStatsMetrics()) {
+                    queryStatsMetricsVec.emplace_back(queryStatsMetrics->getOriginalOpIndex(),
+                                                      queryStatsMetrics->getMetrics());
+                }
+            };
+
+            auto postProcessHandler = [&]() {
+                if (!queryStatsMetricsVec.empty()) {
+                    deleteReply.setQueryStatsMetrics(std::move(queryStatsMetricsVec));
+                }
+            };
+
+            populateReply(opCtx,
+                          !request().getWriteCommandRequestBase().getOrdered(),
+                          request().getDeletes().size(),
+                          std::move(reply),
+                          &deleteReply,
+                          PopulateReplyHooks{singleWriteHandler, postProcessHandler});
+
+            return deleteReply;
+        } catch (const DBException& ex) {
+            NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
+            throw;
+        }
+
+    private:
+        void doCheckAuthorization(OperationContext* opCtx) const final try {
+            auth::checkAuthForDeleteCommand(AuthorizationSession::get(opCtx->getClient()),
+                                            request().getBypassDocumentValidation(),
+                                            request());
+        } catch (const DBException& ex) {
+            NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(ex.code());
+            throw;
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+            // Start the query planning timer right after parsing. In explain, there's only ever
+            // one sub-operation, so we won't create nested CurOps.
+            CurOp::get(opCtx)->beginQueryPlanningTimer();
+
+            uassert(ErrorCodes::InvalidLength,
+                    "explained write batches must be of size 1",
+                    request().getDeletes().size() == 1);
+
+            auto [preConditions, isTimeseriesLogicalRequest] =
+                timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+                    opCtx, ns(), request(), request().getCollectionUUID());
+
+            auto deleteRequest = DeleteRequest{};
+            deleteRequest.setNsString(preConditions.getTargetNs(ns()));
+            deleteRequest.setLegacyRuntimeConstants(request().getLegacyRuntimeConstants().value_or(
+                Variables::generateRuntimeConstants(opCtx)));
+            deleteRequest.setLet(request().getLet());
+
+            const auto& firstDelete = request().getDeletes()[0];
+            BSONObj query = firstDelete.getQ();
+
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                query = processFLEWriteExplainD(
+                    opCtx, write_ops::collationOf(firstDelete), request(), query);
+            }
+            deleteRequest.setQuery(std::move(query));
+
+            deleteRequest.setCollation(write_ops::collationOf(request().getDeletes()[0]));
+            deleteRequest.setMulti(firstDelete.getMulti());
+            deleteRequest.setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            deleteRequest.setHint(firstDelete.getHint());
+            deleteRequest.setIsExplain(true);
+
+            write_ops_exec::explainDelete(opCtx,
+                                          deleteRequest,
+                                          &request(),
+                                          isTimeseriesLogicalRequest,
+                                          request().getSerializationContext(),
+                                          _commandObj,
+                                          preConditions,
+                                          verbosity,
+                                          result);
+        }
+
+        const BSONObj& _commandObj;
+    };
+};
+MONGO_REGISTER_COMMAND(CmdDelete).forShard();
+
+}  // namespace
+}  // namespace mongo

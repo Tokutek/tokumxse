@@ -1,674 +1,1521 @@
-/**
- *    Copyright (C) 2013-2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include "mongo/db/exec/container_size_helper.h"
+#include "mongo/db/exec/plan_stats_visitor.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/pipeline/spilling/spilling_stats.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/eof_node_type.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_stats/data_bearing_node_metrics.h"
+#include "mongo/db/query/record_id_range_list.h"
+#include "mongo/db/query/util/named_enum.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
-
-#include "mongo/base/disallow_copying.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/query/stage_types.h"
-#include "mongo/platform/cstdint.h"
-#include "mongo/util/time_support.h"
-#include "mongo/util/net/listen.h" // for Listener::getElapsedTimeMillis()
 
 namespace mongo {
 
+class PlanStage;
+/**
+ * The type which represents a unique identifier for PlanStages across all enumerated plans for a
+ * query. It is implemented as a typedef to PlanStage* as a convenience, since that is guarenteed to
+ * be unique, but this pointer is never intended to be dereferenced as this type may exist after the
+ * underlying PlanStage has been destroyed.
+ */
+using PlanStageKey = const PlanStage*;
+
+/**
+ * The interface all specific-to-stage stats provide.
+ *
+ * TODO SERVER-112777: Remove 'atlas_streams' dependency on this struct.
+ */
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] SpecificStats {
+    virtual ~SpecificStats() {}
+
     /**
-     * The interface all specific-to-stage stats provide.
+     * Make a deep copy.
      */
-    struct SpecificStats {
-        virtual ~SpecificStats() { }
+    virtual std::unique_ptr<SpecificStats> clone() const = 0;
 
-        /**
-         * Make a deep copy.
-         */
-        virtual SpecificStats* clone() const = 0;
-    };
+    virtual uint64_t estimateObjectSizeInBytes() const = 0;
 
-    // Every stage has CommonStats.
-    struct CommonStats {
-        CommonStats(const char* type)
-                      : stageTypeStr(type),
-                        works(0),
-                        yields(0),
-                        unyields(0),
-                        invalidates(0),
-                        advanced(0),
-                        needTime(0),
-                        needYield(0),
-                        executionTimeMillis(0),
-                        isEOF(false) { }
-        // String giving the type of the stage. Not owned.
-        const char* stageTypeStr;
+    virtual void acceptVisitor(PlanStatsConstVisitor* visitor) const = 0;
+    virtual void acceptVisitor(PlanStatsMutableVisitor* visitor) = 0;
 
-        // Count calls into the stage.
-        size_t works;
-        size_t yields;
-        size_t unyields;
-        size_t invalidates;
+    /**
+     * Subclasses that have the ability to fetch should override this to return 'true'.
+     */
+    virtual bool doesFetch() const {
+        return false;
+    }
+};
 
-        // How many times was this state the return value of work(...)?
-        size_t advanced;
-        size_t needTime;
-        size_t needYield;
+// Every stage has CommonStats.
+struct CommonStats {
+    CommonStats() = delete;
 
-        // BSON representation of a MatchExpression affixed to this node. If there
-        // is no filter affixed, then 'filter' should be an empty BSONObj.
-        BSONObj filter;
+    CommonStats(std::string_view type) : CommonStats(type, nullptr /*originalPlanStage*/) {}
 
-        // Time elapsed while working inside this stage.
-        long long executionTimeMillis;
+    CommonStats(std::string_view type, PlanStageKey originalPlanStage)
+        : stageTypeStr(type),
+          planStage(originalPlanStage),
+          works(0),
+          yields(0),
+          unyields(0),
+          advanced(0),
+          needTime(0),
+          needYield(0),
+          failed(false),
+          isEOF(false) {}
 
-        // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
-        // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
+    uint64_t estimateObjectSizeInBytes() const {
+        return filter.objsize() + sizeof(*this);
+    }
+    // String giving the type of the stage. Not owned.
+    std::string_view stageTypeStr;
 
-        // TODO: once we've picked a plan, collect different (or additional) stats for display to
-        // the user, eg. time_t totalTimeSpent;
+    // Store an identifier to the plan stage which this object is describing.
+    PlanStageKey planStage;
 
-        // TODO: keep track of the total yield time / fetch time done for a plan.
+    // Count calls into the stage.
+    size_t works;
+    size_t yields;
+    size_t unyields;
 
-        bool isEOF;
-    private:
-        // Default constructor is illegal.
-        CommonStats();
-    };
+    // How many times was this state the return value of work(...)?
+    size_t advanced;
+    size_t needTime;
+    size_t needYield;
 
-    // The universal container for a stage's stats.
-    struct PlanStageStats {
-        PlanStageStats(const CommonStats& c, StageType t) : stageType(t), common(c) { }
+    // BSON representation of a MatchExpression affixed to this node. If there
+    // is no filter affixed, then 'filter' should be an empty BSONObj.
+    BSONObj filter;
 
-        ~PlanStageStats() {
-            for (size_t i = 0; i < children.size(); ++i) {
-                delete children[i];
-            }
+    // Time elapsed while working inside this stage. When this field is set to boost::none,
+    // timing info will not be collected during query execution.
+    //
+    // The field must be populated when running explain or when running with the profiler on. It
+    // must also be populated when multi planning, in order to gather stats stored in the plan
+    // cache. This struct includes the execution time and its precision/unit.
+    QueryExecTime executionTime;
+
+    bool failed;
+    bool isEOF;
+};
+
+// The universal container for a stage's stats.
+template <typename C, typename T = void*>
+struct BasePlanStageStats {
+    BasePlanStageStats(const C& c, T t = {}) : stageType(t), common(c) {}
+
+    /**
+     * Make a deep copy.
+     */
+    BasePlanStageStats<C, T>* clone() const {
+        auto stats = new BasePlanStageStats<C, T>(common, stageType);
+        if (specific.get()) {
+            stats->specific = specific->clone();
         }
-
-        /**
-         * Make a deep copy.
-         */
-        PlanStageStats* clone() const {
-            PlanStageStats* stats = new PlanStageStats(common, stageType);
-            if (specific.get()) {
-                stats->specific.reset(specific->clone());
-            }
-            for (size_t i = 0; i < children.size(); ++i) {
-                invariant(children[i]);
-                stats->children.push_back(children[i]->clone());
-            }
-            return stats;
+        for (size_t i = 0; i < children.size(); ++i) {
+            invariant(children[i]);
+            stats->children.emplace_back(children[i]->clone());
         }
+        return stats;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in 'children' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                children,
+                [](const auto& child) { return child->estimateObjectSizeInBytes(); },
+                true) +
+            // Exclude the size of 'common' object since is being added later.
+            (common.estimateObjectSizeInBytes() - sizeof(common)) +
+            // Add 'specific' object size if exists.
+            (specific ? specific->estimateObjectSizeInBytes() : 0) +
+            // Add size of the object.
+            sizeof(*this);
+    }
 
-        // See query/stage_type.h
-        StageType stageType;
+    auto begin() {
+        return children.begin();
+    }
 
-        // Stats exported by implementing the PlanStage interface.
-        CommonStats common;
+    auto begin() const {
+        return children.begin();
+    }
 
-        // Per-stage place to stash additional information
-        boost::scoped_ptr<SpecificStats> specific;
+    auto end() {
+        return children.end();
+    }
 
-        // The stats of the node's children.
-        std::vector<PlanStageStats*> children;
+    auto end() const {
+        return children.end();
+    }
 
-    private:
-        MONGO_DISALLOW_COPYING(PlanStageStats);
-    };
+    T stageType;
+
+    // Stats exported by implementing the PlanStage interface.
+    C common;
+
+    // Per-stage place to stash additional information
+    std::unique_ptr<SpecificStats> specific;
 
-    struct AndHashStats : public SpecificStats {
-        AndHashStats() : flaggedButPassed(0),
-                         flaggedInProgress(0),
-                         memUsage(0),
-                         memLimit(0) { }
+    // Per-stage additional debug info which is opaque to the caller. Callers should not attempt to
+    // process/read this BSONObj other than for dumping the results to logs or back to the user.
+    BSONObj debugInfo;
 
-        virtual ~AndHashStats() { }
+    // The stats of the node's children.
+    std::vector<std::unique_ptr<BasePlanStageStats<C, T>>> children;
 
-        virtual SpecificStats* clone() const {
-            AndHashStats* specific = new AndHashStats(*this);
-            return specific;
-        }
+private:
+    BasePlanStageStats(const BasePlanStageStats<C, T>&) = delete;
+    BasePlanStageStats& operator=(const BasePlanStageStats<C, T>&) = delete;
+};
 
-        // Invalidation counters.
-        // How many results had the AND fully evaluated but were invalidated?
-        size_t flaggedButPassed;
+using PlanStageStats = BasePlanStageStats<mongo::CommonStats, StageType>;
 
-        // How many results were mid-AND but got flagged?
-        size_t flaggedInProgress;
+struct AndHashStats : public SpecificStats {
+    AndHashStats() = default;
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<AndHashStats>(*this);
+    }
 
-        // How many entries are in the map after each child?
-        // child 'i' produced children[i].common.advanced RecordIds, of which mapAfterChild[i] were
-        // intersections.
-        std::vector<size_t> mapAfterChild;
+    uint64_t estimateObjectSizeInBytes() const override {
+        return container_size_helper::estimateObjectSizeInBytes(mapAfterChild) + sizeof(*this);
+    }
 
-        // mapAfterChild[mapAfterChild.size() - 1] WSMswere match tested.
-        // commonstats.advanced is how many passed.
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 
-        // What's our current memory usage?
-        size_t memUsage;
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
 
-        // What's our memory limit?
-        size_t memLimit;
-    };
+    // How many entries are in the map after each child?
+    // child 'i' produced children[i].common.advanced RecordIds, of which mapAfterChild[i] were
+    // intersections.
+    std::vector<size_t> mapAfterChild;
 
-    struct AndSortedStats : public SpecificStats {
-        AndSortedStats() : flagged(0),
-                           matchTested(0) { }
+    // mapAfterChild[mapAfterChild.size() - 1] WSMswere match tested.
+    // commonstats.advanced is how many passed.
 
-        virtual ~AndSortedStats() { }
+    // What's our current memory usage?
+    size_t memUsage = 0u;
 
-        virtual SpecificStats* clone() const {
-            AndSortedStats* specific = new AndSortedStats(*this);
-            return specific;
-        }
+    // What's our memory limit?
+    size_t memLimit = 0u;
+};
 
-        // How many results from each child did not pass the AND?
-        std::vector<size_t> failedAnd;
+struct AndSortedStats : public SpecificStats {
+    AndSortedStats() = default;
 
-        // How many results were flagged via invalidation?
-        size_t flagged;
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<AndSortedStats>(*this);
+    }
 
-        // Fails == common.advanced - matchTested
-        size_t matchTested;
-    };
+    uint64_t estimateObjectSizeInBytes() const override {
+        return container_size_helper::estimateObjectSizeInBytes(failedAnd) + sizeof(*this);
+    }
 
-    struct CachedPlanStats : public SpecificStats {
-        CachedPlanStats() { }
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 
-        virtual SpecificStats* clone() const {
-            return new CachedPlanStats(*this);
-        }
-    };
-
-    struct CollectionScanStats : public SpecificStats {
-        CollectionScanStats() : docsTested(0), direction(1) { }
-
-        virtual SpecificStats* clone() const {
-            CollectionScanStats* specific = new CollectionScanStats(*this);
-            return specific;
-        }
-
-        // How many documents did we check against our filter?
-        size_t docsTested;
-
-        // >0 if we're traversing the collection forwards. <0 if we're traversing it
-        // backwards.
-        int direction;
-    };
-
-    struct CountStats : public SpecificStats {
-        CountStats() : nCounted(0), nSkipped(0), trivialCount(false) { }
-
-        virtual SpecificStats* clone() const {
-            CountStats* specific = new CountStats(*this);
-            return specific;
-        }
-
-        // The result of the count.
-        long long nCounted;
-
-        // The number of results we skipped over.
-        long long nSkipped;
-
-        // A "trivial count" is one that we can answer by calling numRecords() on the
-        // collection, without actually going through any query logic.
-        bool trivialCount;
-    };
-
-    struct CountScanStats : public SpecificStats {
-        CountScanStats() : indexVersion(0),
-                           isMultiKey(false),
-                           keysExamined(0) { }
-
-        virtual ~CountScanStats() { }
-
-        virtual SpecificStats* clone() const {
-            CountScanStats* specific = new CountScanStats(*this);
-            // BSON objects have to be explicitly copied.
-            specific->keyPattern = keyPattern.getOwned();
-            return specific;
-        }
-
-        std::string indexName;
-
-        BSONObj keyPattern;
-
-        int indexVersion;
-
-        bool isMultiKey;
-
-        size_t keysExamined;
-
-    };
-
-    struct DeleteStats : public SpecificStats {
-        DeleteStats() : docsDeleted(0), nInvalidateSkips(0) { }
-
-        virtual SpecificStats* clone() const {
-            return new DeleteStats(*this);
-        }
-
-        size_t docsDeleted;
-
-        // Invalidated documents can be force-fetched, causing the now invalid RecordId to
-        // be thrown out. The delete stage skips over any results which do not have a RecordId.
-        size_t nInvalidateSkips;
-    };
-
-    struct DistinctScanStats : public SpecificStats {
-        DistinctScanStats() : keysExamined(0), indexVersion(0) { }
-
-        virtual SpecificStats* clone() const {
-            DistinctScanStats* specific = new DistinctScanStats(*this);
-            specific->keyPattern = keyPattern.getOwned();
-            return specific;
-        }
-
-        // How many keys did we look at while distinct-ing?
-        size_t keysExamined;
-
-        std::string indexName;
-
-        BSONObj keyPattern;
-
-        int indexVersion;
-    };
-
-    struct FetchStats : public SpecificStats {
-        FetchStats() : alreadyHasObj(0),
-                       forcedFetches(0),
-                       matchTested(0),
-                       docsExamined(0) { }
-
-        virtual ~FetchStats() { }
-
-        virtual SpecificStats* clone() const {
-            FetchStats* specific = new FetchStats(*this);
-            return specific;
-        }
-
-        // Have we seen anything that already had an object?
-        size_t alreadyHasObj;
-
-        // How many records were we forced to fetch as the result of an invalidation?
-        size_t forcedFetches;
-
-        // We know how many passed (it's the # of advanced) and therefore how many failed.
-        size_t matchTested;
-
-        // The total number of full documents touched by the fetch stage.
-        size_t docsExamined;
-    };
-
-    struct GroupStats : public SpecificStats {
-        GroupStats() : nGroups(0) { }
-
-        virtual ~GroupStats() { }
-
-        virtual SpecificStats* clone() const {
-            GroupStats* specific = new GroupStats(*this);
-            return specific;
-        }
-
-        // The total number of groups.
-        size_t nGroups;
-    };
-
-    struct IDHackStats : public SpecificStats {
-        IDHackStats() : keysExamined(0),
-                        docsExamined(0) { }
-
-        virtual ~IDHackStats() { }
-
-        virtual SpecificStats* clone() const {
-            IDHackStats* specific = new IDHackStats(*this);
-            return specific;
-        }
-
-        // Number of entries retrieved from the index while executing the idhack.
-        size_t keysExamined;
-
-        // Number of documents retrieved from the collection while executing the idhack.
-        size_t docsExamined;
-
-    };
-
-    struct IndexScanStats : public SpecificStats {
-        IndexScanStats() : indexVersion(0),
-                           direction(1),
-                           isMultiKey(false),
-                           yieldMovedCursor(0),
-                           dupsTested(0),
-                           dupsDropped(0),
-                           seenInvalidated(0),
-                           matchTested(0),
-                           keysExamined(0) { }
-
-        virtual ~IndexScanStats() { }
-
-        virtual SpecificStats* clone() const {
-            IndexScanStats* specific = new IndexScanStats(*this);
-            // BSON objects have to be explicitly copied.
-            specific->keyPattern = keyPattern.getOwned();
-            specific->indexBounds = indexBounds.getOwned();
-            return specific;
-        }
-
-        // Index type being used.
-        std::string indexType;
-
-        // name of the index being used
-        std::string indexName;
-
-        BSONObj keyPattern;
-
-        int indexVersion;
-
-        // A BSON (opaque, ie. hands off other than toString() it) representation of the bounds
-        // used.
-        BSONObj indexBounds;
-
-        // >1 if we're traversing the index along with its order. <1 if we're traversing it
-        // against the order.
-        int direction;
-
-        // Whether this index is over a field that contain array values.
-        bool isMultiKey;
-
-        size_t yieldMovedCursor;
-        size_t dupsTested;
-        size_t dupsDropped;
-
-        size_t seenInvalidated;
-        // TODO: we could track key sizes here.
-
-        // We know how many passed (it's the # of advanced) and therefore how many failed.
-        size_t matchTested;
-
-        // Number of entries retrieved from the index during the scan.
-        size_t keysExamined;
-
-    };
-
-    struct LimitStats : public SpecificStats {
-        LimitStats() : limit(0) { }
-
-        virtual SpecificStats* clone() const {
-            LimitStats* specific = new LimitStats(*this);
-            return specific;
-        }
-
-        size_t limit;
-    };
-
-    struct MockStats : public SpecificStats {
-        MockStats() { }
-
-        virtual SpecificStats* clone() const {
-            return new MockStats(*this);
-        }
-    };
-
-    struct MultiPlanStats : public SpecificStats {
-        MultiPlanStats() { }
-
-        virtual SpecificStats* clone() const {
-            return new MultiPlanStats(*this);
-        }
-    };
-
-    struct OrStats : public SpecificStats {
-        OrStats() : dupsTested(0),
-                    dupsDropped(0),
-                    locsForgotten(0) { }
-
-        virtual ~OrStats() { }
-
-        virtual SpecificStats* clone() const {
-            OrStats* specific = new OrStats(*this);
-            return specific;
-        }
-
-        size_t dupsTested;
-        size_t dupsDropped;
-
-        // How many calls to invalidate(...) actually removed a RecordId from our deduping map?
-        size_t locsForgotten;
-
-        // We know how many passed (it's the # of advanced) and therefore how many failed.
-        std::vector<size_t> matchTested;
-    };
-
-    struct ProjectionStats : public SpecificStats {
-        ProjectionStats() { }
-
-        virtual SpecificStats* clone() const {
-            ProjectionStats* specific = new ProjectionStats(*this);
-            return specific;
-        }
-
-        // Object specifying the projection transformation to apply.
-        BSONObj projObj;
-    };
-
-    struct SortStats : public SpecificStats {
-        SortStats() : forcedFetches(0), memUsage(0), memLimit(0) { }
-
-        virtual ~SortStats() { }
-
-        virtual SpecificStats* clone() const {
-            SortStats* specific = new SortStats(*this);
-            return specific;
-        }
-
-        // How many records were we forced to fetch as the result of an invalidation?
-        size_t forcedFetches;
-
-        // What's our current memory usage?
-        size_t memUsage;
-
-        // What's our memory limit?
-        size_t memLimit;
-
-        // The number of results to return from the sort.
-        size_t limit;
-
-        // The pattern according to which we are sorting.
-        BSONObj sortPattern;
-    };
-
-    struct MergeSortStats : public SpecificStats {
-        MergeSortStats() : dupsTested(0),
-                           dupsDropped(0),
-                           forcedFetches(0) { }
-
-        virtual ~MergeSortStats() { }
-
-        virtual SpecificStats* clone() const {
-            MergeSortStats* specific = new MergeSortStats(*this);
-            return specific;
-        }
-
-        size_t dupsTested;
-        size_t dupsDropped;
-
-        // How many records were we forced to fetch as the result of an invalidation?
-        size_t forcedFetches;
-
-        // The pattern according to which we are sorting.
-        BSONObj sortPattern;
-    };
-
-    struct ShardingFilterStats : public SpecificStats {
-        ShardingFilterStats() : chunkSkips(0) { }
-
-        virtual SpecificStats* clone() const {
-            ShardingFilterStats* specific = new ShardingFilterStats(*this);
-            return specific;
-        }
-
-        size_t chunkSkips;
-    };
-
-    struct SkipStats : public SpecificStats {
-        SkipStats() : skip(0) { }
-
-        virtual SpecificStats* clone() const {
-            SkipStats* specific = new SkipStats(*this);
-            return specific;
-        }
-
-        size_t skip;
-    };
-
-    struct IntervalStats {
-
-        IntervalStats() :
-            numResultsFound(0),
-            numResultsBuffered(0),
-            minDistanceAllowed(-1),
-            maxDistanceAllowed(-1),
-            inclusiveMaxDistanceAllowed(false),
-            minDistanceFound(-1),
-            maxDistanceFound(-1),
-            minDistanceBuffered(-1),
-            maxDistanceBuffered(-1) {
-        }
-
-        long long numResultsFound;
-        long long numResultsBuffered;
-
-        double minDistanceAllowed;
-        double maxDistanceAllowed;
-        bool inclusiveMaxDistanceAllowed;
-
-        double minDistanceFound;
-        double maxDistanceFound;
-        double minDistanceBuffered;
-        double maxDistanceBuffered;
-    };
-
-    class NearStats : public SpecificStats {
-    public:
-
-        NearStats() {}
-
-        virtual SpecificStats* clone() const {
-            return new NearStats(*this);
-        }
-
-        long long totalResultsFound() {
-            long long totalResultsFound = 0;
-            for (std::vector<IntervalStats>::iterator it = intervalStats.begin();
-                it != intervalStats.end(); ++it) {
-                totalResultsFound += it->numResultsFound;
-            }
-            return totalResultsFound;
-        }
-
-        std::vector<IntervalStats> intervalStats;
-        std::string indexName;
-        BSONObj keyPattern;
-    };
-
-    struct UpdateStats : public SpecificStats {
-        UpdateStats()
-            : nMatched(0),
-              nModified(0),
-              isDocReplacement(false),
-              fastmod(false),
-              fastmodinsert(false),
-              inserted(false),
-              nInvalidateSkips(0) { }
-
-        virtual SpecificStats* clone() const {
-            return new UpdateStats(*this);
-        }
-
-        // The number of documents which match the query part of the update.
-        size_t nMatched;
-
-        // The number of documents modified by this update.
-        size_t nModified;
-
-        // True iff this is a doc-replacement style update, as opposed to a $mod update.
-        bool isDocReplacement;
-
-        // A 'fastmod' update is an in-place update that does not have to modify
-        // any indices. It's "fast" because the only work needed is changing the bits
-        // inside the document.
-        bool fastmod;
-
-        // A 'fastmodinsert' is an insert resulting from an {upsert: true} update
-        // which is a doc-replacement style update. It's "fast" because we don't need
-        // to compute the document to insert based on the modifiers.
-        bool fastmodinsert;
-
-        // Is this an {upsert: true} update that did an insert?
-        bool inserted;
-
-        // The object that was inserted. This is an empty document if no insert was performed.
-        BSONObj objInserted;
-
-        // The document resulting from the update (or the document inserted for an upsert). This is
-        // an empty document if no existing doc was modified and no insert happened, or if this is
-        // a multi-update.
-        //
-        // Only set if requested via UpdateRequest::setStoreResultDoc().
-        BSONObj newObj;
-
-        // Invalidated documents can be force-fetched, causing the now invalid RecordId to
-        // be thrown out. The update stage skips over any results which do not have the
-        // RecordId to update.
-        size_t nInvalidateSkips;
-    };
-
-    struct TextStats : public SpecificStats {
-        TextStats() : keysExamined(0), fetches(0), parsedTextQuery() { }
-
-        virtual SpecificStats* clone() const {
-            TextStats* specific = new TextStats(*this);
-            return specific;
-        }
-
-        std::string indexName;
-
-        size_t keysExamined;
-
-        size_t fetches;
-
-        // Human-readable form of the FTSQuery associated with the text stage.
-        BSONObj parsedTextQuery;
-
-        // Index keys that precede the "text" index key.
-        BSONObj indexPrefix;
-    };
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // How many results from each child did not pass the AND?
+    std::vector<size_t> failedAnd;
+};
+
+struct CachedPlanStats : public SpecificStats {
+    CachedPlanStats() = default;
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<CachedPlanStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+};
+
+struct CollectionScanStats : public SpecificStats {
+    CollectionScanStats() : docsTested(0), direction(1) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<CollectionScanStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // How many documents did we check against our filter?
+    size_t docsTested;
+
+    // >0 if we're traversing the collection forwards. <0 if we're traversing it
+    // backwards.
+    int direction;
+
+    bool tailable{false};
+
+    // The set of RecordId ranges being scanned (mirrors CollectionScanParams::rangeList).
+    RecordIdRangeList rangeList;
+
+    // Number of seeks performed (initial + inter-range seeks for multi-interval scans).
+    size_t seeks = 0;
+};
+
+struct CountStats : public SpecificStats {
+    CountStats() : nCounted(0), nSkipped(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<CountStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The result of the count.
+    long long nCounted;
+
+    // The number of results we skipped over.
+    long long nSkipped;
+};
+
+struct CountScanStats : public SpecificStats {
+    CountScanStats()
+        : indexVersion(0),
+          isMultiKey(false),
+          isPartial(false),
+          isSetSparseByUser(false),
+          isUnique(false),
+          keysExamined(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        auto specific = std::make_unique<CountScanStats>(*this);
+        // BSON objects have to be explicitly copied.
+        specific->keyPattern = keyPattern.getOwned();
+        specific->collation = collation.getOwned();
+        specific->startKey = startKey.getOwned();
+        specific->endKey = endKey.getOwned();
+        return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + startKey.objsize() + endKey.objsize() +
+            indexName.capacity() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    std::string indexName;
+
+    BSONObj keyPattern;
+
+    BSONObj collation;
+
+    // The starting/ending key(s) of the index scan.
+    // startKey and endKey contain the fields of keyPattern, with values
+    // that match the corresponding index bounds.
+    BSONObj startKey;
+    BSONObj endKey;
+    // Whether or not those keys are inclusive or exclusive bounds.
+    bool startKeyInclusive;
+    bool endKeyInclusive;
+
+    int indexVersion;
+
+    // Set to true if the index used for the count scan is multikey.
+    bool isMultiKey;
+
+    // Represents which prefixes of the indexed field(s) cause the index to be multikey.
+    MultikeyPaths multiKeyPaths;
+
+    bool isPartial;
+    // True if the the user explicitly requested it to be sparse.
+    // See IndexDescriptor for more details.
+    bool isSetSparseByUser;
+    bool isUnique;
+
+    size_t keysExamined;
+
+    int64_t peakTrackedMemBytes = 0;
+};
+
+/**
+ * SERVER-112776: Remove 'data_movement' dependency on this struct.
+ */
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] DeleteStats : public SpecificStats {
+    DeleteStats() = default;
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DeleteStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t docsDeleted = 0u;
+    size_t bytesDeleted = 0u;
+
+    // The number of documents fetched by write_stage_common::ensureStillMatches.
+    size_t docsFetched = 0;
+};
+
+/**
+ * SERVER-112776: Remove 'ttl' dependency on this struct.
+ */
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] BatchedDeleteStats : public DeleteStats {
+    BatchedDeleteStats() = default;
+
+    // Unlike a standard multi:true delete, BatchedDeleteStage can complete with PlanStage::IS_EOF
+    // before deleting all the documents that match the query, if a 'BatchedDeleteStageParams'
+    // 'pass' target is met.
+    //
+    // True indicates the operation reaches completion because a 'pass' target is met.
+    //
+    // False indicates either (1) the operation hasn't reached completion or (2) the operation
+    // removed all the documents that matched the criteria to reach completion - this is always the
+    // case with the default 'BatchedDeleteStageParams'.
+    bool passTargetMet = false;
+};
+
+struct DistinctScanStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        auto specific = std::make_unique<DistinctScanStats>(*this);
+        // BSON objects have to be explicitly copied.
+        specific->keyPattern = keyPattern.getOwned();
+        specific->collation = collation.getOwned();
+        specific->indexBounds = indexBounds.getOwned();
+        return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + indexBounds.objsize() +
+            indexName.capacity() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    bool doesFetch() const final {
+        return isFetching;
+    }
+
+    // How many keys did we look at while distinct-ing?
+    size_t keysExamined = 0;
+    // The total number of full documents touched by the embedded fetch stage, if one exists.
+    size_t docsExamined = 0;
+    // Tracks how many times we skipped past orphan chunks.
+    size_t orphanChunkSkips = 0;
+    // Tracks the number of time we filtered out an orphan document (symmetric to
+    // 'ShardingFilterStats').
+    size_t chunkSkips = 0;
+
+    BSONObj keyPattern;
+
+    BSONObj collation;
+
+    // Properties of the index used for the distinct scan.
+    std::string indexName;
+    int indexVersion = 0;
+
+    // Set to true if the index used for the distinct scan is multikey.
+    bool isMultiKey = false;
+
+    // Represents which prefixes of the indexed field(s) cause the index to be multikey.
+    MultikeyPaths multiKeyPaths;
+
+    bool isPartial = false;
+    bool isSetSparseByUser = false;
+    bool isUnique = false;
+    bool isShardFiltering = false;
+    bool isFetching = false;
+    bool unwindsArrays = false;
+    // TODO SERVER-92983: Remove once feature flag is removed.
+    bool isShardFilteringDistinctScanEnabled = false;
+
+    // >1 if we're traversing the index forwards and <1 if we're traversing it backwards.
+    int direction = 1;
+
+    // A BSON representation of the distinct scan's index bounds.
+    BSONObj indexBounds;
+};
+
+struct FetchStats : public SpecificStats {
+    FetchStats() = default;
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<FetchStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    bool doesFetch() const final {
+        return true;
+    }
+
+    // Have we seen anything that already had an object?
+    size_t alreadyHasObj = 0u;
+
+    // The total number of full documents touched by the fetch stage.
+    size_t docsExamined = 0u;
+};
+
+struct IDHackStats : public SpecificStats {
+    IDHackStats() : keysExamined(0), docsExamined(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<IDHackStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return indexName.capacity() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    std::string indexName;
+
+    // Number of entries retrieved from the index while executing the idhack.
+    size_t keysExamined;
+
+    // Number of documents retrieved from the collection while executing the idhack.
+    size_t docsExamined;
+};
+
+struct ReturnKeyStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<ReturnKeyStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+};
+
+struct IndexScanStats : public SpecificStats {
+    IndexScanStats()
+        : indexVersion(0),
+          direction(1),
+          isMultiKey(false),
+          isPartial(false),
+          isSetSparseByUser(false),
+          isUnique(false),
+          dupsTested(0),
+          dupsDropped(0),
+          keysExamined(0),
+          seeks(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        auto specific = std::make_unique<IndexScanStats>(*this);
+        // BSON objects have to be explicitly copied.
+        specific->keyPattern = keyPattern.getOwned();
+        specific->collation = collation.getOwned();
+        specific->indexBounds = indexBounds.getOwned();
+        return specific;
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return container_size_helper::estimateObjectSizeInBytes(
+                   multiKeyPaths,
+                   [](const auto& keyPath) {
+                       // Calculate the size of each std::set in 'multiKeyPaths'.
+                       return container_size_helper::estimateObjectSizeInBytes(keyPath);
+                   },
+                   true) +
+            keyPattern.objsize() + collation.objsize() + indexBounds.objsize() +
+            indexName.capacity() + indexType.capacity() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Index type being used.
+    std::string indexType;
+
+    // name of the index being used
+    std::string indexName;
+
+    BSONObj keyPattern;
+
+    BSONObj collation;
+
+    int indexVersion;
+
+    // A BSON (opaque, ie. hands off other than toString() it) representation of the bounds
+    // used.
+    BSONObj indexBounds;
+
+    // >1 if we're traversing the index along with its order. <1 if we're traversing it
+    // against the order.
+    int direction;
+
+    // index properties
+    // Whether this index is over a field that contain array values.
+    bool isMultiKey;
+
+    // Represents which prefixes of the indexed field(s) cause the index to be multikey.
+    MultikeyPaths multiKeyPaths;
+
+    bool isPartial;
+    // True if the user explicitly requested it to be sparse.
+    // See IndexDescriptor for more details.
+    bool isSetSparseByUser;
+    bool isUnique;
+
+    size_t dupsTested;
+    size_t dupsDropped;
+
+    // Number of entries retrieved from the index during the scan.
+    size_t keysExamined;
+
+    // Number of times the index cursor is re-positioned during the execution of the scan.
+    size_t seeks;
+
+    uint64_t peakTrackedMemBytes = 0u;
+};
+
+struct LimitStats : public SpecificStats {
+    LimitStats() : limit(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<LimitStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t limit;
+};
+
+struct MockStats : public SpecificStats {
+    MockStats() {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<MockStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+};
+
+struct MultiPlanStats : public SpecificStats {
+    MultiPlanStats() {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<MultiPlanStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Currently this is only used for queries destined for SBE. Classic plans should not populate
+    // this field. Only used in the old get_executor path for SBE queries.
+    boost::optional<std::string> replanReason;
+
+    // Total number of works across all candidate plans.
+    int64_t totalWorks = 0;
+    // Total number of documents returned across all candidate plans.
+    int64_t numResultsFound = 0;
+    // Number of candidate plans considered.
+    int numCandidatePlans = 0;
+    // True if we exited the multi-planner early due to one plan hitting EOF or filling a batch
+    bool earlyExit = false;
+};
+
+/**
+ * How a candidate plan's multi-planner trial period ended. Recorded per candidate, unlike
+ * MultiPlanStats::earlyExit, which is a single trial-wide flag that conflates the two early-exit
+ * reasons and says nothing about which plan caused the exit.
+ *
+ * Recorded for every candidate that ran a trial, including one whose trial ended by failing
+ * (kFailed) - a partially executed candidate still carries trial counters and still appears among
+ * the rejected plans, so it has a stop condition to report like any other. Only a candidate that
+ * never ran at all (e.g. one built from a cached plan, or a plan the cost-based ranker rejected
+ * without executing) has none.
+ *
+ * Every condition states what happened to this candidate specifically: the trial period ends for
+ * all candidates at once, but the two conditions that do not describe an early exit of this
+ * candidate's own distinguish whether it ran out of budget or was cut short by a sibling.
+ */
+// clang-format off
+#define MULTI_PLANNER_STOP_CONDITION_TABLE(X)                                                    \
+    /* The candidate's execution tree reached EOF: it exhausted its results before the trial's */\
+    /* work budget. */                                                                           \
+    X(kEof, "EOF")                                                                               \
+    /* The candidate buffered a full batch without reaching EOF. */                              \
+    X(kFullBatch, "fullBatch")                                                                    \
+    /* The candidate met no early-exit condition and used up the trial's per-plan work budget. */ \
+    X(kExhaustedBudget, "exhaustedBudget")                                                        \
+    /* The candidate met no early-exit condition, but another candidate did and ended the trial */\
+    /* period for everyone. This candidate's trial was stopped short with budget left, so its  */ \
+    /* counters say nothing about how it would have fared over a full trial - typically only a */ \
+    /* handful of works. Distinct from kExhaustedBudget precisely because a plan that got three */\
+    /* works of a ten-thousand-work budget did not exhaust anything. */                           \
+    X(kTrialEndedEarly, "trialEndedEarly")                                                        \
+    /* The candidate's trial ended because the plan failed in a recoverable fashion (exceeding  */ \
+    /* an allowed resource consumption, e.g. a blocking sort over its memory limit with disk    */ \
+    /* use disallowed). The multi-planner keeps such a candidate - the trial continues for the  */ \
+    /* others and only an all-candidates failure is fatal - so it is ranked out but still shown */ \
+    /* among the rejected plans, with the partial counters it accumulated before failing and no */ \
+    /* score, since a failed candidate is never scored. */                                        \
+    X(kFailed, "failed")                                                                          \
+    /* The candidate stopped because the results it had stashed reached the trial's memory cap.  */\
+    /* SBE-only: the SBE trial buffers whole documents and caps their total size, which the      */ \
+    /* classic trial has no counterpart for. */                                               \
+    X(kStashSizeLimit, "stashSizeLimit")
+// clang-format on
+
+QUERY_UTIL_NAMED_ENUM_DEFINE(MultiPlannerStopCondition, MULTI_PLANNER_STOP_CONDITION_TABLE)
+#undef MULTI_PLANNER_STOP_CONDITION_TABLE
+
+/**
+ * The stop condition's name, as reported by explain.
+ */
+inline std::string_view toStringView(MultiPlannerStopCondition condition) {
+    return toStringData(condition);
+}
+
+struct OrStats : public SpecificStats {
+    OrStats() = default;
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<OrStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t dupsTested = 0u;
+    size_t dupsDropped = 0u;
+
+    uint64_t peakTrackedMemBytes = 0;
+};
+
+struct ProjectionStats : public SpecificStats {
+    ProjectionStats() {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<ProjectionStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return projObj.objsize() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Object specifying the projection transformation to apply.
+    BSONObj projObj;
+
+    // Peak memory (in bytes) tracked while evaluating the projection's expressions. Only populated
+    // for PROJECTION_DEFAULT when both featureFlagQueryMemoryTracking and
+    // featureFlagExpressionMemoryTracking are enabled; zero otherwise.
+    uint64_t peakTrackedMemBytes = 0;
+};
+
+/**
+ * TODO SERVER-112777: Remove 'atlas_streams' dependency on this struct.
+ */
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] SortStats : public SpecificStats {
+    SortStats() = default;
+    SortStats(uint64_t limit, uint64_t maxMemoryUsageBytes)
+        : limit(limit), maxMemoryUsageBytes(maxMemoryUsageBytes) {}
+
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<SortStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sortPattern.objsize() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The pattern according to which we are sorting.
+    BSONObj sortPattern;
+
+    // The number of results to return from the sort.
+    uint64_t limit = 0u;
+
+    // The maximum number of bytes of memory we're willing to use during execution of the sort. If
+    // this limit is exceeded and 'allowDiskUse' is false, the query will fail at execution time. If
+    // 'allowDiskUse' is true, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = 0u;
+
+    // The amount of data we've sorted in bytes. At various times this data may be buffered in
+    // memory or disk-resident, depending on the configuration of 'maxMemoryUsageBytes' and whether
+    // disk use is allowed.
+    uint64_t totalDataSizeBytes = 0u;
+
+    // The amount of memory that is currently being used, even prior to being sorted.
+    uint64_t memoryUsageBytes = 0u;
+
+    // The maximum amount of memory that was used.
+    uint64_t peakTrackedMemBytes = 0u;
+
+    // The number of keys that we've sorted.
+    uint64_t keysSorted = 0u;
+
+    SpillingStats spillingStats;
+};
+
+struct MergeSortStats : public SpecificStats {
+    MergeSortStats() = default;
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<MergeSortStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sortPattern.objsize() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t dupsTested = 0u;
+    size_t dupsDropped = 0u;
+
+    // The pattern according to which we are sorting.
+    BSONObj sortPattern;
+
+    uint64_t peakTrackedMemBytes = 0u;
+};
+
+struct ShardingFilterStats : public SpecificStats {
+    ShardingFilterStats() : chunkSkips(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<ShardingFilterStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t chunkSkips;
+};
+
+struct SkipStats : public SpecificStats {
+    SkipStats() : skip(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<SkipStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t skip;
+};
+
+struct IntervalStats {
+    // Number of results found in the covering of this interval.
+    long long numResultsBuffered = 0;
+    // Number of documents in this interval returned to the parent stage.
+    long long numResultsReturned = 0;
+    // Number of documents in this interval that passed the distance checks but were rejected by
+    // the residual predicate pushed into this stage. Without a pushed-down predicate this is
+    // always 0. Interval sizing must account for these, since they measure local document density
+    // just as well as the documents that were returned.
+    long long numRejectedByFilter = 0;
+
+    // Min distance of this interval - always inclusive.
+    double minDistanceAllowed = -1;
+    // Max distance of this interval - inclusive iff inclusiveMaxDistanceAllowed.
+    double maxDistanceAllowed = -1;
+    // True only in the last interval.
+    bool inclusiveMaxDistanceAllowed = false;
+};
+
+struct NearStats : public SpecificStats {
+    NearStats() : indexVersion(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<NearStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return container_size_helper::estimateObjectSizeInBytes(intervalStats) +
+            keyPattern.objsize() + indexName.capacity() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    std::vector<IntervalStats> intervalStats;
+    std::string indexName;
+    // btree index version, not geo index version
+    int indexVersion;
+    BSONObj keyPattern;
+
+    SpillingStats spillingStats;
+
+    int64_t peakTrackedMemBytes = 0;
+};
+
+struct UpdateStats : public SpecificStats {
+    UpdateStats() : nMatched(0), nModified(0), isModUpdate(false), nUpserted(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<UpdateStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return objInserted.objsize() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The number of documents which match the query part of the update.
+    size_t nMatched;
+
+    // The number of documents modified by this update.
+    size_t nModified;
+
+    // True iff this is a $mod update.
+    bool isModUpdate;
+
+    // Will be 1 if this is an {upsert: true} update that did an insert, 0 otherwise.
+    size_t nUpserted;
+
+    // The object that was inserted. This is an empty document if no insert was performed.
+    BSONObj objInserted;
+
+    // The number of documents fetched by write_stage_common::ensureStillMatches.
+    size_t docsFetched = 0;
+
+    int64_t peakTrackedMemBytes = 0;
+};
+
+struct TextMatchStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TextMatchStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return parsedTextQuery.objsize() + indexPrefix.objsize() + indexName.capacity() +
+            sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    std::string indexName;
+
+    // Human-readable form of the FTSQuery associated with the text stage.
+    BSONObj parsedTextQuery;
+
+    int textIndexVersion{0};
+
+    // Index keys that precede the "text" index key.
+    BSONObj indexPrefix;
+
+    size_t docsRejected{0};
+};
+
+struct TextOrStats : public SpecificStats {
+    TextOrStats() : fetches(0) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TextOrStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t fetches;
+    SpillingStats spillingStats;
+
+    int64_t peakTrackedMemBytes = 0;
+};
+
+struct TrialStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TrialStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t trialPeriodMaxWorks = 0;
+    double successThreshold = 0;
+
+    size_t trialWorks = 0;
+    size_t trialAdvanced = 0;
+
+    bool trialCompleted = false;
+    bool trialSucceeded = false;
+};
+
+struct GroupStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<GroupStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Tracks an estimate of the total size of all documents output by the group stage in bytes.
+    size_t totalOutputDataSizeBytes = 0;
+
+    SpillingStats spillingStats;
+
+    int64_t peakTrackedMemBytes = 0;
+};
+
+struct DocumentSourceCursorStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceCursorStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    PlanSummaryStats planSummaryStats;
+};
+
+struct DocumentSourceMergeCursorsStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceMergeCursorsStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    PlanSummaryStats planSummaryStats;
+    query_stats::DataBearingNodeMetrics dataBearingNodeMetrics;
+};
+
+struct DocumentSourceLookupStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceLookupStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Tracks the summary stats in aggregate across all executions of the subpipeline.
+    PlanSummaryStats planSummaryStats;
+};
+
+struct UnionWithStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<UnionWithStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Tracks the summary stats of the subpipeline.
+    PlanSummaryStats planSummaryStats;
+};
+
+struct DocumentSourceFacetStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceFacetStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Tracks the cumulative summary stats across all facets.
+    PlanSummaryStats planSummaryStats;
+};
+
+struct UnpackTimeseriesBucketStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<UnpackTimeseriesBucketStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t nBucketsUnpacked = 0u;
+};
+
+struct TimeseriesModifyStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TimeseriesModifyStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return objInserted.objsize() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    std::string opType;
+    BSONObj bucketFilter;
+    BSONObj residualFilter;
+    size_t nBucketsUnpacked = 0u;
+    size_t nMeasurementsMatched = 0u;
+    size_t nMeasurementsModified = 0u;
+
+    // Will be 1 if this is an {upsert: true} update that did an insert, 0 otherwise.
+    size_t nMeasurementsUpserted = 0u;
+
+    // The object that was inserted. This is an empty document if no insert was performed.
+    BSONObj objInserted;
+
+    // True iff this is a $mod update.
+    bool isModUpdate;
+
+    // The number of documents fetched by write_stage_common::ensureStillMatches.
+    size_t docsFetched = 0;
+};
+
+struct SampleFromTimeseriesBucketStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<SampleFromTimeseriesBucketStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t nBucketsDiscarded = 0u;
+    size_t dupsTested = 0u;
+    size_t dupsDropped = 0u;
+};
+
+struct SpoolStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<SpoolStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The maximum number of bytes of memory we're willing to use during execution of the spool. If
+    // this limit is exceeded and 'allowDiskUse' is false, the query will fail at execution time. If
+    // 'allowDiskUse' is true, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = 0u;
+
+    // The maximum number of bytes of disk space we're willing to use during execution of the spool,
+    // if 'allowDiskUse' is true.
+    uint64_t maxDiskUsageBytes = 0u;
+
+    // The amount of data we've spooled in bytes.
+    uint64_t totalDataSizeBytes = 0u;
+
+    // The maximum amount of memory that was used.
+    uint64_t peakTrackedMemBytes = 0u;
+
+    SpillingStats spillingStats;
+};
+
+struct EofStats : public SpecificStats {
+    EofStats(eof_node::EOFType type) : type(type) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<EofStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    eof_node::EOFType type;
+};
+
+struct DocumentSourceIdLookupStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceIdLookupStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Tracks the cumulative summary stats for the idLookup sub-pipeline.
+    PlanSummaryStats planSummaryStats;
+};
+
+struct DocumentSourceGraphLookupStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<DocumentSourceGraphLookupStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The peak amount of RAM used by the stage during execution.
+    uint64_t maxMemoryUsageBytes = 0;
+
+    SpillingStats spillingStats;
+
+    // Tracks the summary stats in aggregate across all executions of the subpipeline.
+    PlanSummaryStats planSummaryStats;
+};
+
+struct DocumentSourceBucketAutoStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<DocumentSourceBucketAutoStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    SpillingStats spillingStats;
+};
+
+struct DocumentSourceSetWindowFieldsStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<DocumentSourceSetWindowFieldsStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    SpillingStats spillingStats;
+
+    int64_t peakTrackedMemBytes = 0;
+};
 
 }  // namespace mongo

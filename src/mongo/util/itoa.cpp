@@ -1,0 +1,110 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/itoa.h"
+
+#include <cstdint>
+#include <cstring>
+#include <iterator>
+#include <string_view>
+#include <type_traits>
+
+namespace mongo {
+namespace {
+
+/**
+ * This is a tunable parameter of the ItoA implementation. It can be adjusted for
+ * benchmarking to find optimal table size. Currently 4 digits has the best performance.
+ * (Changing this number requires adjusting the ALL_DIGITS support macro).
+ */
+#ifndef ITOA_TABLE_DIGITS
+#define ITOA_TABLE_DIGITS 4
+#endif
+
+/**
+ * Generates a table by calling function-like `macro(d3,d2,d1,d0)` with the 4 decimal
+ * digits of the table index. That is, generates the expansion of:
+ *
+ *     `m(0,0,0,0) m(0,0,0,1) ... m(9,9,9,9)`
+ */
+// clang-format off
+#define ALL_DIGITS(m) \
+    D1(m,0) D1(m,1) D1(m,2) D1(m,3) D1(m,4) \
+    D1(m,5) D1(m,6) D1(m,7) D1(m,8) D1(m,9)
+#define D1(m,d0) \
+    D2(m,d0,0) D2(m,d0,1) D2(m,d0,2) D2(m,d0,3) D2(m,d0,4) \
+    D2(m,d0,5) D2(m,d0,6) D2(m,d0,7) D2(m,d0,8) D2(m,d0,9)
+#define D2(m,d1,d0) \
+    D3(m,d1,d0,0) D3(m,d1,d0,1) D3(m,d1,d0,2) D3(m,d1,d0,3) D3(m,d1,d0,4) \
+    D3(m,d1,d0,5) D3(m,d1,d0,6) D3(m,d1,d0,7) D3(m,d1,d0,8) D3(m,d1,d0,9)
+#define D3(m,d2,d1,d0) \
+    D4(m,d2,d1,d0,0) D4(m,d2,d1,d0,1) D4(m,d2,d1,d0,2) D4(m,d2,d1,d0,3) D4(m,d2,d1,d0,4) \
+    D4(m,d2,d1,d0,5) D4(m,d2,d1,d0,6) D4(m,d2,d1,d0,7) D4(m,d2,d1,d0,8) D4(m,d2,d1,d0,9)
+#define D4(macro,d3,d2,d1,d0) \
+    macro(d3,d2,d1,d0)
+// clang-format on
+
+constexpr std::size_t pow10(std::size_t n) {
+    return n ? 10 * pow10(n - 1) : 1;
+}
+
+constexpr std::size_t kTableDigits = ITOA_TABLE_DIGITS;
+constexpr std::size_t kTableSize = pow10(kTableDigits);
+
+//  Examples from a 4-digit `gTable`:
+//    {1, {'0','0','0','0'}}  //    0
+//    {1, {'0','0','0','9'}}  //    9
+//    {2, {'0','0','9','9'}}  //   99
+//    {3, {'0','9','9','9'}}  //  999
+//    {4, {'9','9','9','9'}}  // 9999
+struct Entry {
+    std::uint8_t width;  // Number of digits to be printed when not zero-padded.
+    char s[kTableDigits];
+};
+
+template <int D0, int... Dn>
+constexpr uint8_t printedWidth() {
+    const int kMag = sizeof...(Dn);
+    if constexpr (D0 != 0)
+        return 1 + kMag;
+    else if constexpr (kMag == 0)
+        return 1;  // The all-zeros pattern still has 1 digit when printed.
+    else
+        return printedWidth<Dn...>();
+}
+
+template <int... D>
+constexpr Entry makeEntry() {
+    return Entry{printedWidth<D...>(), {('0' + D)...}};
+}
+
+#define ITOA_MAKE_ENTRY(...) makeEntry<__VA_ARGS__>(),
+
+constexpr Entry gTable[] = {ALL_DIGITS(ITOA_MAKE_ENTRY)};
+static_assert(std::extent_v<decltype(gTable)> == kTableSize, "gTable has correct size.");
+
+}  // namespace
+
+ItoA::ItoA(std::uint64_t val) {
+    if (val < kTableSize) {
+        const auto& e = gTable[val];
+        std::size_t n = e.width;
+        _str = std::string_view(std::end(e.s) - n, n);
+        return;
+    }
+    char* p = std::end(_buf);
+    while (val >= kTableSize) {
+        std::size_t idx = val % kTableSize;
+        val /= kTableSize;
+        const auto& e = gTable[idx];
+        p -= kTableDigits;
+        memcpy(p, std::end(e.s) - kTableDigits, kTableDigits);
+    }
+    const auto& e = gTable[val];
+    auto n = e.width;
+    p -= n;
+    memcpy(p, std::end(e.s) - n, n);
+    _str = std::string_view(p, std::end(_buf) - p);
+}
+
+}  // namespace mongo

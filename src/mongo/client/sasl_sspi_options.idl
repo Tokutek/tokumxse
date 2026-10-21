@@ -1,0 +1,29 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+    cpp_includes:
+        - "mongo/client/sasl_sspi_options.h"
+    configs:
+        section: "Kerberos Options"
+        source: [yaml, cli, ini]
+
+configs:
+    "security.sspiHostnamecanonicalization":
+        short_name: "sspiHostnamecanonicalization"
+        description: "DNS resolution strategy to use for hostname canonicalization. May be one of: {none, forward, forwardAndReverse}"
+        arg_vartype: String
+        default: "none"
+        condition:
+            preprocessor: "defined(_WIN32)"
+
+    "security.sspiRealmOverride":
+        short_name: "sspiRealmOverride"
+        description: "Override the detected realm with the provided string"
+        arg_vartype: String
+        cpp_varname: "saslSSPIGlobalParams.realmOverride"
+        hidden: true
+        condition:
+            preprocessor: "defined(_WIN32)"

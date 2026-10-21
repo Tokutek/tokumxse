@@ -1,0 +1,40 @@
+// These commands were removed from mongos since the last LTS version, but will still appear in the
+// listCommands output of a last LTS version mongos. A last-lts mongos will be unable to
+// run a command on a latest version shard that no longer supports that command. To increase test
+// coverage and allow us to run on same- and mixed-version suites, we allow these commands to have a
+// test defined without always existing on the servers being used.
+export const commandsRemovedFromMongosSinceLastLTS = [
+    "_getAuditConfigGeneration", // Removed in 8.1
+    "changePrimary", // Removed in 9.0
+    "repairShardedCollectionChunksHistory", // Removed in 9.0
+    "startRecordingTraffic",
+    "stopRecordingTraffic",
+    "cleanupReshardCollection",
+];
+
+// These commands were added in mongos since the last LTS version, so will not appear in the
+// listCommands output of a last LTS version mongos. We will allow these commands to have a test
+// defined without always existing on the mongos being used.
+export const commandsAddedToMongosSinceLastLTS = [
+    "_flushShardRegistry",
+    "releaseMemory",
+    "replicateSearchIndexCommand",
+    "getTrafficRecordingStatus",
+    "getTransitionToDedicatedConfigServerStatus",
+    "startTrafficRecording",
+    "stopTrafficRecording",
+    "startShardDraining",
+    "startTransitionToDedicatedConfigServer",
+    "shardDrainingStatus",
+    "stopShardDraining",
+    "stopTransitionToDedicatedConfigServer",
+    "commitShardRemoval",
+    "commitTransitionToDedicatedConfigServer",
+    "rewriteCollection",
+    "abortRewriteCollection",
+    "recreateRangeDeletionTasks",
+    "upgradeDowngradeViewlessTimeseries",
+    "getMetricsFilteringAllowlist",
+    "updateMetricsFilteringAllowlist",
+    "clearJoinPlanCache",
+];

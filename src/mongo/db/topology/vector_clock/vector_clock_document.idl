@@ -1,0 +1,44 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of the vector clock document stored under config.system.version.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    vectorClockDocument:
+        description: "Represents the vector clock persistent state."
+        strict: false
+        fields:
+            _id:
+                type: string
+                description: "Key of the VectorClock state singleton document"
+                default: '"vectorClockState"'
+            configTime:
+                type: timestamp
+                description: "Persists the configTime component of the vector clock"
+                default: Timestamp(0, 1)
+            topologyTime:
+                type: timestamp
+                description: "Persists the topologyTime component of the vector clock"
+                default: Timestamp(0, 1)
+
+server_parameters:
+    maxAcceptableLogicalClockDriftSecs:
+        description:
+            "The value defines the maximum time, in seconds, that a new logical time (such
+            as $clusterTime) may be ahead of the node's current wallclock time. Default
+            value is 1 year."
+        set_at: [startup]
+        cpp_vartype: long long
+        cpp_varname: gMaxAcceptableLogicalClockDriftSecs
+        default:
+            expr: (365 * 24 * 60 * 60) # one year
+        validator:
+            gt: 0
+        redact: false

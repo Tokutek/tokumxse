@@ -1,0 +1,51 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+commands:
+    compact:
+        api_version: ""
+        command_name: compact
+        cpp_name: CompactCommand
+        description: "Parser for the 'compact' command."
+        fields:
+            dryRun:
+                description: "Runs only the estimation phase of the compact operation"
+                default: false
+                type: bool
+            force:
+                description: "Allows to run on a replica set primary"
+                optional: true
+                type: bool
+            freeSpaceTargetMB:
+                description: "Minimum amount of space recoverable for compaction to proceed."
+                optional: true
+                type: safeInt64
+                validator: {gte: 1}
+        namespace: concatenate_with_db
+        strict: true
+
+    autoCompact:
+        api_version: ""
+        command_name: autoCompact
+        cpp_name: AutoCompact
+        description: "Parser for the 'autoCompact' command."
+        namespace: type
+        type: bool
+        fields:
+            freeSpaceTargetMB:
+                description: "Minimum amount of space recoverable for compaction to proceed."
+                optional: true
+                type: safeInt64
+                validator: {gte: 1}
+            runOnce:
+                description: "Run compact once on every file on the node."
+                type: bool
+                default: false

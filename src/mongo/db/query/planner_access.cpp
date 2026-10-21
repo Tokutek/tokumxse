@@ -1,1350 +1,2821 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/planner_access.h"
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/fts/fts_index_format.h"
+#include "mongo/db/fts/fts_query.h"
+#include "mongo/db/fts/fts_query_impl.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/fts/fts_util.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_reordering.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/expression_type.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/clustered_collection_scan.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/compiler/logical_model/projection/projection.h"
+#include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/eof_node_type.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/compiler/rewrites/matcher/expression_optimizer.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/index_tag.h"
+#include "mongo/db/query/indexability.h"
+#include "mongo/db/query/planner_ixselect.h"
+#include "mongo/db/query/planner_wildcard_helpers.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/query/record_id_range.h"
+#include "mongo/db/query/record_id_range_list.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_options_gen.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
 #include <algorithm>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
 
-#include "mongo/db/matcher/expression_array.h"
-#include "mongo/db/matcher/expression_geo.h"
-#include "mongo/db/matcher/expression_text.h"
-#include "mongo/db/query/indexability.h"
-#include "mongo/db/query/index_bounds_builder.h"
-#include "mongo/db/query/index_tag.h"
-#include "mongo/db/query/query_knobs.h"
-#include "mongo/db/query/query_planner.h"
-#include "mongo/db/query/query_planner_common.h"
-#include "mongo/util/log.h"
+#include <s2cellid.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace {
 
-    using namespace mongo;
+using namespace mongo;
 
-    /**
-     * Text node functors.
-     */
-    bool isTextNode(const QuerySolutionNode* node) {
-        return STAGE_TEXT == node->getType();
+namespace wcp = ::mongo::wildcard_planning;
+
+/**
+ * Casts 'node' to a FetchNode* if it is a FetchNode, otherwise returns null.
+ */
+FetchNode* getFetchNode(QuerySolutionNode* node) {
+    if (STAGE_FETCH != node->getType()) {
+        return nullptr;
     }
 
-} // namespace
+    return static_cast<FetchNode*>(node);
+}
+
+/**
+ * If 'node' is an index scan node, casts it to IndexScanNode*. If 'node' is a FetchNode with an
+ * IndexScanNode child, then returns a pointer to the child index scan node. Otherwise returns
+ * null.
+ */
+const IndexScanNode* getIndexScanNode(const QuerySolutionNode* node) {
+    if (STAGE_IXSCAN == node->getType()) {
+        return static_cast<const IndexScanNode*>(node);
+    } else if (STAGE_FETCH == node->getType()) {
+        tassert(11321005,
+                fmt::format("STAGE_FETCH nodes must have exactly one child, but found {}",
+                            node->children.size()),
+                1U == node->children.size());
+        const QuerySolutionNode* child = node->children[0].get();
+        if (STAGE_IXSCAN == child->getType()) {
+            return static_cast<const IndexScanNode*>(child);
+        }
+    }
+
+    return nullptr;
+}
+
+/**
+ * Takes as input two query solution nodes returned by processIndexScans(). If both are
+ * IndexScanNode or FetchNode with an IndexScanNode child and the index scan nodes are identical
+ * (same bounds, same filter, same direction, etc.), then returns true. Otherwise returns false.
+ */
+bool scansAreEquivalent(const QuerySolutionNode* lhs, const QuerySolutionNode* rhs) {
+    const IndexScanNode* leftIxscan = getIndexScanNode(lhs);
+    const IndexScanNode* rightIxscan = getIndexScanNode(rhs);
+    if (!leftIxscan || !rightIxscan) {
+        return false;
+    }
+
+    return *leftIxscan == *rightIxscan;
+}
+
+/**
+ * If all nodes can provide the requested sort, returns a vector expressing which nodes must
+ * have their index scans reversed to provide the sort. Otherwise, returns an empty vector.
+ * 'nodes' must not be empty.
+ */
+std::vector<bool> canProvideSortWithMergeSort(
+    const std::vector<std::unique_ptr<QuerySolutionNode>>& nodes, const BSONObj& requestedSort) {
+    tassert(11321006, "nodes must not be empty", !nodes.empty());
+    std::vector<bool> shouldReverseScan;
+    const auto reverseSort = QueryPlannerCommon::reverseSortObj(requestedSort);
+    for (auto&& node : nodes) {
+        node->computeProperties();
+        if (node->providedSorts().contains(requestedSort)) {
+            shouldReverseScan.push_back(false);
+        } else if (node->providedSorts().contains(reverseSort)) {
+            shouldReverseScan.push_back(true);
+        } else {
+            return {};
+        }
+    }
+    return shouldReverseScan;
+}
+
+/**
+ * Resolves the final direction hint to be used in collection scans, as there multiple
+ * mechanisms of overriding the planner's direction decision. It does so by enforcing the
+ * following precedence: timeseries traversal preference > query settings '$natural' hint >
+ * cursor '$natural' hint.
+ */
+boost::optional<int> determineCollScanHintedDirection(const CanonicalQuery& query,
+                                                      const QueryPlannerParams& params) {
+    // If present, let the traversal preference decide what order to scan to avoid a blocking
+    // sort.
+    if (params.traversalPreference.has_value()) {
+        return boost::none;
+    }
+
+    // Otherwise use the direction specified by query settings if available.
+    if (auto querySettingsDirection = params.mainCollectionInfo.collscanDirection) {
+        return static_cast<int>(*querySettingsDirection);
+    }
+
+    // Next, try to determine the scan direction using the '$natural' cursor hint.
+    const BSONObj& cursorHint = query.getFindCommandRequest().getHint();
+    if (cursorHint.isEmpty() || params.querySettingsApplied) {
+        return boost::none;
+    }
+    auto naturalHint = cursorHint[query_request_helper::kNaturalSortField];
+    if (!naturalHint) {
+        return boost::none;
+    }
+    return naturalHint.safeNumberInt() >= 0 ? 1 : -1;
+}
+}  // namespace
 
 namespace mongo {
 
-    using std::auto_ptr;
-    using std::vector;
+using std::unique_ptr;
+using std::vector;
 
-    // static
-    QuerySolutionNode* QueryPlannerAccess::makeCollectionScan(const CanonicalQuery& query,
-                                                              bool tailable,
-                                                              const QueryPlannerParams& params) {
-        // Make the (only) node, a collection scan.
-        CollectionScanNode* csn = new CollectionScanNode();
-        csn->name = query.ns();
-        csn->filter.reset(query.root()->shallowClone());
-        csn->tailable = tailable;
-        csn->maxScan = query.getParsed().getMaxScan();
+namespace {
+/**
+ * Extracts the lower and upper bounds on the "ts" field from 'me'. This only examines comparisons
+ * of "ts" against a Timestamp at the top level or inside a top-level $and.
+ */
+std::pair<boost::optional<Timestamp>, boost::optional<Timestamp>> extractTsRange(
+    const MatchExpression* me, bool topLevel = true) {
+    boost::optional<Timestamp> min;
+    boost::optional<Timestamp> max;
 
-        // If the hint is {$natural: +-1} this changes the direction of the collection scan.
-        if (!query.getParsed().getHint().isEmpty()) {
-            BSONElement natural = query.getParsed().getHint().getFieldDotted("$natural");
-            if (!natural.eoo()) {
-                csn->direction = natural.numberInt() >= 0 ? 1 : -1;
+    if (me->matchType() == MatchExpression::AND && topLevel) {
+        for (size_t i = 0; i < me->numChildren(); ++i) {
+            boost::optional<Timestamp> childMin;
+            boost::optional<Timestamp> childMax;
+            std::tie(childMin, childMax) = extractTsRange(me->getChild(i), false);
+            if (childMin && (!min || childMin.value() > min.value())) {
+                min = childMin;
+            }
+            if (childMax && (!max || childMax.value() < max.value())) {
+                max = childMax;
             }
         }
-
-        // The sort can specify $natural as well. The sort direction should override the hint
-        // direction if both are specified.
-        const BSONObj& sortObj = query.getParsed().getSort();
-        if (!sortObj.isEmpty()) {
-            BSONElement natural = sortObj.getFieldDotted("$natural");
-            if (!natural.eoo()) {
-                csn->direction = natural.numberInt() >= 0 ? 1 : -1;
-            }
-        }
-
-        return csn;
+        return {min, max};
     }
 
-    // static
-    QuerySolutionNode* QueryPlannerAccess::makeLeafNode(const CanonicalQuery& query,
-                                                        const IndexEntry& index,
-                                                        size_t pos,
-                                                        MatchExpression* expr,
-                                                        IndexBoundsBuilder::BoundsTightness* tightnessOut) {
-        // We're guaranteed that all GEO_NEARs are first.  This slightly violates the "sort index
-        // predicates by their position in the compound index" rule but GEO_NEAR isn't an ixscan.
-        // This saves our bacon when we have {foo: 1, bar: "2dsphere"} and the predicate on bar is a
-        // $near.  If we didn't get the GEO_NEAR first we'd create an IndexScanNode and later cast
-        // it to a GeoNear2DSphereNode
-        //
-        // This should gracefully deal with the case where we have a pred over foo but no geo clause
-        // over bar.  In that case there is no GEO_NEAR to appear first and it's treated like a
-        // straight ixscan.
+    if (!ComparisonMatchExpression::isComparisonMatchExpression(me) ||
+        me->path() != repl::OpTime::kTimestampFieldName) {
+        return {min, max};
+    }
 
-        if (MatchExpression::GEO_NEAR == expr->matchType()) {
-            // We must not keep the expression node around.
-            *tightnessOut = IndexBoundsBuilder::EXACT;
-            GeoNearMatchExpression* nearExpr = static_cast<GeoNearMatchExpression*>(expr);
+    auto rawElem = static_cast<const ComparisonMatchExpression*>(me)->getData();
+    if (rawElem.type() != BSONType::timestamp) {
+        return {min, max};
+    }
 
-            BSONElement elt = index.keyPattern.firstElement();
-            bool indexIs2D = (String == elt.type() && "2d" == elt.String());
+    switch (me->matchType()) {
+        case MatchExpression::EQ:
+            min = rawElem.timestamp();
+            max = rawElem.timestamp();
+            return {min, max};
+        case MatchExpression::GT:
+        case MatchExpression::GTE:
+            min = rawElem.timestamp();
+            return {min, max};
+        case MatchExpression::LT:
+        case MatchExpression::LTE:
+            max = rawElem.timestamp();
+            return {min, max};
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
 
-            if (indexIs2D) {
-                GeoNear2DNode* ret = new GeoNear2DNode();
-                ret->indexKeyPattern = index.keyPattern;
-                ret->nq = &nearExpr->getData();
-                ret->baseBounds.fields.resize(index.keyPattern.nFields());
-                if (NULL != query.getProj()) {
-                    ret->addPointMeta = query.getProj()->wantGeoNearPoint();
-                    ret->addDistMeta = query.getProj()->wantGeoNearDistance();
-                }
+/**
+ * Returns true if 'me' is a GTE or GE predicate over the "ts" field.
+ */
+bool isOplogTsLowerBoundPred(const mongo::MatchExpression* me) {
+    if (mongo::MatchExpression::GT != me->matchType() &&
+        mongo::MatchExpression::GTE != me->matchType()) {
+        return false;
+    }
 
-                return ret;
+    return me->path() == repl::OpTime::kTimestampFieldName;
+}
+
+}  // namespace
+
+void QueryPlannerAccess::handleRIDRangeMinMax(const CanonicalQuery& query,
+                                              const int direction,
+                                              const CollatorInterface* queryCollator,
+                                              const CollatorInterface* ccCollator,
+                                              RecordIdRange& recordRange) {
+    BSONObj minObj = query.getFindCommandRequest().getMin();
+    BSONObj maxObj = query.getFindCommandRequest().getMax();
+    if (minObj.isEmpty() && maxObj.isEmpty()) {
+        return;
+    }
+
+    // If either min() or max() were provided, we can assume they are on the cluster key due to the
+    // following.
+    // (1) min() / max() are only legal when they match the pattern in hint()
+    // (2) Only hint() on a cluster key will generate collection scan rather than an index scan
+    uassert(
+        6137402,
+        "min() / max() are only supported for forward collection scans on clustered collections",
+        direction == 1);
+
+    boost::optional<RecordId> newMinRecord, newMaxRecord;
+    if (!maxObj.isEmpty() &&
+        ClusteredCollectionScanPlanner::compatibleCollator(
+            ccCollator, queryCollator, maxObj.firstElement())) {
+        // max() is exclusive.
+        // Assumes clustered collection scans are only supported with the forward direction.
+        recordRange.maybeNarrowMax(
+            IndexBoundsBuilder::objFromElement(maxObj.firstElement(), queryCollator),
+            false /* NOT inclusive*/);
+    }
+
+    if (!minObj.isEmpty() &&
+        ClusteredCollectionScanPlanner::compatibleCollator(
+            ccCollator, queryCollator, minObj.firstElement())) {
+        // The min() is inclusive as are bounded collection scans by default.
+        recordRange.maybeNarrowMin(
+            IndexBoundsBuilder::objFromElement(minObj.firstElement(), queryCollator),
+            true /* inclusive*/);
+    }
+}
+
+[[nodiscard]] bool QueryPlannerAccess::handleRIDRangeScan(
+    const MatchExpression* conjunct,
+    const CollatorInterface* queryCollator,
+    const CollatorInterface* ccCollator,
+    std::string_view clusterKeyFieldName,
+    RecordIdRangeList& outRangeList,
+    bool* outRangeListExact,
+    const std::function<void(const MatchExpression*, const RecordIdRangeList&)>& visitor) {
+    tassert(12591309, "outRangeList must initially be unbounded.", outRangeList.isUnbounded());
+
+    if (conjunct == nullptr) {
+        return false;
+    }
+
+    // Handle $and: collect a range list from each child, then intersect them.
+    // Note that clustered indexes cannot be multi-key (because _id cannot be an array),
+    // so this is indeed a valid optimization.
+    const AndMatchExpression* andMatchPtr = dynamic_cast<const AndMatchExpression*>(conjunct);
+    if (andMatchPtr != nullptr) {
+        bool atLeastOneConjunctCompatibleCollation = false;
+        bool allExact = true;
+        std::vector<RecordIdRangeList> conjunctRangeLists;
+        for (size_t index = 0; index < andMatchPtr->numChildren(); index++) {
+            const MatchExpression* branch = andMatchPtr->getChild(index);
+            RecordIdRangeList childRangeList;
+            bool branchExact = false;
+            if (handleRIDRangeScan(branch,
+                                   queryCollator,
+                                   ccCollator,
+                                   clusterKeyFieldName,
+                                   childRangeList,
+                                   &branchExact,
+                                   visitor)) {
+                atLeastOneConjunctCompatibleCollation = true;
             }
-            else {
-                GeoNear2DSphereNode* ret = new GeoNear2DSphereNode();
-                ret->indexKeyPattern = index.keyPattern;
-                ret->nq = &nearExpr->getData();
-                ret->baseBounds.fields.resize(index.keyPattern.nFields());
-                if (NULL != query.getProj()) {
-                    ret->addPointMeta = query.getProj()->wantGeoNearPoint();
-                    ret->addDistMeta = query.getProj()->wantGeoNearDistance();
-                }
-                return ret;
+            allExact &= branchExact;
+            conjunctRangeLists.push_back(std::move(childRangeList));
+        }
+
+        outRangeList = RecordIdRangeList::intersect(std::move(conjunctRangeLists));
+        if (outRangeListExact) {
+            *outRangeListExact = allExact;
+        }
+        if (visitor && allExact) {
+            visitor(conjunct, outRangeList);
+        }
+        // If one of the conjuncts excludes values of the cluster key which are affected by
+        // collation, then the entire $and will also exclude those values.
+        return atLeastOneConjunctCompatibleCollation;
+    }
+
+    // Handle $or: bound each branch independently and take the union.
+    const OrMatchExpression* orMatchPtr = dynamic_cast<const OrMatchExpression*>(conjunct);
+    if (orMatchPtr != nullptr) {
+        std::vector<RecordIdRangeList> branchLists;
+        bool allBranchesCompatible = true;
+        bool allExact = true;
+        for (size_t i = 0; i < orMatchPtr->numChildren(); i++) {
+            const MatchExpression* branch = orMatchPtr->getChild(i);
+            RecordIdRangeList branchRangeList;
+            bool branchExact = false;
+            bool branchCompatible = handleRIDRangeScan(branch,
+                                                       queryCollator,
+                                                       ccCollator,
+                                                       clusterKeyFieldName,
+                                                       branchRangeList,
+                                                       &branchExact,
+                                                       visitor);
+            allBranchesCompatible &= branchCompatible;
+            allExact &= branchExact;
+            branchLists.push_back(std::move(branchRangeList));
+        }
+        outRangeList = RecordIdRangeList::unite(std::move(branchLists));
+        if (outRangeListExact) {
+            *outRangeListExact = allExact;
+        }
+        if (visitor && allExact) {
+            visitor(conjunct, outRangeList);
+        }
+        return allBranchesCompatible;
+    }
+
+    // If 'conjunct' does not apply to the cluster key, return early here, as updating bounds based
+    // on this conjunct is incorrect and can result in garbage bounds.
+    if (conjunct->path() != clusterKeyFieldName) {
+        if (outRangeListExact) {
+            *outRangeListExact = false;
+        }
+        // Can skip calling the visitor here because a node not on the cluster key cannot have exact
+        // bounds.
+        return false;
+    }
+
+    // TODO SERVER-62707: Allow $in with regex to use a clustered index.
+    const InMatchExpression* inMatch = dynamic_cast<const InMatchExpression*>(conjunct);
+    if (inMatch && !inMatch->hasRegex()) {
+        // Build one point range per equality value and union them. This allows the execution
+        // engine to seek between disjoint intervals rather than scanning the entire min–max span.
+        std::vector<RecordIdRange> ranges;
+        bool allEltsCollationCompatible = true;
+        for (const BSONElement& element : inMatch->getEqualities()) {
+            RecordIdRange r;
+            if (ClusteredCollectionScanPlanner::compatibleCollator(
+                    ccCollator, queryCollator, element)) {
+                // Represent elements with compatible collation in an $in array as exact
+                // point ranges.
+                const BSONObj collated = IndexBoundsBuilder::objFromElement(element, queryCollator);
+                const RecordIdBound bound(record_id_helpers::keyForObj(collated), collated);
+                r.intersectRange(bound, bound, true /* minInclusive */, true /* maxInclusive */);
+            } else {
+                // Collation-incompatible element: use a coarse type range so the scan is at
+                // least bounded to the right BSON type.
+                allEltsCollationCompatible = false;
+                BSONObjBuilder bMin, bMax;
+                bMin.appendMinForType("", stdx::to_underlying(element.type()));
+                bMax.appendMaxForType("", stdx::to_underlying(element.type()));
+                const BSONObj minObj = bMin.obj(), maxObj = bMax.obj();
+                r.intersectRange(RecordIdBound(record_id_helpers::keyForObj(minObj), minObj),
+                                 RecordIdBound(record_id_helpers::keyForObj(maxObj), maxObj),
+                                 true /* minInclusive */,
+                                 true /* maxInclusive */);
+            }
+            ranges.push_back(std::move(r));
+        }
+        outRangeList = RecordIdRangeList::makeUnion(std::move(ranges));
+        if (outRangeListExact) {
+            *outRangeListExact = allEltsCollationCompatible;
+        }
+        if (visitor && allEltsCollationCompatible) {
+            visitor(conjunct, outRangeList);
+        }
+        return allEltsCollationCompatible;
+    }
+
+    auto match = dynamic_cast<const ComparisonMatchExpressionBase*>(conjunct);
+    if (match == nullptr) {
+        if (outRangeListExact) {
+            *outRangeListExact = false;
+        }
+        // Can skip calling the visitor here because an unsupported node type
+        // cannot have exact bounds.
+        return false;
+    }
+
+    const BSONElement& element = match->getData();
+
+    if (!ComparisonMatchExpressionBase::isInternalExprComparison(match->matchType())) {
+        // Internal comparisons e.g., $_internalExprGt do _not_ carry type bracketing
+        // semantics (consistent with `$expr{$gt:[a,b]}`).
+        // For other comparisons which _do_ perform type bracketing, the RecordId bounds
+        // may be tightened here.
+        RecordIdRange recordRange;
+        BSONObjBuilder minb;
+        minb.appendMinForType("", stdx::to_underlying(element.type()));
+        recordRange.maybeNarrowMin(minb.obj(), true /* inclusive */);
+
+        BSONObjBuilder maxb;
+        maxb.appendMaxForType("", stdx::to_underlying(element.type()));
+        recordRange.maybeNarrowMax(maxb.obj(), true /* inclusive */);
+
+        outRangeList = RecordIdRangeList(std::move(recordRange));
+    }
+
+    bool compatible =
+        ClusteredCollectionScanPlanner::compatibleCollator(ccCollator, queryCollator, element);
+    if (!compatible) {
+        // Collator affects probe and it's not compatible with collection's collator.
+        if (outRangeListExact) {
+            *outRangeListExact = false;
+        }
+        // Can skip calling the visitor here because a node with an incompatible collation
+        // cannot have exact bounds.
+        return false;
+    }
+
+    // Even if the collations don't match at this point, it's fine,
+    // because the bounds exclude values that use it.
+    const BSONObj collated = IndexBoundsBuilder::objFromElement(element, queryCollator);
+    using MType = MatchExpression::MatchType;
+    RecordIdRange recordRange;
+    switch (match->matchType()) {
+        case MType::EQ:
+        case MType::INTERNAL_EXPR_EQ:
+            recordRange.maybeNarrowMin(collated, true /* inclusive */);
+            recordRange.maybeNarrowMax(collated, true /* inclusive */);
+            break;
+        case MType::LT:
+        case MType::INTERNAL_EXPR_LT:
+            recordRange.maybeNarrowMax(collated, false /* EXclusive */);
+            break;
+        case MType::LTE:
+        case MType::INTERNAL_EXPR_LTE:
+            recordRange.maybeNarrowMax(collated, true /* inclusive */);
+            break;
+        case MType::GT:
+        case MType::INTERNAL_EXPR_GT:
+            recordRange.maybeNarrowMin(collated, false /* EXclusive */);
+            break;
+        case MType::GTE:
+        case MType::INTERNAL_EXPR_GTE:
+            recordRange.maybeNarrowMin(collated, true /* inclusive */);
+            break;
+        default:
+            // Unknown match type. Cannot narrow the type-wide bounds, and we are not sure if the
+            // rangeList is exact anymore.
+            if (outRangeListExact) {
+                *outRangeListExact = false;
+            }
+            // Can skip calling the visitor here because an unsupported match type
+            // cannot have exact bounds.
+            return true;
+    }
+    if (outRangeListExact) {
+        *outRangeListExact = true;
+    }
+    // Intersect the loose, type-wide RecordIdRange obtained above for non-internal expr comparisons
+    // (if any) with the point ranges obtained for comparisons with compatible collations.
+    outRangeList = RecordIdRangeList::intersect(
+        {std::move(outRangeList), RecordIdRangeList(std::move(recordRange))});
+    if (visitor) {
+        visitor(conjunct, outRangeList);
+    }
+    return true;
+}
+
+// Returns true iff inner ⊆ outer (every RecordId in inner is also in outer).
+bool QueryPlannerAccess::rangeListContainedIn(const RecordIdRangeList& inner,
+                                              const RecordIdRangeList& outer) {
+    const auto intersection = RecordIdRangeList::intersect({inner, outer});
+    return intersection == inner;
+}
+
+namespace {
+
+// Recursively simplifies the expression tree by nulling out nodes in 'toRemove' (which are
+// trivially true for all scan results) and propagating that information upward:
+//   $and: trivially-true children are removed; an all-true $and is itself nulled (trivially true).
+//   $or:  if any branch becomes trivially true the whole $or is nulled (trivially true).
+// "Trivially true" is communicated as expr == nullptr after the call.
+//
+// Note: $nor and $not are intentionally NOT handled. A trivially-true child of $nor means
+// NOT(child) is trivially false, collapsing the $nor to false — the opposite of what nulling
+// would imply. Leaving them unchanged is conservative but correct.
+void applySimplifications(std::unique_ptr<MatchExpression>& expr,
+                          const stdx::unordered_set<const MatchExpression*>& toRemove) {
+    tassert(12591308, "Expected expr.", expr);
+
+    if (toRemove.count(expr.get())) {
+        expr.reset();
+        return;
+    }
+
+    if (auto* conjunct = dynamic_cast<AndMatchExpression*>(expr.get())) {
+        auto& children = *conjunct->getChildVector();
+        for (auto& child : children) {
+            applySimplifications(child, toRemove);
+        }
+        children.erase(std::remove(children.begin(), children.end(), nullptr), children.end());
+        if (conjunct->isTriviallyTrue()) {
+            expr.reset();
+        }
+        return;
+    }
+
+    if (auto* disjunct = dynamic_cast<OrMatchExpression*>(expr.get())) {
+        for (auto& branch : *disjunct->getChildVector()) {
+            applySimplifications(branch, toRemove);
+            if (!branch) {
+                expr.reset();
+                return;
             }
         }
-        else if (MatchExpression::TEXT == expr->matchType()) {
-            // We must not keep the expression node around.
-            *tightnessOut = IndexBoundsBuilder::EXACT;
-            TextMatchExpression* textExpr = static_cast<TextMatchExpression*>(expr);
-            TextNode* ret = new TextNode();
-            ret->indexKeyPattern = index.keyPattern;
-            ret->query = textExpr->getQuery();
-            ret->language = textExpr->getLanguage();
-            ret->caseSensitive = textExpr->getCaseSensitive();
+        return;
+    }
+}
+
+}  // namespace
+
+void QueryPlannerAccess::simplifyFilter(std::unique_ptr<MatchExpression>& expr,
+                                        const RecordIdRangeList& rangeList,
+                                        const CollatorInterface* queryCollator,
+                                        const CollatorInterface* ccCollator,
+                                        std::string_view clusterKeyFieldName) {
+    tassert(12591307, "Expected expr.", expr);
+
+    // We do a separate pass (after handleRIDRangeScan in makeCollectionScan) to identify redundant
+    // nodes. Those are nodes which a) can be expressed exactly as a range and b) the range of
+    // which covers the scan range for the root node. This has to be a pass separate from the
+    // initial handleRIDRangeScan pass because the redundancy of individual nodes depends on the
+    // scan range of the root node, and caching individual nodes' ranges implies O(n^2) memory
+    // complexity.
+    stdx::unordered_set<const MatchExpression*> toRemove;
+    RecordIdRangeList unused;
+    (void)QueryPlannerAccess::handleRIDRangeScan(
+        /* conjunct */ expr.get(),
+        queryCollator,
+        ccCollator,
+        clusterKeyFieldName,
+        /*outRangeList*/ unused,
+        /*outRangeListExact*/ nullptr,
+        [&](const MatchExpression* node, const RecordIdRangeList& nodeRange) {
+            if (QueryPlannerAccess::rangeListContainedIn(rangeList, nodeRange)) {
+                toRemove.insert(node);
+            }
+        });
+
+    // We remove the nodes identified as redundant by the visitor in a third pass.
+    // This lets handleRIDRangeScan take a const pointer to the MatchExpression.
+    applySimplifications(expr, toRemove);
+
+    if (!expr) {
+        // Simplifying the filter might remove everything; filter can't be left
+        // null, so populate with a trivially true expression.
+        expr = std::make_unique<AndMatchExpression>();
+    }
+}
+
+boost::optional<ResumeScanPoint> getResumePoint(const BSONObj& resumeAfterObj,
+                                                const BSONObj& startAtObj) {
+    tassert(9049501,
+            "Cannot set both $_startAt and $_resumeAfter",
+            resumeAfterObj.isEmpty() || startAtObj.isEmpty());
+    if (!resumeAfterObj.isEmpty()) {
+        BSONElement recordIdElem = resumeAfterObj["$recordId"];
+        return ResumeScanPoint{RecordId::deserializeToken(recordIdElem),
+                               false /* tolerateKeyNotFound */};
+    } else if (!startAtObj.isEmpty()) {
+        BSONElement recordIdElem = startAtObj["$recordId"];
+        return ResumeScanPoint{RecordId::deserializeToken(recordIdElem),
+                               true /* tolerateKeyNotFound */};
+    }
+    return boost::none;
+}
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
+    const CanonicalQuery& query,
+    bool tailable,
+    const QueryPlannerParams& params,
+    int direction,
+    const MatchExpression* root) {
+    // The following are expensive to look up, so only do it once for each.
+    const NamespaceString& nss = query.nss();
+    const bool isOplog = nss.isOplog();
+
+    // Restricted to the change stream oplog scan for now: its filter is a large disjunction
+    // evaluated against every oplog entry on the server, the vast majority of which do not match,
+    // so the order of the branches dominates the cost.
+    auto clonedFilter = root->clone();
+    if (isOplog && tailable && query.getExpCtx()->getChangeStreamSpec()) {
+        allowReordering(query.getOpCtx(), clonedFilter.get());
+    }
+
+    // Make the (only) node, a collection scan.
+    auto csn = std::make_unique<CollectionScanNode>();
+    csn->nss = nss;
+    csn->filter = std::move(clonedFilter);
+    csn->tailable = tailable;
+    csn->shouldTrackLatestOplogTimestamp =
+        params.mainCollectionInfo.options & QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
+    csn->shouldWaitForOplogVisibility =
+        params.mainCollectionInfo.options & QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE;
+    csn->direction = determineCollScanHintedDirection(query, params).value_or(direction);
+    csn->isOplog = isOplog;
+    csn->isClustered = params.clusteredInfo ? true : false;
+
+    if (params.clusteredInfo) {
+        csn->clusteredIndex = params.clusteredInfo->getIndexSpec();
+    }
+
+    // If the client requested a resume token and we are scanning the oplog, prepare
+    // the collection scan to return timestamp-based tokens. Otherwise, we should
+    // return generic RecordId-based tokens.
+    if (query.getFindCommandRequest().getRequestResumeToken()) {
+        csn->shouldTrackLatestOplogTimestamp = isOplog;
+        csn->requestResumeToken = !csn->shouldTrackLatestOplogTimestamp;
+    }
+
+    // Extract and set the resumeScanPoint from the 'resumeAfter' or 'startAt' token, if present.
+    csn->resumeScanPoint = getResumePoint(query.getFindCommandRequest().getResumeAfter(),
+                                          query.getFindCommandRequest().getStartAt());
+
+    const bool assertMinTsHasNotFallenOffOplog = params.mainCollectionInfo.options &
+        QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG;
+    if (isOplog && csn->direction == 1) {
+        // Takes Timestamp 'ts' as input, transforms it to the RecordIdBound and assigns it to the
+        // output parameter 'recordId'. The RecordId format for the oplog is a long integer. The
+        // timestamp should be converted to the required format before assigning it to the
+        // 'recordId'.
+        auto assignRecordIdFromTimestamp = [&](auto& ts, auto* recordId) {
+            auto keyFormat = KeyFormat::Long;
+            auto status = record_id_helpers::keyForOptime(ts, keyFormat);
+            if (status.isOK()) {
+                *recordId = RecordIdBound(status.getValue());
+            }
+        };
+
+        // Optimizes the start and end location parameters for a collection scan for an oplog
+        // collection. Not compatible with resumeScanPoint, so we do not optimize in that case.
+        if (!csn->resumeScanPoint) {
+            auto [minTs, maxTs] = extractTsRange(root);
+            boost::optional<RecordIdBound> minBound, maxBound;
+            if (minTs) {
+                assignRecordIdFromTimestamp(*minTs, &minBound);
+                if (assertMinTsHasNotFallenOffOplog) {
+                    csn->assertTsHasNotFallenOff = *minTs;
+                }
+            }
+            if (maxTs) {
+                assignRecordIdFromTimestamp(*maxTs, &maxBound);
+            }
+            RecordIdRange oplogRange;
+            oplogRange.intersectRange(minBound, maxBound);
+            csn->rangeList = RecordIdRangeList(oplogRange);
+        }
+
+        // If the query is just a lower bound on "ts" on a forward scan, every document in the
+        // collection after the first matching one must also match. To avoid wasting time
+        // running the match expression on every document to be returned, we tell the
+        // CollectionScan stage to stop applying the filter once it finds the first match.
+        if (isOplogTsLowerBoundPred(root)) {
+            csn->stopApplyingFilterAfterFirstMatch = true;
+        }
+    }
+
+    // The user may have requested 'assertMinTsHasNotFallenOffOplog' for a query that does not
+    // specify a minimum timestamp. This is not a valid request, so we throw InvalidOptions.
+    if (assertMinTsHasNotFallenOffOplog) {
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "assertTsHasNotFallenOff cannot be applied to a query "
+                                 "which does not imply a minimum 'ts' value ",
+                csn->assertTsHasNotFallenOff);
+    }
+
+    auto queryCollator = query.getCollator();
+    auto collCollator = params.clusteredCollectionCollator;
+    csn->hasCompatibleCollation = CollatorInterface::collatorsMatch(queryCollator, collCollator);
+
+    // If collation _exactly_ matches, it is safe to drop expressions from the filter which can be
+    // entirely encoded as a {min,max}Record.
+    // handleRIDRangeScan later updates hasCompatibleCollation if the filter restricts the id range
+    // to values unaffected by collation e.g., numbers. This is insufficient to allow the filter to
+    // be safely modified; a query which has compatible collation _given the current filter args_
+    // could be cached and reused for a query with different args which _are_ affected by collation.
+    const bool canSimplifyFilter = csn->hasCompatibleCollation;
+
+    if (csn->isClustered && !csn->resumeScanPoint) {
+        // This is a clustered collection. Attempt to perform an efficient, bounded collection scan
+        // via rangeList if applicable. During this process, we will check if the query is
+        // guaranteed to exclude values of the cluster key which are affected by collation.
+        // If so, then even if the query and collection collations differ, the collation difference
+        // won't affect the query results. In that case, we can say hasCompatibleCollation is true.
+
+        const auto& ifrContext = query.getExpCtx()->getIfrContext();
+        const bool multiRangeCollScanEnabled = ifrContext &&
+            ifrContext->getSavedFlagValue(feature_flags::gFeatureFlagClusteredCollScanMultiRange);
+
+        if (multiRangeCollScanEnabled) {
+            const std::string_view clusterKeyFieldName =
+                clustered_util::getClusterKeyFieldName(params.clusteredInfo->getIndexSpec());
+
+            RecordIdRangeList filterRangeList;
+            bool compatibleCollation = handleRIDRangeScan(csn->filter.get(),
+                                                          queryCollator,
+                                                          collCollator,
+                                                          clusterKeyFieldName,
+                                                          filterRangeList);
+            csn->hasCompatibleCollation |= compatibleCollation;
+
+            // Derive min/max bounds from explicit min()/max() cursor args.
+            RecordIdRange minMaxRange;
+            handleRIDRangeMinMax(query, csn->direction, queryCollator, collCollator, minMaxRange);
+
+            // Intersect: pre-existing rangeList, filter-derived ranges, and explicit min/max
+            // bounds.
+            csn->rangeList =
+                RecordIdRangeList::intersect({RecordIdRangeList(std::move(minMaxRange)),
+                                              std::move(csn->rangeList),
+                                              std::move(filterRangeList)});
+
+            if (canSimplifyFilter) {
+                simplifyFilter(
+                    csn->filter, csn->rangeList, queryCollator, collCollator, clusterKeyFieldName);
+            }
+        } else {
+            ClusteredCollectionScanPlanner::buildLegacyBounds(
+                csn.get(), query, params, queryCollator, collCollator, canSimplifyFilter);
+        }
+    }
+
+    return csn;
+}  // makeCollectionScan
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
+    const CanonicalQuery& query,
+    const IndexEntry& index,
+    size_t pos,
+    const MatchExpression* expr,
+    IndexBoundsBuilder::BoundsTightness* tightnessOut,
+    interval_evaluation_tree::Builder* ietBuilder) {
+    // TODO SERVER-90975: Consider moving this interrupt check into IndexBoundsBuilder::translate
+    query.getOpCtx()->checkForInterrupt();
+
+    // We're guaranteed that all GEO_NEARs are first.  This slightly violates the "sort index
+    // predicates by their position in the compound index" rule but GEO_NEAR isn't an ixscan.
+    // This saves our bacon when we have {foo: 1, bar: "2dsphere"} and the predicate on bar is a
+    // $near.  If we didn't get the GEO_NEAR first we'd create an IndexScanNode and later cast
+    // it to a GeoNear2DSphereNode
+    //
+    // This should gracefully deal with the case where we have a pred over foo but no geo clause
+    // over bar.  In that case there is no GEO_NEAR to appear first and it's treated like a
+    // straight ixscan.
+
+    if (MatchExpression::GEO_NEAR == expr->matchType()) {
+        // We must not keep the expression node around.
+        *tightnessOut = IndexBoundsBuilder::EXACT;
+        auto nearExpr = static_cast<const GeoNearMatchExpression*>(expr);
+
+        BSONElement elt = index.keyPattern.firstElement();
+        bool indexIs2D = (BSONType::string == elt.type() && "2d" == elt.String());
+
+        if (indexIs2D) {
+            auto ret = std::make_unique<GeoNear2DNode>(query.nss(), index);
+            ret->nq = &nearExpr->getData();
+            ret->baseBounds.fields.resize(index.keyPattern.nFields());
+            ret->addPointMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearPoint];
+            ret->addDistMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearDist];
+
+            return ret;
+        } else {
+            auto ret = std::make_unique<GeoNear2DSphereNode>(query.nss(), index);
+            ret->nq = &nearExpr->getData();
+            ret->baseBounds.fields.resize(index.keyPattern.nFields());
+            ret->addPointMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearPoint];
+            ret->addDistMeta = query.metadataDeps()[DocumentMetadataFields::kGeoNearDist];
+
             return ret;
         }
-        else {
-            // Note that indexKeyPattern.firstElement().fieldName() may not equal expr->path()
-            // because expr might be inside an array operator that provides a path prefix.
-            IndexScanNode* isn = new IndexScanNode();
-            isn->indexKeyPattern = index.keyPattern;
-            isn->indexIsMultiKey = index.multikey;
-            isn->bounds.fields.resize(index.keyPattern.nFields());
-            isn->maxScan = query.getParsed().getMaxScan();
-            isn->addKeyMetadata = query.getParsed().returnKey();
-
-            // Get the ixtag->pos-th element of the index key pattern.
-            // TODO: cache this instead/with ixtag->pos?
-            BSONObjIterator it(index.keyPattern);
-            BSONElement keyElt = it.next();
-            for (size_t i = 0; i < pos; ++i) {
-                verify(it.more());
-                keyElt = it.next();
+    } else if (MatchExpression::TEXT == expr->matchType()) {
+        // We must not keep the expression node around.
+        *tightnessOut = IndexBoundsBuilder::EXACT;
+        auto textExpr = static_cast<const TextMatchExpressionBase*>(expr);
+        bool wantTextScore = DepsTracker::needsTextScoreMetadata(query.metadataDeps());
+        auto ret = std::make_unique<TextMatchNode>(
+            query.nss(), index, textExpr->getFTSQuery().clone(), wantTextScore);
+        // Count the number of prefix fields before the "text" field.
+        for (auto&& keyPatternElt : ret->index.keyPattern) {
+            // We know that the only key pattern with a type of String is the _fts field
+            // which is immediately after all prefix fields.
+            if (BSONType::string == keyPatternElt.type()) {
+                break;
             }
-            verify(!keyElt.eoo());
-
-            IndexBoundsBuilder::translate(expr, keyElt, index, &isn->bounds.fields[pos],
-                                          tightnessOut);
-
-            return isn;
-        }
-    }
-
-    bool QueryPlannerAccess::shouldMergeWithLeaf(const MatchExpression* expr,
-                                                 const ScanBuildingState& scanState) {
-        const QuerySolutionNode* node = scanState.currentScan.get();
-        if (NULL == node || NULL == expr) {
-            return false;
+            ++(ret->numPrefixFields);
         }
 
-        if (NULL == scanState.ixtag) {
-            return false;
-        }
-
-        if (scanState.currentIndexNumber != scanState.ixtag->index) {
-            return false;
-        }
-
-        size_t pos = scanState.ixtag->pos;
-        const IndexEntry& index = scanState.indices[scanState.currentIndexNumber];
-        const MatchExpression::MatchType mergeType = scanState.root->matchType();
-
-        const StageType type = node->getType();
-        const MatchExpression::MatchType exprType = expr->matchType();
-
-        //
-        // First handle special solution tree leaf types. In general, normal index bounds
-        // building is not used for special leaf types, and hence we cannot merge leaves.
-        //
-        // This rule is always true for OR, but there are exceptions for AND.
-        // Specifically, we can often merge a predicate with a special leaf type
-        // by adding a filter to the special leaf type.
-        //
-
-        if (STAGE_TEXT == type) {
-            // Currently only one text predicate is allowed, but to be safe, make sure that we
-            // do not try to merge two text predicates.
-            return MatchExpression::AND == mergeType
-                && MatchExpression::TEXT != exprType;
-        }
-
-        if (STAGE_GEO_NEAR_2D == type || STAGE_GEO_NEAR_2DSPHERE == type) {
-            // Currently only one GEO_NEAR is allowed, but to be safe, make sure that we
-            // do not try to merge two GEO_NEAR predicates.
-            return MatchExpression::AND == mergeType
-                && MatchExpression::GEO_NEAR != exprType;
-        }
-
-        //
-        // If we're here, then we're done checking for special leaf nodes, and the leaf
-        // must be a regular index scan.
-        //
-
-        invariant(type == STAGE_IXSCAN);
-        const IndexScanNode* scan = static_cast<const IndexScanNode*>(node);
-        const IndexBounds* boundsToFillOut =  &scan->bounds;
-
-        if (boundsToFillOut->fields[pos].name.empty()) {
-            // The bounds will be compounded. This is OK because the
-            // plan enumerator told us that it is OK.
-            return true;
-        }
-        else {
-            if (MatchExpression::AND == mergeType) {
-                // The bounds will be intersected. This is OK provided
-                // that the index is NOT multikey.
-                return !index.multikey;
-            }
-            else {
-                // The bounds will be unionized.
-                return true;
-            }
-        }
-
-
-    }
-
-    void QueryPlannerAccess::mergeWithLeafNode(MatchExpression* expr,
-                                               ScanBuildingState* scanState) {
-        QuerySolutionNode* node = scanState->currentScan.get();
-        invariant(NULL != node);
-
-        const MatchExpression::MatchType mergeType = scanState->root->matchType();
-        size_t pos = scanState->ixtag->pos;
-        const IndexEntry& index = scanState->indices[scanState->currentIndexNumber];
-
-        const StageType type = node->getType();
-
-        // Text data is covered, but not exactly.  Text covering is unlike any other covering
-        // so we deal with it in addFilterToSolutionNode.
-        if (STAGE_TEXT == type) {
-            scanState->tightness = IndexBoundsBuilder::INEXACT_COVERED;
-            return;
-        }
-
-        IndexBounds* boundsToFillOut = NULL;
-
-        if (STAGE_GEO_NEAR_2D == type) {
-
-            invariant(INDEX_2D == index.type);
-
-            // 2D indexes are weird - the "2d" field stores a normally-indexed BinData field, but
-            // additional array fields are *not* exploded into multi-keys - they are stored directly
-            // as arrays in the index.  Also, no matter what the index expression, the "2d" field is
-            // always first.
-            // This means that we can only generically accumulate bounds for 2D indexes over the
-            // first "2d" field (pos == 0) - MatchExpressions over other fields in the 2D index may
-            // be covered (can be evaluated using only the 2D index key).  The additional fields
-            // must not affect the index scan bounds, since they are not stored in an
-            // IndexScan-compatible format.
-
-            if (pos > 0) {
-                // Marking this field as covered allows the planner to accumulate a MatchExpression
-                // over the returned 2D index keys instead of adding to the index bounds.
-                scanState->tightness = IndexBoundsBuilder::INEXACT_COVERED;
-                return;
-            }
-
-            // We may have other $geoPredicates on a near index - generate bounds for these
-            GeoNear2DNode* gn = static_cast<GeoNear2DNode*>(node);
-            boundsToFillOut = &gn->baseBounds;
-        }
-        else if (STAGE_GEO_NEAR_2DSPHERE == type) {
-            GeoNear2DSphereNode* gn = static_cast<GeoNear2DSphereNode*>(node);
-            boundsToFillOut = &gn->baseBounds;
-        }
-        else {
-            verify(type == STAGE_IXSCAN);
-            IndexScanNode* scan = static_cast<IndexScanNode*>(node);
-
-            // See STAGE_GEO_NEAR_2D above - 2D indexes can only accumulate scan bounds over the
-            // first "2d" field (pos == 0)
-            if (INDEX_2D == index.type && pos > 0) {
-                scanState->tightness = IndexBoundsBuilder::INEXACT_COVERED;
-                return;
-            }
-
-            boundsToFillOut = &scan->bounds;
-        }
+        return ret;
+    } else {
+        // Note that indexKeyPattern.firstElement().fieldName() may not equal expr->path()
+        // because expr might be inside an array operator that provides a path prefix.
+        auto isn = std::make_unique<IndexScanNode>(query.nss(), index);
+        isn->bounds.fields.resize(index.keyPattern.nFields());
+        isn->addKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kIndexKey];
+        isn->queryCollator = query.getCollator();
 
         // Get the ixtag->pos-th element of the index key pattern.
-        // TODO: cache this instead/with ixtag->pos?
+        // TODO SERVER-122502: cache this instead/with ixtag->pos?
         BSONObjIterator it(index.keyPattern);
         BSONElement keyElt = it.next();
         for (size_t i = 0; i < pos; ++i) {
-            verify(it.more());
+            MONGO_verify(it.more());
             keyElt = it.next();
         }
-        verify(!keyElt.eoo());
-        scanState->tightness = IndexBoundsBuilder::INEXACT_FETCH;
+        MONGO_verify(!keyElt.eoo());
 
-        verify(boundsToFillOut->fields.size() > pos);
+        IndexBoundsBuilder::translate(
+            expr, keyElt, index, &isn->bounds.fields[pos], tightnessOut, ietBuilder);
 
-        OrderedIntervalList* oil = &boundsToFillOut->fields[pos];
+        return isn;
+    }
+}
 
-        if (boundsToFillOut->fields[pos].name.empty()) {
-            IndexBoundsBuilder::translate(expr, keyElt, index, oil, &scanState->tightness);
-        }
-        else {
-            if (MatchExpression::AND == mergeType) {
-                IndexBoundsBuilder::translateAndIntersect(expr, keyElt, index, oil,
-                                                          &scanState->tightness);
-            }
-            else {
-                verify(MatchExpression::OR == mergeType);
-                IndexBoundsBuilder::translateAndUnion(expr, keyElt, index, oil,
-                                                      &scanState->tightness);
-            }
-        }
+bool QueryPlannerAccess::shouldMergeWithLeaf(const MatchExpression* expr,
+                                             const ScanBuildingState& scanState) {
+    const QuerySolutionNode* node = scanState.currentScan.get();
+    if (nullptr == node || nullptr == expr) {
+        return false;
     }
 
-    // static
-    void QueryPlannerAccess::finishTextNode(QuerySolutionNode* node, const IndexEntry& index) {
-        TextNode* tn = static_cast<TextNode*>(node);
-
-        // Figure out what positions are prefix positions.  We build an index key prefix from
-        // the predicates over the text index prefix keys.
-        // For example, say keyPattern = { a: 1, _fts: "text", _ftsx: 1, b: 1 }
-        // prefixEnd should be 1.
-        size_t prefixEnd = 0;
-        BSONObjIterator it(tn->indexKeyPattern);
-        // Count how many prefix terms we have.
-        while (it.more()) {
-            // We know that the only key pattern with a type of String is the _fts field
-            // which is immediately after all prefix fields.
-            if (String == it.next().type()) {
-                break;
-            }
-            ++prefixEnd;
-        }
-
-        // If there's no prefix, the filter is already on the node and the index prefix is null.
-        // We can just return.
-        if (!prefixEnd) {
-            return;
-        }
-
-        // We can't create a text stage if there aren't EQ predicates on its prefix terms.  So
-        // if we've made it this far, we should have collected the prefix predicates in the
-        // filter.
-        invariant(NULL != tn->filter.get());
-        MatchExpression* textFilterMe = tn->filter.get();
-
-        BSONObjBuilder prefixBob;
-
-        if (MatchExpression::AND != textFilterMe->matchType()) {
-            // Only one prefix term.
-            invariant(1 == prefixEnd);
-            // Sanity check: must be an EQ.
-            invariant(MatchExpression::EQ == textFilterMe->matchType());
-
-            EqualityMatchExpression* eqExpr = static_cast<EqualityMatchExpression*>(textFilterMe);
-            prefixBob.append(eqExpr->getData());
-            tn->filter.reset();
-        }
-        else {
-            invariant(MatchExpression::AND == textFilterMe->matchType());
-
-            // Indexed by the keyPattern position index assignment.  We want to add
-            // prefixes in order but we must order them first.
-            vector<MatchExpression*> prefixExprs(prefixEnd, NULL);
-
-            AndMatchExpression* amExpr = static_cast<AndMatchExpression*>(textFilterMe);
-            invariant(amExpr->numChildren() >= prefixEnd);
-
-            // Look through the AND children.  The prefix children we want to
-            // stash in prefixExprs.
-            size_t curChild = 0;
-            while (curChild < amExpr->numChildren()) {
-                MatchExpression* child = amExpr->getChild(curChild);
-                IndexTag* ixtag = static_cast<IndexTag*>(child->getTag());
-                invariant(NULL != ixtag);
-                // Skip this child if it's not part of a prefix, or if we've already assigned a
-                // predicate to this prefix position.
-                if (ixtag->pos >= prefixEnd || prefixExprs[ixtag->pos] != NULL) {
-                    ++curChild;
-                    continue;
-                }
-                // prefixExprs takes ownership of 'child'.
-                prefixExprs[ixtag->pos] = child;
-                amExpr->getChildVector()->erase(amExpr->getChildVector()->begin() + curChild);
-                // Don't increment curChild.
-            }
-
-            // Go through the prefix equalities in order and create an index prefix out of them.
-            for (size_t i = 0; i < prefixExprs.size(); ++i) {
-                MatchExpression* prefixMe = prefixExprs[i];
-                invariant(NULL != prefixMe);
-                invariant(MatchExpression::EQ == prefixMe->matchType());
-                EqualityMatchExpression* eqExpr = static_cast<EqualityMatchExpression*>(prefixMe);
-                prefixBob.append(eqExpr->getData());
-                // We removed this from the AND expression that owned it, so we must clean it
-                // up ourselves.
-                delete prefixMe;
-            }
-
-            // Clear out an empty $and.
-            if (0 == amExpr->numChildren()) {
-                tn->filter.reset();
-            }
-            else if (1 == amExpr->numChildren()) {
-                // Clear out unsightly only child of $and
-                MatchExpression* child = amExpr->getChild(0);
-                amExpr->getChildVector()->clear();
-                // Deletes current filter which is amExpr.
-                tn->filter.reset(child);
-            }
-        }
-
-        tn->indexPrefix = prefixBob.obj();
+    if (nullptr == scanState.ixtag) {
+        return false;
     }
 
-    // static
-    bool QueryPlannerAccess::orNeedsFetch(const ScanBuildingState* scanState) {
-        if (scanState->loosestBounds == IndexBoundsBuilder::EXACT) {
-            return false;
-        }
-        else if (scanState->loosestBounds == IndexBoundsBuilder::INEXACT_FETCH) {
+    if (scanState.currentIndexNumber != scanState.ixtag->index) {
+        return false;
+    }
+
+    size_t pos = scanState.ixtag->pos;
+    const IndexEntry& index = scanState.indices[scanState.currentIndexNumber];
+    const MatchExpression::MatchType mergeType = scanState.root->matchType();
+
+    const StageType type = node->getType();
+    const MatchExpression::MatchType exprType = expr->matchType();
+
+    //
+    // First handle special solution tree leaf types. In general, normal index bounds
+    // building is not used for special leaf types, and hence we cannot merge leaves.
+    //
+    // This rule is always true for OR, but there are exceptions for AND.
+    // Specifically, we can often merge a predicate with a special leaf type
+    // by adding a filter to the special leaf type.
+    //
+
+    if (STAGE_TEXT_MATCH == type) {
+        // Currently only one text predicate is allowed, but to be safe, make sure that we
+        // do not try to merge two text predicates.
+        return MatchExpression::AND == mergeType && MatchExpression::TEXT != exprType;
+    }
+
+    if (STAGE_GEO_NEAR_2D == type || STAGE_GEO_NEAR_2DSPHERE == type) {
+        // Currently only one GEO_NEAR is allowed, but to be safe, make sure that we
+        // do not try to merge two GEO_NEAR predicates.
+        return MatchExpression::AND == mergeType && MatchExpression::GEO_NEAR != exprType;
+    }
+
+    //
+    // If we're here, then we're done checking for special leaf nodes, and the leaf
+    // must be a regular index scan.
+    //
+
+    tassert(
+        11321007,
+        fmt::format("Expected type to be STAGE_IXSCAN, but found {}", nodeStageTypeToString(node)),
+        type == STAGE_IXSCAN);
+    const IndexScanNode* scan = static_cast<const IndexScanNode*>(node);
+    const IndexBounds* boundsToFillOut = &scan->bounds;
+
+    if (boundsToFillOut->fields[pos].name.empty()) {
+        // Bounds have yet to be assigned for the 'pos' position in the index. The plan enumerator
+        // should have told us that it is safe to compound bounds in this case.
+        tassert(11321008,
+                "Expected scanState to allow compound bounds",
+                scanState.ixtag->canCombineBounds);
+        return true;
+    } else {
+        // Bounds have already been assigned for the 'pos' position in the index.
+        if (MatchExpression::AND == mergeType) {
+            // The bounds on the 'pos' position in the index would be intersected if we merged these
+            // two leaf expressions.
+            if (!scanState.ixtag->canCombineBounds) {
+                // If the plan enumerator told us that it isn't safe to intersect bounds in this
+                // case, then it must be because we're using a multikey index.
+                invariant(index.multikey);
+            }
+            return scanState.ixtag->canCombineBounds;
+        } else {
+            // The bounds will be unionized.
             return true;
         }
-        else {
-            invariant(scanState->loosestBounds == IndexBoundsBuilder::INEXACT_COVERED);
-            const IndexEntry& index = scanState->indices[scanState->currentIndexNumber];
-            return index.multikey;
-        }
     }
+}
 
-    // static
-    void QueryPlannerAccess::finishAndOutputLeaf(ScanBuildingState* scanState,
-                                                 vector<QuerySolutionNode*>* out) {
-        finishLeafNode(scanState->currentScan.get(),
-                       scanState->indices[scanState->currentIndexNumber]);
+void QueryPlannerAccess::mergeWithLeafNode(MatchExpression* expr, ScanBuildingState* scanState) {
+    QuerySolutionNode* node = scanState->currentScan.get();
+    tassert(11321009, "scanState->currentScan must not be null", nullptr != node);
 
-        if (MatchExpression::OR == scanState->root->matchType()) {
-            if (orNeedsFetch(scanState)) {
-                // In order to correctly evaluate the predicates for this index, we have to
-                // fetch the full documents. Add a fetch node above the index scan whose filter
-                // includes *all* of the predicates used to generate the ixscan.
-                FetchNode* fetch = new FetchNode();
-                // Takes ownership.
-                fetch->filter.reset(scanState->curOr.release());
-                // Takes ownership.
-                fetch->children.push_back(scanState->currentScan.release());
+    const MatchExpression::MatchType mergeType = scanState->root->matchType();
+    const size_t pos = scanState->ixtag->pos;
+    const IndexEntry& index = scanState->indices[scanState->currentIndexNumber];
 
-                scanState->currentScan.reset(fetch);
-            }
-            else if (scanState->loosestBounds == IndexBoundsBuilder::INEXACT_COVERED) {
-                // This an OR, at least one of the predicates used to generate 'currentScan'
-                // is inexact covered, but none is inexact fetch. This means that we can put
-                // these predicates, joined by an $or, as filters on the index scan. This avoids
-                // a fetch and allows the predicates to be covered by the index.
-                //
-                // Ex.
-                //   Say we have index {a: 1} and query {$or: [{a: /foo/}, {a: /bar/}]}.
-                //   The entire query, {$or: [{a: /foo/}, {a: /bar/}]}, should be a filter
-                //   in the index scan stage itself.
-                scanState->currentScan->filter.reset(scanState->curOr.release());
-            }
+    const StageType type = node->getType();
+
+    if (STAGE_TEXT_MATCH == type) {
+        auto textNode = static_cast<TextMatchNode*>(node);
+
+        if (pos < textNode->numPrefixFields) {
+            // This predicate is assigned to one of the prefix fields of the text index. Such
+            // predicates must always be equalities and must always be attached to the TEXT node. In
+            // order to ensure this happens, we assign INEXACT_COVERED tightness.
+            scanState->tightness = IndexBoundsBuilder::INEXACT_COVERED;
+        } else {
+            // The predicate is assigned to one of the trailing fields of the text index. We
+            // currently don't generate bounds for predicates assigned to trailing fields of a text
+            // index, but rather attempt to attach a covered filter. However, certain predicates can
+            // never be correctly covered (e.g. $exists), so we assign the tightness accordingly.
+            scanState->tightness = IndexBoundsBuilder::canUseCoveredMatching(expr, index)
+                ? IndexBoundsBuilder::INEXACT_COVERED
+                : IndexBoundsBuilder::INEXACT_FETCH;
         }
 
-        out->push_back(scanState->currentScan.release());
+        return;
     }
 
-    // static
-    void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntry& index) {
-        const StageType type = node->getType();
+    IndexBounds* boundsToFillOut = nullptr;
 
-        if (STAGE_TEXT == type) {
-            finishTextNode(node, index);
+    if (STAGE_GEO_NEAR_2D == type) {
+        tassert(
+            11321010,
+            fmt::format("Expected index.type to be INDEX_2D, but found {}", toString(index.type)),
+            INDEX_2D == index.type);
+
+        // 2D indexes have a special format - the "2d" field stores a normally-indexed BinData
+        // field, but additional array fields are *not* exploded into multi-keys - they are stored
+        // directly as arrays in the index.  Also, no matter what the index expression, the "2d"
+        // field is always first.
+        //
+        // This means that we can only generically accumulate bounds for 2D indexes over the first
+        // "2d" field (pos == 0) - MatchExpressions over other fields in the 2D index may be covered
+        // (can be evaluated using only the 2D index key).  The additional fields must not affect
+        // the index scan bounds, since they are not stored in an IndexScan-compatible format.
+
+        if (pos > 0) {
+            // The predicate is over a trailing field of the "2d" index. If possible, we assign it
+            // as a covered filter (the INEXACT_COVERED case). Otherwise, the filter must be
+            // evaluated after fetching the full documents.
+            scanState->tightness = IndexBoundsBuilder::canUseCoveredMatching(expr, index)
+                ? IndexBoundsBuilder::INEXACT_COVERED
+                : IndexBoundsBuilder::INEXACT_FETCH;
             return;
         }
 
-        IndexBounds* bounds = NULL;
+        // We may have other $geoPredicates on a near index - generate bounds for these
+        GeoNear2DNode* gn = static_cast<GeoNear2DNode*>(node);
+        boundsToFillOut = &gn->baseBounds;
+    } else if (STAGE_GEO_NEAR_2DSPHERE == type) {
+        GeoNear2DSphereNode* gn = static_cast<GeoNear2DSphereNode*>(node);
+        boundsToFillOut = &gn->baseBounds;
+    } else {
+        MONGO_verify(type == STAGE_IXSCAN);
+        IndexScanNode* scan = static_cast<IndexScanNode*>(node);
 
-        if (STAGE_GEO_NEAR_2D == type) {
-            GeoNear2DNode* gnode = static_cast<GeoNear2DNode*>(node);
-            bounds = &gnode->baseBounds;
-        }
-        else if (STAGE_GEO_NEAR_2DSPHERE == type) {
-            GeoNear2DSphereNode* gnode = static_cast<GeoNear2DSphereNode*>(node);
-            bounds = &gnode->baseBounds;
-        }
-        else {
-            verify(type == STAGE_IXSCAN);
-            IndexScanNode* scan = static_cast<IndexScanNode*>(node);
-            bounds = &scan->bounds;
-        }
-
-        // Find the first field in the scan's bounds that was not filled out.
-        // TODO: could cache this.
-        size_t firstEmptyField = 0;
-        for (firstEmptyField = 0; firstEmptyField < bounds->fields.size(); ++firstEmptyField) {
-            if ("" == bounds->fields[firstEmptyField].name) {
-                verify(bounds->fields[firstEmptyField].intervals.empty());
-                break;
-            }
-        }
-
-        // All fields are filled out with bounds, nothing to do.
-        if (firstEmptyField == bounds->fields.size()) {
-            IndexBoundsBuilder::alignBounds(bounds, index.keyPattern);
+        // See STAGE_GEO_NEAR_2D above - 2D indexes can only accumulate scan bounds over the first
+        // "2d" field (pos == 0).
+        if (INDEX_2D == index.type && pos > 0) {
+            // The predicate is over a trailing field of the "2d" index. If possible, we assign it
+            // as a covered filter (the INEXACT_COVERED case). Otherwise, the filter must be
+            // evaluated after fetching the full documents.
+            scanState->tightness = IndexBoundsBuilder::canUseCoveredMatching(expr, index)
+                ? IndexBoundsBuilder::INEXACT_COVERED
+                : IndexBoundsBuilder::INEXACT_FETCH;
             return;
         }
 
+        boundsToFillOut = &scan->bounds;
+    }
+
+    // Get the ixtag->pos-th element of the index key pattern.
+    // TODO SERVER-122502: cache this instead/with ixtag->pos?
+    BSONObjIterator it(index.keyPattern);
+    BSONElement keyElt = it.next();
+    for (size_t i = 0; i < pos; ++i) {
+        MONGO_verify(it.more());
+        keyElt = it.next();
+    }
+    MONGO_verify(!keyElt.eoo());
+    scanState->tightness = IndexBoundsBuilder::INEXACT_FETCH;
+
+    MONGO_verify(boundsToFillOut->fields.size() > pos);
+
+    OrderedIntervalList* oil = &boundsToFillOut->fields[pos];
+
+    if (boundsToFillOut->fields[pos].name.empty()) {
+        IndexBoundsBuilder::translate(
+            expr, keyElt, index, oil, &scanState->tightness, scanState->getCurrentIETBuilder());
+    } else {
+        if (MatchExpression::AND == mergeType) {
+            IndexBoundsBuilder::translateAndIntersect(
+                expr, keyElt, index, oil, &scanState->tightness, scanState->getCurrentIETBuilder());
+        } else {
+            MONGO_verify(MatchExpression::OR == mergeType);
+            IndexBoundsBuilder::translateAndUnion(
+                expr, keyElt, index, oil, &scanState->tightness, scanState->getCurrentIETBuilder());
+        }
+    }
+}
+
+void buildTextSubPlan(const CanonicalQuery& cq, TextMatchNode* tn) {
+    tassert(5432205, "text match node is null", tn);
+    tassert(5432206, "text match node already has children", tn->children.empty());
+    tassert(5432207, "text search query is not provided", tn->ftsQuery.get());
+
+    auto query = dynamic_cast<const fts::FTSQueryImpl*>(tn->ftsQuery.get());
+    // If we're unable to cast to FTSQueryImpl, then the given query must be an FTSQueryNoop, which
+    // is only used for testing the QueryPlanner and never tries to execute the query, so we don't
+    // need to construct an entire text sub-plan. Moreover, to compute index bounds we need a list
+    // of terms, which can only be obtain from FTSQueryImpl.
+    if (!query) {
+        return;
+    }
+
+    // If the query requires the "textScore" field or involves multiple search terms, a TEXT_OR or
+    // OR stage is needed. Otherwise, we can use a single index scan directly.
+    const bool needOrStage = tn->wantTextScore || query->getTermsForBounds().size() > 1;
+
+    tassert(5432208,
+            "failed to obtain text index version",
+            tn->index.infoObj.hasField("textIndexVersion"));
+    const auto textIndexVersion =
+        static_cast<fts::TextIndexVersion>(tn->index.infoObj["textIndexVersion"].numberInt());
+
+    // Get all the index scans for each term in our query.
+    std::vector<std::unique_ptr<QuerySolutionNode>> indexScanList;
+    indexScanList.reserve(query->getTermsForBounds().size());
+    for (const auto& term : query->getTermsForBounds()) {
+        auto ixscan = std::make_unique<IndexScanNode>(cq.nss(), tn->index);
+        ixscan->bounds.startKey = fts::FTSIndexFormat::getIndexKey(
+            fts::MAX_WEIGHT, term, tn->indexPrefix, textIndexVersion);
+        ixscan->bounds.endKey =
+            fts::FTSIndexFormat::getIndexKey(0, term, tn->indexPrefix, textIndexVersion);
+        ixscan->bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
+        ixscan->bounds.isSimpleRange = true;
+        ixscan->direction = -1;
+        ixscan->shouldDedup = tn->index.multikey;
+
+        // If we will be adding a TEXT_OR or OR stage, then it is responsible for applying the
+        // filter. Otherwise, the index scan applies the filter.
+        if (!needOrStage && tn->filter) {
+            ixscan->filter = tn->filter->clone();
+        }
+
+        indexScanList.push_back(std::move(ixscan));
+    }
+
+    // In case the query didn't have any search term, we can simply use an EOF sub-plan, as no
+    // results can be returned in this case anyway.
+    if (indexScanList.empty()) {
+        indexScanList.push_back(
+            std::make_unique<EofNode>(eof_node::EOFType::PredicateEvalsToFalse));
+    }
+
+    // Build the union of the index scans as a TEXT_OR or an OR stage, depending on whether the
+    // projection requires the "textScore" $meta field.
+    if (tn->wantTextScore) {
+        // We use a TEXT_OR stage to get the union of the results from the index scans and then
+        // compute their text scores. This is a blocking operation.
+        auto textScorer = std::make_unique<TextOrNode>();
+        textScorer->filter = std::move(tn->filter);
+        textScorer->addChildren(std::move(indexScanList));
+        tn->children.push_back(std::move(textScorer));
+    } else {
+        // Because we don't need the text score, we can use a non-blocking OR stage to get the union
+        // of the index scans or use the index scan directly if there is only one.
+        auto textSearcher = [&]() -> std::unique_ptr<QuerySolutionNode> {
+            if (indexScanList.size() == 1) {
+                tassert(5397400,
+                        "If there is only one index scan and we do not need textScore, needOrStage "
+                        "should be false",
+                        !needOrStage);
+                return std::move(indexScanList[0]);
+            } else {
+                auto orTextSearcher = std::make_unique<OrNode>();
+                orTextSearcher->filter = std::move(tn->filter);
+                orTextSearcher->addChildren(std::move(indexScanList));
+                return orTextSearcher;
+            }
+        }();
+
+        // Unlike the TEXT_OR stage, the OR stage does not fetch the documents that it outputs. We
+        // add our own FETCH stage to satisfy the requirement of the TEXT_MATCH stage that its
+        // WorkingSetMember inputs have fetched data.
+        auto fetchNode = std::make_unique<FetchNode>(cq.nss());
+        fetchNode->children.push_back(std::move(textSearcher));
+
+        tn->children.push_back(std::move(fetchNode));
+    }
+}
+
+void QueryPlannerAccess::finishTextNode(const CanonicalQuery& cq,
+                                        QuerySolutionNode* node,
+                                        const IndexEntry& index) {
+    auto tn = static_cast<TextMatchNode*>(node);
+
+    // If there's no prefix, the filter is already on the node and the index prefix is null.
+    // We can just return.
+    if (!tn->numPrefixFields) {
+        buildTextSubPlan(cq, tn);
+        return;
+    }
+
+    // We can't create a text stage if there aren't EQ predicates on its prefix terms.  So
+    // if we've made it this far, we should have collected the prefix predicates in the
+    // filter.
+    tassert(9751500, "unexpected empty filter in the given text node", tn->filter);
+    MatchExpression* textFilterMe = tn->filter.get();
+
+    BSONObjBuilder prefixBob;
+
+    if (MatchExpression::AND != textFilterMe->matchType()) {
+        // Only one prefix term.
+        tassert(9751501,
+                str::stream() << "expected a single prefix term in the given text node, but got "
+                              << tn->numPrefixFields,
+                1u == tn->numPrefixFields);
+        // Sanity check: must be an EQ.
+        tassert(9751502,
+                str::stream() << "expected 'EQ' match type in the given text node, but got "
+                              << textFilterMe->matchType(),
+                MatchExpression::EQ == textFilterMe->matchType());
+
+        EqualityMatchExpression* eqExpr = static_cast<EqualityMatchExpression*>(textFilterMe);
+        prefixBob.append(eqExpr->getData());
+        tn->filter.reset();
+    } else {
+        tassert(9751503,
+                str::stream() << "expected 'AND' match type in the given text node, but got "
+                              << textFilterMe->matchType(),
+                MatchExpression::AND == textFilterMe->matchType());
+
+        // Indexed by the keyPattern position index assignment.  We want to add
+        // prefixes in order but we must order them first.
+        vector<std::unique_ptr<MatchExpression>> prefixExprs(tn->numPrefixFields);
+
+        AndMatchExpression* amExpr = static_cast<AndMatchExpression*>(textFilterMe);
+        tassert(9751504,
+                str::stream() << "'AND' expression children count " << amExpr->numChildren()
+                              << " is less than prefix term count " << tn->numPrefixFields,
+                amExpr->numChildren() >= tn->numPrefixFields);
+
+        // Look through the AND children.  The prefix children we want to
+        // stash in prefixExprs.
+        size_t curChild = 0;
+        while (curChild < amExpr->numChildren()) {
+            IndexTag* ixtag = indexTagCast<IndexTag>(amExpr->getChild(curChild)->getTag());
+            tassert(9751505, "expected non-null index tag", nullptr != ixtag);
+            // Skip this child if it's not part of a prefix, or if we've already assigned a
+            // predicate to this prefix position.
+            if (ixtag->pos >= tn->numPrefixFields || prefixExprs[ixtag->pos] != nullptr) {
+                ++curChild;
+                continue;
+            }
+            prefixExprs[ixtag->pos] = std::move((*amExpr->getChildVector())[curChild]);
+            amExpr->getChildVector()->erase(amExpr->getChildVector()->begin() + curChild);
+            // Don't increment curChild.
+        }
+
+        // Go through the prefix equalities in order and create an index prefix out of them.
+        for (size_t i = 0; i < prefixExprs.size(); ++i) {
+            auto prefixMe = prefixExprs[i].get();
+            tassert(9751506,
+                    "unexpected empty prefix term in the given text node",
+                    nullptr != prefixMe);
+            tassert(9751507,
+                    str::stream() << "expected 'EQ' match type in all prefix terms, but got "
+                                  << prefixMe->matchType(),
+                    MatchExpression::EQ == prefixMe->matchType());
+            EqualityMatchExpression* eqExpr = static_cast<EqualityMatchExpression*>(prefixMe);
+            prefixBob.append(eqExpr->getData());
+        }
+
+        // Clear out an empty $and.
+        if (0 == amExpr->numChildren()) {
+            tn->filter.reset();
+        } else if (1 == amExpr->numChildren()) {
+            // Clear out unsightly only child of $and.
+            auto child = std::move((*amExpr->getChildVector())[0]);
+            amExpr->getChildVector()->clear();
+            // Deletes current filter which is amExpr.
+            tn->filter = std::move(child);
+        }
+    }
+
+    tn->indexPrefix = prefixBob.obj();
+
+    buildTextSubPlan(cq, tn);
+}
+
+bool QueryPlannerAccess::orNeedsFetch(const ScanBuildingState* scanState) {
+    if (scanState->loosestBounds == IndexBoundsBuilder::EXACT) {
+        return false;
+    } else if (scanState->loosestBounds == IndexBoundsBuilder::INEXACT_FETCH) {
+        return true;
+    } else {
+        tassert(11321011,
+                fmt::format("Expected scanState->loosestBounds to be INEXACT_COVERED, but found {}",
+                            static_cast<int>(scanState->loosestBounds)),
+                scanState->loosestBounds == IndexBoundsBuilder::INEXACT_COVERED);
+        const IndexEntry& index = scanState->indices[scanState->currentIndexNumber];
+        return index.multikey;
+    }
+}
+
+void QueryPlannerAccess::finishAndOutputLeaf(const CanonicalQuery& cq,
+                                             ScanBuildingState* scanState,
+                                             vector<std::unique_ptr<QuerySolutionNode>>* out) {
+    finishLeafNode(cq,
+                   scanState->currentScan.get(),
+                   scanState->indices[scanState->currentIndexNumber],
+                   std::move(scanState->ietBuilders));
+
+    if (MatchExpression::OR == scanState->root->matchType()) {
+        if (orNeedsFetch(scanState)) {
+            // In order to correctly evaluate the predicates for this index, we have to
+            // fetch the full documents. Add a fetch node above the index scan whose filter
+            // includes *all* of the predicates used to generate the ixscan.
+            auto fetch = std::make_unique<FetchNode>(cq.nss());
+            // Takes ownership.
+            fetch->filter = std::move(scanState->curOr);
+            // Takes ownership.
+            fetch->children.push_back(std::move(scanState->currentScan));
+
+            scanState->currentScan = std::move(fetch);
+        } else if (scanState->loosestBounds == IndexBoundsBuilder::INEXACT_COVERED) {
+            // This an OR, at least one of the predicates used to generate 'currentScan'
+            // is inexact covered, but none is inexact fetch. This means that we can put
+            // these predicates, joined by an $or, as filters on the index scan. This avoids
+            // a fetch and allows the predicates to be covered by the index.
+            //
+            // Ex.
+            //   Say we have index {a: 1} and query {$or: [{a: /foo/}, {a: /bar/}]}.
+            //   The entire query, {$or: [{a: /foo/}, {a: /bar/}]}, should be a filter
+            //   in the index scan stage itself.
+            scanState->currentScan->filter = std::move(scanState->curOr);
+        }
+    }
+
+    out->push_back(std::move(scanState->currentScan));
+}
+
+void QueryPlannerAccess::finishLeafNode(
+    const CanonicalQuery& cq,
+    QuerySolutionNode* node,
+    const IndexEntry& index,
+    std::vector<interval_evaluation_tree::Builder> ietBuilders) {
+    const StageType type = node->getType();
+
+    if (STAGE_TEXT_MATCH == type) {
+        return finishTextNode(cq, node, index);
+    }
+
+    IndexEntry* nodeIndex = nullptr;
+    IndexBounds* bounds = nullptr;
+
+    if (STAGE_GEO_NEAR_2D == type) {
+        GeoNear2DNode* gnode = static_cast<GeoNear2DNode*>(node);
+        bounds = &gnode->baseBounds;
+        nodeIndex = &gnode->index;
+    } else if (STAGE_GEO_NEAR_2DSPHERE == type) {
+        GeoNear2DSphereNode* gnode = static_cast<GeoNear2DSphereNode*>(node);
+        bounds = &gnode->baseBounds;
+        nodeIndex = &gnode->index;
+    } else {
+        MONGO_verify(type == STAGE_IXSCAN);
+        IndexScanNode* scan = static_cast<IndexScanNode*>(node);
+        nodeIndex = &scan->index;
+        bounds = &scan->bounds;
+
+        // If this is a $** index, update and populate the keyPattern, bounds, and multikeyPaths.
+        if (index.type == IndexType::INDEX_WILDCARD) {
+            wcp::finalizeWildcardIndexScanConfiguration(scan, &ietBuilders);
+        }
+    }
+
+    // Find the first field in the scan's bounds that was not filled out.
+    // TODO SERVER-122503: could cache this.
+    size_t firstEmptyField = 0;
+    for (firstEmptyField = 0; firstEmptyField < bounds->fields.size(); ++firstEmptyField) {
+        if (bounds->fields[firstEmptyField].name.empty()) {
+            MONGO_verify(bounds->fields[firstEmptyField].intervals.empty());
+            break;
+        }
+    }
+
+    // Process a case when some fields are not filled out with bounds.
+    if (firstEmptyField != bounds->fields.size()) {
         // Skip ahead to the firstEmptyField-th element, where we begin filling in bounds.
-        BSONObjIterator it(index.keyPattern);
+        BSONObjIterator it(nodeIndex->keyPattern);
         for (size_t i = 0; i < firstEmptyField; ++i) {
-            verify(it.more());
+            MONGO_verify(it.more());
             it.next();
         }
 
         // For each field in the key...
         while (it.more()) {
             BSONElement kpElt = it.next();
-            // There may be filled-in fields to the right of the firstEmptyField.
-            // Example:
-            // The index {loc:"2dsphere", x:1}
-            // With a predicate over x and a near search over loc.
-            if ("" == bounds->fields[firstEmptyField].name) {
-                verify(bounds->fields[firstEmptyField].intervals.empty());
-                // ...build the "all values" interval.
-                IndexBoundsBuilder::allValuesForField(kpElt,
-                                                      &bounds->fields[firstEmptyField]);
+            // There may be filled-in fields to the right of the firstEmptyField; for instance, the
+            // index {loc:"2dsphere", x:1} with a predicate over x and a near search over loc.
+            if (bounds->fields[firstEmptyField].name.empty()) {
+                MONGO_verify(bounds->fields[firstEmptyField].intervals.empty());
+                IndexBoundsBuilder::allValuesForField(kpElt, &bounds->fields[firstEmptyField]);
             }
             ++firstEmptyField;
         }
 
         // Make sure that the length of the key is the length of the bounds we started.
-        verify(firstEmptyField == bounds->fields.size());
-
-        // We create bounds assuming a forward direction but can easily reverse bounds to align
-        // according to our desired direction.
-        IndexBoundsBuilder::alignBounds(bounds, index.keyPattern);
+        MONGO_verify(firstEmptyField == bounds->fields.size());
     }
 
-    // static
-    void QueryPlannerAccess::findElemMatchChildren(const MatchExpression* node,
-                                                   vector<MatchExpression*>* out,
-                                                   vector<MatchExpression*>* subnodesOut) {
-        for (size_t i = 0; i < node->numChildren(); ++i) {
-            MatchExpression* child = node->getChild(i);
-            if (Indexability::isBoundsGenerating(child) &&
-                NULL != child->getTag()) {
-                out->push_back(child);
-            }
-            else if (MatchExpression::AND == child->matchType() ||
-                     Indexability::arrayUsesIndexOnChildren(child)) {
-                findElemMatchChildren(child, out, subnodesOut);
-            }
-            else if (NULL != child->getTag()) {
-                subnodesOut->push_back(child);
+    // Build Interval Evaluation Trees used to restore index bounds from cached SBE Plans.
+    if (node->getType() == STAGE_IXSCAN && !ietBuilders.empty()) {
+        auto ixScan = static_cast<IndexScanNode*>(node);
+        ixScan->iets.reserve(ietBuilders.size());
+        for (size_t i = 0; i < ietBuilders.size(); ++i) {
+            if (auto iet = ietBuilders[i].done()) {
+                ixScan->iets.push_back(std::move(*iet));
+            } else {
+                ixScan->iets.push_back(
+                    interval_evaluation_tree::IET::make<interval_evaluation_tree::ConstNode>(
+                        bounds->fields[i]));
             }
         }
+        LOGV2_DEBUG(
+            6334900, 5, "Build IETs", "iets"_attr = ietsToString(ixScan->index, ixScan->iets));
     }
 
-    // static
-    bool QueryPlannerAccess::processIndexScans(const CanonicalQuery& query,
-                                               MatchExpression* root,
-                                               bool inArrayOperator,
-                                               const std::vector<IndexEntry>& indices,
-                                               const QueryPlannerParams& params,
-                                               std::vector<QuerySolutionNode*>* out) {
-        // Initialize the ScanBuildingState.
-        ScanBuildingState scanState(root, inArrayOperator, indices);
+    // We create bounds assuming a forward direction but can easily reverse bounds to align
+    // according to our desired direction.
+    IndexBoundsBuilder::alignBounds(bounds, nodeIndex->keyPattern, nodeIndex->collator != nullptr);
+}
 
-        while (scanState.curChild < root->numChildren()) {
-            MatchExpression* child = root->getChild(scanState.curChild);
+void QueryPlannerAccess::findElemMatchChildren(const MatchExpression* node,
+                                               vector<MatchExpression*>* out,
+                                               vector<MatchExpression*>* subnodesOut) {
+    for (size_t i = 0; i < node->numChildren(); ++i) {
+        MatchExpression* child = node->getChild(i);
+        if (Indexability::isBoundsGenerating(child) && nullptr != child->getTag()) {
+            out->push_back(child);
+        } else if (MatchExpression::AND == child->matchType() ||
+                   Indexability::arrayUsesIndexOnChildren(child)) {
+            findElemMatchChildren(child, out, subnodesOut);
+        } else if (nullptr != child->getTag()) {
+            subnodesOut->push_back(child);
+        }
+    }
+}
 
-            // If there is no tag, it's not using an index.  We've sorted our children such that the
-            // children with tags are first, so we stop now.
-            if (NULL == child->getTag()) { break; }
+std::vector<std::unique_ptr<QuerySolutionNode>> QueryPlannerAccess::collapseEquivalentScans(
+    std::vector<std::unique_ptr<QuerySolutionNode>> scans) {
+    tassert(11321012, "scans must not be empty", !scans.empty());
 
-            scanState.ixtag = static_cast<IndexTag*>(child->getTag());
-            // If there's a tag it must be valid.
-            verify(IndexTag::kNoIndex != scanState.ixtag->index);
+    // Scans that need to be collapsed will be adjacent to each other in the list due to how we
+    // sort the query predicate. We step through the list, either merging the current scan into
+    // the last scan in 'collapsedScans', or adding a new entry to 'collapsedScans' if it can't
+    // be merged.
+    std::vector<std::unique_ptr<QuerySolutionNode>> collapsedScans;
 
-            // If the child can't use an index on its own field (and the child is not a negation
-            // of a bounds-generating expression), then it's indexed by virtue of one of
-            // its children having an index.
-            //
-            // NOTE: If the child is logical, it could possibly collapse into a single ixscan.  we
-            // ignore this for now.
-            if (!Indexability::isBoundsGenerating(child)) {
-                // If we're here, then the child is indexed by virtue of its children.
-                // In most cases this means that we recursively build indexed data
-                // access on 'child'.
-                if (!processIndexScansSubnode(query, &scanState, params, out)) {
-                    return false;
+    collapsedScans.push_back(std::move(scans[0]));
+    for (size_t i = 1; i < scans.size(); ++i) {
+        if (scansAreEquivalent(collapsedScans.back().get(), scans[i].get())) {
+            // We collapse the entry from 'ownedScans' into the back of 'collapsedScans'.
+            std::unique_ptr<QuerySolutionNode> collapseFrom = std::move(scans[i]);
+            FetchNode* collapseFromFetch = getFetchNode(collapseFrom.get());
+            FetchNode* collapseIntoFetch = getFetchNode(collapsedScans.back().get());
+
+            // If there's no filter associated with a fetch node on 'collapseFrom', all we have to
+            // do is clear the filter on the node that we are collapsing into.
+            if (!collapseFromFetch || !collapseFromFetch->filter.get()) {
+                if (collapseIntoFetch) {
+                    collapseIntoFetch->filter.reset();
                 }
                 continue;
             }
 
-            // If we're here, we now know that 'child' can use an index directly and the index is
-            // over the child's field.
-
-            // If 'child' is a NOT, then the tag we're interested in is on the NOT's
-            // child node.
-            if (MatchExpression::NOT == child->matchType()) {
-                scanState.ixtag = static_cast<IndexTag*>(child->getChild(0)->getTag());
-                invariant(IndexTag::kNoIndex != scanState.ixtag->index);
+            // If there's no filter associated with a fetch node on the back of the 'collapsedScans'
+            // list, then there's nothing more to do.
+            if (!collapseIntoFetch || !collapseIntoFetch->filter.get()) {
+                continue;
             }
 
-            // If the child we're looking at uses a different index than the current index scan, add
-            // the current index scan to the output as we're done with it.  The index scan created
-            // by the child then becomes our new current index scan.  Note that the current scan
-            // could be NULL, in which case we don't output it.  The rest of the logic is identical.
-            //
-            // If the child uses the same index as the current index scan, we may be able to merge
-            // the bounds for the two scans.
-            //
-            // Guiding principle: must the values we're testing come from the same array in the
-            // document?  If so, we can combine bounds (via intersection or compounding).  If not,
-            // we can't.
-            //
-            // If the index is NOT multikey, it's always semantically correct to combine bounds,
-            // as there are no arrays to worry about.
-            //
-            // If the index is multikey, there are arrays of values.  There are several
-            // complications in the multikey case that have to be obeyed both by the enumerator
-            // and here as we try to merge predicates into query solution leaves. The hairy
-            // details of these rules are documented near the top of planner_access.h.
-            if (shouldMergeWithLeaf(child, scanState)) {
-                // The child uses the same index we're currently building a scan for.  Merge
-                // the bounds and filters.
-                verify(scanState.currentIndexNumber == scanState.ixtag->index);
-                scanState.tightness = IndexBoundsBuilder::INEXACT_FETCH;
-                mergeWithLeafNode(child, &scanState);
-                handleFilter(&scanState);
-            }
-            else {
-                if (NULL != scanState.currentScan.get()) {
-                    // Output the current scan before starting to construct a new out.
-                    finishAndOutputLeaf(&scanState, out);
-                }
-                else {
-                    verify(IndexTag::kNoIndex == scanState.currentIndexNumber);
-                }
+            // Both the 'from' and 'into' nodes have filters. We join them with an
+            // OrMatchExpression.
+            std::unique_ptr<OrMatchExpression> collapsedFilter =
+                std::make_unique<OrMatchExpression>();
+            collapsedFilter->add(std::move(collapseFromFetch->filter));
+            collapsedFilter->add(std::move(collapseIntoFetch->filter));
 
-                // Reset state before producing a new leaf.
-                scanState.resetForNextScan(scanState.ixtag);
-
-                scanState.currentScan.reset(makeLeafNode(query,
-                                                         indices[scanState.currentIndexNumber],
-                                                         scanState.ixtag->pos, child,
-                                                         &scanState.tightness));
-
-                handleFilter(&scanState);
-            }
+            // Normalize the filter and add it to 'into'.
+            collapseIntoFetch->filter = optimizeMatchExpression(std::move(collapsedFilter),
+                                                                /* enableSimplification */ true);
+        } else {
+            // Scans are not equivalent and can't be collapsed.
+            collapsedScans.push_back(std::move(scans[i]));
         }
+    }
 
-        // Output the scan we're done with, if it exists.
-        if (NULL != scanState.currentScan.get()) {
-            finishAndOutputLeaf(&scanState, out);
-        }
+    tassert(11321013, "collapsedScans must not be empty", !collapsedScans.empty());
+    return collapsedScans;
+}
 
+/**
+ * This helper determines if a query can be covered depending on the query projection.
+ */
+bool projNeedsFetch(const CanonicalQuery& query) {
+    if (query.isCountLike()) {
+        return false;
+    }
+
+    // This optimization can only be used for find when the index covers the projection completely.
+    // However, if the indexed field is in the projection, the index may return an incorrect value
+    // for the field, since it does not distinguish between null and missing. Hence, only find
+    // queries projecting _id are covered.
+    auto proj = query.getProj();
+    if (!proj) {
         return true;
     }
 
-    // static
-    bool QueryPlannerAccess::processIndexScansElemMatch(const CanonicalQuery& query,
-                                                        ScanBuildingState* scanState,
-                                                        const QueryPlannerParams& params,
-                                                        std::vector<QuerySolutionNode*>* out) {
-        MatchExpression* root = scanState->root;
-        MatchExpression* child = root->getChild(scanState->curChild);
-        const vector<IndexEntry>& indices = scanState->indices;
+    // We can cover projections on _id and generated fields and expressions depending only on _id.
+    // However, if the projection is an exclusion, requires match details, requires the full
+    // document, or requires metadata, we will still need a FETCH stage.
+    if (proj->type() == projection_ast::ProjectType::kInclusion && !proj->requiresMatchDetails() &&
+        proj->metadataDeps().none() && !proj->requiresDocument()) {
+        const auto& projFields = proj->getRequiredFields();
+        // Note that it is not possible to project onto dotted paths of _id here, since they may be
+        // null or missing, and the index cannot differentiate between the two cases, so we would
+        // still need a FETCH stage.
+        if (projFields.size() == 1 && *projFields.begin() == "_id") {
+            return false;
+        }
+    }
 
-        // We have an AND with an ELEM_MATCH_OBJECT child. The plan enumerator produces
-        // index taggings which indicate that we should try to compound with
-        // predicates retrieved from inside the subtree rooted at the ELEM_MATCH.
-        // In order to obey the enumerator's tagging, we need to retrieve these
-        // predicates from inside the $elemMatch, and try to merge them with
-        // the current index scan.
+    return true;
+}
 
-        // Contains tagged predicates from inside the tree rooted at 'child'
-        // which are logically part of the AND.
-        vector<MatchExpression*> emChildren;
+/**
+ * This helper updates a MAYBE_COVERED query tightness to one of EXACT, INEXACT_COVERED, or
+ * INEXACT_FETCH, depending on whether we need a FETCH/filter to answer the query projection.
+ */
+void refineTightnessForMaybeCoveredQuery(const CanonicalQuery& query,
+                                         IndexBoundsBuilder::BoundsTightness& tightnessOut) {
+    // We need to refine the tightness in case we have a "MAYBE_COVERED" tightness bound which
+    // depends on the query's projection. We will not have information about the projection
+    // later on in order to make this determination, so we do it here.
+    const bool noFetchNeededForProj = !projNeedsFetch(query);
+    if (tightnessOut == IndexBoundsBuilder::EXACT_MAYBE_COVERED) {
+        if (noFetchNeededForProj) {
+            tightnessOut = IndexBoundsBuilder::EXACT;
+        } else {
+            tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
+        }
+    } else if (tightnessOut == IndexBoundsBuilder::INEXACT_MAYBE_COVERED) {
+        if (noFetchNeededForProj) {
+            tightnessOut = IndexBoundsBuilder::INEXACT_COVERED;
+        } else {
+            tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
+        }
+    }
+}
 
-        // Contains tagged nodes that are not logically part of the AND and
-        // cannot use the index directly (e.g. OR nodes which are tagged to
-        // be indexed).
-        vector<MatchExpression*> emSubnodes;
+bool QueryPlannerAccess::processIndexScans(const CanonicalQuery& query,
+                                           MatchExpression* root,
+                                           bool inArrayOperator,
+                                           const std::vector<IndexEntry>& indices,
+                                           const QueryPlannerParams& params,
+                                           std::vector<std::unique_ptr<QuerySolutionNode>>* out) {
+    // Initialize the ScanBuildingState.
+    ScanBuildingState scanState(root, indices, inArrayOperator);
 
-        // Populate 'emChildren' and 'emSubnodes'.
-        findElemMatchChildren(child, &emChildren, &emSubnodes);
+    while (scanState.curChild < root->numChildren()) {
+        MatchExpression* child = root->getChild(scanState.curChild);
 
-        // Recursively build data access for the nodes inside 'emSubnodes'.
-        for (size_t i = 0; i < emSubnodes.size(); ++i) {
-            MatchExpression* subnode = emSubnodes[i];
-
-            if (!Indexability::isBoundsGenerating(subnode)) {
-                // Must pass true for 'inArrayOperator' because the subnode is
-                // beneath an ELEM_MATCH_OBJECT.
-                QuerySolutionNode* childSolution = buildIndexedDataAccess(query,
-                                                                          subnode,
-                                                                          true,
-                                                                          indices,
-                                                                          params);
-
-                // buildIndexedDataAccess(...) returns NULL in error conditions, when
-                // it is unable to construct a query solution from a tagged match
-                // expression tree. If we are unable to construct a solution according
-                // to the instructions from the enumerator, then we bail out early
-                // (by returning false) rather than continuing on and potentially
-                // constructing an invalid solution tree.
-                if (NULL == childSolution) { return false; }
-
-                // Output the resulting solution tree.
-                out->push_back(childSolution);
-            }
+        // If there is no tag, it's not using an index.  We've sorted our children such that the
+        // children with tags are first, so we stop now.
+        if (nullptr == child->getTag()) {
+            break;
         }
 
-        // For each predicate in 'emChildren', try to merge it with the current index scan.
+        scanState.ixtag = indexTagCast<IndexTag>(child->getTag());
+        // If there's a tag it must be valid.
+        MONGO_verify(IndexTag::kNoIndex != scanState.ixtag->index);
+
+        // If the child can't use an index on its own field (and the child is not a negation
+        // of a bounds-generating expression), then it's indexed by virtue of one of
+        // its children having an index.
         //
-        // This loop is similar to that in processIndexScans(...), except it does not call into
-        // handleFilters(...). Instead, we leave the entire $elemMatch filter intact. This way,
-        // the complete $elemMatch expression will be affixed as a filter later on.
-        for (size_t i = 0; i < emChildren.size(); ++i) {
-            MatchExpression* emChild = emChildren[i];
-            invariant(NULL != emChild->getTag());
-            scanState->ixtag = static_cast<IndexTag*>(emChild->getTag());
-
-            // If 'emChild' is a NOT, then the tag we're interested in is on the NOT's
-            // child node.
-            if (MatchExpression::NOT == emChild->matchType()) {
-                invariant(NULL != emChild->getChild(0)->getTag());
-                scanState->ixtag = static_cast<IndexTag*>(emChild->getChild(0)->getTag());
-                invariant(IndexTag::kNoIndex != scanState->ixtag->index);
+        // NOTE: If the child is logical, it could possibly collapse into a single ixscan.  we
+        // ignore this for now.
+        if (!Indexability::isBoundsGenerating(child)) {
+            // If we're here, then the child is indexed by virtue of its children.
+            // In most cases this means that we recursively build indexed data
+            // access on 'child'.
+            if (!processIndexScansSubnode(query, &scanState, params, out)) {
+                return false;
             }
-
-            if (shouldMergeWithLeaf(emChild, *scanState)) {
-                // The child uses the same index we're currently building a scan for.  Merge
-                // the bounds and filters.
-                verify(scanState->currentIndexNumber == scanState->ixtag->index);
-
-                scanState->tightness = IndexBoundsBuilder::INEXACT_FETCH;
-                mergeWithLeafNode(emChild, scanState);
-            }
-            else {
-                if (NULL != scanState->currentScan.get()) {
-                    finishAndOutputLeaf(scanState, out);
-                }
-                else {
-                    verify(IndexTag::kNoIndex == scanState->currentIndexNumber);
-                }
-
-                scanState->currentIndexNumber = scanState->ixtag->index;
-
-                scanState->tightness = IndexBoundsBuilder::INEXACT_FETCH;
-                scanState->currentScan.reset(makeLeafNode(query, indices[scanState->currentIndexNumber],
-                                                          scanState->ixtag->pos,
-                                                          emChild, &scanState->tightness));
-            }
+            continue;
         }
 
-        // We're done processing the $elemMatch child. We leave it hanging off
-        // it's AND parent so that it will be affixed as a filter later on,
-        // and move on to the next child of the AND.
+        // If we're here, we now know that 'child' can use an index directly and the index is
+        // over the child's field.
+
+        // If 'child' is a NOT, then the tag we're interested in is on the NOT's
+        // child node.
+        if (MatchExpression::NOT == child->matchType()) {
+            scanState.ixtag = indexTagCast<IndexTag>(child->getChild(0)->getTag());
+            tassert(11321014,
+                    "Expected the NOT child to have an index tag",
+                    IndexTag::kNoIndex != scanState.ixtag->index);
+        }
+
+        // If the child we're looking at uses a different index than the current index scan, add
+        // the current index scan to the output as we're done with it.  The index scan created
+        // by the child then becomes our new current index scan.  Note that the current scan
+        // could be NULL, in which case we don't output it.  The rest of the logic is identical.
+        //
+        // If the child uses the same index as the current index scan, we may be able to merge
+        // the bounds for the two scans.
+        //
+        // Guiding principle: must the values we're testing come from the same array in the
+        // document?  If so, we can combine bounds (via intersection or compounding).  If not,
+        // we can't.
+        //
+        // If the index is NOT multikey, it's always semantically correct to combine bounds,
+        // as there are no arrays to worry about.
+        //
+        // If the index is multikey, there are arrays of values.  There are several
+        // complications in the multikey case that have to be obeyed both by the enumerator
+        // and here as we try to merge predicates into query solution leaves. The hairy
+        // details of these rules are documented near the top of planner_access.h.
+        if (shouldMergeWithLeaf(child, scanState)) {
+            // The child uses the same index we're currently building a scan for.  Merge
+            // the bounds and filters.
+            MONGO_verify(scanState.currentIndexNumber == scanState.ixtag->index);
+            scanState.tightness = IndexBoundsBuilder::INEXACT_FETCH;
+            mergeWithLeafNode(child, &scanState);
+            refineTightnessForMaybeCoveredQuery(query, scanState.tightness);
+            handleFilter(&scanState);
+        } else {
+            if (nullptr != scanState.currentScan.get()) {
+                // Output the current scan before starting to construct a new out.
+                finishAndOutputLeaf(query, &scanState, out);
+            } else {
+                MONGO_verify(IndexTag::kNoIndex == scanState.currentIndexNumber);
+            }
+
+            // Reset state before producing a new leaf.
+            scanState.resetForNextScan(scanState.ixtag, query.isParameterized());
+
+            scanState.currentScan = makeLeafNode(query,
+                                                 indices[scanState.currentIndexNumber],
+                                                 scanState.ixtag->pos,
+                                                 child,
+                                                 &scanState.tightness,
+                                                 scanState.getCurrentIETBuilder());
+
+            refineTightnessForMaybeCoveredQuery(query, scanState.tightness);
+            handleFilter(&scanState);
+        }
+    }
+
+    // If the index is partial and we have reached children without index tag, check if they are
+    // covered by the index' filter expression. In this case the child can be removed. In some cases
+    // this enables to remove the fetch stage from the plan.
+    // The check could be put inside the 'handleFilterAnd()' function, but if moved then the
+    // optimization will not be applied if the predicate contains an $elemMatch expression, since
+    // then the 'handleFilterAnd()' is not called.
+    if (IndexTag::kNoIndex != scanState.currentIndexNumber) {
+        const IndexEntry& index = indices[scanState.currentIndexNumber];
+        if (index.filterExpr != nullptr) {
+            while (scanState.curChild < root->numChildren()) {
+                MatchExpression* child = root->getChild(scanState.curChild);
+                if (expression::isSubsetOf(index.filterExpr, child)) {
+                    // When the documents satisfying the index filter predicate are a subset of the
+                    // documents satisfying the child expression, the child predicate is redundant.
+                    // Remove the child from the root's children.
+                    // For example: index on 'a' with a filter {$and: [{a: {$gt: 10}}, {b: {$lt:
+                    // 100}}]} and a query predicate {$and: [{a: {$gt: 20}}, {b: {$lt: 100}}]}. The
+                    // non-indexed child {b: {$lt: 100}} is always satisfied by the index filter and
+                    // can be removed.
+
+                    // In case of index filter predicate with $or, this optimization is not
+                    // applicable, since the subset relationship doesn't hold.
+                    // For example, an index on field 'c' with a filter expression {$or: [{a: {$gt:
+                    // 10}}, {b: {$lt: 100}}]} could be applicable for the query with a predicate
+                    // {$and: [{c: {$gt: 100}}, {b: {$lt: 100}}]}, but the predicate will not be
+                    // removed.
+                    scanState.tightness = IndexBoundsBuilder::EXACT;
+                    refineTightnessForMaybeCoveredQuery(query, scanState.tightness);
+                    handleFilter(&scanState);
+                } else {
+                    ++scanState.curChild;
+                }
+            }
+        }
+    }
+
+    // Output the scan we're done with, if it exists.
+    if (nullptr != scanState.currentScan.get()) {
+        finishAndOutputLeaf(query, &scanState, out);
+    }
+
+    return true;
+}
+
+bool QueryPlannerAccess::processIndexScansElemMatch(
+    const CanonicalQuery& query,
+    ScanBuildingState* scanState,
+    const QueryPlannerParams& params,
+    std::vector<std::unique_ptr<QuerySolutionNode>>* out) {
+    MatchExpression* root = scanState->root;
+    MatchExpression* child = root->getChild(scanState->curChild);
+    const vector<IndexEntry>& indices = scanState->indices;
+
+    // We have an AND with an ELEM_MATCH_OBJECT child. The plan enumerator produces
+    // index taggings which indicate that we should try to compound with
+    // predicates retrieved from inside the subtree rooted at the ELEM_MATCH.
+    // In order to obey the enumerator's tagging, we need to retrieve these
+    // predicates from inside the $elemMatch, and try to merge them with
+    // the current index scan.
+
+    // Contains tagged predicates from inside the tree rooted at 'child'
+    // which are logically part of the AND.
+    vector<MatchExpression*> emChildren;
+
+    // Contains tagged nodes that are not logically part of the AND and
+    // cannot use the index directly (e.g. OR nodes which are tagged to
+    // be indexed).
+    vector<MatchExpression*> emSubnodes;
+
+    // Populate 'emChildren' and 'emSubnodes'.
+    findElemMatchChildren(child, &emChildren, &emSubnodes);
+
+    // Recursively build data access for the nodes inside 'emSubnodes'.
+    for (size_t i = 0; i < emSubnodes.size(); ++i) {
+        MatchExpression* subnode = emSubnodes[i];
+
+        if (!Indexability::isBoundsGenerating(subnode)) {
+            // 'subnode' is beneath an $elemMatch. When planning the children of array operators, we
+            // keep ownership of the match expression node. Therefore, we pass nullptr for the
+            // 'ownedRoot' argument.
+            auto childSolution = _buildIndexedDataAccess(query, subnode, nullptr, indices, params);
+
+            // _buildIndexedDataAccess(...) returns NULL in error conditions, when it is unable to
+            // construct a query solution from a tagged match expression tree. If we are unable to
+            // construct a solution according to the instructions from the enumerator, then we bail
+            // out early (by returning false) rather than continuing on and potentially constructing
+            // an invalid solution tree.
+            if (!childSolution) {
+                return false;
+            }
+
+            // Output the resulting solution tree.
+            out->push_back(std::move(childSolution));
+        }
+    }
+
+    // For each predicate in 'emChildren', try to merge it with the current index scan.
+    //
+    // This loop is similar to that in processIndexScans(...), except it does not call into
+    // handleFilters(...). Instead, we leave the entire $elemMatch filter intact. This way,
+    // the complete $elemMatch expression will be affixed as a filter later on.
+    for (size_t i = 0; i < emChildren.size(); ++i) {
+        MatchExpression* emChild = emChildren[i];
+        tassert(
+            11321015, "emChild->getTag() must not return nullptr", nullptr != emChild->getTag());
+        scanState->ixtag = indexTagCast<IndexTag>(emChild->getTag());
+
+        // If 'emChild' is a NOT, then the tag we're interested in is on the NOT's
+        // child node.
+        if (MatchExpression::NOT == emChild->matchType()) {
+            tassert(11321016,
+                    "emChild->getChild(0)->getTag() must not return nullptr",
+                    nullptr != emChild->getChild(0)->getTag());
+            scanState->ixtag = indexTagCast<IndexTag>(emChild->getChild(0)->getTag());
+            tassert(11321017,
+                    "expected scanState->ixtag->index to not be kNoIndex",
+                    IndexTag::kNoIndex != scanState->ixtag->index);
+        }
+
+        if (shouldMergeWithLeaf(emChild, *scanState)) {
+            // The child uses the same index we're currently building a scan for.  Merge
+            // the bounds and filters.
+            MONGO_verify(scanState->currentIndexNumber == scanState->ixtag->index);
+
+            scanState->tightness = IndexBoundsBuilder::INEXACT_FETCH;
+            mergeWithLeafNode(emChild, scanState);
+        } else {
+            if (nullptr != scanState->currentScan.get()) {
+                finishAndOutputLeaf(query, scanState, out);
+            } else {
+                MONGO_verify(IndexTag::kNoIndex == scanState->currentIndexNumber);
+            }
+
+            // Reset state before producing a new leaf.
+            scanState->resetForNextScan(scanState->ixtag, query.isParameterized());
+
+            scanState->currentScan = makeLeafNode(query,
+                                                  indices[scanState->currentIndexNumber],
+                                                  scanState->ixtag->pos,
+                                                  emChild,
+                                                  &scanState->tightness,
+                                                  scanState->getCurrentIETBuilder());
+        }
+    }
+
+    // We're done processing the $elemMatch child. We leave it hanging off
+    // it's AND parent so that it will be affixed as a filter later on,
+    // and move on to the next child of the AND.
+    ++scanState->curChild;
+    return true;
+}
+
+bool QueryPlannerAccess::processIndexScansSubnode(
+    const CanonicalQuery& query,
+    ScanBuildingState* scanState,
+    const QueryPlannerParams& params,
+    std::vector<std::unique_ptr<QuerySolutionNode>>* out) {
+    MatchExpression* root = scanState->root;
+    MatchExpression* child = root->getChild(scanState->curChild);
+    const vector<IndexEntry>& indices = scanState->indices;
+    bool inArrayOperator = scanState->inArrayOperator;
+
+    // We may detach the current child from the tree and assume ownership.
+    std::unique_ptr<MatchExpression> ownedChild;
+
+    if (MatchExpression::AND == root->matchType() &&
+        MatchExpression::ELEM_MATCH_OBJECT == child->matchType()) {
+        return processIndexScansElemMatch(query, scanState, params, out);
+    } else if (!inArrayOperator) {
+        // The logical sub-tree is responsible for fully evaluating itself. Any required filters or
+        // fetches are already hung on it. As such, we remove the filter branch from our tree and
+        // assume ownership of it.
+        ownedChild = std::move((*root->getChildVector())[scanState->curChild]);
+        root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
+    } else {
         ++scanState->curChild;
-        return true;
     }
 
-    // static
-    bool QueryPlannerAccess::processIndexScansSubnode(const CanonicalQuery& query,
-                                                      ScanBuildingState* scanState,
-                                                      const QueryPlannerParams& params,
-                                                      std::vector<QuerySolutionNode*>* out) {
-        MatchExpression* root = scanState->root;
-        MatchExpression* child = root->getChild(scanState->curChild);
-        const vector<IndexEntry>& indices = scanState->indices;
-        bool inArrayOperator = scanState->inArrayOperator;
+    // If inArrayOperator: takes ownership of child, which is OK, since we detached
+    // child from root.
+    auto childSolution =
+        _buildIndexedDataAccess(query, child, std::move(ownedChild), indices, params);
+    if (!childSolution) {
+        return false;
+    }
+    out->push_back(std::move(childSolution));
+    return true;
+}
 
-        if (MatchExpression::AND == root->matchType() &&
-            MatchExpression::ELEM_MATCH_OBJECT == child->matchType()) {
-            return processIndexScansElemMatch(query, scanState, params, out);
-        }
-        else if (!inArrayOperator) {
-            // The logical sub-tree is responsible for fully evaluating itself.  Any
-            // required filters or fetches are already hung on it.  As such, we remove the
-            // filter branch from our tree.  buildIndexedDataAccess takes ownership of the
-            // child.
-            root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
-            // The curChild of today is the curChild+1 of yesterday.
-        }
-        else {
-            ++scanState->curChild;
-        }
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
+    const CanonicalQuery& query,
+    MatchExpression* root,
+    std::unique_ptr<MatchExpression> ownedRoot,
+    const vector<IndexEntry>& indices,
+    const QueryPlannerParams& params) {
+    // Clone the match expression before passing it to processIndexScans(), as it may trim
+    // predicates. If we end up with an index intersection solution, then we use our copy of the
+    // match expression to be sure that the FETCH stage will recheck the entire predicate. It is not
+    // correct to trim predicates for index intersection plans, as this can lead to spurious matches
+    // (see SERVER-16750).
+    auto clonedRoot = root->clone();
 
-        // If inArrayOperator: takes ownership of child, which is OK, since we detached
-        // child from root.
-        QuerySolutionNode* childSolution = buildIndexedDataAccess(query,
-                                                                  child,
-                                                                  inArrayOperator,
-                                                                  indices,
-                                                                  params);
-        if (NULL == childSolution) { return false; }
-        out->push_back(childSolution);
-        return true;
+    std::vector<std::unique_ptr<QuerySolutionNode>> ixscanNodes;
+    const bool inArrayOperator = !ownedRoot;
+    if (!processIndexScans(query, root, inArrayOperator, indices, params, &ixscanNodes)) {
+        return nullptr;
     }
 
-    // static
-    QuerySolutionNode* QueryPlannerAccess::buildIndexedAnd(const CanonicalQuery& query,
-                                                           MatchExpression* root,
-                                                           bool inArrayOperator,
-                                                           const vector<IndexEntry>& indices,
-                                                           const QueryPlannerParams& params) {
-        auto_ptr<MatchExpression> autoRoot;
-        if (!inArrayOperator) {
-            autoRoot.reset(root);
+    //
+    // Process all non-indexed predicates.  We hang these above the AND with a fetch and
+    // filter.
+    //
+
+    // This is the node we're about to return.
+    std::unique_ptr<QuerySolutionNode> andResult;
+
+    // We must use an index for at least one child of the AND.  We shouldn't be here if this
+    // isn't the case.
+    MONGO_verify(ixscanNodes.size() >= 1);
+
+    // Short-circuit: an AND of one child is just the child.
+    if (ixscanNodes.size() == 1) {
+        if (root->numChildren() > 0 &&
+            wildcard_planning::canOnlyAnswerWildcardPrefixQuery(ixscanNodes)) {
+            // If we get here, we have a compound wildcard index which can answer one or more of the
+            // predicates in the $and, but we also have at least one additional node attached to the
+            // filter. Normally, we would be able to satisfy this case using a FETCH + FILTER +
+            // IXSCAN; however, in the case of a $not query which is not supported by the index, the
+            // index entry will be expanded in such a way that we won't be able to satisfy the
+            // query.
+            return nullptr;
+        }
+        andResult = std::move(ixscanNodes[0]);
+    } else {
+        if ((params.mainCollectionInfo.options & QueryPlannerParams::TARGET_SBE_STAGE_BUILDER) &&
+            !query.getExpCtx()->getQueryKnobConfiguration().getForceIntersectionPlans()) {
+            // When targeting the SBE Stage Builder, we don't allow sort-based intersection or
+            // hash-based intersection unless the 'forceIntersectionPlans' query knob (the
+            // 'internalQueryForceIntersectionPlans' server parameter, overridable per query via
+            // query settings) is set, because SBE's implementation of STAGE_AND_HASH and
+            // STAGE_AND_SORTED is not complete.
+            LOGV2_DEBUG(9081800,
+                        5,
+                        "Can't build index intersection solution: AND_SORTED and AND_HASH are not "
+                        "possible due to TARGET_SBE_STAGE_BUILDER option being set");
+            return nullptr;
         }
 
-        // If we are not allowed to trim for ixisect, then clone the match expression before
-        // passing it to processIndexScans(), which may do the trimming. If we end up with
-        // an index intersection solution, then we use our copy of the match expression to be
-        // sure that the FETCH stage will recheck the entire predicate.
-        //
-        // XXX: This block is a hack to accommodate the storage layer concurrency model.
-        std::auto_ptr<MatchExpression> clonedRoot;
-        if (params.options & QueryPlannerParams::CANNOT_TRIM_IXISECT) {
-            clonedRoot.reset(root->shallowClone());
+        // $** indexes are prohibited from participating in either AND_SORTED or AND_HASH.
+        const bool wildcardIndexInvolvedInIntersection =
+            std::any_of(ixscanNodes.begin(), ixscanNodes.end(), [](const auto& ixScan) {
+                return ixScan->getType() == StageType::STAGE_IXSCAN &&
+                    static_cast<IndexScanNode*>(ixScan.get())->index.type == INDEX_WILDCARD;
+            });
+        if (wildcardIndexInvolvedInIntersection) {
+            return nullptr;
         }
 
-        vector<QuerySolutionNode*> ixscanNodes;
-        if (!processIndexScans(query, root, inArrayOperator, indices, params, &ixscanNodes)) {
-            return NULL;
+        // Figure out if we want AndHashNode or AndSortedNode.
+        bool allSortedByDiskLoc = true;
+        for (size_t i = 0; i < ixscanNodes.size(); ++i) {
+            if (!ixscanNodes[i]->sortedByDiskLoc()) {
+                allSortedByDiskLoc = false;
+                break;
+            }
         }
+        if (allSortedByDiskLoc &&
+            query.getExpCtx()
+                ->getQueryKnobConfiguration()
+                .getPlannerEnableSortIndexIntersection()) {
+            auto asn = std::make_unique<AndSortedNode>();
+            asn->addChildren(std::move(ixscanNodes));
+            andResult = std::move(asn);
+        } else if (query.getExpCtx()
+                       ->getQueryKnobConfiguration()
+                       .getPlannerEnableHashIntersection()) {
+            {
+                auto ahn = std::make_unique<AndHashNode>();
+                ahn->addChildren(std::move(ixscanNodes));
+                andResult = std::move(ahn);
+            }
 
-        //
-        // Process all non-indexed predicates.  We hang these above the AND with a fetch and
-        // filter.
-        //
-
-        // This is the node we're about to return.
-        QuerySolutionNode* andResult;
-
-        // We must use an index for at least one child of the AND.  We shouldn't be here if this
-        // isn't the case.
-        verify(ixscanNodes.size() >= 1);
-
-        // Short-circuit: an AND of one child is just the child.
-        if (ixscanNodes.size() == 1) {
-            andResult = ixscanNodes[0];
-        }
-        else {
-            // Figure out if we want AndHashNode or AndSortedNode.
-            bool allSortedByDiskLoc = true;
-            for (size_t i = 0; i < ixscanNodes.size(); ++i) {
-                if (!ixscanNodes[i]->sortedByDiskLoc()) {
-                    allSortedByDiskLoc = false;
+            // The AndHashNode provides the sort order of its last child.  If any of the
+            // possible subnodes of AndHashNode provides the sort order we care about, we put
+            // that one last.
+            for (size_t i = 0; i < andResult->children.size(); ++i) {
+                andResult->children[i]->computeProperties();
+                if (andResult->children[i]->providedSorts().contains(
+                        query.getFindCommandRequest().getSort())) {
+                    std::swap(andResult->children[i], andResult->children.back());
                     break;
                 }
             }
-            if (allSortedByDiskLoc) {
-                AndSortedNode* asn = new AndSortedNode();
-                asn->children.swap(ixscanNodes);
-                andResult = asn;
-            }
-            else if (internalQueryPlannerEnableHashIntersection) {
-                AndHashNode* ahn = new AndHashNode();
-                ahn->children.swap(ixscanNodes);
-                andResult = ahn;
-                // The AndHashNode provides the sort order of its last child.  If any of the
-                // possible subnodes of AndHashNode provides the sort order we care about, we put
-                // that one last.
-                for (size_t i = 0; i < ahn->children.size(); ++i) {
-                    ahn->children[i]->computeProperties();
-                    const BSONObjSet& sorts = ahn->children[i]->getSort();
-                    if (sorts.end() != sorts.find(query.getParsed().getSort())) {
-                        std::swap(ahn->children[i], ahn->children.back());
-                        break;
-                    }
-                }
-            }
-            else {
-                // We can't use sort-based intersection, and hash-based intersection is disabled.
-                // Clean up the index scans and bail out by returning NULL.
-                LOG(5) << "Can't build index intersection solution: "
-                       << "AND_SORTED is not possible and AND_HASH is disabled.";
-
-                for (size_t i = 0; i < ixscanNodes.size(); i++) {
-                    delete ixscanNodes[i];
-                }
-                return NULL;
-            }
+        } else {
+            // Sort-based and hash-based index intersection are both disabled. Bail out by returning
+            // nullptr.
+            LOGV2_DEBUG(20947,
+                        5,
+                        "Can't build index intersection solution: AND_HASH is disabled and "
+                        "AND_SORTED is either not possible or disabled");
+            return nullptr;
         }
+    }
 
-        // Don't bother doing any kind of fetch analysis lite if we're doing it anyway above us.
-        if (inArrayOperator) {
-            return andResult;
-        }
-
-        // XXX: This block is a hack to accommodate the storage layer concurrency model.
-        if ((params.options & QueryPlannerParams::CANNOT_TRIM_IXISECT) &&
-            (andResult->getType() == STAGE_AND_HASH || andResult->getType() == STAGE_AND_SORTED)) {
-            // We got an index intersection solution, and we aren't allowed to answer predicates
-            // using the index. We add a fetch with the entire filter.
-            invariant(clonedRoot.get());
-            FetchNode* fetch = new FetchNode();
-            fetch->filter.reset(clonedRoot.release());
-            // Takes ownership of 'andResult'.
-            fetch->children.push_back(andResult);
-            return fetch;
-        }
-
-        // If there are any nodes still attached to the AND, we can't answer them using the
-        // index, so we put a fetch with filter.
-        if (root->numChildren() > 0) {
-            FetchNode* fetch = new FetchNode();
-            verify(NULL != autoRoot.get());
-            if (autoRoot->numChildren() == 1) {
-                // An $and of one thing is that thing.
-                MatchExpression* child = autoRoot->getChild(0);
-                autoRoot->getChildVector()->clear();
-                // Takes ownership.
-                fetch->filter.reset(child);
-                // 'autoRoot' will delete the empty $and.
-            }
-            else { // root->numChildren() > 1
-                // Takes ownership.
-                fetch->filter.reset(autoRoot.release());
-            }
-            // takes ownership
-            fetch->children.push_back(andResult);
-            andResult = fetch;
-        }
-        else {
-            // root has no children, let autoRoot get rid of it when it goes out of scope.
-        }
-
+    // Don't bother doing any kind of fetch analysis lite if we're doing it anyway above us.
+    if (inArrayOperator) {
         return andResult;
     }
 
-    // static
-    QuerySolutionNode* QueryPlannerAccess::buildIndexedOr(const CanonicalQuery& query,
-                                                          MatchExpression* root,
-                                                          bool inArrayOperator,
-                                                          const vector<IndexEntry>& indices,
-                                                          const QueryPlannerParams& params) {
-        auto_ptr<MatchExpression> autoRoot;
-        if (!inArrayOperator) {
-            autoRoot.reset(root);
-        }
-
-        vector<QuerySolutionNode*> ixscanNodes;
-        if (!processIndexScans(query, root, inArrayOperator, indices, params, &ixscanNodes)) {
-            return NULL;
-        }
-
-        // Unlike an AND, an OR cannot have filters hanging off of it.  We stop processing
-        // when any of our children lack index tags.  If a node lacks an index tag it cannot
-        // be answered via an index.
-        if (!inArrayOperator && 0 != root->numChildren()) {
-            warning() << "planner OR error, non-indexed child of OR.";
-            // We won't enumerate an OR without indices for each child, so this isn't an issue, even
-            // if we have an AND with an OR child -- we won't get here unless the OR is fully
-            // indexed.
-            return NULL;
-        }
-
-        QuerySolutionNode* orResult = NULL;
-
-        // An OR of one node is just that node.
-        if (1 == ixscanNodes.size()) {
-            orResult = ixscanNodes[0];
-        }
-        else {
-            bool shouldMergeSort = false;
-
-            if (!query.getParsed().getSort().isEmpty()) {
-                const BSONObj& desiredSort = query.getParsed().getSort();
-
-                // If there exists a sort order that is present in each child, we can merge them and
-                // maintain that sort order / those sort orders.
-                ixscanNodes[0]->computeProperties();
-                BSONObjSet sharedSortOrders = ixscanNodes[0]->getSort();
-
-                if (!sharedSortOrders.empty()) {
-                    for (size_t i = 1; i < ixscanNodes.size(); ++i) {
-                        ixscanNodes[i]->computeProperties();
-                        BSONObjSet isect;
-                        set_intersection(sharedSortOrders.begin(),
-                                sharedSortOrders.end(),
-                                ixscanNodes[i]->getSort().begin(),
-                                ixscanNodes[i]->getSort().end(),
-                                std::inserter(isect, isect.end()),
-                                BSONObjCmp());
-                        sharedSortOrders = isect;
-                        if (sharedSortOrders.empty()) {
-                            break;
-                        }
-                    }
-                }
-
-                // TODO: If we're looking for the reverse of one of these sort orders we could
-                // possibly reverse the ixscan nodes.
-                shouldMergeSort = (sharedSortOrders.end() != sharedSortOrders.find(desiredSort));
-            }
-
-            if (shouldMergeSort) {
-                MergeSortNode* msn = new MergeSortNode();
-                msn->sort = query.getParsed().getSort();
-                msn->children.swap(ixscanNodes);
-                orResult = msn;
-            }
-            else {
-                OrNode* orn = new OrNode();
-                orn->children.swap(ixscanNodes);
-                orResult = orn;
-            }
-        }
-
-        // Evaluate text nodes first to ensure that text scores are available.
-        // Move text nodes to front of vector.
-        std::stable_partition(orResult->children.begin(), orResult->children.end(), isTextNode);
-
-        // OR must have an index for each child, so we should have detached all children from
-        // 'root', and there's nothing useful to do with an empty or MatchExpression.  We let it die
-        // via autoRoot.
-
-        return orResult;
+    if (andResult->getType() == STAGE_AND_HASH || andResult->getType() == STAGE_AND_SORTED) {
+        // We got an index intersection solution, so we aren't allowed to answer predicates exactly
+        // using the index. This is because the index intersection stage finds documents that match
+        // each index's predicate, but the document isn't guaranteed to be in a state where it
+        // matches all indexed predicates simultaneously. Therefore, it is necessary to add a fetch
+        // stage which will explicitly evaluate the entire predicate (see SERVER-16750).
+        tassert(11321018, "clonedRoot must not be null", clonedRoot);
+        auto fetch = std::make_unique<FetchNode>(query.nss());
+        fetch->filter = std::move(clonedRoot);
+        fetch->children.push_back(std::move(andResult));
+        return fetch;
     }
 
-    // static
-    QuerySolutionNode* QueryPlannerAccess::buildIndexedDataAccess(const CanonicalQuery& query,
-                                                            MatchExpression* root,
-                                                            bool inArrayOperator,
-                                                            const vector<IndexEntry>& indices,
-                                                            const QueryPlannerParams& params) {
-        if (root->isLogical() && !Indexability::isBoundsGeneratingNot(root)) {
-            if (MatchExpression::AND == root->matchType()) {
-                // Takes ownership of root.
-                return buildIndexedAnd(query, root, inArrayOperator, indices, params);
-            }
-            else if (MatchExpression::OR == root->matchType()) {
-                // Takes ownership of root.
-                return buildIndexedOr(query, root, inArrayOperator, indices, params);
-            }
-            else {
-                // Can't do anything with negated logical nodes index-wise.
-                if (!inArrayOperator) {
-                    delete root;
+    // If there are any nodes still attached to the AND, we can't answer them using the
+    // index, so we put a fetch with filter.
+    if (root->numChildren() > 0) {
+        auto fetch = std::make_unique<FetchNode>(query.nss());
+        MONGO_verify(ownedRoot);
+        if (ownedRoot->numChildren() == 1) {
+            // An $and of one thing is that thing.
+            fetch->filter = std::move((*ownedRoot->getChildVector())[0]);
+            ownedRoot->getChildVector()->clear();
+            // 'autoRoot' will delete the empty $and.
+        } else {  // root->numChildren() > 1
+            // Takes ownership.
+            fetch->filter = std::move(ownedRoot);
+        }
+        // takes ownership
+        fetch->children.push_back(std::move(andResult));
+        andResult = std::move(fetch);
+    } else {
+        // root has no children, let autoRoot get rid of it when it goes out of scope.
+    }
+
+    return andResult;
+}
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedOr(
+    const CanonicalQuery& query,
+    MatchExpression* root,
+    std::unique_ptr<MatchExpression> ownedRoot,
+    const vector<IndexEntry>& indices,
+    const QueryPlannerParams& params) {
+
+    const bool inArrayOperator = !ownedRoot;
+    bool usedClusteredCollScan = false;
+    std::vector<std::unique_ptr<QuerySolutionNode>> scanNodes;
+    if (!processIndexScans(query, root, inArrayOperator, indices, params, &scanNodes)) {
+        return nullptr;
+    }
+
+    // Check if we can use a CLUSTERED_IXSCAN on the remaining children if they have no plans.
+    // Since, the only clustered index currently supported is on '_id' if we are in an array
+    // operator, we know we won't make clustered collection scans.
+    if (!inArrayOperator && 0 != root->numChildren()) {
+        bool clusteredCollection = params.clusteredInfo.has_value();
+        const bool isTailable = query.getFindCommandRequest().getTailable();
+        if (clusteredCollection) {
+            auto clusteredScanDirection =
+                QueryPlannerCommon::determineClusteredScanDirection(
+                    query, params.clusteredInfo, params.clusteredCollectionCollator)
+                    .value_or(1);
+            while (0 < root->numChildren()) {
+                usedClusteredCollScan = true;
+                MatchExpression* child = root->getChild(0);
+                std::unique_ptr<QuerySolutionNode> collScan =
+                    makeCollectionScan(query, isTailable, params, clusteredScanDirection, child);
+                // Confirm the collection scan node is a clustered collection scan.
+                CollectionScanNode* collScanNode = static_cast<CollectionScanNode*>(collScan.get());
+                if (!collScanNode->doClusteredCollectionScanClassic()) {
+                    return nullptr;
                 }
-                return NULL;
+
+                // Caching OR queries with collection scans is restricted, since it is challenging
+                // to determine which match expressions from the input query require a clustered
+                // collection scan. Therefore, we cannot correctly calculate the correct bounds for
+                // the query using the cached plan.
+                collScanNode->markNotEligibleForPlanCache();
+                scanNodes.push_back(std::move(collScan));
+                // Erase child from root.
+                root->getChildVector()->erase(root->getChildVector()->begin());
             }
         }
-        else {
-            auto_ptr<MatchExpression> autoRoot;
-            if (!inArrayOperator) {
-                autoRoot.reset(root);
-            }
 
-            // isArray or isLeaf is true.  Either way, it's over one field, and the bounds builder
-            // deals with it.
-            if (NULL == root->getTag()) {
-                // No index to use here, not in the context of logical operator, so we're SOL.
-                return NULL;
-            }
-            else if (Indexability::isBoundsGenerating(root)) {
-                // Make an index scan over the tagged index #.
-                IndexTag* tag = static_cast<IndexTag*>(root->getTag());
-
-                IndexBoundsBuilder::BoundsTightness tightness = IndexBoundsBuilder::EXACT;
-                QuerySolutionNode* soln = makeLeafNode(query, indices[tag->index], tag->pos,
-                                                       root, &tightness);
-                verify(NULL != soln);
-                finishLeafNode(soln, indices[tag->index]);
-
-                if (inArrayOperator) {
-                    return soln;
-                }
-
-                // If the bounds are exact, the set of documents that satisfy the predicate is
-                // exactly equal to the set of documents that the scan provides.
-                //
-                // If the bounds are not exact, the set of documents returned from the scan is a
-                // superset of documents that satisfy the predicate, and we must check the
-                // predicate.
-
-                if (tightness == IndexBoundsBuilder::EXACT) {
-                    return soln;
-                }
-                else if (tightness == IndexBoundsBuilder::INEXACT_COVERED
-                         && !indices[tag->index].multikey) {
-                    verify(NULL == soln->filter.get());
-                    soln->filter.reset(autoRoot.release());
-                    return soln;
-                }
-                else {
-                    FetchNode* fetch = new FetchNode();
-                    verify(NULL != autoRoot.get());
-                    fetch->filter.reset(autoRoot.release());
-                    fetch->children.push_back(soln);
-                    return fetch;
+        // If we have a clustered collection scan, then all index scan stages must be wrapped inside
+        // a 'FETCH'. This is to avoid having an unnecessary collection scan node inside a 'FETCH',
+        // since the documents will already be fetched.
+        // TODO SERVER-77867 investigate when we can avoid adding this 'FETCH' stage.
+        if (usedClusteredCollScan) {
+            for (size_t i = 0; i < scanNodes.size(); ++i) {
+                if (scanNodes[i]->getType() == STAGE_IXSCAN) {
+                    scanNodes[i] =
+                        std::make_unique<FetchNode>(std::move(scanNodes[i]), query.nss());
                 }
             }
-            else if (Indexability::arrayUsesIndexOnChildren(root)) {
-                QuerySolutionNode* solution = NULL;
+        }
+    }
 
-                invariant(MatchExpression::ELEM_MATCH_OBJECT);
-                // The child is an AND.
-                invariant(1 == root->numChildren());
-                solution = buildIndexedDataAccess(query, root->getChild(0), true, indices, params);
-                if (NULL == solution) {
-                    return NULL;
+    // Unlike an AND, an OR cannot have filters hanging off of it.  We stop processing
+    // when any of our children lack index tags.  If a node lacks an index tag it cannot
+    // be answered via an index.
+    if (!inArrayOperator && 0 != root->numChildren()) {
+        LOGV2_WARNING(20948, "Planner OR error, non-indexed child of OR");
+        // We won't enumerate an OR without indices for each child, so this isn't an issue, even
+        // if we have an AND with an OR child -- we won't get here unless the OR is fully
+        // indexed.
+        return nullptr;
+    }
+
+    // If all index scans are identical, then we collapse them into a single scan. This prevents
+    // us from creating OR plans where the branches of the OR perform duplicate work.
+    scanNodes = collapseEquivalentScans(std::move(scanNodes));
+
+    std::unique_ptr<QuerySolutionNode> orResult;
+
+    // An OR of one node is just that node.
+    if (1 == scanNodes.size()) {
+        orResult = std::move(scanNodes[0]);
+    } else {
+        std::vector<bool> shouldReverseScan;
+
+        if (query.getSortPattern()) {
+            // If all 'scanNodes' can provide the sort, shouldReverseScan is populated with which
+            // scans to reverse.
+            shouldReverseScan =
+                canProvideSortWithMergeSort(scanNodes, query.getFindCommandRequest().getSort());
+        }
+
+        if (!shouldReverseScan.empty()) {
+            // TODO SERVER-77601 remove this conditional once SBE supports sort keys in collection
+            // scans.
+            if (usedClusteredCollScan) {
+                return nullptr;
+            }
+            // Each node can provide either the requested sort, or the reverse of the requested
+            // sort.
+            tassert(11321019,
+                    fmt::format("Expected scanNodes.size() to be equal to "
+                                "shouldReverseScan.size(), but {} != {}",
+                                scanNodes.size(),
+                                shouldReverseScan.size()),
+                    scanNodes.size() == shouldReverseScan.size());
+            for (size_t i = 0; i < scanNodes.size(); ++i) {
+                if (shouldReverseScan[i]) {
+                    QueryPlannerCommon::reverseScans(scanNodes[i].get());
                 }
+            }
 
-                // There may be an array operator above us.
-                if (inArrayOperator) { return solution; }
+            auto msn = std::make_unique<MergeSortNode>();
+            msn->sort = query.getFindCommandRequest().getSort();
+            msn->addChildren(std::move(scanNodes));
+            orResult = std::move(msn);
+        } else {
+            auto orn = std::make_unique<OrNode>();
+            orn->addChildren(std::move(scanNodes));
+            orResult = std::move(orn);
+        }
+    }
 
-                FetchNode* fetch = new FetchNode();
-                // Takes ownership of 'root'.
-                verify(NULL != autoRoot.get());
-                fetch->filter.reset(autoRoot.release());
-                fetch->children.push_back(solution);
+    // Evaluate text nodes first to ensure that text scores are available.
+    // Move text nodes to front of vector.
+    std::stable_partition(orResult->children.begin(), orResult->children.end(), [](auto&& child) {
+        return STAGE_TEXT_MATCH == child->getType();
+    });
+
+    // OR must have an index for each child, so we should have detached all children from
+    // 'root', and there's nothing useful to do with an empty or MatchExpression.  We let it die
+    // via autoRoot.
+
+    return orResult;
+}
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedDataAccess(
+    const CanonicalQuery& query,
+    std::unique_ptr<MatchExpression> root,
+    const vector<IndexEntry>& indices,
+    const QueryPlannerParams& params) {
+    MatchExpression* unownedRoot = root.get();
+    return _buildIndexedDataAccess(query, unownedRoot, std::move(root), indices, params);
+}
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::_buildIndexedDataAccess(
+    const CanonicalQuery& query,
+    MatchExpression* root,
+    std::unique_ptr<MatchExpression> ownedRoot,
+    const vector<IndexEntry>& indices,
+    const QueryPlannerParams& params) {
+    if (root->getCategory() == MatchExpression::MatchCategory::kLogical &&
+        !Indexability::isBoundsGeneratingNot(root)) {
+        if (MatchExpression::AND == root->matchType()) {
+            // Takes ownership of root.
+            return buildIndexedAnd(query, root, std::move(ownedRoot), indices, params);
+        } else if (MatchExpression::OR == root->matchType()) {
+            // Takes ownership of root.
+            return buildIndexedOr(query, root, std::move(ownedRoot), indices, params);
+        } else {
+            return nullptr;
+        }
+    } else {
+        if (!root->getTag()) {
+            // No index to use here, not in the context of logical operator, so we're SOL.
+            return nullptr;
+        } else if (Indexability::isBoundsGenerating(root)) {
+            // Make an index scan over the tagged index #.
+            IndexTag* tag = indexTagCast<IndexTag>(root->getTag());
+
+            IndexBoundsBuilder::BoundsTightness tightness = IndexBoundsBuilder::EXACT;
+
+            const auto& index = indices[tag->index];
+
+            std::vector<interval_evaluation_tree::Builder> ietBuilders{};
+            interval_evaluation_tree::Builder* ietBuilder = nullptr;
+            if (query.isParameterized()) {
+                ietBuilders.resize(index.keyPattern.nFields());
+                tassert(6481601,
+                        "IET Builder list size must be equal to the number of fields in the key "
+                        "pattern",
+                        tag->pos < ietBuilders.size());
+                ietBuilder = &ietBuilders[tag->pos];
+            }
+
+            auto soln = makeLeafNode(query, index, tag->pos, root, &tightness, ietBuilder);
+            MONGO_verify(nullptr != soln);
+            finishLeafNode(query, soln.get(), index, std::move(ietBuilders));
+
+            if (!ownedRoot) {
+                // We're performing access planning for the child of an array operator such as
+                // $elemMatch value.
+                return soln;
+            }
+
+            // We may be able to avoid adding an extra fetch stage even though the bounds are
+            // inexact, for instance if the query is counting null values on an indexed field
+            // without projecting that field. We therefore convert "MAYBE_COVERED" bounds into
+            // either EXACT or INEXACT, depending on the query projection.
+            refineTightnessForMaybeCoveredQuery(query, tightness);
+
+            // If the bounds are exact, the set of documents that satisfy the predicate is
+            // exactly equal to the set of documents that the scan provides.
+            //
+            // If the bounds are not exact, the set of documents returned from the scan is a
+            // superset of documents that satisfy the predicate, and we must check the
+            // predicate.
+
+            if (tightness == IndexBoundsBuilder::EXACT) {
+                return soln;
+            } else if (tightness == IndexBoundsBuilder::INEXACT_COVERED &&
+                       !indices[tag->index].multikey) {
+                MONGO_verify(nullptr == soln->filter.get());
+                soln->filter = std::move(ownedRoot);
+                return soln;
+            } else {
+                auto fetch = std::make_unique<FetchNode>(query.nss());
+                fetch->filter = std::move(ownedRoot);
+                fetch->children.push_back(std::move(soln));
                 return fetch;
             }
-        }
+        } else if (Indexability::arrayUsesIndexOnChildren(root)) {
+            std::unique_ptr<QuerySolutionNode> solution;
 
-        if (!inArrayOperator) {
-            delete root;
-        }
+            invariant(root->matchType() == MatchExpression::ELEM_MATCH_OBJECT);
+            // The child is an AND.
+            invariant(1 == root->numChildren());
 
-        return NULL;
-    }
-
-    QuerySolutionNode* QueryPlannerAccess::scanWholeIndex(const IndexEntry& index,
-                                                          const CanonicalQuery& query,
-                                                          const QueryPlannerParams& params,
-                                                          int direction) {
-        QuerySolutionNode* solnRoot = NULL;
-
-        // Build an ixscan over the id index, use it, and return it.
-        IndexScanNode* isn = new IndexScanNode();
-        isn->indexKeyPattern = index.keyPattern;
-        isn->indexIsMultiKey = index.multikey;
-        isn->maxScan = query.getParsed().getMaxScan();
-        isn->addKeyMetadata = query.getParsed().returnKey();
-
-        IndexBoundsBuilder::allValuesBounds(index.keyPattern, &isn->bounds);
-
-        if (-1 == direction) {
-            QueryPlannerCommon::reverseScans(isn);
-            isn->direction = -1;
-        }
-
-        MatchExpression* filter = query.root()->shallowClone();
-
-        // If it's find({}) remove the no-op root.
-        if (MatchExpression::AND == filter->matchType() && (0 == filter->numChildren())) {
-            delete filter;
-            solnRoot = isn;
-        }
-        else {
-            // TODO: We may not need to do the fetch if the predicates in root are covered.  But
-            // for now it's safe (though *maybe* slower).
-            FetchNode* fetch = new FetchNode();
-            fetch->filter.reset(filter);
-            fetch->children.push_back(isn);
-            solnRoot = fetch;
-        }
-
-        return solnRoot;
-    }
-
-    // static
-    void QueryPlannerAccess::addFilterToSolutionNode(QuerySolutionNode* node,
-                                                     MatchExpression* match,
-                                                     MatchExpression::MatchType type) {
-        if (NULL == node->filter) {
-            node->filter.reset(match);
-        }
-        else if (type == node->filter->matchType()) {
-            // The 'node' already has either an AND or OR filter that matches 'type'. Add 'match' as
-            // another branch of the filter.
-            ListOfMatchExpression* listFilter =
-                static_cast<ListOfMatchExpression*>(node->filter.get());
-            listFilter->add(match);
-        }
-        else {
-            // The 'node' already has a filter that does not match 'type'. If 'type' is AND, then
-            // combine 'match' with the existing filter by adding an AND. If 'type' is OR, combine
-            // by adding an OR node.
-            ListOfMatchExpression* listFilter;
-            if (MatchExpression::AND == type) {
-                listFilter = new AndMatchExpression();
-            }
-            else {
-                verify(MatchExpression::OR == type);
-                listFilter = new OrMatchExpression();
-            }
-            MatchExpression* oldFilter = node->filter->shallowClone();
-            listFilter->add(oldFilter);
-            listFilter->add(match);
-            node->filter.reset(listFilter);
-        }
-    }
-
-    // static
-    void QueryPlannerAccess::handleFilter(ScanBuildingState* scanState) {
-        if (MatchExpression::OR == scanState->root->matchType()) {
-            handleFilterOr(scanState);
-        }
-        else if (MatchExpression::AND == scanState->root->matchType()) {
-            handleFilterAnd(scanState);
-        }
-        else {
-            // We must be building leaves for either and AND or an OR.
-            invariant(0);
-        }
-    }
-
-    // static
-    void QueryPlannerAccess::handleFilterOr(ScanBuildingState* scanState) {
-        MatchExpression* root = scanState->root;
-        MatchExpression* child = root->getChild(scanState->curChild);
-
-        if (scanState->inArrayOperator) {
-            // We're inside an array operator. The entire array operator expression
-            // should always be affixed as a filter. We keep 'curChild' in the $and
-            // for affixing later.
-            ++scanState->curChild;
-        }
-        else {
-            if (scanState->tightness < scanState->loosestBounds) {
-                scanState->loosestBounds = scanState->tightness;
+            // Recursively build a data access plan for the child of the $elemMatch object. We
+            // maintain ownership of 'ownedRoot'.
+            solution = _buildIndexedDataAccess(query, root->getChild(0), nullptr, indices, params);
+            if (!solution) {
+                return nullptr;
             }
 
-            // Detach 'child' and add it to 'curOr'.
-            root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
-            scanState->curOr->getChildVector()->push_back(child);
+            // There may be an array operator above us.
+            if (!ownedRoot) {
+                return solution;
+            }
+
+            auto fetch = std::make_unique<FetchNode>(query.nss());
+            fetch->filter = std::move(ownedRoot);
+            fetch->children.push_back(std::move(solution));
+            return fetch;
         }
     }
 
-    // static
-    void QueryPlannerAccess::handleFilterAnd(ScanBuildingState* scanState) {
-        MatchExpression* root = scanState->root;
-        MatchExpression* child = root->getChild(scanState->curChild);
-        const IndexEntry& index = scanState->indices[scanState->currentIndexNumber];
+    return nullptr;
+}
 
-        if (scanState->inArrayOperator) {
-            // We're inside an array operator. The entire array operator expression
-            // should always be affixed as a filter. We keep 'curChild' in the $and
-            // for affixing later.
-            ++scanState->curChild;
-        }
-        else if (scanState->tightness == IndexBoundsBuilder::EXACT) {
-            root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
-            delete child;
-        }
-        else if (scanState->tightness == IndexBoundsBuilder::INEXACT_COVERED
-                 && (INDEX_TEXT == index.type || !index.multikey)) {
-            // The bounds are not exact, but the information needed to
-            // evaluate the predicate is in the index key. Remove the
-            // MatchExpression from its parent and attach it to the filter
-            // of the index scan we're building.
-            //
-            // We can only use this optimization if the index is NOT multikey.
-            // Suppose that we had the multikey index {x: 1} and a document
-            // {x: ["a", "b"]}. Now if we query for {x: /b/} the filter might
-            // ever only be applied to the index key "a". We'd incorrectly
-            // conclude that the document does not match the query :( so we
-            // gotta stick to non-multikey indices.
-            root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
+/**
+ * Recursively traverses the tree and prunes nodes tagged with a PruneTag with prunable=true.
+ * Prunning happens by returning nullptr from this function, which signals to the caller that the
+ * node should be pruned from the tree.
+ *
+ * @param node The current node being traversed.
+ * @return The pruned node, or nullptr if the node itself is pruned.
+ */
+std::unique_ptr<MatchExpression> pruneNodesTaggedForPruning(std::unique_ptr<MatchExpression> node) {
+    tassert(10360116,
+            "Expected PruneTag or nullptr as tag on node",
+            !node->getTag() ||
+                node->getTag()->getType() == MatchExpression::TagData::Type::PruneTag);
+    auto tag = static_cast<PruneTag*>(node->getTag());
+    if (tag && tag->shouldBePruned()) {
+        // Returning nullptr here is effectively pruning this node from the tree.
+        return nullptr;
+    }
 
-            addFilterToSolutionNode(scanState->currentScan.get(), child, root->matchType());
+    // Only AND nodes can be partially pruned, so we only need to check the children of AND nodes
+    // for pruning tags.
+    if (MatchExpression::AND == node->matchType()) {
+        auto childVector = node->getChildVector();
+        std::vector<std::unique_ptr<MatchExpression>> children;
+        for (auto& child : *childVector) {
+            if (auto keptChild = pruneNodesTaggedForPruning(std::move(child))) {
+                children.push_back(std::move(keptChild));
+            }
         }
-        else {
-            // We keep curChild in the AND for affixing later.
-            ++scanState->curChild;
+        // Note: we are replacing the entire child vector of the node here, which is fine since we
+        // are working on a clone of the original tree.
+        *childVector = std::move(children);
+    }
+    // Returning the node here means we are keeping it in the tree.
+    return node;
+}
+
+/**
+ * Describes how much of an expression subtree was tagged for pruning.
+ * Values are ordered so that higher means more pruning, enabling comparisons like
+ * `result >= TagForPruningResult::kPartiallyTagged`.
+ */
+enum class TagForPruningResult {
+    /** Nothing in the subtree needs pruning. */
+    kNothingTagged,
+    /** Some children were tagged for pruning. */
+    kPartiallyTagged,
+    /** The entire subtree (including the root) must be pruned. */
+    kWhollyTagged,
+};
+
+/**
+ * Combines two TagForPruningResult values. If both are the same, the result is that value;
+ * otherwise the result is kPartiallyTagged (i.e. a mix of pruned and unpruned nodes).
+ */
+TagForPruningResult operator|(TagForPruningResult lhs, TagForPruningResult rhs) {
+    if (lhs == rhs) {
+        return lhs;
+    }
+    return TagForPruningResult::kPartiallyTagged;
+}
+
+/**
+ * Traverses the tree and tags nodes with a PruneTag whose value will be true (indicating they
+ * should be pruned) in the cases where the node is either unindexed or index-unsafe.
+ *
+ * @param node Pointer to the current node being traversed.
+ * @return A TagForPruningResult indicating whether the whole tree, parts of it, or nothing was
+ * tagged for pruning.
+ */
+TagForPruningResult tagUnindexedOrIndexUnsafeNodesForPruning(MatchExpression* node) {
+    // Accumulates the combined pruning status across all children using the '|' operator.
+    // Starts at kWhollyTagged since if the container is empty it'd mean it can be pruned.
+    // Subsequent children are folded in using the  '|' operator (same|same -> same, different ->
+    // kPartiallyTagged). For leaf nodes (no children) this value is unused.
+    TagForPruningResult combinedChildResult = TagForPruningResult::kWhollyTagged;
+    bool noChildrenProcessed = true;
+
+    auto nodeDebugStr = node->debugString();
+    ON_BLOCK_EXIT([&] {
+        tassert(10360113,
+                "Expected PruneTag or nullptr as tag on node",
+                !node->getTag() ||
+                    node->getTag()->getType() == MatchExpression::TagData::Type::PruneTag);
+        LOGV2_DEBUG(10360106,
+                    5,
+                    "Finished processing node for pruning",
+                    "before"_attr = nodeDebugStr,
+                    "pruneTag"_attr = static_cast<PruneTag*>(node->getTag())->shouldBePruned(),
+                    "after"_attr = node->debugString());
+    });
+
+    // Any array operator must be processed in the Fetch's filter not in the Index Scan's filter.
+    if (node->getCategory() == MatchExpression::MatchCategory::kArrayMatching) {
+        node->setTag(new PruneTag(true));
+        return TagForPruningResult::kWhollyTagged;
+    }
+
+    // Check children first
+    if (auto childVector = node->getChildVector()) {
+        for (auto& child : *childVector) {
+            auto childResult = tagUnindexedOrIndexUnsafeNodesForPruning(child.get());
+            if (noChildrenProcessed) {
+                combinedChildResult = childResult;
+                noChildrenProcessed = false;
+            } else {
+                combinedChildResult = combinedChildResult | childResult;
+            }
+        }
+    } else if (node->numChildren() == 1) {
+        // Expressions such as NOT or ElemMatch have only one child accessible via getChild(0).
+        // TODO SERVER-120792. For elemMatchValues, leverage the RelevantTag since children is never
+        // tagged.
+        combinedChildResult = tagUnindexedOrIndexUnsafeNodesForPruning(node->getChild(0));
+    } else {
+        tassert(10360111, "Unexpected child count!", node->numChildren() == 0);
+    }
+
+    if (node->numChildren() > 0) {
+        if (node->matchType() == MatchExpression::AND) {
+            // Only prune the AND itself if all children are wholly tagged; otherwise keep the AND
+            // and let individual children be pruned. The combined result already encodes the
+            // nothing/partial/wholly distinction.
+            node->setTag(new PruneTag(combinedChildResult == TagForPruningResult::kWhollyTagged));
+            return combinedChildResult;
+        } else {
+            // For OR/NOT, any pruning in children forces the whole subtree to be pruned to
+            // preserve correctness.
+            bool mustPrune = combinedChildResult != TagForPruningResult::kNothingTagged;
+            node->setTag(new PruneTag(mustPrune));
+            return mustPrune ? TagForPruningResult::kWhollyTagged
+                             : TagForPruningResult::kNothingTagged;
         }
     }
 
-    QuerySolutionNode* QueryPlannerAccess::makeIndexScan(const IndexEntry& index,
-                                                         const CanonicalQuery& query,
-                                                         const QueryPlannerParams& params,
-                                                         const BSONObj& startKey,
-                                                         const BSONObj& endKey) {
-        QuerySolutionNode* solnRoot = NULL;
+    // Only leaf nodes beyond this point.
 
-        // Build an ixscan over the id index, use it, and return it.
-        IndexScanNode* isn = new IndexScanNode();
-        isn->indexKeyPattern = index.keyPattern;
-        isn->indexIsMultiKey = index.multikey;
-        isn->direction = 1;
-        isn->maxScan = query.getParsed().getMaxScan();
-        isn->addKeyMetadata = query.getParsed().returnKey();
-        isn->bounds.isSimpleRange = true;
-        isn->bounds.startKey = startKey;
-        isn->bounds.endKey = endKey;
-        isn->bounds.endKeyInclusive = false;
+    auto rt = static_cast<RelevantTag*>(node->getTag());
+    bool isIndexed = rt && !(rt->notFirst.empty() && rt->first.empty());
 
-        MatchExpression* filter = query.root()->shallowClone();
-
-        // If it's find({}) remove the no-op root.
-        if (MatchExpression::AND == filter->matchType() && (0 == filter->numChildren())) {
-            delete filter;
-            solnRoot = isn;
-        }
-        else {
-            // TODO: We may not need to do the fetch if the predicates in root are covered.  But
-            // for now it's safe (though *maybe* slower).
-            FetchNode* fetch = new FetchNode();
-            fetch->filter.reset(filter);
-            fetch->children.push_back(isn);
-            solnRoot = fetch;
-        }
-
-        return solnRoot;
+    // Unindexed -> Prune
+    if (!isIndexed) {
+        node->setTag(new PruneTag(true));
+        return TagForPruningResult::kWhollyTagged;
     }
 
+    // TODO SERVER-12869. Remove this exception once indexes can be trusted to distinguish between
+    // not existing and null values.
+    bool unsafe = false;
+    if (node->matchType() == MatchExpression::EXISTS) {
+        unsafe = true;
+    } else if (node->matchType() == MatchExpression::TYPE_OPERATOR) {
+        auto typeExpr = static_cast<const TypeMatchExpression*>(node);
+        if (typeExpr->typeSet().hasType(BSONType::null)) {
+            unsafe = true;
+        }
+    }
+
+    node->setTag(new PruneTag(unsafe));
+    return unsafe ? TagForPruningResult::kWhollyTagged : TagForPruningResult::kNothingTagged;
+}
+
+/**
+ * Negates the PruneTag on every leaf node and recomputes container (AND/OR/NOT) tags
+ * bottom-up from the flipped leaf values. This converts tags produced by
+ * tagUnindexedOrIndexUnsafeNodesForPruning (which marks unindexed/unsafe nodes for pruning away
+ * from the IXSCAN) into the complementary tags needed for the FETCH filter (which marks
+ * indexed-safe nodes for pruning).
+ *
+ * The key benefit is that all index-safety and indexedness logic lives in a single tagging
+ * function (tagUnindexedOrIndexUnsafeNodesForPruning). This function only flips and recomputes.
+ *
+ * OR semantics: all-or-nothing. We can only prune an entire OR subtree if ALL children are
+ * prunable after negation. If not, we force all children to not-prunable to preserve
+ * correctness.
+ *
+ * @param node Pointer to the current node being traversed. Must already have PruneTags set.
+ * @return true if the current node is tagged for pruning after negation.
+ */
+bool negatePruneTagsAndRecomputeContainersTag(MatchExpression* node) {
+    bool prunable = true;
+    LOGV2_DEBUG(10360110, 5, "Negating prune tag for node: {}", "node"_attr = node->debugString());
+
+    // Flip the flag of the array operators since they cannot be processed in Index Scan.
+    if (node->getCategory() == MatchExpression::MatchCategory::kArrayMatching) {
+        tassert(10360115,
+                "Expected PruneTag as tag on node",
+                node->getTag() &&
+                    node->getTag()->getType() == MatchExpression::TagData::Type::PruneTag);
+        auto tag = static_cast<PruneTag*>(node->getTag());
+        bool flipped = !tag->shouldBePruned();
+        node->setTag(new PruneTag(flipped));
+        return flipped;
+    }
+
+    if (auto childVector = node->getChildVector()) {
+        for (auto& child : *childVector) {
+            if (!negatePruneTagsAndRecomputeContainersTag(child.get())) {
+                prunable = false;
+            }
+        }
+    } else if (node->numChildren() == 1) {
+        // Some expressions such as NOT or ElemMatch have only one child accessible via
+        // getChild(0).
+        prunable = negatePruneTagsAndRecomputeContainersTag(node->getChild(0));
+    } else {
+        // Leaf node: flip the existing PruneTag.
+        tassert(10360114,
+                "Expected PruneTag as tag on node",
+                node->getTag() &&
+                    node->getTag()->getType() == MatchExpression::TagData::Type::PruneTag);
+        auto tag = static_cast<PruneTag*>(node->getTag());
+        prunable = !tag->shouldBePruned();
+    }
+
+    node->setTag(new PruneTag(prunable));
+    return prunable;
+}
+
+/**
+ * Removes children from AND expressions that have already been indexed, as indicated by their
+ * RelevantTag. This function modifies the expression tree in-place by removing nodes that have
+ * either first or notFirst fields set in their RelevantTag, indicating they were already
+ * considered for index usage.
+ *
+ * @param tree Pointer to the root of the match expression tree to be pruned.
+ *
+ * Example 1:
+ * Input:  AND
+ *        /  \
+ *  {unindexed} {indexed}
+ * Output: AND
+ *         |
+ *    {unindexed}
+ *
+ * Example 2:
+ * Input:         AND
+ *            /    |      \
+ * {unindexed} {indexed} {unindexed}
+ * Output:   AND
+ *        /      \
+ * {unindexed} {unindexed}
+ *
+ * Example 3:
+ * Input:      OR
+ *            /  \
+ *         AND   {unindexed}
+ *        /  \
+ * {unindexed} {indexed}
+ * Output:     Same (OR node remains unchanged since function only processes AND nodes).
+ */
+std::unique_ptr<MatchExpression> pruneIndexSafeChildren(std::unique_ptr<MatchExpression> tree) {
+    // Negate leaf tags and recompute containers to get the complementary tags
+    // needed for the FETCH filter (marks indexed-safe nodes for pruning instead).
+    negatePruneTagsAndRecomputeContainersTag(tree.get());
+    LOGV2_DEBUG(10360101,
+                1,
+                "Negated prune tags and recomputed container tags",
+                "tree"_attr = tree->debugString());
+    return pruneNodesTaggedForPruning(std::move(tree));
+}
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::scanWholeIndex(
+    const IndexEntry& index,
+    const CanonicalQuery& query,
+    const QueryPlannerIXSelect::QueryContext& queryContext,
+    const QueryPlannerParams& params,
+    int direction) {
+
+    std::unique_ptr<QuerySolutionNode> solnRoot;
+
+    // Build an ixscan over the id index, use it, and return it.
+    unique_ptr<IndexScanNode> isn = std::make_unique<IndexScanNode>(query.nss(), index);
+    isn->addKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kIndexKey];
+    isn->queryCollator = query.getCollator();
+
+    IndexBoundsBuilder::allValuesBounds(index.keyPattern, &isn->bounds, index.collator != nullptr);
+
+    if (-1 == direction) {
+        QueryPlannerCommon::reverseScans(isn.get());
+        isn->direction = -1;
+    }
+
+    unique_ptr<MatchExpression> filter = query.getPrimaryMatchExpression()->clone();
+
+    // If it's find({}) remove the no-op root.
+    if (MatchExpression::AND == filter->matchType() && (0 == filter->numChildren())) {
+        solnRoot = std::move(isn);
+    } else {
+        if (query.getExpCtx()
+                ->getQueryKnobConfiguration()
+                .getPlannerPushdownFilterToIxscanForSort()) {
+            solnRoot = pushdownFilterToFullIxscan(
+                std::move(filter), std::move(isn), index, queryContext, params, query.nss());
+        } else {
+            LOGV2_INFO(10360100,
+                       "Not optimizing full IXSCAN as disabled by query knob",
+                       "query"_attr = redact(filter->debugString()),
+                       "index"_attr = index.toString());
+            unique_ptr<FetchNode> fetch = std::make_unique<FetchNode>(query.nss());
+            fetch->filter = std::move(filter);
+            fetch->children.push_back(std::move(isn));
+            solnRoot = std::move(fetch);
+        }
+    }
+
+    return solnRoot;
+}
+
+/**
+ * Attempts to optimize query execution by pushing down parts of the filter predicate into a
+ * full index scan (IXSCAN) when possible. This can reduce the number of documents that need to
+ * be fetched from the collection by applying filter predicates at the index scan stage rather
+ * than at the fetch stage. It could potentially turn the query into a covered one.
+ *
+ * The function analyzes the provided filter and determines which predicates can be evaluated
+ * using the index. These predicates are pushed down to the IXSCAN node. Any remaining
+ * predicates that cannot be evaluated by the index are attached to a FETCH node above the
+ * IXSCAN.
+ *
+ * The optimization is currently skipped for timeseries collections, hashed indexes, and
+ * multikey indexes. Only certain filter types (leaf, AND, NOT) are considered for optimization.
+ * Future work will expand support to OR and NOR expressions.
+ *
+ * @param filter
+ *      The root of the filter expression tree to be analyzed and potentially pushed down.
+ *      Ownership is transferred to this function.
+ * @param isn
+ *      The IndexScanNode representing the full index scan. Ownership is transferred to this
+ * function.
+ * @param index
+ *      The IndexEntry describing the index being scanned.
+ * @param queryContext
+ *      Contextual information about the query for index selection.
+ * @param params
+ *      Query planner parameters, including collection statistics and other planning options.
+ *
+ * @return
+ *      A unique_ptr to the root QuerySolutionNode of the optimized query plan. This will be
+ * either:
+ *          - A FetchNode (with any remaining filter) above the IndexScanNode (with pushed-down
+ * filter), or
+ *          - The IndexScanNode itself if all predicates were pushed down.
+ */
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::pushdownFilterToFullIxscan(
+    std::unique_ptr<MatchExpression> filter,
+    std::unique_ptr<IndexScanNode> isn,
+    const IndexEntry& index,
+    const QueryPlannerIXSelect::QueryContext& queryContext,
+    const QueryPlannerParams& params,
+    const NamespaceString& nss) {
+    std::unique_ptr<QuerySolutionNode> solnRoot;
+    // Sparse or partial indexes could skip documents that match the filter making the resulting
+    // plan incorrect but that's something we do not need to take care here since it has already
+    // been taken care at QueryPlanner::plan time.
+    // TODO SERVER-103594. Do not skip the optimization for timeseries.
+    // TODO SERVER-103595. Do not skip the optimization for hashed indexes.
+    // TODO SERVER-103596. Do not skip the optimization for multikey indexes.
+    // TODO SERVER-103592 optimize also OR expressions.
+    if (index.type == IndexType::INDEX_BTREE && !index.multikey &&
+        !params.mainCollectionInfo.stats.isTimeseries &&
+        filter->matchType() != MatchExpression::OR) {
+        QueryPlannerIXSelect::rateIndices(filter.get(), "" /* prefix */, {index}, queryContext);
+        QueryPlannerIXSelect::stripInvalidAssignments(filter.get(), {index});
+        LOGV2_DEBUG(10360112,
+                    5,
+                    "Checking if full IXSCAN can be optimized",
+                    "query"_attr = redact(filter->debugString()),
+                    "index"_attr = redact(index.toString()));
+
+        auto originalQuery = filter->debugString();
+        // TODO SERVER-120976: early return if root is to be pruned.
+        tagUnindexedOrIndexUnsafeNodesForPruning(filter.get());
+        LOGV2_DEBUG(10360107,
+                    5,
+                    "Tagged unindexed or index unsafe nodes for pruning",
+                    "filter"_attr = filter->debugString());
+        std::unique_ptr<MatchExpression> filterforIXScanStage = filter->clone();
+        std::unique_ptr<MatchExpression> filterForFetchStage = filter->clone();
+        filterforIXScanStage = pruneNodesTaggedForPruning(std::move(filterforIXScanStage));
+        LOGV2_DEBUG(10360108,
+                    5,
+                    "Pruned unindexed or index unsafe nodes for IXSCAN stage",
+                    "filter"_attr =
+                        filterforIXScanStage ? filterforIXScanStage->debugString() : "nullptr");
+        if (filterforIXScanStage) {
+            filterforIXScanStage = optimizeMatchExpression(std::move(filterforIXScanStage));
+        } else {
+            // Everything was pruned meaning no filter at IXSCAN stage
+            filterforIXScanStage = std::make_unique<AndMatchExpression>();
+        }
+        filterforIXScanStage->resetTag();
+        LOGV2_DEBUG(
+            10360102,
+            5,
+            "IXSCAN filter after pruning and reoptimization not indexed or index unsafe nodes",
+            "filter"_attr = filterforIXScanStage->debugString());
+
+        filterForFetchStage = pruneIndexSafeChildren(std::move(filterForFetchStage));
+        LOGV2_DEBUG(10360109,
+                    5,
+                    "Pruned index safe nodes for FETCH stage",
+                    "filter"_attr =
+                        filterForFetchStage ? filterForFetchStage->debugString() : "nullptr");
+        if (filterForFetchStage) {
+            filter = optimizeMatchExpression(std::move(filterForFetchStage));
+        } else {
+            // Everything was pruned, meaning the index covers the query.
+            filter = std::make_unique<AndMatchExpression>();
+        }
+        filter->resetTag();
+        LOGV2_DEBUG(10360103,
+                    5,
+                    "FETCH filter after pruning and reoptimization of index safe nodes",
+                    "filter"_attr = filter->debugString());
+
+        if (!filterforIXScanStage->isTriviallyTrue()) {
+            LOGV2_DEBUG(10360104,
+                        5,
+                        "Adding filter to full IXSCAN stage",
+                        "query"_attr = redact(originalQuery),
+                        "index"_attr = redact(index.toString()),
+                        "IXScanfilter"_attr = redact(filterforIXScanStage->debugString()),
+                        "fetchFilter"_attr = redact(filter->debugString()));
+            isn->filter = std::move(filterforIXScanStage);
+        }
+    }
+
+    if (!filter->isTriviallyTrue()) {
+        unique_ptr<FetchNode> fetch = std::make_unique<FetchNode>(nss);
+        fetch->filter = std::move(filter);
+        fetch->children.push_back(std::move(isn));
+        solnRoot = std::move(fetch);
+    } else {
+        solnRoot = std::move(isn);
+    }
+
+    return solnRoot;
+}
+
+void QueryPlannerAccess::addFilterToSolutionNode(QuerySolutionNode* node,
+                                                 std::unique_ptr<MatchExpression> match,
+                                                 MatchExpression::MatchType type) {
+    if (nullptr == node->filter) {
+        node->filter = std::move(match);
+    } else if (type == node->filter->matchType()) {
+        // The 'node' already has either an AND or OR filter that matches 'type'. Add 'match' as
+        // another branch of the filter.
+        ListOfMatchExpression* listFilter = static_cast<ListOfMatchExpression*>(node->filter.get());
+        listFilter->add(std::move(match));
+    } else {
+        // The 'node' already has a filter that does not match 'type'. If 'type' is AND, then
+        // combine 'match' with the existing filter by adding an AND. If 'type' is OR, combine
+        // by adding an OR node.
+        unique_ptr<ListOfMatchExpression> listFilter;
+        if (MatchExpression::AND == type) {
+            listFilter = std::make_unique<AndMatchExpression>();
+        } else {
+            MONGO_verify(MatchExpression::OR == type);
+            listFilter = std::make_unique<OrMatchExpression>();
+        }
+        unique_ptr<MatchExpression> oldFilter = node->filter->clone();
+        listFilter->add(std::move(oldFilter));
+        listFilter->add(std::move(match));
+        node->filter = std::move(listFilter);
+    }
+}
+
+void QueryPlannerAccess::handleFilter(ScanBuildingState* scanState) {
+    if (MatchExpression::OR == scanState->root->matchType()) {
+        handleFilterOr(scanState);
+    } else if (MatchExpression::AND == scanState->root->matchType()) {
+        handleFilterAnd(scanState);
+    } else {
+        // We must be building leaves for either and AND or an OR.
+        MONGO_UNREACHABLE;
+    }
+}
+
+void QueryPlannerAccess::handleFilterOr(ScanBuildingState* scanState) {
+    MatchExpression* root = scanState->root;
+
+    if (scanState->inArrayOperator) {
+        // We're inside an array operator. The entire array operator expression
+        // should always be affixed as a filter. We keep 'curChild' in the $and
+        // for affixing later.
+        ++scanState->curChild;
+    } else {
+        if (scanState->tightness < scanState->loosestBounds) {
+            scanState->loosestBounds = scanState->tightness;
+        }
+
+        // Detach 'child' and add it to 'curOr'.
+        auto child = std::move((*root->getChildVector())[scanState->curChild]);
+        root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
+        scanState->curOr->getChildVector()->push_back(std::move(child));
+    }
+}
+
+void QueryPlannerAccess::handleFilterAnd(ScanBuildingState* scanState) {
+    MatchExpression* root = scanState->root;
+    const IndexEntry& index = scanState->indices[scanState->currentIndexNumber];
+
+    if (scanState->inArrayOperator) {
+        // We're inside an array operator. The entire array operator expression
+        // should always be affixed as a filter. We keep 'curChild' in the $and
+        // for affixing later.
+        ++scanState->curChild;
+    } else if (scanState->tightness == IndexBoundsBuilder::EXACT) {
+        // The tightness of the bounds is exact. We want to remove this child so that when
+        // control returns to handleIndexedAnd we know that we don't need it to create a FETCH
+        // stage.
+        root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
+    } else if (scanState->tightness == IndexBoundsBuilder::INEXACT_COVERED &&
+               (INDEX_TEXT == index.type || !index.multikey)) {
+        // The bounds are not exact, but the information needed to
+        // evaluate the predicate is in the index key. Remove the
+        // MatchExpression from its parent and attach it to the filter
+        // of the index scan we're building.
+        //
+        // We can only use this optimization if the index is NOT multikey.
+        // Suppose that we had the multikey index {x: 1} and a document
+        // {x: ["a", "b"]}. Now if we query for {x: /b/} the filter might
+        // ever only be applied to the index key "a". We'd incorrectly
+        // conclude that the document does not match the query :( so we
+        // gotta stick to non-multikey indices.
+        auto child = std::move((*root->getChildVector())[scanState->curChild]);
+        root->getChildVector()->erase(root->getChildVector()->begin() + scanState->curChild);
+
+        addFilterToSolutionNode(scanState->currentScan.get(), std::move(child), root->matchType());
+    } else {
+        // We keep curChild in the AND for affixing later.
+        ++scanState->curChild;
+    }
+}
+
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeIndexScan(
+    const IndexEntry& index,
+    const CanonicalQuery& query,
+    const QueryPlannerParams& params,
+    const BSONObj& startKey,
+    const BSONObj& endKey) {
+    std::unique_ptr<QuerySolutionNode> solnRoot;
+
+    // Build an ixscan over the id index, use it, and return it.
+    auto isn = std::make_unique<IndexScanNode>(query.nss(), index);
+    isn->direction = 1;
+    isn->addKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kIndexKey];
+    isn->bounds.isSimpleRange = true;
+    isn->bounds.startKey = startKey;
+    isn->bounds.endKey = endKey;
+    isn->bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
+    isn->queryCollator = query.getCollator();
+
+    unique_ptr<MatchExpression> filter = query.getPrimaryMatchExpression()->clone();
+
+    // If it's find({}) remove the no-op root.
+    if (MatchExpression::AND == filter->matchType() && (0 == filter->numChildren())) {
+        solnRoot = std::move(isn);
+    } else {
+        // TODO SERVER-122504: We may not need to do the fetch if the predicates in root are
+        // covered.  But for now it's safe (though *maybe* slower).
+        unique_ptr<FetchNode> fetch = std::make_unique<FetchNode>(query.nss());
+        fetch->filter = std::move(filter);
+        fetch->children.push_back(std::move(isn));
+        solnRoot = std::move(fetch);
+    }
+
+    return solnRoot;
+}
+
+void QueryPlannerAccess::ScanBuildingState::resetForNextScan(IndexTag* newTag,
+                                                             bool isQueryParameterized) {
+    currentScan.reset(nullptr);
+    currentIndexNumber = newTag->index;
+    tightness = IndexBoundsBuilder::INEXACT_FETCH;
+    loosestBounds = IndexBoundsBuilder::EXACT;
+
+    ietBuilders.clear();
+    if (isQueryParameterized) {
+        const auto& index = indices[newTag->index];
+        ietBuilders.resize(index.keyPattern.nFields());
+    }
+
+    if (MatchExpression::OR == root->matchType()) {
+        curOr = std::make_unique<OrMatchExpression>();
+    }
+}
 }  // namespace mongo

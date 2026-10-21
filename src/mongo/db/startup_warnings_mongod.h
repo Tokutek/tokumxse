@@ -1,60 +1,59 @@
-/**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/base/status.h"
-#include "mongo/base/status_with.h"
+#pragma once
+
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/util/modules.h"
+
+[[MONGO_MOD_PUBLIC]];
 
 namespace mongo {
 
-    struct StorageGlobalParams;
+// Checks various startup conditions and logs any necessary warnings that
+// are specific to the mongod process.
+void logMongodStartupWarnings(const StorageGlobalParams& storageParams,
+                              const ServerGlobalParams& serverParams,
+                              ServiceContext* svcCtx);
 
-    class StartupWarningsMongod {
-    private:
-        StartupWarningsMongod();
+namespace startup_warning_detail {
+#ifdef __linux__
 
-    public:
-        /**
-         * Reads Transparent HugePages kernel parameter in sysfs directory.
-         * Linux only.
-         */
-        static StatusWith<std::string> readTransparentHugePagesParameter(
-            const std::string& parameter);
+enum class THPEnablementWarningLogCase {
+    kWronglyEnabled,
+    kWronglyDisabledViaOptOut,
+    kWronglyDisabledOnSystem,
+    kSystemValueError,
+    kSystemValueErrorWithWrongOptOut,
+    kSystemValueErrorWithOptOutError,
+    kOptOutError,
+    kNone
+};
 
-        /**
-         * For testing only.
-         * Supports alternate directory for transparent huge pages files.
-         */
-        static StatusWith<std::string> readTransparentHugePagesParameter(
-            const std::string& parameter,
-            const std::string& directory);
-    };
+enum class THPDefragWarningLogCase { kWronglyNotUsingDeferMadvise, kError, kNone };
 
-    // Checks various startup conditions and logs any necessary warnings that
-    // are specific to the mongod process.
-    void logMongodStartupWarnings(const StorageGlobalParams& params);
-} // namespace mongo
+/**
+ * Verify that the system max_ptes_none parameter is properly set.
+ */
+bool verifyMaxPtesNoneIsCorrect(bool usingGoogleTCMallocAllocator, unsigned value);
+
+/**
+ * Return the right THP enablement warning based on system conditions.
+ */
+THPEnablementWarningLogCase getTHPEnablementWarningCase(
+    bool usingGoogleTCMallocAllocator,
+    const StatusWith<std::string>& thpEnabled,
+    const std::variant<std::error_code, bool>& optingOutOfTHPForProcess);
+
+/**
+ * Return the right defrag warning case based on system conditions.
+ */
+THPDefragWarningLogCase getDefragWarningCase(bool usingGoogleTCMallocAllocator,
+                                             const StatusWith<std::string>& thpDefragSettings);
+
+#endif  // __linux__
+}  // namespace startup_warning_detail
+
+}  // namespace mongo

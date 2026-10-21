@@ -1,0 +1,143 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/util/modules.h"
+#include "mongo/util/observable_mutex_registry.h"
+
+#include <mutex>
+#include <tuple>
+
+#include <boost/log/detail/fake_mutex.hpp>
+#include <boost/log/detail/locking_ptr.hpp>
+#include <boost/log/sinks/basic_sink_backend.hpp>
+#include <boost/log/sinks/frontend_requirements.hpp>
+
+namespace mongo::logv2 {
+
+template <typename... Backend>
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] CompositeBackend
+    : public boost::log::sinks::basic_formatted_sink_backend<
+          char,
+          boost::log::sinks::combine_requirements<boost::log::sinks::concurrent_feeding,
+                                                  boost::log::sinks::flushing>::type> {
+private:
+    using filter_func = std::function<bool(boost::log::attribute_value_set const&)>;
+    using index_sequence = std::make_index_sequence<sizeof...(Backend)>;
+
+    template <typename backend_t>
+    struct BackendTraits {
+        // Helper to select mutex type depending on requirements of backend
+        using backend_mutex_type = std::conditional_t<
+            boost::log::sinks::has_requirement<typename backend_t::frontend_requirements,
+                                               boost::log::sinks::concurrent_feeding>::value,
+            boost::log::aux::fake_mutex,
+            ObservableMutex<std::mutex>>;
+
+        BackendTraits(boost::shared_ptr<backend_t> backend) : _backend(std::move(backend)) {
+            if constexpr (std::is_same_v<decltype(_mutex), ObservableMutex<std::mutex>>) {
+                ObservableMutexRegistry::get().add("logv2CompositeBackendBackendTraitsMutex",
+                                                   _mutex);
+            }
+        }
+        boost::shared_ptr<backend_t> _backend;
+        backend_mutex_type _mutex;
+        std::function<bool(boost::log::attribute_value_set const&)> _filter;
+    };
+
+    template <size_t I>
+    decltype(auto) getTrait() {
+        return std::get<I>(_backendTraits);
+    }
+
+public:
+    CompositeBackend(boost::shared_ptr<Backend>... backends)
+        : _backendTraits(std::move(backends)...) {}
+
+    /**
+     * Locking accessor to the attached backend at index
+     */
+    template <size_t I>
+    auto lockedBackend() {
+        auto& trait = getTrait<I>();
+        return boost::log::aux::locking_ptr(trait._backend, trait._mutex);
+    }
+
+    /**
+     * Sets post-formatting filter for the attached backend at index
+     */
+    template <size_t I>
+    void setFilter(filter_func filter) {
+        getTrait<I>()._filter = std::move(filter);
+    }
+
+    /**
+     * Resets post-formatting filter for the attached backend at index
+     */
+    template <size_t I>
+    void resetFilter() {
+        getTrait<I>()._filter.reset();
+    }
+
+    /**
+     * Consumes formatted log for all attached backends
+     */
+    void consume(boost::log::record_view const& rec, string_type const& formatted_string) {
+        consumeAll(rec, formatted_string, index_sequence{});
+    }
+
+    /**
+     * Flushes all attached backends that supports flushing
+     */
+    void flush() {
+        flushAll(index_sequence{});
+    }
+
+private:
+    template <typename mutex_t, typename backend_t>
+    void flushBackend(mutex_t& mutex, backend_t& backend) {
+        if constexpr (boost::log::sinks::has_requirement<typename backend_t::frontend_requirements,
+                                                         boost::log::sinks::flushing>::value) {
+            std::lock_guard lock(mutex);
+
+            backend.flush();
+        }
+    }
+
+    // Helper to flush backend at index
+    template <size_t I>
+    void flushAt() {
+        auto& trait = getTrait<I>();
+        flushBackend(trait._mutex, *trait._backend);
+    }
+
+    // Helper to expand tuple for flushing backends
+    template <size_t... Is>
+    void flushAll(std::index_sequence<Is...>) {
+        (flushAt<Is>(), ...);
+    }
+
+    // Helper to consume logs for backend at index
+    template <size_t I>
+    void consumeAt(boost::log::record_view const& rec, string_type const& formatted_string) {
+        auto& trait = getTrait<I>();
+        if (!trait._filter || trait._filter(rec.attribute_values())) {
+            std::lock_guard lock(trait._mutex);
+
+            trait._backend->consume(rec, formatted_string);
+        }
+    }
+
+    // Helper to expand tuple for consuming logs
+    template <size_t... Is>
+    void consumeAll(boost::log::record_view const& rec,
+                    string_type const& formatted_string,
+                    std::index_sequence<Is...>) {
+        (consumeAt<Is>(rec, formatted_string), ...);
+    }
+
+    std::tuple<BackendTraits<Backend>...> _backendTraits;
+};
+
+}  // namespace mongo::logv2

@@ -1,0 +1,339 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/owned_lite_parsed_pipeline.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+
+#include <string_view>
+
+
+namespace mongo {
+
+boost::optional<BSONArray> LiteParsedPipeline::pipelineToBsonForLog() const {
+    const bool noCustomLogs =
+        std::none_of(_stageSpecs.begin(), _stageSpecs.end(), [](const auto& stage) {
+            return stage->hasCustomBsonForLog();
+        });
+    if (noCustomLogs) {
+        return boost::none;
+    }
+    BSONArrayBuilder builder;
+    for (const auto& stage : _stageSpecs) {
+        builder.append(stage->toBsonForLog());
+    }
+    return builder.arr();
+}
+
+ReadConcernSupportResult LiteParsedPipeline::supportsReadConcern(repl::ReadConcernLevel level,
+                                                                 bool isImplicitDefault,
+                                                                 bool explain) const {
+    // Start by assuming that we will support both readConcern and cluster-wide default.
+    ReadConcernSupportResult result = ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    // 2. Determine whether the default read concern must be denied for any pipeline-global reasons.
+    if (explain) {
+        result.defaultReadConcernPermit = {
+            ErrorCodes::InvalidOptions,
+            "Explain for the aggregate command does not permit default readConcern to be "
+            "applied."};
+    }
+
+    // 3. If either the specified or default readConcern have not already been rejected, determine
+    // whether the pipeline stages support them. If not, we record the first error we encounter.
+    result.merge(sourcesSupportReadConcern(level, isImplicitDefault));
+
+    return result;
+}
+
+ReadConcernSupportResult LiteParsedPipeline::sourcesSupportReadConcern(
+    repl::ReadConcernLevel level, bool isImplicitDefault) const {
+    // Start by assuming that we will support both readConcern and cluster-wide default.
+    ReadConcernSupportResult result = ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+
+    for (auto&& spec : _stageSpecs) {
+        // If both result statuses are already not OK, stop checking further stages.
+        if (!result.readConcernSupport.isOK() && !result.defaultReadConcernPermit.isOK()) {
+            break;
+        }
+        result.merge(spec->supportsReadConcern(level, isImplicitDefault));
+    }
+
+    return result;
+}
+
+void LiteParsedPipeline::assertSupportsMultiDocumentTransaction(bool explain) const {
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            "Operation not permitted in transaction :: caused by :: Explain for the aggregate "
+            "command cannot run within a multi-document transaction",
+            !explain);
+
+    for (auto&& spec : _stageSpecs) {
+        spec->assertSupportsMultiDocumentTransaction();
+    }
+}
+
+void LiteParsedPipeline::assertSupportsReadConcern(OperationContext* opCtx, bool explain) const {
+    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    auto readConcernSupport = supportsReadConcern(
+        readConcernArgs.getLevel(), readConcernArgs.isImplicitDefault(), explain);
+    if (readConcernArgs.hasLevel()) {
+        if (!readConcernSupport.readConcernSupport.isOK()) {
+            uassertStatusOK(readConcernSupport.readConcernSupport.withContext(
+                "Operation does not support this transaction's read concern"));
+        }
+    }
+}
+
+void LiteParsedPipeline::verifyIsSupported(
+    OperationContext* opCtx,
+    const std::function<bool(OperationContext*, const NamespaceString&)> isSharded,
+    bool explain) const {
+    // Verify litePipe can be run in a transaction.
+    const bool inMultiDocumentTransaction = opCtx->inMultiDocumentTransaction();
+    if (inMultiDocumentTransaction) {
+        assertSupportsMultiDocumentTransaction(explain);
+        assertSupportsReadConcern(opCtx, explain);
+    }
+    // Verify that no involved namespace is sharded unless allowed by the pipeline.
+    for (const auto& nss : getInvolvedNamespaces()) {
+        const auto status = checkShardedForeignCollAllowed(nss, inMultiDocumentTransaction);
+        uassert(status.code(),
+                str::stream() << nss.toStringForErrorMsg()
+                              << " cannot be sharded: " << status.reason(),
+                status.isOK() || !isSharded(opCtx, nss));
+    }
+}
+
+void LiteParsedPipeline::tickGlobalStageCounters() const {
+    for (auto&& stage : _stageSpecs) {
+        // Tick counter corresponding to current stage.
+        aggStageCounters.increment(stage->getParseTimeName(), 1);
+        // Recursively step through any sub-pipelines.
+        if (auto* subPipelines = stage->getSubPipelines()) {
+            for (auto&& subPipeline : *subPipelines) {
+                subPipeline->tickGlobalStageCounters();
+            }
+        }
+    }
+}
+
+void LiteParsedPipeline::validate(const OperationContext* opCtx,
+                                  bool performApiVersionChecks) const {
+    for (auto stage_it = _stageSpecs.begin(); stage_it != _stageSpecs.end(); stage_it++) {
+        const auto& stage = *stage_it;
+        // TODO SERVER-121094 This can be removed once hybrid search views are validated in
+        // LiteParsed using the LiteParsedConstraints.
+        uassert(10170100,
+                "$rankFusion/$scoreFusion can only be the first stage of an aggregation pipeline.",
+                !((stage_it != _stageSpecs.begin()) && stage->isHybridSearchStage() &&
+                  !isRunningAgainstView_ForHybridSearch()));
+
+        stage->validate(opCtx);
+
+        const auto& stageName = (*stage_it)->getParseTimeName();
+        const auto& stageApiStrict = (*stage_it)->getApiStrict();
+        const auto& stageClientType = (*stage_it)->getClientType();
+
+        // Validate that the stage is API version compatible.
+        if (performApiVersionChecks) {
+
+            std::function<void(const APIParameters&)> sometimesCallback =
+                [&](const APIParameters& apiParameters) {
+                    tassert(5807600,
+                            "Expected callback only if allowed 'sometimes'",
+                            stageApiStrict == AllowedWithApiStrict::kConditionally);
+                    stage->assertPermittedInAPIVersion(apiParameters);
+                };
+            assertLanguageFeatureIsAllowed(
+                opCtx, stageName, stageApiStrict, stageClientType, sometimesCallback);
+        }
+
+        if (auto* subPipelines = stage->getSubPipelines()) {
+            for (auto&& subPipeline : *subPipelines) {
+                subPipeline->validate(opCtx, performApiVersionChecks);
+            }
+        }
+    }
+}
+
+void LiteParsedPipeline::validateAllowPartialResults(const AggregateCommandRequest& request) const {
+    if (!request.getAllowPartialResults().value_or(false)) {
+        return;
+    }
+
+    // Write stages ($out/$merge) persist data on the shards. Silently dropping the contribution of
+    // an unreachable shard could produce an incorrect or partial write, so partial results are not
+    // permitted.
+    uassert(ErrorCodes::InvalidOptions,
+            "allowPartialResults is not supported for aggregations with write stages",
+            !endsWithWriteStage());
+
+    // Change streams are continuous, tailable cursors that must observe every shard to avoid
+    // silently missing events; returning partial results would break their correctness guarantees.
+    uassert(ErrorCodes::InvalidOptions,
+            "allowPartialResults is not supported for change stream aggregations",
+            !hasChangeStream());
+
+    // Search-family stages ($search, $vectorSearch, $rankFusion, $scoreFusion, and their extension
+    // variants) are served by mongot, not the regular shard cursor path, so the router-level
+    // partial-results mechanism does not apply to them.
+    uassert(ErrorCodes::InvalidOptions,
+            "allowPartialResults is not supported for search aggregations",
+            !hasMongotStage());
+}
+
+void LiteParsedPipeline::validateTimeseries() const {
+    for (const auto& stage : _stageSpecs) {
+        auto stageConstraints = stage->constraints();
+        auto unsupportedStage = stageConstraints.timeseriesUnsupportedStageName.value_or(
+            std::string_view(stage->getParseTimeName()));
+        uassert(12093200,
+                str::stream() << unsupportedStage << " is unsupported for timeseries collections",
+                stageConstraints.canRunOnTimeseries);
+    }
+}
+
+void LiteParsedPipeline::checkStagesAllowedInViewDefinition() const {
+    for (auto stage_it = _stageSpecs.begin(); stage_it != _stageSpecs.end(); stage_it++) {
+        const auto& stage = *stage_it;
+
+        uassert(ErrorCodes::OptionNotSupportedOnView,
+                "$rankFusion and $scoreFusion is currently unsupported in a view definition",
+                !stage->isHybridSearchStage());
+
+        uassert(ErrorCodes::OptionNotSupportedOnView,
+                "$score is currently unsupported in a view definition",
+                !(stage->getParseTimeName() == "$score"));
+
+        if (auto* subPipelines = stage->getSubPipelines()) {
+            for (auto&& subPipeline : *subPipelines) {
+                subPipeline->checkStagesAllowedInViewDefinition();
+            }
+        }
+    }
+}
+
+size_t LiteParsedPipeline::replaceStageWith(
+    size_t index, std::vector<std::unique_ptr<LiteParsedDocumentSource>>&& newSources) {
+    tassert(11533000,
+            str::stream() << "replaceStageWith index " << index << " out of range "
+                          << _stageSpecs.size(),
+            index < _stageSpecs.size());
+
+    // Own each new stage's BSON before erasing the old stage: the old stage may own the backing
+    // of cloned subpipeline stages in newSources (e.g. a desugared $rankFusion/$scoreFusion).
+    for (auto& src : newSources) {
+        src->makeOwned();
+    }
+
+    auto& stages = _stageSpecs;
+    const auto numInserted = newSources.size();
+
+    stages.erase(stages.begin() + index);
+    stages.insert(stages.begin() + index,
+                  std::make_move_iterator(newSources.begin()),
+                  std::make_move_iterator(newSources.end()));
+
+    // If we just expanded one of the view-definition stages prepended by handleView(), the boundary
+    // between view stages and user stages moves by the number of stages we added (or removed).
+    if (index < _numPrependedViewStages) {
+        _numPrependedViewStages = _numPrependedViewStages + numInserted - 1;
+    }
+
+    return index + numInserted;
+}
+
+void LiteParsedPipeline::_stitchFront(LiteParsedPipeline&& prefix) {
+    const size_t numPrefixStages = prefix._stageSpecs.size();
+    std::vector<std::unique_ptr<LiteParsedDocumentSource>> newStages;
+    newStages.reserve(numPrefixStages + _stageSpecs.size());
+
+    // Move prefix stages first.
+    for (auto& stage : prefix._stageSpecs) {
+        newStages.push_back(std::move(stage));
+    }
+
+    // Move current stages after.
+    for (auto& stage : _stageSpecs) {
+        newStages.push_back(std::move(stage));
+    }
+
+    _numPrependedViewStages += numPrefixStages;
+    _stageSpecs = std::move(newStages);
+    resetDeferredCaches();
+}
+
+FirstStageViewApplicationPolicy LiteParsedPipeline::getUserFirstStageViewApplicationPolicy() const {
+    if (!_hasUserStages()) {
+        // Either the pipeline is empty or it consists entirely of prepended view stages: there is
+        // no user stage that could apply the view on its own.
+        return FirstStageViewApplicationPolicy::kDefaultPrepend;
+    }
+    return _getFirstUserStage()->getFirstStageViewApplicationPolicy();
+}
+
+bool LiteParsedPipeline::_hasUserStages() const {
+    return _numPrependedViewStages < _stageSpecs.size();
+}
+
+const LiteParsedDocumentSource* LiteParsedPipeline::_getFirstUserStage() const {
+    tassert(13296301,
+            "Cannot get the first user stage of a pipeline that has no user stages",
+            _hasUserStages());
+    return _stageSpecs[_numPrependedViewStages].get();
+}
+
+void LiteParsedPipeline::handleView(const ResolvedNamespace& view,
+                                    const ResolvedNamespaceMap& resolvedNamespaces) {
+    bindResolvedNamespaceToStages(view, resolvedNamespaces, 0, _stageSpecs.size());
+
+    if (view.getNamespace().isEmpty()) {
+        // No top-level view to prepend; bindResolvedNamespace has already done all the work that's
+        // possible against an empty sentinel view.
+        return;
+    }
+
+    const auto firstStagePolicy = _stageSpecs.empty()
+        ? FirstStageViewApplicationPolicy::kDefaultPrepend
+        : _stageSpecs.front()->getFirstStageViewApplicationPolicy();
+    if (firstStagePolicy == FirstStageViewApplicationPolicy::kDefaultPrepend) {
+        // If the first stage doesn't explicitly disallow it, clone and prepend the desugared view
+        // pipeline to the current pipeline.
+        auto clonedViewPipe = view.getViewPipeline();
+
+        // The view-definition stages may themselves carry subpipelines that target views (e.g. a
+        // $unionWith inside the view definition). Bind view info on them so they can inspect
+        // 'resolvedNamespaces'.
+        for (auto& stage : clonedViewPipe._stageSpecs) {
+            if (!stage->isHybridSearchStage()) {
+                stage->bindResolvedNamespace(ResolvedNamespace{}, resolvedNamespaces);
+            }
+        }
+
+        _stitchFront(std::move(clonedViewPipe));
+    }
+}
+
+void LiteParsedPipeline::bindResolvedNamespaceToStages(
+    const ResolvedNamespace& view,
+    const ResolvedNamespaceMap& resolvedNamespaces,
+    size_t start,
+    size_t end) {
+    for (size_t i = start; i < end; ++i) {
+        _stageSpecs[i]->bindResolvedNamespace(view, resolvedNamespaces);
+    }
+}
+
+}  // namespace mongo

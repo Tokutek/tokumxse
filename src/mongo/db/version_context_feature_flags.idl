@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+feature_flags:
+    # TODO (SERVER-110309): remove this feature flag
+    featureFlagReplicateOFCVInOplog:
+        description: >
+            Enabled when all binaries support replicating the OFCV (versionContext) in the oplog.
+            Snapshotting of OFCV for sharded operations is controlled by featureFlagSnapshotFCVInDDLCoordinators.
+
+            (Enable on transitional FCV): Necessary to ensure that operations using OFCV have a
+            stable view of all feature flags with a version greater or equal than this feature flag.
+            See SERVER-102084 for more detail.
+            If this feature flag is disabled by a FCV downgrade, all operations with an operation FCV
+            are drained when finalizing the downgrade.
+        cpp_varname: feature_flags::gReplicateOFCVInOplog
+        default: true
+        version: 8.2
+        fcv_gated: true
+        enable_on_transitional_fcv_UNSAFE: true
+
+    # TODO (SERVER-110309): remove this feature flag
+    featureFlagStrictlyEnforceOperationFCVOnlyFCVGatedFeatureFlags:
+        description: >
+            Enforce feature flags tagged with `check_against_fcv: operation_fcv_only` are checked with an OFCV.
+            This can not be done until FCV 8.2 since ShardingDDLCoordinators (or their sub-commands)
+            do not have an OFCV in FCV 8.0 (see featureFlagSnapshotFCVInDDLCoordinators).
+        cpp_varname: feature_flags::gStrictlyEnforceOperationFCVOnlyFCVGatedFeatureFlags
+        default: true
+        version: 8.2
+        fcv_gated: true
+
+    featureFlagSymmetricFCV:
+        description: Enable the persistence and resumability of setFCV by phases, as well as the extra metadata upgrade phase
+        cpp_varname: gFeatureFlagSymmetricFCV
+        default: true
+        fcv_gated: false

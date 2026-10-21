@@ -1,0 +1,22 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    commandParameterTypeInvalid:
+        description: "invalid command parameter type"
+        command_name: commandParameterTypeInvalid
+        namespace: ignored
+        cpp_name: commandParameterTypeInvalid
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            invalidParameter:
+                type: None
+                stability: stable

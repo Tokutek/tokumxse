@@ -1,0 +1,159 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/mongo-default-approvers
+  - "aggregation_expression_multiversion_fuzzer*":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_mongos_pqs*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "aggregation_multiversion_fuzzer*":
+    approvers:
+      - 10gen/query-optimization
+  - "aggregation_pqs*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "*qemp_ifr_batch1.yml":
+    approvers:
+      - 10gen/query-execution
+  - "*qemp_ifr_no_nlm_transform.yml":
+    approvers:
+      - 10gen/query-execution
+  - "aggregation_sharded_collections_pqs*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "aggregation_sharded_collections_query_shape_hash_stability*":
+    approvers:
+      - 10gen/query-execution-query-settings
+      - 10gen/query-integration-observability
+  - "bulk_write*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "bulk_write_sharded*":
+    approvers:
+      - 10gen/query-execution-router
+  - "change_streams*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "core_ese_gcm.yml":
+    approvers:
+      - 10gen/server-security
+  - "replica_sets_ese.yml":
+    approvers:
+      - 10gen/server-security
+  - "replica_sets_ese_gcm.yml":
+    approvers:
+      - 10gen/server-security
+  - "core_minimum_batch_size.yml":
+    approvers:
+      - 10gen/query-execution
+  - "core_min_batch_repeat_queries_multiplan_single_solutions_ese_gcm.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "core_repeat_queries.yml":
+    approvers:
+      - 10gen/query-optimization
+  - "core_repeat_queries_always_replan.yml":
+    approvers:
+      - 10gen/query-optimization
+      - 10gen/query-execution
+  - "aggregation_repeat_queries_always_replan.yml":
+    approvers:
+      - 10gen/query-optimization
+      - 10gen/query-execution
+  - "replica_sets_jscore_pqs*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "shard*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharded_collections_pqs*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "sharded_collections_query_shape_hash_stability*":
+    approvers:
+      - 10gen/query-execution-query-settings
+      - 10gen/query-integration-observability
+  - "*legacy_timeseries_no_rawdata*":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "sharding_pqs*":
+    approvers:
+      - 10gen/query-execution-query-settings
+  - "sharding_task_executor_pool_size*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "update_fuzzer*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "*injected_catalog_metadata*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "*ingress_request_rate_limiter*":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "fcv_upgrade_downgrade_sharded_collections_jscore_passthrough_retryable_writes.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "fcv_upgrade_downgrade_primary_step_down_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "fcv_upgrade_downgrade_retryable_writes_replica_sets_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-transactions
+  - "fcv_upgrade_downgrade_sharding_jscore_passthrough_retryable_writes.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "*primary_driven_index_builds.yml":
+    approvers:
+      - 10gen/server-index-builds
+  - "replica_sets_kill_secondaries_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "replica_sets_kill_primary_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "replica_sets_max_mirroring.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "replica_sets_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "replica_sets_last_patch.yml":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "*execution_control*":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "*rate_limited*":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "transitioning_replica_sets_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "replica_sets_reconfig*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding*stepdown*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "sharding_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "sharded_collections_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "no_causal_consistency_replica_sets_kill_stepdown_terminate_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "sharded_collections_jscore_passthrough_with_balancer_drop_config_cache_collections.yml":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "with_mongot_extension*":
+    approvers:
+      - 10gen/query-integration-extensions-api
+  - "multiversion_sanity_check*":
+    approvers:
+      - 10gen/server-jstest-infra

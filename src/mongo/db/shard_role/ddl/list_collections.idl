@@ -1,0 +1,172 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ListCollectionsReplyInfoFastCount:
+        description: >-
+            Persisted replicated fast count metadata, surfaced via listCollections so initial
+            sync clients can seed local stores before applying oplog entries.
+        fields:
+            size:
+                type: safeInt64
+                description: >-
+                    Persisted replicated fast count `size` (bytes) for this collection. Emitted
+                    when a persisted entry exists for the collection UUID.
+                optional: true
+                stability: unstable
+            count:
+                type: safeInt64
+                description: >-
+                    Persisted replicated fast count `count` (documents) for this collection.
+                    Emitted when a persisted entry exists for the collection UUID.
+                optional: true
+                stability: unstable
+            validAsOf:
+                type: timestamp
+                description: >-
+                    Timestamp at which `size`/`count` were valid for this collection. Emitted
+                    when a persisted entry exists for the collection UUID.
+                optional: true
+                stability: unstable
+            timestampStoreTs:
+                type: timestamp
+                description: >-
+                    Value of the singleton replicated fast count timestamp store at the time this
+                    listCollections response was generated. Emitted once across the response, on
+                    an eligible collection entry (output order is not guaranteed).
+                optional: true
+                stability: unstable
+
+    ListCollectionsReplyInfo:
+        description: "Information about the collection."
+        fields:
+            readOnly:
+                type: bool
+                description: "If true, the data store is read only."
+                optional: true
+                stability: stable
+            uuid:
+                type: uuid
+                description: "Unique, immutable collection ID."
+                optional: true
+                stability: stable
+            configDebugDump:
+                type: bool
+                description: >-
+                    When true, the collection should be included in full-cluster dumps
+                    (e.g., mongodump).
+                optional: true
+                stability: unstable
+            recordIdsReplicated:
+                type: bool
+                description: "If true, the collection has record Ids replicated."
+                optional: true
+                stability: unstable
+            fastCount:
+                type: ListCollectionsReplyInfoFastCount
+                description: >-
+                    Replicated fast count metadata for this collection. Only emitted when
+                    listCollections is run with rawData and featureFlagReplicatedFastCount is
+                    enabled. For testing purposes only.
+                optional: true
+                stability: unstable
+
+    ListCollectionsReplyItem:
+        description: "Individual result"
+        fields:
+            name:
+                type: string
+                description: "Name of the collection."
+                stability: stable
+            type:
+                type: string
+                description: "Type of data store."
+                stability: stable
+            options:
+                type: object_owned
+                description: "Collection options."
+                optional: true
+                stability: stable
+            info:
+                type: ListCollectionsReplyInfo
+                description: "Information about the collection."
+                optional: true
+                stability: stable
+            idIndex:
+                type: object_owned
+                description: "Provides information on the _id index for the collection."
+                optional: true
+                stability: stable
+
+    ListCollectionsReplyCursor:
+        description: "Cursor object"
+        fields:
+            id:
+                type: long
+                stability: stable
+            ns:
+                type: namespacestring
+                stability: stable
+            firstBatch:
+                type: array<ListCollectionsReplyItem>
+                stability: stable
+
+    ListCollectionsReply:
+        description: "The listCollection command's reply."
+        is_command_reply: true
+        fields:
+            cursor:
+                type: ListCollectionsReplyCursor
+                stability: stable
+
+commands:
+    listCollections:
+        description: "Parser for the listCollections command"
+        command_name: listCollections
+        namespace: ignored
+        cpp_name: listCollections
+        strict: true
+        api_version: "1"
+        access_check:
+            complex:
+                - check: is_authorized_for_any_action_on_resource
+                - check: is_authorized_for_any_action_on_any_resource_in_db
+                - check: should_ignore_auth_checks
+                - check: check_authorized_to_list_collections
+                - privilege:
+                      resource_pattern: database
+                      action_type: listCollections
+        fields:
+            cursor:
+                type: SimpleCursorOptions
+                optional: true
+                stability: stable
+            filter:
+                type: object
+                optional: true
+                stability: stable
+            nameOnly:
+                type: bool
+                default: false
+                stability: stable
+            authorizedCollections:
+                type: bool
+                default: false
+                stability: stable
+            includePendingDrops:
+                # Deprecated: This field has no effect since ~4.2 when we stopped
+                # using drop pending namespaces.
+                # TODO(SERVER-92839): remove this option.
+                ignore: true
+                type: safeBool
+                stability: unstable
+        reply_type: ListCollectionsReply

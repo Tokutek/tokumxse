@@ -1,202 +1,359 @@
-/**
- *    Copyright (C) 2012 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/scoped_array.hpp>
+#include "mongo/bson/bson_depth.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/container_size_helper.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
+#include <set>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/string_data.h"
+#include <boost/container/small_vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
 
-namespace mongo {
+namespace [[MONGO_MOD_PUBLIC]] mongo {
 
+/**
+ * For performance reasons, we need to reduce the size of FieldRef::StringView. Since we have a cap
+ * on the size of FieldRef that is lower than the uint32 max value, we'll never run into overflow.
+ * However we should static assert that this is true in case of future changes.
+ */
+MONGO_STATIC_ASSERT(BSONObjMaxInternalSize < std::numeric_limits<std::uint32_t>::max());
+
+/**
+ * A FieldPath represents a path in a document, starting from the root. The path
+ * is made of "field parts" separated by dots. The class provides an efficient means to
+ * "split" the dotted fields in its parts. It does not do UTF-8 validation but it does throw a
+ * uassert() upon an attempt to construct a FieldRef in which any field path component contains an
+ * embedded null byte.
+ *
+ * Any field part may be replaced, after the "original" field reference was parsed. Any
+ * part can be accessed through a std::string_view object.
+ *
+ * The class is not thread safe.
+ */
+using FieldIndex = BSONDepthIndex;
+class FieldRef {
+public:
     /**
-     * A FieldPath represents a path in a document, starting from the root. The path
-     * is made of "field parts" separated by dots. The class provides an efficient means to
-     * "split" the dotted fields in its parts, but no validation is done.
-     *
-     * Any field part may be replaced, after the "original" field reference was parsed. Any
-     * part can be accessed through a StringData object.
-     *
-     * The class is not thread safe.
+     * Helper class for appending to a FieldRef for the duration of the current scope and then
+     * restoring the FieldRef at the end of the scope.
      */
-    class FieldRef {
-        MONGO_DISALLOW_COPYING(FieldRef);
+    class FieldRefTempAppend {
     public:
-        FieldRef();
+        FieldRefTempAppend(FieldRef& fieldRef, std::string_view part) : _fieldRef(fieldRef) {
+            _fieldRef.appendPart(part);
+        }
 
-        explicit FieldRef(StringData path);
-
-        /**
-         * Field parts accessed through getPart() calls no longer would be valid, after the
-         * destructor ran.
-         */
-        ~FieldRef() {}
-
-        /**
-         * Builds a field path out of each field part in 'dottedField'.
-         */
-        void parse(StringData dottedField);
-
-        /**
-         * Sets the 'i-th' field part to point to 'part'. Assumes i < size(). Behavior is
-         * undefined otherwise.
-         */
-        void setPart(size_t i, StringData part);
-
-        /**
-         * Returns the 'i-th' field part. Assumes i < size(). Behavior is undefined otherwise.
-         */
-        StringData getPart(size_t i) const;
-
-        /**
-         * Returns true when 'this' FieldRef is a prefix of 'other'. Equality is not considered
-         * a prefix.
-         */
-        bool isPrefixOf( const FieldRef& other ) const;
-
-        /**
-         * Returns the number of field parts in the prefix that 'this' and 'other' share.
-         */
-        size_t commonPrefixSize( const FieldRef& other ) const;
-
-        /**
-         * Returns a StringData of the full dotted field in its current state (i.e., some parts may
-         * have been replaced since the parse() call).
-         */
-        StringData dottedField( size_t offsetFromStart = 0 ) const;
-
-        /**
-         * Returns a StringData of parts of the dotted field from startPart to endPart in its
-         * current state (i.e., some parts may have been replaced since the parse() call).
-         */
-        StringData dottedSubstring(size_t startPart, size_t endPart) const;
-
-        /**
-         * Compares the full dotted path represented by this FieldRef to other
-         */
-        bool equalsDottedField( StringData other ) const;
-
-        /**
-         * Return 0 if 'this' is equal to 'other' lexicographically, -1 if is it less than or
-         * +1 if it is greater than.
-         */
-        int compare( const FieldRef& other ) const;
-
-        /**
-         * Resets the internal state. See note in parse() call.
-         */
-        void clear();
-
-        //
-        // accessors
-        //
-
-        /**
-         * Returns the number of parts in this FieldRef.
-         */
-        size_t numParts() const { return _size; }
-
-        bool empty() const { return numParts() == 0; }
+        ~FieldRefTempAppend() {
+            _fieldRef.removeLastPart();
+        }
 
     private:
-        // Dotted fields are most often not longer than four parts. We use a mixed structure
-        // here that will not require any extra memory allocation when that is the case. And
-        // handle larger dotted fields if it is. The idea is not to penalize the common case
-        // with allocations.
-        static const size_t kReserveAhead = 4;
-
-        /**
-         * Parses 'path' into parts.
-         */
-        void _parse(StringData path);
-
-        /** Converts the field part index to the variable part equivalent */
-        size_t getIndex(size_t i) const { return i-kReserveAhead; }
-
-        /**
-         * Returns the new number of parts after appending 'part' to this field path. It
-         * assumes that 'part' is pointing to an internally allocated area.
-         */
-        size_t appendPart(StringData part);
-
-        /**
-         * Re-assemble _dotted from components, including any replacements in _replacements,
-         * and update the StringData components in _fixed and _variable to refer to the parts
-         * of the new _dotted. This is used to make the storage for the current value of this
-         * FieldRef contiguous so it can be returned as a StringData from the dottedField
-         * method above.
-         */
-        void reserialize() const;
-
-        // number of field parts stored
-        size_t _size;
-
-        // first kResevedAhead field components
-        mutable StringData _fixed[kReserveAhead];
-
-         // remaining field components
-        mutable std::vector<StringData> _variable;
-
-        // cached dotted name
-        mutable std::string _dotted;
-
-        // back memory added with the setPart call pointed to by _fized and _variable
-        mutable std::vector<std::string> _replacements;
+        FieldRef& _fieldRef;
     };
 
-    inline bool operator==(const FieldRef& lhs, const FieldRef& rhs) {
-        return lhs.compare(rhs) == 0;
+    /**
+     * Returns true if the argument is a numeric string which is eligible to act as the key name for
+     * an element in a BSON array; in other words, the string matches the regex ^(0|[1-9]+[0-9]*)$.
+     */
+    static bool isNumericPathComponentStrict(std::string_view component);
+
+    /**
+     * Checks whether document path 'path' overlaps with a path of an indexed field 'indexedPath'.
+     */
+    static bool pathOverlaps(const FieldRef& path, const FieldRef& indexedPath);
+
+    /**
+     * Returns the canonicalized index form for 'path', removing numerical path components as well
+     * as '$' path components.
+     */
+    static FieldRef getCanonicalIndexField(const FieldRef& path);
+
+    /**
+     * Returns whether the provided path component can be included in the canonicalized index form
+     * of a path.
+     */
+    static bool isComponentPartOfCanonicalizedIndexPath(std::string_view pathComponent);
+
+    /**
+     * Similar to the function above except strings that contain leading zero's are considered
+     * numeric. For instance, the above function would return false for an input "01" however this
+     * function will return true.
+     */
+    static bool isNumericPathComponentLenient(std::string_view component);
+
+    FieldRef() = default;
+
+    explicit FieldRef(std::string_view path);
+
+    /**
+     * Builds a field path out of each field part in 'dottedField'.
+     */
+    void parse(std::string_view dottedField);
+
+    /**
+     * Sets the 'i-th' field part to point to 'part'. Assumes i < size(). Behavior is undefined
+     * otherwise.
+     */
+    void setPart(FieldIndex i, std::string_view part);
+
+    /**
+     * Adds a new field to the end of the path, increasing its size by 1.
+     */
+    void appendPart(std::string_view part);
+
+    /**
+     * Removes the last part from the path, decreasing its size by 1. Has no effect on a FieldRef
+     * with size 0.
+     */
+    void removeLastPart();
+
+    /**
+     * Removes the first part from the path, decreasing its size by 1. Has no effect on a FieldRef
+     * with size 0.
+     */
+    void removeFirstPart();
+
+    /**
+     * Returns the 'i-th' field part. Assumes i < size(). Behavior is undefined otherwise.
+     */
+    std::string_view getPart(FieldIndex i) const MONGO_COMPILER_LIFETIME_BOUND;
+
+    /**
+     * Returns true when 'this' FieldRef is a prefix of 'other'. Equality is not considered
+     * a prefix.
+     */
+    bool isPrefixOf(const FieldRef& other) const;
+
+    /**
+     * Returns true if 'this' FieldRef is a prefix of 'other', or if both paths are identical.
+     */
+    bool isPrefixOfOrEqualTo(const FieldRef& other) const;
+
+    /**
+     * Returns true if 'this' is a prefix of, or equal to, 'other', or vice versa.
+     */
+    bool fullyOverlapsWith(const FieldRef& other) const;
+
+    /**
+     * Returns the number of field parts in the prefix that 'this' and 'other' share.
+     */
+    FieldIndex commonPrefixSize(const FieldRef& other) const;
+
+    /**
+     * Returns true if the specified path component is a numeric string which is eligible to act as
+     * the key name for an element in a BSON array; in other words, the fieldname matches the regex
+     * ^(0|[1-9]+[0-9]*)$.
+     */
+    bool isNumericPathComponentStrict(FieldIndex i) const;
+
+    /**
+     * Similar to isNumericPathComponentStrict, but returns true for 0-prefixed indices, such as
+     * "00" and "01".
+     */
+    bool isNumericPathComponentLenient(FieldIndex i) const;
+
+    /**
+     * Returns true if this FieldRef has any numeric path components.
+     */
+    bool hasNumericPathComponents() const;
+
+    /**
+     * Returns the positions of all numeric path components, starting from the given position.
+     */
+    std::set<FieldIndex> getNumericPathComponents(FieldIndex startPart = 0) const;
+
+    /**
+     * Returns a std::string_view of the full dotted field in its current state (i.e., some parts
+     * may have been replaced since the parse() call).
+     */
+    std::string_view dottedField(FieldIndex offsetFromStart = 0) const
+        MONGO_COMPILER_LIFETIME_BOUND;
+
+    /**
+     * Returns a std::string_view of parts of the dotted field from startPart to endPart in its
+     * current state (i.e., some parts may have been replaced since the parse() call).
+     */
+    std::string_view dottedSubstring(FieldIndex startPart,
+                                     FieldIndex endPart) const MONGO_COMPILER_LIFETIME_BOUND;
+
+    /**
+     * Compares the full dotted path represented by this FieldRef to other
+     */
+    bool equalsDottedField(std::string_view other) const;
+
+    /**
+     * Resets the internal state. See note in parse() call.
+     */
+    void clear();
+
+    //
+    // accessors
+    //
+
+    /**
+     * Returns the number of parts in this FieldRef.
+     */
+    FieldIndex numParts() const {
+        return _parts.size();
     }
 
-    inline bool operator!=(const FieldRef& lhs, const FieldRef& rhs) {
-        return lhs.compare(rhs) != 0;
+    bool empty() const {
+        return numParts() == 0;
     }
 
-    inline bool operator<(const FieldRef& lhs, const FieldRef& rhs) {
-        return lhs.compare(rhs) < 0;
+    std::string_view operator[](int index) const MONGO_COMPILER_LIFETIME_BOUND {
+        return getPart(index);
     }
 
-    inline bool operator<=(const FieldRef& lhs, const FieldRef& rhs) {
-        return lhs.compare(rhs) <= 0;
+    uint64_t estimateObjectSizeInBytes() const {
+        return  // Add size of each element in '_replacements' vector.
+            container_size_helper::estimateObjectSizeInBytes(
+                _replacements,
+                [](const ValidatedPathString& s) { return s.get().capacity(); },
+                true) +
+            // Add size of each element in '_parts' vector.
+            container_size_helper::estimateObjectSizeInBytes(_parts) +
+            // Add runtime size of '_dotted' string.
+            _dotted.get().capacity() +
+            // Add size of the object.
+            sizeof(*this);
     }
 
-    inline bool operator>(const FieldRef& lhs, const FieldRef& rhs) {
-        return lhs.compare(rhs) > 0;
+    bool operator==(const FieldRef& o) const {
+        if (_parts.size() != o._parts.size())
+            return false;
+        for (size_t i = 0; i < _parts.size(); ++i)
+            if (getPart(i) != o.getPart(i))
+                return false;
+        return true;
     }
 
-    inline bool operator>=(const FieldRef& lhs, const FieldRef& rhs) {
-        return lhs.compare(rhs) >= 0;
+    std::strong_ordering operator<=>(const FieldRef& o) const {
+        const size_t common = std::min(_parts.size(), o._parts.size());
+        for (size_t i = 0; i < common; ++i)
+            if (auto c = getPart(i) <=> o.getPart(i); c != 0)
+                return c;
+        return _parts.size() <=> o._parts.size();
     }
 
-    std::ostream& operator<<(std::ostream& stream, const FieldRef& value);
+    FieldRef operator+(const FieldRef& rhs) const {
+        FieldRef result{*this};
+        for (size_t i = 0; i < rhs.numParts(); ++i)
+            result.appendPart(rhs.getPart(i));
+        return result;
+    }
 
-} // namespace mongo
+    friend std::ostream& operator<<(std::ostream& stream, const FieldRef& field) {
+        return stream << field.dottedField();
+    }
+
+private:
+    /**
+     * Represents a string that has been validated to not contain embedded null bytes.
+     */
+    class ValidatedPathString {
+    public:
+        ValidatedPathString() = default;
+
+        explicit ValidatedPathString(std::string value) : _value(std::move(value)) {
+            uassert(9867600,
+                    "Field name can't contain null bytes",
+                    _value.find('\0') == std::string::npos);
+        }
+
+        void clear() {
+            _value.clear();
+        }
+
+        const std::string& get() const {
+            return _value;
+        }
+
+    private:
+        std::string _value;
+    };
+
+    // 'ValidatedPathString' is used in vectors, so it should be noexcept-movable.
+    static_assert(std::is_nothrow_move_constructible_v<ValidatedPathString>);
+    static_assert(std::is_nothrow_move_assignable_v<ValidatedPathString>);
+
+    // Dotted fields are most often not longer than four parts. We use a mixed structure
+    // here that will not require any extra memory allocation when that is the case. And
+    // handle larger dotted fields if it is. The idea is not to penalize the common case
+    // with allocations.
+    static constexpr size_t kFewDottedFieldParts = 4;
+
+    // In order to make FieldRef copyable, we use a std::string_view-like type that stores an offset
+    // and length into the backing string. std::string_view, in contrast, holds const char* pointers
+    // that would have to be updated to point into the new string on copy.
+    struct StringView {
+        // Constructs an empty StringView.
+        StringView() = default;
+
+        StringView(std::uint32_t offset, std::uint32_t len) : offset(offset), len(len) {}
+
+        std::string_view toStringData(const std::string& viewInto) const {
+            return {viewInto.c_str() + offset, len};
+        }
+
+        // uint32 is large enough for FieldRef since we have a limit on it's size. At the top of
+        // this file we statically assert that this is true.
+        std::uint32_t offset = 0;
+        std::uint32_t len = 0;
+    };
+
+    /**
+     * Returns the new number of parts after appending 'part' to this field path. This is
+     * private, because it is only intended for use by the parse function.
+     */
+    size_t appendParsedPart(StringView part);
+
+    /**
+     * Re-assemble _dotted from components, including any replacements in _replacements,
+     * and update the std::string_view components in _parts to refer to the parts
+     * of the new _dotted. This is used to make the storage for the current value of this
+     * FieldRef contiguous so it can be returned as a std::string_view from the dottedField
+     * method above.
+     */
+    void reserialize() const;
+
+    // Number of field parts in the cached dotted name (_dotted).
+    mutable FieldIndex _cachedSize = 0u;
+
+    // Field components. Each component is either a StringView backed by the
+    // _dotted string or boost::none to indicate that getPart() should read the string from the
+    // _replacements list.
+    mutable boost::container::small_vector<boost::optional<StringView>, kFewDottedFieldParts>
+        _parts;
+
+    /**
+     * Cached copy of the complete dotted name string. The StringView objects in "_parts" reference
+     * this string.
+     */
+    mutable ValidatedPathString _dotted;
+
+    /**
+     * String storage for path parts that have been replaced with setPart() or added with
+     * appendPart() since the lasted time "_dotted" was materialized.
+     */
+    mutable std::vector<ValidatedPathString> _replacements;
+};
+
+}  // namespace mongo

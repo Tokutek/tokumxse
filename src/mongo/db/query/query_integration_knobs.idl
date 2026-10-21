@@ -1,0 +1,238 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+imports:
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/query/query_knob_expressions.h"
+        - "mongo/db/query/query_stats/query_stats_on_parameter_change.h"
+        - "mongo/platform/atomic.h"
+    mod_visibility: public
+
+structs:
+    InternalVectorSearchStoredSource:
+        description: "A specification for the 'internalVectorSearchStoredSource' cluster-wide configuration parameter type."
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            enabled:
+                description: "Whether $vectorSearch supports 'returnStoredSource: true' or not."
+                type: bool
+                default: true
+
+server_parameters:
+    enableSearchMeta:
+        description: >-
+            Exists for backwards compatibility in startup parameters, enabling this was
+            required on 4.4 to access SEARCH_META variables. Does not do anything.
+        set_at: [startup, runtime]
+        cpp_varname: "enableSearchMeta"
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+    internalQueryFLERewriteMemoryLimit:
+        description: >-
+            Maximum memory available for encrypted field query rewrites in bytes. Must be
+            more than zero and less than 16Mb
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryFLERewriteMemoryLimit"
+        cpp_vartype: Atomic<int>
+        default:
+            expr: 14 * 1024 * 1024
+        validator:
+            gt: 0
+            lt: 16777216
+        redact: false
+
+    internalQueryFLEAlwaysUseEncryptedCollScanMode:
+        description: "Boolean flag to force FLE to always use low selectivity mode"
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryFLEAlwaysUseEncryptedCollScanMode"
+        cpp_vartype: Atomic<bool>
+        default:
+            expr: false
+        redact: false
+
+    internalQueryStatsRateLimit:
+        description: >-
+            The maximum number of queries per second that are sampled for query stats using window-based rate limiting.
+            If the rate of queries goes above this number, then rate limiting will kick in, and any
+            further queries will not be sampled. To sample all queries, this can be set to -1.
+            When both internalQueryStatsSampleRate and internalQueryStatsRateLimit are set to non-zero
+            values, the sampling-based rate limiting takes precedence over this window-based rate limiting. To disable
+            query stats collection completely, set both internalQueryStatsRateLimit and internalQueryStatsSampleRate to 0.
+            This parameter does not affect how we collect query stats for writes. Use
+            internalQueryStatsWriteCmdSampleRate to rate-limit query stats collection for write commands.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryStatsRateLimit"
+        cpp_vartype: Atomic<int>
+        default: 0
+        validator:
+            gte: -1
+        on_update: query_stats_util::onQueryStatsRateLimitUpdate
+        redact: false
+
+    internalQueryStatsSampleRate:
+        description: >-
+            The fractional number representing the rate of the queries that are sampled for query stats using
+            sampling-based rate limiting. To sample all queries, this can be set to 1.
+            When both internalQueryStatsSampleRate and internalQueryStatsRateLimit are set to non-zero
+            values, this sampling-based rate limiting takes precedence over window-based rate limiting.
+            If internalQueryStatsSampleRate is set to 0, query sampling will be controlled by the window-based
+            rate limiter. To disable query stats collection completely, set both internalQueryStatsSampleRate and
+            internalQueryStatsRateLimit to 0.
+            This parameter does not affect how we collect query stats for writes. Use
+            internalQueryStatsWriteCmdSampleRate to rate-limit query stats collection for write commands.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryStatsSampleRate"
+        cpp_vartype: Atomic<double>
+        default: 0.01
+        validator:
+            gte: 0.0
+            lte: 1.0
+        on_update: query_stats_util::onQueryStatsSamplingRateUpdate
+        redact: false
+
+    internalQueryStatsWriteCmdSampleRate:
+        description: >-
+            The fractional number representing the rate of write operations that are sampled for
+            query stats using sample-base rate limiting. To sample all write operations, this can be
+            set to 1. This parameter is independent from internalQueryStatsSampleRate and
+            internalQueryStatsRateLimit, and governs only which write operations are sampled. Note
+            that query stats for write commands can only be rate-limited with the sample-based
+            approach (window-based not supported).
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryStatsWriteCmdSampleRate"
+        cpp_vartype: Atomic<double>
+        default: 0.01
+        validator:
+            gte: 0.0
+            lte: 1.0
+        on_update: query_stats_util::onQueryStatsWriteCmdSamplingRateUpdate
+        redact: false
+
+    internalQueryStatsCacheSize:
+        description: >-
+            The maximum amount of memory that the system will allocate for the query queryStats
+            cache. Disables the query stats store when set to 0. This will accept values in either 
+            of the following formats:
+            1. <number>% indicates a percentage of the physical memory available to the process. E.g.: 15%.
+            2. <number>(MB|GB), indicates the amount of memory in MB or GB. E.g.: 1.5GB, 100MB.
+            The default value is 1%, which means 1% of the physical memory available to the process.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryStatsCacheSize"
+        cpp_vartype: synchronized_value<std::string>
+        default: "1%"
+        on_update: query_stats_util::onQueryStatsStoreSizeUpdate
+        validator:
+            callback: query_stats_util::validateQueryStatsStoreSize
+        redact: false
+
+    internalQueryStatsMaxErrorCodesPerShape:
+        description: >-
+            The maximum number of distinct recent error codes tracked per query shape in the query
+            stats store. Once this limit is reached, the least recently seen error code entry for
+            that shape is evicted.
+        set_at: startup
+        cpp_varname: "internalQueryStatsMaxErrorCodesPerShape"
+        cpp_vartype: Atomic<int>
+        default: 10
+        validator:
+            gte: 5
+            lte: 100
+        redact: false
+
+    internalQueryStatsErrorsAreCommandFatal:
+        description: >-
+            Whether errors in the $queryStats stage cause the aggregation pipeline to
+            immediately fail and report the error. Note that this is always the case for debug builds.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryStatsErrorsAreCommandFatal"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
+    internalQueryStatsTopKSortOptimizationEnabled:
+        description: >-
+            Whether the $queryStats top-K sort optimization is enabled. When enabled, a
+            [$queryStats, $sort on a supported metric, $limit] pipeline performs a bounded heap
+            scan of the query stats store and only materializes candidate entries, instead of
+            materializing every entry.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryStatsTopKSortOptimizationEnabled"
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+    internalQueryGlobalProfilingFilter:
+        description: "Enables the setProfilingFilterGlobally command."
+        set_at: [startup, runtime]
+        cpp_varname: internalQueryGlobalProfilingFilter
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
+    internalQueryGlobalProfilingLockDeadlineMs:
+        description: >-
+            A number of milliseconds to wait for a lock acquisition to perform writes to the
+            system.profile collection.
+        set_at: [startup, runtime]
+        cpp_varname: internalQueryGlobalProfilingLockDeadlineMs
+        cpp_vartype: Atomic<int>
+        default: 1
+        redact: false
+        validator:
+            gte: 0
+
+    internalProfilingMaxAbandonedWritesPerSecondPerDb:
+        description: >-
+            If there are more than this many lock timeouts per second when trying to profile, we will
+            skip all future profiling for a given database. Lasts until profiling is manually
+            re-enabled. The value can be zero, in which case even a single lock timeout will disable
+            profiling for the db.
+        set_at: [startup, runtime]
+        cpp_varname: internalProfilingMaxAbandonedWritesPerSecondPerDb
+        cpp_vartype: Atomic<int>
+        default: 1000
+        redact: false
+        validator:
+            gte: 0
+
+    internalQueryCollectOptimizerMetrics:
+        description: "If true, collect query optimizer metrics in queryStats."
+        set_at: [startup, runtime]
+        cpp_varname: internalQueryCollectOptimizerMetrics
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
+    internalVectorSearchStoredSource:
+        description: >-
+            Controls whether $vectorSearch supports returnStoredSource: true as an option.
+        set_at: cluster
+        cpp_varname: internalVectorSearchStoredSource
+        cpp_vartype: InternalVectorSearchStoredSource
+        redact: false
+        omit_in_ftdc: false
+        condition:
+            min_fcv: 8.2
+# Note for adding additional query knobs:
+#
+# When adding a new query knob, you should consider whether or not you need to add an 'on_update'
+# hook to flush the SBE plan cache. If your knob affects the contents of SBE plans which may be
+# cached, then the SBE cache should be flushed when the value of the knob changes. This will ensure
+# that the application actually starts to get plans which reflect the new value of the knob, rather
+# than continuing to use stale cached plans.
+#
+# When adding a new query knob which flushes the SBE plan cache on update, you should test this
+# behavior by including the name of the new knob in the list at the top of the jstest
+# 'sbe_plan_cache_clear_on_param_change.js'.
+#
+# When adding a new runtime query knob, consider adding and accessing it through the
+# 'QueryKnobConfiguration' decoration, especially if it may be accessed multiple times during a
+# query lifetime.

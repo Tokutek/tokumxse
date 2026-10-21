@@ -1,0 +1,103 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "collator_interface",
+    srcs = [
+        "collation_index_key.cpp",
+        "collator_interface.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_library(
+    name = "collator_interface_mock",
+    srcs = [
+        "collator_interface_mock.cpp",
+    ],
+    deps = [
+        ":collator_interface",
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_library(
+    name = "collator_factory_interface",
+    srcs = [
+        "collator_factory_interface.cpp",
+    ],
+    deps = [
+        ":collator_interface",
+        "//src/mongo/db:service_context",
+    ],
+)
+
+mongo_cc_library(
+    name = "collator_factory_mock",
+    srcs = [
+        "collator_factory_mock.cpp",
+    ],
+    deps = [
+        ":collator_factory_interface",
+        ":collator_interface_mock",
+    ],
+)
+
+mongo_cc_library(
+    name = "collator_icu",
+    srcs = [
+        "collator_factory_icu.cpp",
+        "collator_interface_icu.cpp",
+    ],
+    deps = [
+        ":collator_factory_interface",
+        "//src/mongo:base",
+        "//src/mongo/bson/util:bson_extract",
+        "//src/mongo/db:server_base",
+        "//src/mongo/util:icu_init",
+        "//src/third_party/icu4c-57.1/source:icu_i18n",
+    ],
+)
+
+mongo_cc_library(
+    name = "collator_factory_icu",
+    srcs = [
+        "collator_factory_icu_decoration.cpp",
+    ],
+    deps = [
+        ":collator_icu",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "db_query_collation_test",
+    srcs = [
+        "collation_bson_comparison_test.cpp",
+        "collation_index_key_test.cpp",
+        "collator_factory_icu_locales_test.cpp",
+        "collator_factory_icu_test.cpp",
+        "collator_factory_mock_test.cpp",
+        "collator_interface_icu_test.cpp",
+        "collator_interface_mock_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        ":collator_factory_mock",
+        ":collator_icu",
+        ":collator_interface",
+        ":collator_interface_mock",
+        "//src/mongo:base",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/db/storage/key_string",
+    ],
+)

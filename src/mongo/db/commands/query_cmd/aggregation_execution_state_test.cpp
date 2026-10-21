@@ -1,0 +1,984 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/commands/query_cmd/aggregation_execution_state.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/collection_type.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/shard_role/shard_catalog/shard_filtering_metadata_refresh.h"
+#include "mongo/db/sharding_environment/shard_server_test_fixture.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/db/views/view_catalog_helpers.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Test the basic functionality of each subclass of AggCatalogState.
+ */
+class AggregationExecutionStateTest : public ShardServerTestFixtureWithCatalogCacheMock {
+protected:
+    void setUp() override;
+
+    DatabaseVersion getDbVersion() {
+        return _dbVersion;
+    }
+
+    // Install sharded collection metadata for an unsharded collection and fills the cache.
+    void installUnshardedCollectionMetadata(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            bool requiresExtendedRangeSupport = false) {
+        AutoGetCollection coll(opCtx,
+                               NamespaceStringOrUUID(nss),
+                               MODE_IX,
+                               auto_get_collection::Options{}.viewMode(
+                                   auto_get_collection::ViewMode::kViewsPermitted));
+
+        if (requiresExtendedRangeSupport) {
+            coll->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+        }
+
+        CollectionShardingRuntime::acquireExclusive(opCtx, nss)
+            ->setCollectionMetadata(opCtx, CollectionMetadata::UNTRACKED());
+        PointInTimeChunkManager cm(RoutingTableHistoryValueHandle{OptionalRoutingTableHistory{}},
+                                   _dbVersion.getTimestamp());
+        getCatalogCacheMock()->setCollectionReturnValue(
+            nss,
+            CollectionRoutingInfo(
+                std::move(cm),
+                DatabaseTypeValueHandle(DatabaseType{nss.dbName(), kMyShardName, _dbVersion})));
+    }
+
+    // Install sharded collection metadata for 1 chunk sharded collection and fills the cache.
+    void installShardedCollectionMetadata(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          ShardId shardName,
+                                          bool requiresExtendedRangeSupport = false) {
+        // Made up a shard version
+        const ShardVersion shardVersion = ShardVersionFactory::make(ChunkVersion(
+            CollectionGeneration{OID::gen(), Timestamp(5, 0)}, CollectionPlacement(10, 1)));
+
+
+        const auto uuid = [&] {
+            AutoGetCollection autoColl(opCtx, NamespaceStringOrUUID(nss), MODE_IX);
+            return autoColl->uuid();
+        }();
+
+        const auto chunk = ChunkType(uuid,
+                                     ChunkRange{BSON("skey" << MINKEY), BSON("skey" << MAXKEY)},
+                                     shardVersion.placementVersion(),
+                                     shardName);
+
+
+        const std::string shardKey("skey");
+        const ShardKeyPattern shardKeyPattern{BSON(shardKey << 1)};
+        const auto epoch = chunk.getVersion().epoch();
+        const auto timestamp = chunk.getVersion().getTimestamp();
+
+        auto rt = RoutingTableHistory::makeNew(nss,
+                                               uuid,
+                                               shardKeyPattern.getKeyPattern(),
+                                               false, /* unsplittable */
+                                               nullptr,
+                                               false,
+                                               epoch,
+                                               timestamp,
+                                               boost::none /* timeseriesFields */,
+                                               boost::none /* resharding Fields */,
+                                               true /* allowMigrations */,
+                                               {chunk});
+
+        const auto version = rt.getVersion();
+        const auto rtHandle = RoutingTableHistoryValueHandle(
+            std::make_shared<RoutingTableHistory>(std::move(rt)),
+            ComparableChunkVersion::makeComparableChunkVersion(version));
+
+        CurrentChunkManager cm(rtHandle);
+        const auto collectionMetadata = CollectionMetadata(cm, shardName);
+
+        AutoGetCollection coll(opCtx, NamespaceStringOrUUID(nss), MODE_IX);
+
+        if (requiresExtendedRangeSupport) {
+            coll->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+        }
+
+        CollectionShardingRuntime::acquireExclusive(opCtx, nss)
+            ->setCollectionMetadata(opCtx, collectionMetadata);
+
+        getCatalogCacheMock()->setCollectionReturnValue(
+            nss,
+            CollectionRoutingInfo(
+                std::move(cm),
+                DatabaseTypeValueHandle(DatabaseType{nss.dbName(), shardName, _dbVersion})));
+    }
+
+    DatabaseType createTestDatabase(const UUID& uuid, const Timestamp& timestamp) {
+        return DatabaseType(_dbName, kMyShardName, DatabaseVersion(uuid, timestamp));
+    }
+
+    NamespaceString createTestCollectionWithMetadata(std::string_view coll, bool sharded) {
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest(_dbName, coll);
+        auto opCtx = operationContext();
+
+        createTestCollection(opCtx, nss);
+
+        if (sharded) {
+            installShardedCollectionMetadata(opCtx, nss, kMyShardName);
+        } else {
+            installUnshardedCollectionMetadata(opCtx, nss);
+        }
+
+        return nss;
+    }
+
+    NamespaceString createTimeseriesCollection(std::string_view coll,
+                                               bool sharded,
+                                               bool requiresExtendedRangeSupport) {
+        auto tsNss = NamespaceString::createNamespaceString_forTest(_dbName, coll);
+        auto opCtx = operationContext();
+
+        auto timeseriesOptions = BSON("timeField" << "timestamp");
+        createTestCollection(
+            opCtx, tsNss, BSON("create" << coll << "timeseries" << timeseriesOptions));
+
+        // In the case that the timeseries collection is implemented as a view,
+        // get the underlying system buckets namespace.
+        NamespaceString underlyingNss = tsNss;
+        auto viewDefinition = CollectionCatalog::get(opCtx)->lookupView(opCtx, tsNss);
+        if (viewDefinition) {
+            underlyingNss = viewDefinition->viewOn();
+        }
+
+        if (sharded) {
+            installShardedCollectionMetadata(
+                opCtx, underlyingNss, kMyShardName, requiresExtendedRangeSupport);
+        } else {
+            installUnshardedCollectionMetadata(opCtx, underlyingNss, requiresExtendedRangeSupport);
+        }
+
+        return tsNss;
+    }
+
+    std::pair<NamespaceString, std::vector<BSONObj>> createTestViewWithMetadata(
+        std::string_view viewName, std::string_view collName) {
+        NamespaceString viewNss = NamespaceString::createNamespaceString_forTest(_dbName, viewName);
+        NamespaceString collNss = NamespaceString::createNamespaceString_forTest(_dbName, collName);
+        auto opCtx = operationContext();
+
+        auto match = BSON("$match" << BSON("a" << 1));
+        createTestView(opCtx, viewNss, collNss, {match});
+
+        installUnshardedCollectionMetadata(opCtx, viewNss);
+        std::vector<BSONObj> expectedResolvedPipeline = {match};
+        return std::make_pair(viewNss, expectedResolvedPipeline);
+    }
+
+    /**
+     * Create an AggExState instance that one might see for a typical query.
+     */
+    std::unique_ptr<AggExState> createDefaultAggExState(std::string_view coll,
+                                                        bool rawData = false) {
+        auto opCtx = operationContext();
+        if (rawData) {
+            isRawDataOperation(opCtx) = true;
+        }
+
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", coll);
+
+        _cmdObj = BSON("aggregate" << coll << "pipeline" << BSONObj{} << "cursor" << BSONObj{});
+        std::vector<BSONObj> pipeline;
+        _request = std::make_unique<AggregateCommandRequest>(nss, pipeline);
+        _lpp = std::make_unique<LiteParsedPipeline>(*_request);
+
+        return std::make_unique<AggExState>(opCtx,
+                                            *_request,
+                                            *_lpp,
+                                            _cmdObj,
+                                            _privileges,
+                                            _externalSources,
+                                            boost::none /* verbosity */,
+                                            _ifrContext);
+    }
+
+    /**
+     * Create an AggExState instance that one might see for a typical query.
+     */
+    std::unique_ptr<AggExState> createDefaultAggExStateWithSecondaryCollections(
+        std::string_view main, std::string_view secondary) {
+        auto opCtx = operationContext();
+
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", main);
+        NamespaceString nss2 = NamespaceString::createNamespaceString_forTest("test", secondary);
+
+        BSONObj lookup =
+            BSON("$lookup" << BSON("from" << nss2.coll() << "as" << "out" << "localField" << "a"
+                                          << "foreignField" << "b"));
+        BSONArray pipeline = BSON_ARRAY(lookup);
+        _cmdObj = BSON("aggregate" << main << "pipeline" << pipeline << "cursor" << BSONObj{});
+        _request =
+            std::make_unique<AggregateCommandRequest>(nss, std::vector<mongo::BSONObj>{lookup});
+        _lpp = std::make_unique<LiteParsedPipeline>(*_request);
+
+        return std::make_unique<AggExState>(opCtx,
+                                            *_request,
+                                            *_lpp,
+                                            _cmdObj,
+                                            _privileges,
+                                            _externalSources,
+                                            boost::none /* verbosity */,
+                                            _ifrContext);
+    }
+
+    /**
+     * Create an AggExState instance that one might see for change stream query.
+     */
+    std::unique_ptr<AggExState> createOplogAggExState(std::string_view coll, bool rawData = false) {
+        auto opCtx = operationContext();
+        isRawDataOperation(opCtx) = rawData;
+
+        // We will wait indefinitely in this unit test for the read concern to be set unless we set
+        // it explicitly here.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs{repl::ReadConcernLevel::kLocalReadConcern};
+
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", coll);
+        BSONObj changeStreamStage = BSON("$changeStream" << BSONObj{});
+
+        _cmdObj = BSON("aggregate" << coll << "pipeline" << BSON_ARRAY(changeStreamStage)
+                                   << "cursor" << BSONObj{});
+        std::vector<BSONObj> pipeline{changeStreamStage};
+        _request = std::make_unique<AggregateCommandRequest>(nss, pipeline);
+        _lpp = std::make_unique<LiteParsedPipeline>(*_request);
+
+        auto aggExState = std::make_unique<AggExState>(opCtx,
+                                                       *_request,
+                                                       *_lpp,
+                                                       _cmdObj,
+                                                       _privileges,
+                                                       _externalSources,
+                                                       boost::none /* verbosity */,
+                                                       _ifrContext);
+
+        return aggExState;
+    }
+
+    /**
+     * Create an AggExState instance that one might see for a query that is not on any particular
+     * collection.
+     */
+    std::unique_ptr<AggExState> createCollectionlessAggExState() {
+        auto opCtx = operationContext();
+
+        std::string_view coll = "$cmd.aggregate"sv;
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", coll);
+
+        BSONObj documentsStage = BSON("$documents" << BSON_ARRAY(BSON("a" << 1)));
+        _cmdObj = BSON("aggregate" << coll << "pipeline" << BSON_ARRAY(documentsStage) << "cursor"
+                                   << BSONObj{});
+        std::vector<BSONObj> pipeline{documentsStage};
+        _request = std::make_unique<AggregateCommandRequest>(nss, pipeline);
+        _lpp = std::make_unique<LiteParsedPipeline>(*_request);
+
+        return std::make_unique<AggExState>(opCtx,
+                                            *_request,
+                                            *_lpp,
+                                            _cmdObj,
+                                            _privileges,
+                                            _externalSources,
+                                            boost::none /* verbosity */,
+                                            _ifrContext);
+    }
+
+private:
+    std::unique_ptr<AggregateCommandRequest> _request;
+    std::unique_ptr<LiteParsedPipeline> _lpp;
+    PrivilegeVector _privileges;
+    BSONObj _cmdObj;
+    std::vector<std::pair<NamespaceString, std::vector<ExternalDataSourceInfo>>> _externalSources;
+    std::shared_ptr<IncrementalFeatureRolloutContext> _ifrContext =
+        std::make_shared<IncrementalFeatureRolloutContext>();
+    DatabaseVersion _dbVersion = {UUID::gen(), Timestamp(1, 0)};
+    const DatabaseName _dbName = DatabaseName::createDatabaseName_forTest(boost::none, "test");
+};
+
+void AggregationExecutionStateTest::setUp() {
+    ShardServerTestFixtureWithCatalogCacheMock::setUp();
+    serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+
+    auto dbType = createTestDatabase(UUID::gen(), Timestamp(1, 0));
+
+    Grid::get(operationContext())->setShardingInitialized();
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogState) {
+    std::string_view coll{"coll"};
+    auto nss = createTestCollectionWithMetadata(coll, false /*sharded*/);
+    std::unique_ptr<AggExState> aggExState = createDefaultAggExState(coll);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    boost::optional<AutoStatsTracker> tracker;
+    aggCatalogState->getStatsTrackerIfNeeded(tracker);
+    ASSERT_FALSE(tracker.has_value());
+
+    auto [collator, matchesDefault] = aggCatalogState->resolveCollator();
+    ASSERT_TRUE(CollatorInterface::isSimpleCollator(collator.get()));
+    ASSERT_EQ(matchesDefault, ExpressionContextCollationMatchesDefault::kYes);
+
+    ASSERT_TRUE(aggCatalogState->getCollections().hasMainCollection());
+
+    ASSERT_TRUE(aggCatalogState->getUUID().has_value());
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kCollection);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateIfrContextForAggExStateAndExpressionContext) {
+    std::string_view coll{"coll"};
+    createTestCollectionWithMetadata(coll, false /*sharded*/);
+
+    std::unique_ptr<AggExState> aggExState = createDefaultAggExState(coll);
+
+    auto ifrContext = aggExState->getIfrContext();
+    ASSERT_TRUE(ifrContext != nullptr);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    // Verify that the same IFRContext is propagated to the ExpressionContext.
+    ASSERT_EQ(ifrContext.get(), expCtx->getIfrContext().get());
+}
+
+TEST_F(AggregationExecutionStateTest, IFRContextReachableFromCatalogState) {
+    std::string_view coll{"coll"};
+    createTestCollectionWithMetadata(coll, false /*sharded*/);
+
+    std::unique_ptr<AggExState> aggExState = createDefaultAggExState(coll);
+    auto ifrContext = aggExState->getIfrContext();
+    ASSERT_TRUE(ifrContext != nullptr);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    // Verify that AggCatalogState::getIfrContext() returns the same pointer as AggExState.
+    ASSERT_EQ(ifrContext.get(), aggCatalogState->getIfrContext().get());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogStateWithSecondaryCollection) {
+    std::string_view main{"main"};
+    std::string_view secondaryColl{"secondaryColl"};
+
+    auto mainNss = createTestCollectionWithMetadata(main, false /*sharded*/);
+    auto secondaryNssColl = createTestCollectionWithMetadata(secondaryColl, false /*sharded*/);
+
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExStateWithSecondaryCollections(main, secondaryColl);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    // Verify main collection
+    ASSERT_TRUE(aggCatalogState->getCollections().hasMainCollection());
+
+    // Verify secondary collections
+    {
+        const auto& secondaryAcq =
+            aggCatalogState->getCollections().getSecondaryCollectionAcquisitions();
+        ASSERT_EQ(1, secondaryAcq.size());
+        ASSERT_TRUE(secondaryAcq.contains(secondaryNssColl));
+    }
+
+    // Verify MultipleCollectionAccessor
+    ASSERT_FALSE(aggCatalogState->getCollections().isAnySecondaryNamespaceAViewOrNotFullyLocal());
+
+    ASSERT_TRUE(aggCatalogState->getUUID().has_value());
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogStateWithSecondaryShardedCollection) {
+    std::string_view main{"main"};
+    std::string_view secondaryColl{"secondaryColl"};
+
+    auto mainNss = createTestCollectionWithMetadata(main, false /*sharded*/);
+    auto secondaryNssColl = createTestCollectionWithMetadata(secondaryColl, true /*sharded*/);
+
+    // Add at least 1 shard version to the opCtx to simulate a router request. This is necessary
+    // to correctly set the isAnySecondaryNamespaceAViewOrNotFullyLocal.
+    ScopedSetShardRole setShardRole(
+        operationContext(), mainNss, ShardVersion::UNTRACKED(), getDbVersion());
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExStateWithSecondaryCollections(main, secondaryColl);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    // Verify main collection.
+    ASSERT_TRUE(aggCatalogState->getCollections().hasMainCollection());
+
+    // Verify secondary collections
+    {
+        const auto& secondaryAcq =
+            aggCatalogState->getCollections().getSecondaryCollectionAcquisitions();
+        ASSERT_EQ(1, secondaryAcq.size());
+        ASSERT_TRUE(secondaryAcq.contains(secondaryNssColl));
+    }
+
+    // Verify MultipleCollectionAccessor
+    ASSERT_TRUE(aggCatalogState->getCollections().isAnySecondaryNamespaceAViewOrNotFullyLocal());
+
+    ASSERT_TRUE(aggCatalogState->getUUID().has_value());
+
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kCollection);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogStateWithSecondaryView) {
+    std::string_view main{"main"};
+    std::string_view secondaryColl{"secondaryColl"};
+    std::string_view secondaryView{"secondaryView"};
+
+    auto mainNss = createTestCollectionWithMetadata(main, false /*sharded*/);
+    auto secondaryNssColl = createTestCollectionWithMetadata(secondaryColl, false /*sharded*/);
+    auto [secondaryNssView, _] = createTestViewWithMetadata(secondaryView, secondaryColl);
+
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExStateWithSecondaryCollections(main, secondaryView);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    // Verify main collection
+    ASSERT_TRUE(aggCatalogState->getCollections().hasMainCollection());
+    ASSERT_FALSE(aggCatalogState->getMainCollectionOrView().isView());
+
+    // Verify secondary collections
+    {
+        const auto& secondaryAcq =
+            aggCatalogState->getCollections().getSecondaryCollectionAcquisitions();
+        ASSERT_EQ(1, secondaryAcq.size());
+        ASSERT_TRUE(secondaryAcq.contains(secondaryNssView));
+    }
+
+    // Verify MultipleCollectionAccessor
+    ASSERT_TRUE(aggCatalogState->getCollections().isAnySecondaryNamespaceAViewOrNotFullyLocal());
+
+    ASSERT_TRUE(aggCatalogState->getUUID().has_value());
+
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kCollection);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogStateView) {
+    std::string_view coll{"coll"};
+    std::string_view view{"view"};
+    auto viewOn = createTestCollectionWithMetadata(coll, false /*sharded*/);
+    auto [viewNss, expectedPipeline] = createTestViewWithMetadata(view, coll);
+    std::unique_ptr<AggExState> aggExState = createDefaultAggExState(view);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->getMainCollectionOrView().isView());
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    boost::optional<AutoStatsTracker> tracker;
+    aggCatalogState->getStatsTrackerIfNeeded(tracker);
+    ASSERT_FALSE(tracker.has_value());
+
+    auto [collator, matchesDefault] = aggCatalogState->resolveCollator();
+    ASSERT_TRUE(CollatorInterface::isSimpleCollator(collator.get()));
+    ASSERT_EQ(matchesDefault, ExpressionContextCollationMatchesDefault::kYes);
+
+    // Check the resolved view correspond to the expected one
+    auto resolvedView = aggCatalogState->resolveView(operationContext(), viewNss, boost::none);
+    ASSERT_TRUE(resolvedView.isOK());
+    ASSERT_EQ(resolvedView.getValue().getResolvedNamespace(), viewOn);
+    std::vector<BSONObj> result = resolvedView.getValue().getBsonPipeline();
+    ASSERT_EQ(expectedPipeline.size(), result.size());
+    for (uint32_t i = 0; i < expectedPipeline.size(); i++) {
+        ASSERT(SimpleBSONObjComparator::kInstance.evaluate(expectedPipeline[i] == result[i]));
+    }
+
+    // It's a view so apparently there is no main collection, per se.
+    ASSERT_FALSE(aggCatalogState->getCollections().hasMainCollection());
+
+    ASSERT_FALSE(aggCatalogState->getUUID().has_value());
+
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kView);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogStateViewfulTimeseries) {
+    // TODO SERVER-111172: Remove this test once view-ful timeseries are removed and 9.0 is LTS.
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+    std::unique_ptr<AggExState> aggExState = createDefaultAggExState(timeseriesColl);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->getMainCollectionOrView().isView());
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    boost::optional<AutoStatsTracker> tracker;
+    aggCatalogState->getStatsTrackerIfNeeded(tracker);
+    ASSERT_FALSE(tracker.has_value());
+
+    auto [collator, matchesDefault] = aggCatalogState->resolveCollator();
+    ASSERT_TRUE(CollatorInterface::isSimpleCollator(collator.get()));
+    ASSERT_EQ(matchesDefault, ExpressionContextCollationMatchesDefault::kYes);
+
+    ASSERT_TRUE(aggCatalogState->isTimeseries());
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kTimeseries);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateDefaultAggCatalogStateViewlessTimeseries) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+    std::unique_ptr<AggExState> aggExState = createDefaultAggExState(timeseriesColl);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_FALSE(aggCatalogState->getMainCollectionOrView().isView());
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    boost::optional<AutoStatsTracker> tracker;
+    aggCatalogState->getStatsTrackerIfNeeded(tracker);
+    ASSERT_FALSE(tracker.has_value());
+
+    auto [collator, matchesDefault] = aggCatalogState->resolveCollator();
+    ASSERT_TRUE(CollatorInterface::isSimpleCollator(collator.get()));
+    ASSERT_EQ(matchesDefault, ExpressionContextCollationMatchesDefault::kYes);
+
+    ASSERT_TRUE(aggCatalogState->getCollections().hasMainCollection());
+
+    ASSERT_TRUE(aggCatalogState->getUUID().has_value());
+
+    ASSERT_TRUE(aggCatalogState->isTimeseries());
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kTimeseries);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest,
+       CheckViewfulTimeseriesCollWithRawDataIsNotConsideredTimeseries) {
+    // TODO SERVER-111172: Remove this test once view-ful timeseries are removed and 9.0 is LTS.
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExState(timeseriesColl, true /*rawData*/);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kCollection);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest,
+       CheckViewlessTimeseriesCollWithRawDataIsNotConsideredTimeseries) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExState(timeseriesColl, true /*rawData*/);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+    ASSERT_EQ(aggCatalogState->determineCollectionType(), query_shape::CollectionType::kCollection);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, UnshardedSecondaryViewfulTsNssRequiresExtendedRangeSupport) {
+    // TODO SERVER-111172: Remove this test once view-ful timeseries are removed and 9.0 is LTS.
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    // Extensions inside hybrid search are not supported with viewful timeseries (throws
+    // IFRFlagRetry). Disable the flag for this viewful-ts test.
+    unittest::ServerParameterGuard extensionsFlag("featureFlagExtensionsInsideHybridSearch", false);
+
+    std::string_view main{"coll"};
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTestCollectionWithMetadata(main, false /*sharded*/);
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, true /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createDefaultAggExStateWithSecondaryCollections(main, timeseriesColl);
+    auto aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_TRUE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, UnshardedSecondaryViewlessTsNssRequiresExtendedRangeSupport) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    std::string_view main{"coll"};
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTestCollectionWithMetadata(main, false /*sharded*/);
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, true /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createDefaultAggExStateWithSecondaryCollections(main, timeseriesColl);
+    auto aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_TRUE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, ShardedSecondaryViewfulTsNssRequiresExtendedRangeSupport) {
+    // TODO SERVER-111172: Remove this test once view-ful timeseries are removed and 9.0 is LTS.
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    // Extensions inside hybrid search are not supported with viewful timeseries (throws
+    // IFRFlagRetry). Disable the flag for this viewful-ts test.
+    unittest::ServerParameterGuard extensionsFlag("featureFlagExtensionsInsideHybridSearch", false);
+    std::string_view main{"coll"};
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTestCollectionWithMetadata(main, true /*sharded*/);
+    createTimeseriesCollection(
+        timeseriesColl, true /*sharded*/, true /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createDefaultAggExStateWithSecondaryCollections(main, timeseriesColl);
+    auto aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_TRUE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, ShardedSecondaryViewlessTsNssRequiresExtendedRangeSupport) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    std::string_view main{"coll"};
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTestCollectionWithMetadata(main, true /*sharded*/);
+    createTimeseriesCollection(
+        timeseriesColl, true /*sharded*/, true /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createDefaultAggExStateWithSecondaryCollections(main, timeseriesColl);
+    auto aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_TRUE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, SecondaryViewfulTsNssNoExtendedRangeSupport) {
+    // TODO SERVER-111172: Remove this test once view-ful timeseries are removed and 9.0 is LTS.
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    // Extensions inside hybrid search are not supported with viewful timeseries (throws
+    // IFRFlagRetry). Disable the flag for this viewful-ts test.
+    unittest::ServerParameterGuard extensionsFlag("featureFlagExtensionsInsideHybridSearch", false);
+    std::string_view main{"coll"};
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTestCollectionWithMetadata(main, false /*sharded*/);
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createDefaultAggExStateWithSecondaryCollections(main, timeseriesColl);
+    auto aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_FALSE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, SecondaryViewlessTsNssNoExtendedRangeSupport) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    std::string_view main{"coll"};
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTestCollectionWithMetadata(main, false /*sharded*/);
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createDefaultAggExStateWithSecondaryCollections(main, timeseriesColl);
+    auto aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_FALSE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, ViewOnViewfulTsUsingExtendRangeAsSecondaryColl) {
+    // In this test we validate a specific case where we:
+    // - Have a view on top of viewful ts collection
+    // - Running as the secondary collection (i.e. running inside $lookup/$unionWith)
+    // - That has extended range data
+    // and confirm that AggCatalogState reports that the aggregation uses extended range data.
+    //
+    // TODO SERVER-111172: Remove this test once view-ful timeseries are removed and 9.0 is LTS.
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    // Extensions inside hybrid search are not supported with viewful timeseries (throws
+    // IFRFlagRetry). Disable the flag for this viewful-ts test.
+    unittest::ServerParameterGuard extensionsFlag("featureFlagExtensionsInsideHybridSearch", false);
+
+    std::string_view main{"main"};
+    auto mainNss = createTestCollectionWithMetadata(main, false /*sharded*/);
+
+    std::string_view timeseriesColl{"timeseries"};
+    auto secondaryTsNss = createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, true /*requiresExtendedRangeSupport*/);
+
+    std::string_view viewOnTs{"view_on_ts"};
+    auto [secondaryTsViewNss, _] = createTestViewWithMetadata(viewOnTs, timeseriesColl);
+
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExStateWithSecondaryCollections(main, viewOnTs);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_TRUE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, ViewOnViewlessTsUsingExtendRangeAsSecondaryColl) {
+    // In this test we validate a specific case where we:
+    // - Have a view on top of viewless ts collection
+    // - Running as the secondary collection (i.e. running inside $lookup/$unionWith)
+    // - That has extended range data
+    // and confirm that AggCatalogState reports that the aggregation uses extended range data.
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    std::string_view main{"main"};
+    auto mainNss = createTestCollectionWithMetadata(main, false /*sharded*/);
+
+    std::string_view timeseriesColl{"timeseries"};
+    auto secondaryTsNss = createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, true /*requiresExtendedRangeSupport*/);
+
+    std::string_view viewOnTs{"view_on_ts"};
+    auto [secondaryTsViewNss, _] = createTestViewWithMetadata(viewOnTs, timeseriesColl);
+
+    std::unique_ptr<AggExState> aggExState =
+        createDefaultAggExStateWithSecondaryCollections(main, viewOnTs);
+
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_FALSE(aggCatalogState->isTimeseries());
+
+    auto expCtx = aggCatalogState->createExpressionContext();
+
+    ASSERT_TRUE(expCtx->getRequiresTimeseriesExtendedRangeSupport());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateOplogAggCatalogState) {
+    std::string_view coll{"coll"};
+    createTestCollectionWithMetadata(coll, false /*sharded*/);
+    std::unique_ptr<AggExState> aggExState = createOplogAggExState(coll);
+    std::unique_ptr<AggCatalogState> aggCatalogState = aggExState->createAggCatalogState();
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->validate());
+
+    ASSERT_TRUE(aggCatalogState->lockAcquired());
+
+    boost::optional<AutoStatsTracker> tracker;
+    aggCatalogState->getStatsTrackerIfNeeded(tracker);
+    ASSERT_FALSE(tracker.has_value());
+
+    auto [collator, matchesDefault] = aggCatalogState->resolveCollator();
+    ASSERT_TRUE(CollatorInterface::isSimpleCollator(collator.get()));
+    ASSERT_EQ(matchesDefault, ExpressionContextCollationMatchesDefault::kYes);
+
+    ASSERT_TRUE(aggCatalogState->getCollections().hasMainCollection());
+
+    // UUIDs are not used for change stream queries.
+    ASSERT_FALSE(aggCatalogState->getUUID().has_value());
+
+    ASSERT_EQ(aggCatalogState->determineCollectionType(),
+              query_shape::CollectionType::kChangeStream);
+
+    ASSERT_DOES_NOT_THROW(aggCatalogState->relinquishResources());
+}
+
+TEST_F(AggregationExecutionStateTest, CreateOplogAggCatalogStateFailsOnView) {
+    std::string_view coll{"coll"};
+    std::string_view view{"view"};
+    createTestCollectionWithMetadata(coll, false /*sharded*/);
+    createTestViewWithMetadata(view, coll);
+
+    std::unique_ptr<AggExState> aggExState = createOplogAggExState(view);
+
+    // This will call the validate() method which will fail because you cannot open a change
+    // stream on a view.
+    ASSERT_THROWS_CODE(
+        aggExState->createAggCatalogState(), DBException, ErrorCodes::CommandNotSupportedOnView);
+}
+
+TEST_F(AggregationExecutionStateTest,
+       CreateOplogAggCatalogStateFailsOnViewfulTimeseriesCollection) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    std::string_view timeseriesColl{"timeseries"};
+
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    std::unique_ptr<AggExState> aggExState = createOplogAggExState(timeseriesColl);
+
+    // This will call the validate() method which will fail because you cannot open a change
+    // stream on a timeseries collection.
+    ASSERT_THROWS_CODE(
+        aggExState->createAggCatalogState(), DBException, ErrorCodes::CommandNotSupportedOnView);
+}
+
+TEST_F(AggregationExecutionStateTest,
+       Given_OplogAggCatalogStateWithViewlessTimeseriesColl_Then_IsTimeseries) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    auto aggExState = createOplogAggExState(timeseriesColl, true /*rawData*/);
+    auto state = aggExState->createAggCatalogState();
+    ASSERT_TRUE(state->isTimeseries());
+}
+
+TEST_F(
+    AggregationExecutionStateTest,
+    Given_OplogAggCatalogStateWithViewTimeseriesColl_When_CallingValidate_Then_ExceptionIsThrown) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+
+    {
+        auto aggExState = createOplogAggExState(timeseriesColl, false /*rawData*/);
+
+        // Do not allow opening a change stream on a timeseries collection.
+        ASSERT_THROWS_CODE(aggExState->createAggCatalogState(),
+                           DBException,
+                           ErrorCodes::CommandNotSupportedOnView);
+    }
+
+    {
+        auto aggExState = createOplogAggExState(timeseriesColl, true /*rawData*/);
+
+        // Do not allow opening a change stream on a timeseries collection.
+        ASSERT_THROWS_CODE(aggExState->createAggCatalogState(),
+                           DBException,
+                           ErrorCodes::CommandNotSupportedOnView);
+    }
+}
+
+TEST_F(
+    AggregationExecutionStateTest,
+    Given_OplogAggCatalogStateWithViewlessTimeseriesCollAndNoRawData_When_CallingValidate_Then_ExceptionIsThrown) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+    auto aggExState = createOplogAggExState(timeseriesColl, false /*rawData*/);
+
+    // Do not allow opening a change stream on a timeseries collection.
+    ASSERT_THROWS_CODE(
+        aggExState->createAggCatalogState(), DBException, ErrorCodes::CommandNotSupported);
+}
+
+TEST_F(
+    AggregationExecutionStateTest,
+    Given_OplogAggCatalogStateWithViewlessTimeseriesCollAndRawData_When_CallingValidate_Then_NoExceptionIsThrown) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+
+    std::string_view timeseriesColl{"timeseries"};
+    createTimeseriesCollection(
+        timeseriesColl, false /*sharded*/, false /*requiresExtendedRangeSupport*/);
+    auto aggExState = createOplogAggExState(timeseriesColl, true /*rawData*/);
+
+    // Do allow opening a change stream on a timeseries collection if rawData is set to true.
+    ASSERT_DOES_NOT_THROW(aggExState->createAggCatalogState());
+}
+
+}  // namespace
+}  // namespace mongo

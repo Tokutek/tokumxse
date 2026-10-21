@@ -1,0 +1,482 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/resolved_namespace.h"
+
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/owned_lite_parsed_pipeline.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+
+namespace mongo {
+
+MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(ResolvedNamespace);
+
+namespace {
+
+using namespace std::literals::string_view_literals;
+
+constexpr auto kAdditionalResolvedNamespacesFieldName = "additionalResolvedNamespaces"sv;
+constexpr auto kIsSentinelPrimaryFieldName = "isSentinelPrimary"sv;
+
+void appendAdditionalResolvedNamespaceEntry(BSONObjBuilder* entry, const ResolvedNamespace& rn) {
+    entry->append("ns", rn.getResolvedNamespace().toStringForErrorMsg());
+    if (rn.getNamespace() != rn.getResolvedNamespace()) {
+        entry->append("userNs", rn.getNamespace().toStringForErrorMsg());
+    }
+    entry->append("pipeline", rn.getBsonPipeline());
+    if (auto tsMeta = rn.getTimeseriesViewMetadata()) {
+        tsMeta->serialize(entry);
+    }
+    if (!rn.getDefaultCollation().isEmpty()) {
+        entry->append("collation", rn.getDefaultCollation());
+    }
+}
+
+void appendAdditionalResolvedNamespaces(BSONObjBuilder* builder,
+                                        const std::vector<ResolvedNamespace>& additional) {
+    if (additional.empty()) {
+        return;
+    }
+    BSONArrayBuilder arr(builder->subarrayStart(kAdditionalResolvedNamespacesFieldName));
+    for (const auto& rn : additional) {
+        BSONObjBuilder entry(arr.subobjStart());
+        appendAdditionalResolvedNamespaceEntry(&entry, rn);
+        entry.doneFast();
+    }
+    arr.doneFast();
+}
+
+std::vector<ResolvedNamespace> parseAdditionalResolvedNamespaces(const BSONObj& obj) {
+    std::vector<ResolvedNamespace> additional;
+    auto elem = obj[kAdditionalResolvedNamespacesFieldName];
+    if (!elem || elem.type() != BSONType::array) {
+        return additional;
+    }
+    for (const auto& entryElem : elem.Array()) {
+        uassert(12451401,
+                "additionalResolvedNamespaces entries must be objects",
+                entryElem.type() == BSONType::object);
+        additional.push_back(ResolvedNamespace::parseFromBSON(entryElem));
+    }
+    return additional;
+}
+}  // namespace
+
+void ResolvedNamespace::setViewPipelineDesugarer(ViewPipelineDesugarer fn) {
+    _viewPipelineDesugarer = std::move(fn);
+}
+
+const ResolvedNamespaceViewOptions kSimpleViewOptions = ResolvedNamespaceViewOptions{
+    .involvedNamespaceIsAView = true,
+};
+
+namespace {
+// Deep-copy any unowned stages so the pipeline outlives the view-catalog entry it was built from.
+std::vector<BSONObj> makeOwnedPipeline(std::vector<BSONObj> pipeline) {
+    for (auto& stage : pipeline) {
+        if (!stage.isOwned()) {
+            stage = stage.getOwned();
+        }
+    }
+    return pipeline;
+}
+}  // namespace
+
+ResolvedNamespace::ResolvedNamespace() = default;
+
+ResolvedNamespace::ResolvedNamespace(NamespaceString ns_,
+                                     std::vector<BSONObj> pipeline_,
+                                     boost::optional<UUID> collUUID_,
+                                     bool involvedNamespaceIsAView_)
+    : _resolvedNss(ns_),
+      _pipeline(makeOwnedPipeline(std::move(pipeline_))),
+      _uuid(collUUID_),
+      _involvedNamespaceIsAView(involvedNamespaceIsAView_),
+      _userNss(ns_) {}
+
+ResolvedNamespace::ResolvedNamespace(NamespaceString userNss,
+                                     NamespaceString resolvedNss,
+                                     std::vector<BSONObj> pipeline_,
+                                     BSONObj defaultCollation,
+                                     ResolvedNamespaceViewOptions metadata)
+    : _resolvedNss(std::move(resolvedNss)),
+      _pipeline(makeOwnedPipeline(std::move(pipeline_))),
+      _uuid(metadata.collUUID),
+      _involvedNamespaceIsAView(metadata.involvedNamespaceIsAView),
+      _userNss(std::move(userNss)),
+      _defaultCollation(defaultCollation.getOwned()),
+      _timeseriesMetadata(metadata.timeseriesMetadata),
+      _lpOptions(std::move(metadata.options)) {
+    if (metadata.validateIsNotViewlessTimeseries) {
+        // If we reach here with a timeseries query, it will be because we're working with a
+        // view-based timeseries collection. Viewless timeseries collections should be defined
+        // already and should not trigger this kickback at all.
+        //
+        // TODO(SERVER-100862): This check should be removed once the isNewTimeseriesWithoutView
+        // parameter has been removed.
+        tassert(
+            9950300,
+            fmt::format(
+                "Should not be performing view resolution on viewless timeseries collection: {}",
+                _resolvedNss.toStringForErrorMsg()),
+            !metadata.isViewlessTimeseries);
+    }
+
+    if (metadata.shouldParseLpp && _involvedNamespaceIsAView) {
+        liteParseViewPipeline();
+    }
+}
+
+ResolvedNamespace ResolvedNamespace::makeForView(NamespaceString viewName,
+                                                 NamespaceString resolvedNss,
+                                                 std::vector<BSONObj> viewPipeBson) {
+    return makeForView(
+        std::move(viewName), std::move(resolvedNss), std::move(viewPipeBson), LiteParserOptions{});
+}
+
+ResolvedNamespace ResolvedNamespace::makeForView(NamespaceString viewName,
+                                                 NamespaceString resolvedNss,
+                                                 std::vector<BSONObj> viewPipeBson,
+                                                 const LiteParserOptions& options) {
+    return ResolvedNamespace{
+        std::move(viewName),
+        std::move(resolvedNss),
+        std::move(viewPipeBson),
+        BSONObj(),
+        ResolvedNamespaceViewOptions{.options = std::make_shared<LiteParserOptions>(options),
+                                     .shouldParseLpp = true}};
+}
+
+// Copy constructor. Should be used carefully when _parsedPipeline is set to avoid unnecessary
+// clones.
+ResolvedNamespace::ResolvedNamespace(const ResolvedNamespace& other)
+    : _resolvedNss(other._resolvedNss),
+      _pipeline(other._pipeline),
+      _uuid(other._uuid),
+      _involvedNamespaceIsAView(other._involvedNamespaceIsAView),
+      _userNss(other._userNss),
+      _defaultCollation(other._defaultCollation),
+      _timeseriesMetadata(other._timeseriesMetadata),
+      _lpOptions(other._lpOptions),
+      _additionalResolvedNamespaces(other._additionalResolvedNamespaces),
+      _hasSentinelPrimary(other._hasSentinelPrimary) {
+    if (other._parsedPipeline) {
+        _parsedPipeline = std::make_unique<OwnedLiteParsedPipeline>(*other._parsedPipeline);
+    }
+}
+
+// Copy constructor. Should be used carefully when _parsedPipeline is set to avoid unnecessary
+// clones.
+ResolvedNamespace& ResolvedNamespace::operator=(const ResolvedNamespace& other) {
+    if (this == &other)
+        return *this;
+    _resolvedNss = other._resolvedNss;
+    _pipeline = other._pipeline;
+    _uuid = other._uuid;
+    _involvedNamespaceIsAView = other._involvedNamespaceIsAView;
+    _userNss = other._userNss;
+    _defaultCollation = other._defaultCollation;
+    _timeseriesMetadata = other._timeseriesMetadata;
+    _lpOptions = other._lpOptions;
+    _additionalResolvedNamespaces = other._additionalResolvedNamespaces;
+    _hasSentinelPrimary = other._hasSentinelPrimary;
+    if (other._parsedPipeline) {
+        _parsedPipeline = std::make_unique<OwnedLiteParsedPipeline>(*other._parsedPipeline);
+    } else {
+        _parsedPipeline = nullptr;
+    }
+    return *this;
+}
+
+ResolvedNamespace::ResolvedNamespace(ResolvedNamespace&& other) noexcept
+    : _resolvedNss(std::move(other._resolvedNss)),
+      _pipeline(std::move(other._pipeline)),
+      _uuid(std::move(other._uuid)),
+      _involvedNamespaceIsAView(other._involvedNamespaceIsAView),
+      _userNss(std::move(other._userNss)),
+      _defaultCollation(std::move(other._defaultCollation)),
+      _timeseriesMetadata(std::move(other._timeseriesMetadata)),
+      _lpOptions(std::move(other._lpOptions)),
+      _parsedPipeline(std::move(other._parsedPipeline)),
+      _additionalResolvedNamespaces(std::move(other._additionalResolvedNamespaces)),
+      _hasSentinelPrimary(other._hasSentinelPrimary) {}
+
+ResolvedNamespace& ResolvedNamespace::operator=(ResolvedNamespace&& other) noexcept {
+    if (this == &other)
+        return *this;
+    _resolvedNss = std::move(other._resolvedNss);
+    _pipeline = std::move(other._pipeline);
+    _uuid = std::move(other._uuid);
+    _involvedNamespaceIsAView = other._involvedNamespaceIsAView;
+    _userNss = std::move(other._userNss);
+    _defaultCollation = std::move(other._defaultCollation);
+    _timeseriesMetadata = std::move(other._timeseriesMetadata);
+    _lpOptions = std::move(other._lpOptions);
+    _parsedPipeline = std::move(other._parsedPipeline);
+    _additionalResolvedNamespaces = std::move(other._additionalResolvedNamespaces);
+    _hasSentinelPrimary = other._hasSentinelPrimary;
+    return *this;
+}
+
+ResolvedNamespace::~ResolvedNamespace() = default;
+
+const NamespaceString& ResolvedNamespace::getNamespace() const {
+    return _userNss;
+}
+
+const NamespaceString& ResolvedNamespace::getResolvedNamespace() const {
+    return _resolvedNss;
+}
+
+const std::vector<BSONObj>& ResolvedNamespace::getBsonPipeline() const {
+    return _pipeline;
+}
+
+const boost::optional<UUID>& ResolvedNamespace::getCollUUID() const {
+    return _uuid;
+}
+
+bool ResolvedNamespace::isInvolvedNamespaceAView() const {
+    return _involvedNamespaceIsAView;
+}
+
+const BSONObj& ResolvedNamespace::getDefaultCollation() const {
+    return _defaultCollation;
+}
+
+bool ResolvedNamespace::isTimeseries() const {
+    return _timeseriesMetadata.has_value() && _timeseriesMetadata->options.has_value();
+}
+
+boost::optional<TimeseriesViewMetadata> ResolvedNamespace::getTimeseriesViewMetadata() const {
+    return _timeseriesMetadata;
+}
+
+void ResolvedNamespace::liteParseViewPipeline() {
+    LiteParserOptions optsToUse = _lpOptions ? *_lpOptions : LiteParserOptions();
+    _parsedPipeline = std::make_unique<OwnedLiteParsedPipeline>(_resolvedNss, _pipeline, optsToUse);
+}
+
+void ResolvedNamespace::desugarViewPipeline() {
+    // _viewPipelineDesugarer is registered at startup by lite_parsed_desugarer.cpp. See the
+    // ViewPipelineDesugarer typedef comment in resolved_namespace.h for why this is a callback.
+    if (_parsedPipeline && _viewPipelineDesugarer) {
+        auto ifrContext = _lpOptions ? _lpOptions->ifrContext : nullptr;
+        _viewPipelineDesugarer(&_parsedPipeline->pipeline(), std::move(ifrContext));
+    }
+}
+
+LiteParsedPipeline ResolvedNamespace::desugarAndCloneViewPipeline() const {
+    tassert(11506601,
+            "ResolvedNamespace must be parsed before calling `desugarAndCloneViewPipeline()`",
+            _parsedPipeline);
+    auto out = _parsedPipeline->pipeline().clone();
+    out.makeOwned();
+    if (_viewPipelineDesugarer) {
+        auto ifrContext = _lpOptions ? _lpOptions->ifrContext : nullptr;
+        _viewPipelineDesugarer(&out, std::move(ifrContext));
+    }
+    return out;
+}
+
+OwnedLiteParsedPipeline* ResolvedNamespace::getMutableParsedPipeline() {
+    return _parsedPipeline.get();
+}
+
+const LiteParsedPipeline* ResolvedNamespace::getParsedPipeline() const {
+    return _parsedPipeline ? &_parsedPipeline->pipeline() : nullptr;
+}
+
+LiteParsedPipeline ResolvedNamespace::getViewPipeline() const {
+    tassert(11506600,
+            "ResolvedNamespace must be parsed before calling `getViewPipeline()`",
+            _parsedPipeline);
+
+    // clone() produces stages that reference _ownedStages buffers inside _parsedPipeline.
+    // makeOwned() makes each stage own its buffer independently so the returned pipeline outlives
+    // this ResolvedNamespace.
+    auto out = _parsedPipeline->pipeline().clone();
+    out.makeOwned();
+    return out;
+}
+
+std::vector<BSONObj> ResolvedNamespace::getOriginalBson() const {
+    return _pipeline;
+}
+
+std::vector<BSONObj> ResolvedNamespace::getSerializedViewPipeline() const {
+    tassert(11898700,
+            "A ResolvedNamespace must have a parsed view pipeline to get desugared BSON.",
+            _parsedPipeline);
+
+    std::vector<BSONObj> result;
+    result.reserve(_parsedPipeline->pipeline().getStages().size());
+    for (const auto& stage : _parsedPipeline->pipeline().getStages()) {
+        result.push_back(stage->getOriginalBson().wrap());
+    }
+    return result;
+}
+
+ResolvedNamespace ResolvedNamespace::clone() const {
+    return ResolvedNamespace(*this);
+}
+
+ResolvedNamespace ResolvedNamespace::fromBSON(const BSONObj& commandResponseObj) {
+    uassert(40248,
+            "command response expected to have a 'resolvedView' field",
+            commandResponseObj.hasField("resolvedView"));
+
+    auto viewDef = commandResponseObj.getObjectField("resolvedView");
+    uassert(40249, "resolvedView must be an object", !viewDef.isEmpty());
+
+    uassert(40250,
+            "View definition must have 'ns' field of type string",
+            viewDef.hasField("ns") && viewDef.getField("ns").type() == BSONType::string);
+
+    uassert(40251,
+            "View definition must have 'pipeline' field of type array",
+            viewDef.hasField("pipeline") && viewDef.getField("pipeline").type() == BSONType::array);
+
+    std::vector<BSONObj> pipeline;
+    for (auto&& item : viewDef["pipeline"].Obj()) {
+        pipeline.push_back(item.Obj().getOwned());
+    }
+
+    BSONObj collationSpec;
+    if (auto collationElt = viewDef["collation"]) {
+        uassert(40639,
+                "View definition 'collation' field must be an object",
+                collationElt.type() == BSONType::object);
+        collationSpec = collationElt.embeddedObject().getOwned();
+    }
+
+    boost::optional<TimeseriesOptions> timeseriesOptions = boost::none;
+    if (auto tsOptionsElt = viewDef[TimeseriesViewMetadata::kTimeseriesOptions]) {
+        if (tsOptionsElt.isABSONObj()) {
+            timeseriesOptions = TimeseriesOptions::parse(
+                tsOptionsElt.Obj(), IDLParserContext{"ResolvedNamespace::fromBSON"});
+        }
+    }
+
+    boost::optional<bool> mixedSchema = boost::none;
+    if (auto mixedSchemaElem = viewDef[TimeseriesViewMetadata::kTimeseriesMayContainMixedData]) {
+        uassert(6067204,
+                str::stream() << "view definition must have "
+                              << TimeseriesViewMetadata::kTimeseriesMayContainMixedData
+                              << " of type bool or no such field",
+                mixedSchemaElem.type() == BSONType::boolean);
+
+        mixedSchema = boost::optional<bool>(mixedSchemaElem.boolean());
+    }
+
+    boost::optional<bool> usesExtendedRange = boost::none;
+    if (auto usesExtendedRangeElem =
+            viewDef[TimeseriesViewMetadata::kTimeseriesUsesExtendedRange]) {
+        uassert(6646910,
+                str::stream() << "view definition must have "
+                              << TimeseriesViewMetadata::kTimeseriesUsesExtendedRange
+                              << " of type bool or no such field",
+                usesExtendedRangeElem.type() == BSONType::boolean);
+
+        usesExtendedRange = boost::optional<bool>(usesExtendedRangeElem.boolean());
+    }
+
+    boost::optional<bool> fixedBuckets = boost::none;
+    if (auto fixedBucketsElem = viewDef[TimeseriesViewMetadata::kTimeseriesfixedBuckets]) {
+        uassert(7823304,
+                str::stream() << "view definition must have "
+                              << TimeseriesViewMetadata::kTimeseriesfixedBuckets
+                              << " of type bool or no such field",
+                fixedBucketsElem.type() == BSONType::boolean);
+
+        fixedBuckets = boost::optional<bool>(fixedBucketsElem.boolean());
+    }
+
+    TimeseriesViewMetadata tsMetadata{.options = std::move(timeseriesOptions),
+                                      .mayContainMixedData = std::move(mixedSchema),
+                                      .usesExtendedRange = std::move(usesExtendedRange),
+                                      .fixedBuckets = std::move(fixedBuckets)};
+
+    ResolvedNamespaceViewOptions options;
+    options.validateIsNotViewlessTimeseries = true;
+    options.timeseriesMetadata = std::move(tsMetadata);
+
+    NamespaceString resolvedNss =
+        NamespaceStringUtil::deserializeForErrorMsg(viewDef["ns"].valueStringData());
+    NamespaceString userNss = [&] {
+        // Try to parse `userNs` out of BSON spec. If not provided, fallback to `resolvedNss`.
+        if (auto userNsElt = viewDef["userNs"]; userNsElt && userNsElt.type() == BSONType::string) {
+            return NamespaceStringUtil::deserializeForErrorMsg(userNsElt.valueStringData());
+        }
+        return resolvedNss;
+    }();
+
+    ResolvedNamespace rn{std::move(userNss),
+                         std::move(resolvedNss),
+                         std::move(pipeline),
+                         std::move(collationSpec),
+                         options};
+    rn._additionalResolvedNamespaces = parseAdditionalResolvedNamespaces(viewDef);
+    if (auto sentinelElem = viewDef[kIsSentinelPrimaryFieldName];
+        sentinelElem && sentinelElem.type() == BSONType::boolean && sentinelElem.boolean()) {
+        rn._hasSentinelPrimary = true;
+    }
+    return rn;
+}
+
+void TimeseriesViewMetadata::serialize(BSONObjBuilder* subObjBuilder) const {
+    if (options) {
+        BSONObjBuilder tsObj(subObjBuilder->subobjStart(kTimeseriesOptions));
+        options->serialize(&tsObj);
+    }
+    // Only serialize if it doesn't contain mixed data.
+    if ((mayContainMixedData && !(*mayContainMixedData)))
+        subObjBuilder->append(kTimeseriesMayContainMixedData, *mayContainMixedData);
+
+    if ((usesExtendedRange && (*usesExtendedRange)))
+        subObjBuilder->append(kTimeseriesUsesExtendedRange, *usesExtendedRange);
+
+    if ((fixedBuckets && (*fixedBuckets)))
+        subObjBuilder->append(kTimeseriesfixedBuckets, *fixedBuckets);
+}
+
+
+void ResolvedNamespace::serialize(BSONObjBuilder* builder) const {
+    BSONObjBuilder subObj(builder->subobjStart("resolvedView"));
+    subObj.append("ns", _resolvedNss.toStringForErrorMsg());
+    if (_userNss != _resolvedNss) {
+        subObj.append("userNs", _userNss.toStringForErrorMsg());
+    }
+    subObj.append("pipeline", _pipeline);
+    if (_timeseriesMetadata.has_value()) {
+        _timeseriesMetadata->serialize(&subObj);
+    }
+    if (!_defaultCollation.isEmpty()) {
+        subObj.append("collation", _defaultCollation);
+    }
+    appendAdditionalResolvedNamespaces(&subObj, _additionalResolvedNamespaces);
+    if (_hasSentinelPrimary) {
+        subObj.append(kIsSentinelPrimaryFieldName, true);
+    }
+}
+
+std::shared_ptr<const ErrorExtraInfo> ResolvedNamespace::parse(const BSONObj& cmdReply) {
+    return std::make_shared<ResolvedNamespace>(fromBSON(cmdReply));
+}
+
+ResolvedNamespace ResolvedNamespace::parseFromBSON(const BSONElement& elem) {
+    uassert(936370, "resolvedView must be an object", elem.type() == BSONType::object);
+    BSONObjBuilder localBuilder;
+    localBuilder.append("resolvedView", elem.Obj());
+    return fromBSON(localBuilder.done());
+}
+
+void ResolvedNamespace::serializeToBSON(std::string_view fieldName, BSONObjBuilder* builder) const {
+    serialize(builder);
+}
+
+}  // namespace mongo

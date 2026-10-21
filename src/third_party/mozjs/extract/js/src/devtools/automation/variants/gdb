@@ -1,0 +1,16 @@
+{
+    "configure-args": "--enable-rust-simd",
+    "debug": true,
+    "optimize": false,
+    "compiler": "gcc",
+    "skip-tests": {
+        "all": ["jstests", "jittest", "jsapitests"]
+    },
+    "extra-tests": {
+        "all": ["gdb"]
+    },
+    "extra-args": {
+        "gdb": ["--exclude=unwind"]
+    },
+    "use_minidump": false
+}

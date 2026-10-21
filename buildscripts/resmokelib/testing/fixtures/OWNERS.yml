@@ -1,0 +1,8 @@
+version: 1.0.0
+filters:
+  - "replicaset.py":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "mongot.py":
+    approvers:
+      - 10gen/query-integration-search

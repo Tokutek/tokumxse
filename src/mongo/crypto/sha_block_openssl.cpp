@@ -1,0 +1,298 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/config.h"     // IWYU pragma: keep
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/crypto/sha512_block.h"
+#include "mongo/util/assert_util.h"
+
+#include <algorithm>
+#include <initializer_list>
+#include <memory>
+
+#ifndef MONGO_CONFIG_SSL
+#error This file should only be included in SSL-enabled builds
+#endif
+
+#include <cstdint>
+#include <cstring>
+
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/opensslv.h>
+#include <openssl/ossl_typ.h>
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || \
+    (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
+namespace {
+// Copies of OpenSSL after 1.1.0 define new EVP digest routines. We must
+// polyfill used definitions to interact with older OpenSSL versions.
+EVP_MD_CTX* EVP_MD_CTX_new() {
+    void* ret = OPENSSL_malloc(sizeof(EVP_MD_CTX));
+
+    if (ret != NULL) {
+        memset(ret, 0, sizeof(EVP_MD_CTX));
+    }
+    return static_cast<EVP_MD_CTX*>(ret);
+}
+
+void EVP_MD_CTX_free(EVP_MD_CTX* ctx) {
+    EVP_MD_CTX_cleanup(ctx);
+    OPENSSL_free(ctx);
+}
+
+HMAC_CTX* HMAC_CTX_new() {
+    void* ctx = OPENSSL_malloc(sizeof(HMAC_CTX));
+
+    if (ctx != NULL) {
+        memset(ctx, 0, sizeof(HMAC_CTX));
+    }
+    return static_cast<HMAC_CTX*>(ctx);
+}
+
+void HMAC_CTX_free(HMAC_CTX* ctx) {
+    HMAC_CTX_cleanup(ctx);
+    OPENSSL_free(ctx);
+}
+
+}  // namespace
+#endif
+
+namespace mongo {
+
+namespace {
+
+std::string getOpenSSLErrorString() {
+    constexpr size_t kMsgLen = 256;
+    char msg[kMsgLen];
+    ERR_error_string_n(ERR_get_error(), msg, kMsgLen);
+    return msg;
+}
+
+/**
+ * Class to load singleton instances of each SHA algorithm.
+ */
+#if OPENSSL_VERSION_NUMBER > 0x30000000L
+class OpenSSLHashLoader {
+public:
+    OpenSSLHashLoader() {
+        _algoSHA1 = EVP_MD_fetch(NULL, "SHA1", NULL);
+        _algoSHA256 = EVP_MD_fetch(NULL, "SHA2-256", NULL);
+        _algoSHA512 = EVP_MD_fetch(NULL, "SHA2-512", NULL);
+        // Use SHA-256 as the litmus test for a functional OpenSSL environment. SHA-1 may
+        // legitimately be unavailable under FIPS 140-3 where it is not approved for general
+        // hashing. If SHA-256 fails to load, it likely indicates a missing FIPS provider.
+        fassert(11319400,
+                Status(_algoSHA256 ? ErrorCodes::OK : ErrorCodes::InternalError,
+                       _algoSHA256 ? ""
+                                   : "Failed to fetch OpenSSL SHA2-256 hash algorithm: " +
+                               getOpenSSLErrorString() +
+                               ". This may be caused by running in an environment where "
+                               "FIPS mode is enforced (e.g. via system crypto policy or "
+                               "kernel FIPS flag) but the OpenSSL library in use does not "
+                               "have a FIPS provider installed. Ensure OpenSSL is built "
+                               "with FIPS support and the FIPS provider module is "
+                               "available."));
+    }
+
+    ~OpenSSLHashLoader() {
+        EVP_MD_free(_algoSHA1);
+        EVP_MD_free(_algoSHA256);
+        EVP_MD_free(_algoSHA512);
+    }
+
+    const EVP_MD* getSHA512() {
+        return _algoSHA512;
+    }
+
+    const EVP_MD* getSHA256() {
+        return _algoSHA256;
+    }
+
+    const EVP_MD* getSHA1() {
+        return _algoSHA1;
+    }
+
+private:
+    EVP_MD* _algoSHA512;
+    EVP_MD* _algoSHA256;
+    EVP_MD* _algoSHA1;
+};
+#else
+
+class OpenSSLHashLoader {
+public:
+    const EVP_MD* getSHA512() {
+        return EVP_sha512();
+    }
+
+    const EVP_MD* getSHA256() {
+        return EVP_sha256();
+    }
+
+    const EVP_MD* getSHA1() {
+        return EVP_sha1();
+    }
+};
+#endif
+
+static OpenSSLHashLoader& getOpenSSLHashLoader() {
+    static OpenSSLHashLoader* loader = new OpenSSLHashLoader();
+    return *loader;
+}
+
+// Eagerly initialize the OpenSSLHashLoader during startup, before SSLManager loads TLS
+// certificates. This ensures that if SHA2-256 is unavailable (e.g. a FIPS-only OpenSSL
+// config without the FIPS module installed), fassert 11319400 fires with a clear diagnostic
+// message rather than a confusing "decode error" from PEM certificate loading.
+MONGO_INITIALIZER_GENERAL(OpenSSLHashCheck, ("default"), ())
+(InitializerContext*) {
+    getOpenSSLHashLoader();
+}
+
+/*
+ * Computes a SHA hash of 'input'.
+ */
+template <typename HashType>
+void computeHashImpl(const EVP_MD* md,
+                     std::initializer_list<ConstDataRange> input,
+                     HashType* const output) {
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digestCtx(EVP_MD_CTX_new(),
+                                                                      EVP_MD_CTX_free);
+
+    fassert(40379,
+            EVP_DigestInit_ex(digestCtx.get(), md, nullptr) == 1 &&
+                std::all_of(begin(input),
+                            end(input),
+                            [&](const auto& i) {
+                                return EVP_DigestUpdate(digestCtx.get(), i.data(), i.length()) == 1;
+                            }) &&
+                EVP_DigestFinal_ex(digestCtx.get(), output->data(), nullptr) == 1);
+}
+
+template <typename HashType>
+void computeHashImplWithCtx(HashContext* digestCtx,
+                            const EVP_MD* md,
+                            std::initializer_list<ConstDataRange> input,
+                            HashType* const output) {
+    auto ctx = digestCtx->get();
+    fassert(12926900,
+            EVP_DigestInit_ex(ctx, md, nullptr) == 1 &&
+                std::all_of(begin(input),
+                            end(input),
+                            [&](const auto& i) {
+                                return EVP_DigestUpdate(ctx, i.data(), i.length()) == 1;
+                            }) &&
+                EVP_DigestFinal_ex(ctx, output->data(), nullptr) == 1);
+}
+
+template <typename HashType>
+void computeHmacImplWithCtx(HmacContext* digestCtx,
+                            const EVP_MD* md,
+                            const uint8_t* key,
+                            size_t keyLen,
+                            std::initializer_list<ConstDataRange> input,
+                            HashType* const output) {
+    auto ctx = digestCtx->get();
+    fassert(40380,
+            digestCtx->hmacCtxInitFn(md, key, keyLen) == 1 &&
+                std::all_of(begin(input),
+                            end(input),
+                            [&](const auto& i) {
+                                return HMAC_Update(ctx,
+                                                   reinterpret_cast<const unsigned char*>(i.data()),
+                                                   i.length()) == 1;
+                            }) &&
+                HMAC_Final(ctx, output->data(), nullptr) == 1);
+}
+
+template <typename HashType>
+void computeHmacImpl(const EVP_MD* md,
+                     const uint8_t* key,
+                     size_t keyLen,
+                     std::initializer_list<ConstDataRange> input,
+                     HashType* const output) {
+    HmacContext hmacCtx;
+    computeHmacImplWithCtx<HashType>(&hmacCtx, md, key, keyLen, input, output);
+}
+
+}  // namespace
+
+void SHA1BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                  HashType* const output) {
+    computeHashImpl<SHA1BlockTraits::HashType>(getOpenSSLHashLoader().getSHA1(), input, output);
+}
+
+void SHA256BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                    HashType* const output) {
+    computeHashImpl<SHA256BlockTraits::HashType>(getOpenSSLHashLoader().getSHA256(), input, output);
+}
+
+void SHA512BlockTraits::computeHash(std::initializer_list<ConstDataRange> input,
+                                    HashType* const output) {
+    computeHashImpl<SHA512BlockTraits::HashType>(getOpenSSLHashLoader().getSHA512(), input, output);
+}
+
+void SHA256BlockTraits::computeHashWithCtx(HashContext* ctx,
+                                           std::initializer_list<ConstDataRange> input,
+                                           HashType* const output) {
+    return computeHashImplWithCtx<SHA256BlockTraits::HashType>(
+        ctx, getOpenSSLHashLoader().getSHA256(), input, output);
+}
+
+void SHA1BlockTraits::computeHmac(const uint8_t* key,
+                                  size_t keyLen,
+                                  std::initializer_list<ConstDataRange> input,
+                                  SHA1BlockTraits::HashType* const output) {
+    return computeHmacImpl<SHA1BlockTraits::HashType>(
+        getOpenSSLHashLoader().getSHA1(), key, keyLen, input, output);
+}
+
+void SHA1BlockTraits::computeHmacWithCtx(HmacContext* ctx,
+                                         const uint8_t* key,
+                                         size_t keyLen,
+                                         std::initializer_list<ConstDataRange> input,
+                                         HashType* const output) {
+    return computeHmacImplWithCtx<SHA1BlockTraits::HashType>(
+        ctx, getOpenSSLHashLoader().getSHA1(), key, keyLen, input, output);
+}
+
+void SHA256BlockTraits::computeHmac(const uint8_t* key,
+                                    size_t keyLen,
+                                    std::initializer_list<ConstDataRange> input,
+                                    SHA256BlockTraits::HashType* const output) {
+    return computeHmacImpl<SHA256BlockTraits::HashType>(
+        getOpenSSLHashLoader().getSHA256(), key, keyLen, input, output);
+}
+
+void SHA256BlockTraits::computeHmacWithCtx(HmacContext* ctx,
+                                           const uint8_t* key,
+                                           size_t keyLen,
+                                           std::initializer_list<ConstDataRange> input,
+                                           HashType* const output) {
+    return computeHmacImplWithCtx<SHA256BlockTraits::HashType>(
+        ctx, getOpenSSLHashLoader().getSHA256(), key, keyLen, input, output);
+}
+
+void SHA512BlockTraits::computeHmac(const uint8_t* key,
+                                    size_t keyLen,
+                                    std::initializer_list<ConstDataRange> input,
+                                    SHA512BlockTraits::HashType* const output) {
+    return computeHmacImpl<SHA512BlockTraits::HashType>(
+        getOpenSSLHashLoader().getSHA512(), key, keyLen, input, output);
+}
+
+void SHA512BlockTraits::computeHmacWithCtx(HmacContext* ctx,
+                                           const uint8_t* key,
+                                           size_t keyLen,
+                                           std::initializer_list<ConstDataRange> input,
+                                           HashType* const output) {
+    return computeHmacImplWithCtx<SHA512BlockTraits::HashType>(
+        ctx, getOpenSSLHashLoader().getSHA512(), key, keyLen, input, output);
+}
+
+}  // namespace mongo

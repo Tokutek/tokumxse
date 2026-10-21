@@ -1,0 +1,37 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::workload_simulation"
+    cpp_includes:
+        - "mongo/tools/workload_simulation/simulator_options.h"
+    mod_visibility: private
+    configs:
+        source: cli
+        initializer:
+            register: addSimulatorOptions
+
+configs:
+    help:
+        description: "Show this usage information"
+        arg_vartype: Switch
+        single_name: h
+    list:
+        description: "List available suites and their respective workloads"
+        arg_vartype: Switch
+        single_name: l
+    filter:
+        description: "String substring filter on workload name"
+        arg_vartype: String
+        single_name: f
+        cpp_varname: "simulatorGlobalParams.filter"
+    setParameter:
+        description: "Set a configurable parameter"
+        arg_vartype: StringMap
+        duplicate_behavior: append
+    suites:
+        description: "Workload suites to run"
+        arg_vartype: StringVector
+        cpp_varname: "simulatorGlobalParams.suites"
+        hidden: true
+        positional: "1-"

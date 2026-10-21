@@ -1,0 +1,377 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/subplan.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/compiler/ce/exact/exact_cardinality_impl.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_estimator_impl.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_ranking/cbr_plan_ranking.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <utility>
+#include <vector>
+
+
+namespace mongo {
+
+using std::unique_ptr;
+using std::vector;
+
+
+SubplanStage::SubplanStage(ExpressionContext* expCtx,
+                           CollectionAcquisition collection,
+                           WorkingSet* ws,
+                           const CanonicalQuery* cq,
+                           PlanSelectionCallbacks planSelectionCallbacks)
+    : RequiresAllIndicesStage(kStageType, expCtx, collection),
+      _ws(ws),
+      _query(cq),
+      _planSelectionCallbacks(std::move(planSelectionCallbacks)) {
+    tassert(11051627, "Missing Canonical Query", cq);
+    tassert(11051626,
+            "Expecting the primary match expression to be $or expression",
+            _query->getPrimaryMatchExpression()->matchType() == MatchExpression::OR);
+    tassert(11051625,
+            "Cannot use a SUBPLAN stage for an $or with no children",
+            _query->getPrimaryMatchExpression()->numChildren());
+}
+
+Status SubplanStage::choosePlanWholeQuery(const QueryPlannerParams& plannerParams,
+                                          PlanYieldPolicy* yieldPolicy,
+                                          bool shouldConstructClassicExecutableTree) {
+    // Clear out the working set. We'll start with a fresh working set.
+    _ws->clear();
+
+    // Use the query planning module to plan the whole query.
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*_query, plannerParams);
+    if (!statusWithMultiPlanSolns.isOK()) {
+        return statusWithMultiPlanSolns.getStatus().withContext(
+            str::stream() << "error processing query: " << _query->toStringForErrorMsg()
+                          << " planner returned error");
+    }
+    auto solutions = std::move(statusWithMultiPlanSolns.getValue());
+
+    if (1 == solutions.size()) {
+        // Only one possible plan.  Run it.  Build the stages from the solution.
+        if (shouldConstructClassicExecutableTree) {
+            auto&& root = stage_builder::buildClassicExecutableTree(
+                expCtx()->getOperationContext(), collection(), *_query, *solutions[0], _ws);
+            tassert(11051624, "Expecting subplan stage to have no child nodes", _children.empty());
+            _children.emplace_back(std::move(root));
+        }
+        // This SubplanStage takes ownership of the query solution.
+        _compositeSolution = std::move(solutions.back());
+        solutions.pop_back();
+
+        _usesWholeQueryPlan = true;
+        return Status::OK();
+    } else {
+        // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
+        // and so on. The working set will be shared by all candidate plans.
+        tassert(11051623, "Expecting subplan stage to have no child nodes", _children.empty());
+
+        _usesMultiplanning = true;
+
+        _children.emplace_back(std::make_unique<MultiPlanStage>(
+            expCtx(), collection(), _query, _planSelectionCallbacks.onPickPlanWholeQuery));
+
+        MultiPlanStage* multiPlanStage = static_cast<MultiPlanStage*>(child().get());
+
+        for (size_t ix = 0; ix < solutions.size(); ++ix) {
+            solutions[ix]->indexFilterApplied = plannerParams.indexFiltersApplied;
+
+            auto&& nextPlanRoot = stage_builder::buildClassicExecutableTree(
+                expCtx()->getOperationContext(), collection(), *_query, *solutions[ix], _ws);
+            multiPlanStage->addPlan(std::move(solutions[ix]), std::move(nextPlanRoot), _ws);
+        }
+
+        // Delegate the the MultiPlanStage's plan selection facility.
+        auto trialsRunStatus = multiPlanStage->runTrials(yieldPolicy);
+        if (!trialsRunStatus.isOK()) {
+            return trialsRunStatus;
+        }
+        Status planSelectStat = multiPlanStage->pickBestPlan();
+        if (!planSelectStat.isOK()) {
+            return planSelectStat;
+        }
+
+        _usesWholeQueryPlan = true;
+        return Status::OK();
+    }
+}
+
+Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
+                                  PlanYieldPolicy* yieldPolicy,
+                                  bool shouldConstructClassicExecutableTree) {
+    // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of work that
+    // happens here, so this is needed for the time accounting to make sense.
+    auto optTimer = getOptTimer();
+
+    // During plan selection, the list of indices we are using to plan must remain stable, so the
+    // query will die during yield recovery if any index has been dropped. However, once plan
+    // selection completes successfully, we no longer need all indices to stick around. The selected
+    // plan should safely die on yield recovery if it is using the dropped index.
+    //
+    // Dismiss the requirement that no indices can be dropped when this method returns.
+    ON_BLOCK_EXIT([this] { releaseAllIndicesRequirement(); });
+
+    std::function<std::unique_ptr<SolutionCacheData>(const CanonicalQuery& cq,
+                                                     const CollectionAcquisition& coll)>
+        getSolutionCachedData =
+            [](const CanonicalQuery& cq,
+               const CollectionAcquisition& coll) -> std::unique_ptr<SolutionCacheData> {
+        auto planCache = CollectionQueryInfo::get(coll.getCollectionPtr()).getPlanCache();
+        tassert(5969800, "Classic Plan Cache not found", planCache);
+        if (shouldCacheQuery(cq)) {
+            auto planCacheKey = plan_cache_key_factory::make<PlanCacheKey>(cq, coll);
+            if (auto cachedSol = planCache->getCacheEntryIfActive(planCacheKey)) {
+                return std::move(cachedSol->cachedPlan);
+            }
+        }
+
+        return nullptr;
+    };
+
+    MultipleCollectionAccessor multiCollectionAccessor{collection()};
+    auto planRanker = plannerParams.planRanker;
+    const bool cbrEnabled = plannerParams.isCBREnabled();
+    auto rankerMode = _query->getExpCtx()->getQueryKnobConfiguration().getCBRCEMode();
+    // Populating the 'topLevelSampleFieldNames' requires 2 steps:
+    //  1. Extract the set of top level fields from the filter, sort and project components of the
+    //  CanonicalQuery.
+    //  2. Extract the fields of the relevant indexes for each branch of the rooted $or by passing
+    //  in the pointer to 'topLevelSampleFieldNames' to planSubqueries().
+    auto topLevelSampleFieldNames = ce::TopLevelSampleFields::allFields();
+    std::unique_ptr<ce::SamplingEstimator> samplingEstimator{nullptr};
+    std::unique_ptr<ce::ExactCardinalityEstimator> exactCardinality{nullptr};
+    if (cbrEnabled) {
+        if (rankerMode == QueryCBRCEModeEnum::kSamplingCE) {
+            using namespace cost_based_ranker;
+            samplingEstimator = ce::SamplingEstimatorImpl::makeDefaultSamplingEstimator(
+                *_query,
+                CardinalityEstimate{
+                    CardinalityType{plannerParams.mainCollectionInfo.collStats->getCardinality()},
+                    EstimationSource::Metadata},
+                yieldPolicy->getPolicy(),
+                multiCollectionAccessor);
+            topLevelSampleFieldNames =
+                ce::extractTopLevelFieldsFromMatchExpression(_query->getPrimaryMatchExpression());
+        } else if (rankerMode == QueryCBRCEModeEnum::kExactCE) {
+            exactCardinality = std::make_unique<ce::ExactCardinalityImpl>(
+                collection(), *_query, expCtx()->getOperationContext());
+        }
+    }
+
+    // Run the plan enumerator for each of the $or branches thus enumerating all plans for each
+    // $or branch.
+    auto subplanningStatus =
+        QueryPlanner::planSubqueries(expCtx()->getOperationContext(),
+                                     getSolutionCachedData,
+                                     collection(),
+                                     *_query,
+                                     plannerParams,
+                                     samplingEstimator.get(),
+                                     exactCardinality.get(),
+                                     topLevelSampleFieldNames.relevantIndexOutput());
+
+
+    // If the plan ranker is cost-based, plan each branch of the $or using the respective
+    // cost-based ranking. Multiplanning and Mixed plan rankers plan each branch
+    // of the $or using multiplanning as defined in the multiplanCallback below.
+    bool useMultiplanner = planRanker == QueryPlanRankerEnum::kMultiPlanner ||
+        planRanker == QueryPlanRankerEnum::kMixed;
+    if (!useMultiplanner && subplanningStatus.isOK()) {
+        if (rankerMode == QueryCBRCEModeEnum::kSamplingCE) {
+            // If we do not have any fields that we want to sample then we just include all the
+            // fields in the sample. This can occur if we encounter a find all query with no
+            // project or sort specified.
+            // TODO: SERVER-119839 This generates a sample even for trivial queries.
+            // The subplanner should use the CBRPlanRankingStrategy instead.
+            samplingEstimator->generateSample(
+                std::move(topLevelSampleFieldNames).toProjectionParams());
+        }
+
+        for (const auto& branchResult : subplanningStatus.getValue().branches) {
+            auto statusWithCBRSolns =
+                QueryPlanner::planWithCostBasedRanking(plannerParams,
+                                                       samplingEstimator.get(),
+                                                       exactCardinality.get(),
+                                                       std::move(branchResult->solutions),
+                                                       *_query,
+                                                       rankerMode);
+            if (!statusWithCBRSolns.isOK()) {
+                str::stream ss;
+                ss << "Can't plan for subchild " << branchResult->canonicalQuery->toString() << " "
+                   << statusWithCBRSolns.getStatus().reason();
+                subplanningStatus = statusWithCBRSolns.getStatus().withContext(ss);
+                break;
+            }
+            auto& cbrResult = statusWithCBRSolns.getValue();
+            // Store costBased strategy only when it picked a single
+            // winning plan for a branch.
+            if (cbrResult.planSelectionStrategy == PlanSelectionStrategy::kCostBasedRanker) {
+                _anyBranchCostBasedRanked = true;
+            }
+            branchResult->solutions = std::move(cbrResult.solutions);
+        }
+    }
+
+    if (!subplanningStatus.isOK()) {
+        return choosePlanWholeQuery(
+            plannerParams, yieldPolicy, shouldConstructClassicExecutableTree);
+    }
+
+    // Remember whether each branch of the $or was planned from a cached solution.
+    auto subplanningResult = std::move(subplanningStatus.getValue());
+    _branchPlannedFromCache.clear();
+    for (auto&& branch : subplanningResult.branches) {
+        _branchPlannedFromCache.push_back(branch->cachedData != nullptr);
+    }
+
+    // Use the multi plan stage to select a winning plan for each branch, and then construct
+    // the overall winning plan from the resulting index tags.
+    auto multiplanCallback = [&](CanonicalQuery* cq,
+                                 std::vector<std::unique_ptr<QuerySolution>> solutions)
+        -> StatusWith<std::unique_ptr<QuerySolution>> {
+        _ws->clear();
+
+        // This callback runs only for branches with more than one candidate solution, so reaching
+        // it means the multi-planner ranked at least one branch.
+        _anyBranchMultiPlanned = true;
+
+        // We temporarily add the MPS to _children to ensure that we pass down all save/restore
+        // messages that can be generated if pickBestPlan yields.
+        tassert(11051622, "Expecting subplan stage to have no child nodes", _children.empty());
+        _children.emplace_back(std::make_unique<MultiPlanStage>(
+            expCtx(),
+            collection(),
+            cq,
+            // Copy the callback function object since we have to use it for multiple branches.
+            _planSelectionCallbacks.onPickPlanForBranch));
+        ON_BLOCK_EXIT([&] {
+            invariant(_children.size() == 1);  // Make sure nothing else was added to _children.
+            _children.pop_back();
+        });
+        MultiPlanStage* multiPlanStage = static_cast<MultiPlanStage*>(child().get());
+
+        // Dump all the solutions into the MPS.
+        for (size_t ix = 0; ix < solutions.size(); ++ix) {
+            auto&& nextPlanRoot = stage_builder::buildClassicExecutableTree(
+                expCtx()->getOperationContext(), collection(), *cq, *solutions[ix], _ws);
+
+            multiPlanStage->addPlan(std::move(solutions[ix]), std::move(nextPlanRoot), _ws);
+        }
+
+        auto trialsRunStatus = multiPlanStage->runTrials(yieldPolicy);
+        if (!trialsRunStatus.isOK()) {
+            return trialsRunStatus;
+        }
+
+        // While the multiplanner is being used to plan each branch of the query, it is not
+        // choosing the overall winning plan so we don't want to increment
+        // multiPlannerChoseWinningPlan. The branch's histogram stats (works, micros, numPlans)
+        // were already emitted by runTrials() above; only the winner metric is suppressed here.
+        multiPlanStage->markBranchPlanner();
+        Status planSelectStat = multiPlanStage->pickBestPlan();
+        if (!planSelectStat.isOK()) {
+            return planSelectStat;
+        }
+
+        if (!multiPlanStage->bestPlanChosen()) {
+            str::stream ss;
+            ss << "Failed to pick best plan for subchild " << cq->toStringForErrorMsg();
+            return Status(ErrorCodes::NoQueryExecutionPlans, ss);
+        }
+        return multiPlanStage->extractBestSolution();
+    };
+    auto subplanSelectStat = QueryPlanner::choosePlanForSubqueries(
+        *_query, plannerParams, std::move(subplanningResult), multiplanCallback);
+    if (!subplanSelectStat.isOK()) {
+        if (subplanSelectStat != ErrorCodes::NoQueryExecutionPlans) {
+            // Query planning can continue if we failed to find a solution for one of the
+            // children. Otherwise, it cannot, as it may no longer be safe to access the
+            // collection (and index may have been dropped, we may have exceeded the time limit,
+            // etc).
+            return subplanSelectStat.getStatus();
+        }
+        return choosePlanWholeQuery(
+            plannerParams, yieldPolicy, shouldConstructClassicExecutableTree);
+    }
+
+    // Build a plan stage tree from the the composite solution and add it as our child stage.
+    _compositeSolution = std::move(subplanSelectStat.getValue());
+
+    if (shouldConstructClassicExecutableTree) {
+        tassert(11051621, "Expecting subplan stage to have no child nodes", _children.empty());
+        auto&& root = stage_builder::buildClassicExecutableTree(
+            expCtx()->getOperationContext(), collection(), *_query, *_compositeSolution, _ws);
+        _children.emplace_back(std::move(root));
+    }
+
+    _ws->clear();
+
+    return Status::OK();
+}
+
+PlanSelectionStrategy SubplanStage::planSelectionStrategy() const {
+    if (_usesWholeQueryPlan) {
+        return _usesMultiplanning ? PlanSelectionStrategy::kMultiPlanner
+                                  : PlanSelectionStrategy::kSinglePlan;
+    }
+    if (_anyBranchMultiPlanned) {
+        return PlanSelectionStrategy::kMultiPlanner;
+    }
+    if (_anyBranchCostBasedRanked) {
+        return PlanSelectionStrategy::kCostBasedRanker;
+    }
+    if (std::any_of(_branchPlannedFromCache.begin(),
+                    _branchPlannedFromCache.end(),
+                    [](bool fromCache) { return fromCache; })) {
+        return PlanSelectionStrategy::kCachedPlan;
+    }
+    return PlanSelectionStrategy::kSinglePlan;
+}
+
+bool SubplanStage::isEOF() const {
+    // If we're running we best have a runner.
+    invariant(child());
+    return child()->isEOF();
+}
+
+PlanStage::StageState SubplanStage::doWork(WorkingSetID* out) {
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
+    }
+
+    invariant(child());
+    return child()->work(out);
+}
+
+unique_ptr<PlanStageStats> SubplanStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_SUBPLAN);
+    ret->children.emplace_back(child()->getStats());
+    return ret;
+}
+
+const SpecificStats* SubplanStage::getSpecificStats() const {
+    return nullptr;
+}
+}  // namespace mongo

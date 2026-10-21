@@ -1,0 +1,179 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#ifndef _WIN32
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/transport/named_pipe/io_error_message.h"
+#include "mongo/transport/named_pipe/named_pipe.h"
+#include "mongo/util/assert_util.h"
+
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <fstream>  // IWYU pragma: keep
+#include <string>
+#include <thread>
+
+#include <fmt/format.h>
+#include <sys/stat.h>
+
+namespace mongo {
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace {
+// 'rc' must be the return code from POSIX-like OS I/O APIs.
+inline bool hasSucceeded(int rc) {
+    // POSIX-like I/O APIs return 0 for the successful operation.
+    return rc == 0;
+}
+
+// Removes the named pipe and logs an error message when
+// - either 'ignoreNoEntError' == true and there's an error other than the ENOENT error
+// - or 'ignoreNoEntError' == false and there's any error
+void removeNamedPipe(bool ignoreNoEntError, const char* pipeAbsolutePath) {
+    if (!hasSucceeded(remove(pipeAbsolutePath))) {
+        if (ignoreNoEntError && errno == ENOENT) {
+            return;
+        }
+
+        LOGV2_ERROR(7097000,
+                    "Failed to remove",
+                    "error"_attr = getLastSystemErrorMessageFormatted("remove", pipeAbsolutePath));
+    }
+}
+}  // namespace
+
+NamedPipeOutput::NamedPipeOutput(const std::string& pipeDir,
+                                 const std::string& pipeRelativePath,
+                                 bool persistPipe)
+    : _pipeAbsolutePath(pipeDir + pipeRelativePath), _ofs(), _persistPipe(persistPipe) {
+    // Just in case that uncleaned-up named pipe is still there. This is a test-only implementation
+    // and so, it should be fine to just remove it and ignore the ENOENT error.
+    if (!persistPipe) {
+        removeNamedPipe(true /*ignoreNoEntError*/, _pipeAbsolutePath.c_str());
+        uassert(7005005,
+                fmt::format("Failed to create a named pipe, error: {}",
+                            getLastSystemErrorMessageFormatted("mkfifo", _pipeAbsolutePath)),
+                hasSucceeded(mkfifo(_pipeAbsolutePath.c_str(), 0664)));
+    }
+}
+
+NamedPipeOutput::~NamedPipeOutput() {
+    close();
+    // Makes sure that the named pipe is removed.
+    if (!_persistPipe) {
+        removeNamedPipe(false /*ignoreNoEntError*/, _pipeAbsolutePath.c_str());
+    }
+}
+
+void NamedPipeOutput::open() {
+    _ofs.open(_pipeAbsolutePath.c_str(), std::ios::binary | std::ios::app);
+    if (!_ofs.is_open() || !_ofs.good()) {
+        LOGV2_ERROR(7005009,
+                    "Failed to open a named pipe",
+                    "error"_attr = getLastSystemErrorMessageFormatted("open", _pipeAbsolutePath));
+    }
+}
+
+int NamedPipeOutput::write(const char* data, int size) {
+    uassert(7005011, "Output must have been opened before writing", _ofs.is_open());
+    _ofs.write(data, size);
+    if (_ofs.fail()) {
+        uasserted(7239300,
+                  fmt::format("Failed to write to a named pipe, error: {}",
+                              getLastSystemErrorMessageFormatted("write", _pipeAbsolutePath)));
+        return -1;
+    }
+    return size;
+}
+
+void NamedPipeOutput::close() {
+    if (_ofs.is_open()) {
+        _ofs.close();
+    }
+}
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+NamedPipeInput::NamedPipeInput(const std::string& pipeRelativePath)
+    : _pipeAbsolutePath((externalPipeDir == "" ? std::string{kDefaultPipePath} : externalPipeDir) +
+                        pipeRelativePath),
+      _ifs() {
+    uassert(7001100,
+            fmt::format("Pipe path must not include '..' but {} does", _pipeAbsolutePath),
+            _pipeAbsolutePath.find("..") == std::string::npos);
+}
+
+NamedPipeInput::~NamedPipeInput() {
+    close();
+}
+
+void NamedPipeInput::doOpen() {
+    // MultiBsonStreamCursor's (MBSC) assembly buffer is designed to perform well without a lower-
+    // layer IO buffer. Removing std::ifstream's default 8k "associated buffer" improves throughput
+    // by 1.9% by eliminating the hidden copies from that buffer to MBSC's buffer. MBSC itself will
+    // never copy data except when it (rarely) needs to expand its buffer, so by removing
+    // std::ifstream's buffer we get an essentially zero-copy cursor that still avoids lots of tiny
+    // IOs due to MBSC's assembly buffer algorithm.
+    _ifs.rdbuf()->pubsetbuf(0, 0);
+
+    // Retry the open every {1, 2, 4, 8, 16} ms for 1,000 reps each (allowing up to 31 seconds of
+    // retry) in case the pipe writer has not finished creating the pipe yet.
+    int retries = 0;
+    int sleepMs = 1;
+    bool opened;
+    do {
+        _ifs.open(_pipeAbsolutePath.c_str(), std::ios::binary | std::ios::in);
+        opened = _ifs.is_open();
+        if (!opened) {
+            uassert(ErrorCodes::FileNotOpen,
+                    fmt::format("error = {}",
+                                getLastSystemErrorMessageFormatted("open", _pipeAbsolutePath)),
+                    errno == ENOENT);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+            ++retries;
+            if (retries % 1000 == 0) {
+                sleepMs *= 2;
+            }
+        }
+    } while (!opened && retries <= 5000);
+    if (retries > 1000) {
+        LOGV2_WARNING(7184900,
+                      "NamedPipeInput::doOpen() waited for pipe longer than 1 sec",
+                      "_pipeAbsolutePath"_attr = _pipeAbsolutePath);
+    }
+}
+
+int NamedPipeInput::doRead(char* data, int size) {
+    _ifs.read(data, size);
+    return _ifs.gcount();
+}
+
+void NamedPipeInput::doClose() {
+    _ifs.close();
+}
+
+bool NamedPipeInput::isOpen() const {
+    return _ifs.is_open();
+}
+
+bool NamedPipeInput::isGood() const {
+    return _ifs.good();
+}
+
+bool NamedPipeInput::isFailed() const {
+    return _ifs.fail();
+}
+
+bool NamedPipeInput::isEof() const {
+    return _ifs.eof();
+}
+}  // namespace mongo
+#endif

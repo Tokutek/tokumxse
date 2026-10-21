@@ -1,0 +1,214 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/optimizer/join/unit_test_helpers.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/pipeline_factory.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_estimator_impl.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/cbr_test_utils.h"
+#include "mongo/db/query/compiler/optimizer/join/catalog_stats.h"
+
+#include <string_view>
+
+namespace mongo::join_ordering {
+
+using namespace cost_based_ranker;
+
+IndexDescriptor makeIndexDescriptor(BSONObj indexSpec) {
+    IndexSpec spec;
+    spec.version(2).name("name").addKeys(indexSpec);
+    return IndexDescriptor(IndexNames::BTREE, spec.toBSON());
+}
+
+IndexCatalogEntryMock makeIndexCatalogEntry(BSONObj indexSpec) {
+    return IndexCatalogEntryMock{nullptr /*opCtx*/,
+                                 CollectionPtr{},
+                                 "" /*ident*/,
+                                 makeIndexDescriptor(indexSpec),
+                                 false /*isFrozen*/};
+}
+
+IndexCatalogMock makeIndexCatalog(const std::vector<BSONObj>& keyPatterns) {
+    IndexCatalogMock catalog;
+    for (auto&& kp : keyPatterns) {
+        catalog.createIndexEntry(nullptr, nullptr, makeIndexDescriptor(kp), {});
+    }
+    return catalog;
+}
+
+std::vector<std::shared_ptr<const IndexCatalogEntry>> makeIndexCatalogEntries(
+    const std::vector<BSONObj>& keyPatterns) {
+    auto ic = makeIndexCatalog(keyPatterns);
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> idxs(keyPatterns.size());
+    return ic.getEntriesShared(IndexCatalog::InclusionPolicy::kReady);
+}
+
+UniqueFieldInformation buildUniqueFieldInfo(const std::vector<BSONObj>& uniqueKeyPatterns) {
+    UniqueFieldSets uniqueFieldSets;
+    FieldToBit ftb;
+    for (const auto& kp : uniqueKeyPatterns) {
+        auto ufs = buildUniqueFieldSetForIndex(kp, ftb);
+        ASSERT(ufs);
+        uniqueFieldSets.insert(*ufs);
+    }
+    return UniqueFieldInformation{.fieldToBit = ftb, .uniqueFieldSet = uniqueFieldSets};
+}
+
+MultipleCollectionAccessor multipleCollectionAccessor(OperationContext* opCtx,
+                                                      std::vector<NamespaceString> namespaces) {
+    auto mainAcquisitionReq = CollectionAcquisitionRequest::fromOpCtx(
+        opCtx, namespaces.front(), AcquisitionPrerequisites::kRead);
+    auto mainAcquisition = acquireCollection(opCtx, mainAcquisitionReq, LockMode::MODE_X);
+
+    CollectionOrViewAcquisitionRequests acquisitionReqs;
+    for (size_t i = 1; i < namespaces.size(); ++i) {
+        acquisitionReqs.push_back(CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, namespaces[i], AcquisitionPrerequisites::kRead));
+    }
+
+    auto acquisitions = acquireCollectionsOrViews(opCtx, acquisitionReqs, LockMode::MODE_X);
+    auto acquisitionMap = makeAcquisitionMap(acquisitions);
+    return MultipleCollectionAccessor(std::move(mainAcquisition), std::move(acquisitionMap), false);
+}
+
+std::unique_ptr<CanonicalQuery> JoinOrderingTestFixture::makeCanonicalQuery(NamespaceString nss,
+                                                                            BSONObj filter,
+                                                                            BSONObj projection) {
+    auto expCtx = ExpressionContextBuilder{}.opCtx(operationContext()).build();
+    auto findCmd = std::make_unique<FindCommandRequest>(nss);
+    if (!filter.isEmpty()) {
+        findCmd->setFilter(filter);
+        findCmd->setProjection(projection.getOwned());
+        auto swFindCmd = ParsedFindCommand::withExistingFilter(
+            expCtx,
+            nullptr,
+            std::move(MatchExpressionParser::parse(filter, expCtx).getValue()),
+            std::move(findCmd),
+            ProjectionPolicies::aggregateProjectionPolicies());
+        ASSERT_OK(swFindCmd.getStatus());
+        return std::make_unique<CanonicalQuery>(
+            CanonicalQueryParams{.expCtx = expCtx, .parsedFind = std::move(swFindCmd.getValue())});
+    }
+    findCmd->setProjection(projection.getOwned());
+    return std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = expCtx, .parsedFind = ParsedFindCommandParams{std::move(findCmd)}});
+}
+
+std::unique_ptr<QuerySolution> JoinOrderingTestFixture::makeCollScanPlan(
+    NamespaceString nss, std::unique_ptr<MatchExpression> filter) {
+    auto scan = std::make_unique<CollectionScanNode>();
+    scan->nss = nss;
+    scan->filter = std::move(filter);
+    auto soln = std::make_unique<QuerySolution>();
+    soln->setRoot(std::move(scan));
+    return soln;
+}
+
+void JoinOrderingTestFixture::createCollection(NamespaceString nss) {
+    ASSERT_OK(storageInterface()->createCollection(operationContext(), nss, CollectionOptions()));
+}
+
+void JoinOrderingTestFixture::createIndex(UUID collUUID, BSONObj spec, std::string name) {
+    auto indexBuildsCoord = IndexBuildsCoordinator::get(operationContext());
+    auto indexConstraints = IndexBuildsManager::IndexConstraints::kRelax;
+    ASSERT_DOES_NOT_THROW(indexBuildsCoord->createIndex(
+        operationContext(),
+        collUUID,
+        BSON("v" << int(IndexConfig::kLatestIndexVersion) << "key" << spec << "name" << name),
+        indexConstraints,
+        false));
+}
+
+std::unique_ptr<ce::SamplingEstimator> JoinOrderingTestFixture::samplingEstimator(
+    const MultipleCollectionAccessor& mca, NamespaceString nss, double sampleProportion) {
+    const auto& collPtr = mca.lookupCollection(nss);
+    auto size = collPtr->getRecordStore()->numRecords();
+    auto sampleSize = static_cast<long>(size * sampleProportion);
+    auto samplingEstimator = std::make_unique<ce::SamplingEstimatorImpl>(
+        operationContext(),
+        mca,
+        nss,
+        PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
+        sampleSize,
+        SamplingCEMethodEnum::kRandom,
+        boost::none,
+        CardinalityEstimate{CardinalityType{static_cast<double>(size)}, EstimationSource::Code},
+        nullptr /*customerQueryExpCtx*/);
+    samplingEstimator->generateSample(ce::NoProjection{});
+    return samplingEstimator;
+}
+
+NamespaceString makeNSS(std::string_view collName) {
+    return NamespaceString::makeLocalCollection(collName);
+}
+
+void JoinOrderingTestFixture::initGraph(size_t numNodes, bool withIndexes) {
+    for (size_t i = 0; i < numNodes; i++) {
+        auto nss =
+            NamespaceString::createNamespaceString_forTest("test", str::stream() << "nss" << i);
+        std::string fieldName = str::stream() << "a" << i;
+        auto filterBSON = bsonStorage.emplace_back(BSON(fieldName << BSON("$gt" << 0)));
+
+        // Pick some cardinalities.
+        collCards.push_back(makeCard(i * 1000.0 + 10.0));
+        subsetCards.emplace(makeNodeSet((NodeId)i), collCards[i]);
+        const double dataSize = collCards[i].toDouble() * 420.0;
+        catStats.collStats.insert_or_assign(nss, CollectionStats{dataSize, dataSize / 4});
+
+        auto cq = makeCanonicalQuery(nss, filterBSON);
+        cbrCqQsns.emplace(cq.get(),
+                          makeCollScanPlan(nss, cq->getPrimaryMatchExpression()->clone()));
+        ASSERT_TRUE(graph.addNode(nss, std::move(cq), boost::none).has_value());
+
+        if (withIndexes) {
+            perCollIdxs.emplace(nss,
+                                makeIndexCatalogEntries({BSON(fieldName << (i % 2 ? 1 : -1))}));
+        }
+
+        resolvedPaths.emplace_back(ResolvedPath{(NodeId)i, FieldPath(fieldName)});
+    }
+}
+
+namespace {
+std::vector<BSONObj> pipelineFromJsonArray(std::string_view jsonArray) {
+    auto inputBson = fromjson("{pipeline: " + std::string(jsonArray) + "}");
+    ASSERT_EQUALS(inputBson["pipeline"].type(), BSONType::array);
+    std::vector<BSONObj> rawPipeline;
+    for (auto&& stageElem : inputBson["pipeline"].Array()) {
+        ASSERT_EQUALS(stageElem.type(), BSONType::object);
+        rawPipeline.push_back(stageElem.embeddedObject().getOwned());
+    }
+    return rawPipeline;
+}
+}  // namespace
+
+std::unique_ptr<Pipeline> makePipelineForTest(
+    std::vector<BSONObj> bsonStages,
+    std::vector<std::string_view> collNames,
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx) {
+    stdx::unordered_set<NamespaceString> secondaryNamespaces;
+    for (auto&& collName : collNames) {
+        secondaryNamespaces.insert(
+            NamespaceString::createNamespaceString_forTest("test", collName));
+    }
+    expCtx->addResolvedNamespaces(secondaryNamespaces);
+    auto pipeline =
+        pipeline_factory::makePipeline(bsonStages,
+                                       expCtx,
+                                       pipeline_factory::MakePipelineOptions{
+                                           .alreadyOptimized = false, .attachCursorSource = false});
+
+    return pipeline;
+}
+
+std::unique_ptr<Pipeline> makePipelineForTest(
+    std::string_view query,
+    std::vector<std::string_view> collNames,
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx) {
+    const auto bsonStages = pipelineFromJsonArray(query);
+    return makePipelineForTest(std::move(bsonStages), std::move(collNames), expCtx);
+}
+
+}  // namespace mongo::join_ordering

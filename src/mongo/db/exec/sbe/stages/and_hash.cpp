@@ -1,0 +1,301 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/stages/and_hash.h"
+
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace sbe {
+using namespace std::literals::string_view_literals;
+AndHashStage::AndHashStage(std::unique_ptr<PlanStage> outer,
+                           std::unique_ptr<PlanStage> inner,
+                           value::SlotVector outerCond,
+                           value::SlotVector outerProjects,
+                           value::SlotVector innerCond,
+                           value::SlotVector innerProjects,
+                           boost::optional<value::SlotId> collatorSlot,
+                           PlanYieldPolicySBE* yieldPolicy,
+                           PlanNodeId planNodeId,
+                           bool participateInTrialRunTracking)
+    : PlanStage("and_hash"sv, yieldPolicy, planNodeId, participateInTrialRunTracking),
+      _outerCond(std::move(outerCond)),
+      _outerProjects(std::move(outerProjects)),
+      _innerCond(std::move(innerCond)),
+      _innerProjects(std::move(innerProjects)),
+      _collatorSlot(collatorSlot),
+      _probeKey(0) {
+    if (_outerCond.size() != _innerCond.size()) {
+        uasserted(11704900, "left and right size do not match");
+    }
+
+    _children.emplace_back(std::move(outer));
+    _children.emplace_back(std::move(inner));
+}
+
+std::unique_ptr<PlanStage> AndHashStage::clone() const {
+    return std::make_unique<AndHashStage>(_children[0]->clone(),
+                                          _children[1]->clone(),
+                                          _outerCond,
+                                          _outerProjects,
+                                          _innerCond,
+                                          _innerProjects,
+                                          _collatorSlot,
+                                          _yieldPolicy,
+                                          _commonStats.nodeId,
+                                          participateInTrialRunTracking());
+}
+
+void AndHashStage::prepare(CompileCtx& ctx) {
+    _children[0]->prepare(ctx);
+    _children[1]->prepare(ctx);
+
+    if (_collatorSlot) {
+        _collatorAccessor = getAccessor(ctx, *_collatorSlot);
+        tassert(11704901,
+                "collator accessor should exist if collator slot provided to AndHashStage",
+                _collatorAccessor != nullptr);
+    }
+
+    size_t counter = 0;
+    value::SlotSet dupCheck;
+    for (auto& slot : _outerCond) {
+        auto [it, inserted] = dupCheck.emplace(slot);
+        uassert(11704903, str::stream() << "duplicate field: " << slot, inserted);
+
+        _inOuterKeyAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
+        _outOuterKeyAccessors.emplace_back(std::make_unique<HashKeyAccessor>(_htIt, counter++));
+        _outOuterAccessors[slot] = _outOuterKeyAccessors.back().get();
+    }
+
+    counter = 0;
+    for (auto& slot : _innerCond) {
+        auto [it, inserted] = dupCheck.emplace(slot);
+        uassert(11704904, str::stream() << "duplicate field: " << slot, inserted);
+
+        _inInnerKeyAccessors.emplace_back(_children[1]->getAccessor(ctx, slot));
+    }
+
+    counter = 0;
+    for (auto& slot : _outerProjects) {
+        auto [it, inserted] = dupCheck.emplace(slot);
+        uassert(11704905, str::stream() << "duplicate field: " << slot, inserted);
+
+        _inOuterProjectAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
+        _outOuterProjectAccessors.emplace_back(
+            std::make_unique<HashProjectAccessor>(_htIt, counter++));
+        _outOuterAccessors[slot] = _outOuterProjectAccessors.back().get();
+    }
+
+    _probeKey.resize(_inInnerKeyAccessors.size());
+
+    _memoryTracker = OperationMemoryUsageTracker::createSimpleMemoryUsageTrackerForSBE(
+        _opCtx, loadMemoryLimit(StageMemoryLimit::SBEAndHashStageMaxMemoryBytes));
+}
+
+value::SlotAccessor* AndHashStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    if (auto it = _outOuterAccessors.find(slot); it != _outOuterAccessors.end()) {
+        return it->second;
+    }
+    return _children[1]->getAccessor(ctx, slot);
+}
+
+void AndHashStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
+    if (_collatorAccessor) {
+        auto [tag, collatorVal] = _collatorAccessor->getViewOfValue();
+        uassert(
+            11704902, "collatorSlot must be of collator type", tag == value::TypeTags::collator);
+        auto collatorView = value::getCollatorView(collatorVal);
+        const value::MaterializedRowHasher hasher(collatorView);
+        const value::MaterializedRowEq equator(collatorView);
+        _ht.emplace(0, hasher, equator);
+    } else {
+        _ht.emplace();
+    }
+
+    _commonStats.opens++;
+    _memoryTracker.value().set(0);
+    _children[0]->open(reOpen);
+    // Insert the outer side into the hash table.
+    while (_children[0]->getNext() == PlanState::ADVANCED) {
+        value::MaterializedRow key{_inOuterKeyAccessors.size()};
+        value::MaterializedRow project{_inOuterProjectAccessors.size()};
+
+        size_t idx = 0;
+        // Copy keys in order to do the lookup.
+        for (auto& p : _inOuterKeyAccessors) {
+            key.reset(idx++, p->getCopyOfValue());
+        }
+
+        idx = 0;
+        // Copy projects.
+        for (auto& p : _inOuterProjectAccessors) {
+            project.reset(idx++, p->getCopyOfValue());
+        }
+
+        auto memUsage = key.memUsageForSorter() + project.memUsageForSorter();
+        _ht->emplace(std::move(key), std::move(project));
+        _memoryTracker.value().add(memUsage);
+        uassert(12321801,
+                "Exceeded memory limit for and_hash",
+                _memoryTracker.value().withinMemoryLimit(_opCtx));
+    }
+
+    _children[0]->close();
+
+    _children[1]->open(reOpen);
+
+    _htIt = _ht->end();
+    _htItEnd = _ht->end();
+}
+
+PlanState AndHashStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+    checkForInterruptAndYield(_opCtx);
+
+    if (_htIt != _htItEnd) {
+        ++_htIt;
+    }
+
+    if (_htIt == _htItEnd) {
+        while (_htIt == _htItEnd) {
+            auto state = _children[1]->getNext();
+            if (state == PlanState::IS_EOF) {
+                // LEFT and OUTER joins should enumerate "non-returned" rows here.
+                return trackPlanState(state);
+            }
+
+            // Copy keys in order to do the lookup.
+            size_t idx = 0;
+            for (auto& p : _inInnerKeyAccessors) {
+                _probeKey.reset(idx++, p->getViewOfValue());
+            }
+
+            auto [low, hi] = _ht->equal_range(_probeKey);
+            _htIt = low;
+            _htItEnd = hi;
+            // If _htIt == _htItEnd (i.e. no match) then RIGHT and OUTER joins
+            // should enumerate "non-returned" rows here.
+        }
+    }
+
+    return trackPlanState(PlanState::ADVANCED);
+}
+
+void AndHashStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
+    trackClose();
+    _children[1]->close();
+    _ht = boost::none;
+    _memoryTracker.value().set(0);
+    _specificStats.peakTrackedMemBytes = _memoryTracker.value().peakTrackedMemoryBytes();
+}
+
+std::unique_ptr<PlanStageStats> AndHashStage::getStats(bool includeDebugInfo) const {
+    auto ret = std::make_unique<PlanStageStats>(_commonStats);
+    ret->specific = std::make_unique<AndHashStats>(_specificStats);
+
+    if (includeDebugInfo) {
+        BSONObjBuilder bob;
+        if (feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled()) {
+            bob.appendNumber("peakTrackedMemBytes",
+                             static_cast<long long>(_specificStats.peakTrackedMemBytes));
+        }
+        ret->debugInfo = bob.obj();
+    }
+
+    ret->children.emplace_back(_children[0]->getStats(includeDebugInfo));
+    ret->children.emplace_back(_children[1]->getStats(includeDebugInfo));
+    return ret;
+}
+
+const SpecificStats* AndHashStage::getSpecificStats() const {
+    return &_specificStats;
+}
+
+void AndHashStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                                DebugPrintInfo& debugPrintInfo) const {
+    if (_collatorSlot) {
+        DebugPrinter::addIdentifier(ret, *_collatorSlot);
+    }
+
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+
+    DebugPrinter::addKeyword(ret, "left");
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _outerCond.size(); ++idx) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+
+        DebugPrinter::addIdentifier(ret, _outerCond[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _outerProjects.size(); ++idx) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+
+        DebugPrinter::addIdentifier(ret, _outerProjects[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, _children[0]->debugPrint(debugPrintInfo));
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    DebugPrinter::addKeyword(ret, "right");
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _innerCond.size(); ++idx) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+
+        DebugPrinter::addIdentifier(ret, _innerCond[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _innerProjects.size(); ++idx) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+
+        DebugPrinter::addIdentifier(ret, _innerProjects[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, _children[1]->debugPrint(debugPrintInfo));
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+}
+
+size_t AndHashStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_outerCond);
+    size += size_estimator::estimate(_outerProjects);
+    size += size_estimator::estimate(_innerCond);
+    size += size_estimator::estimate(_innerProjects);
+    return size;
+}
+}  // namespace sbe
+}  // namespace mongo

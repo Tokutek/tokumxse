@@ -1,148 +1,349 @@
-/*    Copyright 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/config.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/logv2/log_format.h"
+#include "mongo/platform/atomic.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/util/net/listen.h" // For DEFAULT_MAX_CONN
+#include "mongo/platform/rwmutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/cidr.h"
+#include "mongo/util/version/releases.h"
+#include "mongo/util/versioned_value.h"
+
+#include <algorithm>
+#include <ctime>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
 
 namespace mongo {
 
-    const int DEFAULT_UNIX_PERMS = 0700;
+[[MONGO_MOD_PUBLIC]] constexpr inline int DEFAULT_UNIX_PERMS = 0700;
+[[MONGO_MOD_PUBLIC]] constexpr inline int RATE_LIMIT_MAX = 1000;
+[[MONGO_MOD_PUBLIC]] constexpr inline size_t DEFAULT_MAX_CONN = 1000000;
 
-    struct ServerGlobalParams {
+struct [[MONGO_MOD_PUBLIC]] ServerGlobalParams {
+    std::string binaryName;  // mongod or mongos
+    std::string cwd;         // cwd of when process started
 
-        ServerGlobalParams() :
-            port(DefaultDBPort), rest(false), jsonp(false), indexBuildRetry(true), quiet(false),
-            configsvr(false), cpu(false), objcheck(true), defaultProfile(0),
-            slowMS(100), defaultLocalThresholdMillis(15), moveParanoia(true),
-            noUnixSocket(false), doFork(0), socket("/tmp"), maxConns(DEFAULT_MAX_CONN), 
-            unixSocketPermissions(DEFAULT_UNIX_PERMS), logAppend(false), logRenameOnRotate(true),
-            logWithSyslog(false), isHttpInterfaceEnabled(false)
-        {
-            started = time(0);
-        }
-
-        std::string binaryName;     // mongod or mongos
-        std::string cwd;            // cwd of when process started
-
-        int port;              // --port
-        enum {
-            DefaultDBPort = 27017,
-            ConfigServerPort = 27019,
-            ShardServerPort = 27018
-        };
-        bool isDefaultPort() const { return port == DefaultDBPort; }
-
-        std::string bind_ip;        // --bind_ip
-        bool rest;             // --rest
-        bool jsonp;            // --jsonp
-
-        bool indexBuildRetry;  // --noIndexBuildRetry
-
-        bool quiet;            // --quiet
-
-        bool configsvr;        // --configsvr
-
-        bool cpu;              // --cpu show cpu time periodically
-
-        bool objcheck;         // --objcheck
-
-        int defaultProfile;    // --profile
-        int slowMS;            // --time in ms that is "slow"
-        int defaultLocalThresholdMillis;    // --localThreshold in ms to consider a node local
-        bool moveParanoia;     // for move chunk paranoia
-
-        bool noUnixSocket;     // --nounixsocket
-        bool doFork;           // --fork
-        std::string socket;    // UNIX domain socket directory
-
-        int maxConns;          // Maximum number of simultaneous open connections.
-
-        int unixSocketPermissions; // permissions for the UNIX domain socket
-
-        std::string keyFile;   // Path to keyfile, or empty if none.
-        std::string pidFile;   // Path to pid file, or empty if none.
-
-        std::string logpath;   // Path to log file, if logging to a file; otherwise, empty.
-        bool logAppend;        // True if logging to a file in append mode.
-        bool logRenameOnRotate;// True if logging should rename log files on rotate
-        bool logWithSyslog;    // True if logging to syslog; must not be set if logpath is set.
-        int syslogFacility;    // Facility used when appending messages to the syslog.
-
-        bool isHttpInterfaceEnabled; // True if the dbwebserver should be enabled.
-
-#ifndef _WIN32
-        ProcessId parentProc;      // --fork pid of initial process
-        ProcessId leaderProc;      // --fork pid of leader process
+    int port = DefaultDBPort;            // --port
+    boost::optional<int> secondaryPort;  // --secondaryPort
+    enum {
+        DefaultDBPort = 27017,
+        ShardServerPort = 27018,
+        ConfigServerPort = 27019,
+        CryptDServerPort = 27020,
+#ifdef MONGO_CONFIG_GRPC
+        DefaultGRPCServerPort = 27021,
 #endif
-
-        /**
-         * Switches to enable experimental (unsupported) features.
-         */
-        struct ExperimentalFeatures {
-            ExperimentalFeatures()
-                : indexStatsCmdEnabled(false)
-                , storageDetailsCmdEnabled(false)
-            {}
-            bool indexStatsCmdEnabled; // -- enableExperimentalIndexStatsCmd
-            bool storageDetailsCmdEnabled; // -- enableExperimentalStorageDetailsCmd
-        } experimental;
-
-        time_t started;
-
-        BSONArray argvArray;
-        BSONObj parsedOpts;
-        AtomicInt32 clusterAuthMode;    // --clusterAuthMode, the internal cluster auth mode
-
-        enum ClusterAuthModes {
-            ClusterAuthMode_undefined,
-            /** 
-            * Authenticate using keyfile, accept only keyfiles
-            */
-            ClusterAuthMode_keyFile,
-
-            /**
-            * Authenticate using keyfile, accept both keyfiles and X.509
-            */
-            ClusterAuthMode_sendKeyFile,
-
-            /**
-            * Authenticate using X.509, accept both keyfiles and X.509
-            */
-            ClusterAuthMode_sendX509,
-
-            /**
-            * Authenticate using X.509, accept only X.509
-            */
-            ClusterAuthMode_x509
-        };
+        DefaultMagicRestorePort = 27022,
     };
 
-    extern ServerGlobalParams serverGlobalParams;
-}
+    enum MaintenanceMode { None, ReplicaSetMode, StandaloneMode };
+
+    static std::string getPortSettingHelpText();
+
+    std::vector<std::string> bind_ips;  // --bind_ip
+    bool enableIPv6 = false;
+    bool rest = false;  // --rest
+
+    boost::optional<int> listenBacklog;  // --listenBacklog
+
+    Atomic<bool> quiet{false};  // --quiet
+
+    ClusterRole clusterRole = ClusterRole::None;       // --configsvr/--shardsvr
+    MaintenanceMode maintenanceMode;                   // --maintenanceMode
+    bool replicaSetConfigShardMaintenanceMode{false};  // --replicaSetConfigShardMaintenanceMode
+    bool configOnly{false};                            // --configOnly (mongos only)
+
+    boost::optional<int> proxyPort;       // --proxyPort
+    boost::optional<int> priorityPort;    // --priorityPort
+    bool doAutoBootstrapSharding{false};  // This is derived from other settings during startup.
+
+    // Shell parameter, used for testing only, to tell the shell to crash on InvalidBSON errors.
+    bool crashOnInvalidBSONError = false;  // --crashOnInvalidBSONError
+
+    // When specified, deterministically reproduces the execution order of mongo initializers.
+    unsigned initializerShuffleSeed = 0;  // --initializerShuffleSeed
+
+    int defaultProfile = 0;  // --profile
+    boost::optional<BSONObj> defaultProfileFilter;
+    Atomic<int> slowMS{100};  // --time in ms that is "slow"
+    Atomic<int> defaultSlowInProgMS{
+        5000};                       // --time in ms that is "slow" to log a query in-progress.
+    AtomicWord<int> rateLimit{1};    // --rate limit in the range 1-RATE_LIMIT_MAX represents a  1/N
+                                     // probability that a query will be profiled
+    Atomic<double> sampleRate{1.0};  // --samplerate rate at which to sample slow queries
+    int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
+
+    Atomic<int> slowRunMs{10};  // --slowRunMs is the slow task execution time threshold for logging
+    Atomic<int> slowWaitMs{50};  // --slowWaitMs is the slow wait time threshold for logging
+    bool noUnixSocket = false;   // --nounixsocket
+    bool doFork = false;         // --fork
+    bool isMongoBridge = false;
+
+#ifndef _WIN32
+    std::string proxySocketPrefix;          // Proxy UNIX domain socket directory
+    boost::optional<gid_t> proxySocketGid;  // Proxy UNIX domain socket gid
+#endif
+    std::string socket = "/tmp";  // UNIX domain socket directory
+
+    size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
+    VersionedValue<CIDRList> maxIncomingConnsOverride;
+    int reservedAdminThreads = 0;
+
+    int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
+
+    std::string keyFile;           // Path to keyfile, or empty if none.
+    std::string pidFile;           // Path to pid file, or empty if none.
+    std::string timeZoneInfoPath;  // Path to time zone info directory, or empty if none.
+
+    bool relaxPermChecks = false;  // --relaxPermChecks
+
+    std::string logpath;  // Path to log file, if logging to a file; otherwise, empty.
+    logv2::LogTimestampFormat logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+
+    bool logAppend = false;         // True if logging to a file in append mode.
+    bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
+    bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
+    int syslogFacility;             // Facility used when appending messages to the syslog.
+
+#ifndef _WIN32
+    int forkReadyFd = -1;  // for `--fork`. Write to it and close it when daemon service is up.
+#endif
+
+    /***************************************
+     * Percona Server for MongoDB features.
+     **************************************/
+
+    std::string auditDestination;  // Output type: enables auditing functionality.
+    std::string auditFormat;       // Output format
+    std::string auditFilter;       // JSON query filter on events, users, etc.
+    std::string auditPath;         // Event destination file path and name.
+
+    time_t started = ::time(nullptr);
+
+    BSONArray argvArray;
+    BSONObj parsedOpts;
+
+    enum AuthState { kEnabled, kDisabled, kUndefined };
+
+    AuthState authState = AuthState::kUndefined;
+
+    bool transitionToAuth = false;  // --transitionToAuth, mixed mode for rolling auth upgrade
+
+    ClusterAuthMode startupClusterAuthMode;
+
+    // for the YAML config, sharding._overrideShardIdentity. Can only be used when in
+    // queryableBackupMode.
+    BSONObj overrideShardIdentity;
+
+#ifdef MONGO_CONFIG_GRPC
+    int grpcPort = DefaultGRPCServerPort;
+    int grpcServerMaxThreads = 1000;
+    int grpcKeepAliveTimeMs = INT_MAX;
+    int grpcKeepAliveTimeoutMs = 20000;
+#endif
+
+    /**
+     * Represents a "snapshot" of the in-memory FCV at a particular point in time.
+     * This is useful for callers who need to perform multiple FCV checks and expect the checks to
+     * be performed on a consistent (but possibly stale) FCV value.
+     *
+     * For example: checking isVersionInitialized() && isLessThan() with the same FCVSnapshot value
+     * would have the guarantee that if the FCV value is initialized during isVersionInitialized(),
+     * it will still be during isLessThan().
+     *
+     * Note that this can get stale, so if you call acquireFCVSnapshot() once, and then update
+     * serverGlobalParams.mutableFCV, and expect to use the new FCV value, you must acquire another
+     * snapshot. In general, if you want to check multiple properties of the FCV at a specific point
+     * in time, you should use one snapshot. For example, if you want to check both
+     * that the FCV is initialized and if it's less than some version, and that featureFlagXX is
+     * enabled on this FCV, this should all be using the same FCVSnapshot of the FCV value.
+     *
+     * But if you're doing multiple completely separate FCV checks at different points in time, such
+     * as over multiple functions, or multiple distinct feature flag enablement checks (i.e.
+     * featureFlagXX.isEnabled && featureFlagYY.isEnabled), you should get a new FCV snapshot for
+     * each check since the old one may be stale.
+     */
+    struct FCVSnapshot {
+        using FCV = multiversion::FeatureCompatibilityVersion;
+
+        /**
+         * Creates an immutable "snapshot" of the passed in FCV.
+         */
+        explicit FCVSnapshot(FCV version) : _version(version) {}
+
+        /**
+         * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
+         * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
+         */
+        bool isVersionInitialized() const {
+            return _version != FCV::kUnsetDefaultLastLTSBehavior;
+        }
+
+        /**
+         * This safe getter for the featureCompatibilityVersion parameter ensures the parameter has
+         * been initialized with a meaningful value.
+         */
+        FCV getVersion() const {
+            invariant(isVersionInitialized());
+            return _version;
+        }
+
+        bool isLessThanOrEqualTo(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion <= version;
+        }
+
+        bool isGreaterThanOrEqualTo(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion >= version;
+        }
+
+        bool isLessThan(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion < version;
+        }
+
+        bool isGreaterThan(FCV version, FCV* versionReturn = nullptr) const {
+            auto currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion > version;
+        }
+
+        // This function is to be used for generic FCV references only, and not for FCV-gating.
+        bool isUpgradingOrDowngrading() const {
+            return isUpgradingOrDowngrading(getVersion());
+        }
+
+        static bool isUpgradingOrDowngrading(FCV version) {
+            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+            return version != multiversion::GenericFCV::kLatest &&
+                version != multiversion::GenericFCV::kLastContinuous &&
+                version != multiversion::GenericFCV::kLastLTS;
+        }
+
+        /**
+         * Logs the current FCV global state.
+         * context: the context in which this function was called, to differentiate logs (e.g.
+         * startup, log rotation).
+         */
+        void logFCVWithContext(std::string_view context) const;
+
+    private:
+        const FCV _version;
+    };
+
+    /**
+     * Represents the in-memory FCV that can be changed.
+     * This should only be used to set/reset the in-memory FCV, or get a snapshot of the current
+     * in-memory FCV. It *cannot* be used to check the actual value of the in-memory FCV, and in
+     * particular, check the value over multiple function calls. This is because the in-memory FCV
+     * might change in between those calls (such as during initial sync). Instead, use
+     * acquireFCVSnapshot() to get a snapshot of the FCV, and use the functions available on
+     * FCVSnapshot.
+     */
+    struct MutableFCV {
+        using FCV = multiversion::FeatureCompatibilityVersion;
+
+        /**
+         * Gets an immutable copy/snapshot of the current FCV so that callers can check
+         * the FCV value at a particular point in time over multiple function calls
+         * without the snapshot value changing.
+         * Note that this snapshot might be when the FCV is uninitialized, which could happen
+         * during initial sync. The caller of this function and the subsequent functions
+         * within FCVSnapshot must handle that case.
+         */
+        FCVSnapshot acquireFCVSnapshot() const {
+            return FCVSnapshot(_version.load());
+        }
+
+        void reset() {
+            setVersion(FCV::kUnsetDefaultLastLTSBehavior);
+        }
+
+        // if you have an FeatureCompatibilityVersionDocument, you should use
+        // setVersionFromFCVDocument() instead of this function
+        void setVersion(FCV version) {
+            std::unique_lock lk(_fcvDocMutex);
+            _fcvDoc = boost::none;
+            _version.store(version);
+        }
+
+        void setVersionFromFCVDocument(const FeatureCompatibilityVersionDocument& fcvDoc);
+
+        // fcvDoc is null if setVersion(doc) was never called. callback must be fast.
+        template <typename Callback>
+        void withAcquiredFCVDocument(Callback&& callback) const {
+            std::shared_lock lk(_fcvDocMutex);
+            callback(_fcvDoc ? &*_fcvDoc : nullptr);
+        }
+
+    private:
+        // Protects both _fcvDoc and _version.
+        mutable RWMutex _fcvDocMutex;
+        boost::optional<FeatureCompatibilityVersionDocument> _fcvDoc;
+        Atomic<FCV> _version{FCV::kUnsetDefaultLastLTSBehavior};
+    } mutableFCV;
+
+    // Const reference for featureCompatibilityVersion checks.
+    const MutableFCV& featureCompatibility = mutableFCV;
+
+    // Feature validation differs depending on the role of a mongod in a replica set. Replica set
+    // primaries can accept user-initiated writes and validate based on the feature compatibility
+    // version. A secondary always validates in the upgraded mode so that it can sync new features,
+    // even when in the downgraded feature compatibility mode.
+    Atomic<bool> validateFeaturesAsPrimary{true};
+
+    std::vector<std::string> disabledSecureAllocatorDomains;
+
+    // List of absolute paths to extension shared object files. These will be loaded during startup.
+    std::vector<std::string> extensions;
+
+#ifndef MONGO_CONFIG_EXT_SIG_SECURE
+    // Not in extensions secure build mode. Path to public key to verify test extensions signatures.
+    // If empty string (default), verification will by bypassed (which is fine in insecure mode).
+    std::string extensionsSignaturePublicKeyPath;
+#endif
+
+    // Path to directory containing extension configuration files. If empty, it means the config was
+    // not provided, since the parser will reject empty strings provided by the user.
+    std::string extensionsConfigPath;
+};
+
+[[MONGO_MOD_PUBLIC]] extern ServerGlobalParams serverGlobalParams;
+
+}  // namespace mongo

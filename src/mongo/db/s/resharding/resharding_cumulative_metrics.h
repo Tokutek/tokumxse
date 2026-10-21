@@ -1,0 +1,244 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/s/metrics/cumulative_metrics_state_tracker.h"
+#include "mongo/db/s/resharding/resharding_metrics_common.h"
+#include "mongo/db/s/resharding/resharding_metrics_observer.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/modules.h"
+
+#include <mutex>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ReshardingCumulativeMetrics {
+public:
+    using Role = ReshardingMetricsCommon::Role;
+    using StateTracker =
+        CumulativeMetricsStateTracker<CoordinatorStateEnum, DonorStateEnum, RecipientStateEnum>;
+    using AnyState = StateTracker::AnyState;
+
+    struct MetricsComparer {
+        inline bool operator()(const ReshardingMetricsObserver* a,
+                               const ReshardingMetricsObserver* b) const {
+            auto aTime = a->getStartTimestamp();
+            auto bTime = b->getStartTimestamp();
+            if (aTime == bTime) {
+                return a->getUuid() < b->getUuid();
+            }
+            return aTime < bTime;
+        }
+    };
+    using MetricsSet = std::set<const ReshardingMetricsObserver*, MetricsComparer>;
+
+    /**
+     * RAII type that takes care of deregistering the observer once it goes out of scope.
+     */
+    class ScopedObserver {
+    public:
+        ScopedObserver(ReshardingCumulativeMetrics* metrics,
+                       Role role,
+                       MetricsSet::iterator observerIterator);
+        ScopedObserver(const ScopedObserver&) = delete;
+        ScopedObserver& operator=(const ScopedObserver&) = delete;
+
+        ~ScopedObserver();
+
+    private:
+        ReshardingCumulativeMetrics* const _metrics;
+        const Role _role;
+        const MetricsSet::iterator _observerIterator;
+    };
+
+    using UniqueScopedObserver = std::unique_ptr<ScopedObserver>;
+    friend ScopedObserver;
+
+    static ReshardingCumulativeMetrics* getForResharding(ServiceContext* context);
+    static ReshardingCumulativeMetrics* getForMoveCollection(ServiceContext* context);
+    static ReshardingCumulativeMetrics* getForRewriteCollection(ServiceContext* context);
+    static ReshardingCumulativeMetrics* getForBalancerMoveCollection(ServiceContext* context);
+    static ReshardingCumulativeMetrics* getForUnshardCollection(ServiceContext* context);
+
+    ReshardingCumulativeMetrics();
+    ReshardingCumulativeMetrics(const std::string& rootName);
+
+    [[nodiscard]] UniqueScopedObserver registerInstanceMetrics(
+        const ReshardingMetricsObserver* metrics);
+    int64_t getOldestOperationHighEstimateRemainingTimeMillis(Role role) const;
+    int64_t getOldestOperationLowEstimateRemainingTimeMillis(Role role) const;
+    size_t getObservedMetricsCount() const;
+    size_t getObservedMetricsCount(Role role) const;
+
+    void onStarted();
+    void onSuccess();
+    void onFailure();
+    void onCanceled();
+
+    void setLastOpEndingChunkImbalance(int64_t imbalanceCount);
+
+    void onReadDuringCriticalSection();
+    void onWriteDuringCriticalSection();
+    void onWriteToStashedCollections();
+
+    void onCloningRemoteBatchRetrieval(Milliseconds elapsed);
+    void onInsertsDuringCloning(int64_t count, int64_t bytes, const Milliseconds& elapsedTime);
+
+    void onInsertApplied();
+    void onUpdateApplied();
+    void onDeleteApplied();
+    void onOplogEntriesFetched(int64_t numEntries);
+    void onOplogEntriesApplied(int64_t numEntries);
+
+    void onBatchRetrievedDuringOplogFetching(Milliseconds elapsed);
+    void onLocalInsertDuringOplogFetching(const Milliseconds& elapsedTime);
+    void onBatchRetrievedDuringOplogApplying(const Milliseconds& elapsedTime);
+    void onOplogLocalBatchApplied(Milliseconds elapsed);
+
+    void onSearchIndexAbort();
+
+    void onPreApplyVerificationSuccess();
+    void onPreApplyVerificationFailure();
+    void onPreApplyVerificationSkipped();
+    void onPreApplyVerificationTimedOut();
+    void onPreApplyVerificationRetry();
+    void onPreCommitVerificationSuccess();
+    void onPreCommitVerificationFailure();
+    void onPreCommitVerificationSkipped();
+    void onPreCommitVerificationTimedOut();
+    void onPreCommitDonorVerificationRetry();
+    void onPreCommitRecipientVerificationRetry();
+
+    void onCoordinatorRetry(std::string_view label);
+
+    template <typename T>
+    void onStateTransition(boost::optional<T> before, boost::optional<T> after) {
+        _stateTracker.onStateTransition(before, after);
+    }
+
+    static boost::optional<std::string_view> fieldNameFor(AnyState state);
+    void reportForServerStatus(BSONObjBuilder* bob) const;
+
+    void onStarted(bool isSameKeyResharding, const UUID& reshardingUUID);
+    void onSuccess(bool isSameKeyResharding, const UUID& reshardingUUID);
+    void onFailure(bool isSameKeyResharding, const UUID& reshardingUUID);
+    void onCanceled(bool isSameKeyResharding, const UUID& reshardingUUID);
+
+private:
+    enum EstimateType { kHigh, kLow };
+
+    int64_t getInsertsApplied() const;
+    int64_t getUpdatesApplied() const;
+    int64_t getDeletesApplied() const;
+    int64_t getOplogEntriesFetched() const;
+    int64_t getOplogEntriesApplied() const;
+
+    int64_t getOplogFetchingTotalRemoteBatchesRetrieved() const;
+    int64_t getOplogFetchingTotalRemoteBatchesRetrievalTimeMillis() const;
+    int64_t getOplogFetchingTotalLocalInserts() const;
+    int64_t getOplogFetchingTotalLocalInsertTimeMillis() const;
+    int64_t getOplogApplyingTotalBatchesRetrieved() const;
+    int64_t getOplogApplyingTotalBatchesRetrievalTimeMillis() const;
+    int64_t getOplogBatchApplied() const;
+    int64_t getOplogBatchAppliedMillis() const;
+
+    void reportCountsForAllStates(const StateTracker::StateFieldNameMap& names,
+                                  BSONObjBuilder* bob) const;
+
+    template <typename T>
+    int64_t getCountInState(T state) const {
+        return _stateTracker.getCountInState(state);
+    }
+
+    MetricsSet& getMetricsSetForRole(Role role);
+    const MetricsSet& getMetricsSetForRole(Role role) const;
+    const ReshardingMetricsObserver* getOldestOperation(WithLock, Role role) const;
+    int64_t getOldestOperationEstimateRemainingTimeMillis(Role role, EstimateType type) const;
+    boost::optional<Milliseconds> getEstimate(const ReshardingMetricsObserver* op,
+                                              EstimateType type) const;
+
+    MetricsSet::iterator insertMetrics(const ReshardingMetricsObserver* metrics, MetricsSet& set);
+    void deregisterMetrics(const Role& role, const MetricsSet::iterator& metrics);
+
+    void reportActive(BSONObjBuilder* bob) const;
+    void reportOldestActive(BSONObjBuilder* bob) const;
+    void reportLatencies(BSONObjBuilder* bob) const;
+    void reportCurrentInSteps(BSONObjBuilder* bob) const;
+    void appendOldestDiagnosticMetrics(Role role, BSONObjBuilder* bob) const;
+
+    const std::string _rootSectionName;
+    mutable std::mutex _mutex;
+    std::vector<MetricsSet> _instanceMetricsForAllRoles;
+
+    StateTracker _stateTracker;
+
+    Atomic<bool> _shouldReportMetrics;
+
+    Atomic<int64_t> _countStarted{0};
+    Atomic<int64_t> _countSucceeded{0};
+    Atomic<int64_t> _countFailed{0};
+    Atomic<int64_t> _countCancelled{0};
+
+    Atomic<int64_t> _totalBatchRetrievedDuringClone{0};
+    Atomic<int64_t> _totalBatchRetrievedDuringCloneMillis{0};
+    Atomic<int64_t> _documentsProcessed{0};
+    Atomic<int64_t> _bytesWritten{0};
+
+    Atomic<int64_t> _lastOpEndingChunkImbalance{0};
+    Atomic<int64_t> _readsDuringCriticalSection{0};
+    Atomic<int64_t> _writesDuringCriticalSection{0};
+
+    Atomic<int64_t> _collectionCloningTotalLocalBatchInserts{0};
+    Atomic<int64_t> _collectionCloningTotalLocalInsertTimeMillis{0};
+    Atomic<int64_t> _writesToStashedCollections{0};
+
+    Atomic<int64_t> _insertsApplied{0};
+    Atomic<int64_t> _updatesApplied{0};
+    Atomic<int64_t> _deletesApplied{0};
+    Atomic<int64_t> _oplogEntriesApplied{0};
+    Atomic<int64_t> _oplogEntriesFetched{0};
+
+    Atomic<int64_t> _oplogFetchingTotalRemoteBatchesRetrieved{0};
+    Atomic<int64_t> _oplogFetchingTotalRemoteBatchesRetrievalTimeMillis{0};
+    Atomic<int64_t> _oplogFetchingTotalLocalInserts{0};
+    Atomic<int64_t> _oplogFetchingTotalLocalInsertTimeMillis{0};
+    Atomic<int64_t> _oplogApplyingTotalBatchesRetrieved{0};
+    Atomic<int64_t> _oplogApplyingTotalBatchesRetrievalTimeMillis{0};
+    Atomic<int64_t> _oplogBatchApplied{0};
+    Atomic<int64_t> _oplogBatchAppliedMillis{0};
+
+    Atomic<int64_t> _countSameKeyStarted{0};
+    Atomic<int64_t> _countSameKeySucceeded{0};
+    Atomic<int64_t> _countSameKeyFailed{0};
+    Atomic<int64_t> _countSameKeyCancelled{0};
+
+    Atomic<int64_t> _countSearchIndexAborts{0};
+
+    Atomic<int64_t> _countPreApplyVerificationSucceeded{0};
+    Atomic<int64_t> _countPreApplyVerificationFailed{0};
+    Atomic<int64_t> _countPreApplyVerificationSkipped{0};
+    Atomic<int64_t> _countPreApplyVerificationTimedOut{0};
+    Atomic<int64_t> _countPreApplyVerificationRetried{0};
+    Atomic<int64_t> _countPreCommitVerificationSucceeded{0};
+    Atomic<int64_t> _countPreCommitVerificationFailed{0};
+    Atomic<int64_t> _countPreCommitVerificationSkipped{0};
+    Atomic<int64_t> _countPreCommitVerificationTimedOut{0};
+    Atomic<int64_t> _countPreCommitDonorVerificationRetried{0};
+    Atomic<int64_t> _countPreCommitRecipientVerificationRetried{0};
+
+    std::set<UUID> _activeReshardingOperations;
+    std::mutex _activeReshardingOperationsMutex;
+
+    mutable std::mutex _coordinatorRetriesMutex;
+    stdx::unordered_map<std::string, int64_t> _coordinatorRetryCounts;
+};
+
+}  // namespace mongo

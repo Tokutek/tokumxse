@@ -1,0 +1,122 @@
+version: 1.0.0
+filters:
+  - "write_concern_all_commands.js":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "replsettest.js":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "shardingtest.js":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "assert_schema_match.js":
+    approvers:
+      - 10gen/query-execution
+  - "doc_validation_utils.js":
+    approvers:
+      - 10gen/query-execution
+  - "json_schema_test_runner.js":
+    approvers:
+      - 10gen/query-execution
+  - "*bulk_write*":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "curop_helpers.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "dateutil.js":
+    approvers:
+      - 10gen/query-execution
+  - "local_reads.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "pin_getmore_cursor.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "profiler.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "python.js":
+    approvers:
+      - 10gen/devprod-build
+  - "run_with_retries.js":
+    approvers:
+      - 10gen/query-execution
+  - "stats.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "mochalite.js":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "check_shard_filtering_metadata_helpers.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "catalog_list_operations_consistency_validator.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "raw_operation_utils.js":
+    approvers:
+      - 10gen/server-collection-write-path
+  - "feature_compatibility_version.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "set_fcv_helpers.js":
+    approvers:
+      - 10gen/query-integration-features
+  - "*.pem":
+    approvers:
+      - 10gen/server-security
+  - "*.sha1":
+    approvers:
+      - 10gen/server-security
+  - "*.sha256":
+    approvers:
+      - 10gen/server-security
+  - "*.pfx":
+    approvers:
+      - 10gen/server-security
+  - "fixture_helpers.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "index_utils.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "index_stats_utils.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "cluster_server_parameter_utils.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "mongodb_database_tools.js":
+    approvers:
+      - 10gen/query-optimization-correctness
+  - "*ftdc*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "release_memory_util.js":
+    approvers:
+      - 10gen/query-execution
+  - "index_catalog_helpers.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "*chunk*":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "block_replica_set_writes_utils.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "multikey_consistency_check.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "hook_appname.js":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "oplog_truncation_util.js":
+    approvers:
+      - 10gen/server-oplog
+  - "js_engine_util.js":
+    approvers:
+      - 10gen/query-integration-features
+  - "assertions_core.js":
+    approvers:
+      - 10gen/devprod-test-infrastructure

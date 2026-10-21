@@ -1,0 +1,31 @@
+**/.DS_Store
+**/tags
+**/*.sw?
+.venv/
+.vscode/
+.cache/
+.ccls-cache/
+CMakeUserPresets.json
+compile_commands.json
+cscope.in.out
+cscope.out
+cscope.po.out
+build*/
+/docs/
+test-compatibility-run/
+COMPATIBILITY_TEST/
+TCMALLOC_LIB/
+
+# Python artifacts
+**/*.pyc
+
+# CLion related files & directories
+.idea
+cmake-build-release
+cmake-build-debug
+
+# Claude Code
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/agent-memory-local/
+.claude/worktrees/

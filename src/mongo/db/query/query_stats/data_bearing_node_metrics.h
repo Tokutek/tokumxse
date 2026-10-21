@@ -1,0 +1,192 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/query/client_cursor/cursor_response_gen.h"
+#include "mongo/db/query/query_stats/plan_shape_counters/plan_shape_counts.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+
+namespace mongo::query_stats {
+
+/**
+ * Represents query stats that are only (directly) available on data-bearing nodes. These metrics
+ * are optionally rolled up from the data-bearing nodes to routers, and are aggregated into cursors
+ * and OpDebug. This structure represents those metrics and can be used to store and aggregate them.
+ */
+struct [[MONGO_MOD_PUBLIC]] DataBearingNodeMetrics {
+    uint64_t keysExamined = 0;
+    uint64_t docsExamined = 0;
+    uint64_t bytesRead = 0;
+    Microseconds readingTime{0};
+    Milliseconds clusterWorkingTime{0};
+    // This value will be negative if we are not running on Linux since collecting cpu time is only
+    // supported on Linux systems.
+    Nanoseconds cpuNanos{0};
+
+    uint64_t delinquentAcquisitions{0};
+    Milliseconds totalAcquisitionDelinquency{0};
+    Milliseconds maxAcquisitionDelinquency{0};
+
+    uint64_t numInterruptChecks{0};
+    Milliseconds overdueInterruptApproxMax{0};
+
+    bool hasSortStage : 1 = false;
+    bool usedDisk : 1 = false;
+    bool fromMultiPlanner : 1 = false;
+    bool fromPlanCache : 1 = true;
+
+    uint64_t nMatched = 0;
+    uint64_t nUpserted = 0;
+    uint64_t nModified = 0;
+    uint64_t nDeleted = 0;
+    uint64_t nInserted = 0;
+    uint64_t keysInserted = 0;
+    uint64_t keysDeleted = 0;
+
+    Microseconds totalTimeQueuedMicros{0};
+    uint64_t totalAdmissions = 0;
+    uint64_t totalNormalPriorityAdmissions = 0;
+    uint64_t totalLowPriorityAdmissions = 0;
+    bool wasLoadShed = false;
+    bool wasDeprioritized = false;
+    bool wasMarkedNonDeprioritizable = false;
+
+    Microseconds planningTime{0};
+    CardinalityEstimationMethods cardinalityEstimationMethods;
+    uint64_t nDocsSampled{0};
+    plan_shape_counters::PlanShapeCounts planShapeCounts;
+
+    uint64_t clusterPeakTrackedMemBytes{0};
+
+    /**
+     * Adds the fields from the given object into the fields of this object using addition (in the
+     * case of numeric metrics) or conjunction/disjunction (in the case of boolean metrics).
+     */
+    void add(const DataBearingNodeMetrics& other) {
+        keysExamined += other.keysExamined;
+        docsExamined += other.docsExamined;
+        bytesRead += other.bytesRead;
+        readingTime += other.readingTime;
+        clusterWorkingTime += other.clusterWorkingTime;
+        cpuNanos += other.cpuNanos;
+        delinquentAcquisitions += other.delinquentAcquisitions;
+        totalAcquisitionDelinquency += other.totalAcquisitionDelinquency;
+        maxAcquisitionDelinquency =
+            std::max(maxAcquisitionDelinquency, other.maxAcquisitionDelinquency);
+        numInterruptChecks += other.numInterruptChecks;
+        overdueInterruptApproxMax =
+            std::max(overdueInterruptApproxMax, other.overdueInterruptApproxMax);
+        hasSortStage = hasSortStage || other.hasSortStage;
+        usedDisk = usedDisk || other.usedDisk;
+        fromMultiPlanner = fromMultiPlanner || other.fromMultiPlanner;
+        fromPlanCache = fromPlanCache && other.fromPlanCache;
+        nMatched += other.nMatched;
+        nUpserted += other.nUpserted;
+        nModified += other.nModified;
+        nDeleted += other.nDeleted;
+        nInserted += other.nInserted;
+        keysInserted += other.keysInserted;
+        keysDeleted += other.keysDeleted;
+        totalTimeQueuedMicros += other.totalTimeQueuedMicros;
+        totalAdmissions += other.totalAdmissions;
+        totalNormalPriorityAdmissions += other.totalNormalPriorityAdmissions;
+        totalLowPriorityAdmissions += other.totalLowPriorityAdmissions;
+        wasLoadShed = wasLoadShed || other.wasLoadShed;
+        wasDeprioritized = wasDeprioritized || other.wasDeprioritized;
+        wasMarkedNonDeprioritizable =
+            wasMarkedNonDeprioritizable || other.wasMarkedNonDeprioritizable;
+        planningTime += other.planningTime;
+        cardinalityEstimationMethods.setHistogram(
+            cardinalityEstimationMethods.getHistogram().value_or(0) +
+            other.cardinalityEstimationMethods.getHistogram().value_or(0));
+        cardinalityEstimationMethods.setSampling(
+            cardinalityEstimationMethods.getSampling().value_or(0) +
+            other.cardinalityEstimationMethods.getSampling().value_or(0));
+        cardinalityEstimationMethods.setHeuristics(
+            cardinalityEstimationMethods.getHeuristics().value_or(0) +
+            other.cardinalityEstimationMethods.getHeuristics().value_or(0));
+        cardinalityEstimationMethods.setMixed(
+            cardinalityEstimationMethods.getMixed().value_or(0) +
+            other.cardinalityEstimationMethods.getMixed().value_or(0));
+        cardinalityEstimationMethods.setMetadata(
+            cardinalityEstimationMethods.getMetadata().value_or(0) +
+            other.cardinalityEstimationMethods.getMetadata().value_or(0));
+        cardinalityEstimationMethods.setCode(
+            cardinalityEstimationMethods.getCode().value_or(0) +
+            other.cardinalityEstimationMethods.getCode().value_or(0));
+        nDocsSampled += other.nDocsSampled;
+        planShapeCounts.add(other.planShapeCounts);
+        clusterPeakTrackedMemBytes += other.clusterPeakTrackedMemBytes;
+    }
+
+    void add(const boost::optional<DataBearingNodeMetrics>& other) {
+        if (other) {
+            add(*other);
+        }
+    }
+
+    /**
+     * Aggregates the given CursorMetrics object into this one by field-wise addition (in the case
+     * of numeric metrics) or disjunction (in the case of boolean metrics).
+     */
+    void aggregateCursorMetrics(const CursorMetrics& metrics) {
+        keysExamined += metrics.getKeysExamined();
+        docsExamined += metrics.getDocsExamined();
+        bytesRead += metrics.getBytesRead();
+        readingTime += Microseconds(metrics.getReadingTimeMicros());
+        clusterWorkingTime += Milliseconds(metrics.getWorkingTimeMillis());
+        cpuNanos += Nanoseconds(metrics.getCpuNanos());
+        delinquentAcquisitions += metrics.getDelinquentAcquisitions();
+        totalAcquisitionDelinquency += Milliseconds(metrics.getTotalAcquisitionDelinquencyMillis());
+        maxAcquisitionDelinquency = Milliseconds(std::max(
+            maxAcquisitionDelinquency.count(), metrics.getMaxAcquisitionDelinquencyMillis()));
+        numInterruptChecks += metrics.getNumInterruptChecks();
+        overdueInterruptApproxMax = Milliseconds{std::max(
+            overdueInterruptApproxMax.count(), metrics.getOverdueInterruptApproxMaxMillis())};
+        hasSortStage = hasSortStage || metrics.getHasSortStage();
+        usedDisk = usedDisk || metrics.getUsedDisk();
+        fromMultiPlanner = fromMultiPlanner || metrics.getFromMultiPlanner();
+        fromPlanCache = fromPlanCache && metrics.getFromPlanCache();
+        nMatched += metrics.getNMatched();
+        nUpserted += metrics.getNUpserted();
+        nModified += metrics.getNModified();
+        nDeleted += metrics.getNDeleted();
+        nInserted += metrics.getNInserted();
+        keysInserted += metrics.getKeysInserted();
+        keysDeleted += metrics.getKeysDeleted();
+        totalTimeQueuedMicros += Microseconds(metrics.getTotalTimeQueuedMicros());
+        totalAdmissions += metrics.getTotalAdmissions();
+        totalNormalPriorityAdmissions += metrics.getTotalNormalPriorityAdmissions();
+        totalLowPriorityAdmissions += metrics.getTotalLowPriorityAdmissions();
+        wasLoadShed = wasLoadShed || metrics.getWasLoadShed();
+        wasDeprioritized = wasDeprioritized || metrics.getWasDeprioritized();
+        wasMarkedNonDeprioritizable =
+            wasMarkedNonDeprioritizable || metrics.getWasMarkedNonDeprioritizable();
+        planningTime += Microseconds(metrics.getPlanningTimeMicros());
+        const auto& ce = metrics.getCardinalityEstimationMethods();
+        cardinalityEstimationMethods.setHistogram(
+            cardinalityEstimationMethods.getHistogram().value_or(0) +
+            ce.getHistogram().value_or(0));
+        cardinalityEstimationMethods.setSampling(
+            cardinalityEstimationMethods.getSampling().value_or(0) + ce.getSampling().value_or(0));
+        cardinalityEstimationMethods.setHeuristics(
+            cardinalityEstimationMethods.getHeuristics().value_or(0) +
+            ce.getHeuristics().value_or(0));
+        cardinalityEstimationMethods.setMixed(cardinalityEstimationMethods.getMixed().value_or(0) +
+                                              ce.getMixed().value_or(0));
+        cardinalityEstimationMethods.setMetadata(
+            cardinalityEstimationMethods.getMetadata().value_or(0) + ce.getMetadata().value_or(0));
+        cardinalityEstimationMethods.setCode(cardinalityEstimationMethods.getCode().value_or(0) +
+                                             ce.getCode().value_or(0));
+        nDocsSampled += metrics.getNDocsSampled();
+        if (const auto& psc = metrics.getPlanShapeCounts()) {
+            planShapeCounts.add(*psc);
+        }
+        clusterPeakTrackedMemBytes += metrics.getClusterPeakTrackedMemBytes();
+    }
+};
+
+}  // namespace mongo::query_stats

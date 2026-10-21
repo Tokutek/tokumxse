@@ -1,0 +1,42 @@
+/**
+ * Test that applicationName and namespace appear in queryStats for the find command.
+ * @tags: [requires_fcv_71]
+ */
+import {getQueryStats, getQueryStatsFindCmd} from "jstests/libs/query/query_stats_utils.js";
+
+const kApplicationName = "MongoDB Shell";
+
+// Turn on the collecting of queryStats metrics.
+let options = {
+    setParameter: {
+        internalQueryStatsSampleRate: 1,
+        internalQueryStatsWriteCmdSampleRate: 0,
+        // In replica set suites, cluster-time key generation runs a find on admin.system.keys
+        // shortly after startup, which is recorded in the queryStats store (it is attributed to
+        // the shell's application name, so it is not filtered out) and perturbs the exact entry
+        // count asserted below.
+        "failpoint.disableKeyGeneration": "{'mode':'alwaysOn'}",
+    },
+};
+
+const conn = MongoRunner.runMongod(options);
+conn.setLogLevel(3, "query");
+const testDB = conn.getDB("test");
+let coll = testDB[jsTestName()];
+coll.drop();
+
+coll.insert({v: 1});
+coll.insert({v: 2});
+coll.insert({v: 3});
+
+coll.find({v: 1}).toArray();
+
+let queryStats = getQueryStats(conn);
+assert.eq(1, queryStats.length, queryStats);
+assert.eq(kApplicationName, queryStats[0].key.client.application.name, queryStats);
+
+queryStats = getQueryStatsFindCmd(conn, {transformIdentifiers: true});
+assert.eq(1, queryStats.length, queryStats);
+assert.eq(kApplicationName, queryStats[0].key.client.application.name, queryStats);
+
+MongoRunner.stopMongod(conn);

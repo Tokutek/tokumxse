@@ -1,0 +1,176 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/util/background_thread_clock_source.h"
+
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/time_support.h"
+
+#include <memory>
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
+
+namespace mongo {
+
+BackgroundThreadClockSource::BackgroundThreadClockSource(std::unique_ptr<ClockSource> clockSource,
+                                                         Milliseconds granularity)
+    : _clockSource(std::move(clockSource)), _state(kTimerPaused), _granularity(granularity) {
+    _startTimerThread();
+    _tracksSystemClock = true;
+}
+
+BackgroundThreadClockSource::~BackgroundThreadClockSource() {
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _inShutdown = true;
+        _condition.notify_one();
+    }
+
+    _timer.join();
+}
+
+Milliseconds BackgroundThreadClockSource::getPrecision() {
+    return _granularity;
+}
+
+Date_t BackgroundThreadClockSource::now() {
+    // Since this is called very frequently by many threads, the common case should not write to
+    // shared memory.
+    //
+    // If we read ReaderHasRead, we have at least the last time from a previous reader, or the
+    // background thread.
+    if (MONGO_unlikely(_state.load() != kReaderHasRead)) {  // acquire
+        _updateClockAndWakeTimerIfNeeded();
+    }
+
+    return Date_t::lastNow();
+}
+
+void BackgroundThreadClockSource::_updateClock() {
+    // We capture the lastUpdate time now to ensure that we sleep for the right target granularity,
+    // even if it takes a while for the background thread to wake up.
+    _lastUpdate = _clockSource->now();
+
+    // Updates Date_t::lastNow by calling Date_t::now()
+    Date_t::now();
+}
+
+// This will be called at most once per _granularity per thread. In common cases it will only be
+// called by a single thread per _granularity.
+void BackgroundThreadClockSource::_updateClockAndWakeTimerIfNeeded() {
+    uint8_t expected = kTimerWillPause;
+    _state.compareAndSwap(&expected, kReaderHasRead);
+    // Try to go from TimerWillPause to ReaderHasRead.
+    if (expected != kTimerPaused) {
+        // There are three possible states _state could have been in before this cas:
+        //
+        // kTimerWillPause - In this case, we've transitioned to kReaderHasRead, telling the timer
+        //                   it still has recent readers and should continue to loop.  In that case,
+        //                   we have no more to do, return.
+        //
+        // kReaderHasRead - Another thread had already performed the kTimerWillPause ->
+        //                  kReaderHasRead transition, we have no work to do, return.
+        //
+        // kTimerPaused - The timer was paused, so we have to wake it up.  Don't return and attempt
+        //                to wake the timer thread.
+        //
+        // For the first two cases, we can be sure we've acquired an up to date notion of time (from
+        // the timer thread or a reader that has woken calling updateClock()), from either
+        // succeeding or failing the cas above.
+        return;
+    }
+
+    // We may be in timer paused
+    std::lock_guard<std::mutex> lock(_mutex);
+    // See if we still observe paused, after taking a lock.  This prevents multiple threads from
+    // racing to update the clock.
+    if (_state.load() != kTimerPaused) {
+        // If not, someone else has taken care of it
+        return;
+    }
+
+    // If we were still in pause, there are a couple of tasks we have to do:
+    //
+    // 1. update the clock
+    // 2. store kReaderHasRead
+    // 3. wake the background thread
+    //
+    // It's important that we do them in that order, so that the background thread sleeps
+    // exactly granularity from now, and so that readers that observe kReaderHasRead pick up the
+    // updated time.  Failing to keep that order may cause them to observe what may be a very
+    // stale read (if the background timer was a sleep for an extended period).
+    _updateClock();
+    _state.store(kReaderHasRead);  // release
+
+    _condition.notify_one();
+}
+
+size_t BackgroundThreadClockSource::timesPausedForTest() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return _timesPaused;
+}
+
+void BackgroundThreadClockSource::_startTimerThread() {
+    // Start the background thread that repeatedly sleeps for the specified duration of milliseconds
+    // and wakes up to store the current time.
+    _timer = stdx::thread([&]() {
+        setThreadName("BackgroundThreadClockSource");
+        std::unique_lock<std::mutex> lock(_mutex);
+        _started = true;
+        _condition.notify_one();
+
+        while (!_inShutdown) {
+            // update the clock every pass
+            _updateClock();
+
+            // Always transition to will pause on every run.
+            auto old = _state.swap(kTimerWillPause);  // release
+
+            // There are 3 possible states _state could have been in:
+            //
+            // kTimerWillPause - We slept until the next tick without a reader.  We should pause
+            //
+            // kReaderHasRead - A reader has read since our last sleep.  We should sleep again
+            //
+            // kTimerPaused - We were asleep and spuriously woke or we just started (we start in
+            //                kTimerPaused)
+            //
+            // If we do pause our wake up will indicate:
+            //   1. That we've had a reader and it's time to tick again
+            //   2. That we're in shutdown, where we'll early return from the next condvar wait
+            //   3. Experiencing a spurious wake, which may make us tick an extra time, but no more
+            //      than once per granularity
+
+            if (old != kReaderHasRead) {
+                // Stop running if nothing has read the time since we last updated the time.
+                _state.store(kTimerPaused);
+
+                _timesPaused++;
+
+                // We don't care about spurious wake ups here, at worst we'll update the clock an
+                // extra time.
+                MONGO_IDLE_THREAD_BLOCK;
+                _condition.wait(lock);
+            }
+
+            MONGO_IDLE_THREAD_BLOCK;
+            _clockSource->waitForConditionUntil(
+                _condition, lock, _lastUpdate + _granularity, [this] { return _inShutdown; });
+        }
+    });
+
+    // Wait for the thread to start. This prevents other threads from calling now() until the timer
+    // thread is at its first wait() call. While the code would work without this, it makes startup
+    // more predictable and therefore easier to test.
+    std::unique_lock<std::mutex> lock(_mutex);
+    _condition.wait(lock, [this] { return _started; });
+}
+
+}  // namespace mongo

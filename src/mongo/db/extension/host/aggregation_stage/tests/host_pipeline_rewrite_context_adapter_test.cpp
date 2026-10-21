@@ -1,0 +1,360 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/extension/host/pipeline_rewrite_context.h"
+#include "mongo/db/extension/host_connector/adapter/pipeline_dependencies_adapter.h"
+#include "mongo/db/extension/host_connector/adapter/pipeline_rewrite_context_adapter.h"
+#include "mongo/db/extension/shared/handle/aggregation_stage/logical.h"
+#include "mongo/db/extension/shared/handle/pipeline_dependencies_handle.h"
+#include "mongo/db/extension/shared/handle/pipeline_rewrite_context_handle.h"
+#include "mongo/db/pipeline/document_source_add_fields.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_mock_stages.h"
+#include "mongo/db/pipeline/document_source_skip.h"
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/optimization/rule_based_rewriter.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+
+namespace mongo::extension {
+namespace {
+
+using namespace host_connector;
+using namespace rule_based_rewrites::pipeline;
+
+TEST(PipelineRewriteContextAdapterTest, GetNthNextStageReturnsFirstNextStage) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    auto stage = PipelineRewriteContextAPI(&adapter).getNthNextStage(1);
+    ASSERT_NOT_EQUALS(nullptr, stage.get());
+    ASSERT_EQUALS(DocumentSourceSkip::kStageName, stage->getName());
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetNthNextStageReturnsSecondNextStage) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+    container.push_back(DocumentSourceLimit::create(expCtx, 3));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    auto stage = api.getNthNextStage(2);
+    ASSERT_NOT_EQUALS(nullptr, stage.get());
+    ASSERT_EQUALS(DocumentSourceLimit::kStageName, stage->getName());
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetNthNextStageResultUpdatedOnSubsequentCall) {
+    // Calling getNthNextStage twice returns the correct stage for each index, verifying that the
+    // cached result is replaced on each invocation.
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+    container.push_back(DocumentSourceLimit::create(expCtx, 3));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    ASSERT_EQUALS(DocumentSourceSkip::kStageName, api.getNthNextStage(1)->getName());
+    ASSERT_EQUALS(DocumentSourceLimit::kStageName, api.getNthNextStage(2)->getName());
+}
+
+TEST(PipelineRewriteContextAdapterTest, EraseNthNextStageRemovesFirstNextStage) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+    container.push_back(DocumentSourceLimit::create(expCtx, 3));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    ASSERT_TRUE(api.eraseNthNext(1));
+
+    // $skip (index 1) is gone; the only remaining next stage is the second $limit.
+    ASSERT_EQUALS(2u, container.size());
+    ASSERT_EQUALS(DocumentSourceLimit::kStageName, api.getNthNextStage(1)->getName());
+}
+
+TEST(PipelineRewriteContextAdapterTest, EraseNthNextStageRemovesNonAdjacentStage) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+    container.push_back(DocumentSourceLimit::create(expCtx, 3));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    ASSERT_TRUE(api.eraseNthNext(2));
+
+    // The second $limit (index 2) is gone; $skip (index 1) remains.
+    ASSERT_EQUALS(2u, container.size());
+    ASSERT_EQUALS(DocumentSourceSkip::kStageName, api.getNthNextStage(1)->getName());
+}
+
+TEST(PipelineRewriteContextAdapterTest, HasAtLeastNNextStagesTrueWhenEnoughStagesExist) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+    container.push_back(DocumentSourceLimit::create(expCtx, 3));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    ASSERT_TRUE(api.hasAtLeastNNextStages(1));
+    ASSERT_TRUE(api.hasAtLeastNNextStages(2));
+}
+
+TEST(PipelineRewriteContextAdapterTest, HasAtLeastNNextStagesFalseWhenNotEnoughStagesExist) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    ASSERT_TRUE(api.hasAtLeastNNextStages(1));
+    ASSERT_FALSE(api.hasAtLeastNNextStages(2));
+    ASSERT_FALSE(api.hasAtLeastNNextStages(3));
+}
+
+TEST(PipelineRewriteContextAdapterTest, HasAtLeastNNextStagesFalseAtLastStage) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    PipelineRewriteContextAPI api(&adapter);
+    ASSERT_FALSE(api.hasAtLeastNNextStages(1));
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetPipelineSuffixDependenciesEmptyAtLastStage) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    ASSERT_TRUE(rbrCtx.atLastStage());
+
+    DepsTracker deps = rbrCtx.getPipelineSuffixDependencies();
+    ASSERT_FALSE(deps.getNeedsAnyMetadata());
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetPipelineSuffixDependenciesWithMetadataRequest) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(
+        DocumentSourceGeneratesMetaField::create(expCtx, DocumentMetadataFields::kTextScore));
+    container.push_back(
+        DocumentSourceNeedsMetaField::create(expCtx, DocumentMetadataFields::kTextScore));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    ASSERT_FALSE(rbrCtx.atLastStage());
+
+    DepsTracker deps = rbrCtx.getPipelineSuffixDependencies();
+    ASSERT_TRUE(deps.getNeedsAnyMetadata());
+    ASSERT_TRUE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
+    ASSERT_FALSE(deps.getNeedsMetadata(DocumentMetadataFields::kSearchScore));
+}
+
+TEST(PipelineRewriteContextAdapterTest, VariableRefsEmptyForUnknownVariable) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    auto variableRefs = rbrCtx.getBuiltInVariableRefsInPipelineSuffix();
+    ASSERT_FALSE(variableRefs.contains("SOME_UNKNOWN_VARIABLE"));
+
+    // Verify the adapter agrees.
+    DepsTracker deps;
+    auto adapter =
+        host_connector::PipelineDependenciesAdapter(std::move(deps), std::move(variableRefs));
+    ASSERT_FALSE(PipelineDependenciesHandle(&adapter)->needsVariable("SOME_UNKNOWN_VARIABLE"));
+}
+
+TEST(PipelineRewriteContextAdapterTest, VariableRefsDoNotContainUnreferencedVariable) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    container.push_back(DocumentSourceSkip::create(expCtx, 5));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    // $limit and $skip don't reference $$SEARCH_META.
+    auto variableRefs = rbrCtx.getBuiltInVariableRefsInPipelineSuffix();
+    ASSERT_FALSE(variableRefs.contains("SEARCH_META"));
+
+    DepsTracker deps;
+    auto adapter =
+        host_connector::PipelineDependenciesAdapter(std::move(deps), std::move(variableRefs));
+    ASSERT_FALSE(PipelineDependenciesHandle(&adapter)->needsVariable("SEARCH_META"));
+}
+
+TEST(PipelineRewriteContextAdapterTest, VariableRefsContainSearchMetaWhenReferenced) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+    // $addFields references $$SEARCH_META, so it appears in the suffix variable refs.
+    container.push_back(DocumentSourceAddFields::create(BSON("x" << "$$SEARCH_META"), expCtx));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    auto variableRefs = rbrCtx.getBuiltInVariableRefsInPipelineSuffix();
+    ASSERT_TRUE(variableRefs.contains("SEARCH_META"));
+
+    DepsTracker deps;
+    auto adapter =
+        host_connector::PipelineDependenciesAdapter(std::move(deps), std::move(variableRefs));
+    ASSERT_TRUE(PipelineDependenciesHandle(&adapter)->needsVariable("SEARCH_META"));
+}
+
+TEST(PipelineDependenciesAdapterTest, NeedsWholeDocumentReturnsTrue) {
+    DepsTracker deps;
+    deps.needWholeDocument = true;
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    ASSERT_TRUE(PipelineDependenciesHandle(&adapter)->needsWholeDocument());
+}
+
+TEST(PipelineDependenciesAdapterTest, NeedsWholeDocumentReturnsFalse) {
+    DepsTracker deps;
+    deps.needWholeDocument = false;
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    ASSERT_FALSE(PipelineDependenciesHandle(&adapter)->needsWholeDocument());
+}
+
+TEST(PipelineDependenciesAdapterTest, NeedsMetadataReturnsTrueForSetMetadataType) {
+    DepsTracker deps;
+    deps.setNeedsMetadata(DocumentMetadataFields::kSearchScore);
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    ASSERT_TRUE(PipelineDependenciesHandle(&adapter)->needsMetadata("searchScore"));
+}
+
+TEST(PipelineDependenciesAdapterTest, NeedsMetadataReturnsFalseForUnsetMetadataType) {
+    DepsTracker deps;
+    // Do not set kSearchScore.
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    ASSERT_FALSE(PipelineDependenciesHandle(&adapter)->needsMetadata("searchScore"));
+}
+
+TEST(PipelineDependenciesAdapterTest, GetNeededFieldsReturnsNullWhenNeedsWholeDocument) {
+    DepsTracker deps;
+    deps.needWholeDocument = true;
+    deps.fields.insert("a");
+    deps.fields.insert("b");
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    auto result = PipelineDependenciesHandle(&adapter)->getNeededFields();
+    ASSERT_FALSE(result.has_value());
+}
+
+TEST(PipelineDependenciesAdapterTest, GetNeededFieldsReturnsEmptyArrayWhenNoFieldsNeeded) {
+    DepsTracker deps;
+    deps.needWholeDocument = false;
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    auto result = PipelineDependenciesHandle(&adapter)->getNeededFields();
+    ASSERT_TRUE(result.has_value());
+    ASSERT_BSONOBJ_EQ(*result, BSONArray());
+}
+
+TEST(PipelineDependenciesAdapterTest, GetNeededFieldsReturnsFieldPaths) {
+    DepsTracker deps;
+    deps.needWholeDocument = false;
+    deps.fields.insert("x");
+    deps.fields.insert("a");
+    deps.fields.insert("a.b");
+    auto adapter = host_connector::PipelineDependenciesAdapter(std::move(deps));
+    auto result = PipelineDependenciesHandle(&adapter)->getNeededFields();
+    ASSERT_TRUE(result.has_value());
+    ASSERT_BSONOBJ_EQ(*result, BSON_ARRAY("a" << "a.b" << "x"));
+}
+
+
+TEST(PipelineRewriteContextAdapterTest, GetPipelineSuffixBoundsEmptySuffix) {
+    // When the current stage is the only stage, the suffix is empty and bounds are Unknown/Unknown.
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    auto bounds = PipelineRewriteContextAPI(&adapter).getPipelineSuffixBounds();
+    ASSERT_EQUALS(kDocsNeededConstraintUnknown, bounds.minBounds.type);
+    ASSERT_EQUALS(kDocsNeededConstraintUnknown, bounds.maxBounds.type);
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetPipelineSuffixBoundsWithLimit) {
+    // Suffix containing a $limit yields discrete bounds equal to that limit value.
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));  // current stage
+    container.push_back(DocumentSourceLimit::create(expCtx, 5));   // suffix
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    auto bounds = PipelineRewriteContextAPI(&adapter).getPipelineSuffixBounds();
+    ASSERT_EQUALS(kDocsNeededConstraintDiscrete, bounds.minBounds.type);
+    ASSERT_EQUALS(5u, bounds.minBounds.value);
+    ASSERT_EQUALS(kDocsNeededConstraintDiscrete, bounds.maxBounds.type);
+    ASSERT_EQUALS(5u, bounds.maxBounds.value);
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetPipelineSuffixBoundsWithBlockingStage) {
+    // A blocking stage ($sort) in the suffix yields NeedAll/NeedAll bounds.
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));             // current stage
+    container.push_back(DocumentSourceSort::create(expCtx, BSON("a" << 1)));  // suffix
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    auto bounds = PipelineRewriteContextAPI(&adapter).getPipelineSuffixBounds();
+    ASSERT_EQUALS(kDocsNeededConstraintNeedAll, bounds.minBounds.type);
+    ASSERT_EQUALS(kDocsNeededConstraintNeedAll, bounds.maxBounds.type);
+}
+
+TEST(PipelineRewriteContextAdapterTest, GetPipelineSuffixBoundsWithMixedBounds) {
+    // Suffix [$match, $limit] yields min=discrete, max=unknown: $match has unknown selectivity
+    // so it resets the discrete max to Unknown while leaving the min bound intact.
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+    DocumentSourceContainer container;
+    container.push_back(DocumentSourceLimit::create(expCtx, 10));              // current stage
+    container.push_back(DocumentSourceMatch::create(BSON("a" << 1), expCtx));  // start of suffix
+    container.push_back(DocumentSourceLimit::create(expCtx, 12));
+
+    PipelineRewriteContext rbrCtx(*expCtx, container);
+    PipelineRewriteContextAdapter adapter(host::PipelineRewriteContext::make(&rbrCtx));
+
+    auto bounds = PipelineRewriteContextAPI(&adapter).getPipelineSuffixBounds();
+    ASSERT_EQUALS(kDocsNeededConstraintDiscrete, bounds.minBounds.type);
+    ASSERT_EQUALS(12u, bounds.minBounds.value);
+    ASSERT_EQUALS(kDocsNeededConstraintUnknown, bounds.maxBounds.type);
+}
+
+}  // namespace
+}  // namespace mongo::extension

@@ -1,0 +1,258 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/client/dbclient_connection.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/client/authenticate.h"
+#include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/client/sasl_client_session.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/auth/sasl_command_constants.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/database_name_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/connection_purpose.h"
+#include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/socket_utils.h"
+#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_peer_info.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/version.h"
+
+#include <cmath>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
+namespace mongo {
+
+using std::string;
+
+DBClientConnection::DBClientConnection(DBClientConnectionOptions options)
+    : DBClientSession(options.autoReconnect,
+                      options.soTimeout,
+                      std::move(options.uri),
+                      options.hook,
+                      options.apiParameters,
+                      options.connectionPurpose),
+      _autoReconnectBackoff(Seconds(1), Seconds(2)) {
+    _numConnections.fetchAndAdd(1);
+}
+
+StatusWith<std::shared_ptr<transport::Session>> DBClientConnection::_makeSession(
+    const HostAndPort& host,
+    transport::ConnectSSLMode sslMode,
+    Milliseconds timeout,
+    const boost::optional<TransientSSLParams>& transientSSLParams) {
+    auto swSession =
+        getGlobalServiceContext()->getTransportLayerManager()->getDefaultEgressLayer()->connect(
+            host,
+            transientSSLParams ? transport::kEnableSSL : getURI().getSSLMode(),
+            _socketTimeout.value_or(Milliseconds(5000)),
+            transientSSLParams);
+    if (swSession.isOK()) {
+        const auto& session = swSession.getValue();
+        const ConnectionPurpose purpose = getConnectionPurpose();
+        mongo::getConnectionPurpose(session.get()) = purpose;
+        if (purpose == ConnectionPurpose::kReplication) {
+            getGlobalServiceContext()
+                ->getTransportLayerManager()
+                ->getDefaultEgressLayer()
+                ->registerReplicationSession(session);
+        }
+    }
+    return swSession;
+}
+
+void DBClientConnection::_auth(const BSONObj& params) {
+    if (_autoReconnect) {
+        /* note we remember the auth info before we attempt to auth -- if the connection is broken,
+         * we will then have it for the next autoreconnect attempt.
+         */
+        const DatabaseName dbName = AuthDatabaseNameUtil::deserialize(
+            params[auth::getSaslCommandUserDBFieldName()].valueStringDataSafe());
+        authCache[dbName] = params.getOwned();
+    }
+
+    DBClientSession::_auth(params);
+}
+
+void DBClientConnection::authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) {
+    if (_autoReconnect) {
+        _internalAuthOnReconnect = true;
+        _internalAuthStepDownBehavior = stepDownBehavior;
+    }
+
+    return DBClientSession::authenticateInternalUser(stepDownBehavior);
+}
+
+void DBClientConnection::logout(const DatabaseName& dbName, BSONObj& info) {
+    authCache.erase(dbName);
+    _internalAuthOnReconnect = false;
+    runCommand(dbName, BSON("logout" << 1), info);
+}
+
+std::pair<rpc::UniqueReply, DBClientBase*> DBClientConnection::runCommandWithTarget(
+    OpMsgRequest request) {
+    auto out = DBClientSession::runCommandWithTarget(std::move(request));
+    if (!_parentReplSetName.empty()) {
+        const auto replyBody = out.first->getCommandReply();
+        if (!isOk(replyBody)) {
+            handleNotPrimaryResponse(replyBody, "errmsg");
+        }
+    }
+
+    return out;
+}
+
+std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> DBClientConnection::runCommandWithTarget(
+    OpMsgRequest request, std::shared_ptr<DBClientBase> me) {
+    auto out = DBClientSession::runCommandWithTarget(std::move(request), std::move(me));
+    if (!_parentReplSetName.empty()) {
+        const auto replyBody = out.first->getCommandReply();
+        if (!isOk(replyBody)) {
+            handleNotPrimaryResponse(replyBody, "errmsg");
+        }
+    }
+
+    return out;
+}
+
+rpc::UniqueReply DBClientConnection::parseCommandReplyMessage(const std::string& host,
+                                                              const Message& replyMsg) {
+    try {
+        return DBClientSession::parseCommandReplyMessage(host, replyMsg);
+    } catch (const DBException& ex) {
+        if (ErrorCodes::isConnectionFatalMessageParseError(ex.code())) {
+            _markFailed(kKillSession);
+        }
+        throw;
+    }
+}
+
+void DBClientConnection::_reconnectSession() {
+    // Don't hammer reconnects, backoff if needed
+    sleepFor(_autoReconnectBackoff.nextSleep());
+
+    LOGV2_DEBUG(20120, _logLevel.toInt(), "Trying to reconnect", "connString"_attr = toString());
+
+    try {
+        connect(_serverAddress, _applicationName, _transientSSLParams);
+    } catch (const DBException& e) {
+        _markFailed(kSetFlag);
+        LOGV2_DEBUG(20121,
+                    _logLevel.toInt(),
+                    "Reconnect attempt failed",
+                    "connString"_attr = toString(),
+                    "error"_attr = e.toStatus());
+        if (e.code() == ErrorCodes::IncompatibleCatalogManager) {
+            throw;
+        } else {
+            throwSocketError(SocketErrorKind::CONNECT_ERROR, e.reason());
+        }
+    }
+
+    LOGV2_DEBUG(20122, _logLevel.toInt(), "Reconnected", "connString"_attr = toString());
+    if (_internalAuthOnReconnect) {
+        authenticateInternalUser(_internalAuthStepDownBehavior);
+    } else {
+        for (const auto& kv : authCache) {
+            try {
+                DBClientConnection::_auth(kv.second);
+            } catch (ExceptionFor<ErrorCodes::AuthenticationFailed>& ex) {
+                LOGV2_DEBUG(20123,
+                            _logLevel.toInt(),
+                            "Reconnect: auth failed",
+                            "db"_attr = kv.second[auth::getSaslCommandUserDBFieldName()],
+                            "user"_attr = kv.second[auth::getSaslCommandUserFieldName()],
+                            "error"_attr = ex.what());
+            }
+        }
+    }
+}
+
+void DBClientConnection::_killSession() {
+    if (!_session) {
+        return;
+    }
+    _session->end();
+}
+
+void DBClientConnection::setParentReplSetName(const string& replSetName) {
+    _parentReplSetName = replSetName;
+}
+
+void DBClientConnection::handleNotPrimaryResponse(const BSONObj& replyBody,
+                                                  std::string_view errorMsgFieldName) {
+    const BSONElement errorMsgElem = replyBody[errorMsgFieldName];
+    const BSONElement codeElem = replyBody["code"];
+
+    if (!isNotPrimaryErrorString(errorMsgElem) &&
+        !ErrorCodes::isNotPrimaryError(ErrorCodes::Error(codeElem.numberInt()))) {
+        return;
+    }
+
+    auto monitor = ReplicaSetMonitor::get(_parentReplSetName);
+    if (monitor) {
+        monitor->failedHost(_serverAddress,
+                            {ErrorCodes::NotWritablePrimary,
+                             str::stream() << "got not primary from: " << _serverAddress
+                                           << " of repl set: " << _parentReplSetName});
+    }
+
+    _markFailed(kSetFlag);
+}
+
+#ifdef MONGO_CONFIG_SSL
+const SSLConfiguration* DBClientConnection::getSSLConfiguration() {
+    return _session->getSSLConfiguration();
+}
+
+bool DBClientConnection::isUsingTransientSSLParams() const {
+    return _transientSSLParams.has_value();
+}
+
+#endif
+
+Atomic<int> DBClientConnection::_numConnections;
+
+}  // namespace mongo

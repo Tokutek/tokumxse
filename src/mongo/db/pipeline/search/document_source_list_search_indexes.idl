@@ -1,0 +1,29 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/pipeline/search/document_source_list_search_indexes_validator.h"
+imports:
+    - "mongo/db/basic_types.idl"
+structs:
+    DocumentSourceListSearchIndexesSpec:
+        description:
+            "A document used to specify the $listSearchIndexes stage. If both id and name
+            are empty, then this stage will return the information for all indexes in the collection."
+        strict: true
+        query_shape_component: true
+        cpp_validator_func: "validateListSearchIndexesSpec"
+        fields:
+            id:
+                description: "If set, the information for the index with this id is returned."
+                type: string
+                optional: true
+                query_shape: anonymize
+            name:
+                description: "If set, the information for the index with this name is returned."
+                type: string
+                optional: true
+                query_shape: anonymize

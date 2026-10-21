@@ -1,0 +1,387 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/wildcard_multikey_paths.h"
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/index/multikey_metadata_access_stats.h"
+#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/index/wildcard_metadata_key.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/interval/interval.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/shard_catalog/txn_wildcard_multikey_paths.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <cstddef>
+#include <iterator>
+#include <memory>
+#include <string_view>
+#include <utility>
+
+#include <boost/container/small_vector.hpp>
+#include <boost/none.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+
+/**
+ * A wildcard index contains an unbounded set of multikey paths, therefore, it was decided to store
+ * multikey path as a metadata key to a wildcard index using the following special format:
+ * {["": MinKey, ] "": 1, "": "multikey.path.value" [, "": MinKey] }.
+ * Where MinKey values are corresponding to regular fields of the Wildcard Index, which can never be
+ * multikeys, and the actual multikey path value is prefixed by the integer value 1.
+ * Some examples of Wildcard key patterns and their corresponding metadata keys
+ * - {"$**": 1} --> {"": 1, "some.path": 1}
+ * - {a: 1, "$**": 1} --> {"": MinKey, "": 1, "": "some.path"}
+ * - {a: 1, "$**": 1, b: 1} --> {"": MinKey, "": 1, "": "some.path", "": MinKey}
+ * - {a: 1, c: 1, "$**": 1, b: 1} --> {"": MinKey, "": MinKey, "": 1, "": "some.path", "": MinKey}
+ * where "some.path" represents an actual multikey path in some documents.
+ * The prefix of a number of MinKey values followed by the number "1" allows to differentiate
+ * multikey metadata keys from user-data keys, because user-data keys always have a string value on
+ * the position of the value "1" in a multikey metadata key.
+ */
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Extracts the multikey path from a metadata key stored within a wildcard index.
+ */
+static FieldRef extractMultikeyPathFromIndexKey(const IndexKeyEntry& entry) {
+    tassert(7354600,
+            "A disk location of a Wildcard Index's metadata key must be a reserved value",
+            record_id_helpers::isReserved(entry.loc));
+    tassert(7354601,
+            "A disk location of a Wildcard Index's metadata key must a reserved value of type "
+            "string or int",
+            !entry.loc.isLong() ||
+                entry.loc ==
+                    record_id_helpers::reservedIdFor(
+                        record_id_helpers::ReservationId::kWildcardMultikeyMetadataId,
+                        KeyFormat::Long));
+    tassert(7354602,
+            "A disk location of a Wildcard Index's metadata key must a reserved value of type "
+            "string or int",
+            !entry.loc.isStr() ||
+                entry.loc ==
+                    record_id_helpers::reservedIdFor(
+                        record_id_helpers::ReservationId::kWildcardMultikeyMetadataId,
+                        KeyFormat::String));
+
+    return decodeWildcardMultikeyMetadataPath(entry.key);
+}
+
+/**
+ * Returns IndexBoundsChecker's key pattern for the given Wildcard Index's key pattern.
+ */
+static BSONObj buildIndexBoundsKeyPattern(const BSONObj& wiKeyPattern) {
+    static constexpr std::string_view emptyFieldName = ""sv;
+
+    BSONObjBuilder builder{};
+
+    for (const auto& field : wiKeyPattern) {
+        if (WildcardNames::isWildcardFieldName(field.fieldNameStringData())) {
+            // corresponds to  "$_path" fields which is always in ascending order
+            builder.appendNumber(emptyFieldName, 1);
+        }
+
+        // Add an order corresponding to the next field of the Wildcard Index's key pattern.
+        tassert(7354608,
+                "All fields in a Wildcard Index's key pattern must be number values",
+                field.isNumber());
+
+        builder.appendNumber(emptyFieldName, field.numberInt());
+    }
+
+    return builder.obj();
+}
+
+/**
+ * Scans wildcard multikey metadata keys from the index using the given recovery unit and
+ * index bounds. Adds discovered multikey paths to 'multikeyPaths' and updates 'stats'.
+ */
+static void scanWildcardMetadataKeys(OperationContext* opCtx,
+                                     const WildcardAccessMethod* wam,
+                                     RecoveryUnit& ru,
+                                     const IndexBounds& indexBounds,
+                                     const BSONObj& keyPattern,
+                                     std::set<FieldRef>* multikeyPaths,
+                                     MultikeyMetadataAccessStats* stats) {
+    auto cursor = wam->newCursor(opCtx, ru);
+
+    constexpr int kForward = 1;
+    const auto* sortedDataInterface = wam->getSortedDataInterface();
+    IndexBoundsChecker checker(&indexBounds, keyPattern, kForward);
+    IndexSeekPoint seekPoint;
+    if (!checker.getStartSeekPoint(&seekPoint)) {
+        return;
+    }
+
+    key_string::Builder builder(sortedDataInterface->getKeyStringVersion(),
+                                sortedDataInterface->getOrdering());
+
+    auto view = cursor->seekForKeyValueView(
+        ru, IndexEntryComparison::makeKeyStringFromSeekPointForSeek(seekPoint, kForward, builder));
+
+    ++stats->numSeeks;
+    while (!view.isEmpty()) {
+        ++stats->keysExamined;
+
+        BSONObj dehydratedKey = key_string::toBson(view.getKeyStringWithoutRecordIdView(),
+                                                   sortedDataInterface->getOrdering(),
+                                                   view.getTypeBitsView(),
+                                                   view.getVersion());
+
+        switch (checker.checkKey(dehydratedKey, &seekPoint)) {
+            case KeyState::VALID:
+                multikeyPaths->emplace(extractMultikeyPathFromIndexKey(
+                    {.key = dehydratedKey, .loc = *view.getRecordId()}));
+                view = cursor->nextKeyValueView(ru);
+                break;
+
+            case KeyState::MUST_ADVANCE: {
+                ++stats->numSeeks;
+                key_string::Builder builder(sortedDataInterface->getKeyStringVersion(),
+                                            sortedDataInterface->getOrdering());
+                view = cursor->seekForKeyValueView(
+                    ru,
+                    IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                        seekPoint, kForward, builder));
+                break;
+            }
+
+            case KeyState::DONE:
+                view.reset();
+                break;
+
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+}
+
+/**
+ * Retrieves from the wildcard index the set of multikey path metadata keys bounded by
+ * 'indexBounds'. Returns the set of multikey paths represented by the keys.
+ */
+static std::set<FieldRef> getWildcardMultikeyPathSetHelper(OperationContext* opCtx,
+                                                           const UUID& collectionUuid,
+                                                           const IndexCatalogEntry* index,
+                                                           const IndexBounds& indexBounds,
+                                                           MultikeyMetadataAccessStats* stats) {
+    const WildcardAccessMethod* wam =
+        checked_cast<const WildcardAccessMethod*>(index->accessMethod());
+
+    stats->numSeeks = 0;
+    stats->keysExamined = 0;
+
+    const auto keyPattern = buildIndexBoundsKeyPattern(index->descriptor()->keyPattern());
+    auto& parentRu = *shard_role_details::getRecoveryUnit(opCtx);
+
+    std::set<FieldRef> multikeyPaths{};
+
+    // Always read from the parent transaction's RU. This covers both the case where keys existed in
+    // the snapshot when the transaction started, and the fallback case where the side transaction
+    // was abandoned (because the index was created in the same transaction and is not visible to
+    // the side transaction's snapshot). In that case, metadata keys were written directly in the
+    // parent transaction and are not tracked in TxnWildcardMultikeyPaths.
+    scanWildcardMetadataKeys(opCtx, wam, parentRu, indexBounds, keyPattern, &multikeyPaths, stats);
+
+    // In active multi-document transactions, also union the in-process cache of multikey paths
+    // recorded by side-transaction writes earlier in this transaction. The parent transaction's
+    // WT snapshot was taken before those side commits, so the parent-RU scan above cannot see them.
+    // Without this union, the planner would under-report multikey paths and could produce incorrect
+    // query results.
+    //
+    // The cache lives as a RecoveryUnit::Snapshot decoration, so it survives statement boundaries
+    // via RU stash/unstash and dies automatically with the snapshot on abort or abandonment.
+    if (opCtx->inMultiDocumentTransaction() && parentRu.isActive()) {
+        if (const auto* paths = TxnWildcardMultikeyPaths::tryGet(opCtx)) {
+            paths->appendMatchingPaths(
+                collectionUuid, index->descriptor()->indexName(), &multikeyPaths);
+        }
+    }
+
+    return multikeyPaths;
+}
+
+std::vector<Interval> getMultikeyPathIndexIntervalsForField(FieldRef field) {
+    std::vector<Interval> intervals;
+
+    size_t pointIntervalPrefixParts = field.numParts();
+    const size_t skipFirstFieldElement = 1;
+    const auto numericPathComponents = field.getNumericPathComponents(skipFirstFieldElement);
+    const auto hasNumericPathComponent = !numericPathComponents.empty();
+
+    if (hasNumericPathComponent) {
+        pointIntervalPrefixParts = *numericPathComponents.begin();
+        tassert(11321104,
+                "pointIntervalPrefixParts must be greater than 0",
+                pointIntervalPrefixParts > 0);
+    }
+
+    constexpr bool inclusive = true;
+    constexpr bool exclusive = false;
+
+    // Add a point interval for each path up to the first numeric path component. Field "a.b.c"
+    // would produce point intervals ["a", "a"], ["a.b", "a.b"] and ["a.b.c", "a.b.c"]. Field
+    // "a.b.0.c" would produce point intervals ["a", "a"] and ["a.b", "a.b"].
+    for (size_t i = 1; i <= pointIntervalPrefixParts; ++i) {
+        auto multikeyPath = field.dottedSubstring(0, i);
+        intervals.push_back(IndexBoundsBuilder::makePointInterval(multikeyPath));
+    }
+
+    // If "field" contains a numeric path component then we add a range covering all subfields
+    // of the non-numeric prefix.
+    if (hasNumericPathComponent) {
+        auto rangeBase = field.dottedSubstring(0, pointIntervalPrefixParts);
+        StringBuilder multikeyPathStart;
+        multikeyPathStart << rangeBase << ".";
+        StringBuilder multikeyPathEnd;
+        multikeyPathEnd << rangeBase << static_cast<char>('.' + 1);
+
+        intervals.emplace_back(BSON("" << multikeyPathStart.str() << "" << multikeyPathEnd.str()),
+                               inclusive,
+                               exclusive);
+    }
+
+    return intervals;
+}
+
+/**
+ * Returns the postion of the wildcard field inside the Wildcard Index's keyPattern and the
+ * direction of 'IndexBounds' generated for querying multikey paths.
+ */
+static std::pair<size_t, bool> getWildcardFieldPosition(const BSONObj& keyPattern) {
+    size_t pos = 0;
+    for (const auto& field : keyPattern) {
+        if (WildcardNames::isWildcardFieldName(field.fieldNameStringData())) {
+            return {pos, field.numberInt() < 0};
+        }
+        ++pos;
+    }
+
+    tasserted(
+        7354609,
+        str::stream() << "Wildcard field is required in Wildcard's key pattern, but not found: "
+                      << keyPattern);
+}
+
+/**
+ * Returns the IndexBounds to retrieve multikey metadata keys for the given 'fieldSet'.
+ */
+static IndexBounds buildMetadataKeysIndexBounds(const BSONObj& keyPattern,
+                                                const stdx::unordered_set<std::string>& fieldSet) {
+    IndexBounds indexBounds;
+
+    // Multikey metadata keys are stored in the following format:
+    // '[MinKey]*, 1, <multikeypath>, [MinKey]*'.
+    // A multikey metadata key is always prefixed with the number of MinKeys equal to the number of
+    // regular fields in the index's keyPattern, then follows the number "1", followed by the string
+    // value of the multikey path. At the end of the metadata key the number of MinKey equal to the
+    // number of regular fields after the wildcard field is placed.
+    // We build index bounds in the following 4 steps:
+    // 1. Add the number of prefixed MinKey values, which is 0 or more.
+    // 2. Add the number "1" which is always prefixed the multikey path value.
+    // 3. Add the multikey path.
+    // 4. Add the number of suffixed MinKey values, which is 0 or more.
+
+    const auto [wildcardPosition, shouldReverse] = getWildcardFieldPosition(keyPattern);
+
+    // Step 1. Add the number of prefixed MinKey values, which is 0 or more.
+    for (size_t i = 0; i < wildcardPosition; ++i) {
+        OrderedIntervalList preifixOil;
+        preifixOil.intervals.push_back(IndexBoundsBuilder::makePointInterval(BSON("" << MINKEY)));
+        indexBounds.fields.push_back(std::move(preifixOil));
+    }
+
+    // Step 2. Add the number "1" which is always prefixed the multikey path value.
+    OrderedIntervalList multikeyPathFlagOil;
+    multikeyPathFlagOil.intervals.push_back(IndexBoundsBuilder::makePointInterval(BSON("" << 1)));
+    indexBounds.fields.push_back(std::move(multikeyPathFlagOil));
+
+    // Step 3. Add the multikey path.
+    OrderedIntervalList fieldNameOil;
+    for (const auto& field : fieldSet) {
+        auto intervals = getMultikeyPathIndexIntervalsForField(FieldRef(field));
+        fieldNameOil.intervals.insert(fieldNameOil.intervals.end(),
+                                      std::make_move_iterator(intervals.begin()),
+                                      std::make_move_iterator(intervals.end()));
+    }
+
+    // IndexBoundsBuilder::unionize() sorts the OrderedIntervalList allowing for in order index
+    // traversal.
+    IndexBoundsBuilder::unionize(&fieldNameOil);
+    if (shouldReverse) {
+        fieldNameOil.reverse();
+    }
+    indexBounds.fields.push_back(std::move(fieldNameOil));
+
+    // Step 4. Add the number of suffixed MinKey values, which is 0 or more.
+    const size_t keyPatternNFields = static_cast<size_t>(keyPattern.nFields());
+    for (size_t i = wildcardPosition + 1; i < keyPatternNFields; ++i) {
+        OrderedIntervalList suffixOil;
+        suffixOil.intervals.push_back(IndexBoundsBuilder::makePointInterval(BSON("" << MINKEY)));
+        indexBounds.fields.push_back(std::move(suffixOil));
+    }
+
+    return indexBounds;
+}
+
+std::set<FieldRef> getWildcardMultikeyPathSet(OperationContext* opCtx,
+                                              const UUID& collectionUuid,
+                                              const IndexCatalogEntry* entry,
+                                              const stdx::unordered_set<std::string>& fieldSet,
+                                              MultikeyMetadataAccessStats* stats) {
+    tassert(7354610, "stats must be non-null", stats);
+
+    const auto& indexBounds =
+        buildMetadataKeysIndexBounds(entry->descriptor()->keyPattern(), fieldSet);
+    return getWildcardMultikeyPathSetHelper(opCtx, collectionUuid, entry, indexBounds, stats);
+}
+
+/**
+ * Return key range to retrieve all multikey metadata keys.
+ */
+static std::pair<BSONObj, BSONObj> buildMetadataKeyRange(const BSONObj& keyPattern) {
+    static constexpr std::string_view emptyFieldName = ""sv;
+
+    BSONObjBuilder rangeBeginBuilder{};
+    BSONObjBuilder rangeEndBuilder{};
+    for (const auto& field : keyPattern) {
+        if (WildcardNames::isWildcardFieldName(field.fieldNameStringData())) {
+            rangeBeginBuilder.appendNumber(emptyFieldName, 1);
+            rangeEndBuilder.appendNumber(emptyFieldName, 1);
+            break;
+        } else {
+            rangeBeginBuilder.appendMinKey(emptyFieldName);
+            rangeEndBuilder.appendMinKey(emptyFieldName);
+        }
+    }
+
+    rangeBeginBuilder.appendMinKey(emptyFieldName);
+    rangeEndBuilder.appendMaxKey(emptyFieldName);
+    return std::make_pair(rangeBeginBuilder.obj(), rangeEndBuilder.obj());
+}
+
+}  // namespace mongo

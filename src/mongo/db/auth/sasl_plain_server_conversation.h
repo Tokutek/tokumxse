@@ -1,56 +1,57 @@
-/*
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <string>
+#include "mongo/base/status_with.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/sasl_mechanism_policies.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/modules.h"
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
-#include "mongo/db/auth/sasl_server_conversation.h"
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
-    /**
-     *  Server side authentication session for SASL PLAIN.
-     */
-    class SaslPLAINServerConversation : public SaslServerConversation {
-        MONGO_DISALLOW_COPYING(SaslPLAINServerConversation);
-    public:
-        /**
-         * Implements the server side of a SASL PLAIN mechanism session.
-         *
-         **/
-        explicit SaslPLAINServerConversation(SaslAuthenticationSession* saslAuthSession);
 
-        virtual ~SaslPLAINServerConversation();
+class SASLPlainServerMechanism : public MakeServerMechanism<PLAINPolicy> {
+public:
+    explicit SASLPlainServerMechanism(std::string authenticationDatabase)
+        : MakeServerMechanism<PLAINPolicy>(std::move(authenticationDatabase)) {}
 
-        virtual StatusWith<bool> step(StringData inputData, std::string* outputData);
-    };
+    boost::optional<std::uint32_t> currentStep() const override {
+        return 1;
+    }
+
+    boost::optional<std::uint32_t> totalSteps() const override {
+        return 1;
+    }
+
+private:
+    StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
+                                                       std::string_view input) final;
+};
+
+class PLAINServerFactory : public MakeServerFactory<SASLPlainServerMechanism> {
+public:
+    using MakeServerFactory<SASLPlainServerMechanism>::MakeServerFactory;
+    static constexpr bool isInternal = true;
+    bool canMakeMechanismForUser(const User* user) const final {
+        auto credentials = user->getCredentials();
+        return !credentials.isExternal &&
+            (credentials.scram<SHA1Block>().isValid() ||
+             credentials.scram<SHA256Block>().isValid());
+    }
+};
+
 
 }  // namespace mongo

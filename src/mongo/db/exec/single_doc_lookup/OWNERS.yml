@@ -1,0 +1,23 @@
+version: 1.0.0
+filters:
+  # Generic single-document lookup mechanism, usable by any executor (Express, SBE, aggregation)
+  # and any caller (change streams, $search idLookup, ...). Owned by query-execution at large.
+  - "*":
+    approvers:
+      - 10gen/query-execution
+  - "OWNERS.yml":
+    approvers:
+      - 10gen/query-execution-staff-leads
+  # Express-specific executor follows the ownership of src/mongo/db/exec/express.
+  - "express_*":
+    approvers:
+      - 10gen/query-execution-classic
+  # SBE-based executor touches SBE internals (plan builder, runtime env, slot binder).
+  - "sbe_*":
+    approvers:
+      - 10gen/query-execution-sbe
+  # The sharded (route-based) eligibility decision touches catalog/routing internals.
+  - "sharded_cluster_local_lookup_eligibility*":
+    approvers:
+      - 10gen/query-execution-router
+      - 10gen/server-catalog-and-routing-shard-catalog

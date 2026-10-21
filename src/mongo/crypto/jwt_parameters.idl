@@ -1,0 +1,16 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::crypto"
+    mod_visibility: private
+
+server_parameters:
+    JWKSMinimumQuiescePeriodSecs:
+        description: Minimum time to wait after a successful JWKS fetch before repulling.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gJWKSMinimumQuiescePeriodSecs
+        default: 60 # One minute
+        validator: {gte: 0}
+        redact: false

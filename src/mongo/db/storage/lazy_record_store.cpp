@@ -1,0 +1,110 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/lazy_record_store.h"
+
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+
+namespace mongo {
+LazyRecordStore::~LazyRecordStore() {
+    invariant(!_hasPendingCreation,
+              "WriteUnitOfWork outlived LazyRecordStore which created a RecordStore");
+}
+
+std::unique_ptr<RecordStore> LazyRecordStore::_createRecordStore(OperationContext* opCtx,
+                                                                 std::string_view ident,
+                                                                 LazyRecordStore* lrs) {
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+    bool nested = ru.inUnitOfWork();
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
+    WriteUnitOfWork wuow(opCtx);
+    auto rs = storageEngine->makeInternalRecordStore(opCtx, ident, KeyFormat::Long);
+    // When we create tables inside a nested WUOW, rollback doesn't happen until the top-level WUOW
+    // is done. This is after we store the table on the LRS, so we need to go through the LRS's drop
+    // path to unset the rolled-back table. In the non-nested case, the rollback happens before we
+    // store the table and so we bypass that and directly call the storage engine to drop it.
+    if (nested && lrs) {
+        lrs->_hasPendingCreation = true;
+        struct Change final : public RecoveryUnit::Change {
+            LazyRecordStore* lrs;
+            Change(LazyRecordStore* lrs) : lrs(lrs) {}
+            void rollback(OperationContext* opCtx) noexcept final {
+                lrs->_hasPendingCreation = false;
+                lrs->drop(opCtx, StorageEngine::Immediate{});
+            }
+            void commit(OperationContext* opCtx, boost::optional<Timestamp>) noexcept final {
+                lrs->_hasPendingCreation = false;
+            }
+        };
+        ru.registerChange(std::make_unique<Change>(lrs));
+    } else {
+        ru.onRollback([ident](OperationContext* rollbackOpCtx) {
+            auto se = rollbackOpCtx->getServiceContext()->getStorageEngine();
+            se->addDropPendingIdent(StorageEngine::Immediate{}, std::make_shared<Ident>(ident));
+        });
+    }
+    wuow.commit();
+    return rs;
+}
+
+LazyRecordStore::LazyRecordStore(OperationContext* opCtx,
+                                 std::string_view ident,
+                                 CreateMode createMode)
+    : _tableOrIdent([&]() -> decltype(_tableOrIdent) {
+          auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+          switch (createMode) {
+              case CreateMode::immediate:
+                  return _createRecordStore(opCtx, ident, this);
+              case CreateMode::deferred:
+                  return std::string{ident};
+              case CreateMode::openExisting: {
+                  auto engine = storageEngine->getEngine();
+                  auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+                  return engine->getInternalRecordStore(ru, ident, KeyFormat::Long);
+              }
+              default:
+                  MONGO_UNREACHABLE;
+          }
+      }()) {}
+
+void LazyRecordStore::createTable(OperationContext* opCtx, std::string_view ident) {
+    _createRecordStore(opCtx, ident, nullptr);
+}
+
+RecordStore& LazyRecordStore::getOrCreateTable(OperationContext* opCtx) {
+    if (auto ident = std::get_if<std::string>(&_tableOrIdent)) {
+        _tableOrIdent = _createRecordStore(opCtx, *ident, this);
+    }
+    return *std::get<std::unique_ptr<RecordStore>>(_tableOrIdent);
+}
+
+bool LazyRecordStore::tableExists() const {
+    return std::holds_alternative<std::unique_ptr<RecordStore>>(_tableOrIdent);
+}
+
+RecordStore& LazyRecordStore::getTableOrThrow() const {
+    auto table = std::get_if<std::unique_ptr<RecordStore>>(&_tableOrIdent);
+    tassert(12129700, "LazyRecordStore table has not been created", table);
+    return **table;
+}
+
+void LazyRecordStore::drop(OperationContext* opCtx, StorageEngine::DropTime dropTime) {
+    if (auto table = std::get_if<std::unique_ptr<RecordStore>>(&_tableOrIdent)) {
+        auto identStr = std::string{(*table)->getIdent()};
+        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        storageEngine->addDropPendingIdent(dropTime, std::make_shared<Ident>(identStr));
+        _tableOrIdent = std::move(identStr);
+    }
+}
+
+}  // namespace mongo

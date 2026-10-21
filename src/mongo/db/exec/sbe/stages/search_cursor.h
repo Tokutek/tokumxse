@@ -1,0 +1,162 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/plan_yield_policy_sbe.h"
+#include "mongo/executor/task_executor_cursor.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/string_listset.h"
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+namespace mongo::sbe {
+/**
+ * A stage for $search which maintains a mongot cursor, retrieves one response from mongot in each
+ * getNext() call, and puts the whole response (without metadata) along with specific
+ * fields/metadata into the given slots.
+ *
+ * Debug string representation:
+ *
+ * search_cursor_stage idSlot? resultSlot? [metaSlot1, ..., metadataSlotN] [fieldSlot1, ...,
+ * fieldSlotN] remoteCursorId isStoredSource sortSpecSlot? limitSlot? sortKeySlot? collatorSlot?
+ */
+class SearchCursorStage final : public PlanStage {
+public:
+    static std::unique_ptr<SearchCursorStage> createForStoredSource(
+        NamespaceString nss,
+        boost::optional<UUID> collUuid,
+        boost::optional<value::SlotId> resultSlot,
+        std::vector<std::string> metadataNames,
+        value::SlotVector metadataSlots,
+        std::vector<std::string> fieldNames,
+        value::SlotVector fieldSlots,
+        size_t remoteCursorId,
+        boost::optional<value::SlotId> sortSpecSlot,
+        boost::optional<value::SlotId> limitSlot,
+        boost::optional<value::SlotId> sortKeySlot,
+        boost::optional<value::SlotId> collatorSlot,
+        PlanYieldPolicySBE* yieldPolicy,
+        PlanNodeId planNodeId);
+
+    static std::unique_ptr<SearchCursorStage> createForNonStoredSource(
+        NamespaceString nss,
+        boost::optional<UUID> collUuid,
+        boost::optional<value::SlotId> idSlot,
+        std::vector<std::string> metadataNames,
+        value::SlotVector metadataSlots,
+        size_t remoteCursorId,
+        boost::optional<value::SlotId> sortSpecSlot,
+        boost::optional<value::SlotId> limitSlot,
+        boost::optional<value::SlotId> sortKeySlot,
+        boost::optional<value::SlotId> collatorSlot,
+        PlanYieldPolicySBE* yieldPolicy,
+        PlanNodeId planNodeId);
+
+    static std::unique_ptr<SearchCursorStage> createForMetadata(
+        NamespaceString nss,
+        boost::optional<UUID> collUuid,
+        boost::optional<value::SlotId> resultSlot,
+        size_t remoteCursorId,
+        PlanYieldPolicySBE* yieldPolicy,
+        PlanNodeId planNodeId);
+
+    std::unique_ptr<PlanStage> clone() const final;
+
+    void prepare(CompileCtx& ctx) final;
+    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
+    void open(bool reOpen) final;
+    PlanState getNext() final;
+    void close() final;
+
+    std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
+    const SpecificStats* getSpecificStats() const final;
+    void doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                      DebugPrintInfo& debugPrintInfo) const final;
+    size_t estimateCompileTimeSize() const final;
+
+    /**
+     * Calculate the number of documents needed to satisfy a user-defined limit. This information
+     * can be used in a getMore sent to mongot.
+     */
+    boost::optional<long long> calcDocsNeeded();
+
+protected:
+private:
+    SearchCursorStage(NamespaceString nss,
+                      boost::optional<UUID> collUuid,
+                      boost::optional<value::SlotId> idSlot,
+                      boost::optional<value::SlotId> resultSlot,
+                      std::vector<std::string> metadataNames,
+                      value::SlotVector metadataSlots,
+                      std::vector<std::string> fieldNames,
+                      value::SlotVector fieldSlots,
+                      size_t remoteCursorId,
+                      bool isStoredSource,
+                      boost::optional<value::SlotId> sortSpecSlot,
+                      boost::optional<value::SlotId> limitSlot,
+                      boost::optional<value::SlotId> sortKeySlot,
+                      boost::optional<value::SlotId> collatorSlot,
+                      PlanYieldPolicySBE* yieldPolicy,
+                      PlanNodeId planNodeId);
+
+    PlanState doGetNext();
+    bool shouldReturnEOF();
+
+    const NamespaceString _namespace;
+    const boost::optional<UUID> _collUuid;
+    // Output slots.
+    const boost::optional<value::SlotId> _idSlot;
+    const boost::optional<value::SlotId> _resultSlot;
+    const StringListSet _metadataNames;
+    const value::SlotVector _metadataSlots;
+    const StringListSet _fieldNames;
+    const value::SlotVector _fieldSlots;
+
+    // Input search query info.
+    const size_t _remoteCursorId;
+    const bool _isStoredSource;
+
+    // Input slots.
+    const boost::optional<value::SlotId> _sortSpecSlot;
+    const boost::optional<value::SlotId> _limitSlot;
+    const boost::optional<value::SlotId> _sortKeySlot;
+    const boost::optional<value::SlotId> _collatorSlot;
+
+    // Output slot accessors.
+    value::OwnedValueAccessor _idAccessor;
+    value::OwnedValueAccessor _resultAccessor;
+    absl::InlinedVector<value::OwnedValueAccessor, 3> _metadataAccessors;
+    value::SlotAccessorMap _metadataAccessorsMap;
+    absl::InlinedVector<value::OwnedValueAccessor, 3> _fieldAccessors;
+    value::SlotAccessorMap _fieldAccessorsMap;
+    value::OwnedValueAccessor _sortKeyAccessor;
+
+    // Input slot accessors.
+    value::SlotAccessor* _collatorAccessor{nullptr};
+    value::SlotAccessor* _sortSpecAccessor{nullptr};
+    value::SlotAccessor* _limitAccessor{nullptr};
+
+    // Variables to save the value from input slots.
+    boost::optional<BSONObj> _response;
+    boost::optional<BSONObj> _resultObj;
+    boost::optional<BSONObj> _explainObj;
+    uint64_t _limit{0};
+
+    boost::optional<SortKeyGenerator> _sortKeyGen;
+    executor::TaskExecutorCursor* _cursor{nullptr};
+    SearchStats _specificStats;
+    // Store the cursorId for logging purpose. We need to store it because the id on the
+    // TaskExecutorCursor will be set to zero after the final getMore after the cursor is exhausted.
+    boost::optional<CursorId> _cursorId;
+};
+}  // namespace mongo::sbe

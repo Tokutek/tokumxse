@@ -1,0 +1,358 @@
+# Index Builds
+
+Indexes are built by performing a full scan of collection data. To be considered consistent, an
+index must correctly map keys to all documents.
+
+At a high level, omitting details that will be elaborated upon in further sections, index builds
+have the following procedure:
+
+- While holding a collection X lock, write a new index entry to the array of indexes included as
+  part of a durable catalog entry. This entry has a `ready: false` component. See
+  [Durable Catalog](../shard_role/shard_catalog/README.md#durable-catalog).
+- Downgrade to a collection IX lock.
+- Scan all documents on the collection to be indexed
+  - Generate [keys](../storage/key_string/README.md) for the indexed fields for each document
+  - Periodically yield locks and storage engine snapshots
+  - Insert the generated keys into the [external sorter](../sorter/README.md)
+- Read the sorted keys from the external sorter and load them into the storage engine index. For
+  performance reasons, we insert the keys into the index table in sorted order.
+- While holding a collection X lock, make a final `ready: true` write to the durable catalog.
+
+## Hybrid Index Builds
+
+Hybrid index builds refer to the default procedure introduced in 4.2 that produces efficient index
+data structures without blocking reads or writes for extended periods of time. This is achieved by
+performing a full collection scan and loading keys while concurrently intercepting new writes into
+an internal storage engine table.
+
+### Internal Table For Side Writes
+
+During an index build, new writes (i.e. inserts, updates, and deletes) are applied to the collection
+as usual. However, instead of writing directly into the index table as a normal write would, index
+keys for documents are generated and intercepted by inserting into an internal _side-writes_ table.
+Writes are intercepted for the duration of the index build, from before the collection scan begins
+until the build is completed.
+
+Both inserted and removed keys are recorded in the _side-writes_ table. For example, during an index
+build on `{a: 1}`, an update on a document from `{_id: 0, a: 1}` to `{_id: 0, a: 2}` is recorded as
+a deletion of the key `1` and an insertion of the key `2`.
+
+Each record in the side-writes table is keyed by a monotonically increasing record identifier and
+must be consumed in insertion order. The value is a BSON document with two fields:
+
+- `"op"`: The string `"i"` (insert) or `"d"` (delete).
+- `"key"`: A BinData value containing the serialized index key including both the key bytes and the
+  type bits. The type bits are needed to reconstruct the original BSON types when the key is later
+  deserialized during the drain phase.
+
+For example: `{op: "i", key: BinData(0, <serialized bytes>)}`.
+
+For wildcard indexes, multikey metadata keys are written as additional `"op": "i"` entries in the
+same batch.
+
+Once the collection scan and key-loading phases of the index build are complete, these intercepted
+keys are applied directly to the index in three phases:
+
+- Drain the side table while holding a collection IX lock to allow concurrent reads and writes.
+  - Since writes are still accepted, new keys may appear at the end of the _side-writes_ table. They
+    will be applied in subsequent steps. (Signal commit readiness to the primary)
+- Continue draining the side table while holding a collection IX lock to allow concurrent reads and
+  writes, while waiting for other replicas to become commit-ready.
+- Drain the side table while holding a collection X lock to block all reads and writes.
+
+During drain, each record's BSON value is parsed: the `"key"` field is deserialized into an index
+key and routed to either an insert or delete operation depending on the `"op"` field. The drain
+phase reads records front-to-back and deletes each one after it has been applied to the index.
+
+See
+[IndexBuildInterceptor::sideWrite](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/index_build_interceptor.cpp#L208)
+and
+[IndexBuildInterceptor::drainWritesIntoIndex](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/index_build_interceptor.cpp#L150).
+
+### Internal Table For Duplicate Key Violations
+
+Unique indexes created with `{unique: true}` enforce a constraint that there are no duplicate keys
+in an index. The hybrid index procedure makes it challenging to detect duplicates because keys are
+split between the index and the side-writes table. Additionally, during the lifetime of an index
+build, concurrent writes may introduce and resolve duplicate key conflicts on the index.
+
+For those reasons, during an index build we temporarily allow duplicate key violations, and record
+any detected violations in an internal table, the _duplicate key tracker_. Each record is keyed by a
+monotonic record identifier, and the value is raw binary (not a BSON document): the serialized index
+key **without** the trailing record identifier but **with** type bits. The record identifier is
+excluded because the tracker only cares whether the key still has duplicates at commit time, not
+which specific document owns the key. The type bits are preserved so that a human-readable key can
+be reconstructed for the error message if the violation persists.
+
+At the conclusion of the index build, under a collection X lock,
+[duplicate keys are re-checked](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/index_builds_coordinator.cpp#L3730).
+If the duplicate has been resolved (e.g. the conflicting document was deleted during the build), the
+record is deleted. If it persists, an error is thrown.
+
+See
+[DuplicateKeyTracker](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/duplicate_key_tracker.h#L51).
+
+### Internal Table For Key Generation Errors
+
+In addition to uniqueness constraints, indexes may have per-key constraints. For example, a compound
+index may not be built on documents with parallel arrays. An index build on `{a: 1, b: 1}` will fail
+to generate a key for `{a: [1, 2, 3], b: [4, 5, 6]}`.
+
+On a primary under normal circumstances, index builds fail immediately after encountering a key
+generation error (as opposed to duplicate key errors), and the error is returned to the user. Since
+secondaries apply oplog entries [out of order](../repl/README.md#oplog-entry-application), however,
+spurious key generation errors may be encountered on otherwise consistent data. To solve this
+problem, we relax key constraints and suppress key generation errors on secondaries.
+
+With the introduction of simultaneous index builds, an index build may be started on a secondary
+node, but complete while it is a primary after a state transition. If we ignored constraints while
+in the secondary state, we would not be able to commit the index build and guarantee its consistency
+since we may have suppressed valid key generation errors.
+
+To solve this problem, on secondaries, the records associated with key generation errors are skipped
+and recorded in an internal table, the _skipped records tracker_. Each record is a BSON document
+containing the record identifier of the collection document that failed key generation. No index key
+is stored because the key failed to generate in the first place.
+
+If a secondary node becomes primary and then commits the index build, it re-generates and re-inserts
+keys for the
+[skipped records](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/index_builds_coordinator.cpp#L2037)
+under a collection X lock: for each stored record identifier, the current version of the document is
+read and keys are re-generated. If there are still constraint violations, an error is thrown and the
+index build aborts. Primaries do not suppress key generation errors, so they do not use the skipped
+records tracker; they abort immediately when a key generation error occurs. Secondaries that remain
+secondary rely on the primary's decision to commit as assurance that skipped records do not need to
+be checked.
+
+See
+[SkippedRecordTracker](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/skipped_record_tracker.h#L54).
+
+### Summary of Keys and Values for Internal Tables
+
+| Table           | Key                                                     | Value                                                                |
+| --------------- | ------------------------------------------------------- | -------------------------------------------------------------------- |
+| Sorter          | Serialized index key (field values + types + record ID) | Empty                                                                |
+| Side-writes     | Monotonic record ID                                     | BSON document: `{op: "i"/"d", key: BinData(...)}`                    |
+| Duplicate key   | Monotonic record ID                                     | Raw binary: serialized index key (without record ID, with type bits) |
+| Skipped records | Monotonic record ID                                     | BSON document: `{recordId: <RecordId>}`                              |
+
+## Replica Set Index Builds
+
+Also referred to as "simultaneous index builds" and "two-phase index builds".
+
+As of 4.4, index builds in a replica set use a two-phase commit protocol. When a primary starts an
+index build, it spawns a background thread and replicates a `startIndexBuild` oplog entry. Secondary
+nodes will start the index build in the background as soon as they apply that oplog entry. When a
+primary is done with its indexing, it will decide to replicate either an `abortIndexBuild` or
+`commitIndexBuild` oplog entry.
+
+Each node independently builds the index by scanning its own collection data. The external sorter
+spills to local unreplicated temporary files under `dbpath/_tmp` when the memory limit is reached.
+Once sorted, the keys are [bulk-loaded](https://source.wiredtiger.com/develop/tune_bulk_load.html)
+into the WiredTiger index table. Bulk-loading requires keys to be inserted in sorted order, but
+builds a B-tree structure that is more efficiently filled than with random insertion.
+
+Simultaneous index builds are resilient to replica set state transitions. The node that starts an
+index build does not need to be the same node that decides to commit it.
+
+See
+[Index Builds in Replicated Environments - MongoDB Manual](https://www.mongodb.com/docs/manual/core/index-creation/#index-builds-in-replicated-environments).
+
+Server 7.1 introduces the following improvements:
+
+- Index builds abort immediately after detecting errors other than duplicate key violations. Before
+  7.1, index builds aborted the index build close to completion, potentially long after detection.
+- A secondary member can abort a two-phase index build. Before 7.1, a secondary was forced to crash
+  instead. See the [Voting for Abort](#voting-for-abort) section.
+- Index builds are cancelled if there isn't enough storage space available. See the
+  [Disk Space](#disk-space) section.
+
+### Commit Quorum
+
+The purpose of `commitQuorum` is to ensure secondaries are ready to commit an index build quickly.
+This minimizes replication lag on secondaries: secondaries, on receipt of a `commitIndexBuild` oplog
+entry, will stall oplog application until the local index build can be committed. `commitQuorum`
+delays commit of an index build on the primary node until secondaries are also ready to commit. A
+primary will not commit an index build until a minimum number of data-bearing nodes are ready to
+commit the index build. Index builds can take anywhere from moments to days to complete, so the
+replication lag can be significant. Note: `commitQuorum` makes no guarantee that indexes on
+secondaries are ready for use when the command completes, `writeConcern` must still be used for
+that.
+
+A `commitQuorum` option can be provided to the `createIndexes` command and specifies the number of
+nodes, including itself, for which a primary must wait to be ready before committing. The
+`commitQuorum` option accepts the same range of values as the writeConcern `"w"` option. This can be
+an integer specifying the number of nodes, `"majority"`, `"votingMembers"`, or a replica set tag.
+The default value is `"votingMembers"`, or all voting data-bearing nodes.
+
+Nodes (both primary and secondary) submit votes to the primary when they have finished scanning all
+data on a collection and performed the first drain of side-writes. Voting is implemented by a
+`voteCommitIndexBuild` command, and is persisted as a write to the replicated
+`config.system.indexBuilds` collection.
+
+While waiting for a commit decision, primaries and secondaries continue receiving and applying new
+side writes. When a quorum is reached, the current primary, under a collection X lock, will check
+the remaining index constraints. If there are errors, it will replicate an `abortIndexBuild` oplog
+entry. If the index build is successful, it will replicate a `commitIndexBuild` oplog entry.
+
+Secondaries that were not included in the commit quorum and receive a `commitIndexBuild` oplog entry
+will block replication until their index build is complete.
+
+The `commitQuorum` for a running index build may be changed by the user via the
+[`setIndexCommitQuorum`](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/commands/set_index_commit_quorum_command.cpp#L61)
+server command.
+
+See
+[IndexBuildsCoordinator::\_waitForNextIndexBuildActionAndCommit](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/index_builds_coordinator_mongod.cpp#L936).
+
+### Voting for Abort
+
+As of 7.1, a secondary can abort a two-phase index build by sending a `voteAbortIndexBuild` signal
+to the primary. In contrast, before 7.1 it was forced to crash. Common causes for aborting the index
+build are a killOp on the index build or running low on storage space. The primary, upon receiving a
+vote to abort the index build from a secondary, will replicate an `abortIndexBuild` oplog entry.
+This will cause all secondaries to gracefully abort the index build, even if a specific secondary
+had already voted to commit the index build.
+
+Note that once a secondary has voted to commit the index build, it cannot retract the vote. In the
+unlikely event that a secondary has voted for commit and for some reason it must abort while waiting
+for the primary to replicate a `commitIndexBuild` oplog entry, the secondary is forced to crash.
+
+### Disk Space
+
+As of 7.1, an index build can abort due to a replica set member running low on disk space. This
+applies both to primary and secondary nodes. Additionally, on a primary the index build won't start
+if the available disk space is low. The minimum amount of disk space is controlled by
+[indexBuildMinAvailableDiskSpaceMB](https://github.com/mongodb/mongo/blob/406e69f6f5dee8b698c4e4308de2e9e5cef6c12c/src/mongo/db/storage/two_phase_index_build_knobs.idl#L71)
+which defaults to 500MB.
+
+## Resumable Index Builds
+
+On clean shutdown, index builds save their progress in internal idents that will be used for
+resuming the index builds when the server starts up. The persisted information includes:
+
+- [Phase of the index build](https://github.com/mongodb/mongo/blob/0d45dd9d7ba9d3a1557217a998ad31c68a897d47/src/mongo/db/resumable_index_builds.idl#L43)
+  when it was interrupted for shutdown:
+  - initialized
+  - collection scan
+  - bulk load
+  - drain writes
+- Information relevant to the phase for reconstructing the internal state of the index build at
+  startup. This may include:
+  - The internal state of the external sorter.
+  - Idents for side writes, duplicate keys, and skipped records.
+
+During [startup recovery](../storage/README.md#startup-recovery), the persisted information is used
+to reconstruct the in-memory state for the index build and resume from the phase that we left off
+in. If we fail to resume the index build for whatever reason, the index build will restart from the
+beginning.
+
+Not all incomplete index builds are resumable upon restart. The current criteria for index build
+resumability can be found in
+[IndexBuildsCoordinator::isIndexBuildResumable()](https://github.com/mongodb/mongo/blob/0d45dd9d7ba9d3a1557217a998ad31c68a897d47/src/mongo/db/index_builds_coordinator.cpp#L375).
+Generally, index builds are resumable under the following conditions:
+
+- The index build is running on a voting member of the replica set with the default
+  [commit quorum](#commit-quorum) `"votingMembers"`.
+- Majority read concern is enabled.
+
+The
+[Recover To A Timestamp (RTT) rollback algorithm](https://github.com/mongodb/mongo/blob/04b12743cbdcfea11b339e6ad21fc24dec8f6539/src/mongo/db/repl/README.md#rollback)
+supports resuming index builds interrupted at any phase. On entering rollback, the resumable index
+information is persisted to disk using the same mechanism as shutdown. We resume the index build
+using the startup recovery logic that RTT uses to bring the node back to a writable state.
+
+For improved rollback semantics, resumable index builds require a majority read cursor during
+collection scan phase. Index builds wait for the majority commit point to advance before starting
+the collection scan. The majority wait happens after installing the
+[side table for intercepting new writes](#internal-table-for-side-writes).
+
+See
+[MultiIndexBlock::\_constructStateObject()](https://github.com/mongodb/mongo/blob/0d45dd9d7ba9d3a1557217a998ad31c68a897d47/src/mongo/db/catalog/multi_index_block.cpp#L900)
+for where we persist the relevant information necessary to resume the index build at shutdown and
+[StorageEngineImpl::\_handleInternalIdents()](https://github.com/mongodb/mongo/blob/0d45dd9d7ba9d3a1557217a998ad31c68a897d47/src/mongo/db/storage/storage_engine_impl.cpp#L329)
+for where we search for and parse the resume information on startup.
+
+## Primary-Driven Index Builds
+
+A primary-driven index build is similar to a two-phase index build in that it replicates a
+`startIndexBuild` oplog entry along with either a `commitIndexBuild` or an `abortIndexBuild` oplog
+entry. However, unlike two-phase index builds, the index is not built independently on each node of
+the replica set. Rather, the index is only built on the primary node and all internal writes for the
+index build are explicitly replicated through the oplog via `ci` and `cd` oplog entries; secondaries
+simply apply oplog to build the index. Thus, the concept of commit quorum does not apply to
+primary-driven index builds.
+
+Both primary-driven and two-phase builds use the same
+[bulk builder](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index/index_access_method.cpp#L920)
+for key insertion, but differ in how sorted keys are spilled. Compared to two-phase builds, which
+spill to local unreplicated temporary files, primary-driven builds spill into a
+[replicated storage engine table](https://github.com/mongodb/mongo/blob/e0efdcfb5020b802da043b955e922d0995109619/src/mongo/db/index_builds/index_build_interceptor.h#L221)
+so that sorted keys are propagated to secondaries through the oplog.
+
+### Resumability
+
+Primary-driven index builds support resuming on step-up after a failover or primary restart, at any
+point of the build and for any build configuration. They use a
+[similar on-disk format](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/resumable_index_builds.idl)
+as the [startup-recovery mechanism from two-phase index builds](#resumable-index-builds): a
+build-wide record of which phase (scan, load, drain) the build was in, plus, for each index, a
+record of the sorter's persisted ranges and the idents for its side-writes, duplicate key, and
+skipped records tables. What differs is the exact format of that information. The first entry in the
+table (key 1) holds the build-wide phase information; one entry per index (keys 2 to N+1) holds that
+index's persisted state.
+
+The metadata about the state of the build is updated periodically:
+
+- During the collection scan, the state is
+  [rewritten every time the sorter spills](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/multi_index_block.cpp#L1692)
+  a chunk of sorted keys to the table, via a
+  [callback triggered at spill time](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/multi_index_block.cpp#L561-L567).
+  Only entries that are still reachable in the sorter's persisted ranges are kept; if a resume
+  happens after ranges have been merged but before the merged-from sorter entries are deleted, any
+  sorter entries that fall outside the persisted ranges are simply discarded, since the ranges are
+  always written before the corresponding merged-from entries are removed.
+- During the load phase, the k-way merge that loads sorted keys into the index table periodically
+  persists each range's current iterator position. The interval, in number of keys loaded, is
+  controlled by the
+  [`primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys`](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/multi_index_block.idl#L94-L104)
+  server parameter.
+- Upon entering the drain phase, the
+  [state for all indexes is written once](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/multi_index_block.cpp#L1715-L1740).
+  No further updates are needed for this phase since draining the side-writes table requires no
+  additional metadata to track incremental progress.
+
+On step-up, the coordinator
+[iterates the in-memory registry](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/index_builds_coordinator.cpp#L2190-L2254)
+of primary-driven index builds that were active on the previous primary. For each build, it
+[reads the state of the build](https://github.com/mongodb/mongo/blob/eeaf2c6378e38ac3dc71faf5fbe0bf1d27fe9e48/src/mongo/db/index_builds/primary_driven/util.cpp#L305-L346)
+and attempts to resume it. If the table has no records yet (the build was interrupted before the
+first spill or drain), an initial-phase resume state is synthesized instead of reading one back. If
+resuming fails for any reason, the build is aborted instead.
+
+Since every write during a primary-driven index build, including side writes, is explicitly
+replicated through the oplog, a document write to a collection with `n` indexes being built produces
+`n+1` operations (the collection write plus one side write per index) that must be applied as an
+atomic unit; otherwise a secondary could apply a subset of them and end up with an index state
+inconsistent with its collection data.
+
+## Single-Phase Index Builds
+
+Index builds on empty collections replicate a `createIndexes` oplog entry. This oplog entry was used
+before FCV 4.4 for all index builds, but continues to be used in FCV 4.4 only for index builds that
+are considered "single-phase" and do not need to run in the background. Unlike two-phase index
+builds, the `createIndexes` oplog entry is always applied synchronously on secondaries during batch
+application.
+
+See
+[createIndexForApplyOps](https://github.com/mongodb/mongo/blob/6ea7d1923619b600ea0f16d7ea6e82369f288fd4/src/mongo/db/repl/oplog.cpp#L176-L183).
+
+## Memory Limits
+
+The maximum amount of memory allowed for an index build is controlled by the
+`maxIndexBuildMemoryUsageMegabytes` server parameter. The sorter is passed this value and uses it to
+regulate when to write a chunk of sorted data out to disk in a temporary file. The sorter keeps
+track of the chunks of data spilled to disk using one Iterator for each spill. The memory needed for
+the iterators is taken out of the `maxIndexBuildMemoryUsageMegabytes` and it is a percentage of
+`maxIndexBuildMemoryUsageMegabytes` define by the `maxIteratorsMemoryUsagePercentage` server
+parameter with minimum value enough to store one iterator and maximum value 1MB.

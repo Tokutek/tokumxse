@@ -1,0 +1,15 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+server_parameters:
+    enableExternalScripting:
+        description: "Enable external JavaScript execution using an external JS engine server"
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: gEnableExternalScripting
+        default: false
+        redact: false

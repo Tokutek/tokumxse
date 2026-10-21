@@ -1,0 +1,729 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/stages/hash_agg_accumulator.h"
+
+#include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"  // countName, partialSumName
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/pipeline/accumulator_multi.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <utility>
+
+namespace mongo {
+namespace sbe {
+namespace {
+
+template <class Comparator>
+int32_t minMaxNInsert(value::Array* heap,
+                      size_t maxSize,
+                      int32_t memUsage,
+                      int32_t memLimit,
+                      const Comparator& comp,
+                      value::TagValueOwned field) {
+    auto& elems = heap->values();
+
+    auto addMemUsage = [&](int32_t memAdded) {
+        memUsage += memAdded;
+        uassert(ErrorCodes::ExceededMemoryLimit,
+                str::stream()
+                    << "Accumulator used too much memory and spilling to disk cannot reduce memory "
+                       "consumption any further. Memory limit: "
+                    << memLimit << " bytes",
+                memUsage < memLimit);
+    };
+
+    if (heap->size() < maxSize) {
+        addMemUsage(value::getApproximateSize(field.tag(), field.value()));
+        heap->push_back(std::move(field));
+        std::push_heap(elems.begin(), elems.end(), comp);
+    } else {
+        auto heapRoot = elems.front();
+        if (comp(field.raw(), heapRoot)) {
+            addMemUsage(-value::getApproximateSize(heapRoot.first, heapRoot.second) +
+                        value::getApproximateSize(field.tag(), field.value()));
+            std::pop_heap(elems.begin(), elems.end(), comp);
+            heap->setAt(maxSize - 1, std::move(field));
+            std::push_heap(elems.begin(), elems.end(), comp);
+        }
+    }
+
+    return memUsage;
+}
+}  // namespace
+
+void CompiledHashAggAccumulator::prepare(CompileCtx& ctx,
+                                         value::SlotAccessor* accumulatorAccessor) {
+    if (_optionalInitializerExpr) {
+        _optionalInitializerCode = _optionalInitializerExpr->compile(ctx);
+    }
+
+    // Temporarily update the compiler context to indicate that the target is an "agg
+    // expression" program and to provide an accessor for the accumulator slot.
+    ON_BLOCK_EXIT(
+        [&ctx,
+         savedIsAggExpression = std::exchange(ctx.aggExpression, true),
+         savedAccumulatorAccessor = std::exchange(ctx.accumulator, accumulatorAccessor)]() {
+            // Restore the compiler context when the 'prepare()' method exits.
+            ctx.aggExpression = savedIsAggExpression;
+            ctx.accumulator = savedAccumulatorAccessor;
+        });
+    _accumulatorCode = _accumulatorExpr->compile(ctx);
+}
+
+void CompiledHashAggAccumulator::prepareForMerge(CompileCtx& ctx,
+                                                 value::SlotAccessor* accumulatorAccessor) {
+    // Temporarily update the compiler context to indicate that the target is an "agg
+    // expression" program and to provide an accessor for the accumulator slot.
+    ON_BLOCK_EXIT(
+        [&ctx,
+         savedIsAggExpression = std::exchange(ctx.aggExpression, true),
+         savedAccumulatorAccessor = std::exchange(ctx.accumulator, accumulatorAccessor)]() {
+            // Restore the compiler context when the 'prepareForMerge()' method exits.
+            ctx.aggExpression = savedIsAggExpression;
+            ctx.accumulator = savedAccumulatorAccessor;
+        });
+    _mergingCode = _mergingExpr->compile(ctx);
+}
+
+void CompiledHashAggAccumulator::initialize(vm::ByteCode& bytecode,
+                                            value::AssignableSlotAccessor& accumulatorState) const {
+    if (_optionalInitializerCode) {
+        accumulatorState.reset(bytecode.run(_optionalInitializerCode.get()));
+    }
+}
+
+void CompiledHashAggAccumulator::merge(
+    vm::ByteCode& bytecode, value::MaterializedSingleRowAccessor& accumulatorState) const {
+    tassert(8186807, "Not prepared for merging partial aggregates", _mergingCode);
+
+    accumulatorState.reset(bytecode.run(_mergingCode.get()));
+}
+
+size_t CompiledHashAggAccumulator::estimateSize() const {
+    return sizeof(*this) + size_estimator::estimate(_accumulatorExpr) +
+        size_estimator::estimate(_mergingExpr) +
+        (_optionalInitializerExpr ? size_estimator::estimate(_optionalInitializerExpr) : 0);
+}
+
+boost::optional<std::vector<DebugPrinter::Block>> CompiledHashAggAccumulator::debugPrintInitialize()
+    const {
+    if (!_optionalInitializerExpr) {
+        return {};
+    }
+
+    std::vector<DebugPrinter::Block> debugOutput;
+    DebugPrinter::addBlocks(debugOutput, _optionalInitializerExpr->debugPrint());
+    return debugOutput;
+}
+
+std::vector<DebugPrinter::Block> CompiledHashAggAccumulator::debugPrintAccumulate() const {
+    std::vector<DebugPrinter::Block> debugOutput;
+    DebugPrinter::addBlocks(debugOutput, _accumulatorExpr->debugPrint());
+    return debugOutput;
+}
+
+std::vector<DebugPrinter::Block> CompiledHashAggAccumulator::debugPrintMerge() const {
+    std::vector<DebugPrinter::Block> debugOutput;
+    DebugPrinter::addBlocks(debugOutput, _mergingExpr->debugPrint());
+    return debugOutput;
+}
+
+void SinglePurposeHashAggAccumulator::prepare(CompileCtx& ctx,
+                                              value::SlotAccessor* accumulatorAccessor) {
+    _transformCode = _transformExpr->compile(ctx);
+
+    singlePurposePrepare(ctx);
+}
+
+void SinglePurposeHashAggAccumulator::prepareForMerge(CompileCtx& ctx,
+                                                      value::SlotAccessor* accumulatorAccessor) {
+    _recoverSpilledStateExpr = makeE<EVariable>(_spillSlot);
+    _recoverSpilledStateCode = _recoverSpilledStateExpr->compile(ctx);
+}
+
+void SinglePurposeHashAggAccumulator::accumulate(
+    vm::ByteCode& bytecode, value::AssignableSlotAccessor& accumulatorState) const {
+    value::TagValueMaybeOwned field = bytecode.run(_transformCode.get());
+
+    accumulateTransformedValue(std::move(field), accumulatorState);
+}
+
+void SinglePurposeHashAggAccumulator::finalize(
+    vm::ByteCode&, value::AssignableSlotAccessor& accumulatorState) const {
+    value::TagValueOwned partialAggregate = accumulatorState.copyOrMoveValue();
+    finalizePartialAggregate(std::move(partialAggregate), accumulatorState);
+}
+
+void SinglePurposeHashAggAccumulator::merge(
+    vm::ByteCode& bytecode, value::MaterializedSingleRowAccessor& accumulatorState) const {
+    tassert(8186802, "Not prepared for merging partial aggregates", _recoverSpilledStateCode);
+
+    value::TagValueMaybeOwned recoveredState = bytecode.run(_recoverSpilledStateCode.get());
+    mergeRecoveredState(std::move(recoveredState), accumulatorState);
+}
+
+size_t SinglePurposeHashAggAccumulator::estimateSize() const {
+    return sizeof(*this) + size_estimator::estimate(_transformExpr);
+}
+
+boost::optional<std::vector<DebugPrinter::Block>>
+SinglePurposeHashAggAccumulator::debugPrintInitialize() const {
+    return {};
+}
+
+std::vector<DebugPrinter::Block> SinglePurposeHashAggAccumulator::debugPrintAccumulate() const {
+    std::vector<DebugPrinter::Block> debugOutput;
+
+    DebugPrinter::addKeyword(debugOutput, getDebugName());
+    debugOutput.emplace_back(DebugPrinter::Block("`::`"));
+    DebugPrinter::addKeyword(debugOutput, "accumulate");
+    debugOutput.emplace_back(DebugPrinter::Block("`(`"));
+    DebugPrinter::addIdentifier(debugOutput, _outSlot);
+    debugOutput.emplace_back(DebugPrinter::Block("`,"));
+    DebugPrinter::addBlocks(debugOutput, _transformExpr->debugPrint());
+    debugOutput.emplace_back(DebugPrinter::Block("`)"));
+
+    return debugOutput;
+}
+
+std::vector<DebugPrinter::Block> SinglePurposeHashAggAccumulator::debugPrintMerge() const {
+    std::vector<DebugPrinter::Block> debugOutput;
+
+    DebugPrinter::addKeyword(debugOutput, getDebugName());
+    debugOutput.emplace_back(DebugPrinter::Block("`::`"));
+    DebugPrinter::addKeyword(debugOutput, "merge");
+    if (_recoverSpilledStateExpr) {
+        debugOutput.emplace_back(DebugPrinter::Block("`(`"));
+        DebugPrinter::addBlocks(debugOutput, _recoverSpilledStateExpr->debugPrint());
+        debugOutput.emplace_back(DebugPrinter::Block("`)"));
+    }
+
+    return debugOutput;
+}
+
+void ArithmeticAverageHashAggAccumulatorBase::initialize(
+    vm::ByteCode& bytecode, value::AssignableSlotAccessor& accumulatorState) const {
+    // Create the array for the sum of inputs. See enum AggSumValueElems for documentation of what
+    // these fields mean. The kNonDecimalTotalSum and kNonDecimalTotalAddend must be NumberDouble
+    // per tassert 5755312.
+    auto [tagSum, valSum] = value::makeNewArray();
+    value::Array* arraySum = reinterpret_cast<value::Array*>(valSum);
+    arraySum->push_back_raw(value::TypeTags::NumberInt32,
+                            0);  // AggSumValueElems::kNonDecimalTotalTag
+    arraySum->push_back_raw(value::TypeTags::NumberDouble,
+                            0);  // AggSumValueElems::kNonDecimalTotalSum
+    arraySum->push_back_raw(value::TypeTags::NumberDouble,
+                            0);  // AggSumValueElems::kNonDecimalTotalAddend
+    // AggSumValueElems::kDecimalTotal is added at runtime only if a decimal value is encountered.
+
+    // Create the value for the count of inputs, which is just a scalar NumberInt64.
+    value::TypeTags tagCount = value::TypeTags::NumberInt64;
+    value::Value valCount = 0;
+
+    // Create an array of [sum, count] states as the complete state value for new-style $avg.
+    auto [tagState, valState] = value::makeNewArray();
+    value::Array* arrayState = reinterpret_cast<value::Array*>(valState);
+    arrayState->push_back_raw(tagSum, valSum);
+    arrayState->push_back_raw(tagCount, valCount);
+
+    // Set 'accState' to the initial state we just constructed.
+    accumulatorState.reset(value::TagValueOwned::fromRaw(tagState, valState));
+}
+
+void ArithmeticAverageHashAggAccumulatorBase::accumulateTransformedValue(
+    value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accState) const {
+    if (!value::isNumber(field.tag())) {
+        return;
+    }
+
+    auto [tagState, valState] = accState.getViewOfValue();
+    value::Array* arrayState = reinterpret_cast<value::Array*>(valState);
+
+    // Add the input value to the sum, which is a subarray at index position 0 of 'arrayState'
+    // described by the header for enum AggSumValueElems.
+    auto sumTagVal = arrayState->getAt(0);
+    value::Array* arraySum = reinterpret_cast<value::Array*>(sumTagVal.value);
+    vm::ByteCode::aggDoubleDoubleSumImpl(
+        arraySum, field.tag(), field.value());  // updates 'arraySum'
+
+    // Increment the count, which is in index position 1.
+    auto countTagVal = arrayState->getAt(1);
+    uassert(8186801,
+            "Expected count to have 64-bit integer type",
+            countTagVal.tag == value::TypeTags::NumberInt64);
+    arrayState->setAt(
+        1 /* idx */,
+        countTagVal.tag,
+        value::bitcastFrom<int64_t>(value::bitcastTo<int64_t>(countTagVal.value) + 1));
+}
+
+void ArithmeticAverageHashAggAccumulatorBase::mergeRecoveredState(
+    value::TagValueMaybeOwned recoveredState,
+    value::MaterializedSingleRowAccessor& accumulatorState) const {
+    // The recovered state and the accumulator state should each be a 'value::Array' with two
+    // elements: a sum and a count.
+    tassert(8186803,
+            "Expected recovered partial aggregate to have array type",
+            recoveredState.tag() == value::TypeTags::Array);
+    value::Array* recoveredStateArray = value::getArrayView(recoveredState.value());
+
+    auto [tagAccumulatedState, valAccumulatedState] = accumulatorState.getViewOfValue();
+    tassert(8186804,
+            "Expected partial aggregate to have array type",
+            tagAccumulatedState == value::TypeTags::Array);
+    value::Array* accumulatorStateArray = value::getArrayView(valAccumulatedState);
+
+    // The sum elements of the recovered state and the accumulator state should each be a
+    // 'value::Array' structured appropriately for the SBE VM's "double double sum" instructions.
+    auto recoveredSumTagVal = recoveredStateArray->getAt(0);
+    auto accumulatedSumTagVal = accumulatorStateArray->getAt(0);
+    tassert(8186805,
+            "Expected partial sum to have array type",
+            accumulatedSumTagVal.tag == value::TypeTags::Array);
+
+    // Merge the partial sum from the recovered partial aggregate into the partial sum in the
+    // running total aggregate.
+    vm::ByteCode::aggMergeDoubleDoubleSumsImpl(value::getArrayView(accumulatedSumTagVal.value),
+                                               recoveredSumTagVal.tag,
+                                               recoveredSumTagVal.value);  // updates 'arraySum'
+
+    // Add the counts from the partial aggregate and running total aggregate and store the result in
+    // the running total aggregate.
+    auto recoveredCountTagVal = recoveredStateArray->getAt(1);
+    auto accumulatedCountTagVal = accumulatorStateArray->getAt(1);
+    tassert(8186806,
+            "Expected partial aggregate counts to have 64-bit integer type",
+            recoveredCountTagVal.tag == value::TypeTags::NumberInt64 &&
+                accumulatedCountTagVal.tag == value::TypeTags::NumberInt64);
+    auto mergedCount = value::bitcastTo<int64_t>(accumulatedCountTagVal.value) +
+        value::bitcastTo<int64_t>(recoveredCountTagVal.value);
+    accumulatorStateArray->setAt(
+        1, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(mergedCount));
+}  // SinglePurposeHashAggAccumulatorAvg::diskMergeFn
+
+void ArithmeticAverageHashAggAccumulatorTerminal::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+    tassert(8186808,
+            "Expected partial aggregate to have array type before finalization",
+            partialAggregate.tag() == value::TypeTags::Array);
+    value::Array* partialAggregateArray = value::getArrayView(partialAggregate.value());
+
+    auto partialSumTagVal = partialAggregateArray->getAt(0);
+    tassert(8186809,
+            "Expected partial sum to have array type",
+            partialSumTagVal.tag == value::TypeTags::Array);
+    value::Array* partialSum = value::getArrayView(partialSumTagVal.value);
+
+    auto countTagVal = partialAggregateArray->getAt(1);
+    tassert(8186811,
+            "Expected partial aggregate count to have 64-bit integer type",
+            countTagVal.tag == value::TypeTags::NumberInt64);
+    if (value::bitcastTo<int64_t>(countTagVal.value) == 0) {
+        result.reset(value::TagValueView::null());
+        return;
+    }
+
+    auto finalSum = vm::ByteCode::aggDoubleDoubleSumFinalizeImpl(partialSum);
+
+    result.reset(vm::ByteCode::genericDiv(finalSum.view(), countTagVal));
+}
+
+void ArithmeticAverageHashAggAccumulatorPartial::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+    auto resultObj = value::TagValueOwned::fromRaw(value::makeNewObject());
+
+    tassert(8186813, "New object has unexpected type", resultObj.tag() == value::TypeTags::Object);
+    value::Object* resultObject = value::getObjectView(resultObj.value());
+    resultObject->reserve(2);
+
+    tassert(8186815,
+            "Expected partial aggregate to have array type before finalization",
+            partialAggregate.tag() == value::TypeTags::Array);
+    value::Array* partialAggregateArray = reinterpret_cast<value::Array*>(partialAggregate.value());
+
+    auto countTagVal = partialAggregateArray->getAt(1);
+    resultObject->push_back_raw(
+        mongo::stage_builder::countName, countTagVal.tag, countTagVal.value);
+
+    auto partialSumTagVal = partialAggregateArray->getAt(0);
+    auto [ownedFinalizedSum, tagFinalizedSum, valFinalizedSum] =
+        vm::ByteCode::builtinDoubleDoublePartialSumFinalizeImpl(partialSumTagVal.tag,
+                                                                partialSumTagVal.value)
+            .releaseToRaw();
+    tassert(12084100,
+            "Expected builtinDoubleDoublePartialSumFinalizeImpl to return owned value",
+            ownedFinalizedSum);
+    resultObject->push_back_raw(
+        mongo::stage_builder::partialSumName, tagFinalizedSum, valFinalizedSum);
+
+    result.reset(std::move(resultObj));
+}
+
+void AddToSetHashAggAccumulator::singlePurposePrepare(CompileCtx& ctx) {
+    _collatorAccessor = _collatorSlot ? ctx.getAccessor(*_collatorSlot) : nullptr;
+}
+
+void AddToSetHashAggAccumulator::initialize(vm::ByteCode& bytecode,
+                                            value::AssignableSlotAccessor& accumulatorState) const {
+    accumulatorState.reset(value::TagValueView::nothing());
+}
+
+void AddToSetHashAggAccumulator::accumulateTransformedValue(
+    value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accState) const {
+    CollatorInterface* collator = nullptr;
+    if (_collatorAccessor != nullptr) {
+        auto [tagCollator, valCollator] = _collatorAccessor->getViewOfValue();
+        tassert(10936805, "Collator has unexpected type", tagCollator == value::TypeTags::collator);
+        collator = value::getCollatorView(valCollator);
+    }
+
+    value::TagValueOwned accumulatorState = accState.copyOrMoveValue();
+    value::TagValueMaybeOwned updatedState = vm::ByteCode::addToSetCappedImpl(
+        std::move(accumulatorState), std::move(field), _sizeCap, collator);
+    accState.reset(std::move(updatedState));
+}
+
+void AddToSetHashAggAccumulator::mergeRecoveredState(
+    value::TagValueMaybeOwned recoveredState,
+    value::MaterializedSingleRowAccessor& accumulatorState) const {
+    if (recoveredState.tag() == value::TypeTags::Nothing) {
+        // Leave 'accumulatorState' as is.
+        return;
+    }
+
+    CollatorInterface* collator = nullptr;
+    if (_collatorAccessor != nullptr) {
+        auto [tagCollator, valCollator] = _collatorAccessor->getViewOfValue();
+        tassert(10936806, "Collator has unexpected type", tagCollator == value::TypeTags::collator);
+        collator = value::getCollatorView(valCollator);
+    }
+
+    tassert(10936808,
+            "Expected $addToSet recovered state to be an array",
+            recoveredState.tag() == value::TypeTags::Array);
+    auto recoveredStateArr = value::getArrayView(recoveredState.value());
+
+    // Note that ownership of both 'valNewSetMembers' and 'valAccumulatorState' passes to the
+    // 'setUnionAccumImpl()' function.
+    auto newSetMembers = [&]() {
+        auto newSetMembers =
+            recoveredStateArr->getAt(static_cast<size_t>(vm::AggArrayWithSize::kValues));
+        return value::TagValueOwned::fromRaw(
+            value::copyValue(newSetMembers.tag, newSetMembers.value));
+    }();
+    value::TagValueOwned ownedAccumState = accumulatorState.copyOrMoveValue();
+
+    value::TagValueMaybeOwned result = vm::ByteCode::setUnionAccumImpl(
+        std::move(ownedAccumState), std::move(newSetMembers), _sizeCap, collator);
+    accumulatorState.reset(std::move(result));
+}
+
+void AddToSetHashAggAccumulator::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+    if (partialAggregate.tag() == value::TypeTags::Nothing) {
+        result.reset(value::TagValueView::nothing());
+        return;
+    }
+
+    tassert(10936807,
+            "Expected partial aggregate to have array type before finalization",
+            partialAggregate.tag() == value::TypeTags::Array);
+    // Move the 'kValues' ArraySet out of its parent 'partialAggregate' array, transfering ownership
+    // of it from the 'partialAggregate' array to the calling function.
+    value::TagValueOwned valueArrSet =
+        value::getArrayView(partialAggregate.value())
+            ->swapAt(static_cast<size_t>(vm::AggArrayWithSize::kValues), value::TypeTags::Null, 0);
+
+    result.reset(std::move(valueArrSet));
+}
+
+void PushHashAggAccumulator::initialize(vm::ByteCode& bytecode,
+                                        value::AssignableSlotAccessor& accumulatorState) const {
+    accumulatorState.reset(value::TagValueView::nothing());
+}
+
+void PushHashAggAccumulator::accumulateTransformedValue(
+    value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accState) const {
+    value::TagValueMaybeOwned updatedState = vm::ByteCode::builtinAddToArrayCappedImpl(
+        accState.copyOrMoveValue(), std::move(field), _sizeCap);
+    accState.reset(std::move(updatedState));
+}
+
+void PushHashAggAccumulator::mergeRecoveredState(
+    value::TagValueMaybeOwned recoveredState,
+    value::MaterializedSingleRowAccessor& accumulatorState) const {
+    if (recoveredState.tag() == value::TypeTags::Nothing) {
+        // Leave 'accumulatorState' as is.
+        return;
+    }
+
+    tassert(11004200,
+            "Expected $push recovered state to be an array",
+            recoveredState.tag() == value::TypeTags::Array);
+    auto recoveredStateArr = value::getArrayView(recoveredState.value());
+
+    auto newArrayElementsSizeTagVal =
+        recoveredStateArr->getAt(static_cast<size_t>(vm::AggArrayWithSize::kSizeOfValues));
+    tassert(11004201,
+            "Expected recovered array size to be 64-bit integer",
+            newArrayElementsSizeTagVal.tag == value::TypeTags::NumberInt64);
+
+    // Note that ownership of both 'valNewArrayElements' and 'valAccumulatorState' passes to the
+    // 'setUnionAccumImpl()' function.
+    auto newArrayElements = [&]() {
+        auto newArrayElementsTagVal =
+            recoveredStateArr->getAt(static_cast<size_t>(vm::AggArrayWithSize::kValues));
+        return value::TagValueOwned::fromRaw(
+            value::copyValue(newArrayElementsTagVal.tag, newArrayElementsTagVal.value));
+    }();
+
+    value::TagValueOwned ownedAccumulatorState = accumulatorState.copyOrMoveValue();
+
+    value::TagValueMaybeOwned result = vm::ByteCode::concatArraysAccumImpl(
+        std::move(ownedAccumulatorState),
+        std::move(newArrayElements),
+        value::bitcastTo<int64_t>(newArrayElementsSizeTagVal.value),
+        _sizeCap);
+    accumulatorState.reset(std::move(result));
+}
+
+void PushHashAggAccumulator::finalizePartialAggregate(value::TagValueOwned partialAggregate,
+                                                      value::AssignableSlotAccessor& result) const {
+    if (partialAggregate.tag() == value::TypeTags::Nothing) {
+        result.reset(value::TagValueView::nothing());
+        return;
+    }
+
+    tassert(11004207,
+            "Expected partial aggregate to have array type before finalization",
+            partialAggregate.tag() == value::TypeTags::Array);
+    // Move the 'kValues' Array out of its parent 'partialAggregate' array, transfering ownership of
+    // it from the 'partialAggregate' array to the calling function.
+    value::TagValueOwned valuesArr =
+        value::getArrayView(partialAggregate.value())
+            ->swapAt(static_cast<size_t>(vm::AggArrayWithSize::kValues), value::TypeTags::Null, 0);
+
+    result.reset(std::move(valuesArr));
+}
+
+void FirstHashAggAccumulator::initialize(vm::ByteCode& bytecode,
+                                         value::AssignableSlotAccessor& accumulatorState) const {
+    accumulatorState.reset(value::TagValueView::nothing());
+}
+
+void FirstHashAggAccumulator::accumulateTransformedValue(
+    value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accState) const {
+    auto [tagAccumulatorState, _] = accState.getViewOfValue();
+    if (tagAccumulatorState != value::TypeTags::Nothing) {
+        // The accumulator state already has the first value.
+        return;
+    }
+
+    if (field.tag() == value::TypeTags::Nothing) {
+        // Following MQL semantics, accumulating "nothing" (e.g., reading from a field that does not
+        // exist) has the effect of accumulating NULL.
+        accState.reset(value::TagValueView::null());
+        return;
+    }
+
+    field.makeOwned();
+    accState.reset(std::move(field));
+}
+
+void FirstHashAggAccumulator::mergeRecoveredState(
+    value::TagValueMaybeOwned recoveredState,
+    value::MaterializedSingleRowAccessor& accumulatorState) const {
+    auto [tagAccumulatorState, _] = accumulatorState.getViewOfValue();
+    if (tagAccumulatorState != value::TypeTags::Nothing) {
+        // The accumulator state already has the first value.
+        return;
+    }
+
+    recoveredState.makeOwned();
+    accumulatorState.reset(std::move(recoveredState));
+}
+
+void FirstHashAggAccumulator::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+    // Use the partial aggregate as the final result.
+    result.reset(std::move(partialAggregate));
+}
+
+void CountHashAggAccumulatorBase::initialize(
+    vm::ByteCode& bytecode, value::AssignableSlotAccessor& accumulatorState) const {
+    accumulatorState.reset(value::TagValueView::numberInt64(0));
+}
+
+void CountHashAggAccumulatorBase::accumulateTransformedValue(
+    value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accState) const {
+    auto [tagAccumulatorState, valAccumulatorState] = accState.getViewOfValue();
+    tassert(11004208,
+            "Expected count to have 64-bit integer type",
+            tagAccumulatorState == value::TypeTags::NumberInt64);
+    valAccumulatorState =
+        value::bitcastFrom<int64_t>(value::bitcastTo<int64_t>(valAccumulatorState) + 1);
+    accState.reset(value::TagValueView{tagAccumulatorState, valAccumulatorState});
+}
+
+void CountHashAggAccumulatorBase::mergeRecoveredState(
+    value::TagValueMaybeOwned recoveredState,
+    value::MaterializedSingleRowAccessor& accumulatorState) const {
+    tassert(11004209,
+            "Expected recovered count to have 64-bit integer type",
+            recoveredState.tag() == value::TypeTags::NumberInt64);
+
+    auto [tagAccumulatedState, valAccumulatedState] = accumulatorState.getViewOfValue();
+    tassert(11004210,
+            "Expected accumulated count to have 64-bit integer type",
+            tagAccumulatedState == value::TypeTags::NumberInt64);
+    auto mergedCount = value::bitcastTo<int64_t>(valAccumulatedState) +
+        value::bitcastTo<int64_t>(recoveredState.value());
+    accumulatorState.reset(value::TagValueView::numberInt64(mergedCount));
+}
+
+void CountHashAggAccumulatorTerminal::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+
+    tassert(11004211,
+            "Expected partial count to have 64-bit integer type",
+            partialAggregate.tag() == value::TypeTags::NumberInt64);
+
+    if (value::bitcastTo<int64_t>(partialAggregate.value()) <=
+        std::numeric_limits<int32_t>::max()) {
+        // $count acts as if it is syntactic sugar for {$sum: 1}, which returns its result in the
+        // narrowest type possible.
+        auto count32 = static_cast<int32_t>(value::bitcastTo<int64_t>(partialAggregate.value()));
+        result.reset(value::TagValueView::numberInt32(count32));
+        return;
+    }
+
+    // Use the original NumberInt64 accumulator value.
+    result.reset(std::move(partialAggregate));
+}
+
+void CountHashAggAccumulatorPartial::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+
+    tassert(11004216,
+            "Expected partial count to have 64-bit integer type",
+            partialAggregate.tag() == value::TypeTags::NumberInt64);
+
+    // Coerce the count into the narrowest possible type.
+    int64_t count = value::bitcastTo<int64_t>(partialAggregate.value());
+    auto [tagCount, valCount] = count <= std::numeric_limits<int32_t>::max()
+        ? std::make_pair(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(count))
+        : std::make_pair(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(count));
+
+    // $count acts as if it is syntactic sugar for {$sum: 1}, and when merging partial results from
+    // a distributed query, the merging node expects $count partial aggregates to be in the same
+    // format as $sum partial aggregates. We convert the expected NumberInt64 count into a
+    // serialized 'DoubleDoubleSum' that the merger will expect. As a bonus, we will be prepared to
+    // count groups with more than 9 quintillion documents in the event that storage size expands
+    // faster than expected.
+    result.reset(vm::ByteCode::builtinDoubleDoublePartialSumFinalizeImpl(tagCount, valCount));
+}
+
+template <AccumulatorMinMaxN::MinMaxSense S>
+void MinMaxNHashAggAccumulator<S>::initialize(
+    vm::ByteCode& bytecode, value::AssignableSlotAccessor& accumulatorState) const {
+    _memUsage = 0;
+
+    auto [heapTag, heapVal] = value::makeNewArray();
+    accumulatorState.reset(value::TagValueOwned::fromRaw(heapTag, heapVal));
+}
+
+template <AccumulatorMinMaxN::MinMaxSense S>
+void MinMaxNHashAggAccumulator<S>::singlePurposePrepare(CompileCtx& ctx) {
+    if (_collatorSlot) {
+        _collatorAccessor = ctx.getAccessor(*_collatorSlot);
+    }
+}
+
+template <AccumulatorMinMaxN::MinMaxSense S>
+CollatorInterface* MinMaxNHashAggAccumulator<S>::getCollator() const {
+    if (!_collatorAccessor) {
+        return nullptr;
+    }
+    auto [colTag, colVal] = _collatorAccessor->getViewOfValue();
+    tassert(13199700, "Collator has unexpected type", colTag == value::TypeTags::collator);
+    return value::getCollatorView(colVal);
+}
+
+template <AccumulatorMinMaxN::MinMaxSense S>
+void MinMaxNHashAggAccumulator<S>::accumulateTransformedValue(
+    value::TagValueMaybeOwned field, value::AssignableSlotAccessor& accumulatorState) const {
+    if (value::isNullish(field.tag())) {
+        return;
+    }
+
+    constexpr bool less = S == AccumulatorMinMaxN::MinMaxSense::kMin;
+    value::ValueCompare<less> comp{getCollator()};
+
+    auto [stateTag, stateVal] = accumulatorState.getViewOfValue();
+    auto* heap = value::getArrayView(stateVal);
+
+    _memUsage = minMaxNInsert(
+        heap, static_cast<size_t>(_maxSize), _memUsage, _memLimit, comp, field.moveToOwned());
+}
+
+template <AccumulatorMinMaxN::MinMaxSense S>
+void MinMaxNHashAggAccumulator<S>::mergeRecoveredState(
+    value::TagValueMaybeOwned recoveredState,
+    value::MaterializedSingleRowAccessor& accumulatorState) const {
+    tassert(13199701,
+            "Expected recovered partial aggregate to have array type",
+            recoveredState.tag() == value::TypeTags::Array);
+    auto* recoveredHeap = value::getArrayView(recoveredState.value());
+
+    constexpr bool less = S == AccumulatorMinMaxN::MinMaxSense::kMin;
+    value::ValueCompare<less> comp{getCollator()};
+
+    auto [mergeStateTag, mergeStateVal] = accumulatorState.getViewOfValue();
+    tassert(13199705,
+            "Expected merge partial aggregate to have array type",
+            mergeStateTag == value::TypeTags::Array);
+    auto* mergeHeap = value::getArrayView(mergeStateVal);
+
+    _memUsage = 0;
+    for (const auto& elem : mergeHeap->values()) {
+        _memUsage += value::getApproximateSize(elem.first, elem.second);
+    }
+
+    for (size_t i = 0; i < recoveredHeap->size(); ++i) {
+        value::TagValueOwned field = recoveredHeap->swapAt(i, value::TypeTags::Null, 0);
+        _memUsage = minMaxNInsert(
+            mergeHeap, static_cast<size_t>(_maxSize), _memUsage, _memLimit, comp, std::move(field));
+    }
+}
+
+template <AccumulatorMinMaxN::MinMaxSense S>
+void MinMaxNHashAggAccumulator<S>::finalizePartialAggregate(
+    value::TagValueOwned partialAggregate, value::AssignableSlotAccessor& result) const {
+    tassert(13199704,
+            "Expected partial aggregate to have array type before finalization",
+            partialAggregate.tag() == value::TypeTags::Array);
+
+    auto* heap = value::getArrayView(partialAggregate.value());
+
+    constexpr bool less = S == AccumulatorMinMaxN::MinMaxSense::kMin;
+    value::ValueCompare<less> comp{getCollator()};
+    std::sort_heap(heap->values().begin(), heap->values().end(), comp);
+
+    result.reset(std::move(partialAggregate));
+}
+
+template class MinMaxNHashAggAccumulator<AccumulatorMinMaxN::MinMaxSense::kMin>;
+template class MinMaxNHashAggAccumulator<AccumulatorMinMaxN::MinMaxSense::kMax>;
+
+}  // namespace sbe
+}  // namespace mongo

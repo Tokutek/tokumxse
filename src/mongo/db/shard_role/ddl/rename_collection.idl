@@ -1,0 +1,58 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+commands:
+    renameCollection:
+        description: "Parser for the 'renameCollection' command."
+        command_name: renameCollection
+        cpp_name: RenameCollectionCommand
+        reply_type: ErrorReply
+        # TODO (SERVER-115805): Remove this module visibility override once this command’s API and
+        # implementation are part of the same module.
+        mod_visibility: unfortunately_open
+        strict: true
+        namespace: type
+        type: namespacestring
+        api_version: "1"
+        access_check:
+            simple:
+                privilege:
+                    resource_pattern: exact_namespace
+                    action_type: renameCollection
+        fields:
+            to:
+                description: "The new namespace for the collection being renamed."
+                type: namespacestring
+                stability: stable
+            dropTarget:
+                description: >-
+                    If true or a UUID, mongod will drop the target of renameCollection prior to
+                    renaming the collection. A UUID is the expected UUID of the target collection to
+                    be dropped.
+                type:
+                    variant: [bool, uuid]
+                default: false
+                stability: stable
+            # stayTemp is an internal attribute, which is intentionally undocumented and
+            # not part of the stable API.
+            stayTemp:
+                description:
+                    "If true, the original collection will remain temp if it was temp
+                    before the rename."
+                type: bool
+                default: false
+                stability: internal
+            collectionUUID:
+                description: "The expected UUID of the collection."
+                type: uuid
+                optional: true
+                stability: stable

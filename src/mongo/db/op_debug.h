@@ -1,0 +1,1006 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/extension/host/operation_metrics_registry.h"
+#include "mongo/db/flow_control_ticketholder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_filter.h"
+#include "mongo/db/query/client_cursor/cursor_response_gen.h"
+#include "mongo/db/query/compiler/optimizer/join/fallback_reason.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
+#include "mongo/db/query/query_shape/query_shape_hash.h"
+#include "mongo/db/query/query_stats/data_bearing_node_metrics.h"
+#include "mongo/db/query/query_stats/key.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/rpc/message.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+class CurOp;
+
+
+/* lifespan is different than CurOp because of recursives with DBDirectClient */
+class [[MONGO_MOD_PUBLIC]] OpDebug {
+public:
+    /**
+     * Holds counters for execution statistics that can be accumulated by one or more operations.
+     * They're accumulated as we go for a single operation, but are also extracted and stored
+     * externally if they need to be accumulated across multiple operations (which have multiple
+     * CurOps), including for cursors and multi-statement transactions.
+     */
+    class AdditiveMetrics {
+    public:
+        AdditiveMetrics() = default;
+        AdditiveMetrics(const AdditiveMetrics& other) {
+            this->add(other);
+        }
+
+        AdditiveMetrics& operator=(const AdditiveMetrics& other) {
+            reset();
+            add(other);
+            return *this;
+        }
+
+        // Define move constructor and assignment to avoid add() being invoked when moving.
+        AdditiveMetrics(AdditiveMetrics&&) noexcept = default;
+        AdditiveMetrics& operator=(AdditiveMetrics&&) noexcept = default;
+
+        /**
+         * Adds all the fields of another AdditiveMetrics object together with the fields of this
+         * AdditiveMetrics instance.
+         */
+        void add(const AdditiveMetrics& otherMetrics);
+
+        /**
+         * Adds all of the fields of the given DataBearingNodeMetrics object together with the
+         * corresponding fields of this object.
+         */
+        void aggregateDataBearingNodeMetrics(const query_stats::DataBearingNodeMetrics& metrics);
+        void aggregateDataBearingNodeMetrics(
+            const boost::optional<query_stats::DataBearingNodeMetrics>& metrics);
+
+        /**
+         * Aggregate CursorMetrics (e.g., from a remote cursor) into this AdditiveMetrics instance.
+         */
+        void aggregateCursorMetrics(const CursorMetrics& metrics);
+
+        /**
+         * Aggregates StorageStats from the storage engine into this AdditiveMetrics instance.
+         */
+        void aggregateStorageStats(const StorageStats& stats);
+
+        /**
+         * Resets all members to the default state.
+         */
+        void reset();
+
+        /**
+         * Returns true if the AdditiveMetrics object we are comparing has the same field values as
+         * this AdditiveMetrics instance.
+         */
+        bool equals(const AdditiveMetrics& otherMetrics) const;
+
+        /**
+         * Increments temporarilyUnavailableErrors by n.
+         */
+        void incrementTemporarilyUnavailableErrors(long long n);
+
+        /**
+         * Increments keysInserted by n.
+         */
+        void incrementKeysInserted(long long n);
+
+        /**
+         * Increments keysDeleted by n.
+         */
+        void incrementKeysDeleted(long long n);
+
+        /**
+         * Increments nreturned by n.
+         */
+        void incrementNreturned(long long n);
+
+        /**
+         * Increments nBatches by 1.
+         */
+        void incrementNBatches();
+
+        /**
+         * Increments ninserted by n.
+         */
+        void incrementNinserted(long long n);
+
+        /**
+         * Increments ndeleted by n.
+         */
+        void incrementNdeleted(long long n);
+
+        /**
+         * Increments nUpserted by n.
+         */
+        void incrementNUpserted(long long n);
+
+        /**
+         * Generates a string showing all non-empty fields. For every non-empty field field1,
+         * field2, ..., with corresponding values value1, value2, ..., we will output a string in
+         * the format: "<field1>:<value1> <field2>:<value2> ...".
+         */
+        std::string report() const;
+        BSONObj reportBSON() const;
+
+        void report(logv2::DynamicAttributes* pAttrs) const;
+
+        boost::optional<long long> keysExamined;
+        boost::optional<long long> docsExamined;
+        boost::optional<long long> bytesRead;
+
+        // Number of records that match the query.
+        boost::optional<long long> nMatched;
+        // Number of records returned so far.
+        boost::optional<long long> nreturned;
+        // Number of batches returned so far.
+        boost::optional<long long> nBatches;
+        // Number of records written (no no-ops).
+        boost::optional<long long> nModified;
+        boost::optional<long long> ninserted;
+        boost::optional<long long> ndeleted;
+        boost::optional<long long> nUpserted;
+        boost::optional<long long> nUpdateOps;
+        boost::optional<long long> nDeleteOps;
+
+        // Number of index keys inserted.
+        boost::optional<long long> keysInserted;
+        // Number of index keys removed.
+        boost::optional<long long> keysDeleted;
+
+        // Amount of time spent executing a query.
+        boost::optional<Microseconds> executionTime;
+
+        // If query stats are being collected for this operation, stores the duration of execution
+        // across the cluster. In a standalone mongod, this is just the local working time. In
+        // mongod in a sharded cluster, this is the local execution time plus any execution time
+        // for other nodes to do work on our behalf. In mongos, this tracks the total working time
+        // across the cluster.
+        boost::optional<Milliseconds> clusterWorkingTime{0};
+
+        // Amount of time spent reading from disk in the storage engine.
+        boost::optional<Microseconds> readingTime{0};
+
+        // True if the query plan involves an in-memory sort.
+        bool hasSortStage{false};
+        // True if the given query used disk.
+        bool usedDisk{false};
+        // True if any plan(s) involved in servicing the query (including internal queries sent to
+        // shards) came from the multi-planner (not from the plan cache and not a query with a
+        // single solution).
+        bool fromMultiPlanner{false};
+        // False unless all plan(s) involved in servicing the query came from the plan cache.
+        // This is because we want to report a "negative" outcome (plan cache miss) if any internal
+        // query involved missed the cache. Optional because we need tri-state (true, false, not
+        // set) to make the "sticky towards false" logic work.
+        boost::optional<bool> fromPlanCache;
+
+        // If query stats are being collected for this operation, stores the estimated cpu time
+        // across the cluster. In a mongod, this is the local cpu time and in mongos this track the
+        // total cpu time across the cluster.
+        // This value will be negative if the platform does not support collecting cpu time, since
+        // collecting cpu time is only supported Linux systems. If the value is greater than 0, the
+        // cpu time reported is the cpu time collected.
+        boost::optional<Nanoseconds> cpuNanos{0};
+
+        // If query stats are being collected for this operation, stores the delinquency information
+        // across the cluster. It's only collected in mongod shard and aggregated of all shard in
+        // mongos.
+        boost::optional<uint64_t> delinquentAcquisitions;
+        boost::optional<Milliseconds> totalAcquisitionDelinquency;
+        boost::optional<Milliseconds> maxAcquisitionDelinquency;
+
+        boost::optional<uint64_t> numInterruptChecks;
+        boost::optional<Milliseconds> overdueInterruptApproxMax;
+
+        // If query stats are being collected for this operation, stores the execution control
+        // statistics.
+        boost::optional<Microseconds> totalTimeQueuedMicros;
+        boost::optional<uint64_t> totalAdmissions;
+        boost::optional<uint64_t> totalNormalPriorityAdmissions;
+        boost::optional<uint64_t> totalLowPriorityAdmissions;
+        boost::optional<bool> wasLoadShed;
+        boost::optional<bool> wasDeprioritized;
+        boost::optional<bool> wasMarkedNonDeprioritizable;
+
+        // Amount of time spent planning the query. Begins after parsing and ends
+        // after optimizations. This metric is expected to be positive regardless of whether the
+        // plan came from (e.g. multi-planner, cost-based ranker, join optimizer, plan cache).
+        boost::optional<Microseconds> planningTime;
+        // Counts of cardinality estimation methods used by the winning plan's root node.
+        // On mongos, this aggregates counts across shards. All zeros if CBR was not used.
+        CardinalityEstimationMethods cardinalityEstimationMethods;
+        // Number of documents sampled by cost-based ranker (CBR) when using sampling method to pick
+        // the best plan.
+        boost::optional<long long> nDocsSampled;
+
+        // Counts of the winning plan's query stats plan shape. On mongod this records
+        // the single winning plan's shape (at most one count of one); on mongos it sums the
+        // shapes reported by each shard.
+        plan_shape_counters::PlanShapeCounts planShapeCounts;
+
+        // Local peak tracked memory usage in bytes (max across getMore batches).
+        boost::optional<uint64_t> peakTrackedMemBytes;
+
+        // Sum of local peak and any remote per-shard peaks.
+        boost::optional<uint64_t> clusterPeakTrackedMemBytes;
+    };
+
+    [[MONGO_MOD_PRIVATE]] OpDebug() = default;
+
+    /**
+     * Adds information about the current operation to "pAttrs". Since this information will end up
+     * in logs, typically as part of "Slow Query" logging, this method also handles redaction and
+     * removal of sensitive fields from any command BSON.
+     *
+     * Generally, the metrics/fields reported here should be a subset of what is reported in
+     * append(). The profiler is meant to be more verbose than the slow query log.
+     *
+     * Due to logging implementation, the lifetime of operationDeadline must exceed the lifetime of
+     * pAttrs. Accepting pointer to Date_t instead of reference to avoid compiler extending the
+     * lifetime of temporary objects.
+     * TODO SERVER-114266 - remove this.
+     */
+    void report(OperationContext* opCtx,
+                const SingleThreadedLockStats* lockStats,
+                const SingleThreadedStorageMetrics& storageMetrics,
+                long long prepareReadConflicts,
+                const Date_t* operationDeadline,
+                logv2::DynamicAttributes* pAttrs) const;
+
+    void reportStorageStats(logv2::DynamicAttributes* pAttrs) const;
+
+    /**
+     * Appends information about the current operation to "builder". This info typically ends up in
+     * the DB's profile collection. It is not ready to be logged as-is; redaction and removal of
+     * sensitive command fields are required first.
+     *
+     * @param lockStats lockStats object containing locking information about the operation
+     *
+     * Generally, the metrics/fields reported here should be a superset of what is reported in
+     * report(). The profiler is meant to be more verbose than the slow query log.
+     */
+    [[MONGO_MOD_PRIVATE]] void append(OperationContext* opCtx,
+                                      const SingleThreadedLockStats& lockStats,
+                                      FlowControlTicketholder::CurOp flowControlStats,
+                                      const SingleThreadedStorageMetrics& storageMetrics,
+                                      long long prepareReadConflicts,
+                                      bool omitCommand,
+                                      BSONObjBuilder& builder) const;
+
+    /**
+     * Bundles the three objects needed to build a profile/slow-query log document from a snapshot
+     * of the current operation. Passed into the function returned by appendStaged().
+     */
+    struct AppendArgs {
+        AppendArgs(OperationContext* opCtx, const OpDebug& op, const CurOp& curop)
+            : opCtx(opCtx), op(op), curop(curop) {}
+
+        OperationContext* opCtx;
+        const OpDebug& op;
+        const CurOp& curop;
+    };
+
+    [[MONGO_MOD_PRIVATE]] static std::function<BSONObj(AppendArgs args)> appendStaged(
+        OperationContext* opCtx, StringSet requestedFields, bool needWholeDocument);
+    [[MONGO_MOD_PRIVATE]] static void appendUserInfo(const CurOp&,
+                                                     BSONObjBuilder&,
+                                                     AuthorizationSession*);
+
+    [[MONGO_MOD_PRIVATE]] static void appendDelinquentInfo(OperationContext* opCtx,
+                                                           BSONObjBuilder&,
+                                                           bool reportAcquisitions = true);
+
+    /**
+     * Moves relevant plan summary metrics to this OpDebug instance.
+     */
+    [[MONGO_MOD_PRIVATE]] void setPlanSummaryMetrics(PlanSummaryStats&& planSummaryStats);
+
+    /**
+     * The resulting object has zeros omitted. As is typical in this file.
+     */
+    [[MONGO_MOD_PRIVATE]] static BSONObj makeFlowControlObject(
+        FlowControlTicketholder::CurOp flowControlStats);
+
+    /**
+     * Make object from $search stats with non-populated values omitted.
+     */
+    [[MONGO_MOD_PRIVATE]] BSONObj makeMongotDebugStatsObject() const;
+
+    /**
+     * Accumulate resolved views.
+     */
+    [[MONGO_MOD_PRIVATE]] void addResolvedViews(const std::vector<NamespaceString>& namespaces,
+                                                const std::vector<BSONObj>& pipeline);
+
+    /**
+     * Get a snapshot of the cursor metrics suitable for inclusion in a command response.
+     */
+    [[MONGO_MOD_PRIVATE]] CursorMetrics getCursorMetrics(size_t opIndex = kCurrentOpIndex) const;
+
+    /**
+     * Convenience method that computes QueryShapeHash if '_queryShapeHash' has not been previously
+     * set, sets and returns it. Currently QueryShapeHash for a given command may be computed twice
+     * (due to view resolution). By preventing new QueryShapeHash overwrites we ensure that original
+     * QueryShapeHash is recorded in CurOp::OpDebug.
+     */
+    template <typename Fn>
+    [[MONGO_MOD_PRIVATE]] boost::optional<query_shape::QueryShapeHash> ensureQueryShapeHash(
+        OperationContext* opCtx, Fn&& queryShapeHashFn) {
+        // QueryShapeHash may be accessed by other thread running $currentOp and therefore needs to
+        // be synchronized.
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        if (_didComputeQueryShapeHash) {
+            return _queryShapeHash;
+        }
+
+        auto qsh = queryShapeHashFn();
+        _queryShapeHash = qsh;
+        _didComputeQueryShapeHash = true;
+        return qsh;
+    }
+
+    /**
+     * Returns '_queryShapeHash' value without acquiring the lock.
+     */
+    [[MONGO_MOD_PRIVATE]] boost::optional<query_shape::QueryShapeHash> getQueryShapeHash() const;
+
+    /**
+     * Sets '_queryShapeHash' value to the new  'hash'. Acquires Client lock prior to setting the
+     * hash.
+     */
+    [[MONGO_MOD_PRIVATE]] void setQueryShapeHash(
+        OperationContext* opCtx, const boost::optional<query_shape::QueryShapeHash>& hash);
+
+    /**
+     * Returns the installed settings without acquiring the client lock. The caller must hold the
+     * client lock or be the operation's executing thread.
+     */
+    [[MONGO_MOD_PRIVATE]] const query_settings::QuerySettings& getQuerySettings() const;
+
+    /**
+     * Installs a copy of the settings under the client lock for threadsafe curOp reporting.
+     */
+    [[MONGO_MOD_PRIVATE]] void setQuerySettings(OperationContext* opCtx,
+                                                query_settings::QuerySettings settings);
+
+    // -------------------
+
+    // basic options
+    // _networkOp represents the network-level op code: OP_QUERY, OP_GET_MORE, OP_MSG, etc.
+    NetworkOp networkOp{opInvalid};  // only set this through setNetworkOp() to keep synced
+    // _logicalOp is the logical operation type, ie 'dbQuery' regardless of whether this is an
+    // OP_QUERY find, a find command using OP_QUERY, or a find command using OP_MSG.
+    // Similarly, the return value will be dbGetMore for both OP_GET_MORE and getMore command.
+    LogicalOp logicalOp{LogicalOp::opInvalid};  // only set this through setNetworkOp()
+    bool iscommand{false};
+
+    // detailed options
+    long long cursorid{-1};
+    bool exhaust{false};
+
+    // For search using mongot.
+    boost::optional<long long> mongotCursorId{boost::none};
+    boost::optional<long long> msWaitingForMongot{boost::none};
+    long long mongotBatchNum = 0;
+    BSONObj mongotCountVal = BSONObj();
+    BSONObj mongotSlowQueryLog = BSONObj();
+
+    // Vector search statistics captured for reporting by query stats.
+    struct VectorSearchMetrics {
+        long limit = 0;
+        double numCandidatesLimitRatio = 0.0;
+    };
+    boost::optional<VectorSearchMetrics> vectorSearchMetrics = boost::none;
+
+    // Join optimization statistics captured per query shape for reporting by query stats. Populated
+    // only when a query appears to be join-optimizable (though we may still bail out).
+    struct JoinOptimizationMetrics {
+        // Was this query eligible for join optimization.
+        bool joinOptimizable = false;
+        // Why join optimization stopped doing more than it did, if it stopped early. Read together
+        // with 'joinOptimizable': when false, this is why we bailed out entirely; when true, this
+        // is why the join-graph prefix stopped growing and the query was only optimized over that
+        // prefix.
+        boost::optional<join_ordering::JoinFallbackReason> fallbackReason;
+        // Number of unique namespaces that were pushed into the join model.
+        int numNamespaces = 0;
+        // Number of $lookup stages that remained in the non-join-reorderable query suffix.
+        int numLookupsInSuffix = 0;
+        // Number of suffix document sources we were able to lower into SBE after the
+        // join-optimizable prefix.
+        int numSuffixSourcesPushedToSbe = 0;
+        // Number of "residual" document sources that had to execute in classic DocumentSource land.
+        int numResidualClassicSources = 0;
+        // Number of nodes in the join graph. Note: this is the same as the number of $lookup stages
+        // that were pushed down into the join-reorderable query prefix.
+        int numJoinGraphNodes = 0;
+        // Number of edges in the join graph before inference.
+        int numSyntacticEdges = 0;
+        // Number of inferred edges.
+        int numInferredEdges = 0;
+        // Number of $expr equality join predicates in the join graph (before inference).
+        int numSyntacticExprJoinPredicates = 0;
+        // Number of simple equality ($eq) join predicates in the join graph (before inference).
+        int numSyntacticEqJoinPredicates = 0;
+        // Number of simple equality ($eq) join predicates that were inferred- note that these are
+        // the only type of join predicates we infer.
+        int numInferredEqJoinPredicates = 0;
+        // Number of inferred single-table predicates (one per predicate per table).
+        int numInferredSingleTablePredicates = 0;
+
+        // Whether the join graph is complete, i.e. every pair of nodes is joined (post-inference).
+        bool isClique = false;
+        // Whether one hub node is joined to every other node, and there are no other edges
+        // (post-inference).
+        bool isStar = false;
+        // Whether the join graph contains at least one cycle between nodes (post-inference).
+        bool isCycle = false;
+        // Whether the nodes form a single path, each joined to at most two others (post-inference).
+        bool isChain = false;
+
+        // Time taken to extract a join model from the query.
+        int64_t joinModelingTimeMicros = 0;
+        // Time taken to lower the chosen QSN to SBE.
+        int64_t sbeLoweringTimeMicros = 0;
+
+        // Metrics gathered while enumerating join plans. We only populate these fields if we have a
+        // cache miss.
+        struct PlanEnumerationMetrics {
+            // Number of plans considered in the final subset during plan enumeration.
+            int numPlansEnumerated = 0;
+            // Number of hash joins enumerated across all levels.
+            int numHashJoins = 0;
+            // Number of indexed nested loop joins enumerated across all levels.
+            int numIndexedNestedLoopJoins = 0;
+            // Number of nested loop joins enumerated across all levels.
+            int numNestedLoopJoins = 0;
+            // Number of hash joins in the best (winning) plan.
+            int numFinalPlanHashJoins = 0;
+            // Number of indexed nested loop joins in the best (winning) plan.
+            int numFinalPlanIndexedNestedLoopJoins = 0;
+            // Number of nested loop joins in the best (winning) plan.
+            int numFinalPlanNestedLoopJoins = 0;
+            // Number of join nodes considered but rejected due to cost.
+            int numJoinNodesRejectedByCost = 0;
+            // Number of nodes memoized during plan enumeration.
+            int numMemoizedNodes = 0;
+            // Cost of the best (winning) plan.
+            double winningPlanCost = 0.0;
+            // Number of times we generated a sample during join optimization (one per distinct
+            // namespace in the join graph).
+            int numSamplingCalls = 0;
+            // Number of those samples that were served from a persistent sample rather than freshly
+            // scanned.
+            int numPersistentSamplesUsed = 0;
+            // Number of join edges whose NDV came from index uniqueness metadata instead of
+            // sampling.
+            int numUniqueIndexesUsedForNDV = 0;
+            // Number of distinct persisted NDV statistics (analyze mode "ndv") served during
+            // plan enumeration, for edge selectivity estimation or costing. Repeated requests
+            // for the same statistics are memoized and counted once.
+            int numPersistentNDVStatsUsed = 0;
+            // Number of join-graph collections for which the storage engine did not report a
+            // usable approximate leaf page count (see RecordStore::approxNumLeafPages()), forcing
+            // cost estimation to fall back to a size-based estimate. 'boost::none' until catalog
+            // statistics are collected, so a planning failure reads as "never measured" rather
+            // than as a measured zero.
+            boost::optional<int> numApproxLeafPagesUnavailable;
+
+            // Time spent acquiring samples for CE.
+            int64_t samplingTimeMicros = 0;
+            // Time spent generating single-table access plans in CBR.
+            int64_t cbrPlanningTimeMicros = 0;
+            // Time taken to enumerate plans and pick a winning plan.
+            int64_t planEnumerationTimeMicros = 0;
+            // Time spent evaluating CE for join optimization: up-front edge selectivity estimation
+            // plus the per-subset cardinality estimates computed lazily during enumeration. This
+            // is separate from the CE performed inside CBR.
+            int64_t ceTimeMicros = 0;
+        };
+        boost::optional<PlanEnumerationMetrics> planEnumerationMetrics = boost::none;
+    };
+    boost::optional<JoinOptimizationMetrics> joinOptimizationMetrics = boost::none;
+
+    /**
+     * Tracks the number of documents seen and returned by the $_internalSearchIdLookup
+     * stage. Used for batch size tuning.
+     *
+     * These metrics are stored on OpDebug so that they can be made accessible to extensions, but
+     * their lifetime is managed by $_internalSearchIdLookup, so that the values will be aggregated
+     * across all getMore's for a given query.
+     */
+    class SearchIdLookupMetrics {
+    public:
+        SearchIdLookupMetrics() {}
+
+        long long getDocsReturnedByIdLookup() const {
+            return _docsReturnedByIdLookup;
+        }
+
+        long long getDocsSeenByIdLookup() const {
+            return _docsSeenByIdLookup;
+        }
+
+        void incrementDocsSeenByIdLookup() {
+            _docsSeenByIdLookup++;
+        }
+
+        void incrementDocsReturnedByIdLookup() {
+            _docsReturnedByIdLookup++;
+        }
+
+        /**
+         * Sets the value of _docsSeenByIdLookup & _docsReturnedByLookup to 0.
+         */
+        void resetIdLookupMetrics() {
+            _docsSeenByIdLookup = 0;
+            _docsReturnedByIdLookup = 0;
+        }
+
+        /**
+         * Returns the "success rate" of finding docs by id in the idLookup phase as
+         * a floating point number between 0 and 1, where 0 is 0% and 1 is 100%.
+         * For example, if idLookup has seen 6 documents and 3 were found,
+         * this function would return 0.5 = 50%.
+         */
+        double getIdLookupSuccessRate() const {
+            // Ensure division by zero never occurs if no docs have been seen yet.
+            if (_docsSeenByIdLookup == 0) {
+                return 0;
+            }
+
+            tassert(9074400,
+                    str::stream() << "_docsReturnedByIdLookup must not be greater than "
+                                  << "_docsSeenByIdLookup in SearchIdLookupMetrics, but "
+                                     "_docsReturnedByIdLookup = '"
+                                  << _docsReturnedByIdLookup << "' and _docsSeenByIdLookup = '"
+                                  << _docsSeenByIdLookup << "'.",
+                    !(_docsSeenByIdLookup < _docsReturnedByIdLookup));
+
+            return double(_docsReturnedByIdLookup) / double(_docsSeenByIdLookup);
+        }
+
+    private:
+        // Number of documents that have been passed through the idLookup phase
+        // (regardless of whether they were found or not).
+        long long _docsSeenByIdLookup = 0;
+
+        // When there is an extractable limit in the query, DocumentInternalSearchMongotRemote sends
+        // a getMore to mongot that specifies how many more documents it needs to fulfill that
+        // limit, and it incorporates the amount of documents returned by the
+        // DocumentInternalSearchIdLookup stage into that value.
+        long long _docsReturnedByIdLookup = 0;
+    };
+
+    // Pointer to the operation's SearchIdLookupMetrics, if applicable. These metrics are owned by
+    // the $_internalSearchIdLookup execution stage so that the values can be aggregated across the
+    // entire query.
+    std::shared_ptr<SearchIdLookupMetrics> searchIdLookupMetrics = nullptr;
+
+    // The accumulated spilling statistics per stage type.
+    absl::flat_hash_map<PlanSummaryStats::SpillingStage, SpillingStats> spillingStatsPerStage;
+    size_t sortTotalDataSizeBytes{0};  // The amount of data we've sorted in bytes
+
+    long long keysSorted{0};       // The number of keys that we've sorted.
+    long long collectionScans{0};  // The number of collection scans during query execution.
+    long long collectionScansNonTailable{0};  // The number of non-tailable collection scans.
+    std::set<std::string> indexesUsed;        // The indexes used during query execution.
+
+    // True if a replan was triggered during the execution of this operation.
+    boost::optional<std::string> replanReason;
+
+    bool cursorExhausted{
+        false};  // true if the cursor has been closed at end a find/getMore operation
+
+    bool isChangeStreamQuery{false};
+
+    // True iff this change-stream cursor was opened on the v2 precise shard-targeting path (router
+    // only). Recorded on the ClusterClientCursor (mirroring isChangeStreamQuery) so the getMore
+    // precondition can kill-and-resume the cursor if the IFR flag is turned off.
+    bool usesChangeStreamV2ShardTargeting{false};
+
+    // True iff this change stream cursor's updateLookup stage was wired on the optimized
+    // (Express/SBE) path. Recorded on the ClientCursor so the getMore precondition can
+    // kill-and-resume the cursor if the optimization flag is turned off.
+    bool usesOptimizedUpdateLookup{false};
+
+    BSONObj execStats;  // Owned here.
+
+    // The hash of the PlanCache key for the query being run. This may change depending on what
+    // indexes are present.
+    boost::optional<uint32_t> planCacheKey;
+
+    // The hash of the canonical query encoding CanonicalQuery::QueryShapeString
+    boost::optional<uint32_t> planCacheShapeHash;
+
+    /* The QueryStatsInfo struct was created to bundle all the queryStats related fields of CurOp &
+     * OpDebug together (SERVER-83280).
+     *
+     * ClusterClientCursorImpl and ClientCursor also contain _queryStatsKey and _queryStatsKeyHash
+     * members but NOT other members of the struct. Variable names & accesses would be more
+     * consistent across the code if ClusterClientCursorImpl and ClientCursor each also had a
+     * QueryStatsInfo struct, but we considered and rejected two different potential implementations
+     * of this:
+     *  - Option 1:
+     *    Declare a QueryStatsInfo struct in each .h file. Every struct would have key and keyHash
+     *    fields, and other fields would be added only to CurOp. But it seemed confusing to have
+     *    slightly different structs with the same name declared three different times.
+     *  - Option 2:
+     *    Create a query_stats_info.h that declares QueryStatsInfo--identical to the version defined
+     *    in this file. CurOp/OpDebug, ClientCursor, and ClusterClientCursorImpl would then all
+     *    have their own QueryStatsInfo instances, potentially as a unique_ptr or boost::optional. A
+     *    benefit to this would be the ability to to just move the entire QueryStatsInfo struct from
+     *    Op to the Cursor, instead of copying it over field by field (the current method). But:
+     *      - The current code moves ownership of the key, but copies the keyHash. So, for workflows
+     *        that require multiple cursors, like sharding, one cursor would own the key, but all
+     *        cursors would have copies of the keyHash. The problem with trying to move around the
+     *        struct in its entirety is that access to the *entire* struct would be lost on the
+     *        move, meaning there's no way to retain the keyHash (that doesn't largely nullify the
+     *        benefits of having the struct).
+     *      - It seemed odd to have ClientCursor and ClusterClientCursorImpl using the struct but
+     *        never needing other fields.
+     */
+    struct [[MONGO_MOD_PRIVATE]] QueryStatsInfo {
+        // Uniquely identifies one query stats entry.
+        // `key` may be a nullptr during a subquery execution, but will
+        // be non-null at the highest-level operation as long as query stats are
+        // being collected and the query is not rate limited.
+        std::unique_ptr<query_stats::Key> key;
+        // A cached value of `absl::HashOf(key)`.
+        // Always populated if `key` is non-null at the highest-level operation.
+        boost::optional<std::size_t> keyHash;
+        // True if a subquery is being run, such as if the original query has been resolved to a
+        // view running an aggregation pipeline. If true, stats should not be registered at the
+        // current point in execution.
+        bool disableForSubqueryExecution = false;
+        // Sometimes we need to request metrics as part of a higher-level operation without
+        // actually caring about the metrics for this specific operation. In those cases, we
+        // use metricsRequested to indicate we should request metrics from other nodes.
+        bool metricsRequested = false;
+
+        // Additive metrics to be accumulated across calls to getMore() and/or transactions.
+        AdditiveMetrics additiveMetrics;
+    };
+
+    // Return true if the query stats info for batch writes has been created.
+    [[MONGO_MOD_PRIVATE]] bool queryStatsInfoForBatchWritesExists() const {
+        return _queryStatsInfoForBatchWrites != nullptr;
+    }
+
+    // Initialize the query stats info map for batch writes if it does not exist.
+    [[MONGO_MOD_PRIVATE]] void ensureQueryStatsInfoForBatchWrites() const {
+        if (!_queryStatsInfoForBatchWrites) {
+            _queryStatsInfoForBatchWrites =
+                std::make_unique<absl::flat_hash_map<size_t, QueryStatsInfo>>();
+        }
+    }
+
+    // Return true if the entry for 'opIndex' has been created.
+    [[MONGO_MOD_PRIVATE]] bool hasQueryStatsInfo(size_t opIndex = kCurrentOpIndex) const {
+        if (opIndex == kCurrentOpIndex) {
+            return true;
+        }
+        return queryStatsInfoForBatchWritesExists() &&
+            _queryStatsInfoForBatchWrites->contains(opIndex);
+    }
+
+
+    // Return the QueryStatsInfo for the given operation. By default, return the current operation.
+    [[MONGO_MOD_PRIVATE]] QueryStatsInfo& getQueryStatsInfo(size_t opIndex = kCurrentOpIndex) {
+        return _getQueryStatsInfoHelper(this, opIndex);
+    }
+
+    // Return the QueryStatsInfo for the given operation. By default, return the current main
+    // operation. Const version.
+    [[MONGO_MOD_PRIVATE]] const QueryStatsInfo& getQueryStatsInfo(
+        size_t opIndex = kCurrentOpIndex) const {
+        return _getQueryStatsInfoHelper(this, opIndex);
+    }
+
+    // Returns true if there are any QueryStatsInfo entries for writes statements being processed on
+    // the router.
+    [[MONGO_MOD_PRIVATE]] bool hasBatchWriteMetrics() const {
+        return _queryStatsInfoForBatchWrites && !_queryStatsInfoForBatchWrites->empty();
+    }
+
+    // Create a new default-constructed QueryStatsInfo for the given opIndex, and return a reference
+    // to it.
+    [[MONGO_MOD_PRIVATE]] void setQueryStatsInfoAtOpIndex(size_t opIndex,
+                                                          QueryStatsInfo queryStatsInfo) {
+        uassert(11487700,
+                "cannot create QueryStatsInfo for current operation",
+                opIndex != kCurrentOpIndex);
+
+        ensureQueryStatsInfoForBatchWrites();
+        uassert(11487701,
+                fmt::format("QueryStatsInfo for opIndex {} already exists", opIndex),
+                !_queryStatsInfoForBatchWrites->contains(opIndex));
+
+        _queryStatsInfoForBatchWrites->emplace(opIndex, std::move(queryStatsInfo));
+    }
+
+    // If we have any write statements for which query stats are being collected in the router
+    // role, then execute the function passed in for each QueryStatsInfo instance.
+    template <typename Func>
+    [[MONGO_MOD_PRIVATE]] void forEachQueryStatsInfoForBatchWrites(Func&& fn) {
+        if (!_queryStatsInfoForBatchWrites) {
+            return;
+        }
+        for (auto& [opIndex, info] : *_queryStatsInfoForBatchWrites) {
+            fn(opIndex, info);
+        }
+    }
+
+    // Gathers and returns a vector of all queryStatsMetrics for registered batch write operations.
+    [[MONGO_MOD_PRIVATE]] std::vector<write_ops::QueryStatsMetrics>
+    gatherQueryStatsMetricsForBatchWrites() const {
+        std::vector<write_ops::QueryStatsMetrics> queryStatsMetrics;
+        if (_queryStatsInfoForBatchWrites) {
+            for (const auto& [opIndex, info] : *_queryStatsInfoForBatchWrites) {
+                queryStatsMetrics.emplace_back(write_ops::QueryStatsMetrics{
+                    static_cast<int32_t>(opIndex), getCursorMetrics(opIndex)});
+            }
+        }
+        return queryStatsMetrics;
+    }
+
+    // The query framework that this operation used. Will be unknown for non query operations.
+    PlanExecutor::QueryFramework queryFramework{PlanExecutor::QueryFramework::kUnknown};
+
+    // The strategy that selected the winning plan. Written by setPlanSummaryMetrics.
+    // Reported as "none" when no plan selection took place.
+    boost::optional<PlanSelectionStrategy> planSelectionStrategy;
+
+    // Whether the winning plan was produced by the join optimizer. Written by
+    // setPlanSummaryMetrics. Only ever true when join optimization is enabled.
+    bool usedJoinOptimization{false};
+
+    // Tracks the amount of dynamic indexed loop joins in a pushed down stage.
+    int lookupDynamicIndexedLoopJoin{0};
+
+    // Tracks the amount of indexed loop joins in a pushed down lookup stage.
+    int lookupIndexedLoopJoin{0};
+
+    // Tracks the amount of nested loop joins in a pushed down lookup stage.
+    int lookupNestedLoopJoin{0};
+
+    // Tracks the amount of hash lookups in a pushed down lookup stage.
+    int lookupHashLookup{0};
+
+    // Tracks the amount of spills by hash lookup in a pushed down lookup stage.
+    int hashLookupSpillToDisk{0};
+
+    // Tracks the amount of indexed loop joins in a pushed down lookup+unwind stage.
+    int luIndexedLoopJoin{0};
+
+    // Tracks the amount of nested loop joins in a pushed down lookup+unwind stage.
+    int luNestedLoopJoin{0};
+
+    // Tracks the amount of hash lookups in a pushed down lookup+unwind stage.
+    int luHashLookup{0};
+
+    // Tracks the amount of dynamic indexed loop joins in a pushed down lookup+unwind stage.
+    int luDynamicIndexedLoopJoin{0};
+
+    // Local-side plan shape is tracked for LU but not plain $lookup because the LU IFR rollout
+    // flags gate pushdown based on local plan shape, requiring per-shape observability.
+    // Tracks the amount of local collection scans in a pushed down lookup+unwind stage.
+    int luLocalCollscan{0};
+
+    // Tracks the amount of local index scan + fetch plans in a pushed down lookup+unwind stage.
+    int luLocalIxscanFetch{0};
+
+    // Tracks the amount of complex local plan types (e.g. OR of indexes) in a pushed down
+    // lookup+unwind stage.
+    int luLocalComplex{0};
+
+    // Tracks whether a non leading $match was pushed down to SBE in the trySbeRestricted mode. This
+    // is a bool to ensure it's set only once per query.
+    bool nlpMatch{false};
+    // Tracks whether a non leading $project was pushed down to SBE in the trySbeRestricted mode.
+    // This is a bool to ensure it's set only once per query.
+    bool nlpProject{false};
+    // Tracks whether a non leading $addFields was pushed down to SBE in the trySbeRestricted mode.
+    // This is a bool to ensure it's set only once per query.
+    bool nlpAddFields{false};
+    // Tracks whether a non leading $replaceRoot was pushed down to SBE in the trySbeRestricted
+    // mode. This is a bool to ensure it's set only once per query.
+    bool nlpReplaceRoot{false};
+
+    // 'true' if the query has a leading match filter.
+    bool pathArraynessLeadingFilter{false};
+    // 'true' if the query has simplified a leading match filter by leveraging path arrayness
+    // information.
+    bool pathArraynessSimplified{false};
+
+    // Tracks the number of spilled bytes by hash lookup in a pushed down lookup stage. The spilled
+    // storage size after compression might be different from the bytes spilled.
+    long long hashLookupSpillToDiskBytes{0};
+
+    // Details of any error (whether from an exception or a command returning failure).
+    Status errInfo = Status::OK();
+
+    // Cost computed by the cost-based optimizer.
+    boost::optional<double> estimatedCost;
+    // Cardinality computed by the cost-based optimizer.
+    boost::optional<double> estimatedCardinality;
+
+    // Amount of CPU time used by this thread. Will remain -1 if this platform does not support
+    // this feature.
+    Nanoseconds cpuTime{-1};
+
+    int responseLength{-1};
+
+    // Shard targeting info.
+    int nShards{-1};
+
+    // Stores the duration of time spent blocked on prepare conflicts.
+    Milliseconds prepareConflictDurationMillis{0};
+
+    // Total time spent looking up database entry in the local catalog cache, including eventual
+    // refreshes.
+    Milliseconds catalogCacheDatabaseLookupMillis{0};
+
+    // Total time spent looking up collection entry in the local catalog cache, including eventual
+    // refreshes.
+    Milliseconds catalogCacheCollectionLookupMillis{0};
+
+    // Total time spent looking up index entries in the local cache, including eventual refreshes.
+    Milliseconds catalogCacheIndexLookupMillis{0};
+
+    // Stores the duration of time spent waiting for the shard to refresh the database and wait for
+    // the database critical section.
+    Milliseconds databaseVersionRefreshMillis{0};
+
+    // Stores the duration of time spent waiting for the shard to refresh the collection and wait
+    // for the collection critical section.
+    Milliseconds placementVersionRefreshMillis{0};
+
+    // Stores the duration of time spent waiting for the specified user write concern to
+    // be fulfilled.
+    Milliseconds waitForWriteConcernDurationMillis{0};
+
+    // Stores the duration of execution after removing time spent blocked.
+    Milliseconds workingTimeMillis{0};
+
+    // Stores the amount of the data processed by the throttle cursors in MB/sec.
+    boost::optional<float> dataThroughputLastSecond;
+    boost::optional<float> dataThroughputAverage;
+
+    // Used to track the amount of time spent waiting for a response from remote operations.
+    boost::optional<Microseconds> remoteOpWaitTime;
+
+    // By default, returns the current operation's additive metrics. If they are needed to be
+    // accumulated elsewhere, they should be extracted by another aggregator (like the ClientCursor)
+    // to ensure these only ever reflect just this CurOp's consumption.
+    //
+    // On the router, we may need to collect metrics for writes dispatched in batches to multiple
+    // shards. For this special case, an opIndex can be provided to aggregate metrics across shards.
+    AdditiveMetrics& getAdditiveMetrics(size_t opIndex = kCurrentOpIndex) {
+        return getQueryStatsInfo(opIndex).additiveMetrics;
+    }
+
+    // Const version of the above method.
+    const AdditiveMetrics& getAdditiveMetrics(size_t opIndex = kCurrentOpIndex) const {
+        return getQueryStatsInfo(opIndex).additiveMetrics;
+    }
+
+    // Stores storage statistics.
+    std::unique_ptr<StorageStats> storageStats;
+
+    // Stores storage statistics from the spill engine.
+    std::unique_ptr<StorageStats> spillStorageStats;
+
+    // Records the WC that was waited on during the operation. (The WC in opCtx can't be used
+    // because it's only set while the Command itself executes.)
+    boost::optional<WriteConcernOptions> writeConcern;
+    boost::optional<BSONObj> writeConcernError;
+
+    // The type of collection on which the operation operates.
+    boost::optional<query_shape::CollectionType> collectionType;
+
+    // Maps namespace of a resolved view to its dependency chain and the fully unrolled pipeline. To
+    // make log line deterministic and easier to test, use ordered map. As we don't expect many
+    // resolved views per query, a hash map would unlikely provide any benefits.
+    std::map<NamespaceString, std::pair<std::vector<NamespaceString>, std::vector<BSONObj>>>
+        resolvedViews;
+
+    // Stores metrics handles for extensions to properly manage their lifetimes. The contents of
+    // these stats are opaque to the MongoDB host - this object allows extensions to implement their
+    // own custom aggregation and serialization logic.
+    extension::host::OperationMetricsRegistry extensionMetrics;
+
+    // True if the query had applicable query settings that failed to produce a plan,
+    // causing a fallback to multi-planning without query settings.
+    bool failedPlanningWithQuerySettings{false};
+
+    bool waitingForFlowControl{false};
+
+    // Whether this is an oplog getMore operation for replication oplog fetching.
+    bool isReplOplogGetMore{false};
+    ChangeStreamCursorMetrics changeStreamMetrics;
+
+private:
+    /**
+     * Gets the type of the namespace on which the current operation operates.
+     */
+    std::string getCollectionTypeFromNamespaceString(const NamespaceString& nss) const;
+
+    /**
+     * Get or append the array with resolved views' info.
+     */
+    BSONArray getResolvedViewsInfo() const;
+    void appendResolvedViewsInfo(BSONObjBuilder& builder) const;
+
+    /**
+     * Accessor helper that avoids having to repeat logic for both const and non-const "this."
+     *
+     * We want this be inlined to ensure the happy path stays fast. Except on the router when
+     * collecting query stats for batched writes, it will always be the case that
+     *     opIndex == kCurrentOpIndex.
+     */
+    template <typename This>
+    static auto _getQueryStatsInfoHelper(This* opDebug, size_t opIndex)
+        -> decltype((opDebug->_queryStatsInfo)) {
+        if (opIndex == opDebug->kCurrentOpIndex) {
+            return opDebug->_queryStatsInfo;
+        }
+
+        opDebug->ensureQueryStatsInfoForBatchWrites();
+        uassert(11487702,
+                fmt::format("expected to find QueryStatsInfo at opIndex {} but did not", opIndex),
+                opDebug->_queryStatsInfoForBatchWrites->contains(opIndex));
+        return opDebug->_queryStatsInfoForBatchWrites->at(opIndex);
+    }
+
+    /**
+     * QueryStatsInfo for operations.
+     *
+     * Most of the time we only care about the current operation. However, when collecting
+     * stats for writes to sharded collections dispatched from the router, we need to be able to
+     * aggregate statistics for potentially more than one statement (since writes are typically
+     * batched). For this case, we want to be able to aggregate metrics received from the shards
+     * before updating the query stats store. This map is keyed on the index of the statements entry
+     * in the original write command.
+     */
+    QueryStatsInfo _queryStatsInfo;
+    mutable std::unique_ptr<absl::flat_hash_map<size_t, QueryStatsInfo>>
+        _queryStatsInfoForBatchWrites = nullptr;
+    static constexpr size_t kCurrentOpIndex = std::numeric_limits<size_t>::max();
+
+    // The hash of query_shape::QueryShapeHash.
+    boost::optional<query_shape::QueryShapeHash> _queryShapeHash;
+
+    // Flag indicates if query_shape::QueryShapeHash has already been computed.
+    bool _didComputeQueryShapeHash{false};
+
+    // Access is synchronized with $currentOp by the client lock.
+    // TODO SERVER-136425 Remove this once QueryLifespan::get() is threadsafe.
+    query_settings::QuerySettings _querySettings;
+};
+}  // namespace mongo

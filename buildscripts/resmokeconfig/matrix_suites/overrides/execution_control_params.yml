@@ -1,0 +1,79 @@
+### Overrides for some suites with RotateExecutionControlParams hook ###
+
+- name: replica_sets_reconfig_hooks_with_dynamic_execution_control
+  value:
+    executor:
+      hooks:
+        - class: RunDBCheckInBackground
+        # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
+        # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
+        # validating the entire contents of the collection.
+        - class: CheckReplDBHashInBackground
+        - class: ValidateCollectionsInBackground
+        - class: CheckReplOplogs
+        - class: CheckReplDBHash
+        - class: ValidateCollections
+        - class: CleanEveryN
+          n: 20
+        - class: RotateExecutionControlParams
+
+- name: replica_sets_reconfig_archive_hooks_with_dynamic_execution_control
+  value:
+    executor:
+      archive:
+        test: true
+        hooks:
+          - RunDBCheckInBackground
+          - CheckReplDBHashInBackground
+          - ValidateCollectionsInBackground
+          - CheckReplDBHash
+          - CheckReplOplogs
+          - ValidateCollections
+          - RotateExecutionControlParams
+
+- name: sharding_reconfig_hooks_with_dynamic_execution_control
+  value:
+    executor:
+      hooks:
+        - class: CheckReplDBHash
+        - class: CheckMetadataConsistencyInBackground
+        - class: ValidateCollections
+        - class: CheckShardFilteringMetadata
+        - class: CheckOrphansDeleted
+        - class: CleanEveryN
+          n: 20
+        - class: RotateExecutionControlParams
+
+- name: sharding_reconfig_archive_hooks_with_dynamic_execution_control
+  value:
+    executor:
+      archive:
+        hooks:
+          - CheckReplDBHash
+          - CheckMetadataConsistencyInBackground
+          - ValidateCollections
+          - RotateExecutionControlParams
+
+- name: enable_prioritization
+  value:
+    executor:
+      fixture:
+        mongod_options:
+          set_parameters:
+            enableTestCommands: 1
+            executionControlDeprioritizationGate: true
+
+- name: enable_prioritization_testdata_parameter
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              setParameters:
+                executionControlDeprioritizationGate: true
+
+- name: exclude_execution_control_with_prioritization_incompatible_tag
+  value:
+    exclude_with_any_tags:
+      - incompatible_with_execution_control_with_prioritization

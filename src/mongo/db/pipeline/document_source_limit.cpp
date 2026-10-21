@@ -1,102 +1,75 @@
-/**
-*    Copyright (C) 2011 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
+#include "mongo/db/pipeline/document_source_limit.h"
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <iterator>
+#include <list>
+#include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
+using boost::intrusive_ptr;
 
-    const char DocumentSourceLimit::limitName[] = "$limit";
+DocumentSourceLimit::DocumentSourceLimit(const intrusive_ptr<ExpressionContext>& pExpCtx,
+                                         long long limit)
+    : DocumentSource(kStageName, pExpCtx), _limit(limit) {}
 
-    DocumentSourceLimit::DocumentSourceLimit(const intrusive_ptr<ExpressionContext> &pExpCtx,
-                                             long long limit)
-        : DocumentSource(pExpCtx)
-        , limit(limit)
-        , count(0)
-    {}
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE(limit, LimitLiteParsed::parse, AllowedWithApiStrict::kAlways);
 
-    const char *DocumentSourceLimit::getSourceName() const {
-        return limitName;
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(limit, DocumentSourceLimit, LimitStageParams);
+
+ALLOCATE_DOCUMENT_SOURCE_ID(limit, DocumentSourceLimit::id);
+
+constexpr std::string_view DocumentSourceLimit::kStageName;
+
+DocumentSourceContainer::iterator DocumentSourceLimit::optimizeAt(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
+    tassert(11282987, "Expecting DocumentSource iterator pointing to this stage", *itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
     }
 
-    bool DocumentSourceLimit::coalesce(
-        const intrusive_ptr<DocumentSource> &pNextSource) {
-        DocumentSourceLimit *pLimit =
-            dynamic_cast<DocumentSourceLimit *>(pNextSource.get());
+    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
 
-        /* if it's not another $limit, we can't coalesce */
-        if (!pLimit)
-            return false;
-
-        /* we need to limit by the minimum of the two limits */
-        if (pLimit->limit < limit)
-            limit = pLimit->limit;
-        return true;
+    if (nextLimit) {
+        _limit = std::min(_limit, nextLimit->getLimit());
+        container->erase(std::next(itr));
+        return itr == container->begin() ? itr : std::prev(itr);
     }
-
-    boost::optional<Document> DocumentSourceLimit::getNext() {
-        pExpCtx->checkForInterrupt();
-
-        if (++count > limit) {
-            pSource->dispose();
-            return boost::none;
-        }
-
-        return pSource->getNext();
-    }
-
-    Value DocumentSourceLimit::serialize(bool explain) const {
-        return Value(DOC(getSourceName() << limit));
-    }
-
-    intrusive_ptr<DocumentSourceLimit> DocumentSourceLimit::create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx,
-            long long limit) {
-        uassert(15958, "the limit must be positive",
-                limit > 0);
-        return new DocumentSourceLimit(pExpCtx, limit);
-    }
-
-    intrusive_ptr<DocumentSource> DocumentSourceLimit::createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        uassert(15957, "the limit must be specified as a number",
-                elem.isNumber());
-
-        long long limit = elem.numberLong();
-        return DocumentSourceLimit::create(pExpCtx, limit);
-    }
+    return std::next(itr);
 }
+
+Value DocumentSourceLimit::serialize(const query_shape::SerializationOptions& opts) const {
+    return Value(Document{{getSourceName(), opts.serializeLiteral(_limit)}});
+}
+
+intrusive_ptr<DocumentSourceLimit> DocumentSourceLimit::create(
+    const intrusive_ptr<ExpressionContext>& pExpCtx, long long limit) {
+    uassert(15958, "the limit must be positive", limit > 0);
+    intrusive_ptr<DocumentSourceLimit> source(new DocumentSourceLimit(pExpCtx, limit));
+    return source;
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceLimit::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    const auto limit = elem.parseIntegerElementToNonNegativeLong();
+    uassert(5107201,
+            str::stream() << "invalid argument to $limit stage: " << limit.getStatus().reason(),
+            limit.isOK());
+    return DocumentSourceLimit::create(pExpCtx, limit.getValue());
+}
+}  // namespace mongo

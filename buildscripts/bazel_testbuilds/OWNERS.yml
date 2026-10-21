@@ -1,0 +1,11 @@
+version: 2.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/devprod-build
+  - "jstest_timeout*":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "verify_resmoke_coredump_test.sh":
+    approvers:
+      - 10gen/devprod-test-infrastructure

@@ -1,0 +1,820 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/sharding_environment/sharding_mongos_test_fixture.h"
+#include "mongo/db/topology/vector_clock/vector_clock.h"
+#include "mongo/unittest/log_test.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo {
+
+class ShardRegistryTest : service_context_test::WithSetupTransportLayer,
+                          public ShardingTestFixture {
+protected:
+    void setUp() override {
+        // Setting the role is important for topologyTime gossiping.
+        serverGlobalParams.clusterRole = {ClusterRole::RouterServer};
+        ShardingTestFixture::setUp();
+        configTargeter()->setFindHostReturnValue(kConfigHostAndPort);
+    }
+
+    LogicalTime getLastKnownTopologyTime() {
+        const auto time = VectorClock::get(operationContext())->getTime();
+        return time.topologyTime();
+    }
+
+    ShardType shardIdToShardType(ShardId id) {
+        ShardType shardType;
+        shardType.setName(id.toString());
+        const auto connString = ConnectionString::forReplicaSet(
+            id.toString() + "-replset", {HostAndPort(id.toString(), kDummyPort)});
+        shardType.setHost(connString.toString());
+        return shardType;
+    }
+
+    // Adds a shard to the fixture. This involves creating the entry, and bumping the VectorClock
+    // topology time if advanceTopologyTime.
+    void addShard(ShardId id, bool advanceTopologyTime) {
+        configsvrTopologyTime = Timestamp(addRemoveShardCounterForTopologyTime++, 0);
+
+        auto shardType = shardIdToShardType(id);
+        shardType.setTopologyTime(configsvrTopologyTime);
+        shards.push_back(shardType);
+
+        if (advanceTopologyTime) {
+            VectorClock::get(operationContext())
+                ->advanceTopologyTime_forTest(LogicalTime(configsvrTopologyTime));
+        }
+    }
+
+    // Adds a shard with a custom ShardType (name and connection string). Used when testing
+    // host-to-shard mapping with specific hosts (e.g. recovery after host reassignment).
+    void addShard(ShardType shardType, bool advanceTopologyTime = true) {
+        configsvrTopologyTime = Timestamp(addRemoveShardCounterForTopologyTime++, 0);
+        shardType.setTopologyTime(configsvrTopologyTime);
+        shards.push_back(shardType);
+        if (advanceTopologyTime) {
+            VectorClock::get(operationContext())
+                ->advanceTopologyTime_forTest(LogicalTime(configsvrTopologyTime));
+        }
+    }
+
+    // Clears the fixture's shard list so a new topology can be set up (e.g. to simulate
+    // config.shards change before recovery).
+    void clearShards() {
+        shards.clear();
+    }
+
+    // Adds a shard to the fixture, simulating a config.shards with no topologyTime in any of the
+    // entries. Old versions did not have the topologyTime, when upgrading the shard registry must
+    // still populate the cache.
+    void addShardWithoutTopologyTime(ShardId id) {
+        auto shardType = shardIdToShardType(id);
+        shards.push_back(shardType);
+    }
+
+    // Removes a shard from the fixture. Drops the entry, and updates another entry's topologyTime.
+    // If advanceTopologyTime is true, advances the VectorClock.
+    void removeShard(ShardId id, bool advanceTopologyTime) {
+        invariant(shards.size() >= 2);
+        configsvrTopologyTime = Timestamp(addRemoveShardCounterForTopologyTime++, 0);
+
+        shards.erase(
+            std::remove_if(shards.begin(),
+                           shards.end(),
+                           [&](ShardType& shard) { return shard.getName() == id.toString(); }),
+            shards.end());
+
+        // Recreate ShardType, resetting topologyTime is not allowed.
+        auto& topologyTimeUpdateShard = shards[0];
+        auto shardWithUpdatedTopologyTime = shardIdToShardType(topologyTimeUpdateShard.getName());
+        shardWithUpdatedTopologyTime.setTopologyTime(configsvrTopologyTime);
+
+        topologyTimeUpdateShard = shardWithUpdatedTopologyTime;
+        if (advanceTopologyTime) {
+            VectorClock::get(operationContext())
+                ->advanceTopologyTime_forTest(LogicalTime(configsvrTopologyTime));
+        }
+    }
+
+    // Expect the ShardRegistry to query the config server.
+    void expectCSRSLookup() {
+        expectGetShards(shards);
+    }
+
+    // Expect the ShardRegistry to send a ping to the config server.
+    void expectPing() {
+        onCommand([&](const executor::RemoteCommandRequest& request) {
+            ASSERT_EQ(request.target, kConfigHostAndPort);
+            ASSERT(request.cmdObj.hasField("ping"));
+
+            // Gossip topology time.
+            BSONObjBuilder bob;
+            bob.append(VectorClock::kTopologyTimeFieldName, configsvrTopologyTime);
+            return bob.obj();
+        });
+    }
+
+    void assertShardIdsFromRegistry(const std::vector<ShardId>& fromShardRegistry) {
+        ASSERT_EQ(fromShardRegistry.size(), shards.size());
+
+        auto registryCopy = fromShardRegistry;
+        std::sort(registryCopy.begin(), registryCopy.end(), [](auto& a, auto& b) {
+            return a.toString() < b.toString();
+        });
+
+        auto shardsCopy = shards;
+        std::sort(shardsCopy.begin(), shardsCopy.end(), [](auto& a, auto& b) {
+            return a.getName() < b.getName();
+        });
+
+        for (size_t i = 0; i < shards.size(); i++) {
+            ASSERT_EQ(registryCopy[i].toString(), shardsCopy[i].getName());
+        }
+    }
+
+    void reloadAndWait() {
+        auto future = launchAsync([this] { shardRegistry()->reload(operationContext()); });
+        // If there was no hit to CSRS, this would hang.
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    // ShardRegistry functions attempt an extra refresh when no shards are found. To simplify our
+    // life, we test the core _getData function directly.
+    auto getData() {
+        return shardRegistry()->_getData(operationContext());
+    }
+
+    auto makeTimeForForceReload() {
+        return ShardRegistry::Time::makeForForcedReload();
+    }
+
+    auto makeTimeLatestKnown() {
+        return ShardRegistry::Time::makeLatestKnown(getServiceContext());
+    }
+
+    auto makeTimeWithLookup(std::function<Timestamp(void)>&& lookupFn) {
+        auto [_, time] = ShardRegistry::Time::makeWithLookup([fn = std::move(lookupFn)]() {
+            return std::pair{ShardRegistryData::ShardIdToConnectionStringMap{}, fn()};
+        });
+        return time;
+    }
+
+    const int kDummyPort{12345};
+    const HostAndPort kConfigHostAndPort{"DummyConfig", kDummyPort};
+
+    std::vector<ShardType> shards;
+    int addRemoveShardCounterForTopologyTime = 1;
+
+    const bool kAdvanceTopologyTime = true;
+    const bool kDoNotAdvanceTopologyTime = false;
+    Timestamp configsvrTopologyTime;
+
+    unittest::MinimumLoggedSeverityGuard logSeverityGuard{logv2::LogComponent::kSharding,
+                                                          logv2::LogSeverity::Debug(2)};
+
+    size_t getLatestConnStringsSize() {
+        return shardRegistry()->_latestConnStrings.size();
+    }
+
+    void setLatestConnString(const ConnectionString& cs) {
+        std::lock_guard lk(shardRegistry()->_mutex);
+        shardRegistry()->_latestConnStrings[cs.getSetName()] = cs;
+    }
+
+    bool hasLatestConnString(const std::string& rsName) {
+        std::lock_guard lk(shardRegistry()->_mutex);
+        return shardRegistry()->_latestConnStrings.count(rsName) > 0;
+    }
+
+    void clearForRecovery() {
+        shardRegistry()->_clearForRecovery(operationContext());
+    }
+
+    // Sets up the host reassignment scenario: initial topology has shard1 (host1,2,3) and shard2
+    // (host4,5,6). Then it simulates a config change where host3 moves to shard2. After this, the
+    // mock config has the new topology but the registry still has the old view in memory.
+    void setupHostReassignmentScenario() {
+        addShard(ShardType("shard1", "shard1RS/host1:27017,host2:27017,host3:27017"));
+        addShard(ShardType("shard2", "shard2RS/host4:27017,host5:27017,host6:27017"));
+
+        auto future = launchAsync([this] { shardRegistry()->getAllShardIds(operationContext()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+
+        ASSERT_EQ(2u, shardRegistry()->getAllShardIds(operationContext()).size());
+        auto shardForHost3 = shardRegistry()->getShardForHostNoReload(HostAndPort("host3", 27017));
+        ASSERT(shardForHost3) << "host3 should be found after initial load";
+        ASSERT_EQ(ShardId("shard1"), shardForHost3->getId())
+            << "host3 should initially belong to shard1";
+
+        // Simulate topology change: host3 moves from shard1 to shard2 in config.shards.
+        clearShards();
+        addShard(ShardType("shard1", "shard1RS/host1:27017,host2:27017"));
+        addShard(ShardType("shard2", "shard2RS/host3:27017,host4:27017,host5:27017,host6:27017"));
+
+        auto shardForHost3AfterReassignment =
+            shardRegistry()->getShardForHostNoReload(HostAndPort("host3", 27017));
+        ASSERT(shardForHost3AfterReassignment) << "host3 should be found after reassignment";
+        ASSERT_EQ(ShardId("shard1"), shardForHost3AfterReassignment->getId())
+            << "host3 should still belong to shard1 after reassignment";
+    }
+};
+
+namespace {
+
+TEST_F(ShardRegistryTest, FirstGetDataDoesLookup) {
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+TEST_F(ShardRegistryTest, SimpleAddShard) {
+    // Reload when config.shards is empty.
+    reloadAndWait();
+    // Add a shard and make the topologyTime known to this node.
+    addShard({"0"}, kAdvanceTopologyTime);
+
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+TEST_F(ShardRegistryTest, SimpleRemoveShard) {
+    addShard({"0"}, kAdvanceTopologyTime);
+    addShard({"1"}, kAdvanceTopologyTime);
+    reloadAndWait();
+
+    // Remove a shard and make the topologyTime known to this node.
+    removeShard({"1"}, kAdvanceTopologyTime);
+
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+TEST_F(ShardRegistryTest, LookupGossipsInTopologyTime) {
+    // A shard has been added, this node is not aware of the new topologyTime.
+    addShard({"0"}, kDoNotAdvanceTopologyTime);
+
+    auto topologyTimeBefore = getLastKnownTopologyTime();
+
+    // Force reload, which discovers new topology. This should also cause the new topologyTime to be
+    // gossiped in.
+    reloadAndWait();
+
+    // Sanity check that VectorClock was not advanced before reload.
+    ASSERT_LT(topologyTimeBefore.asTimestamp(), configsvrTopologyTime);
+
+    auto topologyTimeAfter = getLastKnownTopologyTime();
+    ASSERT_EQ(topologyTimeAfter.asTimestamp(), configsvrTopologyTime);
+}
+
+TEST_F(ShardRegistryTest, ForceReloadDoesLookupWithoutNewTopologyTime) {
+    addShard({"0"}, kDoNotAdvanceTopologyTime);
+
+    // Case 1: cache is empty.
+    reloadAndWait();
+    assertShardIdsFromRegistry(shardRegistry()->getAllShardIds(operationContext()));
+
+    addShard({"1"}, kDoNotAdvanceTopologyTime);
+
+    // Case 2: cache is populated, a lookup is expected anyways.
+    reloadAndWait();
+    assertShardIdsFromRegistry(shardRegistry()->getAllShardIds(operationContext()));
+}
+
+TEST_F(ShardRegistryTest, GetDataDoesNoLookupAfterReloadWithNoShards) {
+    reloadAndWait();
+    // Given that we have already performed a force reload, even if the result from the CSRS was
+    // empty, subsequent getData() should not block.
+    getData();
+}
+
+TEST_F(ShardRegistryTest, GetDataDoesNoLookupAfterReloadWithShards) {
+    // A shard has been added, this node is not aware of the new topologyTime.
+    addShard({"0"}, kDoNotAdvanceTopologyTime);
+
+    // Force reload, which discovers new topology.
+    reloadAndWait();
+
+    // Following get requests should not reach out to CSRS.
+    assertShardIdsFromRegistry(getData()->getAllShardIds());
+}
+
+TEST_F(ShardRegistryTest, GetDataDoesLookupWithNewTopologyTime) {
+    addShard({"0"}, kAdvanceTopologyTime);
+    // The registry should reach out the CSRS, cache was empty.
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    // A shard has been added, and the topologyTime gossiped.
+    addShard({"1"}, kAdvanceTopologyTime);
+
+    // The registry should reach out the CSRS, cache was not empty.
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+TEST_F(ShardRegistryTest, GetDataDoesNoLookupWithoutNewTopologyTime) {
+    // A shard has been added, and the topologyTime gossiped.
+    addShard({"0"}, kAdvanceTopologyTime);
+
+    // The registry should reach out the CSRS.
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    // Subsequent getData calls should not lookup. A lookup to CSRS would hang the test.
+    getData();
+}
+
+// There used to be a bug where an empty result would store Timestamp(0,0) in cache, and cause
+// topologyTime updates to never advance the timeInStore.
+TEST_F(ShardRegistryTest, GetDataWithNewTopologyTimeAfterEmptyLookup) {
+    // Reload on when config.shards is empty.
+    reloadAndWait();
+    // Add a shard and make the topologyTime known to this node.
+    addShard({"0"}, kAdvanceTopologyTime);
+
+    // If the new topologyTime does not advance timeInStore, the test would hang because no lookup
+    // would be done.
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+TEST_F(ShardRegistryTest, PeriodicReloaderUpdatesTopologyTime) {
+    // Add a shard and make the topologyTime known to this node.
+    addShard({"0"}, kDoNotAdvanceTopologyTime);
+
+    // Sanity check that VectorClock was not advanced before starting periodic reloader.
+    auto topologyTimeBefore = getLastKnownTopologyTime();
+    ASSERT_LT(topologyTimeBefore.asTimestamp(), configsvrTopologyTime);
+
+    shardRegistry()->startupPeriodicReloader(operationContext());
+
+    expectPing();
+
+    auto topologyTimeAfter = getLastKnownTopologyTime();
+    ASSERT_EQ(topologyTimeAfter.asTimestamp(), configsvrTopologyTime);
+
+    expectCSRSLookup();
+}
+
+TEST_F(ShardRegistryTest, TopologyTimeMonotonicityViolation) {
+    // Unless there's an entry in the cache, there is no timeInStore to compare.
+    reloadAndWait();
+
+    addShard({"0"}, kAdvanceTopologyTime);
+
+    // Corrupt the topologyTime into the future.
+    auto vc = VectorClock::get(operationContext());
+    auto time = vc->getTime();
+    auto topologyTime = time.topologyTime().asTimestamp();
+    VectorClock::get(operationContext())
+        ->advanceTopologyTime_forTest(LogicalTime(Timestamp(topologyTime.getSecs() + 100, 0)));
+
+    auto future = launchAsync([this] { getData(); });
+    expectCSRSLookup();
+    ASSERT_THROWS_CODE(future.default_timed_get(),
+                       DBException,
+                       ErrorCodes::ReadThroughCacheTimeMonotonicityViolation);
+}
+
+TEST_F(ShardRegistryTest, ConfigShardsWithNoTopologyTimeDueToUpgrade) {
+    // Add a shard without a topologyTime. This can be the case when coming from older versions.
+    addShardWithoutTopologyTime({"0"});
+
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+// TODO (SERVER-102087): remove or adapt.
+TEST_F(ShardRegistryTest, ConfigShardsWithNoTopologyTimeWithGossipedTopologyTime) {
+    // Add a shard without a topologyTime. This can be the case when coming from older versions.
+    addShardWithoutTopologyTime({"0"});
+
+    // When a key is not in the ReadThroughCache, timeInStore is Time(). Thus, the expected time
+    // is T(0, 0), and the result is never considered inconsistent.
+    reloadAndWait();
+
+    // Corrupt the topologyTime.
+    VectorClock::get(operationContext())
+        ->advanceTopologyTime_forTest(LogicalTime(Timestamp(100, 0)));
+
+    // To prevent a cluster impacted by SERVER-63742 from crashing the server in benign scenarios
+    // (config.shards without any topologyTime), the ShardRegistry accepts the corrupted time.
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    reloadAndWait();
+
+    // Usually, a force reload without subsequent topologyTime changes should not cause a lookup.
+    // However, given that the forced lookup installs a timeInStore using the config.shards
+    // topologyTime, which is lesser than the corrupted time in the vector clock, subsequent
+    // ShardRegistry operation will cause a lookup.
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+/////// ShardRegistry::Time
+
+TEST_F(ShardRegistryTest, ForceReloadTimeGreaterThanLatestKnown) {
+    auto latestKnown = makeTimeLatestKnown();
+    auto forceReload = makeTimeForForceReload();
+    ASSERT_GT(forceReload, latestKnown);
+}
+
+TEST_F(ShardRegistryTest, ForceReloadGreaterThanAnyLookup) {
+    auto lookupTime = makeTimeWithLookup([]() { return Timestamp::max(); });
+    auto forceReloadTime = makeTimeForForceReload();
+    ASSERT_GT(forceReloadTime, lookupTime);
+}
+
+TEST_F(ShardRegistryTest, NewerForceReloadGreaterThanOlder) {
+    auto olderTime = makeTimeForForceReload();
+    auto newerTime = makeTimeForForceReload();
+    ASSERT_GT(newerTime, olderTime);
+}
+
+TEST_F(ShardRegistryTest, LookupTimeGreaterThanPreviousForceReload) {
+    auto forceReloadTime = makeTimeForForceReload();
+    auto lookupTime =
+        makeTimeWithLookup([]() { return VectorClock::kInitialComponentTime.asTimestamp(); });
+    ASSERT_GT(lookupTime, forceReloadTime);
+}
+
+TEST_F(ShardRegistryTest, NewerLookupTimeGreaterThanOlder) {
+    auto olderTime = makeTimeWithLookup([]() { return Timestamp(1, 1); });
+    auto newerTime = makeTimeWithLookup([]() { return Timestamp(2, 1); });
+    ASSERT_GT(newerTime, olderTime);
+}
+
+TEST_F(ShardRegistryTest, FlushShardRegistryClearsCachedConnectionStrings) {
+    ASSERT_EQ(getLatestConnStringsSize(), 1);  // This is the config shard
+    clearForRecovery();
+    ASSERT_EQ(getLatestConnStringsSize(), 0);
+}
+
+TEST_F(ShardRegistryTest, FlushShardRegistryReloadForRecovery) {
+    setupHostReassignmentScenario();
+
+    auto future = launchAsync([this] {
+        auto [cachedTimeBefore,
+              forceReloadIncrementBefore,
+              cachedTimeAfter,
+              forceReloadIncrementAfter] = shardRegistry()->reloadForRecovery(operationContext());
+        ASSERT_GT(forceReloadIncrementAfter, forceReloadIncrementBefore);
+        ASSERT_GT(cachedTimeAfter, cachedTimeBefore);
+    });
+    expectCSRSLookup();
+    future.default_timed_get();
+
+    auto shardForHost3 = shardRegistry()->getShardForHostNoReload(HostAndPort("host3", 27017));
+    ASSERT(shardForHost3) << "host3 should be found after recovery";
+    ASSERT_EQ(ShardId("shard2"), shardForHost3->getId())
+        << "host3 should now belong to shard2 after reassignment";
+}
+
+TEST_F(ShardRegistryTest, toBSONEmptyRegistry) {
+    reloadAndWait();
+
+    BSONObjBuilder builder;
+    shardRegistry()->toBSON(&builder);
+    auto result = builder.obj();
+
+    ASSERT_TRUE(result.hasField("map"));
+    ASSERT_TRUE(result.hasField("hosts"));
+    ASSERT_TRUE(result.hasField("connStrings"));
+    auto map = result["map"].Obj();
+    // With no shards, the map should only contain the config shard
+    ASSERT_EQ(map.nFields(), 1);
+
+    ASSERT_TRUE(result.hasField("timeInStore"));
+    std::string timeInStoreStr = result["timeInStore"].String();
+    ASSERT_TRUE(timeInStoreStr.find("forceReloadIncrement") != std::string::npos);
+    ASSERT_TRUE(timeInStoreStr.find("topologyTime") != std::string::npos);
+}
+
+TEST_F(ShardRegistryTest, toBSONWithShards) {
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard({"shard1"}, kAdvanceTopologyTime);
+
+    auto future = launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+    expectCSRSLookup();
+    future.default_timed_get();
+
+    BSONObjBuilder builder;
+    shardRegistry()->toBSON(&builder);
+    auto result = builder.obj();
+
+    ASSERT_TRUE(result.hasField("map"));
+    ASSERT_TRUE(result.hasField("hosts"));
+    ASSERT_TRUE(result.hasField("connStrings"));
+    auto map = result["map"].Obj();
+    ASSERT_GTE(map.nFields(), 2);
+    ASSERT_TRUE(map.hasField("shard0"));
+    ASSERT_TRUE(map.hasField("shard1"));
+
+    ASSERT_TRUE(result.hasField("timeInStore"));
+    std::string timeInStoreStr = result["timeInStore"].String();
+    ASSERT_TRUE(timeInStoreStr.find("topologyTime") != std::string::npos);
+}
+
+// When a shard is removed from config.shards, the registry should drop the shard's
+// ID-based entry after a refresh.
+TEST_F(ShardRegistryTest, RemovedShardIsDroppedFromRegistry) {
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard({"extraShard"}, kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    removeShard({"extraShard"}, kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    auto data = getData();
+    ASSERT(data->findShard(ShardId("shard0")));
+    ASSERT(!data->findShard(ShardId("extraShard"))) << "Removed shard should not be in ID lookup";
+}
+
+TEST_F(ShardRegistryTest, UserShardInputResolutionSeparatesIdAndAlternateLookups) {
+    const ShardId shardId("shard0");
+    addShard(shardId, kAdvanceTopologyTime);
+
+    {
+        auto future = launchAsync([this] { getData(); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    const auto shardType = shardIdToShardType(shardId);
+    const auto connString = uassertStatusOK(ConnectionString::parse(shardType.getHost()));
+    const auto hostAndPort = connString.getServers().front();
+    const ShardId connStringId(connString.toString());
+    const ShardId hostAndPortId(hostAndPort.toString());
+
+    auto data = getData();
+    ASSERT(data->findShard(shardId));
+    ASSERT(!data->findShard(connStringId));
+    ASSERT(!data->findShard(hostAndPortId));
+
+    ASSERT_EQ(shardId, data->findShard(shardId, true)->getId());
+    ASSERT_EQ(shardId, data->findShard(connStringId, true)->getId());
+    ASSERT_EQ(shardId, data->findShard(hostAndPortId, true)->getId());
+
+    auto* opCtx = operationContext();
+    ASSERT_EQ(shardId, unittest::assertGet(shardRegistry()->getShard(opCtx, shardId))->getId());
+    ASSERT_EQ(shardId,
+              unittest::assertGet(shardRegistry()->getShard(opCtx, shardId, true))->getId());
+    ASSERT_EQ(shardId,
+              unittest::assertGet(shardRegistry()->getShard(opCtx, connStringId, true))->getId());
+    ASSERT_EQ(shardId,
+              unittest::assertGet(shardRegistry()->getShard(opCtx, hostAndPortId, true))->getId());
+}
+
+TEST_F(ShardRegistryTest, GetShardIdAcceptsShardId) {
+    const ShardId shardId("shard0");
+    addShard(shardId, kAdvanceTopologyTime);
+    reloadAndWait();
+
+    auto* opCtx = operationContext();
+    ASSERT_EQ(shardId,
+              unittest::assertGet(shardRegistry()->resolveShardId(
+                  opCtx, shardId, false /* allowNonShardIdIdentifiers */)));
+    ASSERT_EQ(shardId,
+              unittest::assertGet(shardRegistry()->resolveShardId(
+                  opCtx, shardId, true /* allowNonShardIdIdentifiers */)));
+}
+
+TEST_F(ShardRegistryTest, GetShardIdRejectsUnknownIdentifier) {
+    const ShardId shardId("shard0");
+    addShard(shardId, kAdvanceTopologyTime);
+    reloadAndWait();
+
+    auto* opCtx = operationContext();
+    const ShardId unknownShard("unknown");
+
+    auto future = launchAsync([this, opCtx, unknownShard] {
+        ASSERT_EQ(ErrorCodes::ShardNotFound,
+                  shardRegistry()
+                      ->resolveShardId(opCtx, unknownShard, false /* allowNonShardIdIdentifiers */)
+                      .getStatus());
+    });
+    expectCSRSLookup();
+    future.default_timed_get();
+
+    future = launchAsync([this, opCtx, unknownShard] {
+        ASSERT_EQ(ErrorCodes::ShardNotFound,
+                  shardRegistry()
+                      ->resolveShardId(opCtx, unknownShard, true /* allowNonShardIdIdentifiers */)
+                      .getStatus());
+    });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+TEST_F(ShardRegistryTest, GetShardIdAllowsAlternateIdentifiers) {
+    const ShardId shardId("shard0");
+    addShard(shardId, kAdvanceTopologyTime);
+    reloadAndWait();
+
+    const auto shardType = shardIdToShardType(shardId);
+    const auto connString = uassertStatusOK(ConnectionString::parse(shardType.getHost()));
+    const auto hostAndPort = connString.getServers().front();
+    const ShardId hostAndPortId(hostAndPort.toString());
+
+    auto* opCtx = operationContext();
+    ASSERT_EQ(shardId,
+              unittest::assertGet(shardRegistry()->resolveShardId(
+                  opCtx, hostAndPortId, true /* allowNonShardIdIdentifiers */)));
+
+    auto future = launchAsync([this, opCtx, hostAndPortId] {
+        ASSERT_EQ(ErrorCodes::ShardNotFound,
+                  shardRegistry()
+                      ->resolveShardId(opCtx, hostAndPortId, false /* allowNonShardIdIdentifiers */)
+                      .getStatus());
+    });
+    expectCSRSLookup();
+    future.default_timed_get();
+}
+
+// When a shard is removed from config.shards, _tearDownRemovedShards should erase its RS from
+// _latestConnStrings. This applies to both regular shards and the config shard (kConfigServerId).
+TEST_F(ShardRegistryTest, RemovedShardErasesLatestConnString) {
+    const auto extraConnString =
+        ConnectionString::forReplicaSet("extraShardRS", {HostAndPort("host1", kDummyPort)});
+    const auto configConnString =
+        ConnectionString::forReplicaSet("configRS", {HostAndPort("configHost", kDummyPort)});
+
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard(ShardType("extraShard_0", extraConnString.toString()), kAdvanceTopologyTime);
+    addShard(ShardType("config", configConnString.toString()), kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    setLatestConnString(extraConnString);
+    setLatestConnString(configConnString);
+    ASSERT(hasLatestConnString("extraShardRS"));
+    ASSERT(hasLatestConnString("configRS"));
+
+    // Remove both extraShard_0 and config, keeping only shard0.
+    clearShards();
+    addShard({"shard0"}, kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    auto data = getData();
+    ASSERT(data->findShard(ShardId("shard0")));
+    ASSERT(!data->findShard(ShardId("extraShard_0")));
+    ASSERT(!data->findByRSName("extraShardRS"));
+    ASSERT(!data->findShard(ShardId("config")));
+
+    ASSERT(!hasLatestConnString("extraShardRS"))
+        << "_latestConnStrings for regular shard RS should be erased";
+    ASSERT(!hasLatestConnString("configRS"))
+        << "_latestConnStrings for config shard RS should be erased";
+}
+
+// When a shard is removed and re-added with a different ID but the same RS name, the
+// remove-first-then-create pattern tears down the old RSM, then builds a fresh one for
+// the new shard. The registry should resolve the RS name to the new shard ID, and
+// operations through the registry should succeed (no HostUnreachable).
+TEST_F(ShardRegistryTest, ShardIdChangeWithSameRSNameRecreatesRSM) {
+    const auto sharedConnString =
+        ConnectionString::forReplicaSet("extraShardRS", {HostAndPort("host1", kDummyPort)});
+
+    // Load registry with shard0 + extraShard_0.
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard(ShardType("extraShard_0", sharedConnString.toString()), kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    // Simulate that the RSM has reported a connection string for "extraShardRS".
+    setLatestConnString(sharedConnString);
+    ASSERT(hasLatestConnString("extraShardRS"));
+
+    // Config change: extraShard_0 removed, extraShard_1 added with the same RS name.
+    clearShards();
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard(ShardType("extraShard_1", sharedConnString.toString()), kAdvanceTopologyTime);
+
+    // Refresh the registry — stale RSM is removed first, then a fresh one is created.
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    auto data = getData();
+    ASSERT(!data->findShard(ShardId("extraShard_0")));
+
+    auto shard = data->findShard(ShardId("extraShard_1"));
+    ASSERT(shard) << "extraShard_1 should be in the registry";
+    ASSERT_EQ(shard->getConnString().getSetName(), "extraShardRS");
+
+    auto shardByRS = data->findByRSName("extraShardRS");
+    ASSERT(shardByRS) << "RS name 'extraShardRS' should still resolve to a live shard";
+    ASSERT_EQ(shardByRS->getId(), ShardId("extraShard_1"));
+
+    // The old _latestConnStrings entry was erased when the stale RSM was removed, which is
+    // correct — the fresh RSM will repopulate it when it reports back.
+    ASSERT(!hasLatestConnString("extraShardRS"))
+        << "_latestConnStrings should be cleared after RSM removal and recreation";
+}
+
+// Verifies that when a shard is removed and re-added with the same RS name but DIFFERENT hosts,
+// the registry picks up the new hosts — not the stale ones from _latestConnStrings.
+TEST_F(ShardRegistryTest, ShardIdChangeWithSameRSNameButDifferentHostsPicksUpNewHosts) {
+    const auto oldConnString =
+        ConnectionString::forReplicaSet("extraShardRS", {HostAndPort("oldHost", kDummyPort)});
+    const auto newConnString =
+        ConnectionString::forReplicaSet("extraShardRS", {HostAndPort("newHost", kDummyPort)});
+
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard(ShardType("extraShard_0", oldConnString.toString()), kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    // Simulate that the RSM has reported the old connection string for "extraShardRS".
+    // This populates _latestConnStrings with the stale host set.
+    setLatestConnString(oldConnString);
+    ASSERT(hasLatestConnString("extraShardRS"));
+
+    // extraShard_0 removed, extraShard_1 added with same RS name but NEW hosts.
+    clearShards();
+    addShard({"shard0"}, kAdvanceTopologyTime);
+    addShard(ShardType("extraShard_1", newConnString.toString()), kAdvanceTopologyTime);
+
+    {
+        auto future =
+            launchAsync([this] { assertShardIdsFromRegistry(getData()->getAllShardIds()); });
+        expectCSRSLookup();
+        future.default_timed_get();
+    }
+
+    auto data = getData();
+    ASSERT(!data->findShard(ShardId("extraShard_0")));
+
+    auto shard = data->findShard(ShardId("extraShard_1"));
+    ASSERT(shard) << "extraShard_1 should be in the registry";
+    ASSERT_EQ(shard->getConnString().getSetName(), "extraShardRS");
+
+    auto servers = shard->getConnString().getServers();
+    ASSERT_EQ(servers.size(), 1u);
+    ASSERT_EQ(servers[0].host(), "newHost")
+        << "Shard should have new hosts from config.shards, not stale hosts from "
+           "_latestConnStrings. Actual conn string: "
+        << shard->getConnString().toString();
+}
+
+}  // namespace
+}  // namespace mongo

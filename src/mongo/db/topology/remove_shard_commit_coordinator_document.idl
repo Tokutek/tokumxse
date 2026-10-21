@@ -1,0 +1,53 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+enums:
+    RemoveShardCommitCoordinatorPhase:
+        description: "Current remove shard commit coordinator's operation state."
+        type: string
+        values:
+            kUnset: "unset"
+            kCheckPreconditions: "checkPreconditions"
+            kJoinMigrationsAndCheckRangeDeletions: "joinMigrationsAndCheckRangeDeletions"
+            kStopDDLsAndCleanupData: "stopDDLsAndCleanupData"
+            kCommit: "commit"
+            kResumeDDLs: "resumeDDLs"
+
+structs:
+    RemoveShardCommitCoordinatorDocument:
+        description: "Object with necessary fields to commit a shard removal."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            shardId:
+                type: shard_id
+                description: "The shard id to be removed."
+            replicaSetName:
+                type: string
+                description: "The replica set name of the shard to be removed."
+                optional: true
+            isTransitionToDedicated:
+                type: bool
+                description: >-
+                    True if the command being run is transitionToDedicated, false for normal remove
+                    shard.
+            # TODO SERVER-116328 Remove this argument when 9.0 branches out
+            shouldUpdateClusterCardinality:
+                type: optionalBool
+                description: >-
+                    Unused field only kept for backwards compatibility with old versions where it was required.
+            phase:
+                type: RemoveShardCommitCoordinatorPhase
+                description: "Coordinator phase."
+                default: kUnset

@@ -1,0 +1,148 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/view_response_formatter.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <initializer_list>
+#include <limits>
+
+#include <boost/none.hpp>
+
+namespace mongo {
+namespace {
+
+static const NamespaceString testNss = NamespaceString::createNamespaceString_forTest("db.col");
+static const CursorId testCursor(1);
+
+TEST(ViewResponseFormatter, GetCountValueInitialResponseSuccessfully) {
+    CursorResponse cr(testNss, testCursor, {BSON("count" << 7)});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    ASSERT_EQ(7, formatter.getCountValue(boost::none));
+}
+
+TEST(ViewResponseFormatter, GetCountValueMaxIntInitialResponse) {
+    CursorResponse cr(testNss, testCursor, {BSON("count" << std::numeric_limits<int>::max())});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    ASSERT_EQ(std::numeric_limits<int>::max(), formatter.getCountValue(boost::none));
+}
+
+TEST(ViewResponseFormatter, GetCountValueMaxLongInitialResponse) {
+    CursorResponse cr(
+        testNss, testCursor, {BSON("count" << std::numeric_limits<long long>::max())});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    ASSERT_EQ(std::numeric_limits<long long>::max(), formatter.getCountValue(boost::none));
+}
+
+TEST(ViewResponseFormatter, GetCountValueIntSubsequentResponse) {
+    CursorResponse cr(testNss, testCursor, {BSON("count" << 42)});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::SubsequentResponse));
+    ASSERT_EQ(42, formatter.getCountValue(boost::none));
+}
+
+TEST(ViewResponseFormatter, GetCountValueLongSubsequentResponse) {
+    CursorResponse cr(
+        testNss, testCursor, {BSON("count" << std::numeric_limits<long long>::max())});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::SubsequentResponse));
+    ASSERT_EQ(std::numeric_limits<long long>::max(), formatter.getCountValue(boost::none));
+}
+
+TEST(ViewResponseFormatter, GetCountValueTenantIdInitialResponse) {
+    const TenantId tenantId(OID::gen());
+    const NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, testNss.toString_forTest());
+
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+
+    for (bool flagStatus : {false, true}) {
+        unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID",
+                                                             flagStatus);
+
+        CursorResponse cr(nss, testCursor, {BSON("count" << 7)});
+        ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+        ASSERT_EQ(7, formatter.getCountValue(tenantId));
+    }
+}
+
+
+TEST(ViewResponseFormatter, GetCountValueEmptyInitialResponse) {
+    CursorResponse cr(testNss, testCursor, {});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    ASSERT_EQ(0, formatter.getCountValue(boost::none));
+}
+
+TEST(ViewResponseFormatter, GetCountValueFails) {
+    ViewResponseFormatter formatter(fromjson("{ok: 0, errmsg: 'bad value', code: 2}"));
+    ASSERT_THROWS_CODE(formatter.getCountValue(boost::none), DBException, ErrorCodes::BadValue);
+}
+
+TEST(ViewResponseFormatter, FormatInitialDistinctResponseSuccessfully) {
+    CursorResponse cr(testNss, testCursor, {fromjson("{_id: null, distinct: [5, 9]}")});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    BSONObjBuilder builder;
+    ASSERT_OK(formatter.appendAsDistinctResponse(&builder, boost::none));
+    ASSERT_BSONOBJ_EQ(fromjson("{values: [5, 9], ok: 1}"), builder.obj());
+}
+
+TEST(ViewResponseFormatter, FormatSubsequentDistinctResponseSuccessfully) {
+    CursorResponse cr(testNss, testCursor, {fromjson("{_id: null, distinct: [5, 9]}")});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::SubsequentResponse));
+    BSONObjBuilder builder;
+    ASSERT_OK(formatter.appendAsDistinctResponse(&builder, boost::none));
+    ASSERT_BSONOBJ_EQ(fromjson("{values: [5, 9], ok: 1}"), builder.obj());
+}
+
+TEST(ViewResponseFormatter, FormatInitialDistinctResponseWithTenantIdSuccessfully) {
+    const TenantId tenantId(OID::gen());
+    const NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, testNss.toString_forTest());
+
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+
+    for (bool flagStatus : {false, true}) {
+        unittest::ServerParameterGuard featureFlagController("featureFlagRequireTenantID",
+                                                             flagStatus);
+
+        CursorResponse cr(nss, testCursor, {fromjson("{_id: null, distinct: [5, 9]}")});
+        ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+        BSONObjBuilder builder;
+        ASSERT_OK(formatter.appendAsDistinctResponse(&builder, tenantId));
+        ASSERT_BSONOBJ_EQ(fromjson("{values: [5, 9], ok: 1}"), builder.obj());
+    }
+}
+
+TEST(ViewResponseFormatter, FormatEmptyDistinctValuesSuccessfully) {
+    CursorResponse cr(testNss, testCursor, {fromjson("{_id: null, distinct: []}")});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    BSONObjBuilder builder;
+    ASSERT_OK(formatter.appendAsDistinctResponse(&builder, boost::none));
+    ASSERT_BSONOBJ_EQ(fromjson("{values: [], ok: 1}"), builder.obj());
+}
+
+TEST(ViewResponseFormatter, FormatEmptyDistinctBatchSuccessfully) {
+    CursorResponse cr(testNss, testCursor, {});
+    ViewResponseFormatter formatter(cr.toBSON(CursorResponse::ResponseType::InitialResponse));
+    BSONObjBuilder builder;
+    ASSERT_OK(formatter.appendAsDistinctResponse(&builder, boost::none));
+    ASSERT_BSONOBJ_EQ(fromjson("{values: [], ok: 1}"), builder.obj());
+}
+
+TEST(ViewResponseFormatter, FormatFailedDistinctResponseFails) {
+    ViewResponseFormatter formatter(fromjson("{ok: 0, errmsg: 'bad value', code: 2}"));
+    BSONObjBuilder builder;
+    ASSERT_NOT_OK(formatter.appendAsDistinctResponse(&builder, boost::none));
+    ASSERT_BSONOBJ_EQ(builder.obj(), BSONObj());
+}
+
+}  // namespace
+}  // namespace mongo

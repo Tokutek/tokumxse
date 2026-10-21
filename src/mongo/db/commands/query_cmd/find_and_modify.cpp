@@ -1,0 +1,695 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/query_cmd/update_metrics.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/fle_crud.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
+#include "mongo/db/query/write_ops/canonical_delete.h"
+#include "mongo/db/query/write_ops/canonical_update.h"
+#include "mongo/db/query/write_ops/delete_request_gen.h"
+#include "mongo/db/query/write_ops/insert.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_exec.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/query/write_ops/write_ops_retryability.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/query_analysis_writer.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/document_validation.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_request_util.h"
+#include "mongo/db/timeseries/timeseries_write_util.h"
+#include "mongo/db/transaction/retryable_writes_stats.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_validation.h"
+#include "mongo/db/update/update_util.h"
+#include "mongo/db/version_context.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/analyze_shard_key_common_gen.h"
+#include "mongo/s/analyze_shard_key_role.h"
+#include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/s/would_change_owning_shard_exception.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/log_and_backoff.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+namespace mongo {
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(failAllFindAndModify);
+MONGO_FAIL_POINT_DEFINE(hangBeforeFindAndModifyPerformsUpdate);
+
+void makeDeleteRequest(OperationContext* opCtx,
+                       const write_ops::FindAndModifyCommandRequest& request,
+                       bool explain,
+                       DeleteRequest* requestOut) {
+    requestOut->setQuery(request.getQuery());
+    requestOut->setProj(request.getFields().value_or(BSONObj()));
+    requestOut->setLegacyRuntimeConstants(
+        request.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
+    requestOut->setLet(request.getLet());
+    requestOut->setSort(request.getSort().value_or(BSONObj()));
+    requestOut->setHint(request.getHint());
+    requestOut->setCollation(request.getCollation().value_or(BSONObj()));
+    requestOut->setMulti(false);
+    requestOut->setReturnDeleted(true);  // Always return the old value.
+    requestOut->setIsExplain(explain);
+
+    requestOut->setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+    requestOut->setIsTimeseriesNamespace(request.getIsTimeseriesNamespace());
+}
+
+write_ops::FindAndModifyCommandReply buildResponse(
+    const boost::optional<UpdateResult>& updateResult,
+    bool isRemove,
+    const boost::optional<BSONObj>& value) {
+    write_ops::FindAndModifyLastError lastError;
+    if (isRemove) {
+        lastError.setNumDocs(value ? 1 : 0);
+    } else {
+        invariant(updateResult);
+        lastError.setNumDocs(!updateResult->upsertedId.isEmpty() ? 1 : updateResult->numMatched);
+        lastError.setUpdatedExisting(updateResult->numMatched > 0);
+
+        // Note we have to use the upsertedId from the update result here, rather than 'value'
+        // because the _id field could have been excluded by a projection.
+        if (!updateResult->upsertedId.isEmpty()) {
+            lastError.setUpserted(IDLAnyTypeOwned(updateResult->upsertedId.firstElement()));
+        }
+    }
+
+    write_ops::FindAndModifyCommandReply result;
+    result.setLastErrorObject(std::move(lastError));
+    result.setValue(value);
+    return result;
+}
+
+void recordStatsForTopCommand(OperationContext* opCtx) {
+    auto curOp = CurOp::get(opCtx);
+    Top::getDecoration(opCtx).record(opCtx,
+                                     curOp->getNSS(),
+                                     curOp->getLogicalOp(),
+                                     Top::LockType::WriteLocked,
+                                     curOp->elapsedTimeExcludingPauses(),
+                                     curOp->isCommand(),
+                                     curOp->getReadWriteType());
+}
+
+void checkIfTransactionOnCappedColl(const CollectionPtr& coll, bool inTransaction) {
+    if (coll && coll->isCapped()) {
+        uassert(
+            ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Collection '" << coll->ns().toStringForErrorMsg()
+                          << "' is a capped collection. Writes in transactions are not allowed on "
+                             "capped collections.",
+            !inTransaction);
+    }
+}
+
+class CmdFindAndModify : public write_ops::FindAndModifyCmdVersion1Gen<CmdFindAndModify> {
+public:
+    std::string help() const final {
+        return "{ findAndModify: \"collection\", query: {processed:false}, update: {$set: "
+               "{processed:true}}, new: true}\n"
+               "{ findAndModify: \"collection\", query: {processed:false}, remove: true, sort: "
+               "{priority:-1}}\n"
+               "Either update or remove is required, all other fields have default values.\n"
+               "Output is in the \"value\" field\n";
+    }
+
+    Command::AllowedOnSecondary secondaryAllowed(ServiceContext* srvContext) const final {
+        return Command::AllowedOnSecondary::kNever;
+    }
+
+    Command::ReadWriteType getReadWriteType() const final {
+        return Command::ReadWriteType::kWrite;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    void collectMetrics(const Request& request) const {
+        _updateMetrics->collectMetrics(request);
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    class Invocation final : public InvocationBaseGen {
+    public:
+        Invocation(OperationContext* opCtx,
+                   const Command* command,
+                   const OpMsgRequest& opMsgRequest)
+            : InvocationBaseGen(opCtx, command, opMsgRequest) {
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
+        }
+
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+
+        bool supportsReadMirroring() const final {
+            return true;
+        }
+
+        bool supportsRawData() const final {
+            return true;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
+        NamespaceString ns() const final {
+            return this->request().getNamespace();
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final;
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) final;
+
+        Reply typedRun(OperationContext* opCtx) final;
+
+        void appendMirrorableRequest(BSONObjBuilder* bob) const final;
+    };
+
+protected:
+    void doInitializeClusterRole(ClusterRole role) override {
+        write_ops::FindAndModifyCmdVersion1Gen<CmdFindAndModify>::doInitializeClusterRole(role);
+        _updateMetrics.emplace(getName(), role);
+    }
+
+private:
+    // Update related command execution metrics.
+    mutable boost::optional<UpdateMetrics> _updateMetrics;
+};
+MONGO_REGISTER_COMMAND(CmdFindAndModify).forShard();
+
+void CmdFindAndModify::Invocation::doCheckAuthorization(OperationContext* opCtx) const {
+    std::vector<Privilege> privileges;
+    const auto& request = this->request();
+
+    ActionSet actions;
+    actions.addAction(ActionType::find);
+
+    if (request.getUpdate()) {
+        actions.addAction(ActionType::update);
+    }
+    if (request.getUpsert().value_or(false)) {
+        actions.addAction(ActionType::insert);
+    }
+    if (request.getRemove().value_or(false)) {
+        actions.addAction(ActionType::remove);
+    }
+    if (request.getBypassDocumentValidation().value_or(false)) {
+        actions.addAction(ActionType::bypassDocumentValidation);
+    }
+
+    ResourcePattern resource(CommandHelpers::resourcePatternForNamespace(request.getNamespace()));
+    uassert(17138,
+            "Invalid target namespace " + resource.toString(),
+            resource.isExactNamespacePattern());
+    privileges.push_back(Privilege(resource, actions));
+
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Not authorized to find and modify on database'"
+                          << this->request().getDbName().toStringForErrorMsg() << "'",
+            AuthorizationSession::get(opCtx->getClient())->isAuthorizedForPrivileges(privileges));
+}
+
+void CmdFindAndModify::Invocation::explain(OperationContext* opCtx,
+                                           ExplainOptions::Verbosity verbosity,
+                                           rpc::ReplyBuilderInterface* result) {
+    // Perform common command request validation. Uasserts on invalid requests.
+    FindAndModifyOp::validateCommandRequest(request());
+
+    const BSONObj& cmdObj = request().toBSON();
+
+    // Start the query planning timer right after parsing.
+    auto const curOp = CurOp::get(opCtx);
+    curOp->beginQueryPlanningTimer();
+
+    auto requestAndMsg = [&]() {
+        if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+            return processFLEFindAndModifyExplainMongod(opCtx, request());
+        }
+
+        return std::pair{request(), OpMsgRequest()};
+    }();
+    auto request = requestAndMsg.first;
+    auto nss = request.getNamespace();
+    const auto [preConditions, isTimeseriesLogicalRequest] =
+        timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+            opCtx, nss, request, /*expectedUUID=*/boost::none);
+
+    // Explain calls of the findAndModify command are read-only, but we take write
+    // locks so that the timing information is more accurate.
+    //
+    // In order to correctly serve malformed requests coming from routers affected by SERVER-113997,
+    // we need to make sure that in the case of viewful timeseries collections, we always perform
+    // the shard version checks only after translating the namespace from timeseries view to
+    // timeseries buckets. For this reason, we pass the already translated namespace from
+    // CollectionPreConditions
+    const auto collection = preConditions.acquireCollectionAndCheck(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(
+            opCtx, preConditions.getTargetNs(nss), AcquisitionPrerequisites::OperationType::kWrite),
+        MODE_IX);
+
+    // In case of timeseries collection make sure that from now on we refer to the translated
+    // namespace
+    nss = collection.nss();
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "database " << nss.dbName().toStringForErrorMsg() << " does not exist",
+            DatabaseHolder::get(opCtx)->getDb(opCtx, nss.dbName()));
+
+    uassertStatusOK(userAllowedWriteNS(opCtx, nss));
+
+    CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+        ->checkShardVersionOrThrow(opCtx);
+
+    OpDebug* const opDebug = &curOp->debug();
+
+    if (request.getRemove().value_or(false)) {
+        auto deleteRequest = DeleteRequest{};
+        deleteRequest.setNsString(nss);
+        const bool isExplain = true;
+        makeDeleteRequest(opCtx, request, isExplain, &deleteRequest);
+
+        if (isTimeseriesLogicalRequest) {
+            timeseries::timeseriesRequestChecks<DeleteRequest>(
+                VersionContext::getDecoration(opCtx),
+                collection.getCollectionPtr(),
+                &deleteRequest,
+                timeseries::deleteRequestCheckFunction);
+            timeseries::timeseriesHintTranslation<DeleteRequest>(collection.getCollectionPtr(),
+                                                                 &deleteRequest);
+        }
+
+        auto canonicalDelete = uassertStatusOK(CanonicalDelete::makeFromRequest(
+            opCtx, collection.getCollectionPtr(), deleteRequest, isTimeseriesLogicalRequest));
+
+        const auto exec =
+            uassertStatusOK(getExecutorDelete(opDebug, collection, canonicalDelete, verbosity));
+
+        auto bodyBuilder = result->getBodyBuilder();
+        Explain::explainStages(
+            exec.get(),
+            collection,
+            verbosity,
+            BSONObj(),
+            SerializationContext::stateCommandReply(request.getSerializationContext()),
+            cmdObj,
+            &bodyBuilder);
+    } else {
+        auto updateRequest = UpdateRequest();
+        updateRequest.setNamespaceString(nss);
+        update::makeUpdateRequest(opCtx, request, verbosity, &updateRequest);
+
+        if (isTimeseriesLogicalRequest) {
+            timeseries::timeseriesRequestChecks<UpdateRequest>(
+                VersionContext::getDecoration(opCtx),
+                collection.getCollectionPtr(),
+                &updateRequest,
+                timeseries::updateRequestCheckFunction);
+            timeseries::timeseriesHintTranslation<UpdateRequest>(collection.getCollectionPtr(),
+                                                                 &updateRequest);
+        }
+
+        auto [collatorToUse, expCtxCollationMatchesDefault] =
+            resolveCollator(opCtx, updateRequest.getCollation(), collection.getCollectionPtr());
+
+        auto expCtx =
+            ExpressionContextBuilder{}
+                .fromRequest(opCtx, updateRequest)
+                .collator(std::move(collatorToUse))
+                .collationMatchesDefault(expCtxCollationMatchesDefault)
+                .requiresTimeseriesExtendedRangeSupport(
+                    isTimeseriesLogicalRequest && collection.getCollectionPtr() &&
+                    collection.getCollectionPtr()->getRequiresTimeseriesExtendedRangeSupport())
+                .build();
+
+        auto parsedUpdate = uassertStatusOK(parsed_update_command::parse(
+            expCtx, &updateRequest, makeExtensionsCallback<ExtensionsCallbackReal>(opCtx, &nss)));
+
+        auto canonicalUpdate = uassertStatusOK(CanonicalUpdate::make(expCtx,
+                                                                     std::move(parsedUpdate),
+                                                                     collection.getCollectionPtr(),
+                                                                     isTimeseriesLogicalRequest));
+
+        const auto exec =
+            uassertStatusOK(getExecutorUpdate(opDebug, collection, *canonicalUpdate, verbosity));
+
+        auto bodyBuilder = result->getBodyBuilder();
+        Explain::explainStages(
+            exec.get(),
+            collection,
+            verbosity,
+            BSONObj(),
+            SerializationContext::stateCommandReply(request.getSerializationContext()),
+            cmdObj,
+            &bodyBuilder);
+    }
+}
+
+write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
+    OperationContext* opCtx) {
+    const auto& req = request();
+
+    // Perform common command request validation. Uasserts on invalid requests.
+    FindAndModifyOp::validateCommandRequest(req);
+
+    // Start the query planning timer right after parsing.
+    auto& curOp = *CurOp::get(opCtx);
+    curOp.beginQueryPlanningTimer();
+
+    auto [preConditions, isTimeseriesLogicalRequest] =
+        timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+            opCtx, req.getNamespace(), request(), /*expectedUUID=*/boost::none);
+    if (prepareForFLERewrite(opCtx, req.getEncryptionInformation())) {
+        return processFLEFindAndModify(opCtx, req);
+    }
+
+    auto nsString = req.getNamespace();
+    nsString = preConditions.getTargetNs(nsString);
+    uassertStatusOK(userAllowedWriteNS(opCtx, nsString));
+
+    static_cast<const CmdFindAndModify*>(definition())->collectMetrics(req);
+
+    auto disableDocumentValidation = req.getBypassDocumentValidation().value_or(false);
+    auto fleCrudProcessed = write_ops_exec::getFleCrudProcessed(req.getEncryptionInformation());
+
+    DisableDocumentSchemaValidationRequestedByUserIfTrue docSchemaValidationDisabler(
+        opCtx, disableDocumentValidation);
+
+    DisableSafeContentValidationIfTrue safeContentValidationDisabler(
+        opCtx, disableDocumentValidation, fleCrudProcessed);
+
+    doTransactionValidationForWrites(opCtx, ns());
+
+    const auto stmtId = req.getStmtId().value_or(0);
+    if (opCtx->isRetryableWrite()) {
+        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
+        const auto txnParticipant = TransactionParticipant::get(opCtx);
+        if (auto entry = txnParticipant.checkStatementExecutedAndFetchOplogEntry(opCtx, stmtId)) {
+            RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
+            RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+            RetryableWritesStats::get(opCtx)->recordRetriedWriteDelay(
+                opCtx->fastClockSource().now() - entry->getWallClockTime());
+
+            // Use a SideTransactionBlock since 'parseOplogEntryForFindAndModify' might need to
+            // fetch a pre/post image from the oplog and if this is a retry inside an in-progress
+            // retryable internal transaction, this 'opCtx' would have an active WriteUnitOfWork
+            // and it is illegal to read the the oplog when there is an active WriteUnitOfWork.
+            TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
+            auto findAndModifyReply = parseOplogEntryForFindAndModify(opCtx, req, *entry);
+            findAndModifyReply.setRetriedStmtId(stmtId);
+
+            // Make sure to wait for writeConcern on the opTime that will include this
+            // write. Needs to set to the system last opTime to get the latest term in an
+            // event when an election happened after the actual write.
+            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+            replClient.setLastOpToSystemLastOpTime(opCtx);
+
+            return findAndModifyReply;
+        }
+    }
+
+    // Initialize curOp information.
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        if (req.getIsTimeseriesNamespace() && nsString.isTimeseriesBucketsCollection()) {
+            auto viewNss = nsString.getTimeseriesViewNamespace();
+            curOp.setNS(lk, viewNss);
+            curOp.setOpDescription(lk,
+                                   timeseries::timeseriesViewCommand(
+                                       unparsedRequest().body, "findAndModify", viewNss.coll()));
+        } else {
+            curOp.setNS(lk, nsString);
+        }
+        curOp.ensureStarted();
+    }
+
+    auto sampleId = analyze_shard_key::getOrGenerateSampleId(
+        opCtx, ns(), analyze_shard_key::SampledCommandNameEnum::kFindAndModify, req);
+    if (sampleId) {
+        analyze_shard_key::QueryAnalysisWriter::get(opCtx)
+            ->addFindAndModifyQuery(opCtx, *sampleId, req)
+            .getAsync([](auto) {});
+    }
+
+    if (auto scoped = failAllFindAndModify.scoped(); MONGO_unlikely(scoped.isActive())) {
+        tassert(9276705,
+                "failAllFindAndModify failpoint active!",
+                !scoped.getData().hasField("tassert") || !scoped.getData().getBoolField("tassert"));
+        uasserted(ErrorCodes::InternalError, "failAllFindAndModify failpoint active!");
+    }
+
+    const bool inTransaction = opCtx->inMultiDocumentTransaction();
+
+    auto doWork = [&] {
+        if (req.getRemove().value_or(false)) {
+            DeleteRequest deleteRequest;
+            makeDeleteRequest(opCtx, req, false, &deleteRequest);
+            deleteRequest.setNsString(nsString);
+            if (opCtx->getTxnNumber()) {
+                deleteRequest.setStmtId(stmtId);
+            }
+            boost::optional<BSONObj> docFound;
+            write_ops_exec::performDelete(opCtx,
+                                          nsString,
+                                          &deleteRequest,
+                                          &curOp,
+                                          inTransaction,
+                                          docFound,
+                                          preConditions,
+                                          isTimeseriesLogicalRequest);
+            recordStatsForTopCommand(opCtx);
+            return buildResponse(boost::none, true /* isRemove */, docFound);
+        } else {
+            if (MONGO_unlikely(hangBeforeFindAndModifyPerformsUpdate.shouldFail())) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeFindAndModifyPerformsUpdate,
+                    opCtx,
+                    "hangBeforeFindAndModifyPerformsUpdate");
+            }
+
+            // Nested retry loop to handle concurrent conflicting upserts with equality
+            // match.
+            int retryAttempts = 0;
+            for (;;) {
+                auto updateRequest = UpdateRequest();
+                updateRequest.setNamespaceString(nsString);
+                const auto verbosity = boost::none;
+                update::makeUpdateRequest(opCtx, req, verbosity, &updateRequest);
+
+                if (opCtx->getTxnNumber()) {
+                    updateRequest.setStmtIds({stmtId});
+                }
+                updateRequest.setSampleId(sampleId);
+
+                updateRequest.setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(
+                    req.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery());
+
+                try {
+                    boost::optional<BSONObj> docFound;
+                    auto updateResult =
+                        write_ops_exec::performUpdate(opCtx,
+                                                      nsString,
+                                                      &curOp,
+                                                      inTransaction,
+                                                      req.getRemove().value_or(false),
+                                                      req.getUpsert().value_or(false),
+                                                      docFound,
+                                                      &updateRequest,
+                                                      preConditions,
+                                                      isTimeseriesLogicalRequest);
+                    recordStatsForTopCommand(opCtx);
+                    return buildResponse(updateResult, req.getRemove().value_or(false), docFound);
+
+                } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+                    // The function shouldRetryDuplicateKeyException() will check the collation from
+                    // the collection using 'ex'. So we only need to resolve the collator from the
+                    // request and pass it into 'expCtx'.
+                    auto requestCollator = [&]() -> std::unique_ptr<CollatorInterface> {
+                        if (updateRequest.getCollation().isEmpty()) {
+                            return nullptr;
+                        }
+                        return uassertStatusOK(
+                            CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                ->makeFromBSON(updateRequest.getCollation()));
+                    }();
+                    auto expCtx = ExpressionContextBuilder{}
+                                      .fromRequest(opCtx, updateRequest)
+                                      .collator(std::move(requestCollator))
+                                      .build();
+                    auto cq = uassertStatusOK(parseWriteQueryToCQ(expCtx.get(), updateRequest));
+                    if (!write_ops_exec::shouldRetryDuplicateKeyException(
+                            opCtx,
+                            updateRequest,
+                            *cq,
+                            *ex.extraInfo<DuplicateKeyErrorInfo>(),
+                            retryAttempts)) {
+                        throw;
+                    }
+
+                    ++retryAttempts;
+                    logAndBackoff(4721200,
+                                  ::mongo::logv2::LogComponent::kWrite,
+                                  logv2::LogSeverity::Debug(1),
+                                  retryAttempts,
+                                  "Caught DuplicateKey exception during findAndModify upsert",
+                                  logAttrs(nsString));
+                } catch (const ExceptionFor<ErrorCodes::WouldChangeOwningShard>& ex) {
+                    if (analyze_shard_key::supportsPersistingSampledQueries(opCtx) &&
+                        req.getSampleId()) {
+                        // Sample the diff before rethrowing the error since mongos will handle this
+                        // update by performing a delete on the shard owning the pre-image doc and
+                        // an insert on the shard owning the post-image doc. As a result, this
+                        // update will not show up in the OpObserver as an update.
+                        auto wouldChangeOwningShardInfo =
+                            ex.extraInfo<WouldChangeOwningShardInfo>();
+                        invariant(wouldChangeOwningShardInfo);
+
+                        analyze_shard_key::QueryAnalysisWriter::get(opCtx)
+                            ->addDiff(*req.getSampleId(),
+                                      ns(),
+                                      *wouldChangeOwningShardInfo->getUuid(),
+                                      wouldChangeOwningShardInfo->getPreImage(),
+                                      wouldChangeOwningShardInfo->getPostImage())
+                            .getAsync([](auto) {});
+                    }
+                    throw;
+                }
+            }
+        }
+    };
+
+    // No need to call writeConflictRetry() since it does not retry if in a transaction,
+    // but calling it can cause WCE to be double counted.
+    if (inTransaction) {
+        return doWork();
+    }
+    // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it
+    // is executing a findAndModify. This is done to ensure that we can always match,
+    // modify, and return the document under concurrency, if a matching document exists.
+    return writeConflictRetry(opCtx, "findAndModify", nsString, doWork);
+}
+
+void CmdFindAndModify::Invocation::appendMirrorableRequest(BSONObjBuilder* bob) const {
+    const auto& req = request();
+
+    bob->append(FindCommandRequest::kCommandName, req.getNamespace().coll());
+
+    if (!req.getQuery().isEmpty()) {
+        bob->append(FindCommandRequest::kFilterFieldName, req.getQuery());
+    }
+    if (req.getSort()) {
+        bob->append(write_ops::FindAndModifyCommandRequest::kSortFieldName, *req.getSort());
+    }
+    if (req.getCollation()) {
+        bob->append(write_ops::FindAndModifyCommandRequest::kCollationFieldName,
+                    *req.getCollation());
+    }
+    if (req.getEncryptionInformation()) {
+        bob->append(write_ops::FindAndModifyCommandRequest::kEncryptionInformationFieldName,
+                    req.getEncryptionInformation()->toBSON());
+    }
+
+    const auto& rawCmd = unparsedRequest().body;
+    if (const auto& shardVersion = rawCmd.getField("shardVersion"); !shardVersion.eoo()) {
+        bob->append(shardVersion);
+    }
+    if (const auto& databaseVersion = rawCmd.getField("databaseVersion"); !databaseVersion.eoo()) {
+        bob->append(databaseVersion);
+    }
+    req.getRawData().serializeToBSON(write_ops::FindAndModifyCommandRequest::kRawDataFieldName,
+                                     bob);
+
+    // Prevent the find from returning multiple documents since we can
+    bob->append("batchSize", 1);
+    bob->append("singleBatch", true);
+}
+
+}  // namespace
+}  // namespace mongo

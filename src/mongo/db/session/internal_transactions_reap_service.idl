@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file describes the BSON format for a LogicalSessionId, and
+# handles the serialization to and deserialization from its BSON representation
+# for that class.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+server_parameters:
+    internalSessionsReapThreshold:
+        description:
+            "The minimum number of expired internal sessions that must be buffered in memory
+            before they are early reaped. 0 disables early reaping."
+        set_at: [startup, runtime]
+        cpp_vartype: "Atomic<int>"
+        cpp_varname: internalSessionsReapThreshold
+        default: 1000
+        validator:
+            gte: 0
+        redact: false

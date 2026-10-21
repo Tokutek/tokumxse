@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    UserWritesBlockReason:
+        description: The reason for blocking writes on the cluster.
+        type: string
+        values:
+            kUnspecified: "Unspecified"
+            kClusterToClusterMigrationInProgress: "ClusterToClusterMigrationInProgress"
+            kDiskUseThresholdExceeded: "DiskUseThresholdExceeded"

@@ -1,56 +1,73 @@
 //
 // Tests that we can dump collection metadata via getShardVersion()
 //
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var options = { separateConfig : true };
+let st = new ShardingTest({shards: 2});
 
-var st = new ShardingTest({ shards : 2, mongos : 1, other : options });
-st.stopBalancer();
+let coll = st.s.getCollection("foo.bar");
+let shardAdmin = st.shard0.getDB("admin");
 
-var mongos = st.s0;
-var coll = mongos.getCollection( "foo.bar" );
-var admin = mongos.getDB( "admin" );
-var shards = mongos.getCollection( "config.shards" ).find().toArray();
-var shardAdmin = st.shard0.getDB( "admin" );
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard0.shardName}),
+);
+assert.commandWorked(st.s.adminCommand({shardCollection: coll + "", key: {_id: 1}}));
 
-assert( admin.runCommand({ enableSharding : coll.getDB() + "" }).ok );
-printjson( admin.runCommand({ movePrimary : coll.getDB() + "", to : shards[0]._id }) );
-assert( admin.runCommand({ shardCollection : coll + "", key : { _id : 1 } }).ok );
+assert.commandWorked(shardAdmin.runCommand({getShardVersion: coll + ""}));
 
-assert( shardAdmin.runCommand({ getShardVersion : coll + "" }).ok );
-printjson( shardAdmin.runCommand({ getShardVersion : coll + "", fullMetadata : true }) );
+function getCollMetadataWithRefresh(node, collName) {
+    let shardVersionRes;
 
-// Make sure we have chunks info
-var result = 
-    shardAdmin.runCommand({ getShardVersion : coll + "", fullMetadata : true });
-var metadata = result.metadata;
+    assert.soon(() => {
+        if (!FeatureFlagUtil.isPresentAndEnabled(node, "AuthoritativeShardsCRUD")) {
+            assert.commandWorked(node.adminCommand({_flushRoutingTableCacheUpdates: collName}));
+        }
+        let res = assert.commandWorked(
+            node.adminCommand({getShardVersion: collName, fullMetadata: true}),
+        );
+        assert(
+            res.hasOwnProperty("global"),
+            `Did not found 'global' property in metadata object: ${tojson(res)}`,
+        );
 
-assert.eq( metadata.chunks.length, 1 );
-assert.eq( metadata.pending.length, 0 );
-assert( metadata.chunks[0][0]._id + "" == MinKey + "" );
-assert( metadata.chunks[0][1]._id + "" == MaxKey + "" );
-assert( metadata.shardVersion + "" == result.global + "" );
+        if (res.global === "UKNOWN") {
+            return false;
+        }
+
+        shardVersionRes = res;
+        return true;
+    });
+
+    return shardVersionRes;
+}
+
+// Make sure we have chunks information on the shard after the shard collection call
+let svRes = getCollMetadataWithRefresh(st.shard0, coll.getFullName());
+
+assert.eq(svRes.metadata.chunks.length, 1);
+assert.eq(svRes.metadata.chunks[0][0]._id, MinKey);
+assert.eq(svRes.metadata.chunks[0][1]._id, MaxKey);
+assert.eq(svRes.metadata.shardVersion, svRes.global);
 
 // Make sure a collection with no metadata still returns the metadata field
-assert( shardAdmin.runCommand({ getShardVersion : coll + "xyz", fullMetadata : true })
-        .metadata != undefined );
+assert.neq(
+    shardAdmin.runCommand({getShardVersion: coll + "xyz", fullMetadata: true}).metadata,
+    undefined,
+);
 
-// Make sure we get multiple chunks after a split
-assert( admin.runCommand({ split : coll + "", middle : { _id : 0 } }).ok );
+// Make sure we get multiple chunks after a split and refresh -- splits by themselves do not
+// cause the shard to refresh.
+assert.commandWorked(st.s.adminCommand({split: coll + "", middle: {_id: 0}}));
+assert.commandWorked(shardAdmin.runCommand({getShardVersion: coll + ""}));
 
-assert( shardAdmin.runCommand({ getShardVersion : coll + "" }).ok );
-printjson( shardAdmin.runCommand({ getShardVersion : coll + "", fullMetadata : true }) );
+svRes = getCollMetadataWithRefresh(st.shard0, coll.getFullName());
 
-// Make sure we have chunks info
-result = shardAdmin.runCommand({ getShardVersion : coll + "", fullMetadata : true });
-metadata = result.metadata;
-
-assert.eq( metadata.chunks.length, 2 );
-assert.eq( metadata.pending.length, 0 );
-assert( metadata.chunks[0][0]._id + "" == MinKey + "" );
-assert( metadata.chunks[0][1]._id == 0 );
-assert( metadata.chunks[1][0]._id == 0 );
-assert( metadata.chunks[1][1]._id + "" == MaxKey + "" );
-assert( metadata.shardVersion + "" == result.global + "" );
+assert.eq(svRes.metadata.chunks.length, 2);
+assert(svRes.metadata.chunks[0][0]._id + "" == MinKey + "");
+assert(svRes.metadata.chunks[0][1]._id == 0);
+assert(svRes.metadata.chunks[1][0]._id == 0);
+assert(svRes.metadata.chunks[1][1]._id + "" == MaxKey + "");
+assert(tojson(svRes.metadata.shardVersion) == tojson(svRes.global));
 
 st.stop();

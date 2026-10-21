@@ -1,0 +1,93 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_executor",
+    srcs = [
+        "__init__.py",
+        "test_executor.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_job",
+    srcs = [
+        "__init__.py",
+        "test_job.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_queue_element",
+    srcs = [
+        "__init__.py",
+        "test_queue_element.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_suite",
+    srcs = [
+        "__init__.py",
+        "test_suite.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_symbolizer_service",
+    srcs = [
+        "__init__.py",
+        "test_symbolizer_service.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)
+
+py_test(
+    name = "test_tags",
+    srcs = [
+        "__init__.py",
+        "test_tags.py",
+    ],
+    data = [
+        "//buildscripts/tests/resmokelib/testing:tags.yml",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)

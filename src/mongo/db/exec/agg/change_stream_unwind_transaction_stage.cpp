@@ -1,0 +1,487 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/exec/agg/change_stream_unwind_transaction_stage.h"
+
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/matcher/expression_always_boolean.h"
+#include "mongo/db/matcher/expression_reordering.h"
+#include "mongo/db/pipeline/change_stream_hashed_field_accessors.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
+#include "mongo/db/repl/apply_ops_command_info.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+
+namespace mongo {
+using FieldAccessors = change_stream::HashedFieldAccessors;
+
+using namespace std::literals::string_view_literals;
+
+boost::intrusive_ptr<exec::agg::Stage> documentSourceChangeStreamUnwindTransactionToStageFn(
+    const boost::intrusive_ptr<DocumentSource>& documentSource) {
+    auto* changeStreamUnwindTransactionDS =
+        dynamic_cast<DocumentSourceChangeStreamUnwindTransaction*>(documentSource.get());
+
+    tassert(10561305,
+            "expected 'DocumentSourceChangeStreamUnwindTransaction' type",
+            changeStreamUnwindTransactionDS);
+
+    return make_intrusive<exec::agg::ChangeStreamUnwindTransactionStage>(
+        changeStreamUnwindTransactionDS->kStageName,
+        changeStreamUnwindTransactionDS->getExpCtx(),
+        changeStreamUnwindTransactionDS->_filter.getOwned(),
+        changeStreamUnwindTransactionDS->_expression);
+}
+
+namespace change_stream_filter {
+/**
+ * This filter is only used internally, to test the applicability of the EOT event we generate for
+ * unprepared transactions.
+ */
+std::unique_ptr<MatchExpression> buildEndOfTransactionFilter(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (!expCtx->getChangeStreamSpec()->getShowExpandedEvents()) {
+        return std::make_unique<AlwaysFalseMatchExpression>();
+    }
+
+    auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
+    return std::make_unique<RegexMatchExpression>("o2.endOfTransaction"sv, nsRegex, "" /*options*/);
+}
+}  // namespace change_stream_filter
+
+namespace exec::agg {
+
+REGISTER_AGG_STAGE_MAPPING(_internalChangeStreamUnwindTransaction,
+                           DocumentSourceChangeStreamUnwindTransaction::id,
+                           documentSourceChangeStreamUnwindTransactionToStageFn)
+
+ChangeStreamUnwindTransactionStage::ChangeStreamUnwindTransactionStage(
+    std::string_view stageName,
+    const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+    BSONObj filter,
+    std::shared_ptr<MatchExpression> expression)
+    : Stage(stageName, pExpCtx), _filter(std::move(filter)), _expression(std::move(expression)) {
+    tassert(5543812,
+            str::stream() << DocumentSourceChangeStreamUnwindTransaction::kStageName
+                          << " cannot be executed from router",
+            !pExpCtx->getInRouter());
+
+    // This filter is applied to every individual operation unwound from an 'applyOps' entry, so a
+    // single large transaction can evaluate it many times. The expression belongs to this execution
+    // stage and is not serialized back out, so it is safe to reorder.
+    allowReordering(pExpCtx->getOperationContext(), _expression.get());
+}
+
+GetNextResult ChangeStreamUnwindTransactionStage::doGetNext() {
+    while (true) {
+        // If we're unwinding an 'applyOps' from a transaction, check if there are any documents
+        // we have stored that can be returned.
+        if (_txnIterator) {
+            if (auto next = _txnIterator->getNextTransactionOp(pExpCtx->getOperationContext())) {
+                return std::move(*next);
+            }
+
+            _txnIterator = boost::none;
+        }
+
+        // Get the next input document.
+        auto input = pSource->getNext();
+        if (!input.isAdvanced()) {
+            return input;
+        }
+
+        auto doc = input.releaseDocument();
+
+        // If the oplog entry is not part of a transaction, allow it to pass through.
+        if (!_isTransactionOplogEntry(doc)) {
+            return doc;
+        }
+
+        // The only two commands we will see here are an applyOps or a commit, which both mean
+        // we need to open a "transaction context" representing a group of updates that all
+        // occurred at once as part of a transaction. If we already have a transaction context
+        // open, that would mean we are looking at an applyOps or commit nested within an
+        // applyOps, which is not allowed in the oplog.
+        tassert(5543801, "Transaction iterator found, but expected none", !_txnIterator);
+
+        // Once we initialize the transaction iterator, we can loop back to the top in order to
+        // call 'getNextTransactionOp' on it. Note that is possible for the transaction iterator
+        // to be empty of any relevant operations, meaning that this loop may need to execute
+        // multiple times before it encounters a relevant change to return.
+        _txnIterator.emplace(pExpCtx, doc, _expression.get());
+    }
+}
+
+bool ChangeStreamUnwindTransactionStage::_isTransactionOplogEntry(const Document& doc) {
+    auto op = doc[FieldAccessors::kOpType];
+    auto opType = idl::deserialize<repl::OpTypeEnum>(op.getStringData(),
+                                                     IDLParserContext("ChangeStreamEntry.op"));
+
+    if (opType != repl::OpTypeEnum::kCommand) {
+        // Hot path.
+        return false;
+    }
+
+    // Cold path.
+    auto commandVal = doc[FieldAccessors::kObject];
+    if (commandVal["applyOps"sv].missing() && commandVal["commitTransaction"sv].missing()) {
+        // We should never see an "abortTransaction" command at this point.
+        tassert(5543802,
+                str::stream() << "Unexpected op at "
+                              << doc[FieldAccessors::kTimestamp].getTimestamp().toString(),
+                commandVal["abortTransaction"sv].missing());
+        return false;
+    }
+
+    return true;
+}
+
+ChangeStreamUnwindTransactionStage::TransactionOpIterator::TransactionOpIterator(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const Document& input,
+    const MatchExpression* expression)
+    : _mongoProcessInterface(expCtx->getMongoProcessInterface()),
+      _expression(expression),
+      _endOfTransactionExpression(change_stream_filter::buildEndOfTransactionFilter(expCtx)) {
+
+    Value multiOpTypeValue = input[repl::OplogEntry::kMultiOpTypeFieldName];
+    DocumentSourceChangeStream::checkValueTypeOrMissing(
+        multiOpTypeValue, repl::OplogEntry::kMultiOpTypeFieldName, BSONType::numberInt);
+    const boost::optional<repl::MultiOplogEntryType> multiOpType = multiOpTypeValue.missing()
+        ? boost::none
+        : boost::make_optional(static_cast<repl::MultiOplogEntryType>(multiOpTypeValue.getInt()));
+    const bool applyOpsAppliedSeparately =
+        multiOpType == repl::MultiOplogEntryType::kApplyOpsAppliedSeparately;
+    const bool isRetryableApplyOps = applyOpsAppliedSeparately ||
+        multiOpType == repl::MultiOplogEntryType::kApplyOpsAppliedAtomically;
+
+    // lsid and txnNumber identify the transaction an operation belongs to and are surfaced on its
+    // change event so clients can correlate events from the same transaction. They are not parsed
+    // for retryable-write applyOps, which are not transactions.
+    if (!isRetryableApplyOps) {
+        Value lsidValue = input[DocumentSourceChangeStream::kLsidField];
+        DocumentSourceChangeStream::checkValueTypeOrMissing(
+            lsidValue, DocumentSourceChangeStream::kLsidField, BSONType::object);
+        _lsid =
+            lsidValue.missing() ? boost::none : boost::optional<Document>(lsidValue.getDocument());
+        Value txnNumberValue = input[DocumentSourceChangeStream::kTxnNumberField];
+        DocumentSourceChangeStream::checkValueTypeOrMissing(
+            txnNumberValue, DocumentSourceChangeStream::kTxnNumberField, BSONType::numberLong);
+        _txnNumber = txnNumberValue.missing()
+            ? boost::none
+            : boost::optional<TxnNumber>(txnNumberValue.getLong());
+    }
+    // We want to parse the OpTime out of this document using the BSON OpTime parser. Instead of
+    // converting the entire Document back to BSON, we convert only the fields we need.
+    repl::OpTime txnOpTime = repl::OpTime::parse(BSON(repl::OpTime::kTimestampFieldName
+                                                      << input[repl::OpTime::kTimestampFieldName]
+                                                      << repl::OpTime::kTermFieldName
+                                                      << input[repl::OpTime::kTermFieldName]));
+    _clusterTime = txnOpTime.getTimestamp();
+
+    Value wallTime = input[FieldAccessors::kWallClockTime];
+    DocumentSourceChangeStream::checkValueType(
+        wallTime, repl::OplogEntry::kWallClockTimeFieldName, BSONType::date);
+    _wallTime = wallTime.getDate();
+
+    auto commandObj = input[FieldAccessors::kObject].getDocument();
+    Value applyOps = commandObj["applyOps"sv];
+
+    if (!applyOps.missing()) {
+        // We found an applyOps that implicitly commits a transaction. We include it in the
+        // '_txnOplogEntries' stack of applyOps entries that the change stream should process as
+        // part of this transaction. There may be additional applyOps entries linked through the
+        // 'prevOpTime' field, which will also get added to '_txnOplogEntries' later in this
+        // function. Note that this style of transaction does not have a 'commitTransaction'
+        // command.
+        _txnOplogEntries.push(txnOpTime);
+    } else {
+        // This must be a "commitTransaction" command, which commits a prepared transaction.
+        // This style of transaction does not have an applyOps entry that implicitly commits it,
+        // as in the previous case. We're going to iterate through the other oplog entries in
+        // the transaction, but this entry does not have any updates in it, so we do not include
+        // it in the '_txnOplogEntries' stack.
+        tassert(5543803,
+                str::stream() << "Unexpected op at "
+                              << input[FieldAccessors::kTimestamp].getTimestamp().toString(),
+                !commandObj["commitTransaction"].missing());
+
+        if (auto commitTimestamp = commandObj["commitTimestamp"]; !commitTimestamp.missing()) {
+            // Track commit timestamp of the prepared transaction if it's present in the oplog
+            // entry.
+            _commitTimestamp = commitTimestamp.getTimestamp();
+        }
+    }
+
+    // We need endOfTransaction only for unprepared multi-document transactions: so this must be an
+    // applyOps with set lsid and txnNumber, but not a retryable-write applyOps.
+    _needEndOfTransaction = feature_flags::gFeatureFlagEndOfTransactionChangeEvent.isEnabled(
+                                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        !applyOps.missing() && !isRetryableApplyOps && _lsid.has_value() && _txnNumber.has_value();
+
+    // When operations span multiple applyOps entries linked by 'prevOpTime', walk that chain to
+    // gather them all. kApplyOpsAppliedSeparately entries are standalone, so there is no chain to
+    // follow. kApplyOpsAppliedAtomically entries also use 'prevOpTime' to link between retryable
+    // write statements, so bound its walk by the terminal's 'count' of operations. A terminal
+    // entry without 'count' is a single-entry batch with no chain to walk. See walkApplyOpsChain().
+    boost::optional<std::size_t> opsStillToCollect;
+    if (isRetryableApplyOps) {
+        const Value count = commandObj["count"sv];
+        opsStillToCollect = count.missing()
+            ? 0
+            : repl::remainingApplyOpsChainOps(static_cast<std::size_t>(count.getLong()),
+                                              repl::numOperationsInApplyOps(applyOps));
+    }
+
+    if (!applyOpsAppliedSeparately &&
+        BSONType::object ==
+            input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getType()) {
+        // As with the 'txnOpTime' parsing above, we convert a portion of 'input' back to BSON
+        // in order to parse an OpTime, this time from the "prevOpTime" field.
+        repl::OpTime prevOpTime = repl::OpTime::parse(
+            input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getDocument().toBson());
+        _collectAllOpTimesFromTransaction(
+            expCtx->getOperationContext(), prevOpTime, opsStillToCollect);
+    }
+
+    // Pop the first OpTime off the stack and use it to load the first oplog entry into the
+    // '_currentApplyOps' field.
+    tassert(5543804, "No transaction oplog entries found", _txnOplogEntries.size() > 0);
+    const auto firstTimestamp = _txnOplogEntries.top();
+    _txnOplogEntries.pop();
+
+    if (firstTimestamp == txnOpTime) {
+        // This transaction consists of only one oplog entry, from which we have already
+        // extracted the "applyOps" array, so there is no need to do any more work.
+        tassert(5543805,
+                str::stream() << "Expected no transaction entries, found "
+                              << _txnOplogEntries.size(),
+                _txnOplogEntries.size() == 0);
+        _currentApplyOps = std::move(applyOps);
+    } else {
+        // This transaction consists of multiple oplog entries; grab the chronologically first
+        // entry and extract its "applyOps" array.
+        auto firstApplyOpsEntry =
+            _lookUpOplogEntryByOpTime(expCtx->getOperationContext(), firstTimestamp);
+
+        auto bsonOp = firstApplyOpsEntry.getOperationToApply();
+        tassert(5543806,
+                str::stream() << "Expected 'applyOps' type " << BSONType::array << ", found "
+                              << bsonOp["applyOps"].type(),
+                BSONType::array == bsonOp["applyOps"].type());
+        _currentApplyOps = Value(bsonOp["applyOps"]);
+    }
+
+    DocumentSourceChangeStream::checkValueType(_currentApplyOps, "applyOps", BSONType::array);
+
+    // Initialize iterators at the beginning of the transaction.
+    _currentApplyOpsIt = _currentApplyOps.getArray().begin();
+    _currentApplyOpsTs = firstTimestamp.getTimestamp();
+    _currentApplyOpsIndex = 0;
+    _txnOpIndex = 0;
+}
+
+boost::optional<Document>
+ChangeStreamUnwindTransactionStage::TransactionOpIterator::getNextTransactionOp(
+    OperationContext* opCtx) {
+    while (true) {
+        while (_currentApplyOpsIt != _currentApplyOps.getArray().end()) {
+            Document doc = (_currentApplyOpsIt++)->getDocument();
+            ++_currentApplyOpsIndex;
+            ++_txnOpIndex;
+
+            _assertExpectedTransactionEventFormat(doc);
+
+            if (_needEndOfTransaction) {
+                _addAffectedNamespaces(doc);
+            }
+            // If the document is relevant, update it with the required txn fields before returning.
+            if (exec::matcher::matchesBSON(_expression, doc.toBson())) {
+                return _addRequiredTransactionFields(doc);
+            }
+        }
+
+        if (_txnOplogEntries.empty()) {
+            // There are no more operations in this transaction.
+            return _createEndOfTransactionIfNeeded();
+        }
+
+        // We've processed all the operations in the previous applyOps entry, but we have a new
+        // one to process.
+        auto applyOpsEntry = _lookUpOplogEntryByOpTime(opCtx, _txnOplogEntries.top());
+        _txnOplogEntries.pop();
+
+        auto bsonOp = applyOpsEntry.getOperationToApply();
+        tassert(5543807,
+                str::stream() << "Expected 'applyOps' type " << BSONType::array << ", found "
+                              << bsonOp["applyOps"].type(),
+                BSONType::array == bsonOp["applyOps"].type());
+
+        _currentApplyOps = Value(bsonOp["applyOps"]);
+        _currentApplyOpsTs = applyOpsEntry.getTimestamp();
+        _currentApplyOpsIt = _currentApplyOps.getArray().begin();
+        _currentApplyOpsIndex = 0;
+    }
+}
+
+void ChangeStreamUnwindTransactionStage::TransactionOpIterator::
+    _assertExpectedTransactionEventFormat(const Document& doc) const {
+    Value op = doc[FieldAccessors::kOpType];
+    tassert(5543808,
+            str::stream() << "Unexpected format for entry within a transaction oplog entry: "
+                             "'op' field was type "
+                          << typeName(op.getType()),
+            op.getType() == BSONType::string);
+    tassert(5543809,
+            str::stream() << "Unexpected noop entry within a transaction " << redact(op.toString()),
+            op.getStringData() != "n"sv);
+}
+
+Document ChangeStreamUnwindTransactionStage::TransactionOpIterator::_addRequiredTransactionFields(
+    const Document& doc) const {
+    MutableDocument newDoc(doc);
+    // The 'getNextTransactionOp' increments the '_txnOpIndex' by 1, to point to the next
+    // transaction number. The 'txnOpIndex()' must be called to get the current transaction number.
+    newDoc.addField(DocumentSourceChangeStream::kTxnOpIndexField,
+                    Value(static_cast<long long>(txnOpIndex())));
+
+    // The 'getNextTransactionOp' updates the '_currentApplyOpsIndex' to point to the next entry in
+    // the '_currentApplyOps' array. The 'applyOpsIndex()' method must be called to get the index of
+    // the current entry.
+    newDoc.addField(DocumentSourceChangeStream::kApplyOpsIndexField,
+                    Value(static_cast<long long>(applyOpsIndex())));
+    newDoc.addField(DocumentSourceChangeStream::kApplyOpsTsField, Value(applyOpsTs()));
+
+    newDoc.addField(repl::OplogEntry::kTimestampFieldName, Value(_clusterTime));
+    newDoc.addField(repl::OplogEntry::kWallClockTimeFieldName, Value(_wallTime));
+
+    newDoc.addField(DocumentSourceChangeStream::kCommitTimestampField,
+                    _commitTimestamp ? Value(*_commitTimestamp) : Value());
+
+    newDoc.addField(repl::OplogEntry::kSessionIdFieldName, _lsid ? Value(*_lsid) : Value());
+    newDoc.addField(repl::OplogEntry::kTxnNumberFieldName,
+                    _txnNumber ? Value(static_cast<long long>(*_txnNumber)) : Value());
+
+    return newDoc.freeze();
+}
+
+repl::OplogEntry
+ChangeStreamUnwindTransactionStage::TransactionOpIterator::_lookUpOplogEntryByOpTime(
+    OperationContext* opCtx, repl::OpTime lookupTime) const {
+    tassert(5543811, "Cannot look up transaction entry with null op time", !lookupTime.isNull());
+
+    std::unique_ptr<TransactionHistoryIteratorBase> iterator(
+        _mongoProcessInterface->createTransactionHistoryIterator(lookupTime));
+
+    try {
+        return iterator->next(opCtx);
+    } catch (ExceptionFor<ErrorCodes::IncompleteTransactionHistory>& ex) {
+        ex.addContext(
+            str::stream()
+            << "Oplog no longer has history necessary for $changeStream to observe operations "
+               "from a committed transaction (lookupTime: "
+            << lookupTime.getTimestamp() << ")");
+        uasserted(ErrorCodes::ChangeStreamHistoryLost, ex.reason());
+    }
+}
+
+void ChangeStreamUnwindTransactionStage::TransactionOpIterator::_collectAllOpTimesFromTransaction(
+    OperationContext* opCtx,
+    repl::OpTime firstOpTime,
+    boost::optional<std::size_t> opsStillToCollect) {
+    // A single-entry batch links to the previous applyOps chain with nothing of its own to walk.
+    if (opsStillToCollect && *opsStillToCollect == 0) {
+        return;
+    }
+
+    std::unique_ptr<TransactionHistoryIteratorBase> iterator(
+        _mongoProcessInterface->createTransactionHistoryIterator(firstOpTime));
+
+    try {
+        walkApplyOpsChain(*iterator, opsStillToCollect, [&]() -> std::size_t {
+            if (!opsStillToCollect) {
+                // A transaction walks the whole chain and only needs each entry's optime; the
+                // returned op count is unused when there is no budget to decrement.
+                _txnOplogEntries.push(iterator->nextOpTime(opCtx));
+                return 0;
+            }
+            // A retryable chain is bounded by 'count', so fetch the entry to count its operations.
+            const auto entry = iterator->next(opCtx);
+            _txnOplogEntries.push(entry.getOpTime());
+            return repl::numOperationsInApplyOps(entry);
+        });
+    } catch (ExceptionFor<ErrorCodes::IncompleteTransactionHistory>& ex) {
+        ex.addContext(
+            str::stream()
+            << "Oplog no longer has history necessary for $changeStream to observe operations "
+               "from a committed transaction (firstOpTime: "
+            << firstOpTime.getTimestamp() << ")");
+        uasserted(ErrorCodes::ChangeStreamHistoryLost, ex.reason());
+    }
+}
+
+void ChangeStreamUnwindTransactionStage::TransactionOpIterator::_addAffectedNamespaces(
+    const Document& doc) {
+    const auto dbCmdNs = NamespaceStringUtil::deserialize(boost::none /* tenantId */,
+                                                          doc["ns"sv].getStringData(),
+                                                          SerializationContext::stateDefault());
+    if (doc[FieldAccessors::kOpType].getStringData() != "c"sv) {
+        _affectedNamespaces.insert(dbCmdNs);
+        return;
+    }
+
+    // The only supported DDL commands inside transactions are "create" and "createIndexes".
+    // Creating databases, dropping collections, databases or indexes are not supported. Neither are
+    // renaming nor collMod operations.
+    constexpr std::array<std::string_view, 2> kCollectionField = {"create"sv, "createIndexes"sv};
+    const Document& object = doc[FieldAccessors::kObject].getDocument();
+    for (const auto& fieldName : kCollectionField) {
+        const auto field = object[fieldName];
+        if (field.getType() == BSONType::string) {
+            _affectedNamespaces.insert(
+                NamespaceStringUtil::deserialize(dbCmdNs.dbName(), field.getStringData()));
+            return;
+        }
+    }
+
+    tasserted(7694300,
+              str::stream() << "Unexpected op in applyOps at " << _currentApplyOpsTs << " index "
+                            << _currentApplyOpsIndex << " object " << redact(object.toString()));
+}
+
+boost::optional<Document>
+ChangeStreamUnwindTransactionStage::TransactionOpIterator::_createEndOfTransactionIfNeeded() {
+    if (!_needEndOfTransaction || _endOfTransactionReturned) {
+        return boost::none;
+    }
+    ++_currentApplyOpsIndex;
+    ++_txnOpIndex;
+    _endOfTransactionReturned = true;
+
+    std::vector<NamespaceString> namespaces{_affectedNamespaces.begin(), _affectedNamespaces.end()};
+    auto lsid = LogicalSessionId::parse(_lsid->toBson(), IDLParserContext("LogicalSessionId"));
+    repl::MutableOplogEntry oplogEntry = change_stream::createEndOfTransactionOplogEntry(
+        lsid, *_txnNumber, namespaces, _clusterTime, _wallTime);
+
+    MutableDocument newDoc(Document(oplogEntry.toBSON()));
+    newDoc.addField(DocumentSourceChangeStream::kTxnOpIndexField,
+                    Value(static_cast<long long>(txnOpIndex())));
+    newDoc.addField(DocumentSourceChangeStream::kApplyOpsIndexField,
+                    Value(static_cast<long long>(applyOpsIndex())));
+    newDoc.addField(DocumentSourceChangeStream::kApplyOpsTsField, Value(applyOpsTs()));
+
+    Document endOfTransaction = newDoc.freeze();
+    return {
+        exec::matcher::matchesBSON(_endOfTransactionExpression.get(), endOfTransaction.toBson()),
+        endOfTransaction};
+}
+
+}  // namespace exec::agg
+}  // namespace mongo

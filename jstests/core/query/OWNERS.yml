@@ -1,0 +1,20 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/query
+  - "*pbt*":
+    approvers:
+      - 10gen/query-property-based-testing
+  - "boolean_expression_simplification.js":
+    approvers:
+      - 10gen/query-optimization
+  - "noop_writes.js":
+    approvers:
+      - 10gen/query-execution-write-exec
+  - "write_change_stream_pit_preimage.js":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "release_memory/*":
+    approvers:
+      - 10gen/query-execution

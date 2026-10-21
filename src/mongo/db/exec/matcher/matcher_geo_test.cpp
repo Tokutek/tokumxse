@@ -1,0 +1,431 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/matcher/matcher.h"
+#include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/expression_internal_bucket_geo_within.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_geo_parser.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/unittest/unittest.h"
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+using namespace std::literals::string_view_literals;
+
+namespace mongo::evaluate_matcher_geo_test {
+
+class InternalBucketGeoWithinExpression : public mongo::unittest::Test {
+public:
+    auto getExpCtx() {
+        return _expCtx;
+    }
+
+    BSONObj createBucketObj(BSONElement minLoc, BSONElement maxLoc) {
+        BSONObjBuilder bob(fromjson(R"({
+            _id : 1,
+            meta : { field : "a" },
+            data : {
+                time : {
+                    "0" : 1626739090
+                },
+                _id : {
+                    "0" : 0
+                }
+            }
+        })"));
+
+        BSONObjBuilder controlBob(bob.subobjStart("control"));
+        controlBob.appendNumber("version", 1);
+        BSONObjBuilder minObj(controlBob.subobjStart("min"));
+        minObj.appendDate("time", Date_t());
+        minObj.appendNumber("_id", 0);
+        minObj.append(minLoc);
+        minObj.doneFast();
+
+        BSONObjBuilder maxObj(controlBob.subobjStart("max"));
+        maxObj.appendDate("time", Date_t());
+        maxObj.appendNumber("_id", 1);
+        maxObj.append(maxLoc);
+        maxObj.doneFast();
+        controlBob.doneFast();
+
+        return bob.obj();
+    }
+
+    std::unique_ptr<MatchExpression> getDummyBucketGeoExpr() {
+        _ownedGeoNoVersion = fromjson(R"(
+            {$_internalBucketGeoWithin: {
+                withinRegion: {
+                    $geometry: {
+                        type : "Polygon",
+                        coordinates : [[[ 0, 0 ], [ 0, 5 ], [ 5, 5 ], [ 5, 0 ], [ 0, 0 ]]]
+                    }
+                },
+                field: "loc"
+            }})");
+        auto expr = MatchExpressionParser::parse(_ownedGeoNoVersion, _expCtx);
+        ASSERT_OK(expr.getStatus());
+
+        return std::move(expr.getValue());
+    }
+
+    std::unique_ptr<MatchExpression> getDummyBucketGeoExprLegacy() {
+        _ownedGeoLegacy = fromjson(R"(
+            {$_internalBucketGeoWithin: {
+                withinRegion: {
+                    $box: [
+                        [0, 0],
+                        [5, 5] 
+                    ]
+                },
+                field: "loc"
+            }})");
+        auto expr = MatchExpressionParser::parse(_ownedGeoLegacy, _expCtx);
+        ASSERT_OK(expr.getStatus());
+
+        return std::move(expr.getValue());
+    }
+
+    std::unique_ptr<MatchExpression> getDummyBucketGeoExprWithIndexVersion(int indexVersion) {
+        _ownedGeoWithVersion =
+            BSON("$_internalBucketGeoWithin"
+                 << BSON("withinRegion"
+                         << BSON("$geometry" << BSON(
+                                     "type" << "Polygon"
+                                            << "coordinates"
+                                            << BSON_ARRAY(BSON_ARRAY(
+                                                   BSON_ARRAY(0 << 0)
+                                                   << BSON_ARRAY(0 << 5) << BSON_ARRAY(5 << 5)
+                                                   << BSON_ARRAY(5 << 0) << BSON_ARRAY(0 << 0)))))
+                         << "field"
+                         << "loc"
+                         << "2dsphereIndexVersion" << indexVersion));
+
+        auto expr = MatchExpressionParser::parse(_ownedGeoWithVersion,
+                                                 _expCtx,
+                                                 ExtensionsCallbackNoop(),
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
+        ASSERT_OK(expr.getStatus());
+
+        return std::move(expr.getValue());
+    }
+
+protected:
+    BSONObj _ownedGeoWithVersion;
+    BSONObj _ownedGeoNoVersion;
+    BSONObj _ownedGeoLegacy;
+
+private:
+    boost::intrusive_ptr<ExpressionContextForTest> _expCtx = new ExpressionContextForTest();
+};
+
+TEST_F(InternalBucketGeoWithinExpression, BoxPolygonOverlap) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj = createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(0 << 0)))
+                                   .firstElement(),
+                               BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(5 << 5)))
+                                   .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, ShouldFilterOutBucketDisjoint) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj = createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(10 << 10)))
+                                   .firstElement(),
+                               BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(20 << 20)))
+                                   .firstElement());
+
+    ASSERT_FALSE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, ShouldFilterOutBucketDisjointLegacyPoints) {
+    auto expr = getDummyBucketGeoExprLegacy();
+
+    auto obj = createBucketObj(BSON("loc" << BSON_ARRAY(10 << 10)).firstElement(),
+                               BSON("loc" << BSON_ARRAY(20 << 20)).firstElement());
+
+    ASSERT_FALSE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, ContainsAllPointsInTheBucket) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj = createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(1 << 1)))
+                                   .firstElement(),
+                               BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(3 << 3)))
+                                   .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, ContainsAllPointsInTheBucketLegacy) {
+    auto expr = getDummyBucketGeoExprLegacy();
+
+    auto obj = createBucketObj(BSON("loc" << BSON_ARRAY(1 << 1)).firstElement(),
+                               BSON("loc" << BSON_ARRAY(3 << 3)).firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BBoxContainsWithinRegion) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj = createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(-3 << -3)))
+                                   .firstElement(),
+                               BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(10 << 10)))
+                                   .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BBoxContainsWithinRegionLegacy) {
+    auto expr = getDummyBucketGeoExprLegacy();
+
+    auto obj = createBucketObj(BSON("loc" << BSON_ARRAY(-3 << -3)).firstElement(),
+                               BSON("loc" << BSON_ARRAY(10 << 10)).firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BBoxIntersectsWithinRegion) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj = createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(3 << 3)))
+                                   .firstElement(),
+                               BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(10 << 10)))
+                                   .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BBoxIntersectsWithinRegionLegacy) {
+    auto expr = getDummyBucketGeoExprLegacy();
+
+    auto obj = createBucketObj(BSON("loc" << BSON_ARRAY(3 << 3)).firstElement(),
+                               BSON("loc" << BSON_ARRAY(10 << 10)).firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BigBBoxContainsWithinRegion) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj =
+        createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(-179 << -89)))
+                            .firstElement(),
+                        BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(179 << 89)))
+                            .firstElement());
+
+    // This big spherical bounding box should contain the prime meridian(0° longitude) instead of
+    // the anti-meridian(180° longitude).
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+// Regression: GeoJSON->S2Point->S2LatLng round-trip can produce slightly different latitudes for
+// identical input latitudes at different longitudes, tripping S2LatLngRect's is_valid() DCHECK.
+// Values from a property-based test (PBT) failure.
+TEST_F(InternalBucketGeoWithinExpression, LatitudeRoundTripPrecision) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj =
+        createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(-2.599 << 2.763)))
+                            .firstElement(),
+                        BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(2.500 << 2.763)))
+                            .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+// Verifies same-longitude points produce ordered latitudes, so this exercises the normal path.
+TEST_F(InternalBucketGeoWithinExpression, SameLongitudeDifferentLatitude) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj =
+        createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(2.763 << 1.0)))
+                            .firstElement(),
+                        BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(2.763 << 3.0)))
+                            .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+// Verifies FromPointPair fix does not make the filter over-conservative for same-latitude buckets.
+TEST_F(InternalBucketGeoWithinExpression, SameLatitudeDisjointBucket) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj =
+        createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(10.0 << 10.0)))
+                            .firstElement(),
+                        BSON("loc" << BSON("type" << "Point"
+                                                  << "coordinates" << BSON_ARRAY(20.0 << 10.0)))
+                            .firstElement());
+
+    ASSERT_FALSE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BucketContainsNonPointType) {
+    auto expr = getDummyBucketGeoExpr();
+
+    auto obj = createBucketObj(
+        BSON("loc" << BSON("type" << "Point"
+                                  << "coordinates" << BSON_ARRAY(1 << 1)))
+            .firstElement(),
+        BSON("loc" << BSON("type" << "LineString"
+                                  << "coordinates"
+                                  << BSON_ARRAY(BSON_ARRAY(2 << 2) << BSON_ARRAY(3 << 3))))
+            .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, BucketContainsNonPointTypeLegacy) {
+    auto expr = getDummyBucketGeoExprLegacy();
+
+    auto obj = createBucketObj(
+        BSON("loc" << BSON("$box" << BSON_ARRAY(BSON_ARRAY(0 << 0) << BSON_ARRAY(5 << 5))))
+            .firstElement(),
+        BSON("loc" << BSON_ARRAY(10 << 10)).firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, With2dsphereIndexVersion4GeoJSONPoints) {
+    auto expr = getDummyBucketGeoExprWithIndexVersion(4);
+
+    auto obj = createBucketObj(BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(1 << 1)))
+                                   .firstElement(),
+                               BSON("loc" << BSON("type" << "Point"
+                                                         << "coordinates" << BSON_ARRAY(3 << 3)))
+                                   .firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, With2dsphereIndexVersion3LegacyPoints) {
+    auto expr = getDummyBucketGeoExprWithIndexVersion(3);
+
+    auto obj = createBucketObj(BSON("loc" << BSON_ARRAY(1 << 1)).firstElement(),
+                               BSON("loc" << BSON_ARRAY(3 << 3)).firstElement());
+
+    ASSERT_TRUE(exec::matcher::matchesBSON(expr.get(), obj));
+}
+
+TEST_F(InternalBucketGeoWithinExpression, EquivalentAndClonePreserveIndexVersion) {
+    auto exprWithVersion = getDummyBucketGeoExprWithIndexVersion(4);
+    auto exprWithoutVersion = getDummyBucketGeoExpr();
+
+    // Expressions with and without index version should not be equivalent.
+    ASSERT_FALSE(exprWithVersion->equivalent(exprWithoutVersion.get()));
+    ASSERT_FALSE(exprWithoutVersion->equivalent(exprWithVersion.get()));
+
+    // Clone should preserve index version and be equivalent to original.
+    auto clone = exprWithVersion->clone();
+    ASSERT_TRUE(exprWithVersion->equivalent(clone.get()));
+
+    auto* ibgwWithVersion =
+        static_cast<InternalBucketGeoWithinMatchExpression*>(exprWithVersion.get());
+    auto* ibgwClone = static_cast<InternalBucketGeoWithinMatchExpression*>(clone.get());
+    ASSERT_TRUE(ibgwWithVersion->getIndexVersion());
+    ASSERT_TRUE(ibgwClone->getIndexVersion());
+    ASSERT_EQUALS(*ibgwWithVersion->getIndexVersion(), *ibgwClone->getIndexVersion());
+}
+
+TEST(ExpressionGeoTest, Geo1) {
+    BSONObj query = fromjson("{loc:{$within:{$box:[{x: 4, y:4},[6,6]]}}}");
+
+    std::unique_ptr<GeoExpression> gq(new GeoExpression);
+    ASSERT_OK(parsers::matcher::parseGeoExpressionFromBSON(query["loc"].Obj(), *gq));
+
+    GeoMatchExpression ge("a"sv, gq.release(), query);
+
+    ASSERT(!exec::matcher::matchesBSON(&ge, fromjson("{a: [3,4]}")));
+    ASSERT(exec::matcher::matchesBSON(&ge, fromjson("{a: [4,4]}")));
+    ASSERT(exec::matcher::matchesBSON(&ge, fromjson("{a: [5,5]}")));
+    ASSERT(exec::matcher::matchesBSON(&ge, fromjson("{a: [5,5.1]}")));
+    ASSERT(exec::matcher::matchesBSON(&ge, fromjson("{a: {x: 5, y:5.1}}")));
+}
+
+TEST(MatchExpressionParserGeo, WithinBox) {
+    BSONObj query = fromjson("{a:{$within:{$box:[{x: 4, y:4},[6,6]]}}}");
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::kAllowAllSpecialFeatures);
+    ASSERT_TRUE(result.isOK());
+
+    ASSERT(!exec::matcher::matchesBSON(result.getValue().get(), fromjson("{a: [3,4]}")));
+    ASSERT(exec::matcher::matchesBSON(result.getValue().get(), fromjson("{a: [4,4]}")));
+    ASSERT(exec::matcher::matchesBSON(result.getValue().get(), fromjson("{a: [5,5]}")));
+    ASSERT(exec::matcher::matchesBSON(result.getValue().get(), fromjson("{a: [5,5.1]}")));
+    ASSERT(exec::matcher::matchesBSON(result.getValue().get(), fromjson("{a: {x: 5, y:5.1}}")));
+}
+
+// $geoIntersects and $geoWithin against a stored GeometryCollection containing a strict-winding
+// polygon must return false (not crash) on the non-index (collection-scan) path. getNativeCRS()
+// returns STRICT_SPHERE for such a collection, which triggers the "Never match big polygon" guard
+// in geoContains before any null s2Polygon is dereferenced.
+TEST(MatchExpressionParserGeo, StrictWindingPolygonInGeometryCollectionGeoIntersects) {
+    BSONObj query = fromjson(
+        "{geo: {$geoIntersects: {$geometry:"
+        "  {type: 'Polygon', coordinates: [[[0,0],[10,0],[10,10],[0,10],[0,0]]]}}}}");
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::kAllowAllSpecialFeatures);
+    ASSERT_TRUE(result.isOK());
+
+    BSONObj doc = fromjson(
+        "{geo: {type: 'GeometryCollection', geometries: ["
+        "  {type: 'Polygon', coordinates: [[[0,0],[5,0],[5,5],[0,5],[0,0]]],"
+        "   crs: {type: 'name', properties:"
+        "         {name: 'urn:x-mongodb:crs:strictwinding:EPSG:4326'}}}"
+        "]}}");
+
+    ASSERT_FALSE(exec::matcher::matchesBSON(result.getValue().get(), doc));
+}
+
+TEST(MatchExpressionParserGeo, StrictWindingPolygonInGeometryCollectionGeoWithin) {
+    BSONObj query = fromjson(
+        "{geo: {$geoWithin: {$geometry:"
+        "  {type: 'Polygon', coordinates: [[[-10,-10],[10,-10],[10,10],[-10,10],[-10,-10]]]}}}}");
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::kAllowAllSpecialFeatures);
+    ASSERT_TRUE(result.isOK());
+
+    BSONObj doc = fromjson(
+        "{geo: {type: 'GeometryCollection', geometries: ["
+        "  {type: 'Polygon', coordinates: [[[0,0],[5,0],[5,5],[0,5],[0,0]]],"
+        "   crs: {type: 'name', properties:"
+        "         {name: 'urn:x-mongodb:crs:strictwinding:EPSG:4326'}}}"
+        "]}}");
+
+    ASSERT_FALSE(exec::matcher::matchesBSON(result.getValue().get(), doc));
+}
+
+}  // namespace mongo::evaluate_matcher_geo_test

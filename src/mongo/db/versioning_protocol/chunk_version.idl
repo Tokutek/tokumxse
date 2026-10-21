@@ -1,0 +1,61 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# ChunkVersion IDL type definition
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/versioning_protocol/chunk_version.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    CollectionGenerationBase:
+        description:
+            Represents the generation part of a collection version which changes every time
+            the collection undergoes some major transformation. This is the most
+            significant part of the version of a collection.
+        strict: false
+        fields:
+            e:
+                type: objectid
+                description: "Collection epoch"
+                cpp_name: Epoch
+            t:
+                type: timestamp
+                description: "Collection timestamp"
+                cpp_name: Timestamp
+
+    CollectionPlacementBase:
+        description:
+            Represents the chunk-placement part of a collection version, which is
+            subordinate to the collection generation.
+        strict: false
+        fields:
+            v:
+                type: timestamp
+                description: "Bitwise concatenation of the 32-bit major/minor versions"
+                cpp_name: Version
+
+    ChunkVersion60Format:
+        description:
+            New chunk version format with is parsed by 6.0 binaries but only generated
+            starting with the 6.0 binaries when the FCV is 6.0.
+        strict: false
+        chained_structs:
+            CollectionGenerationBase: Generation
+            CollectionPlacementBase: Placement
+
+types:
+    # The canonical serialisation format for ChunkVersions
+    ChunkVersion:
+        bson_serialization_type: any
+        description: An object representing a chunk version for a collection.
+        cpp_type: ChunkVersion
+        serializer: ChunkVersion::serialize
+        deserializer: ChunkVersion::parse
+        # ChunkVersion has only non view members.
+        is_view: false

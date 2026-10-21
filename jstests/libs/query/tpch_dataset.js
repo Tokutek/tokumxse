@@ -1,0 +1,89 @@
+import {Mongorestore} from "jstests/libs/mongodb_database_tools.js";
+import {checkPauseAfterPopulate} from "jstests/libs/query_optimization/pause_after_populate.js";
+
+/**
+ * Populate the TPCH dataset by restoring it from a mongorestore archive. This requires the following prerequisites:
+ * - the `mongorestore` tool, accessible on the $PATH.
+ * - the TPC-H dataset, located in a directory named `tpc-h` that is on the same level as the mongodb repository.
+ *
+ * `mongorestore` is part of the "MongoDB Database Tools" package,
+ * available at https://www.mongodb.com/try/download/database-tools
+ *
+ * The TPC-H dataset is available from the `query-benchmark-data` S3 bucket.
+ *
+ * In evergreen, tasks such as `query_golden_join_optimization_plan_stability`
+ * make sure the prerequisites are already in place.
+ *
+ * @param {string} scale - The scale of the TPCH dataset to populate.
+ * @param {string} [dbName=jsTestName()] - Destination database name. The archive's `tpch.*`
+ *     namespaces are remapped to `${dbName}.*`.
+ * @param {{compact?: boolean}} [options] - `compact` (default true) runs compact on each
+ *     collection after restore to reduce on-disk non-determinism.
+ * @returns {DB} The populated TPC-H database.
+ */
+export function populateTPCHDataset(scale, dbName = jsTestName(), {compact = true} = {}) {
+    const mr = new Mongorestore();
+
+    mr.execute({
+        archive: `../tpc-h/tpch-${scale}-normalized.archive.gz`,
+        nsFrom: "tpch.*",
+        nsTo: `${dbName}.*`,
+        drop: true,
+        gzip: true,
+        // Remove as much concurrency as possible in order to reduce
+        // the non-determinism in the final on-disk and memory representations.
+        maintainInsertionOrder: true,
+        numParallelCollections: 1,
+        numInsertionWorkersPerCollection: 1,
+    });
+
+    const tpchDb = db.getMongo().getDB(dbName);
+
+    if (compact) {
+        // Compact each collection to further reduce the potential for non-determinism
+        tpchDb.getCollectionNames().forEach(function (collName) {
+            assert.commandWorked(tpchDb.runCommand({compact: collName}));
+        });
+    }
+
+    checkPauseAfterPopulate();
+
+    return tpchDb;
+}
+
+/**
+ * Execute a callback with the TPCH dataset populated and the syncdelay set to 0 and fsync locked.
+ * These are set to increase determinism in the WT on-disk files (which have an effect on join costing)
+ * by preventing further writes.
+ * @param {string} scale - The scale of the TPCH dataset to populate.
+ * @param {Function} callback - The callback to execute, passed the populated TPCH database as an argument.
+ * @returns {any} The result of the callback.
+ */
+export function withTPCHDataset(scale, callback) {
+    const tpchDb = populateTPCHDataset(scale);
+    // get the current syncdelay value
+    const currentSyncdelay = assert.commandWorked(
+        tpchDb.adminCommand({getParameter: 1, syncdelay: 1}),
+    ).syncdelay;
+    // set syncdelay to 0
+    assert.commandWorked(tpchDb.adminCommand({setParameter: 1, syncdelay: 0}));
+    let fsyncLocked = false;
+    try {
+        // acquire the fsync lock
+        assert.commandWorked(tpchDb.adminCommand({fsync: 1, lock: true}));
+        fsyncLocked = true;
+        return callback(tpchDb);
+    } finally {
+        try {
+            // release the fsync lock
+            if (fsyncLocked) {
+                assert.commandWorked(tpchDb.adminCommand({fsyncUnlock: 1}));
+            }
+        } finally {
+            // restore the original syncdelay value
+            assert.commandWorked(
+                tpchDb.adminCommand({setParameter: 1, syncdelay: currentSyncdelay}),
+            );
+        }
+    }
+}

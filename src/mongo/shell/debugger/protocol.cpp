@@ -1,0 +1,342 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/shell/debugger/protocol.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+
+namespace mongo {
+namespace mozjs {
+namespace debugger {
+namespace protocol {
+
+
+/**
+ * Request
+ */
+
+std::shared_ptr<Request> Request::fromJSON(std::string line) {
+    BSONObj obj = fromjson(line);
+
+    auto seq = obj.getIntField("seq");
+    std::string command{obj.getStringField("command")};
+    auto args = obj.getObjectField("arguments").getOwned();
+
+    auto partial = PartialRequest(seq, args, command);
+
+    if (command == SetBreakpointsRequest::COMMAND) {
+        return std::make_shared<SetBreakpointsRequest>(partial);
+    }
+    if (command == ContinueRequest::COMMAND) {
+        return std::make_shared<ContinueRequest>(partial);
+    }
+    if (command == StackTraceRequest::COMMAND) {
+        return std::make_shared<StackTraceRequest>(partial);
+    }
+    if (command == ScopesRequest::COMMAND) {
+        return std::make_shared<ScopesRequest>(partial);
+    }
+    if (command == VariablesRequest::COMMAND) {
+        return std::make_shared<VariablesRequest>(partial);
+    }
+    if (command == EvaluateRequest::COMMAND) {
+        return std::make_shared<EvaluateRequest>(partial);
+    }
+    if (command == SetVariableRequest::COMMAND) {
+        return std::make_shared<SetVariableRequest>(partial);
+    }
+    if (command == ConfigurationDoneRequest::COMMAND) {
+        return std::make_shared<ConfigurationDoneRequest>(partial);
+    }
+
+    // Null Object pattern
+    return std::make_shared<UnknownRequest>(partial);
+}
+
+/**
+ * ConfigurationDoneRequest
+ */
+
+Response ConfigurationDoneRequest::response() {
+    return Response::Ack(*this);
+}
+
+/**
+ * SetBreakpointsRequest
+ */
+
+SetBreakpointsRequest::SetBreakpointsRequest(const PartialRequest& partial)
+    : VisitableRequest(partial) {
+    // Get source from arguments
+    auto sourceField = arguments.getObjectField("source");
+    source = std::string(sourceField.getStringField("path"));
+
+    // Get lines array from arguments and extract line numbers
+    std::vector<BSONElement> bpArr = arguments.getField("breakpoints").Array();
+    for (const auto& bpElem : bpArr) {
+        BSONObj bpObj = bpElem.Obj();
+        int lineNum = bpObj.getIntField("line");
+        lines.push_back(lineNum);
+    }
+}
+
+Response SetBreakpointsRequest::response() {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+
+    BSONObjBuilder bodyBuilder;
+
+    BSONObjBuilder sourceBuilder;
+    sourceBuilder.append("path", source);
+    BSONObj sourceObj = sourceBuilder.obj();
+
+    BSONArrayBuilder breakpointsArr;
+    // Create a breakpoint response for each requested line
+    for (size_t i = 0; i < lines.size(); ++i) {
+        BSONObjBuilder bpBuilder;
+        bpBuilder.append("id", static_cast<int>(i + 1));
+        bpBuilder.append("verified", true);
+        bpBuilder.append("line", lines[i]);
+        bpBuilder.append("column", 0);
+        bpBuilder.append("source", sourceObj);
+
+        breakpointsArr.append(bpBuilder.obj());
+    }
+    bodyBuilder.append("breakpoints", breakpointsArr.arr());
+
+    responseBuilder.append("body", bodyBuilder.obj());
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+/**
+ * ContinueRequest
+ */
+
+Response ContinueRequest::response() {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+    responseBuilder.append("command", "continue");
+    responseBuilder.append("success", true);
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+/**
+ * StackTraceRequest
+ */
+
+Response StackTraceRequest::response(std::vector<StackFrame> frames) {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+
+    BSONObjBuilder bodyBuilder;
+    BSONArrayBuilder stackFramesArr;
+
+    int frameId = 1;
+    for (const auto& frame : frames) {
+        BSONObjBuilder frameBuilder;
+        frameBuilder.append("id", frameId);
+        frameBuilder.append("name", frame.name);
+
+        BSONObjBuilder sourceBuilder;
+        sourceBuilder.append("path", frame.source);
+        frameBuilder.append("source", sourceBuilder.obj());
+
+        frameBuilder.append("line", frame.line);
+        frameBuilder.append("column", 0);
+
+        stackFramesArr.append(frameBuilder.obj());
+        frameId++;
+    }
+
+    bodyBuilder.append("stackFrames", stackFramesArr.arr());
+
+    responseBuilder.append("body", bodyBuilder.obj());
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+
+/**
+ * ScopesRequest
+ */
+
+ScopesRequest::ScopesRequest(const PartialRequest& partial) : VisitableRequest(partial) {
+    frameId = arguments.getIntField("frameId");
+}
+
+Response ScopesRequest::response(std::vector<Scope> scopes) {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+
+    BSONObjBuilder bodyBuilder;
+    BSONArrayBuilder scopesArray;
+
+    for (const auto& scope : scopes) {
+        scopesArray.append(scope.toBSON());
+    }
+
+    bodyBuilder.append("scopes", scopesArray.arr());
+    responseBuilder.append("body", bodyBuilder.obj());
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+/**
+ * Scope
+ */
+BSONObj Scope::toBSON() const {
+    BSONObjBuilder obj;
+    obj.append("name", name);
+    obj.append("variablesReference", variablesReference);
+    obj.append("expensive", expensive);
+    return obj.obj();
+}
+
+
+/**
+ * VariablesRequest
+ */
+
+VariablesRequest::VariablesRequest(const PartialRequest& partial) : VisitableRequest(partial) {
+    variablesReference = arguments.getIntField("variablesReference");
+}
+
+Response VariablesRequest::response(std::vector<Variable> variables) {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+
+    BSONObjBuilder bodyBuilder;
+    BSONArrayBuilder variablesArray;
+
+    for (const auto& variable : variables) {
+        variablesArray.append(variable.toBSON());
+    }
+
+    bodyBuilder.append("variables", variablesArray.arr());
+    responseBuilder.append("body", bodyBuilder.obj());
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+/**
+ * Variable
+ */
+
+BSONObj Variable::toBSON() const {
+    BSONObjBuilder obj;
+    obj.append("name", name);
+    obj.append("value", value);
+    obj.append("type", type);
+    obj.append("variablesReference", variablesReference);
+    return obj.obj();
+}
+
+
+/**
+ * EvaluateRequest
+ */
+
+EvaluateRequest::EvaluateRequest(const PartialRequest& partial) : VisitableRequest(partial) {
+    expression = std::string(arguments.getStringField("expression"));
+}
+
+Response EvaluateRequest::response(std::string result) {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+
+    BSONObjBuilder bodyBuilder;
+    bodyBuilder.append("result", result);
+    responseBuilder.append("body", bodyBuilder.obj());
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+/**
+ * SetVariableRequest
+ */
+SetVariableRequest::SetVariableRequest(const PartialRequest& partial) : VisitableRequest(partial) {
+    name = std::string(arguments.getStringField("name"));
+    value = std::string(arguments.getStringField("value"));
+}
+
+Response SetVariableRequest::response(std::string value) {
+    BSONObjBuilder responseBuilder;
+    responseBuilder.append("type", "response");
+    responseBuilder.append("seq", seq);
+
+    BSONObjBuilder bodyBuilder;
+    bodyBuilder.append("value", value);
+    responseBuilder.append("body", bodyBuilder.obj());
+
+    Response response(seq, responseBuilder.obj().getOwned());
+    return response;
+}
+
+
+/**
+ * StoppedEvent
+ */
+
+StoppedEvent StoppedEvent::Breakpoint() {
+    StoppedEvent e("breakpoint");
+    return e;
+}
+
+StoppedEvent StoppedEvent::Exception(std::string text) {
+    StoppedEvent e("exception");
+    e.text = text;
+    return e;
+}
+
+std::string StoppedEvent::getJson() const {
+    BSONObjBuilder eventBuilder;
+    eventBuilder.append("type", "event");
+    eventBuilder.append("event", "stopped");
+
+    BSONObjBuilder bodyBuilder;
+    bodyBuilder.append("reason", reason);
+    if (text) {
+        bodyBuilder.append("text", *text);
+    }
+
+    eventBuilder.append("body", bodyBuilder.obj());
+
+    return eventBuilder.obj().jsonString(LegacyStrict);
+}
+
+/**
+ * Response
+ */
+
+std::string Response::getJson() const {
+    return bson.jsonString(LegacyStrict);
+}
+
+Response Response::Ack(Message msg) {
+    BSONObjBuilder builder;
+    builder.append("type", "response");
+    builder.append("seq", msg.seq);
+    builder.append("success", true);
+    Response response(msg.seq, builder.obj());
+    return response;
+}
+
+}  // namespace protocol
+}  // namespace debugger
+}  // namespace mozjs
+}  // namespace mongo

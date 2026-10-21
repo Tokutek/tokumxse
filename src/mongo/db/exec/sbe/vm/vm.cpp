@@ -1,0 +1,835 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/vm/vm.h"
+
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"
+#include "mongo/db/exec/sbe/values/arith_common.h"
+#include "mongo/db/exec/sbe/values/util.h"
+#include "mongo/db/exec/sbe/values/value.h"
+
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+void ByteCode::allocStackImpl(size_t newSizeDelta) noexcept {
+    tassert(11086816, "Asking for 0 bytes on stack", newSizeDelta != 0);
+
+    auto oldSize = _argStackEnd - _argStack;
+    auto oldTop = _argStackTop - _argStack;
+
+    auto newSize = oldSize + newSizeDelta;
+    uint8_t* newArgStack = static_cast<uint8_t*>(::operator new(newSize));
+    memcpy(newArgStack, _argStack, oldSize);
+    ::operator delete(_argStack, oldSize);
+
+    _argStack = newArgStack;
+    _argStackEnd = _argStack + newSize;
+    _argStackTop = _argStack + oldTop;
+}
+
+ByteCode::TopBottomArgs::~TopBottomArgs() {}
+
+value::TagValueView ByteCode::getField(value::TagValueView obj, value::TagValueView field) {
+    if (!value::isString(field.tag)) {
+        return value::TagValueView::nothing();
+    }
+    return getField(obj, value::getStringView(field.tag, field.value));
+}
+
+value::TagValueView ByteCode::getField(value::TagValueView obj, std::string_view fieldStr) {
+    if (MONGO_likely(obj.tag == value::TypeTags::bsonObject)) {
+        auto be = value::bitcastTo<const char*>(obj.value);
+        return bson::getField(be, fieldStr);
+    } else if (obj.tag == value::TypeTags::Object) {
+        return value::getObjectView(obj.value)->getField(fieldStr);
+    }
+    return value::TagValueView::nothing();
+}
+
+value::TagValueView ByteCode::getElement(value::TagValueView arr, value::TagValueView idx) {
+    // We need to ensure that 'size_t' is wide enough to store 32-bit index.
+    static_assert(sizeof(size_t) >= sizeof(int32_t), "size_t must be at least 32-bits");
+
+    if (!value::isArray(arr.tag)) {
+        return value::TagValueView::nothing();
+    }
+
+    if (idx.tag != value::TypeTags::NumberInt32) {
+        return value::TagValueView::nothing();
+    }
+
+    const auto idxInt32 = value::bitcastTo<int32_t>(idx.value);
+    const bool isNegative = idxInt32 < 0;
+
+    size_t i = 0;
+    if (isNegative) {
+        // Upcast 'idxInt32' to 'int64_t' prevent overflow during the sign change.
+        i = static_cast<size_t>(-static_cast<int64_t>(idxInt32));
+    } else {
+        i = static_cast<size_t>(idxInt32);
+    }
+
+    if (arr.tag == value::TypeTags::Array) {
+        // If 'arr' is an SBE array, use Array::getAt() to retrieve the element at index 'i'.
+        auto arrayView = value::getArrayView(arr.value);
+
+        size_t convertedIdx = i;
+        if (isNegative) {
+            if (i > arrayView->size()) {
+                return value::TagValueView::nothing();
+            }
+            convertedIdx = arrayView->size() - i;
+        }
+
+        return arrayView->getAt(convertedIdx);
+    } else if (value::tagIn(arr.tag,
+                            value::TypeTags::bsonArray,
+                            value::TypeTags::ArraySet,
+                            value::TypeTags::ArrayMultiSet)) {
+        value::ArrayEnumerator enumerator(arr.tag, arr.value);
+
+        if (!isNegative) {
+            // Loop through array until we meet element at position 'i'.
+            size_t j = 0;
+            while (j < i && !enumerator.atEnd()) {
+                j++;
+                enumerator.advance();
+            }
+            // If the array didn't have an element at index 'i', return Nothing.
+            if (enumerator.atEnd()) {
+                return value::TagValueView::nothing();
+            }
+            return enumerator.getViewOfValue();
+        }
+
+        // For negative indexes we use two pointers approach. We start two array enumerators at the
+        // distance of 'i' and move them at the same time. Once one of the enumerators reaches the
+        // end of the array, the second one points to the element at position '-i'.
+        //
+        // First, move one of the enumerators 'i' elements forward.
+        size_t j = 0;
+        while (j < i && !enumerator.atEnd()) {
+            enumerator.advance();
+            j++;
+        }
+
+        if (j != i) {
+            // Array is too small to have an element at the requested index.
+            return value::TagValueView::nothing();
+        }
+
+        // Initiate second enumerator at the start of the array. Now the distance between
+        // 'enumerator' and 'windowEndEnumerator' is exactly 'i' elements. Move both enumerators
+        // until the first one reaches the end of the array.
+        value::ArrayEnumerator windowEndEnumerator(arr.tag, arr.value);
+        while (!enumerator.atEnd() && !windowEndEnumerator.atEnd()) {
+            enumerator.advance();
+            windowEndEnumerator.advance();
+        }
+        tassert(11093714, "Enumerator didn't reach the end of the array", enumerator.atEnd());
+        tassert(11093715,
+                "Enumerator should not have reached the end of the array",
+                !windowEndEnumerator.atEnd());
+
+        return windowEndEnumerator.getViewOfValue();
+    } else {
+        // Earlier in this function we bailed out if the 'arr.tag' wasn't Array, ArraySet or
+        // bsonArray, so it should be impossible to reach this point.
+        MONGO_UNREACHABLE_TASSERT(11122951);
+    }
+}
+
+value::TagValueView ByteCode::getFieldOrElement(value::TagValueView obj,
+                                                value::TagValueView field) {
+    // If this is an array and we can convert the "field name" to a reasonable number then treat
+    // this as getElement call.
+    if (value::isArray(obj.tag) && value::isString(field.tag)) {
+        int idx;
+        auto status = NumberParser{}(value::getStringView(field.tag, field.value), &idx);
+        if (!status.isOK()) {
+            return value::TagValueView::nothing();
+        }
+        return getElement(obj, value::TagValueView::numberInt32(idx));
+    } else {
+        return getField(obj, field);
+    }
+}
+
+void ByteCode::traverseP(const CodeFragment* code) {
+    // Traverse a projection path - evaluate the input lambda on every element of the input array.
+    // The traversal is recursive; i.e. we visit nested arrays if any.
+    auto [maxDepthOwn, maxDepthTag, maxDepthVal] = getFromStack(0);
+    popAndReleaseStack();
+    auto [lamOwn, lamTag, lamVal] = getFromStack(0);
+    popAndReleaseStack();
+
+    if ((maxDepthTag != value::TypeTags::Nothing && maxDepthTag != value::TypeTags::NumberInt32) ||
+        (lamTag != value::TypeTags::LocalOneArgLambda &&
+         lamTag != value::TypeTags::LocalTwoArgLambda)) {
+        popAndReleaseStack();
+        pushStack(false, value::TypeTags::Nothing, 0);
+        return;
+    }
+
+    int64_t lamPos = value::bitcastTo<int64_t>(lamVal);
+    int64_t maxDepth = maxDepthTag == value::TypeTags::NumberInt32
+        ? value::bitcastTo<int32_t>(maxDepthVal)
+        : std::numeric_limits<int64_t>::max();
+
+    traverseP(code, lamPos, lamTag == value::TypeTags::LocalTwoArgLambda, maxDepth);
+}
+
+void ByteCode::traverseP(const CodeFragment* code,
+                         int64_t position,
+                         bool providePosition,
+                         int64_t maxDepth) {
+    auto [own, tag, val] = getFromStack(0);
+
+    if (value::isArray(tag) && maxDepth > 0) {
+        value::TagValueMaybeOwned input(own, tag, val);
+        popStack();
+
+        if (maxDepth != std::numeric_limits<int64_t>::max()) {
+            --maxDepth;
+        }
+
+        traverseP_nested(code, position, tag, val, providePosition, maxDepth, 0);
+    } else {
+        if (providePosition) {
+            // Push a -1 on the stack (to indicate that we are not iterating over an array) before
+            // the value to be processed
+            pushStack(false, value::TypeTags::NumberInt64, value::bitcastTo<int64_t>(-1));
+        }
+        runLambdaInternal(code, position);
+        if (providePosition) {
+            // Remove the position from the stack.
+            swapStack();
+            popStack();
+        }
+    }
+}
+
+void ByteCode::traverseP_nested(const CodeFragment* code,
+                                int64_t position,
+                                value::TypeTags tagInput,
+                                value::Value valInput,
+                                bool providePosition,
+                                int64_t maxDepth,
+                                int64_t curDepth) {
+    auto decrement = [](int64_t d) {
+        return d == std::numeric_limits<int64_t>::max() ? d : d - 1;
+    };
+
+    value::TagValueOwned newArr = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arrOutput = value::getArrayView(newArr.value());
+    // The array position we will be sending to the lambda holds the depth in the highest 32 bit,
+    // and the actual index in the current array in the lowest 32 bit.
+    size_t arrayPos = curDepth << 32;
+    value::arrayForEach(tagInput, valInput, [&](value::TypeTags elemTag, value::Value elemVal) {
+        if (maxDepth > 0 && value::isArray(elemTag)) {
+            traverseP_nested(code,
+                             position,
+                             elemTag,
+                             elemVal,
+                             providePosition,
+                             decrement(maxDepth),
+                             curDepth + 1);
+        } else {
+            pushStack(false, elemTag, elemVal);
+            if (providePosition) {
+                pushStack(false, value::TypeTags::NumberInt64, value::bitcastTo<int64_t>(arrayPos));
+            }
+            runLambdaInternal(code, position);
+            if (providePosition) {
+                // Remove the position from the stack.
+                swapStack();
+                popStack();
+            }
+        }
+        arrayPos++;
+
+        auto [retOwn, retTag, retVal] = getFromStack(0);
+        popStack();
+        if (!retOwn) {
+            auto [copyTag, copyVal] = value::copyValue(retTag, retVal);
+            retTag = copyTag;
+            retVal = copyVal;
+        }
+        arrOutput->push_back_raw(retTag, retVal);
+    });
+    auto [tagArrOutput, valArrOutput] = newArr.releaseToRaw();
+    pushStack(true, tagArrOutput, valArrOutput);
+}
+
+void ByteCode::traverseF(const CodeFragment* code) {
+    // Traverse a filter path - evaluate the input lambda (predicate) on every element of the input
+    // array without recursion.
+    auto [numberOwn, numberTag, numberVal] = getFromStack(0);
+    popAndReleaseStack();
+    auto [lamOwn, lamTag, lamVal] = getFromStack(0);
+    popAndReleaseStack();
+
+    if (lamTag != value::TypeTags::LocalOneArgLambda &&
+        lamTag != value::TypeTags::LocalTwoArgLambda) {
+        popAndReleaseStack();
+        pushStack(false, value::TypeTags::Nothing, 0);
+        return;
+    }
+    int64_t lamPos = value::bitcastTo<int64_t>(lamVal);
+
+    bool compareArray = numberTag == value::TypeTags::Boolean && value::bitcastTo<bool>(numberVal);
+
+    traverseF(code, lamPos, lamTag == value::TypeTags::LocalTwoArgLambda, compareArray);
+}
+
+void ByteCode::traverseF(const CodeFragment* code,
+                         int64_t position,
+                         bool providePosition,
+                         bool compareArray) {
+    auto [ownInput, tagInput, valInput] = getFromStack(0);
+
+    if (value::isArray(tagInput)) {
+        traverseFInArray(code, position, providePosition, compareArray);
+    } else {
+        // Push a -1 on the stack (to indicate that we are not iterating over an array) before the
+        // value to be processed
+        if (providePosition) {
+            pushStack(false, value::TypeTags::NumberInt64, value::bitcastTo<int64_t>(-1));
+        }
+        runLambdaInternal(code, position);
+        // Remove the item position from the stack.
+        if (providePosition) {
+            swapStack();
+            popStack();
+        }
+    }
+}
+
+bool ByteCode::runLambdaPredicate(const CodeFragment* code, int64_t position) {
+    runLambdaInternal(code, position);
+    auto ret = getMaybeOwnedFromStack(0);
+    popStack();
+    return (ret.tag() == value::TypeTags::Boolean) && value::bitcastTo<bool>(ret.value());
+}
+
+void ByteCode::traverseFInArray(const CodeFragment* code,
+                                int64_t position,
+                                bool providePosition,
+                                bool compareArray) {
+    auto [ownInput, tagInput, valInput] = getFromStack(0);
+
+    value::TagValueMaybeOwned input(ownInput, tagInput, valInput);
+    popStack();
+
+    size_t arrayPos = 0;
+    const bool passed =
+        value::arrayAny(tagInput, valInput, [&](value::TypeTags tag, value::Value val) {
+            pushStack(false, tag, val);
+            if (providePosition) {
+                pushStack(
+                    false, value::TypeTags::NumberInt64, value::bitcastTo<int64_t>(arrayPos++));
+            }
+            if (runLambdaPredicate(code, position)) {
+                if (providePosition) {
+                    popStack();
+                }
+                pushStack(false, value::TypeTags::Boolean, value::bitcastFrom<bool>(true));
+                return true;
+            }
+            if (providePosition) {
+                popStack();
+            }
+            return false;
+        });
+
+    if (passed) {
+        return;
+    }
+
+    // If this is a filter over a number path then run over the whole array. More details in
+    // SERVER-27442.
+    if (compareArray) {
+        // Transfer the ownership to the lambda
+        pushStack(ownInput, tagInput, valInput);
+        if (providePosition) {
+            pushStack(false, value::TypeTags::NumberInt64, value::bitcastTo<int64_t>(-1));
+        }
+        input.disown();
+        runLambdaInternal(code, position);
+        if (providePosition) {
+            swapStack();
+            popStack();
+        }
+        return;
+    }
+
+    pushStack(false, value::TypeTags::Boolean, value::bitcastFrom<bool>(false));
+}
+
+
+value::TagValueView ByteCode::getArraySize(value::TagValueView arr) {
+    size_t result = 0;
+
+    switch (arr.tag) {
+        case value::TypeTags::Array: {
+            result = value::getArrayView(arr.value)->size();
+            break;
+        }
+        case value::TypeTags::ArraySet: {
+            result = value::getArraySetView(arr.value)->size();
+            break;
+        }
+        case value::TypeTags::ArrayMultiSet: {
+            result = value::getArrayMultiSetView(arr.value)->size();
+            break;
+        }
+        case value::TypeTags::bsonArray: {
+            value::arrayForEach(
+                arr.tag, arr.value, [&](value::TypeTags, value::Value) { result++; });
+            break;
+        }
+        default:
+            return value::TagValueView::nothing();
+    }
+
+    return value::TagValueView::numberInt64(static_cast<int64_t>(result));
+}
+
+value::TagValueOwned ByteCode::aggSum(value::TagValueOwned acc, value::TagValueView field) {
+    // Skip aggregation step if the input is Nothing or non-numeric.
+    if (!value::isNumber(field.tag)) {
+        return acc;
+    }
+
+    // Initialize the accumulator.
+    if (acc.tag() == value::TypeTags::Nothing) {
+        acc = value::TagValueOwned::numberInt32(0);
+    }
+
+    return genericAdd(acc.tag(), acc.value(), field.tag, field.value).moveToOwned();
+}
+
+value::TagValueOwned ByteCode::aggCount(value::TagValueOwned acc) {
+    int64_t n =
+        acc.tag() == value::TypeTags::NumberInt64 ? value::bitcastTo<int64_t>(acc.value()) : 0;
+    return value::TagValueOwned::numberInt64(n + 1);
+}
+
+void ByteCode::genericResetDoubleDoubleSumState(value::Array* state) {
+    state->clear();
+    // The order of the following three elements should match to 'AggSumValueElems'. An absent
+    // 'kDecimalTotal' element means that we've not seen any decimal value. So, we're not adding
+    // 'kDecimalTotal' element yet.
+    state->push_back_raw(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(0));
+    state->push_back_raw(value::TypeTags::NumberDouble, value::bitcastFrom<double>(0.0));
+    state->push_back_raw(value::TypeTags::NumberDouble, value::bitcastFrom<double>(0.0));
+}
+
+std::pair<value::TypeTags, value::Value> ByteCode::genericInitializeDoubleDoubleSumState() {
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arr = value::getArrayView(result.value());
+    arr->reserve(AggSumValueElems::kMaxSizeOfArray);
+
+    genericResetDoubleDoubleSumState(arr);
+
+    return result.releaseToRaw();
+}
+
+value::TagValueOwned ByteCode::aggMin(value::TagValueView acc,
+                                      value::TagValueView field,
+                                      CollatorInterface* collator) {
+    // Skip aggregation step if we don't have the input.
+    if (field.tag == value::TypeTags::Nothing) {
+        return acc.copy();
+    }
+
+    // Initialize the accumulator.
+    if (acc.tag == value::TypeTags::Nothing) {
+        return field.copy();
+    }
+
+    auto [tag, val] = value::compare3way(acc.tag, acc.value, field.tag, field.value, collator);
+
+    if (tag == value::TypeTags::NumberInt32 && value::bitcastTo<int>(val) < 0) {
+        return acc.copy();
+    } else {
+        return field.copy();
+    }
+}
+
+value::TagValueOwned ByteCode::aggMax(value::TagValueView acc,
+                                      value::TagValueView field,
+                                      CollatorInterface* collator) {
+    // Skip aggregation step if we don't have the input.
+    if (field.tag == value::TypeTags::Nothing) {
+        return acc.copy();
+    }
+
+    // Initialize the accumulator.
+    if (acc.tag == value::TypeTags::Nothing) {
+        return field.copy();
+    }
+
+    auto [tag, val] = value::compare3way(acc.tag, acc.value, field.tag, field.value, collator);
+
+    if (tag == value::TypeTags::NumberInt32 && value::bitcastTo<int>(val) > 0) {
+        return acc.copy();
+    } else {
+        return field.copy();
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::aggFirst(value::TypeTags accTag,
+                                             value::Value accValue,
+                                             value::TypeTags fieldTag,
+                                             value::Value fieldValue) {
+    // Skip aggregation step if we don't have the input.
+    if (fieldTag == value::TypeTags::Nothing) {
+        auto [tag, val] = value::copyValue(accTag, accValue);
+        return {true, tag, val};
+    }
+
+    // Initialize the accumulator.
+    if (accTag == value::TypeTags::Nothing) {
+        auto [tag, val] = value::copyValue(fieldTag, fieldValue);
+        return {true, tag, val};
+    }
+
+    // Disregard the next value, always return the first one.
+    auto [tag, val] = value::copyValue(accTag, accValue);
+    return {true, tag, val};
+}
+
+value::TagValueMaybeOwned ByteCode::aggLast(value::TypeTags accTag,
+                                            value::Value accValue,
+                                            value::TypeTags fieldTag,
+                                            value::Value fieldValue) {
+    // Skip aggregation step if we don't have the input.
+    if (fieldTag == value::TypeTags::Nothing) {
+        auto [tag, val] = value::copyValue(accTag, accValue);
+        return {true, tag, val};
+    }
+
+    // Initialize the accumulator.
+    if (accTag == value::TypeTags::Nothing) {
+        auto [tag, val] = value::copyValue(fieldTag, fieldValue);
+        return {true, tag, val};
+    }
+
+    // Disregard the accumulator, always return the next value.
+    auto [tag, val] = value::copyValue(fieldTag, fieldValue);
+    return {true, tag, val};
+}
+
+
+bool hasSeparatorAt(size_t idx, std::string_view input, std::string_view separator) {
+    return (idx + separator.size() <= input.size()) &&
+        input.substr(idx, separator.size()) == separator;
+}
+
+value::TagValueMaybeOwned ByteCode::addToSetCappedImpl(value::TagValueOwned accumulatorStateTagVal,
+                                                       value::TagValueMaybeOwned newElem,
+                                                       int32_t sizeCap,
+                                                       CollatorInterface* collator) {
+
+    // The capped addToSet accumulator holds a value of Nothing at first and gets initialized on
+    // demand when the first value gets added. Once initialized, the state is a two-element array
+    // containing the set and its size in bytes, which is necessary to enforce the memory cap.
+    if (accumulatorStateTagVal.tag() == value::TypeTags::Nothing) {
+        accumulatorStateTagVal = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto accumulatorState = value::getArrayView(accumulatorStateTagVal.value());
+
+        auto [tagAccSet, valAccSet] = value::makeNewArraySet(collator);
+
+        // The order is important! The accumulated array should be at index
+        // AggArrayWithSize::kValues, and the size should be at index
+        // AggArrayWithSize::kSizeOfValues.
+        accumulatorState->push_back_raw(tagAccSet, valAccSet);
+        accumulatorState->push_back_raw(value::TypeTags::NumberInt64,
+                                        value::bitcastFrom<int64_t>(0));
+    }
+    tassert(10936800,
+            "Expected array for set accumulator state",
+            accumulatorStateTagVal.tag() == value::TypeTags::Array);
+
+    auto accumulatorState = value::getArrayView(accumulatorStateTagVal.value());
+    tassert(10936801,
+            "Set accumulator with invalid length",
+            accumulatorState->size() == static_cast<size_t>(AggArrayWithSize::kLast));
+
+    // Check that the accumulated size of the set won't exceed the limit after adding the new value,
+    // and if so, add the value.
+    auto accSetTagVal = accumulatorState->getAt(static_cast<size_t>(AggArrayWithSize::kValues));
+    tassert(10936802,
+            "Expected ArraySet in accumulator state",
+            accSetTagVal.tag == value::TypeTags::ArraySet);
+    auto accSet = value::getArraySetView(accSetTagVal.value);
+    if (!accSet->values().contains(newElem.raw())) {
+        auto elemSize = value::getApproximateSize(newElem.tag(), newElem.value());
+        auto accSizeTagVal =
+            accumulatorState->getAt(static_cast<size_t>(AggArrayWithSize::kSizeOfValues));
+        tassert(10936803,
+                "Expected integer value for ArraySet size",
+                accSizeTagVal.tag == value::TypeTags::NumberInt64);
+        const int64_t currentSize = value::bitcastTo<int64_t>(accSizeTagVal.value);
+        int64_t newSize = currentSize + elemSize;
+
+        uassert(ErrorCodes::ExceededMemoryLimit,
+                str::stream() << "Used too much memory for a single set. Memory limit: " << sizeCap
+                              << " bytes. The set contains " << accSet->size()
+                              << " elements and is of size " << currentSize
+                              << " bytes. The element being added has size " << elemSize
+                              << " bytes.",
+                newSize < static_cast<int64_t>(sizeCap));
+
+        accumulatorState->setAt(static_cast<size_t>(AggArrayWithSize::kSizeOfValues),
+                                value::TypeTags::NumberInt64,
+                                value::bitcastFrom<int64_t>(newSize));
+
+        // Insert the new value. Note that array will ignore Nothing.
+        if (newElem.owned()) {
+            accSet->push_back_raw(newElem.releaseToOwnedRaw());
+        } else {
+            accSet->push_back_clone(newElem.tag(), newElem.value());
+        }
+    }
+
+    return accumulatorStateTagVal;
+}
+
+value::TagValueMaybeOwned ByteCode::setUnionAccumImpl(value::TagValueOwned accumulatorStateTagVal,
+                                                      value::TagValueOwned newSetMembers,
+                                                      int32_t sizeCap,
+                                                      CollatorInterface* collator) {
+
+    // The capped addToSet accumulator holds a value of Nothing at first and gets initialized on
+    // demand when the first value gets added. Once initialized, the state is a two-element array
+    // containing the set and its size in bytes, which is necessary to enforce the memory cap.
+    if (accumulatorStateTagVal.tag() == value::TypeTags::Nothing) {
+        auto [tagAccSet, valAccSet] = value::makeNewArraySet(collator);
+
+        accumulatorStateTagVal = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto accumulatorState = value::getArrayView(accumulatorStateTagVal.value());
+
+        // The order is important! The accumulated array should be at index
+        // AggArrayWithSize::kValues, and the size should be at index
+        // AggArrayWithSize::kSizeOfValues.
+        accumulatorState->push_back_raw(tagAccSet, valAccSet);
+        accumulatorState->push_back_raw(value::TypeTags::NumberInt64,
+                                        value::bitcastFrom<int64_t>(0));
+    }
+    tassert(7039521,
+            "Expected array for set accumulator state",
+            accumulatorStateTagVal.tag() == value::TypeTags::Array);
+
+    tassert(10936804,
+            "Expected right-hand side of union to have array type",
+            value::isArray(newSetMembers.tag()) || newSetMembers.tag() == value::TypeTags::Nothing);
+
+    auto accumulatorState = value::getArrayView(accumulatorStateTagVal.value());
+    tassert(1093605,
+            "Set accumulator with invalid length",
+            accumulatorState->size() == static_cast<size_t>(AggArrayWithSize::kLast));
+
+    auto accSetTagVal = accumulatorState->getAt(static_cast<size_t>(AggArrayWithSize::kValues));
+    tassert(7039523,
+            "Expected ArraySet in accumulator state",
+            accSetTagVal.tag == value::TypeTags::ArraySet);
+    auto accSet = value::getArraySetView(accSetTagVal.value);
+
+    // Extract the current size of the accumulator. As we add elements to the set, we will increment
+    // the current size accordingly and throw an exception if we ever exceed the size limit. We
+    // cannot simply sum the two sizes, since the two sets could have a substantial intersection.
+    auto accSizeTagVal =
+        accumulatorState->getAt(static_cast<size_t>(AggArrayWithSize::kSizeOfValues));
+    tassert(7039524, "expected 64-bit int", accSizeTagVal.tag == value::TypeTags::NumberInt64);
+    int64_t currentSize = value::bitcastTo<int64_t>(accSizeTagVal.value);
+
+    if (newSetMembers.tag() != value::TypeTags::Nothing) {
+        value::arrayForEach<true>(
+            newSetMembers.tag(),
+            newSetMembers.value(),
+            [&](value::TypeTags tagNewElem, value::Value valNewElem) {
+                value::TagValueOwned newElem =
+                    value::TagValueOwned::fromRaw(tagNewElem, valNewElem);
+
+                if (accSet->values().contains({tagNewElem, valNewElem})) {
+                    // Skip this element, because it's already in the set, and continue with the
+                    // remaining elements.
+                    return;
+                }
+
+                int elemSize = value::getApproximateSize(tagNewElem, valNewElem);
+                currentSize += elemSize;
+                uassert(ErrorCodes::ExceededMemoryLimit,
+                        str::stream() << "Used too much memory for a single array. Memory limit: "
+                                      << sizeCap << ". Current set has " << accSet->size()
+                                      << " elements and is " << currentSize << " bytes.",
+                        currentSize < static_cast<int64_t>(sizeCap));
+
+                accSet->push_back(std::move(newElem));
+            });
+    }
+
+    // Update the accumulator with the new total size.
+    accumulatorState->setAt(static_cast<size_t>(AggArrayWithSize::kSizeOfValues),
+                            value::TypeTags::NumberInt64,
+                            value::bitcastFrom<int64_t>(currentSize));
+
+    return accumulatorStateTagVal;
+}
+
+ByteCode::MultiAccState ByteCode::getMultiAccState(value::TagValueView state) {
+    uassert(
+        7548600, "The accumulator state should be an array", state.tag == value::TypeTags::Array);
+    auto stateArray = value::getArrayView(state.value);
+
+    uassert(7548601,
+            "The accumulator state should have correct number of elements",
+            stateArray->size() == static_cast<size_t>(AggMultiElems::kSizeOfArray));
+
+    auto arrayTagVal = stateArray->getAt(static_cast<size_t>(AggMultiElems::kInternalArr));
+    uassert(7548602,
+            "Internal array component is not of correct type",
+            arrayTagVal.tag == value::TypeTags::Array);
+    auto array = value::getArrayView(arrayTagVal.value);
+
+    auto startIndexTagVal = stateArray->getAt(static_cast<size_t>(AggMultiElems::kStartIdx));
+    uassert(7548700,
+            "Index component be a 64-bit integer",
+            startIndexTagVal.tag == value::TypeTags::NumberInt64);
+    int64_t startIndex = value::bitcastTo<int64_t>(startIndexTagVal.value);
+
+    auto maxSizeTagVal = stateArray->getAt(static_cast<size_t>(AggMultiElems::kMaxSize));
+    uassert(7548603,
+            "MaxSize component should be a 64-bit integer",
+            maxSizeTagVal.tag == value::TypeTags::NumberInt64);
+    int64_t maxSize = value::bitcastTo<int64_t>(maxSizeTagVal.value);
+
+    auto memUsageTagVal = stateArray->getAt(static_cast<size_t>(AggMultiElems::kMemUsage));
+    uassert(7548612,
+            "MemUsage component should be a 32-bit integer",
+            memUsageTagVal.tag == value::TypeTags::NumberInt32);
+    int32_t memUsage = value::bitcastTo<int32_t>(memUsageTagVal.value);
+
+    auto memLimitTagVal = stateArray->getAt(static_cast<size_t>(AggMultiElems::kMemLimit));
+    uassert(7548613,
+            "MemLimit component should be a 32-bit integer",
+            memLimitTagVal.tag == value::TypeTags::NumberInt32);
+    auto memLimit = value::bitcastTo<int32_t>(memLimitTagVal.value);
+
+    auto isGroupAccumTagVal = stateArray->getAt(static_cast<size_t>(AggMultiElems::kIsGroupAccum));
+    uassert(8070611,
+            "IsGroupAccum component should be a boolean",
+            isGroupAccumTagVal.tag == value::TypeTags::Boolean);
+    auto isGroupAccum = value::bitcastTo<bool>(isGroupAccumTagVal.value);
+
+    return {stateArray, array, startIndex, maxSize, memUsage, memLimit, isGroupAccum};
+}
+
+int32_t updateAndCheckMemUsage(
+    value::Array* state, int32_t memUsage, int32_t memAdded, int32_t memLimit, size_t idx) {
+    memUsage += memAdded;
+    uassert(ErrorCodes::ExceededMemoryLimit,
+            str::stream()
+                << "Accumulator used too much memory and spilling to disk cannot reduce memory "
+                   "consumption any further. Memory limit: "
+                << memLimit << " bytes",
+            memUsage < memLimit);
+    state->setAt(idx, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(memUsage));
+    return memUsage;
+}
+
+template <TopBottomSense Sense>
+int32_t ByteCode::aggTopBottomNAdd(value::Array* state,
+                                   value::Array* array,
+                                   size_t maxSize,
+                                   int32_t memUsage,
+                                   int32_t memLimit,
+                                   ByteCode::TopBottomArgs& args) {
+    using Less =
+        std::conditional_t<Sense == TopBottomSense::kTop, SortPatternLess, SortPatternGreater>;
+
+    auto memAdded = [](value::TagValueView key, value::TagValueView value) {
+        return value::getApproximateSize(key.tag, key.value) +
+            value::getApproximateSize(value.tag, value.value);
+    };
+
+    auto less = Less(args.getSortSpec());
+    auto keyLess = PairKeyComp(less);
+    auto& heap = array->values();
+
+    if (array->size() < maxSize) {
+        auto ownedPair = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto pair = value::getArrayView(ownedPair.value());
+        pair->reserve(2);
+
+        value::TagValueOwned key = args.getOwnedKey();
+        value::TagValueOwned value = args.getOwnedValue();
+
+        memUsage =
+            updateAndCheckMemUsage(state, memUsage, memAdded(key.view(), value.view()), memLimit);
+
+        pair->push_back(std::move(key));
+        pair->push_back(std::move(value));
+
+        array->push_back(std::move(ownedPair));
+        std::push_heap(heap.begin(), heap.end(), keyLess);
+    } else {
+        tassert(5807005,
+                "Heap should contain same number of elements as MaxSize",
+                array->size() == maxSize);
+
+        auto [worstTag, worstVal] = heap.front();
+        auto worst = value::getArrayView(worstVal);
+        auto worstKey = worst->getAt(0);
+
+        if (args.keySortsBefore(worstKey)) {
+            value::TagValueOwned key = args.getOwnedKey();
+            value::TagValueOwned value = args.getOwnedValue();
+
+            memUsage = updateAndCheckMemUsage(state,
+                                              memUsage,
+                                              -memAdded(worst->getAt(0), worst->getAt(1)) +
+                                                  memAdded(key.view(), value.view()),
+                                              memLimit);
+
+            std::pop_heap(heap.begin(), heap.end(), keyLess);
+
+            worst->setAt(0, std::move(key));
+            worst->setAt(1, std::move(value));
+
+            std::push_heap(heap.begin(), heap.end(), keyLess);
+        }
+    }
+
+    return memUsage;
+}  // aggTopBottomNAdd
+
+int32_t ByteCode::aggTopNAdd(value::Array* state,
+                             value::Array* array,
+                             size_t maxSize,
+                             int32_t memUsage,
+                             int32_t memLimit,
+                             TopBottomArgs& args) {
+    return aggTopBottomNAdd<TopBottomSense::kTop>(state, array, maxSize, memUsage, memLimit, args);
+}
+
+int32_t ByteCode::aggBottomNAdd(value::Array* state,
+                                value::Array* array,
+                                size_t maxSize,
+                                int32_t memUsage,
+                                int32_t memLimit,
+                                TopBottomArgs& args) {
+    return aggTopBottomNAdd<TopBottomSense::kBottom>(
+        state, array, maxSize, memUsage, memLimit, args);
+}
+
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

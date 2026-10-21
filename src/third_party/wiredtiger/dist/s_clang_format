@@ -1,0 +1,36 @@
+#! /bin/bash
+
+set -o pipefail
+. `dirname -- ${BASH_SOURCE[0]}`/common_functions.sh
+setup_trap
+cd_top
+check_fast_mode_flag
+
+check_clang_format
+
+# Parallel execution: if it's the main invocation of the script, collect the file names
+# to process and run them in subprocesses.
+if is_main_run; then
+    search=`find bench examples ext src test tools/checksum_bitflip -name '*.[ch]' \
+        -o -name '*.cpp' | grep -v 'test/3rdparty' | filter_if_fast`
+    for f in `cat dist/s_clang_format.list`; do
+        search=`echo "$search" | sed "\#$f#d"`
+    done
+    echo "$search" | do_in_parallel
+    exit $?
+fi
+
+# A list of files provided: process them one by one.
+# Don't format inplace with -i flag.
+# We want to be able to detect modifications.
+for f in "$@"; do
+    cat "$f" | \
+            "$clang_format" --fallback-style=none | \
+            python3 dist/s_comment.py > "$t" || exit 1
+    if ! cmp -s "$f" "$t"; then
+        if [[ -n "$S_RECURSE" ]] ; then
+            echo "Modifying $f"
+        fi
+        cp "$t" "$f"
+    fi
+done

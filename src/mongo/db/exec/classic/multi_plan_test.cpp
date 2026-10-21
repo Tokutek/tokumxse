@@ -1,0 +1,1451 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/multi_plan.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/classic/collection_scan.h"
+#include "mongo/db/exec/classic/fetch.h"
+#include "mongo/db/exec/classic/index_scan.h"
+#include "mongo/db/exec/classic/mock_stage.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/mock_yield_policies.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/plan_yield_policy_impl.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration_test_util.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_planner_test_lib.h"
+#include "mongo/db/query/query_tester/mock_version_info.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/platform/atomic.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/serialization_context.h"
+
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+
+using unittest::assertGet;
+
+const std::unique_ptr<ClockSource> clockSource = std::make_unique<ClockSourceMock>();
+
+namespace {
+
+using std::unique_ptr;
+using std::vector;
+
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("unittests.multi_plan_test");
+
+std::unique_ptr<QuerySolution> createQuerySolution() {
+    auto soln = std::make_unique<QuerySolution>();
+    soln->setRoot(std::make_unique<CollectionScanNode>());
+    soln->cacheData = std::make_unique<SolutionCacheData>();
+    soln->cacheData->solnType = SolutionCacheData::COLLSCAN_SOLN;
+    soln->cacheData->tree = std::make_unique<PlanCacheIndexTree>();
+    return soln;
+}
+
+class QueryStageMultiPlanTest : public ServiceContextMongoDTest {
+public:
+    QueryStageMultiPlanTest()
+        : opCtx{makeOperationContext()},
+          expCtx{ExpressionContextBuilder{}.opCtx(opCtx.get()).ns(nss).build()},
+          client{std::make_unique<DBDirectClient>(opCtx.get())} {
+        // Make sure we are the primary so we can create collections and indexes.
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
+        ASSERT(replCoord);
+        auto replCoordMock = dynamic_cast<repl::ReplicationCoordinatorMock*>(replCoord);
+        ASSERT(replCoordMock);
+        ASSERT_OK(replCoordMock->setFollowerMode(repl::MemberState::RS_PRIMARY));
+    }
+
+    void addIndex(const BSONObj& obj) {
+        client->createCollection(nss);
+        IndexSpec spec;
+        spec.name(DBClientBase::genIndexName(obj));
+        spec.addKeys(obj);
+        client->createIndex(nss, spec);
+    }
+
+    void insert(const BSONObj& obj) {
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setDocuments({obj});
+        auto insertReply = client->insert(insertOp);
+        ASSERT_EQ(insertReply.getN(), 1);
+        ASSERT_FALSE(insertReply.getWriteErrors());
+    }
+
+    QueryPlannerParams makePlannerParams(const CollectionAcquisition& collection,
+                                         const CanonicalQuery& canonicalQuery) {
+        MultipleCollectionAccessor collections(collection);
+        return QueryPlannerParams{
+            QueryPlannerParams::ArgsForSingleCollectionQuery{
+                .opCtx = opCtx.get(),
+                .canonicalQuery = canonicalQuery,
+                .collections = collections,
+                .plannerOptions = QueryPlannerParams::DEFAULT,
+            },
+        };
+    }
+
+    CollectionAcquisition getCollection() {
+        return acquireCollection(opCtx.get(),
+                                 CollectionAcquisitionRequest::fromOpCtx(
+                                     opCtx.get(), nss, AcquisitionPrerequisites::kRead),
+                                 MODE_IS);
+    }
+
+protected:
+    ServiceContext::UniqueOperationContext opCtx;
+    boost::intrusive_ptr<ExpressionContext> expCtx;
+    std::unique_ptr<DBDirectClient> client;
+};
+
+std::unique_ptr<CanonicalQuery> makeCanonicalQuery(OperationContext* opCtx,
+                                                   NamespaceString nss,
+                                                   BSONObj filter) {
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(filter);
+    return std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+}
+
+unique_ptr<PlanStage> getIxScanPlan(ExpressionContext* expCtx,
+                                    const CollectionAcquisition& coll,
+                                    WorkingSet* sharedWs,
+                                    int desiredFooValue) {
+    std::vector<const IndexCatalogEntry*> indexes;
+    coll.getCollectionPtr()->getIndexCatalog()->findIndexesByKeyPattern(
+        expCtx->getOperationContext(),
+        BSON("foo" << 1),
+        IndexCatalog::InclusionPolicy::kReady,
+        &indexes);
+    ASSERT_EQ(indexes.size(), 1U);
+
+    IndexScanParams ixparams(expCtx->getOperationContext(), coll.getCollectionPtr(), indexes[0]);
+    ixparams.bounds.isSimpleRange = true;
+    ixparams.bounds.startKey = BSON("" << desiredFooValue);
+    ixparams.bounds.endKey = BSON("" << desiredFooValue);
+    ixparams.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
+    ixparams.direction = 1;
+
+    auto ixscan = std::make_unique<IndexScan>(expCtx, coll, ixparams, sharedWs, nullptr);
+    return std::make_unique<FetchStage>(expCtx, sharedWs, std::move(ixscan), nullptr, coll);
+}
+
+unique_ptr<MatchExpression> makeMatchExpressionFromFilter(ExpressionContext* expCtx,
+                                                          BSONObj filterObj) {
+    StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(filterObj, expCtx);
+    ASSERT_OK(statusWithMatcher.getStatus());
+    unique_ptr<MatchExpression> filter = std::move(statusWithMatcher.getValue());
+    ASSERT(filter);
+    return filter;
+}
+
+
+unique_ptr<PlanStage> getCollScanPlan(ExpressionContext* expCtx,
+                                      const CollectionAcquisition& coll,
+                                      WorkingSet* sharedWs,
+                                      MatchExpression* matchExpr) {
+    CollectionScanParams csparams;
+    csparams.direction = CollectionScanParams::FORWARD;
+
+    unique_ptr<PlanStage> root(new CollectionScan(expCtx, coll, csparams, sharedWs, matchExpr));
+    return root;
+}
+
+const PlanStage* getBestPlanRoot(const MultiPlanStage* mps) {
+    auto bestPlanIdx = mps->bestPlanIdx();
+    return bestPlanIdx ? mps->getChildren()[bestPlanIdx.get()].get() : nullptr;
+}
+
+std::unique_ptr<MultiPlanStage> runMultiPlanner(ExpressionContext* expCtx,
+                                                const NamespaceString& nss,
+                                                const CollectionAcquisition& coll,
+                                                int desiredFooValue) {
+    // Plan 0: IXScan over foo == desiredFooValue
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx, coll, sharedWs.get(), desiredFooValue);
+    const auto* ixScanRootPtr = ixScanRoot.get();
+
+    // Plan 1: CollScan.
+    BSONObj filterObj = BSON("foo" << desiredFooValue);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx, filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx, coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq =
+        makeCanonicalQuery(expCtx->getOperationContext(), nss, BSON("foo" << desiredFooValue));
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx,
+        coll,
+        cq.get(),
+        plan_cache_util::ClassicPlanCacheWriter{expCtx->getOperationContext(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    // Plan 0 aka the first plan aka the index scan should be the best.
+    NoopYieldPolicy yieldPolicy(expCtx->getOperationContext(),
+                                &expCtx->getOperationContext()->fastClockSource());
+    ASSERT_OK(mps->runTrials(&yieldPolicy));
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT(mps->bestPlanChosen());
+    ASSERT_EQUALS(getBestPlanRoot(mps.get()), ixScanRootPtr);
+
+    return mps;
+}
+
+size_t getBestPlanWorks(MultiPlanStage* mps) {
+    auto bestPlanIdx = mps->bestPlanIdx();
+    tassert(3420011,
+            "Trying to get stats of a MultiPlanStage without winning plan",
+            bestPlanIdx.has_value());
+    return mps->getChildren()[*bestPlanIdx]->getStats()->common.works;
+}
+
+
+// Basic ranking test: collection scan vs. highly selective index scan.  Make sure we also get
+// all expected results out as well.
+TEST_F(QueryStageMultiPlanTest, MPSCollectionScanVsHighlySelectiveIXScan) {
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    const auto* ixScanRootPtr = ixScanRoot.get();
+
+    // Plan 1: CollScan with matcher.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto* mpsPtr = mps.get();
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mpsPtr),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    ASSERT_OK(mpsPtr->runTrials(planYieldPolicy.get()));
+    ASSERT_OK(mpsPtr->pickBestPlan());
+    ASSERT_TRUE(mpsPtr->bestPlanChosen());
+    ASSERT_EQUALS(mpsPtr->getChildren()[mpsPtr->bestPlanIdx().get()].get(), ixScanRootPtr);
+
+    // Takes ownership of arguments other than 'collection'.
+    auto exec = plan_executor_factory::make(std::move(cq),
+                                            std::move(sharedWs),
+                                            std::move(mps),
+                                            coll,
+                                            PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                            QueryPlannerParams::DEFAULT,
+                                            nss);
+
+    // Get all our results out.
+    int results = 0;
+    BSONObj obj;
+    PlanExecutor::ExecState state;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+        ASSERT_EQUALS(obj["foo"].numberInt(), 7);
+        ++results;
+    }
+    ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
+    ASSERT_EQUALS(results, N / 10);
+}
+
+TEST_F(QueryStageMultiPlanTest, MPSDoesNotCreateActiveCacheEntryImmediately) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        // Have a larger proportion of 5's than anything else.
+        int toInsert = i % 10 >= 8 ? 5 : i % 10;
+        insert(BSON("foo" << toInsert));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    const auto cq = makeCanonicalQuery(opCtx.get(), nss, BSON("foo" << 7));
+    auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, coll);
+
+    // Run an index scan and collection scan, searching for {foo: 7}.
+    auto mps = runMultiPlanner(expCtx.get(), nss, coll, 7);
+    // Be sure that an inactive cache entry was added.
+    PlanCache* cache = CollectionQueryInfo::get(coll.getCollectionPtr()).getPlanCache();
+    ASSERT_EQ(cache->size(), 1U);
+    auto entry = assertGet(cache->getEntry(key));
+    ASSERT_FALSE(entry->isActive);
+    const size_t firstQueryWorks = getBestPlanWorks(mps.get());
+    ASSERT(entry->planCacheDecisionMetrics);
+    ASSERT_EQ(firstQueryWorks, entry->planCacheDecisionMetrics->works.value);
+
+    // Run the multi-planner again. The index scan will again win, but the number of works
+    // will be greater, since {foo: 5} appears more frequently in the collection.
+    mps = runMultiPlanner(expCtx.get(), nss, coll, 5);
+
+    // The last plan run should have required far more works than the previous plan. This means
+    // that the 'works' in the cache entry should have doubled.
+    ASSERT_EQ(cache->size(), 1U);
+    entry = assertGet(cache->getEntry(key));
+    ASSERT_FALSE(entry->isActive);
+    ASSERT(entry->planCacheDecisionMetrics);
+    ASSERT_EQ(firstQueryWorks * 2, entry->planCacheDecisionMetrics->works.value);
+
+    // Run the exact same query again. This will still take more works than 'works', and
+    // should cause the cache entry's 'works' to be doubled again.
+    mps = runMultiPlanner(expCtx.get(), nss, coll, 5);
+    ASSERT_EQ(cache->size(), 1U);
+    entry = assertGet(cache->getEntry(key));
+    ASSERT_FALSE(entry->isActive);
+    ASSERT_EQ(firstQueryWorks * 2 * 2, entry->planCacheDecisionMetrics->works.value);
+
+    // Run the query yet again. This time, an active cache entry should be created.
+    mps = runMultiPlanner(expCtx.get(), nss, coll, 5);
+    ASSERT_EQ(cache->size(), 1U);
+    entry = assertGet(cache->getEntry(key));
+    ASSERT_TRUE(entry->isActive);
+    ASSERT_EQ(getBestPlanWorks(mps.get()), entry->planCacheDecisionMetrics->works.value);
+}
+
+TEST_F(QueryStageMultiPlanTest, MPSDoesCreatesActiveEntryWhenInactiveEntriesDisabled) {
+    // Set the global flag for disabling active entries.
+    unittest::ServerParameterGuard disableInactivePlanCacheEntries{
+        "internalQueryCacheDisableInactiveEntries", true};
+
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << i));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    const auto cq = makeCanonicalQuery(opCtx.get(), nss, BSON("foo" << 7));
+    auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, coll);
+
+    // Run an index scan and collection scan, searching for {foo: 7}.
+    auto mps = runMultiPlanner(expCtx.get(), nss, coll, 7);
+    // Be sure that an _active_ cache entry was added.
+    PlanCache* cache = CollectionQueryInfo::get(coll.getCollectionPtr()).getPlanCache();
+    ASSERT_EQ(cache->get(key).state, PlanCache::CacheEntryState::kPresentActive);
+
+    // Run the multi-planner again. The entry should still be active.
+    mps = runMultiPlanner(expCtx.get(), nss, coll, 5);
+
+    ASSERT_EQ(cache->get(key).state, PlanCache::CacheEntryState::kPresentActive);
+}
+
+// Case in which we select a blocking plan as the winner, and a non-blocking plan
+// is available as a backup.
+TEST_F(QueryStageMultiPlanTest, MPSBackupPlan) {
+    // Data is just a single {_id: 1, a: 1, b: 1} document.
+    insert(BSON("_id" << 1 << "a" << 1 << "b" << 1));
+
+    // Indices on 'a' and 'b'.
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+
+    auto collection = getCollection();
+
+    // Query for both 'a' and 'b' and sort on 'b'.
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("a" << 1 << "b" << 1));
+    findCommand->setSort(BSON("b" << 1));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, collection);
+
+    // Force index intersection and enable AND_SORTED intersection.
+    QueryKnobGuardForTest forceIntersectionPlans{
+        opCtx.get(), "internalQueryForceIntersectionPlans", true};
+    QueryKnobGuardForTest enableSortIntersection{
+        opCtx.get(), "internalQueryPlannerEnableSortIndexIntersection", true};
+
+    // Plan.
+    auto plannerParams = makePlannerParams(collection, *cq);
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, plannerParams);
+    ASSERT_OK(statusWithMultiPlanSolns.getStatus());
+    auto solutions = std::move(statusWithMultiPlanSolns.getValue());
+
+    // We expect a plan using index {a: 1} and plan using index {b: 1} and
+    // an index intersection plan.
+    ASSERT_EQUALS(solutions.size(), 3U);
+
+    // Fill out the MultiPlanStage.
+    auto mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(),
+        collection,
+        cq.get(),
+        plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), collection});
+    unique_ptr<WorkingSet> ws(new WorkingSet());
+    // Put each solution from the planner into the MPR.
+    for (size_t i = 0; i < solutions.size(); ++i) {
+        auto&& root = stage_builder::buildClassicExecutableTree(
+            opCtx.get(), collection, *cq, *solutions[i], ws.get());
+        mps->addPlan(std::move(solutions[i]), std::move(root), ws.get());
+    }
+
+    // This sets a backup plan.
+    NoopYieldPolicy yieldPolicy(expCtx->getOperationContext(), &opCtx.get()->fastClockSource());
+    ASSERT_OK(mps->runTrials(&yieldPolicy));
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT(mps->bestPlanChosen());
+    ASSERT(mps->hasBackupPlan());
+
+    // We should have picked the index intersection plan due to forcing ixisect.
+    auto soln = static_cast<const MultiPlanStage*>(mps.get())->bestSolution();
+    ASSERT(QueryPlannerTestLib::solutionMatches("{sort: {pattern: {b: 1}, limit: 0, node:"
+                                                "{fetch: {node: {andSorted: {nodes: ["
+                                                "{ixscan: {filter: null, pattern: {a:1}}},"
+                                                "{ixscan: {filter: null, pattern: {b:1}}}]}}}}}}",
+                                                soln->root())
+               .isOK());
+
+    // Get the resulting document.
+    PlanStage::StageState state = PlanStage::NEED_TIME;
+    WorkingSetID wsid;
+    while (state != PlanStage::ADVANCED) {
+        state = mps->work(&wsid);
+    }
+    WorkingSetMember* member = ws->get(wsid);
+
+    // Check the document returned by the query.
+    ASSERT(member->hasObj());
+    BSONObj expectedDoc = BSON("_id" << 1 << "a" << 1 << "b" << 1);
+    ASSERT_BSONOBJ_EQ(expectedDoc, member->doc.value().toBson());
+
+    // The blocking plan became unblocked, so we should no longer have a backup plan,
+    // and the winning plan should still be the index intersection one.
+    ASSERT(!mps->hasBackupPlan());
+    soln = static_cast<const MultiPlanStage*>(mps.get())->bestSolution();
+    ASSERT(QueryPlannerTestLib::solutionMatches("{sort: {pattern: {b: 1}, limit: 0, node:"
+                                                "{fetch: {node: {andSorted: {nodes: ["
+                                                "{ixscan: {filter: null, pattern: {a:1}}},"
+                                                "{ixscan: {filter: null, pattern: {b:1}}}]}}}}}}",
+                                                soln->root())
+               .isOK());
+}
+
+/**
+ * Allocates a new WorkingSetMember with data 'dataObj' in 'ws', and adds the WorkingSetMember
+ * to 'qds'.
+ */
+void addMember(MockStage* mockStage, WorkingSet* ws, BSONObj dataObj) {
+    WorkingSetID id = ws->allocate();
+    WorkingSetMember* wsm = ws->get(id);
+    wsm->doc = {SnapshotId(), Document{BSON("x" << 1)}};
+    wsm->transitionToOwnedObj();
+    mockStage->enqueueAdvanced(id);
+}
+
+// Test the structure and values of the explain output.
+TEST_F(QueryStageMultiPlanTest, MPSExplainAllPlans) {
+    // Insert a document to create the collection.
+    insert(BSON("x" << 1));
+
+    const int nDocs = 500;
+
+    auto ws = std::make_unique<WorkingSet>();
+    auto firstPlan = std::make_unique<MockStage>(expCtx.get(), ws.get());
+    const auto* firstPlanPtr = firstPlan.get();
+
+    auto secondPlan = std::make_unique<MockStage>(expCtx.get(), ws.get());
+
+    for (int i = 0; i < nDocs; ++i) {
+        addMember(firstPlan.get(), ws.get(), BSON("x" << 1));
+
+        // Make the second plan slower by inserting a NEED_TIME between every result.
+        addMember(secondPlan.get(), ws.get(), BSON("x" << 1));
+        secondPlan->enqueueStateCode(PlanStage::NEED_TIME);
+    }
+
+    auto coll = getCollection();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("x" << 1));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    // Put each plan into the MultiPlanStage. Takes ownership of 'firstPlan' and 'secondPlan'.
+    mps->addPlan(std::make_unique<QuerySolution>(), std::move(firstPlan), ws.get());
+    mps->addPlan(std::make_unique<QuerySolution>(), std::move(secondPlan), ws.get());
+
+    // The first candidate plan should have won.
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mps.get()),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    ASSERT_OK(mps->runTrials(planYieldPolicy.get()));
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT_TRUE(mps->bestPlanChosen());
+    ASSERT_EQ(getBestPlanRoot(mps.get()), firstPlanPtr);
+
+    auto exec = plan_executor_factory::make(expCtx.get(),
+                                            std::move(ws),
+                                            std::move(mps),
+                                            coll,
+                                            PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                            QueryPlannerParams::DEFAULT,
+                                            nss);
+    BSONObjBuilder bob;
+    auto mockVersionInfo = query_tester::MockVersionInfo();
+    VersionInfoInterface::enable(&mockVersionInfo);
+    Explain::explainStages(exec.get(),
+                           coll,
+                           ExplainOptions::Verbosity::kExecAllPlans,
+                           BSONObj(),
+                           SerializationContext::stateCommandReply(),
+                           BSONObj(),
+                           &bob);
+    BSONObj explained = bob.done();
+    ASSERT_EQ(explained["executionStats"]["nReturned"].Int(), nDocs);
+    ASSERT_EQ(explained["executionStats"]["executionStages"]["needTime"].Int(), 0);
+    auto allPlansStats = explained["executionStats"]["allPlansExecution"].Array();
+    ASSERT_EQ(allPlansStats.size(), 2UL);
+    for (auto&& planStats : allPlansStats) {
+        int maxEvaluationResults = internalQueryPlanEvaluationMaxResults.load();
+        ASSERT_EQ(planStats["executionStages"]["stage"].String(), "MOCK");
+        if (planStats["executionStages"]["needTime"].Int() > 0) {
+            // This is the losing plan. Should only have advanced about half the time.
+            ASSERT_LT(planStats["nReturned"].Int(), maxEvaluationResults);
+        } else {
+            // This is the winning plan. Stats here should be from the trial period.
+            ASSERT_EQ(planStats["nReturned"].Int(), maxEvaluationResults);
+        }
+    }
+}
+
+// Test that the plan summary only includes stats from the winning plan.
+//
+// This is a regression test for SERVER-20111.
+TEST_F(QueryStageMultiPlanTest, MPSSummaryStats) {
+    unittest::ServerParameterGuard controller("internalQueryFrameworkControl",
+                                              "forceClassicEngine");
+    // Ensure running the test with multiplanner.
+    unittest::ServerParameterGuard cbrController("featureFlagCostBasedRanker", false);
+
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    // Add two indices to give more plans.
+    addIndex(BSON("foo" << 1));
+    addIndex(BSON("foo" << -1 << "bar" << 1));
+
+    auto coll = getCollection();
+
+    // Create the executor (Matching all documents).
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("foo" << BSON("$gte" << 0)));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    auto exec = uassertStatusOK(getExecutorFind(opCtx.get(),
+                                                MultipleCollectionAccessor{coll},
+                                                std::move(cq),
+                                                PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY));
+
+    auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
+    ASSERT(execImpl);
+    ASSERT_EQ(execImpl->getRootStage()->stageType(), StageType::STAGE_MULTI_PLAN);
+
+    // Execute the plan executor util EOF, discarding the results.
+    {
+        BSONObj obj;
+        while (exec->getNext(&obj, nullptr) == PlanExecutor::ADVANCED) {
+            // Do nothing with the documents produced by the executor.
+        }
+    }
+
+    PlanSummaryStats stats;
+    exec->getPlanExplainer().getSummaryStats(&stats);
+
+    // If only the winning plan's stats are recorded, we should not have examined more than the
+    // total number of documents/index keys.
+    ASSERT_LTE(stats.totalDocsExamined, static_cast<size_t>(N));
+    ASSERT_LTE(stats.totalKeysExamined, static_cast<size_t>(N));
+}
+
+TEST_F(QueryStageMultiPlanTest, ShouldReportErrorIfExceedsTimeLimitDuringPlanning) {
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    // Add two indices to give more plans.
+    addIndex(BSON("foo" << 1));
+    addIndex(BSON("foo" << -1 << "bar" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    // Make the filter.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(filterObj);
+    auto canonicalQuery = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    MultiPlanStage multiPlanStage(
+        expCtx.get(), coll, canonicalQuery.get(), plan_cache_util::NoopPlanCacheWriter{});
+    multiPlanStage.addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    multiPlanStage.addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    AlwaysTimeOutYieldPolicy alwaysTimeOutPolicy(expCtx->getOperationContext(),
+                                                 &opCtx.get()->fastClockSource());
+    const auto status = multiPlanStage.runTrials(&alwaysTimeOutPolicy);
+    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "error while multiplanner was selecting best plan");
+}
+
+TEST_F(QueryStageMultiPlanTest, ShouldReportErrorIfKilledDuringPlanning) {
+    const int N = 5000;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    // Add two indices to give more plans.
+    addIndex(BSON("foo" << 1));
+    addIndex(BSON("foo" << -1 << "bar" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    // Plan 1: CollScan.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("foo" << BSON("$gte" << 0)));
+    auto canonicalQuery = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    MultiPlanStage multiPlanStage(
+        expCtx.get(), coll, canonicalQuery.get(), plan_cache_util::NoopPlanCacheWriter{});
+    multiPlanStage.addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    multiPlanStage.addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    AlwaysPlanKilledYieldPolicy alwaysPlanKilledYieldPolicy(expCtx->getOperationContext(),
+                                                            &opCtx.get()->fastClockSource());
+    ASSERT_EQ(ErrorCodes::QueryPlanKilled, multiPlanStage.runTrials(&alwaysPlanKilledYieldPolicy));
+}
+
+/**
+ * A PlanStage for testing which always throws exceptions.
+ */
+class ThrowyPlanStage : public PlanStage {
+protected:
+    StageState doWork(WorkingSetID* out) override {
+        uasserted(ErrorCodes::InternalError, "Mwahahaha! You've fallen into my trap.");
+    }
+
+public:
+    ThrowyPlanStage(ExpressionContext* expCtx) : PlanStage("throwy", expCtx) {}
+    bool isEOF() const final {
+        return false;
+    }
+    StageType stageType() const final {
+        return STAGE_UNKNOWN;
+    }
+    std::unique_ptr<PlanStageStats> getStats() final {
+        return nullptr;
+    }
+    const SpecificStats* getSpecificStats() const final {
+        return nullptr;
+    }
+};
+
+TEST_F(QueryStageMultiPlanTest, AddsContextDuringException) {
+    insert(BSON("foo" << 10));
+    auto coll = getCollection();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("fake" << "query"));
+    auto canonicalQuery = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    MultiPlanStage multiPlanStage(
+        expCtx.get(), coll, canonicalQuery.get(), plan_cache_util::NoopPlanCacheWriter{});
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    multiPlanStage.addPlan(
+        createQuerySolution(), std::make_unique<ThrowyPlanStage>(expCtx.get()), sharedWs.get());
+    multiPlanStage.addPlan(
+        createQuerySolution(), std::make_unique<ThrowyPlanStage>(expCtx.get()), sharedWs.get());
+
+    NoopYieldPolicy yieldPolicy(expCtx->getOperationContext(), &opCtx.get()->fastClockSource());
+    auto status = multiPlanStage.runTrials(&yieldPolicy);
+    ASSERT_EQ(ErrorCodes::InternalError, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "error while multiplanner was selecting best plan");
+}
+
+TEST_F(QueryStageMultiPlanTest, MPSCanRunTrialsInBatches) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    const auto* ixScanRootPtr = ixScanRoot.get();
+
+    // Plan 1: CollScan with matcher.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto* mpsPtr = mps.get();
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mpsPtr),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    trial_period::TrialPhaseConfig trialsConfig{.maxNumWorksPerPlan = 7, .targetNumResults = 100};
+    // Run a first batch of trials. Up to 7 works per plan.
+    ASSERT_OK(mpsPtr->runTrials(planYieldPolicy.get(), trialsConfig));
+    auto mpStats = dynamic_cast<const MultiPlanStats*>(mpsPtr->getSpecificStats());
+    ASSERT_FALSE(mpStats->earlyExit);
+    ASSERT_EQUALS(mpStats->numCandidatePlans, 2);
+    ASSERT_EQUALS(mpStats->numResultsFound,
+                  7);  // It finds 7 7s from the index.
+    ASSERT_EQUALS(mpStats->totalWorks, 14);
+    ASSERT_FALSE(mpsPtr->bestPlanChosen());
+    // Now run a second batch towards the end.
+    ASSERT_OK(mpsPtr->runTrials(planYieldPolicy.get()));
+    ASSERT_OK(mpsPtr->pickBestPlan());
+    ASSERT_TRUE(mpsPtr->bestPlanChosen());
+    ASSERT_EQUALS(mpsPtr->getChildren()[mpsPtr->bestPlanIdx().get()].get(), ixScanRootPtr);
+    mpStats = dynamic_cast<const MultiPlanStats*>(mpsPtr->getSpecificStats());
+    ASSERT_TRUE(mpStats->earlyExit);
+    ASSERT_EQUALS(mpStats->numCandidatePlans, 2);
+    ASSERT_EQUALS(mpStats->numResultsFound, 11);
+    ASSERT_EQUALS(mpStats->totalWorks, 22);
+
+    // Takes ownership of arguments other than 'collection'.
+    auto exec = plan_executor_factory::make(std::move(cq),
+                                            std::move(sharedWs),
+                                            std::move(mps),
+                                            coll,
+                                            PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                            QueryPlannerParams::DEFAULT,
+                                            nss);
+
+    // Get all our results out.
+    int results = 0;
+    BSONObj obj;
+    PlanExecutor::ExecState state;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+        ASSERT_EQUALS(obj["foo"].numberInt(), 7);
+        ++results;
+    }
+    ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
+    ASSERT_EQUALS(results, N / 10);
+}
+
+TEST_F(QueryStageMultiPlanTest, MPSRunTrialsEarlyExit) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    const auto* ixScanRootPtr = ixScanRoot.get();
+
+    // Plan 1: CollScan with matcher.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto* mpsPtr = mps.get();
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mpsPtr),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    trial_period::TrialPhaseConfig trialsConfig{.maxNumWorksPerPlan = 1000,
+                                                .targetNumResults = 100};
+    ASSERT_OK(mpsPtr->runTrials(planYieldPolicy.get(), trialsConfig));
+    auto mpStats = dynamic_cast<const MultiPlanStats*>(mpsPtr->getSpecificStats());
+    ASSERT_TRUE(mpStats->earlyExit);
+    ASSERT_EQUALS(mpStats->numCandidatePlans, 2);
+    ASSERT_EQUALS(mpStats->numResultsFound,
+                  11);  // It finds all 7s in the index plus one extra from the collscan.
+    ASSERT_EQUALS(mpStats->totalWorks, 22);
+    ASSERT_FALSE(mpsPtr->bestPlanChosen());
+    ASSERT_OK(mpsPtr->pickBestPlan());
+    ASSERT_TRUE(mpsPtr->bestPlanChosen());
+    ASSERT_EQUALS(mpsPtr->getChildren()[mpsPtr->bestPlanIdx().get()].get(), ixScanRootPtr);
+    mpStats = dynamic_cast<const MultiPlanStats*>(mpsPtr->getSpecificStats());
+    ASSERT_TRUE(mpStats->earlyExit);
+    ASSERT_EQUALS(mpStats->numCandidatePlans, 2);
+    ASSERT_EQUALS(mpStats->numResultsFound, 11);
+    ASSERT_EQUALS(mpStats->totalWorks, 22);
+
+    // Takes ownership of arguments other than 'collection'.
+    auto exec = plan_executor_factory::make(std::move(cq),
+                                            std::move(sharedWs),
+                                            std::move(mps),
+                                            coll,
+                                            PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                            QueryPlannerParams::DEFAULT,
+                                            nss);
+
+    // Get all our results out.
+    int results = 0;
+    BSONObj obj;
+    PlanExecutor::ExecState state;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+        ASSERT_EQUALS(obj["foo"].numberInt(), 7);
+        ++results;
+    }
+    ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
+    ASSERT_EQUALS(results, N / 10);
+}
+
+using QueryStageMultiPlanDeathTest = QueryStageMultiPlanTest;
+
+DEATH_TEST_REGEX_F(QueryStageMultiPlanDeathTest,
+                   CannotRunTrialsOnceEarlyExitHasOccurred,
+                   "Tripwire assertion.*11482700") {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    // Plan 1: CollScan with matcher.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto* mpsPtr = mps.get();
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mpsPtr),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    trial_period::TrialPhaseConfig trialsConfig{.maxNumWorksPerPlan = 1000,
+                                                .targetNumResults = 100};
+    ASSERT_OK(mpsPtr->runTrials(planYieldPolicy.get(), trialsConfig));
+    auto mpStats = dynamic_cast<const MultiPlanStats*>(mpsPtr->getSpecificStats());
+    ASSERT_TRUE(mpStats->earlyExit);
+    ASSERT_THROWS_CODE(mpsPtr->runTrials(planYieldPolicy.get()), DBException, 11482700);
+}
+
+DEATH_TEST_REGEX_F(QueryStageMultiPlanDeathTest,
+                   CannotPickBestPlanWithoutRunningTrials,
+                   "Tripwire assertion.*11484502") {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+
+    // Plan 1: CollScan with matcher.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    ASSERT_THROWS_CODE(mps->pickBestPlan(), DBException, 11484502);
+}
+
+DEATH_TEST_REGEX_F(QueryStageMultiPlanDeathTest,
+                   CannotRunTrialsOnceASolutionIsChosen,
+                   "Tripwire assertion.*11521900") {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+    // Plan 0: IXScan over foo == 7
+    // Every call to work() returns something so this should clearly win (by current scoring
+    // at least).
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    // Plan 1: CollScan with matcher.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    // Hand the plans off to the MPS.
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto* mpsPtr = mps.get();
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mpsPtr),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    trial_period::TrialPhaseConfig trialsConfig{.maxNumWorksPerPlan = 1000,
+                                                .targetNumResults = 100};
+    ASSERT_OK(mpsPtr->runTrials(planYieldPolicy.get(), trialsConfig));
+    auto mpStats = dynamic_cast<const MultiPlanStats*>(mpsPtr->getSpecificStats());
+    ASSERT_TRUE(mpStats->earlyExit);
+    ASSERT_OK(mpsPtr->pickBestPlan());
+    ASSERT_TRUE(mpsPtr->bestPlanChosen());
+    ASSERT_THROWS_CODE(mpsPtr->runTrials(planYieldPolicy.get()), DBException, 11521900);
+}
+
+TEST_F(QueryStageMultiPlanTest, ExtractRejectedPlansSimple) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7. Winner.
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    // Plan 1: CollScan. Loser.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mps.get()),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+    ASSERT_OK(mps->runTrials(planYieldPolicy.get()));
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT_TRUE(mps->bestPlanChosen());
+
+    auto planExplainerData = mps->extractPlanExplainerData();
+    auto& rejectedPlansWithStages = planExplainerData.rejectedPlansWithStages;
+    ASSERT_EQ(rejectedPlansWithStages.size(), 1);
+    ASSERT_TRUE(rejectedPlansWithStages[0].solution);
+    ASSERT_TRUE(rejectedPlansWithStages[0].planStage);
+    ASSERT_EQ(rejectedPlansWithStages[0].planStage->stageType(), STAGE_COLLSCAN);
+    auto& mpWinningPlanTrialStats = planExplainerData.multiPlannerWinningPlanTrialStats;
+    ASSERT_EQ(mpWinningPlanTrialStats->common.works,
+              11);  // SEEK + 10 advances
+    ASSERT_EQ(mpWinningPlanTrialStats->common.advanced, 10);
+    ASSERT(planExplainerData.multiPlannerWinningPlanScore >
+           rejectedPlansWithStages[0].solution->score);
+}
+
+TEST_F(QueryStageMultiPlanTest, NoRejectedPlansExtractedWhenBackupPlanIsLast) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("b" << (i % 10) << "a" << 0));
+    }
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+
+    auto coll = getCollection();
+
+    // Query for 'a'. Sort on 'b'.
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("a" << 1));
+    findCommand->setSort(BSON("b" << 1));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, coll);
+
+    // Plan.
+    auto plannerParams = makePlannerParams(coll, *cq);
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, plannerParams);
+    ASSERT_OK(statusWithMultiPlanSolns.getStatus());
+    auto solutions = std::move(statusWithMultiPlanSolns.getValue());
+
+    // We expect a plan using index {a: 1} + sort and and plan using index {b: 1} to satisfy the
+    // sorting.
+    // The winner will be the plan using index {a: 1} + sort since it will EOF on the
+    // IXSCAN stage.
+    ASSERT_EQUALS(solutions.size(), 2U);
+
+    // Fill out the MultiPlanStage.
+    auto mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    unique_ptr<WorkingSet> ws(new WorkingSet());
+    // Put each solution from the planner into the MPS.
+    for (size_t i = 0; i < solutions.size(); ++i) {
+        auto&& root = stage_builder::buildClassicExecutableTree(
+            opCtx.get(), coll, *cq, *solutions[i], ws.get());
+        mps->addPlan(std::move(solutions[i]), std::move(root), ws.get());
+    }
+
+    NoopYieldPolicy yieldPolicy(expCtx->getOperationContext(), &opCtx.get()->fastClockSource());
+    ASSERT_OK(mps->runTrials(&yieldPolicy));
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT(mps->bestPlanChosen());
+    // A backup plan will be set since the the winner plan includes a blocking SORT stage.
+    ASSERT(mps->hasBackupPlan());
+
+    auto planExplainerData = mps->extractPlanExplainerData();
+    // We expect no rejected plan as the backup plan is not considered rejected.
+    ASSERT_EQ(planExplainerData.rejectedPlansWithStages.size(), 0);
+    auto& multiplannerWinningTrialStats = planExplainerData.multiPlannerWinningPlanTrialStats;
+    ASSERT_EQ(multiplannerWinningTrialStats->common.works,
+              2);  // SEEK + 1 needs time
+    ASSERT_EQ(multiplannerWinningTrialStats->common.needTime, 1);
+    ASSERT_EQ(multiplannerWinningTrialStats->common.advanced, 0);
+    ASSERT(planExplainerData.multiPlannerWinningPlanScore.value() > 0);
+}
+
+TEST_F(QueryStageMultiPlanTest, ExtractRejectedPlansWhenBackupPlanIsNotLast) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("b" << (i % 10) << "a" << 0 << "c" << i));
+    }
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+
+    auto coll = getCollection();
+
+    // Query for both 'a' and 'b' and sort on 'b'.
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("a" << 1 << "c" << BSON("$gte" << 0)));
+    findCommand->setSort(BSON("b" << 1));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, coll);
+
+    // Plan.
+    auto plannerParams = makePlannerParams(coll, *cq);
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, plannerParams);
+    ASSERT_OK(statusWithMultiPlanSolns.getStatus());
+    auto solutions = std::move(statusWithMultiPlanSolns.getValue());
+
+    // We expect the following plans:
+    // 1. One using index {a: 1} + sort
+    // 2. Another using index {b: 1} to satisfy the sorting
+    // 3. A plan using index {c: 1} to filter on 'c' + sort.
+    // The winner will be the plan using index {a: 1} + sort since it will EOF on the
+    // IXSCAN stage.
+    ASSERT_EQUALS(solutions.size(), 3U);
+
+    // Fill out the MultiPlanStage.
+    auto mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+    unique_ptr<WorkingSet> ws(new WorkingSet());
+    // Put each solution from the planner into the MPS.
+    for (size_t i = 0; i < solutions.size(); ++i) {
+        auto&& root = stage_builder::buildClassicExecutableTree(
+            opCtx.get(), coll, *cq, *solutions[i], ws.get());
+        mps->addPlan(std::move(solutions[i]), std::move(root), ws.get());
+    }
+
+    // This sets a backup plan.
+    NoopYieldPolicy yieldPolicy(expCtx->getOperationContext(), &opCtx.get()->fastClockSource());
+    ASSERT_OK(mps->runTrials(&yieldPolicy));
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT(mps->bestPlanChosen());
+    // A backup plan will be set since the winner plan includes a blocking SORT stage.
+    ASSERT(mps->hasBackupPlan());
+
+    auto planExplainerData = mps->extractPlanExplainerData();
+    auto& rejectedPlansWithStages = planExplainerData.rejectedPlansWithStages;
+    ASSERT_EQ(rejectedPlansWithStages.size(), 1);
+    ASSERT_TRUE(rejectedPlansWithStages[0].solution);
+    ASSERT_OK(QueryPlannerTestLib::solutionMatches(
+        ""
+        "{sort:{"
+        "  pattern: {b: 1}, limit: 0, node:{fetch:{ "
+        "    filter: {a:1}, node:{ixscan: {"
+        "      pattern: {c:1}, bounds: {c: [[0, Infinity, true, true]]}"
+        "    }}"
+        "  }}"
+        "}}",
+        rejectedPlansWithStages[0].solution->root()));
+    ASSERT_TRUE(rejectedPlansWithStages[0].planStage);
+    ASSERT_EQ(rejectedPlansWithStages[0].planStage->stageType(), STAGE_SORT_SIMPLE);
+    auto& mpWinningTrialStats = planExplainerData.multiPlannerWinningPlanTrialStats;
+    ASSERT_EQ(mpWinningTrialStats->common.works,
+              2);  // SEEK + 1 needs time
+    ASSERT_EQ(mpWinningTrialStats->common.needTime, 1);
+    ASSERT_EQ(mpWinningTrialStats->common.advanced, 0);
+    ASSERT(planExplainerData.multiPlannerWinningPlanScore >
+           planExplainerData.rejectedPlansWithStages[0].solution->score);
+}
+
+TEST_F(QueryStageMultiPlanTest, ExtractRejectedPlansAfterAbandonTrials) {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+
+    auto coll = getCollection();
+
+    // Query for 'a' 'b' and 'c'.
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(BSON("a" << 1 << "b" << 1 << "c" << 1));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
+    auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, coll);
+
+    // Plan.
+    auto plannerParams = makePlannerParams(coll, *cq);
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, plannerParams);
+    ASSERT_OK(statusWithMultiPlanSolns.getStatus());
+    auto solutions = std::move(statusWithMultiPlanSolns.getValue());
+
+    // Expect one solution per index.
+    ASSERT_EQ(solutions.size(), 3);
+
+    auto solution1Hash = solutions[0]->hash();
+    auto solution2Hash = solutions[1]->hash();
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+
+    for (auto&& solution : std::move(solutions)) {
+        auto root = stage_builder::buildClassicExecutableTree(
+            opCtx.get(), coll, *cq, *solution, sharedWs.get());
+        mps->addPlan(std::move(solution), std::move(root), sharedWs.get());
+    }
+
+    std::map<QuerySolutionNode*, PlanStage*> solutionToPlanStage;
+    for (size_t i = 0; i < solutions.size(); i++) {
+        solutionToPlanStage[mps->getCandidate(i).solution->root()] = mps->getChildren()[i].get();
+    }
+
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mps.get()),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    ASSERT_OK(mps->runTrials(planYieldPolicy.get()));
+    // Abandon all except the second index scan
+    mps->abandonTrialsExceptHashes({solution1Hash, solution2Hash});
+    ASSERT_FALSE(mps->bestPlanChosen());
+
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT(mps->bestPlanChosen());
+
+    auto planExplainerData = mps->extractPlanExplainerData();
+    auto& rejectedPlansWithStages = planExplainerData.rejectedPlansWithStages;
+    // The rejected plans should be returned as rejected.
+    ASSERT_EQ(rejectedPlansWithStages.size(), 2UL);
+    for (const auto& rejection : rejectedPlansWithStages) {
+        ASSERT_TRUE(rejection.solution);
+        ASSERT_TRUE(rejection.planStage);
+        // Must maintain the correspndence between solution <-> plan stage
+        ASSERT_EQ(solutionToPlanStage[rejection.solution->root()], rejection.planStage.get());
+    }
+    // The MultiPlan stage should have one child (the non-rejected plan)
+    ASSERT_EQ(mps->getChildren().size(), 1);
+    // This relies on the non-rejected plan being moves to the first slot.
+    ASSERT(
+        (std::set{solution1Hash, solution2Hash}).contains(mps->getCandidate(0).solution->hash()));
+    ASSERT(planExplainerData.multiPlannerWinningPlanTrialStats);
+    ASSERT(planExplainerData.multiPlannerWinningPlanScore);
+    // Also check the solution <-> plan stage coherence for the winning plan.
+    ASSERT_EQ(solutionToPlanStage[mps->getCandidate(0).solution->root()],
+              mps->getChildren()[0].get());
+}
+
+DEATH_TEST_REGEX_F(QueryStageMultiPlanDeathTest,
+                   ExtractRejectedPlansWithoutDecisionThrows,
+                   "Tripwire assertion.*11540200") {
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        insert(BSON("foo" << (i % 10)));
+    }
+
+    addIndex(BSON("foo" << 1));
+
+    auto coll = getCollection();
+
+    // Plan 0: IXScan over foo == 7
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    unique_ptr<PlanStage> ixScanRoot = getIxScanPlan(expCtx.get(), coll, sharedWs.get(), 7);
+
+    // Plan 1: CollScan.
+    BSONObj filterObj = BSON("foo" << 7);
+    unique_ptr<MatchExpression> filter = makeMatchExpressionFromFilter(expCtx.get(), filterObj);
+    unique_ptr<PlanStage> collScanRoot =
+        getCollScanPlan(expCtx.get(), coll, sharedWs.get(), filter.get());
+
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, filterObj);
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    mps->addPlan(createQuerySolution(), std::move(ixScanRoot), sharedWs.get());
+    mps->addPlan(createQuerySolution(), std::move(collScanRoot), sharedWs.get());
+
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mps.get()),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    ASSERT_OK(mps->runTrials(planYieldPolicy.get()));
+    // Verify calling extraction before picking best plan or abandoning triggers assertion.
+    auto rejected = mps->extractPlanExplainerData();
+}
+
+TEST_F(QueryStageMultiPlanTest, ManagesStateAroundAbandoningTrials) {
+    // Insert a dummy object, just so the collection exists.
+    insert(BSON("foo" << 0));
+    auto coll = getCollection();
+
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, {});
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    mps->addPlan(createQuerySolution(),
+                 getCollScanPlan(expCtx.get(), coll, sharedWs.get(), {}),
+                 sharedWs.get());
+
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mps.get()),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    ASSERT_FALSE(mps->isStateSaved());
+    ASSERT_OK(mps->runTrials(planYieldPolicy.get()));
+    ASSERT_TRUE(mps->isStateSaved());
+    mps->abandonTrialsExceptHashes({createQuerySolution()->hash()});
+    ASSERT_FALSE(mps->isStateSaved());
+}
+
+DEATH_TEST_REGEX_F(QueryStageMultiPlanDeathTest,
+                   CannotAbandonExceptNonExistentCandidate,
+                   "Tripwire assertion.*11763501") {
+    // Insert a dummy object, just so the collection exists.
+    insert(BSON("foo" << 0));
+    auto coll = getCollection();
+
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, {});
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    // No solution with this hash exists (no solution was added
+    // in the first place). So this should assert.
+    mps->abandonTrialsExceptHashes({12345});
+}
+
+TEST_F(QueryStageMultiPlanTest, ManagesStateAroundPickingBestPlan) {
+    // Insert a dummy object, just so the collection exists.
+    insert(BSON("foo" << 0));
+    auto coll = getCollection();
+
+    auto cq = makeCanonicalQuery(opCtx.get(), nss, {});
+
+    unique_ptr<MultiPlanStage> mps = std::make_unique<MultiPlanStage>(
+        expCtx.get(), coll, cq.get(), plan_cache_util::ClassicPlanCacheWriter{opCtx.get(), coll});
+
+    unique_ptr<WorkingSet> sharedWs(new WorkingSet());
+    mps->addPlan(createQuerySolution(),
+                 getCollScanPlan(expCtx.get(), coll, sharedWs.get(), {}),
+                 sharedWs.get());
+
+
+    auto planYieldPolicy = makeClassicYieldPolicy(opCtx.get(),
+                                                  nss,
+                                                  static_cast<PlanStage*>(mps.get()),
+                                                  PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY);
+
+    ASSERT_FALSE(mps->isStateSaved());
+    ASSERT_OK(mps->runTrials(planYieldPolicy.get()));
+    ASSERT_TRUE(mps->isStateSaved());
+    ASSERT_OK(mps->pickBestPlan());
+    ASSERT(mps->bestPlanChosen());
+    ASSERT_FALSE(mps->isStateSaved());
+}
+
+}  // namespace
+}  // namespace mongo

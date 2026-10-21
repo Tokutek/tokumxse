@@ -1,0 +1,878 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/expression/evaluate.h"
+
+#include <string_view>
+
+namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(sleepBeforeCurrentDateEvaluation);
+
+namespace {
+
+/**
+ * This function checks whether a field is a number.
+ *
+ * If 'field' is null, the default value is returned trough the 'returnValue' out
+ * parameter and the function returns true.
+ *
+ * If 'field' is not null:
+ * - if the value is "nullish", the function returns false.
+ * - if the value can not be coerced to an integral value, a UserException is thrown.
+ * - otherwise, the coerced integral value is returned through the 'returnValue'
+ *   out parameter, and the function returns true.
+ */
+bool evaluateNumberWithDefault(const Document& root,
+                               const Expression* field,
+                               std::string_view fieldName,
+                               long long defaultValue,
+                               long long* returnValue,
+                               Variables* variables,
+                               const EvaluationContext& ctx) {
+    if (!field) {
+        *returnValue = defaultValue;
+        return true;
+    }
+
+    auto fieldValue = field->evaluate(root, variables, ctx);
+
+    if (fieldValue.nullish()) {
+        return false;
+    }
+
+    uassert(40515,
+            str::stream() << "'" << fieldName << "' must evaluate to an integer, found "
+                          << typeName(fieldValue.getType()) << " with value "
+                          << fieldValue.toString(),
+            fieldValue.integral64Bit());
+
+    *returnValue = fieldValue.coerceToLong();
+
+    return true;
+}
+
+/**
+ * This function has the same behavior as evaluteNumberWithDefault(), except that it uasserts if
+ * the resulting value is not in the range defined by kMaxValueForDatePart and
+ * kMinValueForDatePart.
+ */
+bool evaluateNumberWithDefaultAndBounds(const Document& root,
+                                        const Expression* field,
+                                        std::string_view fieldName,
+                                        long long defaultValue,
+                                        long long* returnValue,
+                                        Variables* variables,
+                                        const EvaluationContext& ctx) {
+    // Some date conversions spend a long time iterating through date tables when dealing with large
+    // input numbers, so we place a reasonable limit on the magnitude of any argument to
+    // $dateFromParts: inputs that fit within a 16-bit int are permitted.
+    static constexpr long long kMaxValueForDatePart = std::numeric_limits<int16_t>::max();
+    static constexpr long long kMinValueForDatePart = std::numeric_limits<int16_t>::lowest();
+
+    bool result = evaluateNumberWithDefault(
+        root, field, fieldName, defaultValue, returnValue, variables, ctx);
+
+    uassert(
+        31034,
+        str::stream() << "'" << fieldName << "'"
+                      << " must evaluate to a value in the range [" << kMinValueForDatePart << ", "
+                      << kMaxValueForDatePart << "]; value " << *returnValue << " is not in range",
+        !result || (*returnValue >= kMinValueForDatePart && *returnValue <= kMaxValueForDatePart));
+
+    return result;
+}
+
+boost::optional<int> evaluateIso8601Flag(const Expression* iso8601,
+                                         const Document& root,
+                                         Variables* variables,
+                                         const EvaluationContext& ctx) {
+    if (!iso8601) {
+        return false;
+    }
+
+    auto iso8601Output = iso8601->evaluate(root, variables, ctx);
+
+    if (iso8601Output.nullish()) {
+        return boost::none;
+    }
+
+    uassert(40521,
+            str::stream() << "iso8601 must evaluate to a bool, found "
+                          << typeName(iso8601Output.getType()),
+            iso8601Output.getType() == BSONType::boolean);
+
+    return iso8601Output.getBool();
+}
+
+/**
+ * Converts 'value' to Date_t type for $dateDiff expression for parameter 'parameterName'.
+ */
+Date_t convertDate(const Value& value,
+                   std::string_view expressionName,
+                   std::string_view parameterName) {
+    uassert(5166307,
+            str::stream() << expressionName << " requires '" << parameterName
+                          << "' to be a date, but got " << typeName(value.getType()),
+            value.coercibleToDate());
+    return value.coerceToDate();
+}
+
+}  // namespace
+
+namespace exec::expression {
+using namespace std::literals::string_view_literals;
+
+TimeUnit parseTimeUnit(const Value& value, std::string_view expressionName) {
+    uassert(5439013,
+            str::stream() << expressionName << " requires 'unit' to be a string, but got "
+                          << typeName(value.getType()),
+            BSONType::string == value.getType());
+    return addContextToAssertionException(
+        [&]() { return mongo::parseTimeUnit(value.getStringData()); },
+        expressionName,
+        " parameter 'unit' value parsing failed"sv);
+}
+
+DayOfWeek parseDayOfWeek(const Value& value,
+                         std::string_view expressionName,
+                         std::string_view parameterName) {
+    uassert(5439015,
+            str::stream() << expressionName << " requires '" << parameterName
+                          << "' to be a string, but got " << typeName(value.getType()),
+            BSONType::string == value.getType());
+    uassert(5439016,
+            str::stream() << expressionName << " parameter '" << parameterName
+                          << "' value cannot be recognized as a day of a week: "
+                          << value.getStringData(),
+            isValidDayOfWeek(value.getStringData()));
+    return mongo::parseDayOfWeek(value.getStringData());
+}
+
+boost::optional<TimeZone> makeTimeZone(const TimeZoneDatabase* tzdb,
+                                       const Document& root,
+                                       const Expression* timeZone,
+                                       Variables* variables,
+                                       const EvaluationContext& ctx) {
+    tassert(11103500, "Expected non-null TimeZoneDatabase", tzdb);
+
+    if (!timeZone) {
+        return mongo::TimeZoneDatabase::utcZone();
+    }
+
+    auto timeZoneId = timeZone->evaluate(root, variables, ctx);
+
+    if (timeZoneId.nullish()) {
+        return boost::none;
+    }
+
+    uassert(40517,
+            str::stream() << "timezone must evaluate to a string, found "
+                          << typeName(timeZoneId.getType()),
+            timeZoneId.getType() == BSONType::string);
+
+    return tzdb->getTimeZone(timeZoneId.getStringData());
+}
+
+unsigned long long convertDateTruncBinSizeValue(const Value& value) {
+    uassert(5439017,
+            str::stream() << "$dateTrunc requires 'binSize' to be a 64-bit integer, but got value '"
+                          << value.toString() << "' of type " << typeName(value.getType()),
+            value.integral64Bit());
+    const long long binSize = value.coerceToLong();
+    uassert(5439018,
+            str::stream() << "$dateTrunc requires 'binSize' to be greater than 0, but got value "
+                          << binSize,
+            binSize > 0);
+    return static_cast<unsigned long long>(binSize);
+}
+
+Value evaluate(const ExpressionDateFromParts& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    long long hour, minute, second, millisecond;
+
+    if (!evaluateNumberWithDefaultAndBounds(
+            root, expr.getHour(), "hour"sv, 0, &hour, variables, ctx) ||
+        !evaluateNumberWithDefaultAndBounds(
+            root, expr.getMinute(), "minute"sv, 0, &minute, variables, ctx) ||
+        !evaluateNumberWithDefault(
+            root, expr.getSecond(), "second"sv, 0, &second, variables, ctx) ||
+        !evaluateNumberWithDefault(
+            root, expr.getMillisecond(), "millisecond"sv, 0, &millisecond, variables, ctx)) {
+        // One of the evaluated inputs in nullish.
+        return Value(BSONNULL);
+    }
+
+    boost::optional<TimeZone> timeZone = expr.getParsedTimeZone();
+    if (!timeZone) {
+        timeZone = makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                root,
+                                expr.getTimeZone(),
+                                variables,
+                                ctx);
+        if (!timeZone) {
+            return Value(BSONNULL);
+        }
+    }
+
+    if (expr.getYear()) {
+        long long year, month, day;
+
+        if (!evaluateNumberWithDefault(
+                root, expr.getYear(), "year"sv, 1970, &year, variables, ctx) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, expr.getMonth(), "month"sv, 1, &month, variables, ctx) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, expr.getDay(), "day"sv, 1, &day, variables, ctx)) {
+            // One of the evaluated inputs in nullish.
+            return Value(BSONNULL);
+        }
+
+        uassert(40523,
+                str::stream() << "'year' must evaluate to an integer in the range " << 1 << " to "
+                              << 9999 << ", found " << year,
+                year >= 1 && year <= 9999);
+
+        return Value(
+            timeZone->createFromDateParts(year, month, day, hour, minute, second, millisecond));
+    }
+
+    if (expr.getIsoWeekYear()) {
+        long long isoWeekYear, isoWeek, isoDayOfWeek;
+
+        if (!evaluateNumberWithDefault(
+                root, expr.getIsoWeekYear(), "isoWeekYear"sv, 1970, &isoWeekYear, variables, ctx) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, expr.getIsoWeek(), "isoWeek"sv, 1, &isoWeek, variables, ctx) ||
+            !evaluateNumberWithDefaultAndBounds(
+                root, expr.getIsoDayOfWeek(), "isoDayOfWeek"sv, 1, &isoDayOfWeek, variables, ctx)) {
+            // One of the evaluated inputs in nullish.
+            return Value(BSONNULL);
+        }
+
+        uassert(31095,
+                str::stream() << "'isoWeekYear' must evaluate to an integer in the range " << 1
+                              << " to " << 9999 << ", found " << isoWeekYear,
+                isoWeekYear >= 1 && isoWeekYear <= 9999);
+
+        return Value(timeZone->createFromIso8601DateParts(
+            isoWeekYear, isoWeek, isoDayOfWeek, hour, minute, second, millisecond));
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+Value evaluate(const ExpressionDateFromString& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    const Value dateString = expr.getDateString()->evaluate(root, variables, ctx);
+    Value formatValue;
+
+    // Eagerly validate the format parameter, ignoring if nullish since the input string nullish
+    // behavior takes precedence.
+    if (expr.getFormat()) {
+        formatValue = expr.getFormat()->evaluate(root, variables, ctx);
+        if (!formatValue.nullish()) {
+            uassert(40684,
+                    str::stream() << "$dateFromString requires that 'format' be a string, found: "
+                                  << typeName(formatValue.getType()) << " with value "
+                                  << formatValue.toString(),
+                    formatValue.getType() == BSONType::string);
+
+            TimeZone::validateFromStringFormat(formatValue.getStringData());
+        }
+    }
+
+    // Evaluate the timezone parameter before checking for nullish input, as this will throw an
+    // exception for an invalid timezone string.
+    boost::optional<TimeZone> timeZone = expr.getParsedTimeZone();
+    if (!timeZone) {
+        timeZone = makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                root,
+                                expr.getTimeZone(),
+                                variables,
+                                ctx);
+    }
+
+    // Behavior for nullish input takes precedence over other nullish elements.
+    if (dateString.nullish()) {
+        return expr.getOnNull() ? expr.getOnNull()->evaluate(root, variables, ctx)
+                                : Value(BSONNULL);
+    }
+
+    try {
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "$dateFromString requires that 'dateString' be a string, found: "
+                              << typeName(dateString.getType()) << " with value "
+                              << dateString.toString(),
+                dateString.getType() == BSONType::string);
+
+        const auto dateTimeString = dateString.getStringData();
+
+        if (!timeZone) {
+            return Value(BSONNULL);
+        }
+
+        if (expr.getFormat()) {
+            if (formatValue.nullish()) {
+                return Value(BSONNULL);
+            }
+
+            return Value(expr.getExpressionContext()->getTimeZoneDatabase()->fromString(
+                dateTimeString, timeZone.value(), formatValue.getStringData()));
+        }
+
+        return Value(expr.getExpressionContext()->getTimeZoneDatabase()->fromString(
+            dateTimeString, timeZone.value()));
+    } catch (const ExceptionFor<ErrorCodes::ConversionFailure>&) {
+        if (expr.getOnError()) {
+            return expr.getOnError()->evaluate(root, variables, ctx);
+        }
+        throw;
+    }
+}
+
+Value evaluate(const ExpressionDateToParts& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    tassert(9711500, "Missing date argument", expr.getDate() != nullptr);
+    const Value date = expr.getDate()->evaluate(root, variables, ctx);
+
+    boost::optional<TimeZone> timeZone = expr.getParsedTimeZone();
+    if (!timeZone) {
+        timeZone = makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                root,
+                                expr.getTimeZone(),
+                                variables,
+                                ctx);
+        if (!timeZone) {
+            return Value(BSONNULL);
+        }
+    }
+
+    auto iso8601 = evaluateIso8601Flag(expr.getIso8601(), root, variables, ctx);
+    if (!iso8601) {
+        return Value(BSONNULL);
+    }
+
+    if (date.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    auto dateValue = date.coerceToDate();
+
+    if (*iso8601) {
+        auto parts = timeZone->dateIso8601Parts(dateValue);
+        return Value(Document{{"isoWeekYear", parts.year},
+                              {"isoWeek", parts.weekOfYear},
+                              {"isoDayOfWeek", parts.dayOfWeek},
+                              {"hour", parts.hour},
+                              {"minute", parts.minute},
+                              {"second", parts.second},
+                              {"millisecond", parts.millisecond}});
+    } else {
+        auto parts = timeZone->dateParts(dateValue);
+        return Value(Document{{"year", parts.year},
+                              {"month", parts.month},
+                              {"day", parts.dayOfMonth},
+                              {"hour", parts.hour},
+                              {"minute", parts.minute},
+                              {"second", parts.second},
+                              {"millisecond", parts.millisecond}});
+    }
+}
+
+Value evaluate(const ExpressionDateToString& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    tassert(9711501, "Missing date argument", expr.getDate() != nullptr);
+    const Value date = expr.getDate()->evaluate(root, variables, ctx);
+    Value formatValue;
+
+    // Eagerly validate the format parameter, ignoring if nullish since the input date nullish
+    // behavior takes precedence.
+    if (expr.getFormat()) {
+        formatValue = expr.getFormat()->evaluate(root, variables, ctx);
+        if (!formatValue.nullish()) {
+            uassert(18533,
+                    str::stream() << "$dateToString requires that 'format' be a string, found: "
+                                  << typeName(formatValue.getType()) << " with value "
+                                  << formatValue.toString(),
+                    formatValue.getType() == BSONType::string);
+
+            TimeZone::validateToStringFormat(formatValue.getStringData());
+        }
+    }
+
+    // Evaluate the timezone parameter before checking for nullish input, as this will throw an
+    // exception for an invalid timezone string.
+    boost::optional<TimeZone> timeZone = expr.getParsedTimeZone();
+    if (!timeZone) {
+        timeZone = makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                root,
+                                expr.getTimeZone(),
+                                variables,
+                                ctx);
+    }
+
+    if (date.nullish()) {
+        return expr.getOnNull() ? expr.getOnNull()->evaluate(root, variables, ctx)
+                                : Value(BSONNULL);
+    }
+
+    if (!timeZone) {
+        return Value(BSONNULL);
+    }
+
+    if (expr.getFormat()) {
+        if (formatValue.nullish()) {
+            return Value(BSONNULL);
+        }
+
+        return Value(uassertStatusOK(
+            timeZone->formatDate(formatValue.getStringData(), date.coerceToDate())));
+    }
+
+    return Value(uassertStatusOK(timeZone->formatDate(
+        timeZone->isUtcZone() ? kIsoFormatStringZ : kIsoFormatStringNonZ, date.coerceToDate())));
+}
+
+Value evaluate(const ExpressionDateDiff& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    const Value startDateValue = expr.getStartDate()->evaluate(root, variables, ctx);
+    if (startDateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const Value endDateValue = expr.getEndDate()->evaluate(root, variables, ctx);
+    if (endDateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    TimeUnit unit;
+    if (expr.getParsedUnit()) {
+        unit = *expr.getParsedUnit();
+    } else {
+        const Value unitValue = expr.getUnit()->evaluate(root, variables, ctx);
+        if (unitValue.nullish()) {
+            return Value(BSONNULL);
+        }
+        unit = parseTimeUnit(unitValue, "$dateDiff"sv);
+    }
+
+    DayOfWeek startOfWeek = kStartOfWeekDefault;
+    if (unit == TimeUnit::week) {
+        if (expr.getParsedStartOfWeek()) {
+            startOfWeek = *expr.getParsedStartOfWeek();
+        } else if (expr.getStartOfWeek()) {
+            const Value startOfWeekValue = expr.getStartOfWeek()->evaluate(root, variables, ctx);
+            if (startOfWeekValue.nullish()) {
+                return Value(BSONNULL);
+            }
+            startOfWeek = parseDayOfWeek(startOfWeekValue, "$dateDiff"sv, "startOfWeek"sv);
+        }
+    }
+
+    boost::optional<TimeZone> timezone = expr.getParsedTimeZone();
+    if (!timezone) {
+        timezone = addContextToAssertionException(
+            [&]() {
+                return makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                    root,
+                                    expr.getTimeZone(),
+                                    variables,
+                                    ctx);
+            },
+            "$dateDiff parameter 'timezone' value parsing failed"sv);
+        if (!timezone) {
+            return Value(BSONNULL);
+        }
+    }
+
+    const Date_t startDate = convertDate(startDateValue, "$dateDiff"sv, "startDate"sv);
+    const Date_t endDate = convertDate(endDateValue, "$dateDiff"sv, "endDate"sv);
+    return Value{dateDiff(startDate, endDate, unit, *timezone, startOfWeek)};
+}
+
+namespace {
+
+// Common code shared between DateAdd and DateSubtract implementations. It converts the parameters
+// of the function into their native C++ types. It returns false if at least one of the parameters
+// is Null, and throws an AssertionException if any of them is an invalid value.
+bool extractDateArithmetics(const ExpressionDateArithmetics& expr,
+                            const Document& root,
+                            Variables* variables,
+                            const EvaluationContext& ctx,
+                            Date_t& outDate,
+                            TimeUnit& unit,
+                            long long& outAmount,
+                            boost::optional<TimeZone>& timezone) {
+    const Value startDate = expr.getStartDate()->evaluate(root, variables, ctx);
+    if (startDate.nullish()) {
+        return false;
+    }
+
+    if (expr.getParsedUnit()) {
+        unit = *expr.getParsedUnit();
+    } else {
+        const Value unitVal = expr.getUnit()->evaluate(root, variables, ctx);
+        if (unitVal.nullish()) {
+            return false;
+        }
+        unit = parseTimeUnit(unitVal, expr.getOpName());
+    }
+
+    auto amount = expr.getAmount()->evaluate(root, variables, ctx);
+    if (amount.nullish()) {
+        return false;
+    }
+
+    // Get the TimeZone object for the timezone parameter, if it is specified, or UTC otherwise.
+    timezone = expr.getParsedTimeZone();
+    if (!timezone) {
+        timezone = makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                root,
+                                expr.getTimeZone(),
+                                variables,
+                                ctx);
+        if (!timezone) {
+            return false;
+        }
+    }
+
+    uassert(5166403,
+            str::stream() << expr.getOpName() << " requires startDate to be convertible to a date",
+            startDate.coercibleToDate());
+    uassert(5166405,
+            str::stream() << expr.getOpName() << " expects integer amount of time units",
+            amount.integral64Bit());
+
+    outDate = startDate.coerceToDate();
+    outAmount = amount.coerceToLong();
+    return true;
+}
+
+}  // namespace
+
+Value evaluate(const ExpressionDateAdd& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    Date_t date;
+    TimeUnit unit;
+    long long amount;
+    boost::optional<TimeZone> timezone;
+    if (!extractDateArithmetics(expr, root, variables, ctx, date, unit, amount, timezone)) {
+        return Value(BSONNULL);
+    }
+    return Value(dateAdd(date, unit, amount, *timezone));
+}
+
+Value evaluate(const ExpressionDateSubtract& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    Date_t date;
+    TimeUnit unit;
+    long long amount;
+    boost::optional<TimeZone> timezone;
+    if (!extractDateArithmetics(expr, root, variables, ctx, date, unit, amount, timezone)) {
+        return Value(BSONNULL);
+    }
+    // Long long min value cannot be negated.
+    uassert(6045000,
+            str::stream() << "invalid $dateSubtract 'amount' parameter value: " << amount,
+            amount != std::numeric_limits<long long>::min());
+    return Value(dateAdd(date, unit, -amount, *timezone));
+}
+
+Value evaluate(const ExpressionDateTrunc& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    tassert(9711502, "Missing date argument", expr.getDate() != nullptr);
+    const Value dateValue = expr.getDate()->evaluate(root, variables, ctx);
+    if (dateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    unsigned long long binSize = 1;
+    if (expr.getParsedBinSize()) {
+        binSize = *expr.getParsedBinSize();
+    } else if (expr.getBinSize()) {
+        const Value binSizeValue = expr.getBinSize()->evaluate(root, variables, ctx);
+        if (binSizeValue.nullish()) {
+            return Value(BSONNULL);
+        }
+        binSize = convertDateTruncBinSizeValue(binSizeValue);
+    }
+
+    TimeUnit unit;
+    if (expr.getParsedUnit()) {
+        unit = *expr.getParsedUnit();
+    } else {
+        const Value unitValue = expr.getUnit()->evaluate(root, variables, ctx);
+        if (unitValue.nullish()) {
+            return Value(BSONNULL);
+        }
+        unit = parseTimeUnit(unitValue, "$dateTrunc"sv);
+    }
+
+    DayOfWeek startOfWeek = kStartOfWeekDefault;
+    if (unit == TimeUnit::week) {
+        if (expr.getParsedStartOfWeek()) {
+            startOfWeek = *expr.getParsedStartOfWeek();
+        } else if (expr.getStartOfWeek()) {
+            const Value startOfWeekValue = expr.getStartOfWeek()->evaluate(root, variables, ctx);
+            if (startOfWeekValue.nullish()) {
+                return Value(BSONNULL);
+            }
+            startOfWeek = parseDayOfWeek(startOfWeekValue, "$dateTrunc"sv, "startOfWeek"sv);
+        }
+    }
+
+    boost::optional<TimeZone> timezone = expr.getParsedTimeZone();
+    if (!timezone) {
+        timezone = addContextToAssertionException(
+            [&]() {
+                return makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                                    root,
+                                    expr.getTimeZone(),
+                                    variables,
+                                    ctx);
+            },
+            "$dateTrunc parameter 'timezone' value parsing failed"sv);
+        if (!timezone) {
+            return Value(BSONNULL);
+        }
+    }
+
+    // Convert parameter values.
+    const Date_t date = convertDate(dateValue, "$dateTrunc"sv, "date"sv);
+    return Value{truncateDate(date, unit, binSize, *timezone, startOfWeek)};
+}
+
+Value evaluate(const ExpressionTsSecond& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    const Value operand = expr.getOperandList()[0]->evaluate(root, variables, ctx);
+
+    if (operand.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(5687301,
+            str::stream() << " Argument to " << expr.getOpName() << " must be a timestamp, but is "
+                          << typeName(operand.getType()),
+            operand.getType() == BSONType::timestamp);
+
+    return Value(static_cast<long long>(operand.getTimestamp().getSecs()));
+}
+
+Value evaluate(const ExpressionTsIncrement& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    const Value operand = expr.getOperandList()[0]->evaluate(root, variables, ctx);
+
+    if (operand.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(5687302,
+            str::stream() << " Argument to " << expr.getOpName() << " must be a timestamp, but is "
+                          << typeName(operand.getType()),
+            operand.getType() == BSONType::timestamp);
+
+    return Value(static_cast<long long>(operand.getTimestamp().getInc()));
+}
+
+namespace {
+
+// Common code shared between all the single-argument date extraction functions. It converts the
+// parameters of the function into their native C++ types, throwing an AssertionException if any of
+// them is an invalid value. It then invokes the provided lambda function on the computed date and
+// timezone.
+template <typename dateFuncFn>
+Value evaluateDateTimezoneArg(const DateExpressionAcceptingTimeZone& expr,
+                              const Document& root,
+                              Variables* variables,
+                              const EvaluationContext& ctx,
+                              dateFuncFn dateFn) {
+    tassert(9711503, "Missing date argument", expr.getDate() != nullptr);
+    auto dateVal = expr.getDate()->evaluate(root, variables, ctx);
+    if (dateVal.nullish()) {
+        return Value(BSONNULL);
+    }
+    auto date = dateVal.coerceToDate();
+
+    if (expr.getParsedTimeZone()) {
+        return dateFn(date, *expr.getParsedTimeZone());
+    } else {
+        boost::optional<TimeZone> timeZone =
+            makeTimeZone(expr.getExpressionContext()->getTimeZoneDatabase(),
+                         root,
+                         expr.getTimeZone(),
+                         variables,
+                         ctx);
+        if (!timeZone) {
+            return Value(BSONNULL);
+        } else {
+            return dateFn(date, *timeZone);
+        }
+    }
+}
+}  // namespace
+
+Value evaluate(const ExpressionDayOfMonth& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).dayOfMonth);
+        });
+}
+
+Value evaluate(const ExpressionDayOfWeek& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dayOfWeek(date));
+        });
+}
+
+Value evaluate(const ExpressionDayOfYear& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dayOfYear(date));
+        });
+}
+
+Value evaluate(const ExpressionHour& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).hour);
+        });
+}
+
+Value evaluate(const ExpressionMillisecond& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).millisecond);
+        });
+}
+
+Value evaluate(const ExpressionMinute& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).minute);
+        });
+}
+
+Value evaluate(const ExpressionMonth& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).month);
+        });
+}
+
+Value evaluate(const ExpressionSecond& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).second);
+        });
+}
+
+Value evaluate(const ExpressionWeek& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.week(date));
+        });
+}
+
+Value evaluate(const ExpressionIsoWeekYear& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.isoYear(date));
+        });
+}
+
+Value evaluate(const ExpressionIsoDayOfWeek& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.isoDayOfWeek(date));
+        });
+}
+
+Value evaluate(const ExpressionIsoWeek& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.isoWeek(date));
+        });
+}
+
+Value evaluate(const ExpressionYear& expr,
+               const Document& root,
+               Variables* variables,
+               const EvaluationContext& ctx) {
+    return evaluateDateTimezoneArg(
+        expr, root, variables, ctx, [](Date_t date, const TimeZone& timeZone) {
+            return Value(timeZone.dateParts(date).year);
+        });
+}
+
+Value evaluate(const ExpressionCurrentDate&,
+               const Document&,
+               Variables*,
+               const EvaluationContext&) {
+    if (MONGO_unlikely(sleepBeforeCurrentDateEvaluation.shouldFail())) {
+        sleepBeforeCurrentDateEvaluation.execute(
+            [&](const BSONObj& data) { sleepmillis(data["ms"].numberInt()); });
+    }
+
+    return Value(Date_t::now());
+}
+
+}  // namespace exec::expression
+}  // namespace mongo

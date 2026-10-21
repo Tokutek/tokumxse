@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Feature flag for TLS connection handoff.
+
+global:
+    cpp_namespace: "mongo::feature_flags"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+feature_flags:
+    featureFlagTLSConnectionHandoff:
+        description: "Enable the TLS connection handoff transport layer (HandoffTransportLayer)"
+        cpp_varname: gFeatureFlagTLSConnectionHandoff
+        default: false
+        fcv_gated: false

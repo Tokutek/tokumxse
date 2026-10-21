@@ -1,0 +1,199 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/vm/vm.h"
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
+#include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/collation/collator_factory_icu.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <benchmark/benchmark.h>
+
+
+namespace mongo::sbe {
+namespace {
+using namespace std::literals::string_view_literals;
+
+using TagValue = std::pair<value::TypeTags, value::Value>;
+
+class ValueVectorGuard {
+public:
+    ValueVectorGuard(std::vector<TagValue>& values) : _values(values) {}
+    ~ValueVectorGuard() {
+        for (auto [tag, value] : _values) {
+            value::releaseValue(tag, value);
+        }
+    }
+
+private:
+    std::vector<TagValue>& _values;
+};
+
+class SbeVmBenchmark : public benchmark::Fixture {
+private:
+    static constexpr int32_t kSeed = 1;
+
+public:
+    SbeVmBenchmark() : SbeVmBenchmark(std::make_unique<RuntimeEnvironment>()) {}
+
+    void benchmarkExpression(std::unique_ptr<EExpression> expr,
+                             const std::vector<TagValue>& inputs,
+                             benchmark::State& state) {
+        vm::CodeFragment code = expr->compileDirect(_compileCtx);
+        vm::ByteCode vm;
+        auto inputAccessor = _env->getAccessor(_inputSlotId);
+        for (auto keepRunning : state) {
+            for (auto [inputTag, inputVal] : inputs) {
+                inputAccessor->reset(value::TagValueView{inputTag, inputVal});
+                auto value = vm.run(&code);
+            }
+            benchmark::ClobberMemory();
+        }
+    }
+
+    TagValue generateRandomString(size_t size) {
+        static const std::string kAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        std::string str;
+        str.reserve(size);
+        for (size_t j = 0; j < size; ++j) {
+            str.push_back(kAlphabet[_random.nextInt32(kAlphabet.size())]);
+        }
+        return value::makeNewString(str);
+    }
+
+    std::vector<TagValue> generateRandomStrings(size_t count, size_t size) {
+        std::vector<TagValue> strings;
+        strings.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            strings.push_back(generateRandomString(size));
+        }
+        return strings;
+    }
+
+    TagValue makeArraySet(const std::vector<TagValue>& values, const CollatorInterface* collator) {
+        auto [tag, value] = value::makeNewArraySet(collator);
+        auto* arraySet = value::getArraySetView(value);
+        for (const auto& [tag, value] : values) {
+            arraySet->push_back_clone(tag, value);
+        }
+        return {tag, value};
+    }
+
+    value::SlotId setCollator(const CollatorInterface* collator) {
+        auto collatorSlot = _env->getSlotIfExists("collator"sv);
+        if (collatorSlot) {
+            _env->getAccessor(*collatorSlot)
+                ->reset(
+                    value::TagValueView{value::TypeTags::collator,
+                                        value::bitcastFrom<const CollatorInterface*>(collator)});
+            return *collatorSlot;
+        }
+        return _env->registerSlot("collator"sv,
+                                  value::TypeTags::collator,
+                                  value::bitcastFrom<const CollatorInterface*>(collator),
+                                  false,
+                                  &_slotIdGenerator);
+    }
+
+    std::unique_ptr<CollatorInterface> createCollator() {
+        auto statusWithCollator = _collatorFactory.makeFromBSON(BSON("locale" << "en_US"));
+        tassert(11093705, "Could not create collator", statusWithCollator.isOK());
+        return std::move(statusWithCollator.getValue());
+    }
+
+    value::SlotId inputSlotId() const {
+        return _inputSlotId;
+    }
+
+    PseudoRandom random() const {
+        return _random;
+    }
+
+private:
+    SbeVmBenchmark(std::unique_ptr<RuntimeEnvironment> env)
+        : _env(env.get()), _compileCtx(std::move(env)), _random(kSeed) {
+        _env->registerSlot("timeZoneDB"sv,
+                           value::TypeTags::timeZoneDB,
+                           value::bitcastFrom<TimeZoneDatabase*>(&_timeZoneDB),
+                           false,
+                           &_slotIdGenerator);
+        _inputSlotId =
+            _env->registerSlot("input"sv, value::TypeTags::Nothing, 0, false, &_slotIdGenerator);
+    }
+
+    RuntimeEnvironment* _env;
+    CompileCtx _compileCtx;
+    value::SlotIdGenerator _slotIdGenerator;
+    value::SlotId _inputSlotId;
+
+    PseudoRandom _random;
+
+    TimeZoneDatabase _timeZoneDB;
+
+    CollatorFactoryICU _collatorFactory;
+};
+
+BENCHMARK_DEFINE_F(SbeVmBenchmark, BM_IsMember_ArraySet_NoCollator)(benchmark::State& state) {
+    auto strings = generateRandomStrings(state.range(0) /*count*/, state.range(1) /*size*/);
+    ValueVectorGuard guards(strings);
+
+    TagValue arraySet = makeArraySet(strings, nullptr /*collator*/);
+    auto arraySetConstant = makeE<EConstant>(arraySet.first, arraySet.second);
+
+    auto expr = makeE<EFunction>(
+        sbe::EFn::kIsMember, makeEs(makeE<EVariable>(inputSlotId()), std::move(arraySetConstant)));
+    TagValue searchValue = generateRandomString(state.range(1) /*size*/);
+    value::TagValueOwned searchValueOwned =
+        value::TagValueOwned::fromRaw(searchValue.first, searchValue.second);
+    benchmarkExpression(std::move(expr), {searchValue}, state);
+}
+
+BENCHMARK_DEFINE_F(SbeVmBenchmark, BM_IsMember_ArraySet_Collator)(benchmark::State& state) {
+    auto strings = generateRandomStrings(state.range(0) /*count*/, state.range(1) /*size*/);
+    ValueVectorGuard guards(strings);
+    auto collator = createCollator();
+
+    TagValue arraySet = makeArraySet(strings, collator.get());
+    auto arraySetConstant = makeE<EConstant>(arraySet.first, arraySet.second);
+
+    auto expr = makeE<EFunction>(
+        sbe::EFn::kIsMember, makeEs(makeE<EVariable>(inputSlotId()), std::move(arraySetConstant)));
+    TagValue searchValue = generateRandomString(state.range(1) /*size*/);
+    value::TagValueOwned searchValueOwned =
+        value::TagValueOwned::fromRaw(searchValue.first, searchValue.second);
+    benchmarkExpression(std::move(expr), {searchValue}, state);
+}
+
+#define ADD_ARGS()        \
+    Args({5, 5})          \
+        ->Args({10, 5})   \
+        ->Args({10, 10})  \
+        ->Args({50, 10})  \
+        ->Args({10, 50})  \
+        ->Args({50, 50})  \
+        ->Args({10, 100}) \
+        ->Args({50, 100}) \
+        ->Args({100, 100})
+
+BENCHMARK_REGISTER_F(SbeVmBenchmark, BM_IsMember_ArraySet_NoCollator)->Args({100, 100});
+
+BENCHMARK_REGISTER_F(SbeVmBenchmark, BM_IsMember_ArraySet_Collator)->ADD_ARGS();
+
+}  // namespace
+}  // namespace mongo::sbe

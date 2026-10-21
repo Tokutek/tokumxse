@@ -1,0 +1,14 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::transport"
+
+server_parameters:
+    joinIngressSessionsOnShutdown:
+        description: Allow server to perform a graceful shutdown for ingress sessions.
+        set_at: startup
+        cpp_varname: gJoinIngressSessionsOnShutdown
+        cpp_vartype: bool
+        default: false
+        redact: false

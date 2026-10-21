@@ -1,185 +1,214 @@
-/**
- * Copyright 2011 (c) 10gen Inc.
- *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
+#include "mongo/db/pipeline/document_source_unwind.h"
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/compiler/logical_model/sort_pattern/sort_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <iterator>
+#include <list>
+#include <string_view>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using std::string;
-    using std::vector;
+using boost::intrusive_ptr;
+using std::string;
 
-    /** Helper class to unwind array from a single document. */
-    class DocumentSourceUnwind::Unwinder {
-    public:
-        /** @param unwindPath is the field path to the array to unwind. */
-        Unwinder(const FieldPath& unwindPath);
-        /** Reset the unwinder to unwind a new document. */
-        void resetDocument(const Document& document);
+DocumentSourceUnwind::DocumentSourceUnwind(const intrusive_ptr<ExpressionContext>& pExpCtx,
+                                           const FieldPath& fieldPath,
+                                           bool preserveNullAndEmptyArrays,
+                                           const boost::optional<FieldPath>& indexPath,
+                                           bool strict)
+    : DocumentSource(kStageName, pExpCtx),
+      _unwindPath(fieldPath),
+      _preserveNullAndEmptyArrays(preserveNullAndEmptyArrays),
+      _indexPath(indexPath),
+      _strict(strict) {}
 
-        /**
-         * @return the next document unwound from the document provided to resetDocument(), using
-         * the current value in the array located at the provided unwindPath.
-         *
-         * Returns boost::none if the array is exhausted.
-         */
-        boost::optional<Document> getNext();
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE(unwind,
+                                     UnwindLiteParsed::parse,
+                                     AllowedWithApiStrict::kAlways);
 
-    private:
-        // Path to the array to unwind.
-        const FieldPath _unwindPath;
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(unwind, DocumentSourceUnwind, UnwindStageParams);
 
-        Value _inputArray;
-        MutableDocument _output;
+ALLOCATE_DOCUMENT_SOURCE_ID(unwind, DocumentSourceUnwind::id)
 
-        // Document indexes of the field path components.
-        vector<Position> _unwindPathFieldIndexes;
-        // Index into the _inputArray to return next.
-        size_t _index;
-    };
-
-    DocumentSourceUnwind::Unwinder::Unwinder(const FieldPath& unwindPath):
-        _unwindPath(unwindPath) {
-    }
-
-    void DocumentSourceUnwind::Unwinder::resetDocument(const Document& document) {
-
-        // Reset document specific attributes.
-        _inputArray = Value();
-        _output.reset(document);
-        _unwindPathFieldIndexes.clear();
-        _index = 0;
-
-        Value pathValue = document.getNestedField(_unwindPath, &_unwindPathFieldIndexes);
-        if (pathValue.nullish()) {
-            // The path does not exist or is null.
-            return;
-        }
-
-        _inputArray = pathValue;
-    }
-
-    boost::optional<Document> DocumentSourceUnwind::Unwinder::getNext() {
-        if (_inputArray.missing())
-            return boost::none;
-
-        // If needed, this will automatically clone all the documents along the
-        // field path so that the end values are not shared across documents
-        // that have come out of this pipeline operator.  This is a partial deep
-        // clone. Because the value at the end will be replaced, everything
-        // along the path leading to that will be replaced in order not to share
-        // that change with any other clones (or the original).
-
-        if (_inputArray.getType() == Array) {
-            if (_index == _inputArray.getArrayLength())
-                return boost::none;
-            _output.setNestedField(_unwindPathFieldIndexes, _inputArray[_index]);
-        }
-        else if (_index > 0) {
-            return boost::none;
-        }
-        else {
-            //_output.setNestedField(_unwindPathFieldIndexes, _inputArray);
-        }
-        _index++;
-        return _output.peek();
-    }
-
-    const char DocumentSourceUnwind::unwindName[] = "$unwind";
-
-    DocumentSourceUnwind::DocumentSourceUnwind(
-        const intrusive_ptr<ExpressionContext> &pExpCtx):
-        DocumentSource(pExpCtx) {
-    }
-
-    const char *DocumentSourceUnwind::getSourceName() const {
-        return unwindName;
-    }
-
-    boost::optional<Document> DocumentSourceUnwind::getNext() {
-        pExpCtx->checkForInterrupt();
-
-        boost::optional<Document> out = _unwinder->getNext();
-        while (!out) {
-            // No more elements in array currently being unwound. This will loop if the input
-            // document is missing the unwind field or has an empty array.
-            boost::optional<Document> input = pSource->getNext();
-            if (!input)
-                return boost::none; // input exhausted
-
-            // Try to extract an output document from the new input document.
-            _unwinder->resetDocument(*input);
-            out = _unwinder->getNext();
-        }
-
-        return out;
-    }
-
-    Value DocumentSourceUnwind::serialize(bool explain) const {
-        verify(_unwindPath);
-        return Value(DOC(getSourceName() << _unwindPath->getPath(true)));
-    }
-
-    DocumentSource::GetDepsReturn DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
-        deps->fields.insert(_unwindPath->getPath(false));
-        return SEE_NEXT;
-    }
-
-    void DocumentSourceUnwind::unwindPath(const FieldPath &fieldPath) {
-        // Can't set more than one unwind path.
-        uassert(15979, str::stream() << unwindName << "can't unwind more than one path",
-                !_unwindPath);
-        // Record the unwind path.
-        _unwindPath.reset(new FieldPath(fieldPath));
-        _unwinder.reset(new Unwinder(fieldPath));
-    }
-
-    intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        /*
-          The value of $unwind should just be a field path.
-         */
-        uassert(15981, str::stream() << "the " << unwindName <<
-                " field path must be specified as a string",
-                elem.type() == String);
-
-        string prefixedPathString(elem.str());
-        string pathString(Expression::removeFieldPrefix(prefixedPathString));
-        intrusive_ptr<DocumentSourceUnwind> pUnwind(new DocumentSourceUnwind(pExpCtx));
-        pUnwind->unwindPath(FieldPath(pathString));
-
-        return pUnwind;
-    }
+std::string_view DocumentSourceUnwind::getSourceName() const {
+    return kStageName;
 }
+
+intrusive_ptr<DocumentSourceUnwind> DocumentSourceUnwind::create(
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    const string& unwindPath,
+    bool preserveNullAndEmptyArrays,
+    const boost::optional<string>& indexPath,
+    bool strict) {
+    intrusive_ptr<DocumentSourceUnwind> source(
+        new DocumentSourceUnwind(expCtx,
+                                 FieldPath(unwindPath),
+                                 preserveNullAndEmptyArrays,
+                                 indexPath ? FieldPath(*indexPath) : boost::optional<FieldPath>(),
+                                 strict));
+    return source;
+}
+
+DocumentSource::GetModPathsReturn DocumentSourceUnwind::getModifiedPaths() const {
+    OrderedPathSet modifiedFields{getUnwindPath()};
+    if (indexPath()) {
+        modifiedFields.insert(indexPath()->fullPath());
+    }
+    return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedFields), {}};
+}
+
+bool DocumentSourceUnwind::canPushSortBack(const DocumentSourceSort* sort) const {
+    // If the sort has a limit, we should also check that _preserveNullAndEmptyArrays is true,
+    // otherwise when we swap the limit and unwind, we could end up providing fewer results to the
+    // user than expected.
+    if (!sort->hasLimit() || preserveNullAndEmptyArrays()) {
+        auto modifiedPaths = getModifiedPaths();
+
+        // Checks if any of the $sort's paths depend on the unwind path (or vice versa).
+        SortPattern sortKeyPattern = sort->getSortPattern();
+        bool sortDependsOnUnwind =
+            std::any_of(sortKeyPattern.begin(), sortKeyPattern.end(), [&](auto& sortKey) {
+                // If 'sortKey' is a $meta expression, we can do the swap.
+                return sortKey.fieldPath && modifiedPaths.canModify(*sortKey.fieldPath);
+            });
+        return !sortDependsOnUnwind;
+    }
+    return false;
+}
+
+bool DocumentSourceUnwind::canPushLimitBack(const DocumentSourceLimit* limit) const {
+    // If _smallestLimitPushedDown is boost::none, then we have not yet pushed a limit down. So no
+    // matter what the limit is, we should duplicate and push down. Otherwise we should only push
+    // the limit down if it is smaller than the smallest limit we have pushed down so far.
+    return !_smallestLimitPushedDown || limit->getLimit() < _smallestLimitPushedDown.value();
+}
+
+DocumentSourceContainer::iterator DocumentSourceUnwind::optimizeAt(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
+    tassert(5482200, "DocumentSourceUnwind: itr must point to this object", *itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
+    // If the following stage is $sort (on a different field), push before $unwind.
+    auto next = std::next(itr);
+    auto nextSort = dynamic_cast<DocumentSourceSort*>(next->get());
+    if (nextSort && canPushSortBack(nextSort)) {
+        // If this sort is a top-k sort, we should add a limit after the unwind so that we preserve
+        // behavior and not provide more results than requested.
+        if (nextSort->hasLimit()) {
+            container->insert(
+                std::next(next),
+                DocumentSourceLimit::create(nextSort->getExpCtx(), nextSort->getLimit().value()));
+        }
+        std::swap(*itr, *next);
+        return itr == container->begin() ? itr : std::prev(itr);
+    }
+
+    // If _preserveNullAndEmptyArrays is true, and unwind is followed by a limit, we can add a
+    // duplicate limit before the unwind to prevent sources further down the pipeline from giving us
+    // more than we need.
+    auto nextLimit = dynamic_cast<DocumentSourceLimit*>(next->get());
+    if (nextLimit && preserveNullAndEmptyArrays() && canPushLimitBack(nextLimit)) {
+        _smallestLimitPushedDown = nextLimit->getLimit();
+        auto newStageItr = container->insert(
+            itr, DocumentSourceLimit::create(nextLimit->getExpCtx(), nextLimit->getLimit()));
+        return newStageItr == container->begin() ? newStageItr : std::prev(newStageItr);
+    }
+
+    return std::next(itr);
+}
+
+Value DocumentSourceUnwind::serialize(const query_shape::SerializationOptions& opts) const {
+    return Value(
+        DOC(getSourceName() << DOC(
+                "path" << opts.serializeFieldPathWithPrefix(getUnwindPath())
+                       << "preserveNullAndEmptyArrays"
+                       << (preserveNullAndEmptyArrays() ? opts.serializeLiteral(true) : Value())
+                       << "includeArrayIndex"
+                       << (indexPath() ? Value(opts.serializeFieldPath(*indexPath())) : Value()))));
+}
+
+DepsTracker::State DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
+    deps->fields.insert(getUnwindPath());
+    return DepsTracker::State::SEE_NEXT;
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    // $unwind accepts either the legacy "{$unwind: '$path'}" syntax, or a nested document with
+    // extra options.
+    string prefixedPathString;
+    bool preserveNullAndEmptyArrays = false;
+    boost::optional<string> indexPath;
+    if (elem.type() == BSONType::object) {
+        for (auto&& subElem : elem.Obj()) {
+            if (subElem.fieldNameStringData() == "path") {
+                uassert(28808,
+                        str::stream() << "expected a string as the path for $unwind stage, got "
+                                      << typeName(subElem.type()),
+                        subElem.type() == BSONType::string);
+                prefixedPathString = subElem.str();
+            } else if (subElem.fieldNameStringData() == "preserveNullAndEmptyArrays") {
+                uassert(28809,
+                        str::stream() << "expected a boolean for the preserveNullAndEmptyArrays "
+                                         "option to $unwind stage, got "
+                                      << typeName(subElem.type()),
+                        subElem.type() == BSONType::boolean);
+                preserveNullAndEmptyArrays = subElem.Bool();
+            } else if (subElem.fieldNameStringData() == "includeArrayIndex") {
+                uassert(28810,
+                        str::stream() << "expected a non-empty string for the includeArrayIndex "
+                                         " option to $unwind stage, got "
+                                      << typeName(subElem.type()),
+                        subElem.type() == BSONType::string && !subElem.String().empty());
+                indexPath = subElem.String();
+                uassert(28822,
+                        str::stream() << "includeArrayIndex option to $unwind stage should not be "
+                                         "prefixed with a '$': "
+                                      << (*indexPath),
+                        (*indexPath)[0] != '$');
+            } else {
+                uasserted(28811,
+                          str::stream() << "unrecognized option to $unwind stage: "
+                                        << subElem.fieldNameStringData());
+            }
+        }
+    } else if (elem.type() == BSONType::string) {
+        prefixedPathString = elem.str();
+    } else {
+        uasserted(
+            15981,
+            str::stream()
+                << "expected either a string or an object as specification for $unwind stage, got "
+                << typeName(elem.type()));
+    }
+    uassert(28812, "no path specified to $unwind stage", !prefixedPathString.empty());
+
+    uassert(28818,
+            str::stream() << "path option to $unwind stage should be prefixed with a '$': "
+                          << prefixedPathString,
+            prefixedPathString[0] == '$');
+    string pathString(Expression::removeFieldPrefix(prefixedPathString));
+    return DocumentSourceUnwind::create(pExpCtx, pathString, preserveNullAndEmptyArrays, indexPath);
+}
+}  // namespace mongo

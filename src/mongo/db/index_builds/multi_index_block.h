@@ -1,0 +1,521 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_builds/index_build_block.h"
+#include "mongo/db/index_builds/index_build_interceptor.h"
+#include "mongo/db/index_builds/resumable_index_builds_gen.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/storage/lazy_record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/throttle_cursor.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/progress_meter.h"
+#include "mongo/util/uuid.h"
+
+#include <functional>
+#include <memory>
+#include <string_view>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+/**
+ * Builds one or more indexes.
+ *
+ * If any method other than insertSingleDocumentForInitialSyncOrRecovery() returns a not-ok Status,
+ * this MultiIndexBlock should be considered failed and must be destroyed.
+ *
+ * If a MultiIndexBlock is destroyed before commit() or if commit() is rolled back, it will
+ * clean up all traces of the indexes being constructed. MultiIndexBlocks should not be
+ * destructed from inside of a WriteUnitOfWork as any cleanup needed should never be rolled back
+ * (as it is itself essentially a form of rollback, you don't want to "rollback the rollback").
+ */
+class MultiIndexBlock {
+    MultiIndexBlock(const MultiIndexBlock&) = delete;
+    MultiIndexBlock& operator=(const MultiIndexBlock&) = delete;
+
+public:
+    using RetrySkippedRecordMode = IndexBuildInterceptor::RetrySkippedRecordMode;
+
+    MultiIndexBlock() = default;
+    ~MultiIndexBlock();
+
+    /**
+     * Gets total allowed memory usage for all index builds from
+     * the server parameter 'maxIndexBuildMemoryUsageMegabytes'.
+     *
+     * This function does all bounds checking on the server
+     * parameter and computes a percentage-based value, if set.
+     */
+    static size_t getTotalIndexBuildMaxMemoryUsageBytes();
+
+    /**
+     * When this is called:
+     * For hybrid index builds, the index interceptor will not track duplicates.
+     * For foreground index builds, the uniqueness constraint will be relaxed.
+     */
+    void ignoreUniqueConstraint();
+
+    /**
+     * Sets an index build UUID associated with the indexes for this builder.
+     */
+    void setBuildUUID(UUID indexBuildUUID) {
+        _buildUUID = indexBuildUUID;
+    }
+
+    using OnInitFn = std::function<void()>;
+    enum class InitMode { SteadyState, InitialSync, Recovery };
+
+    /**
+     * Prepares the index(es) for building and returns the canonicalized form of the requested index
+     * specifications.
+     *
+     * Calls 'onInitFn' in the same WriteUnitOfWork as the 'ready: false' write to the index after
+     * all indexes have been initialized. For callers that timestamp this write, use
+     * 'makeTimestampedIndexOnInitFn', otherwise use 'kNoopOnInitFn'.
+     *
+     * Callers can optionally limit the memory usage via 'maxMemoryUsageBytes'. If omitted, the
+     * default memory limit is controlled by the 'maxIndexBuildMemoryUsageMegabytes' server
+     * parameter.
+     *
+     * Does not need to be called inside of a WriteUnitOfWork (but can be due to nesting).
+     *
+     * Requires holding an exclusive lock on the collection.
+     */
+    StatusWith<std::vector<BSONObj>> init(
+        OperationContext* opCtx,
+        CollectionWriter& collection,
+        const std::vector<IndexBuildInfo>& indexes,
+        OnInitFn onInit,
+        InitMode initMode,
+        const boost::optional<ResumeIndexInfo>& resumeInfo,
+        boost::optional<size_t> maxMemoryUsageBytes = boost::none);
+    /**
+     * Not all index initializations need an OnInitFn, in particular index builds that do not need
+     * to timestamp catalog writes. This is a no-op.
+     */
+    static const inline OnInitFn kNoopOnInitFn = nullptr;
+
+    /**
+     * Returns an OnInit function for initialization when this index build should be timestamped.
+     * When called on primaries, this generates a new optime, writes a no-op oplog entry, and
+     * timestamps the first catalog write. Does nothing on secondaries.
+     */
+    static OnInitFn makeTimestampedIndexOnInitFn(OperationContext* opCtx,
+                                                 const CollectionPtr& coll);
+
+    /**
+     * Inserts all documents in the Collection into the indexes and logs with timing info.
+     *
+     * This is a replacement for calling both insertSingleDocumentForInitialSyncOrRecovery and
+     * dumpInsertsFromBulk. Do not call this if you are calling either of them.
+     *
+     * Will fail if violators of uniqueness constraints exist.
+     *
+     * Can throw an exception if interrupted.
+     *
+     * Should not be called inside of a WriteUnitOfWork.
+     */
+    Status insertAllDocumentsInCollection(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nssOrUUID,
+        const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
+
+    /**
+     * Call this after init() for each document in the collection.
+     *
+     * Do not call if you called insertAllDocumentsInCollection();
+     *
+     * Should be called inside of a WriteUnitOfWork.
+     *
+     * 'saveCursorBeforeWrite' and 'restoreCursorAfterWrite' will only be called if an index
+     * constraint violation is found and written out to the constraint violation side table. Any
+     * open cursors held by the caller should be saved in 'saveCursorBeforeWrite' and restored in
+     * 'saveCursorBeforeWrite'. Otherwise, the cursors may get reset unexpectedly because of an
+     * internally handled WCE.
+     */
+    Status insertSingleDocumentForInitialSyncOrRecovery(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const BSONObj& wholeDocument,
+        const RecordId& loc,
+        const std::function<void()>& saveCursorBeforeWrite,
+        const std::function<void()>& restoreCursorAfterWrite);
+
+    /**
+     * Call this after the last insertSingleDocumentForInitialSyncOrRecovery(). This gives the index
+     * builder a chance to do any long-running operations in separate units of work from commit().
+     *
+     * Do not call if you called insertAllDocumentsInCollection();
+     *
+     * If 'onDuplicateRecord' is passed as non-NULL and duplicates are not allowed for the index,
+     * violators of uniqueness constraints will be handled by 'onDuplicateRecord'.
+     *
+     * Should not be called inside of a WriteUnitOfWork.
+     */
+    Status dumpInsertsFromBulk(OperationContext* opCtx, const CollectionAcquisition& collection);
+    Status dumpInsertsFromBulk(OperationContext* opCtx,
+                               const CollectionAcquisition& collection,
+                               const IndexAccessMethod::RecordIdHandlerFn& onDuplicateRecord);
+    /**
+     * For background indexes using an IndexBuildInterceptor to capture inserts during a build,
+     * drain these writes into the index. If intent locks are held on the collection, more writes
+     * may come in after this drain completes. To ensure that all writes are completely drained
+     * before calling commit(), stop writes on the collection by holding a S or X while calling this
+     * method.
+     *
+     * When 'readSource' is not kNoTimestamp, perform the drain by reading at the timestamp
+     * described by the ReadSource.
+     *
+     * Must not be in a WriteUnitOfWork.
+     */
+    Status drainBackgroundWrites(OperationContext* opCtx,
+                                 RecoveryUnit::ReadSource readSource,
+                                 IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
+
+
+    /**
+     * By default, retries key generation and insertion for all records skipped during the
+     * collection scanning phase.
+     *
+     * Index builds ignore key generation errors on secondaries. In steady-state replication, all
+     * writes from the primary are eventually applied, so an index build should always succeed when
+     * the primary commits. In two-phase index builds, a secondary may become primary in the middle
+     * of an index build, so it must ensure that before it finishes, it has indexed all documents in
+     * a collection, requiring a call to this function upon completion.
+     *
+     * Index builds are also preemptively aborted on step up if the skipped records remain invalid.
+     */
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
+
+    /**
+     * Check any constraits that may have been temporarily violated during the index build for
+     * background indexes using an IndexBuildInterceptor to capture writes. The caller is
+     * responsible for ensuring that all writes on the collection are visible.
+     *
+     * Must not be in a WriteUnitOfWork.
+     */
+    Status checkConstraints(OperationContext* opCtx, const CollectionPtr& collection);
+
+    /**
+     * Marks the index ready for use. Should only be called as the last method after
+     * dumpInsertsFromBulk() or insertAllDocumentsInCollection() return success.
+     *
+     * Should be called inside of a WriteUnitOfWork. If the index building is to be logOp'd,
+     * logOp() should be called from the same unit of work as commit().
+     *
+     * `onCreateEach` will be called after each index has been marked as "ready".
+     *
+     * `onCommit` will be called after all indexes have been marked "ready", with the per-index
+     * multikey paths collected during the commit attempt.
+     *
+     * Requires holding an exclusive lock on the collection.
+     */
+    using OnCommitFn =
+        function_ref<void(const std::vector<boost::optional<MultikeyPaths>>& multikeys)>;
+    using OnCreateEachFn = function_ref<void(
+        const BSONObj& spec, IndexCatalogEntry& entry, boost::optional<MultikeyPaths>&& multikey)>;
+    Status commit(OperationContext* opCtx,
+                  Collection* collection,
+                  OnCreateEachFn onCreateEach,
+                  OnCommitFn onCommit);
+
+    /**
+     * Not all index commits need these functions, in particular index builds that do not need
+     * to timestamp catalog writes. These are no-ops.
+     */
+    static OnCreateEachFn kNoopOnCreateEachFn;
+    static OnCommitFn kNoopOnCommitFn;
+
+    /**
+     * Ensures the index build state is cleared correctly after index build failure.
+     *
+     * Must be called before object destruction if init() has been called; and safe to call if
+     * init() has not been called.
+     *
+     * By only requiring this call after init(), we allow owners of the object to exit without
+     * further handling if they never use the object.
+     *
+     * `onCleanUp` will be called after all indexes have been removed from the catalog.
+     */
+    using OnCleanUpFn = std::function<void()>;
+    void abortIndexBuild(OperationContext* opCtx,
+                         CollectionWriter& collection,
+                         OnCleanUpFn onCleanUp) noexcept;
+
+    /**
+     * Not all index aborts need this function, in particular index builds that do not need
+     * to timestamp catalog writes. This is a no-op.
+     */
+    static OnCleanUpFn kNoopOnCleanUpFn;
+
+    /**
+     * When called, will persist the resume state on demand; this should be valid to be called any
+     * time after construction but before a successful commit(). Writes the resumable index build
+     * state to disk if resumable index builds are supported.
+     *
+     * As the resume state, as well as the per-index trackers for side writes, duplicate keys, and
+     * skipped records, all use temporary tables, following a successful commit these temporary
+     * tables will be dropped after destruction of this MultiIndexBlock. If the server crashes,
+     * however, these temporary tables can be used to continue the resumable index build.
+     *
+     * To persist the resume state prior to a clean shutdown, abortWithoutCleanup(..) should be
+     * used, which will ensure the temporary tables will not be dropped.
+     */
+    void persistResumeState(OperationContext* opCtx, const CollectionPtr& collection);
+
+    /**
+     * May be called at any time after construction but before a successful commit(). Suppresses
+     * the default behavior on destruction of removing all traces of uncommitted index builds. May
+     * delete internal tables, but this is not transactional. Writes the resumable index build
+     * state to disk if resumable index builds are supported.
+     *
+     * This should only be used during shutdown or rollback. It is valid (and necessary) to call
+     * abortWithoutCleanup(..) on shutdown even if the resume state has already been persisted with
+     * persistResumeState(..).
+     */
+    void abortWithoutCleanup(OperationContext* opCtx, const CollectionPtr& collection);
+
+    /**
+     * Marks this build as cleaned up. Used during teardown when no actual table cleanup is needed.
+     */
+    void markAsCleanedUp() {
+        _buildIsCleanedUp = true;
+    }
+
+    /**
+     * Returns true if this build block supports background writes while building an index. This is
+     * true for the kHybrid method.
+     */
+    bool isBackgroundBuilding() const;
+
+    void setIndexBuildMethod(IndexBuildMethodEnum indexBuildMethod);
+
+    void setContainerWriteBehavior(ContainerWriteBehavior containerWriteBehavior);
+
+    void setIsResumable(bool isResumable);
+
+    /**
+     * Appends the current state information of the index build to the builder.
+     */
+    void appendBuildInfo(BSONObjBuilder* builder) const;
+
+    /**
+     * Returns the phase the index build is currently in.
+     */
+    IndexBuildPhaseEnum getPhase() const {
+        return _phase;
+    }
+
+    /**
+     * Running total number of keys and bytes written to the index tables by this index build,
+     * including deletions. The number of bytes is calculated as the total size of the key strings
+     * being written.
+     *
+     * More specifically, this tracks the number of keys and bytes written during
+     * the bulk load and side writes drain phases, since the collection scan phase does not itself
+     * write to an index table.
+     *
+     */
+    struct IndexBuildWriteStats {
+        int64_t numKeysWrittenBulkLoad = 0;
+        int64_t numBytesWrittenBulkLoad = 0;
+        int64_t numKeysWrittenSideWritesDrain = 0;
+        int64_t numBytesWrittenSideWritesDrain = 0;
+    };
+
+    IndexBuildWriteStats getIndexTableWrites() const {
+        return _indexWriteStats;
+    }
+
+private:
+    struct IndexToBuild {
+        std::unique_ptr<IndexBuildBlock> block;
+
+        IndexAccessMethod* real = nullptr;        // owned elsewhere
+        const MatchExpression* filterExpression;  // might be NULL, owned elsewhere
+        std::unique_ptr<IndexAccessMethod::BulkBuilder> bulk;
+
+        InsertDeleteOptions options;
+
+        // The highest spilled record id. Only set during the scan phase when replicating container
+        // writes.
+        boost::optional<RecordId> lastSpilledRecordId;
+
+        // Multikey state this build recovered from the side writes it drained.
+        bool drainedMultikey = false;
+        MultikeyPaths drainedMultikeyPaths;
+
+        // We cache index catalog entry pointer for the collection scan phase. This is necessary for
+        // index build performance in the insert path.
+        const IndexCatalogEntry* entryForScan = nullptr;
+    };
+
+    void _writeStateToDisk(OperationContext* opCtx);
+
+    /**
+     * If replicating container writes, releases the builder's sorters and any resources held by
+     * them.
+     */
+    void _releaseReplicatedSorters();
+
+    /**
+     * Performs an update-or-insert of a single record into the index build container. Caller must
+     * already be inside a WriteUnitOfWork.
+     */
+    void _upsertIntoContainer(OperationContext* opCtx, int64_t key, const BSONObj& obj) const;
+
+    /**
+     * Writes the IndexBuildMetadata to the index build container. No-op when not replicating
+     * container writes or not resumable.
+     */
+    void _writeIndexBuildMetadataToContainer(OperationContext* opCtx) const;
+
+    /**
+     * Writes a single IndexStateInfo to the index build container for the given index. No-op when
+     * not replicating container writes or not resumable.
+     */
+    void _writeIndexStateInfoToContainer(OperationContext* opCtx, size_t index) const;
+
+    /**
+     * Writes the IndexStateInfo for the given index within the caller's transaction. Callers that
+     * are not already in one should use `_writeIndexStateInfoToContainer`.
+     */
+    void _upsertIndexStateInfo(OperationContext* opCtx, size_t index) const;
+
+    /**
+     * Writes the IndexBuildMetadata and the IndexStateInfo for all indexes to the index build
+     * container. No-op when not replicating container writes or not resumable.
+     */
+    void _writeAllStateToContainer(OperationContext* opCtx) const;
+
+    /**
+     * Folds multikey paths recovered while draining side writes or retrying skipped records into
+     * this build's state and persists them with the rest of the resume state, within the caller's
+     * transaction.
+     */
+    Status _recordRecoveredMultikeyPaths(OperationContext* opCtx,
+                                         size_t index,
+                                         const MultikeyPaths& paths);
+
+    BSONObj _constructStateObject() const;
+
+    IndexBuildMetadata _buildIndexBuildMetadata() const;
+
+    IndexStateInfo _buildIndexStateInfo(const IndexToBuild& index) const;
+
+    Status _failPointHangDuringBuild(OperationContext* opCtx,
+                                     FailPoint* fp,
+                                     std::string_view where,
+                                     const BSONObj& doc,
+                                     unsigned long long iteration) const;
+
+    /**
+     * Inserts documents to be indexed from the collection scan into the bulk builder, to insert the
+     * relevant index keys into the external sorter.
+     * Returns the insert status along with the number of times the document was inserted into index
+     * bulk builders.
+     */
+    StatusWith<int64_t> _insert(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        const BSONObj& wholeDocument,
+        const RecordId& loc,
+        const IndexAccessMethod::OnSuppressedErrorFn& onSuppressedError,
+        const IndexAccessMethod::ShouldRelaxConstraintsFn& shouldRelaxConstraints = nullptr);
+
+    /**
+     * Performs a collection scan on the given collection and inserts the relevant index keys into
+     * the external sorter.
+     */
+    void _doCollectionScan(OperationContext* opCtx,
+                           const CollectionAcquisition& collection,
+                           const boost::optional<RecordId>& resumeAfterRecordId,
+                           ProgressMeterHolder* progress);
+
+    // Is set during init() and ensures subsequent function calls act on the same Collection.
+    boost::optional<UUID> _collectionUUID;
+
+    std::vector<IndexToBuild> _indexes;
+
+    IndexBuildMethodEnum _method = IndexBuildMethodEnum::kHybrid;
+
+    ContainerWriteBehavior _containerWriteBehavior = ContainerWriteBehavior::kDoNotReplicate;
+
+    bool _isResumable = false;
+
+    // True if init() was called with a resumeInfo.
+    bool _wasResumed = false;
+
+    // Whether any of this builder's indexes have spilled.
+    bool _anyIndexSpilled = false;
+
+    bool _ignoreUnique = false;
+
+    // True if one or more indexes being built are on time-series measurements.
+    bool _containsIndexBuildOnTimeseriesMeasurement = false;
+
+    // True if at least one bucket document contains mixed-schema data and
+    // '_containsIndexBuildOnTimeseriesMeasurement=true'.
+    bool _timeseriesBucketContainsMixedSchemaData = false;
+
+    // Set to true when no work remains to be done, the object can safely destruct without leaving
+    // incorrect state set anywhere.
+    bool _buildIsCleanedUp = true;
+
+    // A unique identifier associating this index build with a two-phase index build within a
+    // replica set.
+    boost::optional<UUID> _buildUUID;
+
+    // The RecordId corresponding to the object most recently inserted using this MultiIndexBlock,
+    // or boost::none if nothing has been inserted.
+    boost::optional<RecordId> _lastRecordIdInserted;
+
+    // The current phase of the index build.
+    IndexBuildPhaseEnum _phase = IndexBuildPhaseEnum::kInitialized;
+
+    // The number of keys and bytes written to the index tables so far by this index build.
+    IndexBuildWriteStats _indexWriteStats;
+
+    // We cache the collection pointer for the collection scan phase. The collection pointer is
+    // compared after yielding, which is used to indicate whether we need to refetch the index
+    // catalog entry pointers in IndexToBuild. This is necessary for index build performance.
+    const Collection* _collForScan = nullptr;
+
+    // Collection-scan executor and current document, used during _doCollectionScan. These are
+    // members so the ContainerBasedSpiller's SpillCallbacks (captured at spiller construction
+    // time in init()) can save/restore the executor and own the document around any internal
+    // writeConflictRetry the spiller performs.
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
+    BSONObj _objToIndex;
+
+    // Paces the container writes of the spills issued by the collection scan phase. Installed by
+    // _doCollectionScan for the duration of the scan and reset on the way out, so that the
+    // SpillCallbacks captured in init() only pace the scan phase's spills. Disengaged when the
+    // scan is not running or when container writes are not replicated.
+    boost::optional<DataThrottle> _scanContainerWriteThrottle;
+
+    // The temporary record store used for persisting the resume state of a resumable index build.
+    boost::optional<LazyRecordStore> _resumeStateTempRecordStore;
+};
+}  // namespace mongo

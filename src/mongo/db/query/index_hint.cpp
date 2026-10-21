@@ -1,0 +1,154 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/index_hint.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/str.h"
+
+#include <string_view>
+
+#include <boost/functional/hash.hpp>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+static constexpr auto kNaturalFieldName = "$natural"sv;
+
+std::strong_ordering compare(const IndexKeyPattern& a, const IndexKeyPattern& b) {
+    return a.woCompare(b) <=> 0;
+}
+
+std::strong_ordering compare(const IndexName& a, const IndexName& b) {
+    // NOTE: spaceship operator is not available on macos for strings, therefore implementing one
+    // myself instead.
+    return a.compare(b) <=> 0;
+}
+
+std::strong_ordering compare(const NaturalOrderHint& a, const NaturalOrderHint& b) {
+    return a <=> b;
+}
+};  // namespace
+
+bool isForward(NaturalOrderHint::Direction dir) {
+    return dir == NaturalOrderHint::Direction::kForward;
+}
+
+std::string toString(NaturalOrderHint::Direction dir) {
+    StackStringBuilder ssb;
+    ssb << dir;
+    return ssb.str();
+}
+
+IndexHint IndexHint::parse(const BSONElement& element) {
+    if (element.type() == BSONType::string) {
+        return IndexHint(element.String());
+    } else if (element.type() == BSONType::object) {
+        auto obj = element.Obj();
+        if (obj.firstElementFieldName() == kNaturalFieldName) {
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "$natural hint may only accept one field"
+                                  << element.toString(),
+                    obj.nFields() == 1);
+            switch (obj.firstElement().numberInt()) {
+                case 1:
+                    return IndexHint(NaturalOrderHint(NaturalOrderHint::Direction::kForward));
+                case -1:
+                    return IndexHint(NaturalOrderHint(NaturalOrderHint::Direction::kBackward));
+                default:
+                    uasserted(ErrorCodes::FailedToParse,
+                              str::stream() << "$natural hint may only accept 1 or -1, not "
+                                            << element.toString());
+            }
+        }
+        return IndexHint(obj.getOwned());
+    } else {
+        uasserted(ErrorCodes::FailedToParse, "Hint must be a string or an object");
+    }
+}
+
+void IndexHint::append(const IndexHint& hint, std::string_view fieldName, BSONObjBuilder* builder) {
+    visit(OverloadedVisitor{
+              [&](const IndexKeyPattern& keyPattern) { builder->append(fieldName, keyPattern); },
+              [&](const IndexName& indexName) { builder->append(fieldName, indexName); },
+              [&](const NaturalOrderHint& naturalOrderHint) {
+                  builder->append(fieldName, BSON(kNaturalFieldName << naturalOrderHint.direction));
+              }},
+          hint._hint);
+}
+
+void IndexHint::append(BSONArrayBuilder* builder) const {
+    visit(OverloadedVisitor{[&](const IndexKeyPattern& keyPattern) { builder->append(keyPattern); },
+                            [&](const IndexName& indexName) { builder->append(indexName); },
+                            [&](const NaturalOrderHint& naturalOrderHint) {
+                                builder->append(
+                                    BSON(kNaturalFieldName << naturalOrderHint.direction));
+                            }},
+          _hint);
+}
+
+boost::optional<const IndexKeyPattern&> IndexHint::getIndexKeyPattern() const {
+    if (!holds_alternative<IndexKeyPattern>(_hint)) {
+        return {};
+    }
+    return get<IndexKeyPattern>(_hint);
+}
+
+boost::optional<const IndexName&> IndexHint::getIndexName() const {
+    if (!holds_alternative<IndexName>(_hint)) {
+        return {};
+    }
+    return get<IndexName>(_hint);
+}
+
+boost::optional<const NaturalOrderHint&> IndexHint::getNaturalHint() const {
+    if (!holds_alternative<NaturalOrderHint>(_hint)) {
+        return {};
+    }
+    return get<NaturalOrderHint>(_hint);
+}
+
+size_t IndexHint::hash() const {
+    return visit(
+        OverloadedVisitor{
+            [&](const IndexKeyPattern& keyPattern) {
+                return SimpleBSONObjComparator::kInstance.hash(keyPattern);
+            },
+            [&](const IndexName& indexName) { return boost::hash<std::string>{}(indexName); },
+            [&](const NaturalOrderHint& naturalOrderHint) {
+                return boost::hash<NaturalOrderHint::Direction>{}(naturalOrderHint.direction);
+            }},
+        _hint);
+}
+
+std::strong_ordering IndexHint::operator<=>(const IndexHint& other) const {
+    if (auto cmp = _hint.valueless_by_exception() <=> other._hint.valueless_by_exception();
+        !std::is_eq(cmp)) {
+        return cmp;
+    }
+
+    if (auto cmp = _hint.index() <=> other._hint.index(); !std::is_eq(cmp)) {
+        return cmp;
+    }
+
+    return std::visit(
+        [&other](auto&& a) { return compare(a, std::get<std::decay_t<decltype(a)>>(other._hint)); },
+        _hint);
+};
+
+bool IndexHint::operator==(const IndexHint& other) const {
+    return std::is_eq(*this <=> other);
+}
+
+size_t hash_value(const IndexHint& hint) {
+    return hint.hash();
+}
+
+};  // namespace mongo

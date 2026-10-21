@@ -1,0 +1,45 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Server parameters related to the replication thread pool used by oplog appliers/writers
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/repl/repl_worker_pool_thread_count.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    # From repl_worker_pool_thread_count.cpp
+    replWriterThreadCount:
+        description: The number of threads in the thread pool used to apply the oplog
+        set_at: [startup, runtime]
+        cpp_vartype: int
+        cpp_varname: replWriterThreadCount
+        on_update: onUpdateReplWriterThreadCount
+        default: 16
+        validator:
+            # This range is also enforced in validateUpdateReplWriterThreadCount(),
+            # both should validate the same range.
+            gte: 1
+            lte: 256
+            callback: validateUpdateReplWriterThreadCount
+        redact: false
+
+    replWriterMinThreadCount:
+        description: The minimum number of threads in the thread pool used to apply the oplog
+        set_at: [startup, runtime]
+        cpp_vartype: int
+        cpp_varname: replWriterMinThreadCount
+        on_update: onUpdateReplWriterMinThreadCount
+        default: 0
+        validator:
+            # This range is also enforced in validateUpdateReplWriterMinThreadCount(),
+            # both should validate the same range.
+            gte: 0
+            lte: 256
+            callback: validateUpdateReplWriterMinThreadCount
+        redact: false

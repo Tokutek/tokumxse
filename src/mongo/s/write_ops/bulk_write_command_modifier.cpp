@@ -1,0 +1,207 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/s/write_ops/bulk_write_command_modifier.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands/query_cmd/bulk_write_gen.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/util/assert_util.h"
+
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+void BulkWriteCommandModifier::parseRequestFromOpMsg(const NamespaceString& nss,
+                                                     const OpMsgRequest& request) {
+    auto shardVersionField = request.body[ShardVersion::kShardVersionField];
+    if (!shardVersionField.eoo()) {
+        auto shardVersion = ShardVersion::parse(shardVersionField);
+        if (shardVersion == ShardVersion::UNTRACKED()) {
+            setDbVersion(nss, DatabaseVersion(request.body));
+        }
+        setShardVersion(nss, shardVersion);
+    }
+
+    // The 'isTimeseriesNamespace' is an internal parameter used for communication between mongos
+    // and mongod.
+    auto isTimeseriesNamespace =
+        request.body[write_ops::WriteCommandRequestBase::kIsTimeseriesNamespaceFieldName];
+    uassert(7299100,
+            "the 'isTimeseriesNamespace' parameter cannot be used on mongos",
+            !isTimeseriesNamespace.trueValue());
+
+    setIsTimeseriesNamespace(nss, isTimeseriesNamespace.trueValue());
+}
+
+std::tuple<NamespaceInfoEntry&, size_t> BulkWriteCommandModifier::getNsInfoEntry(
+    const NamespaceString& nss) {
+    if (_nsInfoIdxes.contains(nss)) {
+        // Already have this NamespaceInfoEntry stored.
+        auto idx = _nsInfoIdxes[nss];
+        return std::tie(_nsInfos[idx], idx);
+    }
+    // Create new NamespaceInfoEntry.
+    auto nsInfoEntry = NamespaceInfoEntry(nss);
+    auto idx = _nsInfos.size();
+    _nsInfos.emplace_back(nsInfoEntry);
+
+    _nsInfoIdxes[nss] = idx;
+    return std::tie(_nsInfos[idx], idx);
+}
+
+void BulkWriteCommandModifier::finishBuild() {
+    _request->setOps(std::move(_ops));
+    _request->setNsInfo(std::move(_nsInfos));
+}
+
+void BulkWriteCommandModifier::addOp(const write_ops::InsertCommandRequest& insertOp) {
+    const auto& nss = insertOp.getNamespace();
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+    nsInfoEntry.setEncryptionInformation(insertOp.getEncryptionInformation());
+
+    for (const auto& doc : insertOp.getDocuments()) {
+        auto op = BulkWriteInsertOp(idx, doc);
+        _ops.emplace_back(op);
+    }
+}
+
+void BulkWriteCommandModifier::addOp(const write_ops::UpdateCommandRequest& updateOp) {
+    const auto& nss = updateOp.getNamespace();
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+    nsInfoEntry.setEncryptionInformation(updateOp.getEncryptionInformation());
+
+    for (const auto& update : updateOp.getUpdates()) {
+        auto op = BulkWriteUpdateOp(idx, update.getQ(), update.getU());
+
+        op.setArrayFilters(update.getArrayFilters());
+        op.setSort(update.getSort());
+        op.setMulti(update.getMulti());
+        op.setCollation(update.getCollation());
+        op.setUpsert(update.getUpsert());
+        op.setHint(update.getHint());
+        op.setConstants(update.getC());
+
+        _ops.emplace_back(op);
+    }
+}
+
+void BulkWriteCommandModifier::addOp(const write_ops::DeleteCommandRequest& deleteOp) {
+    const auto& nss = deleteOp.getNamespace();
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+    nsInfoEntry.setEncryptionInformation(deleteOp.getEncryptionInformation());
+
+    for (const auto& delOp : deleteOp.getDeletes()) {
+        auto op = BulkWriteDeleteOp(idx, delOp.getQ());
+
+        op.setHint(delOp.getHint());
+        op.setMulti(delOp.getMulti());
+        op.setCollation(delOp.getCollation());
+
+        _ops.emplace_back(op);
+    }
+}
+
+void BulkWriteCommandModifier::addInsert(const OpMsgRequest& request) {
+    auto parsedInsertOp = InsertOp::parse(request);
+
+    auto nss = parsedInsertOp.getNamespace();
+
+    parseRequestFromOpMsg(nss, request);
+
+    addOp(parsedInsertOp);
+}
+
+void BulkWriteCommandModifier::addUpdate(const OpMsgRequest& request) {
+    auto parsedUpdateOp = UpdateOp::parse(request);
+
+    auto nss = parsedUpdateOp.getNamespace();
+
+    parseRequestFromOpMsg(nss, request);
+
+    addOp(parsedUpdateOp);
+}
+
+void BulkWriteCommandModifier::addDelete(const OpMsgRequest& request) {
+    auto parsedDeleteOp = DeleteOp::parse(request);
+
+    auto nss = parsedDeleteOp.getNamespace();
+
+    parseRequestFromOpMsg(nss, request);
+
+    addOp(parsedDeleteOp);
+}
+
+void BulkWriteCommandModifier::addInsertOps(const NamespaceString& nss,
+                                            const std::vector<BSONObj> docs) {
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+
+    for (const auto& doc : docs) {
+        auto op = BulkWriteInsertOp(idx, doc);
+
+        _ops.emplace_back(op);
+    }
+}
+
+void BulkWriteCommandModifier::addUpdateOp(
+    const NamespaceString& nss,
+    const BSONObj& query,
+    const BSONObj& update,
+    bool upsert,
+    bool multi,
+    const boost::optional<std::vector<BSONObj>>& arrayFilters,
+    const boost::optional<BSONObj>& sort,
+    const boost::optional<BSONObj>& collation,
+    const boost::optional<BSONObj>& hint) {
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+
+    auto op = BulkWriteUpdateOp(idx, query, update);
+
+    op.setUpsert(upsert);
+    op.setMulti(multi);
+    op.setCollation(collation);
+    op.setSort(sort);
+    op.setHint(hint.value_or(BSONObj()));
+    op.setArrayFilters(arrayFilters);
+
+    _ops.emplace_back(op);
+}
+
+void BulkWriteCommandModifier::addPipelineUpdateOps(const NamespaceString& nss,
+                                                    const BSONObj& query,
+                                                    const std::vector<BSONObj>& updates,
+                                                    bool upsert,
+                                                    bool useMultiUpdate) {
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+
+    auto op = BulkWriteUpdateOp(idx, query, updates);
+
+    op.setUpsert(upsert);
+    op.setMulti(useMultiUpdate);
+
+    _ops.emplace_back(op);
+}
+
+void BulkWriteCommandModifier::addDeleteOp(const NamespaceString& nss,
+                                           const BSONObj& query,
+                                           bool multiDelete,
+                                           const boost::optional<BSONObj>& collation,
+                                           const boost::optional<BSONObj>& hint) {
+    auto [nsInfoEntry, idx] = getNsInfoEntry(nss);
+
+    auto op = BulkWriteDeleteOp(idx, query);
+
+    op.setMulti(multiDelete);
+    op.setHint(hint.value_or(BSONObj()));
+    op.setCollation(collation);
+
+    _ops.emplace_back(op);
+}
+
+}  // namespace mongo

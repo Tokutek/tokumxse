@@ -1,69 +1,89 @@
-// Tests "stacking" multiple migration cleanup threads and their behavior when the collection changes
+// Tests "stacking" multiple migration cleanup threads and their behavior when the collection
+// changes
+// @tags: [assumes_balancer_off]
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // start up a new sharded cluster
-var st = new ShardingTest({ shards : 2, mongos : 1 });
+let st = new ShardingTest({shards: 2, mongos: 1, other: {enableBalancer: false}});
 
-// stop balancer since we want manual control for this
-st.stopBalancer();
-
-var mongos = st.s;
-var admin = mongos.getDB("admin");
-var shards = mongos.getDB("config").shards.find().toArray();
-var coll = mongos.getCollection("foo.bar");
+let mongos = st.s;
+let coll = mongos.getCollection("foo.bar");
 
 // Enable sharding of the collection
-printjson(mongos.adminCommand({ enablesharding : coll.getDB() + "" }));
-printjson(mongos.adminCommand({ movePrimary : coll.getDB() + "", to : shards[0]._id }));
-printjson(mongos.adminCommand({ shardcollection : coll + "", key: { _id : 1 } }));
+assert.commandWorked(
+    mongos.adminCommand({enablesharding: coll.getDB() + "", primaryShard: st.shard0.shardName}),
+);
+assert.commandWorked(mongos.adminCommand({shardcollection: coll + "", key: {_id: 1}}));
 
-var numChunks = 30;
+let numChunks = 30;
 
 // Create a bunch of chunks
-for (var i = 0; i < numChunks; i++) {
-    printjson(mongos.adminCommand({ split : coll + "", middle : { _id : i } }))
+for (let i = 0; i < numChunks; i++) {
+    assert.commandWorked(mongos.adminCommand({split: coll + "", middle: {_id: i}}));
 }
 
-jsTest.log("Inserting a lot of small documents...")
+jsTest.log("Inserting a lot of small documents...");
 
 // Insert a lot of small documents to make multiple cursor batches
-var bulk = coll.initializeUnorderedBulkOp();
-for (var i = 0; i < 10 * 1000; i++) {
-    bulk.insert({ _id : i });
+let bulk = coll.initializeUnorderedBulkOp();
+for (let i = 0; i < 10 * 1000; i++) {
+    bulk.insert({_id: i});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 jsTest.log("Opening a mongod cursor...");
 
 // Open a new cursor on the mongod
-var cursor = coll.find();
-var next = cursor.next();
+let cursor = coll.find();
+cursor.next();
 
-jsTest.log("Moving a bunch of chunks to stack cleanup...")
+jsTest.log("Moving a bunch of chunks to stack cleanup...");
 
 // Move a bunch of chunks, but don't close the cursor so they stack.
-for (var i = 0; i < numChunks; i++) {
-    printjson(mongos.adminCommand({ moveChunk : coll + "", find : { _id : i }, to : shards[1]._id }))
+for (let i = 0; i < numChunks; i++) {
+    assert.commandWorked(
+        mongos.adminCommand({moveChunk: coll + "", find: {_id: i}, to: st.shard1.shardName}),
+    );
 }
 
-jsTest.log("Dropping and re-creating collection...")
+jsTest.log("Verifying that the donor still has the range deletion task docs...");
 
-coll.drop()
+// Range deletions are queued async of migrate thread.
+let rangeDelDocs = st.shard0
+    .getDB("config")
+    .getCollection("rangeDeletions")
+    .find({nss: coll + ""})
+    .toArray();
+assert.eq(numChunks, rangeDelDocs.length, `rangeDelDocs: ${tojson(rangeDelDocs.length)}`);
+
+jsTest.log("Dropping and re-creating collection...");
+
+coll.drop();
+
 bulk = coll.initializeUnorderedBulkOp();
-for (var i = 0; i < numChunks; i++) {
-    bulk.insert({ _id : i });
+for (let i = 0; i < numChunks; i++) {
+    bulk.insert({_id: i});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
-sleep(10 * 1000);
+jsTest.log("Allowing the range deletion tasks to be processed by closing the cursor...");
+cursor.close();
 
-jsTest.log("Checking that documents were not cleaned up...")
+assert.soon(() => {
+    return (
+        0 ===
+        st.shard0
+            .getDB("config")
+            .getCollection("rangeDeletions")
+            .count({nss: coll + ""})
+    );
+});
 
-for (var i = 0; i < numChunks; i++) {
-    assert.neq(null, coll.findOne({ _id : i }))   
+jsTest.log("Checking that the new collection's documents were not cleaned up...");
+
+for (let i = 0; i < numChunks; i++) {
+    assert.neq(null, coll.findOne({_id: i}));
 }
-
-jsTest.log("DONE!")
 
 st.stop();
-
-

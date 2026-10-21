@@ -1,0 +1,21 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ChunkRangeBase:
+        description: "Basic types that represents range bounds"
+        strict: false
+        fields:
+            min:
+                description: "Lower bound of the range"
+                type: object_owned
+            max:
+                description: "Upper bound of the range"
+                type: object_owned

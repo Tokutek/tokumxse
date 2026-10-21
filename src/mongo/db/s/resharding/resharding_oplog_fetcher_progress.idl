@@ -1,0 +1,30 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the document used for storing progress by the resharding oplog applier.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/s/resharding/common_types.idl"
+
+structs:
+    ReshardingOplogFetcherProgress:
+        description: "Used for storing the progress made by the resharding oplog fetcher."
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            _id:
+                type: ReshardingSourceId
+                description: "The identifier for the source of the oplog entries."
+                cpp_name: oplogSourceId
+            numEntriesFetched:
+                type: long
+                description: >-
+                    The total number of oplog entries that have been fetched by the
+                    ReshardingOplogFetcher for this source.

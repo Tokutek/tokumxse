@@ -1,0 +1,175 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/query_solution_analyzer.h"
+
+namespace mongo::query_solution_analyzer {
+
+StateMachine::StateMachine() {
+    // Create the special states. User-defined states come after them.
+    _states.resize(kMaxReservedState);
+}
+
+int StateMachine::addState(int state,
+                           StageType stage,
+                           Range allowedChildren,
+                           PredicateType predicate) {
+    validateState(state);
+    int nextState = allocState();
+    validateState(nextState);
+
+    StateSpec& spec = _states[state];
+    auto res = spec.edges.emplace(stage, Edge{predicate, allowedChildren, nextState});
+    // If this triggers, it means we're trying to add two transitions with the same stage type
+    // to the same state. NFAs allow this, but it'd complicate our implementation and provide
+    // worse performance.
+    tassert(12308402, "Engine selection state machine doesn't have unique transitions", res.second);
+
+    return nextState;
+}
+
+int StateMachine::addOrGetState(int state,
+                                StageType stage,
+                                Range allowedChildren,
+                                PredicateType predicate) {
+    validateState(state);
+    const auto& edges = _states[state].edges;
+    if (auto it = edges.find(stage); it != edges.end()) {
+        const Edge& existingEdge = it->second;
+        tassert(11907605,
+                "addOrGetState found an existing transition with conflicting constraints",
+                existingEdge.allowedChildren == allowedChildren &&
+                    existingEdge.predicate == predicate);
+        return existingEdge.nextState;
+    }
+    return addState(state, stage, allowedChildren, predicate);
+}
+
+StateMachineMatcher::StateMachineMatcher(const StateMachine& machine, bool ignoreNonEssentialNodes)
+    : _machine(machine), _ignoreNonEssentialNodes(ignoreNonEssentialNodes) {
+    // Set start state.
+    _stack.push(_machine.getStartState());
+}
+
+void StateMachineMatcher::preVisit(RuleEngine& engine,
+                                   const QuerySolutionNode& node,
+                                   size_t index) {
+    if (isStageIgnoredForCounters(node)) {
+        // Don't consume a state transition or push a stack frame, so this node's child is
+        // matched exactly as if the node weren't present.
+    } else {
+        // Consume this QSN node and transition the state of the current root to leaf path.
+        step(node, index);
+    }
+
+    const bool isLeaf = node.children.empty();
+    if (isLeaf) {
+        if (!isMatch()) {
+            // If any root to leaf path ends in a non-matching state, it means the pattern
+            // didn't recognize that branch. Once we unwind the traversal, we will reject the
+            // candidate tree.
+            _allBranchesMatch = false;
+        } else if (const auto& tag = currentState().matchTag; tag) {
+            if (!_matchedTag) {
+                _matchedTag = tag;
+            } else if (_matchedTag != tag) {
+                // The leaves ended in match states of two different patterns, so the tree as a
+                // whole follows no single pattern.
+                _allBranchesMatch = false;
+            }
+        }
+    }
+}
+
+void StateMachineMatcher::postVisit(RuleEngine& engine, const QuerySolutionNode& node) {
+    if (isStageIgnoredForCounters(node)) {
+        // preVisit() pushed no frame for this node, so there is nothing to unwind.
+        return;
+    }
+
+    // Unwind the state so that we can keep matching other branches.
+    _stack.pop();
+
+    // Once we finish traversal, we match if all the branches were recognized.
+    if (_stack.size() == 1 && _allBranchesMatch) {
+        engine.match(&node);
+    }
+}
+
+bool StateMachineMatcher::matchesPredicate(const StateMachine::Edge& edge,
+                                           const QuerySolutionNode& node,
+                                           size_t index) const {
+    if (!edge.allowedChildren.contains(index)) {
+        return false;
+    }
+
+    switch (edge.predicate) {
+        case PredicateType::kNone:
+            return true;
+        case PredicateType::kSortWithoutAbsorbedLimit:
+            tassert(12594101,
+                    "The SortWithoutAbsorbedLimit predicate can only be applied to SORT nodes",
+                    node.getType() == STAGE_SORT_DEFAULT);
+            return static_cast<const SortNode&>(node).limit == 0;
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+void StateMachineMatcher::step(const QuerySolutionNode& node, size_t index) {
+    const StateMachine::StateSpec& state = currentState();
+
+    auto it = state.edges.find(node.getType());
+    if (it != state.edges.end() && matchesPredicate(it->second, node, index)) {
+        // We have a partial match, so we transition to the next state.
+        _stack.push(it->second.nextState);
+    } else {
+        // There's no match in this node or its children, so we transition to the not match
+        // state. Once we reach the leaf nodes of this subtree, they will set
+        // _allBranchesMatch=false.
+        _stack.push(StateMachine::kNotMatch);
+    }
+}
+
+bool StateMachineMatcher::isStageIgnoredForCounters(const QuerySolutionNode& node) const {
+    if (!_ignoreNonEssentialNodes) {
+        return false;
+    }
+    switch (node.getType()) {
+        case STAGE_SKIP:
+        case STAGE_LIMIT:
+        case STAGE_SHARDING_FILTER:
+        case STAGE_SORT_KEY_GENERATOR:
+        case STAGE_RETURN_KEY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void StateMachineMatcher::dumpStates() {
+    for (size_t i = 0; i < _machine._states.size(); ++i) {
+        std::cout << "State " << i << ":";
+        if (i == StateMachine::kStart)
+            std::cout << " [START]";
+        if (i == StateMachine::kNotMatch)
+            std::cout << " [NOT_MATCH]";
+        if (_machine._states[i].isMatch)
+            std::cout << " [MATCH]";
+        std::cout << std::endl;
+
+        for (const auto& [stage, edge] : _machine._states[i].edges) {
+            const auto& range = edge.allowedChildren;
+            const auto& nextState = edge.nextState;
+
+            std::cout << "  Stage(" << stage << ")";
+            if (edge.predicate == PredicateType::kSortWithoutAbsorbedLimit) {
+                std::cout << " + SortWithoutAbsorbedLimit";
+            }
+
+            std::cout << " [" << range.min << ", " << range.max << ") -> State " << nextState
+                      << std::endl;
+        }
+    }
+}
+}  // namespace mongo::query_solution_analyzer

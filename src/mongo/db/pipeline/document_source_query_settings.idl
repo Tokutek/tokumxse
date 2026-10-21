@@ -1,0 +1,22 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Document source query settings stage IDL file
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    DocumentSourceQuerySettingsSpec:
+        description: A document used to specify the $querySettings stage of an aggregation pipeline.
+        fields:
+            showDebugQueryShape:
+                cpp_name: showDebugQueryShape
+                type: optionalBool
+                description: >-
+                    A flag indicating whether an additional 'debugQueryShape' field has to be included in the
+                    stage output.

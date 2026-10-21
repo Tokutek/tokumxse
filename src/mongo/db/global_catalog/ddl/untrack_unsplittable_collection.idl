@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+imports:
+    - "mongo/db/basic_types.idl"
+commands:
+    clusterUntrackUnsplittableCollection:
+        command_name: untrackUnshardedCollection
+        cpp_name: ClusterUntrackUnsplittableCollection
+        description: "Internal command to untrack unsplittable collections"
+        strict: false
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        reply_type: OkReply

@@ -1,0 +1,429 @@
+/*-
+ * Copyright (c) 2014-present MongoDB, Inc.
+ * Copyright (c) 2008-2014 WiredTiger, Inc.
+ *	All rights reserved.
+ *
+ * See the file LICENSE for redistribution information.
+ */
+
+#include "wt_internal.h"
+
+/*
+ * __block_disagg_header_byteswap --
+ *     Place holder - it might be necessary to swap things into network byte order.
+ */
+static void
+__block_disagg_header_byteswap(WT_BLOCK_DISAGG_HEADER *blk)
+{
+    WT_UNUSED(blk);
+}
+
+/*
+ * __wt_block_disagg_header_byteswap_copy --
+ *     Place holder - might be necessary to handle network order.
+ */
+void
+__wt_block_disagg_header_byteswap_copy(WT_BLOCK_DISAGG_HEADER *from, WT_BLOCK_DISAGG_HEADER *to)
+{
+    *to = *from;
+}
+
+/*
+ * __wti_block_disagg_header_write_size --
+ *     Return the size of the block header a newly opened handle should write. Only the block
+ *     manager's handle-open path calls this: everything working on an existing image takes the size
+ *     from the btree, which fixed it here when the handle opened.
+ */
+u_int
+__wti_block_disagg_header_write_size(WT_SESSION_IMPL *session)
+{
+#ifdef HAVE_DIAGNOSTIC
+    /* For testing, return a larger header size if the debug mode requests it. */
+    if (S2C(session)->debug.disagg_block_header_upgrade ==
+        WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_COMPATIBLE ||
+      S2C(session)->debug.disagg_block_header_upgrade ==
+        WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_INCOMPATIBLE)
+        return (WT_BLOCK_DISAGG_HEADER_WRITE_SIZE + WT_BLOCK_DISAGG_HEADER_DEBUG_EXTRA_SIZE);
+
+    /* The oversized version 1 mode keeps the version 1 layout and only records a wrong size. */
+#else
+    WT_UNUSED(session);
+#endif
+    return (WT_BLOCK_DISAGG_HEADER_WRITE_SIZE);
+}
+
+/*
+ * __wti_block_disagg_header_init --
+ *     Stamp the fields that identify a block header and describe its extent. A disk image laid out
+ *     for writing may be walked by the read path before it is written, and the read path recovers
+ *     the header size from the header itself, so these have to be set as soon as the image exists.
+ *     The caller owns the rest of the header, including the checksums.
+ */
+void
+__wti_block_disagg_header_init(WT_SESSION_IMPL *session, WT_BLOCK_DISAGG_HEADER *blk)
+{
+    blk->magic = WT_BLOCK_DISAGG_MAGIC_BASE;
+    blk->version = WT_BLOCK_DISAGG_VERSION;
+    blk->compatible_version = WT_BLOCK_DISAGG_COMPATIBLE_VERSION;
+
+    /*
+     * The size has to describe the layout the image actually has, so take it from the btree, which
+     * fixed it when the handle opened. Recomputing it here would disagree with the layout for any
+     * handle that opened before the connection's debug setting changed.
+     */
+    blk->combined_header_size =
+      (uint8_t)(WT_PAGE_HEADER_SIZE + S2BT(session)->block_header_write_size);
+
+#ifdef HAVE_DIAGNOSTIC
+    switch (S2C(session)->debug.disagg_block_header_upgrade) {
+    case WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_NONE:
+        break;
+    case WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_COMPATIBLE:
+        /* A newer writer whose extra fields this build's readers may skip. */
+        blk->version = WT_BLOCK_DISAGG_VERSION + 1;
+        break;
+    case WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_INCOMPATIBLE:
+        /* A newer writer whose blocks this build's readers must refuse. */
+        blk->version = WT_BLOCK_DISAGG_VERSION + 1;
+        blk->compatible_version = WT_BLOCK_DISAGG_VERSION + 1;
+        break;
+    case WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_V1_OVERSIZED:
+        /* Recorded only in the written block; see __wti_block_disagg_write_internal. */
+        break;
+    }
+#endif
+}
+
+/*
+ * __wti_block_disagg_write_size --
+ *     Return the buffer size required to write a block.
+ */
+int
+__wti_block_disagg_write_size(WT_SESSION_IMPL *session, size_t *sizep)
+{
+    /*
+     * We write the page size, in bytes, into the block's header as a 4B unsigned value, and it's
+     * possible for the engine to accept an item we can't write. For example, a huge key/value where
+     * the allocation size has been set to something large will overflow 4B when it tries to align
+     * the write. We could make this work, but it's not worth the effort, writing 4GB objects into a
+     * btree makes no sense. Limit the writes to (4GB - 1KB), it gives us potential mode bits, and
+     * I'm not interested in debugging corner cases anyway.
+     *
+     * For disaggregated storage, we use the maximum header size, since we have multiple kinds of
+     * header and we don't know which one this is. Since the caller is invariably using the result
+     * to size a buffer, we may cause a little bit of waste (for deltas), which should not be a
+     * problem.
+     */
+    *sizep = (size_t)(*sizep + WT_PAGE_HEADER_SIZE + S2BT(session)->block_header_write_size);
+    return (*sizep > UINT32_MAX - 1024 ? EINVAL : 0);
+}
+
+/*
+ * __block_disagg_addr_flags --
+ *     Generate flags for the address cookie.
+ */
+static uint64_t
+__block_disagg_addr_flags(const WT_PAGE_BLOCK_META *block_meta)
+{
+    uint64_t flags;
+    flags = 0;
+    if (block_meta->delta_count > 0)
+        flags |= WT_BLOCK_DISAGG_ADDR_FLAG_DELTA;
+    return (flags);
+}
+
+/*
+ * __wti_block_disagg_write_internal --
+ *     Write a buffer into a block, returning the block's id, size, checksum, and the new block
+ *     metadata for the page. Note that the current and the new block page metadata pointers could
+ *     be the same.
+ */
+int
+__wti_block_disagg_write_internal(WT_SESSION_IMPL *session, WT_BLOCK_DISAGG *block_disagg,
+  WT_ITEM *buf, WT_PAGE_BLOCK_META *block_meta, size_t page_image_size, uint32_t *sizep,
+  uint32_t *checksump, bool data_checksum, bool checkpoint_io)
+{
+    WT_BLOCK_DISAGG_HEADER *blk;
+    WT_BTREE *btree;
+    WT_CONNECTION_IMPL *conn;
+    WT_DECL_RET;
+    WT_PAGE_HEADER *header;
+    WT_PAGE_LOG_HANDLE *plhandle;
+    WT_PAGE_LOG_PUT_ARGS put_args;
+    uint64_t page_id, time_start, time_stop;
+    uint32_t checksum;
+    uint8_t combined_header_size;
+
+    time_start = __wt_clock(session);
+    btree = S2BT(session);
+
+    WT_ASSERT(session, block_meta != NULL);
+    WT_ASSERT(session, block_meta->page_id >= WT_BLOCK_MIN_PAGE_ID);
+
+    conn = S2C(session);
+
+    *sizep = 0;     /* -Werror=maybe-uninitialized */
+    *checksump = 0; /* -Werror=maybe-uninitialized */
+
+    plhandle = block_disagg->plhandle;
+    WT_CLEAR(put_args);
+
+    WT_ASSERT_ALWAYS(session, plhandle != NULL, "Disaggregated block store requires page log");
+
+    /*
+     * Clear the block header to ensure all of it is initialized, even the unused fields.
+     */
+    blk = WT_BLOCK_HEADER_REF(buf->mem);
+    memset(blk, 0, btree->block_header_write_size);
+
+    if (buf->size > UINT32_MAX) {
+        WT_ASSERT(session, buf->size <= UINT32_MAX);
+        WT_RET_MSG(session, EINVAL, "buffer size check: write buffer too large to write");
+    }
+
+    /* Get the page ID. */
+    page_id = block_meta->page_id;
+
+    /* Check that we are the leader (only leaders can write). */
+    WT_ASSERT_ALWAYS(session, __wt_atomic_load_bool_relaxed(&conn->layered_table_manager.leader),
+      "Trying to write the page from a follower");
+
+    /*
+     * Update the block's checksum: if our caller specifies, checksum the complete data, otherwise
+     * checksum the leading WT_BLOCK_COMPRESS_SKIP bytes. The assumption is applications with good
+     * compression support turn off checksums and assume corrupted blocks won't decompress
+     * correctly. However, if compression failed to shrink the block, the block wasn't compressed,
+     * in which case our caller will tell us to checksum the data to detect corruption. If
+     * compression succeeded, we still need to checksum the first WT_BLOCK_COMPRESS_SKIP bytes
+     * because they're not compressed, both to give salvage a quick test of whether a block is
+     * useful and to give us a test so we don't lose the first WT_BLOCK_COMPRESS_SKIP bytes without
+     * noticing.
+     *
+     * Checksum a little-endian version of the header, and write everything in little-endian format.
+     * The checksum is (potentially) returned in a big-endian format, swap it into place in a
+     * separate step.
+     */
+    blk->flags = 0;
+    if (data_checksum)
+        F_SET(blk, WT_BLOCK_DISAGG_DATA_CKSUM);
+
+    /*
+     * We have two sets of flags for encrypt/compress! Set the block manager encrypt/compress flags
+     * - the block manager/block cache layer will eventually do all encrypt/compress and it will use
+     * a unified set of flags for encrypt/compress, (only in the block header). But we can only do
+     * that when the block header is always at the beginning of the data.
+     */
+    header = (WT_PAGE_HEADER *)buf->mem;
+    if (F_ISSET(header, WT_PAGE_COMPRESSED))
+        F_SET(blk, WT_BLOCK_DISAGG_COMPRESSED);
+    if (F_ISSET(header, WT_PAGE_ENCRYPTED))
+        F_SET(blk, WT_BLOCK_DISAGG_ENCRYPTED);
+
+    __wti_block_disagg_header_init(session, blk);
+    if (block_meta->delta_count != 0) {
+        blk->magic = WT_BLOCK_DISAGG_MAGIC_DELTA;
+        F_SET(&put_args, WT_PAGE_LOG_DELTA);
+    }
+
+    /*
+     * Ensure that we don't accidentally write a block with flags that should not be written out to
+     * stable storage, even though we just constructed the flags above. The "modified" flag should
+     * never be set during normal write path, as it indicates an offline modification outside of the
+     * regular write path, e.g., by the victim block cache.
+     */
+    WT_ASSERT_ALWAYS(session, !F_ISSET(blk, WT_BLOCK_DISAGG_MODIFIED),
+      "the modified flag must not be set on a block written through the regular write path");
+
+    /*
+     * The reconciliation id stored in the block header is diagnostic, we don't care if it's
+     * truncated.
+     */
+    blk->previous_checksum = block_meta->checksum;
+    blk->checksum = 0;
+
+    combined_header_size = blk->combined_header_size;
+#ifdef HAVE_DIAGNOSTIC
+    /*
+     * For testing record the wrong header size in the block. Only the stored block carries it: the
+     * in-memory image may be walked after the write and must keep the true size.
+     */
+    if (conn->debug.disagg_block_header_upgrade ==
+      WT_CONN_DEBUG_DISAGG_BLOCK_HEADER_UPGRADE_V1_OVERSIZED)
+        blk->combined_header_size += WT_BLOCK_DISAGG_HEADER_DEBUG_EXTRA_SIZE;
+#endif
+    __block_disagg_header_byteswap(blk);
+    blk->checksum = checksum = __wt_checksum(
+      buf->mem, data_checksum ? buf->size : WT_MIN(buf->size, WT_BLOCK_COMPRESS_SKIP));
+
+    put_args.backlink_lsn = block_meta->backlink_lsn;
+    put_args.base_lsn = block_meta->base_lsn;
+    put_args.image_size = page_image_size;
+
+    if (F_ISSET(blk, WT_BLOCK_DISAGG_COMPRESSED))
+        F_SET(&put_args, WT_PAGE_LOG_COMPRESSED);
+    if (F_ISSET(blk, WT_BLOCK_DISAGG_ENCRYPTED))
+        F_SET(&put_args, WT_PAGE_LOG_ENCRYPTED);
+    if (btree->storage_tier == WT_BTREE_STORAGE_TIER_COLD)
+        F_SET(&put_args, WT_PAGE_LOG_COLD);
+
+    /* Write the block. */
+    if (__wt_failpoint(session, WT_TIMING_STRESS_FAILPOINT_PAGE_LOG_HANDLE_PUT, 100)) {
+        WT_STAT_CONN_DSRC_INCR(session, disagg_block_plh_put_failed);
+        return (EBUSY);
+    }
+    ret = plhandle->plh_put(plhandle, &session->iface, page_id, 0, &put_args, buf);
+    blk->combined_header_size = combined_header_size;
+    WT_RET(ret);
+
+    WT_STAT_CONN_INCR(session, disagg_block_put);
+    WT_STAT_CONN_INCR(session, block_write);
+    WT_STAT_CONN_INCRV(session, block_byte_write, buf->size);
+    if (F_ISSET(block_disagg, WT_BLOCK_DISAGG_HS)) {
+        WT_STAT_CONN_INCR(session, disagg_block_hs_put);
+        WT_STAT_CONN_INCRV(session, disagg_block_hs_byte_write, buf->size);
+    }
+    if (F_ISSET(&put_args, WT_PAGE_LOG_COLD))
+        WT_STAT_CONN_INCR(session, disagg_block_put_cold);
+    if (checkpoint_io)
+        WT_STAT_CONN_INCRV(session, block_byte_write_checkpoint, buf->size);
+    time_stop = __wt_clock(session);
+    __wt_stat_usecs_hist_incr_disaggbmwrite(session, WT_CLOCKDIFF_US(time_stop, time_start));
+
+    __wt_verbose(session, WT_VERB_WRITE,
+      "page_id %" PRIu64 ", table_id %" PRIu64 ", size %" WT_SIZET_FMT ", checksum %" PRIx32
+      ", lsn %" PRIu64 ", page_image_size %" WT_SIZET_FMT,
+      page_id, block_disagg->tableid, buf->size, checksum, put_args.lsn, page_image_size);
+
+    /* Some extra data is set by the put interface, and must be returned up the chain. */
+    block_meta->disagg_lsn = put_args.lsn;
+    WT_ASSERT(session, put_args.lsn > 0);
+    block_meta->checksum = checksum;
+
+    *sizep = WT_STORE_SIZE(buf->size);
+    *checksump = checksum;
+
+    return (0);
+}
+
+/*
+ * __wti_block_disagg_write --
+ *     Write a buffer into a block, returning the block's address cookie.
+ */
+int
+__wti_block_disagg_write(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_ITEM *buf,
+  WT_PAGE_BLOCK_META *block_meta, size_t page_image_size, uint8_t *addr, size_t *addr_sizep,
+  bool data_checksum, bool checkpoint_io)
+{
+    WT_BLOCK_DISAGG *block_disagg;
+    WT_BLOCK_DISAGG_ADDRESS_COOKIE cookie;
+    uint32_t checksum, size;
+    uint8_t *endp;
+
+    /*
+     * The data structure needs to be cleaned up, so it can be specialized similarly to how a
+     * session has public and private parts. That involves a bunch of mechanical replacement in the
+     * existing block manager code, so for now just cheat and specialize inside the disagg block
+     * code.
+     */
+    block_disagg = (WT_BLOCK_DISAGG *)block;
+    /*
+     * Ensure the page header is in little endian order; this doesn't belong here, but it's the best
+     * place to catch all callers. After the write, swap values back to native order so callers
+     * never see anything other than their original content.
+     */
+    __wt_page_header_byteswap(buf->mem);
+
+    WT_RET(__wti_block_disagg_write_internal(session, block_disagg, buf, block_meta,
+      page_image_size, &size, &checksum, data_checksum, checkpoint_io));
+
+    __wt_page_header_byteswap(buf->mem);
+
+    WT_CLEAR(cookie);
+    cookie.page_id = block_meta->page_id;
+    cookie.flags = __block_disagg_addr_flags(block_meta);
+    cookie.lsn = block_meta->disagg_lsn;
+    cookie.base_lsn = block_meta->base_lsn;
+    cookie.checksum = checksum;
+
+    /* Calculate the cumulative size and store it in cookie.size. */
+    if (block_meta->delta_count == 0)
+        cookie.size = size;
+    else
+        cookie.size = block_meta->cumulative_size + size;
+
+    /* Update the block_meta for future delta writes. */
+    block_meta->cumulative_size = cookie.size;
+
+    endp = addr;
+    WT_RET(__wti_block_disagg_addr_pack(session, &endp, &cookie));
+    *addr_sizep = WT_PTRDIFF(endp, addr);
+
+    /*
+     * The size is increased by the size of the current write. If there is a error path for this
+     * function, we should decrease the size back to the previous value, same as at the beginning of
+     * this function. This is important for the correctness of the size tracking, and to avoid
+     * potential issues with the block manager's size accounting.
+     */
+    __wti_block_disagg_increase_size(block_disagg, size);
+
+    return (0);
+}
+
+/*
+ * __wti_block_disagg_page_discard --
+ *     Discard a page.
+ */
+int
+__wti_block_disagg_page_discard(WT_SESSION_IMPL *session, WT_BLOCK_DISAGG *block_disagg,
+  const uint8_t *addr, size_t addr_size, bool is_root)
+{
+    /* Crack the cookie. */
+    WT_BLOCK_DISAGG_ADDRESS_COOKIE cookie;
+    WT_RET(__wt_block_disagg_addr_unpack(session, &addr, addr_size, &cookie));
+
+    __wt_verbose(session, WT_VERB_BLOCK,
+      "block free: page_id %" PRIu64 ", table_id %" PRIu64 ", flags %" PRIx64 ", lsn %" PRIu64
+      ", base_lsn %" PRIu64 ", size %" PRIu32 ", checksum %" PRIx32,
+      cookie.page_id, block_disagg->tableid, cookie.flags, cookie.lsn, cookie.base_lsn, cookie.size,
+      cookie.checksum);
+
+    /* Create the discard request. */
+    WT_PAGE_LOG_HANDLE *plhandle = block_disagg->plhandle;
+
+    /*
+     * Skip the size decrement for root pages for two reasons:
+     *
+     * First, the old root page discard occurs after the checkpoint size has already been written
+     * out to the metadata. This means the old root page's size is intentionally included in the
+     * checkpoint size at the point it is recorded. Decrementing here would produce a size smaller
+     * than what was written to metadata, causing verify to fail.
+     *
+     * Second, to account for the above, __bmd_checkpoint_pack_raw explicitly manages root page size
+     * transitions in block_disagg->size: it subtracts the previous root size and adds the current
+     * root size at the moment the checkpoint size is computed. Decrementing here as well would
+     * cause the old root page size to be subtracted twice.
+     */
+    if (!is_root)
+        __wti_block_disagg_decrease_size(session, block_disagg, cookie.size);
+
+    /* Ignore the call if the function is not implemented. */
+    if (plhandle->plh_discard == NULL) {
+        __wt_verbose_warning(
+          session, WT_VERB_DISAGGREGATED_STORAGE, "%s", "plh_discard is not implemented");
+        return (0);
+    }
+
+    WT_PAGE_LOG_DISCARD_ARGS discard_args;
+    WT_CLEAR(discard_args);
+
+    /* Set the base LSN to the last full page image. */
+    bool is_delta = FLD_ISSET(cookie.flags, WT_BLOCK_DISAGG_ADDR_FLAG_DELTA);
+    discard_args.base_lsn = is_delta ? cookie.base_lsn : cookie.lsn;
+
+    /* Set the backlink LSN to the LSN of the last page version. */
+    discard_args.backlink_lsn = cookie.lsn;
+
+    WT_STAT_CONN_INCR(session, disagg_block_page_discard);
+
+    return (plhandle->plh_discard(plhandle, &session->iface, cookie.page_id, 0, &discard_args));
+}

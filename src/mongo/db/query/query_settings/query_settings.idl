@@ -1,0 +1,124 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::query_settings"
+    cpp_includes:
+        - "mongo/db/query/query_settings/query_framework_serialization.h"
+        - "mongo/db/query/query_settings/index_hints_serialization.h"
+        - "mongo/db/query/query_settings/query_settings_comment.h"
+        - "mongo/db/query/query_settings/query_knob_overrides.h"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/namespace_spec.idl"
+    - "mongo/db/query/index_hint.idl"
+    - "mongo/db/query/query_execution_knobs.idl"
+    - "mongo/db/query/query_shape/query_shape_hash.idl"
+
+types:
+    QueryFramework:
+        description: >-
+            Enum representing the query engine version as a combination of execution
+            engine and optimizer being used when executing the query.
+        bson_serialization_type: string
+        cpp_type: "mongo::QueryFrameworkControlEnum"
+        deserializer: "::mongo::query_settings::query_framework::parse"
+        serializer: "::mongo::query_settings::query_framework::serialize"
+        is_view: false
+    IndexHintSpecs:
+        description: Array representing the index hints specified for different collections.
+        bson_serialization_type: any
+        cpp_type: "query_settings::IndexHintSpecs"
+        serializer: "::mongo::query_settings::index_hints::serialize"
+        deserializer: "::mongo::query_settings::index_hints::parse"
+        deserialize_with_tenant: true
+        is_view: false
+    Comment:
+        description: Any type object representing the comment left on a particular instance of query settings.
+        bson_serialization_type: any
+        cpp_type: "query_settings::Comment"
+        serializer: "mongo::query_settings::Comment::serializeToBSON"
+        deserializer: "mongo::query_settings::Comment::parseFromBSON"
+        is_view: false
+    QuerySettingsKnobOverrides:
+        description: "Object in the form of '{[wireName]: [knobValue]}'  which will override the global query knob values."
+        bson_serialization_type: any
+        cpp_type: "query_settings::QuerySettingsKnobOverrides"
+        serializer: "mongo::query_settings::QuerySettingsKnobOverrides::toBSON"
+        deserializer: "mongo::query_settings::QuerySettingsKnobOverrides::fromBSON"
+        is_view: false
+
+structs:
+    IndexHintSpec:
+        description: "Struct representing the index hint spec."
+        generate_comparison_operators: true
+        strict: false
+        fields:
+            ns:
+                type: NamespaceSpec
+                stability: internal
+            allowedIndexes:
+                non_const_getter: true
+                type: array<IndexHint>
+                stability: internal
+
+    QuerySettings:
+        description: >-
+            Struct representing possible settings that may be applied to a given query.
+        generate_comparison_operators: true
+        strict: false
+        fields:
+            indexHints:
+                non_const_getter: true
+                type: IndexHintSpecs
+                optional: true
+                stability: internal
+            queryFramework:
+                type: QueryFramework
+                optional: true
+                stability: internal
+            reject:
+                type: optionalBool
+                stability: internal
+            comment:
+                type: Comment
+                optional: true
+                stability: internal
+            queryKnobs:
+                type: QuerySettingsKnobOverrides
+                optional: true
+                stability: internal
+            maxTimeMS:
+                type: safeInt64
+                optional: true
+                stability: internal
+                validator: {gte: 0, lte: 2147483647} # [0, 2^31 - 1]
+        mod_visibility: public
+
+    QueryShapeConfiguration:
+        description: >-
+            Struct representing configuration for a particular query shape. Configuration
+            consists of query settings that will be applied to all query instances of the
+            query shape. The representative query for the query shape is stored in the
+            dedicated 'config.queryShapeRepresentativeQueries' collection.
+        strict: false
+        fields:
+            queryShapeHash: QueryShapeHash
+            settings: QuerySettings
+
+    QueryShapeRepresentativeQuery:
+        description: >-
+            A structure to store 'QueryShapeHash' with the corresponding 'QueryInstance'.
+        strict: false
+        fields:
+            _id:
+                type: QueryShapeHash
+                stability: internal
+            representativeQuery:
+                type: object_owned
+                stability: internal
+            lastModifiedTime:
+                type: logicalTime
+                stability: internal

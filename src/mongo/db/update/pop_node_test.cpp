@@ -1,0 +1,411 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/pop_node.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/update/update_executor.h"
+#include "mongo/db/update/update_node_test_fixture.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <string>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace {
+
+namespace mmb = mongo::mutablebson;
+using PopNodeTest = UpdateTestFixture;
+using PopNodeDeathTest = PopNodeTest;
+
+TEST(SimplePopNodeTest, InitSucceedsPositiveOne) {
+    auto update = fromjson("{$pop: {a: 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a"], expCtx));
+    ASSERT_FALSE(popNode.popFromFront());
+}
+
+TEST(SimplePopNodeTest, InitSucceedsNegativeOne) {
+    auto update = fromjson("{$pop: {a: -1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a"], expCtx));
+    ASSERT_TRUE(popNode.popFromFront());
+}
+
+TEST(SimplePopNodeTest, InitFailsOnePointOne) {
+    auto update = fromjson("{$pop: {a: 1.1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_EQ(ErrorCodes::FailedToParse, popNode.init(update["$pop"]["a"], expCtx));
+}
+
+TEST(SimplePopNodeTest, InitFailsZero) {
+    auto update = fromjson("{$pop: {a: 0}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_EQ(ErrorCodes::FailedToParse, popNode.init(update["$pop"]["a"], expCtx));
+}
+
+TEST(SimplePopNodeTest, InitFailsString) {
+    auto update = fromjson("{$pop: {a: 'foo'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_EQ(ErrorCodes::FailedToParse, popNode.init(update["$pop"]["a"], expCtx));
+}
+
+TEST(SimplePopNodeTest, InitFailsNestedObject) {
+    auto update = fromjson("{$pop: {a: {b: 1}}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_EQ(ErrorCodes::FailedToParse, popNode.init(update["$pop"]["a"], expCtx));
+}
+
+TEST(SimplePopNodeTest, InitFailsNestedArray) {
+    auto update = fromjson("{$pop: {a: [{b: 1}]}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_EQ(ErrorCodes::FailedToParse, popNode.init(update["$pop"]["a"], expCtx));
+}
+
+TEST(SimplePopNodeTest, InitFailsBool) {
+    auto update = fromjson("{$pop: {a: true}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_EQ(ErrorCodes::FailedToParse, popNode.init(update["$pop"]["a"], expCtx));
+}
+
+TEST_F(PopNodeTest, NoopWhenFirstPathComponentDoesNotExist) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{b: [1, 2, 3]}"));
+    setPathToCreate("a.b");
+    addIndexedPath("a.b");
+    auto result = popNode.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
+    ASSERT_EQUALS(fromjson("{b: [1, 2, 3]}"), doc);
+
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, NoopWhenPathPartiallyExists) {
+    auto update = fromjson("{$pop: {'a.b.c': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b.c"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {}}"));
+    setPathToCreate("b.c");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
+    addIndexedPath("a.b.c");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
+    ASSERT_EQUALS(fromjson("{a: {}}"), doc);
+
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS("{a.b.c}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, NoopWhenNumericalPathComponentExceedsArrayLength) {
+    auto update = fromjson("{$pop: {'a.0': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.0"], expCtx));
+
+    mmb::Document doc(fromjson("{a: []}"));
+    setPathToCreate("0");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
+    addIndexedPath("a.0");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
+    ASSERT_EQUALS(fromjson("{a: []}"), doc);
+
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS("{a.0}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, ThrowsWhenPathIsBlockedByAScalar) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: 'foo'}"));
+    setPathToCreate("b");
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
+    addIndexedPath("a.b");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        popNode.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::PathNotViable,
+        "Cannot use the part (b) of (a.b) to traverse the element ({a: \"foo\"})");
+}
+
+DEATH_TEST_REGEX_F(PopNodeDeathTest,
+                   NonOkElementWhenPathExistsIsFatal,
+                   R"#(Invariant failure.*applyParams.element.ok\(\))#") {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {b: [1, 2, 3]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b");
+    popNode.apply(getApplyParams(doc.end()), getUpdateNodeApplyParams());
+}
+
+TEST_F(PopNodeTest, ThrowsWhenPathExistsButDoesNotContainAnArray) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {b: 'foo'}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::TypeMismatch,
+        "Path 'a.b' contains an element of non-array type 'string'");
+}
+
+TEST_F(PopNodeTest, NoopWhenPathContainsAnEmptyArray) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {b: []}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
+    ASSERT_EQUALS(fromjson("{a: {b: []}}"), doc);
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, PopsSingleElementFromTheBack) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_FALSE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [1]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: []}}"), doc);
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: []}}}}"));
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, PopsSingleElementFromTheFront) {
+    auto update = fromjson("{$pop: {'a.b': -1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_TRUE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [[1]]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: []}}"), doc);
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: []}}}}"));
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, PopsFromTheBackOfMultiElementArray) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_FALSE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [1, 2, 3]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b.c");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: [1, 2]}}"), doc);
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: [1, 2]}}}}"));
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, PopsFromTheFrontOfMultiElementArray) {
+    auto update = fromjson("{$pop: {'a.b': -1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_TRUE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [1, 2, 3]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: [2, 3]}}"), doc);
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: [2, 3]}}}}"));
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, PopsFromTheFrontOfMultiElementArrayWithoutAffectingIndexes) {
+    auto update = fromjson("{$pop: {'a.b': -1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_TRUE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [1, 2, 3]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("unrelated.path");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: [2, 3]}}"), doc);
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: [2, 3]}}}}"));
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, SucceedsWithNullUpdateIndexData) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_FALSE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [1, 2, 3]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: [1, 2]}}"), doc);
+
+    assertOplogEntry(fromjson("{$v: 2, diff: {sa: {u: {b: [1, 2]}}}}"));
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, SucceedsWithNullLogBuilder) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+    ASSERT_FALSE(popNode.popFromFront());
+
+    mmb::Document doc(fromjson("{a: {b: [1, 2, 3]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addIndexedPath("a.b.c");
+    setLogBuilderToNull();
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_EQUALS(fromjson("{a: {b: [1, 2]}}"), doc);
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+TEST_F(PopNodeTest, ThrowsWhenPathIsImmutable) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {b: [0]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addImmutablePath("a.b");
+    addIndexedPath("a.b");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::ImmutableField,
+        "Performing an update on the path 'a.b' would modify the immutable field 'a.b'");
+}
+
+TEST_F(PopNodeTest, ThrowsWhenPathIsPrefixOfImmutable) {
+
+    // This is only possible for an upsert, since it is not legal to have an array in an immutable
+    // path. If this update did not fail, we would fail later for storing an immutable path with an
+    // array in it.
+
+    auto update = fromjson("{$pop: {'a': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a"], expCtx));
+
+    mmb::Document doc(fromjson("{a: [0]}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a"));
+    addImmutablePath("a.0");
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        popNode.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::ImmutableField,
+        "Performing an update on the path 'a' would modify the immutable field 'a.0'");
+}
+
+TEST_F(PopNodeTest, ThrowsWhenPathIsSuffixOfImmutable) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {b: [0]}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addImmutablePath("a");
+    addIndexedPath("a.b");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams()),
+        AssertionException,
+        ErrorCodes::ImmutableField,
+        "Performing an update on the path 'a.b' would modify the immutable field 'a'");
+}
+
+TEST_F(PopNodeTest, NoopOnImmutablePathSucceeds) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    PopNode popNode;
+    ASSERT_OK(popNode.init(update["$pop"]["a.b"], expCtx));
+
+    mmb::Document doc(fromjson("{a: {b: []}}"));
+    setPathTaken(makeRuntimeUpdatePathForTest("a.b"));
+    addImmutablePath("a.b");
+    addIndexedPath("a.b");
+    auto result = popNode.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
+    ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
+    ASSERT_EQUALS(fromjson("{a: {b: []}}"), doc);
+
+    assertOplogEntryIsNoop();
+    ASSERT_EQUALS("{a.b}", getModifiedPaths());
+}
+
+}  // namespace
+}  // namespace mongo

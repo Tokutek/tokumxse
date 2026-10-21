@@ -1,0 +1,139 @@
+/*-
+ * Copyright (c) 2014-present MongoDB, Inc.
+ * Copyright (c) 2008-2014 WiredTiger, Inc.
+ *	All rights reserved.
+ *
+ * See the file LICENSE for redistribution information.
+ */
+
+#include "wt_internal.h"
+
+/*
+ * __wt_checkpoint_handle_stats_clear --
+ *     Clear handle-related stats.
+ */
+void
+__wt_checkpoint_handle_stats_clear(WT_SESSION_IMPL *session)
+{
+    WT_CKPT_CONNECTION *ckpt = &S2C(session)->ckpt;
+
+    ckpt->handle_stats.apply = ckpt->handle_stats.drop = ckpt->handle_stats.lock =
+      ckpt->handle_stats.meta_check = ckpt->handle_stats.skip = 0;
+    ckpt->handle_stats.apply_time = ckpt->handle_stats.drop_time = ckpt->handle_stats.lock_time =
+      ckpt->handle_stats.meta_check_time = ckpt->handle_stats.skip_time = 0;
+}
+
+/*
+ * __wt_checkpoint_timer_stats_clear --
+ *     Clear timer-related stats.
+ */
+void
+__wt_checkpoint_timer_stats_clear(WT_SESSION_IMPL *session)
+{
+    WT_CKPT_CONNECTION *ckpt = &S2C(session)->ckpt;
+
+    ckpt->prepare.min = UINT64_MAX;
+    ckpt->ckpt_api.min = UINT64_MAX;
+    ckpt->scrub.min = UINT64_MAX;
+}
+
+/*
+ * __wt_checkpoint_handle_stats --
+ *     Update handle-related stats.
+ */
+void
+__wt_checkpoint_handle_stats(WT_SESSION_IMPL *session, uint64_t gathering_handles_time_us)
+{
+    WT_CKPT_CONNECTION *ckpt = &S2C(session)->ckpt;
+
+    WT_STAT_CONN_SET(session, checkpoint_handle_applied, ckpt->handle_stats.apply);
+    WT_STAT_CONN_SET(session, checkpoint_handle_apply_duration, ckpt->handle_stats.apply_time);
+    WT_STAT_CONN_SET(session, checkpoint_handle_drop_duration, ckpt->handle_stats.drop_time);
+    WT_STAT_CONN_SET(session, checkpoint_handle_dropped, ckpt->handle_stats.drop);
+    WT_STAT_CONN_SET(session, checkpoint_handle_duration, gathering_handles_time_us);
+    WT_STAT_CONN_SET(session, checkpoint_handle_lock_duration, ckpt->handle_stats.lock_time);
+    WT_STAT_CONN_SET(session, checkpoint_handle_locked, ckpt->handle_stats.lock);
+    WT_STAT_CONN_SET(session, checkpoint_handle_meta_checked, ckpt->handle_stats.meta_check);
+    WT_STAT_CONN_SET(
+      session, checkpoint_handle_meta_check_duration, ckpt->handle_stats.meta_check_time);
+    WT_STAT_CONN_SET(session, checkpoint_handle_skipped, ckpt->handle_stats.skip);
+    WT_STAT_CONN_SET(session, checkpoint_handle_skip_duration, ckpt->handle_stats.skip_time);
+}
+
+/*
+ * __wt_checkpoint_rec_time_stats --
+ *     Accumulate per-file reconciliation and sync wall-clock time into the per-checkpoint totals.
+ */
+void
+__wt_checkpoint_rec_time_stats(
+  WT_SESSION_IMPL *session, uint64_t reconcile_time_ticks, uint64_t sync_time_ticks)
+{
+    WT_CKPT_CONNECTION *ckpt = &S2C(session)->ckpt;
+
+    (void)__wt_atomic_add_uint64(&ckpt->reconcile_time_ticks, reconcile_time_ticks);
+    (void)__wt_atomic_add_uint64(&ckpt->sync_time_ticks, sync_time_ticks);
+}
+
+/*
+ * __wt_checkpoint_timer_stats --
+ *     Update timer-related stats.
+ */
+void
+__wt_checkpoint_timer_stats(WT_SESSION_IMPL *session)
+{
+    WT_CKPT_CONNECTION *ckpt = &S2C(session)->ckpt;
+    uint64_t min, rec_ticks, total_ticks;
+
+    WT_STAT_CONN_SET(
+      session, checkpoint_scrub_max, __wt_atomic_load_uint64_relaxed(&ckpt->scrub.max));
+    min = __wt_atomic_load_uint64_relaxed(&ckpt->scrub.min);
+    if (min != UINT64_MAX)
+        WT_STAT_CONN_SET(session, checkpoint_scrub_min, min);
+    WT_STAT_CONN_SET(
+      session, checkpoint_scrub_recent, __wt_atomic_load_uint64_relaxed(&ckpt->scrub.recent));
+    WT_STAT_CONN_SET(
+      session, checkpoint_scrub_total, __wt_atomic_load_uint64_relaxed(&ckpt->scrub.total));
+
+    WT_STAT_CONN_SET(
+      session, checkpoint_prep_max, __wt_atomic_load_uint64_relaxed(&ckpt->prepare.max));
+    min = __wt_atomic_load_uint64_relaxed(&ckpt->prepare.min);
+    if (min != UINT64_MAX)
+        WT_STAT_CONN_SET(session, checkpoint_prep_min, min);
+    WT_STAT_CONN_SET(
+      session, checkpoint_prep_recent, __wt_atomic_load_uint64_relaxed(&ckpt->prepare.recent));
+    WT_STAT_CONN_SET(
+      session, checkpoint_prep_total, __wt_atomic_load_uint64_relaxed(&ckpt->prepare.total));
+
+    WT_STAT_CONN_SET(
+      session, checkpoint_time_max, __wt_atomic_load_uint64_relaxed(&ckpt->ckpt_api.max));
+    min = __wt_atomic_load_uint64_relaxed(&ckpt->ckpt_api.min);
+    if (min != UINT64_MAX)
+        WT_STAT_CONN_SET(session, checkpoint_time_min, min);
+    WT_STAT_CONN_SET(
+      session, checkpoint_time_recent, __wt_atomic_load_uint64_relaxed(&ckpt->ckpt_api.recent));
+    WT_STAT_CONN_SET(
+      session, checkpoint_time_total, __wt_atomic_load_uint64_relaxed(&ckpt->ckpt_api.total));
+
+    rec_ticks = __wt_atomic_load_uint64_relaxed(&ckpt->reconcile_time_ticks);
+    total_ticks = __wt_atomic_load_uint64_relaxed(&ckpt->sync_time_ticks);
+    WT_STAT_CONN_SET(
+      session, checkpoint_sync_rec_pct, total_ticks > 0 ? (rec_ticks * 100) / total_ticks : 0);
+}
+
+/*
+ * __wt_checkpoint_apply_or_skip_handle_stats --
+ *     Update the apply or skip handle-related stats.
+ */
+void
+__wt_checkpoint_apply_or_skip_handle_stats(WT_SESSION_IMPL *session, uint64_t time_us)
+{
+    WT_CKPT_CONNECTION *ckpt = &S2C(session)->ckpt;
+
+    if (F_ISSET_ATOMIC_32(S2BT(session), WT_BTREE_SKIP_CKPT)) {
+        ++ckpt->handle_stats.skip;
+        ckpt->handle_stats.skip_time += time_us;
+    } else {
+        ++ckpt->handle_stats.apply;
+        ckpt->handle_stats.apply_time += time_us;
+    }
+}

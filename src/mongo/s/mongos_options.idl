@@ -1,0 +1,73 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/s/mongos_options.h"
+        - "mongo/util/landlock/landlock.h"
+    configs:
+        section: "Sharding options"
+        source: [yaml, cli, ini]
+
+configs:
+    "sharding.configDB":
+        description: >-
+            Connection string for communicating with config servers:
+            <config replset name>/<host1:port>,<host2:port>,[...]
+        short_name: configdb
+        arg_vartype: String
+    "sharding.configOnly":
+        description: >-
+            Run mongos in config-only mode for standby clusters. This mode only provides the ability
+            to connect to the standby cluster's config server for non-data-accessing commands.
+        short_name: configOnly
+        cpp_varname: "serverGlobalParams.configOnly"
+        arg_vartype: Bool
+        implicit: true
+    "replication.localPingThresholdMs":
+        description: "ping time (in ms) for a node to be considered local (default 15ms)"
+        short_name: "localThreshold"
+        cpp_varname: "serverGlobalParams.defaultLocalThresholdMillis"
+        arg_vartype: Int
+    "test":
+        description: "just run unit tests"
+        short_name: "test"
+        arg_vartype: Switch
+        source: [cli, ini]
+    "noscripting":
+        description: "Disable scripting engine"
+        arg_vartype: Switch
+        source: [cli, ini]
+    "security.javascriptEnabled":
+        description: "Enable javascript execution"
+        arg_vartype: Bool
+        source: [yaml]
+    "security.landlock.mode":
+        description: >-
+            Landlock self-sandboxing mode, restricting the server's filesystem access at
+            startup to a least-privilege set of paths. Alternatives are 'enforce' (refuse to
+            start when the running kernel cannot enforce the sandbox), 'bestEffort' (start
+            unsandboxed when it cannot) and 'disabled' (skip Landlock entirely). Linux only.
+        short_name: landlockMode
+        arg_vartype: String
+        default: "disabled"
+        source: [cli, yaml]
+        condition:
+            preprocessor: "defined(__linux__)"
+    "security.landlock.additionalPathRules":
+        description: >-
+            Additional filesystem hierarchies to permit under the Landlock sandbox, for paths
+            the server cannot derive from its own configuration. Each entry is
+            '<access>:<path>', where <access> is 'r' for read or 'rw' for read and write, and
+            <path> is absolute; the grant covers everything beneath it. Give one entry per
+            YAML list element, or repeat this option once per rule on the command line;
+            entries from both sources accumulate. Linux only.
+        short_name: landlockAdditionalPathRules
+        arg_vartype: StringVector
+        duplicate_behavior: append
+        source: [cli, yaml]
+        validator:
+            callback: validateLandlockAdditionalPathRules
+        condition:
+            preprocessor: "defined(__linux__)"

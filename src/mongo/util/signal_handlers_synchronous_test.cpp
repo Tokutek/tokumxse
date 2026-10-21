@@ -1,0 +1,277 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/util/signal_handlers_synchronous.h"
+
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/fixed_string.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/str.h"
+
+#include <csignal>
+#include <exception>
+#include <string>
+#include <string_view>
+#include <thread>
+
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+namespace mongo {
+namespace {
+
+// Tests of signals that should be ignored raise each signal twice, to ensure that the handler isn't
+// reset.
+#define IGNORED_SIGNAL(SIGNUM)           \
+    TEST(IgnoredSignalTest, SIGNUM##_) { \
+        ASSERT_EQ(0, raise(SIGNUM));     \
+        ASSERT_EQ(0, raise(SIGNUM));     \
+    }
+
+#define FATAL_SIGNAL(SIGNUM)                                                                     \
+    DEATH_TEST(                                                                                  \
+        FatalSignalTestDeathTest, SIGNUM##_, str::stream() << "Got signal: " << SIGNUM << " ") { \
+        ASSERT_EQ(0, raise(SIGNUM));                                                             \
+    }
+
+#ifdef __linux__
+// The si_code field is always SI_TKILL when using raise
+#define DUMP_SIGINFO(SIGNUM)                                                               \
+    DEATH_TEST(DumpSiginfoTestDeathTest,                                                   \
+               SIGNUM##_,                                                                  \
+               fmt::format("Dumping siginfo (si_code={}): ", fmt::underlying(SI_TKILL))) { \
+        ASSERT_EQ(0, raise(SIGNUM));                                                       \
+    }
+#else
+#define DUMP_SIGINFO(SIGNUM)
+#endif
+
+IGNORED_SIGNAL(SIGUSR2)
+IGNORED_SIGNAL(SIGHUP)
+IGNORED_SIGNAL(SIGPIPE)
+FATAL_SIGNAL(SIGQUIT)
+FATAL_SIGNAL(SIGILL)
+DUMP_SIGINFO(SIGILL)
+FATAL_SIGNAL(SIGABRT)
+
+#if !__has_feature(address_sanitizer)
+// These signals trip the leak sanitizer
+FATAL_SIGNAL(SIGSEGV)
+DUMP_SIGINFO(SIGSEGV)
+FATAL_SIGNAL(SIGBUS)
+DUMP_SIGINFO(SIGBUS)
+FATAL_SIGNAL(SIGFPE)
+DUMP_SIGINFO(SIGFPE)
+#endif
+
+DEATH_TEST(FatalTerminateTestDeathTest,
+           TerminateIsFatalWithoutException,
+           "terminate() called. No exception") {
+    std::terminate();
+}
+
+DEATH_TEST(FatalTerminateTestDeathTest,
+           TerminateIsFatalWithDBException,
+           "terminate() called. An exception is active") {
+    try {
+        uasserted(28720, "Fatal DBException occurrence");
+    } catch (...) {
+        std::terminate();
+    }
+}
+
+DEATH_TEST(FatalTerminateTestDeathTest,
+           TerminateIsFatalWithDoubleException,
+           "terminate() called. An exception is active") {
+    class ThrowInDestructor {
+    public:
+        ~ThrowInDestructor() {
+            uasserted(28721, "Fatal second exception");
+        }
+    } tid;
+
+    // This is a workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=83400. We should delete
+    // this variable once we are on a compiler that doesn't require it.
+    volatile bool workaroundGCCBug = true;  // NOLINT
+    if (workaroundGCCBug)
+        uasserted(28719, "Non-fatal first exception");
+}
+
+/**
+ * `MallocFreeOStreamGuard` is locked when certain synchronous signal handlers
+ * run. Here we test its self-deadlock mitigation.
+ */
+class MallocFreeOStreamGuardTest : public unittest::Test {
+public:
+    /**
+     * We use a constexpr id and late-bind that to a consistent signal number,
+     * which lets the test logicaly organize the signal numbers it uses.
+     *
+     * The two signals were arbitrarily chosen. We only need two because
+     * the deadlock mitigation we are testing against triggers upon entering
+     * the scope of two guards.
+     */
+    template <size_t id>
+    struct SignalIndex {
+        explicit(false) operator int() const {
+            return std::array<int, 2>{SIGUSR1, SIGUSR2}[id];
+        }
+    };
+    template <size_t i>
+    static constexpr SignalIndex<i> sig = SignalIndex<i>{};
+
+    static inline Atomic<int> handlerCount{0};
+
+    static void blockSignal(int signo, bool block) {
+        sigset_t sigset;
+        sigemptyset(&sigset);
+        sigaddset(&sigset, signo);
+        if (sigprocmask(block ? SIG_BLOCK : SIG_UNBLOCK, &sigset, nullptr) != 0) {
+            auto ec = lastSystemError();
+            LOGV2_FATAL(9493800,
+                        "sigprocmask",
+                        "block"_attr = block,
+                        "signal"_attr = signo,
+                        "error"_attr = errorMessage(ec));
+        }
+    }
+
+    static void installSignalHandler(int signo, void (*handler)(int)) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = handler;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(signo, &sa, nullptr) != 0) {
+            auto ec = lastSystemError();
+            LOGV2_FATAL(9493801,
+                        "Error installing signal handler",
+                        "signal"_attr = signo,
+                        "error"_attr = errorMessage(ec));
+        }
+    }
+
+    static void write(std::string_view s) {
+        logv2::signalSafeWriteToStderr(s);
+    }
+
+    /**
+     * For the duration of these tests, we'll have a global Deadlock listener installed.
+     */
+    void setUp() override {
+        setMallocFreeOStreamGuardDeadlockCallback_forTest([](int) { write("[deadlock]"); });
+    }
+
+    void tearDown() override {
+        setMallocFreeOStreamGuardDeadlockCallback_forTest(nullptr);
+    }
+
+    static std::shared_ptr<void> makeGuard(int signo) {
+        return makeMallocFreeOStreamGuard_forTest(signo);
+    }
+
+    template <FixedString message, auto nextAction>
+    static void handler(int signo) {
+        {
+            write(std::string_view{message});
+            auto guard = makeGuard(signo);
+            nextAction();
+        }
+        handlerCount.fetchAndAdd(1);
+    }
+
+    template <SignalIndex idx>
+    static void thenRaise() {
+        raise(idx);
+    }
+
+    /** The clean exit will deliberately fail death tests that use this handler. */
+    static void thenExitCleanly() {
+        quickExit(ExitCode::clean);
+    }
+};
+
+using MallocFreeOStreamGuardTestDeathTest = MallocFreeOStreamGuardTest;
+DEATH_TEST_F(MallocFreeOStreamGuardTestDeathTest, SecondGuardQuits, "[deadlock]") {
+    auto guard1 = makeGuard(sig<0>);
+    auto guard2 = makeGuard(sig<1>);
+}
+
+DEATH_TEST_F(MallocFreeOStreamGuardTestDeathTest, DeadlockCounterOnlyIncreases, "[deadlock]") {
+    // The deadlock avoidance counter remains incremented after guard dies.
+    (void)makeGuard(sig<0>);
+    (void)makeGuard(sig<1>);
+}
+
+DEATH_TEST_F(MallocFreeOStreamGuardTestDeathTest,
+             RaiseWithinHandler,
+             "[sig<1>][sig<0>][deadlock]") {
+    installSignalHandler(sig<0>, handler<"[sig<0>]", thenExitCleanly>);
+    installSignalHandler(sig<1>, handler<"[sig<1>]", thenRaise<sig<0>>>);
+    raise(sig<1>);
+}
+
+/**
+ * Because we made a guard, the `sig<0>` signal handlers will die, and the
+ * `exitCleanly` action won't happen.
+ */
+DEATH_TEST_F(MallocFreeOStreamGuardTestDeathTest, WithoutBlockedSignal, "[sig<0>][deadlock]") {
+    installSignalHandler(sig<0>, handler<"[sig<0>]", thenExitCleanly>);
+    auto guard = makeGuard(sig<1>);
+    raise(sig<0>);
+}
+
+/**
+ * Exactly like the `WithoutBlockedSignal` case, but with signal blocking, so
+ * the second guard inside the handler is never created. When `sig<0>` is
+ * unblocked, the pending `sig<0>` will activate and trigger the deadlock
+ * mitigation.
+ */
+DEATH_TEST_F(MallocFreeOStreamGuardTestDeathTest,
+             WithBlockedSignal,
+             "[survived][sig<0>][deadlock]") {
+    blockSignal(sig<0>, true);
+    installSignalHandler(sig<0>, handler<"[sig<0>]", thenExitCleanly>);
+    auto guard = makeGuard(sig<1>);
+
+    raise(sig<0>);
+    write("[survived]");
+
+    // raise() will return only after the signal handler has returned, so we don't need
+    // synchronization on raise calls, but unblocking has no guarantee. The signal handlers
+    // may not have run when unblock call returns, so we spin wait.
+    auto h0 = handlerCount.load();
+    blockSignal(sig<0>, false);
+    while (handlerCount.load() == h0)
+        std::this_thread::yield();
+}
+
+class BlockInsideSignalHandlerTest : public MallocFreeOStreamGuardTest {
+public:
+    void setUp() override {
+        setMallocFreeOStreamGuardDeadlockCallback_forTest([](int) {
+            blockSignal(sig<1>, true);
+            write("[deadlock]");
+        });
+    }
+};
+
+// Tests that even if the signal is blocked (e.g. by another thread) between the start of the signal
+// handler and the deadlock mitigation, the deadlock mitigation ends the process as expected.
+using BlockInsideSignalHandlerTestDeathTest = BlockInsideSignalHandlerTest;
+DEATH_TEST_F(BlockInsideSignalHandlerTestDeathTest, ProcessEnds, "[sig<0>][sig<1>][deadlock]") {
+    installSignalHandler(sig<0>, handler<"[sig<0>]", thenRaise<sig<1>>>);
+    installSignalHandler(sig<1>, handler<"[sig<1>]", thenExitCleanly>);
+    raise(sig<0>);
+}
+
+}  // namespace
+}  // namespace mongo

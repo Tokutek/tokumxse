@@ -1,0 +1,324 @@
+// Wrapper around the validate command that can be used to validate index key counts.
+import {Thread} from "jstests/libs/parallelTester.js";
+import newMongoWithRetry from "jstests/libs/retryable_mongo.js";
+
+export class CollectionValidator {
+    validateCollections(db, obj) {
+        return validateCollectionsImpl(db, obj);
+    }
+
+    validateNodes(hostList) {
+        // We run the scoped threads in a try/finally block in case any thread throws an exception,
+        // in which case we want to still join all the threads.
+        let threads = [];
+
+        try {
+            hostList.forEach((host) => {
+                const thread = new Thread(
+                    validateCollectionsThread,
+                    newMongoWithRetry,
+                    validateCollectionsImpl,
+                    host,
+                );
+                threads.push(thread);
+                thread.start();
+            });
+        } finally {
+            // Wait for each thread to finish. Throw an error if any thread fails.
+            const returnData = threads.map((thread) => {
+                thread.join();
+                return thread.returnData();
+            });
+
+            const isMultiversion = Boolean(jsTest.options().useRandomBinVersionsWithinReplicaSet);
+
+            // Compare hashes between nodes.
+            let hashes = {};
+            let hashesSet = false;
+            returnData.forEach((res) => {
+                assert.commandWorked(res, "Collection validation failed");
+                if (TestData.skipInterNodeCollectionHashValidation) {
+                    jsTest.log.info(
+                        "Skipping inter-node collection hash validation as per test configuration",
+                    );
+                    return;
+                }
+
+                if (!hashesSet) {
+                    if (!res.dbHashes || Object.keys(res.dbHashes).length === 0) {
+                        return;
+                    }
+                    // Skipping config server hash checks.
+                    if (res.dbHashes["config"] && res.dbHashes["config"]["mongos"]) {
+                        return;
+                    }
+                    hashes = res.dbHashes;
+                    hashesSet = true;
+                } else {
+                    let currHashes = res.dbHashes;
+                    if (!currHashes || Object.keys(currHashes).length === 0) {
+                        // No data to compare against.
+                        return;
+                    }
+                    // Skipping config server hash checks.
+                    if (currHashes.config?.mongos) {
+                        return;
+                    }
+
+                    Object.keys(hashes).forEach((db) => {
+                        Object.keys(hashes[db]).forEach((coll) => {
+                            // Skip checking the local database.
+                            if (db == "local") {
+                                return;
+                            }
+                            if (
+                                db == "config" &&
+                                (coll == "fast_count_metadata_store" ||
+                                    coll == "fast_count_metadata_store_timestamps")
+                            ) {
+                                // The contents of the fast count store collections can temporarily differ if
+                                // validation is called when the primary has updated entries based on writes it
+                                // observed in the latest checkpoint but a secondary has not yet applied those writes.
+                                return;
+                            }
+                            if (!currHashes[db] || !currHashes[db][coll]) {
+                                return;
+                            }
+                            assert.eq(
+                                hashes[db][coll].all,
+                                currHashes[db][coll].all,
+                                "Collection hashes are different for " + db + "." + coll,
+                            );
+                            // Skip collections that are not explicitly replicated, tests running initial sync, and for multiversion tests. The collections are not guaranteed to have the same idents for these cases.
+                            if (
+                                TestData.isRunningInitialSync ||
+                                isMultiversion ||
+                                (db == "config" && coll == "transactions")
+                            ) {
+                                return;
+                            }
+                            assert.eq(
+                                hashes[db][coll].metadata,
+                                currHashes[db][coll].metadata,
+                                "Metadata hashes are different for " + db + "." + coll,
+                            );
+                        });
+                    });
+                }
+            });
+        }
+    }
+}
+
+function validateCollectionsImpl(db, obj) {
+    function dumpCollection(coll, limit) {
+        print("Printing indexes in: " + coll.getFullName());
+        printjson(coll.getIndexes());
+
+        print("Printing the first " + limit + " documents in: " + coll.getFullName());
+        const res = coll.find().limit(limit);
+        while (res.hasNext()) {
+            printjson(res.next());
+        }
+    }
+
+    assert.eq(typeof db, "object", "Invalid `db` object, is the shell connected to a mongod?");
+    assert.eq(typeof obj, "object", "The `obj` argument must be an object");
+    assert(obj.hasOwnProperty("full"), "Please specify whether to use full validation");
+
+    // Failed collection validation results are saved in failed_res.
+    let full_res = {ok: 1, failed_res: [], hashes: {}};
+
+    // Don't run validate on view namespaces.
+    let filter = {type: {$ne: "view"}};
+
+    // Optionally skip collections.
+    if (
+        Array.isArray(jsTest.options().skipValidationNamespaces) &&
+        jsTest.options().skipValidationNamespaces.length > 0
+    ) {
+        let skippedCollections = [];
+        for (let ns of jsTest.options().skipValidationNamespaces) {
+            // Attempt to strip the name of the database we are about to validate off of the
+            // namespace we wish to skip. If the replace() function does find a match with the
+            // database, then we know that the collection we want to skip is in the database we
+            // are about to validate. We will then put it in the 'filter' for later use.
+            const collName = ns.replace(new RegExp("^" + db.getName() + "\."), "");
+            if (collName !== ns) {
+                skippedCollections.push({name: {$ne: collName}});
+            }
+        }
+        filter = {$and: [filter, ...skippedCollections]};
+    }
+
+    // In a sharded cluster with in-progress validate command for the config database
+    // (i.e. on the config server), a listCommand command on a mongos or shardsvr mongod that
+    // has stale routing info may fail since a refresh would involve running read commands
+    // against the config database. The read commands are lock free so they are not blocked by
+    // the validate command and instead are subject to failing with a ObjectIsBusy error. Since
+    // this is a transient state, we should retry.
+    let collInfo;
+    assert.soon(() => {
+        try {
+            collInfo = db.getCollectionInfos(filter);
+            // TODO(SERVER-118882): Remove this once 9.0 becomes last LTS.
+            // Filter out system.buckets.* collections
+            // timeseries collections will be tested through their main namespace
+            collInfo = collInfo.filter((c) => !c.name.startsWith("system.buckets."));
+        } catch (ex) {
+            if (ex.code === ErrorCodes.ObjectIsBusy) {
+                return false;
+            }
+            // If the new filter {type: {$ne: "view"}} fails with InvalidViewDefinition in
+            // multiversion environments, fall back to the legacy "exclude views and
+            // timeseries" filter that matches only collections (or entries with no 'type'
+            // field on older servers).
+            if (ex.code === ErrorCodes.InvalidViewDefinition) {
+                filter = {$or: [{type: "collection"}, {type: {$exists: false}}]};
+                return false; // Retry with the fallback filter
+            }
+            throw ex;
+        }
+        return true;
+    });
+
+    for (let collDocument of collInfo) {
+        const coll = db.getCollection(collDocument["name"]);
+        const res = coll.validate(obj);
+
+        if (!res.ok || !res.valid) {
+            if (
+                jsTest.options().skipValidationOnNamespaceNotFound &&
+                res.codeName === "NamespaceNotFound"
+            ) {
+                // During a 'stopStart' backup/restore on the secondary node, the actual list of
+                // collections can be out of date if ops are still being applied from the oplog.
+                // In this case we skip the collection if the ns was not found at time of
+                // validation and continue to next.
+                print(
+                    "Skipping collection validation for " +
+                        coll.getFullName() +
+                        " since collection was not found",
+                );
+                continue;
+            } else if (
+                res.codeName === "NamespaceNotFound" &&
+                res.errmsg?.includes("Timeseries buckets collection does not exist")
+            ) {
+                // TODO(SERVER-118882): Remove this once 9.0 becomes last LTS.
+                // A legacy timeseries view exists but its corresponding bucket collection doesn't.
+                // This can happen when tests intentionally create views on non-existent buckets
+                // or drop the bucket without dropping the view. Skip validation in this case.
+                print(
+                    `Skipping collection validation for ${coll.getFullName()} since it is a legacy timeseries view without a bucket`,
+                );
+                continue;
+            } else if (res.codeName === "CommandNotSupportedOnView") {
+                // Even though we pass a filter to getCollectionInfos() to only fetch
+                // collections, nothing is preventing the collection from being dropped and
+                // recreated as a view.
+                print(
+                    "Skipping collection validation for " + coll.getFullName() + " as it is a view",
+                );
+                continue;
+            }
+            const host = db.getMongo().host;
+            print(
+                "Collection validation failed on host " + host + " with response: " + tojson(res),
+            );
+            dumpCollection(coll, 100);
+            full_res.failed_res.push(res);
+            full_res.ok = 0;
+        }
+
+        if (obj.collHash && res.all && res.metadata) {
+            full_res.hashes[collDocument["name"]] = {"all": res.all, "metadata": res.metadata};
+        }
+    }
+
+    return full_res;
+}
+
+// Run a separate thread to validate collections on each server in parallel.
+function validateCollectionsThread(newMongoWithRetry, validatorFunc, host) {
+    try {
+        print("Running validate() on " + host);
+        const conn = newMongoWithRetry(host);
+        conn.setSecondaryOk();
+        jsTest.authenticate(conn);
+
+        // Skip validating collections for arbiters.
+        if (conn.getDB("admin").isMaster("admin").arbiterOnly === true) {
+            print("Skipping collection validation on arbiter " + host);
+            return {ok: 1};
+        }
+
+        // Skip fast count validation on nodes using FCBIS since FCBIS can result in inaccurate fast
+        // counts.
+        if (
+            conn.adminCommand({getParameter: 1, initialSyncMethod: 1}).initialSyncMethod ===
+            "fileCopyBased"
+        ) {
+            print(
+                "Skipping fast count validation against test node: " +
+                    host +
+                    " because it uses FCBIS and fast count is expected to be incorrect.",
+            );
+            TestData.skipEnforceFastCountOnValidate = true;
+        }
+
+        let requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
+        if (requiredFCV) {
+            requiredFCV = new Function(
+                `return typeof ${requiredFCV} === "string" ? ${requiredFCV} : "${requiredFCV}"`,
+            )();
+            // Make sure this node has the desired FCV as it may take time for the updates to
+            // replicate to the nodes that weren't part of the w=majority.
+            assert.soonNoExcept(() => {
+                checkFCV(conn.getDB("admin"), requiredFCV);
+                return true;
+            });
+        }
+
+        let dbHashes = {};
+
+        const dbs = conn.getDBs().databases;
+        for (let db of dbs) {
+            const dbName = db.name;
+            const tenant = db.tenantId;
+            const token = tenant ? _createTenantToken({tenant}) : undefined;
+            try {
+                conn._setSecurityToken(token);
+                const validateRes = validatorFunc(conn.getDB(dbName), {
+                    // Run non-full validation because certain test fixtures run validate while
+                    // the oplog applier is still active, and full:true runs WT::verify which can
+                    // cause the oplog applier thread to encounter EBUSY errors during internal finds.
+                    full: false,
+                    // TODO (SERVER-24266): Always enforce fast counts, once they are always
+                    // accurate.
+                    enforceFastCount:
+                        !TestData.skipEnforceFastCountOnValidate && !TestData.allowUncleanShutdowns,
+                    enforceFastSize:
+                        !TestData.allowUncleanShutdowns && TestData.enforceFastSizeOnValidate,
+                    collHash: true,
+                });
+                if (validateRes.ok !== 1) {
+                    return {ok: 0, host: host, validateRes: validateRes};
+                }
+                if (validateRes.hashes && Object.keys(validateRes.hashes).length !== 0) {
+                    dbHashes[dbName] = validateRes.hashes;
+                }
+            } finally {
+                conn._setSecurityToken(undefined);
+            }
+        }
+        return {ok: 1, dbHashes};
+    } catch (e) {
+        print("Exception caught in scoped thread running validationCollections on server: " + host);
+        return {ok: 0, error: e.toString(), stack: e.stack, host: host};
+    }
+}
+
+// Ensure compatibility with existing callers. Cannot use `const` or `let` here since this file may
+// be loaded more than once.
+export const validateCollections = new CollectionValidator().validateCollections;

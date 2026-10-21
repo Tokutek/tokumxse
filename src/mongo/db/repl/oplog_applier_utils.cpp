@@ -1,0 +1,1069 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/oplog_applier_utils.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonelement_comparator.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/crypto/oplog_key_entry_handler.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/curop_metrics.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/repl/container_oplog_entry_gen.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/split_prepare_session_manager.h"
+#include "mongo/db/replicated_fast_count/repair_replicated_metadata_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_catalog/document_validation.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/exceptions.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <set>
+#include <span>
+#include <string>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/hash/hash.h>
+#include <absl/meta/type_traits.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+
+MONGO_FAIL_POINT_DEFINE(hangAfterApplyingCollectionDropOplogEntry);
+
+namespace mongo {
+namespace repl {
+CachedCollectionProperties::CollectionProperties
+CachedCollectionProperties::getCollectionProperties(OperationContext* opCtx,
+                                                    const NamespaceString& nss) {
+    auto it = _cache.find(nss);
+    if (it != _cache.end()) {
+        return it->second;
+    }
+
+    CollectionProperties collProperties;
+    if (auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
+        collProperties.isCapped = collection->isCapped();
+        collProperties.isClustered = collection->isClustered();
+        collProperties.collator = collection->getDefaultCollator();
+    }
+    _cache[nss] = collProperties;
+    return collProperties;
+}
+
+namespace {
+/**
+ * Populates a CRUD op's idHash and updates the isForCappedCollection field if necessary.
+ */
+void processCrudOp(OperationContext* opCtx,
+                   OplogEntry* op,
+                   const CachedCollectionProperties::CollectionProperties& collProperties,
+                   boost::optional<size_t>& idHash) {
+    // Include the _id of the document in the hash so we get parallelism even if all writes are to a
+    // single collection.
+    //
+    // For capped collections, this is usually illegal, since capped collections must preserve
+    // insertion order. One exception are clustered capped collections with a monotonically
+    // increasing cluster key, which guarantee preservation of the insertion order.
+    if (!collProperties.isCapped || collProperties.isClustered) {
+        BSONElement id = [&]() {
+            return op->getIdElement();
+        }();
+        BSONElementComparator elementHasher(BSONElementComparator::FieldNamesMode::kIgnore,
+                                            collProperties.collator);
+        idHash.emplace(elementHasher.hash(id));
+    }
+
+    if (op->getOpType() == OpTypeEnum::kInsert && collProperties.isCapped) {
+        // Mark capped collection ops before storing them to ensure we do not attempt to
+        // bulk insert them.
+        op->setIsForCappedCollection(true);
+    }
+}
+
+
+/**
+ * Returns the number of single-key ops that 'op' expands to, or boost::none if 'op' is not a packed
+ * container op.
+ *
+ * Note the count is not enough on its own to tell whether an op is packed: an array holding a
+ * single key is packed but expands to one op, and an empty array is packed but expands to none.
+ */
+boost::optional<size_t> packedContainerOpCount(const OplogEntry& op) {
+    if (!op.isContainerOpType()) {
+        return boost::none;
+    }
+    const BSONObj& o = op.getObject();
+    if (const auto key = o[ContainerInsertOplogEntryO::kKeyFieldName];
+        ContainerKey::isPacked(key)) {
+        return key.embeddedObject().nFields();
+    }
+    // An unpacked key paired with a packed value covers the consecutive keys starting at that key,
+    // so the number of values is the number of keys written.
+    if (const auto val = o[ContainerInsertOplogEntryO::kValueFieldName];
+        ContainerVal::isPacked(val)) {
+        return val.embeddedObject().nFields();
+    }
+    return boost::none;
+}
+
+/**
+ * Returns true if 'op' is a container op that packs more than one key into a single entry, either
+ * by making the key an array or by making the value an array (in which case the keys are the
+ * consecutive integers starting at the key).
+ */
+bool isBatchedContainerOp(const OplogEntry& op) {
+    if (!op.isContainerOpType()) {
+        return false;
+    }
+    const BSONObj& o = op.getObject();
+    return ContainerKey::isPacked(o[ContainerInsertOplogEntryO::kKeyFieldName]) ||
+        ContainerVal::isPacked(o[ContainerInsertOplogEntryO::kValueFieldName]);
+}
+
+void getContainerKeyHash(OperationContext* opCtx,
+                         OplogEntry* op,
+                         boost::optional<size_t>& hashKey) {
+    // Multi-key entries must have been expanded by expandBatchedContainerOps() before reaching
+    // here. Hashing one as a unit would send it to a different writer thread than the other entries
+    // touching its keys, letting inserts and deletes of the same key race.
+    invariant(!isBatchedContainerOp(*op),
+              str::stream() << "container op packing multiple keys reached writer thread "
+                               "assignment: "
+                            << redact(op->toBSONForLogging()));
+
+    BSONElement key = op->getObject()["k"];
+    BSONElementComparator elementHasher(BSONElementComparator::FieldNamesMode::kIgnore, nullptr);
+    hashKey.emplace(elementHasher.hash(key));
+}
+
+/**
+ * Returns a copy of baseObject with an OplogEntry::kObjectFieldName appended.
+ *
+ * The baseObject must not have an existing OplogEntry::kObjectFieldName.
+ *
+ * Note that the rebuilt 'o' is appended last rather than in its original position, so the field
+ * order of the result differs from that of a natural oplog entry.
+ */
+OplogEntry withObject(const BSONObj& baseObject, const BSONObj& oField) {
+    dassert(!baseObject.hasField(OplogEntry::kObjectFieldName), baseObject.toString());
+    // The fixed per-element overhead of an appended BSON field: one type byte ahead of the field
+    // name and one NUL byte terminating it. baseObject.objsize() already accounts for the object's
+    // 4-byte length header and trailing EOO byte, both of which carry over to the result.
+    static constexpr int kElementOverheadBytes = 2;
+    BSONObjBuilder builder(baseObject.objsize() + kElementOverheadBytes +
+                           static_cast<int>(OplogEntry::kObjectFieldName.size()) +
+                           oField.objsize());
+    builder.appendElements(baseObject);
+    builder.append(OplogEntry::kObjectFieldName, oField);
+    return OplogEntry(builder.obj());
+}
+
+/**
+ * Makes room in 'v' for 'additional' more elements.
+ *
+ * Note this grows geometrically rather than to exactly the size needed. expandBatchedContainerOps()
+ * accumulates many expansions into one buffer, and reserving the exact size each time would
+ * reallocate on every packed op instead of amortizing the growth.
+ */
+void reserveAdditional(std::vector<OplogEntry>& v, size_t additional) {
+    const size_t needed = v.size() + additional;
+    if (needed > v.capacity()) {
+        v.reserve(std::max(needed, v.capacity() * 2));
+    }
+}
+
+BSONObj makeSingleContainerInsertO(ContainerKey key, boost::optional<ContainerVal> value) {
+    ContainerInsertOplogEntryO insertO;
+    insertO.setKey(std::move(key));
+    if (value) {
+        insertO.setValue(std::move(*value));
+    }
+    return insertO.toBSON();
+}
+
+/**
+ * Returns the ID of the writer thread that this op will be assigned to, determined by the
+ * namespace string (and document key if exists) of the op.
+ */
+uint32_t getWriterId(OperationContext* opCtx,
+                     OplogEntry* op,
+                     CachedCollectionProperties* collPropertiesCache,
+                     uint32_t numWriters,
+                     boost::optional<uint32_t> forceWriterId = boost::none) {
+    auto hash = OplogApplierUtils::getOplogEntryHash(opCtx, op, collPropertiesCache);
+    return (forceWriterId ? *forceWriterId : hash) % numWriters;
+}
+
+/**
+ * Returns the ID of the writer thread that this op will be assigned to, determined by the
+ * session ID of the op.
+ */
+uint32_t getWriterIdBySessionId(OplogEntry* op, uint32_t numWriters) {
+    LogicalSessionIdHash lsidHasher;
+
+    invariant(op->getSessionId());
+    auto hash = static_cast<uint32_t>(lsidHasher(*op->getSessionId()));
+
+    return hash % numWriters;
+}
+
+/**
+ * Adds an op to the writer vector of the given writer ID. The variadic arguments will be
+ * forwarded to the writer vector to in-place construct the op.
+ */
+template <typename Operation, typename... Args>
+uint32_t addToWriterVectorImpl(uint32_t writerId,
+                               std::vector<std::vector<Operation>>* writerVectors,
+                               Args&&... args) {
+    auto& writer = (*writerVectors)[writerId];
+
+    if (writer.empty()) {
+        // Skip a few growth rounds.
+        writer.reserve(8);
+    }
+    writer.emplace_back(std::forward<Args>(args)...);
+
+    return writerId;
+}
+
+/**
+ * Adds the top-level prepareTransaction op to the writerVectors.
+ */
+void addTopLevelPrepare(OperationContext* opCtx,
+                        OplogEntry* prepareOp,
+                        std::vector<OplogEntry>* derivedOps,
+                        std::vector<std::vector<ApplierOperation>>* writerVectors) {
+    auto writerId = getWriterIdBySessionId(prepareOp, writerVectors->size());
+    addToWriterVectorImpl(writerId,
+                          writerVectors,
+                          prepareOp,
+                          ApplicationInstruction::applyTopLevelPreparedTxnOp,
+                          *derivedOps);
+}
+
+/**
+ * Adds the top-level commitTransaction or AbortTransaction op to the writerVectors.
+ */
+void addTopLevelCommitOrAbort(OperationContext* opCtx,
+                              OplogEntry* commitOrAbortOp,
+                              std::vector<std::vector<ApplierOperation>>* writerVectors) {
+    auto writerId = getWriterIdBySessionId(commitOrAbortOp, writerVectors->size());
+    addToWriterVectorImpl(writerId,
+                          writerVectors,
+                          commitOrAbortOp,
+                          ApplicationInstruction::applyTopLevelPreparedTxnOp);
+}
+}  // namespace
+
+uint32_t OplogApplierUtils::getOplogEntryHash(OperationContext* opCtx,
+                                              OplogEntry* op,
+                                              CachedCollectionProperties* collPropertiesCache) {
+    boost::optional<size_t> opHash;
+    NamespaceString nss = op->getNss();
+
+    if (op->isCrudOpType()) {
+        auto collProperties = collPropertiesCache->getCollectionProperties(opCtx, nss);
+        processCrudOp(opCtx, op, collProperties, opHash);
+    } else if (op->isContainerOpType()) {
+        getContainerKeyHash(opCtx, op, opHash);
+        return absl::HashOf(*op->getContainer(), *opHash);
+    }
+
+    return opHash ? absl::HashOf(nss, *opHash) : absl::HashOf(nss);
+}
+
+namespace {
+/**
+ * Appends to 'expanded' the single-key container ops equivalent to 'op' and returns true. Returns
+ * false, leaving 'expanded' untouched, if 'op' is not a container op that packs multiple keys.
+ *
+ * This is the accumulating form used by expandBatchedContainerOps(), which collects many expansions
+ * into one buffer. expandBatchedContainerOp() wraps it for callers holding a single op.
+ */
+bool appendExpandedContainerOp(const OplogEntry& op, std::vector<OplogEntry>& expanded) {
+    if (!isBatchedContainerOp(op)) {
+        return false;
+    }
+
+    const BSONObj o = op.getObject();
+
+    // Create an owned copy and strip the object field, this will serve as a template to create
+    // "unrolled" batched oplog.
+    const BSONObj rawWithoutO = op.getRaw().removeField(OplogEntry::kObjectFieldName);
+
+    switch (op.getOpType()) {
+        case OpTypeEnum::kContainerInsert: {
+            const auto insertO = ContainerInsertOplogEntryO::parse(
+                o, IDLParserContext("ContainerInsertOplogEntryO"));
+            const auto& key = insertO.getKey();
+            const auto& maybeVal = insertO.getValue();
+
+            if (maybeVal && maybeVal->isArrayVal()) {
+                const auto& values = maybeVal->getArrayVal();
+                if (key.isIntKey()) {
+                    // A single int key with an array of values inserts at the consecutive keys
+                    // starting at that key, matching applyContainerOperations().
+                    const int64_t baseKey = key.getIntKey();
+                    reserveAdditional(expanded, values.size());
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        expanded.emplace_back(
+                            withObject(rawWithoutO,
+                                       makeSingleContainerInsertO(
+                                           ContainerKey(baseKey + static_cast<int64_t>(i)),
+                                           ContainerVal(values[i]))));
+                    }
+                    return true;
+                }
+                // Otherwise keys and values are paired off; DurableOplogEntry's constructor has
+                // already checked that the two arrays are the same length.
+                const auto& keys = key.getArrayKey();
+                invariant(keys.size() == values.size(), op.toStringForLogging());
+                reserveAdditional(expanded, keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    expanded.emplace_back(
+                        withObject(rawWithoutO,
+                                   makeSingleContainerInsertO(ContainerKey(keys[i]),
+                                                              ContainerVal(values[i]))));
+                }
+                return true;
+            }
+
+            // An array of keys sharing one (possibly absent) value.
+            invariant(key.isArrayKey(), op.toStringForLogging());
+            const auto& keys = key.getArrayKey();
+            reserveAdditional(expanded, keys.size());
+            for (auto&& singleKey : keys) {
+                expanded.emplace_back(withObject(
+                    rawWithoutO, makeSingleContainerInsertO(ContainerKey(singleKey), maybeVal)));
+            }
+            return true;
+        }
+        case OpTypeEnum::kContainerDelete: {
+            const auto deleteO = ContainerDeleteOplogEntryO::parse(
+                o, IDLParserContext("ContainerDeleteOplogEntryO"));
+            const auto& keys = deleteO.getKey().getArrayKey();
+            reserveAdditional(expanded, keys.size());
+            for (auto&& singleKey : keys) {
+                ContainerDeleteOplogEntryO singleO;
+                singleO.setKey(ContainerKey(singleKey));
+                expanded.emplace_back(withObject(rawWithoutO, singleO.toBSON()));
+            }
+            return true;
+        }
+        case OpTypeEnum::kContainerUpdate:
+            // Container updates are always a single key and a single value, enforced by
+            // DurableOplogEntry's constructor.
+            //
+            // TODO SERVER-131747 Support container updates with multiple kvs
+            MONGO_UNREACHABLE_TASSERT(13230702);
+        default:
+            MONGO_UNREACHABLE_TASSERT(13230703);
+    }
+}
+}  // namespace
+
+boost::optional<std::vector<OplogEntry>> OplogApplierUtils::expandBatchedContainerOp(
+    const OplogEntry& op) {
+    std::vector<OplogEntry> expanded;
+    if (!appendExpandedContainerOp(op, expanded)) {
+        return boost::none;
+    }
+    return expanded;
+}
+
+void OplogApplierUtils::expandBatchedContainerOps(std::vector<OplogEntry>& ops) {
+    // One pass to decide whether anything needs expanding and, if so, how large the result will be.
+    // Sizing the buffer exactly means building it never reallocates, which matters because
+    // OplogEntry is not nothrow move constructible, so every reallocation would copy rather than
+    // move. Walking the packed arrays to count them only reads BSON element headers, far cheaper
+    // than the entry copy each expanded op already costs.
+    //
+    // Note 'anyPacked' cannot be derived from 'expandedSize': a packed op holding a single key
+    // expands to one op, leaving the total equal to ops.size() even though expansion is required.
+    size_t expandedSize = 0;
+    bool anyPacked = false;
+    for (const auto& op : ops) {
+        if (const auto count = packedContainerOpCount(op)) {
+            anyPacked = true;
+            expandedSize += *count;
+        } else {
+            ++expandedSize;
+        }
+    }
+
+    // Container ops are rare next to CRUD ops, so don't rebuild the vector unless one of them
+    // actually needs expanding.
+    if (!anyPacked) {
+        return;
+    }
+
+    // Ops that are not expanded are copied rather than moved out of 'ops', so that a throw from
+    // appendExpandedContainerOp() leaves 'ops' as it was instead of leaving a prefix of it
+    // moved-from. Building the whole result before committing it below keeps this all-or-nothing.
+    std::vector<OplogEntry> expandedOps;
+    expandedOps.reserve(expandedSize);
+    for (const auto& op : ops) {
+        if (!appendExpandedContainerOp(op, expandedOps)) {
+            expandedOps.push_back(op);
+        }
+    }
+
+    // Commit. Swapping two vectors cannot throw, so 'ops' either keeps its original contents or
+    // gets the fully expanded ones.
+    ops.swap(expandedOps);
+}
+
+uint32_t OplogApplierUtils::addToWriterVector(
+    OperationContext* opCtx,
+    OplogEntry* op,
+    std::vector<std::vector<ApplierOperation>>* writerVectors,
+    CachedCollectionProperties* collPropertiesCache,
+    boost::optional<uint32_t> forceWriterId) {
+    auto writerId =
+        getWriterId(opCtx, op, collPropertiesCache, writerVectors->size(), forceWriterId);
+    return addToWriterVectorImpl(writerId, writerVectors, op);
+}
+
+void OplogApplierUtils::stableSortByNamespace(std::vector<ApplierOperation>& ops) {
+    auto nssComparator = [](const ApplierOperation& l, const ApplierOperation& r) {
+        if (l->getNss().isCommand()) {
+            if (r->getNss().isCommand())
+                // l == r; now compare the namespace
+                return l->getNss() < r->getNss();
+            // l < r
+            return true;
+        }
+        if (r->getNss().isCommand())
+            // l > r
+            return false;
+        return l->getNss() < r->getNss();
+    };
+
+    // Walk through the vector, if a prepared transaction command is encountered, sort
+    // the ops between the previous prepared transaction command and the current one.
+    for (size_t start = 0, end = 0; end <= ops.size(); ++end) {
+        // The end iterator acts as a dummy prepared transaction command, so we would
+        // also sort the ops after the last real one encountered.
+        if (end == ops.size() || ops.at(end)->isPreparedTransactionCommand()) {
+            std::stable_sort(ops.begin() + start, ops.begin() + end, nssComparator);
+            start = end + 1;
+        }
+    }
+}
+
+void OplogApplierUtils::addDerivedOps(OperationContext* opCtx,
+                                      std::vector<OplogEntry>* derivedOps,
+                                      std::vector<std::vector<ApplierOperation>>* writerVectors,
+                                      CachedCollectionProperties* collPropertiesCache,
+                                      bool serial) {
+    // Used to determine which writer vector to assign serial ops.
+    boost::optional<uint32_t> serialWriterId;
+
+    for (auto&& op : *derivedOps) {
+        auto writerId =
+            addToWriterVector(opCtx, &op, writerVectors, collPropertiesCache, serialWriterId);
+        if (serial && !serialWriterId) {
+            serialWriterId.emplace(writerId);
+        }
+    }
+}
+
+void OplogApplierUtils::addDerivedPrepares(
+    OperationContext* opCtx,
+    OplogEntry* prepareOp,
+    std::vector<OplogEntry>* derivedOps,
+    std::vector<std::vector<ApplierOperation>>* writerVectors,
+    CachedCollectionProperties* collPropertiesCache,
+    bool serial) {
+
+    // Get the SplitPrepareSessionManager to be used to create split sessions.
+    auto splitSessManager = ReplicationCoordinator::get(opCtx)->getSplitPrepareSessionManager();
+    auto splitSessFunc = [=](const std::vector<uint32_t>& writerIds) -> const auto& {
+        const auto& sessions = splitSessManager->splitSession(
+            *prepareOp->getSessionId(), *prepareOp->getTxnNumber(), writerIds);
+        invariant(sessions.size() == writerIds.size());
+        return sessions;
+    };
+
+    if (derivedOps->empty()) {
+        // For empty (read-only) prepares, we use the namespace of the original prepare oplog entry
+        // (admin.$cmd) to decide which writer thread to apply it, and assigned it a split session.
+        // The reason that we also split an empty prepare instead of treating it as some standalone
+        // prepare op (as the prepares in initial sync or recovery mode) is so that we can keep a
+        // logical invariant that all prepares in secondary mode are split, and thus we can apply
+        // empty and non-empty prepares in the same way.
+        auto writerId = getWriterId(opCtx, prepareOp, collPropertiesCache, writerVectors->size());
+        const auto& sessionInfos = splitSessFunc({writerId});
+        addToWriterVectorImpl(writerId,
+                              writerVectors,
+                              prepareOp,
+                              ApplicationInstruction::applySplitPreparedTxnOp,
+                              sessionInfos[0].session,
+                              std::vector<const OplogEntry*>{});
+    } else {
+        // For non-empty prepares, the namespace of each derived op in the transaction is used to
+        // decide which writer thread to apply it. We first add all the derived ops to a buffer
+        // writer vector in order to get all the writer threads needed to apply this transaction.
+        // We then acquire that number of split sessions and assign each writer thread a unique
+        // split session when moving the ops to the real writer vector.
+        std::set<uint32_t> writerIds;
+        std::vector<std::vector<const OplogEntry*>> bufWriterVectors(writerVectors->size());
+        boost::optional<uint32_t> serialWriterId;
+        for (auto&& op : *derivedOps) {
+            auto writerId = getWriterId(opCtx, &op, collPropertiesCache, writerVectors->size());
+            if (serial && !serialWriterId) {
+                serialWriterId.emplace(writerId);
+                writerIds.emplace(*serialWriterId);
+            }
+            if (serialWriterId) {
+                addToWriterVectorImpl(*serialWriterId, &bufWriterVectors, &op);
+            } else {
+                addToWriterVectorImpl(writerId, &bufWriterVectors, &op);
+                writerIds.emplace(writerId);
+            }
+        }
+
+        const auto& sessionInfos = splitSessFunc({writerIds.begin(), writerIds.end()});
+        for (size_t i = 0, j = 0; i < bufWriterVectors.size(); ++i) {
+            auto& bufWriter = bufWriterVectors[i];
+            if (!bufWriter.empty()) {
+                addToWriterVectorImpl(i,
+                                      writerVectors,
+                                      prepareOp,
+                                      ApplicationInstruction::applySplitPreparedTxnOp,
+                                      sessionInfos[j++].session,
+                                      std::move(bufWriter));
+            }
+        }
+    }
+
+    // Add the top-level transaction to the writerVectors. Applying split transactions would
+    // update the TransactionParticipant states of the split sessions, however we must also
+    // update the TransactionParticipant states of the original (i.e. top-level) session in
+    // case later this node becomes a primary.
+    addTopLevelPrepare(opCtx, prepareOp, derivedOps, writerVectors);
+}
+
+void OplogApplierUtils::addDerivedCommitsOrAborts(
+    OperationContext* opCtx,
+    OplogEntry* commitOrAbortOp,
+    std::vector<std::vector<ApplierOperation>>* writerVectors,
+    CachedCollectionProperties* collPropertiesCache) {
+
+    auto splitSessManager = ReplicationCoordinator::get(opCtx)->getSplitPrepareSessionManager();
+    const auto& sessionInfos = splitSessManager->getSplitSessions(*commitOrAbortOp->getSessionId(),
+                                                                  *commitOrAbortOp->getTxnNumber());
+
+    // When this commit refers to a non-split prepare, it means the transaction was
+    // prepared when the node was primary or during inital sync/recovery. In this
+    // case we do not split the commit and just add it as-is to the writer vector.
+    if (!sessionInfos.has_value()) {
+        addToWriterVector(opCtx, commitOrAbortOp, writerVectors, collPropertiesCache);
+        return;
+    }
+
+    // When this commit refers to a split prepare, we split the commit and add them
+    // to the writers that have been assigned split prepare ops.
+    for (const auto& sessInfo : *sessionInfos) {
+        // The number of workers could have changed since the prepare phase: mod by list size to
+        // make sure we are still in bounds.
+        const auto idx = sessInfo.requesterId % writerVectors->size();
+        addToWriterVectorImpl(idx,
+                              writerVectors,
+                              commitOrAbortOp,
+                              ApplicationInstruction::applySplitPreparedTxnOp,
+                              sessInfo.session);
+    }
+
+    // Add the top-level transaction to the writerVectors. Applying split transactions would
+    // update the TransactionParticipant states of the split sessions, however we must also
+    // update the TransactionParticipant states of the original (i.e. top-level) session in
+    // case later this node becomes a primary.
+    addTopLevelCommitOrAbort(opCtx, commitOrAbortOp, writerVectors);
+}
+
+NamespaceStringOrUUID OplogApplierUtils::getNsOrUUID(const NamespaceString& nss,
+                                                     const OplogEntry& op) {
+    if (auto ui = op.getUuid()) {
+        return {nss.dbName(), ui.value()};
+    }
+    return nss;
+}
+
+namespace {
+
+// True if `o2` is the o2 object of a repairReplicatedMetadata no-op entry.
+bool isRepairReplicatedMetadataO2(const BSONObj& o2) {
+    const auto typeElem = o2.getField("type");
+    return typeElem.type() == BSONType::string &&
+        typeElem.valueStringData() == "repairReplicatedMetadata";
+}
+
+void applyRepairReplicatedMetadataNoop(OperationContext* opCtx, const BSONObj& o2) {
+    // Replication does not otherwise validate a no-op's o2, so a malformed repair entry is
+    // ignored rather than surfaced as an error, mirroring the fast-count oplog scan.
+    boost::optional<RepairReplicatedMetadataO2> parsed;
+    try {
+        parsed = RepairReplicatedMetadataO2::parse(o2);
+    } catch (const DBException&) {
+        return;
+    }
+
+    boost::optional<NamespaceString> nss;
+    {
+        Lock::GlobalLock globalLock(opCtx, MODE_IS);
+        nss = CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, parsed->getUuid());
+    }
+    if (!nss) {
+        return;
+    }
+
+    auto collection = acquireCollection(opCtx,
+                                        {*nss,
+                                         parsed->getUuid(),
+                                         PlacementConcern::kPretendUnsharded,
+                                         repl::ReadConcernArgs::get(opCtx),
+                                         AcquisitionPrerequisites::kWrite},
+                                        MODE_IX);
+    if (!collection.exists() || collection.uuid() != parsed->getUuid()) {
+        return;
+    }
+
+    const auto& metadata = parsed->getM();
+    collection.getCollectionPtr()->getRecordStore()->adjustAccurateSizeCount(
+        metadata.getSz().value_or(0), metadata.getCt().value_or(0));
+}
+
+}  // namespace
+
+Status OplogApplierUtils::applyOplogEntryOrGroupedInsertsCommon(
+    OperationContext* opCtx,
+    const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
+    OplogApplication::Mode oplogApplicationMode,
+    const bool isDataConsistent,
+    IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
+    OpCounters* opCounters) {
+    invariant(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabledForInternalOp());
+
+    const auto& op = entryOrGroupedInserts.getOp();
+    // Count each log op application as a separate operation, for reporting purposes.
+    CurOp individualOp;
+    individualOp.push(opCtx);
+    ON_BLOCK_EXIT([opCtx]() { recordCurOpMetricsOplogApplication(opCtx); });
+
+    const NamespaceString nss(op->getNss());
+    auto opType = op->getOpType();
+
+    if (gMultitenancySupport &&
+        gFeatureFlagRequireTenantID.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        invariant(op->getTid() == nss.tenantId());
+    } else {
+        invariant(op->getTid() == boost::none);
+    }
+
+    // VersionContext fixes a FCV snapshot over the opCtx, making FCV-gated feature
+    // flags checks in secondaries behave as they did on the primary, thus ensuring
+    // correct application even if the FCV changed due to a concurrent setFCV.
+    boost::optional<VersionContext::ScopedSetDecoration> scopedVersionContext;
+    if (op->getVersionContext()) {
+        scopedVersionContext.emplace(opCtx, *op->getVersionContext());
+    }
+
+    if (opType == OpTypeEnum::kNoop) {
+        const auto& o2 = op->getObject2();
+        if (o2 && isRepairReplicatedMetadataO2(*o2)) {
+            applyRepairReplicatedMetadataNoop(opCtx, *o2);
+        }
+        incrementOpsAppliedStats(1);
+        return Status::OK();
+    } else if (opType == OpTypeEnum::kKeyMaterial || opType == OpTypeEnum::kCMKRotation) {
+        auto handler = OplogKeyEntryHandler::get(opCtx->getServiceContext());
+        auto status = handler->applyOplogEntry(opCtx, repl::OplogEntry(*op));
+        if (!status.isOK()) {
+            return status;
+        }
+        incrementOpsAppliedStats(1);
+        return Status::OK();
+    } else if (DurableOplogEntry::isCrudOpType(opType)) {
+        auto status = writeConflictRetry(opCtx, "applyOplogEntryOrGroupedInserts_CRUD", nss, [&] {
+            // Need to throw instead of returning a status for it to be properly ignored.
+            try {
+                boost::optional<CollectionAcquisition> coll;
+                Database* db = nullptr;
+
+                // If the collection UUID does not resolve, acquire the collection using the
+                // namespace. This is so we reach `applyOperation_inlock` below and invalidate
+                // the preimage / postimage for the op if applicable.
+
+                // TODO SERVER-41371 / SERVER-73661 this code is difficult to maintain and
+                // needs to be done everywhere this situation is possible. We should try
+                // to consolidate this into applyOperation_inlock.
+                try {
+                    coll.emplace(
+                        acquireCollection(opCtx,
+                                          {getNsOrUUID(nss, *op),
+                                           PlacementConcern::kPretendUnsharded,
+                                           repl::ReadConcernArgs::get(opCtx),
+                                           AcquisitionPrerequisites::kWrite},
+                                          fixLockModeForSystemDotViewsChanges(nss, MODE_IX)));
+
+                    AutoGetDb autoDb(opCtx, coll->nss().dbName(), MODE_IX);
+                    db = autoDb.getDb();
+                } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+                    if (!isDataConsistent) {
+                        coll.emplace(
+                            acquireCollection(opCtx,
+                                              {nss,
+                                               PlacementConcern::kPretendUnsharded,
+                                               repl::ReadConcernArgs::get(opCtx),
+                                               AcquisitionPrerequisites::kWrite},
+                                              fixLockModeForSystemDotViewsChanges(nss, MODE_IX)));
+
+                        AutoGetDb autoDb(opCtx, coll->nss().dbName(), MODE_IX);
+                        db = autoDb.ensureDbExists(opCtx);
+                    } else {
+                        throw ex;
+                    }
+                }
+
+                invariant(coll);
+                uassert(ErrorCodes::NamespaceNotFound,
+                        str::stream()
+                            << "missing database (" << nss.dbName().toStringForErrorMsg() << ")",
+                        db);
+
+                AutoStatsTracker statsTracker(
+                    opCtx,
+                    nss,
+                    Top::LockType::WriteLocked,
+                    AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                    DatabaseProfileSettings::get(opCtx->getServiceContext())
+                        .getDatabaseProfileLevel(nss.dbName()));
+                // We convert updates to upserts in secondary mode when the
+                // oplogApplicationEnforcesSteadyStateConstraints parameter is false, to avoid
+                // failing on the constraint that updates in steady state mode always update
+                // an existing document.
+                //
+                // In initial sync and recovery modes we always ignore errors about missing
+                // documents on update, so there is no reason to convert the updates to upsert.
+
+                bool shouldAlwaysUpsert = !oplogApplicationEnforcesSteadyStateConstraints.load() &&
+                    oplogApplicationMode == OplogApplication::Mode::kSecondary;
+                Status status = applyOperation_inlock(opCtx,
+                                                      *coll,
+                                                      entryOrGroupedInserts,
+                                                      shouldAlwaysUpsert,
+                                                      oplogApplicationMode,
+                                                      isDataConsistent,
+                                                      incrementOpsAppliedStats);
+                if (!status.isOK() && status.code() == ErrorCodes::WriteConflict) {
+                    throwWriteConflictException(str::stream()
+                                                << "WriteConflict caught when applying operation."
+                                                << " Original error: " << status.reason());
+                }
+                return status;
+            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+                // This can happen in initial sync or recovery modes (when a delete of the
+                // namespace appears later in the oplog), but we will ignore it in the caller.
+                //
+                // When we're not enforcing steady-state constraints, the error is ignored
+                // only for deletes, on the grounds that deleting from a non-existent collection
+                // is a no-op.
+                if (opType == OpTypeEnum::kDelete &&
+                    !oplogApplicationEnforcesSteadyStateConstraints.load() &&
+                    oplogApplicationMode == OplogApplication::Mode::kSecondary) {
+                    LOGV2_DEBUG(8994800,
+                                1,
+                                "Acceptable error when applying CRUD op",
+                                "error"_attr = redact(ex),
+                                "op"_attr = redact(entryOrGroupedInserts.toBSON()));
+                    if (opCounters) {
+                        const auto& opObj = redact(op->toBSONForLogging());
+                        opCounters->gotDeleteFromMissingNamespace();
+                        logOplogConstraintViolation(
+                            opCtx,
+                            op->getNss(),
+                            OplogConstraintViolationEnum::kDeleteOnMissingNs,
+                            "delete",
+                            opObj,
+                            boost::none /* status */);
+                    }
+                    return Status::OK();
+                }
+
+                ex.addContext(str::stream() << "Failed to apply operation: "
+                                            << redact(entryOrGroupedInserts.toBSON()));
+                throw;
+            } catch (ExceptionFor<ErrorCodes::CommandNotSupportedOnView>& ex) {
+                // This can happen in initial sync or unstable recovery mode when a time-series
+                // collection is created in place of a dropped regular collection and oplog entries
+                // are being applied that were originally performed on the regular collection.
+                if (oplogApplicationMode == OplogApplication::Mode::kInitialSync ||
+                    oplogApplicationMode == OplogApplication::Mode::kUnstableRecovering) {
+                    LOGV2_DEBUG(8994801,
+                                1,
+                                "Acceptable error when applying CRUD op",
+                                "error"_attr = redact(ex),
+                                "op"_attr = redact(entryOrGroupedInserts.toBSON()));
+                    return Status::OK();
+                }
+
+                throw;
+            }
+        });
+        return status;
+    } else if (DurableOplogEntry::isContainerOpType(opType)) {
+        return writeConflictRetry(opCtx, "applyOplogEntryOrGroupedInserts_container", nss, [&] {
+            Status status = applyContainerOperations(
+                opCtx, std::span<const ApplierOperation>{&op, 1}, oplogApplicationMode);
+            if (status.isOK()) {
+                incrementOpsAppliedStats(1);
+            }
+            return status;
+        });
+    } else if (opType == OpTypeEnum::kCommand) {
+        auto status =
+            writeConflictRetry(opCtx, "applyOplogEntryOrGroupedInserts_command", nss, [&] {
+                // A special case apply for commands to avoid implicit database creation.
+                Status status = applyCommand_inlock(opCtx, op, oplogApplicationMode);
+                incrementOpsAppliedStats(1);
+                return status;
+            });
+        if (op->getCommandType() == mongo::repl::OplogEntry::CommandType::kDrop) {
+            hangAfterApplyingCollectionDropOplogEntry.executeIf(
+                [&](const BSONObj&) {
+                    hangAfterApplyingCollectionDropOplogEntry.pauseWhileSet();
+                    LOGV2(5863600,
+                          "Hanging due to 'hangAfterApplyingCollectionDropOplogEntry' failpoint.");
+                },
+                [&](const BSONObj& data) {
+                    const auto fpDbName = DatabaseNameUtil::parseFailPointData(data, "dbName");
+                    return nss.dbName() == fpDbName;
+                });
+        }
+        return status;
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+namespace {
+
+/**
+ * Groups consecutive container ops starting at 'it' that share the same namespace, ident,
+ * timestamp, and version context, and applies them atomically. On success, returns an iterator
+ * to the last op in the group. On failure, returns the error status.
+ */
+StatusWith<std::vector<ApplierOperation>::const_iterator> groupAndApplyContainerOps(
+    OperationContext* opCtx,
+    std::vector<ApplierOperation>::const_iterator it,
+    std::vector<ApplierOperation>::const_iterator end,
+    OplogApplication::Mode mode,
+    IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
+    const auto& op = *it;
+    const auto groupNss = op->getNss();
+    const auto groupIdent = op->getContainer();
+    const auto& groupVCtx = op->getVersionContext();
+    // Group by getTimestamp(), the timestamp the whole applyOps chain commits at, so container ops
+    // from one chain stay in the same group and commit together. getApplyOpsTimestamp() is the
+    // per-entry optime and would split them. See applyContainerOperations.
+    const auto groupTs = op->getTimestamp();
+
+    auto groupEnd = std::find_if(it + 1, end, [&](const ApplierOperation& nextOp) {
+        return !nextOp->isContainerOpType() || nextOp->getNss() != groupNss ||
+            nextOp->getContainer() != groupIdent || nextOp->getVersionContext() != groupVCtx ||
+            nextOp->getTimestamp() != groupTs;
+    });
+
+    const size_t groupSize = std::distance(it, groupEnd);
+    std::span<const ApplierOperation> containerOps{&*it, groupSize};
+
+    boost::optional<VersionContext::ScopedSetDecoration> scopedVersionContext;
+    if (groupVCtx) {
+        scopedVersionContext.emplace(opCtx, *groupVCtx);
+    }
+
+    auto status = writeConflictRetry(opCtx, "applyGroupedContainerOps", groupNss, [&] {
+        return applyContainerOperations(opCtx, containerOps, mode);
+    });
+
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (incrementOpsAppliedStats) {
+        incrementOpsAppliedStats(groupSize);
+    }
+
+    return groupEnd - 1;
+}
+
+}  // namespace
+
+Status OplogApplierUtils::applyOplogBatchCommon(
+    OperationContext* opCtx,
+    std::vector<ApplierOperation>& ops,
+    OplogApplication::Mode oplogApplicationMode,
+    bool allowNamespaceNotFoundErrorsOnCrudOps,
+    const bool isDataConsistent,
+    InsertGroup::ApplyFunc applyOplogEntryOrGroupedInserts,
+    IncrementOpsAppliedStatsFn incrementOpsAppliedStats) noexcept {
+
+    // We cannot do document validation, because document validation could have been disabled when
+    // these oplog entries were generated.
+    DisableDocumentValidationForInternalOp validationDisabler(opCtx);
+    // Group the operations by namespace in order to get larger groups for bulk inserts, but do not
+    // mix up the current order of oplog entries within the same namespace (thus *stable* sort).
+    stableSortByNamespace(ops);
+    InsertGroup insertGroup(
+        ops, opCtx, oplogApplicationMode, isDataConsistent, applyOplogEntryOrGroupedInserts);
+
+    const bool inStableRecovery = oplogApplicationMode == OplogApplication::Mode::kStableRecovering;
+    for (auto it = ops.cbegin(); it != ops.cend(); ++it) {
+        const auto& op = *it;
+
+        // If we are successful in grouping and applying inserts, advance the current iterator
+        // past the end of the inserted group of entries.
+        auto groupResult = insertGroup.groupAndApplyInserts(it);
+        if (groupResult.isOK()) {
+            it = groupResult.getValue();
+            continue;
+        }
+
+        if (op->isContainerOpType()) {
+            auto result = groupAndApplyContainerOps(
+                opCtx, it, ops.cend(), oplogApplicationMode, incrementOpsAppliedStats);
+            if (!result.isOK()) {
+                LOGV2_FATAL_CONTINUE(12337303,
+                                     "Error applying grouped container operations",
+                                     "opTime"_attr = op->getOpTime(),
+                                     "oplogEntry"_attr = redact(op->toBSONForLogging()),
+                                     "error"_attr = causedBy(redact(result.getStatus())));
+                return result.getStatus();
+            }
+            it = result.getValue();
+            continue;
+        }
+
+        // If we didn't create a group, try to apply the op individually.
+        try {
+            Status status =
+                applyOplogEntryOrGroupedInserts(opCtx, op, oplogApplicationMode, isDataConsistent);
+
+            if (!status.isOK()) {
+                // Tried to apply an update operation but the document is missing, there must be
+                // a delete operation for the document later in the oplog.
+                // Server will crash on oplog application failure during recovery from stable
+                // checkpoint in the test environment.
+                if (status == ErrorCodes::UpdateOperationFailed &&
+                    (oplogApplicationMode == OplogApplication::Mode::kInitialSync ||
+                     OplogApplication::inRecovering(oplogApplicationMode))) {
+                    if (inStableRecovery) {
+                        repl::OplogApplication::checkOnOplogFailureForRecovery(
+                            opCtx,
+                            op->getNss(),
+                            redact(op->toBSONForLogging()),
+                            op->getOpTime(),
+                            redact(status));
+                    }
+                    continue;
+                }
+
+                LOGV2_FATAL_CONTINUE(21237,
+                                     "Error applying operation",
+                                     "opTime"_attr = op->getOpTime(),
+                                     "oplogEntry"_attr = redact(op->toBSONForLogging()),
+                                     "error"_attr = causedBy(redact(status)));
+                return status;
+            }
+        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& e) {
+            auto info = e.extraInfo<DuplicateKeyErrorInfo>();
+            LOGV2_FATAL_CONTINUE(5689600,
+                                 "Writer worker caught duplicate key exception",
+                                 "keyPattern"_attr = info->getKeyPattern(),
+                                 "keyValue"_attr = redact(info->getDuplicatedKeyValue()),
+                                 "error"_attr = redact(e.reason()),
+                                 "opTime"_attr = op->getOpTime(),
+                                 "oplogEntry"_attr = redact(op->toBSONForLogging()));
+            return e.toStatus();
+        } catch (const DBException& e) {
+            // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
+            // dropped before initial sync or recovery ends anyways and we should ignore it.
+            // Server will crash on oplog application failure during recovery from stable checkpoint
+            // in the test environment.
+            if (e.code() == ErrorCodes::NamespaceNotFound && op->isCrudOpType() &&
+                allowNamespaceNotFoundErrorsOnCrudOps) {
+                if (inStableRecovery) {
+                    repl::OplogApplication::checkOnOplogFailureForRecovery(
+                        opCtx,
+                        op->getNss(),
+                        redact(op->toBSONForLogging()),
+                        op->getOpTime(),
+                        redact(e));
+                } else {
+                    LOGV2_DEBUG(
+                        9067401,
+                        2,
+                        "Attempted to apply operation to missing namespace when this was allowed",
+                        "error"_attr = redact(e),
+                        "oplogEntry"_attr = redact(op->toBSONForLogging()));
+                }
+                continue;
+            }
+
+            LOGV2_FATAL_CONTINUE(21238,
+                                 "Writer worker caught exception",
+                                 "error"_attr = redact(e),
+                                 "opTime"_attr = op->getOpTime(),
+                                 "oplogEntry"_attr = redact(op->toBSONForLogging()));
+            return e.toStatus();
+        }
+    }
+    return Status::OK();
+}
+
+}  // namespace repl
+}  // namespace mongo

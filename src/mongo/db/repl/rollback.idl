@@ -1,0 +1,35 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Rollback IDL File
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/repl/optime.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/repl/replication_types.idl"
+
+structs:
+    rollbackID:
+        description: A document in which the server stores its Rollback ID on disk.
+        fields:
+            _id:
+                type: string
+                description: "The _id of the document stored in the database"
+            rollbackId:
+                type: int
+                description: "The Rollback ID stored in the document"
+
+    rollbackProgress:
+        description: A document in which the server stores its rollback progress on disk.
+        fields:
+            _id:
+                type: string
+                description: "The _id of the document stored in the database."
+            applyUntil:
+                type: optime
+                description: "The op time that rollback has to reach to complete successfully."

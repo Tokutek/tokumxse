@@ -1,0 +1,168 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/transaction/transaction_history_iterator.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <memory>
+#include <utility>
+
+namespace mongo {
+
+namespace {
+
+/**
+ * Finds the oplog entry with the given timestamp in the oplog.
+ */
+BSONObj findOneOplogEntry(OperationContext* opCtx,
+                          const repl::OpTime& opTime,
+                          bool permitYield,
+                          bool prevOpOnly = false) {
+    BSONObj oplogBSON;
+    invariant(!opTime.isNull());
+
+    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString::kRsOplogNamespace);
+    findCommand->setFilter(opTime.asQuery());
+
+    if (prevOpOnly) {
+        findCommand->setProjection(
+            BSON("_id" << 0 << repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName << 1LL));
+    }
+
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                              .allowedFeatures =
+                                                  MatchExpressionParser::kBanAllSpecialFeatures},
+    });
+    const auto oplogRead = acquireCollectionOrViewMaybeLockFree(
+        opCtx,
+        CollectionOrViewAcquisitionRequest(NamespaceString::kRsOplogNamespace,
+                                           PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                           repl::ReadConcernArgs::get(opCtx),
+                                           AcquisitionPrerequisites::kRead));
+
+    const auto localDb = DatabaseHolder::get(opCtx)->getDb(opCtx, DatabaseName::kLocal);
+    invariant(localDb);
+    AutoStatsTracker statsTracker(opCtx,
+                                  NamespaceString::kRsOplogNamespace,
+                                  Top::LockType::ReadLocked,
+                                  AutoStatsTracker::LogMode::kUpdateTop,
+                                  DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                      .getDatabaseProfileLevel(DatabaseName::kLocal),
+                                  Date_t::max());
+
+    const auto yieldPolicy = permitYield ? PlanYieldPolicy::YieldPolicy::YIELD_AUTO
+                                         : PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY;
+    auto exec = uassertStatusOK(
+        getExecutorFind(opCtx, MultipleCollectionAccessor{oplogRead}, std::move(cq), yieldPolicy));
+
+    PlanExecutor::ExecState getNextResult;
+    try {
+        getNextResult = exec->getNext(&oplogBSON, nullptr);
+    } catch (DBException& exception) {
+        exception.addContext("PlanExecutor error in TransactionHistoryIterator");
+        throw;
+    }
+
+    uassert(ErrorCodes::IncompleteTransactionHistory,
+            str::stream() << "oplog no longer contains the complete write history of this "
+                             "transaction, log with opTime "
+                          << opTime.toBSON() << " cannot be found",
+            getNextResult != PlanExecutor::IS_EOF);
+
+    return oplogBSON.getOwned();
+}
+
+}  // namespace
+
+TransactionHistoryIterator::TransactionHistoryIterator(
+    repl::OpTime startingOpTime, bool permitYield, IncludeCommitTimestamp includeCommitTimestamp)
+    : _permitYield(permitYield),
+      _includeCommitTimestamp(includeCommitTimestamp),
+      _nextOpTime(std::move(startingOpTime)) {}
+
+bool TransactionHistoryIterator::hasNext() const {
+    return !_nextOpTime.isNull();
+}
+
+repl::OplogEntry TransactionHistoryIterator::next(OperationContext* opCtx) {
+    BSONObj oplogBSON = findOneOplogEntry(opCtx, _nextOpTime, _permitYield);
+
+    auto oplogEntry = uassertStatusOK(repl::OplogEntry::parse(oplogBSON));
+    const auto& oplogPrevTsOption = oplogEntry.getPrevWriteOpTimeInTransaction();
+    uassert(ErrorCodes::FailedToParse,
+            str::stream()
+                << "Missing prevOpTime field on oplog entry of previous write in transaction: "
+                << redact(oplogBSON),
+            oplogPrevTsOption);
+
+    if (_includeCommitTimestamp == IncludeCommitTimestamp::kYes) {
+        uassert(11910611,
+                "Requested the commit timestamp but this is not a transaction",
+                oplogEntry.isInTransaction());
+        uassert(11910612,
+                "Requested the commit timestamp but this is an aborted transaction",
+                !oplogEntry.isPreparedAbort());
+
+        if (oplogEntry.isTerminalApplyOps() || oplogEntry.isPreparedCommit()) {
+            _commitTimestamp = uassertStatusOK(oplogEntry.extractCommitTransactionTimestamp());
+        }
+
+        uassert(11910613,
+                "Requested the commit timestamp but this transaction has not committed",
+                !_commitTimestamp.isNull());
+        oplogEntry.setCommitTransactionTimestamp(_commitTimestamp);
+    }
+
+    _nextOpTime = oplogPrevTsOption.value();
+
+    return oplogEntry;
+}
+
+repl::OplogEntry TransactionHistoryIterator::nextFatalOnErrors(OperationContext* opCtx) try {
+    return next(opCtx);
+} catch (const DBException& ex) {
+    fassertFailedWithStatus(31145, ex.toStatus());
+}
+
+repl::OpTime TransactionHistoryIterator::nextOpTime(OperationContext* opCtx) {
+    BSONObj oplogBSON = findOneOplogEntry(opCtx, _nextOpTime, _permitYield, true /* prevOpOnly */);
+
+    auto prevOpTime = oplogBSON[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName];
+    uassert(ErrorCodes::FailedToParse,
+            str::stream()
+                << "Missing prevOpTime field on oplog entry of previous write in transaction: "
+                << redact(oplogBSON),
+            !prevOpTime.eoo() && prevOpTime.isABSONObj());
+
+    auto returnOpTime = _nextOpTime;
+    _nextOpTime = repl::OpTime::parse(prevOpTime.Obj());
+    return returnOpTime;
+}
+
+}  // namespace mongo

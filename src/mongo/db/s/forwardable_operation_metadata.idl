@@ -1,0 +1,64 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/rpc/metadata/audit_user_attrs.h"
+        - "mongo/rpc/metadata/audit_client_attrs.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/version_context.idl"
+    - "mongo/rpc/metadata/audit_attrs.idl"
+    - "mongo/rpc/metadata/audit_metadata.idl"
+
+structs:
+    ForwardableOperationMetadataBase:
+        description: "Used to store metadata of an operation context that can be safely passed among different threads."
+        mod_visibility: public
+        strict: false
+        fields:
+            comment:
+                type: object_owned
+                description: "The comment associated with the operation."
+                optional: true
+            auditUserMetadata:
+                type: AuditUserAttrs
+                description: "Users and roles that should be audited for this op"
+                optional: true
+            auditClientMetadata:
+                type: AuditClientAttrs
+                description: "The client information that should be audited on this operation"
+                optional: true
+            mayBypassWriteBlocking:
+                type: optionalBool
+                description: "Whether this operation is allowed to bypass user write blocking."
+            mayBypassReplicaSetWritesBlocking:
+                type: optionalBool
+                description: "Whether this operation is allowed to bypass replica set writes blocking."
+            rawData:
+                type: optionalBool
+                description:
+                    "Whether to use the raw underlying data format. When being run on a
+                    collection type that stores its data in a different format from that
+                    in which users interact with, this means that the command will operate
+                    directly on the format in which it is stored."
+            isDirectSystemBucketsAccess:
+                type: optionalBool
+                description:
+                    "Whether the operation was initiated by a user directly targeting a
+                    system.buckets namespace through the router."
+            validatedTenancyScopeToken:
+                type: string
+                description: "Token used to validate and create a new ValidatedTenancyScope."
+                optional: true
+            versionContext:
+                type: version_context
+                description: "Snapshot of the FCV used by the operation,
+                    which ensures that feature flag checks are stable through its execution."
+                # TODO SERVER-99655: make non-optional once gSnapshotFCVInDDLCoordinators is enabled on the lastLTS
+                optional: true
+            telemetryContext:
+                type: object_owned
+                optional: true

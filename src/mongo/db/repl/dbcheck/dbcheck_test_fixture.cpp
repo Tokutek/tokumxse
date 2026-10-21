@@ -1,0 +1,272 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/dbcheck/dbcheck_test_fixture.h"
+
+#include "mongo/bson/bson_validate_gen.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_mock.h"
+#include "mongo/db/repl/dbcheck/health_log.h"
+#include "mongo/db/repl/dbcheck/health_log_gen.h"
+#include "mongo/db/repl/dbcheck/health_log_interface.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/util/fail_point.h"
+
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+void DbCheckTest::setUp() {
+    CatalogTestFixture::setUp();
+
+    // Create collection kNss for unit tests to use. It will possess a default _id index.
+    ASSERT_OK(storageInterface()->createCollection(operationContext(), kNss, _collectionOptions));
+
+    auto service = getServiceContext();
+
+    // Set up OpObserver so that we will append actual oplog entries to the oplog using
+    // repl::logOp(). This supports index builds that have to look up the last oplog entry.
+    auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
+    opObserverRegistry->addObserver(
+        std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerMock>()));
+
+    // Index builds expect a non-empty oplog and a valid committed snapshot.
+    auto opCtx = operationContext();
+    Lock::GlobalLock lk(opCtx, MODE_IX);
+    WriteUnitOfWork wuow(opCtx);
+    service->getOpObserver()->onOpMessage(opCtx, BSONObj());
+    wuow.commit();
+
+    // Provide an initial committed snapshot so that index build can begin the collection scan.
+    auto snapshotManager = service->getStorageEngine()->getSnapshotManager();
+    auto lastAppliedOpTime = repl::ReplicationCoordinator::get(service)->getMyLastAppliedOpTime();
+    snapshotManager->setCommittedSnapshot(lastAppliedOpTime.getTimestamp());
+
+    // Set up the health log writer. To ensure writes are completed, each test should individually
+    // shut down the health log.
+    HealthLogInterface::set(service, std::make_unique<HealthLog>());
+    HealthLogInterface::get(service)->startup();
+};
+
+void DbCheckTest::insertDocs(OperationContext* opCtx,
+                             int startIDNum,
+                             int numDocs,
+                             const std::vector<std::string>& fieldNames,
+                             bool duplicateFieldNames) {
+    std::vector<BSONObj> inserts;
+    for (int i = 0; i < numDocs; ++i) {
+        BSONObjBuilder bsonBuilder;
+        bsonBuilder << "_id" << i + startIDNum;
+        for (const auto& name : fieldNames) {
+            bsonBuilder << name << i + startIDNum;
+        }
+
+        // If `duplicateFieldNames` is true, the inserted doc will have a duplicated field name so
+        // that it fails the kExtended mode of BSON validate check.
+        if (duplicateFieldNames && !fieldNames.empty()) {
+            bsonBuilder << fieldNames[0] << i + startIDNum + 1;
+        }
+
+        inserts.push_back(bsonBuilder.obj());
+    }
+
+    auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, kNss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    WriteUnitOfWork wuow(opCtx);
+    ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), inserts));
+    wuow.commit();
+}
+
+void DbCheckTest::insertInvalidUuid(OperationContext* opCtx,
+                                    int startIDNum,
+                                    const std::vector<std::string>& fieldNames) {
+    BSONObjBuilder bsonBuilder;
+    bsonBuilder << "_id" << startIDNum;
+    uint8_t uuidBytes[] = {0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0};
+    // The UUID is invalid because its length is 10 instead of 16.
+    bsonBuilder << "invalid uuid" << BSONBinData(uuidBytes, 10, newUUID);
+    const auto obj = bsonBuilder.obj();
+
+    auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, kNss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    WriteUnitOfWork wuow(opCtx);
+    ASSERT_OK(Helpers::insert(opCtx, coll.getCollectionPtr(), obj));
+    wuow.commit();
+}
+
+void DbCheckTest::deleteDocs(OperationContext* opCtx, int startIDNum, int numDocs) {
+    auto cmdObj = [&] {
+        write_ops::DeleteCommandRequest deleteOp(kNss);
+        deleteOp.setDeletes({[&] {
+            std::vector<write_ops::DeleteOpEntry> deleteStatements;
+            for (int i = 0; i < numDocs; ++i) {
+                write_ops::DeleteOpEntry entry;
+                entry.setQ(BSON("_id" << i + startIDNum));
+                entry.setMulti(false);
+            }
+            return deleteStatements;
+        }()});
+        return deleteOp.toBSON();
+    }();
+
+    DBDirectClient client(opCtx);
+    BSONObj result;
+    client.runCommand(kNss.dbName(), cmdObj, result);
+    ASSERT_OK(getStatusFromWriteCommandReply(result));
+}
+
+void DbCheckTest::insertDocsWithMissingIndexKeys(OperationContext* opCtx,
+                                                 int startIDNum,
+                                                 int numDocs,
+                                                 const std::vector<std::string>& fieldNames) {
+    FailPointEnableBlock skipIndexFp("skipIndexNewRecords", BSON("skipIdIndex" << false));
+    insertDocs(opCtx, startIDNum, numDocs, fieldNames);
+}
+
+DbCheckCollectionInfo DbCheckTest::createDbCheckCollectionInfo(
+    OperationContext* opCtx,
+    const BSONObj& start,
+    const BSONObj& end,
+    const SecondaryIndexCheckParameters& params) {
+    auto swUUID = storageInterface()->getCollectionUUID(opCtx, kNss);
+    ASSERT_OK(swUUID);
+
+    DbCheckCollectionInfo info = {
+        .nss = kNss,
+        .uuid = swUUID.getValue(),
+        .start = start,
+        .end = end,
+        .maxCount = kDefaultMaxCount,
+        .maxSize = kDefaultMaxSize,
+        .maxDocsPerBatch = kDefaultMaxDocsPerBatch,
+        .maxBatchTimeMillis = kDefaultMaxBatchTimeMillis,
+        .writeConcern = WriteConcernOptions(),
+        .secondaryIndexCheckParameters = params,
+        .dataThrottle =
+            DataThrottle(opCtx->fastClockSource().now().toMillisSinceEpoch(), []() { return 0; }),
+    };
+    return info;
+}
+
+/**
+ * Builds an index on kNss. 'indexKey' specifies the index key, e.g. {'a': 1};
+ */
+void DbCheckTest::createIndex(OperationContext* opCtx, const BSONObj& indexKey) {
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, kNss, AcquisitionPrerequisites::kWrite),
+        MODE_X);
+    ASSERT(collection.exists());
+
+    ASSERT_EQ(1, indexKey.nFields()) << kNss.toStringForErrorMsg() << "/" << indexKey;
+    auto spec = BSON("v" << int(IndexConfig::kLatestIndexVersion) << "key" << indexKey << "name"
+                         << (std::string(indexKey.firstElementFieldNameStringData()) + "_1"));
+
+    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    auto indexConstraints = IndexBuildsManager::IndexConstraints::kEnforce;
+    auto fromMigrate = false;
+    indexBuildsCoord->createIndex(opCtx, collection.uuid(), spec, indexConstraints, fromMigrate);
+}
+
+Status DbCheckTest::runHashForCollectionCheck(
+    OperationContext* opCtx,
+    const BSONObj& start,
+    const BSONObj& end,
+    boost::optional<SecondaryIndexCheckParameters> secondaryIndexCheckParams,
+    int64_t maxCount,
+    int64_t maxBytes,
+    Date_t deadlineOnSecondary) {
+    const DbCheckAcquisition acquisition(
+        opCtx, kNss, {RecoveryUnit::ReadSource::kNoTimestamp}, PrepareConflictBehavior::kEnforce);
+    const auto& collection = acquisition.collection().getCollectionPtr();
+    // Disable throttling for testing.
+    DataThrottle dataThrottle(opCtx->fastClockSource().now().toMillisSinceEpoch(),
+                              []() { return 0; });
+    auto hasher = DbCheckHasher(opCtx,
+                                acquisition,
+                                start,
+                                end,
+                                secondaryIndexCheckParams,
+                                &dataThrottle,
+                                boost::none /* indexName */,
+                                maxCount,
+                                maxBytes,
+                                deadlineOnSecondary);
+    return hasher.hashForCollectionCheck(opCtx, collection);
+}
+
+Status DbCheckTest::runHashForExtraIndexKeysCheck(
+    OperationContext* opCtx,
+    const BSONObj& batchStart,
+    const BSONObj& batchEnd,
+    const BSONObj& lastKeyChecked,
+    boost::optional<SecondaryIndexCheckParameters> secondaryIndexCheckParams,
+    int64_t maxCount,
+    int64_t maxBytes,
+    Date_t deadlineOnSecondary) {
+    const DbCheckAcquisition acquisition(
+        opCtx, kNss, {RecoveryUnit::ReadSource::kNoTimestamp}, PrepareConflictBehavior::kEnforce);
+    const auto& collection = acquisition.collection().getCollectionPtr();
+    // Disable throttling for testing.
+    DataThrottle dataThrottle(opCtx->fastClockSource().now().toMillisSinceEpoch(),
+                              []() { return 0; });
+    auto hasher = DbCheckHasher(opCtx,
+                                acquisition,
+                                batchStart,
+                                batchEnd,
+                                secondaryIndexCheckParams,
+                                &dataThrottle,
+                                secondaryIndexCheckParams.get().getSecondaryIndex(),
+                                maxCount,
+                                maxBytes,
+                                deadlineOnSecondary);
+    return hasher.hashForExtraIndexKeysCheck(
+        opCtx, collection.get(), batchStart, batchEnd, lastKeyChecked);
+}
+
+SecondaryIndexCheckParameters DbCheckTest::createSecondaryIndexCheckParams(
+    DbCheckValidationModeEnum validateMode,
+    std::string_view secondaryIndex,
+    bool skipLookupForExtraKeys,
+    BSONValidateModeEnum bsonValidateMode) {
+    auto params = SecondaryIndexCheckParameters();
+    params.setValidateMode(validateMode);
+    params.setSecondaryIndex(secondaryIndex);
+    params.setSkipLookupForExtraKeys(skipLookupForExtraKeys);
+    params.setBsonValidateMode(bsonValidateMode);
+    return params;
+}
+
+int DbCheckTest::getNumDocsFoundInHealthLog(OperationContext* opCtx, const BSONObj& query) {
+    FindCommandRequest findCommand(NamespaceString::kLocalHealthLogNamespace);
+    findCommand.setFilter(query);
+
+    DBDirectClient client(opCtx);
+    auto cursor = client.find(
+        findCommand, ReadPreferenceSetting{ReadPreference::PrimaryPreferred}, ExhaustMode::kOff);
+
+    int count = 0;
+    while (cursor->more()) {
+        count++;
+        cursor->next();
+    }
+    return count;
+}
+
+}  // namespace mongo

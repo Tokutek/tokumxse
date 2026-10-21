@@ -1,0 +1,59 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)
+
+mongo_cc_unit_test(
+    name = "extension_sdk_test",
+    srcs = [
+        "aggregation_stage_test.cpp",
+        "api_version_vector_to_span_test.cpp",
+        "catalog_context_test.cpp",
+        "exec_agg_stage_results_and_metadata_source_test.cpp",
+        "get_next_result_test.cpp",
+        "host_services_test.cpp",
+        "operation_metrics_test.cpp",
+        "query_execution_context_test.cpp",
+        "versioned_extension_test.cpp",
+    ],
+    tags = ["mongo_unittest_second_group"],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:shard_role_api",
+        "//src/mongo/db/extension/host:extension_host",
+        "//src/mongo/db/extension/host_connector/adapter:host_adapters",
+        "//src/mongo/db/extension/host_connector/adapter:host_services_adapter",
+        "//src/mongo/db/extension/host_connector/handle:host_handles",
+        "//src/mongo/db/extension/sdk:sdk_cpp",
+        "//src/mongo/db/extension/shared",
+        "//src/mongo/db/extension/shared/handle",
+        "//src/mongo/db/extension/shared/handle/aggregation_stage:aggregation_stage_handles",
+        "//src/mongo/db/pipeline:expression_context_for_test",
+    ],
+)
+
+# Separate target for long-running tests (death tests). Death tests spawn separate processes
+# and may take longer to execute than regular unit tests.
+mongo_cc_unit_test(
+    name = "extension_sdk_lrt_tests",
+    srcs = [
+        "aggregation_stage_death_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/extension/host:extension_host",
+        "//src/mongo/db/extension/host_connector/adapter:host_adapters",
+        "//src/mongo/db/extension/host_connector/adapter:host_services_adapter",
+        "//src/mongo/db/extension/host_connector/handle:host_handles",
+        "//src/mongo/db/extension/sdk:sdk_cpp",
+        "//src/mongo/db/extension/shared/handle",
+        "//src/mongo/db/extension/shared/handle/aggregation_stage:aggregation_stage_handles",
+        "//src/mongo/db/pipeline:expression_context_for_test",
+    ],
+)

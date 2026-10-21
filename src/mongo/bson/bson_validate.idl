@@ -1,0 +1,48 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# BSON validate modes
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    BSONValidateMode:
+        description: "The validate mode that dbCheck will run for BSON consistency checks"
+        type: string
+        # kDefault: Only fast structural BSON consistency checks
+        # kExtended: Structural BSON consistency and extra fast checks on BSON specifications.
+        # kFull: Structural BSON consistency and extra comprehensive checks on BSON specifications.
+        values:
+            kDefault: "kDefault"
+            kExtended: "kExtended"
+            kFull: "kFull"
+
+# Server paramaters for validation.
+# Range and default value should be kept in sync with src/mongo/bson/bson_validate.h
+
+server_parameters:
+    bsonTestValidationVersion:
+        description: "The version of the BSON validator that will be used to check correctness of data in test environments"
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: bsonTestValidationVersion
+        validator:
+            gte: 1
+            lte: 2
+        default: 2
+        redact: false
+
+    bsonMaxExpandedMemUsage:
+        description: "The maximum amount of memory usage to expand a BSON object in bytes, taking BSONColumn into account."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<long long>
+        cpp_varname: bsonMaxExpandedMemUsage
+        validator:
+            gte: 0
+        default: 209715200 # 200Mb
+        redact: false

@@ -1,0 +1,49 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/query/query_settings/query_settings.idl"
+    - "mongo/db/query/query_shape/query_shape_hash.idl"
+
+structs:
+    SetQuerySettingsCommandReply:
+        description: "Reply to setQuerySettings command."
+        is_command_reply: true
+        inline_chained_structs: true
+        chained_structs:
+            QueryShapeConfiguration: queryShapeConfiguration
+        fields:
+            representativeQuery:
+                type: object_owned
+                optional: true
+
+commands:
+    setQuerySettings:
+        description: "Sets query settings on the entire cluster for the given query shape."
+        command_name: setQuerySettings
+        namespace: type
+        cpp_name: SetQuerySettingsCommandRequest
+        api_version: ""
+        strict: true
+        type:
+            variant: [QueryShapeHash, object_owned]
+        fields:
+            settings: QuerySettings
+        reply_type: SetQuerySettingsCommandReply
+
+    removeQuerySettings:
+        description: "Removes query settings on the entire cluster for the given query shape."
+        command_name: removeQuerySettings
+        namespace: type
+        cpp_name: RemoveQuerySettingsCommandRequest
+        api_version: ""
+        strict: true
+        type:
+            variant: [QueryShapeHash, object_owned]

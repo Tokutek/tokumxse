@@ -1,0 +1,1458 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_init.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_test_helpers.h"
+#include "mongo/db/replicated_fast_count/size_count_store.h"
+#include "mongo/db/replicated_fast_count/size_count_timestamp_store.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+
+namespace mongo::replicated_fast_count {
+namespace {
+
+using test_helpers::checkCommittedSizeCount;
+using test_helpers::registerOpObserverForTest;
+
+class ReplicatedFastCountManagerTest : public CatalogTestFixture {
+public:
+    ReplicatedFastCountManagerTest()
+        : CatalogTestFixture(Options().setPersistenceProvider(
+              std::make_unique<test_helpers::ReplicatedFastCountTestPersistenceProvider>())) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+
+        ASSERT_OK(createInternalFastCountContainers(operationContext(),
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+
+        manager = std::make_unique<ReplicatedFastCountManager>();
+
+        KVEngine* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+        manager->initializeContainerStores(
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStore,
+                                   RecordStore::Options{.keyFormat = KeyFormat::String},
+                                   /*uuid=*/boost::none),
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStoreTimestamps,
+                                   RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                   /*uuid=*/boost::none));
+    }
+
+    /**
+     * Returns a reference to the `SizeCountStore` in the `ReplicatedFastCountManager`.
+     */
+    SizeCountStore& sizeCountStore() {
+        return *manager->getSizeCountStores_ForTest().first;
+    }
+
+    /**
+     * Returns a reference to the `SizeCountTimestampStore` in the `ReplicatedFastCountManager`.
+     */
+    SizeCountTimestampStore& sizeCountTimestampStore() {
+        return *manager->getSizeCountStores_ForTest().second;
+    }
+
+    boost::optional<std::pair<CollectionReplicatedMetadata, Timestamp>> findPersisted(UUID uuid) {
+        Lock::GlobalLock lk(operationContext(), MODE_IS);
+        return manager->findPersisted(operationContext(), uuid);
+    }
+
+    boost::optional<Timestamp> findPersistedTimestampStoreTs() {
+        Lock::GlobalLock lk(operationContext(), MODE_IS);
+        return manager->findPersistedTimestampStoreTs(operationContext());
+    }
+
+    // Sets the stable timestamp. In the ephemeral unit-test storage engine
+    // getLastStableRecoveryTimestamp() returns the stable timestamp directly, so this controls the
+    // cold-start seed computed by _computeColdStartTimestamp().
+    void setStableTimestamp(Timestamp ts) {
+        operationContext()->getServiceContext()->getStorageEngine()->setStableTimestamp(
+            ts, /*force=*/true);
+    }
+
+    test_helpers::NsAndUUID collA = {
+        .nss = NamespaceString::createNamespaceString_forTest("find_test", "collA"),
+        .uuid = UUID::gen()};
+    test_helpers::NsAndUUID collB = {
+        .nss = NamespaceString::createNamespaceString_forTest("find_test", "collB"),
+        .uuid = UUID::gen()};
+
+    std::unique_ptr<ReplicatedFastCountManager> manager;
+};
+
+using ReplicatedFastCountManagerIdempotenceTest = ReplicatedFastCountManagerTest;
+
+TEST_F(ReplicatedFastCountManagerIdempotenceTest, IdempotentStartupAndShutdown) {
+    // Both startup() and shutdown() should be able to be called successively without failure.
+    manager->startup(operationContext());
+    manager->startup(operationContext());
+
+    manager->shutdown(operationContext());
+    manager->shutdown(operationContext());
+}
+
+// The checkpoint coordinator captures raw SizeCount[Timestamp]Store pointers at construction, so
+// the manager must never replace the store objects it points at while the coordinator is running.
+//
+// This fixture binds the manager to container-backed stores from the start and exercises repeated
+// initializeContainerStores() calls.
+class ReplicatedFastCountManagerRebindContainerTest : public CatalogTestFixture {
+public:
+    ReplicatedFastCountManagerRebindContainerTest()
+        : CatalogTestFixture(Options().setPersistenceProvider(
+              std::make_unique<test_helpers::ReplicatedFastCountTestPersistenceProvider>())) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+        _opCtx = operationContext();
+        _engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+
+        ASSERT_OK(createInternalFastCountContainers(_opCtx,
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+
+        // Register an OpObserver so that watermark entries written by the flusher thread are
+        // actually written to the oplog.
+        registerOpObserverForTest(getServiceContext());
+    }
+
+    // Returns freshly opened RecordStores for the container idents created in setUp().
+    std::pair<std::unique_ptr<RecordStore>, std::unique_ptr<RecordStore>> makeContainerStores() {
+        auto metadataRS =
+            _engine->getRecordStore(_opCtx,
+                                    NamespaceString::kAdminCommandNamespace,
+                                    ident::kFastCountMetadataStore,
+                                    RecordStore::Options{.keyFormat = KeyFormat::String},
+                                    /*uuid=*/boost::none);
+        auto timestampsRS =
+            _engine->getRecordStore(_opCtx,
+                                    NamespaceString::kAdminCommandNamespace,
+                                    ident::kFastCountMetadataStoreTimestamps,
+                                    RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                    /*uuid=*/boost::none);
+        return {std::move(metadataRS), std::move(timestampsRS)};
+    }
+
+    OperationContext* _opCtx;
+    KVEngine* _engine;
+    test_helpers::NsAndUUID _coll = {
+        .nss = NamespaceString::createNamespaceString_forTest("rebind_container_test", "coll"),
+        .uuid = UUID::gen()};
+};
+
+TEST_F(ReplicatedFastCountManagerRebindContainerTest,
+       InitializeContainerStoresIsIdempotentWhenAlreadyContainerBacked) {
+    // Bind the manager to container-backed stores and start the checkpoint coordinator with live
+    // background threads.
+    auto [metadataRS, timestampsRS] = makeContainerStores();
+    auto manager = std::make_unique<ReplicatedFastCountManager>(
+        std::make_unique<SizeCountStore>(std::move(metadataRS)),
+        std::make_unique<SizeCountTimestampStore>(std::move(timestampsRS)));
+    manager->startup(_opCtx);
+    ASSERT_TRUE(manager->isRunning_ForTest());
+
+    SizeCountStore* boundSizeCountStore = manager->getSizeCountStores_ForTest().first;
+    SizeCountTimestampStore* boundTimestampStore = manager->getSizeCountStores_ForTest().second;
+
+    // Calling initializeContainerStores() again while the stores are already container-backed is a
+    // no-op: the coordinator keeps running against the same store objects rather than being stopped
+    // and the stores replaced. The freshly opened RecordStores passed in are dropped.
+    auto [metadataRS2, timestampsRS2] = makeContainerStores();
+    manager->initializeContainerStores(std::move(metadataRS2), std::move(timestampsRS2));
+
+    ASSERT_TRUE(manager->isRunning_ForTest());
+    ASSERT_EQ(manager->getSizeCountStores_ForTest().first, boundSizeCountStore);
+    ASSERT_EQ(manager->getSizeCountStores_ForTest().second, boundTimestampStore);
+
+    manager->shutdown(_opCtx);
+    ASSERT_FALSE(manager->isRunning_ForTest());
+}
+
+// Stronger variant of the above: a repeated initializeContainerStores() while the flusher thread
+// is stalled mid-flush must leave the coordinator running and the bound stores untouched. If the
+// call instead destroyed and replaced the store objects, the resumed flusher would dereference
+// freed store pointers.
+TEST_F(ReplicatedFastCountManagerRebindContainerTest,
+       InitializeContainerStoresIdempotentDuringInFlightFlush) {
+    auto [metadataRS, timestampsRS] = makeContainerStores();
+    auto manager = std::make_unique<ReplicatedFastCountManager>(
+        std::make_unique<SizeCountStore>(std::move(metadataRS)),
+        std::make_unique<SizeCountTimestampStore>(std::move(timestampsRS)));
+    manager->startup(_opCtx);
+    ASSERT_TRUE(manager->isRunning_ForTest());
+
+    SizeCountStore* boundSizeCountStore = manager->getSizeCountStores_ForTest().first;
+    SizeCountTimestampStore* boundTimestampStore = manager->getSizeCountStores_ForTest().second;
+
+    // Buffer a size/count delta so the flush has real work, then stall the flusher right after it
+    // checks out the batch and before it reads the timestamp store.
+    test_helpers::writeToOplog(_opCtx, test_helpers::makeCreateOplogEntry(Timestamp(0, 1), _coll));
+    test_helpers::writeToOplog(
+        _opCtx,
+        test_helpers::makeOplogEntry(Timestamp(1, 1), _coll, repl::OpTypeEnum::kInsert, 10));
+    FailPointEnableBlock hangFp("hangAfterReplicatedFastCountSnapshot");
+    test_helpers::waitForFlushFailpoint(hangFp, [&] { manager->flushAsync(); });
+
+    // The flusher is now parked holding pointers to the bound stores. A repeated
+    // initializeContainerStores() returns immediately without touching the stores or the
+    // coordinator; the flusher resumes against the same live store objects.
+    auto [metadataRS2, timestampsRS2] = makeContainerStores();
+    manager->initializeContainerStores(std::move(metadataRS2), std::move(timestampsRS2));
+
+    ASSERT_TRUE(manager->isRunning_ForTest());
+    ASSERT_EQ(manager->getSizeCountStores_ForTest().first, boundSizeCountStore);
+    ASSERT_EQ(manager->getSizeCountStores_ForTest().second, boundTimestampStore);
+
+    globalFailPointRegistry().find("hangAfterReplicatedFastCountSnapshot")->setMode(FailPoint::off);
+
+    manager->shutdown(_opCtx);
+    ASSERT_FALSE(manager->isRunning_ForTest());
+}
+
+class ReplicatedFastCountManagerWithOplogTest : public ReplicatedFastCountManagerTest {
+protected:
+    void setUp() override {
+        ReplicatedFastCountManagerTest::setUp();
+        // Register an OpObserver so that watermark entries written by the flusher thread are
+        // actually written to the oplog and then seen in waitForFlush() below.
+        registerOpObserverForTest(getServiceContext());
+    }
+
+    Timestamp waitForFlush() {
+        return test_helpers::waitForFlush(
+            operationContext(), sizeCountTimestampStore(), [&] { manager->flushAsync(); });
+    }
+};
+
+using ReplicatedFastCountManagerStartupTest = ReplicatedFastCountManagerWithOplogTest;
+
+// TODO SERVER-130675 - Remove this test once we no longer skip the oplog scan.
+TEST_F(ReplicatedFastCountManagerStartupTest, StartupSkipsOplogScanWhenOldestEntryFarBehindLatest) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    unittest::ServerParameterGuard maxLag("replicatedFastCountMaxOplogScanLagSecs", 600);
+
+    const int64_t sizeDelta = 100;
+    // No persisted valid-as-of timestamp entry, and the oldest oplog entry (the create entries at
+    // Timestamp(0,)) is more than replicatedFastCountMaxOplogScanLagSecs behind the stable
+    // recovery timestamp (Timestamp(700)), so the checkpoint coordinator is seeded from a visible
+    // oplog entry near the stable recovery timestamp instead of scanning from the beginning.
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeCreateOplogEntry(Timestamp(0, 1), collA));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeCreateOplogEntry(Timestamp(0, 2), collB));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(700, 1), collB, repl::OpTypeEnum::kInsert, sizeDelta));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(800, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+
+    // Set the stable recovery timestamp to Timestamp(700,1). The checkpoint tailer should seek to
+    // the visible oplog entry at/after this timestamp (the entry at 700) and then start scanning
+    // from that point onwards; the first entry it should see is the entry at timestamp (800).
+    setStableTimestamp(Timestamp(700, 1));
+
+    manager->startup(operationContext());
+
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(900, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+
+    waitForFlush();
+
+    // CollA's size and count should reflect only one write from before startup and one write after
+    // startup.
+    const auto persistedA = findPersisted(collA.uuid);
+    ASSERT_TRUE(persistedA.has_value());
+    EXPECT_EQ(persistedA->first.sizeCount,
+              (CollectionSizeCount{.size = sizeDelta * 2, .count = 2}));
+
+    // All of the writes to collB are skipped.
+    EXPECT_FALSE(findPersisted(collB.uuid).has_value());
+
+    manager->shutdown(operationContext());
+}
+
+// TODO SERVER-130675 - Remove this test once we no longer skip the oplog scan.
+TEST_F(ReplicatedFastCountManagerStartupTest, StartupSkipScanTailerThreadFindsRealOplogEntry) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    unittest::ServerParameterGuard maxLag("replicatedFastCountMaxOplogScanLagSecs", 600);
+
+    const int64_t sizeDelta = 100;
+
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeCreateOplogEntry(Timestamp(0, 1), collA));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(700, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(800, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+
+    setStableTimestamp(Timestamp(700, 1));
+
+    // Start the tailer and flusher threads. If startup seeded the tailer thread with an oplog entry
+    // that didn't exist, the thread would tassert.
+    manager->startup(operationContext());
+    ASSERT_TRUE(manager->isRunning_ForTest());
+
+    const Timestamp validAsOf = waitForFlush();
+    ASSERT_EQ(*findPersistedTimestampStoreTs(), validAsOf);
+
+    manager->shutdown(operationContext());
+}
+
+// TODO SERVER-130675 - Remove this test once we no longer skip the oplog scan.
+TEST_F(ReplicatedFastCountManagerStartupTest, StartupSkipScanSeedWithoutExactOplogEntry) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    unittest::ServerParameterGuard maxLag("replicatedFastCountMaxOplogScanLagSecs", 600);
+
+    const int64_t sizeDelta = 100;
+
+    // Oplog entries exist at Timestamp(0) (the create), Timestamp(800) and Timestamp(900), but NOT
+    // at the last applied optime Timestamp(700).
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeCreateOplogEntry(Timestamp(0, 1), collA));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(800, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(900, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+
+    // The stable recovery timestamp Timestamp(700,1) has no oplog entry. Seeding the tailer
+    // directly from it would trip tassert 12101812 on seekExact(); instead startup resolves the
+    // seed to the first visible entry at/after it (Timestamp(800)), which the tailer can seek to.
+    setStableTimestamp(Timestamp(700, 1));
+
+    manager->startup(operationContext());
+    waitForFlush();
+
+    // The seed resolves to the entry at (800), so only the write after it (Timestamp(900)) is
+    // counted; the entries at (0) and (800) are not.
+    const auto persistedA = findPersisted(collA.uuid);
+    ASSERT_TRUE(persistedA.has_value());
+    EXPECT_EQ(persistedA->first.sizeCount, (CollectionSizeCount{.size = sizeDelta, .count = 1}));
+
+    manager->shutdown(operationContext());
+}
+
+TEST_F(ReplicatedFastCountManagerStartupTest, StartupScansFullOplogWhenWithinLag) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    unittest::ServerParameterGuard maxLag("replicatedFastCountMaxOplogScanLagSecs", 600);
+
+    const int64_t sizeDelta = 100;
+
+    // The oldest entry (the create at (0,)) is within replicatedFastCountMaxOplogScanLagSecs of
+    // the stable recovery timestamp (3), so there is no skip: the tailer scans the whole oplog
+    // from the beginning.
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeCreateOplogEntry(Timestamp(0, 1), collA));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(Timestamp(2, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(Timestamp(3, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+
+    setStableTimestamp(Timestamp(3, 1));
+
+    manager->startup(operationContext());
+    waitForFlush();
+
+    // All three writes are counted because the full oplog was scanned.
+    const auto persistedA = findPersisted(collA.uuid);
+    ASSERT_TRUE(persistedA.has_value());
+    EXPECT_EQ(persistedA->first.sizeCount,
+              (CollectionSizeCount{.size = sizeDelta * 3, .count = 3}));
+
+    manager->shutdown(operationContext());
+}
+
+// TODO SERVER-130675 - Remove this test once we no longer skip the oplog scan.
+TEST_F(ReplicatedFastCountManagerStartupTest, StartupWithNoStableTimestampScansFullOplog) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    // A tiny lag threshold would normally take the skip path, but with no applied optime we cannot
+    // compute a seekable seed and must fall back to a full scan instead.
+    unittest::ServerParameterGuard maxLag("replicatedFastCountMaxOplogScanLagSecs", 1);
+
+    const int64_t sizeDelta = 100;
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+    test_helpers::writeToOplog(operationContext(),
+                               test_helpers::makeOplogEntry(
+                                   Timestamp(800, 1), collA, repl::OpTypeEnum::kInsert, sizeDelta));
+
+    // Intentionally do NOT set an applied optime, so getMyLastAppliedOpTime() is null.
+    manager->startup(operationContext());
+    waitForFlush();
+
+    // Both entries are counted because we scanned from the beginning of the oplog.
+    const auto persistedA = findPersisted(collA.uuid);
+    ASSERT_TRUE(persistedA.has_value());
+    EXPECT_EQ(persistedA->first.sizeCount,
+              (CollectionSizeCount{.size = sizeDelta * 2, .count = 2}));
+
+    manager->shutdown(operationContext());
+}
+
+using ReplicatedFastCountManagerNoCollectionsTest = CatalogTestFixture;
+
+TEST_F(ReplicatedFastCountManagerNoCollectionsTest, InitializeMetadataDoesNothing) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    ReplicatedFastCountManager manager;
+    manager.initializeMetadata(operationContext());
+}
+
+class ReplicatedFastCountManagerInitializeMetadataTest : public CatalogTestFixture {
+public:
+    ReplicatedFastCountManagerInitializeMetadataTest()
+        : CatalogTestFixture(Options().setPersistenceProvider(
+              std::make_unique<test_helpers::ReplicatedFastCountTestPersistenceProvider>())) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+        ASSERT_OK(createInternalFastCountContainers(operationContext(),
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+        // Do not call initializeContainerStores() because initializeMetadata() expects the
+        // SizeCountStore and SizeCountTimestampStore to be uninitialized.
+        manager = std::make_unique<ReplicatedFastCountManager>();
+    }
+
+    /**
+     * Returns a pointer to the `SizeCountStore`.
+     *
+     * This function gets the underlying `RecordStore` pointer from the storage engine because the
+     * `ReplicatedFastCountManager` has not initialized its `SizeCountStore` in this fixture.
+     */
+    std::unique_ptr<SizeCountStore> sizeCountStore() {
+        KVEngine* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+
+        return std::make_unique<SizeCountStore>(
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStore,
+                                   RecordStore::Options{.keyFormat = KeyFormat::String},
+                                   /*uuid=*/boost::none));
+    }
+
+    /**
+     * Returns a pointer to the `SizeCountTimestampStore`.
+     *
+     * This function gets the underlying `RecordStore` pointer from the storage engine because the
+     * `ReplicatedFastCountManager` has not initialized its `SizeCountTimestampStore` in this
+     * fixture.
+     */
+    std::unique_ptr<SizeCountTimestampStore> sizeCountTimestampStore() {
+        KVEngine* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+        return std::make_unique<SizeCountTimestampStore>(
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStoreTimestamps,
+                                   RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                   /*uuid=*/boost::none));
+    }
+
+    // Sets the stable timestamp. In the ephemeral unit-test storage engine
+    // getLastStableRecoveryTimestamp() returns the stable timestamp directly, so this controls the
+    // cold-start seed computed by _computeColdStartTimestamp().
+    void setStableTimestamp(Timestamp ts) {
+        operationContext()->getServiceContext()->getStorageEngine()->setStableTimestamp(
+            ts, /*force=*/true);
+    }
+
+    test_helpers::NsAndUUID collA = {
+        .nss = NamespaceString::createNamespaceString_forTest("find_test", "collA"),
+        .uuid = UUID::gen()};
+    test_helpers::NsAndUUID collB = {
+        .nss = NamespaceString::createNamespaceString_forTest("find_test", "collB"),
+        .uuid = UUID::gen()};
+
+    std::unique_ptr<ReplicatedFastCountManager> manager;
+};
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, InitializeMetadataNoData) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    manager->initializeMetadata(operationContext());
+}
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, NoStoreData) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(2, 2), collB, repl::OpTypeEnum::kInsert, /*sizeDelta=*/100));
+
+    manager->initializeMetadata(operationContext());
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 10, .count = 1});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 100, .count = 1});
+}
+
+// TODO SERVER-130675 - Remove this test once we no longer skip the oplog scan.
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest,
+       SkipsOplogScanWhenOldestEntryFarBehindLatest) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    unittest::ServerParameterGuard maxLag("replicatedFastCountMaxOplogScanLagSecs", 600);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    // No persisted valid-as-of timestamp entry, and the oldest oplog entry (Timestamp(1,)) is more
+    // than replicatedFastCountMaxOplogScanLagSecs behind the stable recovery timestamp (Timestamp
+    // (700)), so initializeMetadata skips the oplog scan entirely.
+    //
+    // Any persisted fast count values should be preserved.
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 5, .count = 1});
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(700, 1), collB, repl::OpTypeEnum::kInsert, /*sizeDelta=*/100));
+
+    setStableTimestamp(Timestamp(700, 1));
+    manager->initializeMetadata(operationContext());
+
+    // CollA's size and count reflect only the value that was already persisted; since we skipped
+    // the oplog scan, none of the writes in the oplog should be reflected here.
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 5, .count = 1});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 0, .count = 0});
+}
+
+// TODO SERVER-130675 - Remove this test once we no longer skip the oplog scan.
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest,
+       RaisingMaxOplogScanLagPerformsScanForOtherwiseSkippedOplog) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    // Set the maximum allowed oplog scan to a threshold that isn't tripped by this set up - no
+    // entries should be skipped.
+    unittest::ServerParameterGuard maxLagGuard("replicatedFastCountMaxOplogScanLagSecs", 1000);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(700, 1), collB, repl::OpTypeEnum::kInsert, /*sizeDelta=*/100));
+
+    // Oldest entry (1) is within the raised replicatedFastCountMaxOplogScanLagSecs of the stable
+    // recovery timestamp (700), so there is no skip and the full oplog is scanned.
+    setStableTimestamp(Timestamp(700, 1));
+    manager->initializeMetadata(operationContext());
+
+    // Because the scan was performed, both collections' writes are reflected.
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 10, .count = 1});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 100, .count = 1});
+}
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, NoOplogData) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 5, .count = 1});
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collB.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 6, .count = 2});
+
+    manager->initializeMetadata(operationContext());
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 5, .count = 1});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 6, .count = 2});
+}
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, NoOplogAfterTimestamp) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 5, .count = 1});
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collB.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 6, .count = 2});
+
+    test_helpers::insertSizeCountTimestamp(
+        operationContext(), *sizeCountTimestampStore(), Timestamp(3, 3));
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(2, 2), collB, repl::OpTypeEnum::kInsert, /*sizeDelta=*/100));
+
+    manager->initializeMetadata(operationContext());
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 5, .count = 1});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 6, .count = 2});
+}
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, StoreAndOplogData) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 5, .count = 1});
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        collB.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 6, .count = 2});
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(2, 2), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(3, 3), collB, repl::OpTypeEnum::kInsert, /*sizeDelta=*/100));
+
+    manager->initializeMetadata(operationContext());
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 5 + 10, .count = 1 + 1});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 6 + 100, .count = 2 + 1});
+}
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, SkipsDroppedCollections) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+
+    // Insert a size/count for a UUID that has no corresponding collection in the catalog.
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        UUID::gen(),
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 999, .count = 99});
+
+    // Initialization should skip the size/count entry without failing.
+    manager->initializeMetadata(operationContext());
+}
+
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest, InitializeMetadataTracksOplogSizeCount) {
+    unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", true);
+    unittest::ServerParameterGuard truncationFeatureFlag(
+        "featureFlagSizeBasedOplogTruncationForDisagg", true);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+
+    const auto catalog = CollectionCatalog::latest(operationContext()->getServiceContext());
+    const Collection* oplogColl = catalog->lookupCollectionByNamespace(
+        operationContext(), NamespaceString::kRsOplogNamespace);
+    ASSERT(oplogColl);
+    const UUID oplogUuid = oplogColl->uuid();
+
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        *sizeCountStore(),
+        oplogUuid,
+        SizeCountStore::Entry{.timestamp = Timestamp::min(), .size = 500, .count = 50});
+
+    const repl::OplogEntry entry1 = test_helpers::makeOplogEntry(
+        Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10);
+    const repl::OplogEntry entry2 = test_helpers::makeOplogEntry(
+        Timestamp(2, 2), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/20);
+
+    const int64_t oplogSizeDelta =
+        entry1.getEntry().toBSON().objsize() + entry2.getEntry().toBSON().objsize();
+
+    test_helpers::writeToOplog(operationContext(), entry1);
+    test_helpers::writeToOplog(operationContext(), entry2);
+
+    manager->initializeMetadata(operationContext());
+
+    checkCommittedSizeCount(
+        operationContext(), oplogUuid, {.size = 500 + oplogSizeDelta, .count = 50 + 2});
+}
+
+// Container-backed fixture mirroring the post-seed state of initial sync: the manager's stores are
+// already bound to containers (initializeContainerStores ran during seeding), so
+// finalizeMetadataFromInitialSync must read through the bound stores rather than reopen the ident.
+class ReplicatedFastCountManagerFinalizeContainerTest : public CatalogTestFixture {
+public:
+    ReplicatedFastCountManagerFinalizeContainerTest()
+        : CatalogTestFixture(Options().setPersistenceProvider(
+              std::make_unique<test_helpers::ReplicatedFastCountTestPersistenceProvider>())) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+
+        ASSERT_OK(storageInterface()->createCollection(
+            operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+
+        ASSERT_OK(createInternalFastCountContainers(operationContext(),
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+        auto* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+        auto metadataRS =
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStore,
+                                   RecordStore::Options{.keyFormat = KeyFormat::String},
+                                   /*uuid=*/boost::none);
+        auto timestampsRS =
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStoreTimestamps,
+                                   RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                   /*uuid=*/boost::none);
+        manager = std::make_unique<ReplicatedFastCountManager>(
+            std::make_unique<SizeCountStore>(std::move(metadataRS)),
+            std::make_unique<SizeCountTimestampStore>(std::move(timestampsRS)));
+    }
+
+    unittest::ServerParameterGuard _ffFastCount{"featureFlagReplicatedFastCount", true};
+    test_helpers::NsAndUUID collA = {
+        .nss = NamespaceString::createNamespaceString_forTest("finalize_container_test", "collA"),
+        .uuid = UUID::gen()};
+    std::unique_ptr<ReplicatedFastCountManager> manager;
+};
+
+TEST_F(ReplicatedFastCountManagerFinalizeContainerTest,
+       RecomputesFromBoundContainerStoresAndOplog) {
+    // Seed the bound container stores exactly as populateFromInitialSync does during initial sync.
+    // populateFromInitialSync writes only the persisted stores; the in-memory count stays 0 until
+    // finalize recomputes it below.
+    {
+        Lock::GlobalWrite globalLock(operationContext());
+        manager->populateFromInitialSync(
+            operationContext(),
+            {{collA.uuid,
+              ReplicatedFastCountManager::FastCountEntry{
+                  .timestamp = Timestamp(3, 3), .size = 100, .count = 5}}},
+            Timestamp(3, 3));
+    }
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 0, .count = 0});
+
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(3, 3), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/7));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(4, 4), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(5, 5), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/20));
+
+    manager->finalizeMetadataFromInitialSync(operationContext());
+
+    // persisted {100, 5} + deltas at (4, 4) and (5, 5): +2 count, +30 size.
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 100 + 30, .count = 5 + 2});
+}
+
+TEST_F(ReplicatedFastCountManagerFinalizeContainerTest,
+       DerivesCollectionsWithoutPersistedEntryFromOplog) {
+    // collB has no persisted checkpoint entry. A collection with no entry must have been created
+    // after the checkpoint, so all of its documents arrive as post-checkpoint oplog inserts
+    // replayed during initial sync; finalize must reconstruct its size and count from those deltas
+    // alone (baseline 0) rather than leaving the in-memory count untouched.
+    const test_helpers::NsAndUUID collB = {
+        .nss = NamespaceString::createNamespaceString_forTest("finalize_container_test", "collB"),
+        .uuid = UUID::gen()};
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+
+    // Seed only collA's persisted entry, exactly as populateFromInitialSync does during initial
+    // sync. collB is deliberately left without a persisted entry.
+    {
+        Lock::GlobalWrite globalLock(operationContext());
+        manager->populateFromInitialSync(
+            operationContext(),
+            {{collA.uuid,
+              ReplicatedFastCountManager::FastCountEntry{
+                  .timestamp = Timestamp(3, 3), .size = 100, .count = 5}}},
+            Timestamp(3, 3));
+    }
+
+    // Post-checkpoint oplog deltas. collA gets one insert at (4, 4). collB was created after the
+    // checkpoint, so each of its documents appears as a post-checkpoint oplog insert whose size
+    // delta matches the document -- the deltas alone reconstruct collB's full size and count.
+    const std::vector<BSONObj> collBDocs = {BSON("_id" << 0), BSON("_id" << 1), BSON("_id" << 2)};
+    int64_t collBSize = 0;
+    for (const auto& doc : collBDocs) {
+        collBSize += doc.objsize();
+    }
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(4, 4), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    for (size_t i = 0; i < collBDocs.size(); ++i) {
+        test_helpers::writeToOplog(
+            operationContext(),
+            test_helpers::makeOplogEntry(Timestamp(static_cast<unsigned>(5 + i), 5),
+                                         collB,
+                                         repl::OpTypeEnum::kInsert,
+                                         /*sizeDelta=*/collBDocs[i].objsize()));
+    }
+
+    manager->finalizeMetadataFromInitialSync(operationContext());
+
+    // collA is recomputed from its persisted entry plus the (4, 4) delta.
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 100 + 10, .count = 5 + 1});
+    // collB has no persisted entry, so its authoritative size and count are derived entirely from
+    // its post-checkpoint oplog inserts (baseline 0). The empty record store confirms finalize
+    // populates the count from the oplog rather than leaving it at 0.
+    checkCommittedSizeCount(operationContext(),
+                            collB.uuid,
+                            {.size = collBSize, .count = static_cast<int64_t>(collBDocs.size())});
+}
+
+using ReplicatedFastCountManagerCommitTest = ReplicatedFastCountManagerTest;
+
+TEST_F(ReplicatedFastCountManagerCommitTest, CommitNothing) {
+    UncommittedFastCountChangeMap changes{};
+    manager->commit(operationContext(), changes);
+}
+
+TEST_F(ReplicatedFastCountManagerCommitTest, CommitZeros) {
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    const auto catalog = CollectionCatalog::latest(operationContext()->getServiceContext());
+    RecordStore* rs =
+        catalog->lookupCollectionByUUID(operationContext(), collA.uuid)->getRecordStore();
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 0, .count = 0});
+
+    UncommittedFastCountChangeMap changes{
+        {collA.uuid,
+         UncommittedFastCountChange{
+             .delta = {.size = 0, .count = 0},
+             .recordStore = rs,
+         }},
+    };
+    manager->commit(operationContext(), changes);
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 0, .count = 0});
+}
+
+TEST_F(ReplicatedFastCountManagerCommitTest, CommitUpdatesRecordStoreSizeCount) {
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collB.nss, CollectionOptions{.uuid = collB.uuid}));
+    const auto catalog = CollectionCatalog::latest(operationContext()->getServiceContext());
+    RecordStore* rsA =
+        catalog->lookupCollectionByUUID(operationContext(), collA.uuid)->getRecordStore();
+    RecordStore* rsB =
+        catalog->lookupCollectionByUUID(operationContext(), collB.uuid)->getRecordStore();
+
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 0, .count = 0});
+    checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 0, .count = 0});
+
+    {
+        UncommittedFastCountChangeMap changes{
+            {collA.uuid,
+             UncommittedFastCountChange{
+                 .delta = {.size = 42, .count = 2},
+                 .recordStore = rsA,
+             }},
+            {collB.uuid,
+             UncommittedFastCountChange{
+                 .delta = {.size = 111, .count = 17},
+                 .recordStore = rsB,
+             }},
+        };
+        manager->commit(operationContext(), changes);
+
+        checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 42, .count = 2});
+        checkCommittedSizeCount(operationContext(), collB.uuid, {.size = 111, .count = 17});
+    }
+
+    {
+        UncommittedFastCountChangeMap changes{
+            {collA.uuid,
+             UncommittedFastCountChange{
+                 .delta = {.size = -10, .count = -3},
+                 .recordStore = rsA,
+             }},
+            {collB.uuid,
+             UncommittedFastCountChange{
+                 .delta = {.size = -11, .count = -4},
+                 .recordStore = rsB,
+             }},
+        };
+        manager->commit(operationContext(), changes);
+
+        checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 42 - 10, .count = 2 - 3});
+        checkCommittedSizeCount(
+            operationContext(), collB.uuid, {.size = 111 - 11, .count = 17 - 4});
+    }
+}
+
+using ReplicatedFastCountManagerCommitDeathTest = ReplicatedFastCountManagerCommitTest;
+
+DEATH_TEST_F(ReplicatedFastCountManagerCommitDeathTest,
+             MissingRecordStoreTerminates,
+             "Missing RecordStore for fast count change") {
+    // Deltas are non-zero to avoid early return.
+    UncommittedFastCountChangeMap changes{
+        {collA.uuid,
+         UncommittedFastCountChange{
+             .delta = {.size = 1, .count = 1},
+             .recordStore = nullptr,
+         }},
+    };
+    manager->commit(operationContext(), changes);
+}
+
+using ReplicatedFastCountManagerFindPersistedTest = ReplicatedFastCountManagerTest;
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTest, ReturnsNoneWhenNoEntryExists) {
+    EXPECT_FALSE(findPersisted(collA.uuid).has_value());
+}
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTest, ReturnsPersistedSizeCountAndTimestamp) {
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp(7, 7), .size = 5, .count = 1});
+
+    const auto result = findPersisted(collA.uuid);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->first.sizeCount, (CollectionSizeCount{.size = 5, .count = 1}));
+    EXPECT_EQ(result->second, Timestamp(7, 7));
+}
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTest, ReturnsPersistedValidationHash) {
+    // A negative value, since the hash is the full 64-bit range reinterpreted as signed.
+    const int64_t hash = -4472309216717240578;
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp(7, 7), .size = 5, .count = 1, .hash = hash});
+
+    const auto result = findPersisted(collA.uuid);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->first.hash.has_value());
+    EXPECT_EQ(*result->first.hash, hash);
+}
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTest, ReturnsNoHashWhenNoneWasPersisted) {
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp(7, 7), .size = 5, .count = 1});
+
+    const auto result = findPersisted(collA.uuid);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->first.hash.has_value());
+}
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTest, ReturnsEntryForRequestedUuidOnly) {
+    test_helpers::insertSizeCountEntry(
+        operationContext(),
+        sizeCountStore(),
+        collA.uuid,
+        SizeCountStore::Entry{.timestamp = Timestamp(7, 7), .size = 5, .count = 1});
+
+    // A different, unpersisted UUID still returns none.
+    EXPECT_FALSE(findPersisted(collB.uuid).has_value());
+}
+
+using ReplicatedFastCountManagerFindPersistedTimestampStoreTsTest = ReplicatedFastCountManagerTest;
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTimestampStoreTsTest, ReturnsNoneWhenStoreEmpty) {
+    EXPECT_FALSE(findPersistedTimestampStoreTs().has_value());
+}
+
+TEST_F(ReplicatedFastCountManagerFindPersistedTimestampStoreTsTest, ReturnsPersistedTimestamp) {
+    test_helpers::insertSizeCountTimestamp(
+        operationContext(), sizeCountTimestampStore(), Timestamp(3, 3));
+
+    const auto result = findPersistedTimestampStoreTs();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, Timestamp(3, 3));
+}
+
+/**
+ * Cold-boot fixture that bypasses `setUpReplicatedFastCount()` so tests can exercise
+ * `initializeMetadata` against on-disk state that the manager has not yet been told about.
+ * Use this for tests that validate the manager's ability to discover existing fast count
+ * containers directly from the storage engine at startup.
+ */
+class ReplicatedFastCountManagerColdBootTest : public CatalogTestFixture {
+public:
+    ReplicatedFastCountManagerColdBootTest()
+        : CatalogTestFixture(Options().setPersistenceProvider(
+              std::make_unique<test_helpers::ReplicatedFastCountTestPersistenceProvider>())) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+        _opCtx = operationContext();
+
+        auto* registry = dynamic_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
+        ASSERT(registry);
+        registry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
+
+        _fastCountManager = &ReplicatedFastCountManager::get(_opCtx->getServiceContext());
+        _fastCountManager->disablePeriodicWrites_ForTest();
+        // Intentionally do NOT call setUpReplicatedFastCount() — the test exercises the
+        // cold-boot path where on-disk containers exist before the manager is configured.
+
+        // Create two collections so their UUIDs exist in the CollectionCatalog
+        ASSERT_OK(storageInterface()->createCollection(
+            _opCtx, _coll1.nss, CollectionOptions{.uuid = _coll1.uuid}));
+        ASSERT_OK(storageInterface()->createCollection(
+            _opCtx, _coll2.nss, CollectionOptions{.uuid = _coll2.uuid}));
+    }
+
+    OperationContext* _opCtx;
+    ReplicatedFastCountManager* _fastCountManager;
+
+    test_helpers::NsAndUUID _coll1 = {
+        .nss = NamespaceString::createNamespaceString_forTest("coldboot_test", "coll1"),
+        .uuid = UUID::gen()};
+    test_helpers::NsAndUUID _coll2 = {
+        .nss = NamespaceString::createNamespaceString_forTest("coldboot_test", "coll2"),
+        .uuid = UUID::gen()};
+};
+
+TEST_F(ReplicatedFastCountManagerColdBootTest,
+       InitializePopulatesMetadataFromExistingInternalContainer) {
+    unittest::ServerParameterGuard ffFastCount("featureFlagReplicatedFastCount", true);
+
+    ASSERT_OK(createInternalFastCountContainers(_opCtx,
+                                                NamespaceString::kAdminCommandNamespace,
+                                                ident::kFastCountMetadataStore,
+                                                KeyFormat::String,
+                                                ident::kFastCountMetadataStoreTimestamps,
+                                                KeyFormat::Long,
+                                                /*writeToOplog=*/true));
+
+    auto* engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto metadataRS = engine->getRecordStore(_opCtx,
+                                             NamespaceString::kAdminCommandNamespace,
+                                             ident::kFastCountMetadataStore,
+                                             RecordStore::Options{.keyFormat = KeyFormat::String},
+                                             /*uuid=*/boost::none);
+    auto timestampsRS = engine->getRecordStore(_opCtx,
+                                               NamespaceString::kAdminCommandNamespace,
+                                               ident::kFastCountMetadataStoreTimestamps,
+                                               RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                               /*uuid=*/boost::none);
+
+    const int64_t expectedCount1 = 5;
+    const int64_t expectedSize1 = 100;
+
+    const int64_t expectedCount2 = 10;
+    const int64_t expectedSize2 = 250;
+
+    const BSONObj entry1Bson = test_helpers::makeEntryBson(expectedCount1, expectedSize1);
+    const BSONObj entry2Bson = test_helpers::makeEntryBson(expectedCount2, expectedSize2);
+
+    {
+        auto containerVariant = metadataRS->getContainer();
+        auto& container =
+            std::get<std::reference_wrapper<StringKeyedContainer>>(containerVariant).get();
+        auto& ru = *shard_role_details::getRecoveryUnit(_opCtx);
+
+        WriteUnitOfWork wuow(_opCtx);
+        ASSERT_OK(container.insert(ru,
+                                   test_helpers::uuidSpan(_coll1.uuid),
+                                   test_helpers::bsonSpan(entry1Bson),
+                                   container::ExistingKeyPolicy::reject));
+        ASSERT_OK(container.insert(ru,
+                                   test_helpers::uuidSpan(_coll2.uuid),
+                                   test_helpers::bsonSpan(entry2Bson),
+                                   container::ExistingKeyPolicy::reject));
+        wuow.commit();
+    }
+
+    auto checkFastCountMetadataInContainer =
+        [&](const UUID& uuid, int64_t expectedCount, int64_t expectedSize) {
+            BSONObj persisted;
+            const bool found = test_helpers::findPersistedDocInContainer(_opCtx, uuid, persisted);
+            ASSERT_TRUE(found);
+
+            const int64_t persistedCount = persisted.getField(replicated_fast_count::kMetadataKey)
+                                               .Obj()
+                                               .getField(replicated_fast_count::kCountKey)
+                                               .Long();
+            const int64_t persistedSize = persisted.getField(replicated_fast_count::kMetadataKey)
+                                              .Obj()
+                                              .getField(replicated_fast_count::kSizeKey)
+                                              .Long();
+            EXPECT_EQ(persistedCount, expectedCount);
+            EXPECT_EQ(persistedSize, expectedSize);
+
+            EXPECT_TRUE(persisted.hasField(replicated_fast_count::kValidAsOfKey));
+        };
+
+    checkFastCountMetadataInContainer(_coll1.uuid, expectedCount1, expectedSize1);
+    checkFastCountMetadataInContainer(_coll2.uuid, expectedCount2, expectedSize2);
+
+    checkCommittedSizeCount(_opCtx, _coll1.uuid, {.size = 0, .count = 0});
+    checkCommittedSizeCount(_opCtx, _coll2.uuid, {.size = 0, .count = 0});
+
+    _fastCountManager->initializeMetadata(_opCtx);
+
+    // The in-memory RecordStore should reflect the persisted values.
+    checkCommittedSizeCount(_opCtx, _coll1.uuid, {.size = expectedSize1, .count = expectedCount1});
+    checkCommittedSizeCount(_opCtx, _coll2.uuid, {.size = expectedSize2, .count = expectedCount2});
+}
+
+TEST_F(ReplicatedFastCountManagerColdBootTest, InitializeScansOplogWhenContainerIdentIsMissing) {
+    unittest::ServerParameterGuard ffFastCount("featureFlagReplicatedFastCount", true);
+
+    const Timestamp afterSetup = storageInterface()->getLatestOplogTimestamp(_opCtx);
+    const Timestamp ts1(afterSetup.getSecs(), afterSetup.getInc() + 1);
+    const Timestamp ts2(afterSetup.getSecs(), afterSetup.getInc() + 2);
+
+    // Intentionally do not create the fastCountMetadataStore/Timestamps containers.
+    auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(_opCtx);
+    ASSERT_FALSE(storageEngine->getEngine()->hasIdent(ru, ident::kFastCountMetadataStore));
+    ASSERT_FALSE(
+        storageEngine->getEngine()->hasIdent(ru, ident::kFastCountMetadataStoreTimestamps));
+
+    test_helpers::writeToOplog(
+        _opCtx,
+        test_helpers::makeOplogEntry(ts1, _coll1, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        _opCtx,
+        test_helpers::makeOplogEntry(ts2, _coll2, repl::OpTypeEnum::kInsert, /*sizeDelta=*/100));
+
+    checkCommittedSizeCount(_opCtx, _coll1.uuid, {.size = 0, .count = 0});
+    checkCommittedSizeCount(_opCtx, _coll2.uuid, {.size = 0, .count = 0});
+
+    _fastCountManager->initializeMetadata(_opCtx);
+
+    checkCommittedSizeCount(_opCtx, _coll1.uuid, {.size = 10, .count = 1});
+    checkCommittedSizeCount(_opCtx, _coll2.uuid, {.size = 100, .count = 1});
+}
+
+// Regression test for SERVER-127435: initializeMetadata() in container mode used to always scan
+// the oplog from Timestamp::min() because _timestampStore->read() returned boost::none
+// (the collection-backed implementation was still in place before initializeContainerStores()).
+TEST_F(ReplicatedFastCountManagerInitializeMetadataTest,
+       ContainerModeReadsTimestampFromIdentToFilterOplogScan) {
+    unittest::ServerParameterGuard ffFastCount("featureFlagReplicatedFastCount", true);
+
+    ASSERT_OK(storageInterface()->createCollection(
+        operationContext(), collA.nss, CollectionOptions{.uuid = collA.uuid}));
+
+    auto* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+
+    // Persist metadata: collA has 5 records, 100 bytes.
+    {
+        auto metadataRS =
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStore,
+                                   RecordStore::Options{.keyFormat = KeyFormat::String},
+                                   /*uuid=*/boost::none);
+        auto containerVariant = metadataRS->getContainer();
+        auto& container =
+            std::get<std::reference_wrapper<StringKeyedContainer>>(containerVariant).get();
+        auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
+
+        const BSONObj entryBson = test_helpers::makeEntryBson(/*count=*/5, /*size=*/100);
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(container.insert(ru,
+                                   test_helpers::uuidSpan(collA.uuid),
+                                   test_helpers::bsonSpan(entryBson),
+                                   container::ExistingKeyPolicy::reject));
+        wuow.commit();
+    }
+
+    // Persist checkpoint timestamp Timestamp(3, 3) directly to the container
+    // (bypass container_write to avoid the oplog write path).
+    const Timestamp checkpointTs(3, 3);
+    {
+        auto timestampsRS =
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStoreTimestamps,
+                                   RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                   /*uuid=*/boost::none);
+        auto containerVariant = timestampsRS->getContainer();
+        auto& container =
+            std::get<std::reference_wrapper<IntegerKeyedContainer>>(containerVariant).get();
+        auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
+        const BSONObj tsVal = BSON(kValidAsOfKey << checkpointTs);
+        const std::span<const char> valSpan{tsVal.objdata(), static_cast<size_t>(tsVal.objsize())};
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(container.insert(ru, int64_t{0}, valSpan, container::ExistingKeyPolicy::reject));
+        wuow.commit();
+    }
+
+    // Write oplog entries: two at or before the checkpoint, one after. No OpObserverImpl is
+    // registered in this fixture so these are the only oplog entries — no conflicting creates.
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(1, 1), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(3, 3), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/20));
+    test_helpers::writeToOplog(
+        operationContext(),
+        test_helpers::makeOplogEntry(
+            Timestamp(4, 4), collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/30));
+
+    manager->initializeMetadata(operationContext());
+
+    // Only the entry at Timestamp(4, 4) should be accumulated — entries at or before
+    // checkpointTs are already captured in the persisted metadata.
+    checkCommittedSizeCount(operationContext(), collA.uuid, {.size = 100 + 30, .count = 5 + 1});
+}
+
+class ReplicatedFastCountManagerPopulateFromInitialSyncTest : public CatalogTestFixture {
+public:
+    ReplicatedFastCountManagerPopulateFromInitialSyncTest()
+        : CatalogTestFixture(Options().setPersistenceProvider(
+              std::make_unique<test_helpers::ReplicatedFastCountTestPersistenceProvider>())) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+
+        ASSERT_OK(createInternalFastCountContainers(operationContext(),
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+
+        auto* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+        auto metadataRS =
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStore,
+                                   RecordStore::Options{.keyFormat = KeyFormat::String},
+                                   /*uuid=*/boost::none);
+        auto timestampsRS =
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStoreTimestamps,
+                                   RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                   /*uuid=*/boost::none);
+
+        manager = std::make_unique<ReplicatedFastCountManager>(
+            std::make_unique<SizeCountStore>(std::move(metadataRS)),
+            std::make_unique<SizeCountTimestampStore>(std::move(timestampsRS)));
+    }
+
+    std::unique_ptr<ReplicatedFastCountManager> manager;
+};
+
+TEST_F(ReplicatedFastCountManagerPopulateFromInitialSyncTest,
+       WritesEntriesAndTimestampToPersistedStores) {
+    // populateFromInitialSync and the find* reads assert the GlobalLock is held, matching the
+    // lock the production caller (InitialSyncer) holds while seeding.
+    Lock::GlobalWrite globalLock(operationContext());
+    const UUID u1 = UUID::gen();
+    const UUID u2 = UUID::gen();
+    std::vector<std::pair<UUID, ReplicatedFastCountManager::FastCountEntry>> entries{
+        {u1,
+         ReplicatedFastCountManager::FastCountEntry{
+             .timestamp = Timestamp{100, 1}, .size = 1234, .count = 7}},
+        {u2,
+         ReplicatedFastCountManager::FastCountEntry{
+             .timestamp = Timestamp{200, 1}, .size = 9999, .count = 42}},
+    };
+
+    manager->populateFromInitialSync(operationContext(), entries, Timestamp{300, 1});
+
+    auto e1 = manager->findPersisted(operationContext(), u1);
+    ASSERT_TRUE(e1.has_value());
+    EXPECT_EQ(e1->first.sizeCount.size, 1234);
+    EXPECT_EQ(e1->first.sizeCount.count, 7);
+    EXPECT_EQ(e1->second, (Timestamp{100, 1}));
+
+    auto e2 = manager->findPersisted(operationContext(), u2);
+    ASSERT_TRUE(e2.has_value());
+    EXPECT_EQ(e2->first.sizeCount.size, 9999);
+    EXPECT_EQ(e2->first.sizeCount.count, 42);
+    EXPECT_EQ(e2->second, (Timestamp{200, 1}));
+
+    auto ts = manager->findPersistedTimestampStoreTs(operationContext());
+    ASSERT_TRUE(ts.has_value());
+    EXPECT_EQ(*ts, (Timestamp{300, 1}));
+}
+
+TEST_F(ReplicatedFastCountManagerPopulateFromInitialSyncTest, OverwritesExistingEntries) {
+    Lock::GlobalWrite globalLock(operationContext());
+    const UUID u = UUID::gen();
+    manager->populateFromInitialSync(operationContext(),
+                                     {{u,
+                                       ReplicatedFastCountManager::FastCountEntry{
+                                           .timestamp = Timestamp{10, 1}, .size = 1, .count = 1}}},
+                                     Timestamp{10, 1});
+    manager->populateFromInitialSync(operationContext(),
+                                     {{u,
+                                       ReplicatedFastCountManager::FastCountEntry{
+                                           .timestamp = Timestamp{20, 1}, .size = 2, .count = 2}}},
+                                     Timestamp{20, 1});
+
+    auto e = manager->findPersisted(operationContext(), u);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->first.sizeCount.size, 2);
+    EXPECT_EQ(e->first.sizeCount.count, 2);
+    EXPECT_EQ(e->second, (Timestamp{20, 1}));
+    auto ts = manager->findPersistedTimestampStoreTs(operationContext());
+    ASSERT_TRUE(ts.has_value());
+    EXPECT_EQ(*ts, (Timestamp{20, 1}));
+}
+
+TEST_F(ReplicatedFastCountManagerPopulateFromInitialSyncTest, EmptyEntriesOnlyWritesTimestamp) {
+    Lock::GlobalWrite globalLock(operationContext());
+    manager->populateFromInitialSync(operationContext(), {}, Timestamp{50, 1});
+
+    auto ts = manager->findPersistedTimestampStoreTs(operationContext());
+    ASSERT_TRUE(ts.has_value());
+    EXPECT_EQ(*ts, (Timestamp{50, 1}));
+}
+
+TEST_F(ReplicatedFastCountManagerPopulateFromInitialSyncTest,
+       NoTimestampLeavesTimestampStoreEmpty) {
+    Lock::GlobalWrite globalLock(operationContext());
+    const UUID u = UUID::gen();
+    manager->populateFromInitialSync(operationContext(),
+                                     {{u,
+                                       ReplicatedFastCountManager::FastCountEntry{
+                                           .timestamp = Timestamp{10, 1}, .size = 1, .count = 1}}},
+                                     boost::none);
+
+    EXPECT_FALSE(manager->findPersistedTimestampStoreTs(operationContext()).has_value());
+    auto e = manager->findPersisted(operationContext(), u);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->first.sizeCount.size, 1);
+    EXPECT_EQ(e->first.sizeCount.count, 1);
+}
+
+TEST_F(ReplicatedFastCountManagerTest, FindPersistedReturnsNoneWhenStoresUninitialized) {
+    ReplicatedFastCountManager uninitializedManager;
+    Lock::GlobalLock readLock(operationContext(), MODE_IS);
+    EXPECT_FALSE(uninitializedManager.findPersisted(operationContext(), UUID::gen()).has_value());
+}
+
+TEST_F(ReplicatedFastCountManagerTest,
+       FindPersistedTimestampStoreTsReturnsNoneWhenStoresUninitialized) {
+    ReplicatedFastCountManager uninitializedManager;
+    Lock::GlobalLock readLock(operationContext(), MODE_IS);
+    EXPECT_FALSE(
+        uninitializedManager.findPersistedTimestampStoreTs(operationContext()).has_value());
+}
+
+}  // namespace
+}  // namespace mongo::replicated_fast_count

@@ -1,0 +1,72 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    readHedgingMode:
+        description: >-
+            DEPRECATED. Has no effect on server behavior.
+            Previously enabled hedged reads.
+        set_at: [startup, runtime]
+        cpp_class:
+            name: ReadHedgingModeParameter
+            override_set: true
+        redact: false
+
+    maxTimeMSForHedgedReads:
+        description: >-
+            DEPRECATED. Has no effect on server behavior.
+            Previously was the maxTimeMS to set on hedged reads.
+        set_at: [startup, runtime]
+        cpp_class:
+            name: MaxTimeMSForHedgedReadsParameter
+            override_set: true
+        redact: false
+
+    mongosShutdownTimeoutMillisForSignaledShutdown:
+        description: >-
+            The time taken for quiesce mode at shutdown in response to SIGTERM.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: "mongosShutdownTimeoutMillisForSignaledShutdown"
+        default: 15000
+        validator:
+            gte: 0
+        redact: false
+
+    loadBalancerPort:
+        description: >-
+            The port over which proxied connections using the Proxy Protocol may be made.
+            A value of 0 disables the port entirely. Access to this port MUST be restricted to
+            trusted hosts (the load balancer or reverse proxy).
+        set_at: [startup]
+        cpp_vartype: Atomic<int>
+        cpp_varname: "loadBalancerPort"
+        default: 0
+        validator: {gte: 0, lte: 65535}
+        redact: false
+
+    testMongosOnlyRuntimeParameter:
+        description: "Test runtime-only mongos server parameter"
+        test_only: true
+        set_at: runtime
+        cpp_vartype: bool
+        cpp_varname: gTestMongosRuntimeParameter
+        default: false
+        redact: false
+
+    maxRoundsWithoutProgressParameter:
+        description: "Maximum number of retries for batch write operations without progress"
+        test_only: false
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: "gMaxRoundsWithoutProgress"
+        default: 5
+        validator: {gte: 5, lte: 20}
+        redact: false

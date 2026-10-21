@@ -1,0 +1,29 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file describes the BSON format for a LogicalSessionId, and
+# handles the serialization to and deserialization from its BSON representation
+# for that class.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    EndSessions:
+        description: "A struct representing an endSessions command"
+        strict: true
+        fields:
+            endSessions: array<object>
+
+server_parameters:
+    skipShellCursorFinalize:
+        description: "Skip finalizing cursors during garbage collection in shell"
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: "skipShellCursorFinalize"
+        default: false
+        redact: false

@@ -1,0 +1,240 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/db/exec/sbe/stages/sorted_merge.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <string_view>
+#include <utility>
+
+namespace mongo {
+namespace sbe {
+using namespace std::literals::string_view_literals;
+SortedMergeStage::SortedMergeStage(PlanStage::Vector inputStages,
+                                   std::vector<value::SlotVector> inputKeys,
+                                   std::vector<value::SortDirection> dirs,
+                                   std::vector<value::SlotVector> inputVals,
+                                   value::SlotVector outputVals,
+                                   PlanNodeId planNodeId,
+                                   bool participateInTrialRunTracking)
+    : PlanStage("smerge"sv, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _inputKeys(std::move(inputKeys)),
+      _dirs(std::move(dirs)),
+      _inputVals(std::move(inputVals)),
+      _outputVals(std::move(outputVals)) {
+    _children = std::move(inputStages);
+
+    tassert(11094710,
+            "Expect the number of input keys to match the number of input stages",
+            _inputKeys.size() == _children.size());
+    tassert(11094709,
+            "Expect the number of input values to match the number of input stages",
+            _inputVals.size() == _children.size());
+
+    tassert(11094708,
+            "Expect the length of all input slot vectors to match the length of output slot vector",
+            std::all_of(
+                _inputVals.begin(),
+                _inputVals.end(),
+                [size = _outputVals.size()](const auto& slots) { return slots.size() == size; }));
+
+    tassert(11094707,
+            "Expect the length of all input slot vectors to match the number of sort directions",
+            std::all_of(_inputKeys.begin(),
+                        _inputKeys.end(),
+                        [size = _dirs.size()](const auto& slots) { return slots.size() == size; }));
+}
+
+std::unique_ptr<PlanStage> SortedMergeStage::clone() const {
+    Vector inputStages;
+    inputStages.reserve(_children.size());
+    for (auto& child : _children) {
+        inputStages.emplace_back(child->clone());
+    }
+    return std::make_unique<SortedMergeStage>(std::move(inputStages),
+                                              _inputKeys,
+                                              _dirs,
+                                              _inputVals,
+                                              _outputVals,
+                                              _commonStats.nodeId,
+                                              participateInTrialRunTracking());
+}
+
+void SortedMergeStage::prepare(CompileCtx& ctx) {
+    std::vector<std::vector<value::SlotAccessor*>> inputKeyAccessors;
+    std::vector<PlanStage*> streams;
+
+    for (size_t childNum = 0; childNum < _children.size(); childNum++) {
+        auto& child = _children[childNum];
+        child->prepare(ctx);
+
+        streams.emplace_back(child.get());
+
+        inputKeyAccessors.emplace_back();
+
+        for (auto slot : _inputKeys[childNum]) {
+            inputKeyAccessors.back().push_back(child->getAccessor(ctx, slot));
+        }
+    }
+
+    for (size_t idx = 0; idx < _outputVals.size(); ++idx) {
+        std::vector<value::SlotAccessor*> accessors;
+        accessors.reserve(_children.size());
+
+        for (size_t childNum = 0; childNum < _children.size(); childNum++) {
+            auto slot = _inputVals[childNum][idx];
+
+            accessors.emplace_back(_children[childNum]->getAccessor(ctx, slot));
+        }
+
+        _outAccessors.emplace_back(value::SwitchAccessor{std::move(accessors)});
+    }
+
+    _merger.emplace(std::move(inputKeyAccessors), std::move(streams), _dirs, _outAccessors);
+}
+
+value::SlotAccessor* SortedMergeStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    for (size_t idx = 0; idx < _outputVals.size(); idx++) {
+        if (_outputVals[idx] == slot) {
+            return &_outAccessors[idx];
+        }
+    }
+
+    return ctx.getAccessor(slot);
+}
+
+void SortedMergeStage::open(bool reOpen) {
+    ++_commonStats.opens;
+
+    for (size_t i = 0; i < _children.size(); ++i) {
+        auto& child = _children[i];
+        child->open(reOpen);
+    }
+    _merger->init();
+}
+
+PlanState SortedMergeStage::getNext() {
+    return trackPlanState(_merger->getNext());
+}
+
+void SortedMergeStage::close() {
+    trackClose();
+    for (auto& child : _children) {
+        child->close();
+    }
+
+    _merger->clear();
+}
+
+std::unique_ptr<PlanStageStats> SortedMergeStage::getStats(bool includeDebugInfo) const {
+    auto ret = std::make_unique<PlanStageStats>(_commonStats);
+
+    if (includeDebugInfo) {
+        BSONObjBuilder bob;
+
+        {
+            BSONArrayBuilder keysArrBob(bob.subarrayStart("inputKeySlots"));
+            for (auto&& slots : _inputKeys) {
+                BSONObjBuilder childrenBob(keysArrBob.subobjStart());
+                for (size_t idx = 0; idx < slots.size(); ++idx) {
+                    childrenBob.append(str::stream() << slots[idx],
+                                       _dirs[idx] == sbe::value::SortDirection::Ascending ? "asc"
+                                                                                          : "desc");
+                }
+            }
+        }
+
+        {
+            BSONArrayBuilder valsArrBob(bob.subarrayStart("inputValSlots"));
+            for (auto&& slots : _inputVals) {
+                valsArrBob.append(slots.begin(), slots.end());
+            }
+        }
+
+        bob.append("outputSlots", _outputVals.begin(), _outputVals.end());
+        ret->debugInfo = bob.obj();
+    }
+
+    for (auto&& child : _children) {
+        ret->children.emplace_back(child->getStats(includeDebugInfo));
+    }
+    return ret;
+}
+
+const SpecificStats* SortedMergeStage::getSpecificStats() const {
+    return nullptr;
+}
+
+void SortedMergeStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                                    DebugPrintInfo& debugPrintInfo) const {
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _outputVals.size(); idx++) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(ret, _outputVals[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _dirs.size(); idx++) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(ret,
+                                    _dirs[idx] == value::SortDirection::Ascending ? "asc" : "desc");
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    for (size_t childNum = 0; childNum < _children.size(); childNum++) {
+        ret.emplace_back(DebugPrinter::Block("[`"));
+        for (size_t idx = 0; idx < _inputKeys[childNum].size(); idx++) {
+            if (idx) {
+                ret.emplace_back(DebugPrinter::Block("`,"));
+            }
+            DebugPrinter::addIdentifier(ret, _inputKeys[childNum][idx]);
+        }
+        ret.emplace_back(DebugPrinter::Block("`]"));
+
+        ret.emplace_back(DebugPrinter::Block("[`"));
+        for (size_t idx = 0; idx < _inputVals[childNum].size(); idx++) {
+            if (idx) {
+                ret.emplace_back(DebugPrinter::Block("`,"));
+            }
+            DebugPrinter::addIdentifier(ret, _inputVals[childNum][idx]);
+        }
+        ret.emplace_back(DebugPrinter::Block("`]"));
+
+        DebugPrinter::addBlocks(ret, _children[childNum]->debugPrint(debugPrintInfo));
+
+        if (childNum + 1 < _children.size()) {
+            ret.emplace_back(DebugPrinter::Block(","));
+            DebugPrinter::addNewLine(ret);
+        }
+    }
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+    ret.emplace_back(DebugPrinter::Block("`]"));
+}
+
+size_t SortedMergeStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_inputKeys);
+    size += size_estimator::estimate(_dirs);
+    size += size_estimator::estimate(_inputVals);
+    size += size_estimator::estimate(_outputVals);
+    return size;
+}
+}  // namespace sbe
+}  // namespace mongo

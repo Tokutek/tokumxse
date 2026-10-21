@@ -1,0 +1,44 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+    ]),
+)
+
+mongo_cc_library(
+    name = "extensions_api_public",
+    srcs = [
+        ":extension_agg_stage_static_properties_gen",
+        ":extension_error_types_gen",
+        "//src/mongo/db/extension/shared:extension_agg_stage_static_properties_validator.cpp",
+    ],
+    hdrs = [
+        "//src/mongo/db/extension/shared:extension_agg_stage_static_properties_validator.h",
+    ],
+    deps = [
+        ":api",
+        "//src/mongo:base",
+        "//src/mongo/idl:idl_parser",
+    ],
+)
+
+mongo_cc_library(name = "api")
+
+idl_generator(
+    name = "extension_error_types_gen",
+    src = "extension_error_types.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+idl_generator(
+    name = "extension_agg_stage_static_properties_gen",
+    src = "extension_agg_stage_static_properties.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)

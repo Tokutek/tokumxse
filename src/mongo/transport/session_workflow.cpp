@@ -1,0 +1,1199 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/transport/session_workflow.h"
+
+#include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/admission/egress_response_rate_limiter.h"
+#include "mongo/db/admission/egress_response_rate_limiter_gen.h"
+#include "mongo/db/admission/ingress_request_rate_limiter.h"
+#include "mongo/db/admission/ingress_request_rate_limiter_gen.h"
+#include "mongo/db/client.h"
+#include "mongo/db/client_strand.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/error_labels.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/kill_cursors_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/traffic_recorder.h"
+#include "mongo/db/traffic_recorder/stashed_request.h"
+#include "mongo/executor/split_timer.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/factory.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/op_compressed.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/protocol.h"
+#include "mongo/transport/ingress_handshake_metrics.h"
+#include "mongo/transport/message_compressor_base.h"
+#include "mongo/transport/message_compressor_manager.h"
+#include "mongo/transport/message_filter_hooks.h"
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/service_executor.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/session_establishment_rate_limiter.h"
+#include "mongo/transport/session_manager.h"
+#include "mongo/transport/session_workflow_p.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/transport/transport_options_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/ssl_peer_info.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
+
+#include <array>
+#include <cstddef>
+#include <memory>
+#include <ratio>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
+
+namespace mongo::transport {
+using namespace std::literals::string_view_literals;
+namespace {
+
+using namespace std::literals::string_view_literals;
+
+MONGO_FAIL_POINT_DEFINE(doNotSetMoreToCome);
+MONGO_FAIL_POINT_DEFINE(beforeCompressingExhaustResponse);
+MONGO_FAIL_POINT_DEFINE(sessionWorkflowDelayOrFailSendMessage);
+
+namespace metrics_detail {
+
+/** Applies X(id) for each SplitId */
+#define EXPAND_TIME_SPLIT_IDS(X) \
+    X(started)                   \
+    X(yieldedBeforeReceive)      \
+    X(receivedWork)              \
+    X(processedWork)             \
+    X(sentResponse)              \
+    X(yieldedAfterSend)          \
+    X(done)                      \
+    /**/
+
+/**
+ * Applies X(id, startSplit, endSplit) for each IntervalId.
+ *
+ * This table defines the intervals of a per-command `SessionWorkflow` loop
+ * iteration as reported to a `SplitTimer`. The splits are time points, and the
+ * `intervals` are durations between notable pairs of them.
+ *
+ *  [started]
+ *  |   [yieldedBeforeReceive]
+ *  |   |   [receivedWork]
+ *  |   |   |   [processedWork]
+ *  |   |   |   |   [sentResponse]
+ *  |   |   |   |   |   [yieldedAfterSend]
+ *  |   |   |   |   |   |   [done]
+ *  |<--------------------->| total
+ *  |<->|   |   |   |   |   | yieldBeforeReceive
+ *  |   |<->|   |   |   |   | receiveWork
+ *  |   |   |<------------->| active
+ *  |   |   |<->|   |   |   | processWork
+ *  |   |   |   |<->|   |   | sendResponse
+ *  |   |   |   |   |<->|   | yieldAfterSend
+ *  |   |   |   |   |   |<->| finalize
+ */
+#define EXPAND_INTERVAL_IDS(X)                           \
+    X(total, started, done)                              \
+    X(yieldBeforeReceive, started, yieldedBeforeReceive) \
+    X(receiveWork, yieldedBeforeReceive, receivedWork)   \
+    X(active, receivedWork, done)                        \
+    X(processWork, receivedWork, processedWork)          \
+    X(sendResponse, processedWork, sentResponse)         \
+    X(finalize, yieldedAfterSend, done)                  \
+    /**/
+
+#define X_ID(id, ...) id,
+enum class IntervalId : size_t { EXPAND_INTERVAL_IDS(X_ID) };
+enum class TimeSplitId : size_t { EXPAND_TIME_SPLIT_IDS(X_ID) };
+#undef X_ID
+
+/** Trait for the count of the elements in a packed enum. */
+template <typename T>
+static constexpr size_t enumExtent = 0;
+
+#define X_COUNT(...) +1
+template <>
+constexpr inline size_t enumExtent<IntervalId> = EXPAND_INTERVAL_IDS(X_COUNT);
+template <>
+constexpr inline size_t enumExtent<TimeSplitId> = EXPAND_TIME_SPLIT_IDS(X_COUNT);
+#undef X_COUNT
+
+struct TimeSplitDef {
+    TimeSplitId id;
+    std::string_view name;
+};
+
+struct IntervalDef {
+    IntervalId id;
+    std::string_view name;
+    TimeSplitId start;
+    TimeSplitId end;
+};
+
+constexpr inline auto timeSplitDefs = std::array{
+#define X(id) TimeSplitDef{TimeSplitId::id, #id ""sv},
+    EXPAND_TIME_SPLIT_IDS(X)
+#undef X
+};
+
+constexpr inline auto intervalDefs = std::array{
+#define X(id, start, end) \
+    IntervalDef{IntervalId::id, #id "Millis"sv, TimeSplitId::start, TimeSplitId::end},
+    EXPAND_INTERVAL_IDS(X)
+#undef X
+};
+
+#undef EXPAND_TIME_SPLIT_IDS
+#undef EXPAND_INTERVAL_IDS
+
+struct SplitTimerPolicy {
+    using TimeSplitIdType = TimeSplitId;
+    using IntervalIdType = IntervalId;
+
+    static constexpr size_t numTimeSplitIds = enumExtent<TimeSplitIdType>;
+    static constexpr size_t numIntervalIds = enumExtent<IntervalIdType>;
+
+    template <typename E>
+    static constexpr size_t toIdx(E e) {
+        return static_cast<size_t>(e);
+    }
+
+    static constexpr std::string_view getName(IntervalIdType iId) {
+        return intervalDefs[toIdx(iId)].name;
+    }
+
+    static constexpr TimeSplitIdType getStartSplit(IntervalIdType iId) {
+        return intervalDefs[toIdx(iId)].start;
+    }
+
+    static constexpr TimeSplitIdType getEndSplit(IntervalIdType iId) {
+        return intervalDefs[toIdx(iId)].end;
+    }
+
+    static constexpr std::string_view getName(TimeSplitIdType tsId) {
+        return timeSplitDefs[toIdx(tsId)].name;
+    }
+
+    void onStart(SplitTimer<SplitTimerPolicy>* splitTimer) {
+        splitTimer->notify(TimeSplitIdType::started);
+    }
+
+    void onFinish(SplitTimer<SplitTimerPolicy>* splitTimer) {
+        splitTimer->notify(TimeSplitIdType::done);
+        auto t = splitTimer->getSplitInterval(IntervalIdType::sendResponse);
+        if (MONGO_likely(!t || *t < Milliseconds{serverGlobalParams.slowMS.load()}))
+            return;
+        BSONObjBuilder bob;
+        splitTimer->appendIntervals(bob);
+
+        if (!gEnableDetailedConnectionHealthMetricLogLines.load()) {
+            return;
+        }
+
+        static StaticImmortal<logv2::SeveritySuppressor> logSuppressor{
+            Seconds{5}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
+
+        logv2::LogSeverity severity = sessionWorkflowDelayOrFailSendMessage.shouldFail()
+            ? logv2::LogSeverity::Info()
+            : (*logSuppressor)();
+
+        LOGV2_DEBUG(6983000,
+                    severity.toInt(),
+                    "Slow network response send time",
+                    "elapsed"_attr = bob.obj());
+    }
+
+    Timer makeTimer() {
+        return Timer{};
+    }
+};
+
+class SessionWorkflowMetrics {
+public:
+    void start() {
+        _t.emplace(SplitTimerPolicy{});
+    }
+    void yieldedBeforeReceive() {
+        _t->notify(TimeSplitId::yieldedBeforeReceive);
+    }
+    void received() {
+        _t->notify(TimeSplitId::receivedWork);
+    }
+    void processed() {
+        _t->notify(TimeSplitId::processedWork);
+    }
+    void sent(Session& session) {
+        _t->notify(TimeSplitId::sentResponse);
+        IngressHandshakeMetrics::get(session).onResponseSent(
+            *_t->getSplitInterval(IntervalId::processWork),
+            *_t->getSplitInterval(IntervalId::sendResponse));
+    }
+    void yieldedAfterSend() {
+        _t->notify(TimeSplitId::yieldedAfterSend);
+    }
+    void finish() {
+        _t.reset();
+    }
+
+private:
+    boost::optional<SplitTimer<SplitTimerPolicy>> _t;
+};
+
+// TODO(SERVER-63883): Remove when re-introducing real metrics.
+class NoopSessionWorkflowMetrics {
+public:
+    explicit NoopSessionWorkflowMetrics() {}
+    void start() {}
+    void yieldedBeforeReceive() {}
+    void received() {}
+    void processed() {}
+    void sent(Session&) {}
+    void yieldedAfterSend() {}
+    void finish() {}
+};
+
+using Metrics = NoopSessionWorkflowMetrics;
+}  // namespace metrics_detail
+
+/**
+ * Given a request and its already generated response, checks for exhaust flags. If exhaust is
+ * allowed, produces the subsequent request message, and modifies the response message to indicate
+ * it is part of an exhaust stream. Returns the subsequent request message, which is known as a
+ * 'synthetic' exhaust request. Returns an empty optional if exhaust is not allowed.
+ */
+boost::optional<Message> makeExhaustMessage(Message requestMsg, DbResponse& response) {
+    if (!OpMsgRequest::isFlagSet(requestMsg, OpMsg::kExhaustSupported) ||
+        !response.shouldRunAgainForExhaust)
+        return {};
+
+    int32_t responseOp = response.response.operation();
+    invariant(responseOp == dbMsg,
+              fmt::format("Exhaust response must use OP_MSG opcode, instead used {}", responseOp));
+
+    const bool checksumPresent = OpMsg::isFlagSet(requestMsg, OpMsg::kChecksumPresent);
+    Message exhaustMessage;
+
+    if (auto nextInvocation = response.nextInvocation) {
+        // The command provided a new BSONObj for the next invocation.
+        OpMsgBuilder builder;
+        builder.setBody(*nextInvocation);
+        exhaustMessage = builder.finish();
+    } else {
+        // Reuse the previous invocation for the next invocation.
+        OpMsg::removeChecksum(&requestMsg);
+        exhaustMessage = requestMsg;
+    }
+
+    // The id of the response is used as the request id of this 'synthetic' request. Re-checksum
+    // if needed.
+    exhaustMessage.header().setId(response.response.header().getId());
+    exhaustMessage.header().setResponseToMsgId(response.response.header().getResponseToMsgId());
+    OpMsg::setFlag(&exhaustMessage, OpMsg::kExhaustSupported);
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&exhaustMessage);
+    }
+
+    OpMsg::removeChecksum(&response.response);
+    // Indicate that the response is part of an exhaust stream (unless the 'doNotSetMoreToCome'
+    // failpoint is set). Re-checksum if needed.
+    if (!MONGO_unlikely(doNotSetMoreToCome.shouldFail())) {
+        OpMsg::setFlag(&response.response, OpMsg::kMoreToCome);
+    }
+    if (checksumPresent) {
+        OpMsg::appendChecksum(&response.response);
+    }
+
+    return exhaustMessage;
+}
+
+bool isPreAuth(Client* client) {
+    if (MONGO_unlikely(serverGlobalParams.isMongoBridge)) {
+        // Do not perform pre-auth check for mongo bridge connections.
+        return false;
+    }
+
+    if (!AuthorizationSession::exists(client)) {
+        return true;
+    }
+
+    const auto authorizationSession = AuthorizationSession::get(client);
+    if (authorizationSession->shouldIgnoreAuthChecks()) {
+        // If authentication is disabled, never consider sessions pre-auth.
+        return false;
+    }
+
+    return !authorizationSession->isAuthenticated();
+}
+
+// Counts the # of responses to completed operations that we were unable to send back to the client.
+auto& unsendableCompletedResponses =
+    *MetricBuilder<Counter64>("operation.unsendableCompletedResponses");
+}  // namespace
+
+class SessionWorkflow::Impl {
+public:
+    class WorkItem;
+
+    Impl(SessionWorkflow* workflow, ServiceContext::UniqueClient uniqueClient)
+        : _workflow{workflow},
+          _serviceContext{uniqueClient->getServiceContext()},
+          _sep{uniqueClient->getService()->getServiceEntryPoint()},
+          _clientStrand{ClientStrand::make(std::move(uniqueClient))} {
+        invariant(session()->isIngress());
+
+        // Can't assume all sessions should be treated as preauth on creation. In particular, if
+        // auth is disabled, then no session should be treated as preauth.
+        session()->setPreauthIngress(isPreAuth(client()));
+    }
+
+    Client* client() const {
+        return _clientStrand->getClientPointer();
+    }
+
+    void start() {
+        // Record a session start event.
+        TrafficRecorder::get(_serviceContext).sessionStarted(*session());
+        _scheduleIteration();
+    }
+
+    /*
+     * Terminates the associated transport Session, regardless of tags.
+     *
+     * This will not block on the session terminating cleaning itself up, it returns immediately.
+     */
+    void terminate();
+
+    /*
+     * Terminates the associated transport Session if the connection tags in the client don't match
+     * the supplied tags.  If the connection tags indicate a pending state, before any tags have
+     * been set, it will not be terminated.
+     *
+     * This will not block on the session terminating cleaning itself up, it returns immediately.
+     */
+    void terminateIfTagsDontMatch(Client::TagMask tags);
+
+    const std::shared_ptr<Session>& session() const {
+        return client()->session();
+    }
+
+    ServiceExecutor* executor() {
+        return seCtx()->getServiceExecutor();
+    }
+
+    std::shared_ptr<ServiceExecutor::TaskRunner> taskRunner() {
+        auto exec = executor();
+        // Allows switching the executor between iterations of the workflow.
+        if (MONGO_unlikely(!_taskRunner.source || _taskRunner.source != exec))
+            _taskRunner = {exec->makeTaskRunner(), exec};
+        return _taskRunner.runner;
+    }
+
+    bool isTLS() const {
+#ifdef MONGO_CONFIG_SSL
+        auto sslPeerInfo = SSLPeerInfo::forSession(session());
+        return sslPeerInfo && sslPeerInfo->isTLS();
+#else
+        return false;
+#endif
+    }
+
+    ServiceExecutorContext* seCtx() {
+        return ServiceExecutorContext::get(client());
+    }
+
+private:
+    struct RunnerAndSource {
+        std::shared_ptr<ServiceExecutor::TaskRunner> runner;
+        ServiceExecutor* source = nullptr;
+    };
+
+    struct IterationFrame {
+        explicit IterationFrame(const Impl& impl) : client(impl.client()), metrics{} {
+            metrics.start();
+        }
+        ~IterationFrame() {
+            metrics.finish();
+            // Clean up any stale deferred admission token on error paths or at end of iteration.
+            admission::IngressRequestRateLimiter::clearDeferredAdmissionToken(client);
+        }
+
+        Client* client;
+        metrics_detail::Metrics metrics;
+    };
+
+    /** Alias: refers to this Impl, but holds a ref to the enclosing workflow. */
+    std::shared_ptr<Impl> shared_from_this() {
+        return {_workflow->shared_from_this(), this};
+    }
+
+    /**
+     * Returns a callback that's just like `cb`, but runs under the `_clientStrand`.
+     * The wrapper binds a `shared_from_this` so `cb` doesn't need its own copy
+     * of that anchoring shared pointer.
+     */
+    unique_function<void(Status)> _captureContext(unique_function<void(Status)> cb) {
+        return [this, a = shared_from_this(), cb = std::move(cb)](Status st) mutable {
+            _clientStrand->run([&] { cb(st); });
+        };
+    }
+
+    void _scheduleIteration();
+
+    Future<void> _doOneIteration();
+
+    /** Returns a Future for the next WorkItem. */
+    Future<std::unique_ptr<WorkItem>> _getNextWork() {
+        invariant(!_work);
+        if (_nextWork)
+            return Future{std::move(_nextWork)};  // Already have one ready.
+
+        // Yield here to avoid pinning the CPU. Give other threads some CPU
+        // time to avoid a spiky latency distribution (BF-27452). Even if
+        // this client can run continuously and receive another command
+        // without blocking, we yield anyway. We WANT context switching, and
+        // we're trying deliberately to make it happen, to reduce long tail
+        // latency.
+        _yieldPointReached();
+        _iterationFrame->metrics.yieldedBeforeReceive();
+        return _receiveRequest();
+    }
+
+    /** Receives a message from the session and creates a new WorkItem from it. */
+    std::unique_ptr<WorkItem> _receiveRequest();
+
+    bool _rateLimit() const;
+
+    /** Sends work to the ServiceEntryPoint, obtaining a future for its completion. */
+    Future<DbResponse> _dispatchWork();
+
+    /** Handles the completed response from dispatched work. */
+    void _acceptResponse(DbResponse response);
+
+    /** Writes the completed work response to the Session. */
+    void _sendResponse();
+
+    /**
+     * Throttles the egress of an IngressRequestRateLimiter rejection reply for user/application
+     * connections, using the SessionManager's shutdown-cancellable Interruptible. No-op unless
+     * the current work item is a rate-limit rejection and the limiter is enabled and applicable.
+     */
+    void _maybeThrottleEgressResponse();
+
+    void _onLoopError(Status error);
+
+    void _cleanupSession(const Status& status);
+
+    /*
+     * Releases all the resources associated with the exhaust request.
+     * When the session is closing, the most recently synthesized exhaust
+     * `WorkItem` may refer to a cursor that we won't need anymore, so we can
+     * try to kill it early as an optimization.
+     */
+    void _cleanupExhaustResources();
+
+    /**
+     * Notify the task runner that this would be a good time to yield. It might
+     * not actually yield, depending on implementation and on overall system
+     * state.
+     *
+     * Yielding at certain points in a command's processing pipeline has been
+     * considered to be beneficial to performance.
+     */
+    void _yieldPointReached() {
+        executor()->yieldIfAppropriate();
+    }
+
+    SessionWorkflow* const _workflow;
+    ServiceContext* const _serviceContext;
+    ServiceEntryPoint* _sep;
+    RunnerAndSource _taskRunner;
+
+    Atomic<bool> _isTerminated{false};
+    ClientStrandPtr _clientStrand;
+
+    bool _inFirstIteration = true;
+
+    std::unique_ptr<WorkItem> _work;
+    std::unique_ptr<WorkItem> _nextWork; /**< created by exhaust responses */
+    boost::optional<IterationFrame> _iterationFrame;
+};
+
+class SessionWorkflow::Impl::WorkItem {
+public:
+    WorkItem(Impl* swf, Message in)
+        : _swf{swf},
+          _in{std::move(in)},
+          _started(_swf->_serviceContext->getFastClockSource()->now()) {}
+
+    bool isExhaust() const {
+        return _isExhaust;
+    }
+
+    /**
+     * True when the work was rejected by the IngressRequestRateLimiter. Used by the egress response
+     * rate-limiter gate in _sendResponse to decide whether to pace the reply.
+     */
+    bool isRateLimitRejection() const {
+        return _isRateLimitRejection;
+    }
+
+    void markRateLimitRejection() {
+        _isRateLimitRejection = true;
+    }
+
+    void initOperation() {
+        auto newOpCtx = _swf->client()->makeOperationContext();
+        if (_isExhaust)
+            newOpCtx->markKillOnClientDisconnect();
+        if (_in.operation() == dbCompressed)
+            newOpCtx->setOpCompressed(true);
+        _opCtx = std::move(newOpCtx);
+    }
+
+    void clearOperation() {
+        _opCtx.reset();
+    }
+
+    OperationContext* opCtx() const {
+        return _opCtx.get();
+    }
+
+    const Message& in() const {
+        return _in;
+    }
+
+    Date_t started() const {
+        return _started;
+    }
+
+    void decompressRequest() {
+        if (_in.operation() != dbCompressed)
+            return;
+        MessageCompressorId cid;
+        _in = isPreAuth(_swf->client())
+            ? uassertStatusOK(compressorMgr().decompressMessage(
+                  _in, &cid, gPreAuthMaximumMessageSizeBytes.loadRelaxed()))
+            : uassertStatusOK(compressorMgr().decompressMessage(_in, &cid));
+        _compressorId = cid;
+        MessageHooks::onMessageReceived(*_swf->session(), _in);
+    }
+
+    Message compressResponse(Message msg) {
+        if (!_compressorId)
+            return msg;
+        auto cid = *_compressorId;
+        return uassertStatusOK(compressorMgr().compressMessage(msg, &cid));
+    }
+
+    bool hasCompressorId() const {
+        return !!_compressorId;
+    }
+
+    Message consumeOut() {
+        return std::move(*std::exchange(_out, {}));
+    }
+
+    bool hasOut() const {
+        return !!_out;
+    }
+
+    void setOut(Message out) {
+        _out = std::move(out);
+    }
+
+    /**
+     * If the incoming message has the exhaust flag set, then we bypass the normal RPC
+     * behavior. We will sink the response to the network, but we also synthesize a new
+     * request, as if we sourced a new message from the network. This new request is
+     * sent to the database once again to be processed. This cycle repeats as long as
+     * the command indicates the exhaust stream should continue.
+     */
+    std::unique_ptr<WorkItem> synthesizeExhaust(DbResponse& response) {
+        auto m = makeExhaustMessage(_in, response);
+        if (!m)
+            return nullptr;
+        auto synth = std::make_unique<WorkItem>(_swf, std::move(*m));
+        synth->_isExhaust = true;
+        synth->_compressorId = _compressorId;
+        return synth;
+    }
+
+    /**
+     * If this work item is a "getMore" command on an exhaust cursor, return the parsed request.
+     */
+    boost::optional<OpMsgRequest> getRequestIfGetMoreOnExhaustCursor(Client* client) {
+        if (!_isExhaust) {
+            return boost::none;
+        }
+        try {
+            auto inRequest = OpMsgRequest::parse(in(), client);
+            const BSONObj& body = inRequest.body;
+            const auto& [cmd, firstElement] = body.firstElement();
+            if (cmd != "getMore"sv)
+                return boost::none;
+            return inRequest;
+        } catch (const DBException& e) {
+            LOGV2(12615100,
+                  "Failed to parse request for cleanup of exhaust cursor",
+                  "error"_attr = e);
+        }
+        return boost::none;
+    }
+
+private:
+    MessageCompressorManager& compressorMgr() const {
+        return MessageCompressorManager::forSession(_swf->session());
+    }
+
+    Impl* _swf;
+    Message _in;
+    bool _isExhaust = false;
+    bool _isRateLimitRejection = false;
+    ServiceContext::UniqueOperationContext _opCtx;
+    boost::optional<MessageCompressorId> _compressorId;
+    boost::optional<Message> _out;
+    Date_t _started;
+};
+
+std::unique_ptr<SessionWorkflow::Impl::WorkItem> SessionWorkflow::Impl::_receiveRequest() {
+    try {
+        auto msg = uassertStatusOK([&] {
+            MONGO_IDLE_THREAD_BLOCK;
+            return session()->sourceMessage();
+        }());
+        invariant(!msg.empty());
+        MessageHooks::onMessageReceived(*session(), msg);
+        return std::make_unique<WorkItem>(this, std::move(msg));
+    } catch (const DBException& ex) {
+        auto remote = session()->remote();
+        const auto& status = ex.toStatus();
+        if (ErrorCodes::isInterruption(status.code()) ||
+            ErrorCodes::isNetworkError(status.code())) {
+            LOGV2_DEBUG(22986,
+                        2,
+                        "Session from remote encountered a network error during SourceMessage",
+                        "remote"_attr = remote,
+                        "error"_attr = status);
+        } else if (status == TransportLayer::TicketSessionClosedStatus) {
+            // Our session may have been closed internally.
+            LOGV2_DEBUG(22987,
+                        2,
+                        "Session from {remote} was closed internally during SourceMessage",
+                        "remote"_attr = remote);
+        } else {
+            LOGV2(22988,
+                  "Error receiving request from client. Ending connection from remote",
+                  "error"_attr = status,
+                  "remote"_attr = remote,
+                  "connectionId"_attr = session()->id());
+        }
+        throw;
+    }
+}
+
+void SessionWorkflow::Impl::_maybeThrottleEgressResponse() {
+    if (MONGO_likely(!_work->isRateLimitRejection() ||
+                     !admission::gEgressResponseRateLimiterEnabled.load())) {
+        return;
+    }
+    auto* sm = session()->getTransportLayer()->getSessionManager();
+    if (!sm) {
+        return;
+    }
+    DisconnectShutdownAwareInterruptible interruptible{
+        sm->getShutdownToken(), session().get(), _serviceContext->getPreciseClockSource()};
+    admission::EgressResponseRateLimiter::get(_serviceContext)
+        .throttle(&interruptible, _serviceContext->getPreciseClockSource())
+        .ignore();
+}
+
+void SessionWorkflow::Impl::_sendResponse() {
+    if (!_work->hasOut())
+        return;
+
+    _maybeThrottleEgressResponse();
+
+    try {
+        sessionWorkflowDelayOrFailSendMessage.execute([this](auto&& data) {
+            if (auto isDelay = data["millis"]; !isDelay.eoo()) {
+                Milliseconds delay{isDelay.safeNumberLong()};
+                LOGV2(6724101, "sendMessage: failpoint-induced delay", "delay"_attr = delay);
+                sleepFor(delay);
+            } else {
+                auto md = ClientMetadata::get(client());
+                if (md && (md->getApplicationName() == data["appName"].str())) {
+                    LOGV2(4920200, "sendMessage: failpoint-induced failure");
+                    uasserted(ErrorCodes::HostUnreachable, "Sink message failed");
+                }
+            }
+        });
+        uassertStatusOK(session()->sinkMessage(_work->consumeOut()));
+    } catch (const DBException& ex) {
+        LOGV2(22989,
+              "Error sending response to client. Ending connection from remote",
+              "error"_attr = ex,
+              "remote"_attr = session()->remote(),
+              "connectionId"_attr = session()->id());
+        unsendableCompletedResponses.increment();
+        throw;
+    }
+}
+
+bool SessionWorkflow::Impl::_rateLimit() const {
+    if (!gFeatureFlagIngressRateLimiting.isEnabled() ||
+        !admission::gIngressRequestRateLimiterEnabled.load()) {
+        return true;
+    }
+
+    auto& admissionRateLimiter = admission::IngressRequestRateLimiter::get(_serviceContext);
+    return admissionRateLimiter.admitRequest(client());
+}
+
+namespace {
+
+Message makeRateLimitRejectionMessage(rpc::Protocol protocol,
+                                      bool allowRetries,
+                                      long long baseBackoffMS) {
+    const auto replyBuilder = rpc::makeReplyBuilder(protocol);
+    replyBuilder->setCommandReply(admission::IngressRequestRateLimiter::rejectionStatus(), {});
+
+    {
+        // We need to mirror the getErrorLabels logic because we lack an operation context at this
+        // point. See error_labels.cpp for more details.
+        auto commandBodyBob = replyBuilder->getBodyBuilder();
+        {
+            BSONArrayBuilder arrayBuilder(commandBodyBob.subarrayStart(kErrorLabelsFieldName));
+            arrayBuilder.append(ErrorLabel::kSystemOverloadedError);
+
+            if (allowRetries) {
+                arrayBuilder.append(ErrorLabel::kRetryableError);
+            }
+            // It can't be determined whether the request being rejected is a write or not without
+            // deserializing it, so we just always append the NoWritesPerformed label.
+            arrayBuilder.append(ErrorLabel::kNoWritesPerformed);
+        }
+
+        if (allowRetries && baseBackoffMS > 0) {
+            commandBodyBob.append(kBaseBackoffMSFieldName, baseBackoffMS);
+        }
+    }
+
+    return replyBuilder->done();
+}
+
+// A process-wide, immutable, pre-built OP_MSG rejection response for
+// IngressRequestRateLimitExceeded errors. The body is identical across all such rejections except
+// for two per-rejection fields: the wire-header responseTo, and (when present) the baseBackoffMS
+// value. Callers obtain an owned copy via the static makeResponse() entry point, which
+// selects the appropriate cached variant and stamps the per-rejection fields.
+class RejectionResponseTemplate {
+public:
+    static Message makeResponse(bool allowRetries, long long baseBackoffMS) {
+        return templateFor(allowRetries, baseBackoffMS > 0).stamp(baseBackoffMS);
+    }
+
+private:
+    explicit RejectionResponseTemplate(bool allowRetries, bool withBaseBackoff) {
+        // The rejection fast path only ever serves OP_MSG requests, so assume kOpMsg.
+        Message responseMsg = makeRateLimitRejectionMessage(
+            rpc::Protocol::kOpMsg, allowRetries, withBaseBackoff ? 1 : 0);
+
+        // Zero out responseTo; it is stamped per-rejection at send time.
+        responseMsg.header().setResponseToMsgId(0);
+
+        if (allowRetries && withBaseBackoff) {
+            // baseBackoffMS is the last field appended to the body (see
+            // makeRateLimitRejectionMessage) and the template has no trailing bytes after the BSON
+            // document, so its 8-byte value occupies the bytes immediately before the document
+            // terminator.
+            _baseBackoffValueOffset = static_cast<int>(responseMsg.size() - sizeof(long long) - 1);
+        }
+
+        _template = std::move(responseMsg);
+    }
+
+    // Returns the cached variant, built once on first use.
+    static const RejectionResponseTemplate& templateFor(bool retryable, bool withBaseBackoff) {
+        static const RejectionResponseTemplate kNoRetry{/*allowRetries=*/false,
+                                                        /*withBaseBackoff=*/false};
+        static const RejectionResponseTemplate kRetryableNoBaseBackoff{/*allowRetries=*/true,
+                                                                       /*withBaseBackoff=*/false};
+        static const RejectionResponseTemplate kRetryableWithBaseBackoff{/*allowRetries=*/true,
+                                                                         /*withBaseBackoff=*/true};
+
+        if (!retryable) {
+            return kNoRetry;
+        } else {
+            return withBaseBackoff ? kRetryableWithBaseBackoff : kRetryableNoBaseBackoff;
+        }
+    }
+
+    // Copies the template into a fresh owned buffer and stamps the per-rejection fields.
+    Message stamp(long long baseBackoffMS) const {
+        // Pre-reserve the checksum's worth of slack so appendChecksum's realloc check finds enough
+        // room downstream and doesn't have to grow the buffer at all.
+        const size_t templateSize = _template.size();
+        auto buf = SharedBuffer::allocate(templateSize + OpMsg::kCrc32Size);
+        memcpy(buf.get(), _template.buf(), templateSize);
+
+        Message msg(std::move(buf));
+        if (_baseBackoffValueOffset >= 0) {
+            DataView(msg.buf()).write<LittleEndian<long long>>(baseBackoffMS,
+                                                               _baseBackoffValueOffset);
+        }
+        return msg;
+    }
+
+    // The pre-built OP_MSG rejection response, used as an immutable template
+    Message _template;
+    // Byte offset within the template of the 8-byte little-endian baseBackoffMS value, or -1 if
+    // this template has no baseBackoffMS field.
+    int _baseBackoffValueOffset = -1;
+};
+
+}  // namespace
+
+DbResponse makeDbResponseErrorForRateLimiting(const Message& message) {
+    invariant(!message.empty());
+
+    // When the MoreToCome flag is set, return an empty response as this is a fire and forget
+    // request.
+    if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
+        return DbResponse{};
+    }
+
+    auto allowRetries = admission::gIngressRequestRateLimiterAllowRetries.loadRelaxed();
+    const long long baseBackoffMS = getExternalClientBaseBackoffMS();
+
+    // Fast path for OP_MSG rejections, which are the overwhelmingly common case when the ingress
+    // rate limiter is enabled.
+    if (MONGO_likely(rpc::protocolForMessage(message) == rpc::Protocol::kOpMsg)) {
+        return DbResponse{.response =
+                              RejectionResponseTemplate::makeResponse(allowRetries, baseBackoffMS)};
+    }
+
+    return DbResponse{.response = makeRateLimitRejectionMessage(
+                          rpc::protocolForMessage(message), allowRetries, baseBackoffMS)};
+}
+
+Future<DbResponse> SessionWorkflow::Impl::_dispatchWork() {
+    invariant(_work);
+    invariant(!_work->in().empty());
+
+    // If a traffic recording is active, we may need to record this request.
+    // The decision as to whether to record depends on the _parsed_ request
+    // (to know if the request is "sensitive" e.g., auth), but we wish to record
+    // exactly what was received off the wire.
+    auto requestForTrafficRecording =
+        boost::make_optional(TrafficRecorder::get(_serviceContext).isActive(), _work->in());
+
+    _work->decompressRequest();
+
+    globalNetworkCounter().hitLogicalIn(NetworkCounter::ConnectionType::kIngress,
+                                        _work->in().size());
+
+    if (const auto admitted = _rateLimit(); !admitted) {
+        _work->markRateLimitRejection();
+        return makeDbResponseErrorForRateLimiting(_work->in());
+    }
+
+    // Pass sourced Message to handler to generate response.
+    _work->initOperation();
+
+    if (requestForTrafficRecording) {
+        // The opCtx has been initialized, stash the request.
+        // If processing the request finds it to be "sensitive",
+        // this stashed request will be cleared, and will not be
+        // written to disk.
+        StashedRequest::get(_work->opCtx()).set(std::move(*requestForTrafficRecording));
+    }
+
+    return _sep->handleRequest(_work->opCtx(), _work->in(), _work->started())
+        .tapAll([this](auto&&) {
+            // Handling the request may have changed whether the session is authenticated, so update
+            // it here. We can go back to "preauth" after a logout.
+            session()->setPreauthIngress(isPreAuth(client()));
+        });
+}
+
+void SessionWorkflow::Impl::_acceptResponse(DbResponse response) {
+    auto&& work = *_work;
+    // The opCtx must be marked as pending destruction here so that the operation cannot show up in
+    // currentOp results after the response reaches the client. We are assuming that the operation
+    // has already been killed once we are accepting the response here, so marking it as pending
+    // destruction is sufficient. Actual destruction of the already killed opCtx is postponed for
+    // later (i.e., after completion of the future-chain) to mitigate its performance impact on the
+    // critical path of execution.
+    // Note that destroying futures after execution, rather that postponing the destruction
+    // until completion of the future-chain, would expose the cost of destroying opCtx to
+    // the critical path and result in serious performance implications.
+    // It may happen that the opCtx is null, when _dispatchWork is returning a DbResponse before
+    // starting the actual operation. Request rate limiting will do that in order to return a
+    // passable error response without paying the cost of starting the operation.
+    if (const auto opCtx = work.opCtx()) {
+        _serviceContext->markOperationAsPendingDestruction(opCtx);
+    }
+    // Format our response, if we have one
+    Message& toSink = response.response;
+    if (toSink.empty())
+        return;
+
+    tassert(ErrorCodes::InternalError,
+            "Attempted to respond to fire-and-forget request",
+            !OpMsg::isFlagSet(work.in(), OpMsg::kMoreToCome));
+    invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
+
+    // Validate that the response uses a supported server-to-client opcode.
+    const NetworkOp responseOp = toSink.operation();
+    invariant(responseOp == dbMsg || responseOp == opReply,
+              fmt::format("Response uses unsupported opcode: {}", fmt::underlying(responseOp)));
+
+    // Update the header for the response message.
+    toSink.header().setId(nextMessageId());
+    toSink.header().setResponseToMsgId(work.in().header().getId());
+    if (!isTLS() && OpMsg::isFlagSet(work.in(), OpMsg::kChecksumPresent))
+        OpMsg::appendChecksum(&toSink);
+
+    MessageHooks::onReplyReady(*session(), _work->in(), toSink);
+
+    // If the incoming message has the exhaust flag set, then bypass the normal RPC
+    // behavior. Sink the response to the network, but also synthesize a new
+    // request, as if a new message was sourced from the network. This new request is
+    // sent to the database once again to be processed. This cycle repeats as long as
+    // the dbresponses continue to indicate the exhaust stream should continue.
+    _nextWork = work.synthesizeExhaust(response);
+
+    globalNetworkCounter().hitLogicalOut(NetworkCounter::ConnectionType::kIngress,
+                                         toSink.size(),
+                                         getConnectionPurpose(session().get()),
+                                         getReplicationId(session().get()));
+
+    beforeCompressingExhaustResponse.executeIf(
+        [&](auto&&) {}, [&](auto&&) { return work.hasCompressorId() && _nextWork; });
+
+    toSink = work.compressResponse(toSink);
+
+    // If opCtx is null, this is a case which returned a response before parsing
+    // and executing the request e.g., a rate limit rejection.
+    // In that case, we don't know if the request contains sensitive data,
+    // and there is no opCtx to have stashed it in anyway.
+    if (auto* opCtx = _work->opCtx()) {
+        if (const auto& request = StashedRequest::get(opCtx).take()) {
+            // We stashed a request, and it was not found to contain sensitive data,
+            // so we can now write out the request and corresponding response.
+            auto& rec = TrafficRecorder::get(_serviceContext);
+            rec.observeRequest(*session(), std::move(*request));
+            rec.observeResponse(*session(), toSink);
+        }
+    }
+
+    work.setOut(std::move(toSink));
+}
+
+void SessionWorkflow::Impl::_onLoopError(Status error) {
+    LOGV2_DEBUG(5763901, 2, "Terminating session due to error", "error"_attr = error);
+    terminate();
+    _cleanupSession(error);
+}
+
+/** Returns a Future representing the completion of one loop iteration. */
+Future<void> SessionWorkflow::Impl::_doOneIteration() {
+    _iterationFrame.emplace(*this);
+    return _getNextWork()
+        .then([&](auto work) {
+            _iterationFrame->metrics.received();
+            invariant(!_work);
+            _work = std::move(work);
+            return _dispatchWork();
+        })
+        .then([&](auto rsp) {
+            _acceptResponse(std::move(rsp));
+            _iterationFrame->metrics.processed();
+            _sendResponse();
+            _iterationFrame->metrics.sent(*session());
+            _yieldPointReached();
+            _iterationFrame->metrics.yieldedAfterSend();
+            _iterationFrame.reset();
+        });
+}
+
+void SessionWorkflow::Impl::_scheduleIteration() try {
+    _work = nullptr;
+    auto runOneIteration = _captureContext([&](Status status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            _cleanupSession(status);
+            return;
+        }
+
+        try {
+            if (MONGO_unlikely(_inFirstIteration)) {
+                session()->prelude();
+                if (gIngressConnectionEstablishmentRateLimiterEnabled.load()) {
+                    // This enforces the connection establishment rate limit by possibly sleeping
+                    // the current thread ("queued") or throwing an exception ("rejected").
+                    uassertStatusOK(session()
+                                        ->getTransportLayer()
+                                        ->getSessionManager()
+                                        ->getSessionEstablishmentRateLimiter()
+                                        .throttleIfNeeded(client()));
+                }
+                _inFirstIteration = false;
+            }
+
+            // All available service executors use dedicated threads, so it's okay to
+            // run eager futures in an ordinary loop to bypass scheduler overhead. Loop
+            // while we have `_nextWork` in case there have been synthetic exhaust
+            // requests produced on this iteration.
+            do {
+                _doOneIteration().get();
+                _work = nullptr;
+            } while (_nextWork);
+            _scheduleIteration();
+        } catch (const DBException& ex) {
+            _onLoopError(ex.toStatus());
+        }
+    });
+
+    taskRunner()->runTaskForSession(session(), std::move(runOneIteration));
+} catch (const DBException& ex) {
+    auto error = ex.toStatus();
+    LOGV2_WARNING_OPTIONS(22993,
+                          {logv2::LogComponent::kExecutor},
+                          "Unable to schedule a new loop for the session workflow",
+                          "error"_attr = error);
+    _onLoopError(error);
+}
+
+void SessionWorkflow::Impl::terminate() {
+    if (_isTerminated.swap(true))
+        return;
+
+    // Record a session end event.
+    TrafficRecorder::get(_serviceContext).sessionEnded(*session());
+
+    session()->end();
+}
+
+void SessionWorkflow::Impl::terminateIfTagsDontMatch(Client::TagMask tags) {
+    if (_isTerminated.load())
+        return;
+
+    auto clientTags = client()->getTags();
+
+    // If terminateIfTagsDontMatch gets called when we still are 'pending' where no tags have been
+    // set, then skip the termination check.
+    if ((clientTags & tags) || (clientTags & Client::kPending)) {
+        LOGV2(
+            22991, "Skip closing connection for connection", "connectionId"_attr = session()->id());
+        return;
+    }
+
+    terminate();
+}
+
+void SessionWorkflow::Impl::_cleanupExhaustResources() {
+    // Make a best-effort attempt to kill any exhaust cursors for this request. If the killCursors
+    // request fails here for any reason, it will still be cleaned up once the cursor times out.
+    // Check if we have an exhaust cursor to kill in either the current or next work items
+    boost::optional<OpMsgRequest> inRequest;
+    if (_nextWork)
+        inRequest = _nextWork->getRequestIfGetMoreOnExhaustCursor(client());
+    if (!inRequest && _work)
+        inRequest = _work->getRequestIfGetMoreOnExhaustCursor(client());
+    if (!inRequest)
+        return;
+
+    auto opCtx = client()->makeOperationContext();
+
+    try {
+        const BSONObj& body = inRequest->body;
+        auto dbName = inRequest->parseDbName();
+        _sep->handleRequest(opCtx.get(),
+                            OpMsgRequestBuilder::create(
+                                auth::ValidatedTenancyScope::get(opCtx.get()),
+                                dbName,
+                                KillCursorsCommandRequest(NamespaceStringUtil::deserialize(
+                                                              dbName, body["collection"].String()),
+                                                          {CursorId{body.firstElement().Long()}})
+                                    .toBSON())
+                                .serialize(),
+                            client()->getServiceContext()->getFastClockSource()->now())
+            .get();
+    } catch (const DBException& e) {
+        LOGV2(22992, "Error cleaning up resources for exhaust request", "error"_attr = e);
+    }
+}
+
+void SessionWorkflow::Impl::_cleanupSession(const Status& status) {
+    invariant(!status.isOK());
+    LOGV2_DEBUG(5127900, 2, "Ending session", "error"_attr = status);
+    // Normally we want to defer destroying operation contexts until after we've sent the response
+    // to the user, but in this case we're tearing down the session without sending a response and
+    // so can destroy them immediately, and need to do so as some of the subsequent cleanup steps
+    // need to be able to create a non-killed operation context.
+    if (_work)
+        _work->clearOperation();
+    if (_nextWork)
+        _nextWork->clearOperation();
+    _cleanupExhaustResources();
+    _taskRunner = {};
+    client()->session()->getTransportLayer()->getSessionManager()->endSessionByClient(client());
+}
+
+SessionWorkflow::SessionWorkflow(PassKeyTag, ServiceContext::UniqueClient client)
+    : _impl{std::make_unique<Impl>(this, std::move(client))} {}
+
+SessionWorkflow::~SessionWorkflow() = default;
+
+Client* SessionWorkflow::client() const {
+    return _impl->client();
+}
+
+void SessionWorkflow::start() {
+    _impl->start();
+}
+
+void SessionWorkflow::terminate() {
+    _impl->terminate();
+}
+
+void SessionWorkflow::terminateIfTagsDontMatch(Client::TagMask tags) {
+    _impl->terminateIfTagsDontMatch(tags);
+}
+
+}  // namespace mongo::transport

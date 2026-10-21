@@ -1,0 +1,1973 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/json.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_estimator.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_test_utils.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/cbr_test_utils.h"
+#include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
+#include "mongo/unittest/unittest.h"
+
+#include <limits>
+#include <string_view>
+
+#include <gmock/gmock.h>
+
+namespace mongo::cost_based_ranker {
+namespace {
+
+// Subclass of CardinalityEstimator that exposes protected methods for unit tests.
+class CardinalityEstimatorForTest : public CardinalityEstimator {
+public:
+    using CardinalityEstimator::CardinalityEstimator;
+    using CardinalityEstimator::estimateIndexSeeks;
+};
+
+CEResult estimateIndexSeeks(ce::SamplingEstimator& samplingEstimator,
+                            const IndexBounds& bounds,
+                            bool multiKey) {
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({}, 1000.0));
+    EstimateMap qsnEstimates;
+    CardinalityEstimatorForTest estimator{
+        collInfo, &samplingEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+    return estimator.estimateIndexSeeks(bounds, multiKey);
+}
+
+TEST(CardinalityEstimator, PointInterval) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    auto plan =
+        makeIndexScanFetchPlan(testNss, makePointIntervalBounds(5.0, indexFields[0]), indexFields);
+    ASSERT_EQ(getPlanHeuristicCE(*plan, 100.0), makeCard(10.0));
+}
+
+TEST(CardinalityEstimator, ManyPointIntervals) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    OrderedIntervalList oil(indexFields[0]);
+    for (size_t i = 0; i < 5; ++i) {
+        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(i));
+    }
+    IndexBounds bounds;
+    bounds.fields.push_back(oil);
+    auto plan = makeIndexScanFetchPlan(testNss, std::move(bounds), indexFields);
+    ASSERT_EQ(getPlanHeuristicCE(*plan, 100.0), makeCard(50.0));
+}
+
+TEST(CardinalityEstimator, CompoundIndex) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    IndexBounds bounds;
+    std::vector<std::string> indexFields = {"a", "b", "c", "d", "e"};
+    for (size_t i = 0; i < indexFields.size(); ++i) {
+        OrderedIntervalList oil(indexFields[i]);
+        for (size_t j = 0; j < 7; ++j) {
+            oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(i * j));
+        }
+        bounds.fields.push_back(oil);
+    }
+    auto plan = makeIndexScanFetchPlan(testNss, std::move(bounds), indexFields);
+    ASSERT_EQ(getPlanHeuristicCE(*plan, 100.0), makeCard(51.2341));
+}
+
+TEST(CardinalityEstimator, PointMoreSelectiveThanRange) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    auto pointPlan =
+        makeIndexScanFetchPlan(testNss, makePointIntervalBounds(5.0, indexFields[0]), indexFields);
+
+    IndexBounds rangeBounds = makeRangeIntervalBounds(
+        BSON("" << 5 << " " << 6), BoundInclusion::kIncludeBothStartAndEndKeys, indexFields[0]);
+    auto rangePlan = makeIndexScanFetchPlan(testNss, std::move(rangeBounds), indexFields);
+
+    ASSERT_TRUE(
+        approxLt(getPlanHeuristicCE(*pointPlan, 100.0), getPlanHeuristicCE(*rangePlan, 100.0)));
+}
+
+TEST(CardinalityEstimator, CompoundBoundsMoreSelectiveThanSingleField) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a", "b"};
+    OrderedIntervalList oil1(indexFields[0]);
+    oil1.intervals.push_back(IndexBoundsBuilder::makePointInterval(5));
+
+    IndexBounds singleField;
+    singleField.fields.push_back(oil1);
+    auto singleFieldPlan = makeIndexScanFetchPlan(testNss, std::move(singleField), indexFields);
+
+    IndexBounds compoundBounds;
+    compoundBounds.fields.push_back(oil1);
+    OrderedIntervalList oil2 = oil1;
+    oil2.name = indexFields[1];
+    compoundBounds.fields.push_back(oil2);
+    auto compoundBoundsPlan =
+        makeIndexScanFetchPlan(testNss, std::move(compoundBounds), indexFields);
+
+    ASSERT_TRUE(approxLt(getPlanHeuristicCE(*compoundBoundsPlan, 100.0),
+                         getPlanHeuristicCE(*singleFieldPlan, 100.0)));
+}
+
+TEST(CardinalityEstimator, PointIntervalSelectivityDependsOnInputCard) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    auto plan =
+        makeIndexScanFetchPlan(testNss, makePointIntervalBounds(5.0, indexFields[0]), indexFields);
+
+    ASSERT_LT(getPlanHeuristicCE(*plan, 10000.0).toDouble() / 10000.0,
+              getPlanHeuristicCE(*plan, 100.0).toDouble() / 100.0);
+}
+
+TEST(CardinalityEstimator, EqualityMatchesIndexPointInterval) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    // Bounds for [5,5]
+    auto indexPlan =
+        makeIndexScanFetchPlan(testNss, makePointIntervalBounds(5.0, indexFields[0]), indexFields);
+
+    // Expression for a = 5
+    BSONObj query = fromjson("{a: 5}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+
+    auto collCard = 100;
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, collCard), getPlanHeuristicCE(*collPlan, collCard));
+}
+
+TEST(CardinalityEstimator, InequalityMatchesRangeOpenInterval) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    // Bounds for (5,inf]
+    IndexBounds bounds =
+        makeRangeIntervalBounds(BSON("" << 5.0 << " " << std::numeric_limits<double>::infinity()),
+                                BoundInclusion::kIncludeEndKeyOnly,
+                                indexFields[0]);
+    auto indexPlan = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+
+    // Expression for a > 5
+    BSONObj query = fromjson("{a: {$gt: 5}}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+
+    auto collCard = 100;
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, collCard), getPlanHeuristicCE(*collPlan, collCard));
+}
+
+TEST(CardinalityEstimator, InequalityMatchesRangeClosedInterval) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    // Bounds for [5,inf]
+    IndexBounds bounds =
+        makeRangeIntervalBounds(BSON("" << 5 << " " << std::numeric_limits<double>::infinity()),
+                                BoundInclusion::kIncludeBothStartAndEndKeys,
+                                indexFields[0]);
+    auto indexPlan = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+
+    // Expression for a >= 5
+    BSONObj query = fromjson("{a: {$gte: 5}}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+
+    auto collCard = 100;
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, collCard), getPlanHeuristicCE(*collPlan, collCard));
+}
+
+TEST(CardinalityEstimator, InExpressionMatchesIntervals) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    // Interval for [[1,1], [2,2], [3,3]]
+    OrderedIntervalList oil;
+    for (size_t i = 0; i < 3; ++i) {
+        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(i));
+    }
+    IndexBounds bounds;
+    bounds.fields.push_back(oil);
+    auto indexPlan = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+
+    BSONObj query = fromjson("{a: {$in: [1,2,3]}}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+
+    auto collCard = 100;
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, collCard), getPlanHeuristicCE(*collPlan, collCard));
+}
+
+TEST(CardinalityEstimator, TypeExpressionMatchesIntervals) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    OrderedIntervalList oil(indexFields[0]);
+    oil.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(BSON("" << Date_t::min() << " " << Date_t::max()),
+                                              BoundInclusion::kIncludeBothStartAndEndKeys));
+    oil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+        BSON("" << false << " " << true), BoundInclusion::kIncludeBothStartAndEndKeys));
+    IndexBounds bounds;
+    bounds.fields.push_back(oil);
+    auto indexPlan = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+
+    BSONObj query = fromjson("{a: {$type: ['date', 'bool']}}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+
+    auto collCard = 100;
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, collCard), getPlanHeuristicCE(*collPlan, collCard));
+}
+
+TEST(CardinalityEstimator, ThreeOrsWithImplicitAnd) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a", "b", "c"};
+    // Interval for [[1,1], [2,2]]
+    OrderedIntervalList oil(indexFields[0]);
+    for (size_t i = 0; i < 2; ++i) {
+        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(i));
+    }
+    IndexBounds bounds;
+    bounds.fields.push_back(oil);
+
+    BSONObj indexCond = fromjson("{$or: [{b: /abc/}, {c: /def/}]}");
+    auto indexExpr = parse(indexCond);
+
+    BSONObj fetchCond = fromjson("{$or: [{x: 'abc'}, {y: 42}]}");
+    auto fetchExpr = parse(indexCond);
+
+    auto indexPlan = makeIndexScanFetchPlan(
+        testNss, bounds, indexFields, std::move(indexExpr), std::move(fetchExpr));
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, 1000), makeCard(10.6626));
+}
+
+TEST(CardinalityEstimator, ThreeOrsWithAndChildrenImplicitAnd) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a", "b", "c"};
+    IndexBounds bounds = makePointIntervalBounds(13.0, indexFields[0]);
+    constexpr const char* orWithAndChildren =
+        "{$or: [{b: /abc/},"
+        "       {$and: [{b: {$gt: 5}}, {b: {$gt: 7}}]},"
+        "       {$and: [{c: {$eq: 6}}, {c: {$eq: 9}}]}"
+        "]}";
+
+    BSONObj indexCond = fromjson(orWithAndChildren);
+    auto indexExpr = parse(indexCond);
+    auto fetchExpr = indexExpr->clone();
+
+    auto indexPlan = makeIndexScanFetchPlan(
+        testNss, bounds, indexFields, std::move(indexExpr), std::move(fetchExpr));
+    ASSERT_EQ(getPlanHeuristicCE(*indexPlan, 1000), makeCard(10.0423));
+}
+
+TEST(CardinalityEstimator, IndexIntersectionWithFetchFilter) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields1 = {"a"};
+    // First index scan
+    IndexBounds rangeBounds = makeRangeIntervalBounds(
+        BSON("" << 5 << " " << 6), BoundInclusion::kIncludeBothStartAndEndKeys, indexFields1[0]);
+    auto indexScan1 = makeIndexScan(testNss, rangeBounds, indexFields1);
+
+    // Second index scan
+    std::vector<std::string> indexFields2 = {"a", "b", "c"};
+    constexpr const char* orWithAndChildren =
+        "{$or: [{b: /abc/},"
+        "       {$and: [{b: {$gt: 5}}, {b: {$gt: 7}}]},"
+        "       {$and: [{c: {$eq: 6}}, {c: {$eq: 9}}]}"
+        "]}";
+
+    BSONObj indexCond2 = fromjson(orWithAndChildren);
+    auto indexExpr2 = parse(indexCond2);
+    auto indexScan2 = makeIndexScan(testNss,
+                                    makePointIntervalBounds(13.0, indexFields2[0]),
+                                    indexFields2,
+                                    std::move(indexExpr2));
+
+    // Index intersection 1
+    auto andHashNode1 = std::make_unique<AndHashNode>();
+    andHashNode1->children.push_back(indexScan1->clone());
+    andHashNode1->children.push_back(indexScan2->clone());
+
+    // Index intersection 2 - child scans are in reverse order
+    auto andHashNode2 = std::make_unique<AndHashNode>();
+    andHashNode2->children.push_back(std::move(indexScan2));
+    andHashNode2->children.push_back(std::move(indexScan1));
+
+    // Make two complete intersection plans that only differ in the order of child index scans
+    BSONObj fetchCond = fromjson("{$or: [{x: 'abc'}, {y: 42}]}");
+    auto fetchExpr = parse(fetchCond);
+    auto fetch1 = std::make_unique<FetchNode>(std::move(andHashNode1), testNss);
+    auto fetch2 = std::make_unique<FetchNode>(std::move(andHashNode2), testNss);
+    fetch1->filter = fetchExpr->clone();
+    fetch2->filter = std::move(fetchExpr);
+    auto intersectionPlan1 = std::make_unique<QuerySolution>();
+    auto intersectionPlan2 = std::make_unique<QuerySolution>();
+    intersectionPlan1->setRoot(std::move(fetch1));
+    intersectionPlan2->setRoot(std::move(fetch2));
+
+    CardinalityEstimate e1 = getPlanHeuristicCE(*intersectionPlan1, 1000);
+    CardinalityEstimate e2 = getPlanHeuristicCE(*intersectionPlan2, 1000);
+
+    ASSERT_EQ(e1, e2);
+    ASSERT_EQ(e1, makeCard(3.78916));
+}
+
+TEST(CardinalityEstimator, IndexUnionWithFetchFilter) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields1 = {"a"};
+    // First index scan
+    IndexBounds rangeBounds = makeRangeIntervalBounds(
+        BSON("" << 5 << " " << 6), BoundInclusion::kIncludeBothStartAndEndKeys, indexFields1[0]);
+    auto indexScan1 = makeIndexScan(testNss, rangeBounds, indexFields1);
+
+    // Second index scan
+    std::vector<std::string> indexFields2 = {"a", "b", "c"};
+    constexpr const char* andWithAndChildren =
+        "{$and: [{b: /abc/},"
+        "       {$and: [{b: {$gt: 5}}, {b: {$gt: 7}}]},"
+        "       {$and: [{c: {$eq: 6}}, {c: {$eq: 9}}]}"
+        "]}";
+
+    BSONObj indexCond2 = fromjson(andWithAndChildren);
+    auto indexExpr2 = parse(indexCond2);
+    auto indexScan2 = makeIndexScan(testNss,
+                                    makePointIntervalBounds(13.0, indexFields2[0]),
+                                    indexFields2,
+                                    std::move(indexExpr2));
+
+    // Index union 1
+    auto orNode1 = std::make_unique<OrNode>();
+    orNode1->children.push_back(indexScan1->clone());
+    orNode1->children.push_back(indexScan2->clone());
+
+    // Index union 2 - child scans are in reverse order
+    auto orNode2 = std::make_unique<OrNode>();
+    orNode2->children.push_back(std::move(indexScan2));
+    orNode2->children.push_back(std::move(indexScan1));
+
+    // Make two complete union plans that only differ in the order of child index scans
+    BSONObj fetchCond = fromjson("{$or: [{x: 'abc'}, {y: 42}]}");
+    auto fetchExpr = parse(fetchCond);
+    auto fetch1 = std::make_unique<FetchNode>(std::move(orNode1), testNss);
+    auto fetch2 = std::make_unique<FetchNode>(std::move(orNode2), testNss);
+    fetch1->filter = fetchExpr->clone();
+    fetch2->filter = std::move(fetchExpr);
+    auto unionPlan1 = std::make_unique<QuerySolution>();
+    auto unionPlan2 = std::make_unique<QuerySolution>();
+    unionPlan1->setRoot(std::move(fetch1));
+    unionPlan2->setRoot(std::move(fetch2));
+
+    CardinalityEstimate e1 = getPlanHeuristicCE(*unionPlan1, 1000);
+    CardinalityEstimate e2 = getPlanHeuristicCE(*unionPlan2, 1000);
+
+    ASSERT_EQ(e1, e2);
+    ASSERT_EQ(e1, makeCard(21.0504));
+}
+
+TEST(CardinalityEstimator, IntersectionOfUnionsFallback) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    // IXSCAN over 'a' with bounds a: [0, 10].
+    std::vector<std::string> indexFieldsA = {"a"};
+    auto indexScanA =
+        makeIndexScan(testNss,
+                      makeRangeIntervalBounds(BSON("" << 0 << " " << 10),
+                                              BoundInclusion::kIncludeBothStartAndEndKeys,
+                                              indexFieldsA[0]),
+                      indexFieldsA);
+
+    // IXSCAN over 'b' with bounds b: [13, 13].
+    std::vector<std::string> indexFieldsB = {"b"};
+    auto indexScanB =
+        makeIndexScan(testNss, makePointIntervalBounds(13.0, indexFieldsB[0]), indexFieldsB);
+
+    // Build a union of the two index scans, either as an OR or as a merge-sort (a union which
+    // provides a sort).
+    auto makeUnionNode = [&](bool mergeSort) {
+        std::unique_ptr<QuerySolutionNode> unionNode;
+        if (mergeSort) {
+            auto mergeSortNode = std::make_unique<MergeSortNode>();
+            mergeSortNode->sort = BSON("a" << 1 << "b" << 1);
+            mergeSortNode->dedup = true;
+            mergeSortNode->children.push_back(indexScanA->clone());
+            mergeSortNode->children.push_back(indexScanB->clone());
+            unionNode = std::move(mergeSortNode);
+        } else {
+            auto orNode = std::make_unique<OrNode>();
+            orNode->children.push_back(indexScanA->clone());
+            orNode->children.push_back(indexScanB->clone());
+            unionNode = std::move(orNode);
+        }
+        return unionNode;
+    };
+
+    const auto collInfo = buildCollectionInfo({}, makeCollStats(1000.0));
+
+    // Build plans of the shape FETCH -> AND_HASH -> [<union>, IXSCAN] where the union may be an
+    // OR or a SORT_MERGE node in either position of the intersection. All of them must be
+    // rejected, as intersections of unions are unsupported by CBR.
+    auto makePlan = [&](const QuerySolutionNode& unionNode, bool unionFirst) {
+        auto andHash = std::make_unique<AndHashNode>();
+        andHash->children.push_back(unionFirst ? unionNode.clone() : indexScanA->clone());
+        andHash->children.push_back(unionFirst ? indexScanA->clone() : unionNode.clone());
+        auto plan = std::make_unique<QuerySolution>();
+        plan->setRoot(std::make_unique<FetchNode>(std::move(andHash), testNss));
+        return plan;
+    };
+
+    for (bool mergeSort : {false, true}) {
+        auto unionNode = makeUnionNode(mergeSort);
+        for (bool unionFirst : {false, true}) {
+            auto plan = makePlan(*unionNode, unionFirst);
+            const auto ceRes = getPlanCE(*plan, collInfo, QueryCBRCEModeEnum::kHeuristicCE);
+            ASSERT_EQ(ceRes.getStatus(), ErrorCodes::UnsupportedCbrNode);
+        }
+    }
+}
+
+TEST(CardinalityEstimator, TopLevelUnionIsCosted) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a"};
+    auto indexScan1 =
+        makeIndexScan(testNss,
+                      makeRangeIntervalBounds(BSON("" << 0 << " " << 10),
+                                              BoundInclusion::kIncludeBothStartAndEndKeys,
+                                              indexFields[0]),
+                      indexFields);
+    auto indexScan2 =
+        makeIndexScan(testNss,
+                      makeRangeIntervalBounds(BSON("" << 20 << " " << 30),
+                                              BoundInclusion::kIncludeBothStartAndEndKeys,
+                                              indexFields[0]),
+                      indexFields);
+
+    // FETCH -> OR -> [IXSCAN, IXSCAN]
+    auto orNode = std::make_unique<OrNode>();
+    orNode->children.push_back(std::move(indexScan1));
+    orNode->children.push_back(std::move(indexScan2));
+    auto fetch = std::make_unique<FetchNode>(std::move(orNode), testNss);
+
+    auto plan = std::make_unique<QuerySolution>();
+    plan->setRoot(std::move(fetch));
+
+    ASSERT_TRUE(approxGt(getPlanHeuristicCE(*plan, 1000.0), zeroCE));
+}
+
+TEST(CardinalityEstimator, HistogramIndexedAndNonIndexedSolutionHaveSameCardinality) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    // Plan 1: Ixscan(a: (5, inf]) -> Fetch
+    std::vector<std::string> indexFields = {"a"};
+    auto histFields = indexFields;
+    IndexBounds bounds =
+        makeRangeIntervalBounds(BSON("" << 5 << " " << std::numeric_limits<double>::infinity()),
+                                BoundInclusion::kIncludeEndKeyOnly,
+                                indexFields[0]);
+    auto plan1 = makeIndexScanFetchPlan(testNss, std::move(bounds), std::move(indexFields));
+
+    // Plan 2: CollScan(a > 5)
+    BSONObj query = fromjson("{a: {$gt: 5}}");
+    auto plan2 = makeCollScanPlan(parse(query));
+
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms(histFields, 1000.0));
+    CardinalityEstimate e1 = getPlanHistogramCE(*plan1, collInfo);
+    CardinalityEstimate e2 = getPlanHistogramCE(*plan2, collInfo);
+    ASSERT_EQ(e1, e2);
+    ASSERT_TRUE(approxGt(e1, zeroCE));
+}
+
+TEST(CardinalityEstimator, HistogramIndexedAndNonIndexedSolutionConjunctionHaveSameCardinality) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    // Plan 1: Ixscan(a: [5, 5], b: [6, 6]) -> Fetch
+    std::vector<std::string> indexFields = {"a", "b"};
+    auto histFields = indexFields;
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointInterval(5, indexFields[0]));
+    bounds.fields.push_back(makePointInterval(6, indexFields[1]));
+    auto plan1 = makeIndexScanFetchPlan(testNss, std::move(bounds), std::move(indexFields));
+
+    // Plan 2: CollScan(a == 5 AND b == 6)
+    BSONObj query = fromjson("{a: 5, b: 6}");
+    auto plan2 = makeCollScanPlan(parse(query));
+
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms(histFields, 1000.0));
+    CardinalityEstimate e1 = getPlanHistogramCE(*plan1, collInfo);
+    CardinalityEstimate e2 = getPlanHistogramCE(*plan2, collInfo);
+    ASSERT_EQ(e1, e2);
+    ASSERT_TRUE(approxGt(e1, zeroCE));
+}
+
+TEST(CardinalityEstimator, NoHistogramForPath) {
+    BSONObj query = fromjson("{a: {$gt: 5}}");
+    auto plan = makeCollScanPlan(parse(query));
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({"b"}, 1000.0));
+    const auto ceRes = getPlanCE(*plan, collInfo, QueryCBRCEModeEnum::kHistogramCE);
+    ASSERT(!ceRes.isOK() && ceRes.getStatus().code() == ErrorCodes::HistogramCEFailure);
+}
+
+// Under histogramCE, a non-sargable leaf predicate (e.g. $size, $bitsAllSet) cannot be estimated.
+TEST(CardinalityEstimator, UnsupportedMatchExpressionFallsBack) {
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({"a"}, 1000.0));
+    for (const auto& query : {fromjson("{a: {$size: 2}}"), fromjson("{a: {$bitsAllSet: [1]}}")}) {
+        auto plan = makeCollScanPlan(parse(query));
+        const auto ceRes = getPlanCE(*plan, collInfo, QueryCBRCEModeEnum::kHistogramCE);
+        ASSERT(!ceRes.isOK() && ceRes.getStatus().code() == ErrorCodes::UnsupportedCbrNode)
+            << "expected UnsupportedCbrNode for " << query << ", got " << ceRes.getStatus();
+    }
+}
+
+TEST(CardinalityEstimator, HistogramConjunctionOverMultikey) {
+    BSONObj query = fromjson("{a: {$gt: 1, $lt: 5}}");
+    auto plan = makeCollScanPlan(parse(query));
+    auto collStatsFn = []() {
+        return makeCollStatsWithHistograms({"a"}, 1000.0);
+    };
+    auto nonMultikeyIndex = buildSimpleIndexEntry({"a"});
+    auto nonMultikeyCollInfo = buildCollectionInfo({nonMultikeyIndex}, collStatsFn());
+
+    auto multikeyIndex = buildMultikeyIndexEntry({"a"}, "a");
+    auto multikeyCollInfo = buildCollectionInfo({multikeyIndex}, collStatsFn());
+
+    // Estimate the cardinality of the query twice: one using a catalog with 'a' as non-multikey and
+    // a second time with a catalog with 'a' as multikey. The non-multikey version will create an
+    // interval (1,5) while the multikey version cannot intersect intervals and thus will estimate
+    // [-inf, 5) and (1, inf] using the histogram and combine their selectivities like a regular
+    // conjunction (exponential backoff). We verify this behavior by asserting the estimates have
+    // histogram source and that the non-multikey estimate is smaller.
+    CardinalityEstimate nonMultikeyEst = getPlanHistogramCE(*plan, nonMultikeyCollInfo);
+    CardinalityEstimate multikeyEst = getPlanHistogramCE(*plan, multikeyCollInfo);
+    ASSERT_EQ(nonMultikeyEst.source(), EstimationSource::Histogram);
+    ASSERT_EQ(multikeyEst.source(), EstimationSource::Histogram);
+    ASSERT_TRUE(approxLt(nonMultikeyEst, multikeyEst));
+}
+
+TEST(CardinalityEstimator, NorEstimatesNegateOr) {
+    // Test relationship between Nor and Or
+    BSONObj norEqualities = fromjson("{$nor: [{a: 5}, {b: 6}]}");
+    BSONObj orEqualities = fromjson("{$or: [{a: 5}, {b: 6}]}");
+    auto norPlan = makeCollScanPlan(parse(norEqualities));
+    auto orPlan = makeCollScanPlan(parse(orEqualities));
+    CardinalityEstimate norEst = getPlanHeuristicCE(*norPlan, 1000);
+    CardinalityEstimate orEst = getPlanHeuristicCE(*orPlan, 1000);
+    ASSERT_EQ(norEst + orEst, makeCard(1000));
+}
+
+TEST(CardinalityEstimator, NorWithEqGreaterEstiamteThanNorWithInequality) {
+    // Test relationship between NOR(a=5,b=6) and NOR(a>5, b=6)
+    BSONObj norEqualities = fromjson("{$nor: [{a: 5}, {b: 6}]}");
+    BSONObj norInequalities = fromjson("{$nor: [{a: {$gt: 5}}, {b: 6}]}");
+    auto eqPlan = makeCollScanPlan(parse(norEqualities));
+    auto inEqPlan = makeCollScanPlan(parse(norInequalities));
+    CardinalityEstimate eqEst = getPlanHeuristicCE(*eqPlan, 1000);
+    CardinalityEstimate inEqEst = getPlanHeuristicCE(*inEqPlan, 1000);
+    ASSERT_TRUE(approxGt(eqEst, inEqEst));
+}
+
+TEST(CardinalityEstimator, ElemMatchNonMultiKey) {
+    BSONObj elemMatchQuery = fromjson("{a: {$elemMatch: {$gt: 5, $lt: 10}}}");
+    auto elemMatchPlan = makeCollScanPlan(parse(elemMatchQuery));
+    auto index = buildSimpleIndexEntry({"a"});
+    auto collInfo = buildCollectionInfo({index}, makeCollStats(1000.0));
+    CardinalityEstimate est = getPlanHeuristicCE(*elemMatchPlan, collInfo);
+    ASSERT_EQ(est, zeroCE);
+}
+
+TEST(CardinalityEstimator, ElemMatchMultikeyComparedToAndNonMultikey) {
+    CardinalityEstimate elemMatchEst{zeroCE};
+    CardinalityEstimate andEst{zeroCE};
+    {
+        BSONObj elemMatchQuery = fromjson("{a: {$elemMatch: {$gt: 5, $lt: 10}}}");
+        auto elemMatchPlan = makeCollScanPlan(parse(elemMatchQuery));
+        auto index = buildMultikeyIndexEntry({"a"}, "a");
+        auto collInfo = buildCollectionInfo({index}, makeCollStats(1000.0));
+        elemMatchEst = getPlanHeuristicCE(*elemMatchPlan, collInfo);
+    }
+    {
+        BSONObj andQuery = fromjson("{a: {$gt: 5, $lt: 10}}");
+        auto andPlan = makeCollScanPlan(parse(andQuery));
+        auto index = buildSimpleIndexEntry({"a"});
+        auto collInfo = buildCollectionInfo({index}, makeCollStats(1000.0));
+        andEst = getPlanHeuristicCE(*andPlan, collInfo);
+    }
+    ASSERT_TRUE(approxLt(elemMatchEst, andEst));
+}
+
+TEST(CardinalityEstimator, NestedElemMatchMoreSelectiveThanSingle) {
+    BSONObj elemMatchQuery = fromjson("{a: {$elemMatch: {$gt: 5, $lt: 10}}}");
+    BSONObj nestedElemMatchQuery = fromjson("{a: {$elemMatch: {$elemMatch: {$gt: 5, $lt: 10}}}}");
+    auto elemMatchPlan = makeCollScanPlan(parse(elemMatchQuery));
+    auto nestedElemMatchPlan = makeCollScanPlan(parse(nestedElemMatchQuery));
+    auto index = buildMultikeyIndexEntry({"a"}, "a");
+    auto collInfo = buildCollectionInfo({index}, makeCollStats(1000.0));
+    auto elemMatchEst = getPlanHeuristicCE(*elemMatchPlan, collInfo);
+    auto nestedElemMatchEst = getPlanHeuristicCE(*nestedElemMatchPlan, collInfo);
+    ASSERT_TRUE(approxGt(elemMatchEst, nestedElemMatchEst));
+}
+
+TEST(CardinalityEstimator, NAryXOR) {
+    BSONObj xorCond1 = fromjson("{$_internalSchemaXor: [{a: { $ne: 5 }}]}");
+    auto xorExpr1 = parse(xorCond1);
+    auto xorPlan1 = makeCollScanPlan(std::move(xorExpr1));
+
+    BSONObj xorCond2 = fromjson("{$_internalSchemaXor: [{a: { $lt: 0 }}, {b: 0}]}");
+    auto xorExpr2 = parse(xorCond2);
+    auto xorPlan2 = makeCollScanPlan(std::move(xorExpr2));
+
+    BSONObj xorCond3 =
+        fromjson("{$_internalSchemaXor: [{a: { $gt: 10 }}, {a: { $lt: 0 }}, {b: 0}]}");
+    auto xorExpr3 = parse(xorCond3);
+    auto xorPlan3 = makeCollScanPlan(std::move(xorExpr3));
+
+    double card = 1000.0;
+    auto collInfo = buildCollectionInfo({}, makeCollStats(card));
+
+    const auto ceRes1 = getPlanHeuristicCE(*xorPlan1, collInfo);
+    ASSERT_EQ(ceRes1, makeCard(968.377));
+
+    const auto ceRes2 = getPlanHeuristicCE(*xorPlan2, collInfo);
+    ASSERT_EQ(ceRes2, makeCard(340.752));
+
+    const auto ceRes3 = getPlanCE(*xorPlan3, collInfo, QueryCBRCEModeEnum::kHistogramCE);
+    ASSERT(!ceRes3.isOK() && ceRes3.getStatus().code() == ErrorCodes::CEFailure);
+}
+
+// Cardinality estimator with sampling.
+TEST(CardinalityEstimator, CompareCardinalityEstimatesForIndexScans) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    size_t collCard = 5000;
+    ce::SamplingEstimatorTest samplingEstimatorTest;
+    samplingEstimatorTest.setUp();
+    auto samplingEstimator = samplingEstimatorTest.createSamplingEstimatorForTesting(
+        collCard, collCard, ce::NoProjection{});
+
+    // Create indexed plan without filter.
+    std::vector<std::string> indexFields = {"a", "b"};
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointInterval(50, indexFields[0]));
+    OrderedIntervalList oilRange(indexFields[1]);
+    oilRange.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+        BSON("" << 0 << "" << 6), BoundInclusion::kIncludeBothStartAndEndKeys));
+    bounds.fields.push_back(oilRange);
+    auto indexedPlan = makeIndexScanFetchPlan(testNss, std::move(bounds), std::move(indexFields));
+    auto estIndexedPlan = getPlanSamplingCE(*indexedPlan, collCard, &samplingEstimator);
+
+    // Create collection scan plan with match expression equivalent to the index bounds.
+    BSONObj query = fromjson("{a: 50, b: {$gte: 0, $lte: 6}}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+    auto estCollScan = getPlanSamplingCE(*collPlan, collCard, &samplingEstimator);
+
+    ASSERT_EQUALS(estIndexedPlan, estCollScan);
+}
+
+TEST(CardinalityEstimator, CompareCardinalityEstimatesForIndexScanAndFetch) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    size_t collCard = 5000;
+    ce::SamplingEstimatorTest samplingEstimatorTest;
+    samplingEstimatorTest.setUp();
+    auto samplingEstimator = samplingEstimatorTest.createSamplingEstimatorForTesting(
+        collCard, collCard, ce::NoProjection{});
+
+    // Create indexed plan with a fetch filter.
+    std::vector<std::string> indexFields = {"a"};
+    // 'b' is 0 in every sampled document where 'a' is 50, so this filter matches some documents;
+    // a filter matching nothing would abort estimation with ZeroCEEstimate.
+    BSONObj fetchCond = fromjson("{$or: [{b: 0}, {c: 'xyz'}]}");
+    auto fetchExpr = parse(fetchCond);
+    auto indexedPlan = makeIndexScanFetchPlan(testNss,
+                                              makePointIntervalBounds(50.0, indexFields[0]),
+                                              indexFields,
+                                              nullptr,
+                                              std::move(fetchExpr));
+    auto estIndexedPlan = getPlanSamplingCE(*indexedPlan, collCard, &samplingEstimator);
+
+    // Create collection scan plan with match expression that is a conjunction of the index bounds
+    // and the fetch expression.
+    BSONObj query = fromjson("{$and: [{a: 50}, {$or: [{b: 0}, {c: 'xyz'}]}]}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+    auto estCollScan = getPlanSamplingCE(*collPlan, collCard, &samplingEstimator);
+
+    ASSERT_EQUALS(estIndexedPlan, estCollScan);
+}
+
+TEST(CardinalityEstimator, CompareCardinalityEstimatesForIndexScanIndexKeyOptimization) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    size_t collCard = 1000;
+    ce::SamplingEstimatorTest samplingEstimatorTest;
+    samplingEstimatorTest.setUp();
+    // Sample the full collection so that the point predicate below (matching 10 of 1000 docs) is
+    // guaranteed to be observed. A random partial sample may miss all matching docs, producing a
+    // zero scan estimate which aborts plan estimation with ZeroCEEstimate.
+    auto samplingEstimator = samplingEstimatorTest.createSamplingEstimatorForTesting(
+        collCard, collCard, ce::NoProjection{});
+
+    // Incrementally compare that all the following cases for index scan cardinality estimation
+    // return the same results.
+
+    // 1. check sampling cardinality estimates of index scan
+    // for non-multikey
+    // without residual filter (on index scan)
+    // with query including only point predicates
+    CardinalityEstimate indexScanNonMultiKeyNoFilterPoint(CardinalityType{0.0},
+                                                          EstimationSource::Sampling);
+    {
+        std::vector<std::string> indexFields = {"a", "b"};
+        IndexBounds bounds;
+        bounds.fields.push_back(makePointInterval(50, indexFields[0]));
+
+        auto plan = makeIndexScanFetchPlan(testNss, std::move(bounds), std::move(indexFields));
+        indexScanNonMultiKeyNoFilterPoint = getPlanSamplingCE(*plan, collCard, &samplingEstimator);
+    }
+
+    // 2. check sampling cardinality estimates of index scan
+    // for non-multikey
+    // without residual filter (on index scan)
+    // with query including range predicates
+    CardinalityEstimate indexScanNonMultiKeyNoFilterRange(CardinalityType{0.0},
+                                                          EstimationSource::Sampling);
+    {
+        std::vector<std::string> indexFields = {"a", "b"};
+        IndexBounds bounds;
+        bounds.fields.push_back(makePointInterval(50, indexFields[0]));
+        OrderedIntervalList oilRange(indexFields[1]);
+        oilRange.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            BSON("" << 0 << "" << 6), BoundInclusion::kIncludeBothStartAndEndKeys));
+        bounds.fields.push_back(oilRange);
+
+        auto plan = makeIndexScanFetchPlan(testNss, std::move(bounds), std::move(indexFields));
+        indexScanNonMultiKeyNoFilterRange = getPlanSamplingCE(*plan, collCard, &samplingEstimator);
+    }
+
+    ASSERT_EQUALS(indexScanNonMultiKeyNoFilterPoint, indexScanNonMultiKeyNoFilterRange);
+
+    // 3. check sampling cardinality estimates of index scan
+    // for multikey field
+    CardinalityEstimate indexScanMultiKey(CardinalityType{0.0}, EstimationSource::Sampling);
+    {
+        // Create query.
+        std::vector<std::string> indexFields = {"a", "b"};
+        IndexBounds bounds;
+        bounds.fields.push_back(makePointInterval(50, indexFields[0]));
+
+        auto plan =
+            makeMultiKeyIndexScanFetchPlan(testNss, std::move(bounds), std::move(indexFields), "a");
+        // Use cardinalityEstimator that uses index bounds.
+        indexScanMultiKey = getPlanSamplingCE(*plan, collCard, &samplingEstimator);
+    }
+
+    ASSERT_EQUALS(indexScanNonMultiKeyNoFilterRange, indexScanMultiKey);
+}
+
+TEST(CardinalityEstimator, CompareCardinalityEstimatesForIndexScanWithFetchNoFilter) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    size_t collCard = 100;
+    ce::SamplingEstimatorTest samplingEstimatorTest;
+    samplingEstimatorTest.setUp();
+    auto samplingEstimator =
+        samplingEstimatorTest.createSamplingEstimatorForTesting(collCard, 200, ce::NoProjection{});
+
+    // Create indexed plan with an empty fetch filter since the IndexScan bounds can be used to
+    // satisfy the predicate.
+    std::vector<std::string> indexFields = {"a"};
+    BSONObj fetchCond = fromjson("{}");
+    auto fetchExpr = parse(fetchCond);
+    auto indexPlan = makeIndexScanFetchPlan(testNss,
+                                            makePointIntervalBounds(50.0, indexFields[0]),
+                                            indexFields,
+                                            nullptr,
+                                            std::move(fetchExpr));
+
+    BSONObj query = fromjson("{a: 50}");
+    auto expr = parse(query);
+    auto collPlan = makeCollScanPlan(std::move(expr));
+    // We expect that a Fetch + Index Scan plan where the bounds fully cover the predicate (i.e. no
+    // filter on FetchNode) is equal to a Collection Scan plan with the same predicate.
+    ASSERT_EQ(getPlanSamplingCE(*indexPlan, collCard, &samplingEstimator),
+              getPlanSamplingCE(*collPlan, collCard, &samplingEstimator));
+}
+
+TEST(CardinalityEstimator, SamplingCEInvokesEstimateCardinality) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    // Constant settings
+    size_t collCard = 10000;
+    ce::SamplingEstimatorTest planRankingTest;
+    planRankingTest.setUp();
+
+    const size_t seed_value1_low = 1724178;
+    const size_t seed_value2_low = 8713211;
+    const size_t seed_value3_low = 9247231;
+    const size_t seed_value4_low = 19984748;
+    const size_t seed_value5_low = 584573;
+
+    std::vector<ce::CollectionFieldConfiguration> collectionFieldConfig = {
+        ce::CollectionFieldConfiguration(
+            /*fieldName*/ "a",
+            /*fieldPosition*/ 0,
+            /*fieldType*/ sbe::value::TypeTags::NumberInt64,
+            /*ndv*/ 10,
+            /*dataDistribution*/ stats::DistrType::kUniform,
+            /*seed*/ seed_value1_low),
+        ce::CollectionFieldConfiguration(
+            /*fieldName*/ "b",
+            /*fieldPosition*/ 5,
+            /*fieldType*/ sbe::value::TypeTags::NumberInt64,
+            /*ndv*/ 10,
+            /*dataDistribution*/ stats::DistrType::kUniform,
+            /*seed*/ seed_value2_low),
+        ce::CollectionFieldConfiguration(
+            /*fieldName*/ "c",
+            /*fieldPosition*/ 20,
+            /*fieldType*/ sbe::value::TypeTags::NumberInt64,
+            /*ndv*/ 10,
+            /*dataDistribution*/ stats::DistrType::kUniform,
+            /*seed*/ seed_value3_low),
+        ce::CollectionFieldConfiguration(
+            /*fieldName*/ "e",
+            /*fieldPosition*/ 22,
+            /*fieldType*/ sbe::value::TypeTags::NumberInt64,
+            /*ndv*/ 10,
+            /*dataDistribution*/ stats::DistrType::kUniform,
+            /*seed*/ seed_value5_low),
+        ce::CollectionFieldConfiguration(
+            /*fieldName*/ "d",
+            /*fieldPosition*/ 25,
+            /*fieldType*/ sbe::value::TypeTags::NumberInt64,
+            /*ndv*/ 10,
+            /*dataDistribution*/ stats::DistrType::kUniform,
+            /*seed*/ seed_value4_low)};
+
+    // Translate the fields and positions configurations based on the defined map.
+    ce::DataConfiguration dataConfig(
+        /*dataSize*/ collCard,
+        /*dataFieldConfig*/ collectionFieldConfig);
+
+    // Generate data and populate source collection
+    std::vector<std::vector<stats::SBEValue>> allData;
+    generateDataBasedOnConfig(dataConfig, allData);
+    auto dataBSON = ce::SamplingEstimatorTest::createDocumentsFromSBEValue(
+        allData, dataConfig.collectionFieldsConfiguration);
+
+    planRankingTest.insertDocuments(planRankingTest._kTestNss, dataBSON);
+
+    size_t sampleSize = 1000;
+    ce::ProjectionParams projectionParams = ce::NoProjection();
+    auto collection = acquireCollectionOrView(
+        planRankingTest.getOperationContext(),
+        CollectionOrViewAcquisitionRequest::fromOpCtx(planRankingTest.getOperationContext(),
+                                                      planRankingTest._kTestNss,
+                                                      AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    auto colls = MultipleCollectionAccessor(
+        collection, {}, false /* isAnySecondaryNamespaceAViewOrNotFullyLocal */);
+
+    ce::SamplingEstimatorAssertingKeysScanned samplingEstimator(
+        planRankingTest.getOperationContext(),
+        colls,
+        collection.nss(),
+        PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+        sampleSize,
+        SamplingCEMethodEnum::kRandom,
+        boost::none,
+        ce::SamplingEstimatorTest::makeCardinalityEstimate(collCard),
+        nullptr);
+    samplingEstimator.generateSample(projectionParams);
+
+    // Running only on sampling estimator.
+
+    // Residual filter is on nullptr.
+    std::unique_ptr<MatchExpression> residualFilter = nullptr;
+
+    // Point query on one field (InCE == OutCE)
+    {
+        // Query on non multikey field (a).
+        // bounds: ['a']: [88.0, 88.0]
+        std::vector<std::string> indexFields = {"a"};
+        auto bounds = makePointIntervalBounds(88.0, indexFields[0]);
+
+        std::unique_ptr<IndexScanNode> indexScan =
+            makeIndexScan(testNss, bounds, indexFields, std::move(residualFilter));
+
+        auto indexPlan = std::make_unique<QuerySolution>();
+        indexPlan->setRoot(std::move(indexScan));
+
+        EstimateMap qsnEstimates;
+        const CollectionInfo collInfo =
+            buildCollectionInfo({}, makeCollStatsWithHistograms({}, collCard));
+        CardinalityEstimator ceEstimator{
+            collInfo, &samplingEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+        auto _ = ceEstimator.estimatePlan(*indexPlan);
+    }
+
+    // Multiple fields only point queries
+    {
+        // Query on multiple fields (a, b, c, d)
+        // bounds: ['a']: [88.0, 88.0], ['b']: [937.0, 937.0], ['c']: [806.0, 806.0], ['d']:
+        // [35.0, 35.0]
+        IndexBounds bounds;
+        std::vector<std::string> indexFields = {"a", "b", "c", "d"};
+        bounds.fields.emplace_back(makePointInterval(88, indexFields[0]));
+        bounds.fields.emplace_back(makePointInterval(937, indexFields[1]));
+        bounds.fields.emplace_back(makePointInterval(806, indexFields[2]));
+        bounds.fields.emplace_back(makePointInterval(35, indexFields[3]));
+
+        std::unique_ptr<IndexScanNode> indexScan =
+            makeIndexScan(testNss, bounds, indexFields, std::move(residualFilter));
+
+        auto indexPlan = std::make_unique<QuerySolution>();
+        indexPlan->setRoot(std::move(indexScan));
+
+        EstimateMap qsnEstimates;
+        const CollectionInfo collInfo =
+            buildCollectionInfo({}, makeCollStatsWithHistograms({}, collCard));
+        CardinalityEstimator ceEstimator{
+            collInfo, &samplingEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+        auto _ = ceEstimator.estimatePlan(*indexPlan);
+    }
+
+    // Range query on one field
+    {
+        // Query on non multikey field (a).
+        // bounds = ['a']: [10, 80]
+        std::vector<std::string> indexFields = {"a"};
+        auto bounds = makeRangeIntervalBounds(BSON("" << 10 << " " << 80),
+                                              BoundInclusion::kIncludeBothStartAndEndKeys,
+                                              indexFields[0]);
+
+        std::unique_ptr<IndexScanNode> indexScan =
+            makeIndexScan(testNss, bounds, indexFields, std::move(residualFilter));
+
+        auto indexPlan = std::make_unique<QuerySolution>();
+        indexPlan->setRoot(std::move(indexScan));
+
+        EstimateMap qsnEstimates;
+        const CollectionInfo collInfo =
+            buildCollectionInfo({}, makeCollStatsWithHistograms({}, collCard));
+        CardinalityEstimator ceEstimator{
+            collInfo, &samplingEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+        auto _ = ceEstimator.estimatePlan(*indexPlan);
+    }
+
+    // Range and point queries on multiple fields
+    {
+        // Query on multiple fields (a, b, c, d)
+        // bounds: ['a']: [10, 1080], ['b']: [937.0, 937.0], ['c']: [10, 2280], ['d']: [937.0,
+        // 937.0]
+        IndexBounds bounds;
+        std::vector<std::string> indexFields = {"a", "b", "c", "d"};
+        OrderedIntervalList oilRange1(indexFields[0]);
+        oilRange1.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            BSON("" << 10 << " " << 1080), BoundInclusion::kIncludeBothStartAndEndKeys));
+        bounds.fields.push_back(oilRange1);
+
+        bounds.fields.emplace_back(makePointInterval(937, indexFields[1]));
+
+        OrderedIntervalList oilRange3(indexFields[2]);
+        oilRange3.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            BSON("" << 10 << " " << 2280), BoundInclusion::kIncludeBothStartAndEndKeys));
+        bounds.fields.push_back(oilRange3);
+
+        bounds.fields.emplace_back(makePointInterval(937, indexFields[3]));
+
+        std::unique_ptr<IndexScanNode> indexScan =
+            makeIndexScan(testNss, bounds, indexFields, std::move(residualFilter));
+
+        auto indexPlan = std::make_unique<QuerySolution>();
+        indexPlan->setRoot(std::move(indexScan));
+
+        EstimateMap qsnEstimates;
+        const CollectionInfo collInfo =
+            buildCollectionInfo({}, makeCollStatsWithHistograms({}, collCard));
+        CardinalityEstimator ceEstimator{
+            collInfo, &samplingEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+        auto _ = ceEstimator.estimatePlan(*indexPlan);
+    }
+}
+
+TEST(CardinalityEstimator, SamplingCECompareIndexWithSample) {
+    // Constant settings
+    size_t collCard = 10000;
+    ce::SamplingEstimatorTest planRankingTest;
+    planRankingTest.setUp();
+
+    // Collection containing 3 types of documents
+    // i. documents with fields _id,a,b,c all with non-null values
+    // ii. documents with fields _id,b,c all with non-null values
+    // iii. documents with fields _id,a,b,c with 'a' null value.
+    std::vector<BSONObj> dataBSON;
+    int counter = 0;
+    for (int i = 0; i < 500; i++) {
+        dataBSON.push_back(BSON("_id" << counter++ << "a" << 1 << "b" << 1 << "c" << 1));
+        dataBSON.push_back(BSON("_id" << counter++ << "b" << 2 << "c" << 2));
+        BSONObjBuilder bob;
+        bob.appendNumber("_id", counter++);
+        bob.appendNull("a");
+        bob.appendNumber("b", 3);
+        bob.appendNumber("c", 3);
+        dataBSON.push_back(bob.obj());
+    }
+
+    planRankingTest.insertDocuments(planRankingTest._kTestNss, dataBSON);
+
+    size_t sampleSize = 1000;
+    ce::ProjectionParams projectionParams = ce::NoProjection();
+    auto collection = acquireCollectionOrView(
+        planRankingTest.getOperationContext(),
+        CollectionOrViewAcquisitionRequest::fromOpCtx(planRankingTest.getOperationContext(),
+                                                      planRankingTest._kTestNss,
+                                                      AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    auto colls = MultipleCollectionAccessor(
+        collection, {}, false /* isAnySecondaryNamespaceAViewOrNotFullyLocal */);
+
+    ce::SamplingEstimatorForTesting samplingEstimator(
+        planRankingTest.getOperationContext(),
+        colls,
+        collection.nss(),
+        PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+        sampleSize,
+        SamplingCEMethodEnum::kRandom,
+        boost::none,
+        ce::SamplingEstimatorTest::makeCardinalityEstimate(collCard),
+        nullptr);
+    samplingEstimator.generateSample(projectionParams);
+
+    // Running only on sampling estimator.
+
+    // Residual filter is on nullptr.
+    std::unique_ptr<MatchExpression> residualFilter = nullptr;
+
+    // Point query null
+    {
+        // Query on non multikey field (a).
+        // bounds: ['a']: [null, null]
+        std::string fieldName = "a";
+
+        // compute based on estimateKeysScanned
+        OrderedIntervalList list(fieldName);
+        list.intervals.push_back(IndexBoundsBuilder::kNullPointInterval);
+
+        auto idxBounds = std::make_unique<IndexBounds>();
+        idxBounds->fields.push_back(list);
+
+        // compute based on estimateCardinality
+        BSONObjBuilder builder;
+        stats::addSbeValueToBSONBuilder(stats::makeNullValue(), "$eq", builder);
+        auto operand = builder.obj();
+        const auto matchExpr = std::make_unique<EqualityMatchExpression>(
+            std::string_view(fieldName), mongo::Value(operand["$eq"]));
+
+        // For point queries, the estimates should be identical.
+        // (estimateKeysScanned: 6800 == estimateCardinality: 6800)
+        ASSERT_EQ(samplingEstimator.estimateKeysScanned(*idxBounds).toDouble(),
+                  samplingEstimator.estimateCardinality(matchExpr.get()).toDouble());
+    }
+
+    // Range query including null ($lte: x)
+    {
+        // Query on non multikey field (a).
+        // bounds: ['a']: [null, 50]
+        std::string fieldName = "a";
+
+        OrderedIntervalList out;
+        BSONObjBuilder bob;
+        bob.appendMinKey(fieldName);
+        bob.appendNumber(fieldName, 50);
+        out.name = fieldName;
+        out.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            bob.obj(), BoundInclusion::kIncludeBothStartAndEndKeys));
+
+        auto idxBounds = std::make_unique<IndexBounds>();
+        idxBounds->fields.push_back(out);
+
+        BSONObjBuilder builder;
+        stats::addSbeValueToBSONBuilder(stats::makeInt32Value(50), "$lte", builder);
+        auto operand = builder.obj();
+
+        const auto matchExpr = std::make_unique<LTEMatchExpression>(std::string_view(fieldName),
+                                                                    mongo::Value(operand["$lte"]));
+
+        // For range queries, the estimates should be different.
+        // (estimateKeysScanned: 10000 != estimateCardinality: 3200)
+        ASSERT_NE(samplingEstimator.estimateKeysScanned(*idxBounds).toDouble(),
+                  samplingEstimator.estimateCardinality(matchExpr.get()).toDouble());
+    }
+}
+
+// Mock sampling estimator that counts calls to estimateRIDs.
+class CountingEstimator : public ce::SamplingEstimator {
+public:
+    mutable size_t estimateRIDsCallCount = 0;
+
+    CardinalityEstimate estimateCardinality(const MatchExpression*) const override {
+        return makeCard(10.0);
+    }
+    CardinalityEstimate estimateKeysScanned(const IndexBounds&) const override {
+        return makeCard(10.0);
+    }
+    std::vector<CardinalityEstimate> estimateKeysScanned(
+        const std::vector<const IndexBounds*>&) const override {
+        return {};
+    }
+    CardinalityEstimate estimateRIDs(const IndexBounds&, const MatchExpression*) const override {
+        ++estimateRIDsCallCount;
+        return makeCard(10.0);
+    }
+    std::vector<CardinalityEstimate> estimateRIDs(
+        const std::vector<const IndexBounds*>&,
+        const std::vector<const MatchExpression*>&) const override {
+        return {};
+    }
+    void generateSample(ce::ProjectionParams) override {}
+    CardinalityEstimate estimateNDV(
+        const std::vector<ce::FieldPathAndEqSemantics>&,
+        boost::optional<std::span<const OrderedIntervalList>>) const override {
+        return makeCard(10.0);
+    }
+    CardinalityEstimate estimateNDVMultiKey(
+        const std::vector<ce::FieldPathAndEqSemantics>&,
+        boost::optional<std::span<const OrderedIntervalList>>) const override {
+        return makeCard(10.0);
+    }
+    CardinalityEstimate getCollCard() const override {
+        return makeCard(100.0);
+    }
+    size_t getSampleSize() const override {
+        return 100;
+    }
+    ce::SamplingMetadata getSamplingMetadata() const override {
+        MONGO_UNREACHABLE;
+    }
+    std::vector<ce::PersistedNDVEntry> getPersistedNDVMetadata() const override {
+        return {};
+    }
+};
+
+// Build IndexBounds with a single-point OIL on "a" and 'bIntervalCount' point intervals on "b".
+// Having a single-point OIL first avoids triggering the index skip-scan detection inside
+// equalityPrefix(), which requires that all OILs after the equality prefix are fully open.
+IndexBounds makeTwoFieldBounds(size_t bIntervalCount) {
+    IndexBounds bounds;
+    OrderedIntervalList oilA("a");
+    oilA.intervals.push_back(IndexBoundsBuilder::makePointInterval(0.0));
+    bounds.fields.push_back(oilA);
+
+    OrderedIntervalList oilB("b");
+    for (size_t i = 0; i < bIntervalCount; ++i) {
+        oilB.intervals.push_back(IndexBoundsBuilder::makePointInterval(static_cast<double>(i)));
+    }
+    bounds.fields.push_back(oilB);
+    return bounds;
+}
+
+TEST(CardinalityEstimator, CachesEstimateWhenTotalIntervalsAtOrBelowLimit) {
+    // OIL "a": 1 interval, OIL "b": 999 intervals → total = 1000 == kMaxNumIntervalsCached.
+    // Estimating the same bounds twice should hit the cache on the second evaluation,
+    // so estimateRIDs is called only once across both plan estimations.
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a", "b"};
+    IndexBounds bounds = makeTwoFieldBounds(kMaxNumIntervalsCached - 1);
+
+    auto plan1 = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+    auto plan2 = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+
+    CountingEstimator mockEstimator;
+    const CollectionInfo collInfo = buildCollectionInfo({}, makeCollStats(100.0));
+    EstimateMap qsnEstimates;
+    CardinalityEstimator estimator{
+        collInfo, &mockEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+
+    ASSERT(estimator.estimatePlan(*plan1).isOK());
+    ASSERT(estimator.estimatePlan(*plan2).isOK());
+
+    // All evaluations after the first cache miss should hit the cache.
+    ASSERT_EQ(mockEstimator.estimateRIDsCallCount, 1u);
+}
+
+TEST(CardinalityEstimator, DoesNotCacheEstimateWhenTotalIntervalsAboveLimit) {
+    // OIL "a": 1 interval, OIL "b": 1000 intervals → total = 1001 > kMaxNumIntervalsCached.
+    // The cache is bypassed every time, so estimateRIDs is called on every ridsEstFunct
+    // invocation: 2 per plan estimation (main + equality-prefix inCE) × 2 plans = 4.
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    std::vector<std::string> indexFields = {"a", "b"};
+    IndexBounds bounds = makeTwoFieldBounds(kMaxNumIntervalsCached);
+
+    auto plan1 = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+    auto plan2 = makeIndexScanFetchPlan(testNss, bounds, indexFields);
+
+    CountingEstimator mockEstimator;
+    const CollectionInfo collInfo = buildCollectionInfo({}, makeCollStats(100.0));
+    EstimateMap qsnEstimates;
+    CardinalityEstimator estimator{
+        collInfo, &mockEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+
+    ASSERT(estimator.estimatePlan(*plan1).isOK());
+    ASSERT(estimator.estimatePlan(*plan2).isOK());
+
+    // Cache is never used: estimateRIDs called on every invocation.
+    ASSERT_EQ(mockEstimator.estimateRIDsCallCount, 4u);
+}
+
+// Helpers shared by EqualityPrefixHeuristicCETest and EqualityPrefixSamplingCETest.
+namespace {
+OrderedIntervalList makeFullyOpenOil(const std::string& fieldName) {
+    OrderedIntervalList oil(fieldName);
+    IndexBoundsBuilder::allValuesForField(BSON(fieldName << 1).firstElement(), &oil);
+    return oil;
+}
+
+OrderedIntervalList makeRangeOil(const std::string& fieldName) {
+    OrderedIntervalList oil(fieldName);
+    oil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+        BSON("" << 3 << " " << 7), BoundInclusion::kIncludeBothStartAndEndKeys));
+    return oil;
+}
+
+OrderedIntervalList makePointOil(const std::string& fieldName) {
+    return makePointInterval(5.0, fieldName);
+}
+
+// An empty OIL represents an unsatisfiable predicate -- no values can match.
+OrderedIntervalList makeEmptyOil(const std::string& fieldName) {
+    return OrderedIntervalList(fieldName);
+}
+
+// Non-fullyOpen OIL with multiple intervals, e.g. representing an $in predicate.
+OrderedIntervalList makeMultiIntervalOil(const std::string& fieldName) {
+    OrderedIntervalList oil(fieldName);
+    oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(1.0));
+    oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(3.0));
+    oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(5.0));
+    return oil;
+}
+
+std::unique_ptr<QuerySolution> makeEqualityPrefixPlan(IndexBounds bounds) {
+    std::vector<std::string> indexFields;
+    for (const auto& oil : bounds.fields) {
+        indexFields.push_back(oil.name);
+    }
+    const auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    return makeIndexScanFetchPlan(testNss, std::move(bounds), indexFields);
+}
+}  // namespace
+
+// Fixture for testing index bounds patterns that involve skip scans via heuristic CE.
+class EqualityPrefixHeuristicCETest : public unittest::Test {
+protected:
+    void assertSkipScan(IndexBounds bounds) {
+        assertEstimable(std::move(bounds));
+    }
+
+    void assertNotSkipScan(IndexBounds bounds) {
+        assertEstimable(std::move(bounds));
+    }
+
+    // Asserts that the plan estimates to zero, which aborts estimation with ZeroCEEstimate.
+    void assertZeroCE(IndexBounds bounds) {
+        auto plan = makeEqualityPrefixPlan(std::move(bounds));
+        const auto ceRes = getPlanCE(*plan, _collInfo, QueryCBRCEModeEnum::kHeuristicCE);
+        ASSERT_EQ(ErrorCodes::ZeroCEEstimate, ceRes.getStatus().code());
+    }
+
+private:
+    // Estimation must not fail; a zero estimate is allowed and reported as ZeroCEEstimate.
+    void assertEstimable(IndexBounds bounds) {
+        auto plan = makeEqualityPrefixPlan(std::move(bounds));
+        const auto ceRes = getPlanCE(*plan, _collInfo, QueryCBRCEModeEnum::kHeuristicCE);
+        ASSERT(ceRes.isOK() || ceRes.getStatus().code() == ErrorCodes::ZeroCEEstimate)
+            << ceRes.getStatus();
+    }
+
+    const CollectionInfo _collInfo =
+        buildCollectionInfo({}, makeCollStatsWithHistograms({}, 100.0));
+};
+
+// Fixture for testing index bounds patterns that involve skip scans via sampling CE.
+class EqualityPrefixSamplingCETest : public ce::SamplingEstimatorTest {
+protected:
+    void setUp() override {
+        ce::SamplingEstimatorTest::setUp();
+        _samplingEstimator.emplace(createSamplingEstimatorForTesting(100, 50, ce::NoProjection{}));
+    }
+
+    void assertSkipScan(IndexBounds bounds) {
+        assertEstimable(std::move(bounds));
+    }
+
+    void assertNotSkipScan(IndexBounds bounds) {
+        assertEstimable(std::move(bounds));
+    }
+
+    // Asserts that the plan estimates to zero, which aborts estimation with ZeroCEEstimate.
+    void assertZeroCE(IndexBounds bounds) {
+        ASSERT_EQ(ErrorCodes::ZeroCEEstimate, estimate(std::move(bounds)).getStatus().code());
+    }
+
+private:
+    CEResult estimate(IndexBounds bounds) {
+        auto plan = makeEqualityPrefixPlan(std::move(bounds));
+        EstimateMap qsnEstimates;
+        auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({}, 100.0));
+        CardinalityEstimator estimator{
+            collInfo, &*_samplingEstimator, qsnEstimates, QueryCBRCEModeEnum::kSamplingCE};
+        return estimator.estimatePlan(*plan);
+    }
+
+    // Estimation must not fail; a zero estimate is allowed and reported as ZeroCEEstimate. The
+    // sampled documents only have fields 'a' and 'b', so bounds over other fields, or over values
+    // absent from the sample, legitimately estimate to zero.
+    void assertEstimable(IndexBounds bounds) {
+        const auto ceRes = estimate(std::move(bounds));
+        ASSERT(ceRes.isOK() || ceRes.getStatus().code() == ErrorCodes::ZeroCEEstimate)
+            << ceRes.getStatus();
+    }
+
+    boost::optional<ce::SamplingEstimatorForTesting> _samplingEstimator;
+};
+
+template <typename Fixture>
+class EqualityPrefixTypedTest : public Fixture {};
+
+using EqualityPrefixFixtures =
+    ::testing::Types<EqualityPrefixHeuristicCETest, EqualityPrefixSamplingCETest>;
+// The TYPED_TEST_SUITE allows the following tests to be run under both test fixtures enumerated.
+TYPED_TEST_SUITE(EqualityPrefixTypedTest, EqualityPrefixFixtures);
+
+// OIL list: [eqPrefix, fullyOpen, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_FullyOpen_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeRangeOil("c"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, non-fullyOpen, fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_NonFullyOpen_FullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    this->assertNotSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_FullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    this->assertNotSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    this->assertNotSkipScan(std::move(bounds));
+}
+
+// OIL list: [fullyOpen, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, FullyOpen_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeFullyOpenOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [non-fullyOpen, fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, NonFullyOpen_FullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    this->assertNotSkipScan(std::move(bounds));
+}
+
+// OIL list: [non-fullyOpen, fullyOpen, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, NonFullyOpen_FullyOpen_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeRangeOil("c"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [non-fullyOpen, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, NonFullyOpen_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, empty]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_Empty) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeEmptyOil("b"));
+    this->assertZeroCE(std::move(bounds));
+}
+
+// OIL list: [fullyOpen, empty]
+TYPED_TEST(EqualityPrefixTypedTest, FullyOpen_Empty) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeFullyOpenOil("a"));
+    bounds.fields.push_back(makeEmptyOil("b"));
+    this->assertZeroCE(std::move(bounds));
+}
+
+// OIL list: [empty, range]
+TYPED_TEST(EqualityPrefixTypedTest, Empty_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeEmptyOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    this->assertZeroCE(std::move(bounds));
+}
+
+// OIL list: [empty, fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, Empty_FullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeEmptyOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    this->assertZeroCE(std::move(bounds));
+}
+
+// The following cases repeat the above patterns using a multi-interval non-fullyOpen OIL
+// (e.g. from an $in predicate) to confirm that the skip scan detection is not sensitive to
+// whether the non-fullyOpen OIL has one or many intervals.
+
+// OIL list: [eqPrefix, multiInterval]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_MultiInterval) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeMultiIntervalOil("b"));
+    this->assertNotSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, fullyOpen, multiInterval]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_FullyOpen_MultiInterval) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeMultiIntervalOil("c"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [fullyOpen, multiInterval]
+TYPED_TEST(EqualityPrefixTypedTest, FullyOpen_MultiInterval) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeFullyOpenOil("a"));
+    bounds.fields.push_back(makeMultiIntervalOil("b"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [multiInterval, fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, MultiInterval_FullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeMultiIntervalOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    this->assertNotSkipScan(std::move(bounds));
+}
+
+// OIL list: [multiInterval, multiInterval]
+TYPED_TEST(EqualityPrefixTypedTest, MultiInterval_MultiInterval) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeMultiIntervalOil("a"));
+    bounds.fields.push_back(makeMultiIntervalOil("b"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, fullyOpen, fullyOpen, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_FullyOpen_FullyOpen_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    bounds.fields.push_back(makeRangeOil("d"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [eqPrefix, fullyOpen, fullyOpen, multiInterval]
+TYPED_TEST(EqualityPrefixTypedTest, EqPrefix_FullyOpen_FullyOpen_MultiInterval) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    bounds.fields.push_back(makeMultiIntervalOil("d"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [non-fullyOpen, fullyOpen, fullyOpen, non-fullyOpen]
+TYPED_TEST(EqualityPrefixTypedTest, NonFullyOpen_FullyOpen_FullyOpen_NonFullyOpen) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    bounds.fields.push_back(makeRangeOil("d"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// OIL list: [non-fullyOpen, fullyOpen, fullyOpen, multiInterval]
+TYPED_TEST(EqualityPrefixTypedTest, NonFullyOpen_FullyOpen_FullyOpen_MultiInterval) {
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    bounds.fields.push_back(makeMultiIntervalOil("d"));
+    this->assertSkipScan(std::move(bounds));
+}
+
+// Tests for CardinalityEstimator::estimateIndexSeeks.
+//
+// estimateIndexSeeks computes the number of index seeks for a set of IndexBounds. The algorithm
+// works backwards through the OILs:
+//  1. Trailing fully-open OILs are stripped (they never cause a seek).
+//  2. The first non-open OIL contributes numIntervals seeks.
+//  3. The remaining (leading) OILs contribute NDV seeks. Leading point OILs (before the first
+//     non-point OIL) contribute NDV=1 but are still passed to estimateNDV, since they restrict
+//     which keys are reachable. Point OILs after the first non-point OIL are removed. If all
+//     remaining OILs are point intervals, the NDV is at most 1 and the estimateNDV calculation is
+//     skipped.
+//  4. An empty OIL anywhere yields zeroCE (no seeks, no docs).
+
+// A minimal SamplingEstimator mock. Only estimateNDV and estimateNDVMultiKey are implemented;
+// all other methods are unimplemented and will throw if called.
+class MockSamplingEstimator : public ce::SamplingEstimator {
+public:
+    explicit MockSamplingEstimator(double ndv,
+                                   boost::optional<double> ndvMultiKey = boost::none,
+                                   boost::optional<double> ndvBounded = boost::none,
+                                   boost::optional<double> ndvMultiKeyBounded = boost::none)
+        : _ndv(ndv),
+          _ndvMultiKey(ndvMultiKey.value_or(ndv)),
+          _ndvBounded(ndvBounded.value_or(ndv)),
+          _ndvMultiKeyBounded(ndvMultiKeyBounded.value_or(_ndvMultiKey)) {}
+
+    CardinalityEstimate estimateCardinality(const MatchExpression*) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    CardinalityEstimate estimateKeysScanned(const IndexBounds&) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    std::vector<CardinalityEstimate> estimateKeysScanned(
+        const std::vector<const IndexBounds*>&) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    CardinalityEstimate estimateRIDs(const IndexBounds&, const MatchExpression*) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    std::vector<CardinalityEstimate> estimateRIDs(
+        const std::vector<const IndexBounds*>&,
+        const std::vector<const MatchExpression*>&) const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    void generateSample(ce::ProjectionParams) override {
+        MONGO_UNIMPLEMENTED;
+    }
+    CardinalityEstimate estimateNDV(
+        const std::vector<ce::FieldPathAndEqSemantics>& fields,
+        boost::optional<std::span<const OrderedIntervalList>> bounds) const override {
+        recordNDVArgs(fields, bounds);
+        return makeCard(bounds ? _ndvBounded : _ndv);
+    }
+    CardinalityEstimate estimateNDVMultiKey(
+        const std::vector<ce::FieldPathAndEqSemantics>& fields,
+        boost::optional<std::span<const OrderedIntervalList>> bounds) const override {
+        recordNDVArgs(fields, bounds);
+        return makeCard(bounds ? _ndvMultiKeyBounded : _ndvMultiKey);
+    }
+    CardinalityEstimate getCollCard() const override {
+        return makeCard(1000.0);
+    }
+    size_t getSampleSize() const override {
+        MONGO_UNIMPLEMENTED;
+    }
+    ce::SamplingMetadata getSamplingMetadata() const override {
+        MONGO_UNREACHABLE;
+    }
+    std::vector<ce::PersistedNDVEntry> getPersistedNDVMetadata() const override {
+        return {};
+    }
+
+    // Field names and bound names passed to the most recent NDV call.
+    mutable std::vector<std::string> lastNDVFields;
+    mutable std::vector<std::string> lastNDVBoundNames;
+
+private:
+    void recordNDVArgs(const std::vector<ce::FieldPathAndEqSemantics>& fields,
+                       boost::optional<std::span<const OrderedIntervalList>> bounds) const {
+        lastNDVFields.clear();
+        lastNDVBoundNames.clear();
+        for (const auto& field : fields) {
+            lastNDVFields.push_back(field.path.fullPath());
+        }
+        if (bounds) {
+            for (const auto& oil : *bounds) {
+                lastNDVBoundNames.push_back(oil.name);
+            }
+        }
+    }
+
+    double _ndv;
+    double _ndvMultiKey;
+    double _ndvBounded;
+    double _ndvMultiKeyBounded;
+};
+
+// Single-field, single point interval: one seek to position the cursor.
+TEST(CardinalityEstimator, IndexSeeks_SingleFieldPointInterval) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+}
+
+// Single-field, multiple intervals (e.g. $in with 3 values): one seek per interval.
+TEST(CardinalityEstimator, IndexSeeks_SingleFieldMultipleIntervals) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makeMultiIntervalOil("a"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    ASSERT_EQ(result.getValue(), makeCard(3.0));
+}
+
+// Single-field, single range interval: one seek (the trailing field contributes numIntervals=1).
+TEST(CardinalityEstimator, IndexSeeks_SingleFieldRangeInterval) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // Only one field, the trailing non-open field: seekEstimate = numIntervals = 1.
+    // The NDV mock is not consulted since there are no preceding fields.
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+}
+
+// Single-field, empty OIL: no possible keys to seek to, so the result is zeroCE.
+TEST(CardinalityEstimator, IndexSeeks_SingleFieldEmptyInterval) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    IndexBounds bounds;
+    bounds.fields.emplace_back(OrderedIntervalList("a"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    ASSERT_EQ(result.getValue(), zeroCE);
+}
+
+// Trailing fully-open OIL is stripped; the preceding field determines seek count.
+TEST(CardinalityEstimator, IndexSeeks_TrailingFullyOpenDropped) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: single range interval; b: fully open (MinKey..MaxKey)
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b is stripped; a is the first non-open field with 1 interval; no preceding fields.
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+}
+
+// Multiple trailing fully-open OILs are all stripped; only the first non-open field counts.
+TEST(CardinalityEstimator, IndexSeeks_MultipleTrailingFullyOpenDropped) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: 3 point intervals; b: fully open; c: fully open
+    IndexBounds bounds;
+    bounds.fields.push_back(makeMultiIntervalOil("a"));
+    bounds.fields.push_back(makeFullyOpenOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b and c stripped; a is the first non-open field with 3 intervals; no preceding fields.
+    ASSERT_EQ(result.getValue(), makeCard(3.0));
+}
+
+// Point interval in leading position contributes NDV=1 (no multiplier effect).
+TEST(CardinalityEstimator, IndexSeeks_PointLeadingFieldContributesNDVOne) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: point; b: 3 point intervals
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeMultiIntervalOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b is the first non-open trailing field: seekEstimate = 3.
+    // a is point: NDV=1, no multiplier. seek = 3.
+    ASSERT_EQ(result.getValue(), makeCard(3.0));
+}
+
+// Range interval in leading position multiplies seeks by NDV from the sampling estimator.
+TEST(CardinalityEstimator, IndexSeeks_RangeLeadingFieldMultipliesByNDV) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: range; b: single range interval
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b is the first non-open trailing field: seekEstimate = 1.
+    // a is range (non-point): seekEstimate *= NDV(a) = 5. seek = 5.
+    ASSERT_EQ(result.getValue(), makeCard(5.0));
+}
+
+// NDV of zero is clamped to 1 to avoid discarding information from other fields.
+TEST(CardinalityEstimator, IndexSeeks_NDVClampedToOne) {
+    MockSamplingEstimator mock{/*ndv=*/0.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b contributes 1; a's NDV=0 is clamped to 1. seek = 1.
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+}
+
+// Empty OIL in a leading position (preceding the last non-open field) returns zeroCE.
+TEST(CardinalityEstimator, IndexSeeks_EmptyLeadingFieldReturnsZero) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: empty; b: range interval
+    IndexBounds bounds;
+    bounds.fields.emplace_back(OrderedIntervalList("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b contributes 1 seek; then a is empty -> return zeroCE.
+    ASSERT_EQ(result.getValue(), zeroCE);
+}
+
+// Empty OIL at the trailing (last) position returns zeroCE.
+TEST(CardinalityEstimator, IndexSeeks_EmptyTrailingFieldReturnsZero) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: point; b: empty OIL
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.emplace_back(OrderedIntervalList("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b is the first non-open trailing field; b.intervals is empty -> return zeroCE.
+    ASSERT_EQ(result.getValue(), zeroCE);
+}
+
+// Trailing fully-open OIL after a range plus a leading point: only the range is counted.
+TEST(CardinalityEstimator, IndexSeeks_PointRangeTrailingOpen) {
+    MockSamplingEstimator mock{/*ndv=*/5.0};
+    // a: point; b: range; c: fully open
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    bounds.fields.push_back(makeFullyOpenOil("c"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // c stripped; b is first non-open, 1 interval; a is point -> no change. seek = 1.
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+}
+
+// A leading point OIL must be kept in the NDV computation: it does not multiply the seek count, but
+// it restricts which keys the scan can reach (SERVER-135566).
+TEST(CardinalityEstimator, IndexSeeks_PointPrefixKeptInNDV) {
+    // The bounded NDV is 0 when no sampled documents match the point interval on 'a'.
+    MockSamplingEstimator mock{/*ndv=*/1000.0, /*ndvMultiKey=*/boost::none, /*ndvBounded=*/0.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    bounds.fields.push_back(makePointOil("c"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // c contributes 1 seek; NDV((a, b)) with bounds is 0, clamped to 1: seek = 1.
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+    std::vector<std::string> expected{"a", "b"};
+    ASSERT_EQ(mock.lastNDVFields, expected);
+    ASSERT_EQ(mock.lastNDVBoundNames, expected);
+}
+
+// A point OIL after a range does not restrict the index seeks: the scan still seeks for every
+// distinct value of the range field. It must be removed from the NDV computation.
+TEST(CardinalityEstimator, IndexSeeks_PointAfterRangeRemovedFromNDV) {
+    MockSamplingEstimator mock{/*ndv=*/10.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makePointOil("b"));
+    bounds.fields.push_back(makePointOil("c"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // c contributes 1 seek; b is removed; NDV(a) = 10: seek = 10.
+    ASSERT_EQ(result.getValue(), makeCard(10.0));
+    std::vector<std::string> expected{"a"};
+    ASSERT_EQ(mock.lastNDVFields, expected);
+    ASSERT_EQ(mock.lastNDVBoundNames, expected);
+}
+
+// Only the leading point OILs are kept.
+TEST(CardinalityEstimator, IndexSeeks_OnlyLeadingPointsKeptInNDV) {
+    MockSamplingEstimator mock{/*ndv=*/10.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    bounds.fields.push_back(makePointOil("c"));
+    bounds.fields.push_back(makeRangeOil("d"));
+    bounds.fields.push_back(makePointOil("e"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // e contributes 1 seek; a is kept; c is removed; NDV((a, b, d)) = 10: seek = 10.
+    ASSERT_EQ(result.getValue(), makeCard(10.0));
+    std::vector<std::string> expected{"a", "b", "d"};
+    ASSERT_EQ(mock.lastNDVFields, expected);
+    ASSERT_EQ(mock.lastNDVBoundNames, expected);
+}
+
+// If all OILs preceding the last non-open field are point intervals, estimateNDV is not called.
+TEST(CardinalityEstimator, IndexSeeks_AllPointPrefixSkipsNDV) {
+    // Any NDV call would return 100 and inflate the estimate.
+    MockSamplingEstimator mock{/*ndv=*/100.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makePointOil("a"));
+    bounds.fields.push_back(makePointOil("b"));
+    bounds.fields.push_back(makeRangeOil("c"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // c contributes 1 seek; a and b are point intervals, so estimateNDV is not called: seek = 1.
+    ASSERT_EQ(result.getValue(), makeCard(1.0));
+    ASSERT_TRUE(mock.lastNDVFields.empty());
+    ASSERT_TRUE(mock.lastNDVBoundNames.empty());
+}
+
+// Multikey index uses estimateNDVMultiKey rather than estimateNDV, producing a different estimate.
+TEST(CardinalityEstimator, IndexSeeks_MultikeyUsesNDVMultiKey) {
+    // Non-multikey mock returns NDV=3, multikey mock returns NDVMultiKey=7.
+    MockSamplingEstimator mock{/*ndv=*/3.0, /*ndvMultiKey=*/7.0};
+    // a: range; b: single range interval
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+
+    auto nonMultikeyResult = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(nonMultikeyResult);
+    ASSERT_EQ(nonMultikeyResult.getValue(), makeCard(3.0));
+
+    auto multikeyResult = estimateIndexSeeks(mock, bounds, /*multiKey=*/true);
+    ASSERT_OK(multikeyResult);
+    ASSERT_EQ(multikeyResult.getValue(), makeCard(7.0));
+}
+
+// estimateIndexSeeks must pass the OIL to estimateNDV (not boost::none), so the estimator
+// can constrain its sample to values within the interval.
+TEST(CardinalityEstimator, IndexSeeks_IntervalsPassedToNDV) {
+    // ndvBounded=3.0 is what the mock returns when bounds are supplied;
+    // _ndv=10.0 would be returned if boost::none were passed instead.
+    MockSamplingEstimator mock{/*ndv=*/10.0,
+                               /*ndvMultiKey=*/boost::none,
+                               /*ndvBounded=*/3.0};
+    // a: range [leading]; b: range [trailing, determines numIntervals=1]
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/false);
+    ASSERT_OK(result);
+    // b contributes 1 seek; a is leading range -> seekEstimate *= NDV(a, bounds).
+    // If intervals are passed correctly, NDV == 3.0 -> seek = 3.0.
+    // If intervals were omitted (boost::none), NDV == 10.0 -> seek = 10.0.
+    ASSERT_EQ(result.getValue(), makeCard(3.0));
+}
+
+// Same check for the multikey path: estimateNDVMultiKey must receive the OIL.
+TEST(CardinalityEstimator, IndexSeeks_IntervalsPassedToNDVMultiKey) {
+    // ndvMultiKeyBounded=4.0 is returned when bounds are supplied to estimateNDVMultiKey;
+    // ndvMultiKey=10.0 would be returned for boost::none.
+    MockSamplingEstimator mock{/*ndv=*/10.0,
+                               /*ndvMultiKey=*/10.0,
+                               /*ndvBounded=*/10.0,
+                               /*ndvMultiKeyBounded=*/4.0};
+    IndexBounds bounds;
+    bounds.fields.push_back(makeRangeOil("a"));
+    bounds.fields.push_back(makeRangeOil("b"));
+    auto result = estimateIndexSeeks(mock, bounds, /*multiKey=*/true);
+    ASSERT_OK(result);
+    // b contributes 1 seek; a is leading range -> seekEstimate *= NDVMultiKey(a, bounds).
+    // Correct: NDVMultiKey with bounds == 4.0 -> seek = 4.0.
+    // Wrong (no intervals): NDVMultiKey without bounds == 10.0 -> seek = 10.0.
+    ASSERT_EQ(result.getValue(), makeCard(4.0));
+}
+
+// A shard filter passes through all documents from its child (chunk migrations are rare, so
+// effectively no documents are filtered out).
+TEST(CardinalityEstimator, ShardFilterIsPassThrough) {
+    auto collCard = 100.0;
+
+    auto collScanPlan = makeCollScanPlan(nullptr);
+    auto collScanCE = getPlanHeuristicCE(*collScanPlan, collCard);
+
+    auto collScanNode = std::make_unique<CollectionScanNode>();
+    auto shardFilterNode = std::make_unique<ShardingFilterNode>();
+    shardFilterNode->children.push_back(std::move(collScanNode));
+    auto shardFilterPlan = std::make_unique<QuerySolution>();
+    shardFilterPlan->setRoot(std::move(shardFilterNode));
+
+    ASSERT_EQ(getPlanHeuristicCE(*shardFilterPlan, collCard), collScanCE);
+}
+
+// An approximate-source (histogram) zero estimate for a node aborts plan estimation with a
+// ZeroCEEstimate error: the zero means "not observed", so ranking cannot trust it.
+TEST(CardinalityEstimator, ZeroCEEstimateFromApproximateSourceFailsEstimation) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    // The histogram fixture's bucket frequencies total 1000, so collCard must match.
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({"a"}, 1000.0));
+    EstimateMap estimates;
+    CardinalityEstimator estimator{
+        collInfo, nullptr /*samplingEstimator*/, estimates, QueryCBRCEModeEnum::kHistogramCE};
+
+    // The histogram over 'a' covers values 0..6, so a point query on 100 estimates to zero.
+    std::vector<std::string> indexFields = {"a"};
+    auto zeroPlan = makeIndexScanFetchPlan(
+        testNss, makePointIntervalBounds(100.0, indexFields[0]), indexFields);
+    auto ceRes = estimator.estimatePlan(*zeroPlan);
+    ASSERT_NOT_OK(ceRes);
+    ASSERT_EQ(ceRes.getStatus().code(), ErrorCodes::ZeroCEEstimate);
+}
+
+TEST(CardinalityEstimator, NonZeroEstimatePlanDoesNotFail) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({"a"}, 1000.0));
+    EstimateMap estimates;
+    CardinalityEstimator estimator{
+        collInfo, nullptr /*samplingEstimator*/, estimates, QueryCBRCEModeEnum::kHistogramCE};
+
+    // Value 5 is inside the histogram over 'a' and has non-zero frequency.
+    std::vector<std::string> indexFields = {"a"};
+    auto plan =
+        makeIndexScanFetchPlan(testNss, makePointIntervalBounds(5.0, indexFields[0]), indexFields);
+    auto ceRes = estimator.estimatePlan(*plan);
+    ASSERT_OK(ceRes);
+    ASSERT_TRUE(approxGt(ceRes.getValue(), zeroCE));
+}
+
+// Callers that opt out of the zero-scan abort (join optimization) get a costed plan instead: the
+// approximate zero is clamped to the minimum estimate like any other zero.
+TEST(CardinalityEstimator, ZeroCEEstimateIsClampedWhenNotFailingOnZeroScanCE) {
+    auto testNss = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+    size_t collCard = 1000;
+    size_t sampleSize = 200;
+    ce::SamplingEstimatorTest samplingEstimatorTest;
+    samplingEstimatorTest.setUp();
+    auto samplingEstimator = samplingEstimatorTest.createSamplingEstimatorForTesting(
+        collCard, sampleSize, ce::NoProjection{});
+
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({}, collCard));
+    EstimateMap estimates;
+    CardinalityEstimator estimator{collInfo,
+                                   &samplingEstimator,
+                                   estimates,
+                                   QueryCBRCEModeEnum::kSamplingCE,
+                                   false /* failOnZeroIxscanCE */};
+
+    // The sampled documents have 'a' in [0, 99], so a point query on 100 estimates to zero.
+    std::vector<std::string> indexFields = {"a"};
+    auto zeroPlan = makeIndexScanFetchPlan(
+        testNss, makePointIntervalBounds(100.0, indexFields[0]), indexFields);
+    auto ceRes = estimator.estimatePlan(*zeroPlan);
+    ASSERT_OK(ceRes);
+    // Clamped to the minimum estimate of one row.
+    ASSERT_EQ(ceRes.getValue(),
+              CardinalityEstimate(CardinalityType{1.0}, EstimationSource::Sampling));
+}
+
+}  // unnamed namespace
+}  // namespace mongo::cost_based_ranker

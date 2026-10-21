@@ -1,0 +1,284 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/platform/waitable_atomic.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/transport/asio/asio_session.h"
+#include "mongo/transport/baton.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+
+#include <list>
+#include <map>
+#include <mutex>
+#include <source_location>
+#include <string>
+#include <vector>
+
+#include <poll.h>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace transport {
+
+class TransportLayer;
+
+/**
+ * AsioTransportLayer Baton implementation for linux.
+ *
+ * We implement our networking reactor on top of poll + eventfd for wakeups
+ */
+class AsioNetworkingBaton : public NetworkingBaton {
+public:
+    AsioNetworkingBaton(const TransportLayer* tl, OperationContext* opCtx)
+        : _opCtx(opCtx), _tl(tl) {}
+
+    ~AsioNetworkingBaton() override {
+        invariant(!_opCtx);
+        invariant(_sessions.empty());
+        invariant(_scheduled.empty());
+        invariant(_timers.empty());
+    }
+
+    // Overrides for `OutOfLineExecutor`
+    void schedule(Task func) override;
+
+    // Overrides for `Waitable` and `Notifiable`
+    void notify() noexcept override;
+
+    Waitable::TimeoutState run_until(ClockSource* clkSource, Date_t deadline) noexcept override;
+
+    void run(ClockSource* clkSource) noexcept override;
+
+    // Overrides for `Baton`
+    void markKillOnClientDisconnect() override;
+
+    // Overrides for `NetworkingBaton`
+    Future<void> addSession(Session& session, Type type) override;
+
+    Future<void> waitUntil(const ReactorTimer& timer, Date_t expiration) override;
+
+    Future<void> waitUntil(Date_t expiration, const CancellationToken&) override;
+
+    /**
+     * Cancellations are not necessarily processed in order. For example, consider:
+     * Baton someBaton;
+     * someBaton.addSession(S1); someBaton.addSession(S2);
+     * someBaton.cancelSession(S1); someBaton.cancelSession(S2);
+     * The continuation for `S1` may run before or after that of `S2`. Continuations for
+     * timers behave similarly with respect to cancellation.
+     *
+     * Sessions and timers that are still active when the baton detaches will be cancelled in the
+     * context of the detachment and their continuations will run inline with detachment.
+     */
+    bool cancelSession(Session& session) override;
+
+    bool cancelTimer(const ReactorTimer& timer) override;
+
+    bool canWait() override;
+
+    const TransportLayer* getTransportLayer() const override {
+        return _tl;
+    }
+
+private:
+    struct Caller {
+        std::source_location location;
+        std::string threadName;
+    };
+
+    class AuditedPromise {
+    public:
+        AuditedPromise() = default;
+        explicit AuditedPromise(Promise<void>);
+
+        /** Moves the underlying promise out of this object and return the promise. */
+        Promise<void> release(std::source_location location = std::source_location::current());
+
+        /** Sets the specified status as an error value on the underlying promise. */
+        void setError(Status status,
+                      std::source_location location = std::source_location::current());
+
+    private:
+        logv2::DynamicAttributes logAttributes(const Caller& previous, const Caller& current);
+
+        Promise<void> _promise;
+        boost::optional<Caller> _releaseCaller;
+        boost::optional<Caller> _setErrorCaller;
+    };
+
+    struct Timer {
+        Timer() = default;
+        Timer(size_t id, Promise<void> promise);
+
+        size_t id;  // Stores the unique identifier for the timer, provided by `ReactorTimer`.
+        bool canceled = false;
+        AuditedPromise promise;
+    };
+
+    struct TransportSession {
+        TransportSession() = default;
+        TransportSession(int fd, short events, bool canceled, Promise<void> promise);
+
+        int fd;
+        short events;  // Events to consider while polling for this session (e.g., `POLLIN`).
+        bool canceled = false;
+        AuditedPromise promise;
+    };
+
+    bool _cancelTimer(size_t timerId);
+    void _addTimer(Date_t expiration, Timer timer);
+
+    /*
+     * Internally, `AsioNetworkingBaton` thinks in terms of synchronized units of work. This is
+     * because a baton effectively represents a green thread with the potential to add or remove
+     * work (i.e., jobs) at any time. Thus, scheduled jobs must release their lock before executing
+     * any task external to the baton (e.g., `OutOfLineExecutor::Task`, `TransportSession:promise`,
+     * and `ReactorTimer::promise`).
+     */
+    using Job = unique_function<void(std::unique_lock<std::mutex>)>;
+
+    /**
+     * Invokes a job with exclusive access to the baton's internals.
+     *
+     * If the baton is currently polling (i.e., `_inPoll` is `true`), the polling thread owns the
+     * baton, so we schedule the job and notify the polling thread to wake up and run the job.
+     *
+     * Otherwise, take exclusive access and run the job on the current thread.
+     *
+     * Note that `_safeExecute()` will throw (and `_safeExecuteNoThrow` will invariant) if the baton
+     * has been detached.
+     *
+     * Also note that the job may not run inline, and may get scheduled to run by the baton, so it
+     * should never throw.
+     */
+    void _safeExecute(std::unique_lock<std::mutex> lk, Job job);
+    void _safeExecuteNoThrow(std::unique_lock<std::mutex> lk, Job job) noexcept;
+
+    /**
+     * Blocks polling on the registered sessions until one of the following happens:
+     * - `notify()` is called, either directly or through other methods (e.g., `schedule()`).
+     * - One of the timers scheduled on this baton times out.
+     * - There is an event for at least one of the registered sessions (e.g., data is available).
+     * Returns two lists of promises that must be fulfilled as the result of polling - the first
+     * must be fulfilled successfully and the second must be fulfilled with a cancellation error.
+     */
+    std::pair<std::list<Promise<void>>, std::list<Promise<void>>> _poll(
+        std::unique_lock<std::mutex>&, ClockSource*);
+
+    Future<void> _addSession(Session& session, short events);
+
+    void detachImpl() override;
+
+    std::mutex _mutex;
+
+    OperationContext* _opCtx;
+
+    bool _inPoll = false;
+
+    /**
+     * We use `_notificationState` to allow the baton to use different polling/waiting mechanisms
+     * (for efficiency) depending on what circumstances allow. Calls to `notify()` take the current
+     * state into consideration when deciding which mechanism to use to wake up the polling
+     * thread. In all states, notifiers must set the notification state to `kNotificationPending`.
+     * If we're in the middle of a call to `::poll` (state `kInPoll`), notifiers must then use
+     * the eventfd to to wake the polling thread. If we're in the middle of waiting on
+     * `_notificationState` itself (state `kInAtomicWait`), notifiers must notify on
+     * `_notificationState`. In state `kNone`, no thread is blocked polling or waiting, so the
+     * notifier only needs to set the state to `kNotificationPending`. Finally, in state
+     * `kNotificationPending`, `notify()` is a no-op.
+     *
+     * In `notify()`, a thread sending a notification can cause a transition from any state to
+     * `kNotificationPending`. Graphically:
+     *
+     * kNone ----1----> kNotificationPending <----2---- kInPoll          kInAtomicWait
+     *                                   ^                                  |
+     *                                   +-------------------------3--------+
+     * (1) The polling thread is not blocked - just transition to `kNotificationPending`.
+     * (2) The polling thread may be blocked in `::poll()` - notify the eventfd.
+     * (3) The polling thread may be blocked on `_notificationState` - notify it.
+     *
+     * In `_poll()`, if there are active sessions, the polling thread transitions to `kInPoll`
+     * (from `kNone` or `kNotificationPending`) before calling `::poll()`, and transitions to
+     * `kNone` after `::poll()` returns. Alternatively, when there are no active sessions and no
+     * pending notifications, the polling thread instead transitions from `kNone` to
+     * `kInAtomicWait` and waits on `_notificationState`. There is also a fast path from
+     * `kNotificationPending` to `kNone` when a notification is pending and there are no sessions
+     * to poll on.
+     *
+     * +-------+ -----2-----> +---------+            +----------------------+
+     * | kNone |              | kInPoll | <----3---- | kNotificationPending |
+     * +-------+ <----1------ +---------+            +----------------------+
+     *  |     ^                                           |
+     *  5     +-----------------4-------------------------+
+     *  V
+     * +---------------+
+     * | kInAtomicWait |
+     * +---------------+
+     *
+     * (1) Return from `::poll()`
+     * (2) Start polling with no pending notification and at least one active session
+     *      - use a blocking call to `::poll()`.
+     * (3) Start polling with a pending notification and at least one active session
+     *      - use a non-blocking call to `::poll()`.
+     * (4) Start polling with a pending notification and no active sessions
+     *      - go straight to `kNone` without blocking.
+     * (5) Start polling with no pending notification and no active sessions
+     *      - wait on `_notificationState`.
+     *
+     * Notice that only notifying threads transition to `kNotificationPending` and only the polling
+     * thread transitions out of `kNotificationPending`. This gives the polling thread exclusive
+     * ownership over `_notificationState` in that state (i.e., no one else will write to it).
+     *
+     * `_notificationState` is a BasicWaitableAtomic because the state tells us if anyone is
+     * waiting. The only time there might be a waiter is in `kInAtomicWait`, and there is only
+     * ever one waiter.
+     */
+    enum NotificationState : uint32_t { kNone, kNotificationPending, kInPoll, kInAtomicWait };
+    BasicWaitableAtomic<NotificationState> _notificationState;
+
+    /**
+     * Stores the sessions we need to poll on.
+     * `_pendingSessions` stores sessions that have been added, but due to an ongoing poll, haven't
+     * been added to `_sessions` yet. The baton only starts polling on a session once it gets
+     * added to `_sessions`.
+     */
+    absl::flat_hash_map<SessionId, TransportSession> _sessions;
+    absl::flat_hash_map<SessionId, TransportSession> _pendingSessions;
+
+    /**
+     * We use three structures to maintain timers:
+     * - `_timers` keeps a sorted list of timers according to their expiration date.
+     * - `_timersById` allows using the unique timer id to find and cancel a timer in constant time.
+     * - `_pendingTimers` keeps a map from timer id to (timer, expiration) pairs that haven't
+     *   been added to the other two members yet due to an ongoing `_poll`.
+     * Timers that are in `_pendingTimers` won't fire upon expiration until they are added to
+     * `_timers` and `_timersById`.
+     */
+    std::multimap<Date_t, Timer> _timers;
+    stdx::unordered_map<size_t, std::multimap<Date_t, Timer>::iterator> _timersById;
+    stdx::unordered_map<size_t, std::pair<Date_t, Timer>> _pendingTimers;
+
+    // Tasks scheduled for deferred execution.
+    std::vector<Job> _scheduled;
+
+    /*
+     * We hold the following values at the object level to save on allocations when a baton is
+     * waited on many times over the course of its lifetime:
+     * `_pollSet`: the poll set for `::poll`.
+     * `_pollSessions`: maps members of `_pollSet` to their corresponding session in `_sessions`.
+     */
+    std::vector<::pollfd> _pollSet;
+    std::vector<decltype(_sessions)::iterator> _pollSessions;
+
+    const TransportLayer* _tl;
+};
+
+}  // namespace transport
+}  // namespace mongo

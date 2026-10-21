@@ -1,0 +1,180 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+/*
+ * An alarm scheduler will fill a Future<void> at some time in the future and allow the caller to
+ * cancel specific alarms by opaque ID.
+ *
+ * All alarm service implementations take a ClockSource and all Date_t/Durations used to schedule
+ * alarms must be in relation to that ClockSource's now() and epoch.
+ *
+ * A scheduler won't actually process alarms. Some executor must be calling processExpiredAlarms()
+ * in order for alarms to fire.
+ */
+class AlarmScheduler {
+public:
+    /*
+     * This type gets returned when an alarm is scheduled and allows you to cancel the alarm.
+     *
+     * Once this handle is destroyed, the alarm will still be processed if it is still outstanding
+     * and there will be no way to cancel it.
+     */
+    class Handle {
+    public:
+        virtual ~Handle() = default;
+        /*
+         * Cancels the alarm if it has not already been fulfilled. If the alarm has already been
+         * fulfilled this returns an ErrorCodes::AlarmAlreadyFulfilled error
+         */
+        virtual Status cancel() = 0;
+    };
+
+    using SharedHandle = std::shared_ptr<Handle>;
+    using AlarmCount = uint64_t;
+
+    explicit AlarmScheduler(ClockSource* clockSource) : _clockSource(clockSource) {}
+
+    virtual ~AlarmScheduler() = default;
+
+    /*
+     * Fulfills all outstanding alarms with CallbackCanceled. Memory associated with the scheduler
+     * may not be freed until the last outstanding Handle is destroyed, however there should be
+     * no broken promises.
+     *
+     * This will be called implicitly by the destructor.
+     */
+    virtual void clearAllAlarms() = 0;
+
+    /*
+     * Clears all alarms as above, and prevents any new alarms from being scheduled. Calls to
+     * alarmAt will return a ready Future with a ShutdownInProgress error code.
+     */
+    virtual void clearAllAlarmsAndShutdown() = 0;
+
+    struct Alarm {
+        Future<void> future;
+        SharedHandle handle;
+    };
+    /*
+     * Schedules an alarm some milliseconds from now().
+     */
+    Alarm alarmFromNow(Milliseconds time) {
+        return alarmAt(_clockSource->now() + time);
+    };
+
+    /*
+     * Schedules an alarm at a specific time on the service's clock source.
+     */
+    virtual Alarm alarmAt(Date_t time) = 0;
+
+    /*
+     * Registers a callback that will be called when a new alarm has been registered.
+     *
+     * The hook will be called with a Date_t representing the next time an alarm will expire after
+     * all internal locks have been released. This can be used to unblock between calling
+     * processExpiredAlarms() with a new amount of time to block for.
+     */
+    using AlarmRegisterHook = unique_function<void(Date_t, const std::shared_ptr<AlarmScheduler>&)>;
+    void setAlarmRegisterHook(AlarmRegisterHook onAlarmHook) {
+        _registerHook = std::move(onAlarmHook);
+    }
+
+    /*
+     * Processes all alarms that have expired as of now(). If maxAlarms is not boost::none, then
+     * this will only expire that many alarms before returning.
+     *
+     * Returns the number of alarms that were expired by this call.
+     */
+    using AlarmExpireHook = unique_function<bool(AlarmCount)>;
+    virtual void processExpiredAlarms(boost::optional<AlarmExpireHook> hook = boost::none) = 0;
+
+    /*
+     * Returns the Date_t of the next scheduled alarm.
+     */
+    virtual Date_t nextAlarm() = 0;
+
+    virtual ClockSource* clockSource() const {
+        return _clockSource;
+    }
+
+protected:
+    void callRegisterHook(Date_t nextAlarm, const std::shared_ptr<AlarmScheduler>& which) {
+        if (_registerHook) {
+            _registerHook(nextAlarm, which);
+        }
+    }
+
+private:
+    AlarmRegisterHook _registerHook;
+    ClockSource* const _clockSource;
+};
+
+/*
+ * Implements a basic alarm scheduler based on a multimap of date_t to promise.
+ *
+ * Scheduling an alarm takes O(log(n)) where n is the number of outstanding alarms.
+ * Canceling an alarm is done in constant time.
+ * Processing alarms is done in constant time.
+ */
+class AlarmSchedulerPrecise : public AlarmScheduler,
+                              public std::enable_shared_from_this<AlarmSchedulerPrecise> {
+public:
+    explicit AlarmSchedulerPrecise(ClockSource* clockSource) : AlarmScheduler(clockSource) {}
+
+    ~AlarmSchedulerPrecise() override;
+
+    void clearAllAlarms() override;
+
+    void clearAllAlarmsAndShutdown() override;
+
+    Alarm alarmAt(Date_t time) override;
+
+    void processExpiredAlarms(boost::optional<AlarmExpireHook> hook) override;
+
+    Date_t nextAlarm() override;
+
+private:
+    class HandleImpl;
+
+    enum AlarmState { kOutstanding, kFulfilled, kAbandoned };
+    struct AlarmData {
+        explicit AlarmData(Promise<void> promise_) : promise(std::move(promise_)) {}
+
+        std::weak_ptr<HandleImpl> handle;
+        Promise<void> promise;
+    };
+
+    using AlarmMap = std::multimap<Date_t, AlarmData>;
+    using AlarmMapIt = AlarmMap::iterator;
+
+    void _clearAllAlarmsImpl(std::unique_lock<std::mutex>& lk);
+
+    std::mutex _mutex;
+    bool _shutdown = false;
+    AlarmMap _alarms;
+};
+
+}  // namespace mongo

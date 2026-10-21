@@ -1,0 +1,376 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/exec/agg/dynamic_batch_size.h"
+#include "mongo/db/exec/agg/exec_pipeline.h"
+#include "mongo/db/exec/agg/stage.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/exchange_spec_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/shard_role/resource_yielder.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+
+namespace mongo {
+namespace exec {
+namespace agg {
+
+/**
+ * Exchange operator implementation. The state in this class is shared between the consumer threads.
+ * TODO: SERVER-108866 don't expose this operator beyond ExchangeStage code.
+ **/
+class Exchange : public RefCountable {
+    static constexpr size_t kInvalidThreadId{std::numeric_limits<size_t>::max()};
+    static constexpr size_t kMaxBufferSize = 100 * 1024 * 1024;  // 100 MB
+    static constexpr size_t kMaxNumberConsumers = 100;
+
+    /**
+     * Convert the BSON representation of boundaries (as deserialized off the wire) to the internal
+     * format (KeyString).
+     */
+    static std::vector<std::string> extractBoundaries(
+        const boost::optional<std::vector<BSONObj>>& obj, Ordering ordering);
+
+    /**
+     * Validate consumer ids coming off the wire. If the ids pass the validation then return them.
+     * If the ids are not provided (boost::none) then generate a sequence [0..nConsumer-1].
+     */
+    static std::vector<size_t> extractConsumerIds(
+        const boost::optional<std::vector<std::int32_t>>& consumerIds, size_t nConsumers);
+
+    /**
+     * Extract the order description from the key.
+     */
+    static Ordering extractOrdering(const BSONObj& keyPattern);
+
+    /**
+     * Extract dotted paths from the key.
+     */
+    static std::vector<FieldPath> extractKeyPaths(const BSONObj& keyPattern);
+
+public:
+    /**
+     * How the operation memory tracker of the input subpipeline (the producer) is owned and
+     * reported.
+     */
+    enum class InputMemoryPolicy {
+        // The Exchange takes a reference to the memory tracker of any active opCtx, co-owning it.
+        // The co-ownership is important because there is no guaranteed lifetime ordering between
+        // the Exchange and an opCtx: in the case of getMores, the opCtx can come and go multiple
+        // times. With this policy, a co-owning copy of the tracker is published to whichever
+        // consumer drives the load, but memory is only reported to consumer 0's
+        // curOp. Requires the consumer pipelines to not have a distinct memory tracker: publishing
+        // overwrites the opCtx's tracker slot, and two trackers reporting to one CurOp would
+        // overwrite each other's stats.
+        kOwnAndReportToCurOp,
+
+        // The Exchange owns the tracker as above but never puts it on an opCtx: the producer's
+        // memory is still tracked and limit-enforced, just not reported to CurOp. For exchanges
+        // whose consumers have memory-tracking stages of their own.
+        //
+        // TODO SERVER-110499: a tracking strategy that supports memory-tracking stages after the
+        // exchange alongside the producer would let the producer's memory be reported to CurOp in
+        // all cases, removing this policy.
+        kOwnWithoutReporting,
+
+        // The tracker stays on the opCtx; the producer and all consumer stages built on that opCtx
+        // share it, so the producer's memory is accounted and reported as part of the whole query.
+        // Only valid when the whole exchange runs on a single opCtx with no concurrent consumers.
+        kShareOperationTracker,
+    };
+
+    /**
+     * Create an exchange. 'pipeline' represents the input to the exchange operator and must not be
+     * nullptr.
+     **/
+    Exchange(OperationContext* opCtx,
+             ExchangeSpec spec,
+             std::unique_ptr<mongo::Pipeline> pipeline,
+             InputMemoryPolicy inputMemoryPolicy = InputMemoryPolicy::kOwnAndReportToCurOp);
+
+    /**
+     * Interface for retrieving the next document. 'resourceYielder' is optional, and if provided,
+     * will be used to give up resources while waiting for other threads to empty their buffers.
+     */
+    DocumentSource::GetNextResult getNext(OperationContext* opCtx,
+                                          size_t consumerId,
+                                          ResourceYielder* resourceYielder);
+
+    size_t getConsumers() const {
+        return _consumers.size();
+    }
+
+    auto& getSpec() const {
+        return _spec;
+    }
+
+    [[MONGO_MOD_PRIVATE]] DynamicBatchSize* getDynamicBatchSize_forTest() {
+        return &_dynamicBatchSize;
+    }
+
+    [[MONGO_MOD_PRIVATE]] const OperationMemoryUsageTracker* getOperationMemoryTracker_forTest()
+        const {
+        return _memoryTracker.get();
+    }
+
+    [[MONGO_MOD_PRIVATE]] size_t getBatchDocCount_forTest(size_t consumerId) const;
+
+
+    void dispose(OperationContext* opCtx, size_t consumerId);
+
+    /**
+     * Unblocks the loading thread (a producer) if the loading is blocked by a consumer identified
+     * by consumerId. Note that there is no such thing as being blocked by multiple consumers. It is
+     * always one consumer that blocks the loading (i.e. the consumer's buffer is full and we can
+     * not append new documents). The unblocking happens when a consumer consumes some documents
+     * from its buffer (i.e. making room for appends) or when a consumer is disposed.
+     */
+    void unblockLoading(size_t consumerId);
+
+private:
+    /**
+     * Needed before executing/using the sub-pipeline (by the driving consumer).
+     *
+     * Attaches the subpipeline to the given opCtx, ensuring state like maxTimeMS is visible.
+     *
+     * Concerning memory tracking: If this->reportsInputMemoryToCurOp(), then this also attaches the
+     * Exchange's OperationMemoryUsageTracker to this opCtx. That way, the subpipeline's
+     * memory-tracked stages bind to the co-owned tracker and we aggregate memory use regardless of
+     * which consuming thread is driving the execution. The producer's memory is reported to CurOp
+     * only for consumer 0, so the metric is not duplicated across consumers.
+     */
+    void attachContext(OperationContext* opCtx, size_t consumerId);
+
+    /**
+     * Execute the subpipeline and fill the exchange buffers until one of the buffers is full.
+     * Returns the consumerId of the full buffer.
+     */
+    size_t loadNextBatch();
+
+    /**
+     * Detaches the subpipeline from its opCtx.
+     *
+     * If 'this->reportsInputMemoryToCurOp()', also unpublishes the OperationMemoryUsageTracker from
+     * that opCtx. Note that this never clears the Exchange's own reference to the memory tracker:
+     * If it came from attachContext(), then the co-ownership ensures that unpublishing it does not
+     * free it.  If it was created lazily during the subpipeline load, the Exchange adopts it.
+     *
+     * 'consumerId' is used only for diagnostics in the tripwire message.
+     */
+    void detachContext(OperationContext* opCtx, size_t consumerId);
+
+    size_t getTargetConsumer(const Document& input);
+
+    /**
+     * For consumerId zero, updates CurOp with the current memory metrics in
+     * OperationMemoryUsageTracker.
+     */
+    void updateMemoryTrackingForDispose(OperationContext* opCtx);
+
+    class ExchangeBuffer {
+    public:
+        bool appendDocument(DocumentSource::GetNextResult input,
+                            size_t memoryLimit,
+                            size_t docCountLimit = 0);
+        DocumentSource::GetNextResult getNext();
+        bool isEmpty() const {
+            return _buffer.empty();
+        }
+        /**
+         * Mark the buffer associated with a consumer as disposed. After calling this method,
+         * subsequent results that are appended to this buffer are instead discarded to prevent this
+         * unused buffer from filling up and blocking progress on other threads.
+         */
+        void dispose() {
+            invariant(!_disposed);
+            _disposed = true;
+            _buffer.clear();
+            _bytesInBuffer = 0;
+        }
+
+        bool isDisposed() const {
+            return _disposed;
+        }
+
+        size_t getBatchDocCount() const {
+            return _batchDocCount;
+        }
+
+    private:
+        size_t _bytesInBuffer{0};
+        size_t _batchDocCount{0};
+        std::deque<DocumentSource::GetNextResult> _buffer;
+        bool _disposed{false};
+    };
+
+    // Keep a copy of the spec for serialization purposes.
+    const ExchangeSpec _spec;
+
+    /**
+     * Dynamic batch size shared with the producer pipeline stage that controls
+     * docLimit. Consumers read it via appendDocument. One batch size is supported
+     * for all consumers, applied to the size of the buffer. For example, if the
+     * dynamic batch size is 10 when we are loading the next batch, if any
+     * consumer's buffer reaches 10 documents, we pause loading there.
+     */
+    DynamicBatchSize _dynamicBatchSize;
+
+    // An input to the exchange operator
+    std::unique_ptr<mongo::Pipeline> _pipeline;
+    std::unique_ptr<exec::agg::Pipeline> _execPipeline;
+
+    // A pattern for extracting a key from a document used by range and hash policies.
+    const BSONObj _keyPattern;
+
+    const Ordering _ordering;
+
+    const std::vector<FieldPath> _keyPaths;
+
+    // Range boundaries. The boundaries are ordered and must cover the whole domain, e.g.
+    // [Min, -200, 0, 200, Max] partitions the domain into 4 ranges (i.e. 1 less than number of
+    // boundaries). Every range has an assigned consumer that will process documents in that range.
+    const std::vector<std::string> _boundaries;
+
+    // A mapping from the range to consumer id. For the ranges from the example above the array must
+    // have 4 elements (1 for every range):
+    // [0, 1, 0, 1]
+    // consumer 0 processes ranges 1 and 3 (i.e. [Min,-200] and [0,200])
+    // consumer 1 processes ranges 2 and 4 (i.e. [-200,0] and [200,Max])
+    const std::vector<size_t> _consumerIds;
+
+    // A policy that tells how to distribute input documents to consumers.
+    const ExchangePolicyEnum _policy;
+
+    // If set to true then a producer sends special 'high watermark' documents to consumers in order
+    // to prevent deadlocks.
+    const bool _orderPreserving;
+
+    // A maximum size of buffer per consumer.
+    const size_t _maxBufferSize;
+
+    // Synchronization.
+    std::mutex _mutex;
+    stdx::condition_variable _haveBufferSpace;
+
+    // A thread that is currently loading the exchange buffers.
+    size_t _loadingThreadId{kInvalidThreadId};
+
+    // A status indicating that the exception was thrown during loadNextBatch(). Once in the failed
+    // state all other producing threads will fail too.
+    Status _errorInLoadNextBatch{Status::OK()};
+
+    size_t _roundRobinCounter{0};
+
+    // A rundown counter of consumers disposing of the pipelines. Only the last consumer will
+    // dispose of the 'inner' exchange pipeline.
+    size_t _disposeRunDown{0};
+
+    std::vector<std::unique_ptr<ExchangeBuffer>> _consumers;
+
+    bool ownsOperationMemoryTracker() const {
+        return _inputMemoryPolicy != InputMemoryPolicy::kShareOperationTracker;
+    }
+
+    bool reportsInputMemoryToCurOp() const {
+        return _inputMemoryPolicy == InputMemoryPolicy::kOwnAndReportToCurOp;
+    }
+
+    const InputMemoryPolicy _inputMemoryPolicy;
+
+    // The OperationMemoryTracker for the exchange pipeline. Stages in the subpipeline that track
+    // memory will report to this memory tracker. Only set when this Exchange owns the tracker
+    // (otherwise the tracker stays on the opCtx and this is null). Under
+    // InputMemoryPolicy::kOwnAndReportToCurOp a co-owning copy is also published on the driving
+    // consumer's opCtx. The Exchange stays an owner throughout, so the tracker cannot
+    // be destroyed out from under sub-stages -- which hold their tracker base as a raw pointer --
+    // when a consumer's opCtx goes away. Co-owning rather than moving the tracker also avoids the
+    // data races that arose from handing it back and forth between the OperationContext and the
+    // ClientCursor while a pipeline is executing.
+    std::shared_ptr<OperationMemoryUsageTracker> _memoryTracker;
+};
+
+/**
+ * This class handles the execution part of internal exchange stage and
+ * is part of the execution pipeline. Its construction is based on
+ * DocumentSourceSingleDocumentTransformation, which handles the optimization part.
+ *
+ * This stage is very unusual in that it is executed by multiple threads in
+ * parallel. The execution flow goes like this:
+ * - An aggregate request with an exchange spec arrives at a mongod. Example:
+ *   {
+ *     aggregate: collName,
+ *     pipeline: [{ $group: ... }],
+ *     cursor: {batchSize: 0},
+ *     exchange: {
+ *       "policy": "roundrobin",
+ *       "consumers": 5,
+ *       "orderPreserving": false,
+ *       "bufferSize": NumberInt(128),
+ *       "key": {}
+ *     }
+ *   }
+ * - The response generated by mongod will have 5 cursors one for each consumer.
+ * - Each cursor will have an executor whose pipeline is an ExchangeStage.
+ *   All 5 ExchangeStages will point at the same Exchange object (member _exchange).
+ * - The Exchange object has synchronization members as well as an attached subpipeline. All 5
+ *   consumers cooperatively execute the pipeline to buffer documents to be consumed according the
+ *   exchange spec's policy.
+ *
+ * ExchangeStage presents some challenges for tracking memory:
+ * - TODO SERVER-110500: Idle cursors for exchange pipeline will not show memory metrics
+ * - TODO SERVER-109511: Implement memory tracking for exchange stage buffered documents
+ * - TODO SERVER-110499: Allow tracking memory for stages after Exchange
+ *
+ * The current approach avoids data races between the first consumer (consumerId 0) and the other
+ * threads by attaching the OperationMemoryUsageTracker to the shared Exchange object, rather than a
+ * consumer's cursor and opCtx. However, this means that we don't report memory metrics for
+ * consumer 0 when its cursor is idle. This is SERVER-110500.
+ */
+class ExchangeStage final : public Stage {
+public:
+    ExchangeStage(std::string_view stageName,
+                  const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                  boost::intrusive_ptr<Exchange> exchange,
+                  size_t consumerId,
+                  const std::shared_ptr<ResourceYielder>& resourceYielder);
+
+private:
+    void setSource(Stage* source) final;
+    void doDispose() final;
+    GetNextResult doGetNext() final;
+
+    boost::intrusive_ptr<Exchange> _exchange;
+    const size_t _consumerId;
+
+    // While waiting for another thread to make room in its buffer, we may want to yield certain
+    // resources (such as the Session). Through this interface we can do that.
+    std::shared_ptr<ResourceYielder> _resourceYielder;
+};
+}  // namespace agg
+}  // namespace exec
+}  // namespace mongo

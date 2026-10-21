@@ -1,0 +1,258 @@
+/**
+ * Tests that the time series bucket level filters are able to skip entire buckets before unpacking.
+ *
+ * @tags: [
+ *   uses_explain,
+ *   requires_timeseries,
+ *   # Aggregation with explain may return incomplete results if interrupted by a stepdown.
+ *   does_not_support_stepdowns,
+ *   # During fcv upgrade/downgrade the engine might not be what we expect.
+ *   cannot_run_during_upgrade_downgrade,
+ *   # "Explain of a resolved view must be executed by mongos"
+ *   directly_against_shardsvrs_incompatible,
+ *   # SBE previously returned incorrect results for $gt(e): MinKey queries
+ *   requires_fcv_90,
+ *   # The explain assertions assume unsharded collection (getAggPlanStage).
+ *   assumes_unsharded_collection,
+ * ]
+ */
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {getAggPlanStage, getEngine} from "jstests/libs/query/analyze_plan.js";
+import {getSbePlanStages} from "jstests/libs/query/sbe_explain_helpers.js";
+
+const coll = db[jsTestName()];
+coll.drop();
+assert.commandWorked(
+    db.createCollection(coll.getName(), {timeseries: {timeField: "time", metaField: "tag"}}),
+);
+
+// Trivial, small data set with one document and one bucket.
+assert.commandWorked(coll.insert({time: new Date(), tag: 1, a: 42, b: 17}));
+
+// Test that bucket-level filters are applied on a collscan plan.
+(function testBucketLevelFiltersOnCollScanPlan() {
+    const pipeline = [
+        {$match: {a: {$gt: 100}}}, // 'a' is never greater than 100.
+        {$count: "ct"},
+    ];
+    const explain = coll.explain("executionStats").aggregate(pipeline);
+    if (getEngine(explain) == "sbe") {
+        // Ensure we get a collection scan, with one 'scan' stage.
+        const scanStages = getSbePlanStages(explain, "scan");
+        assert.eq(scanStages.length, 1, () => "Expected one scan stage " + tojson(explain));
+
+        // Ensure the scan actually returned something.
+        assert.gte(
+            scanStages[0].nReturned,
+            1,
+            () => "Expected one value returned from scan " + tojson(explain),
+        );
+
+        // Check that the ts_bucket_to_cellblock stage and its child returned 0 blocks, since
+        // nothing passed the bucket level filter.
+        const bucketStages = getSbePlanStages(explain, "ts_bucket_to_cellblock");
+        assert.eq(bucketStages.length, 1, () => "Expected one bucket stage " + tojson(explain));
+
+        assert.eq(
+            bucketStages[0].nReturned,
+            0,
+            () => "Expected bucket stage to return nothing " + tojson(explain),
+        );
+        assert.eq(
+            bucketStages[0].inputStage.nReturned,
+            0,
+            () => "Expected bucket stage child to return nothing " + tojson(explain),
+        );
+    } else {
+        const collScanStage = getAggPlanStage(explain, "COLLSCAN");
+
+        // The bucket-level filter attached to the COLLSCAN should have filtered out everything.
+        assert.eq(
+            0,
+            collScanStage.nReturned,
+            () => "Expected coll scan stage to return nothing " + tojson(explain),
+        );
+        assert.gt(
+            collScanStage.docsExamined,
+            0,
+            () => "Expected at least 1 doc examined by collscan stage " + tojson(explain),
+        );
+    }
+})();
+
+// Test that bucket-level filters are applied at the FETCH stage.
+(function testBucketLevelFiltersOnIxScanFetchPlan() {
+    const pipeline = [
+        // 'a' is never greater than 100, but there is a bucket with meta value tag=1. The match
+        // on the 'metaField' should allow this to use the default {meta:1,time:1} index.
+        {$match: {tag: 1, a: {$gt: 100}}},
+
+        // For simplicity, just count all the results.
+        {$count: "ct"},
+    ];
+    const explain = coll.explain("executionStats").aggregate(pipeline);
+
+    if (getEngine(explain) == "sbe") {
+        // Ensure we get an ixscan/fetch plan, with one ixseek stage and one seek stage.
+        const seekStages = getSbePlanStages(explain, "fetch");
+        assert.eq(seekStages.length, 1, () => "Expected one seek stage " + tojson(explain));
+        assert.eq(
+            getSbePlanStages(explain, "ixseek").length,
+            1,
+            () => "Expected one ixseek stage " + tojson(explain),
+        );
+
+        // Ensure the seek stage actually returned something.
+        assert.gte(
+            seekStages[0].nReturned,
+            1,
+            () => "Expected seek to have returned something " + tojson(explain),
+        );
+
+        const bucketStages = getSbePlanStages(explain, "ts_bucket_to_cellblock");
+        assert.eq(bucketStages.length, 1, () => "Expected a bucket stage " + tojson(explain));
+
+        // Ensure that the ts_bucket_to_cellblock stage and its child returned 0 blocks, since
+        // nothing passed the bucket level filter.
+        assert.eq(
+            bucketStages[0].nReturned,
+            0,
+            () => "Expected bucket stage to return 0 rows " + tojson(bucketStages[0]),
+        );
+        assert.eq(
+            bucketStages[0].inputStage.nReturned,
+            0,
+            () => "Expected bucket stage child to return 0 rows " + tojson(bucketStages[0]),
+        );
+    } else {
+        const ixscanStage = getAggPlanStage(explain, "IXSCAN");
+        // The ixscan stage should return some data.
+        assert.gt(
+            ixscanStage.nReturned,
+            0,
+            () => "Expected ixscan stage to return at least one row " + tojson(explain),
+        );
+
+        const fetchStage = getAggPlanStage(explain, "FETCH");
+        // The fetch stage should filter out all of the buckets with the bucket-level filter.
+        assert.eq(
+            0,
+            fetchStage.nReturned,
+            () => "Expected fetch stage to return 0 rows " + tojson(explain),
+        );
+    }
+})();
+
+// Test that filters over data with missing fields yield correct results (this probably means that
+// the bucket-level filters couldn't be applied, but we don't care to check the plan as long as the
+// results are correct).
+(function testWithMissingField() {
+    coll.drop();
+    assert.commandWorked(
+        db.createCollection(coll.getName(), {timeseries: {timeField: "t", metaField: "m"}}),
+    );
+
+    // These two events will be inserted into the same bucket.
+    const event = {_id: 0, t: new Date(), m: 0, x: "abc"};
+    const event_with_missing = {_id: 0, t: new Date(), m: 0};
+    coll.insertMany([event, event_with_missing]);
+
+    const testCases = [
+        // Explicit comparison for null should find missing.
+        {pipeline: [{$match: {x: null}}], expectedResult: [event_with_missing]},
+
+        // Type-bracketing comparison.
+        {pipeline: [{$match: {x: {$lt: "aaa"}}}], expectedResult: []},
+        {pipeline: [{$match: {x: {$lte: 10}}}], expectedResult: []},
+
+        // In non-type-bracketing comparison (inside $expr): missing == null < number < string
+        {pipeline: [{$match: {$expr: {$lt: ["$x", "aaa"]}}}], expectedResult: [event_with_missing]},
+        {pipeline: [{$match: {$expr: {$lte: ["$x", 10]}}}], expectedResult: [event_with_missing]},
+    ];
+
+    for (const test of testCases) {
+        assertArrayEq({
+            expected: test.expectedResult,
+            actual: coll.aggregate(test.pipeline).toArray(),
+            extraErrorMsg: ` result of $match over data with missing field. Explain: ${tojson(
+                coll.explain().aggregate(test.pipeline),
+            )}`,
+        });
+    }
+})();
+
+// Test that a {$gte: MinKey} predicate (and its $expr comparison variants) over a field that is
+// entirely absent from a bucket does not incorrectly drop that bucket. MinKey is the only value
+// smaller than a missing field, so every document matches {$gte: MinKey}. When the field is missing
+// from all measurements, the bucket's 'control.max.<field>' is also missing.
+(function testMinKeyComparisonWithMissingField() {
+    coll.drop();
+    assert.commandWorked(
+        db.createCollection(coll.getName(), {timeseries: {timeField: "t", metaField: "m"}}),
+    );
+
+    // Neither measurement has the queried field 'x', so 'control.min.x'/'control.max.x' are absent.
+    const docs = [
+        {_id: 0, t: ISODate("2024-01-01T00:00:00Z"), m: 0},
+        {_id: 1, t: ISODate("2024-01-01T00:01:00Z"), m: 0},
+    ];
+    assert.commandWorked(coll.insertMany(docs));
+
+    // A trailing inclusion $project exercises the block-processing path in SBE.
+    const proj = {$project: {_id: 1}};
+    const all = [{_id: 0}, {_id: 1}];
+    const testCases = [
+        // Missing field is greater than MinKey, so these match every document.
+        {pipeline: [{$match: {x: {$gte: MinKey}}}, proj], expectedResult: all},
+        {pipeline: [{$match: {$expr: {$gte: ["$x", MinKey]}}}, proj], expectedResult: all},
+        {pipeline: [{$match: {$expr: {$gt: ["$x", MinKey]}}}, proj], expectedResult: all},
+        // Missing field is greater than MinKey, so these match nothing.
+        {pipeline: [{$match: {$expr: {$lt: ["$x", MinKey]}}}, proj], expectedResult: []},
+        {pipeline: [{$match: {$expr: {$lte: ["$x", MinKey]}}}, proj], expectedResult: []},
+        {pipeline: [{$match: {$expr: {$eq: ["$x", MinKey]}}}, proj], expectedResult: []},
+        // Missing field is less than MaxKey, so {$lt[e]: MaxKey} matches every document.
+        {pipeline: [{$match: {x: {$lt: MaxKey}}}, proj], expectedResult: all},
+        {pipeline: [{$match: {x: {$lte: MaxKey}}}, proj], expectedResult: all},
+        {pipeline: [{$match: {$expr: {$lt: ["$x", MaxKey]}}}, proj], expectedResult: all},
+        {pipeline: [{$match: {$expr: {$lte: ["$x", MaxKey]}}}, proj], expectedResult: all},
+    ];
+
+    for (const test of testCases) {
+        assertArrayEq({
+            expected: test.expectedResult,
+            actual: coll.aggregate(test.pipeline).toArray(),
+            extraErrorMsg: ` result of MinKey/MaxKey comparison over a missing field. Explain: ${tojson(
+                coll.explain().aggregate(test.pipeline),
+            )}`,
+        });
+    }
+})();
+
+// Test that a bucket containing a NaN measurement isn't incorrectly dropped by the bucket-level
+// filter. NaN sorts as the smallest value, so it becomes the bucket's control.min; a bucket-level
+// filter must not use that to conclude the whole bucket fails a range predicate (SERVER-126494).
+(function testWithNaNMeasurement() {
+    coll.drop();
+    assert.commandWorked(
+        db.createCollection(coll.getName(), {timeseries: {timeField: "ts", metaField: "m"}}),
+    );
+
+    const docs = [
+        {ts: ISODate("2024-01-01T00:00:00Z"), m: 1, v: 1},
+        {ts: ISODate("2024-01-01T00:01:00Z"), m: 1, v: NaN},
+        {ts: ISODate("2024-01-01T00:02:00Z"), m: 1, v: 100},
+    ];
+    assert.commandWorked(coll.insertMany(docs));
+
+    // The $match on 'v' followed by an inclusion $project exercises the block-processing path,
+    // where a matching measurement (v: 1) must still be returned even though the bucket also
+    // contains NaN.
+    const pipeline = [{$match: {v: {$lt: 50}}}, {$project: {_id: 0, v: 1}}];
+    assertArrayEq({
+        expected: [{v: 1}],
+        actual: coll.aggregate(pipeline).toArray(),
+        extraErrorMsg: ` result of $match on a field with a NaN measurement. Explain: ${tojson(
+            coll.explain().aggregate(pipeline),
+        )}`,
+    });
+})();

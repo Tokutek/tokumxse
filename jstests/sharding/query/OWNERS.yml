@@ -1,0 +1,72 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/query
+  - "collmod_upgrade_to_constraint_sharded.js":
+    approvers:
+      - 10gen/query-execution
+  - "collmod_constraint_scan_with_chunk_migration.js":
+    approvers:
+      - 10gen/query-execution
+  - "bulk_write*":
+    approvers:
+      - 10gen/query-execution-router
+  - "log_remote_op_wait*":
+    approvers:
+      - 10gen/query-execution-router
+  - "*plan_cache*":
+    approvers:
+      - 10gen/query-optimization
+  - "*target*":
+    approvers:
+      - 10gen/query-optimization
+  - "exact_shard_key_target.js":
+    approvers:
+      - 10gen/query-optimization
+  - "hidden_index.js":
+    approvers:
+      - 10gen/query-optimization
+  - "internal_search_id_lookup*.js":
+    approvers:
+      - 10gen/query-integration-search
+  - "sharded_profile.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "count_explain_raw_data_query_shape.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "authwhere.js":
+    approvers:
+      - 10gen/query-integration-features
+  - "batch_write_command_sharded.js":
+    approvers:
+      - 10gen/query-execution-router
+  - "clustered_coll_scan.js":
+    approvers:
+      - 10gen/query-execution
+  - "is_not_primary_error_does_not_leak_shard_cursor.js":
+    approvers:
+      - 10gen/query-execution-router
+  - "lookup_from_config_cache_chunks.js":
+    approvers:
+      - 10gen/query-optimization
+  - "stats.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "unowned_doc_filtering.js":
+    approvers:
+      - 10gen/query-execution-router
+  - "update_delete_many_metrics.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "release_memory*":
+    approvers:
+      - 10gen/query-execution
+  - "opcounters_aggregate.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "ifr_*.js":
+    approvers:
+      - 10gen/query-integration-features
+      - 10gen/query-execution

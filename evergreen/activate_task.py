@@ -1,0 +1,94 @@
+"""Script that activates the input task on the same variant as the running task"""
+
+from typing import Optional
+
+import requests
+import typer
+from typing_extensions import Annotated
+
+from buildscripts.resmokelib.utils import evergreen_conn
+from buildscripts.util.read_config import read_config_file
+
+
+def main(
+    task_name: str,
+    skip_for_patch_author: Annotated[Optional[str], typer.Argument()] = None,
+    skip_activate_task: Annotated[Optional[bool], typer.Argument()] = False,
+):
+    expansions_file = "../expansions.yml"
+    expansions = read_config_file(expansions_file)
+    evg_api = evergreen_conn.get_evergreen_api()
+
+    # skip if in commit-queue, commit-queue patches cannot be modified
+    if expansions.get("is_commit_queue", False):
+        return
+
+    # Skip activation if the patch author is the excluded user
+    if (
+        (skip_for_patch_author is not None) and expansions.get("author") == skip_for_patch_author
+    ) or skip_activate_task:
+        return
+
+    variant_id = expansions.get("build_id")
+    variant = evg_api.build_by_id(variant_id)
+    resolved_build_variant = expansions.get("build_variant") or getattr(
+        variant, "build_variant", None
+    )
+    found_task = None
+    for task in variant.get_tasks():
+        if task.display_name == task_name:
+            found_task = task
+            break
+
+    is_patch = expansions.get("is_patch", False)
+    if found_task:
+        # In non-patch evergreen versions the task will live as not activated
+        # We can just find the task and activate it if it is not activated yet
+        if found_task.activated:
+            return
+
+        evg_api.configure_task(found_task.task_id, activated=True)
+    elif is_patch:
+        # Evergreen patches work differently than other evergreen versions
+        # When a task is not scheduled initially it does not exist as an unscheduled task
+        # So we need to use a different path in the api to schedule the task
+        if not resolved_build_variant:
+            raise RuntimeError(
+                f"Could not determine the build variant for patch activation from build {variant_id}"
+            )
+        patch_id = expansions.get("version_id")
+        evg_api.configure_patch(patch_id, [{"id": resolved_build_variant, "tasks": [task_name]}])
+    else:
+        # Tasks on waterfall versions may not be materialized until they are activated. Use the
+        # version endpoint to schedule the task when it is not already present in the build.
+        if not resolved_build_variant:
+            raise RuntimeError(
+                f"Could not determine the build variant for version activation from build {variant_id}"
+            )
+        version_id = expansions.get("version_id")
+        if not version_id:
+            raise RuntimeError(
+                f"Could not determine the version for activation from build {variant_id}"
+            )
+        try:
+            evg_api.activate_version_tasks(
+                version_id, [{"name": resolved_build_variant, "tasks": [task_name]}]
+            )
+        except requests.exceptions.HTTPError as err:
+            # Concurrent activation requests for the same version can race: another request
+            # may have already materialized and activated this task, and Evergreen returns a
+            # 400 for activation requests that have nothing left to activate. Only swallow the
+            # error once a fresh lookup confirms this task is actually activated.
+            if err.response is None or err.response.status_code != 400:
+                raise
+            for task in evg_api.build_by_id(variant_id).get_tasks():
+                if task.display_name == task_name and task.activated:
+                    return
+            raise
+
+
+app = typer.Typer(pretty_exceptions_show_locals=False)
+app.command()(main)
+
+if __name__ == "__main__":
+    app()

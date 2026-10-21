@@ -1,0 +1,911 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/index_builds/index_builds_coordinator_mongod.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/index_builds/commit_quorum_options.h"
+#include "mongo/db/index_builds/index_build_oplog_entry.h"
+#include "mongo/db/index_builds/primary_driven/util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_member_in_standalone_mode.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/timestamp_block.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_control.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/otel/metrics/metric_names.h"
+#include "mongo/otel/metrics/metrics_test_util.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <functional>
+#include <mutex>
+#include <string>
+
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+
+using unittest::assertGet;
+
+namespace {
+// TODO SERVER-121249: Replace these local helpers if SERVER-121249 introduces an OTel histogram
+// test helper that supports empty histograms.
+int64_t readInt64CounterOrZero(otel::metrics::OtelMetricsCapturer& capturer,
+                               otel::metrics::MetricName name) {
+    try {
+        return capturer.readInt64Counter(name);
+    } catch (const DBException& ex) {
+        if (ex.code() == ErrorCodes::KeyNotFound) {
+            return 0;
+        }
+        throw;
+    }
+}
+
+int64_t readInt64GaugeOrZero(otel::metrics::OtelMetricsCapturer& capturer,
+                             otel::metrics::MetricName name) {
+    try {
+        return capturer.readInt64Gauge(name);
+    } catch (const DBException& ex) {
+        if (ex.code() == ErrorCodes::KeyNotFound) {
+            return 0;
+        }
+        throw;
+    }
+}
+
+struct IndexBuildMetricsSnapshot {
+    int64_t active = 0;
+    int64_t started = 0;
+    int64_t succeeded = 0;
+    int64_t failed = 0;
+    int64_t toBeResumed = 0;
+};
+
+IndexBuildMetricsSnapshot readIndexBuildMetrics(otel::metrics::OtelMetricsCapturer& capturer) {
+    return {
+        .active = readInt64GaugeOrZero(capturer, otel::metrics::MetricNames::kIndexBuildsActive),
+        .started =
+            readInt64CounterOrZero(capturer, otel::metrics::MetricNames::kIndexBuildsStarted),
+        .succeeded =
+            readInt64CounterOrZero(capturer, otel::metrics::MetricNames::kIndexBuildsSucceeded),
+        .failed = readInt64CounterOrZero(capturer, otel::metrics::MetricNames::kIndexBuildsFailed),
+        .toBeResumed =
+            readInt64CounterOrZero(capturer, otel::metrics::MetricNames::kIndexBuildsToBeResumed),
+    };
+}
+
+class IndexBuildsCoordinatorMongodTest : public CatalogTestFixture {
+private:
+    void setUp() override;
+    void tearDown() override;
+
+public:
+    /**
+     * Creates a collection with a default CollectionsOptions and the given UUID.
+     */
+    void createCollection(const NamespaceString& nss, UUID uuid);
+
+    void createEmptyCollection(const NamespaceString& nss, UUID uuid);
+
+    CollectionAcquisition getCollectionExclusive(OperationContext* opCtx,
+                                                 const NamespaceString& nss);
+
+    std::vector<IndexBuildInfo> makeSpecs(std::vector<std::string> keys, std::vector<int32_t> ids);
+
+    // Registers and starts a primary-driven index build on _testFooNss, returning the build's
+    // completion future. The caller is expected to have enabled the PDIB feature flags and, if a
+    // particular failure is desired, configured the 'failIndexBuildWithError' fail point first.
+    auto startPrimaryDrivenIndexBuild(const UUID& buildUUID,
+                                      const std::vector<IndexBuildInfo>& indexes) {
+        index_builds::primary_driven::registry(operationContext()->getServiceContext())
+            .add(buildUUID, _testFooNss.dbName(), _testFooUUID, indexes, boost::none);
+        return assertGet(_indexBuildsCoord->startIndexBuild(
+            operationContext(),
+            _testFooNss.dbName(),
+            _testFooUUID,
+            indexes,
+            buildUUID,
+            {.indexBuildMethod = IndexBuildMethodEnum::kPrimaryDriven,
+             .indexBuildProtocol = IndexBuildProtocol::kPrimaryDriven,
+             .commitQuorum = CommitQuorumOptions{CommitQuorumOptions::kPrimarySelfVote}}));
+    }
+
+    const UUID _testFooUUID = UUID::gen();
+    const NamespaceString _testFooNss = NamespaceString::createNamespaceString_forTest("test.foo");
+    const UUID _testBarUUID = UUID::gen();
+    const NamespaceString _testBarNss = NamespaceString::createNamespaceString_forTest("test.bar");
+    const UUID _othertestFooUUID = UUID::gen();
+    const NamespaceString _othertestFooNss =
+        NamespaceString::createNamespaceString_forTest("othertest.foo");
+    const TenantId _tenantId{OID::gen()};
+    const NamespaceString _testTenantFooNss =
+        NamespaceString::createNamespaceString_forTest(_tenantId, "test.test");
+    const UUID _testFooTenantUUID = UUID::gen();
+    const IndexBuildsCoordinator::IndexBuildOptions _indexBuildOptions = {
+        .commitQuorum = CommitQuorumOptions(CommitQuorumOptions::kPrimarySelfVote)};
+    std::unique_ptr<IndexBuildsCoordinator> _indexBuildsCoord;
+};
+
+void IndexBuildsCoordinatorMongodTest::setUp() {
+    CatalogTestFixture::setUp();
+    // Create config.system.indexBuilds collection to store commit quorum value during index
+    // building.
+    createCollection(NamespaceString::kIndexBuildEntryNamespace, UUID::gen());
+
+    createCollection(_testFooNss, _testFooUUID);
+    createCollection(_testBarNss, _testBarUUID);
+    createCollection(_othertestFooNss, _othertestFooUUID);
+    createCollection(_testTenantFooNss, _testFooTenantUUID);
+
+    _indexBuildsCoord = std::make_unique<IndexBuildsCoordinatorMongod>();
+}
+
+void IndexBuildsCoordinatorMongodTest::tearDown() {
+    // Resume index builds left running by test failures so that shutdown() will not block.
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+
+    _indexBuildsCoord->shutdown(operationContext());
+    _indexBuildsCoord.reset();
+    // All databases are dropped during tear down.
+    CatalogTestFixture::tearDown();
+}
+
+void IndexBuildsCoordinatorMongodTest::createCollection(const NamespaceString& nss, UUID uuid) {
+    createEmptyCollection(nss, uuid);
+
+    // Insert document into collection to avoid optimization for index creation on an empty
+    // collection. This allows us to pause index builds on the collection using the test function
+    // IndexBuildsCoordinator::sleepIndexBuilds_forTestOnly().
+    ASSERT_OK(storageInterface()->insertDocument(operationContext(),
+                                                 nss,
+                                                 {BSON("_id" << 0), Timestamp()},
+                                                 repl::OpTime::kUninitializedTerm));
+}
+
+void IndexBuildsCoordinatorMongodTest::createEmptyCollection(const NamespaceString& nss,
+                                                             UUID uuid) {
+    CollectionOptions options;
+    options.uuid = uuid;
+    ASSERT_OK(storageInterface()->createCollection(operationContext(), nss, options));
+}
+
+CollectionAcquisition IndexBuildsCoordinatorMongodTest::getCollectionExclusive(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    return acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_X);
+}
+
+std::vector<IndexBuildInfo> IndexBuildsCoordinatorMongodTest::makeSpecs(
+    std::vector<std::string> keys, std::vector<int32_t> ids) {
+    invariant(keys.size());
+    invariant(keys.size() == ids.size());
+    auto storageEngine = operationContext()->getServiceContext()->getStorageEngine();
+    std::vector<IndexBuildInfo> indexes;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& keyName = keys[i];
+        indexes.emplace_back(
+            BSON("v" << 2 << "key" << BSON(keyName << 1) << "name" << (keyName + "_1")),
+            fmt::format("index-{}", ids[i]),
+            *storageEngine);
+    }
+    return indexes;
+}
+
+/**
+ * Tests the IndexBuildsCoordinator methods that wait and block until index builds finish
+ * (assertNoIndexBuildInProgForCollection() and assertNoBgOpInProgForDb()). They must honour
+ * interruption of the waiter's OperationContext.
+ */
+class IndexBuildsCoordinatorMongodInterruptibleWaitTest : public IndexBuildsCoordinatorMongodTest {
+public:
+    static constexpr auto kInterruptCode = ErrorCodes::InterruptedDueToReplStateChange;
+    // The protocol used by builds started with _indexBuildOptions, which leaves
+    // IndexBuildOptions::indexBuildProtocol at its kTwoPhase default.
+    static constexpr auto kProtocol = IndexBuildProtocol::kTwoPhase;
+
+    struct WaiterResult {
+        // Whether the waiter was observed inside an interruptible wait. False means the wait never
+        // consulted its OperationContext.
+        bool reachedInterruptibleWait = false;
+        // Whether the test had to abort the index build to get the waiter moving again. True means
+        // the interrupt was ignored.
+        bool neededEscapeHatch = false;
+        // What the wait threw, or Status::OK() if it returned normally.
+        Status status = Status::OK();
+    };
+
+    /**
+     * Starts a paused index build on _testFooNss, runs 'waitFn' on a separate thread with its own
+     * OperationContext, and once that thread is observed to be waiting on the opCtx, interrupts it
+     * and checks waitFn() correctly threw an exception.
+     *
+     * Always joins the waiter thread and leaves no index build in progress, so callers can assert
+     * on the result without leaking a wedged thread.
+     */
+    WaiterResult runInterruptedWaiter(std::function<void(OperationContext*)> waitFn) {
+        static constexpr auto kTimeout = Seconds(10);
+
+        // Hold an index build in progress for the duration of the wait.
+        _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+        const auto buildUUID = UUID::gen();
+        auto buildFuture = assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                                        _testFooNss.dbName(),
+                                                                        _testFooUUID,
+                                                                        makeSpecs({"a"}, {1}),
+                                                                        buildUUID,
+                                                                        _indexBuildOptions));
+
+        // Releases the index build, so if we ignore the interrupt, we abort the index build and
+        // fail the test instead of hanging forever.
+        auto escapeHatch = [&] {
+            _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+            _indexBuildsCoord->abortIndexBuildByBuildUUID(
+                operationContext(),
+                buildUUID,
+                IndexBuildAction::kPrimaryAbort,
+                Status{ErrorCodes::IndexBuildAborted, "interruptibility test cleanup"});
+            buildFuture.getNoThrow().getStatus().ignore();
+        };
+
+        WaiterResult result;
+        auto [finishedPromise, finishedFuture] = makePromiseFuture<void>();
+
+        auto waiterClient = getServiceContext()->getService()->makeClient("indexBuildWaiter");
+        auto waiterOpCtx = waiterClient->makeOperationContext();
+
+        stdx::thread waiter([&]() {
+            try {
+                waitFn(waiterOpCtx.get());
+            } catch (const DBException& ex) {
+                result.status = ex.toStatus();
+            }
+            finishedPromise.emplaceValue();
+        });
+
+        result.reachedInterruptibleWait = waitForPredicate(
+            [&] { return waiterOpCtx->isWaitingForConditionOrInterrupt(); }, kTimeout);
+        markKilled(waiterOpCtx.get());
+
+        // Give the waiter a bounded chance to unwind. Timing out means the interrupt was ignored.
+        if (!waitForPredicate([&] { return finishedFuture.isReady(); }, kTimeout)) {
+            result.neededEscapeHatch = true;
+            escapeHatch();
+        }
+        waiter.join();
+
+        if (!result.neededEscapeHatch) {
+            // Clean up the index build.
+            escapeHatch();
+        }
+        return result;
+    }
+
+    void assertWasInterrupted(const WaiterResult& result) {
+        EXPECT_TRUE(result.reachedInterruptibleWait)
+            << "the waiter never entered an interruptible wait; the wait is ignoring its "
+               "OperationContext";
+        EXPECT_FALSE(result.neededEscapeHatch)
+            << "the wait ignored the interrupt and only unwound once the index build completed";
+        EXPECT_EQ(result.status.code(), kInterruptCode);
+    }
+
+private:
+    static void markKilled(OperationContext* opCtx) {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        opCtx->markKilled(kInterruptCode);
+    }
+
+    // Polls 'pred' until it returns true or 'timeout' elapses, and returns its final value.
+    static bool waitForPredicate(const std::function<bool()>& pred, Milliseconds timeout) {
+        static constexpr auto kSleepInterval = Milliseconds(10);
+
+        const auto deadline = Date_t::now() + timeout;
+        while (Date_t::now() < deadline) {
+            if (pred()) {
+                return true;
+            }
+            sleepFor(kSleepInterval);
+        }
+        return pred();
+    }
+};
+
+TEST_F(IndexBuildsCoordinatorMongodTest, AttemptBuildSameIndexFails) {
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+
+    // Register an index build on _testFooNss.
+    const auto buildUUID = UUID::gen();
+    auto testFoo1Future =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _testFooNss.dbName(),
+                                                     _testFooUUID,
+                                                     makeSpecs({"a", "b"}, {1, 2}),
+                                                     buildUUID,
+                                                     _indexBuildOptions));
+
+    // Attempt and fail to register an index build on _testFooNss with the same index name, while
+    // the prior build is still running.
+    EXPECT_EQ(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                 _testFooNss.dbName(),
+                                                 _testFooUUID,
+                                                 makeSpecs({"b"}, {3}),
+                                                 UUID::gen(),
+                                                 _indexBuildOptions),
+              ErrorCodes::IndexBuildAlreadyInProgress);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        buildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+    auto indexCatalogStats = unittest::assertGet(testFoo1Future.getNoThrow());
+    EXPECT_EQ(1, indexCatalogStats.numIndexesBefore);
+    EXPECT_EQ(3, indexCatalogStats.numIndexesAfter);
+}
+
+// Incrementally registering index builds and checking both that the registration was successful and
+// that the access functions convey the expected state of the manager.
+TEST_F(IndexBuildsCoordinatorMongodTest, Registration) {
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+
+    // Register an index build on _testFooNss.
+    const auto testFoo1BuildUUID = UUID::gen();
+    auto testFoo1Future =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _testFooNss.dbName(),
+                                                     _testFooUUID,
+                                                     makeSpecs({"a", "b"}, {1, 2}),
+                                                     testFoo1BuildUUID,
+                                                     _indexBuildOptions));
+
+    EXPECT_EQ(_indexBuildsCoord->numInProgForDb(_testFooNss.dbName()), 1);
+    ASSERT(_indexBuildsCoord->inProgForCollection(_testFooUUID));
+    ASSERT(_indexBuildsCoord->inProgForDb(_testFooNss.dbName()));
+    ASSERT_THROWS_WITH_CHECK(
+        _indexBuildsCoord->assertNoIndexBuildInProgForCollection(_testFooUUID),
+        ExceptionFor<ErrorCodes::BackgroundOperationInProgressForNamespace>,
+        [&](const auto& ex) { ASSERT_STRING_CONTAINS(ex.reason(), testFoo1BuildUUID.toString()); });
+    ASSERT_THROWS_WITH_CHECK(
+        _indexBuildsCoord->assertNoBgOpInProgForDb(_testFooNss.dbName()),
+        ExceptionFor<ErrorCodes::BackgroundOperationInProgressForDatabase>,
+        [&](const auto& ex) { ASSERT_STRING_CONTAINS(ex.reason(), testFoo1BuildUUID.toString()); });
+
+    // Register a second index build on _testFooNss.
+    const auto testFoo2BuildUUID = UUID::gen();
+    auto testFoo2Future =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _testFooNss.dbName(),
+                                                     _testFooUUID,
+                                                     makeSpecs({"c", "d"}, {3, 4}),
+                                                     testFoo2BuildUUID,
+                                                     _indexBuildOptions));
+
+    EXPECT_EQ(_indexBuildsCoord->numInProgForDb(_testFooNss.dbName()), 2);
+    ASSERT(_indexBuildsCoord->inProgForCollection(_testFooUUID));
+    ASSERT(_indexBuildsCoord->inProgForDb(_testFooNss.dbName()));
+    ASSERT_THROWS_CODE(_indexBuildsCoord->assertNoIndexBuildInProgForCollection(_testFooUUID),
+                       AssertionException,
+                       ErrorCodes::BackgroundOperationInProgressForNamespace);
+    ASSERT_THROWS_CODE(_indexBuildsCoord->assertNoBgOpInProgForDb(_testFooNss.dbName()),
+                       AssertionException,
+                       ErrorCodes::BackgroundOperationInProgressForDatabase);
+
+    // Register an index build on a different collection _testBarNss.
+    const auto testBarBuildUUID = UUID::gen();
+    auto testBarFuture = assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                                      _testBarNss.dbName(),
+                                                                      _testBarUUID,
+                                                                      makeSpecs({"x", "y"}, {5, 6}),
+                                                                      testBarBuildUUID,
+                                                                      _indexBuildOptions));
+
+    EXPECT_EQ(_indexBuildsCoord->numInProgForDb(_testBarNss.dbName()), 3);
+    ASSERT(_indexBuildsCoord->inProgForCollection(_testBarUUID));
+    ASSERT(_indexBuildsCoord->inProgForDb(_testBarNss.dbName()));
+    ASSERT_THROWS_CODE(_indexBuildsCoord->assertNoIndexBuildInProgForCollection(_testBarUUID),
+                       AssertionException,
+                       ErrorCodes::BackgroundOperationInProgressForNamespace);
+    ASSERT_THROWS_CODE(_indexBuildsCoord->assertNoBgOpInProgForDb(_testBarNss.dbName()),
+                       AssertionException,
+                       ErrorCodes::BackgroundOperationInProgressForDatabase);
+
+    // Register an index build on a collection in a different database _othertestFoo.
+    const auto othertestFooBuildUUID = UUID::gen();
+    auto othertestFooFuture =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _othertestFooNss.dbName(),
+                                                     _othertestFooUUID,
+                                                     makeSpecs({"r", "s"}, {7, 8}),
+                                                     othertestFooBuildUUID,
+                                                     _indexBuildOptions));
+
+    EXPECT_EQ(_indexBuildsCoord->numInProgForDb(_othertestFooNss.dbName()), 1);
+    ASSERT(_indexBuildsCoord->inProgForCollection(_othertestFooUUID));
+    ASSERT(_indexBuildsCoord->inProgForDb(_othertestFooNss.dbName()));
+    ASSERT_THROWS_CODE(_indexBuildsCoord->assertNoIndexBuildInProgForCollection(_othertestFooUUID),
+                       AssertionException,
+                       ErrorCodes::BackgroundOperationInProgressForNamespace);
+    ASSERT_THROWS_CODE(_indexBuildsCoord->assertNoBgOpInProgForDb(_othertestFooNss.dbName()),
+                       AssertionException,
+                       ErrorCodes::BackgroundOperationInProgressForDatabase);
+
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        testFoo1BuildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    auto indexCatalogStats = unittest::assertGet(testFoo1Future.getNoThrow());
+    EXPECT_GE(indexCatalogStats.numIndexesBefore, 1);
+    EXPECT_GT(indexCatalogStats.numIndexesAfter, 1);
+    EXPECT_LE(indexCatalogStats.numIndexesAfter, 5);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        testFoo2BuildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    indexCatalogStats = unittest::assertGet(testFoo2Future.getNoThrow());
+    EXPECT_GE(indexCatalogStats.numIndexesBefore, 1);
+    EXPECT_GT(indexCatalogStats.numIndexesAfter, 1);
+    EXPECT_LE(indexCatalogStats.numIndexesAfter, 5);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        testBarBuildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    indexCatalogStats = unittest::assertGet(testBarFuture.getNoThrow());
+    EXPECT_EQ(1, indexCatalogStats.numIndexesBefore);
+    EXPECT_EQ(3, indexCatalogStats.numIndexesAfter);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        othertestFooBuildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    indexCatalogStats = unittest::assertGet(othertestFooFuture.getNoThrow());
+    EXPECT_EQ(1, indexCatalogStats.numIndexesBefore);
+    EXPECT_EQ(3, indexCatalogStats.numIndexesAfter);
+
+    _indexBuildsCoord->assertNoIndexBuildInProgForCollection(_testFooUUID);
+    _indexBuildsCoord->assertNoIndexBuildInProgForCollection(_testBarUUID);
+    _indexBuildsCoord->assertNoIndexBuildInProgForCollection(_othertestFooUUID);
+
+    _indexBuildsCoord->assertNoBgOpInProgForDb(_testFooNss.dbName());
+    _indexBuildsCoord->assertNoBgOpInProgForDb(_othertestFooNss.dbName());
+
+    EXPECT_NE(_testFooNss, _testBarNss);
+    EXPECT_NE(_testFooNss, _othertestFooNss);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodInterruptibleWaitTest,
+       AwaitNoIndexBuildInProgressForCollectionIsInterruptible) {
+    // Test awaitNoIndexBuildInProgressForCollection() 2-arguments overload.
+    auto result = runInterruptedWaiter([&](OperationContext* opCtx) {
+        _indexBuildsCoord->awaitNoIndexBuildInProgressForCollection(opCtx, _testFooUUID);
+    });
+
+    assertWasInterrupted(result);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodInterruptibleWaitTest,
+       AwaitNoIndexBuildInProgressForCollectionWithProtocolIsInterruptible) {
+    // Test awaitNoIndexBuildInProgressForCollection() 3-arguments overload.
+    auto result = runInterruptedWaiter([&](OperationContext* opCtx) {
+        _indexBuildsCoord->awaitNoIndexBuildInProgressForCollection(opCtx, _testFooUUID, kProtocol);
+    });
+
+    assertWasInterrupted(result);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodInterruptibleWaitTest, AwaitNoBgOpInProgForDbIsInterruptible) {
+    auto result = runInterruptedWaiter([&](OperationContext* opCtx) {
+        _indexBuildsCoord->awaitNoBgOpInProgForDb(opCtx, _testFooNss.dbName(), {kProtocol});
+    });
+
+    assertWasInterrupted(result);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, SetCommitQuorumWithBadArguments) {
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+
+    CommitQuorumOptions newCommitQuorum("majority");
+
+    // Pass in an empty index list.
+    Status status =
+        _indexBuildsCoord->setCommitQuorum(operationContext(), _testFooNss, {}, newCommitQuorum);
+    EXPECT_EQ(ErrorCodes::IndexNotFound, status);
+
+    // Use an invalid collection namespace.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("bad.collection");
+    status = _indexBuildsCoord->setCommitQuorum(
+        operationContext(), nss, {"a_1", "b_1"}, newCommitQuorum);
+    EXPECT_EQ(ErrorCodes::NamespaceNotFound, status);
+
+    // No index builds are happening on the collection.
+    status = _indexBuildsCoord->setCommitQuorum(
+        operationContext(), _testFooNss, {"a_1", "b_1"}, newCommitQuorum);
+    EXPECT_EQ(ErrorCodes::IndexNotFound, status);
+
+    // Register an index build on _testFooNss.
+    const auto testFoo1BuildUUID = UUID::gen();
+    auto testFoo1Future =
+        assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                     _testFooNss.dbName(),
+                                                     _testFooUUID,
+                                                     makeSpecs({"a", "b"}, {1, 2}),
+                                                     testFoo1BuildUUID,
+                                                     _indexBuildOptions));
+
+    // No index with the name "c" is being built.
+    status =
+        _indexBuildsCoord->setCommitQuorum(operationContext(), _testFooNss, {"c"}, newCommitQuorum);
+    EXPECT_EQ(ErrorCodes::IndexNotFound, status);
+
+    // Pass in extra indexes not being built by the same index builder.
+    status = _indexBuildsCoord->setCommitQuorum(
+        operationContext(), _testFooNss, {"a_1", "b_1", "c_1"}, newCommitQuorum);
+    EXPECT_EQ(ErrorCodes::IndexNotFound, status);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        testFoo1BuildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+    unittest::assertGet(testFoo1Future.getNoThrow());
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsTrackSuccessfulBuilds) {
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    const auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+
+    const auto buildUUID = UUID::gen();
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(true);
+    auto buildFuture = assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                                    _testFooNss.dbName(),
+                                                                    _testFooUUID,
+                                                                    makeSpecs({"a"}, {1}),
+                                                                    buildUUID,
+                                                                    _indexBuildOptions));
+
+    const auto metricsDuringBuild = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsDuringBuild.active, metricsBeforeBuild.active + 1);
+    EXPECT_EQ(metricsDuringBuild.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsDuringBuild.succeeded, metricsBeforeBuild.succeeded);
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        buildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+
+    _indexBuildsCoord->sleepIndexBuilds_forTestOnly(false);
+    unittest::assertGet(buildFuture.getNoThrow());
+
+    const auto metricsAfterBuild = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfterBuild.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfterBuild.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfterBuild.succeeded, metricsBeforeBuild.succeeded + 1);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsTrackFailedBuilds) {
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    const auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+    const auto buildUUID = UUID::gen();
+
+    ASSERT_OK(storageInterface()->insertDocument(operationContext(),
+                                                 _testBarNss,
+                                                 {BSON("_id" << 1 << "a" << 1), Timestamp()},
+                                                 repl::OpTime::kUninitializedTerm));
+    ASSERT_OK(storageInterface()->insertDocument(operationContext(),
+                                                 _testBarNss,
+                                                 {BSON("_id" << 2 << "a" << 1), Timestamp()},
+                                                 repl::OpTime::kUninitializedTerm));
+
+    auto storageEngine = operationContext()->getServiceContext()->getStorageEngine();
+    std::vector<IndexBuildInfo> uniqueIndex;
+    uniqueIndex.emplace_back(BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                                      << "a_1"
+                                      << "unique" << true),
+                             "index-1",
+                             *storageEngine);
+
+    auto failedBuildFuture = assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                                          _testBarNss.dbName(),
+                                                                          _testBarUUID,
+                                                                          uniqueIndex,
+                                                                          buildUUID,
+                                                                          _indexBuildOptions));
+
+    ASSERT_OK(_indexBuildsCoord->voteCommitIndexBuild(
+        operationContext(),
+        buildUUID,
+        repl::ReplicationCoordinator::get(operationContext())->getMyHostAndPort()));
+    auto buildStatus = failedBuildFuture.getNoThrow();
+    EXPECT_EQ(buildStatus.getStatus(), ErrorCodes::DuplicateKey);
+    _indexBuildsCoord->awaitNoIndexBuildInProgressForCollection(
+        operationContext(), _testBarUUID, IndexBuildProtocol::kTwoPhase);
+
+    const auto metricsAfterFailure = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfterFailure.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfterFailure.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfterFailure.failed, metricsBeforeBuild.failed + 1);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsTrackAbortedBuildsAsFailures) {
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    const auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+
+    const auto buildUUID = UUID::gen();
+    auto buildFuture = assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                                    _testFooNss.dbName(),
+                                                                    _testFooUUID,
+                                                                    makeSpecs({"a"}, {1}),
+                                                                    buildUUID,
+                                                                    _indexBuildOptions));
+
+    ASSERT_TRUE(_indexBuildsCoord->abortIndexBuildByBuildUUID(
+        operationContext(),
+        buildUUID,
+        IndexBuildAction::kPrimaryAbort,
+        Status{ErrorCodes::IndexBuildAborted, "test abort"}));
+    auto buildStatus = buildFuture.getNoThrow();
+    EXPECT_EQ(buildStatus.getStatus(), ErrorCodes::IndexBuildAborted);
+
+    const auto metricsAfterAbort = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfterAbort.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfterAbort.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfterAbort.failed, metricsBeforeBuild.failed + 1);
+}
+
+// Sets the 'failIndexBuildWithError' fail point so the builder thread for 'buildUUID' throws
+// 'error' once it starts running (after setup is complete and abort cleanup is required).
+BSONObj makeFailIndexBuildWithErrorData(const UUID& buildUUID, ErrorCodes::Error error) {
+    BSONObjBuilder builder;
+    builder.append("error", static_cast<int>(error));
+    buildUUID.appendToBuilder(&builder, "buildUUID");
+    return builder.obj();
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsTwoPhaseBuildAfterShutdown) {
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+
+    auto buildUUID = UUID::gen();
+    FailPointEnableBlock failBuild{
+        "failIndexBuildWithError",
+        makeFailIndexBuildWithErrorData(buildUUID, ErrorCodes::InterruptedAtShutdown)};
+
+    auto buildFuture = assertGet(_indexBuildsCoord->startIndexBuild(operationContext(),
+                                                                    _testFooNss.dbName(),
+                                                                    _testFooUUID,
+                                                                    makeSpecs({"a"}, {1}),
+                                                                    buildUUID,
+                                                                    _indexBuildOptions));
+    EXPECT_EQ(buildFuture.getNoThrow().getStatus(), ErrorCodes::InterruptedAtShutdown);
+
+    auto metricsAfter = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfter.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfter.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfter.failed, metricsBeforeBuild.failed + 1);
+    EXPECT_EQ(metricsAfter.toBeResumed, metricsBeforeBuild.toBeResumed);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsPrimaryDrivenBuildAfterStepdown) {
+    // TODO (SERVER-116165): Remove feature flag controllers.
+    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
+    unittest::ServerParameterGuard ffPDIB("featureFlagPrimaryDrivenIndexBuilds", true);
+
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+
+    auto buildUUID = UUID::gen();
+    FailPointEnableBlock failBuild{
+        "failIndexBuildWithError",
+        makeFailIndexBuildWithErrorData(buildUUID, ErrorCodes::InterruptedDueToReplStateChange)};
+
+    auto buildFuture = startPrimaryDrivenIndexBuild(buildUUID, makeSpecs({"a"}, {1}));
+    EXPECT_EQ(buildFuture.getNoThrow().getStatus(), ErrorCodes::InterruptedDueToReplStateChange);
+
+    auto metricsAfter = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfter.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfter.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfter.failed, metricsBeforeBuild.failed);
+    EXPECT_EQ(metricsAfter.toBeResumed, metricsBeforeBuild.toBeResumed + 1);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsPrimaryDrivenBuildAfterShutdown) {
+    // TODO (SERVER-116165): Remove feature flag controllers.
+    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
+    unittest::ServerParameterGuard ffPDIB("featureFlagPrimaryDrivenIndexBuilds", true);
+
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+
+    auto buildUUID = UUID::gen();
+    FailPointEnableBlock failBuild{
+        "failIndexBuildWithError",
+        makeFailIndexBuildWithErrorData(buildUUID, ErrorCodes::InterruptedAtShutdown)};
+
+    auto buildFuture = startPrimaryDrivenIndexBuild(buildUUID, makeSpecs({"a"}, {1}));
+    EXPECT_EQ(buildFuture.getNoThrow().getStatus(), ErrorCodes::InterruptedAtShutdown);
+
+    auto metricsAfter = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfter.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfter.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfter.failed, metricsBeforeBuild.failed);
+    EXPECT_EQ(metricsAfter.toBeResumed, metricsBeforeBuild.toBeResumed + 1);
+}
+
+TEST_F(IndexBuildsCoordinatorMongodTest, OtelMetricsPrimaryDrivenBuildAfterAbort) {
+    // TODO (SERVER-116165): Remove feature flag controllers.
+    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
+    unittest::ServerParameterGuard ffPDIB("featureFlagPrimaryDrivenIndexBuilds", true);
+
+    otel::metrics::OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        GTEST_SKIP() << "Skipping test due to OTel metrics being unavailable in this build";
+        return;
+    }
+    auto metricsBeforeBuild = readIndexBuildMetrics(capturer);
+
+    auto buildUUID = UUID::gen();
+    FailPointEnableBlock failBuild{
+        "failIndexBuildWithError",
+        makeFailIndexBuildWithErrorData(buildUUID, ErrorCodes::OutOfDiskSpace)};
+
+    auto buildFuture = startPrimaryDrivenIndexBuild(buildUUID, makeSpecs({"a"}, {1}));
+    EXPECT_EQ(buildFuture.getNoThrow().getStatus(), ErrorCodes::OutOfDiskSpace);
+
+    auto metricsAfter = readIndexBuildMetrics(capturer);
+    EXPECT_EQ(metricsAfter.active, metricsBeforeBuild.active);
+    EXPECT_EQ(metricsAfter.started, metricsBeforeBuild.started + 1);
+    EXPECT_EQ(metricsAfter.failed, metricsBeforeBuild.failed + 1);
+    EXPECT_EQ(metricsAfter.toBeResumed, metricsBeforeBuild.toBeResumed);
+}
+
+
+class IndexBuildsCoordinatorMongodStandaloneRecoveryTest : public IndexBuildsCoordinatorMongodTest {
+public:
+    /**
+     * Writes the given indexes to the durable catalog as one unfinished two-phase build, then
+     * reloads the catalog the way startup does for a replica set member in standalone mode, so
+     * they come back frozen and no index builds are restarted.
+     */
+    void createFrozenIndexes(const UUID& buildUUID, const std::vector<IndexBuildInfo>& indexes) {
+        auto opCtx = operationContext();
+        {
+            auto coll = getCollectionExclusive(opCtx, _testFooNss);
+            WriteUnitOfWork wuow(opCtx);
+            CollectionWriter writer{opCtx, &coll};
+            auto writableColl = writer.getWritableCollection(opCtx);
+            for (const auto& index : indexes) {
+                IndexDescriptor desc{IndexNames::BTREE, index.spec};
+                ASSERT_OK(
+                    writableColl->prepareForIndexBuild(opCtx, &desc, index.indexIdent, buildUUID));
+            }
+            wuow.commit();
+        }
+
+        setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);
+        Lock::GlobalLock globalLk(opCtx, MODE_X);
+        catalog::closeCatalog(opCtx);
+        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        storageEngine->loadMDBCatalog(opCtx, StorageEngine::LastShutdownState::kClean);
+        catalog::initializeCollectionCatalog(opCtx, storageEngine, catalog::InitMode::kStartup);
+        for (auto&& dbName : catalog::listDatabases()) {
+            DatabaseHolder::get(opCtx)->openDb(opCtx, dbName);
+        }
+    }
+
+    IndexBuildOplogEntry makeAbortOplogEntry(const UUID& buildUUID,
+                                             std::vector<IndexBuildInfo> indexes) {
+        return {.collUUID = _testFooUUID,
+                .commandType = repl::OplogEntry::CommandType::kAbortIndexBuild,
+                .commandName = "abortIndexBuild",
+                .buildUUID = buildUUID,
+                .indexes = std::move(indexes),
+                .cause = Status{ErrorCodes::IndexBuildAborted, "test abort"}};
+    }
+
+    void applyAbort(const IndexBuildOplogEntry& oplogEntry) {
+        TimestampBlock tsBlock(operationContext(), Timestamp(10, 1));
+        _indexBuildsCoord->applyAbortIndexBuild(operationContext(), oplogEntry);
+    }
+
+    std::vector<std::string> nonIdIndexNames() {
+        auto coll = getCollectionExclusive(operationContext(), _testFooNss);
+        std::vector<std::string> names;
+        auto it = coll.getCollectionPtr()->getIndexCatalog()->getIndexIterator(
+            IndexCatalog::InclusionPolicy::kAll);
+        while (it->more()) {
+            auto name = it->next()->descriptor()->indexName();
+            if (name != "_id_") {
+                names.push_back(name);
+            }
+        }
+        return names;
+    }
+
+    unittest::ServerParameterGuard _recoverAsStandalone{"recoverFromOplogAsStandalone", true};
+};
+
+TEST_F(IndexBuildsCoordinatorMongodStandaloneRecoveryTest,
+       ApplyAbortDropsFrozenIndexesWhenSomeIndexesAreMissing) {
+    const auto buildUUID = UUID::gen();
+    auto indexes = makeSpecs({"a", "b", "c"}, {1, 2, 3});
+    createFrozenIndexes(buildUUID, {indexes[0], indexes[2]});
+    ASSERT_EQ(2U, nonIdIndexNames().size());
+
+    applyAbort(makeAbortOplogEntry(buildUUID, indexes));
+
+    ASSERT_EQ(std::vector<std::string>{}, nonIdIndexNames());
+}
+
+TEST_F(IndexBuildsCoordinatorMongodStandaloneRecoveryTest,
+       ApplyAbortIsNoOpWhenAllIndexesAreAlreadyDropped) {
+    const auto buildUUID = UUID::gen();
+    auto indexes = makeSpecs({"a", "b"}, {1, 2});
+    createFrozenIndexes(buildUUID, indexes);
+    ASSERT_EQ(2U, nonIdIndexNames().size());
+
+    applyAbort(makeAbortOplogEntry(buildUUID, indexes));
+    ASSERT_EQ(std::vector<std::string>{}, nonIdIndexNames());
+
+    applyAbort(makeAbortOplogEntry(buildUUID, indexes));
+    ASSERT_EQ(std::vector<std::string>{}, nonIdIndexNames());
+}
+
+}  // namespace
+
+}  // namespace mongo

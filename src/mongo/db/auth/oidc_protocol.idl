@@ -1,0 +1,51 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::auth"
+    cpp_includes:
+        - "mongo/util/net/http_client.h"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    OIDCMechanismClientStep1:
+        description: Client's opening request in saslStart or
+            hello.speculativeAuthenticate
+        strict: false
+        fields:
+            n:
+                description: "Principal name of client"
+                cpp_name: principalName
+                type: string
+                optional: true
+
+    OIDCMechanismServerStep1:
+        description: "Server's reply to clientStep1"
+        strict: false
+        fields:
+            issuer:
+                description: >-
+                    URL which describes the Authorization Server. This identifier should be
+                    the iss of provided access tokens, and be viable for RFC8414
+                    metadata discovery and RFC9207 identification.
+                type: string
+                validator: {callback: "HttpClient::endpointIsSecure"}
+            clientId:
+                description: "Unique client ID for this OIDC client"
+                type: string
+                optional: true # Omitted if an IdP is intended for machine flows only
+            requestScopes:
+                description: "Additional scopes to request from IDP"
+                type: array<string>
+                optional: true
+    OIDCMechanismClientStep2:
+        description: "Client's request with signed token"
+        strict: false
+        fields:
+            jwt:
+                description: "Compact serialized JWT with signature"
+                cpp_name: JWT
+                type: string

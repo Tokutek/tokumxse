@@ -1,0 +1,345 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/ticketing/ticketholder_queue_stats.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/tick_source.h"
+#include "mongo/util/time_support.h"
+
+#include <string>
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+
+/**
+ * Tracks metrics for a single multi-document transaction.
+ *
+ * For all timing related stats, a TickSource with at least microsecond resolution must be used.
+ */
+class SingleTransactionStats {
+public:
+    /**
+     * Stores information about the last client to run a transaction operation.
+     */
+    struct LastClientInfo {
+        std::string clientHostAndPort;
+        long long connectionId;
+        BSONObj clientMetadata;
+        std::string appName;
+
+        void update(Client* client) {
+            if (client->hasRemote()) {
+                clientHostAndPort = client->getRemote().toString();
+            }
+            connectionId = client->getConnectionId();
+            if (auto metadata = ClientMetadata::get(client)) {
+                clientMetadata = metadata->getDocument();
+                appName = std::string{metadata->getApplicationName()};
+            }
+        }
+    };
+
+    SingleTransactionStats()
+        : _txnNumberAndRetryCounter(kUninitializedTxnNumber, kUninitializedTxnRetryCounter) {};
+    SingleTransactionStats(TxnNumberAndRetryCounter txnNumberAndRetryCounter)
+        : _txnNumberAndRetryCounter(txnNumberAndRetryCounter) {};
+
+    /**
+     * Sets the transaction's start time, only if it hasn't already been set.
+     *
+     * This method takes two sources of input for the current time. The 'curTick' argument should be
+     * the current time as measured by a TickSource, which is a high precision interface for
+     * measuring the passage of time that should provide at least microsecond resolution. The given
+     * 'curWallClockTime' need only be a millisecond resolution time point that serves as a close
+     * approximation to the true start time. This millisecond resolution time point is not used for
+     * measuring transaction durations. The given tick value, however, is.
+     *
+     * This method must only be called once.
+     */
+    void setStartTime(TickSource::Tick curTick, Date_t curWallClockTime);
+
+    /**
+     * If the transaction is currently in progress, this method returns the duration
+     * the transaction has been running for in microseconds, given the current time value.
+     *
+     * For a completed transaction, this method returns the total duration of the
+     * transaction in microseconds.
+     *
+     * This method cannot be called until setStartTime() has been called.
+     */
+    Microseconds getDuration(TickSource* tickSource, TickSource::Tick curTick) const;
+
+    /**
+     * If the transaction is currently in progress, this method returns the duration
+     * the transaction has been in the prepared state for in microseconds, given the
+     * current time value.
+     *
+     * For a completed transaction, this method returns the total duration the transaction
+     * has been in the prepared state in microseconds.
+     *
+     * This method cannot be called until setStartTime() and setPreparedStartTime() have been
+     * called.
+     */
+    Microseconds getPreparedDuration(TickSource* tickSource, TickSource::Tick curTick) const;
+
+    /**
+     * Sets the time at which a transaction enters the prepared state.
+     *
+     * This method cannot be called until setStartTime() has been called.
+     */
+    void setPreparedStartTime(TickSource::Tick time);
+
+    /**
+     * Sets the transaction's end time, only if the start time has already been set.
+     *
+     * This method cannot be called until setStartTime() has been called.
+     */
+    void setEndTime(TickSource::Tick time);
+
+    /**
+     * Returns the total active time of the transaction, given the current time value. A transaction
+     * is active when there is a running operation that is part of the transaction.
+     */
+    Microseconds getTimeActiveMicros(TickSource* tickSource, TickSource::Tick curTick) const;
+
+    /**
+     * Returns the total inactive time of the transaction, given the current time value. A
+     * transaction is inactive when it is idly waiting for a new operation to occur.
+     */
+    Microseconds getTimeInactiveMicros(TickSource* tickSource, TickSource::Tick curTick) const;
+
+    /**
+     * Marks the transaction as active and sets the start of the transaction's active time.
+     *
+     * This method cannot be called if the transaction is currently active. A call to setActive()
+     * must be followed by a call to setInactive() before calling setActive() again.
+     */
+    void setActive(TickSource::Tick curTick);
+
+    /**
+     * Marks the transaction as inactive and sets the total active time of the transaction. The
+     * total active time will only be set if the transaction was active prior to this call.
+     *
+     * This method cannot be called if the transaction is currently not active.
+     */
+    void setInactive(TickSource* tickSource, TickSource::Tick curTick);
+
+    /**
+     * Returns whether or not the transaction is currently active.
+     */
+    bool isActive() const {
+        return _lastTimeActiveStart != 0;
+    }
+
+    /**
+     * Returns whether these stats are for a multi-document transaction.
+     */
+    bool isForMultiDocumentTransaction() const {
+        return _autoCommit != boost::none;
+    }
+
+    /**
+     * Returns whether or not the transaction is currently prepared.
+     */
+    bool isPrepared() const {
+        return _preparedStartTime != boost::none;
+    }
+
+    /**
+     * Returns the OpDebug object stored in this SingleTransactionStats instance.
+     */
+    const OpDebug* getOpDebug() const {
+        return &_opDebug;
+    }
+    OpDebug* getOpDebug() {
+        return &_opDebug;
+    }
+
+    void incrementPrepareReadConflicts(long long n) {
+        _prepareReadConflicts.inc(n);
+    }
+
+    long long getPrepareReadConflicts() const {
+        return _prepareReadConflicts.get();
+    }
+
+    AtomicStorageMetrics& getTransactionStorageMetrics() {
+        return _storageMetrics;
+    }
+    const AtomicStorageMetrics& getTransactionStorageMetrics() const {
+        return _storageMetrics;
+    }
+    /**
+     * Returns the LastClientInfo object stored in this SingleTransactionStats instance.
+     */
+    const LastClientInfo& getLastClientInfo() const {
+        return _lastClientInfo;
+    }
+
+    /**
+     * Updates the LastClientInfo object stored in this SingleTransactionStats instance with the
+     * given Client's information.
+     */
+    void updateLastClientInfo(Client* client) {
+        _lastClientInfo.update(client);
+    }
+
+
+    /**
+     * Returns the TicketHolderQueueStats object stored in this SingleTransactionStats.
+     */
+    const TicketHolderQueueStats& getQueueStats() const {
+        return _queueStats;
+    }
+    /**
+     * Updates the TicketHolderQueueStats to include the latest operation's queueing stats.
+     */
+    void updateQueueStats(OperationContext* opCtx) {
+        TicketHolderQueueStats newOpQueueStat(opCtx);
+        _queueStats.add(newOpQueueStat);
+    }
+
+    void setRecoveredFromPreciseCheckpoint(bool recovered) {
+        _recoveredFromPreciseCheckpoint = recovered;
+    }
+
+    bool isRecoveredFromPreciseCheckpoint() const {
+        return _recoveredFromPreciseCheckpoint;
+    }
+
+    void setIsServerInitiatedTransaction(bool isServerInitiated) {
+        _isServerInitiatedTransaction = isServerInitiated;
+    }
+
+    bool isServerInitiatedTransaction() const {
+        return _isServerInitiatedTransaction;
+    }
+
+    /**
+     * Set the autoCommit field.  If this field is unset, this is not a transaction but a
+     * retryable write and other values will not be meaningful.
+     */
+    void setAutoCommit(boost::optional<bool> autoCommit) {
+        _autoCommit = autoCommit;
+    }
+
+    /**
+     * Set the transaction expiration date.
+     */
+    void setExpireDate(Date_t expireDate) {
+        _expireDate = expireDate;
+    }
+
+    /**
+     * Set the transaction storage read timestamp.
+     */
+    void setReadTimestamp(Timestamp readTimestamp) {
+        _readTimestamp = readTimestamp;
+    }
+
+    Timestamp getReadTimestamp() const {
+        return _readTimestamp;
+    }
+
+    /**
+     * Append the stats to the builder.
+     */
+    void report(BSONObjBuilder* builder,
+                const repl::ReadConcernArgs& readConcernArgs,
+                TickSource* tickSource,
+                TickSource::Tick curTick) const;
+
+private:
+    class AtomicPrepareReadConflicts {
+    public:
+        long long get() const {
+            return _prepareReadConflicts.loadRelaxed();
+        }
+
+        void inc(long long n) {
+            _prepareReadConflicts.fetchAndAddRelaxed(n);
+        }
+
+        AtomicPrepareReadConflicts& operator=(const AtomicPrepareReadConflicts& other) {
+            _prepareReadConflicts.storeRelaxed(other.get());
+            return *this;
+        }
+
+    private:
+        Atomic<long long> _prepareReadConflicts{0};
+    };
+
+    // The struct containing the transaction number and transaction retry counter.
+    TxnNumberAndRetryCounter _txnNumberAndRetryCounter;
+
+    // Unset for retryable write, 'false' for multi-document transaction.  Value 'true' is
+    // for future use.
+    boost::optional<bool> _autoCommit;
+
+    // The start time of the transaction in millisecond resolution. Used only for diagnostics
+    // reporting. Not used for measuring transaction durations.
+    Date_t _startWallClockTime;
+
+    // The start time of the transaction. Note that tick values should only ever be used to measure
+    // distance from other tick values, not for reporting absolute wall clock time.
+    TickSource::Tick _startTime{0};
+
+    // The end time of the transaction.
+    TickSource::Tick _endTime{0};
+
+    // The total amount of active time spent by the transaction.
+    Microseconds _timeActiveMicros = Microseconds{0};
+
+    // The time at which the transaction was last marked as active. The transaction is considered
+    // active if this value is not equal to 0.
+    TickSource::Tick _lastTimeActiveStart{0};
+
+    // The expiration date of the transaction.
+    Date_t _expireDate = Date_t::max();
+
+    // The storage read timestamp of the transaction.
+    Timestamp _readTimestamp;
+
+    // Tracks and accumulates stats from all operations that run inside the transaction.
+    OpDebug _opDebug;
+
+    AtomicPrepareReadConflicts _prepareReadConflicts;
+
+    AtomicStorageMetrics _storageMetrics;
+
+    // Holds information about the last client to run a transaction operation.
+    LastClientInfo _lastClientInfo;
+
+    // The time at which a transaction becomes prepared. It is possible for _preparedStartTime to
+    // not be set in a transaction that is in state kPrepared if an exception is thrown after the
+    // transaction transitions to the prepared state but before setPreparedStartTime is called.
+    boost::optional<TickSource::Tick> _preparedStartTime{boost::none};
+
+    // Tracks and aggregates statistics for admission and execution control queueing across all
+    // operations within a transaction.
+    TicketHolderQueueStats _queueStats;
+
+    bool _recoveredFromPreciseCheckpoint{false};
+
+    // Indicates if the current transaction was started by the server itself (internal transaction)
+    // rather than explicitly by a user. Set when the transaction starts.
+    bool _isServerInitiatedTransaction{true};
+};
+
+}  // namespace mongo

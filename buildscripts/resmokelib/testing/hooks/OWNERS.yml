@@ -1,0 +1,108 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "README.md":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "add_remove_shards.py":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "analyze_shard_key.py":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "queryable_server_hook.py":
+    approvers:
+      - 10gen/server-backup-restore
+  - "change_streams.py":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "run_query_stats.py":
+    approvers:
+      - 10gen/query-integration-observability
+  - "fcv_upgrade_downgrade.py":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "initialsync.py":
+    approvers:
+      - 10gen/server-initial-sync
+  - "magic_restore.py":
+    approvers:
+      - 10gen/server-recovery
+  - "metrics_filtering_background.py":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "maintenance.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "oplog.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "periodic_kill_secondaries.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "reconfig_background.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "secondary_lag.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "stepdown.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "wait_for_replication.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "generate_and_check_perf_results.py":
+    approvers:
+      - 10gen/devprod-performance-infrastructure
+  - "replicaset_transition_to_and_from_csrs.py":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "drop_config_cache_collections.py":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "drop_sessions_collection.py":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "check_idle_cursors.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "check_connection_count.py":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "rotate_execution_control_params.py":
+    approvers:
+      - 10gen/server-workload-resilience
+  - "fuzz_runtime_parameters.py":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "validate.py":
+    approvers:
+      - 10gen/server-validate
+      - 10gen/devprod-test-infrastructure
+  - "validate_find_and_modify_image_collection_not_exist.py":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "simulate_crash.py":
+    approvers:
+      - 10gen/query-execution-router
+  - "check_system_buckets_metrics.py":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "continuous_initial_sync.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "lifecycle.py":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "cleanup.py":
+    approvers:
+      - 10gen/devprod-test-infrastructure
+  - "check_multikey_consistency_background.py":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "lightweight_resharding_stepdown.py":
+    approvers:
+      - 10gen/server-cluster-scalability

@@ -1,0 +1,96 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/requires_index_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string_view>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+class IndexAccessMethod;
+class RecordCursor;
+
+/**
+ * A standalone stage implementing the fast path for key-value retrievals via the _id index. Since
+ * the _id index always has the collection default collation, the IDHackStage can only be used when
+ * the query's collation is equal to the collection default.
+ */
+class IDHackStage final : public RequiresIndexStage {
+public:
+    /** Takes ownership of all the arguments -collection. */
+    IDHackStage(ExpressionContext* expCtx,
+                const CanonicalQuery* query,
+                WorkingSet* ws,
+                CollectionAcquisition collection,
+                const IndexCatalogEntry* entry);
+
+    IDHackStage(ExpressionContext* expCtx,
+                const BSONObj& key,
+                WorkingSet* ws,
+                CollectionAcquisition collection,
+                const IndexCatalogEntry* entry);
+
+    ~IDHackStage() override;
+
+    bool isEOF() const final;
+    StageState doWork(WorkingSetID* out) final;
+
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+
+    StageType stageType() const final {
+        return STAGE_IDHACK;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() override;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static constexpr std::string_view kStageType = "IDHACK"sv;
+
+protected:
+    void doSaveStateRequiresIndex() final;
+
+    void doRestoreStateRequiresIndex() final;
+
+private:
+    /**
+     * Marks this stage as done, optionally adds key metadata, and returns PlanStage::ADVANCED.
+     *
+     * Called whenever we have a WSM containing the matching obj.
+     */
+    StageState advance(WorkingSetID id, WorkingSetMember* member, WorkingSetID* out);
+
+    std::unique_ptr<SeekableRecordCursor> _recordCursor;
+
+    // The WorkingSet we annotate with results.  Not owned by us.
+    WorkingSet* _workingSet;
+
+    // The value to match against the _id field.
+    BSONObj _key;
+
+    // Have we returned our one document?
+    bool _done = false;
+
+    // Do we need to add index key metadata for returnKey?
+    bool _addKeyMetadata = false;
+
+    IDHackStats _specificStats;
+};
+
+}  // namespace mongo

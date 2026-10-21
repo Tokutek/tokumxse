@@ -1,0 +1,33 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the document used for storing progress by the resharding config.transactions
+# cloner.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/s/resharding/common_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+structs:
+    ReshardingTxnClonerProgress:
+        description: "Used for storing the progress made by the resharding transaction cloner."
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            _id:
+                type: ReshardingSourceId
+                description: "The identifier for the source of the config.transactions entries."
+                cpp_name: sourceId
+            progress:
+                type: LogicalSessionId
+                description: >-
+                    The minimum point where the resharding transaction cloner can start without
+                    missing any config.transactions entries it needs to process.

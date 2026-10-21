@@ -1,0 +1,366 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/query/query_settings/query_settings_gen.h"
+#include "mongo/db/query/query_shape/query_shape.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/s/query/exec/cluster_client_cursor_params.h"
+#include "mongo/s/query/exec/cluster_query_result.h"
+#include "mongo/s/query/exec/router_exec_stage.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+
+#include <boost/optional.hpp>
+
+namespace mongo {
+
+class OperationContext;
+template <typename T>
+class StatusWith;
+
+/**
+ * ClusterClientCursor is used to generate results from cursor-generating commands on one or
+ * more remote hosts. A cursor-generating command (e.g. the find command) is one that
+ * establishes a ClientCursor and a matching cursor id on the remote host. In order to retrieve
+ * all command results, getMores must be issued against each of the remote cursors until they
+ * are exhausted.
+ *
+ * Results are generated using a pipeline of mongoS query execution stages called RouterExecStage.
+ *
+ * Does not throw exceptions.
+ */
+class [[MONGO_MOD_PUBLIC]] ClusterClientCursor {
+    ClusterClientCursor(const ClusterClientCursor&) = delete;
+    ClusterClientCursor& operator=(const ClusterClientCursor&) = delete;
+
+public:
+    ClusterClientCursor() = default;
+    virtual ~ClusterClientCursor() = default;
+
+    /**
+     * Returns the next available result document (along with an ok status). May block waiting
+     * for results from remote nodes.
+     *
+     * If there are no further results, the end of the stream is indicated with an empty
+     * QueryResult and an ok status.
+     *
+     * A non-ok status is returned in case of any error.
+     */
+    virtual StatusWith<ClusterQueryResult> next() = 0;
+
+    virtual Status releaseMemory() = 0;
+
+    /**
+     * Must be called before destruction to abandon a not-yet-exhausted cursor. If next() has
+     * already returned boost::none, then the cursor is exhausted and is safe to destroy.
+     *
+     * May block waiting for responses from remote hosts.
+     */
+    virtual void kill(OperationContext* opCtx) = 0;
+
+    /**
+     * Sets the operation context for the cursor.
+     */
+    virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
+
+    /**
+     * Detaches the cursor from its current OperationContext. Must be called before the
+     * OperationContext in use is deleted.
+     */
+    virtual void detachFromOperationContext() = 0;
+
+    /**
+     * Return the current context the cursor is attached to, if any.
+     */
+    virtual OperationContext* getCurrentOperationContext() const = 0;
+
+    /**
+     * Returns whether or not this cursor is tailable.
+     */
+    virtual bool isTailable() const = 0;
+
+    /**
+     * Returns whether or not this cursor is tailable and awaitData.
+     */
+    virtual bool isTailableAndAwaitData() const = 0;
+
+    /**
+     * Returns the original command object which created this cursor.
+     */
+    virtual BSONObj getOriginatingCommand() const = 0;
+
+    /**
+     * Returns the privileges required to run a getMore against this cursor. This is the same as the
+     * set of privileges which would have been required to create the cursor in the first place.
+     */
+    virtual const PrivilegeVector& getOriginatingPrivileges() const& = 0;
+    void getOriginatingPrivileges() && = delete;
+
+    /**
+     * Returns true if the cursor was opened with 'allowPartialResults:true' and results are not
+     * available from one or more shards.
+     */
+    virtual bool partialResultsReturned() const = 0;
+
+    /**
+     * Returns the number of remote hosts involved in this operation.
+     */
+    virtual std::size_t getNumRemotes() const = 0;
+
+    /**
+     * Returns the current most-recent resume token for this cursor, or an empty object if this is
+     * not a $changeStream cursor.
+     */
+    virtual BSONObj getPostBatchResumeToken() const = 0;
+
+    /**
+     * Returns the number of result documents returned so far by this cursor via the next() method.
+     */
+    virtual long long getNumReturnedSoFar() const = 0;
+
+    /**
+     * For a change stream cursor, records the documents, bytes, and the single batch returned to
+     * the client since the previous call into the global change stream throughput counters
+     * (changeStreams.cursor.{docsReturned,bytesReturned,batchesReturned}). Intended to be called
+     * once per batch handed back to the client (the initial batch and each getMore). A no-op for
+     * non-change-stream cursors.
+     */
+    virtual void recordChangeStreamThroughputMetricsForBatch() = 0;
+
+    /**
+     * Stash the ClusterQueryResult so that it gets returned from the CCC on a later call to
+     * next().
+     *
+     * Queued documents are returned in FIFO order. The queued results are exhausted before
+     * generating further results from the underlying mongos query stages.
+     *
+     * The BSONObj in the 'ClusterQueryResult' must be owned BSON.
+     */
+    virtual void queueResult(ClusterQueryResult&& result) = 0;
+
+    /**
+     * Returns whether or not all the remote cursors underlying this cursor have been exhausted.
+     * Documents that are buffered in the cursor locally does not affect the return value of this
+     * function.
+     */
+    virtual bool remotesExhausted() const = 0;
+
+    /**
+     * Returns true if the cursor has no more results to return. This is a non-destructive check
+     * that does not block or consume results. It returns true when both the internal result stash
+     * is empty and all remote cursors are exhausted.
+     */
+    virtual bool isEOF() const = 0;
+
+    /**
+     * Returns whether or not the cursor has been killed. Repeated calls to kill() can occur in
+     * ~ClusterClientCursorGuard() if the cursor was killed while the cursor was checked out or in
+     * use with the guard.
+     */
+    virtual bool hasBeenKilled() const = 0;
+
+    /**
+     * Sets the maxTimeMS value that the cursor should forward with any internally issued getMore
+     * requests.
+     *
+     * Returns a non-OK status if this cursor type does not support maxTimeMS on getMore (i.e. if
+     * the cursor is not tailable + awaitData).
+     */
+    virtual Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) = 0;
+
+    /**
+     * Returns the logical session id for this cursor.
+     */
+    virtual boost::optional<LogicalSessionId> getLsid() const = 0;
+
+    /**
+     * Returns the transaction number for this cursor.
+     */
+    virtual boost::optional<TxnNumber> getTxnNumber() const = 0;
+
+    /**
+     * Returns the APIParameters for this cursor.
+     */
+    virtual APIParameters getAPIParameters() const = 0;
+
+    /**
+     * Returns the readPreference for this cursor.
+     */
+    virtual boost::optional<ReadPreferenceSetting> getReadPreference() const = 0;
+
+    /**
+     * Returns the readConcern for this cursor.
+     */
+    virtual boost::optional<repl::ReadConcernArgs> getReadConcern() const = 0;
+
+    /**
+     * Returns whether the originating command was a rawData operation.
+     */
+    virtual bool getRawData() const = 0;
+
+    /**
+     * Returns a fresh clone of the IFR context under which this cursor's **execution** plan was
+     * built. Installed onto each getMore's OperationContext so remote dispatch uses the same
+     * feature-flag values, including any flag disabled by an IFR kickback retry.
+     *
+     * A clone is returned rather than the cursor's own context so that callers cannot mutate the
+     * pinned state, and because the cursor's context carries a memoized egress serialization from
+     * the originating operation which a new OperationContext must not inherit.
+     */
+    virtual std::shared_ptr<IncrementalFeatureRolloutContext> cloneIfrContext() const = 0;
+
+    /**
+     * Returns the creation date of the cursor.
+     */
+    virtual Date_t getCreatedDate() const = 0;
+
+    /**
+     * Returns the date the cursor was last used.
+     */
+    virtual Date_t getLastUseDate() const = 0;
+
+    /**
+     * Returns whether this is a change stream cursor.
+     */
+    virtual bool isChangeStreamCursor() const = 0;
+
+    /**
+     * Returns whether this change stream cursor was opened on the v2 precise shard-targeting path.
+     */
+    virtual bool usesChangeStreamV2ShardTargeting() const = 0;
+
+    /**
+     * Set the last use date to the provided time.
+     */
+    virtual void setLastUseDate(Date_t now) = 0;
+
+    /**
+     * Returns the 'planCacheShapeHash' of the query.
+     */
+    virtual boost::optional<uint32_t> getPlanCacheShapeHash() const = 0;
+
+    virtual boost::optional<std::size_t> getQueryStatsKeyHash() const = 0;
+
+    virtual boost::optional<query_shape::QueryShapeHash> getQueryShapeHash() const = 0;
+
+    virtual const query_settings::QuerySettings& getQuerySettings() const = 0;
+
+    /**
+     * Returns the number of batches returned by this cursor.
+     */
+    std::uint64_t getNBatches() const {
+        return _metrics.nBatches.value_or(0);
+    }
+
+    /**
+     * Increment the number of batches returned so far by one.
+     */
+    void incNBatches() {
+        _metrics.incrementNBatches();
+    }
+
+    void updateMetrics(const OpDebug::AdditiveMetrics& newMetrics) {
+        _metrics.add(newMetrics);
+        if (!_firstResponseExecutionTime) {
+            _firstResponseExecutionTime = _metrics.executionTime;
+        }
+        // This is the per-batch consolidation point for cursor metrics (both the initial batch and
+        // each getMore), so it is also where we emit change stream read throughput for the batch
+        // just returned to the client. No-op for non-change-stream cursors.
+        recordChangeStreamThroughputMetricsForBatch();
+    }
+
+    void updateMetrics(const ChangeStreamCursorMetrics& csMetrics) {
+        if (!isChangeStreamCursor() || !csMetrics.getOptime()) {
+            return;
+        }
+        if (!_changeStreamMetrics) {
+            _changeStreamMetrics.emplace();
+        }
+        _changeStreamMetrics->setOptime(csMetrics.getOptime());
+    }
+
+    const boost::optional<ChangeStreamCursorMetrics>& getChangeStreamMetrics() const {
+        return _changeStreamMetrics;
+    }
+
+    //
+    // maxTimeMS support.
+    //
+
+    /**
+     * Returns the amount of time execution time available to this cursor. Only valid at the
+     * beginning of a getMore request, and only really for use by the maxTime tracking code.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    Microseconds getLeftoverMaxTimeMicros() const {
+        return _leftoverMaxTimeMicros;
+    }
+
+    /**
+     * Sets the amount of execution time available to this cursor. This is only called when an
+     * operation that uses a cursor is finishing, to update its remaining time.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
+        _leftoverMaxTimeMicros = leftoverMaxTimeMicros;
+    }
+
+    /**
+     * Returns true if operations with this cursor should be omitted from diagnostic sources such as
+     * currentOp and the profiler.
+     */
+    virtual bool shouldOmitDiagnosticInformation() const = 0;
+
+    /**
+     * Returns and releases ownership of the Key associated with the request this
+     * cursor is handling.
+     */
+    virtual std::unique_ptr<query_stats::Key> takeKey() = 0;
+
+    /**
+     * Returns the aggregated metrics from any remote requests made by this cursor (if any).
+     */
+    virtual boost::optional<query_stats::DataBearingNodeMetrics> takeRemoteMetrics() = 0;
+
+    std::shared_ptr<OperationMemoryUsageTracker> releaseMemoryUsageTracker() {
+        return std::move(_memoryTracker);
+    }
+
+    OperationMemoryUsageTracker* getMemoryUsageTracker() const {
+        return _memoryTracker.get();
+    }
+
+    void setMemoryUsageTracker(std::shared_ptr<OperationMemoryUsageTracker> memoryTracker) {
+        _memoryTracker = std::move(memoryTracker);
+    }
+
+protected:
+    // Metrics that are accumulated over the lifetime of the cursor, incremented with each getMore.
+    // Useful for diagnostics like queryStats.
+    OpDebug::AdditiveMetrics _metrics;
+
+    // The execution time collected from the initial operation prior to any getMore requests.
+    boost::optional<Microseconds> _firstResponseExecutionTime;
+
+    // Change stream cursor metrics, updated on each cursor unpin.
+    boost::optional<ChangeStreamCursorMetrics> _changeStreamMetrics;
+
+private:
+    // Unused maxTime budget for this cursor.
+    Microseconds _leftoverMaxTimeMicros = Microseconds::max();
+
+    std::shared_ptr<OperationMemoryUsageTracker> _memoryTracker;
+};
+
+}  // namespace mongo

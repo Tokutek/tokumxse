@@ -1,0 +1,203 @@
+/**
+ * Utilities for writing tests for the cost-based ranker (CBR).
+ */
+
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+
+// Round the given number to the nearest 0.1
+function round(num) {
+    return Math.round(num * 10) / 10;
+}
+
+// Compare two cardinality estimates with approximate equality. This is done so that our tests can
+// be robust to floating point rounding differences but detect large changes in estimation
+// indicating a real change in estimation behavior.
+export function ceEqual(lhs, rhs) {
+    return Math.abs(round(lhs) - round(rhs)) < 0.1;
+}
+
+function planEstimateTypeIs(plan, type) {
+    return plan.estimatesMetadata.ceSource === type;
+}
+
+// Return true if the plan was estimated with a histogam estimation source. Return false otherwise.
+export function planEstimatedWithHistogram(plan) {
+    return planEstimateTypeIs(plan, "Histogram");
+}
+
+/**
+ * Returns whether the given plan was costed or not. Legacy explain places the cost estimate flat
+ * on the plan node; the V3 explain shape groups it under the per-node "statistics.costBased"
+ * subobject.
+ */
+export function isPlanCosted(plan) {
+    return (
+        plan.hasOwnProperty("costEstimate") ||
+        plan.statistics?.costBased?.hasOwnProperty("costEstimate") === true
+    );
+}
+
+/**
+ * Assert the given plan was not costed. This is used as an indicator to whether CBR used its
+ * fallback to multiplanning for this plan.
+ */
+export function assertPlanNotCosted(plan) {
+    assert(!isPlanCosted(plan), plan);
+}
+
+/**
+ * Assert the given plan was costed.
+ */
+export function assertPlanCosted(plan) {
+    assert(isPlanCosted(plan), plan);
+}
+
+export function getPlanRanker(db) {
+    if (db !== null) {
+        const getParam = db.adminCommand({
+            getParameter: 1,
+            featureFlagCostBasedRanker: 1,
+            internalQueryPlanRanker: 1,
+        });
+
+        return !getParam.featureFlagCostBasedRanker?.value
+            ? "multiPlanning"
+            : getParam.internalQueryPlanRanker;
+    } else {
+        return TestData.setParameters.planRanker
+            ? TestData.setParameters.planRanker
+            : "multiPlanning";
+    }
+}
+
+export function getMixedPlanRankingStrategy(db) {
+    if (db !== null) {
+        const getParam = db.adminCommand({
+            getParameter: 1,
+            internalQueryMixedPlanRankingStrategy: 1,
+        });
+
+        return getParam.hasOwnProperty("internalQueryMixedPlanRankingStrategy")
+            ? getParam.internalQueryMixedPlanRankingStrategy
+            : "NoMultiplanningResults";
+    } else {
+        return TestData.setParameters.internalQueryMixedPlanRankingStrategy
+            ? TestData.setParameters.internalQueryMixedPlanRankingStrategy
+            : "NoMultiplanningResults";
+    }
+}
+
+export function getMultiplanningBatchSize() {
+    const result = db.adminCommand({
+        getParameter: 1,
+        internalQueryPlanEvaluationMaxResults: 1,
+    });
+
+    if (result.ok === 1) {
+        return result.internalQueryPlanEvaluationMaxResults;
+    } else {
+        throw new Error("Failed to retrieve multiplanning batch size: " + JSON.stringify(result));
+    }
+}
+
+/**
+ * Computes the per-plan MP trial budget (max works per plan) using the same formula as the server:
+ *   collFraction = min(collFractionParam, totalCollFractionParam / numPlans)
+ *   maxWorksPerPlan = max(evalWorksParam, collFraction * numRecords)
+ */
+export function getExpectedWorksPerPlan(db, coll, numPlans) {
+    const params = assert.commandWorked(
+        db.adminCommand({
+            getParameter: 1,
+            internalQueryPlanEvaluationWorks: 1,
+            internalQueryPlanEvaluationCollFraction: 1,
+            internalQueryPlanTotalEvaluationCollFraction: 1,
+        }),
+    );
+    const numRecords = coll.count();
+    const collFraction = Math.min(
+        params.internalQueryPlanEvaluationCollFraction,
+        params.internalQueryPlanTotalEvaluationCollFraction / numPlans,
+    );
+    return Math.max(params.internalQueryPlanEvaluationWorks, collFraction * numRecords);
+}
+
+export function getPlanRankerConfig(db) {
+    if (db === null) {
+        // In suites without db (e.g. sharding) fall back to TestData.
+        const params = TestData.setParameters;
+        return {
+            featureFlagCostBasedRanker: params.featureFlagCostBasedRanker ?? false,
+            internalQueryPlanRanker: params.internalQueryPlanRanker ?? "multiPlanning",
+            internalQueryCBRCEMode: params.internalQueryCBRCEMode ?? "",
+            internalQueryMixedPlanRankingStrategy:
+                params.internalQueryMixedPlanRankingStrategy ?? "",
+        };
+    }
+
+    const config = assert.commandWorked(
+        db.adminCommand({
+            getParameter: 1,
+            featureFlagCostBasedRanker: 1,
+            internalQueryPlanRanker: 1,
+            internalQueryCBRCEMode: 1,
+            internalQueryMixedPlanRankingStrategy: 1,
+            internalSamplingSizeOverride: 1,
+        }),
+    );
+
+    return {
+        featureFlagCostBasedRanker: config.featureFlagCostBasedRanker.value,
+        internalQueryPlanRanker: config.internalQueryPlanRanker,
+        internalQueryCBRCEMode: config.internalQueryCBRCEMode,
+        internalQueryMixedPlanRankingStrategy: config.internalQueryMixedPlanRankingStrategy,
+        internalSamplingSizeOverride: config.internalSamplingSizeOverride,
+    };
+}
+
+export function setPlanRankerConfig(
+    db,
+    {
+        featureFlagCostBasedRanker = true,
+        internalQueryPlanRanker = "mixed",
+        internalQueryCBRCEMode = "samplingCE",
+        internalQueryMixedPlanRankingStrategy = "NoMultiplanningResults",
+        internalSamplingSizeOverride = 0,
+    } = {},
+) {
+    assert.commandWorked(
+        db.adminCommand({
+            setParameter: 1,
+            featureFlagCostBasedRanker,
+            internalQueryPlanRanker,
+            internalQueryCBRCEMode,
+            internalQueryMixedPlanRankingStrategy,
+            internalSamplingSizeOverride,
+        }),
+    );
+}
+
+/**
+ * @param {Parameters<typeof setPlanRankerConfig>[1]} config
+ */
+export function setPlanRankerConfigOnAllNonConfigNodes(conn, config) {
+    for (const host of DiscoverTopology.findNonConfigNodes(conn)) {
+        setPlanRankerConfig(new Mongo(host).getDB("admin"), config);
+    }
+}
+
+/**
+ * Returns the cost estimate of a plan root, handling both the flat and the 'statistics.costBased'
+ * explain shapes.
+ */
+export function getCost(plan) {
+    if (plan.hasOwnProperty("costEstimate")) {
+        return plan.costEstimate;
+    }
+    assert(
+        plan.hasOwnProperty("statistics") && plan.statistics.hasOwnProperty("costBased"),
+        "plan has no cost estimate",
+        {plan},
+    );
+    return plan.statistics.costBased.costEstimate;
+}

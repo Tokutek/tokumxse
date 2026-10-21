@@ -1,0 +1,689 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/index_builds/index_builds_common.h"
+#include "mongo/db/repl/container_oplog_entry_gen.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/storage/container.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/unittest/assert.h"
+
+#include <string_view>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+
+namespace mongo {
+namespace repl {
+
+OplogEntry makeCommandOplogEntry(OpTime opTime,
+                                 const NamespaceString& nss,
+                                 const BSONObj& object,
+                                 boost::optional<BSONObj> object2,
+                                 boost::optional<UUID> uuid) {
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kCommand,
+                                                      .nss = nss.getCommandNS(),
+                                                      .uuid = uuid,
+                                                      .oField = object,
+                                                      .o2Field = object2,
+                                                      .wallClockTime = Date_t()}}};
+}
+
+OplogEntry makeCommandOplogEntryWithSessionInfoAndStmtIds(OpTime opTime,
+                                                          const NamespaceString& nss,
+                                                          const BSONObj& command,
+                                                          LogicalSessionId lsid,
+                                                          TxnNumber txnNum,
+                                                          std::vector<StmtId> stmtIds,
+                                                          boost::optional<OpTime> prevOpTime) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kCommand,
+                                                      .nss = nss.getCommandNS(),
+                                                      .oField = command,
+                                                      .sessionInfo = info,
+                                                      .wallClockTime = Date_t::min(),
+                                                      .statementIds = std::move(stmtIds),
+                                                      .prevWriteOpTimeInTransaction = prevOpTime}}};
+}
+
+OplogEntry makeInsertDocumentOplogEntry(OpTime opTime,
+                                        const NamespaceString& nss,
+                                        const BSONObj& documentToInsert) {
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kInsert,
+                                                      .nss = nss,
+                                                      .oField = documentToInsert,
+                                                      .wallClockTime = Date_t::now()}}};
+}
+
+OplogEntry makeDeleteDocumentOplogEntry(OpTime opTime,
+                                        const NamespaceString& nss,
+                                        const BSONObj& documentToDelete) {
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kDelete,
+                                                      .nss = nss,
+                                                      .oField = documentToDelete,
+                                                      .wallClockTime = Date_t::now()}}};
+}
+
+OplogEntry makeUpdateDocumentOplogEntry(OpTime opTime,
+                                        const NamespaceString& nss,
+                                        const BSONObj& documentToUpdate,
+                                        const BSONObj& updatedDocument) {
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kUpdate,
+                                                      .nss = nss,
+                                                      .oField = updatedDocument,
+                                                      .o2Field = documentToUpdate,
+                                                      .wallClockTime = Date_t::now()}}};
+}
+
+namespace {
+ContainerKey toContainerKey(BSONBinData binData) {
+    return ContainerKey(std::span<const char>{static_cast<const char*>(binData.data),
+                                              static_cast<size_t>(binData.length)});
+}
+
+ContainerVal toContainerVal(BSONBinData binData) {
+    return ContainerVal(std::span<const char>{static_cast<const char*>(binData.data),
+                                              static_cast<size_t>(binData.length)});
+}
+}  // namespace
+
+OplogEntry makeContainerInsertOplogEntry(OpTime opTime,
+                                         std::string_view containerIdent,
+                                         int64_t key,
+                                         BSONBinData value) {
+    ContainerInsertOplogEntryO insertO;
+    insertO.setKey(ContainerKey(key));
+    insertO.setValue(toContainerVal(value));
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kContainerInsert,
+        .nss = NamespaceString::kContainerNamespace,
+        .container = containerIdent,
+        .oField = insertO.toBSON(),
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeContainerInsertOplogEntry(OpTime opTime,
+                                         std::string_view containerIdent,
+                                         BSONBinData key,
+                                         BSONBinData value) {
+    ContainerInsertOplogEntryO insertO;
+    insertO.setKey(toContainerKey(key));
+    insertO.setValue(toContainerVal(value));
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kContainerInsert,
+        .nss = NamespaceString::kContainerNamespace,
+        .container = containerIdent,
+        .oField = insertO.toBSON(),
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeContainerUpdateOplogEntry(OpTime opTime,
+                                         std::string_view containerIdent,
+                                         int64_t key,
+                                         BSONBinData value) {
+    ContainerUpdateOplogEntryO updateO;
+    updateO.setKey(ContainerKey(key));
+    updateO.setValue(toContainerVal(value));
+    updateO.setVersion(
+        static_cast<int64_t>(container::UpdateOplogEntryVersion::kFullReplacementV1));
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kContainerUpdate,
+        .nss = NamespaceString::kContainerNamespace,
+        .container = containerIdent,
+        .oField = updateO.toBSON(),
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeContainerUpdateOplogEntry(OpTime opTime,
+                                         std::string_view containerIdent,
+                                         BSONBinData key,
+                                         BSONBinData value) {
+    ContainerUpdateOplogEntryO updateO;
+    updateO.setKey(toContainerKey(key));
+    updateO.setValue(toContainerVal(value));
+    updateO.setVersion(
+        static_cast<int64_t>(container::UpdateOplogEntryVersion::kFullReplacementV1));
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kContainerUpdate,
+        .nss = NamespaceString::kContainerNamespace,
+        .container = containerIdent,
+        .oField = updateO.toBSON(),
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeContainerDeleteOplogEntry(OpTime opTime,
+                                         std::string_view containerIdent,
+                                         int64_t key) {
+    ContainerDeleteOplogEntryO deleteO;
+    deleteO.setKey(ContainerKey(key));
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kContainerDelete,
+        .nss = NamespaceString::kContainerNamespace,
+        .container = containerIdent,
+        .oField = deleteO.toBSON(),
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeContainerDeleteOplogEntry(OpTime opTime,
+                                         std::string_view containerIdent,
+                                         BSONBinData key) {
+    ContainerDeleteOplogEntryO deleteO;
+    deleteO.setKey(toContainerKey(key));
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kContainerDelete,
+        .nss = NamespaceString::kContainerNamespace,
+        .container = containerIdent,
+        .oField = deleteO.toBSON(),
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeCreateIndexOplogEntry(OpTime opTime,
+                                     const NamespaceString& nss,
+                                     const std::string& indexName,
+                                     const BSONObj& keyPattern,
+                                     const UUID& uuid,
+                                     const BSONObj& options) {
+    BSONObjBuilder spec;
+    spec.append("v", 2);
+    spec.append("key", keyPattern);
+    spec.append("name", indexName);
+    spec.appendElementsUnique(options);
+
+    BSONObjBuilder oBuilder;
+    oBuilder.append("createIndexes", nss.coll());
+    oBuilder.appendElements(spec.obj());
+
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kCommand,
+        .nss = nss.getCommandNS(),
+        .uuid = uuid,
+        .oField = oBuilder.obj(),
+        .o2Field = boost::none,
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeStartIndexBuildOplogEntry(OpTime opTime,
+                                         const NamespaceString& nss,
+                                         const UUID& uuid,
+                                         const UUID& indexBuildUUID,
+                                         const IndexBuildInfo& indexBuildInfo,
+                                         std::string_view indexIdent) {
+    BSONObjBuilder oplogEntryBuilder;
+    oplogEntryBuilder.append("startIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
+    oplogEntryBuilder.append("indexes", BSON_ARRAY(indexBuildInfo.spec));
+
+    return makeCommandOplogEntry(opTime,
+                                 nss,
+                                 oplogEntryBuilder.obj(),
+                                 BSON("indexes" << BSON_ARRAY(BSON("indexIdent" << indexIdent))),
+                                 uuid);
+}
+
+OplogEntry makeCommitIndexBuildOplogEntry(OpTime opTime,
+                                          const NamespaceString& nss,
+                                          const UUID& uuid,
+                                          const UUID& indexBuildUUID,
+                                          const IndexBuildInfo& indexBuildInfo) {
+    BSONObjBuilder oplogEntryBuilder;
+    oplogEntryBuilder.append("commitIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&oplogEntryBuilder, "indexBuildUUID");
+    oplogEntryBuilder.append("indexes", BSON_ARRAY(indexBuildInfo.spec));
+
+    return makeCommandOplogEntry(
+        opTime, nss, oplogEntryBuilder.obj(), boost::none /* object2 */, uuid);
+}
+
+OplogEntry makeInsertDocumentOplogEntryWithSessionInfo(OpTime opTime,
+                                                       const NamespaceString& nss,
+                                                       const BSONObj& documentToInsert,
+                                                       OperationSessionInfo info) {
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kInsert,
+                                                      .nss = nss,
+                                                      .oField = documentToInsert,
+                                                      .sessionInfo = info,
+                                                      .wallClockTime = Date_t::now()}}};
+}
+
+OplogEntry makeInsertDocumentOplogEntryWithSessionInfoAndStmtIds(
+    OpTime opTime,
+    const NamespaceString& nss,
+    boost::optional<UUID> uuid,
+    const BSONObj& documentToInsert,
+    LogicalSessionId lsid,
+    TxnNumber txnNum,
+    const std::vector<StmtId>& stmtIds,
+    boost::optional<OpTime> prevOpTime) {
+    OperationSessionInfo info;
+    info.setSessionId(lsid);
+    info.setTxnNumber(txnNum);
+
+    return {DurableOplogEntry{DurableOplogEntryParams{.opTime = opTime,
+                                                      .opType = OpTypeEnum::kInsert,
+                                                      .nss = nss,
+                                                      .uuid = uuid,
+                                                      .oField = documentToInsert,
+                                                      .sessionInfo = info,
+                                                      .wallClockTime = Date_t::now(),
+                                                      .statementIds = stmtIds,
+                                                      .prevWriteOpTimeInTransaction = prevOpTime}}};
+}
+
+repl::MutableOplogEntry makeNoopMutableOplogEntry(const NamespaceString& nss,
+                                                  UUID uuid,
+                                                  const LogicalSessionId& lsid,
+                                                  TxnNumber txnNumber,
+                                                  const std::vector<StmtId>& stmtIds,
+                                                  repl::OpTime prevOpTime) {
+    repl::MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
+    oplogEntry.setNss(nss);
+    oplogEntry.setUuid(uuid);
+    oplogEntry.setObject(BSON("TestValue" << 0));
+    oplogEntry.setWallClockTime(Date_t::now());
+    oplogEntry.setSessionId(lsid);
+    oplogEntry.setTxnNumber(txnNumber);
+    oplogEntry.setStatementIds(stmtIds);
+    oplogEntry.setPrevWriteOpTimeInTransaction(prevOpTime);
+    return oplogEntry;
+}
+
+repl::OplogEntry makeNoopOplogEntry(repl::OpTime opTime,
+                                    const NamespaceString& nss,
+                                    UUID uuid,
+                                    const LogicalSessionId& lsid,
+                                    TxnNumber txnNumber,
+                                    const std::vector<StmtId>& stmtIds,
+                                    repl::OpTime prevOpTime) {
+    auto mutableOplogEntry =
+        makeNoopMutableOplogEntry(nss, uuid, lsid, txnNumber, stmtIds, prevOpTime);
+    mutableOplogEntry.setOpTime(opTime);
+    return uassertStatusOK(repl::OplogEntry::parse(mutableOplogEntry.toBSON()));
+}
+
+repl::MutableOplogEntry makeApplyOpsMutableOplogEntry(
+    std::vector<repl::ReplOperation> ops,
+    OperationSessionInfo sessionInfo,
+    Date_t wallClockTime,
+    const std::vector<StmtId>& stmtIds,
+    boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+    boost::optional<repl::MultiOplogEntryType> multiOpType,
+    boost::optional<ApplyOpsType> applyOpsType) {
+    repl::MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+    oplogEntry.setNss(NamespaceString::kAdminCommandNamespace);
+    oplogEntry.setOperationSessionInfo(sessionInfo);
+    oplogEntry.setWallClockTime(wallClockTime);
+    oplogEntry.setStatementIds(stmtIds);
+    oplogEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTimeInTransaction);
+    oplogEntry.setMultiOpType(multiOpType);
+
+    BSONObjBuilder applyOpsBuilder;
+    BSONArrayBuilder opsArrayBuilder = applyOpsBuilder.subarrayStart("applyOps");
+    for (const auto& op : ops) {
+        opsArrayBuilder.append(op.toBSON());
+    }
+    opsArrayBuilder.done();
+    if (applyOpsType == ApplyOpsType::kPrepare) {
+        applyOpsBuilder.append(repl::ApplyOpsCommandInfoBase::kPrepareFieldName, true);
+    } else if (applyOpsType == ApplyOpsType::kPartial) {
+        applyOpsBuilder.append(repl::ApplyOpsCommandInfoBase::kPartialTxnFieldName, true);
+    }
+    applyOpsBuilder.doneFast();
+    oplogEntry.setObject(applyOpsBuilder.obj());
+
+    return oplogEntry;
+}
+
+repl::OplogEntry makeApplyOpsOplogEntry(repl::OpTime opTime,
+                                        std::vector<repl::ReplOperation> ops,
+                                        OperationSessionInfo sessionInfo,
+                                        Date_t wallClockTime,
+                                        const std::vector<StmtId>& stmtIds,
+                                        boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+                                        boost::optional<repl::MultiOplogEntryType> multiOpType,
+                                        boost::optional<ApplyOpsType> applyOpsType) {
+    auto mutableOplogEntry = makeApplyOpsMutableOplogEntry(ops,
+                                                           sessionInfo,
+                                                           wallClockTime,
+                                                           stmtIds,
+                                                           prevWriteOpTimeInTransaction,
+                                                           multiOpType,
+                                                           applyOpsType);
+    mutableOplogEntry.setOpTime(opTime);
+    return uassertStatusOK(repl::OplogEntry::parse(mutableOplogEntry.toBSON()));
+}
+
+repl::OplogEntry makeCommitTransactionOplogEntry(
+    repl::OpTime opTime,
+    OperationSessionInfo sessionInfo,
+    Timestamp commitTimestamp,
+    boost::optional<repl::OpTime> prevWriteOpTimeInTransaction) {
+    CommitTransactionOplogObject commitObject;
+    commitObject.setCommitTimestamp(commitTimestamp);
+
+    repl::MutableOplogEntry op;
+    op.setOpType(repl::OpTypeEnum::kCommand);
+    op.setObject(commitObject.toBSON());
+    op.setSessionId(sessionInfo.getSessionId());
+    op.setTxnNumber(sessionInfo.getTxnNumber());
+    op.setOpTime(opTime);
+    op.setPrevWriteOpTimeInTransaction(prevWriteOpTimeInTransaction);
+    op.setWallClockTime({});
+    op.setNss({});
+
+    return {op.toBSON()};
+}
+
+repl::OplogEntry makeAbortTransactionOplogEntry(
+    repl::OpTime opTime,
+    OperationSessionInfo sessionInfo,
+    boost::optional<repl::OpTime> prevWriteOpTimeInTransaction) {
+    AbortTransactionOplogObject abortObject;
+
+    repl::MutableOplogEntry op;
+    op.setOpType(repl::OpTypeEnum::kCommand);
+    op.setObject(abortObject.toBSON());
+    op.setSessionId(sessionInfo.getSessionId());
+    op.setTxnNumber(sessionInfo.getTxnNumber());
+    op.setOpTime(opTime);
+    op.setPrevWriteOpTimeInTransaction(prevWriteOpTimeInTransaction);
+    op.setWallClockTime({});
+    op.setNss({});
+
+    return {op.toBSON()};
+}
+
+OplogEntry makeInsertOplogEntry(OpTime opTime,
+                                const NamespaceString& nss,
+                                const UUID& uuid,
+                                const BSONObj& docToInsert) {
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kInsert,
+        .nss = nss,
+        .uuid = uuid,
+        .oField = docToInsert,
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeDeleteOplogEntry(OpTime opTime,
+                                const NamespaceString& nss,
+                                const UUID& uuid,
+                                const BSONObj& docToDelete) {
+    return {DurableOplogEntry{DurableOplogEntryParams{
+        .opTime = opTime,
+        .opType = OpTypeEnum::kDelete,
+        .nss = nss,
+        .uuid = uuid,
+        .oField = docToDelete,
+        .wallClockTime = Date_t::now(),
+    }}};
+}
+
+OplogEntry makeInsertOplogEntryWithRecordId(OpTime opTime,
+                                            const NamespaceString& nss,
+                                            const UUID& uuid,
+                                            const BSONObj& docToInsert,
+                                            const RecordId& rid) {
+    OplogEntry baseEntry = makeInsertOplogEntry(opTime, nss, uuid, docToInsert);
+
+    // Add the recordId field since it's not included in DurableOplogEntryParams.
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    rid.serializeToken("rid", &builder);
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+// TODO SERVER-131416: Rename to makeUpdateOplogEntryWithSingleOpMetadataNoSz
+OplogEntry makeUpdateOplogEntryWithRecordId(OpTime opTime,
+                                            const NamespaceString& nss,
+                                            const BSONObj& documentToUpdate,
+                                            const BSONObj& updatedDocument,
+                                            const RecordId& rid) {
+    OplogEntry baseEntry =
+        makeUpdateDocumentOplogEntry(opTime, nss, documentToUpdate, updatedDocument);
+
+    // Add the recordId field since it's not included in DurableOplogEntryParams.
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    rid.serializeToken("rid", &builder);
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+// TODO SERVER-131416: Rename to makeDeleteOplogEntryWithSingleOpMetadataNoSz
+OplogEntry makeUpdateOplogEntryWithUpsert(OpTime opTime,
+                                          const NamespaceString& nss,
+                                          const BSONObj& documentToUpdate,
+                                          const BSONObj& updatedDocument) {
+    OplogEntry baseEntry =
+        makeUpdateDocumentOplogEntry(opTime, nss, documentToUpdate, updatedDocument);
+
+    // Add the upsert flag ("b" field) to the oplog entry.
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("b", true);
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeUpdateOplogEntryWithUpsertAndRecordId(OpTime opTime,
+                                                     const NamespaceString& nss,
+                                                     const BSONObj& documentToUpdate,
+                                                     const BSONObj& updatedDocument,
+                                                     const RecordId& rid) {
+    OplogEntry baseEntry =
+        makeUpdateOplogEntryWithRecordId(opTime, nss, documentToUpdate, updatedDocument, rid);
+
+    // Add the upsert flag ("b" field) to the oplog entry that already has a recordId.
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("b", true);
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeDeleteOplogEntryWithRecordId(OpTime opTime,
+                                            const NamespaceString& nss,
+                                            const UUID& uuid,
+                                            const BSONObj& docToDelete,
+                                            const RecordId& rid) {
+    OplogEntry baseEntry = makeDeleteDocumentOplogEntry(opTime, nss, docToDelete);
+
+    // Add the recordId field since it's not included in DurableOplogEntryParams.
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    rid.serializeToken("rid", &builder);
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeInsertOplogEntryWithRecordIdAndHash(OpTime opTime,
+                                                   const NamespaceString& nss,
+                                                   const UUID& uuid,
+                                                   const BSONObj& docToInsert,
+                                                   const RecordId& rid,
+                                                   int64_t hash) {
+    OplogEntry baseEntry = makeInsertOplogEntryWithRecordId(opTime, nss, uuid, docToInsert, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSON("h" << hash));
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeDeleteOplogEntryWithRecordIdAndHash(OpTime opTime,
+                                                   const NamespaceString& nss,
+                                                   const UUID& uuid,
+                                                   const BSONObj& docToDelete,
+                                                   const RecordId& rid,
+                                                   int64_t hash) {
+    OplogEntry baseEntry = makeDeleteOplogEntryWithRecordId(opTime, nss, uuid, docToDelete, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSON("h" << hash));
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeUpdateOplogEntryWithRecordIdAndHash(OpTime opTime,
+                                                   const NamespaceString& nss,
+                                                   const BSONObj& documentToUpdate,
+                                                   const BSONObj& updatedDocument,
+                                                   const RecordId& rid,
+                                                   int64_t hash) {
+    OplogEntry baseEntry =
+        makeUpdateOplogEntryWithRecordId(opTime, nss, documentToUpdate, updatedDocument, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSON("h" << hash));
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeUpdateOplogEntryWithRecordIdAndSizeMetadata(OpTime opTime,
+                                                           const NamespaceString& nss,
+                                                           const BSONObj& documentToUpdate,
+                                                           const BSONObj& updatedDocument,
+                                                           const RecordId& rid,
+                                                           int sizeDelta) {
+    OplogEntry baseEntry =
+        makeUpdateOplogEntryWithRecordId(opTime, nss, documentToUpdate, updatedDocument, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSON("sz" << sizeDelta));
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeDeleteOplogEntryWithRecordIdAndSizeMetadata(OpTime opTime,
+                                                           const NamespaceString& nss,
+                                                           const UUID& uuid,
+                                                           const BSONObj& docToDelete,
+                                                           const RecordId& rid,
+                                                           int sizeDelta) {
+    OplogEntry baseEntry = makeDeleteOplogEntryWithRecordId(opTime, nss, uuid, docToDelete, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSON("sz" << sizeDelta));
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeUpdateOplogEntryWithRecordIdWithoutSz(OpTime opTime,
+                                                     const NamespaceString& nss,
+                                                     const BSONObj& documentToUpdate,
+                                                     const BSONObj& updatedDocument,
+                                                     const RecordId& rid) {
+    OplogEntry baseEntry =
+        makeUpdateOplogEntryWithRecordId(opTime, nss, documentToUpdate, updatedDocument, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSONObj());
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+OplogEntry makeDeleteOplogEntryWithRecordIdWithoutSz(OpTime opTime,
+                                                     const NamespaceString& nss,
+                                                     const UUID& uuid,
+                                                     const BSONObj& docToDelete,
+                                                     const RecordId& rid) {
+    OplogEntry baseEntry = makeDeleteOplogEntryWithRecordId(opTime, nss, uuid, docToDelete, rid);
+
+    BSONObjBuilder builder;
+    builder.appendElements(baseEntry.getEntry().toBSON());
+    builder.append("m", BSONObj());
+
+    return {DurableOplogEntry(builder.obj())};
+}
+
+UUID getCollectionUUID(OperationContext* opCtx, const NamespaceString& nss) {
+    const auto optUuid = CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, nss);
+    ASSERT_TRUE(optUuid);
+    return *optUuid;
+}
+
+void insertDocumentAtRecordId(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              const BSONObj& doc,
+                              const RecordId& rid) {
+    WriteUnitOfWork wuow(opCtx);
+    auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT_TRUE(coll.exists());
+
+    InsertStatement stmt{doc};
+    stmt.replicatedRecordId = rid;
+    ASSERT_OK(collection_internal::insertDocument(opCtx, coll.getCollectionPtr(), stmt, nullptr));
+
+    wuow.commit();
+}
+
+boost::optional<BSONObj> documentAtRecordId(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            const RecordId& rid) {
+    auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    if (!coll.exists()) {
+        return boost::none;
+    }
+    auto cursor = coll.getCollectionPtr()->getCursor(opCtx);
+    auto record = cursor->seekExact(rid);
+    if (record.has_value()) {
+        return record->data.getOwned().releaseToBson();
+    }
+    return boost::none;
+}
+
+bool documentExistsAtRecordId(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              const RecordId& rid) {
+    return documentAtRecordId(opCtx, nss, rid).has_value();
+}
+}  // namespace repl
+}  // namespace mongo

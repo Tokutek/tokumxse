@@ -1,0 +1,137 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/pcre_util.h"
+
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/pcre.h"
+
+#include <climits>
+#include <cstdint>
+#include <string_view>
+
+#include <fmt/format.h>
+
+namespace mongo::pcre_util {
+namespace {
+using namespace std::literals::string_view_literals;
+
+// Test compares `CompileOptions` as integers.
+TEST(PcreUtilTest, FlagsToOptions) {
+    using namespace pcre::options;
+    auto parse = [](std::string_view flags) {
+        return static_cast<uint32_t>(flagsToOptions(flags));
+    };
+    auto expect = [](pcre::CompileOptions o) {
+        return static_cast<uint32_t>(o);
+    };
+    ASSERT_EQ(parse(""), expect(UTF)) << " UTF is on by default";
+    ASSERT_EQ(parse("i"), expect(UTF | CASELESS));
+    ASSERT_EQ(parse("m"), expect(UTF | MULTILINE));
+    ASSERT_EQ(parse("s"), expect(UTF | DOTALL));
+    ASSERT_EQ(parse("u"), expect(UTF));
+    ASSERT_EQ(parse("x"), expect(UTF | EXTENDED));
+    ASSERT_EQ(parse("imsux"), expect(CASELESS | MULTILINE | DOTALL | UTF | EXTENDED));
+    ASSERT_EQ(parse("xusmi"), expect(CASELESS | MULTILINE | DOTALL | UTF | EXTENDED));
+
+    auto isBadFlagException = [](const DBException& ex) {
+        return ex.code() == 51108;
+    };
+    ASSERT_THROWS_WITH_CHECK(parse("z"), DBException, isBadFlagException);
+    ASSERT_THROWS_WITH_CHECK(parse("iz"), DBException, isBadFlagException);
+}
+
+// Test compares `CompileOptions` as strings of option flags.
+TEST(PcreUtilTest, OptionsToFlags) {
+    using namespace pcre::options;
+    auto parse = [](pcre::CompileOptions flags) {
+        return static_cast<std::string>(optionsToFlags(flags));
+    };
+    auto expect = [](std::string o) {
+        return (o);
+    };
+    ASSERT_EQ(parse(UTF | CASELESS), expect("i"));
+    ASSERT_EQ(parse(UTF | MULTILINE), expect("m"));
+    ASSERT_EQ(parse(UTF | DOTALL), expect("s"));
+    ASSERT_EQ(parse(UTF), expect("")) << " UTF is on by default";
+    ASSERT_EQ(parse(UTF | EXTENDED), expect("x"));
+    ASSERT_EQ(parse(UTF | CASELESS | MULTILINE | DOTALL | EXTENDED), expect("imsx"));
+    ASSERT_EQ(parse(UTF | CASELESS | MULTILINE | DOTALL), expect("ims"));
+    ASSERT_EQ(parse(UTF | CASELESS | MULTILINE | EXTENDED), expect("imx"));
+    ASSERT_EQ(parse(UTF | CASELESS | DOTALL | EXTENDED), expect("isx"));
+    ASSERT_EQ(parse(UTF | MULTILINE | DOTALL | EXTENDED), expect("msx"));
+}
+
+TEST(PcreUtilTest, QuoteMeta) {
+    ASSERT_EQ(quoteMeta(""), "");
+    ASSERT_EQ(quoteMeta("abc_def_123"sv), "abc_def_123");
+    ASSERT_EQ(quoteMeta("🍌"sv), "🍌");
+    ASSERT_EQ(quoteMeta("\0"sv), "\\0") << "NUL";
+    ASSERT_EQ(quoteMeta("\n"sv), "\\\n") << "one escape";
+    ASSERT_EQ(quoteMeta("a\n\nb"sv), "a\\\n\\\nb") << "two adjacent escapes";
+    ASSERT_EQ(quoteMeta("a\nb\nc"sv), "a\\\nb\\\nc") << "two nonadjacent escapes";
+
+    // All the single chars except '\0', which is already tested and behaves differently.
+    for (int i = 1; i <= CHAR_MAX; ++i) {
+        char c = i;
+        std::string_view in(&c, 1);
+        std::string out = quoteMeta(in);
+
+        // [a-zA-Z0-9_] and bit7 chars are not escaped. Everything else is.
+        bool shouldEscape = [&] {
+            if (ctype::isAlnum(c))
+                return false;
+            if (c == '_')
+                return false;
+            if (static_cast<unsigned char>(c) >= 0x80)
+                return false;
+            return true;
+        }();
+
+        auto hexdump = [](std::string_view in) {
+            std::string r = "[";
+            std::string_view sep;
+            for (unsigned char c : in) {
+                static constexpr auto d = "0123456789abcdef"sv;
+                r += sep;
+                r += d[(c >> 4) & 0xf];
+                r += d[(c >> 0) & 0xf];
+                sep = ",";
+            }
+            r += "]";
+            return r;
+        };
+        auto note = fmt::format("{} => {}", hexdump(in), hexdump(out));
+        if (shouldEscape) {
+            ASSERT_EQ(out, fmt::format("\\{}", in)) << note;
+        } else {
+            ASSERT_EQ(out, in) << note;
+        }
+    }
+}
+
+TEST(PcreUtilTest, BackslashCKMatchAtContinuationByteThrows) {
+    using namespace pcre::options;
+    pcre::Regex re("\\C\\K\\C", flagsToOptions(""));
+    ASSERT_TRUE(!!re);
+    ASSERT_THROWS_CODE(re.matchView("\xC3\xA9"), DBException, 12407700);
+}
+
+TEST(PcreUtilTest, BackslashCMatchEndingMidCharacterThrows) {
+    using namespace pcre::options;
+    pcre::Regex re("\\C", flagsToOptions(""));
+    ASSERT_TRUE(!!re);
+    ASSERT_THROWS_CODE(re.matchView("\xC3\xA9"), DBException, 12407700);
+}
+
+TEST(PcreUtilTest, BackslashCCaptureGroupMidCharacterThrows) {
+    using namespace pcre::options;
+    pcre::Regex re("(\\C)(\\C)", flagsToOptions(""));
+    ASSERT_TRUE(!!re);
+    ASSERT_THROWS_CODE(re.matchView("\xC3\xA9"), DBException, 12407700);
+}
+
+}  // namespace
+}  // namespace mongo::pcre_util

@@ -1,261 +1,453 @@
-// test_commands.cpp
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
-*    Copyright (C) 2013-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+#include "mongo/db/commands/test_commands.h"
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/base/init.h"
-#include "mongo/base/initializer_context.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/client.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/collection_crud/capped_collection_maintenance.h"
+#include "mongo/db/collection_crud/capped_utils.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/index_builder.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/feature_flag_test_gen.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/profile_settings.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/util/log.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/write_ops/insert.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/intent_registry.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <memory>
+#include <ostream>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
+namespace {
 
-    using std::endl;
-    using std::string;
-    using std::stringstream;
+const std::string kTestingDurableHistoryPinName = "_testing";
 
-    /* For testing only, not for general use. Enabled via command-line */
-    class GodInsert : public Command {
-    public:
-        GodInsert() : Command( "godinsert" ) { }
-        virtual bool adminOnly() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-        virtual void help( stringstream &help ) const {
-            help << "internal. for testing only.";
-        }
-        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            string coll = cmdObj[ "godinsert" ].valuestrsafe();
-            log() << "test only command godinsert invoked coll:" << coll << endl;
-            uassert( 13049, "godinsert must specify a collection", !coll.empty() );
-            string ns = dbname + "." + coll;
-            BSONObj obj = cmdObj[ "obj" ].embeddedObjectUserCheck();
+using repl::UnreplicatedWritesBlock;
+using std::string;
+using std::stringstream;
 
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-            OldClientContext ctx(txn,  ns );
-            Database* db = ctx.db();
+/**
+ * The commands in this file are for testing only, not for general use.
+ * For more on this topic and how to enable these commands, see docs/test_commands.md.
+ */
 
-            WriteUnitOfWork wunit(txn);
-            Collection* collection = db->getCollection( ns );
-            if ( !collection ) {
-                collection = db->createCollection( txn, ns );
-                if ( !collection ) {
-                    errmsg = "could not create collection";
-                    return false;
-                }
-            }
-            StatusWith<RecordId> res = collection->insertDocument( txn, obj, false );
-            Status status = res.getStatus();
-            if (status.isOK()) {
-                wunit.commit();
-            }
-            return appendCommandStatus( result, res.getStatus() );
-        }
-    };
+class GodInsert : public BasicCommand {
+public:
+    GodInsert() : BasicCommand("godinsert") {}
+    bool adminOnly() const override {
+        return false;
+    }
 
-    /* for diagnostic / testing purposes. Enabled via command line. */
-    class CmdSleep : public Command {
-    public:
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool slaveOk() const { return true; }
-        virtual void help( stringstream& help ) const {
-            help << "internal testing command.  Makes db block (in a read lock) for 100 seconds\n";
-            help << "w:true write lock. secs:<seconds>";
-        }
-        // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-        CmdSleep() : Command("sleep") { }
-        bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            log() << "test only command sleep invoked" << endl;
-            long long millis = 10 * 1000;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
 
-            if (cmdObj["secs"].isNumber() && cmdObj["millis"].isNumber()) {
-                millis = cmdObj["secs"].numberLong() * 1000 + cmdObj["millis"].numberLong();
-            }
-            else if (cmdObj["secs"].isNumber()) {
-                millis = cmdObj["secs"].numberLong() * 1000;
-            }
-            else if (cmdObj["millis"].isNumber()) {
-                millis = cmdObj["millis"].numberLong();
-            }
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
-            if(cmdObj.getBoolField("w")) {
-                ScopedTransaction transaction(txn, MODE_X);
-                Lock::GlobalWrite lk(txn->lockState());
-                sleepmillis(millis);
-            }
-            else {
-                ScopedTransaction transaction(txn, MODE_S);
-                Lock::GlobalRead lk(txn->lockState());
-                sleepmillis(millis);
-            }
-
-            // Interrupt point for testing (e.g. maxTimeMS).
-            txn->checkForInterrupt();
-
-            return true;
-        }
-    };
-
-    // Testing only, enabled via command-line.
-    class CapTrunc : public Command {
-    public:
-        CapTrunc() : Command( "captrunc" ) {}
-        virtual bool slaveOk() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            string coll = cmdObj[ "captrunc" ].valuestrsafe();
-            uassert( 13416, "captrunc must specify a collection", !coll.empty() );
-            NamespaceString nss( dbname, coll );
-            int n = cmdObj.getIntField( "n" );
-            bool inc = cmdObj.getBoolField( "inc" ); // inclusive range?
-
-            OldClientWriteContext ctx(txn,  nss.ns() );
-            Collection* collection = ctx.getCollection();
-            massert( 13417, "captrunc collection not found or empty", collection);
-
-            RecordId end;
-            {
-                boost::scoped_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn,
-                                                                                     nss.ns(),
-                                                                                     collection,
-                                                                                     InternalPlanner::BACKWARD));
-                // We remove 'n' elements so the start is one past that
-                for( int i = 0; i < n + 1; ++i ) {
-                    PlanExecutor::ExecState state = exec->getNext(NULL, &end);
-                    massert( 13418, "captrunc invalid n", PlanExecutor::ADVANCED == state);
-                }
-            }
-            WriteUnitOfWork wuow(txn);
-            collection->temp_cappedTruncateAfter( txn, end, inc );
-            wuow.commit();
-            return true;
-        }
-    };
-
-    // Testing-only, enabled via command line.
-    class EmptyCapped : public Command {
-    public:
-        EmptyCapped() : Command( "emptycapped" ) {}
-        virtual bool slaveOk() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool logTheOp() { return true; }
-        // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
-                                                     const BSONObj& cmdObj) {
-            const std::string ns = parseNsCollectionRequired(db->name(), cmdObj);
-
-            IndexCatalog::IndexKillCriteria criteria;
-            criteria.ns = ns;
-            return IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
-        }
-
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
-
-            ScopedTransaction scopedXact(txn, MODE_IX);
-            AutoGetDb autoDb(txn, dbname, MODE_X);
-
-            if (!fromRepl &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
-                return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
-                    << "Not primary while truncating collection " << ns));
-            }
-
-            Database* db = autoDb.getDb();
-            massert(13429, "no such database", db);
-
-            Collection* collection = db->getCollection(ns);
-            massert(28584, "no such collection", collection);
-
-            std::vector<BSONObj> indexes = stopIndexBuilds(txn, db, cmdObj);
-
-            WriteUnitOfWork wuow(txn);
-
-            Status status = collection->truncate(txn);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            IndexBuilder::restoreIndexes(txn, indexes);
-
-            if (!fromRepl) {
-                getGlobalEnvironment()->getOpObserver()->onEmptyCapped(txn, collection->ns());
-            }
-
-            wuow.commit();
-
-            return true;
-        }
-    };
-
-    // ----------------------------
-
-    MONGO_INITIALIZER(RegisterEmptyCappedCmd)(InitializerContext* context) {
-        if (Command::testCommandsEnabled) {
-            // Leaked intentionally: a Command registers itself when constructed.
-            new CapTrunc();
-            new CmdSleep();
-            new EmptyCapped();
-            new GodInsert();
-        }
+    // No auth needed because it only works when enabled via command line.
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
 
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
 
+
+    std::string help() const override {
+        return "internal. for testing only.";
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+        LOGV2(20505, "Test-only command 'godinsert' invoked", "collection"_attr = nss.coll());
+        BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
+
+        // The insert below runs under an UnreplicatedWritesBlock, so no oplog entry is logged and
+        // nothing supplies a commit timestamp, even though the target collection is replicated.
+        shard_role_details::allowOneUntimestampedWrite(opCtx);
+
+        AutoGetDb autodb(
+            opCtx,
+            dbName,
+            MODE_X,
+            boost::none,
+            Date_t::max(),
+            Lock::DBLockSkipOptions{
+                false, false, false, rss::consensus::IntentRegistry::Intent::LocalWrite});
+        Database* db = autodb.ensureDbExists(opCtx);
+
+        AutoStatsTracker statsTracker(opCtx,
+                                      nss,
+                                      Top::LockType::WriteLocked,
+                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                      DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                          .getDatabaseProfileLevel(dbName));
+
+        // GodInsert is a test only command that can execute inserts on secondary nodes and uses an
+        // unreplicated writes block.
+        auto collection =
+            acquireCollection(opCtx,
+                              CollectionAcquisitionRequest::fromOpCtx(
+                                  opCtx, nss, AcquisitionPrerequisites::kUnreplicatedWrite),
+                              MODE_IX);
+
+        WriteUnitOfWork wunit(opCtx);
+        UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
+        if (!collection.exists()) {
+            ScopedLocalCatalogWriteFence scopedLocalCatalogWriteFence(opCtx, &collection);
+            db->createCollection(opCtx, nss);
+        }
+        uassert(
+            ErrorCodes::CannotCreateCollection, "could not create collection", collection.exists());
+
+        Status status = Helpers::insert(opCtx, collection.getCollectionPtr(), obj);
+        if (status.isOK()) {
+            wunit.commit();
+        }
+        uassertStatusOK(status);
+        return true;
+    }
+};
+
+MONGO_REGISTER_COMMAND(GodInsert).testOnly().forShard();
+
+
+class DurableHistoryReplicatedTestCmd : public BasicCommand {
+public:
+    DurableHistoryReplicatedTestCmd() : BasicCommand("pinHistoryReplicated") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    // No auth needed because it only works when enabled via command line.
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
+
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
+
+    std::string help() const override {
+        return "pins the oldest timestamp";
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const Timestamp requestedPinTs = cmdObj.firstElement().timestamp();
+        const bool round = cmdObj["round"].booleanSafe();
+
+        AutoGetDb autoDb(opCtx, NamespaceString::kDurableHistoryTestNamespace.dbName(), MODE_IX);
+        Lock::CollectionLock collLock(
+            opCtx, NamespaceString::kDurableHistoryTestNamespace, MODE_IX);
+        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+                opCtx,
+                NamespaceString::kDurableHistoryTestNamespace)) {  // someone else may have beat us
+                                                                   // to it.
+            uassertStatusOK(
+                userAllowedCreateNS(opCtx, NamespaceString::kDurableHistoryTestNamespace));
+            WriteUnitOfWork wuow(opCtx);
+            CollectionOptions defaultCollectionOptions;
+            auto db = autoDb.ensureDbExists(opCtx);
+            uassertStatusOK(db->userCreateNS(
+                opCtx, NamespaceString::kDurableHistoryTestNamespace, defaultCollectionOptions));
+            wuow.commit();
+        }
+
+        const auto collection = acquireCollection(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(
+                opCtx,
+                static_cast<const NamespaceString&>(NamespaceString::kDurableHistoryTestNamespace),
+                AcquisitionPrerequisites::kWrite),
+            MODE_IX);
+        WriteUnitOfWork wuow(opCtx);
+
+        // Note, this write will replicate to secondaries, but a secondary will not in-turn pin
+        // the oldest timestamp. The write otherwise must be timestamped in a storage engine
+        // table with logging disabled. This is to test that rolling back the written document
+        // also results in the pin being lifted.
+        Timestamp pinTs =
+            uassertStatusOK(opCtx->getServiceContext()->getStorageEngine()->pinOldestTimestamp(
+                *shard_role_details::getRecoveryUnit(opCtx),
+                kTestingDurableHistoryPinName,
+                requestedPinTs,
+                round));
+
+        uassertStatusOK(
+            Helpers::insert(opCtx,
+                            collection.getCollectionPtr(),
+                            fixDocumentForInsert(opCtx, BSON("pinTs" << pinTs)).getValue()));
+        wuow.commit();
+
+        result.append("requestedPinTs", requestedPinTs);
+        result.append("pinTs", pinTs);
+        return true;
+    }
+};
+
+MONGO_REGISTER_COMMAND(DurableHistoryReplicatedTestCmd).testOnly().forShard();
+
+
+// TODO SERVER-110189: Make testing this command resilient to releases or update the name of this
+// command.
+class CommandFeatureFlaggedOnLatestFCVTestCmd91 : public BasicCommand {
+public:
+    CommandFeatureFlaggedOnLatestFCVTestCmd91()
+        : BasicCommand("testCommandFeatureFlaggedOnLatestFCV91") {}
+
+    bool adminOnly() const override {
+        return false;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    // No auth needed because it only works when enabled via command line.
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
+
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
+
+    std::string help() const override {
+        return "internal. for testing only.";
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        LOGV2(10044800, "Test-only command 'testCommandFeatureFlaggedOnLatestFCV91' invoked");
+        return true;
+    }
+};
+
+MONGO_REGISTER_COMMAND(CommandFeatureFlaggedOnLatestFCVTestCmd91)
+    .testOnly()
+    .requiresFeatureFlag(feature_flags::gFeatureFlagBlender)
+    .forShard();
+
+}  // namespace
+
+std::string TestingDurableHistoryPin::getName() {
+    return kTestingDurableHistoryPinName;
 }
+
+boost::optional<Timestamp> TestingDurableHistoryPin::calculatePin(OperationContext* opCtx) {
+    const auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(NamespaceString::kDurableHistoryTestNamespace,
+                                     PlacementConcern::kPretendUnsharded,
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kRead),
+        MODE_IS);
+    if (!coll.exists()) {
+        return boost::none;
+    }
+
+    Timestamp ret = Timestamp::max();
+    auto cursor = coll.getCollectionPtr()->getCursor(opCtx);
+    for (auto doc = cursor->next(); doc; doc = cursor->next()) {
+        const BSONObj obj = doc.value().data.toBson();
+        const Timestamp ts = obj["pinTs"].timestamp();
+        ret = std::min(ret, ts);
+    }
+
+    if (ret == Timestamp::min()) {
+        return boost::none;
+    }
+
+    return ret;
+}
+
+/**
+ * Generates a description of the persistence provider capabilities of this node (based on the
+ * information exposed by the PersistenceProvider).
+ */
+class PersistenceProviderPropertiesTestCmd : public BasicCommand {
+public:
+    PersistenceProviderPropertiesTestCmd() : BasicCommand("persistenceProviderProperties") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    // No auth needed because it only works when enabled via command line.
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
+
+    bool requiresAuthzChecks() const override {
+        return false;
+    }
+
+    bool maintenanceOk() const override {
+        return true;
+    }
+
+    std::string help() const override {
+        return "returns the list of features a persistence provider may support and whether this "
+               "mongod's provider supports the feature";
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+
+        const auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+
+#define BUILD_DESCRIPTOR_FOR_BOOL_CAPABILITIES(BOOL_FIELD_BUILDER_FN)        \
+    BOOL_FIELD_BUILDER_FN(mustUsePrimaryDrivenIndexBuilds)                   \
+    BOOL_FIELD_BUILDER_FN(mustUseContainerWrites)                            \
+    BOOL_FIELD_BUILDER_FN(shouldAvoidDuplicateCheckpoints)                   \
+    BOOL_FIELD_BUILDER_FN(shouldDelayDataAccessDuringStartup)                \
+    BOOL_FIELD_BUILDER_FN(shouldDisableTransactionUpdateCoalescing)          \
+    BOOL_FIELD_BUILDER_FN(shouldStepDownForShutdown)                         \
+    BOOL_FIELD_BUILDER_FN(usesSchemaEpochs)                                  \
+    BOOL_FIELD_BUILDER_FN(shouldUseClusteredCollectionOplogFastPath)         \
+    BOOL_FIELD_BUILDER_FN(shouldUseOplogWritesForFlowControlSampling)        \
+    BOOL_FIELD_BUILDER_FN(shouldUseReplicatedCatalogIdentifiers)             \
+    BOOL_FIELD_BUILDER_FN(shouldUseReplicatedFastCount)                      \
+    BOOL_FIELD_BUILDER_FN(shouldUseReplicatedRecordIds)                      \
+    BOOL_FIELD_BUILDER_FN(shouldUseReplicatedTruncates)                      \
+    BOOL_FIELD_BUILDER_FN(supportsCompaction)                                \
+    BOOL_FIELD_BUILDER_FN(supportsCrossShardTransactions)                    \
+    BOOL_FIELD_BUILDER_FN(supportsCursorReuseForExpressPathQueries)          \
+    BOOL_FIELD_BUILDER_FN(supportsFindAndModifyImageCollection)              \
+    BOOL_FIELD_BUILDER_FN(supportsLocalCollections)                          \
+    BOOL_FIELD_BUILDER_FN(supportsPersistentOplogCapMaintainerThread)        \
+    BOOL_FIELD_BUILDER_FN(supportsAsyncOplogMarkerGeneration)                \
+    BOOL_FIELD_BUILDER_FN(supportsOplogSampling)                             \
+    BOOL_FIELD_BUILDER_FN(supportsOplogScanning)                             \
+    BOOL_FIELD_BUILDER_FN(supportsPreservingPreparedTxnInPreciseCheckpoints) \
+    BOOL_FIELD_BUILDER_FN(supportsTableLogging)                              \
+    BOOL_FIELD_BUILDER_FN(supportsUnstableCheckpoints)                       \
+    BOOL_FIELD_BUILDER_FN(supportsVersionCursor)                             \
+    BOOL_FIELD_BUILDER_FN(supportsColdCollections)
+
+        // For each method listed in PERSISTENCE_PROVIDER_BOOL_CAPABILITIES, call the method and
+        // append the result with the method name.
+#define ADD_BOOL_FIELD(fieldName) result.append(#fieldName, provider.fieldName());
+        BUILD_DESCRIPTOR_FOR_BOOL_CAPABILITIES(ADD_BOOL_FIELD);
+
+        // Enumerate ReadConcern level support.
+        // e.g.
+        // "supportsReadConcernLevel" : {
+        //     "local"        : true,
+        //     "majority"     : true,
+        //     "available"    : true,
+        //     "linearizable" : false,
+        //     "snapshot"     : true
+        // }
+        constexpr repl::ReadConcernLevel kAllReadConcernLevels[] = {
+            repl::ReadConcernLevel::kLocalReadConcern,
+            repl::ReadConcernLevel::kMajorityReadConcern,
+            repl::ReadConcernLevel::kAvailableReadConcern,
+            repl::ReadConcernLevel::kLinearizableReadConcern,
+            repl::ReadConcernLevel::kSnapshotReadConcern,
+        };
+        {
+            BSONObjBuilder rcSubObj(result.subobjStart("supportsReadConcernLevel"));
+            for (auto level : kAllReadConcernLevels) {
+                rcSubObj.append(repl::readConcernLevels::toString(level),
+                                provider.supportsReadConcernLevel(level));
+            }
+        }
+
+        return true;
+    }
+};
+
+MONGO_REGISTER_COMMAND(PersistenceProviderPropertiesTestCmd).testOnly().forShard();
+
+}  // namespace mongo

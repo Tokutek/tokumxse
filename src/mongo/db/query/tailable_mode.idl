@@ -1,0 +1,15 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+enums:
+    TailableMode:
+        description: "Describes the tailablility of a cursor."
+        type: string
+        values:
+            kNormal: "normal"
+            kTailable: "tailable"
+            kTailableAndAwaitData: "tailableAndAwaitData"

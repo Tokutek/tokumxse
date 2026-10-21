@@ -1,0 +1,234 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/ftdc/collector.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/ftdc/constants.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/concurrency/notification.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/synchronized_value.h"
+#include "mongo/util/time_support.h"
+
+#include <string_view>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+constexpr auto kFieldName = "Field"sv;
+constexpr auto kAnotherFieldName = "AnotherField"sv;
+constexpr auto kCollectorName = "Collector1";
+constexpr auto kAnotherCollectorName = "Collector2";
+constexpr auto kSampleData = 1;
+constexpr auto kMoreSampleData = 12;
+
+class SampleCollectorCacheTestFixture : public ServiceContextTest {
+public:
+    void setUp() override {
+        ServiceContextTest::setUp();
+        _opCtx = makeOperationContext();
+    }
+
+    BSONObj collect(SampleCollectorCache& collectorCache) {
+        BSONObjBuilder bob;
+        collectorCache.refresh(_opCtx.get(), &bob);
+        return bob.obj();
+    }
+
+    SampleCollectorCache makeSampleCollectorCache(Milliseconds timeout = Milliseconds{200},
+                                                  size_t minThreads = 1,
+                                                  size_t maxThreads = 2) {
+        return {timeout, minThreads, maxThreads};
+    }
+
+private:
+    ServiceContext::UniqueOperationContext _opCtx;
+};
+
+class DummyFTDCCollector : public FTDCCollectorInterface {
+public:
+    std::string name() const override {
+        return "dummy";
+    }
+
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {
+        builder.append("name", "dummy");
+    }
+};
+
+class NamedDummyFTDCCollector : public FTDCCollectorInterface {
+public:
+    explicit NamedDummyFTDCCollector(std::string name) : _name(std::move(name)) {}
+
+    std::string name() const override {
+        return _name;
+    }
+
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {}
+
+private:
+    std::string _name;
+};
+
+TEST(FTDCCollectorTest, SyncCollectionRejectsDuplicateCollectorNames) {
+    SyncFTDCCollectorCollection coll;
+    coll.add(std::make_unique<NamedDummyFTDCCollector>("same"));
+    coll.add(std::make_unique<NamedDummyFTDCCollector>("different"));
+    ASSERT_THROWS_CODE(coll.add(std::make_unique<NamedDummyFTDCCollector>("same")),
+                       DBException,
+                       ErrorCodes::BadValue);
+}
+
+TEST(FTDCCollectorTest, FilteredCollectorTest) {
+    auto doCollect = [](FTDCCollectorInterface& collector) {
+        BSONObjBuilder builder;
+        if (collector.hasData()) {
+            collector.collect(nullptr, builder);
+        }
+        return builder.done().toString();
+    };
+
+    bool enabled = true;
+    FilteredFTDCCollector filter([&] { return enabled; }, std::make_unique<DummyFTDCCollector>());
+
+    ASSERT_TRUE(filter.hasData());
+    ASSERT_EQUALS(doCollect(filter), R"({ name: "dummy" })");
+
+    enabled = false;
+    ASSERT_FALSE(filter.hasData());
+    ASSERT_EQUALS(doCollect(filter), R"({})");
+}
+
+TEST_F(SampleCollectorCacheTestFixture, DuplicateCollectorNamesRejected) {
+    auto collector = makeSampleCollectorCache();
+    collector.addCollector(kCollectorName, true, [](OperationContext*, BSONObjBuilder*) {});
+    collector.addCollector(kAnotherCollectorName, true, [](OperationContext*, BSONObjBuilder*) {});
+    ASSERT_THROWS_CODE(
+        collector.addCollector(kCollectorName, true, [](OperationContext*, BSONObjBuilder*) {}),
+        DBException,
+        ErrorCodes::BadValue);
+}
+
+TEST_F(SampleCollectorCacheTestFixture, NoCollectorsShouldReturnNothing) {
+    auto collector = makeSampleCollectorCache();
+    auto sample = collect(collector);
+    ASSERT_EQ(sample.begin(), sample.end());
+}
+
+TEST_F(SampleCollectorCacheTestFixture, MultipleCollectors) {
+    auto collector = makeSampleCollectorCache();
+    collector.addCollector(kCollectorName, true, [&](OperationContext*, BSONObjBuilder* bob) {
+        bob->append(kFieldName, kSampleData);
+    });
+    collector.addCollector(
+        kAnotherCollectorName, true, [&](OperationContext*, BSONObjBuilder* bob) {
+            bob->append(kAnotherFieldName, kMoreSampleData);
+        });
+
+    auto sample = collect(collector);
+    ASSERT_TRUE(sample.hasField(kCollectorName));
+    ASSERT_TRUE(sample.hasField(kAnotherCollectorName));
+}
+
+TEST_F(SampleCollectorCacheTestFixture, CollectorThrowsError) {
+    auto collector = makeSampleCollectorCache(Seconds(5));
+    collector.addCollector(kCollectorName, true, [&](OperationContext*, BSONObjBuilder*) {
+        uasserted(ErrorCodes::CallbackCanceled, "Collection threw an error.");
+    });
+
+    // An error thrown in the collection thread should be passed into the main thread.
+    ASSERT_THROWS_CODE(collect(collector), DBException, ErrorCodes::CallbackCanceled);
+}
+
+TEST_F(SampleCollectorCacheTestFixture, TimeoutDuringCollectionShouldFinishInTheNextCycle) {
+    auto collector = makeSampleCollectorCache();
+
+    Notification<void> stall;
+    collector.addCollector(kCollectorName, true, [&](OperationContext*, BSONObjBuilder* bob) {
+        stall.get();
+        bob->append(kFieldName, kSampleData);
+    });
+
+    // Sample should be empty since collector is stalling.
+    auto sample1 = collect(collector);
+    ASSERT_EQ(sample1.begin(), sample1.end());
+
+    stall.set();
+
+    collector.waitForCollectorToFinish_forTest(kCollectorName);
+
+    // After the stall, we should be able to get the data.
+    auto sample2 = collect(collector);
+    ASSERT_TRUE(sample2.hasField(kCollectorName));
+}
+
+TEST_F(SampleCollectorCacheTestFixture, TimeoutShouldNotAffectOtherSamples) {
+    // Tracks the order of collections by recording the name of collectors in the order they are
+    // invoked by `collector`.
+    synchronized_value<std::vector<std::string_view>> collections;
+
+    auto collector = makeSampleCollectorCache();
+
+    Notification<void> collectionCanMakeProgress;
+    collector.addCollector(kCollectorName, true, [&](OperationContext*, BSONObjBuilder* bob) {
+        (**collections).push_back(kCollectorName);
+        collectionCanMakeProgress.get();
+        bob->append(kFieldName, kSampleData);
+    });
+
+    collector.addCollector(
+        kAnotherCollectorName, true, [&](OperationContext*, BSONObjBuilder* bob) {
+            (**collections).push_back(kAnotherCollectorName);
+            bob->append(kAnotherFieldName, kMoreSampleData);
+        });
+
+    auto sample1 = collect(collector);
+
+    // The following is set for the next round of tests -- i.e. `auto sample2 = collect(...)`, but
+    // we set it early to make sure the test doesn't hang if any of the following assertions throw.
+    collectionCanMakeProgress.set();
+
+    ASSERT_FALSE(sample1.hasField(kCollectorName));
+    ASSERT_TRUE(sample1.hasField(kAnotherCollectorName));
+
+    using unittest::match::Eq;
+    ASSERT_THAT(**collections,
+                Eq(std::vector<std::string_view>{kCollectorName, kAnotherCollectorName}));
+
+    collector.waitForCollectorToFinish_forTest(kCollectorName);
+
+    auto sample2 = collect(collector);
+    ASSERT_TRUE(sample2.hasField(kCollectorName));
+    ASSERT_TRUE(sample2.hasField(kAnotherCollectorName));
+}
+
+TEST_F(SampleCollectorCacheTestFixture, ShutdownDrainsWork) {
+    Notification<void> workDrained;
+    {
+        Notification<void> collectReturned;
+        auto collector = makeSampleCollectorCache();
+        ON_BLOCK_EXIT([&] { collectReturned.set(); });
+        collector.addCollector(kCollectorName, true, [&](OperationContext* opCtx, BSONObjBuilder*) {
+            collectReturned.get();
+            // The following just increases the odds of running the destructor for `collector`
+            // while still running this callback.
+            opCtx->sleepFor(Milliseconds(100));
+            workDrained.set();
+        });
+        collect(collector);
+    }
+
+    ASSERT_TRUE(workDrained);
+}
+
+}  // namespace
+}  // namespace mongo

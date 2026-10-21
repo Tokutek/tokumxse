@@ -1,0 +1,418 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/commands/server_status/server_status_metric.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/static_immortal.h"
+
+#include <cstddef>
+#include <deque>
+#include <memory>
+#include <new>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include <absl/container/node_hash_set.h>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+namespace {
+
+/** Algorithm object implementing the `appendMergedTrees` function.  */
+class AppendMergedTreesInvocation {
+    /** Represents progress in the iteration through the children of one node. */
+    class TreeNodeCursor {
+    public:
+        explicit TreeNodeCursor(const MetricTree* node) : _node{node} {
+            invariant(_node);
+            start();
+        }
+
+        /** The name of the child element to which this refers. Requires `!done()`. */
+        std::string_view key() const {
+            return _iter->first;
+        }
+
+        /** Requires `isSubtree()`. */
+        const MetricTree& getSubtree() const {
+            return *_iter->second.getSubtree();
+        }
+
+        /** Requires `!isSubtree()`. */
+        const ServerStatusMetric& getMetric() const {
+            return *_iter->second.getMetric();
+        }
+
+        /** Is the child node referred to by the cursor a subtree? Requires `!done()`. */
+        bool isSubtree() const {
+            return _iter->second.isSubtree();
+        }
+
+        bool done() const {
+            return _iter == _node->children().end();
+        }
+
+        /** Reset the cursor to beginning of children. */
+        void start() {
+            _iter = _node->children().begin();
+        }
+
+        /** Requires `!done()`. */
+        void advance() {
+            ++_iter;
+        }
+
+    private:
+        const MetricTree* _node;
+        MetricTree::ChildMap::const_iterator _iter;
+    };
+
+    /**
+     * Manages a stack frame in a recursive descent through the
+     * virtual aggregate merged tree.
+     *
+     * As we visit each node, we are walking through a list of input `cursors`,
+     * appending metrics to the `bob` subobject, excluding keys in the
+     * `excludePaths` subobject.
+     *
+     * Each node's sequence of children is traversed twice. This is tracked by
+     * `inSubtreePhase`. First pass is to emit all metrics. Second pass is to
+     * visit all subtrees.
+     */
+    struct Frame {
+        /** Set all input trees' node cursors to their first child. */
+        void startCursors() {
+            for (auto&& c : cursors)
+                c.start();
+        }
+
+        /** Advance all cursors past phase-irrelevant nodes. */
+        void skipIgnoredNodes() {
+            for (auto&& cp : cursors)
+                while (!cp.done() && cp.isSubtree() != inSubtreePhase)
+                    cp.advance();
+        }
+
+        std::vector<TreeNodeCursor> cursors;
+        BSONObjBuilder* bob;
+        std::unique_ptr<BSONObjBuilder> bobStorage;
+        bool inSubtreePhase;
+        std::string_view key;
+        BSONObj excludePaths;
+    };
+
+public:
+    void operator()(std::vector<const MetricTree*> trees,
+                    BSONObjBuilder& b,
+                    const BSONObj& excludePaths) {
+        // The `_stack` tracks recursive traversal of the virtual merged tree.
+        // Traversing a node is done in two phases, first the leaf nodes, then
+        // all of the subtree nodes. When the top frame is finished, it is popped.
+        // So we initialize by pushing the root Frame onto the `_stack` and looping
+        // until the `_stack` is empty. Each iteration of this loop corresponds
+        // to the visitation of one node of the virtual merged metric tree view.
+        _init(std::move(trees), &b, excludePaths);
+        while (!_stack.empty()) {
+            Frame& frame = _stack.back();
+            // So that all cursors are either at a relevant node or exhausted.
+            frame.skipIgnoredNodes();
+
+            // Pick which cursors are going to be visited and advanced.
+            // It's all cursors that tie for min key value.
+            const auto relevant = _selectCursors(frame);
+            if (relevant.empty()) {
+                _atEndOfSubtree();
+                continue;
+            }
+            const auto& cursor = *relevant.front();
+            auto key = cursor.key();
+
+            auto [excluded, excludeSub] = _applyExclusion(key);
+            if (!excluded) {
+                if (!frame.inSubtreePhase) {
+                    // This node has no subtrees. It should therefore have one member.
+                    uassert(
+                        ErrorCodes::BadValue,
+                        fmt::format("Collision between trees at node {}.{}", _pathDiagJoin(), key),
+                        relevant.size() == 1);
+                    cursor.getMetric().appendTo(*frame.bob, key);
+                } else {
+                    _stack.push_back(_descentFrame(relevant, std::move(excludeSub)));
+                }
+            }
+
+            for (auto&& cp : relevant)
+                if (!cp->done())
+                    cp->advance();
+        }
+    }
+
+private:
+    /**
+     * Returns `true` if `key` is a path excluded from the active Frame. If
+     * active Frame is in the subtree phase, and the entire `key` subtree is not
+     * excluded, then this returns false and the embedded subtree under that key
+     * for use in recursive descent, hence the `std::pair` return type.
+     */
+    std::pair<bool, BSONObj> _applyExclusion(std::string_view key) {
+        Frame& frame = _stack.back();
+        auto el = frame.excludePaths.getField(key);
+        if (!el)
+            return {false, {}};
+        if (el.type() == BSONType::boolean)
+            return {!el.boolean(), {}};
+        if (el.type() == BSONType::object && frame.inSubtreePhase)
+            return {false, el.embeddedObject()};
+        uasserted(ErrorCodes::InvalidBSONType,
+                  "Exclusion value must be a boolean for leaf nodes. "
+                  "Nonleaf nodes may also accept a nested object.");
+    }
+
+    /** Returns a new `Frame` suitable for descending into the subtree at the current cursor set. */
+    Frame _descentFrame(const std::vector<TreeNodeCursor*>& relevant, BSONObj excludePaths) {
+        auto&& frame = _stack.back();
+        auto key = relevant.front()->key();
+        auto sub = std::make_unique<BSONObjBuilder>(frame.bob->subobjStart(key));
+        auto subPtr = &*sub;
+        std::vector<TreeNodeCursor> cursors;
+        cursors.reserve(relevant.size());
+        for (auto&& cp : relevant)
+            cursors.push_back(TreeNodeCursor{&cp->getSubtree()});
+        return Frame{
+            std::move(cursors), subPtr, std::move(sub), false, key, std::move(excludePaths)};
+    }
+
+    /**
+     * Called when the end of a node is reached. The active Frame could either
+     * restart in a new phase, or be truly finished and popped from the `_stack`.
+     */
+    void _atEndOfSubtree() {
+        Frame& frame = _stack.back();
+        if (!frame.inSubtreePhase) {
+            frame.startCursors();
+            frame.inSubtreePhase = true;
+        } else {
+            _stack.pop_back();
+        }
+    }
+
+    /** Initialize with a frame pointing at the start of the roots of all trees. */
+    void _init(std::vector<const MetricTree*> trees, BSONObjBuilder* b, BSONObj excludePaths) {
+        std::vector<TreeNodeCursor> cursors;
+        cursors.reserve(trees.size());
+        for (const MetricTree* node : trees)
+            cursors.push_back(TreeNodeCursor{node});
+        _stack.push_back(Frame{std::move(cursors), b, nullptr, false, "", std::move(excludePaths)});
+    }
+
+    /**
+     * Searches all cursors in `frame` to determine the min-valued key among
+     * them. Returns pointers to all cursors in `frame` that share this
+     * min-valued key. Cursors that are not applicable to the frame's current
+     * phase (visiting leaves vs visiting subtrees) are ignored.
+     */
+    std::vector<TreeNodeCursor*> _selectCursors(Frame& frame) {
+        std::vector<TreeNodeCursor*> cursors;
+        for (auto&& c : frame.cursors) {
+            if (c.done() || c.isSubtree() != frame.inSubtreePhase)
+                continue;
+            if (!cursors.empty()) {
+                int rel = c.key().compare(cursors.front()->key());
+                if (rel > 0)
+                    continue;
+                if (rel < 0)
+                    cursors.clear();
+            }
+            cursors.push_back(&c);
+        }
+        return cursors;
+    }
+
+    /** Returns current path built from the `_stack` keys. */
+    std::vector<std::string_view> _pathDiag() const {
+        std::vector<std::string_view> parts;
+        parts.reserve(_stack.size());
+        for (auto&& fr : _stack)
+            parts.push_back(fr.key);
+        return parts;
+    }
+
+    /** The `_pathDiag` vector, joined by dots. */
+    std::string _pathDiagJoin() const {
+        std::string r;
+        std::string_view sep;
+        for (auto s : _pathDiag()) {
+            (r += sep) += s;
+            sep = ".";
+        }
+        return r;
+    }
+
+    std::vector<const MetricTree*> _trees;
+    std::deque<Frame> _stack;
+};
+
+/**
+ * Returns true iff called on the process's main thread.
+ *
+ * The main thread's id is captured on the first call. For metric registration that first call
+ * always happens during single-threaded startup -- static MetricBuilder construction and
+ * MONGO_INITIALIZERs run on the main thread before any other thread is created -- so the captured
+ * id is the main thread's. This is correct on every platform, unlike a getpid()==gettid()
+ * comparison (on macOS and Windows the main thread's OS thread id never equals the process id).
+ */
+bool isMainThread() {
+    static const std::thread::id mainThreadId = std::this_thread::get_id();
+    return std::this_thread::get_id() == mainThreadId;
+}
+
+}  // namespace
+
+void MetricTree::add(std::string_view path, std::unique_ptr<ServerStatusMetric> metric) {
+    invariant(!_frozen,
+              fmt::format("Cannot add metric '{}' after the MetricTreeSet has been frozen", path));
+    invariant(isMainThread(), fmt::format("Cannot add metric '{}' from a non-main thread", path));
+    // Never add metrics with empty names.
+    // If there's a leading ".", strip it.
+    // Otherwise, we're really adding with an implied "metrics." prefix.
+    if (path.empty())
+        return;
+    if (path.starts_with('.')) {
+        path.remove_prefix(1);
+        if (!path.empty())
+            _add(path, std::move(metric));
+    } else {
+        _add(fmt::format("metrics.{}", path), std::move(metric));
+    }
+}
+
+void MetricTree::_add(std::string_view path, std::unique_ptr<ServerStatusMetric> metric) {
+    std::string_view tail = path;
+    MetricTree* sub = this;
+    while (true) {
+        // Walk the tree popping heads and creating interior nodes until there's no more tail.
+        auto dot = tail.find('.');
+        if (dot == std::string::npos) {
+            auto [insIter, insOk] =
+                sub->_children.try_emplace(std::string{tail}, std::move(metric));
+            if (!insOk)
+                LOGV2_FATAL(6483100, "metric conflict", "path"_attr = path);
+            return;
+        }
+        // Found a dot, so hop to an interior node, creating it if necessary.
+        std::string_view part = tail.substr(0, dot);
+        tail = tail.substr(dot + 1);
+        auto iter = sub->_children.find(part);
+        if (iter != sub->_children.end()) {
+            if (!iter->second.isSubtree())
+                LOGV2_FATAL(16461, "metric conflict", "path"_attr = path);
+        } else {
+            auto [insIter, ok] =
+                sub->_children.try_emplace(std::string{part}, std::make_unique<MetricTree>());
+            iter = insIter;
+        }
+        sub = iter->second.getSubtree().get();
+    }
+}
+
+void MetricTree::removeForTests(std::string_view path) {
+    if (path.empty()) {
+        return;
+    }
+    if (path.starts_with('.')) {
+        path.remove_prefix(1);
+        if (!path.empty()) {
+            _removeForTests(path);
+        }
+    } else {
+        _removeForTests(fmt::format("metrics.{}", path));
+    }
+    _frozen = false;
+}
+
+void MetricTree::_removeForTests(std::string_view path) {
+    // Walk the path, recording (parent, key) pairs so we can prune empty subtrees afterward.
+    struct Node {
+        MetricTree* parent;
+        std::string key;
+    };
+    std::vector<Node> stack;
+    std::string_view tail = path;
+    MetricTree* subTree = this;
+
+    while (true) {
+        auto dot = tail.find('.');
+
+        if (dot == std::string::npos) {
+            subTree->_children.erase(std::string{tail});
+            break;
+        }
+
+        std::string_view part = tail.substr(0, dot);
+        tail = tail.substr(dot + 1);
+        auto iter = subTree->_children.find(part);
+
+        if (iter == subTree->_children.end() || !iter->second.isSubtree()) {
+            return;
+        }
+        stack.push_back({subTree, std::string{part}});
+        subTree = iter->second.getSubtree().get();
+    }
+
+    // Prune empty parent subtrees bottom-up.
+    for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+        auto childIter = it->parent->_children.find(it->key);
+        if (childIter == it->parent->_children.end() || !childIter->second.isSubtree()) {
+            break;
+        }
+        if (!childIter->second.getSubtree()->_children.empty()) {
+            break;
+        }
+        it->parent->_children.erase(childIter);
+    }
+}
+
+void appendMergedTrees(std::vector<const MetricTree*> trees,
+                       BSONObjBuilder& b,
+                       const BSONObj& excludePaths) {
+    AppendMergedTreesInvocation{}(std::move(trees), b, excludePaths);
+}
+
+void MetricTree::appendTo(BSONObjBuilder& b, const BSONObj& excludePaths) const {
+    appendMergedTrees({this}, b, excludePaths);
+}
+
+MetricTree& MetricTreeSet::operator[](ClusterRole role) {
+    if (role.hasExclusively(ClusterRole::None))
+        return _none;
+    if (role.hasExclusively(ClusterRole::ShardServer))
+        return _shard;
+    if (role.hasExclusively(ClusterRole::RouterServer))
+        return _router;
+    MONGO_UNREACHABLE;
+}
+
+void MetricTreeSet::freeze() {
+    _none.freeze();
+    _shard.freeze();
+    _router.freeze();
+}
+
+MetricTreeSet& globalMetricTreeSet() {
+    static StaticImmortal<MetricTreeSet> obj;
+    return *obj;
+}
+
+
+}  // namespace mongo

@@ -1,0 +1,29 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file describes the BSON format for ElectionReasonCounterBase and
+# handles the serialization to and deserialization from its BSON
+# representations for that class.
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ElectionReasonCounterBase:
+        description:
+            "Stores the total number of elections a node has called for a given reason and
+            the number of those elections that were successful"
+        strict: true
+        fields:
+            called:
+                description: "Number of elections this node has called for the given reason"
+                type: long
+                default: 0
+            successful:
+                description: "Number of successful elections for the given reason"
+                type: long
+                default: 0

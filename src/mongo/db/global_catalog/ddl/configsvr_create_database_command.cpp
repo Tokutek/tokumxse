@@ -1,0 +1,186 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/global_catalog/ddl/create_database_coordinator.h"
+#include "mongo/db/global_catalog/ddl/create_database_coordinator_document_gen.h"
+#include "mongo/db/global_catalog/ddl/create_database_util.h"
+#include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
+#include "mongo/db/global_catalog/ddl/sharding_catalog_manager.h"
+#include "mongo/db/global_catalog/type_database_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/ddl/ddl_lock_manager.h"
+#include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/util/assert_util.h"
+
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
+namespace mongo {
+
+class ConfigSvrCreateDatabaseCommand final : public TypedCommand<ConfigSvrCreateDatabaseCommand> {
+public:
+    /**
+     * We accept any apiVersion, apiStrict, and/or apiDeprecationErrors forwarded with this internal
+     * command.
+     */
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
+
+    using Request = ConfigsvrCreateDatabase;
+    using Response = ConfigsvrCreateDatabaseResponse;
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        Response typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::IllegalOperation,
+                    "_configsvrCreateDatabase can only be run on config servers",
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+            // Set the operation context read concern level to local for reads into the config
+            // database.
+            repl::ReadConcernArgs::get(opCtx) =
+                repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
+            const auto dbNameStr = request().getCommandParameter();
+            const auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbNameStr, request().getSerializationContext());
+
+            audit::logEnableSharding(opCtx->getClient(), dbNameStr);
+
+            // Checks for restricted and invalid namespaces.
+            if (const auto configDatabaseOpt =
+                    create_database_util::checkDbNameConstraints(dbName)) {
+                return configDatabaseOpt->getVersion();
+            }
+            const auto optResolvedPrimaryShard =
+                create_database_util::resolvePrimaryShard(opCtx, request().getPrimaryShardId());
+
+            {
+                // The use isEnabledAndIgnoreFCVUnsafe is intentional, we want to check whether the
+                // feature flag is enabled on any version. This is a hack, but SERVER-102647 will
+                // get rid of this code before it hits production. The reason we take the DDL lock
+                // here is to respect the acquisition order DDL Lock -> FCV Lock, and avoid
+                // deadlocks. This is a pessimization, and thus we only do this if
+                // AuthoritativeShardsDDL is active in this binary.
+                // (Ignore FCV check): We need to know if the feature flag is active in any version.
+                // TODO (SERVER-102647): Remove this code.
+                boost::optional<DDLLockManager::ScopedBaseDDLLock> ddlLock;
+                if (feature_flags::gAuthoritativeShardsDDL.isEnabledAndIgnoreFCVUnsafe()) {
+                    ddlLock.emplace(
+                        opCtx,
+                        shard_role_details::getLocker(opCtx),
+                        DatabaseNameUtil::deserialize(boost::none,
+                                                      str::toLower(dbNameStr),
+                                                      request().getSerializationContext()),
+                        "createDatabase" /* reason */,
+                        MODE_X,
+                        true /*waitForRecovery*/);
+                }
+
+                boost::optional<FixedFCVRegion> fixedFcvRegion{opCtx};
+
+                const auto fcvSnapshot = (*fixedFcvRegion)->acquireFCVSnapshot();
+                // The Operation FCV is currently propagated only for DDL operations,
+                // which cannot be nested. Therefore, the VersionContext shouldn't have an OFCV yet.
+                invariant(!VersionContext::getDecoration(opCtx).hasOperationFCV());
+                const auto createDatabaseDDLCoordinatorFeatureFlagEnabled =
+                    feature_flags::gCreateDatabaseDDLCoordinator.isEnabled(
+                        VersionContext::getDecoration(opCtx), fcvSnapshot);
+
+                if (!createDatabaseDDLCoordinatorFeatureFlagEnabled) {
+                    // (Ignore FCV check): The use isEnabledAndIgnoreFCVUnsafe is intentional, we
+                    // want to check whether the feature flag is enabled on any version.
+                    // We need to maintain the FixedFCVRegion during the execution of the command
+                    // to guarantee that all in-flight legacy commands are drained after
+                    // transitioning to kUpgrading during FCV upgrade.
+                    // TODO (SERVER-102647): unconditionally exit the FixedFCVRegion here
+                    if (!feature_flags::gAuthoritativeShardsDDL.isEnabledAndIgnoreFCVUnsafe()) {
+                        fixedFcvRegion.reset();
+                    }
+
+                    auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
+                        opCtx,
+                        dbName,
+                        optResolvedPrimaryShard,
+                        request().getSerializationContext());
+
+                    return Response(dbt.getVersion());
+                } else {
+                    CreateDatabaseCoordinatorDocument coordinatorDoc;
+                    coordinatorDoc.setShardingCoordinatorMetadata(
+                        {{NamespaceString(dbName), CoordinatorTypeEnum::kCreateDatabase}});
+                    coordinatorDoc.setPrimaryShard(optResolvedPrimaryShard);
+                    coordinatorDoc.setUserSelectedPrimary(optResolvedPrimaryShard.is_initialized());
+                    auto createDatabaseCoordinator =
+                        checked_pointer_cast<CreateDatabaseCoordinator>(
+                            ShardingCoordinatorService::getService(opCtx)->getOrCreateInstance(
+                                opCtx, coordinatorDoc.toBSON(), *fixedFcvRegion));
+
+                    fixedFcvRegion.reset();
+                    ddlLock.reset();
+                    return createDatabaseCoordinator->getResult(opCtx);
+                }
+            }
+        }
+
+    private:
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
+        }
+    };
+
+private:
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Create a database.";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+};
+MONGO_REGISTER_COMMAND(ConfigSvrCreateDatabaseCommand).forShard();
+
+}  // namespace mongo

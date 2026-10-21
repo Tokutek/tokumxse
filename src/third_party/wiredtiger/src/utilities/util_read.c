@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,95 +8,124 @@
 
 #include "util.h"
 
-static int usage(void);
-
-int
-util_read(WT_SESSION *session, int argc, char *argv[])
-{
-	WT_CURSOR *cursor;
-	WT_DECL_RET;
-	uint64_t recno;
-	int ch, rkey, rval;
-	const char *uri, *value;
-
-	while ((ch = __wt_getopt(progname, argc, argv, "")) != EOF)
-		switch (ch) {
-		case '?':
-		default:
-			return (usage());
-		}
-	argc -= __wt_optind;
-	argv += __wt_optind;
-
-	/* The remaining arguments are a uri followed by a list of keys. */
-	if (argc < 2)
-		return (usage());
-	if ((uri = util_name(session, *argv, "table")) == NULL)
-		return (1);
-
-	/* Open the object. */
-	if ((ret = session->open_cursor(
-	    session, uri, NULL, NULL, &cursor)) != 0)
-		return (util_err(session, ret, "%s: session.open", uri));
-
-	/*
-	 * A simple search only makes sense if the key format is a string or a
-	 * record number, and the value format is a single string.
-	 */
-	if (strcmp(cursor->key_format, "r") != 0 &&
-	    strcmp(cursor->key_format, "S") != 0) {
-		fprintf(stderr,
-		    "%s: read command only possible when the key format is "
-		    "a record number or string\n",
-		    progname);
-		return (1);
-	}
-	rkey = strcmp(cursor->key_format, "r") == 0 ? 1 : 0;
-	if (strcmp(cursor->value_format, "S") != 0) {
-		fprintf(stderr,
-		    "%s: read command only possible when the value format is "
-		    "a string\n",
-		    progname);
-		return (1);
-	}
-
-	/*
-	 * Run through the keys, returning non-zero on error or if any requested
-	 * key isn't found.
-	 */
-	for (rval = 0; *++argv != NULL;) {
-		if (rkey) {
-			if (util_str2recno(session, *argv, &recno))
-				return (1);
-			cursor->set_key(cursor, recno);
-		} else
-			cursor->set_key(cursor, *argv);
-
-		switch (ret = cursor->search(cursor)) {
-		case 0:
-			if ((ret = cursor->get_value(cursor, &value)) != 0)
-				return (util_cerr(cursor, "get_value", ret));
-			if (printf("%s\n", value) < 0)
-				return (util_err(session, EIO, NULL));
-			break;
-		case WT_NOTFOUND:
-			(void)util_err(session, 0, "%s: not found", *argv);
-			rval = 1;
-			break;
-		default:
-			return (util_cerr(cursor, "search", ret));
-		}
-	}
-
-	return (rval);
-}
-
+/*
+ * usage --
+ *     Display a usage message for the read command.
+ */
 static int
 usage(void)
 {
-	(void)fprintf(stderr,
-	    "usage: %s %s "
-	    "read uri key ...\n",
-	    progname, usage_prefix);
-	return (1);
+    static const char *options[] = {"-?", "show this message", NULL, NULL};
+
+    util_usage("read uri key ...", "options:", options);
+    return (1);
+}
+
+/*
+ * corrupt_read --
+ *     Check if a read operation encountered data corruption.
+ */
+static bool
+corrupt_read(WT_SESSION *session, int ret)
+{
+    return (ret == WT_ERROR &&
+      F_ISSET_ATOMIC_32(S2C((WT_SESSION_IMPL *)session), WT_CONN_DATA_CORRUPTION));
+}
+
+/*
+ * util_read --
+ *     The read command.
+ */
+int
+util_read(WT_SESSION *session, int argc, char *argv[])
+{
+    WT_CURSOR *cursor;
+    WT_DECL_RET;
+    uint64_t recno;
+    int ch;
+    char *uri, *value;
+    bool rkey, rval;
+
+    uri = NULL;
+    while ((ch = __wt_getopt(progname, argc, argv, "?")) != EOF)
+        switch (ch) {
+        case '?':
+            usage();
+            return (0);
+        default:
+            return (usage());
+        }
+    argc -= __wt_optind;
+    argv += __wt_optind;
+
+    /* The remaining arguments are a uri followed by a list of keys. */
+    if (argc < 2)
+        return (usage());
+    if ((uri = util_uri(session, *argv, "table")) == NULL)
+        return (1);
+
+    /*
+     * Open the object; free allocated memory immediately to simplify future error handling.
+     */
+    if ((ret = session->open_cursor(session, uri, NULL, NULL, &cursor)) != 0)
+        (void)util_err(session, ret, "%s: session.open_cursor", uri);
+    util_free(uri);
+    if (ret != 0)
+        return (ret);
+
+    /*
+     * A simple search only makes sense if the key format is a string or a record number, and the
+     * value format is a single string.
+     */
+    if (!WT_STREQ(cursor->key_format, "r") && !WT_STREQ(cursor->key_format, "S")) {
+        fprintf(stderr,
+          "%s: read command only possible when the key format is a record number or string\n",
+          progname);
+        return (1);
+    }
+    rkey = WT_STREQ(cursor->key_format, "r");
+    if (!WT_STREQ(cursor->value_format, "S")) {
+        fprintf(
+          stderr, "%s: read command only possible when the value format is a string\n", progname);
+        return (1);
+    }
+
+    /*
+     * Run through the keys, returning non-zero on error or if any requested key isn't found. Under
+     * read-corrupt, a WT_ERROR from a key's descent is reported and the loop moves on.
+     */
+    for (rval = false; *++argv != NULL;) {
+        if (rkey) {
+            if (util_str2num(session, *argv, true, &recno))
+                return (1);
+            cursor->set_key(cursor, recno);
+        } else
+            cursor->set_key(cursor, *argv);
+
+        switch (ret = cursor->search(cursor)) {
+        case 0:
+            if ((ret = cursor->get_value(cursor, &value)) != 0) {
+                (void)util_cerr(cursor, "get_value", ret);
+                if (!read_corrupt || !corrupt_read(session, ret))
+                    return (1);
+                rval = true;
+                break;
+            }
+            if (printf("%s\n", value) < 0)
+                return (util_err(session, EIO, NULL));
+            break;
+        case WT_NOTFOUND:
+            (void)util_err(session, 0, "%s: not found", *argv);
+            rval = true;
+            break;
+        default:
+            (void)util_cerr(cursor, "search", ret);
+            if (!read_corrupt || !corrupt_read(session, ret))
+                return (1);
+            rval = true;
+            break;
+        }
+    }
+
+    return (rval ? 1 : 0);
 }

@@ -1,77 +1,67 @@
-// checked_cast.h
-
-/**
- *    Copyright (C) 2015 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include "mongo/util/assert_util.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <type_traits>
+
+[[MONGO_MOD_PUBLIC]];
 
 namespace mongo {
 
-    /**
-     * Similar to static_cast, but in debug builds uses RTTI to confirm that the cast
-     * is legal at runtime.
-     */
-    template<bool>
-    struct checked_cast_impl;
-
-    template<>
-    struct checked_cast_impl<false> {
-        template<typename T, typename U>
-        static T cast(const U& u) {
-            return static_cast<T>(u);
-        }
-    };
-
-    template<>
-    struct checked_cast_impl<true> {
-        template<typename T, typename U>
-        static T cast(U* u) {
-            if (!u) {
-                return NULL;
-            }
+/**
+ * Similar to static_cast, but in debug builds uses RTTI to confirm that the cast
+ * is legal at runtime.
+ */
+template <typename T, typename U>
+T checked_cast(U&& u) {
+    if constexpr (kDebugBuild) {
+        if constexpr (std::is_pointer_v<std::remove_reference_t<U>>) {
+            if (!u)
+                return nullptr;
             T t = dynamic_cast<T>(u);
             invariant(t);
             return t;
+        } else {
+            return dynamic_cast<T>(std::forward<U>(u));
         }
+    } else {
+        return static_cast<T>(std::forward<U>(u));
+    }
+}
 
-        template<typename T, typename U>
-        static T cast(const U& u) {
-            return dynamic_cast<T>(u);
-        }
+namespace checked_cast_detail {
+template <typename T, typename U>
+std::shared_ptr<T> checked_pointer_cast(U&& u) {
+    if constexpr (kDebugBuild) {
+        if (!u)
+            return nullptr;
+        std::shared_ptr<T> t = std::dynamic_pointer_cast<T>(std::forward<U>(u));
+        invariant(t);
+        return t;
+    } else {
+        return std::static_pointer_cast<T>(std::forward<U>(u));
+    }
+}
+}  // namespace checked_cast_detail
 
-    };
+/**
+ * Similar to static_pointer_cast, but in debug builds uses RTTI to confirm that the cast
+ * is legal at runtime.
+ */
+template <typename T, typename U>
+std::shared_ptr<T> checked_pointer_cast(const std::shared_ptr<U>& u) {
+    return checked_cast_detail::checked_pointer_cast<T>(u);
+}
 
-    template<typename T, typename U>
-    T checked_cast(const U& u) {
-        return checked_cast_impl<kDebugBuild>::cast<T>(u);
-    };
+template <typename T, typename U>
+std::shared_ptr<T> checked_pointer_cast(std::shared_ptr<U>&& u) {
+    return checked_cast_detail::checked_pointer_cast<T>(std::move(u));
+}
 
-} // namespace mongo
+}  // namespace mongo

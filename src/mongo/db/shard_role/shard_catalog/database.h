@@ -1,0 +1,141 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbcommands_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/virtual_collection_options.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/modules.h"
+
+namespace mongo {
+
+/**
+ * Represents a logical database containing Collections.
+ *
+ * The semantics for a const Database are that you can mutate individual collections but not add or
+ * remove them.
+ */
+class [[MONGO_MOD_PUBLIC]] Database : public Decorable<Database> {
+public:
+    /**
+     * Creates the namespace 'ns' in the database 'db' according to 'options'. If
+     * 'createDefaultIndexes' is true, creates the _id index for the collection (and the system
+     * indexes, in the case of system collections). Creates the collection's _id index according
+     * to 'idIndex', if it is non-empty.  When 'idIndex' is empty, creates the default _id index.
+     * If present, 'catalogIdentifier' specifies how to persist and identify the new collection
+     * through the catalog. The `recordIdsReplicated` define if the collection should use
+     * replicated record Ids or not when it is not empty. When the value is empty the
+     * decision would be made based on the collection type and other conditions.
+     */
+    virtual Status userCreateNS(
+        OperationContext* opCtx,
+        const NamespaceString& fullns,
+        CollectionOptions collectionOptions,
+        bool createDefaultIndexes = true,
+        const BSONObj& idIndex = BSONObj(),
+        bool fromMigrate = false,
+        const boost::optional<CreateCollCatalogIdentifier>& catalogIdentifier = boost::none,
+        boost::optional<bool> recordIdsReplicated = boost::none) const = 0;
+
+    /**
+     * Creates the virtual namespace 'fullns' according to 'opts' and 'vopts'.
+     */
+    virtual Status userCreateVirtualNS(OperationContext* opCtx,
+                                       const NamespaceString& fullns,
+                                       CollectionOptions opts,
+                                       const VirtualCollectionOptions& vopts) const = 0;
+
+    Database() = default;
+
+    // must call close first
+    ~Database() override = default;
+
+    inline Database(Database&&) = delete;
+    inline Database& operator=(Database&&) = delete;
+
+    /**
+     * Sets up internal memory structures.
+     */
+    virtual void init(OperationContext* opCtx) = 0;
+
+    virtual const DatabaseName& name() const = 0;
+
+    virtual void getStats(OperationContext* opCtx,
+                          DBStats* output,
+                          bool includeFreeStorage,
+                          double scale = 1) const = 0;
+
+    /**
+     * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
+     * that is required.
+     *
+     * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
+     * of the oplog entry.
+     *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility (e.g. in change streams).
+     *
+     * The caller should hold a DB IX lock and ensure there are no index builds in progress on the
+     * collection.
+     * N.B. Namespace argument is passed by value as it may otherwise disappear or change.
+     */
+    virtual Status dropCollection(OperationContext* opCtx,
+                                  NamespaceString nss,
+                                  repl::OpTime dropOpTime = {},
+                                  bool markFromMigrate = false) const = 0;
+
+    virtual Status dropCollectionEvenIfSystem(OperationContext* opCtx,
+                                              NamespaceString nss,
+                                              repl::OpTime dropOpTime = {},
+                                              bool markFromMigrate = false) const = 0;
+
+    virtual Status dropView(OperationContext* opCtx, NamespaceString viewName) const = 0;
+
+    /**
+     * A MODE_IX collection lock must be held for this call. Throws a WriteConflictException error
+     * if the collection already exists (say if another thread raced to create it).
+     *
+     * Surrounding writeConflictRetry loops must encompass checking that the collection exists as
+     * well as creating it. Otherwise the loop will endlessly throw WCEs: the caller must check that
+     * the collection exists to break free.
+     */
+    virtual Collection* createCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptions& options = CollectionOptions(),
+        bool createDefaultIndexes = true,
+        const BSONObj& idIndex = BSONObj(),
+        bool fromMigrate = false,
+        boost::optional<bool> recordIdsReplicated = boost::none) const = 0;
+
+    virtual StatusWith<std::unique_ptr<CollatorInterface>> validateCollator(
+        OperationContext* opCtx, CollectionOptions& opts) const = 0;
+
+    /**
+     * Arguments are passed by value as they otherwise would be changing as result of renaming.
+     */
+    virtual Status renameCollection(OperationContext* opCtx,
+                                    NamespaceString fromNss,
+                                    NamespaceString toNss,
+                                    bool stayTemp) const = 0;
+
+    virtual const NamespaceString& getSystemViewsName() const = 0;
+
+    /**
+     * Create 'system.views' in a separate WriteUnitOfWork, if it does not exist.
+     * A MODE_X lock on 'system.views' must be held for this call.
+     * The caller must not be in a WriteUnitOfWork when calling this method.
+     */
+    virtual void createSystemDotViewsIfNecessary(OperationContext* opCtx) const = 0;
+};
+
+}  // namespace mongo

@@ -1,0 +1,48 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in the `config.collectionCriticalSections`
+# collection. Each document is used to represent that a database or a collection is under an
+# operation that entered the critical section.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    collectionCriticalSectionDocument:
+        description:
+            "Represents that a database or a collection is under an operation that entered
+            the critical section."
+        generate_comparison_operators: false
+        strict: false
+        fields:
+            _id:
+                type: namespacestring
+                description:
+                    "The name of the database or the namespace of the collection that is
+                    under the critical section."
+                cpp_name: nss
+            reason:
+                type: object
+                description:
+                    "An identifier of the operation that entered the critical section.
+                    Only used for diagnostic purposes."
+            blockReads:
+                type: bool
+                description:
+                    "It states whether this critical section should block reads (CS in
+                    commit phase) or not (CS in catch up phase)."
+            # TODO (SERVER-98118): Remove this field once 9.0 is last-lts and shards are authoritative.
+            clearShardCatalogCache:
+                type: safeBool
+                description: >-
+                    If true, the metadata from the shard catalog cache (CSS / DSS) will be cleared,
+                    forcing a refresh the next time this metadata is needed.
+                    When the shard is authoritative, it is no longer necessary to clear the metadata.
+                    This information is only expected to be consumed by secondary nodes upon
+                    receiving an `onDelete()` notification from `ShardServerOpObserver`.
+                default: true

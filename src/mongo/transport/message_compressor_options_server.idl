@@ -1,0 +1,13 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+configs:
+    "net.compression.compressors":
+        description: "Comma-separated list of compressors to use for network messages"
+        source: [cli, ini, yaml]
+        arg_vartype: String
+        short_name: networkMessageCompressors
+        default: "snappy,zstd,zlib"

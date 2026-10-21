@@ -1,0 +1,15 @@
+test_kind: js_test
+
+selector:
+  roots:
+    - jstests/client_encrypt/*.js
+
+executor:
+  config:
+    shell_options:
+      nodb: ""
+      ssl: ""
+      tlsAllowInvalidHostnames: ""
+      tlsAllowInvalidCertificates: ""
+      tlsCAFile: ${x509ObjDir}/ca.pem
+      tlsCertificateKeyFile: ${x509ObjDir}/client.pem

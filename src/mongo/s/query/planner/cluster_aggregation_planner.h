@@ -1,0 +1,162 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/agg/exec_pipeline.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/s/query/exec/cluster_client_cursor_guard.h"
+#include "mongo/s/query/exec/cluster_client_cursor_impl.h"
+#include "mongo/s/query/exec/cluster_client_cursor_params.h"
+#include "mongo/s/query/planner/cluster_aggregate.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <functional>
+#include <memory>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace cluster_aggregation_planner {
+
+/**
+ * Builds a ClusterClientCursor which will execute 'pipeline'. If 'pipeline' consists entirely of
+ * $skip and $limit stages, the pipeline is eliminated entirely and replaced with a RouterExecStage
+ * tree that does same thing but will avoid using a RouterStagePipeline. Avoiding a
+ * RouterStagePipeline will remove an expensive conversion from BSONObj -> Document for each result.
+ */
+ClusterClientCursorGuard buildClusterCursor(OperationContext* opCtx,
+                                            std::unique_ptr<Pipeline> pipeline,
+                                            ClusterClientCursorParams&&);
+
+/**
+ * The result of resolveCollectionInfo() below: the collection info an aggregation needs from the
+ * primary shard -- the collation, plus whether the collection is an untracked viewless timeseries
+ * collection.
+ */
+struct ResolvedCollectionInfo {
+    BSONObj collation;
+    ExpressionContextCollationMatchesDefault collationMatchesDefault;
+
+    // Whether 'nss' is an untracked viewless timeseries collection. Only ever true when
+    // resolveCollectionInfo() contacted the primary shard (see below); false otherwise, including
+    // when we never needed to check.
+    bool untrackedIsViewlessTimeseries = false;
+};
+
+/**
+ * Determines whether correctly handling this aggregation requires contacting the primary shard
+ * for an untracked collection, and does so if it does. Reports the collation to use (and whether
+ * it matches the collection's default) with the following semantics:
+ *  - Return 'collation' if the aggregation is collectionless.
+ *  - If 'nss' is tracked, we return 'collation' if it is non-empty. If it is empty, we return the
+ * collection default collation if there is one and the simple collation otherwise.
+ *  - If 'nss' is untracked and 'requiresCollationForParsingUnshardedAggregate' is false, we return
+ * an empty BSONObj (or 'collation', if the caller supplied one) as we will infer the correct
+ * collation when the command reaches the primary shard.
+ *  - If 'nss' is untracked and 'requiresCollationForParsingUnshardedAggregate' is true, we always
+ * contact the primary shard, even if the caller already supplied 'collation': that contact is also
+ * how we learn whether the collection is an untracked viewless timeseries collection which callers
+ * need to correctly defer the pipeline's mandatory timeseries rewrite -- and thus optimization --
+ * to the shard.
+ *
+ *  TODO SERVER-81991: Delete 'requiresCollationForParsingUnshardedAggregate' parameter once all
+ * unsharded collections are tracked in the sharding catalog as unsplittable along with their
+ * collation.
+ */
+ResolvedCollectionInfo resolveCollectionInfo(OperationContext* opCtx,
+                                             const boost::optional<CollectionRoutingInfo>& cri,
+                                             const NamespaceString& nss,
+                                             const BSONObj& collation,
+                                             bool requiresCollationForParsingUnshardedAggregate);
+
+/**
+ * This structure contains information for targeting an aggregation pipeline in a sharded cluster.
+ */
+struct AggregationTargeter {
+    /**
+     * Populates and returns targeting info for an aggregation pipeline on the given namespace
+     * 'executionNss'.
+     */
+    static AggregationTargeter make(OperationContext* opCtx,
+                                    std::unique_ptr<Pipeline> pipeline,
+                                    const NamespaceString& execNss,
+                                    boost::optional<CollectionRoutingInfo> cri,
+                                    sharded_agg_helpers::PipelineDataSource pipelineDataSource,
+                                    bool perShardCursor);
+
+    enum TargetingPolicy {
+        kMongosRequired,
+        kAnyShard,
+        kSpecificShardOnly,
+    } policy;
+
+    std::unique_ptr<Pipeline> pipeline;
+};
+
+/**
+ * Runs a pipeline on mongoS, having first validated that it is eligible to do so. This can be a
+ * pipeline which is split for merging, or an intact pipeline which must run entirely on mongoS.
+ */
+Status runPipelineOnMongoS(const ClusterAggregate::Namespaces& namespaces,
+                           long long batchSize,
+                           std::unique_ptr<Pipeline> pipeline,
+                           BSONObjBuilder* result,
+                           const PrivilegeVector& privileges,
+                           IncludeMetrics remoteMetricsToInclude);
+
+/**
+ * Dispatches the pipeline in 'targeter' to the shards that are involved, and merges the results if
+ * necessary on either mongos or a randomly designated shard. If 'eligibleForSampling' is true,
+ * attaches a unique sample id to the request for one of the targeted shards if the collection has
+ * query sampling enabled and the rate-limited sampler successfully generates a sample id for it.
+ */
+Status dispatchPipelineAndMerge(OperationContext* opCtx,
+                                RoutingContext& routingCtx,
+                                AggregationTargeter targeter,
+                                Document serializedCommand,
+                                long long batchSize,
+                                const ClusterAggregate::Namespaces& namespaces,
+                                const PrivilegeVector& privileges,
+                                BSONObjBuilder* result,
+                                sharded_agg_helpers::PipelineDataSource pipelineDataSource,
+                                bool eligibleForSampling,
+                                IncludeMetrics remoteMetricsToInclude);
+
+/**
+ * Runs a pipeline on a specific shard. Used for running a pipeline on a specifc shard (i.e. by per
+ * shard $changeStream cursors). This function will not add a shard version to the request sent to
+ * mongod.
+ */
+Status runPipelineOnSpecificShardOnly(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      RoutingContext& routingCtx,
+                                      const ClusterAggregate::Namespaces& namespaces,
+                                      boost::optional<ExplainOptions::Verbosity> explain,
+                                      Document serializedCommand,
+                                      const PrivilegeVector& privileges,
+                                      ShardId shardId,
+                                      BSONObjBuilder* out,
+                                      IncludeMetrics remoteMetricsToInclude);
+
+}  // namespace cluster_aggregation_planner
+}  // namespace mongo

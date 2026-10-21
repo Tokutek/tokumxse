@@ -1,0 +1,974 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/config.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/otel/metrics/metric_names.h"
+#include "mongo/otel/metrics/metric_unit.h"
+#include "mongo/otel/metrics/metrics_counter.h"
+#include "mongo/otel/metrics/metrics_gauge.h"
+#include "mongo/otel/metrics/metrics_histogram.h"
+#include "mongo/otel/metrics/metrics_metric.h"
+#include "mongo/otel/metrics/metrics_scalar_metric.h"
+#include "mongo/otel/metrics/metrics_updown_counter.h"
+#include "mongo/otel/metrics/otel_metric_name_validation.h"
+#include "mongo/otel/metrics/server_status_metric_name_validation.h"
+#include "mongo/otel/metrics/server_status_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/modules.h"
+
+#include <limits>
+#include <memory>
+#include <string_view>
+#include <typeindex>
+#include <vector>
+
+#include <absl/container/btree_map.h>
+#include <boost/optional.hpp>
+#include <fmt/format.h>
+
+#ifdef MONGO_CONFIG_OTEL
+#include <opentelemetry/metrics/meter.h>
+#include <opentelemetry/metrics/provider.h>
+#endif  // MONGO_CONFIG_OTEL
+
+[[MONGO_MOD_PUBLIC]];
+namespace mongo::otel::metrics {
+
+struct ScalarMetricOptions {
+    boost::optional<ServerStatusOptions> serverStatusOptions = boost::none;
+    // Overrides the default ScalarMetricImpl reporting policy.
+    // By default, uses kUnconditionally for metrics without attributes, and
+    // kIfCurrentlyNonZero for metrics with attributes.
+    // Set to kUnconditionally for metrics where 0 is significant, like ratios.
+    boost::optional<ReportingPolicy> reportingPolicy = boost::none;
+};
+using CounterOptions = ScalarMetricOptions;
+using UpDownCounterOptions = ScalarMetricOptions;
+using GaugeOptions = ScalarMetricOptions;
+
+struct HistogramOptions {
+    boost::optional<ServerStatusOptions> serverStatusOptions = boost::none;
+    /**
+     * explicitBucketBoundaries allows users to specify custom buckets. The vector elements
+     * denote the upper and lower bounds for the histogram buckets.
+     *
+     * Bucket upper-bounds are inclusive (except when the upper-bound is +inf), and bucket
+     * lower-bounds are exclusive. The implicit first boundary is -inf and the implicit last
+     * boundary is +inf. Given a list of n boundaries, there are n + 1 buckets. For example,
+     *
+     * boundaries = {2, 4}
+     * buckets = (-inf, 2], (2, 4], (4, +inf)
+     *
+     * If, for example, the value 2 is recorded, the corresponding counts for each bucket would
+     * be {1, 0, 0}.
+     *
+     * If a value is not provided, the default bucket boundaries will be used: {0, 5, 10, 25,
+     * 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000}.
+     *
+     * See https://opentelemetry.io/docs/specs/otel/metrics/data-model/#histogram for more
+     * information.
+     */
+    boost::optional<std::vector<double>> explicitBucketBoundaries;
+    /**
+     * Controls how the histogram is serialized to BSON (currently used for server status
+     * reporting). Defaults to kAverage, which is cheaper since it only tracks an exponential
+     * moving average and a total count. Use kBucketCounts if per-bucket counts are needed.
+     */
+    HistogramSerializationFormat serializationFormat = HistogramSerializationFormat::kAverage;
+};
+
+/**
+ * The MetricsService is the external interface by which API consumers can create Instruments. The
+ * MetricsService must be initialized before metrics can record values or be read.
+ */
+class MetricsService final {
+public:
+    static constexpr std::string_view kMeterName = "mongodb";
+
+    static MetricsService& instance() {
+        static MetricsService metricsService;
+        return metricsService;
+    }
+
+    /** `metricTreeSet` is provided for testing purposes. */
+    MetricsService(MetricTreeSet& metricTreeSet = globalMetricTreeSet());
+
+    /**
+     * Creates an int64_t counter with the provided parameters. The function will throw an exception
+     * if the counter would collide with an existing metric (i.e., same name but different type or
+     * other parameters). Metrics should be stashed once they are created to avoid taking a lock on
+     * the global list of metrics in performance-sensitive codepaths. Note that this will take
+     * storage proportional to all possible attribute combinations, and will throw an exception if
+     * there are too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    Counter<int64_t, AttributeTs...>& createInt64Counter(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const CounterOptions& = {});
+
+    /**
+     * Creates a double counter with the provided parameters. The function will throw an exception
+     * if the counter would collide with an existing metric (i.e., same name but different type or
+     * other parameters). Metrics should be stashed once they are created to avoid taking a lock on
+     * the global list of metrics in performance-sensitive codepaths. Note that this will take
+     * storage proportional to all possible attribute combinations, and will throw an exception if
+     * there are too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    Counter<double, AttributeTs...>& createDoubleCounter(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const CounterOptions& = {});
+
+    /**
+     * Creates an int64_t up-down counter with the provided parameters. The function will throw an
+     * exception if the up-down counter would collide with an existing metric (i.e., same name but
+     * different type or other parameters). Metrics should be stashed once they are created to avoid
+     * taking a lock on the global list of metrics in performance-sensitive codepaths. Note that
+     * this will take storage proportional to all possible attribute combinations, and will throw an
+     * exception if there are too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    UpDownCounter<int64_t, AttributeTs...>& createInt64UpDownCounter(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const UpDownCounterOptions& = {});
+
+    /**
+     * Creates a double up-down counter with the provided parameters. The function will throw an
+     * exception if the up-down counter would collide with an existing metric (i.e., same name but
+     * different type or other parameters). Metrics should be stashed once they are created to avoid
+     * taking a lock on the global list of metrics in performance-sensitive codepaths. Note that
+     * this will take storage proportional to all possible attribute combinations, and will throw an
+     * exception if there are too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    UpDownCounter<double, AttributeTs...>& createDoubleUpDownCounter(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const UpDownCounterOptions& = {});
+
+    /**
+     * Creates an int64_t gauge with the provided parameters. The function will throw an exception
+     * if the gauge would collide with an existing metric (i.e., same name but different type or
+     * other parameters). Metrics should be stashed once they are created to avoid taking a lock on
+     * the global list of metrics in performance-sensitive codepaths. Note that this will take
+     * storage proportional to all possible attribute combinations, and will throw an exception if
+     * there are too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    Gauge<int64_t, AttributeTs...>& createInt64Gauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& = {});
+
+    /**
+     * Creates a double gauge with the provided parameters. The function will throw an exception if
+     * the gauge would collide with an existing metric (i.e., same name but different type or other
+     * parameters). Metrics should be stashed once they are created to avoid taking a lock on the
+     * global list of metrics in performance-sensitive codepaths. Note that this will take storage
+     * proportional to all possible attribute combinations, and will throw an exception if there are
+     * too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    Gauge<double, AttributeTs...>& createDoubleGauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& = {});
+
+    /**
+     * Creates a min gauge that atomically tracks the minimum value observed via setIfLess(). The
+     * function will throw an exception if the gauge would collide with a different metric (i.e.,
+     * same name but different type or other parameters). Note that this will take storage
+     * proportional to all possible attribute combinations, and will throw an exception if there are
+     * too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    MinGauge<int64_t, AttributeTs...>& createInt64MinGauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& = {});
+
+    /**
+     * Creates a min gauge that atomically tracks the minimum value observed via setIfLess(). The
+     * function will throw an exception if the gauge would collide with a different metric (i.e.,
+     * same name but different type or other parameters). Note that this will take storage
+     * proportional to all possible attribute combinations, and will throw an exception if there are
+     * too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    MinGauge<double, AttributeTs...>& createDoubleMinGauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& = {});
+
+    /**
+     * Creates a max gauge that atomically tracks the maximum value observed via setIfGreater(). The
+     * function will throw an exception if the gauge would collide with a different metric (i.e.,
+     * same name but different type or other parameters). Note that this will take storage
+     * proportional to all possible attribute combinations, and will throw an exception if there are
+     * too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    MaxGauge<int64_t, AttributeTs...>& createInt64MaxGauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& = {});
+
+    /**
+     * Creates a max gauge that atomically tracks the maximum value observed via setIfGreater(). The
+     * function will throw an exception if the gauge would collide with a different metric (i.e.,
+     * same name but different type or other parameters). Note that this will take storage
+     * proportional to all possible attribute combinations, and will throw an exception if there are
+     * too many.
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    MaxGauge<double, AttributeTs...>& createDoubleMaxGauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& = {});
+
+    /**
+     * Creates an int64_t histogram with the provided parameters. The function will throw an
+     * exception if the histogram would collide with an existing metric (i.e., same name but
+     * different type or other parameters). Metrics should be stashed once they are created to avoid
+     * taking a lock on the global list of metrics in performance-sensitive codepaths. Note that
+     * attribute definitions determine the set of valid attribute combinations passed to record().
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    Histogram<int64_t, AttributeTs...>& createInt64Histogram(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const HistogramOptions& options = {});
+
+    /**
+     * Creates a double histogram with the provided parameters. The function will throw an exception
+     * if the histogram would collide with an existing metric (i.e., same name but different type or
+     * other parameters). Metrics should be stashed once they are created to avoid taking a lock on
+     * the global list of metrics in performance-sensitive codepaths. Note that attribute
+     * definitions determine the set of valid attribute combinations passed to record().
+     *
+     * All callers must add an entry in metric_names.h to create a MetricName to pass to the API.
+     */
+    template <AttributeType... AttributeTs>
+    Histogram<double, AttributeTs...>& createDoubleHistogram(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const HistogramOptions& options = {});
+
+    /** Returns the attribute names for a metric in definition order. Exposed for testing only. */
+    [[MONGO_MOD_PRIVATE]] std::vector<std::string> getAttributeNamesForTests(MetricName name) const;
+
+#ifdef MONGO_CONFIG_OTEL
+    /**
+     * Initializes the metrics service by registering metrics created before initialization with the
+     * provided meter provider.
+     *
+     * This function enables metrics to be created statically, before the meter provider is
+     * initialized in mongod_main.cpp. Any metrics created before initialization are reset to their
+     * default value.
+     */
+    [[MONGO_MOD_PRIVATE]] void initialize(opentelemetry::metrics::MeterProvider& provider);
+#endif  // MONGO_CONFIG_OTEL
+
+private:
+    /** Identifies metrics to help prevent conflicting registrations. */
+    struct MetricIdentifier {
+        std::string description;
+        MetricUnit unit;
+        /** The type index of the implementation class, which includes the attribute types. */
+        std::type_index typeIndex = typeid(void);
+        boost::optional<ServerStatusOptions> serverStatusOptions = boost::none;
+        boost::optional<std::vector<double>> histogramBucketBoundaries = boost::none;
+        /**
+         * Names and formatted possible values for each attribute, in definition order.
+         * NOTE: This duplicates attribute values also held by the metric implementation. If needed,
+         * this could be removed by storing the attribute values in a centralized place and using
+         * them both here and in the metric implementation.
+         */
+        std::vector<ComparableAttributeDefinition> attributeDefinitions;
+
+        auto operator<=>(const MetricIdentifier& other) const = default;
+    };
+
+    template <typename InstrumentT>
+    using MakeInstrumentRef =
+        function_ref<std::unique_ptr<InstrumentT>(WithLock, const std::string& nameStr)>;
+
+    template <typename InstrumentT>
+    using AddObservableRef =
+        function_ref<void(WithLock, const std::string& nameStr, InstrumentT* instrumentPtr)>;
+
+    /**
+     * Retrieves an existing metric if one with the same name, identifier, and type T exists.
+     *
+     * This helper handles cases where developers may attempt to "create" the same metric multiple
+     * times (e.g., when refactoring a class into multiple files with duplicated metric recording
+     * logic). If a matching metric exists, a pointer to it is returned. Otherwise, returns nullptr.
+     *
+     * If a metric with the same name and different identifier or type T exists, an exception is
+     * thrown.
+     */
+    template <typename ImplT, typename OwnedMetricT>
+    ImplT* _getDuplicateMetric(WithLock, const std::string& name, MetricIdentifier identifier);
+
+    /**
+     * Creates a scalar metric (Counter, Gauge, or UpDownCounter) with attributes of type
+     * AttributeTs and values of type T. ObservableT selects the instrument type and determines
+     * which OTEL instrument is registered. This includes adding it to the appropriate internal data
+     * structures.
+     */
+    template <template <typename> class ObservableT, typename T, AttributeType... AttributeTs>
+    ScalarMetricImpl<T, AttributeTs...>& _createScalarMetric(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const ScalarMetricOptions& options);
+
+    template <template <typename> class ObservableT, typename T, AttributeType... AttributeTs>
+    ScalarMetricImpl<T, AttributeTs...>& _createMinMaxGauge(
+        MetricName name,
+        std::string description,
+        MetricUnit unit,
+        T initialValue,
+        const AttributeDefinition<AttributeTs>&... defs,
+        const GaugeOptions& options);
+
+    template <typename T, AttributeType... AttributeTs>
+    Histogram<T, AttributeTs...>& _createHistogram(MetricName name,
+                                                   std::string description,
+                                                   MetricUnit unit,
+                                                   const AttributeDefinition<AttributeTs>&... defs,
+                                                   const HistogramOptions& options);
+
+#ifdef MONGO_CONFIG_OTEL
+    void _registerHistogramView(
+        WithLock lock,
+        const std::string& name,
+        const std::string& description,
+        const std::string& unit,
+        const boost::optional<std::vector<double>>& explicitBucketBoundaries);
+#endif  // MONGO_CONFIG_OTEL
+
+    /**
+     * If `serverStatusOptions` is specified, registers the given metric onto one of the
+     * serverStatus metric trees based on the specified dotted path and role. Currently, the
+     * registration is not thread-safe at runtime as the metric trees are not guarded by a mutex.
+     * Therefore, `serverStatusOptions` must not be specified when creating a metric at runtime.
+     */
+    void _registerServerStatusTree(WithLock,
+                                   Metric* metricPtr,
+                                   const boost::optional<ServerStatusOptions>& serverStatusOptions);
+
+    /**
+     * Validates the given options. Then, either returns an existing matching metric or creates
+     * one with `makeInstrument` and stores it. Then, registers the serverStatus tree if requested
+     * and optionally runs `addObservable` if OTEL is enabled. ImplT is the implementation class and
+     * OwnedMetricT is the type used for storage in _metrics and observation (where applicable).
+     */
+    template <typename ImplT, typename OwnedMetricT, typename Options>
+    ImplT& _createMetric(MetricName name,
+                         const Options& options,
+                         MetricIdentifier identifier,
+                         MakeInstrumentRef<ImplT> makeInstrument,
+                         AddObservableRef<ImplT> addObservable);
+
+#ifdef MONGO_CONFIG_OTEL
+    /**
+     * Registers an observable counter instrument with the OTEL provider and stores the resulting
+     * handle in `_observableInstruments`.
+     */
+    template <template <typename> class MetricT, typename T>
+    void _addObservable(WithLock,
+                        const std::string& nameStr,
+                        MetricT<T>* metricPtr,
+                        std::string description,
+                        MetricUnit unit);
+#endif  // MONGO_CONFIG_OTEL
+
+    using OwnedMetric = std::variant<std::unique_ptr<ObservableCounter<int64_t>>,
+                                     std::unique_ptr<ObservableCounter<double>>,
+                                     std::unique_ptr<ObservableUpDownCounter<int64_t>>,
+                                     std::unique_ptr<ObservableUpDownCounter<double>>,
+                                     std::unique_ptr<ObservableGauge<int64_t>>,
+                                     std::unique_ptr<ObservableGauge<double>>,
+                                     std::unique_ptr<ObservableMinGauge<int64_t>>,
+                                     std::unique_ptr<ObservableMinGauge<double>>,
+                                     std::unique_ptr<ObservableMaxGauge<int64_t>>,
+                                     std::unique_ptr<ObservableMaxGauge<double>>,
+                                     std::unique_ptr<HistogramBase<int64_t>>,
+                                     std::unique_ptr<HistogramBase<double>>>;
+
+#ifdef MONGO_CONFIG_OTEL
+    /**
+     * Visitor struct used for initializing OwnedMetric variants in MetricsService::initialize().
+     *
+     * The visitor assumes the MetricService mutex is locked, hence the WithLock member variable.
+     */
+    struct OwnedMetricVisitor {
+        WithLock lock;
+        opentelemetry::metrics::MeterProvider& provider;
+        const std::string& name;
+        MetricIdentifier id;
+        std::vector<std::shared_ptr<opentelemetry::metrics::ObservableInstrument>>&
+            newObservableInstruments;
+
+        void operator()(std::unique_ptr<ObservableCounter<int64_t>>& counter);
+        void operator()(std::unique_ptr<ObservableCounter<double>>& counter);
+        void operator()(std::unique_ptr<ObservableUpDownCounter<int64_t>>& upDownCounter);
+        void operator()(std::unique_ptr<ObservableUpDownCounter<double>>& upDownCounter);
+        void operator()(std::unique_ptr<ObservableGauge<int64_t>>& gauge);
+        void operator()(std::unique_ptr<ObservableGauge<double>>& gauge);
+        void operator()(std::unique_ptr<ObservableMinGauge<int64_t>>& gauge);
+        void operator()(std::unique_ptr<ObservableMinGauge<double>>& gauge);
+        void operator()(std::unique_ptr<ObservableMaxGauge<int64_t>>& gauge);
+        void operator()(std::unique_ptr<ObservableMaxGauge<double>>& gauge);
+        void operator()(std::unique_ptr<HistogramBase<double>>& histogram);
+        void operator()(std::unique_ptr<HistogramBase<int64_t>>& histogram);
+    };
+#endif  // MONGO_CONFIG_OTEL
+
+    struct IdentifierAndMetric {
+        MetricIdentifier identifier;
+        OwnedMetric metric;
+    };
+
+    // Where serverStatus metrics are registered.
+    MetricTreeSet& _metricTreeSet;
+
+    // Guards `_observableInstruments` and `_metrics`.
+    mutable std::mutex _mutex;
+
+#ifdef MONGO_CONFIG_OTEL
+    // Pointers to all observable instruments. These are not directly used, but must be kept alive
+    // while the instruments they back are still in use. Guarded by `_mutex`.
+    std::vector<std::shared_ptr<opentelemetry::metrics::ObservableInstrument>>
+        _observableInstruments;
+#endif  // MONGO_CONFIG_OTEL
+
+    // Map from metric name to its definition and implementation. Guarded by `_mutex`.
+    absl::btree_map<std::string, IdentifierAndMetric> _metrics;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Implementation details
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename ImplT, typename OwnedMetricT>
+ImplT* MetricsService::_getDuplicateMetric(WithLock,
+                                           const std::string& name,
+                                           MetricIdentifier identifier) {
+    if (auto it = _metrics.find(name); it != _metrics.end()) {
+        massert(ErrorCodes::ObjectAlreadyExists,
+                fmt::format("Tried to create a metric with the name: {} but different definition "
+                            "already exists.",
+                            name),
+                it->second.identifier == identifier);
+        massert(ErrorCodes::ObjectAlreadyExists,
+                "Tried to create a new metric, but a metric with a different type parameter "
+                "already exists.",
+                std::holds_alternative<std::unique_ptr<OwnedMetricT>>(it->second.metric));
+
+        return static_cast<ImplT*>(
+            std::get<std::unique_ptr<OwnedMetricT>>(it->second.metric).get());
+    }
+    return nullptr;
+}
+
+template <typename ImplT, typename OwnedMetricT, typename Options>
+ImplT& MetricsService::_createMetric(MetricName name,
+                                     const Options& options,
+                                     MetricIdentifier identifier,
+                                     MakeInstrumentRef<ImplT> makeInstrument,
+                                     AddObservableRef<ImplT> addObservable) {
+    // Validate otel and serverStatus metric names.
+    uassertStatusOK(validateOtelMetricName(name.getName()));
+    if (options.serverStatusOptions && !options.serverStatusOptions->skipPathValidation) {
+        uassertStatusOK(validateServerStatusMetricPath(options.serverStatusOptions->dottedPath));
+    }
+
+    const std::string nameStr(name.getName());
+
+    std::lock_guard lock(_mutex);
+
+    // Check for duplicate.
+    if (auto* duplicate = _getDuplicateMetric<ImplT, OwnedMetricT>(lock, nameStr, identifier)) {
+        return *duplicate;
+    }
+
+    // Register.
+    auto impl = makeInstrument(lock, nameStr);
+    ImplT* const ptr = impl.get();
+
+    auto owned = OwnedMetric{std::unique_ptr<OwnedMetricT>(std::move(impl))};
+    _metrics[nameStr] = {.identifier = std::move(identifier), .metric = std::move(owned)};
+    _registerServerStatusTree(lock, static_cast<Metric*>(ptr), options.serverStatusOptions);
+#ifdef MONGO_CONFIG_OTEL
+    addObservable(lock, nameStr, ptr);
+#endif  // MONGO_CONFIG_OTEL
+    return *ptr;
+}
+
+template <template <typename> class ObservableT, typename T, AttributeType... AttributeTs>
+ScalarMetricImpl<T, AttributeTs...>& MetricsService::_createScalarMetric(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const ScalarMetricOptions& options) {
+    MetricIdentifier identifier{
+        .description = description,
+        .unit = unit,
+        .serverStatusOptions = options.serverStatusOptions,
+        .histogramBucketBoundaries = boost::none,
+        .attributeDefinitions = {makeComparableAttributeDefinition(defs)...}};
+    return _createMetric<ScalarMetricImpl<T, AttributeTs...>, ObservableT<T>, ScalarMetricOptions>(
+        name,
+        options,
+        std::move(identifier),
+        /* makeInstrument= */
+        [&](WithLock, const std::string&) {
+            if (options.reportingPolicy) {
+                return std::make_unique<ScalarMetricImpl<T, AttributeTs...>>(
+                    *options.reportingPolicy, defs...);
+            }
+            return std::make_unique<ScalarMetricImpl<T, AttributeTs...>>(defs...);
+        },
+#ifdef MONGO_CONFIG_OTEL
+        /* addObservable= */
+        [this, desc = std::move(description), unit](
+            WithLock lock,
+            const std::string& nameStr,
+            ScalarMetricImpl<T, AttributeTs...>* ptr) mutable {
+            _addObservable(lock, nameStr, static_cast<ObservableT<T>*>(ptr), std::move(desc), unit);
+        }
+#else
+        /* addObservable= */
+        [](WithLock, const std::string&, ScalarMetricImpl<T, AttributeTs...>*) {}
+#endif  // MONGO_CONFIG_OTEL
+    );
+}
+
+template <AttributeType... AttributeTs>
+Counter<int64_t, AttributeTs...>& MetricsService::createInt64Counter(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const CounterOptions& options) {
+    return _createScalarMetric<ObservableCounter, int64_t, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+Counter<double, AttributeTs...>& MetricsService::createDoubleCounter(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const CounterOptions& options) {
+    return _createScalarMetric<ObservableCounter, double, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <typename T, AttributeType... AttributeTs>
+Histogram<T, AttributeTs...>& MetricsService::_createHistogram(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const HistogramOptions& options) {
+    const std::string unitStr = static_cast<std::string>(toString(unit));
+    MetricIdentifier identifier{
+        .description = description,
+        .unit = unit,
+        .serverStatusOptions = options.serverStatusOptions,
+        .histogramBucketBoundaries = options.explicitBucketBoundaries,
+        .attributeDefinitions = {makeComparableAttributeDefinition(defs)...}};
+    return _createMetric<HistogramImpl<T, AttributeTs...>, HistogramBase<T>, HistogramOptions>(
+        name,
+        options,
+        std::move(identifier),
+        /* makeInstrument= */
+        [&](WithLock lock, const std::string& nameStr) {
+#ifdef MONGO_CONFIG_OTEL
+            _registerHistogramView(
+                lock, nameStr, description, unitStr, options.explicitBucketBoundaries);
+            auto meter = opentelemetry::metrics::Provider::GetMeterProvider()->GetMeter(
+                std::string{kMeterName});
+            return std::make_unique<HistogramImpl<T, AttributeTs...>>(
+                *meter,
+                nameStr,
+                description,
+                unitStr,
+                options.serializationFormat,
+                options.explicitBucketBoundaries,
+                defs...);
+#else
+            return std::make_unique<HistogramImpl<T, AttributeTs...>>(
+                options.serializationFormat, options.explicitBucketBoundaries, defs...);
+#endif  // MONGO_CONFIG_OTEL
+        },
+        /* addObservable= */
+        [](WithLock, const std::string&, HistogramImpl<T, AttributeTs...>*) {});
+}
+
+template <AttributeType... AttributeTs>
+Histogram<int64_t, AttributeTs...>& MetricsService::createInt64Histogram(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const HistogramOptions& options) {
+    return _createHistogram<int64_t, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+Histogram<double, AttributeTs...>& MetricsService::createDoubleHistogram(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const HistogramOptions& options) {
+    return _createHistogram<double, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+#ifdef MONGO_CONFIG_OTEL
+namespace metrics_service_detail {
+
+template <template <typename> class MetricT, typename ValueT>
+[[MONGO_MOD_FILE_PRIVATE]] void observableCallback(
+    opentelemetry::metrics::ObserverResult observer_result, void* state) {
+    invariant(state != nullptr);
+    auto* const metric = static_cast<MetricT<ValueT>*>(state);
+    auto observer = std::get_if<std::shared_ptr<opentelemetry::metrics::ObserverResultT<ValueT>>>(
+        &observer_result);
+    invariant(observer != nullptr && *observer != nullptr);
+    for (const auto& entry : metric->values()) {
+        (*observer)->Observe(entry.value, entry.attributes);
+    }
+}
+
+template <typename T>
+[[MONGO_MOD_FILE_PRIVATE]] std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument(opentelemetry::metrics::MeterProvider& provider,
+                         std::string name,
+                         std::string description,
+                         MetricUnit unit);
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableCounter<int64_t>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateInt64ObservableCounter(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableCounter<double>>(opentelemetry::metrics::MeterProvider& provider,
+                                                    std::string name,
+                                                    std::string description,
+                                                    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateDoubleObservableCounter(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableUpDownCounter<int64_t>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateInt64ObservableUpDownCounter(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableUpDownCounter<double>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateDoubleObservableUpDownCounter(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableGauge<int64_t>>(opentelemetry::metrics::MeterProvider& provider,
+                                                   std::string name,
+                                                   std::string description,
+                                                   MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateInt64ObservableGauge(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableGauge<double>>(opentelemetry::metrics::MeterProvider& provider,
+                                                  std::string name,
+                                                  std::string description,
+                                                  MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateDoubleObservableGauge(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableMinGauge<int64_t>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateInt64ObservableGauge(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableMinGauge<double>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateDoubleObservableGauge(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableMaxGauge<int64_t>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateInt64ObservableGauge(name, description, toString(unit));
+}
+
+template <>
+[[MONGO_MOD_FILE_PRIVATE]] inline std::shared_ptr<opentelemetry::metrics::ObservableInstrument>
+makeObservableInstrument<ObservableMaxGauge<double>>(
+    opentelemetry::metrics::MeterProvider& provider,
+    std::string name,
+    std::string description,
+    MetricUnit unit) {
+    return provider.GetMeter(std::string{MetricsService::kMeterName})
+        ->CreateDoubleObservableGauge(name, description, toString(unit));
+}
+}  // namespace metrics_service_detail
+
+template <template <typename> class MetricT, typename T>
+void MetricsService::_addObservable(WithLock,
+                                    const std::string& nameStr,
+                                    MetricT<T>* metricPtr,
+                                    std::string description,
+                                    MetricUnit unit) {
+    auto provider = opentelemetry::metrics::Provider::GetMeterProvider();
+    auto observable = metrics_service_detail::makeObservableInstrument<MetricT<T>>(
+        *provider, nameStr, description, unit);
+    tassert(ErrorCodes::InternalError,
+            fmt::format("Could not create observable instrument for metric: {}", nameStr),
+            observable != nullptr);
+    observable->AddCallback(metrics_service_detail::observableCallback<MetricT, T>, metricPtr);
+    _observableInstruments.push_back(std::move(observable));
+}
+#endif  // MONGO_CONFIG_OTEL
+
+template <AttributeType... AttributeTs>
+UpDownCounter<int64_t, AttributeTs...>& MetricsService::createInt64UpDownCounter(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const UpDownCounterOptions& options) {
+    return _createScalarMetric<ObservableUpDownCounter, int64_t, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+UpDownCounter<double, AttributeTs...>& MetricsService::createDoubleUpDownCounter(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const UpDownCounterOptions& options) {
+    return _createScalarMetric<ObservableUpDownCounter, double, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+Gauge<int64_t, AttributeTs...>& MetricsService::createInt64Gauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    return _createScalarMetric<ObservableGauge, int64_t, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+Gauge<double, AttributeTs...>& MetricsService::createDoubleGauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    return _createScalarMetric<ObservableGauge, double, AttributeTs...>(
+        name, std::move(description), unit, defs..., options);
+}
+
+template <template <typename> class ObservableT, typename T, AttributeType... AttributeTs>
+ScalarMetricImpl<T, AttributeTs...>& MetricsService::_createMinMaxGauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    T initialValue,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    MetricIdentifier identifier{
+        .description = description,
+        .unit = unit,
+        .serverStatusOptions = options.serverStatusOptions,
+        .histogramBucketBoundaries = boost::none,
+        .attributeDefinitions = {makeComparableAttributeDefinition(defs)...}};
+    return _createMetric<ScalarMetricImpl<T, AttributeTs...>, ObservableT<T>, GaugeOptions>(
+        name,
+        options,
+        std::move(identifier),
+        /* makeInstrument= */
+        [&](WithLock, const std::string&) {
+            return std::make_unique<ScalarMetricImpl<T, AttributeTs...>>(
+                initialValue, ReportingPolicy::kUnconditionally, defs...);
+        },
+#ifdef MONGO_CONFIG_OTEL
+        /* addObservable= */
+        [this, desc = std::move(description), unit](
+            WithLock lock,
+            const std::string& nameStr,
+            ScalarMetricImpl<T, AttributeTs...>* ptr) mutable {
+            _addObservable(lock, nameStr, static_cast<ObservableT<T>*>(ptr), std::move(desc), unit);
+        }
+#else
+        /* addObservable= */
+        [](WithLock, const std::string&, ScalarMetricImpl<T, AttributeTs...>*) {}
+#endif  // MONGO_CONFIG_OTEL
+    );
+}
+
+template <AttributeType... AttributeTs>
+MinGauge<int64_t, AttributeTs...>& MetricsService::createInt64MinGauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    return _createMinMaxGauge<ObservableMinGauge, int64_t, AttributeTs...>(
+        name, std::move(description), unit, std::numeric_limits<int64_t>::max(), defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+MinGauge<double, AttributeTs...>& MetricsService::createDoubleMinGauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    return _createMinMaxGauge<ObservableMinGauge, double, AttributeTs...>(
+        name, std::move(description), unit, std::numeric_limits<double>::max(), defs..., options);
+}
+
+template <AttributeType... AttributeTs>
+MaxGauge<int64_t, AttributeTs...>& MetricsService::createInt64MaxGauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    return _createMinMaxGauge<ObservableMaxGauge, int64_t, AttributeTs...>(
+        name,
+        std::move(description),
+        unit,
+        std::numeric_limits<int64_t>::lowest(),
+        defs...,
+        options);
+}
+
+template <AttributeType... AttributeTs>
+MaxGauge<double, AttributeTs...>& MetricsService::createDoubleMaxGauge(
+    MetricName name,
+    std::string description,
+    MetricUnit unit,
+    const AttributeDefinition<AttributeTs>&... defs,
+    const GaugeOptions& options) {
+    return _createMinMaxGauge<ObservableMaxGauge, double, AttributeTs...>(
+        name,
+        std::move(description),
+        unit,
+        std::numeric_limits<double>::lowest(),
+        defs...,
+        options);
+}
+}  // namespace mongo::otel::metrics

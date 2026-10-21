@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the struct for coordinator session.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+
+structs:
+    CoordinatorSession:
+        description:
+            "Container for coordinator session used for guaranteeing remote
+            command idempotency."
+        strict: true
+        fields:
+            lsid:
+                type: LogicalSessionId
+            txnNumber:
+                type: TxnNumber

@@ -1,0 +1,560 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/global_catalog/ddl/sharding_catalog_manager.h"
+#include "mongo/db/global_catalog/sharding_catalog_client.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/global_catalog/type_collection.h"
+#include "mongo/db/global_catalog/type_config_version_gen.h"
+#include "mongo/db/global_catalog/type_namespace_placement_gen.h"
+#include "mongo/db/global_catalog/type_shard.h"
+#include "mongo/db/global_catalog/type_tags.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/sharding_environment/config_server_op_observer.h"
+#include "mongo/db/sharding_environment/config_server_test_fixture.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/topology/vector_clock/vector_clock.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <random>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+namespace mongo {
+namespace {
+
+using unittest::assertGet;
+
+class ConfigInitializationTest : public ConfigServerTestFixture {
+protected:
+    void setUp() override {
+        ConfigServerTestFixture::setUp();
+        DBDirectClient client(operationContext());
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
+                             {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
+
+        ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
+
+        LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
+        TransactionCoordinatorService::get(operationContext())
+            ->initializeIfNeeded(operationContext(), /* term */ 1);
+
+        WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
+    }
+
+    Status initializeConfigDatabaseIfNeededAtStepUp() {
+        auto* opCtx = operationContext();
+        const auto canAcceptNonLocalWrites = replicationCoordinator()->canAcceptNonLocalWrites();
+        replicationCoordinator()->setCanAcceptNonLocalWrites(false);
+
+        Status status = Status::OK();
+        {
+            repl::AllowNonLocalWritesBlock allowNonLocalWrites(opCtx);
+            status = ShardingCatalogManager::get(opCtx)->initializeConfigDatabaseIfNeeded(opCtx);
+        }
+
+        replicationCoordinator()->setCanAcceptNonLocalWrites(canAcceptNonLocalWrites);
+        return status;
+    }
+
+    void tearDown() override {
+        TransactionCoordinatorService::get(operationContext())->interruptForStepDown();
+        WaitForMajorityService::get(getServiceContext()).shutDown();
+        ConfigServerTestFixture::tearDown();
+    }
+
+    /* Generate and insert an entry into the config.shards collection using the received shard ID
+     * and an auto generated value for the host port.
+     */
+    void createShardMetadata(const std::vector<ShardId>& shardIds) {
+        uint32_t portOffset = 0;
+        std::vector<ShardType> shards;
+        for (const auto& shardId : shardIds) {
+            const std::string host("localhost:" + std::to_string(30000 + portOffset++));
+            shards.emplace_back(shardId.toString(), host);
+        }
+        setupShards(std::move(shards));
+    }
+
+
+    std::pair<CollectionType, std::vector<ChunkType>> createCollectionAndChunksMetadata(
+        OperationContext* opCtx,
+        const NamespaceString& collName,
+        int32_t numChunks,
+        std::vector<ShardId> desiredShards,
+        bool setOnCurrentShardSice = true) {
+        const auto collUUID = UUID::gen();
+        const auto collEpoch = OID::gen();
+        const auto collCreationTime = Date_t::now();
+        const auto collTimestamp = Timestamp(collCreationTime);
+        const auto shardKeyPattern = KeyPattern(BSON("x" << 1));
+
+        ChunkVersion chunkVersion({collEpoch, collTimestamp}, {1, 1});
+
+        std::vector<ChunkType> collChunks;
+        std::shuffle(desiredShards.begin(), desiredShards.end(), std::random_device());
+        for (int32_t i = 1; i <= numChunks; ++i) {
+            const auto minKey = i == 1 ? shardKeyPattern.globalMin() : BSON("x" << i * 10);
+            const auto maxKey =
+                i == numChunks ? shardKeyPattern.globalMax() : BSON("x" << (i + 1) * 10);
+            const auto shardId = desiredShards[i % desiredShards.size()];
+            chunkVersion.incMinor();
+            ChunkType chunk(collUUID, ChunkRange(minKey, maxKey), chunkVersion, shardId);
+            if (setOnCurrentShardSice) {
+                Timestamp onShardSince(collCreationTime + Milliseconds(i));
+                chunk.setHistory({ChunkHistory(onShardSince, shardId)});
+                chunk.setOnCurrentShardSince(onShardSince);
+            }
+
+            collChunks.push_back(std::move(chunk));
+        }
+
+        auto coll = setupCollection(collName, shardKeyPattern, collChunks);
+
+        return std::make_pair(std::move(coll), std::move(collChunks));
+    }
+
+    void assertSamePlacementInfo(const NamespacePlacementType& expected,
+                                 const NamespacePlacementType& found) {
+
+        ASSERT_EQ(expected.getNss(), found.getNss());
+        ASSERT_EQ(expected.getTimestamp(), found.getTimestamp());
+        ASSERT_EQ(expected.getUuid(), found.getUuid());
+
+        auto expectedShards = expected.getShards();
+        auto foundShards = found.getShards();
+        std::sort(expectedShards.begin(), expectedShards.end());
+        std::sort(foundShards.begin(), foundShards.end());
+        ASSERT_EQ(expectedShards, foundShards);
+    }
+
+private:
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+};
+
+TEST_F(ConfigInitializationTest, InitClusterMultipleVersionDocs) {
+    VersionType version;
+    version.setClusterId(OID::gen());
+    ASSERT_OK(insertToConfigCollection(
+        operationContext(), NamespaceString::kConfigVersionNamespace, version.toBSON()));
+
+    ASSERT_OK(insertToConfigCollection(operationContext(),
+                                       NamespaceString::kConfigVersionNamespace,
+                                       BSON("_id" << "a second document")));
+
+    ASSERT_EQ(ErrorCodes::TooManyMatchingDocuments, initializeConfigDatabaseIfNeededAtStepUp());
+}
+
+TEST_F(ConfigInitializationTest, InitInvalidConfigVersionDoc) {
+    BSONObj versionDoc(fromjson(R"({
+                    _id: 1,
+                    clusterId: "should be an ID"
+                })"));
+    ASSERT_OK(insertToConfigCollection(
+        operationContext(), NamespaceString::kConfigVersionNamespace, versionDoc));
+
+    ASSERT_EQ(ErrorCodes::TypeMismatch, initializeConfigDatabaseIfNeededAtStepUp());
+}
+
+
+TEST_F(ConfigInitializationTest, InitNoVersionDocEmptyConfig) {
+    // Make sure there is no existing document
+    ASSERT_EQUALS(ErrorCodes::NoMatchingDocument,
+                  findOneOnConfigCollection(
+                      operationContext(), NamespaceString::kConfigVersionNamespace, BSONObj()));
+
+    ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
+
+    auto versionDoc = assertGet(findOneOnConfigCollection(
+        operationContext(), NamespaceString::kConfigVersionNamespace, BSONObj()));
+
+    VersionType foundVersion = VersionType::parse(versionDoc, IDLParserContext("VersionType"));
+
+    ASSERT_TRUE(foundVersion.getClusterId().isSet());
+}
+
+TEST_F(ConfigInitializationTest, OnlyRunsOnce) {
+    ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
+
+    auto versionDoc = assertGet(findOneOnConfigCollection(
+        operationContext(), NamespaceString::kConfigVersionNamespace, BSONObj()));
+
+    VersionType foundVersion = VersionType::parse(versionDoc, IDLParserContext("VersionType"));
+
+    ASSERT_TRUE(foundVersion.getClusterId().isSet());
+
+    ASSERT_EQUALS(ErrorCodes::AlreadyInitialized, initializeConfigDatabaseIfNeededAtStepUp());
+}
+
+TEST_F(ConfigInitializationTest, ReRunsIfDocRolledBackThenReElected) {
+    ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
+
+    auto versionDoc = assertGet(findOneOnConfigCollection(
+        operationContext(), NamespaceString::kConfigVersionNamespace, BSONObj()));
+
+    VersionType foundVersion = VersionType::parse(versionDoc, IDLParserContext("VersionType"));
+
+    ASSERT_TRUE(foundVersion.getClusterId().isSet());
+
+    // Now remove the version document and re-run initializeConfigDatabaseIfNeeded().
+    {
+        // Mirror what happens if the config.version document is rolled back.
+        ON_BLOCK_EXIT([&] {
+            replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY).ignore();
+        });
+        ASSERT_OK(replicationCoordinator()->setFollowerMode(repl::MemberState::RS_ROLLBACK));
+        auto opCtx = operationContext();
+        repl::UnreplicatedWritesBlock uwb(opCtx);
+        auto nss = NamespaceString::kConfigVersionNamespace;
+        writeConflictRetry(opCtx, "removeConfigDocuments", nss, [&] {
+            AutoGetCollection coll(opCtx, nss, MODE_IX);
+            ASSERT_TRUE(coll);
+            auto cursor = coll->getCursor(opCtx);
+            std::vector<RecordId> recordIds;
+            while (auto recordId = cursor->next()) {
+                recordIds.push_back(recordId->id);
+            }
+            mongo::WriteUnitOfWork wuow(opCtx);
+            for (const auto& recordId : recordIds) {
+                collection_internal::deleteDocument(
+                    opCtx, *coll, kUninitializedStmtId, recordId, nullptr);
+            }
+            wuow.commit();
+            ASSERT_EQUALS(0UL, coll->numRecords(opCtx));
+        });
+    }
+
+    // Verify the document was actually removed.
+    ASSERT_EQUALS(ErrorCodes::NoMatchingDocument,
+                  findOneOnConfigCollection(
+                      operationContext(), NamespaceString::kConfigVersionNamespace, BSONObj()));
+
+    // Throw out cached information.
+    ShardingCatalogManager::get(operationContext())
+        ->discardCachedConfigDatabaseInitializationState();
+
+    // Re-create the config.version document.
+    ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
+
+    auto newVersionDoc = assertGet(findOneOnConfigCollection(
+        operationContext(), NamespaceString::kConfigVersionNamespace, BSONObj()));
+
+    VersionType newFoundVersion =
+        VersionType::parse(newVersionDoc, IDLParserContext("VersionType"));
+
+    ASSERT_TRUE(newFoundVersion.getClusterId().isSet());
+    ASSERT_NOT_EQUALS(newFoundVersion.getClusterId(), foundVersion.getClusterId());
+}
+
+TEST_F(ConfigInitializationTest, BuildsNecessaryIndexes) {
+    ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
+
+    std::vector<BSONObj> expectedChunksIndexes = std::vector<BSONObj>{
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key" << BSON("uuid" << 1 << "min" << 1) << "name"
+                 << "uuid_1_min_1"
+                 << "unique" << true),
+        BSON("v" << 2 << "key" << BSON("uuid" << 1 << "shard" << 1 << "min" << 1) << "name"
+                 << "uuid_1_shard_1_min_1"
+                 << "unique" << true),
+        BSON("v" << 2 << "key" << BSON("uuid" << 1 << "lastmod" << 1) << "name"
+                 << "uuid_1_lastmod_1"
+                 << "unique" << true),
+        BSON("v" << 2 << "key" << BSON("uuid" << 1 << "shard" << 1 << "onCurrentShardSince" << 1)
+                 << "name"
+                 << "uuid_1_shard_1_onCurrentShardSince_1")};
+
+    auto expectedShardsIndexes = std::vector<BSONObj>{
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "unique" << true << "key" << BSON("host" << 1) << "name"
+                 << "host_1"),
+        BSON("v" << 2 << "unique" << true << "key" << BSON("uuid" << 1) << "name"
+                 << "uuid_1")};
+    auto expectedTagsIndexes = std::vector<BSONObj>{
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "min" << 1) << "name"
+                 << "ns_1_min_1"),
+        BSON("v" << 2 << "key" << BSON("ns" << 1 << "tag" << 1) << "name"
+                 << "ns_1_tag_1")};
+
+    auto foundChunksIndexes =
+        assertGet(getIndexes(operationContext(), NamespaceString::kConfigsvrChunksNamespace));
+    assertBSONObjsSame(expectedChunksIndexes, foundChunksIndexes);
+
+    auto foundShardsIndexes =
+        assertGet(getIndexes(operationContext(), NamespaceString::kConfigsvrShardsNamespace));
+    assertBSONObjsSame(expectedShardsIndexes, foundShardsIndexes);
+
+    auto foundTagsIndexes = assertGet(getIndexes(operationContext(), TagsType::ConfigNS));
+    assertBSONObjsSame(expectedTagsIndexes, foundTagsIndexes);
+
+    auto expectedPlacementHistoryIndexes = std::vector<BSONObj>{
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "unique" << true << "key" << BSON("nss" << 1 << "timestamp" << -1)
+                 << "name"
+                 << "nss_1_timestamp_-1"),
+        BSON("v" << 2 << "key" << BSON("timestamp" << -1 << "nss" << 1) << "name"
+                 << "timestamp_-1_nss_1")};
+    auto foundPlacementHistoryIndexes = assertGet(
+        getIndexes(operationContext(), NamespaceString::kConfigsvrPlacementHistoryNamespace));
+    assertBSONObjsSame(expectedPlacementHistoryIndexes, foundPlacementHistoryIndexes);
+}
+
+using ConfigInitializationTestDeathTest = ConfigInitializationTest;
+DEATH_TEST_F(ConfigInitializationTestDeathTest,
+             ContinuesCreatingIndexesAfterNonEmptyCollectionError,
+             "Tripwire assertion") {
+    // Make config.tags non-empty without its required non-unique index.
+    DBDirectClient client(operationContext());
+    client.insert(TagsType::ConfigNS, BSON("_id" << 1));
+
+    auto status = initializeConfigDatabaseIfNeededAtStepUp();
+    ASSERT_EQ(12352501, status.code());
+
+    // Indexes for every collection after config.tags are created before returning its error.
+    ASSERT_EQ(1U, assertGet(getIndexes(operationContext(), TagsType::ConfigNS)).size());
+    ASSERT_EQ(
+        2U,
+        assertGet(getIndexes(operationContext(), NamespaceString::kConfigQueryAnalyzersNamespace))
+            .size());
+    ASSERT_EQ(3U,
+              assertGet(getIndexes(operationContext(),
+                                   NamespaceString::kConfigsvrPlacementHistoryNamespace))
+                  .size());
+}
+
+DEATH_TEST_F(ConfigInitializationTestDeathTest,
+             ReturnsFirstErrorWhenLaterIndexCreationFails,
+             "Tripwire assertion") {
+    DBDirectClient client(operationContext());
+
+    // Cause the config.tags non-unique index build to fail with 12352501.
+    client.insert(TagsType::ConfigNS, BSON("_id" << 1));
+
+    // Cause the later config.queryAnalyzers index build to fail with a non-tripwire error.
+    client.createIndexes(NamespaceString::kConfigQueryAnalyzersNamespace,
+                         {BSON("key" << BSON("x" << 1) << "name" << "collUuid_1")});
+
+    auto status = initializeConfigDatabaseIfNeededAtStepUp();
+    ASSERT_EQ(12352501, status.code());
+}
+
+TEST_F(ConfigInitializationTest, InitializePlacementHistory) {
+    ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
+
+    // Test setup
+    // - Four shards
+    // - Three databases (one with no sharded collections)
+    // - Three sharded collections (one with corrupted placement data)
+    const std::vector<ShardId> allShardIds = {
+        ShardId("shard1"), ShardId("shard2"), ShardId("shard3"), ShardId("shard4")};
+    createShardMetadata(allShardIds);
+
+    // (dbname, primaryShard, timestamp field of DatabaseVersion)
+    const std::vector<std::tuple<DatabaseName, ShardId, Timestamp>> databaseInfos{
+        std::make_tuple(
+            DatabaseName::createDatabaseName_forTest(boost::none, "dbWithoutCollections"),
+            ShardId("shard1"),
+            Timestamp(1, 1)),
+        std::make_tuple(
+            DatabaseName::createDatabaseName_forTest(boost::none, "dbWithCollections_1_2"),
+            ShardId("shard2"),
+            Timestamp(2, 1)),
+        std::make_tuple(
+            DatabaseName::createDatabaseName_forTest(boost::none, "dbWithCorruptedCollection"),
+            ShardId("shard3"),
+            Timestamp(3, 1))};
+
+    for (const auto& [dbName, primaryShard, timestamp] : databaseInfos) {
+        setupDatabase(dbName, ShardId(primaryShard), DatabaseVersion(UUID::gen(), timestamp));
+    }
+
+    NamespaceString coll1Name =
+        NamespaceString::createNamespaceString_forTest("dbWithCollections_1_2", "coll1");
+    std::vector<ShardId> expectedColl1Placement{ShardId("shard1"), ShardId("shard4")};
+    const auto [coll1, coll1Chunks] =
+        createCollectionAndChunksMetadata(operationContext(), coll1Name, 2, expectedColl1Placement);
+
+    NamespaceString coll2Name =
+        NamespaceString::createNamespaceString_forTest("dbWithCollections_1_2", "coll2");
+    std::vector<ShardId> expectedColl2Placement{
+        ShardId("shard1"), ShardId("shard2"), ShardId("shard3"), ShardId("shard4")};
+    const auto [coll2, coll2Chunks] =
+        createCollectionAndChunksMetadata(operationContext(), coll2Name, 8, expectedColl2Placement);
+
+    NamespaceString corruptedCollName = NamespaceString::createNamespaceString_forTest(
+        "dbWithCorruptedCollection", "corruptedColl");
+    std::vector<ShardId> expectedCorruptedCollPlacement{
+        ShardId("shard1"), ShardId("shard2"), ShardId("shard3")};
+    const auto [corruptedColl, corruptedCollChunks] =
+        createCollectionAndChunksMetadata(operationContext(),
+                                          corruptedCollName,
+                                          8,
+                                          expectedCorruptedCollPlacement,
+                                          false /* setOnCurrentShardSince*/);
+
+    // Ensure that the vector clock is able to return an up-to-date config time to both the
+    // ShardingCatalogManager and this test.
+    ConfigServerOpObserver opObserver;
+    auto now = VectorClock::get(operationContext())->getTime();
+    repl::OpTime majorityCommitPoint(now.clusterTime().asTimestamp(), 1);
+    opObserver.onMajorityCommitPointUpdate(getServiceContext(), majorityCommitPoint);
+
+    now = VectorClock::get(operationContext())->getTime();
+    const auto initializationTime = now.configTime().asTimestamp();
+
+    // init placement history
+    ShardingCatalogManager::get(operationContext())
+        ->initializePlacementHistory(operationContext(), initializationTime);
+
+    // Verify the outcome of the initialization procedure.
+    DBDirectClient dbClient(operationContext());
+
+    // The expected amount of documents has been generated
+    ASSERT_EQUALS(dbClient.count(NamespaceString::kConfigsvrPlacementHistoryNamespace, BSONObj()),
+                  3 /*numDatabases*/ + 3 /*numCollections*/ + 2 /*numMarkers*/);
+
+    // Each database is correctly described
+    for (const auto& [dbName, primaryShard, timeOfCreation] : databaseInfos) {
+        const NamespacePlacementType expectedEntry(
+            NamespaceString::createNamespaceString_forTest(dbName), timeOfCreation, {primaryShard});
+        const auto generatedEntry = findOneOnConfigCollection<NamespacePlacementType>(
+            operationContext(),
+            NamespaceString::kConfigsvrPlacementHistoryNamespace,
+            BSON("nss" << dbName.toString_forTest() /*filter*/));
+
+        assertSamePlacementInfo(expectedEntry, generatedEntry);
+    }
+
+    // Each collection is properly described:
+    const auto getExpectedTimestampForColl = [](const std::vector<ChunkType>& collChunks) {
+        return std::max_element(collChunks.begin(),
+                                collChunks.end(),
+                                [](const ChunkType& lhs, const ChunkType& rhs) {
+                                    return *lhs.getOnCurrentShardSince() <
+                                        *rhs.getOnCurrentShardSince();
+                                })
+            ->getOnCurrentShardSince()
+            .value();
+    };
+
+    // - coll1
+    NamespacePlacementType expectedEntryForColl1(
+        coll1.getNss(), getExpectedTimestampForColl(coll1Chunks), expectedColl1Placement);
+    expectedEntryForColl1.setUuid(coll1.getUuid());
+    const auto generatedEntryForColl1 = findOneOnConfigCollection<NamespacePlacementType>(
+        operationContext(),
+        NamespaceString::kConfigsvrPlacementHistoryNamespace,
+        BSON("nss" << coll1.getNss().ns_forTest()));
+
+    assertSamePlacementInfo(expectedEntryForColl1, generatedEntryForColl1);
+
+    // - coll2
+    NamespacePlacementType expectedEntryForColl2(
+        coll2.getNss(), getExpectedTimestampForColl(coll2Chunks), expectedColl2Placement);
+    expectedEntryForColl2.setUuid(coll2.getUuid());
+    const auto generatedEntryForColl2 = findOneOnConfigCollection<NamespacePlacementType>(
+        operationContext(),
+        NamespaceString::kConfigsvrPlacementHistoryNamespace,
+        BSON("nss" << coll2.getNss().ns_forTest()));
+
+    assertSamePlacementInfo(expectedEntryForColl2, generatedEntryForColl2);
+
+    // - corruptedColl
+    NamespacePlacementType expectedEntryForCorruptedColl(
+        corruptedColl.getNss(), initializationTime, expectedCorruptedCollPlacement);
+    expectedEntryForCorruptedColl.setUuid(corruptedColl.getUuid());
+    const auto generatedEntryForCorruptedColl = findOneOnConfigCollection<NamespacePlacementType>(
+        operationContext(),
+        NamespaceString::kConfigsvrPlacementHistoryNamespace,
+        BSON("nss" << corruptedColl.getNss().ns_forTest()));
+
+    assertSamePlacementInfo(expectedEntryForCorruptedColl, generatedEntryForCorruptedColl);
+
+    // Check placement initialization markers:
+    // - one entry at begin-of-time with all the currently existing shards (and no UUID set).
+    const NamespacePlacementType expectedMarkerForDawnOfTime(
+        ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker,
+        Timestamp(0, 1),
+        allShardIds);
+    const auto generatedMarkerForDawnOfTime = findOneOnConfigCollection<NamespacePlacementType>(
+        operationContext(),
+        NamespaceString::kConfigsvrPlacementHistoryNamespace,
+        BSON(
+            "nss" << ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker.ns_forTest()
+                  << "timestamp" << Timestamp(0, 1)));
+
+    assertSamePlacementInfo(expectedMarkerForDawnOfTime, generatedMarkerForDawnOfTime);
+
+    // - one entry at the time the initialization is performed with an empty set of shards
+    // (and no UUID set).
+    const NamespacePlacementType expectedMarkerForInitializationTime(
+        ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker, initializationTime, {});
+    const auto generatedMarkerForInitializationTime =
+        findOneOnConfigCollection<NamespacePlacementType>(
+            operationContext(),
+            NamespaceString::kConfigsvrPlacementHistoryNamespace,
+            BSON("nss"
+                 << ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker.ns_forTest()
+                 << "timestamp" << initializationTime));
+
+    assertSamePlacementInfo(expectedMarkerForInitializationTime,
+                            generatedMarkerForInitializationTime);
+}
+
+}  // unnamed namespace
+}  // namespace mongo

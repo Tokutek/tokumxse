@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,688 +8,1352 @@
 
 #include "wt_internal.h"
 
-static int __btree_conf(WT_SESSION_IMPL *, WT_CKPT *ckpt);
+static int __btree_conf(WT_SESSION_IMPL *, WT_CKPT *ckpt, bool);
 static int __btree_get_last_recno(WT_SESSION_IMPL *);
 static int __btree_page_sizes(WT_SESSION_IMPL *);
 static int __btree_preload(WT_SESSION_IMPL *);
-static int __btree_tree_open_empty(WT_SESSION_IMPL *, int);
+static int __btree_tree_open_empty(WT_SESSION_IMPL *, bool);
+
+/*
+ * __btree_clear --
+ *     Clear a Btree, either on handle discard or re-open.
+ */
+static int
+__btree_clear(WT_SESSION_IMPL *session)
+{
+    WT_BTREE *btree;
+    WT_DECL_RET;
+
+    btree = S2BT(session);
+
+    /*
+     * If the tree hasn't gone through an open/close cycle, there's no cleanup to be done.
+     */
+    if (!F_ISSET(btree, WT_BTREE_CLOSED))
+        return (0);
+
+    /* Terminate any associated collator. */
+    if (btree->collator_owned && btree->collator->terminate != NULL)
+        WT_TRET(btree->collator->terminate(btree->collator, &session->iface));
+
+    /* Destroy locks. */
+    __wt_rwlock_destroy(session, &btree->ovfl_lock);
+    __wt_spin_destroy(session, &btree->flush_lock);
+
+    /* Free allocated memory. */
+    __wt_free(session, btree->key_format);
+    __wt_free(session, btree->value_format);
+
+    return (ret);
+}
+
+/*
+ * __btree_pin_hs_dhandle --
+ *     Pin the history store dhandle for the stable btree.
+ */
+static int
+__btree_pin_hs_dhandle(WT_SESSION_IMPL *session, WT_BTREE *btree)
+{
+    WT_DATA_HANDLE *hs_dhandle;
+    WT_DECL_ITEM(hs_uri_buf);
+    WT_DECL_RET;
+    const char *hs_checkpoint_name;
+
+    hs_dhandle = NULL;
+
+    /* Look up the most recent history store checkpoint. This fetches the exact name to use. */
+    WT_RET(
+      __wt_meta_checkpoint_last_name(session, WT_HS_URI_SHARED, &hs_checkpoint_name, NULL, NULL));
+
+    WT_ERR(__wt_scr_alloc(session, 0, &hs_uri_buf));
+    /*
+     * Use a URI with a "/<checkpoint name> suffix. This is interpreted as reading from the stable
+     * checkpoint, but without it being a traditional checkpoint cursor.
+     */
+    WT_ERR(__wt_buf_fmt(session, hs_uri_buf, "%s/%s", WT_HS_URI_SHARED, hs_checkpoint_name));
+    WT_ERR(__wt_session_get_dhandle(session, hs_uri_buf->data, NULL, NULL, 0));
+
+    /*
+     * Save the dhandle pointer before incrementing session_inuse: releasing the dhandle clears the
+     * reference unconditionally, so we need our own copy to undo the increment on the error path.
+     */
+    hs_dhandle = session->dhandle;
+    (void)__wt_atomic_add_int32(&hs_dhandle->session_inuse, 1);
+    WT_ERR(__wt_session_release_dhandle(session));
+    btree->hs_checkpoint_name = hs_checkpoint_name;
+
+    __wt_scr_free(session, &hs_uri_buf);
+    return (0);
+
+err:
+    if (hs_dhandle != NULL)
+        (void)__wt_atomic_sub_int32(&hs_dhandle->session_inuse, 1);
+    __wt_scr_free(session, &hs_uri_buf);
+    __wt_free(session, hs_checkpoint_name);
+    return (ret);
+}
+
+/*
+ * __wt_btree_release_hs_dhandle --
+ *     Release the history store dhandle for the stable btree.
+ */
+int
+__wt_btree_release_hs_dhandle(WT_SESSION_IMPL *session, WT_BTREE *btree)
+{
+    WT_DECL_ITEM(hs_uri_buf);
+    WT_DECL_RET;
+
+    /*
+     * If the connection is closing, all data is being discarded, and the history store dhandle may
+     * already have been removed. In this case, no further action is necessary.
+     */
+    if (F_ISSET_ATOMIC_32(S2C(session), WT_CONN_CLOSING)) {
+        __wt_free(session, btree->hs_checkpoint_name);
+        return (0);
+    }
+
+    WT_RET(__wt_scr_alloc(session, 0, &hs_uri_buf));
+    /*
+     * Use a URI with a "/<checkpoint name> suffix. This is interpreted as reading from the stable
+     * checkpoint, but without it being a traditional checkpoint cursor.
+     */
+    WT_ERR(__wt_buf_fmt(session, hs_uri_buf, "%s/%s", WT_HS_URI_SHARED, btree->hs_checkpoint_name));
+    WT_ERR(__wt_session_get_dhandle(session, hs_uri_buf->data, NULL, NULL, 0));
+
+    (void)__wt_atomic_sub_int32(&session->dhandle->session_inuse, 1);
+    WT_ERR(__wt_session_release_dhandle(session));
+    __wt_free(session, btree->hs_checkpoint_name);
+
+err:
+    __wt_scr_free(session, &hs_uri_buf);
+    return (ret);
+}
+
+/*
+ * __btree_pin_hs_dhandle_and_get_meta_checkpoint --
+ *     Pin the history store dhandle for the stable btree and get the stable btree checkpoint
+ *     information.
+ */
+static int
+__btree_pin_hs_dhandle_and_get_meta_checkpoint(WT_SESSION_IMPL *session, WT_BTREE *btree,
+  const char *dhandle_name, const char *checkpoint, WT_CKPT *ckpt,
+  WT_LIVE_RESTORE_FH_META *lr_fh_meta)
+{
+    WT_DECL_RET;
+
+    /* Pin the matching history store dhandle in the session. */
+    if (!WT_IS_URI_HS(dhandle_name))
+        WT_WITHOUT_DHANDLE(session, ret = __btree_pin_hs_dhandle(session, btree));
+    /* The shared history store might be empty and may not have been checkpointed before. */
+    WT_RET_NOTFOUND_OK(ret);
+    /*
+     * A race condition occurs while acquiring a new checkpoint, resulting in the intended
+     * checkpoint no longer being available. Respond with "busy" to prompt the caller to retry.
+     */
+    WT_ERR_NOTFOUND_OK(
+      __wt_meta_checkpoint(session, dhandle_name, checkpoint, ckpt, lr_fh_meta), true);
+    if (ret == WT_NOTFOUND) {
+        /* The history store dhandle is pinned. We must find it. */
+        WT_ASSERT(session, !WT_IS_URI_HS(dhandle_name));
+        return (__wt_set_return(session, EBUSY));
+    }
+    F_SET_ATOMIC_32(btree, WT_BTREE_READONLY);
+
+err:
+    /*
+     * On error, the pinned history store dhandle is not released here. The caller is responsible
+     * for releasing it on the error path.
+     */
+    return (ret);
+}
 
 /*
  * __wt_btree_open --
- *	Open a Btree.
+ *     Open a Btree.
  */
 int
 __wt_btree_open(WT_SESSION_IMPL *session, const char *op_cfg[])
 {
-	WT_BM *bm;
-	WT_BTREE *btree;
-	WT_CKPT ckpt;
-	WT_CONFIG_ITEM cval;
-	WT_DATA_HANDLE *dhandle;
-	WT_DECL_RET;
-	size_t root_addr_size;
-	uint8_t root_addr[WT_BTREE_MAX_ADDR_COOKIE];
-	int creation, forced_salvage, readonly;
-	const char *filename;
+    WT_BM *bm;
+    WT_BTREE *btree;
+    WT_CKPT ckpt;
+    WT_CONFIG_ITEM cval;
+    WT_DATA_HANDLE *dhandle;
+    WT_DECL_ITEM(name_buf);
+    WT_DECL_ITEM(tmp);
+    WT_DECL_RET;
+    WT_LIVE_RESTORE_FH_META lr_fh_meta;
+    size_t root_addr_size;
+    uint8_t root_addr[WT_ADDR_MAX_COOKIE];
+    const char *dhandle_name, *checkpoint;
+    bool forced_salvage, has_ckpt, empty_ckpt;
 
-	dhandle = session->dhandle;
-	btree = S2BT(session);
+    btree = S2BT(session);
+    dhandle = session->dhandle;
+    dhandle_name = dhandle->name;
+    checkpoint = NULL;
+    has_ckpt = false;
+    WT_CLEAR(lr_fh_meta);
 
-	/* Checkpoint files are readonly. */
-	readonly = dhandle->checkpoint == NULL ? 0 : 1;
+    /*
+     * This may be a re-open, clean up the btree structure. Clear the fields that don't persist
+     * across a re-open. Clear all flags other than the operation flags (which are set by the
+     * connection handle software that called us).
+     */
+    WT_RET(__btree_clear(session));
+    memset(btree, 0, WT_BTREE_CLEAR_SIZE);
+    __wt_evict_clear_npos(btree);
+    F_CLR(btree, ~WT_BTREE_SPECIAL_FLAGS);
+    F_CLR_ATOMIC_32(btree, WT_BTREE_READONLY | WT_BTREE_SKIP_CKPT);
 
-	/* Get the checkpoint information for this name/checkpoint pair. */
-	WT_CLEAR(ckpt);
-	WT_RET(__wt_meta_checkpoint(
-	    session, dhandle->name, dhandle->checkpoint, &ckpt));
+    /* Set the data handle first, our called functions reasonably use it. */
+    btree->dhandle = dhandle;
 
-	/*
-	 * Bulk-load is only permitted on newly created files, not any empty
-	 * file -- see the checkpoint code for a discussion.
-	 */
-	creation = ckpt.raw.size == 0;
-	if (!creation && F_ISSET(btree, WT_BTREE_BULK))
-		WT_ERR_MSG(session, EINVAL,
-		    "bulk-load is only supported on newly created objects");
+    __wt_cache_top_btree_open(session, btree);
 
-	/* Handle salvage configuration. */
-	forced_salvage = 0;
-	if (F_ISSET(btree, WT_BTREE_SALVAGE)) {
-		WT_ERR(__wt_config_gets(session, op_cfg, "force", &cval));
-		forced_salvage = (cval.val != 0);
-	}
+    /* Checkpoint and verify files are readonly. */
+    if (WT_DHANDLE_IS_CHECKPOINT(dhandle) || F_ISSET(btree, WT_BTREE_VERIFY) ||
+      F_ISSET(S2C(session), WT_CONN_READONLY))
+        F_SET_ATOMIC_32(btree, WT_BTREE_READONLY);
 
-	/* Initialize and configure the WT_BTREE structure. */
-	WT_ERR(__btree_conf(session, &ckpt));
+    /* For disaggregated stable tree opens, separate any trailing checkpoint indicator. */
+    WT_ERR(__wt_btree_shared_base_name(session, &dhandle_name, &checkpoint, &name_buf));
 
-	/* Connect to the underlying block manager. */
-	filename = dhandle->name;
-	if (!WT_PREFIX_SKIP(filename, "file:"))
-		WT_ERR_MSG(session, EINVAL, "expected a 'file:' URI");
+    /* Get the checkpoint information for this name/checkpoint pair. */
+    if (checkpoint != NULL) {
+        /*
+         * Acquiring the checkpoint lock to prevent racing with picking up a new checkpoint.
+         *
+         * FIXME-WT-16477: if we directly read from the shared metadata, we can avoid taking the
+         * checkpoint lock here.
+         */
+        WT_ASSERT_ALWAYS(session,
+          !FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_SCHEMA) ||
+            FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_CHECKPOINT),
+          "deadlock");
+        WT_WITH_CHECKPOINT_LOCK(session,
+          ret = __btree_pin_hs_dhandle_and_get_meta_checkpoint(
+            session, btree, dhandle_name, checkpoint, &ckpt, &lr_fh_meta));
+        WT_ERR(ret);
+    } else
+        WT_ERR(
+          __wt_meta_checkpoint(session, dhandle_name, dhandle->checkpoint, &ckpt, &lr_fh_meta));
 
-	WT_ERR(__wt_block_manager_open(session, filename, dhandle->cfg,
-	    forced_salvage, readonly, btree->allocsize, &btree->bm));
-	bm = btree->bm;
+    has_ckpt = true;
 
-	/*
-	 * !!!
-	 * As part of block-manager configuration, we need to return the maximum
-	 * sized address cookie that a block manager will ever return.  There's
-	 * a limit of WT_BTREE_MAX_ADDR_COOKIE, but at 255B, it's too large for
-	 * a Btree with 512B internal pages.  The default block manager packs
-	 * a wt_off_t and 2 uint32_t's into its cookie, so there's no problem
-	 * now, but when we create a block manager extension API, we need some
-	 * way to consider the block manager's maximum cookie size versus the
-	 * minimum Btree internal node size.
-	 */
-	btree->block_header = bm->block_header(bm);
+    /* Set the order number. */
+    dhandle->checkpoint_order = ckpt.order;
 
-	/*
-	 * Open the specified checkpoint unless it's a special command (special
-	 * commands are responsible for loading their own checkpoints, if any).
-	 */
-	if (!F_ISSET(btree,
-	    WT_BTREE_SALVAGE | WT_BTREE_UPGRADE | WT_BTREE_VERIFY)) {
-		/*
-		 * There are two reasons to load an empty tree rather than a
-		 * checkpoint: either there is no checkpoint (the file is
-		 * being created), or the load call returns no root page (the
-		 * checkpoint is for an empty file).
-		 */
-		WT_ERR(bm->checkpoint_load(bm, session,
-		    ckpt.raw.data, ckpt.raw.size,
-		    root_addr, &root_addr_size, readonly));
-		if (creation || root_addr_size == 0)
-			WT_ERR(__btree_tree_open_empty(session, creation));
-		else {
-			WT_ERR(__wt_btree_tree_open(
-			    session, root_addr, root_addr_size));
+    /*
+     * Bulk-load is only permitted on newly created files, not any empty file -- see the checkpoint
+     * code for a discussion.
+     */
+    empty_ckpt = ckpt.raw.size == 0;
+    if (!empty_ckpt && F_ISSET(btree, WT_BTREE_BULK))
+        WT_ERR_MSG(session, EINVAL, "bulk-load is only supported on newly created objects");
 
-			/* Warm the cache, if possible. */
-			WT_WITH_PAGE_INDEX(session,
-			    ret = __btree_preload(session));
-			WT_ERR(ret);
+    /* Handle salvage configuration. */
+    forced_salvage = false;
+    if (F_ISSET(btree, WT_BTREE_SALVAGE)) {
+        WT_ERR(__wt_config_gets(session, op_cfg, "force", &cval));
+        forced_salvage = cval.val != 0;
+    }
 
-			/* Get the last record number in a column-store file. */
-			if (btree->type != BTREE_ROW)
-				WT_ERR(__btree_get_last_recno(session));
-		}
-	}
+    /* Initialize and configure the WT_BTREE structure. */
+    WT_ERR(__btree_conf(session, &ckpt, WT_DHANDLE_IS_CHECKPOINT(dhandle)));
+    lr_fh_meta.allocsize = btree->allocsize;
 
-	if (0) {
-err:		WT_TRET(__wt_btree_close(session));
-	}
-	__wt_meta_checkpoint_free(session, &ckpt);
+    /* Connect to the underlying block manager. */
+    WT_ERR(__wt_blkcache_open(session, dhandle_name, dhandle->cfg, forced_salvage, false,
+      btree->allocsize, &lr_fh_meta, &btree->bm));
 
-	return (ret);
+    bm = btree->bm;
+
+    /*
+     * Initialize the block manager's size from the checkpoint metadata, but only for the live
+     * handle. A checkpoint cursor open must not clobber the live running total with a stale
+     * checkpoint size, which would later underflow the total in the eviction path.
+     */
+    if (F_ISSET(btree, WT_BTREE_DISAGGREGATED) && !WT_DHANDLE_IS_CHECKPOINT(dhandle) &&
+      checkpoint == NULL)
+        __wt_block_disagg_set_size(session, ckpt.size);
+
+    /*
+     * !!!
+     * As part of block-manager configuration, we need to return the maximum
+     * sized address cookie that a block manager will ever return.  There's
+     * a limit of WT_ADDR_MAX_COOKIE, but at 255B, it's too large for
+     * a Btree with 512B internal pages.  The default block manager packs
+     * a wt_off_t and 2 uint32_t's into its cookie, so there's no problem
+     * now, but when we create a block manager extension API, we need some
+     * way to consider the block manager's maximum cookie size versus the
+     * minimum Btree internal node size.
+     */
+    btree->block_header_write_size = bm->block_header_write_size(bm, session);
+
+    /*
+     * Open the specified checkpoint unless it's a special command (special commands are responsible
+     * for loading their own checkpoints, if any).
+     */
+    if (!F_ISSET(btree, WT_BTREE_SALVAGE | WT_BTREE_VERIFY)) {
+        /*
+         * There are two reasons to load an empty tree rather than a checkpoint: either there is no
+         * checkpoint (the file is being created), or the load call returns no root page (the
+         * checkpoint is for an empty file).
+         */
+        WT_ERR(bm->checkpoint_load(bm, session, ckpt.raw.data, ckpt.raw.size, root_addr,
+          &root_addr_size, F_ISSET_ATOMIC_32(btree, WT_BTREE_READONLY)));
+        if (empty_ckpt || root_addr_size == 0)
+            WT_ERR(__btree_tree_open_empty(session, empty_ckpt));
+        else {
+            WT_ERR(__wti_btree_tree_open(session, root_addr, root_addr_size));
+
+            /*
+             * Warm the cache, if possible. Skip when the connection is in read-corrupt mode so that
+             * corrupt pages are handled during the explicit walk instead of via preload.
+             */
+            if (!__wt_conn_is_disagg(session) && !F_ISSET(session, WT_SESSION_READ_SKIP_CORRUPT)) {
+                WT_WITH_PAGE_INDEX(session, ret = __btree_preload(session));
+                WT_ERR(ret);
+            }
+
+            /* Get the last record number in a column-store file. */
+            if (btree->type != BTREE_ROW)
+                WT_ERR(__btree_get_last_recno(session));
+        }
+    }
+
+    /*
+     * Eviction ignores trees until the handle's open flag is set, configure eviction before that
+     * happens.
+     *
+     * Files that can still be bulk-loaded cannot be evicted. Permanently cache-resident files can
+     * never be evicted. Special operations don't enable eviction. The underlying commands may turn
+     * on eviction (for example, verify turns on eviction while working a file to keep from
+     * consuming the cache), but it's their decision. If an underlying command reconfigures
+     * eviction, it must either clear the evict-disabled-open flag or restore the eviction
+     * configuration when finished so that handle close behaves correctly.
+     */
+    if (__wt_atomic_load_uint8_relaxed(&btree->original) ||
+      F_ISSET(btree, WT_BTREE_NO_EVICT | WT_BTREE_SALVAGE | WT_BTREE_VERIFY)) {
+        WT_ERR(__wt_evict_file_exclusive_on(session));
+        btree->evict_disabled_open = true;
+    }
+
+    /* A btree cannot be both an ingest btree and a stable btree. */
+    WT_ASSERT(session,
+      !F_ISSET(btree, WT_BTREE_GARBAGE_COLLECT) || !F_ISSET(btree, WT_BTREE_DISAGGREGATED));
+
+    if (0) {
+err:
+        /*
+         * Closing the btree releases the pinned history store dhandle, covering the case where the
+         * history store was pinned successfully but a later step failed.
+         */
+        WT_TRET(__wt_btree_close(session));
+    }
+    __wt_free(session, lr_fh_meta.bitmap_str);
+    if (has_ckpt)
+        __wt_checkpoint_free(session, &ckpt);
+
+    __wt_scr_free(session, &name_buf);
+    __wt_scr_free(session, &tmp);
+    return (ret);
 }
 
 /*
  * __wt_btree_close --
- *	Close a Btree.
+ *     Close a Btree.
  */
 int
 __wt_btree_close(WT_SESSION_IMPL *session)
 {
-	WT_BM *bm;
-	WT_BTREE *btree;
-	WT_DATA_HANDLE *dhandle;
-	WT_DECL_RET;
+    WT_BM *bm;
+    WT_BTREE *btree;
+    WT_DECL_RET;
 
-	dhandle = session->dhandle;
-	btree = S2BT(session);
+    btree = S2BT(session);
 
-	if ((bm = btree->bm) != NULL) {
-		/* Unload the checkpoint, unless it's a special command. */
-		if (F_ISSET(dhandle, WT_DHANDLE_OPEN) &&
-		    !F_ISSET(btree,
-		    WT_BTREE_SALVAGE | WT_BTREE_UPGRADE | WT_BTREE_VERIFY))
-			WT_TRET(bm->checkpoint_unload(bm, session));
+    /*
+     * The close process isn't the same as discarding the handle: we might re-open the handle, which
+     * isn't a big deal, but the backing blocks for the handle may not yet have been discarded from
+     * the cache, and eviction uses WT_BTREE structure elements. Free backing resources but leave
+     * the rest alone, and we'll discard the structure when we discard the data handle.
+     *
+     * Handles can be closed multiple times, ignore all but the first.
+     */
+    if (F_ISSET(btree, WT_BTREE_CLOSED))
+        return (0);
 
-		/* Close the underlying block manager reference. */
-		WT_TRET(bm->close(bm, session));
+    if (btree->hs_checkpoint_name != NULL) {
+        WT_SAVE_DHANDLE(session, ret = __wt_btree_release_hs_dhandle(session, btree));
+        WT_TRET(ret);
+    }
 
-		btree->bm = NULL;
-	}
+    F_SET(btree, WT_BTREE_CLOSED);
 
-	/* Close the Huffman tree. */
-	__wt_btree_huffman_close(session);
+    /*
+     * Verify the history store state. If the history store is open and this btree has history store
+     * entries, it can't be a metadata file, nor can it be the history store file.
+     */
+    WT_ASSERT(session,
+      !F_ISSET_ATOMIC_32(S2C(session), WT_CONN_HS_OPEN) || !btree->hs_entries ||
+        (!WT_IS_METADATA(btree->dhandle) && !WT_IS_HS(btree->dhandle)));
 
-	/* Destroy locks. */
-	WT_TRET(__wt_rwlock_destroy(session, &btree->ovfl_lock));
-	__wt_spin_destroy(session, &btree->flush_lock);
+    /* Clear the saved checkpoint information. */
+    __wt_ckptlist_saved_free(session);
 
-	/* Free allocated memory. */
-	__wt_free(session, btree->key_format);
-	__wt_free(session, btree->value_format);
+    /*
+     * If we turned eviction off and never turned it back on, do that now, otherwise the counter
+     * will be off.
+     */
+    if (btree->evict_disabled_open) {
+        btree->evict_disabled_open = false;
+        __wt_evict_file_exclusive_off(session);
+    }
 
-	if (btree->collator_owned) {
-		if (btree->collator->terminate != NULL)
-			WT_TRET(btree->collator->terminate(
-			    btree->collator, &session->iface));
-		btree->collator_owned = 0;
-	}
-	btree->collator = NULL;
+    /* Discard any underlying block manager resources. */
+    if ((bm = btree->bm) != NULL) {
+        btree->bm = NULL;
 
-	btree->bulk_load_ok = 0;
+        /* Unload the checkpoint, unless it's a special command. */
+        if (!F_ISSET(btree, WT_BTREE_SALVAGE | WT_BTREE_VERIFY))
+            WT_TRET(bm->checkpoint_unload(bm, session));
 
-	return (ret);
+        /* Close the underlying block manager reference. */
+        WT_TRET(bm->close(bm, session));
+    }
+
+    /*
+     * Drop the tree from the cache-consumer rankings: a re-open clears the fields recording cache
+     * ranking, and a slot left pointing here would then be orphaned. Page discard runs after this
+     * and can put the tree back in a ranking, but only for a handle already marked dead, which is
+     * discarded rather than re-opened.
+     */
+    __wt_cache_top_btree_discard(session, btree);
+
+    return (ret);
+}
+
+/*
+ * __wt_btree_discard --
+ *     Discard a Btree.
+ */
+int
+__wt_btree_discard(WT_SESSION_IMPL *session)
+{
+    WT_BTREE *btree;
+    WT_DECL_RET;
+
+    ret = __btree_clear(session);
+
+    btree = S2BT(session);
+    __wt_cache_top_btree_discard(session, btree);
+    __wt_overwrite_and_free(session, btree);
+    session->dhandle->handle = NULL;
+
+    return (ret);
+}
+
+/*
+ * __wt_btree_config_encryptor --
+ *     Return an encryptor handle based on the configuration.
+ */
+int
+__wt_btree_config_encryptor(
+  WT_SESSION_IMPL *session, const char **cfg, WT_KEYED_ENCRYPTOR **kencryptorp)
+{
+    WT_CONFIG_ITEM cval, enc, keyid;
+    WT_DECL_RET;
+    const char *enc_cfg[] = {NULL, NULL};
+
+    /*
+     * We do not use __wt_config_gets_none here because "none" and the empty string have different
+     * meanings. The empty string means inherit the system encryption setting and "none" means this
+     * table is in the clear even if the database is encrypted.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "encryption.name", &cval));
+    if (cval.len == 0)
+        *kencryptorp = S2C(session)->kencryptor;
+    else if (WT_CONFIG_LIT_MATCH("none", cval))
+        *kencryptorp = NULL;
+    else {
+        WT_RET(__wt_config_gets_none(session, cfg, "encryption.keyid", &keyid));
+        WT_RET(__wt_config_gets(session, cfg, "encryption", &enc));
+        if (enc.len != 0)
+            WT_RET(__wt_strndup(session, enc.str, enc.len, &enc_cfg[0]));
+        ret = __wt_encryptor_config(session, &cval, &keyid, (WT_CONFIG_ARG *)enc_cfg, kencryptorp);
+        __wt_free(session, enc_cfg[0]);
+        WT_RET(ret);
+    }
+    return (0);
 }
 
 /*
  * __btree_conf --
- *	Configure a WT_BTREE structure.
+ *     Configure a WT_BTREE structure.
  */
 static int
-__btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
+__btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt, bool is_ckpt)
 {
-	WT_BTREE *btree;
-	WT_CONFIG_ITEM cval, metadata;
-	int64_t maj_version, min_version;
-	uint32_t bitcnt;
-	int fixed;
-	const char **cfg;
+    WT_BTREE *btree;
+    WT_CONFIG_ITEM cval, metadata;
+    WT_CONNECTION_IMPL *conn;
+    WT_DECL_RET;
+    int64_t maj_version, min_version;
+    const char **cfg;
+    bool awaits_publish;
 
-	btree = S2BT(session);
-	cfg = btree->dhandle->cfg;
+    btree = S2BT(session);
+    cfg = btree->dhandle->cfg;
+    conn = S2C(session);
 
-	/* Dump out format information. */
-	if (WT_VERBOSE_ISSET(session, WT_VERB_VERSION)) {
-		WT_RET(__wt_config_gets(session, cfg, "version.major", &cval));
-		maj_version = cval.val;
-		WT_RET(__wt_config_gets(session, cfg, "version.minor", &cval));
-		min_version = cval.val;
-		WT_RET(__wt_verbose(session, WT_VERB_VERSION,
-		    "%" PRIu64 ".%" PRIu64, maj_version, min_version));
-	}
+    /* Dump out format information. */
+    if (WT_VERBOSE_ISSET(session, WT_VERB_VERSION)) {
+        WT_RET(__wt_config_gets(session, cfg, "version.major", &cval));
+        maj_version = cval.val;
+        WT_RET(__wt_config_gets(session, cfg, "version.minor", &cval));
+        min_version = cval.val;
+        __wt_verbose(session, WT_VERB_VERSION, "btree version: %" PRId64 ".%" PRId64, maj_version,
+          min_version);
+    }
 
-	/* Get the file ID. */
-	WT_RET(__wt_config_gets(session, cfg, "id", &cval));
-	btree->id = (uint32_t)cval.val;
+    /* Get the file ID. */
+    WT_RET(__wt_config_gets(session, cfg, "id", &cval));
+    btree->id = (uint32_t)cval.val;
 
-	/* Validate file types and check the data format plan. */
-	WT_RET(__wt_config_gets(session, cfg, "key_format", &cval));
-	WT_RET(__wt_struct_confchk(session, &cval));
-	if (WT_STRING_MATCH("r", cval.str, cval.len))
-		btree->type = BTREE_COL_VAR;
-	else
-		btree->type = BTREE_ROW;
-	WT_RET(__wt_strndup(session, cval.str, cval.len, &btree->key_format));
+    /* Validate file types and check the data format plan. */
+    WT_RET(__wt_config_gets(session, cfg, "key_format", &cval));
+    WT_RET(__wt_struct_confchk(session, &cval));
+    if (WT_CONFIG_LIT_MATCH("r", cval))
+        btree->type = BTREE_COL_VAR;
+    else
+        btree->type = BTREE_ROW;
+    WT_RET(__wt_strndup(session, cval.str, cval.len, &btree->key_format));
 
-	WT_RET(__wt_config_gets(session, cfg, "value_format", &cval));
-	WT_RET(__wt_struct_confchk(session, &cval));
-	WT_RET(__wt_strndup(session, cval.str, cval.len, &btree->value_format));
+    WT_RET(__wt_config_gets(session, cfg, "value_format", &cval));
+    WT_RET(__wt_struct_confchk(session, &cval));
+    WT_RET(__wt_strndup(session, cval.str, cval.len, &btree->value_format));
 
-	/* Row-store key comparison and key gap for prefix compression. */
-	if (btree->type == BTREE_ROW) {
-		WT_RET(__wt_config_gets_none(session, cfg, "collator", &cval));
-		if (cval.len != 0) {
-			WT_RET(__wt_config_gets(
-			    session, cfg, "app_metadata", &metadata));
-			WT_RET(__wt_collator_config(
-			    session, btree->dhandle->name, &cval, &metadata,
-			    &btree->collator, &btree->collator_owned));
-		}
+    /* Row-store key comparison. */
+    if (btree->type == BTREE_ROW) {
+        WT_RET(__wt_config_gets_none(session, cfg, "collator", &cval));
+        if (cval.len != 0) {
+            WT_RET(__wt_config_gets(session, cfg, "app_metadata", &metadata));
+            WT_RET(__wt_collator_config(session, btree->dhandle->name, &cval, &metadata,
+              &btree->collator, &btree->collator_owned));
+        }
+    }
 
-		WT_RET(__wt_config_gets(session, cfg, "key_gap", &cval));
-		btree->key_gap = (uint32_t)cval.val;
-	}
+    /*
+     * This option turns off eviction for a tree. Therefore, its memory footprint can only grow. But
+     * checkpoint will still visit it to persist the data.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "cache_resident", &cval));
+    if (cval.val)
+        F_SET(btree, WT_BTREE_NO_EVICT);
+    else
+        F_CLR(btree, WT_BTREE_NO_EVICT);
 
-	/* Column-store: check for fixed-size data. */
-	if (btree->type == BTREE_COL_VAR) {
-		WT_RET(__wt_struct_check(
-		    session, cval.str, cval.len, &fixed, &bitcnt));
-		if (fixed) {
-			if (bitcnt == 0 || bitcnt > 8)
-				WT_RET_MSG(session, EINVAL,
-				    "fixed-width field sizes must be greater "
-				    "than 0 and less than or equal to 8");
-			btree->bitcnt = (uint8_t)bitcnt;
-			btree->type = BTREE_COL_FIX;
-		}
-	}
+    WT_RET(__wt_config_gets(session, cfg, "ignore_in_memory_cache_size", &cval));
+    if (cval.val) {
+        if (!F_ISSET(conn, WT_CONN_IN_MEMORY))
+            WT_RET_MSG(session, EINVAL,
+              "ignore_in_memory_cache_size setting is only valid with databases configured to run "
+              "in-memory");
+        F_SET(btree, WT_BTREE_IGNORE_CACHE);
+    } else
+        F_CLR(btree, WT_BTREE_IGNORE_CACHE);
 
-	/* Page sizes */
-	WT_RET(__btree_page_sizes(session));
+    /*
+     * Turn on logging when it's enabled in the database and not disabled for the tree. Timestamp
+     * behavior is described by the logging configurations for historical reasons; logged objects
+     * imply commit-level durability and ignored timestamps, not-logged objects imply checkpoint-
+     * level durability and supported timestamps. In-memory configurations default to ignoring all
+     * timestamps, and the application uses the logging configuration flag to turn on timestamps.
+     */
+    if (F_ISSET(&conn->log_mgr, WT_LOG_ENABLED)) {
+        WT_RET(__wt_config_gets(session, cfg, "log.enabled", &cval));
+        if (cval.val)
+            F_SET(btree, WT_BTREE_LOGGED);
+    }
 
-	/* Eviction; the metadata file is never evicted. */
-	if (WT_IS_METADATA(btree->dhandle))
-		F_SET(btree, WT_BTREE_NO_EVICTION | WT_BTREE_NO_HAZARD);
-	else {
-		WT_RET(__wt_config_gets(session, cfg, "cache_resident", &cval));
-		if (cval.val)
-			F_SET(btree, WT_BTREE_NO_EVICTION | WT_BTREE_NO_HAZARD);
-		else
-			F_CLR(btree, WT_BTREE_NO_EVICTION);
-	}
+    /*
+     * Detect if the btree is disaggregated. FIXME-WT-14721: the file extension check should be
+     * replaced with something more robust.
+     */
+    if (WT_URI_IS_INGEST(btree->dhandle->name))
+        /* Flag the ingest btree as participating in automatic garbage collection */
+        F_SET(btree, WT_BTREE_GARBAGE_COLLECT);
+    else {
+        WT_RET(__wt_config_gets(session, cfg, "block_manager", &cval));
+        if (WT_URI_IS_STABLE(btree->dhandle->name) || WT_CONFIG_LIT_MATCH("disagg", cval)) {
+            F_SET(btree, WT_BTREE_DISAGGREGATED);
 
-	/* Checksums */
-	WT_RET(__wt_config_gets(session, cfg, "checksum", &cval));
-	if (WT_STRING_MATCH("on", cval.str, cval.len))
-		btree->checksum = CKSUM_ON;
-	else if (WT_STRING_MATCH("off", cval.str, cval.len))
-		btree->checksum = CKSUM_OFF;
-	else
-		btree->checksum = CKSUM_UNCOMPRESSED;
+            /*
+             * A follower must not open a live stable tree: it reads checkpoint views. The shared
+             * history store and the shared metadata table are exceptions, a follower still opens
+             * them live today. FIXME-WT-18356: stop keeping a live shared history store handle on a
+             * follower.
+             *
+             * A step-down can race with anyone opening a live tree: the open was dispatched on a
+             * leader-role read and completes on a follower. The schema lock decides that race: a
+             * role change holds it across the whole transition, and every fresh open holds it too,
+             * so the two never interleave and the role read below is the current role, never a
+             * stale one. An open that lost the race sees the follower role here and returns EBUSY.
+             * The layered cursor, for example, converts this EBUSY to a rollback, and the
+             * application's retry reopens the checkpoint view. FIXME-WT-18357: assert a follower
+             * holds no writable live stable handle, and separate a raced open from an open that
+             * begins on a follower.
+             */
+            if (!__wt_atomic_load_bool_acquire(&conn->layered_table_manager.leader) &&
+              WT_URI_IS_STABLE(btree->dhandle->name) &&
+              !WT_URI_IS_STABLE_CHECKPOINT(btree->dhandle->name) &&
+              !WT_IS_URI_METADATA(btree->dhandle->name) && !WT_IS_URI_HS(btree->dhandle->name)) {
+                WT_ASSERT(session, __wt_conn_is_disagg(session));
+                WT_STAT_CONN_INCR(session, layered_stable_live_open_refused);
+                WT_RET_SUB(session, EBUSY, WT_CONFLICT_DISAGG,
+                  "a live stable table cannot be opened on a follower");
+            }
 
-	/* Huffman encoding */
-	WT_RET(__wt_btree_huffman_open(session));
+            WT_RET(
+              __wt_schema_page_log_from_config(session, btree->dhandle->cfg, &btree->page_log));
 
-	/*
-	 * Reconciliation configuration:
-	 *	Block compression (all)
-	 *	Dictionary compression (variable-length column-store, row-store)
-	 *	Page-split percentage
-	 *	Prefix compression (row-store)
-	 *	Suffix compression (row-store)
-	 */
-	switch (btree->type) {
-	case BTREE_COL_FIX:
-		break;
-	case BTREE_ROW:
-		WT_RET(__wt_config_gets(
-		    session, cfg, "internal_key_truncate", &cval));
-		btree->internal_key_truncate = cval.val == 0 ? 0 : 1;
+            if (btree->page_log == NULL)
+                WT_RET_MSG(session, EINVAL,
+                  "%s: the disaggregated block manager requires a page log, none is configured for "
+                  "this table or connection",
+                  btree->dhandle->name);
+        }
+    }
 
-		WT_RET(__wt_config_gets(
-		    session, cfg, "prefix_compression", &cval));
-		btree->prefix_compression = cval.val == 0 ? 0 : 1;
-		WT_RET(__wt_config_gets(
-		    session, cfg, "prefix_compression_min", &cval));
-		btree->prefix_compression_min = (u_int)cval.val;
-		/* FALLTHROUGH */
-	case BTREE_COL_VAR:
-		WT_RET(__wt_config_gets(session, cfg, "dictionary", &cval));
-		btree->dictionary = (u_int)cval.val;
-		break;
-	}
+    /*
+     * Check if we expect the btree to be published in the future, which happens if (1) the btree is
+     * newly created, (2) it is disaggregated, and (3) the disaggregated stable schema epoch is set.
+     * Ignore the "system" tables, such as the shared history store and the shared metadata table.
+     *
+     * If we use schema epochs in disaggregated storage, the btree starts in memory, so that we
+     * cannot write any pages until the table is published - not even an empty root page.
+     */
+    awaits_publish = F_ISSET(session, WT_SESSION_CREATE_BTREE) &&
+      F_ISSET(btree, WT_BTREE_DISAGGREGATED) && !WT_IS_URI_HS(btree->dhandle->name) &&
+      !WT_IS_URI_METADATA(btree->dhandle->name) &&
+      (__wt_get_stable_disaggregated_schema_epoch(session) != WT_SCHEMA_EPOCH_NONE);
 
-	WT_RET(__wt_config_gets_none(session, cfg, "block_compressor", &cval));
-	WT_RET(__wt_compressor_config(session, &cval, &btree->compressor));
+    /* Publishing the create records the epoch. */
+    __wt_atomic_store_uint64_relaxed(&btree->create_schema_epoch, WT_SCHEMA_EPOCH_NONE);
 
-	/* Initialize locks. */
-	WT_RET(__wt_rwlock_alloc(
-	    session, &btree->ovfl_lock, "btree overflow lock"));
-	WT_RET(__wt_spin_init(session, &btree->flush_lock, "btree flush lock"));
+    if (awaits_publish) {
+        F_SET_ATOMIC_32(btree, WT_BTREE_AWAITS_PUBLISH);
+        /*
+         * Disable eviction because it can leave pages clean without a durable address, causing the
+         * publishing checkpoint to skip them.
+         */
+        WT_RET(__wt_evict_file_exclusive_on(session));
+    } else if (F_ISSET_ATOMIC_32(btree, WT_BTREE_AWAITS_PUBLISH)) {
+        F_CLR_ATOMIC_32(btree, WT_BTREE_AWAITS_PUBLISH);
+        __wt_evict_file_exclusive_off(session);
+    }
 
-	__wt_stat_init_dsrc_stats(&btree->dhandle->stats);
+    /*
+     * This option allows the tree to be reconciled by eviction. But we only replace the disk image
+     * in memory to reduce the memory footprint and nothing is written to disk and no data is moved
+     * to the history store. Checkpoint will also skip this tree.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "in_memory", &cval));
+    if (cval.val || F_ISSET(conn, WT_CONN_IN_MEMORY))
+        F_SET(btree, WT_BTREE_IN_MEMORY);
+    else
+        F_CLR(btree, WT_BTREE_IN_MEMORY);
 
-	btree->write_gen = ckpt->write_gen;		/* Write generation */
-	btree->modified = 0;				/* Clean */
+    if (F_ISSET(btree, WT_BTREE_IN_MEMORY)) {
+        F_SET(btree, WT_BTREE_LOGGED);
+        WT_RET(__wt_config_gets(session, cfg, "log.enabled", &cval));
+        if (!cval.val)
+            F_CLR(btree, WT_BTREE_LOGGED);
+    }
 
-	return (0);
+    /*
+     * The metadata isn't blocked by in-memory cache limits because metadata "unroll" is performed
+     * by updates that are potentially blocked by the cache-full checks.
+     *
+     * The metadata file ignores timestamps and is logged if at all possible.
+     */
+    if (WT_IS_METADATA(btree->dhandle)) {
+        F_SET(btree, WT_BTREE_IGNORE_CACHE);
+        F_SET(btree, WT_BTREE_LOGGED);
+    }
+
+    /* The history store file is never logged and supports timestamps. */
+    if (WT_IS_URI_HS(session->dhandle->name)) {
+        F_SET(btree->dhandle, WT_DHANDLE_HS);
+        F_CLR(btree, WT_BTREE_LOGGED);
+    }
+
+    /* The disaggregated storage metadata is never logged. */
+    if (strcmp(session->dhandle->name, WT_DISAGG_METADATA_URI) == 0) {
+        F_SET(btree->dhandle, WT_DHANDLE_DISAGG_META);
+        F_CLR(btree, WT_BTREE_LOGGED);
+    }
+
+    /* Page sizes */
+    WT_RET(__btree_page_sizes(session));
+
+    /* Checksums */
+    WT_RET(__wt_config_gets(session, cfg, "checksum", &cval));
+    if (WT_CONFIG_LIT_MATCH("on", cval))
+        btree->checksum = CKSUM_ON;
+    else if (WT_CONFIG_LIT_MATCH("off", cval))
+        btree->checksum = CKSUM_OFF;
+    else if (WT_CONFIG_LIT_MATCH("uncompressed", cval))
+        btree->checksum = CKSUM_UNCOMPRESSED;
+    else
+        btree->checksum = CKSUM_UNENCRYPTED;
+
+    ret = __wt_config_gets(session, cfg, "huffman_value", &cval);
+    if (ret == 0 && cval.len != 0)
+        WT_RET_MSG(session, ENOTSUP, "Huffman encoding for values is no longer supported.");
+
+    /*
+     * Reconciliation configuration:
+     *	Block compression (all)
+     *	Dictionary compression (variable-length column-store, row-store)
+     *	Page-split percentage
+     *	Prefix compression (row-store)
+     *	Suffix compression (row-store)
+     */
+    switch (btree->type) {
+    case BTREE_ROW:
+        WT_RET(__wt_config_gets(session, cfg, "internal_key_truncate", &cval));
+        btree->internal_key_truncate = cval.val != 0;
+
+        WT_RET(__wt_config_gets(session, cfg, "prefix_compression", &cval));
+        btree->prefix_compression = cval.val != 0;
+        WT_RET(__wt_config_gets(session, cfg, "prefix_compression_min", &cval));
+        btree->prefix_compression_min = (u_int)cval.val;
+    /* FALLTHROUGH */
+    case BTREE_COL_VAR:
+        WT_RET(__wt_config_gets(session, cfg, "dictionary", &cval));
+        btree->dictionary = (u_int)cval.val;
+        break;
+    }
+
+    WT_RET(__wt_config_gets_none(session, cfg, "block_compressor", &cval));
+    WT_RET(__wt_compressor_config(session, &cval, &btree->compressor));
+
+    /*
+     * Configure compression adjustment. When doing compression, assume compression rates that will
+     * result in pages larger than the maximum in-memory images allowed. If we're wrong, we adjust
+     * downward (but we're almost certainly correct, the maximum in-memory images allowed are only
+     * 4x the maximum page size, and compression always gives us more than 4x).
+     */
+    btree->intlpage_compadjust = false;
+    btree->maxintlpage_precomp = btree->maxintlpage;
+    btree->leafpage_compadjust = false;
+    btree->maxleafpage_precomp = btree->maxleafpage;
+    if (btree->compressor != NULL && btree->compressor->compress != NULL) {
+        /*
+         * Don't do compression adjustment when on-disk page sizes are less than 16KB. There's not
+         * enough compression going on to fine-tune the size, all we end up doing is hammering
+         * shared memory.
+         *
+         * Don't do compression adjustment when on-disk page sizes are equal to the maximum
+         * in-memory page image, the bytes taken for compression can't grow past the base value.
+         */
+        if (btree->maxintlpage >= 16 * 1024 && btree->maxmempage_image > btree->maxintlpage) {
+            btree->intlpage_compadjust = true;
+            btree->maxintlpage_precomp = btree->maxmempage_image;
+        }
+        if (btree->maxleafpage >= 16 * 1024 && btree->maxmempage_image > btree->maxleafpage) {
+            btree->leafpage_compadjust = true;
+            btree->maxleafpage_precomp = btree->maxmempage_image;
+        }
+    }
+
+    /* Configure encryption. */
+    WT_RET(__wt_btree_config_encryptor(session, cfg, &btree->kencryptor));
+
+    /* Configure read-only. */
+    WT_RET(__wt_config_gets(session, cfg, "readonly", &cval));
+    if (cval.val)
+        F_SET_ATOMIC_32(btree, WT_BTREE_READONLY);
+
+    /* Configure disaggregated storage tier. */
+    WT_RET(__wt_config_gets(session, cfg, "disaggregated.storage_tier", &cval));
+    if (cval.len > 0 && strncmp(cval.str, "cold", cval.len) == 0)
+        btree->storage_tier = WT_BTREE_STORAGE_TIER_COLD;
+    else
+        btree->storage_tier = WT_BTREE_STORAGE_TIER_NONE;
+
+    /* Initialize locks. */
+    WT_RET(__wt_rwlock_init(session, &btree->ovfl_lock));
+    WT_RET(__wt_spin_init(session, &btree->flush_lock, "btree flush"));
+
+    btree->modified = false; /* Clean */
+
+    __wt_atomic_store_enum_relaxed(&btree->syncing, WT_BTREE_SYNC_OFF); /* Not syncing */
+    btree->checkpoint_gen = __wt_gen(session, WT_GEN_CHECKPOINT);       /* Checkpoint generation */
+
+    /*
+     * The first time we open a btree, we'll be initializing the write gen to the connection-wide
+     * base write generation since this is the largest of all btree write generations from the
+     * previous run. This has the nice property of ensuring that the range of write generations used
+     * by consecutive runs do not overlap which aids with debugging.
+     *
+     * If we're reopening a btree or importing a new one to a running system, the btree write
+     * generation from the last run may actually be ahead of the connection-wide base write
+     * generation. In that case, we should initialize our write gen just ahead of our btree specific
+     * write generation.
+     *
+     * The runtime write generation is important since it's going to determine what we're going to
+     * use as the base write generation (and thus what pages to wipe transaction ids from). The idea
+     * is that we want to initialize it once the first time we open the btree during a run and then
+     * for every subsequent open, we want to reuse it. This so that we're still able to read
+     * transaction ids from the previous time a btree was open in the same run.
+     */
+    btree->write_gen =
+      WT_MAX(ckpt->write_gen + 1, __wt_atomic_load_uint64_relaxed(&conn->base_write_gen));
+    WT_ASSERT(session, ckpt->write_gen >= ckpt->run_write_gen);
+
+    /*
+     * Reset the runtime write generation when the checkpoint's transaction ids are not usable in
+     * this run: an imported tree, or a checkpoint whose generations precede this run's base write
+     * generation. A stable tree opened at a specific checkpoint by name (a
+     * "...wt_stable/checkpoint" URI) also resets: it is a follower's view of a checkpoint another
+     * node wrote, and the ids are meaningless in this node's id space. A leader's live tree keeps
+     * its own ids, so a checkpoint it reopens in the same run stays readable.
+     *
+     * For a checkpoint that carries the write generation high-water mark, the run_write_gen <
+     * base_write_gen comparison usually makes the WT_URI_IS_STABLE_CHECKPOINT clause below
+     * redundant: the follower lifts its base write generation past the mark at pickup, so the
+     * mark's checkpoint has run_write_gen < base_write_gen. The WT_URI_IS_STABLE_CHECKPOINT clause
+     * is still required for two cases the comparison does not cover. A checkpoint written before
+     * the mark existed (an old-format or cross-version checkpoint) has no mark to adopt, and the
+     * follower cannot scan to derive a base (that is leader-only), so its base stays low and the
+     * comparison does not fire. And at the very first generations the base and a checkpoint's
+     * run_write_gen can both still be at their initial value, where the strict comparison also does
+     * not fire. In both cases the WT_URI_IS_STABLE_CHECKPOINT clause is what treats the foreign
+     * checkpoint's ids as cross-run.
+     */
+    if (F_ISSET(session, WT_SESSION_IMPORT) ||
+      ckpt->run_write_gen < __wt_atomic_load_uint64_relaxed(&conn->base_write_gen) ||
+      (F_ISSET(btree, WT_BTREE_DISAGGREGATED) && WT_URI_IS_STABLE_CHECKPOINT(btree->dhandle->name)))
+        btree->run_write_gen = btree->write_gen;
+    else
+        btree->run_write_gen = ckpt->run_write_gen;
+
+    /*
+     * In recovery use the last checkpointed run write generation number as base write generation
+     * number to reset the transaction ids of the pages that were modified before the restart. The
+     * transaction ids are retained only on the pages that are written after the restart.
+     *
+     * Rollback to stable does not operate on logged tables and metadata, so it is skipped.
+     *
+     * The only scenarios where the checkpoint run write generation number is less than the
+     * connection last checkpoint base write generation number are when rollback to stable doesn't
+     * happen during the recovery due to the unavailability of history store file, or when reading a
+     * checkpoint.
+     */
+    if ((!F_ISSET(conn, WT_CONN_RECOVERING) || F_ISSET(btree, WT_BTREE_LOGGED) ||
+          ckpt->run_write_gen < conn->ckpt.last_base_write_gen) &&
+      !is_ckpt)
+        btree->base_write_gen = btree->run_write_gen;
+    else
+        btree->base_write_gen = ckpt->run_write_gen;
+
+    /* Load the next page ID for disaggregated storage. */
+    if (ckpt->next_page_id == 0)
+        btree->next_page_id = WT_BLOCK_MIN_PAGE_ID; /* Should this be in create? */
+    else
+        btree->next_page_id = ckpt->next_page_id;
+
+    __wt_atomic_store_uint64_relaxed(&btree->leaf_entry_ewma, ckpt->leaf_entry_ewma);
+    __wt_atomic_store_uint64_relaxed(&btree->approx_leaf_pages, ckpt->approx_leaf_pages);
+
+    /*
+     * We've just overwritten the runtime write generation based off the fact that know that we're
+     * importing and therefore, the checkpoint data's runtime write generation is meaningless. We
+     * need to ensure that the underlying dhandle doesn't get discarded without being included in a
+     * subsequent checkpoint including the new overwritten runtime write generation. Otherwise,
+     * we'll reopen, won't know that we're in the import case and will incorrectly use the old
+     * system's runtime write generation.
+     */
+    if (F_ISSET(session, WT_SESSION_IMPORT))
+        btree->modified = true;
+
+    btree->checkpoint_timestamp =
+      __wt_atomic_load_uint64_acquire(&conn->disaggregated_storage.last_checkpoint_timestamp);
+    if (F_ISSET(btree, WT_BTREE_GARBAGE_COLLECT))
+        __wt_atomic_store_uint64_relaxed(&btree->prune_timestamp, btree->checkpoint_timestamp);
+
+    return (0);
 }
 
 /*
  * __wt_root_ref_init --
- *	Initialize a tree root reference, and link in the root page.
+ *     Initialize a tree root reference, and link in the root page.
  */
 void
-__wt_root_ref_init(WT_REF *root_ref, WT_PAGE *root, int is_recno)
+__wt_root_ref_init(WT_SESSION_IMPL *session, WT_REF *root_ref, WT_PAGE *root, bool is_recno)
 {
-	memset(root_ref, 0, sizeof(*root_ref));
+    WT_UNUSED(session); /* Used in a macro for diagnostic builds */
+    memset(root_ref, 0, sizeof(*root_ref));
 
-	root_ref->page = root;
-	root_ref->state = WT_REF_MEM;
+    root_ref->page = root;
+    F_SET(root_ref, WT_REF_FLAG_INTERNAL);
+    WT_REF_SET_STATE(root_ref, WT_REF_MEM);
 
-	root_ref->key.recno = is_recno ? 1 : 0;
+    root_ref->ref_recno = is_recno ? 1 : WT_RECNO_OOB;
 
-	root->pg_intl_parent_ref = root_ref;
+    root->pg_intl_parent_ref = root_ref;
 }
 
 /*
- * __wt_btree_tree_open --
- *	Read in a tree from disk.
+ * __wti_btree_tree_open --
+ *     Read in a tree from disk.
  */
 int
-__wt_btree_tree_open(
-    WT_SESSION_IMPL *session, const uint8_t *addr, size_t addr_size)
+__wti_btree_tree_open(WT_SESSION_IMPL *session, const uint8_t *addr, size_t addr_size)
 {
-	WT_BTREE *btree;
-	WT_DECL_RET;
-	WT_ITEM dsk;
-	WT_PAGE *page;
+    WT_BM *bm;
+    WT_BTREE *btree;
+    WT_DECL_ITEM(tmp);
+    WT_DECL_RET;
+    WT_ITEM dsk;
+    WT_PAGE *page;
+    WT_PAGE_BLOCK_META block_meta;
 
-	btree = S2BT(session);
+    btree = S2BT(session);
+    bm = btree->bm;
 
-	/*
-	 * A buffer into which we read a root page; don't use a scratch buffer,
-	 * the buffer's allocated memory becomes the persistent in-memory page.
-	 */
-	WT_CLEAR(dsk);
+    WT_CLEAR(block_meta);
 
-	/*
-	 * Read the page, then build the in-memory version of the page. Clear
-	 * any local reference to an allocated copy of the disk image on return,
-	 * the page steals it.
-	 */
-	WT_ERR(__wt_bt_read(session, &dsk, addr, addr_size));
-	WT_ERR(__wt_page_inmem(session, NULL, dsk.data, dsk.memsize,
-	    WT_DATA_IN_ITEM(&dsk) ?
-	    WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED, &page));
-	dsk.mem = NULL;
+    /*
+     * A buffer into which we read a root page; don't use a scratch buffer, the buffer's allocated
+     * memory becomes the persistent in-memory page.
+     */
+    WT_CLEAR(dsk);
 
-	/* Finish initializing the root, root reference links. */
-	__wt_root_ref_init(&btree->root, page, btree->type != BTREE_ROW);
+    /*
+     * Read and verify the page (verify to catch encrypted objects we can't decrypt, where we read
+     * the object successfully but we can't decrypt it, and we want to fail gracefully).
+     *
+     * Create a printable version of the address to pass to verify.
+     */
+    WT_ERR(__wt_scr_alloc(session, 0, &tmp));
+    WT_ERR(bm->addr_string(bm, session, tmp, addr, addr_size));
 
-err:	__wt_buf_free(session, &dsk);
-	return (ret);
+    F_SET(session, WT_SESSION_QUIET_CORRUPT_FILE);
+    if ((ret = __wt_blkcache_read(session, &dsk, &block_meta, addr, addr_size)) == 0)
+        ret = __wt_verify_dsk(session, tmp->data, &dsk);
+    /*
+     * Flag any failed read or verification: if we're in startup, it may be fatal.
+     */
+    if (ret != 0)
+        F_SET_ATOMIC_32(S2C(session), WT_CONN_DATA_CORRUPTION);
+    F_CLR(session, WT_SESSION_QUIET_CORRUPT_FILE);
+    if (ret != 0)
+        __wt_err(session, ret, "unable to read root page from %s (address %s)",
+          session->dhandle->name, (const char *)tmp->data);
+    /*
+     * Failure to open metadata means that the database is unavailable. Try to provide a helpful
+     * failure message.
+     */
+    if (ret != 0 && WT_IS_METADATA(session->dhandle)) {
+        __wt_err(session, ret, "WiredTiger has failed to open its metadata");
+        __wt_err(session, ret,
+          "This may be due to the database files being encrypted, being from an older version or "
+          "due to corruption on disk");
+        __wt_err(session, ret,
+          "You should confirm that you have opened the database with the correct options including "
+          "all encryption and compression options");
+    }
+    WT_ERR(ret);
+
+    /* The root reference is always internal. */
+    if (!WT_PAGE_TYPE_IS_INTERNAL(((const WT_PAGE_HEADER *)dsk.data)->type)) {
+        F_SET_ATOMIC_32(S2C(session), WT_CONN_DATA_CORRUPTION);
+        WT_ERR_MSG(session, WT_ERROR, "root page from %s (address %s) is not an internal page",
+          session->dhandle->name, (const char *)tmp->data);
+    }
+
+    /*
+     * Build the in-memory version of the page. Clear our local reference to the allocated copy of
+     * the disk image on return, the in-memory object steals it.
+     */
+    WT_ERR(__wti_page_inmem(session, NULL, dsk.data,
+      WT_DATA_IN_ITEM(&dsk) ? WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED, NULL, &page, NULL));
+    dsk.mem = NULL;
+    if (page->disagg_info != NULL)
+        page->disagg_info->block_meta = block_meta;
+
+    /* Finish initializing the root, root reference links. */
+    __wt_root_ref_init(session, &btree->root, page, btree->type != BTREE_ROW);
+
+err:
+    __wt_buf_free(session, &dsk);
+    __wt_scr_free(session, &tmp);
+
+    return (ret);
 }
 
 /*
  * __btree_tree_open_empty --
- *	Create an empty in-memory tree.
+ *     Create an empty in-memory tree.
  */
 static int
-__btree_tree_open_empty(WT_SESSION_IMPL *session, int creation)
+__btree_tree_open_empty(WT_SESSION_IMPL *session, bool empty_ckpt)
 {
-	WT_BTREE *btree;
-	WT_DECL_RET;
-	WT_PAGE *leaf, *root;
-	WT_PAGE_INDEX *pindex;
-	WT_REF *ref;
+    WT_BTREE *btree;
+    WT_DECL_RET;
+    WT_PAGE *root;
+    WT_PAGE_INDEX *pindex;
+    WT_REF *ref;
 
-	btree = S2BT(session);
-	root = leaf = NULL;
-	ref = NULL;
+    btree = S2BT(session);
+    root = NULL;
+    ref = NULL;
 
-	/*
-	 * Newly created objects can be used for cursor inserts or for bulk
-	 * loads; set a flag that's cleared when a row is inserted into the
-	 * tree.   Objects being bulk-loaded cannot be evicted, we set it
-	 * globally, there's no point in searching empty trees for eviction.
-	 */
-	if (creation) {
-		btree->bulk_load_ok = 1;
-		__wt_btree_evictable(session, 0);
-	}
+    /*
+     * Newly created objects can be used for cursor inserts or for bulk loads; set a flag that's
+     * cleared when a row is inserted into the tree.
+     */
+    if (empty_ckpt)
+        __wt_atomic_store_uint8_relaxed(&btree->original, 1);
 
-	/*
-	 * A note about empty trees: the initial tree is a single root page.
-	 * It has a single reference to a leaf page, marked deleted.  The leaf
-	 * page will be created by the first update.  If the root is evicted
-	 * without being modified, that's OK, nothing is ever written.
-	 *
-	 * !!!
-	 * Be cautious about changing the order of updates in this code: to call
-	 * __wt_page_out on error, we require a correct page setup at each point
-	 * where we might fail.
-	 */
-	switch (btree->type) {
-	case BTREE_COL_FIX:
-	case BTREE_COL_VAR:
-		WT_ERR(
-		    __wt_page_alloc(session, WT_PAGE_COL_INT, 1, 1, 1, &root));
-		root->pg_intl_parent_ref = &btree->root;
+    /*
+     * A note about empty trees: the initial tree is a single root page. It has a single reference
+     * to a leaf page, marked deleted. The leaf page will be created by the first update. If the
+     * root is evicted without being modified, that's OK, nothing is ever written.
+     *
+     * !!!
+     * Be cautious about changing the order of updates in this code: to call __wt_page_out on error,
+     * we require a correct page setup at each point where we might fail.
+     */
+    switch (btree->type) {
+    case BTREE_COL_VAR:
+        WT_ERR(__wt_page_alloc(session, WT_PAGE_COL_INT, 1, true, &root, 0));
+        root->pg_intl_parent_ref = &btree->root;
 
-		pindex = WT_INTL_INDEX_COPY(root);
-		ref = pindex->index[0];
-		ref->home = root;
-		ref->page = NULL;
-		ref->addr = NULL;
-		ref->state = WT_REF_DELETED;
-		ref->key.recno = 1;
-		break;
-	case BTREE_ROW:
-		WT_ERR(
-		    __wt_page_alloc(session, WT_PAGE_ROW_INT, 0, 1, 1, &root));
-		root->pg_intl_parent_ref = &btree->root;
+        WT_INTL_INDEX_GET_SAFE(root, pindex);
+        ref = pindex->index[0];
+        __wt_atomic_store_ptr_relaxed(&ref->home, root);
+        ref->page = NULL;
+        ref->addr = NULL;
+        F_SET(ref, WT_REF_FLAG_LEAF);
+        WT_REF_SET_STATE(ref, WT_REF_DELETED);
+        ref->ref_recno = 1;
+        break;
+    case BTREE_ROW:
+        WT_ERR(__wt_page_alloc(session, WT_PAGE_ROW_INT, 1, true, &root, 0));
+        root->pg_intl_parent_ref = &btree->root;
 
-		pindex = WT_INTL_INDEX_COPY(root);
-		ref = pindex->index[0];
-		ref->home = root;
-		ref->page = NULL;
-		ref->addr = NULL;
-		ref->state = WT_REF_DELETED;
-		WT_ERR(__wt_row_ikey_incr(session, root, 0, "", 1, ref));
-		break;
-	WT_ILLEGAL_VALUE_ERR(session);
-	}
+        WT_INTL_INDEX_GET_SAFE(root, pindex);
+        ref = pindex->index[0];
+        __wt_atomic_store_ptr_relaxed(&ref->home, root);
+        ref->page = NULL;
+        ref->addr = NULL;
+        F_SET(ref, WT_REF_FLAG_LEAF);
+        WT_REF_SET_STATE(ref, WT_REF_DELETED);
+        WT_ERR(__wti_row_ikey_incr(session, root, 0, "", 1, ref));
+        break;
+    }
 
-	/* Bulk loads require a leaf page for reconciliation: create it now. */
-	if (F_ISSET(btree, WT_BTREE_BULK)) {
-		WT_ERR(__wt_btree_new_leaf_page(session, &leaf));
-		ref->page = leaf;
-		ref->state = WT_REF_MEM;
-		WT_ERR(__wt_page_modify_init(session, leaf));
-		__wt_page_only_modify_set(session, leaf);
-	}
+    /* Bulk loads require a leaf page for reconciliation: create it now. */
+    if (F_ISSET(btree, WT_BTREE_BULK)) {
+        WT_ERR(__wti_btree_new_leaf_page(session, ref));
+        F_SET(ref, WT_REF_FLAG_LEAF);
+        WT_REF_SET_STATE(ref, WT_REF_MEM);
+        WT_ERR(__wt_page_modify_init(session, ref->page));
+        __wt_page_only_modify_set(session, ref->page);
+    }
 
-	/* Finish initializing the root, root reference links. */
-	__wt_root_ref_init(&btree->root, root, btree->type != BTREE_ROW);
+    /* Finish initializing the root, root reference links. */
+    __wt_root_ref_init(session, &btree->root, root, btree->type != BTREE_ROW);
 
-	return (0);
+    return (0);
 
-err:	if (leaf != NULL)
-		__wt_page_out(session, &leaf);
-	if (root != NULL)
-		__wt_page_out(session, &root);
-	return (ret);
+err:
+    if (ref != NULL && ref->page != NULL)
+        __wt_page_out(session, &ref->page);
+    if (root != NULL)
+        __wt_page_out(session, &root);
+    return (ret);
 }
 
 /*
- * __wt_btree_new_leaf_page --
- *	Create an empty leaf page.
+ * __wti_btree_new_leaf_page --
+ *     Create an empty leaf page.
  */
 int
-__wt_btree_new_leaf_page(WT_SESSION_IMPL *session, WT_PAGE **pagep)
+__wti_btree_new_leaf_page(WT_SESSION_IMPL *session, WT_REF *ref)
 {
-	WT_BTREE *btree;
+    WT_BTREE *btree;
 
-	btree = S2BT(session);
+    btree = S2BT(session);
 
-	switch (btree->type) {
-	case BTREE_COL_FIX:
-		WT_RET(
-		    __wt_page_alloc(session, WT_PAGE_COL_FIX, 1, 0, 0, pagep));
-		break;
-	case BTREE_COL_VAR:
-		WT_RET(
-		    __wt_page_alloc(session, WT_PAGE_COL_VAR, 1, 0, 0, pagep));
-		break;
-	case BTREE_ROW:
-		WT_RET(
-		    __wt_page_alloc(session, WT_PAGE_ROW_LEAF, 0, 0, 0, pagep));
-		break;
-	WT_ILLEGAL_VALUE(session);
-	}
-	return (0);
-}
+    switch (btree->type) {
+    case BTREE_COL_VAR:
+        WT_RET(__wt_page_alloc(session, WT_PAGE_COL_VAR, 0, false, &ref->page, 0));
+        break;
+    case BTREE_ROW:
+        WT_RET(__wt_page_alloc(session, WT_PAGE_ROW_LEAF, 0, false, &ref->page, 0));
+        break;
+    }
 
-/*
- * __wt_btree_evictable --
- *      Setup or release a cache-resident tree.
- */
-void
-__wt_btree_evictable(WT_SESSION_IMPL *session, int on)
-{
-	WT_BTREE *btree;
+    /*
+     * When deleting a chunk of the name-space, we can delete internal pages. However, if we are
+     * ever forced to re-instantiate that piece of the namespace, it comes back as a leaf page.
+     * Reset the WT_REF type as it's possible that it has changed.
+     */
+    F_CLR(ref, WT_REF_FLAG_INTERNAL);
+    F_SET(ref, WT_REF_FLAG_LEAF);
 
-	btree = S2BT(session);
-
-	/* The metadata file is never evicted. */
-	if (on && !WT_IS_METADATA(btree->dhandle))
-		F_CLR(btree, WT_BTREE_NO_EVICTION);
-	else
-		F_SET(btree, WT_BTREE_NO_EVICTION);
+    return (0);
 }
 
 /*
  * __btree_preload --
- *	Pre-load internal pages.
+ *     Pre-load internal pages.
  */
 static int
 __btree_preload(WT_SESSION_IMPL *session)
 {
-	WT_BM *bm;
-	WT_BTREE *btree;
-	WT_REF *ref;
-	size_t addr_size;
-	const uint8_t *addr;
+    WT_ADDR_COPY addr;
+    WT_BTREE *btree;
+    WT_DECL_ITEM(tmp);
+    WT_DECL_RET;
+    WT_REF *ref;
+    uint64_t block_preload;
 
-	btree = S2BT(session);
-	bm = btree->bm;
+    btree = S2BT(session);
+    block_preload = 0;
 
-	/* Pre-load the second-level internal pages. */
-	WT_INTL_FOREACH_BEGIN(session, btree->root.page, ref) {
-		WT_RET(__wt_ref_info(session, ref, &addr, &addr_size, NULL));
-		if (addr != NULL)
-			WT_RET(bm->preload(bm, session, addr, addr_size));
-	} WT_INTL_FOREACH_END;
-	return (0);
+    WT_RET(__wt_scr_alloc(session, 0, &tmp));
+
+    /* Pre-load the second-level internal pages. */
+    WT_INTL_FOREACH_BEGIN (session, btree->root.page, ref)
+        if (__wt_ref_addr_copy(session, ref, &addr)) {
+            /*
+             * FIXME-WT-14612: If we want to use prefetch with disaggregated storage we will need to
+             * supply block metadata.
+             */
+            WT_ERR(__wt_blkcache_read(session, tmp, NULL, addr.addr, addr.size));
+            ++block_preload;
+        }
+    WT_INTL_FOREACH_END;
+
+err:
+    __wt_scr_free(session, &tmp);
+
+    WT_STAT_CONN_INCRV(session, block_preload, block_preload);
+    return (ret);
 }
 
 /*
  * __btree_get_last_recno --
- *	Set the last record number for a column-store.
+ *     Set the last record number for a column-store. Note that this is used to handle appending to
+ *     a column store after a truncate operation. It is not related to the WT_CURSOR::largest_key
+ *     API.
  */
 static int
 __btree_get_last_recno(WT_SESSION_IMPL *session)
 {
-	WT_BTREE *btree;
-	WT_PAGE *page;
-	WT_REF *next_walk;
+    WT_BTREE *btree;
+    WT_REF *next_walk;
+    uint64_t last_recno;
+    uint32_t flags;
 
-	btree = S2BT(session);
+    btree = S2BT(session);
 
-	next_walk = NULL;
-	WT_RET(__wt_tree_walk(session, &next_walk, NULL, WT_READ_PREV));
-	if (next_walk == NULL)
-		return (WT_NOTFOUND);
+    /*
+     * The last record number is used to support appending to a column store tree that has had a
+     * final page truncated. Since checkpoint trees are read-only they don't need the value.
+     */
+    if (WT_READING_CHECKPOINT(session)) {
+        btree->last_recno = WT_RECNO_OOB;
+        return (0);
+    }
 
-	page = next_walk->page;
-	btree->last_recno = page->type == WT_PAGE_COL_VAR ?
-	    __col_var_last_recno(page) : __col_fix_last_recno(page);
+    /*
+     * The endpoint for append is global; read the last page with global visibility (even if it's
+     * deleted) to make sure that if the end of the tree is truncated, the tree walk finds the
+     * correct page. (Note that this path does not examine the visibility of individual data items;
+     * it only checks whether whole pages are deleted.)
+     */
+    flags = WT_READ_PREV | WT_READ_VISIBLE_ALL | WT_READ_SEE_DELETED;
 
-	return (__wt_page_release(session, next_walk, 0));
+    next_walk = NULL;
+    WT_RET(__wt_tree_walk(session, &next_walk, flags));
+    if (next_walk == NULL)
+        return (WT_NOTFOUND);
+
+    last_recno = __col_var_last_recno(next_walk);
+
+    /*
+     * If the right-most page is deleted and globally visible, we skip reading the page from disk
+     * and instead instantiate an empty page in memory. It's possible that next_walk points to this
+     * empty page. When this happens, it has no entries and the last record number will be out of
+     * bounds, i.e. zero.
+     *
+     * In this context, the page also can't have an insert (or append) list, so it's safe to simply
+     * take the last ref's starting record number as the last record number of the tree.
+     */
+    if (last_recno == WT_RECNO_OOB)
+        last_recno = next_walk->key.recno;
+    btree->last_recno = last_recno;
+
+    return (__wt_page_release(session, next_walk, 0));
 }
 
 /*
  * __btree_page_sizes --
- *	Verify the page sizes. Some of these sizes are automatically checked
- *	using limits defined in the API, don't duplicate the logic here.
+ *     Verify the page sizes. Some of these sizes are automatically checked using limits defined in
+ *     the API, don't duplicate the logic here.
  */
 static int
 __btree_page_sizes(WT_SESSION_IMPL *session)
 {
-	WT_BTREE *btree;
-	WT_CONFIG_ITEM cval;
-	uint64_t cache_size;
-	uint32_t intl_split_size, leaf_split_size;
-	const char **cfg;
+    WT_BTREE *btree;
+    WT_CONFIG_ITEM cval;
+    WT_CONNECTION_IMPL *conn;
+    double dirty_trigger;
+    uint64_t cache_size;
+    uint32_t leaf_split_size, max;
+    const char **cfg;
 
-	btree = S2BT(session);
-	cfg = btree->dhandle->cfg;
+    btree = S2BT(session);
+    conn = S2C(session);
+    cfg = btree->dhandle->cfg;
 
-	/*
-	 * Get the allocation size.  Allocation sizes must be a power-of-two,
-	 * nothing else makes sense.
-	 */
-	WT_RET(__wt_direct_io_size_check(
-	    session, cfg, "allocation_size", &btree->allocsize));
-	if (!__wt_ispo2(btree->allocsize))
-		WT_RET_MSG(session,
-		    EINVAL, "the allocation size must be a power of two");
+    /*
+     * Get the allocation size. Allocation sizes must be a power-of-two, nothing else makes sense.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "allocation_size", &cval));
+    btree->allocsize = (uint32_t)cval.val;
 
-	/*
-	 * Get the internal/leaf page sizes.
-	 * All page sizes must be in units of the allocation size.
-	 */
-	WT_RET(__wt_direct_io_size_check(
-	    session, cfg, "internal_page_max", &btree->maxintlpage));
-	WT_RET(__wt_direct_io_size_check(
-	    session, cfg, "leaf_page_max", &btree->maxleafpage));
-	if (btree->maxintlpage < btree->allocsize ||
-	    btree->maxintlpage % btree->allocsize != 0 ||
-	    btree->maxleafpage < btree->allocsize ||
-	    btree->maxleafpage % btree->allocsize != 0)
-		WT_RET_MSG(session, EINVAL,
-		    "page sizes must be a multiple of the page allocation "
-		    "size (%" PRIu32 "B)", btree->allocsize);
+    if (!__wt_ispo2(btree->allocsize))
+        WT_RET_MSG(session, EINVAL, "the allocation size must be a power of two");
 
-	/*
-	 * When a page is forced to split, we want at least 50 entries on its
-	 * parent.
-	 *
-	 * Don't let pages grow larger than a quarter of the cache, with too-
-	 * small caches, we can end up in a situation where nothing can be
-	 * evicted.  Take care getting the cache size: with a shared cache,
-	 * it may not have been set.
-	 */
-	WT_RET(__wt_config_gets(session, cfg, "memory_page_max", &cval));
-	btree->maxmempage =
-	    WT_MAX((uint64_t)cval.val, 50 * (uint64_t)btree->maxleafpage);
-	cache_size = S2C(session)->cache_size;
-	if (cache_size > 0)
-		btree->maxmempage = WT_MIN(btree->maxmempage, cache_size / 4);
+    /*
+     * Get the internal/leaf page sizes. All page sizes must be in units of the allocation size.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "internal_page_max", &cval));
+    btree->maxintlpage = (uint32_t)cval.val;
+    WT_RET(__wt_config_gets(session, cfg, "leaf_page_max", &cval));
+    btree->maxleafpage = (uint32_t)cval.val;
 
-	/*
-	 * Get the split percentage (reconciliation splits pages into smaller
-	 * than the maximum page size chunks so we don't split every time a
-	 * new entry is added). Determine how large newly split pages will be.
-	 */
-	WT_RET(__wt_config_gets(session, cfg, "split_pct", &cval));
-	btree->split_pct = (int)cval.val;
-	intl_split_size = __wt_split_page_size(btree, btree->maxintlpage);
-	leaf_split_size = __wt_split_page_size(btree, btree->maxleafpage);
+    if (btree->maxintlpage < btree->allocsize || btree->maxintlpage % btree->allocsize != 0 ||
+      btree->maxleafpage < btree->allocsize || btree->maxleafpage % btree->allocsize != 0)
+        WT_RET_MSG(session, EINVAL,
+          "page sizes must be a multiple of the page allocation size (%" PRIu32 "B)",
+          btree->allocsize);
 
-	/*
-	 * In-memory split configuration.
-	 */
-	if (__wt_config_gets(
-	    session, cfg, "split_deepen_min_child", &cval) == WT_NOTFOUND ||
-	    cval.val == 0)
-		btree->split_deepen_min_child = WT_SPLIT_DEEPEN_MIN_CHILD_DEF;
-	else
-		btree->split_deepen_min_child = (u_int)cval.val;
-	if (__wt_config_gets(
-	    session, cfg, "split_deepen_per_child", &cval) == WT_NOTFOUND ||
-	    cval.val == 0)
-		btree->split_deepen_per_child = WT_SPLIT_DEEPEN_PER_CHILD_DEF;
-	else
-		btree->split_deepen_per_child = (u_int)cval.val;
+    /*
+     * Default in-memory page image size for compression is 4x the maximum internal or leaf page
+     * size, and enforce the on-disk page sizes as a lower-limit for the in-memory image size.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "memory_page_image_max", &cval));
+    btree->maxmempage_image = (uint32_t)cval.val;
+    max = WT_MAX(btree->maxintlpage, btree->maxleafpage);
+    if (btree->maxmempage_image == 0)
+        btree->maxmempage_image = 4 * max;
+    else if (btree->maxmempage_image < max)
+        WT_RET_MSG(session, EINVAL,
+          "in-memory page image size must be larger than the maximum page size (%" PRIu32
+          "B < %" PRIu32 "B)",
+          btree->maxmempage_image, max);
 
-	/*
-	 * Get the maximum internal/leaf page key/value sizes.
-	 *
-	 * In historic versions of WiredTiger, the maximum internal/leaf page
-	 * key/value sizes were set by the internal_item_max and leaf_item_max
-	 * configuration strings. Look for those strings if we don't find the
-	 * newer ones.
-	 */
-	WT_RET(__wt_config_gets(session, cfg, "internal_key_max", &cval));
-	btree->maxintlkey = (uint32_t)cval.val;
-	if (btree->maxintlkey == 0) {
-		WT_RET(
-		    __wt_config_gets(session, cfg, "internal_item_max", &cval));
-		btree->maxintlkey = (uint32_t)cval.val;
-	}
-	WT_RET(__wt_config_gets(session, cfg, "leaf_key_max", &cval));
-	btree->maxleafkey = (uint32_t)cval.val;
-	WT_RET(__wt_config_gets(session, cfg, "leaf_value_max", &cval));
-	btree->maxleafvalue = (uint32_t)cval.val;
-	if (btree->maxleafkey == 0 && btree->maxleafvalue == 0) {
-		WT_RET(__wt_config_gets(session, cfg, "leaf_item_max", &cval));
-		btree->maxleafkey = (uint32_t)cval.val;
-		btree->maxleafvalue = (uint32_t)cval.val;
-	}
+    /*
+     * Don't let pages grow large compared to the cache size or we can end
+     * up in a situation where nothing can be evicted.  Make sure at least
+     * 10 pages fit in cache when it is at the dirty trigger where threads
+     * stall.
+     *
+     * Take care getting the cache size: with a shared cache, it may not
+     * have been set.  Don't forget to update the API documentation if you
+     * alter the bounds for any of the parameters here.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "memory_page_max", &cval));
+    btree->maxmempage = (uint64_t)cval.val;
 
-	/*
-	 * Default/maximum for internal and leaf page keys: split-page / 10.
-	 * Default for leaf page values: split-page / 2.
-	 *
-	 * It's difficult for applications to configure this in any exact way as
-	 * they have to duplicate our calculation of how many keys must fit on a
-	 * page, and given a split-percentage and page header, that isn't easy
-	 * to do. If the maximum internal key value is too large for the page,
-	 * reset it to the default.
-	 */
-	if (btree->maxintlkey == 0 || btree->maxintlkey > intl_split_size / 10)
-		    btree->maxintlkey = intl_split_size / 10;
-	if (btree->maxleafkey == 0)
-		    btree->maxleafkey = leaf_split_size / 10;
-	if (btree->maxleafvalue == 0)
-		    btree->maxleafvalue = leaf_split_size / 2;
+#define WT_MIN_PAGES 10
+    if (!F_ISSET_ATOMIC_32(conn, WT_CONN_CACHE_POOL) && (cache_size = conn->cache_size) > 0) {
+        dirty_trigger = __wt_atomic_load_double_relaxed(&conn->evict->eviction_dirty_trigger);
+        btree->maxmempage =
+          (uint64_t)WT_MIN(btree->maxmempage, ((dirty_trigger * cache_size) / 100) / WT_MIN_PAGES);
+    }
 
-	return (0);
+    /* Enforce a lower bound of a single disk leaf page */
+    btree->maxmempage = WT_MAX(btree->maxmempage, btree->maxleafpage);
+
+    /*
+     * Try in-memory splits once we hit 80% of the maximum in-memory page size. This gives
+     * multi-threaded append workloads a better chance of not stalling.
+     */
+    btree->splitmempage = (8 * btree->maxmempage) / 10;
+
+    /*
+     * Get the split percentage (reconciliation splits pages into smaller than the maximum page size
+     * chunks so we don't split every time a new entry is added). Determine how large newly split
+     * pages will be. Set to the minimum, if the read value is less than that.
+     */
+    WT_RET(__wt_config_gets(session, cfg, "split_pct", &cval));
+    if (cval.val < WT_BTREE_MIN_SPLIT_PCT) {
+        btree->split_pct = WT_BTREE_MIN_SPLIT_PCT;
+        __wt_verbose_notice(session, WT_VERB_SPLIT,
+          "Re-setting split_pct for %s to the minimum allowed of %d%%", session->dhandle->name,
+          WT_BTREE_MIN_SPLIT_PCT);
+    } else
+        btree->split_pct = (int)cval.val;
+    leaf_split_size = __wt_split_page_size(btree->split_pct, btree->maxleafpage, btree->allocsize);
+
+    /*
+     * In-memory split configuration.
+     */
+    if (__wt_config_gets(session, cfg, "split_deepen_min_child", &cval) == WT_NOTFOUND ||
+      cval.val == 0)
+        btree->split_deepen_min_child = WT_SPLIT_DEEPEN_MIN_CHILD_DEF;
+    else
+        btree->split_deepen_min_child = (u_int)cval.val;
+    if (__wt_config_gets(session, cfg, "split_deepen_per_child", &cval) == WT_NOTFOUND ||
+      cval.val == 0)
+        btree->split_deepen_per_child = WT_SPLIT_DEEPEN_PER_CHILD_DEF;
+    else
+        btree->split_deepen_per_child = (u_int)cval.val;
+
+    /*
+     * Get the maximum internal/leaf page key/value sizes.
+     *
+     * In-memory configuration overrides any key/value sizes, there's no such thing as an overflow
+     * item in an in-memory configuration.
+     *
+     * Writing overflow keys and values isn't possible with disaggregated storage because overflow
+     * items are stored on a different page within the same tree, which cannot be handled by
+     * disaggregated storage.
+     */
+    if (F_ISSET(btree, WT_BTREE_IN_MEMORY | WT_BTREE_DISAGGREGATED)) {
+        btree->maxleafkey = WT_BTREE_MAX_OBJECT_SIZE;
+        btree->maxleafvalue = WT_BTREE_MAX_OBJECT_SIZE;
+        return (0);
+    }
+
+    WT_RET(__wt_config_gets(session, cfg, "leaf_key_max", &cval));
+    btree->maxleafkey = (uint32_t)cval.val;
+    WT_RET(__wt_config_gets(session, cfg, "leaf_value_max", &cval));
+    btree->maxleafvalue = (uint32_t)cval.val;
+
+    /*
+     * Default max for leaf keys: split-page / 10. Default max for leaf values: split-page / 2.
+     *
+     * It's difficult for applications to configure this in any exact way as they have to duplicate
+     * our calculation of how many keys must fit on a page, and given a split-percentage and page
+     * header, that isn't easy to do.
+     */
+    if (btree->maxleafkey == 0)
+        btree->maxleafkey = leaf_split_size / 10;
+    if (btree->maxleafvalue == 0)
+        btree->maxleafvalue = leaf_split_size / 2;
+
+    return (0);
 }

@@ -1,36 +1,31 @@
 // test $out in a replicated environment
-var name = "pipelineout";
-var replTest = new ReplSetTest( {name: name, nodes: 2} );
-var nodes = replTest.nodeList();
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
+let name = "pipelineout";
+let replTest = new ReplSetTest({name: name, nodes: 2});
+let nodes = replTest.nodeList();
 
 replTest.startSet();
-replTest.initiate({"_id" : name,
-                   "members" : [
-                         {"_id" : 0, "host" : nodes[0]},
-                         {"_id" : 1, "host" : nodes[1]}
-     ]});
+replTest.initiate({
+    "_id": name,
+    "members": [
+        {"_id": 0, "host": nodes[0]},
+        {"_id": 1, "host": nodes[1]},
+    ],
+});
 
-var primary = replTest.getMaster().getDB(name);
-var secondary = replTest.liveNodes.slaves[0].getDB(name);
+let primary = replTest.getPrimary().getDB(name);
+let secondary = replTest.getSecondary().getDB(name);
 
 // populate the collection
-for (i=0; i<5; i++) {
-    primary.in.insert({x:i});
+for (let i = 0; i < 5; i++) {
+    primary.coll.insert({x: i});
 }
 replTest.awaitReplication();
 
-// make sure $out cannot be run on a secondary
-assert.throws(function() {
-                  secondary.in.aggregate({$out: "out"}).itcount;
-        });
-// even if slaveOk
-secondary.setSlaveOk();
-assert.throws(function() {
-                  secondary.in.aggregate({$out: "out"}).itcount;
-        });
-
 // run one and check for proper replication
-primary.in.aggregate({$out: "out"}).itcount;
+primary.coll.aggregate({$out: "out"}).itcount();
 replTest.awaitReplication();
-assert.eq(primary.out.find().sort( { x : 1 } ).toArray(),
-          secondary.out.find().sort( { x : 1 } ).toArray());
+assert.eq(primary.out.find().sort({x: 1}).toArray(), secondary.out.find().sort({x: 1}).toArray());
+
+replTest.stopSet();

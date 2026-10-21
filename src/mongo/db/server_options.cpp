@@ -1,40 +1,47 @@
-/*    Copyright 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/server_options.h"
 
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/feature_compatibility_version_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
+#include "mongo/util/version/releases.h"
+
+#include <mutex>
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 namespace mongo {
 
-    /**
-     * This struct represents global configuration data for the server.  These options get set from
-     * the command line and are used inline in the code.  Note that much shared code uses this
-     * struct, which is why it is here in its own file rather than in the same file as the code that
-     * sets it via the command line, which would pull in more dependencies.
-     */
-    ServerGlobalParams serverGlobalParams;
+/**
+ * This struct represents global configuration data for the server.  These options get set from
+ * the command line and are used inline in the code.  Note that much shared code uses this
+ * struct, which is why it is here in its own file rather than in the same file as the code that
+ * sets it via the command line, which would pull in more dependencies.
+ */
+ServerGlobalParams serverGlobalParams;
 
-} // namespace mongo
+std::string ServerGlobalParams::getPortSettingHelpText() {
+    return str::stream() << "Specify port number - " << serverGlobalParams.port << " by default";
+}
+
+void ServerGlobalParams::MutableFCV::setVersionFromFCVDocument(
+    const FeatureCompatibilityVersionDocument& fcvDoc) {
+    auto version = uassertStatusOK(FeatureCompatibilityVersionParser::parse(fcvDoc.toBSON()));
+    std::unique_lock lk(_fcvDocMutex);
+    _fcvDoc = fcvDoc;
+    _version.store(version);
+}
+
+void ServerGlobalParams::FCVSnapshot::logFCVWithContext(std::string_view context) const {
+    LOGV2_OPTIONS(5853300,
+                  {logv2::LogComponent::kReplication},
+                  "current featureCompatibilityVersion value",
+                  "featureCompatibilityVersion"_attr = multiversion::toString(_version),
+                  "context"_attr = context);
+}
+
+}  // namespace mongo

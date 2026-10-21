@@ -1,0 +1,60 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::explain"
+    mod_visibility: public
+
+enums:
+    Verbosity:
+        description:
+            "The various supported verbosity levels for explain. The order is significant:
+            the enum values are assigned in order of increasing verbosity"
+        type: string
+        values:
+            # At all verbosities greater than or equal to kQueryPlanner, we display information
+            # about the plan selected and alternate rejected plans. Does not include any
+            # execution-related info.
+            kQueryPlanner: "queryPlanner"
+
+            # At all verbosities greater than or equal to kExecStats, we display a section of output
+            # containing both overall execution stats, and stats per stage in the execution tree.
+            kExecStats: "executionStats"
+
+            # At this verbosity level, we generate the execution stats for each rejected plan as
+            # well as the winning plan.
+            kExecAllPlans: "allPlansExecution"
+
+            # V3 explain verbosity modes. They are additive: each one includes the contents of the
+            # previous. Supplying any of them causes explain to generate "explainVersion: '3'".
+            #
+            # The order of these enum values is not content-significant. Explain content decisions
+            # go through ExplainPolicy / explainPolicyFor() (see explain_policy.h) rather than
+            # ordinal comparisons of this enum. Relational operators on the enum are deleted so that
+            # no such comparison can compile. Reordering or inserting values here can therefore
+            # never change explain content semantics.
+            #
+            # These values remain positioned between kExecAllPlans and kInternal only as a
+            # historical artifact and to keep the underlying integer serialization stable; the
+            # placement carries no meaning.
+
+            # A very compact representation of the plan structure with minimal stable structural
+            # information about the chosen plans.
+            kPlanSummary: "planSummary"
+
+            # Shows the plan structure with more detail than kPlanSummary. Excludes multi-planning,
+            # cost-based ranking, and execution statistics.
+            kPlannerChoice: "plannerChoice"
+
+            # Shows the plan structure with associated multi-planning and/or cost-based ranking
+            # statistics, including the trial-phase statistics currently reported via
+            # "allPlansExecution".
+            kPlannerStats: "plannerStats"
+
+            # In addition to kPlannerStats, also runs the winning plan and adds its execution
+            # statistics. This is the V3 counterpart of kExecStats.
+            kExecStatsV3: "execStats"
+
+            # This verbosity is set aside for miscellaneous information. It includes virtual machine
+            # bytecode for the slot-based execution engine.
+            kInternal: "internal"

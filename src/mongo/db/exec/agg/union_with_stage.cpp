@@ -1,0 +1,273 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/exec/agg/union_with_stage.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/exec/agg/pipeline_builder.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
+#include "mongo/db/pipeline/resolved_namespace.h"  // IWYU pragma: keep
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/logv2/log.h"
+
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo {
+
+exec::agg::StagePtr documentSourceUnionWithToStageFn(
+    const boost::intrusive_ptr<const DocumentSource>& documentSource) {
+    auto unionWith = boost::dynamic_pointer_cast<const DocumentSourceUnionWith>(documentSource);
+    tassert(1042403, "Expect 'DocumentSourceUnionWith' type", unionWith);
+
+    return make_intrusive<exec::agg::UnionWithStage>(DocumentSourceUnionWith::kStageName,
+                                                     unionWith->getExpCtx(),
+                                                     unionWith->getSharedState(),
+                                                     unionWith->_userNss);
+}
+
+namespace exec::agg {
+using namespace std::literals::string_view_literals;
+
+namespace {
+
+REGISTER_AGG_STAGE_MAPPING(unionWith,
+                           mongo::DocumentSourceUnionWith::id,
+                           documentSourceUnionWithToStageFn);
+
+// The use of these logging macros is done in separate NOINLINE functions to reduce the stack space
+// used on the hot getNext() path. This is done to avoid stack overflows.
+MONGO_COMPILER_NOINLINE void logStartingSubPipeline(const std::vector<BSONObj>& serializedPipe) {
+    LOGV2_DEBUG(1042401,
+                1,
+                "$unionWith attaching cursor to pipeline {pipeline}",
+                "pipeline"_attr = serializedPipe);
+}
+
+MONGO_COMPILER_NOINLINE void logShardedViewFound(
+    const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e,
+    const mongo::Pipeline& new_pipeline) {
+    LOGV2_DEBUG(1042402,
+                3,
+                "$unionWith found view definition. ns: {namespace}, pipeline: {pipeline}. New "
+                "$unionWith sub-pipeline: {new_pipe}",
+                logAttrs(e->getResolvedNamespace()),
+                "pipeline"_attr = Value(e->getBsonPipeline()),
+                "new_pipe"_attr = new_pipeline.serializeToBson());
+}
+
+template <size_t N>
+MONGO_COMPILER_NOINLINE void logPipeline(int32_t id,
+                                         const char (&msg)[N],
+                                         const mongo::Pipeline& pipe) {
+    LOGV2_DEBUG(id, 5, msg, "pipeline"_attr = pipe.serializeToBson());
+}
+
+}  // namespace
+
+UnionWithStage::UnionWithStage(const std::string_view stageName,
+                               const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                               const std::shared_ptr<UnionWithSharedState>& sharedState,
+                               const NamespaceString& userNss)
+    : Stage(stageName, pExpCtx), _sharedState(sharedState), _userNss(userNss) {}
+
+GetNextResult UnionWithStage::doGetNext() {
+    if (!_sharedState->_pipeline) {
+        // We must have already been disposed, so we're finished.
+        return GetNextResult::makeEOF();
+    }
+
+    if (_sharedState->_executionState ==
+        UnionWithSharedState::ExecutionProgress::kIteratingSource) {
+        if (auto nextInput = pSource->getNext(); !nextInput.isEOF()) {
+            return nextInput;
+        }
+
+        // All documents from the base collection have been returned, switch to iterating the sub-
+        // pipeline by falling through below.
+        _sharedState->_executionState =
+            UnionWithSharedState::ExecutionProgress::kStartingSubPipeline;
+    }
+
+    if (_sharedState->_executionState ==
+        UnionWithSharedState::ExecutionProgress::kStartingSubPipeline) {
+        // If prepareSubPipeline throws CommandOnShardedViewNotSupportedOnMongod, the serialized
+        // pipeline is fed back through parsePipelineWithMaybeViewDefinition which reparses. Use
+        // serializeForReparse so stages emit user form and the re-parse doesn't trip an
+        // internal-field check. If we don't throw, the serialized pipeline is consumed by
+        // prepareSubPipeline only for logging.
+        query_shape::SerializationOptions wireOptsForSub{.isSerializingForRemoteDispatch = true,
+                                                         .serializeForReparse = true};
+        auto serializedPipeline = _sharedState->_pipeline->serializeToBson(wireOptsForSub);
+
+        // Prepare the sub pipeline. This is expected to fail if the command is not supported on a
+        // sharded view.
+        try {
+            prepareSubPipeline(serializedPipeline);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e) {
+            // Preparation of sub pipeline failed. The pipeline will be modified to use the view
+            // definition instead, and we attempt to prepare it again.
+            const auto& resolvedNs = *e.extraInfo<ResolvedNamespace>();
+            _sharedState->_pipeline = DocumentSourceUnionWith::parsePipelineWithMaybeViewDefinition(
+                pExpCtx, resolvedNs, std::move(serializedPipeline), _userNss);
+            logShardedViewFound(e, *_sharedState->_pipeline);
+
+            // Serialize the new pipeline. Use serializeForReparse for consistency with the
+            // first serialize above.
+            serializedPipeline = _sharedState->_pipeline->serializeToBson(wireOptsForSub);
+
+            // If this throws again, the exception will bubble up and will be caught by an outer
+            // layer.
+            prepareSubPipeline(serializedPipeline);
+        }
+    }
+
+    if (auto res = _sharedState->_execPipeline->getNext()) {
+        return std::move(*res);
+    }
+
+    // Record the plan summary stats after $unionWith operation is done.
+    _sharedState->_execPipeline->accumulatePlanSummaryStats(_stats.planSummaryStats);
+
+    // stats update (previously done in usedDisk())
+    _stats.planSummaryStats.usedDisk =
+        _stats.planSummaryStats.usedDisk || _sharedState->_execPipeline->usedDisk();
+
+    _sharedState->_executionState = UnionWithSharedState::ExecutionProgress::kFinished;
+    return GetNextResult::makeEOF();
+}
+
+void UnionWithStage::prepareSubPipeline(const std::vector<BSONObj>& serializedPipeline) {
+    // Since the subpipeline will be executed again for explain, we store the starting state of
+    // the variables to reset them later.
+    if (pExpCtx->getExplain()) {
+        auto expCtx = _sharedState->_pipeline->getContext();
+        _sharedState->_variables = expCtx->variables;
+        _sharedState->_variablesParseState =
+            expCtx->variablesParseState.copyWith(_sharedState->_variables.useIdGenerator());
+    }
+
+    logStartingSubPipeline(serializedPipeline);
+
+    // Query settings are looked up after parsing and therefore are not populated in the
+    // context of the unionWith '_pipeline' as part of DocumentSourceUnionWith constructor.
+    // Attach query settings to the '_pipeline->getContext()' by copying them from the
+    // parent query ExpressionContext.
+    const boost::intrusive_ptr<ExpressionContext>& pipelineCtx =
+        _sharedState->_pipeline->getContext();
+    pipelineCtx->initializeReferencedSystemVariables();
+
+    logPipeline(104243, "$unionWith before pipeline prep: ", *_sharedState->_pipeline);
+
+    _sharedState->_pipeline =
+        pExpCtx->getMongoProcessInterface()->finalizeAndMaybePreparePipelineForExecution(
+            pipelineCtx,
+            std::move(_sharedState->_pipeline),
+            true /* attachCursorAfterOptimizing */,
+            pipeline_optimization::optimizeAndValidatePipeline);
+    logPipeline(104244, "$unionWith POST pipeline prep: ", *_sharedState->_pipeline);
+
+    // If the local-read shortcut left a cursorless stage ($collStats, $listCatalog, ...) at the
+    // front of the prepared sub-pipeline, the catalog acquisition that runs as part of getNext()
+    // needs a placement version for the secondary nss so it doesn't trip the no-router-role
+    // assertion. Acquire the scoped shard role once and hold it for the lifetime of the
+    // sub-pipeline iteration. Versions are only required if sharding is initialized.
+    auto* opCtx = pExpCtx->getOperationContext();
+    auto* grid = Grid::get(opCtx->getServiceContext());
+    if (grid->isInitialized() && grid->isShardingInitialized() &&
+        OperationShardingState::isShardingAware(opCtx)) {
+        const auto& resultSources = _sharedState->_pipeline->getSources();
+        const bool isMergePipeline =
+            !resultSources.empty() && resultSources.front()->getSourceName() == "$mergeCursors"sv;
+        if (!isMergePipeline) {
+            const bool isCursorlessAtFront = resultSources.empty() ||
+                resultSources.front()->getSourceName() != DocumentSourceCursor::kStageName;
+            const auto& subPipelineNss =
+                _sharedState->_pipeline->getContext()->getNamespaceString();
+            if (isCursorlessAtFront && subPipelineNss != pExpCtx->getNamespaceString()) {
+                if (auto role = pExpCtx->getMongoProcessInterface()->setLocalRouting(
+                        opCtx, subPipelineNss)) {
+                    _scopedShardRole.emplace(std::move(*role));
+                }
+            }
+        }
+    }
+
+    _sharedState->_executionState = UnionWithSharedState::ExecutionProgress::kIteratingSubPipeline;
+
+    // The $unionWith stage takes responsibility for disposing of its Pipeline. When the outer
+    // Pipeline that contains the $unionWith is disposed of, it will propagate dispose() to its
+    // subpipeline.
+    _sharedState->_execPipeline = exec::agg::buildPipeline(_sharedState->_pipeline->freeze());
+}
+
+bool UnionWithStage::usedDisk() const {
+    return _sharedState->_execPipeline && _sharedState->_execPipeline->usedDisk();
+}
+
+void UnionWithStage::doDispose() {
+    // Update execution statistics.
+    if (_sharedState->_execPipeline) {
+        _stats.planSummaryStats.usedDisk =
+            _stats.planSummaryStats.usedDisk || _sharedState->_execPipeline->usedDisk();
+        _sharedState->_execPipeline->accumulatePlanSummaryStats(_stats.planSummaryStats);
+    }
+
+    // When not in explain command, propagate disposal to the subpipeline, otherwise the subpipeline
+    // will be disposed in '~UnionWithSharedState()'.
+    if (!pExpCtx->getExplain()) {
+        if (_sharedState->_execPipeline) {
+            _sharedState->_execPipeline->reattachToOperationContext(pExpCtx->getOperationContext());
+            _sharedState->_execPipeline->dispose();
+        }
+        _sharedState->_pipeline.reset();
+        _sharedState->_execPipeline.reset();
+    }
+}
+
+void UnionWithStage::detachFromOperationContext() {
+    // We have an execution pipeline we're going to execute across multiple commands, so we need to
+    // detach it from the operation context when it goes out of scope.
+    if (_sharedState->_execPipeline) {
+        _sharedState->_execPipeline->detachFromOperationContext();
+    }
+    // Some methods require pipeline to have a valid operation context. Normally, a pipeline and the
+    // corresponding execution pipeline share the same expression context containing a pointer to
+    // the operation context, but it might not be the case anymore when a pipeline is cloned with
+    // another expression context.
+    if (_sharedState->_pipeline) {
+        _sharedState->_pipeline->detachFromOperationContext();
+    }
+    // Reset the scoped shard role for cursorless sub-pipelines.
+    _scopedShardRole.reset();
+}
+
+void UnionWithStage::reattachToOperationContext(OperationContext* opCtx) {
+    // We have an execution pipeline we're going to execute across multiple commands, so we need to
+    // propagate the new operation context to the pipeline stages.
+    if (_sharedState->_execPipeline) {
+        _sharedState->_execPipeline->reattachToOperationContext(opCtx);
+    }
+    // Some methods require pipeline to have a valid operation context. Normally, a pipeline and the
+    // corresponding execution pipeline share the same expression context containing a pointer to
+    // the operation context, but it might not be the case anymore when a pipeline is cloned with
+    // another expression context.
+    if (_sharedState->_pipeline) {
+        _sharedState->_pipeline->reattachToOperationContext(opCtx);
+    }
+}
+
+bool UnionWithStage::validateOperationContext(const OperationContext* opCtx) const {
+    return getContext()->getOperationContext() == opCtx &&
+        (!_sharedState->_execPipeline ||
+         _sharedState->_execPipeline->validateOperationContext(opCtx));
+}
+}  // namespace exec::agg
+}  // namespace mongo

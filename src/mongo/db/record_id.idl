@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/record_id.h"
+
+types:
+    RecordId:
+        bson_serialization_type: any
+        cpp_type: RecordId
+        description: RecordId value
+        serializer: RecordId::serializeToken
+        deserializer: RecordId::deserializeToken
+        # Deserializer does not construct RecordId as a view.
+        is_view: false

@@ -1,0 +1,174 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/admission/ticketing/ticketholder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/migration_batch_inserter.h"
+#include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <memory>
+#include <string>
+
+#pragma once
+
+namespace mongo {
+
+
+// This class is only instantiated on the destination of a chunk migration and
+// has a single purpose: to manage two thread pools, one
+// on which threads perform inserters, and one on which
+// threads run _migrateClone requests (to fetch batches of documents to insert).
+//
+// The constructor creates and starts the inserter thread pool.  The destructor shuts down
+// and joins the inserter thread pool.
+//
+// The main work of the class is in method fetchAndScheduleInsertion.  That method
+// starts a thread pool for fetchers.  Each thread in that thread pool sits in a loop
+// sending out _migrateClone requests, blocking on the response, and scheduling an
+// inserter on the inserter thread pool.  This function joins and shuts down the
+// fetcher thread pool once all batches have been fetched.
+//
+// Inserter is templated only to allow a mock inserter to exist.
+// There is only one implementation of inserter currently, which is MigrationBatchInserter.
+//
+// A few things to note:
+//  - After fetchAndScheduleInsertion returns, insertions are still being executed (although fetches
+//    are not).
+//  - Sending out _migrateClone requests in parallel implies the need for synchronization on the
+//    source.  See the comments in migration_chunk_cloner_source.h for details around
+//    that.
+//  - The requirement on source side synchronization implies that care must be taken on upgrade.
+//    In particular, if the source is running an earlier binary that doesn't have code for
+//    source side synchronization, it is unsafe to send _migrateClone requests in parallel.
+//    To handle that case, when the source is prepared to service _migrateClone requests in
+//    parallel, the field "parallelMigrateCloneSupported" is included in the "_recvChunkStart"
+//    command.  The inclusion of that field indicates to the destination that it is safe
+//    to send _migrateClone requests in parallel.  Its exclusion indicates that it is unsafe.
+template <typename Inserter>
+class MigrationBatchFetcher {
+public:
+    MigrationBatchFetcher(OperationContext* outerOpCtx,
+                          OperationContext* innerOpCtx,
+                          NamespaceString nss,
+                          MigrationSessionId sessionId,
+                          const WriteConcernOptions& writeConcern,
+                          const ShardId& fromShardId,
+                          const ChunkRange& range,
+                          const UUID& migrationId,
+                          const UUID& collectionId,
+                          std::shared_ptr<MigrationCloningProgressSharedState> migrationInfo,
+                          int maxBufferedSizeBytesPerThread);
+
+    ~MigrationBatchFetcher();
+
+    // Repeatedly fetch batches (using _migrateClone request) and schedule inserter jobs
+    // on thread pool.
+    void fetchAndScheduleInsertion();
+
+    // Get inserter thread pool stats.
+    ThreadPool::Stats getThreadPoolStats() const {
+        return _inserterWorkers->getStats();
+    }
+
+private:
+    /**
+     * Keeps track of memory usage and makes sure it won't exceed the limit.
+     */
+    class BufferSizeTracker {
+    public:
+        const static int kUnlimited{0};
+
+        BufferSizeTracker(int maxSizeBytes) : _maxSizeBytes(maxSizeBytes) {}
+
+        /**
+         * If adding the given amount of bytes will go over the limit, wait until there's
+         * enough space then add.
+         */
+        void waitUntilSpaceAvailableAndAdd(OperationContext* opCtx, int sizeBytes);
+
+        /**
+         * Subtracts the tracked bytes by the given amount.
+         */
+        void remove(int sizeBytes);
+
+    private:
+        std::mutex _mutex;
+        stdx::condition_variable _hasAvailableSpace;
+
+        const int _maxSizeBytes;
+        int _currentSize{0};
+    };
+
+    NamespaceString _nss;
+
+    MigrationSessionId _sessionId;
+
+    // Inserter thread pool.
+    std::unique_ptr<ThreadPool> _inserterWorkers;
+
+    BSONObj _migrateCloneRequest;
+
+    OperationContext* _outerOpCtx;
+
+    OperationContext* _innerOpCtx;
+
+    std::shared_ptr<Shard> _fromShard;
+
+    // Shared state, by which the progress of migration is communicated
+    // to MigrationDestinationManager.
+    std::shared_ptr<MigrationCloningProgressSharedState> _migrationProgress;
+
+    ChunkRange _range;
+
+    UUID _collectionUuid;
+
+    UUID _migrationId;
+
+    WriteConcernOptions _writeConcern;
+
+    TicketHolder _secondaryThrottleTicket;
+
+    BufferSizeTracker _bufferSizeTracker;
+
+    // Given session id and namespace, create migrateCloneRequest.
+    // Only should be created once for the lifetime of the object.
+    BSONObj _createMigrateCloneRequest() const {
+        BSONObjBuilder builder;
+        builder.append("_migrateClone",
+                       NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+        _sessionId.append(&builder);
+        return builder.obj();
+    }
+
+    void _runFetcher();
+
+    // Fetches next batch using _migrateClone request and return it.  May return an empty batch.
+    BSONObj _fetchBatch(OperationContext* opCtx);
+
+    static bool _isEmptyBatch(const BSONObj& batch) {
+        return batch.getField("objects").Obj().isEmpty();
+    }
+
+    static void onCreateThread(const std::string& threadName) {
+        Client::initThread(threadName, getGlobalServiceContext()->getService());
+    }
+
+};  // namespace mongo
+
+}  // namespace mongo

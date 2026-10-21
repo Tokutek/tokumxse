@@ -1,71 +1,65 @@
-/**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/index/btree_access_method.h"
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/index/expression_keys_private.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+
+#include <utility>
 #include <vector>
 
-#include "mongo/base/status.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/keypattern.h"
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    using std::vector;
+using std::vector;
 
-    // Standard Btree implementation below.
-    BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree )
-        : IndexAccessMethod(btreeState, btree) {
+// Standard Btree implementation below.
+BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState,
+                                     std::unique_ptr<SortedDataInterface> btree)
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)) {
+    // The key generation wants these values.
+    vector<const char*> fieldNames;
+    vector<BSONElement> fixed;
 
-        // The key generation wants these values.
-        vector<const char*> fieldNames;
-        vector<BSONElement> fixed;
-
-        BSONObjIterator it(_descriptor->keyPattern());
-        while (it.more()) {
-            BSONElement elt = it.next();
-            fieldNames.push_back(elt.fieldName());
-            fixed.push_back(BSONElement());
-        }
-
-        if (0 == _descriptor->version()) {
-            _keyGenerator.reset(new BtreeKeyGeneratorV0(fieldNames, fixed,
-                _descriptor->isSparse()));
-        } else if (1 == _descriptor->version()) {
-            _keyGenerator.reset(new BtreeKeyGeneratorV1(fieldNames, fixed,
-                _descriptor->isSparse()));
-        } else {
-            massert(16745, "Invalid index version for key generation.", false );
-        }
+    BSONObjIterator it(btreeState->descriptor()->keyPattern());
+    while (it.more()) {
+        BSONElement elt = it.next();
+        fieldNames.push_back(elt.fieldName());
+        fixed.push_back(BSONElement());
     }
 
-    void BtreeAccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) const {
-        _keyGenerator->getKeys(obj, keys);
-    }
+    _keyGenerator =
+        std::make_unique<BtreeKeyGenerator>(fieldNames,
+                                            fixed,
+                                            btreeState->descriptor()->isSetSparseByUser(),
+                                            getSortedDataInterface()->getKeyStringVersion(),
+                                            getSortedDataInterface()->getOrdering());
+}
+
+void BtreeAccessMethod::validateDocument(const CollectionPtr& collection,
+                                         const BSONObj& obj,
+                                         const BSONObj& keyPattern) const {
+    ExpressionKeysPrivate::validateDocumentCommon(collection, obj, keyPattern);
+}
+
+void BtreeAccessMethod::doGetKeys(OperationContext* opCtx,
+                                  const CollectionPtr& collection,
+                                  const IndexCatalogEntry* entry,
+                                  SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                  const BSONObj& obj,
+                                  GetKeysContext context,
+                                  KeyStringSet* keys,
+                                  KeyStringSet* multikeyMetadataKeys,
+                                  MultikeyPaths* multikeyPaths,
+                                  const boost::optional<RecordId>& id) const {
+    const auto skipMultikey =
+        context == GetKeysContext::kValidatingKeys && !entry->isMultikey(opCtx, collection);
+    _keyGenerator->getKeys(
+        pooledBufferBuilder, obj, skipMultikey, keys, multikeyPaths, entry->getCollator(), id);
+}
 
 }  // namespace mongo

@@ -1,0 +1,208 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/op_observer/fallback_op_observer.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keys_collection_document_gen.h"
+#include "mongo/db/logical_time_validator.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/op_observer/batched_write_context.h"
+#include "mongo/db/op_observer/op_observer_util.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_killer.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/views_for_database.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/views/util.h"
+#include "mongo/db/views/view_catalog_helpers.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#include <memory>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+void FallbackOpObserver::onInserts(OperationContext* opCtx,
+                                   const CollectionPtr& coll,
+                                   std::vector<InsertStatement>::const_iterator first,
+                                   std::vector<InsertStatement>::const_iterator last,
+                                   const std::vector<RecordId>& recordIds,
+                                   const std::vector<bool>& fromMigrate,
+                                   bool defaultFromMigrate,
+                                   OpStateAccumulator* opAccumulator) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    const bool inMultiDocumentTransaction =
+        txnParticipant && opCtx->writesAreReplicated() && txnParticipant.transactionIsOpen();
+    if (inMultiDocumentTransaction && !shard_role_details::getWriteUnitOfWork(opCtx)) {
+        return;
+    }
+
+    const auto& nss = coll->ns();
+    const bool inReplicatedBatchedWrite =
+        BatchedWriteContext::get(opCtx).writesAreBatched() && opCtx->writesAreReplicated();
+
+    if (nss.isSystemDotJavascript()) {
+        Scope::storedFuncMod(opCtx);
+    } else if (nss.isSystemDotViews()) {
+        try {
+            for (auto it = first; it != last; it++) {
+                view_util::validateViewDefinitionBSON(opCtx, it->doc, nss.dbName());
+
+                uassertStatusOK(CollectionCatalog::get(opCtx)->createView(
+                    opCtx,
+                    NamespaceStringUtil::deserialize(nss.dbName().tenantId(),
+                                                     it->doc.getStringField("_id"),
+                                                     SerializationContext::stateDefault()),
+                    NamespaceStringUtil::deserialize(nss.dbName(),
+                                                     it->doc.getStringField("viewOn")),
+                    BSONArray{it->doc.getObjectField("pipeline")},
+                    view_catalog_helpers::validatePipeline,
+                    it->doc.getObjectField("collation"),
+                    ViewsForDatabase::Durability::kAlreadyDurable));
+            }
+        } catch (const DBException&) {
+            // If a previous operation left the view catalog in an invalid state, our inserts can
+            // fail even if all the definitions are valid. Reloading may help us reset the state.
+            CollectionCatalog::get(opCtx)->reloadViews(opCtx, nss.dbName());
+        }
+    } else if (nss == NamespaceString::kSessionTransactionsTableNamespace) {
+        if (inReplicatedBatchedWrite ||
+            (opAccumulator && !opAccumulator->batchOpTimes.empty() &&
+             !opAccumulator->batchOpTimes.back().isNull())) {
+            for (auto it = first; it != last; it++) {
+                auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+                mongoDSessionCatalog->observeDirectWriteToConfigTransactions(opCtx, it->doc);
+            }
+        }
+    } else if (nss == NamespaceString::kConfigSettingsNamespace) {
+        for (auto it = first; it != last; it++) {
+            ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
+                opCtx, it->doc["_id"], it->doc);
+        }
+    } else if (nss == NamespaceString::kExternalKeysCollectionNamespace) {
+        for (auto it = first; it != last; it++) {
+            auto externalKey =
+                ExternalKeysCollectionDocument::parse(it->doc, IDLParserContext("externalKey"));
+            shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+                [this, externalKey = std::move(externalKey)](OperationContext* opCtx,
+                                                             boost::optional<Timestamp>) mutable {
+                    auto validator = LogicalTimeValidator::get(opCtx);
+                    if (validator) {
+                        validator->cacheExternalKey(externalKey);
+                    }
+                });
+        }
+    }
+}
+
+void FallbackOpObserver::onUpdate(OperationContext* opCtx,
+                                  const OplogUpdateEntryArgs& args,
+                                  OpStateAccumulator* opAccumulator) {
+    if (args.updateArgs->update.isEmpty()) {
+        return;
+    }
+
+    const auto& nss = args.coll->ns();
+    const bool inReplicatedBatchedWrite =
+        BatchedWriteContext::get(opCtx).writesAreBatched() && opCtx->writesAreReplicated();
+
+    if (nss.isSystemDotJavascript()) {
+        Scope::storedFuncMod(opCtx);
+    } else if (nss.isSystemDotViews()) {
+        CollectionCatalog::get(opCtx)->reloadViews(opCtx, nss.dbName());
+    } else if (nss == NamespaceString::kSessionTransactionsTableNamespace &&
+               (inReplicatedBatchedWrite || !opAccumulator->opTime.writeOpTime.isNull())) {
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        mongoDSessionCatalog->observeDirectWriteToConfigTransactions(opCtx,
+                                                                     args.updateArgs->updatedDoc);
+    } else if (nss == NamespaceString::kConfigSettingsNamespace) {
+        ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
+            opCtx, args.updateArgs->updatedDoc["_id"], args.updateArgs->updatedDoc);
+    }
+}
+
+void FallbackOpObserver::onDelete(OperationContext* opCtx,
+                                  const CollectionPtr& coll,
+                                  StmtId stmtId,
+                                  const BSONObj& doc,
+                                  const DocumentKey& documentKey,
+                                  const OplogDeleteEntryArgs& args,
+                                  OpStateAccumulator* opAccumulator) {
+    const auto& nss = coll->ns();
+    const bool inReplicatedBatchedWrite =
+        BatchedWriteContext::get(opCtx).writesAreBatched() && opCtx->writesAreReplicated();
+
+    if (nss.isSystemDotJavascript()) {
+        Scope::storedFuncMod(opCtx);
+    } else if (nss.isSystemDotViews()) {
+        CollectionCatalog::get(opCtx)->reloadViews(opCtx, nss.dbName());
+    } else if (nss == NamespaceString::kSessionTransactionsTableNamespace &&
+               (inReplicatedBatchedWrite || !opAccumulator->opTime.writeOpTime.isNull())) {
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        mongoDSessionCatalog->observeDirectWriteToConfigTransactions(opCtx, documentKey.getId());
+    } else if (nss == NamespaceString::kConfigSettingsNamespace) {
+        ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
+            opCtx, documentKey.getId().firstElement(), boost::none);
+    }
+}
+
+void FallbackOpObserver::onDropDatabase(OperationContext* opCtx,
+                                        const DatabaseName& dbName,
+                                        bool markFromMigrate) {
+    if (dbName == NamespaceString::kSessionTransactionsTableNamespace.dbName()) {
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        mongoDSessionCatalog->invalidateAllSessions(opCtx);
+    }
+}
+
+repl::OpTime FallbackOpObserver::onDropCollection(OperationContext* opCtx,
+                                                  const NamespaceString& collectionName,
+                                                  const UUID& uuid,
+                                                  std::uint64_t numRecords,
+                                                  bool markFromMigrate,
+                                                  bool isTimeseries) {
+    if (collectionName.isSystemDotJavascript()) {
+        Scope::storedFuncMod(opCtx);
+    } else if (collectionName.isSystemDotViews()) {
+        CollectionCatalog::get(opCtx)->clearViews(opCtx, collectionName.dbName());
+    } else if (collectionName == NamespaceString::kSessionTransactionsTableNamespace) {
+        // Disallow this drop if there are currently prepared transactions.
+        const auto sessionCatalog = SessionCatalog::get(opCtx);
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        bool noPreparedTxns = true;
+        sessionCatalog->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            if (txnParticipant.transactionIsPrepared()) {
+                noPreparedTxns = false;
+            }
+        });
+        uassert(4852500,
+                "Unable to drop transactions table (config.transactions) while prepared "
+                "transactions are present.",
+                noPreparedTxns);
+
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        mongoDSessionCatalog->invalidateAllSessions(opCtx);
+    } else if (collectionName == NamespaceString::kConfigSettingsNamespace) {
+        ReadWriteConcernDefaults::get(opCtx).invalidate();
+    }
+
+    return {};
+}
+
+}  // namespace mongo

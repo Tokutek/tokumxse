@@ -1,0 +1,381 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/expression_function.h"
+#include "mongo/db/pipeline/expression_js_emit.h"
+#include "mongo/db/pipeline/process_interface/standalone_process_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/scopeguard.h"
+
+#include <memory>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace {
+
+class ExpressionJavascriptTest : public ServiceContextMongoDTest {
+protected:
+    ExpressionJavascriptTest()
+        : _expCtx((new ExpressionContextForTest())), _vps(_expCtx->variablesParseState) {
+        _expCtx->setMongoProcessInterface(std::make_shared<StandaloneProcessInterface>(nullptr));
+    }
+
+    auto& getExpCtx() {
+        return _expCtx;
+    }
+    auto getExpCtxRaw() {
+        return _expCtx.get();
+    }
+
+    const VariablesParseState& getVPS() {
+        return _vps;
+    }
+
+    Variables* getVariables() {
+        return &_expCtx->variables;
+    }
+
+private:
+    void setUp() override;
+    void tearDown() override;
+
+    boost::intrusive_ptr<ExpressionContextForTest> _expCtx;
+    VariablesParseState _vps;
+};
+
+
+void ExpressionJavascriptTest::setUp() {
+    ServiceContextMongoDTest::setUp();
+    ScriptEngine::setup(ExecutionEnvironment::Server);
+}
+
+void ExpressionJavascriptTest::tearDown() {
+    ScriptEngine::dropScopeCache();
+    ServiceContextMongoDTest::tearDown();
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionProducesExpectedResult) {
+    auto bsonExpr =
+        BSON("expr" << BSON("body" << "function(first, second) {return first + second;};"
+                                   << "args" << BSON_ARRAY("$a" << 4) << "lang"
+                                   << ExpressionFunction::kJavaScript));
+
+    auto expr = ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    Value result = expr->evaluate(Document{BSON("a" << 2)}, getVariables());
+    ASSERT_VALUE_EQ(result, Value(6));
+
+    bsonExpr = BSON(
+        "expr" << BSON("body" << "function(first, second, third) {return first + second + third;};"
+                              << "args" << BSON_ARRAY(1 << 2 << 4) << "lang"
+                              << ExpressionFunction::kJavaScript));
+    expr = ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+    result = expr->evaluate(Document{BSONObj{}}, getVariables());
+    ASSERT_VALUE_EQ(result, Value(7));
+
+    bsonExpr = BSON("expr" << BSON("body" << "function(first) {return first;};"
+                                          << "args" << BSON_ARRAY(1) << "lang"
+                                          << ExpressionFunction::kJavaScript));
+    expr = ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+    result = expr->evaluate(Document{BSONObj{}}, getVariables());
+    ASSERT_VALUE_EQ(result, Value(1));
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfArgsDoesNotEvaluateToArray) {
+    auto bsonExpr =
+        BSON("expr" << BSON("body" << "function(first, second) {return first + second;};"
+                                   << "args" << BSON("a" << 1) << "lang"
+                                   << ExpressionFunction::kJavaScript));
+    auto expr = ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    ASSERT_THROWS_CODE(expr->evaluate({}, getVariables()), AssertionException, 31266);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsWithInvalidFunction) {
+    auto bsonExpr = BSON("expr" << BSON("body" << "INVALID"
+                                               << "args" << BSON_ARRAY(1 << 2) << "lang"
+                                               << ExpressionFunction::kJavaScript));
+    auto expr = ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    ASSERT_THROWS_CODE(
+        expr->evaluate({}, getVariables()), AssertionException, ErrorCodes::JSInterpreterFailure);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfArgumentIsNotObject) {
+    auto bsonExpr = BSON("expr" << 1);
+    ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+                       AssertionException,
+                       31260);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfBodyNotSpecified) {
+    auto bsonExpr = BSON(
+        "expr" << BSON("args" << BSON_ARRAY(1 << 2) << "lang" << ExpressionFunction::kJavaScript));
+    ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+                       AssertionException,
+                       31261);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfBodyIsNotConstantExpression) {
+    auto bsonExpr = BSON("expr" << BSON("body" << "$a"
+                                               << "args" << BSON_ARRAY(1 << 2) << "lang"
+                                               << ExpressionFunction::kJavaScript));
+    ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+                       AssertionException,
+                       31432);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfBodyIsNotCorrectType) {
+    auto bsonExpr = BSON("expr" << BSON("body" << 1 << "args" << BSON_ARRAY(1 << 2) << "lang"
+                                               << ExpressionFunction::kJavaScript));
+    ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+                       AssertionException,
+                       31262);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfArgsIsNotSpecified) {
+    auto bsonExpr = BSON("expr" << BSON("body" << "function(first) {return first;};"
+                                               << "lang" << ExpressionFunction::kJavaScript));
+    ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+                       AssertionException,
+                       31263);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionFailsIfLangIsNotSpecified) {
+    auto bsonExpr = BSON("expr" << BSON("body" << "function(first) {return first;};"
+                                               << "args" << BSON_ARRAY(1 << 2)));
+    ASSERT_THROWS_CODE(ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+                       AssertionException,
+                       31418);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitProducesExpectedResult) {
+    auto bsonExpr =
+        BSON("expr" << BSON("this" << "$$ROOT"
+                                   << "eval"
+                                   << "function() {emit(this.a, 1); emit(this.b, 1)};"));
+
+    auto expr = ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    Value result = expr->evaluate(Document{BSON("a" << 3 << "b" << 6)}, getVariables());
+    ASSERT_VALUE_EQ(result,
+                    Value(BSON_ARRAY(BSON("k" << 3 << "v" << 1) << BSON("k" << 6 << "v" << 1))));
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsIfThisArgumentNotSpecified) {
+    auto bsonExpr =
+        BSON("expr" << BSON("eval" << "function() {emit(this.a, 1); emit(this.b, 1)};"));
+    ASSERT_THROWS_CODE(
+        ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+        AssertionException,
+        31223);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsIfThisArgumentIsNotAnObject) {
+    auto bsonExpr =
+        BSON("expr" << BSON("this" << 123 << "eval"
+                                   << "function() {emit(this.a, 1); emit(this.b, 1)};"));
+    auto expr = ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    ASSERT_THROWS_CODE(expr->evaluate({}, getVariables()), AssertionException, 31225);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsWithInvalidFunction) {
+    auto bsonExpr = BSON("expr" << BSON("this" << "$$ROOT"
+                                               << "eval"
+                                               << "INVALID"));
+    auto expr = ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    ASSERT_THROWS_CODE(
+        expr->evaluate({}, getVariables()), AssertionException, ErrorCodes::JSInterpreterFailure);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsWithInvalidNumberOfEvalArguments) {
+    auto bsonExpr = BSON("expr" << BSON("this" << "$$ROOT"
+                                               << "eval"
+                                               << "function() {emit(this.a);};"));
+    auto expr = ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+
+    ASSERT_THROWS_CODE(
+        expr->evaluate(Document{BSON("a" << 3)}, getVariables()), AssertionException, 31220);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsIfArgumentIsNotObject) {
+    auto bsonExpr = BSON("expr" << 1);
+    ASSERT_THROWS_CODE(
+        ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+        AssertionException,
+        31221);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsIfEvalNotSpecified) {
+    auto bsonExpr = BSON("expr" << BSON("this" << "$$ROOT"));
+    ASSERT_THROWS_CODE(
+        ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+        AssertionException,
+        31222);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitFailsIfEvalIsNotCorrectType) {
+    auto bsonExpr = BSON("expr" << BSON("this" << "$$ROOT"
+                                               << "eval" << 12.3));
+    ASSERT_THROWS_CODE(
+        ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS()),
+        AssertionException,
+        31224);
+}
+
+TEST_F(ExpressionJavascriptTest,
+       ExpressionInternalJsErrorsIfProducesTooManyDocumentsForNonDefaultValue) {
+    auto origLimit = internalQueryMaxJsEmitBytes.load();
+    internalQueryMaxJsEmitBytes.store(1);
+    ON_BLOCK_EXIT([&] { internalQueryMaxJsEmitBytes.store(origLimit); });
+    auto bsonExpr = BSON(
+        "expr" << BSON("this" << "$$ROOT"
+                              << "eval"
+                              << "function() {for (var i = 0; i < this.val; ++i) {emit(i, 1);}}"));
+    auto expr = ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+    ASSERT_THROWS_CODE(
+        expr->evaluate(Document{BSON("val" << 1)}, getVariables()), AssertionException, 31292);
+}
+
+// ExpressionFunction and ExpressionInternalJsEmit that share an ExpressionContext also share
+// the same MozJS scope, so globalThis written by one is visible to the other.
+TEST_F(ExpressionJavascriptTest, GlobalThisIsSharedBetweenExpressionFunctionAndInternalJsEmit) {
+    auto expCtx = getExpCtxRaw();
+    auto funcBson =
+        BSON("expr" << BSON("body" << "function() { globalThis._shared = true; return 1; }"
+                                   << "args" << BSONArray() << "lang"
+                                   << ExpressionFunction::kJavaScript));
+    auto funcExpr = ExpressionFunction::parse(expCtx, funcBson.firstElement(), getVPS());
+    funcExpr->evaluate(Document{BSONObj{}}, getVariables());
+
+    auto emitBson =
+        BSON("expr" << BSON("this" << "$$ROOT"
+                                   << "eval"
+                                   << "function() { emit(this.c, globalThis._shared ? 1 : 0); }"));
+    auto emitExpr = ExpressionInternalJsEmit::parse(expCtx, emitBson.firstElement(), getVPS());
+    Value result = emitExpr->evaluate(Document{Document{BSON("c" << 3)}}, getVariables());
+    ASSERT_VALUE_EQ(result, Value(BSON_ARRAY(BSON("k" << 3 << "v" << 1))));
+}
+
+// Calling a stale emit() reference (stored in globalThis) from ExpressionFunction after
+// the owning ExpressionInternalJsEmit evaluate() has returned must throw error 9712400.
+TEST_F(ExpressionJavascriptTest,
+       ExpressionInternalJsEmitStaleEmitCalledFromExpressionFunctionThrows) {
+    auto expCtx = getExpCtxRaw();
+    auto emitBson =
+        BSON("expr" << BSON("this" << "$$ROOT"
+                                   << "eval"
+                                   << "function() { if (!globalThis._staleEmit) "
+                                      "globalThis._staleEmit = emit; emit(this.x, 1); }"));
+    auto emitExpr = ExpressionInternalJsEmit::parse(expCtx, emitBson.firstElement(), getVPS());
+    Value emitResult = emitExpr->evaluate(Document{BSON("x" << 5)}, getVariables());
+    ASSERT_VALUE_EQ(emitResult, Value(BSON_ARRAY(BSON("k" << 5 << "v" << 1))));
+
+    auto funcBson = BSON("expr" << BSON("body" << "function() { if (globalThis._staleEmit) "
+                                                  "globalThis._staleEmit(this.x, 999); return 42; }"
+                                               << "args" << BSONArray() << "lang"
+                                               << ExpressionFunction::kJavaScript));
+    auto funcExpr = ExpressionFunction::parse(expCtx, funcBson.firstElement(), getVPS());
+    ASSERT_THROWS_CODE(
+        funcExpr->evaluate(Document{BSON("x" << 5)}, getVariables()), AssertionException, 9712400);
+}
+
+// The results of an ExpressionInternalJsEmit evaluation must not be polluted by a stale emit
+// reference that happens to be called from a $function stage between two document evaluations.
+TEST_F(ExpressionJavascriptTest,
+       ExpressionInternalJsEmitResultsAreCleanAfterStaleEmitCalledBetweenEvaluations) {
+    // First evaluate on doc {x:1}: saves emit to globalThis, produces [{k:1,v:1}].
+    auto expCtx = getExpCtxRaw();
+    auto emitBson1 =
+        BSON("expr" << BSON("this" << "$$ROOT"
+                                   << "eval"
+                                   << "function() { if (!globalThis._staleEmit2) "
+                                      "globalThis._staleEmit2 = emit; emit(this.x, 1); }"));
+    auto emitExpr = ExpressionInternalJsEmit::parse(expCtx, emitBson1.firstElement(), getVPS());
+    Value r1 = emitExpr->evaluate(Document{BSON("x" << 1)}, getVariables());
+    ASSERT_VALUE_EQ(r1, Value(BSON_ARRAY(BSON("k" << 1 << "v" << 1))));
+
+    // Stale emit should still act like emit() within another internal JS emit evaluation.
+    auto emitBson2 =
+        BSON("expr" << BSON(
+                 "this" << "$$ROOT"
+                        << "eval"
+                        << "function() { emit(this.x, 1); globalThis._staleEmit2(this.x, 999); }"));
+    auto emitExpr2 = ExpressionInternalJsEmit::parse(expCtx, emitBson2.firstElement(), getVPS());
+    Value r2 = emitExpr2->evaluate(Document{BSON("x" << 2)}, getVariables());
+    ASSERT_VALUE_EQ(r2,
+                    Value(BSON_ARRAY(BSON("k" << 2 << "v" << 1) << BSON("k" << 2 << "v" << 999))));
+}
+
+// Test if the JsExecution being a decoration on the
+// OperationContext which can be re-used for multiple pipeline executions. The query code must not
+// assume that a single OperationContext is only ever associated with a single pipeline.
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitReusesOperationContextAcrossPipelines) {
+    internalQueryMaxJsEmitBytes.store(100 * 1024 * 1024);
+
+    // Share a single OperationContext across the ExpressionContext of each pipeline.
+    auto* opCtx = getExpCtxRaw()->getOperationContext();
+
+    auto evaluateJsEmit = [&](std::string_view func, const Document& root) {
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest(opCtx));
+        expCtx->setMongoProcessInterface(std::make_shared<StandaloneProcessInterface>(nullptr));
+        auto bsonExpr = BSON("expr" << BSON("this" << "$$ROOT"
+                                                   << "eval" << func));
+        auto expr = ExpressionInternalJsEmit::parse(
+            expCtx.get(), bsonExpr.firstElement(), expCtx->variablesParseState);
+        return expr->evaluate(root, &expCtx->variables);
+    };
+
+    Value firstResult = evaluateJsEmit("function() {emit(this.a, 1); emit(this.b, 1)};",
+                                       Document{BSON("a" << 3 << "b" << 6)});
+    ASSERT_VALUE_EQ(firstResult,
+                    Value(BSON_ARRAY(BSON("k" << 3 << "v" << 1) << BSON("k" << 6 << "v" << 1))));
+
+    Value secondResult = evaluateJsEmit("function() {emit(this.c, 2)};", Document{BSON("c" << 9)});
+    ASSERT_VALUE_EQ(secondResult, Value(BSON_ARRAY(BSON("k" << 9 << "v" << 2))));
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionFunctionRejectsMalformedBSONColumn) {
+    auto bsonExpr = BSON("expr" << BSON("body" << "function() { return new BinData(7, 'Ag=='); };"
+                                               << "args" << BSONArray() << "lang"
+                                               << ExpressionFunction::kJavaScript));
+    auto expr = ExpressionFunction::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+    ASSERT_THROWS_CODE(expr->evaluate({}, getVariables()),
+                       AssertionException,
+                       ErrorCodes::InvalidBSONFromJavaScript);
+}
+
+TEST_F(ExpressionJavascriptTest, ExpressionInternalJsEmitRejectsMalformedBSONColumn) {
+    auto bsonExpr =
+        BSON("expr" << BSON("this" << "$$ROOT"
+                                   << "eval"
+                                   << "function() { emit(this._id, new BinData(7, 'Ag==')); }"));
+    auto expr = ExpressionInternalJsEmit::parse(getExpCtxRaw(), bsonExpr.firstElement(), getVPS());
+    ASSERT_THROWS_CODE(expr->evaluate(Document{BSON("_id" << 1)}, getVariables()),
+                       AssertionException,
+                       ErrorCodes::InvalidBSONFromJavaScript);
+}
+}  // namespace
+}  // namespace mongo

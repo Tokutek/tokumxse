@@ -1,300 +1,119 @@
-/**
- *    Copyright (C) 2013 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/s/cluster_write.h"
 
-#include <string>
-#include <vector>
+#include "mongo/db/fle_crud.h"
+#include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/db/query/shard_key_diagnostic_printer.h"
+#include "mongo/db/router_role/collection_routing_info_targeter.h"
+#include "mongo/db/router_role/ns_targeter.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/write_ops/bulk_write_exec.h"
+#include "mongo/s/write_ops/fle.h"
+#include "mongo/s/write_ops/unified_write_executor/stats.h"
+#include "mongo/s/write_ops/unified_write_executor/unified_write_executor.h"
+#include "mongo/util/decorable.h"
 
-#include "mongo/base/status.h"
-#include "mongo/db/write_concern_options.h"
-#include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/chunk_manager_targeter.h"
-#include "mongo/s/client/dbclient_multi_command.h"
-#include "mongo/s/config.h"
-#include "mongo/s/dbclient_shard_resolver.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/write_ops/batch_write_exec.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
+namespace {
 
-    using std::auto_ptr;
-    using std::vector;
-    using std::map;
-    using std::string;
-    using std::stringstream;
+// Utility to port 'uweStats' to 'batchStats'. This is done to enable re-using the existing logic
+// for cluster write statistics.
+// TODO SERVER-109104: This can be removed once we delete BatchWriteExec.
+void fillOutBatchWriteStats(unified_write_executor::Stats& uweStats,
+                            BatchWriteExecStats& batchStats) {
+    const auto& map = uweStats.getTargetingStatsMap();
+    if (map.empty()) {
+        return;
+    }
+    tassert(11499200,
+            "Expected only a single entry in targeting stats map for a batch write",
+            map.size() == 1 && map.count(0) != 0);
+    const auto& targetingStats = map.at(0);
+    batchStats.noteNumShardsOwningChunks(targetingStats.numShardsOwningChunks);
+    batchStats.noteTargetedCollectionIsSharded(targetingStats.isSharded);
+    for (const auto& shard : uweStats.getTargetedShards()) {
+        batchStats.noteTargetedShard(shard);
+    }
+}
+}  // namespace
+namespace cluster {
 
-    const int ConfigOpTimeoutMillis = 30 * 1000;
+void write(OperationContext* opCtx,
+           const BatchedCommandRequest& request,
+           NamespaceString* nss,
+           BatchWriteExecStats* stats,
+           BatchedCommandResponse* response,
+           boost::optional<OID> targetEpoch) {
+    NotPrimaryErrorTracker::Disabled scopeDisabledTracker(
+        &NotPrimaryErrorTracker::get(opCtx->getClient()));
 
-    namespace {
+    tassert(11499201, "Should have initialized 'stats' object", stats);
+    CollectionRoutingInfoTargeter targeter(opCtx, request.getNS(), targetEpoch);
+    if (nss) {
+        *nss = targeter.getNS();
+    }
 
-        /**
-         * Constructs the BSON specification document for the given namespace, index key
-         * and options.
-         */
-        BSONObj createIndexDoc(const string& ns, const BSONObj& keys, bool unique) {
-            BSONObjBuilder indexDoc;
-            indexDoc.append("ns", ns);
-            indexDoc.append("key", keys);
+    LOGV2_DEBUG_OPTIONS(
+        4817400, 2, {logv2::LogComponent::kShardMigrationPerf}, "Starting batch write");
 
-            stringstream indexName;
+    if (unified_write_executor::isEnabled(opCtx)) {
+        unified_write_executor::Stats uweStats;
+        *response = unified_write_executor::write(opCtx, request, uweStats, targetEpoch);
+        // SERVER-109104 This can be removed once we delete BatchWriteExec.
+        fillOutBatchWriteStats(uweStats, *stats);
+    } else {
+        // Create an RAII object that prints the collection's shard key in the case of a tassert
+        // or crash.
+        ScopedDebugInfo shardKeyDiagnostics(
+            "ShardKeyDiagnostics",
+            diagnostic_printers::ShardKeyDiagnosticPrinter{
+                targeter.isTargetedCollectionSharded()
+                    ? targeter.getRoutingInfo().getChunkManager().getShardKeyPattern().toBSON()
+                    : BSONObj()});
 
-            bool isFirstKey = true;
-            for (BSONObjIterator keyIter(keys); keyIter.more();) {
-                BSONElement currentKey = keyIter.next();
-
-                if (isFirstKey) {
-                    isFirstKey = false;
-                }
-                else {
-                    indexName << "_";
-                }
-
-                indexName << currentKey.fieldName() << "_";
-                if (currentKey.isNumber()) {
-                    indexName << currentKey.numberInt();
-                }
-                else {
-                    indexName << currentKey.str(); //this should match up with shell command
-                }
-            }
-
-            indexDoc.append("name", indexName.str());
-
-            if (unique) {
-                indexDoc.appendBool("unique", unique);
-            }
-
-            return indexDoc.obj();
-        }
-
-        void toBatchError(const Status& status, BatchedCommandResponse* response) {
-            response->clear();
-            response->setErrCode(status.code());
-            response->setErrMessage(status.reason());
-            response->setOk(false);
-            dassert(response->isValid(NULL));
-        }
-
-        /**
-         * Splits the chunks touched based from the targeter stats if needed.
-         */
-        void splitIfNeeded(const string& ns, const TargeterStats& stats) {
-            if (!Chunk::ShouldAutoSplit) {
+        if (prepareForFLERewrite(opCtx,
+                                 request.getWriteCommandRequestBase().getEncryptionInformation())) {
+            FLEBatchResult result = processFLEBatch(opCtx, request, response);
+            if (result == FLEBatchResult::kProcessed) {
                 return;
             }
 
-            DBConfigPtr config;
-
-            try {
-                config = grid.getDBConfig(ns);
-            }
-            catch (const DBException& ex) {
-                warning() << "failed to get database config for " << ns
-                          << " while checking for auto-split: " << causedBy(ex);
-                return;
-            }
-
-            ChunkManagerPtr chunkManager;
-            ShardPtr dummyShard;
-            config->getChunkManagerOrPrimary(ns, chunkManager, dummyShard);
-
-            if (!chunkManager) {
-                return;
-            }
-
-            for (map<BSONObj, int>::const_iterator it = stats.chunkSizeDelta.begin();
-                 it != stats.chunkSizeDelta.end();
-                 ++it) {
-
-                ChunkPtr chunk;
-                try {
-                    chunk = chunkManager->findIntersectingChunk(it->first);
-                }
-                catch (const AssertionException& ex) {
-                    warning() << "could not find chunk while checking for auto-split: "
-                              << causedBy(ex);
-                    return;
-                }
-
-                chunk->splitIfShould(it->second);
-            }
+            // fall through
         }
 
-    } // namespace
-
-    Status clusterCreateIndex( const string& ns,
-                               BSONObj keys,
-                               bool unique,
-                               BatchedCommandResponse* response ) {
-
-        const NamespaceString nss(ns);
-        const std::string dbName = nss.db().toString();
-
-        BSONObj indexDoc = createIndexDoc(ns, keys, unique);
-
-        // Go through the shard insert path
-        std::auto_ptr<BatchedInsertRequest> insert(new BatchedInsertRequest());
-        insert->addToDocuments(indexDoc);
-
-        BatchedCommandRequest request(insert.release());
-        request.setNS(nss.getSystemIndexesCollection());
-        request.setWriteConcern(WriteConcernOptions::Acknowledged);
-
-        BatchedCommandResponse dummyResponse;
-        if (response == NULL) {
-            response = &dummyResponse;
-        }
-
-        ClusterWriter writer(false, 0);
-        writer.write(request, response);
-
-        if (response->getOk() != 1) {
-            return Status(static_cast<ErrorCodes::Error>(response->getErrCode()),
-                                                         response->getErrMessage());
-        }
-
-        if (response->isErrDetailsSet()) {
-            const WriteErrorDetail* errDetail = response->getErrDetails().front();
-
-            return Status(static_cast<ErrorCodes::Error>(errDetail->getErrCode()),
-                                                         errDetail->getErrMessage());
-        }
-
-        if (response->isWriteConcernErrorSet()) {
-            const WCErrorDetail* errDetail = response->getWriteConcernError();
-
-            return Status(static_cast<ErrorCodes::Error>(errDetail->getErrCode()),
-                                                         errDetail->getErrMessage());
-        }
-
-        return Status::OK();
+        BatchWriteExec::executeBatch(opCtx, targeter, request, response, stats);
     }
+    LOGV2_DEBUG_OPTIONS(
+        4817401, 2, {logv2::LogComponent::kShardMigrationPerf}, "Finished batch write");
+}
 
-
-    void ClusterWriter::write( const BatchedCommandRequest& origRequest,
-                               BatchedCommandResponse* response ) {
-
-        // Add _ids to insert request if req'd
-        auto_ptr<BatchedCommandRequest> idRequest(BatchedCommandRequest::cloneWithIds(origRequest));
-        const BatchedCommandRequest& request = NULL != idRequest.get() ? *idRequest : origRequest;
-
-        const NamespaceString& nss = request.getNSS();
-        if ( !nss.isValid() ) {
-            toBatchError( Status( ErrorCodes::InvalidNamespace,
-                                  nss.ns() + " is not a valid namespace" ),
-                          response );
-            return;
+bulk_write_exec::BulkWriteReplyInfo bulkWrite(
+    OperationContext* opCtx,
+    const BulkWriteCommandRequest& request,
+    const std::vector<std::unique_ptr<NSTargeter>>& targeters,
+    bulk_write_exec::BulkWriteExecStats& execStats) {
+    if (unified_write_executor::isEnabled(opCtx)) {
+        unified_write_executor::Stats uweStats;
+        return unified_write_executor::bulkWrite(opCtx, request, uweStats);
+    } else {
+        if (prepareForFLERewrite(opCtx, request.getNsInfo()[0].getEncryptionInformation())) {
+            auto [result, replies] = attemptExecuteFLE(opCtx, request);
+            if (result == FLEBatchResult::kProcessed) {
+                return replies;
+            }  // else fallthrough.
         }
-
-        if ( !NamespaceString::validCollectionName( nss.coll() ) ) {
-            toBatchError( Status( ErrorCodes::BadValue,
-                                  str::stream() << "invalid collection name " << nss.coll() ),
-                          response );
-            return;
-        }
-
-        if ( request.sizeWriteOps() == 0u ) {
-            toBatchError( Status( ErrorCodes::InvalidLength,
-                                  "no write ops were included in the batch" ),
-                          response );
-            return;
-        }
-
-        if ( request.sizeWriteOps() > BatchedCommandRequest::kMaxWriteBatchSize ) {
-            toBatchError( Status( ErrorCodes::InvalidLength,
-                                  str::stream() << "exceeded maximum write batch size of "
-                                                << BatchedCommandRequest::kMaxWriteBatchSize ),
-                          response );
-            return;
-        }
-
-        string errMsg;
-        if ( request.isInsertIndexRequest() && !request.isValidIndexRequest( &errMsg ) ) {
-            toBatchError( Status( ErrorCodes::InvalidOptions, errMsg ), response );
-            return;
-        }
-
-        // Config writes and shard writes are done differently
-        const string dbName = nss.db().toString();
-
-        if (dbName == "config" || dbName == "admin") {
-            grid.catalogManager()->writeConfigServerDirect(request, response);
-        }
-        else {
-            ChunkManagerTargeter targeter(request.getTargetingNSS());
-            Status targetInitStatus = targeter.init();
-
-            if (!targetInitStatus.isOK()) {
-                // Errors will be reported in response if we are unable to target
-                warning() << "could not initialize targeter for"
-                          << (request.isInsertIndexRequest() ? " index" : "")
-                          << " write op in collection " << request.getTargetingNS();
-            }
-
-            DBClientShardResolver resolver;
-            DBClientMultiCommand dispatcher;
-            BatchWriteExec exec(&targeter, &resolver, &dispatcher);
-            exec.executeBatch(request, response);
-
-            if (_autoSplit) {
-                splitIfNeeded(request.getNS(), *targeter.getStats());
-            }
-
-            _stats->setShardStats(exec.releaseStats());
-        }
+        return bulk_write_exec::execute(opCtx, targeters, request, execStats);
     }
+}
 
-    ClusterWriter::ClusterWriter( bool autoSplit, int timeoutMillis ) :
-        _autoSplit( autoSplit ), _timeoutMillis( timeoutMillis ), _stats( new ClusterWriterStats ) {
-    }
-
-    const ClusterWriterStats& ClusterWriter::getStats() {
-        return *_stats;
-    }
-
-    void ClusterWriterStats::setShardStats( BatchWriteExecStats* shardStats ) {
-        _shardStats.reset( shardStats );
-    }
-
-    bool ClusterWriterStats::hasShardStats() const {
-        return NULL != _shardStats.get();
-    }
-
-    const BatchWriteExecStats& ClusterWriterStats::getShardStats() const {
-        return *_shardStats;
-    }
-
-} // namespace mongo
+}  // namespace cluster
+}  // namespace mongo

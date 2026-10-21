@@ -1,0 +1,166 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+
+namespace mongo {
+namespace repl {
+
+namespace {
+
+const std::string kCheckEmptyFieldName = "checkEmpty";
+const std::string kConfigVersionFieldName = "configVersion";
+const std::string kConfigTermFieldName = "configTerm";
+const std::string kHeartbeatVersionFieldName = "hbv";
+const std::string kSenderHostFieldName = "from";
+const std::string kSenderIdFieldName = "fromId";
+const std::string kSetNameFieldName = "replSetHeartbeat";
+const std::string kTermFieldName = "term";
+const std::string kPrimaryIdFieldName = "primaryId";
+}  // namespace
+
+Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
+    Status status =
+        bsonExtractBooleanFieldWithDefault(argsObj, kCheckEmptyFieldName, false, &_checkEmpty);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_configVersion);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_configTerm);
+    if (!status.isOK())
+        return status;
+
+    long long tempHeartbeatVersion;
+    status = bsonExtractIntegerField(argsObj, kHeartbeatVersionFieldName, &tempHeartbeatVersion);
+    if (status.isOK()) {
+        if (tempHeartbeatVersion != 1) {
+            return Status(ErrorCodes::Error(40666),
+                          str::stream()
+                              << "Found invalid value for field " << kHeartbeatVersionFieldName
+                              << ": " << tempHeartbeatVersion);
+        }
+        _heartbeatVersion = tempHeartbeatVersion;
+        _hasHeartbeatVersion = true;
+    } else if (status.code() != ErrorCodes::NoSuchKey) {
+        return status;
+    }
+
+    status = bsonExtractIntegerFieldWithDefault(argsObj, kSenderIdFieldName, -1, &_senderId);
+    if (!status.isOK())
+        return status;
+
+    std::string hostAndPortString;
+    status = bsonExtractStringField(argsObj, kSenderHostFieldName, &hostAndPortString);
+    if (!status.isOK())
+        return status;
+    if (!hostAndPortString.empty()) {
+        status = _senderHost.initialize(hostAndPortString);
+        if (!status.isOK())
+            return status;
+        _hasSender = true;
+    }
+
+    // If sender is in an older version, the request object may not have the 'primaryId' field, but
+    // we still parse and allow it whenever it is present.
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kPrimaryIdFieldName, kEmptyPrimaryId, &_primaryId);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractStringField(argsObj, kSetNameFieldName, &_setName);
+    if (!status.isOK())
+        return status;
+
+    // Store optional $replData sub-document when present (request metadata merged into
+    // command body by OP_MSG layer). Field-level parsing is done by the consumer.
+    if (auto replDataElem = argsObj[rpc::kReplSetMetadataFieldName]; replDataElem.isABSONObj()) {
+        _extra = replDataElem.Obj().getOwned();
+    }
+
+    return Status::OK();
+}
+
+bool ReplSetHeartbeatArgsV1::isInitialized() const {
+    return _configVersion != -1 && _term != -1 && !_setName.empty();
+}
+
+void ReplSetHeartbeatArgsV1::setConfigVersion(long long newVal) {
+    _configVersion = newVal;
+}
+
+void ReplSetHeartbeatArgsV1::setConfigTerm(long long newVal) {
+    _configTerm = newVal;
+}
+
+void ReplSetHeartbeatArgsV1::setHeartbeatVersion(long long newVal) {
+    _heartbeatVersion = newVal;
+    _hasHeartbeatVersion = true;
+}
+
+void ReplSetHeartbeatArgsV1::setSenderHost(const HostAndPort& newVal) {
+    _senderHost = newVal;
+    _hasSender = true;
+}
+
+void ReplSetHeartbeatArgsV1::setSenderId(long long newVal) {
+    _senderId = newVal;
+}
+
+void ReplSetHeartbeatArgsV1::setSetName(std::string_view newVal) {
+    _setName = std::string{newVal};
+}
+
+void ReplSetHeartbeatArgsV1::setTerm(long long newVal) {
+    _term = newVal;
+}
+
+void ReplSetHeartbeatArgsV1::setCheckEmpty() {
+    _checkEmpty = true;
+}
+
+void ReplSetHeartbeatArgsV1::setPrimaryId(long long primaryId) {
+    _primaryId = primaryId;
+}
+
+BSONObj ReplSetHeartbeatArgsV1::toBSON() const {
+    invariant(isInitialized());
+    BSONObjBuilder builder;
+    addToBSON(&builder);
+    return builder.obj();
+}
+
+void ReplSetHeartbeatArgsV1::addToBSON(BSONObjBuilder* builder) const {
+    builder->append(kSetNameFieldName, _setName);
+    if (_checkEmpty) {
+        builder->append(kCheckEmptyFieldName, _checkEmpty);
+    }
+    builder->appendNumber(kConfigVersionFieldName, _configVersion);
+    builder->appendNumber(kConfigTermFieldName, _configTerm);
+    if (_hasHeartbeatVersion) {
+        builder->appendNumber(kHeartbeatVersionFieldName, _hasHeartbeatVersion);
+    }
+    builder->append(kSenderHostFieldName, _hasSender ? _senderHost.toString() : "");
+    builder->appendNumber(kSenderIdFieldName, _senderId);
+    builder->appendNumber(kTermFieldName, _term);
+    builder->append(kPrimaryIdFieldName, _primaryId);
+}
+
+}  // namespace repl
+}  // namespace mongo

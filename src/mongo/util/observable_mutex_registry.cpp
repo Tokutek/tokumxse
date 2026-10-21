@@ -1,0 +1,189 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/observable_mutex_registry.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
+#include "mongo/util/static_immortal.h"
+
+#include <string_view>
+
+#include <fmt/format.h>
+
+namespace mongo {
+MutexStats operator+(const MutexStats& lhs, const ObservableMutexRegistry::StatsRecord& rhs) {
+    return {lhs + rhs.data};
+}
+
+namespace {
+
+void serialize(BSONObjBuilder& bob, const MutexAcquisitionStats& stats) {
+    bob.append(ObservableMutexRegistry::kTotalAcquisitionsFieldName,
+               static_cast<long long>(stats.total));
+    bob.append(ObservableMutexRegistry::kTotalContentionsFieldName,
+               static_cast<long long>(stats.contentions));
+    bob.append(ObservableMutexRegistry::kTotalWaitCyclesFieldName,
+               static_cast<long long>(stats.waitCycles));
+    bob.append(ObservableMutexRegistry::kTotalWaitMicrosFieldName,
+               static_cast<long long>(waitCyclesToMicros(stats.waitCycles)));
+}
+
+void serialize(BSONObjBuilder& bob, const MutexStats& stats) {
+    {
+        BSONObjBuilder sub(bob.subobjStart(ObservableMutexRegistry::kExclusiveFieldName));
+        serialize(sub, stats.exclusiveAcquisitions);
+    }
+    {
+        BSONObjBuilder sub(bob.subobjStart(ObservableMutexRegistry::kSharedFieldName));
+        serialize(sub, stats.sharedAcquisitions);
+    }
+}
+
+void serialize(BSONArrayBuilder& builder, const ObservableMutexRegistry::StatsRecord& entry) {
+    BSONObjBuilder subObjBuilder;
+    invariant(entry.mutexId && entry.registered);
+    subObjBuilder.append(ObservableMutexRegistry::kIdFieldName, entry.mutexId.get());
+    if (entry.instanceLabel) {
+        subObjBuilder.append(ObservableMutexRegistry::kInstanceLabelFieldName,
+                             entry.instanceLabel.get());
+    }
+    subObjBuilder.appendDate(ObservableMutexRegistry::kRegisteredFieldName, entry.registered.get());
+    serialize(subObjBuilder, entry.data);
+
+    builder.append(subObjBuilder.obj());
+}
+
+BSONObj serializeStats(StringMap<std::vector<ObservableMutexRegistry::StatsRecord>>& statsMap,
+                       bool listAll) {
+    BSONObjBuilder bob;
+    // Using a `set` to store tags and ensure the serialized stats are sorted by their tags.
+    std::set<std::string_view> tags;
+    for (const auto& [tag, _] : statsMap) {
+        tags.insert(tag);
+    }
+
+    for (auto tag : tags) {
+        auto& stats = statsMap[tag];
+        BSONObjBuilder tagSubObj(bob.subobjStart(tag));
+        const auto sum = std::accumulate(stats.begin(), stats.end(), MutexStats{});
+        serialize(tagSubObj, sum);
+
+        if (MONGO_unlikely(listAll)) {
+            BSONArrayBuilder mutexSubArray(
+                tagSubObj.subarrayStart(ObservableMutexRegistry::kMutexFieldName));
+            for (const auto& entry : stats) {
+                if (!entry.mutexId || !entry.registered) {
+                    // The listAll output should ignore stats from invalidated mutexes.
+                    continue;
+                }
+                serialize(mutexSubArray, entry);
+            }
+        }
+    }
+    return bob.obj();
+}
+}  // namespace
+
+
+// Checks if a tag is a valid OpenTelemetry metric name segment.
+bool isValidSegment(std::string_view seg) {
+    if (seg.empty() || seg.front() < 'a' || seg.front() > 'z') {
+        return false;
+    }
+    bool hasUpper = false, hasUnderscore = false;
+    for (size_t i = 1; i < seg.size(); ++i) {
+        const char c = seg[i];
+        if (c == '_') {
+            hasUnderscore = true;
+            if (i + 1 == seg.size() || !ctype::isAlnum(seg[i + 1])) {
+                return false;
+            }
+        } else if (ctype::isUpper(c)) {
+            hasUpper = true;
+        } else if (!ctype::isLower(c) && !ctype::isDigit(c)) {
+            return false;
+        }
+    }
+    return !(hasUpper && hasUnderscore);
+}
+
+void ObservableMutexRegistry::_validateTag(std::string_view tag) {
+    uassert(ErrorCodes::InvalidOptions,
+            fmt::format("mutex tag is not a valid OTel metric name segment: '{}'", tag),
+            isValidSegment(tag));
+}
+
+ObservableMutexRegistry& ObservableMutexRegistry::get() {
+    static StaticImmortal<ObservableMutexRegistry> obj;
+    return *obj;
+}
+
+BSONObj ObservableMutexRegistry::report(bool listAll) {
+    auto stats = _collectStats();
+    return serializeStats(stats, listAll);
+}
+
+StringMap<MutexStats> ObservableMutexRegistry::statsPerTag() {
+    auto rawStats = _collectStats();
+    StringMap<MutexStats> result;
+    for (auto& [tag, records] : rawStats) {
+        result[tag] = std::accumulate(records.begin(), records.end(), MutexStats{});
+    }
+    return result;
+}
+
+StringMap<std::vector<ObservableMutexRegistry::StatsRecord>>
+ObservableMutexRegistry::_collectStats() {
+    std::lock_guard lk(_collectionMutex);
+
+    std::list<NewMutexEntry> newEntries;
+    {
+        std::lock_guard lk(_registrationMutex);
+        newEntries.splice(newEntries.end(), _newMutexEntries);
+    }
+    // Integrate the new entries into `_mutexEntries`.
+    for (NewMutexEntry& entry : newEntries) {
+        _mutexEntries[std::move(entry.tag)].push_back(
+            {.id = _nextMutexId++,
+             .instanceLabel = std::move(entry.instanceLabel),
+             .registrationTime = entry.registrationTime,
+             .token = std::move(entry.token)});
+    }
+
+    StringMap<std::vector<StatsRecord>> statsMap;
+    for (auto& [tag, entries] : _mutexEntries) {
+        auto& records = statsMap[tag];
+        MutexStats* removedTotal = nullptr;
+        for (auto it = entries.begin(); it != entries.end();) {
+            const auto stats = it->token->getStats();
+            if (MONGO_unlikely(!it->token->isValid())) {
+                if (!removedTotal) {
+                    removedTotal = &_removedTokensSnapshots[tag];
+                }
+                *removedTotal += stats;
+                it = entries.erase(it);
+            } else {
+                records.push_back(
+                    StatsRecord{stats, it->id, it->registrationTime, it->instanceLabel});
+                ++it;
+            }
+        }
+    }
+
+    _includeRemovedSnapshots(lk, statsMap);
+    return statsMap;
+}
+
+void ObservableMutexRegistry::_includeRemovedSnapshots(
+    WithLock, StringMap<std::vector<StatsRecord>>& statsMap) {
+    for (const auto& [tag, stats] : _removedTokensSnapshots) {
+        // The mutexId and registered field within entry are left blank to indicate that these stats
+        // came from invalidated mutexes.
+        StatsRecord entry{stats};
+        statsMap[tag].push_back(entry);
+    }
+}
+}  // namespace mongo

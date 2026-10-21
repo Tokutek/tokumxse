@@ -1,0 +1,176 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/util/modules.h"
+
+#include <set>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+/**
+ * Given a simple BSON query, extracts the shard key corresponding to the key pattern from equality
+ * matches in the query. The query expression *must not* be a complex query with sorts or other
+ * attributes.
+ *
+ * Logically, the equalities in the BSON query can be serialized into a BSON document and then a
+ * shard key is extracted from this equality document.
+ *
+ * NOTE: BSON queries and BSON documents look similar but are different languages. Use the correct
+ * shard key extraction function.
+ *
+ * Returns !OK status if the query cannot be parsed.
+ * Returns an empty BSONObj() if there is no shard key found in the query equalities.
+ *
+ * Examples:
+ *  If the key pattern is { a : 1 }
+ *   { a : "hi", b : 4 } --> returns { a : "hi" }
+ *   { a : { $eq : "hi" }, b : 4 } --> returns { a : "hi" }
+ *   { $and : [{a : { $eq : "hi" }}, { b : 4 }] } --> returns { a : "hi" }
+ *  If the key pattern is { 'a.b' : 1 }
+ *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
+ *   { 'a.b' : "hi" } --> returns { 'a.b' : "hi" }
+ *   { a : { b : { $eq : "hi" } } } --> returns {} because the query language treats this as
+ *                                                 a : { $eq : { b : ... } }
+ */
+[[MONGO_MOD_PUBLIC]] StatusWith<BSONObj> extractShardKeyFromBasicQuery(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ShardKeyPattern& shardKeyPattern,
+    const BSONObj& basicQuery);
+
+/**
+ * Variant of the above, which is used to parse queries that contain let parameters and runtime
+ * constants.
+ */
+StatusWith<BSONObj> extractShardKeyFromBasicQueryWithContext(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    const ShardKeyPattern& shardKeyPattern,
+    const BSONObj& basicQuery);
+
+[[MONGO_MOD_PUBLIC]] BSONObj extractShardKeyFromQuery(const ShardKeyPattern& shardKeyPattern,
+                                                      const CanonicalQuery& query);
+
+/**
+ * Return an ordered list of bounds generated using a ShardKeyPattern and the bounds from the
+ * IndexBounds. This function is used in sharding to determine where to route queries according to
+ * the shard key pattern.
+ *
+ * Returns boost::none if the IndexBounds is boost::none (see getIndexBoundsForQuery).
+ *
+ * Examples:
+ *
+ * Key { a: 1 }, Bounds a: [0] => { a: 0 } -> { a: 0 }
+ * Key { a: 1 }, Bounds a: [2, 3) => { a: 2 } -> { a: 3 }  // bound inclusion ignored.
+ *
+ * The bounds returned by this function may be a superset of those defined by the constraints. For
+ * instance, if this KeyPattern is {a : 1, b: 1} Bounds: { a : {$in : [1,2]} , b : {$in : [3,4,5]} }
+ *         => {a : 1 , b : 3} -> {a : 1 , b : 5}, {a : 2 , b : 3} -> {a : 2 , b : 5}
+ *
+ * If the IndexBounds are not defined for all the fields in this keypattern, which means some fields
+ * are unsatisfied, an empty BoundList could return.
+ *
+ */
+[[MONGO_MOD_PUBLIC]] boost::optional<BoundList> flattenBounds(
+    const ShardKeyPattern& shardKeyPattern, const boost::optional<IndexBounds>& indexBounds);
+
+/**
+ * Transforms query into bounds for each field in the shard key.
+ * For example :
+ *   Key { a: 1, b: 1 },
+ *   Query { a : { $gte : 1, $lt : 2 },
+ *           b : { $gte : 3, $lt : 4 } }
+ *   => Bounds { a : [1, 2), b : [3, 4) }
+ *
+ * For queries which are trivially empty, returns boost::none.
+ */
+[[MONGO_MOD_PUBLIC]] boost::optional<IndexBounds> getIndexBoundsForQuery(
+    const BSONObj& key, const CanonicalQuery& canonicalQuery);
+
+namespace shard_key_pattern_query_util {
+
+struct [[MONGO_MOD_PUBLIC]] QueryTargetingInfo {
+    enum Description { kSingleKey, kMultipleKeys, kMinKeyToMaxKey };
+
+    Description desc;
+    std::set<ChunkRange> chunkRanges;
+};
+
+}  // namespace shard_key_pattern_query_util
+
+/**
+ * Populates 'shardIds' with the shard ids for a query with given filter and collation. If the
+ * collation is empty, it uses the collection default collation for targeting. If
+ * 'bypassIsFieldHashedCheck' is true, it skips checking if the shard key was hashed and assumes
+ * that any non-collatable shard key was not hashed from a collatable type.
+ */
+[[MONGO_MOD_PUBLIC]] void getShardIdsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                              const BSONObj& query,
+                                              const BSONObj& collation,
+                                              const ChunkManager& cm,
+                                              std::set<ShardId>* shardIds,
+                                              bool bypassIsFieldHashedCheck = false);
+
+/**
+ * Populates 'shardIds' with the shard ids for a query with given filter and collation. If the
+ * collation is empty, it uses the collection default collation for targeting. If 'info' is not
+ * null, populates it with the ChunkRanges that the query targets and a description about whether
+ * the query targets a single shard key value, multiple but not all shard key values or all shard
+ * key values. If 'bypassIsFieldHashedCheck' is true, it skips checking if the shard key was hashed
+ * and assumes that any non-collatable shard key was not hashed from a collatable type.
+ *
+ * IMPORTANT: populating ChunkRanges can significantly degrade the execution time of this function.
+ * If you only require shard IDs, consider using getShardIdsForQuery for better performance.
+ */
+[[MONGO_MOD_PUBLIC]] void getShardIdsAndChunksForQuery(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    const BSONObj& query,
+    const BSONObj& collation,
+    const ChunkManager& cm,
+    std::set<ShardId>* shardIds,
+    shard_key_pattern_query_util::QueryTargetingInfo* info = nullptr,
+    bool bypassIsFieldHashedCheck = false);
+
+/**
+ * Populates 'shardIds' with the shard ids for a query with given filter. If
+ * 'bypassIsFieldHashedCheck' is true, it skips checking if the shard key was hashed and assumes
+ * that any non-collatable shard key was not hashed from a collatable type.
+ */
+[[MONGO_MOD_PUBLIC]] void getShardIdsForCanonicalQuery(const CanonicalQuery& query,
+                                                       const ChunkManager& cm,
+                                                       std::set<ShardId>* shardIds,
+                                                       bool bypassIsFieldHashedCheck = false);
+
+/**
+ * Populates 'shardIds' with the shard ids for a query with given filter. If 'info' is
+ * not null, populates it with the ChunkRanges that the query targets and a description about
+ * whether the query targets a single shard key value, multiple but not all shard key values or all
+ * shard key values.  If 'bypassIsFieldHashedCheck' is true, it skips checking if the shard key was
+ * hashed and assumes that any non-collatable shard key was not hashed from a collatable type.
+ *
+ * IMPORTANT: populating ChunkRanges can significantly degrade the execution time of this function.
+ * If you only require shard IDs, consider using getShardIdsForCanonicalQuery for better
+ * performance.
+ */
+[[MONGO_MOD_PUBLIC]] void getShardIdsAndChunksForCanonicalQuery(
+    const CanonicalQuery& query,
+    const ChunkManager& cm,
+    std::set<ShardId>* shardIds,
+    shard_key_pattern_query_util::QueryTargetingInfo* info = nullptr,
+    bool bypassIsFieldHashedCheck = false);
+
+}  // namespace mongo

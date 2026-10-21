@@ -1,0 +1,257 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <memory>
+#include <random>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/node_hash_map.h>
+#include <absl/strings/string_view.h>
+#include <benchmark/benchmark.h>
+
+
+namespace mongo {
+namespace {
+
+constexpr uint32_t kMaxContainerSize = 1000000;
+// Two fixed seeds, what they are doesn't matter much, they should just generate distict ranges.
+constexpr uint32_t kDefaultSeed = 34862;
+constexpr uint32_t kOtherSeed = 76453;
+
+using StdUnorderedInt = std::unordered_map<uint32_t, bool>;        // NOLINT
+using StdUnorderedString = std::unordered_map<std::string, bool>;  // NOLINT
+
+using AbslFlatHashMapInt = absl::flat_hash_map<uint32_t, bool>;
+using AbslFlatHashMapString = absl::flat_hash_map<std::string, bool>;
+
+using AbslNodeHashMapInt = absl::node_hash_map<uint32_t, bool>;
+using AbslNodeHashMapString = absl::node_hash_map<std::string, bool>;
+
+template <typename>
+struct IsAbslHashMap : std::false_type {};
+
+template <typename K, typename V, typename Hash, typename Eq, typename Allocator>
+struct IsAbslHashMap<absl::flat_hash_map<K, V, Hash, Eq, Allocator>> : std::true_type {};
+
+template <typename K, typename V, typename Hash, typename Eq, typename Allocator>
+struct IsAbslHashMap<absl::node_hash_map<K, V, Hash, Eq, Allocator>> : std::true_type {};
+
+// Template conditional magic, I want to switch out the key type if storage is std::string AND
+// the container is absl.
+template <typename Container>
+struct LookupType {
+    using type = std::conditional_t<
+        std::is_same<typename Container::key_type, std::string>::value,
+        std::conditional_t<IsAbslHashMap<Container>::value, absl::string_view, std::string>,
+        typename Container::key_type>;
+};
+
+class BaseGenerator {
+public:
+    template <typename K>
+    K generate();
+
+private:
+    virtual uint32_t generateInteger() = 0;
+
+    std::string_view generateStringData(uint32_t i) {
+        if (!_mem.get()) {
+            // Use a very large buffer to store string keys contiguously so fetching the key memory
+            // doesn't interfere with the actual test.
+            // We create strings from 32bit integers, so they will have a maximum length of 10
+            _mem = std::make_unique<char[]>(kMaxContainerSize * 10);
+            _current = _mem.get();
+        }
+        sprintf(_current, "%u", i);
+        std::string_view sd(_current);
+        _current += sd.size();
+        return sd;
+    }
+
+    std::unique_ptr<char[]> _mem{nullptr};
+    char* _current{nullptr};
+};
+
+template <>
+uint32_t BaseGenerator::generate<uint32_t>() {
+    return generateInteger();
+}
+
+template <>
+std::string_view BaseGenerator::generate<std::string_view>() {
+    return generateStringData(generate<uint32_t>());
+}
+
+template <>
+std::string BaseGenerator::generate<std::string>() {
+    return std::string{generate<std::string_view>()};
+}
+
+class Sequence : public BaseGenerator {
+private:
+    uint32_t generateInteger() override {
+        return ++_state;
+    }
+
+    uint32_t _state{0};
+};
+
+template <uint32_t Seed>
+class UniformDistribution : public BaseGenerator {
+public:
+    UniformDistribution() : _gen(Seed) {}
+
+private:
+    uint32_t generateInteger() override {
+        return _dist(_gen);
+    }
+
+    std::uniform_int_distribution<uint32_t> _dist;
+    std::mt19937 _gen;
+};
+
+template <class Container, class LookupKey, class StorageGenerator, class LookupGenerator>
+void LookupTest(benchmark::State& state) {
+    Container container;
+    StorageGenerator storage_gen;
+
+    const int num = state.range(0) + 1;
+    for (int i = num - 1; i; --i) {
+        container[storage_gen.template generate<LookupKey>()];
+    }
+
+    std::vector<LookupKey> lookup_keys;
+    LookupGenerator lookup_gen;
+    for (int i = num; i; --i) {
+        lookup_keys.push_back(lookup_gen.template generate<LookupKey>());
+    }
+    // Make sure we don't do the lookup in the same order as insert.
+    std::shuffle(lookup_keys.begin(),
+                 lookup_keys.end(),
+                 std::default_random_engine(kDefaultSeed + kOtherSeed));
+
+    int i = 0;
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(container.find(lookup_keys[i++]));
+        if (i == num) {
+            i = 0;
+        }
+    }
+
+    state.counters["size"] = state.range(0);
+    state.counters["load_factor"] = container.load_factor();
+}
+
+template <class Container, class LookupKey, class StorageGenerator>
+void InsertTest(benchmark::State& state) {
+    std::vector<LookupKey> insert_keys;
+    StorageGenerator storage_gen;
+
+    const int num = state.range(0);
+    for (int i = num; i; --i) {
+        insert_keys.push_back(storage_gen.template generate<LookupKey>());
+    }
+
+    int i = 0;
+    Container container;
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(container[insert_keys[i++]]);
+        if (i == num) {
+            i = 0;
+
+            Container swap_container;
+            std::swap(container, swap_container);
+        }
+    }
+
+    state.counters["size"] = state.range(0);
+}
+
+template <class Container>
+void BM_SuccessfulLookup(benchmark::State& state) {
+    LookupTest<Container,
+               typename LookupType<Container>::type,
+               UniformDistribution<kDefaultSeed>,
+               UniformDistribution<kDefaultSeed>>(state);
+}
+
+template <class Container>
+void BM_UnsuccessfulLookup(benchmark::State& state) {
+    LookupTest<Container,
+               typename LookupType<Container>::type,
+               UniformDistribution<kDefaultSeed>,
+               UniformDistribution<kOtherSeed>>(state);
+}
+
+template <class Container>
+void BM_UnsuccessfulLookupSeq(benchmark::State& state) {
+    LookupTest<Container,
+               typename LookupType<Container>::type,
+               Sequence,
+               UniformDistribution<kDefaultSeed>>(state);
+}
+
+template <class Container>
+void BM_Insert(benchmark::State& state) {
+    InsertTest<Container, typename LookupType<Container>::type, UniformDistribution<kDefaultSeed>>(
+        state);
+}
+
+template <uint32_t Start = 0>
+static void Range(benchmark::internal::Benchmark* b) {
+    uint32_t n0 = Start, n1 = kMaxContainerSize;
+    double fdn = 0.01;
+    for (uint32_t n = n0; n <= n1; n += std::max(1u, static_cast<uint32_t>(n * fdn))) {
+        b->Arg(n);
+    }
+}
+
+
+// Integer key tests
+BENCHMARK_TEMPLATE(BM_SuccessfulLookup, StdUnorderedInt)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_SuccessfulLookup, AbslFlatHashMapInt)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_SuccessfulLookup, AbslNodeHashMapInt)->Apply(Range);
+
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookup, StdUnorderedInt)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookup, AbslFlatHashMapInt)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookup, AbslNodeHashMapInt)->Apply(Range);
+
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookupSeq, StdUnorderedInt)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookupSeq, AbslFlatHashMapInt)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookupSeq, AbslNodeHashMapInt)->Apply(Range);
+
+BENCHMARK_TEMPLATE(BM_Insert, StdUnorderedInt)->Apply(Range<1>);
+BENCHMARK_TEMPLATE(BM_Insert, AbslFlatHashMapInt)->Apply(Range<1>);
+BENCHMARK_TEMPLATE(BM_Insert, AbslNodeHashMapInt)->Apply(Range<1>);
+
+// String key tests
+BENCHMARK_TEMPLATE(BM_SuccessfulLookup, StdUnorderedString)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_SuccessfulLookup, AbslFlatHashMapString)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_SuccessfulLookup, AbslNodeHashMapString)->Apply(Range);
+
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookup, StdUnorderedString)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookup, AbslFlatHashMapString)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookup, AbslNodeHashMapString)->Apply(Range);
+
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookupSeq, StdUnorderedString)->Apply(Range);
+BENCHMARK_TEMPLATE(BM_UnsuccessfulLookupSeq, AbslNodeHashMapString)->Apply(Range);
+
+BENCHMARK_TEMPLATE(BM_Insert, StdUnorderedString)->Apply(Range<1>);
+BENCHMARK_TEMPLATE(BM_Insert, AbslFlatHashMapString)->Apply(Range<1>);
+BENCHMARK_TEMPLATE(BM_Insert, AbslNodeHashMapString)->Apply(Range<1>);
+
+}  // namespace
+}  // namespace mongo

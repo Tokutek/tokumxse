@@ -1,0 +1,66 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_test(
+    name = "test_dumper",
+    srcs = [
+        "__init__.py",
+        "test_dumper.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/hang_analyzer",
+        dependency(
+            "psutil",
+            group = "core",
+        ),
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_process_list",
+    srcs = [
+        "__init__.py",
+        "test_process_list.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/hang_analyzer",
+        dependency(
+            "psutil",
+            group = "core",
+        ),
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)
+
+py_test(
+    name = "test_extractor",
+    srcs = [
+        "test_extractor.py",
+    ],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/hang_analyzer",
+    ],
+)
+
+py_test(
+    name = "test_gen_hang_analyzer_tasks",
+    srcs = [
+        "test_gen_hang_analyzer_tasks.py",
+    ],
+    deps = [
+        "//buildscripts/resmokelib",
+        "//buildscripts/resmokelib/hang_analyzer",
+    ],
+)

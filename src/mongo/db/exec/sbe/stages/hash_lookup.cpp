@@ -1,0 +1,290 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/stages/hash_lookup.h"
+
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/stage_visitors.h"
+#include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
+
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+namespace mongo::sbe {
+using namespace std::literals::string_view_literals;
+
+HashLookupStage::HashLookupStage(std::unique_ptr<PlanStage> outer,
+                                 std::unique_ptr<PlanStage> inner,
+                                 value::SlotId outerKeySlot,
+                                 value::SlotId innerKeySlot,
+                                 value::SlotId innerProjectSlot,
+                                 SlotExprPair innerAgg,
+                                 boost::optional<value::SlotId> collatorSlot,
+                                 PlanNodeId planNodeId,
+                                 bool participateInTrialRunTracking)
+    : PlanStage(
+          "hash_lookup"sv, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _outerKeySlot(outerKeySlot),
+      _innerKeySlot(innerKeySlot),
+      _innerProjectSlot(innerProjectSlot),
+      _innerAgg(std::move(innerAgg)),
+      _lookupStageOutputSlot(_innerAgg.first),
+      _collatorSlot(collatorSlot) {
+    _children.emplace_back(std::move(outer));
+    _children.emplace_back(std::move(inner));
+}
+
+std::unique_ptr<PlanStage> HashLookupStage::clone() const {
+    auto& [slotId, expr] = _innerAgg;
+    SlotExprPair innerAgg{slotId, expr->clone()};
+
+    return std::make_unique<HashLookupStage>(outerChild()->clone(),
+                                             innerChild()->clone(),
+                                             _outerKeySlot,
+                                             _innerKeySlot,
+                                             _innerProjectSlot,
+                                             std::move(innerAgg),
+                                             _collatorSlot,
+                                             _commonStats.nodeId,
+                                             participateInTrialRunTracking());
+}
+
+void HashLookupStage::prepare(CompileCtx& ctx) {
+    outerChild()->prepare(ctx);
+    innerChild()->prepare(ctx);
+
+    if (_collatorSlot) {
+        _collatorAccessor = getAccessor(ctx, *_collatorSlot);
+        tassert(6367801,
+                "collator accessor should exist if collator slot provided to HashLookupStage",
+                _collatorAccessor != nullptr);
+        auto [collatorTag, collatorVal] = _collatorAccessor->getViewOfValue();
+        tassert(6367805,
+                "collatorSlot must be of collator type",
+                collatorTag == value::TypeTags::collator);
+        // Stash the collator because we need it when spilling strings to the record store.
+        _hashTable.setCollator(value::getCollatorView(collatorVal));
+    }
+
+    value::SlotSet inputSlots;
+
+    value::SlotId slot = _outerKeySlot;
+    inputSlots.emplace(slot);
+    _inOuterMatchAccessor = outerChild()->getAccessor(ctx, slot);
+
+    slot = _innerKeySlot;
+    inputSlots.emplace(slot);
+    _inInnerMatchAccessor = innerChild()->getAccessor(ctx, slot);
+
+    // Accessor for '_innerProjectSlot' only when outside the VM.
+    slot = _innerProjectSlot;
+    inputSlots.emplace(slot);
+    _inInnerProjectAccessor = innerChild()->getAccessor(ctx, slot);
+
+    // Set '_compileInnerAgg' to make getAccessor() return '_outInnerProjectAccessor' as the
+    // accessor for the SlotId '_innerProjectSlot' (called 'foreignRecordSlot' in the stage builder)
+    // while compiling the EExpr, as the compiler binds that SlotId to that accessor inside the VM.
+    _compileInnerAgg = true;
+    ctx.root = this;
+    ctx.aggExpression = true;
+    ctx.accumulator = &_lookupStageOutputAccessor;  // VM output slot
+    _aggCode = _innerAgg.second->compile(ctx);
+    ctx.aggExpression = false;
+    _compileInnerAgg = false;
+
+    if (inputSlots.contains(_lookupStageOutputSlot)) {
+        // 'errMsg' works around tasserted() macro's problem referencing '_lookupStageOutputSlot'.
+        std::string errMsg = str::stream()
+            << "conflicting input and result field: " << _lookupStageOutputSlot;
+        tasserted(6367804, errMsg);
+    }
+
+    _outInnerProject.resize(1);
+    _lookupStageOutput.resize(1);
+
+    _memoryTracker = OperationMemoryUsageTracker::createSimpleMemoryUsageTrackerForSBE(
+        _opCtx, loadMemoryLimit(StageMemoryLimit::QuerySBELookupApproxMemoryUseInBytesBeforeSpill));
+}  // HashLookupStage::prepare
+
+value::SlotAccessor* HashLookupStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
+    if (_compileInnerAgg) {
+        if (slot == _innerProjectSlot) {
+            return &_outInnerProjectAccessor;
+        }
+        return ctx.getAccessor(slot);
+    } else {
+        if (slot == _lookupStageOutputSlot) {
+            return &_lookupStageOutputAccessor;
+        }
+        return outerChild()->getAccessor(ctx, slot);
+    }
+}
+
+void HashLookupStage::doAttachToOperationContext(OperationContext* opCtx) {
+    _hashTable.doAttachToOperationContext(_opCtx);
+}
+
+void HashLookupStage::doDetachFromOperationContext() {
+    _hashTable.doDetachFromOperationContext();
+}
+
+void HashLookupStage::reset(bool fromClose) {
+    // Also resets the memory threshold if the knob changes between re-open calls.
+    _hashTable.reset(fromClose);
+    _memoryTracker.value().set(_hashTable.getMemUsage());
+}
+
+void HashLookupStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
+    if (reOpen) {
+        reset(false /* fromClose */);
+    }
+
+    _commonStats.opens++;
+    _hashTable.open();
+
+    // Insert the inner side into the hash table.
+    innerChild()->open(false);
+    value::FixedSizeRow<1 /*N*/> value{1};
+    while (innerChild()->getNext() == PlanState::ADVANCED) {
+        // Copy the projected value.
+        value.reset(0, _inInnerProjectAccessor->getCopyOfValue());
+
+        // This where we put the value in here. This can grow need to spill.
+        size_t bufferIndex = _hashTable.bufferValueOrSpill(value);
+        _memoryTracker.value().set(_hashTable.getMemUsage());
+
+        auto [tagKeyView, valKeyView] = _inInnerMatchAccessor->getViewOfValue();
+        if (value::isArray(tagKeyView)) {
+            value::ArrayAccessor arrayAccessor;
+            arrayAccessor.reset(_inInnerMatchAccessor);
+
+            while (!arrayAccessor.atEnd()) {
+                _hashTable.addHashTableEntry(&arrayAccessor, bufferIndex);
+                _memoryTracker.value().set(_hashTable.getMemUsage());
+                arrayAccessor.advance();
+            }
+        } else {
+            _hashTable.addHashTableEntry(_inInnerMatchAccessor, bufferIndex);
+            _memoryTracker.value().set(_hashTable.getMemUsage());
+        }
+    }
+
+    innerChild()->close();
+    outerChild()->open(reOpen);
+}  // HashLookupStage::open
+
+void HashLookupStage::accumulateFromValueIndices(const RecordIndexCollection* bufferIndices) {
+    for (const size_t bufferIdx : *bufferIndices) {
+        boost::optional<value::TagValueView> innerMatch = _hashTable.getValueAtIndex(bufferIdx);
+        tassert(10801300, "Expected non-empty innerMatch", innerMatch);
+        _outInnerProjectAccessor.reset(*innerMatch);
+
+        // Run the VM code to "accumulate" the current inner doc into the lookup output array.
+        _lookupStageOutput.reset(0 /* column */, _bytecode.run(_aggCode.get()));
+    }
+}  // HashLookupStage::accumulateFromValueIndices
+
+PlanState HashLookupStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
+    PlanState state = outerChild()->getNext();
+    if (state == PlanState::ADVANCED) {
+        // We just got this outer doc, so reset the $lookup "as" result array accumulator to nothing
+        // and the hash table iterator to the outer key.
+        _lookupStageOutput.reset(0, value::TagValueView::nothing());
+        _hashTable.htIter.reset(_inOuterMatchAccessor->getViewOfValue());
+
+        // Accumulate all the matching inner docs for the outer key(s).
+        accumulateFromValueIndices(_hashTable.htIter.getAllMatchingIndices());
+    }
+    return trackPlanState(state);
+}  // HashLookupStage::getNext
+
+void HashLookupStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+    trackClose();
+    outerChild()->close();
+    reset(true /* fromClose */);
+}
+
+std::unique_ptr<PlanStageStats> HashLookupStage::getStats(bool includeDebugInfo) const {
+    auto ret = std::make_unique<PlanStageStats>(_commonStats);
+
+    ret->children.emplace_back(outerChild()->getStats(includeDebugInfo));
+    ret->children.emplace_back(innerChild()->getStats(includeDebugInfo));
+
+    const HashLookupStats* specificStats = static_cast<const HashLookupStats*>(getSpecificStats());
+    ret->specific = std::make_unique<HashLookupStats>(*specificStats);
+    if (includeDebugInfo) {
+        BSONObjBuilder bob(StorageAccessStatsVisitor::collectStats(*this, *ret).toBSON());
+        // Spilling stats.
+        auto spillingStats = specificStats->getTotalSpillingStats();
+        bob.appendBool("usedDisk", specificStats->usedDisk)
+            .appendNumber("spills", static_cast<long long>(spillingStats.getSpills()))
+            .appendNumber("spilledRecords",
+                          static_cast<long long>(spillingStats.getSpilledRecords()))
+            .appendNumber("spilledBytes", static_cast<long long>(spillingStats.getSpilledBytes()))
+            .appendNumber("spilledDataStorageSize",
+                          static_cast<long long>(spillingStats.getSpilledDataStorageSize()));
+        if (feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled()) {
+            bob.appendNumber("peakTrackedMemBytes",
+                             static_cast<long long>(specificStats->peakTrackedMemBytes));
+        }
+        ret->debugInfo = bob.obj();
+    }
+    return ret;
+}
+
+const SpecificStats* HashLookupStage::getSpecificStats() const {
+    return _hashTable.getHashLookupStats();
+}
+
+void HashLookupStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
+                                   DebugPrintInfo& debugPrintInfo) const {
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    auto& [slot, expr] = _innerAgg;
+    DebugPrinter::addIdentifier(ret, slot);
+    ret.emplace_back("=");
+    DebugPrinter::addBlocks(ret, expr->debugPrint());
+    ret.emplace_back("`]");
+
+    if (_collatorSlot) {
+        DebugPrinter::addIdentifier(ret, *_collatorSlot);
+    }
+
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+
+    DebugPrinter::addKeyword(ret, "outer");
+    DebugPrinter::addIdentifier(ret, _outerKeySlot);
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, outerChild()->debugPrint(debugPrintInfo));
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    DebugPrinter::addKeyword(ret, "inner");
+    DebugPrinter::addIdentifier(ret, _innerKeySlot);
+    DebugPrinter::addIdentifier(ret, _innerProjectSlot);
+
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, innerChild()->debugPrint(debugPrintInfo));
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    if (debugPrintInfo.printBytecode) {
+        PlanStage::debugPrintBytecode(ret, _aggCode, "AGGREGATE" /*title*/);
+    }
+}  // HashLookupStage::doDebugPrint
+
+size_t HashLookupStage::estimateCompileTimeSize() const {
+    size_t size = sizeof(*this);
+    size += size_estimator::estimate(_children);
+    size += size_estimator::estimate(_innerProjectSlot);
+    size += size_estimator::estimate(_innerAgg);
+    return size;
+}
+}  // namespace mongo::sbe

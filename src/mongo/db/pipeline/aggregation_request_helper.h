@@ -1,0 +1,204 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/exchange_spec_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/version_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/serialization_context.h"
+
+#include <string_view>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+template <typename T>
+class StatusWith;
+class Document;
+class AggregateCommandRequest;
+class OperationContext;
+
+namespace aggregation_request_helper {
+using namespace std::literals::string_view_literals;
+
+/**
+ * Helpers to serialize/deserialize AggregateCommandRequest.
+ */
+[[MONGO_MOD_PUBLIC]] static constexpr std::string_view kBatchSizeField = "batchSize"sv;
+[[MONGO_MOD_PUBLIC]] static constexpr long long kDefaultBatchSize = 101;
+
+/**
+ * Create a new instance of AggregateCommandRequest by parsing the raw command object. Throws an
+ * exception if a required field was missing, if there was an unrecognized field name, or if there
+ * was a bad value for one of the fields.
+ *
+ * If we are parsing a request for an explained aggregation with an explain verbosity provided,
+ * then 'explainVerbosity' contains this information. In this case, 'cmdObj' may not itself
+ * contain the explain specifier. Otherwise, 'explainVerbosity' should be boost::none.
+ *
+ * Callers must provide the validated tenancy scope (if any) to ensure that any namespaces
+ * deserialized from the aggregation request properly account for the tenant ID.
+ */
+[[MONGO_MOD_PUBLIC]] AggregateCommandRequest parseFromBSON(
+    const BSONObj& cmdObj,
+    const boost::optional<auth::ValidatedTenancyScope>& vts,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity,
+    const SerializationContext& serializationContext = SerializationContext());
+
+[[MONGO_MOD_PUBLIC]] StatusWith<AggregateCommandRequest> parseFromBSONForTests(
+    const BSONObj& cmdObj,
+    const boost::optional<auth::ValidatedTenancyScope>& vts = boost::none,
+    boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none);
+
+/**
+ * Retrieves the resolved query settings for the operation and, if non-default, attaches them to the
+ * request object. Thin wrapper over 'query_settings::addQuerySettingsToRequest'.
+ */
+void addQuerySettingsToRequest(AggregateCommandRequest& request,
+                               const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+/**
+ * Validate the aggregate command object. If 'client' is provided, also validates that internal
+ * fields such as 'querySettings' and 'originalQueryShapeHash' are only set by internal clients.
+ */
+void validate(const AggregateCommandRequest& aggregate,
+              const BSONObj& cmdObj,
+              const NamespaceString& nss,
+              Client* client = nullptr);
+
+/**
+ * Validates if 'AggregateCommandRequest' specs complies with the current Client, which is required
+ * for API versioning checks. Throws uassert in case of any failure.
+ */
+void validateRequestWithClient(const OperationContext* opCtx,
+                               const AggregateCommandRequest& request);
+/**
+ * Validates if 'AggregateCommandRequest' sets the "isClusterQueryWithoutShardKeyCmd" field then the
+ * request must have been fromRouter.
+ */
+void validateRequestFromClusterQueryWithoutShardKey(const AggregateCommandRequest& request);
+
+// TODO SERVER-95358 remove once 9.0 becomes last LTS.
+const mongo::OptionalBool& getFromRouter(const AggregateCommandRequest& request);
+
+// TODO SERVER-95358 remove once 9.0 becomes last LTS.
+void setFromRouter(const VersionContext& vCtx,
+                   AggregateCommandRequest& request,
+                   mongo::OptionalBool value);
+
+// TODO SERVER-95358 remove once 9.0 becomes last LTS.
+void setFromRouter(const VersionContext& vCtx, MutableDocument& doc, mongo::Value value);
+
+/**
+ * Returns true if this aggregation request has a $mergeCursors stage.
+ */
+bool hasMergeCursors(const AggregateCommandRequest& request);
+
+/**
+ * Builds a modified aggregate command object for logging by replacing the pipeline field with
+ * 'modifiedPipeline'.
+ */
+BSONObj buildModifiedAggregateCommandForLog(const BSONObj& cmdObj,
+                                            const BSONArray& modifiedPipeline);
+
+/**
+ * Updates the CurOp opDescription with the modified command object.
+ */
+void updateOpDescriptionForLog(OperationContext* opCtx,
+                               const BSONObj& cmdObj,
+                               const BSONArray& pipelineForLog);
+
+/**
+ * If the opDescription was replaced by an inner command (e.g. an aggregate with extension stages
+ * that set a custom opDescription via toBsonForLog), rewraps it in the outer explain so
+ * the slow query log shows "explain: {aggregate: ...}" rather than just the inner command.
+ */
+void restoreExplainOpDescription(OperationContext* opCtx, const BSONObj& outerRequestBody);
+}  // namespace aggregation_request_helper
+
+/**
+ * Custom serializers/deserializers for AggregateCommandRequest.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+boost::optional<bool> parseExplainModeFromBSON(const BSONElement& explainElem);
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void serializeExplainToBSON(const bool& explain,
+                            std::string_view fieldName,
+                            BSONObjBuilder* builder);
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+mongo::SimpleCursorOptions parseAggregateCursorFromBSON(const BSONElement& cursorElem);
+
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+void serializeAggregateCursorToBSON(const SimpleCursorOptions& cursor,
+                                    std::string_view fieldName,
+                                    BSONObjBuilder* builder);
+
+/**
+ * Parse an aggregation pipeline definition from 'pipelineElem'.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
+static StatusWith<std::vector<BSONObj>> attemptToParsePipelineFromBSON(
+    const BSONElement& pipelineElem) {
+    std::vector<BSONObj> pipeline;
+
+    if (pipelineElem.eoo() || pipelineElem.type() != BSONType::array) {
+        return {ErrorCodes::TypeMismatch, "A pipeline must be an array of objects"};
+    }
+
+    for (auto elem : pipelineElem.Obj()) {
+        if (elem.type() != BSONType::object) {
+            return {ErrorCodes::TypeMismatch,
+                    "Each element of the 'pipeline' array must be an object"};
+        }
+        pipeline.push_back(elem.embeddedObject().getOwned());
+    }
+
+    return pipeline;
+}
+
+/**
+ * A throwing version of the above.
+ */
+[[MONGO_MOD_PUBLIC]] static std::vector<BSONObj> parsePipelineFromBSON(
+    const BSONElement& pipelineElem) {
+    return uassertStatusOK(attemptToParsePipelineFromBSON(pipelineElem));
+}
+
+}  // namespace mongo

@@ -1,0 +1,808 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/index_key_validate.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_mock.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cmath>
+#include <limits>
+#include <memory>
+
+namespace mongo {
+namespace {
+
+using index_key_validate::validateIdIndexSpec;
+using index_key_validate::validateIndexSpec;
+using index_key_validate::validateIndexSpecCollation;
+
+/**
+ * Helper function used to return the fields of a BSONObj in a consistent order.
+ */
+BSONObj sorted(const BSONObj& obj) {
+    BSONObjIteratorSorted iter(obj);
+    BSONObjBuilder bob;
+    while (iter.more()) {
+        bob.append(iter.next());
+    }
+    return bob.obj();
+}
+
+namespace index_spec_validate_test {
+
+class IndexSpecValidateTest : public ServiceContextMongoDTest {};
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotAnObject) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << 1 << "name"
+                                           << "indexName")));
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << "not an object"
+                                           << "name"
+                                           << "indexName")));
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSONArray() << "name"
+                                           << "indexName")));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfFieldRepeatedInKeyPattern) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1 << "field" << 1) << "name"
+                                           << "indexName")));
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1 << "otherField" << -1 << "field"
+                                                           << "2dsphere")
+                                           << "name"
+                                           << "indexName")));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotPresent) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::FailedToParse,
+              validateIndexSpec(opCtx.get(), BSON("name" << "indexName")));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotAString) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(), BSON("key" << BSON("field" << 1) << "name" << 1)));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotPresent) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::FailedToParse,
+              validateIndexSpec(opCtx.get(), BSON("key" << BSON("field" << 1))));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsIndexSpecUnchangedIfVersionIsPresent) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "v" << 1));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 1)),
+                      sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotANumber) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v"
+                                           << "not a number")));
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << BSONObj())));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotRepresentableAsInt) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << 2.2)));
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << std::nan("1"))));
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << std::numeric_limits<double>::infinity())));
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << std::numeric_limits<long long>::max())));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsV0) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::CannotCreateIndex,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << 0)));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsUnsupported) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::CannotCreateIndex,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << 3 << "collation" << BSON("locale" << "en"))));
+
+    EXPECT_EQ(ErrorCodes::CannotCreateIndex,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "v" << -3LL)));
+}
+
+TEST_F(IndexSpecValidateTest, AcceptsIndexVersionsThatAreAllowedForCreation) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "v" << 1));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 1)),
+                      sorted(result.getValue()));
+
+    result = validateIndexSpec(opCtx.get(),
+                               BSON("key" << BSON("field" << 1) << "name"
+                                          << "indexName"
+                                          << "v" << 2LL));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 2LL)),
+                      sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecValidateTest, DefaultIndexVersionIsV2) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 2)),
+                      sorted(result.getValue()));
+
+    // Verify that the index specification we returned is still considered valid.
+    ASSERT_OK(validateIndexSpec(opCtx.get(), result.getValue()));
+}
+
+TEST_F(IndexSpecValidateTest, AcceptsIndexVersionV1) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "v" << 1));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 1)),
+                      sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsNotAnObject) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "collation" << 1)));
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "collation"
+                                           << "not an object")));
+    EXPECT_EQ(ErrorCodes::TypeMismatch,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "collation" << BSONArray())));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsEmpty) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIndexSpec(opCtx.get(),
+                                BSON("key" << BSON("field" << 1) << "name"
+                                           << "indexName"
+                                           << "collation" << BSONObj())));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsPresentAndVersionIsLessThanV2) {
+    auto opCtx = makeOperationContext();
+
+    EXPECT_EQ(
+        ErrorCodes::CannotCreateIndex,
+        validateIndexSpec(opCtx.get(),
+                          BSON("key" << BSON("field" << 1) << "name"
+                                     << "indexName"
+                                     << "collation" << BSON("locale" << "simple") << "v" << 1)));
+}
+
+TEST_F(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
+    auto opCtx = makeOperationContext();
+
+    auto result =
+        validateIndexSpec(opCtx.get(),
+                          BSON("key" << BSON("field" << 1) << "name"
+                                     << "indexName"
+                                     << "v" << 2 << "collation" << BSON("locale" << "simple")));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 2 << "collation" << BSON("locale" << "simple"))),
+                      sorted(result.getValue()));
+
+    result = validateIndexSpec(opCtx.get(),
+                               BSON("key" << BSON("field" << 1) << "name"
+                                          << "indexName"
+                                          << "v" << 2 << "collation"
+                                          << BSON("unknownCollationOption" << true)));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(
+        sorted(BSON("key" << BSON("field" << 1) << "name"
+                          << "indexName"
+                          << "v" << 2 << "collation" << BSON("unknownCollationOption" << true))),
+        sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecValidateTest, AcceptsIndexSpecIfCollationIsPresentAndVersionIsEqualToV2) {
+    auto opCtx = makeOperationContext();
+
+    auto result =
+        validateIndexSpec(opCtx.get(),
+                          BSON("key" << BSON("field" << 1) << "name"
+                                     << "indexName"
+                                     << "v" << 2 << "collation" << BSON("locale" << "en")));
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 2 << "collation" << BSON("locale" << "en"))),
+                      sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV2) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "v" << 2 << "unknownField" << 1));
+    EXPECT_EQ(ErrorCodes::InvalidIndexSpecificationOption, result);
+}
+
+TEST_F(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV1) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "v" << 1 << "unknownField" << 1));
+    EXPECT_EQ(ErrorCodes::InvalidIndexSpecificationOption, result);
+}
+
+TEST_F(IndexSpecValidateTest, DisallowSpecifyingBothUniqueAndPrepareUnique) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("a" << 1) << "name"
+                                               << "indexName"
+                                               << "unique" << true << "prepareUnique" << true));
+    EXPECT_EQ(result.getStatus().code(), ErrorCodes::CannotCreateIndex);
+}
+
+}  // namespace index_spec_validate_test
+
+namespace id_index_spec_validate_test {
+
+class IdIndexSpecValidateTest : public ServiceContextMongoDTest {};
+
+TEST_F(IdIndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsIncorrectForIdIndex) {
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIdIndexSpec(BSON("key" << BSON("_id" << -1) << "name"
+                                             << IndexConstants::kIdIndexName << "v" << 2)));
+    EXPECT_EQ(ErrorCodes::BadValue,
+              validateIdIndexSpec(BSON("key" << BSON("a" << 1) << "name"
+                                             << IndexConstants::kIdIndexName << "v" << 2)));
+}
+
+TEST_F(IdIndexSpecValidateTest, ReturnsOKStatusIfKeyPatternCorrectForIdIndex) {
+    ASSERT_OK(validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name"
+                                             << "anyname"
+                                             << "v" << 2)));
+}
+
+TEST_F(IdIndexSpecValidateTest, ReturnsAnErrorIfFieldNotAllowedForIdIndex) {
+    EXPECT_EQ(
+        ErrorCodes::InvalidIndexSpecificationOption,
+        validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName
+                                       << "v" << 2 << "background" << false)));
+    EXPECT_EQ(
+        ErrorCodes::InvalidIndexSpecificationOption,
+        validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName
+                                       << "v" << 2 << "unique" << true)));
+    EXPECT_EQ(ErrorCodes::InvalidIndexSpecificationOption,
+              validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name"
+                                             << IndexConstants::kIdIndexName << "v" << 2
+                                             << "partialFilterExpression" << BSON("a" << 5))));
+    EXPECT_EQ(
+        ErrorCodes::InvalidIndexSpecificationOption,
+        validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName
+                                       << "v" << 2 << "sparse" << false)));
+    EXPECT_EQ(
+        ErrorCodes::InvalidIndexSpecificationOption,
+        validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName
+                                       << "v" << 2 << "expireAfterSeconds" << 3600)));
+    EXPECT_EQ(
+        ErrorCodes::InvalidIndexSpecificationOption,
+        validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName
+                                       << "v" << 2 << "storageEngine" << BSONObj())));
+}
+
+TEST_F(IdIndexSpecValidateTest, ReturnsOKStatusIfAllFieldsAllowedForIdIndex) {
+    ASSERT_OK(
+        validateIdIndexSpec(BSON("key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName
+                                       << "v" << 2 << "collation" << BSON("locale" << "simple"))));
+}
+
+}  // namespace id_index_spec_validate_test
+
+namespace index_spec_collation_validate_test {
+
+class IndexSpecCollationValidateTest : public ServiceContextMongoDTest {
+protected:
+    IndexSpecCollationValidateTest() {
+        CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
+    }
+};
+
+TEST_F(IndexSpecCollationValidateTest, FillsInFullCollationSpec) {
+    auto opCtx = makeOperationContext();
+
+    const CollatorInterface* defaultCollator = nullptr;
+
+    auto result = validateIndexSpecCollation(opCtx.get(),
+                                             BSON("key" << BSON("field" << 1) << "name"
+                                                        << "indexName"
+                                                        << "v" << 2 << "collation"
+                                                        << BSON("locale" << "mock_reverse_string")),
+                                             defaultCollator);
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(
+        sorted(BSON("key" << BSON("field" << 1) << "name"
+                          << "indexName"
+                          << "v" << 2 << "collation"
+                          << BSON("locale"
+                                  << "mock_reverse_string"
+                                  << "caseLevel" << false << "caseFirst"
+                                  << "off"
+                                  << "strength" << 3 << "numericOrdering" << false << "alternate"
+                                  << "non-ignorable"
+                                  << "maxVariable"
+                                  << "punct"
+                                  << "normalization" << false << "backwards" << false << "version"
+                                  << "mock_version"))),
+        sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecCollationValidateTest, RemovesCollationFieldIfSimple) {
+    auto opCtx = makeOperationContext();
+
+    const CollatorInterface* defaultCollator = nullptr;
+
+    auto result = validateIndexSpecCollation(opCtx.get(),
+                                             BSON("key" << BSON("field" << 1) << "name"
+                                                        << "indexName"
+                                                        << "v" << 2 << "collation"
+                                                        << BSON("locale" << "simple")),
+                                             defaultCollator);
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(sorted(BSON("key" << BSON("field" << 1) << "name"
+                                        << "indexName"
+                                        << "v" << 2)),
+                      sorted(result.getValue()));
+}
+
+TEST_F(IndexSpecCollationValidateTest, FillsInCollationFieldWithCollectionDefaultIfNotPresent) {
+    auto opCtx = makeOperationContext();
+
+    const CollatorInterfaceMock defaultCollator(CollatorInterfaceMock::MockType::kReverseString);
+
+    auto result = validateIndexSpecCollation(opCtx.get(),
+                                             BSON("key" << BSON("field" << 1) << "name"
+                                                        << "indexName"
+                                                        << "v" << 2),
+                                             &defaultCollator);
+    ASSERT_OK(result.getStatus());
+
+    // We don't care about the order of the fields in the resulting index specification.
+    ASSERT_BSONOBJ_EQ(
+        sorted(BSON("key" << BSON("field" << 1) << "name"
+                          << "indexName"
+                          << "v" << 2 << "collation"
+                          << BSON("locale"
+                                  << "mock_reverse_string"
+                                  << "caseLevel" << false << "caseFirst"
+                                  << "off"
+                                  << "strength" << 3 << "numericOrdering" << false << "alternate"
+                                  << "non-ignorable"
+                                  << "maxVariable"
+                                  << "punct"
+                                  << "normalization" << false << "backwards" << false << "version"
+                                  << "mock_version"))),
+        sorted(result.getValue()));
+}
+
+}  // namespace index_spec_collation_validate_test
+
+namespace index_spec_partial_filter_test {
+
+class IndexSpecPartialFilterTest : public ServiceContextMongoDTest {};
+
+TEST_F(IndexSpecPartialFilterTest, FailsIfPartialFilterIsNotAnObject) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "partialFilterExpression" << 1));
+    EXPECT_EQ(result.getStatus(), ErrorCodes::TypeMismatch);
+}
+
+TEST_F(IndexSpecPartialFilterTest, FailsIfPartialFilterContainsBannedFeature) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "partialFilterExpression"
+                                               << BSON("$jsonSchema" << BSONObj())));
+    EXPECT_EQ(result.getStatus(), ErrorCodes::QueryFeatureNotAllowed);
+}
+
+TEST_F(IndexSpecPartialFilterTest, AcceptsValidPartialFilterExpression) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "partialFilterExpression" << BSON("a" << 1)));
+    ASSERT_OK(result.getStatus());
+}
+
+}  // namespace index_spec_partial_filter_test
+
+namespace index_spec_wildcard_test {
+
+class IndexSpecWildcardTest : public ServiceContextMongoDTest {};
+
+TEST_F(IndexSpecWildcardTest, SucceedsWithInclusion) {
+    auto opCtx = makeOperationContext();
+
+    auto result =
+        validateIndexSpec(opCtx.get(),
+                          BSON("key" << BSON("$**" << 1) << "name"
+                                     << "indexName"
+                                     << "wildcardProjection" << BSON("a" << 1 << "b" << 1)));
+    ASSERT_OK(result.getStatus());
+}
+
+TEST_F(IndexSpecWildcardTest, SucceedsWithExclusion) {
+    auto opCtx = makeOperationContext();
+
+    auto result =
+        validateIndexSpec(opCtx.get(),
+                          BSON("key" << BSON("$**" << 1) << "name"
+                                     << "indexName"
+                                     << "wildcardProjection" << BSON("a" << 0 << "b" << 0)));
+    ASSERT_OK(result.getStatus());
+}
+
+TEST_F(IndexSpecWildcardTest, SucceedsWithExclusionIncludingId) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id" << 1 << "a" << 0 << "b" << 0)));
+    ASSERT_OK(result.getStatus());
+}
+
+TEST_F(IndexSpecWildcardTest, SucceedsWithInclusionExcludingId) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id" << 0 << "a" << 1 << "b" << 1)));
+    ASSERT_OK(result.getStatus());
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWithInclusionExcludingIdSubfield) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id.field" << 0 << "a" << 1 << "b" << 1)));
+    EXPECT_EQ(result.getStatus().code(), 31253);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWithExclusionIncludingIdSubfield) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id.field" << 1 << "a" << 0 << "b" << 0)));
+    EXPECT_EQ(result.getStatus().code(), 31254);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWithMixedProjection) {
+    auto opCtx = makeOperationContext();
+
+    auto result =
+        validateIndexSpec(opCtx.get(),
+                          BSON("key" << BSON("$**" << 1) << "name"
+                                     << "indexName"
+                                     << "wildcardProjection" << BSON("a" << 1 << "b" << 0)));
+    EXPECT_EQ(result.getStatus().code(), 31254);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWithComputedFieldsInProjection) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 1 << "b"
+                                                           << "string")));
+    EXPECT_EQ(result.getStatus().code(), 51271);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWhenProjectionPluginNotWildcard) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("a" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection" << BSON("a" << 1)));
+    EXPECT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWhenProjectionIsNotAnObject) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection" << 4));
+    EXPECT_EQ(result.getStatus().code(), ErrorCodes::TypeMismatch);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWithEmptyProjection) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection" << BSONObj()));
+    EXPECT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWhenInclusionWithSubpath) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("a.$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection" << BSON("a" << 1)));
+    EXPECT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+TEST_F(IndexSpecWildcardTest, FailsWhenExclusionWithSubpath) {
+    auto opCtx = makeOperationContext();
+
+    auto result = validateIndexSpec(opCtx.get(),
+                                    BSON("key" << BSON("a.$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection" << BSON("b" << 0)));
+    EXPECT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+}  // namespace index_spec_wildcard_test
+
+namespace index_spec_field_validate_test {
+
+class IndexSpecFieldValidateTest : public ServiceContextMongoDTest {};
+
+TEST_F(IndexSpecFieldValidateTest, CompoundHashedIndex) {
+    auto opCtx = makeOperationContext();
+    // Validation succeeds with hashed prefix in the index.
+    ASSERT_OK(
+        validateIndexSpec(opCtx.get(), fromjson("{key: {a : 'hashed', b: 1}, name: 'index'}")));
+
+    // Validation succeeds with non-hashed prefix in the index.
+    ASSERT_OK(validateIndexSpec(opCtx.get(),
+                                fromjson("{key: {b: 1, a : 'hashed', c: 1}, name: 'index'}")));
+}
+
+TEST_F(IndexSpecFieldValidateTest, Background) {
+    auto opCtx = makeOperationContext();
+    ASSERT_OK(
+        validateIndexSpec(opCtx.get(), fromjson("{key: {a: 1}, name: 'index', background: true}")));
+
+    ASSERT_OK(
+        validateIndexSpec(opCtx.get(), fromjson("{key: {a: 1}, name: 'index', background: 1}")));
+
+    ASSERT_OK(
+        validateIndexSpec(opCtx.get(), fromjson("{key: {a: 1}, name: 'index', background: 0}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(opCtx.get(),
+                                    fromjson("{key: {a: 1}, name: 'index', background: 'foo'}")));
+
+    ASSERT_NOT_OK(
+        validateIndexSpec(opCtx.get(), fromjson("{key: {a: 1}, name: 'index', background: []}")));
+}
+
+TEST_F(IndexSpecFieldValidateTest, UpdateTTLIndexNaNExpireAfterSeconds) {
+    auto opCtx = makeOperationContext();
+    ASSERT(
+        BSON("key" << BSON("a" << 1) << "name"
+                   << "index"
+                   << "expireAfterSeconds" << std::numeric_limits<int32_t>::max()
+                   << IndexDescriptor::kIndexVersionFieldName << IndexDescriptor::IndexVersion::kV2)
+            .binaryEqual(unittest::assertGet(validateIndexSpec(
+                opCtx.get(), fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: NaN}")))));
+}
+
+TEST_F(IndexSpecFieldValidateTest, ValidateAfterSecondsAcceptsFloatingPointNumber) {
+    auto opCtx = makeOperationContext();
+    auto spec = unittest::assertGet(validateIndexSpec(
+        opCtx.get(), fromjson("{key: {a: 1}, name: 'index', expireAfterSeconds: 123.456}")));
+
+    // TTLMonitor extracts 'expireAfterSeconds' using BSONElement::safeNumberLong().
+    EXPECT_EQ(spec["expireAfterSeconds"].safeNumberLong(), 123LL);
+}
+
+// TODO (SERVER-120350): Remove this test case.
+TEST_F(IndexSpecFieldValidateTest, UpgradeRepairRejectsNonIntegerExpireAfterSeconds) {
+    auto opCtx = makeOperationContext();
+    // Non-integer expireAfterSeconds is accepted during normal validation.
+    ASSERT_OK(validateIndexSpec(opCtx.get(),
+                                fromjson("{key: {a: 1}, name: 'index', "
+                                         "expireAfterSeconds: 123.456}"))
+                  .getStatus());
+
+    // During upgrade repair, a non-integer expireAfterSeconds must return TypeMismatch so that
+    // repairIndexSpec() can convert the on-disk value to an integer.
+    auto status = validateIndexSpec(opCtx.get(),
+                                    fromjson("{key: {a: 1}, name: 'index', "
+                                             "expireAfterSeconds: 123.456}"),
+                                    index_key_validate::kAllowedFieldNames,
+                                    /*isUpgradeRepair=*/true)
+                      .getStatus();
+    EXPECT_EQ(status.code(), ErrorCodes::TypeMismatch);
+}
+
+TEST_F(IndexSpecFieldValidateTest, GeoIndexSpecs) {
+    auto opCtx = makeOperationContext();
+    ASSERT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':17,'"
+                 "coarsestIndexedLevel':5}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':'string','"
+                 "coarsestIndexedLevel':'string'}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':17,'"
+                 "coarsestIndexedLevel':'string'}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':'string','"
+                 "coarsestIndexedLevel':5}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':true,'"
+                 "coarsestIndexedLevel':true}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':17,'"
+                 "coarsestIndexedLevel':true}")));
+
+    ASSERT_NOT_OK(validateIndexSpec(
+        opCtx.get(),
+        fromjson("{'key':{'loc':'2dsphere'},'name':'loc_2dsphere','finestIndexedLevel':true,'"
+                 "coarsestIndexedLevel':5}")));
+}
+
+}  // namespace index_spec_field_validate_test
+}  // namespace
+}  // namespace mongo

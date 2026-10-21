@@ -1,0 +1,300 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/column/bson_element_storage.h"
+#include "mongo/db/exec/sbe/values/block_interface.h"
+#include "mongo/db/exec/sbe/values/cell_interface.h"
+#include "mongo/db/exec/sbe/values/path_request.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <memory>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+
+namespace mongo::sbe::value {
+class TsBlock;
+/**
+ * Evaluates paths on a time series bucket. The constructor input is a set of paths using the
+ * Get/Traverse/Id primitives. When given a TS bucket, it evaluates each path on the block of
+ * "documents" in the TS bucket, producing a block of cells for each path.
+ *
+ * TODO: For now only top-level fields are supported.
+ */
+class TsBucketPathExtractor {
+public:
+    struct ExtractResult {
+        size_t numMeasurements = 0;
+        std::vector<std::unique_ptr<TsBlock>> storageBlocks;
+        std::vector<std::unique_ptr<CellBlock>> cellBlocks;
+    };
+
+    TsBucketPathExtractor(std::vector<PathRequest> reqs, std::string_view timeField);
+
+    /*
+     * Returns one CellBlock per path given in the constructor. A CellBlock represents all of the
+     * values at a path, along with information on their position.
+     */
+    ExtractResult extractCellBlocks(const BSONObj& bucket);
+
+private:
+    /**
+     * Tries to apply path-based decompression to the non-top-level paths for a block.
+     *
+     * If successful, updates 'outCells' accordingly and returns true. Otherwise, no paths are
+     * decompresssed and returns false.
+     *
+     * Currently path-based decompression is only supported for scalar fields.
+     */
+    bool tryPathBasedDecompression(TsBlock& tsBlock,
+                                   BSONElement fieldMin,
+                                   BSONElement fieldMax,
+                                   const std::vector<size_t>& nonTopLevelIdxesForCurrentField,
+                                   std::vector<std::unique_ptr<CellBlock>>& outCells) const;
+
+    std::vector<PathRequest> _pathReqs;
+
+    // Set of indexes in _pathReqs which are paths NOT of the form [Get <field> Id]. This includes
+    // paths like [Get <field> Traverse Id] as well as access to nested paths. Paths of the form
+    // [Get <field> Id] can be provided in a special/faster way, since the time series decoding API
+    // (currently) provides top-level fields only.
+    stdx::unordered_set<size_t> _nonTopLevelGetPathIdxes;
+
+
+    std::string_view _timeField;
+
+    // This maps [top-level field -> [index into '_paths' which start with this field]]
+    //
+    // A vector is needed in case multiple fields with the same prefix (e.g. a.b and a.c) are
+    // requested.
+    StringDataMap<std::vector<size_t>> _topLevelFieldToIdxes;
+};
+
+/**
+ * This class implements a block of data in the time series format which is either a BSON object
+ * or a binary BSON column. This class is only used for top-level fields.
+ */
+class TsBlock : public ValueBlock {
+public:
+    static bool canUseControlValue(value::TypeTags tag) {
+        return !isObject(tag) && !isArray(tag);
+    }
+
+    // Note: This constructor is special and is only used by the TsCellBlockForTopLevelField to
+    // create a TsBlock for a top-level field, where the 'ncells` is actually same as the number of
+    // values in this block.
+    TsBlock(size_t ncells,
+            bool owned,
+            TypeTags blockTag,
+            Value blockVal,
+            int bucketVersion,
+            bool isTimefield = false,
+            std::pair<TypeTags, Value> controlMin = {TypeTags::Nothing, Value{0u}},
+            std::pair<TypeTags, Value> controlMax = {TypeTags::Nothing, Value{0u}});
+
+    // We don't have use cases for copy/move constructors and assignment operators and so disable
+    // them until we have one.
+    TsBlock(const TsBlock& other) = delete;
+    TsBlock(TsBlock&& other) = delete;
+
+    std::unique_ptr<ValueBlock> clone() const override;
+    std::unique_ptr<TsBlock> cloneStrongTyped() const;
+
+    DeblockedTagVals deblock(boost::optional<DeblockedTagValStorage>& storage) override;
+
+    std::unique_ptr<ValueBlock> fillEmpty(TypeTags fillTag, Value fillVal) override;
+
+    std::unique_ptr<ValueBlock> fillType(uint32_t typeMask,
+                                         TypeTags fillTag,
+                                         Value fillVal) override;
+
+    // Returns true if none of the values in this block are arrays or objects. Returns false if
+    // any _may_ be arrays or objects.
+    bool hasNoObjsOrArrays() const {
+        if (_controlMin.tag() == _controlMax.tag() && !isArray(_controlMin.tag()) &&
+            !isObject(_controlMin.tag()) && _controlMin.tag() != TypeTags::Nothing) {
+            // Checking !isArray after the initial if statement is redundant but this is the
+            // explicit condition we are using to see if a field cannot contain any array values.
+            return true;
+        }
+        return false;
+    }
+
+    size_t count() override {
+        return _count;
+    }
+
+    TagValueView tryLowerBound() const override {
+        // The time field's control value is rounded down, so we can use it as a lower bound,
+        // but cannot necessarily use it as the min().
+        if (canUseControlValue(_controlMin.tag())) {
+            return _controlMin.view();
+        }
+        return {TypeTags::Nothing, Value{0u}};
+    }
+
+    TagValueView tryUpperBound() const override {
+        // Similar to tryLowerBound(), the control can be rounded up. It is a valid upper bound but
+        // not a valid max.
+        if (canUseControlValue(_controlMax.tag())) {
+            return _controlMax.view();
+        }
+        return {TypeTags::Nothing, Value{0u}};
+    }
+
+    TagValueView tryMin() const override;
+    TagValueView tryMax() const override;
+
+    boost::optional<bool> tryDense() const override;
+    boost::optional<bool> tryHasArray() const override;
+
+    // Whether this TS block was decompressed. This is not a method on the block API.
+    bool decompressed() const {
+        return static_cast<bool>(_decompressedBlock);
+    }
+
+    boost::optional<size_t> argMin() override;
+    boost::optional<size_t> argMax() override;
+
+    TagValueView at(size_t idx) override;
+
+    TypeTags getBlockTag() const {
+        return _block.tag();
+    }
+
+    /**
+     * Returns the BinData for this TsBlock, if present. It's illegal to call this for TsBlocks
+     * backed by a bucket which does not use BinData/BSONColumn.
+     */
+    BSONBinData getBinData() const;
+
+    // Test-only helper.
+    ValueBlock* decompressedBlock_forTest() {
+        return _decompressedBlock.get();
+    }
+
+    int getApproximateSize() const final {
+        int result = sizeof(*this) + _atCache.capacity() * sizeof(decltype(_atCache)::value_type);
+        if (_block.owned()) {
+            result += sbe::value::getApproximateSize(_block.tag(), _block.value());
+        }
+        if (_decompressedBlock) {
+            result += _decompressedBlock->getApproximateSize();
+        }
+        if (_atCacheAllocator) {
+            result += _atCacheAllocator->totalBlocksMemory() + sizeof(BSONElementStorage);
+        }
+        return result;
+    }
+
+private:
+    void ensureDeblocked();
+    void ensureAtCacheAllocator();
+
+    /**
+     * Deblocks the values from a BSON object block.
+     */
+    void deblockFromBsonObj();
+
+    /**
+     * Deblocks the values from a BSON column block.
+     */
+    void deblockFromBsonColumn();
+
+    bool isTimeFieldSorted() const;
+
+    // TsBlock owned by the TsCellBlockForTopLevelField which in turn is owned by the
+    // TsBucketToCellBlockStage can be in a special unowned state of '_block', where it is merely
+    // a view on the BSON provided by the stage tree below. This is done as an optimization to avoid
+    // copying all the data we read. Any TsBlocks created outside that stage (either via clone() or
+    // any other way) are fully owned, and have no pointers to outside data. So, we need to keep
+    // track of whether the underlying buffer '_block' is owned or not.
+    //
+    // If the '_block' is not owned, this TsBlock is valid only as long as the underlying BSON.
+    const TagValueMaybeOwned _block;
+
+    // The number of values in this block.
+    const size_t _count;
+
+    // The version of the bucket, which indicates whether the data is compressed and whether the
+    // time field is sorted.
+    const int _bucketVersion;
+
+    // true if all values in the block are non-nothing. Currently only true for timeField
+    const bool _isTimeField;
+
+    // Store the min and max found in the control field of a bucket
+    TagValueOwned _controlMin;
+    TagValueOwned _controlMax;
+
+    // A HeterogeneousBlock or HomogeneousBlock that stores the decompressed values of the original
+    // TsBlock.
+    std::unique_ptr<ValueBlock> _decompressedBlock;
+
+    // Cached result of tryDense(). Populated lazily on first call. Mutable because tryDense()
+    // is const.
+    mutable boost::optional<bool> _densenessCache;
+
+    // Maps logical row index -> tag/value view for elements materialized by argMin/argMax or at()
+    // boundary fast paths. For deep types, the view's Value points into _atCacheAllocator's
+    // storage. Clones start empty: BSONElementStorage uses thread_unsafe_counter refcounting, and
+    // the class invariant requires clones to be fully owned with no pointers into outside data.
+    absl::flat_hash_map<size_t, TagValueView> _atCache;
+
+    // Owns BSONElementStorage for any deep-type bytes referenced by _atCache. Lazily constructed by
+    // ensureAtCacheAllocator() on the first cache-miss path that materializes via a bsoncolumn
+    // expression.
+    boost::intrusive_ptr<BSONElementStorage> _atCacheAllocator;
+};
+
+/**
+ * Implements CellBlock interface for timeseries buckets. Currently this class is only used for top
+ * level fields. Subfields use a materialized cell block.
+ */
+class TsCellBlockForTopLevelField : public CellBlock {
+public:
+    TsCellBlockForTopLevelField(TsBlock* block);
+
+    // We don't have use cases for copy/move constructors and assignment operators and so disable
+    // them until we have one.
+    TsCellBlockForTopLevelField(const TsCellBlockForTopLevelField& other) = delete;
+    TsCellBlockForTopLevelField(TsCellBlockForTopLevelField&&) = delete;
+    TsCellBlockForTopLevelField& operator=(const TsCellBlockForTopLevelField& other) = delete;
+    TsCellBlockForTopLevelField& operator=(TsCellBlockForTopLevelField&& other) = delete;
+
+    ~TsCellBlockForTopLevelField() override = default;
+
+    ValueBlock& getValueBlock() override;
+
+    std::unique_ptr<CellBlock> clone() const override;
+
+    const std::vector<int32_t>& filterPositionInfo() override {
+        return _positionInfo;
+    }
+
+    int getApproximateSize() const override {
+        int result = sizeof(*this);
+        result += static_cast<int>(_positionInfo.capacity() * sizeof(int32_t));
+        if (_ownedTsBlock) {
+            result += _ownedTsBlock->getApproximateSize();
+        }
+        return result;
+    }
+
+private:
+    TsCellBlockForTopLevelField(std::unique_ptr<TsBlock> tsBlock);
+
+    std::unique_ptr<TsBlock> _ownedTsBlock;
+    // If _ownedTsBlock is non-null, this points to _ownedTsBlock.
+    TsBlock* _unownedTsBlock;
+
+    // For now this is always empty since only top-level fields are supported.
+    std::vector<int32_t> _positionInfo;
+};
+}  // namespace mongo::sbe::value

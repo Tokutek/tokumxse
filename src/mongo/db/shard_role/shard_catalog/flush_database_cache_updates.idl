@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# _flushDatabaseCacheUpdates IDL File
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _flushDatabaseCacheUpdates:
+        description: "An internal command to wait for the last routing table cache refresh for a particular database to be persisted to disk"
+        command_name: _flushDatabaseCacheUpdates
+        cpp_name: FlushDatabaseCacheUpdates
+        strict: true
+        namespace: type
+        api_version: ""
+        type: string
+        fields:
+            syncFromConfig:
+                type: bool
+                description: "If true, forces a refresh of the cache entry from the config server before waiting for updates to be persist"
+                default: true
+
+    _flushDatabaseCacheUpdatesWithWriteConcern:
+        description: "The same behavior as _flushDatabaseCacheUpdates but accepts writeConcern"
+        command_name: _flushDatabaseCacheUpdatesWithWriteConcern
+        cpp_name: FlushDatabaseCacheUpdatesWithWriteConcern
+        strict: true
+        namespace: type
+        api_version: ""
+        type: string
+        fields:
+            syncFromConfig:
+                type: bool
+                description: "If true, forces a refresh of the cache entry from the config server before waiting for updates to be persist"
+                default: true
+        reply_type: OkReply

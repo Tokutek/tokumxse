@@ -1,0 +1,32 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    multiUpdateCoordinatorServiceMinThreadCount:
+        description: The min number of threads in the multi update coordinator's thread pool.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gMultiUpdateCoordinatorServiceMinThreadCount
+        default: 0
+        validator:
+            gte: 0
+            lte: 255
+        redact: false
+
+    multiUpdateCoordinatorServiceMaxThreadCount:
+        description: The max number of threads in the multi update coordinator's thread pool.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gMultiUpdateCoordinatorServiceMaxThreadCount
+        default: 8
+        validator:
+            gte: 1
+            lte: 255
+        redact: false

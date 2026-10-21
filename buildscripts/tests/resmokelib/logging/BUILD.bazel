@@ -1,0 +1,25 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_handlers",
+    srcs = [
+        "__init__.py",
+        "test_handlers.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)
+
+py_test(
+    name = "test_loggers",
+    srcs = [
+        "__init__.py",
+        "test_loggers.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/resmokelib",
+    ],
+)

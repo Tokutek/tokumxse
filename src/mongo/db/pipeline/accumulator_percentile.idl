@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+    cpp_includes:
+        - "mongo/db/pipeline/accumulator_percentile.h"
+        - "mongo/db/pipeline/accumulator_percentile_enum_gen.h"
+imports:
+    - "mongo/db/basic_types.idl"
+structs:
+    # $percentile allows expressions for 'input' and 'p' fields, which we cannot evaluate through
+    # the 'validator' callback and have to accept IDLAnyType.
+    AccumulatorPercentileSpec:
+        description: "Specification for the $percentile accumulator."
+        strict: true
+        fields:
+            input:
+                description: "The expression to find the percentiles of."
+                type: IDLAnyType
+                optional: false
+            p:
+                description: "The array listing the percentiles we will calculate."
+                type: IDLAnyType
+                optional: false
+            method:
+                description: "The method we will use to find the percentile."
+                type: string
+                optional: false
+    AccumulatorMedianSpec:
+        description: "Specification for the $median accumulator."
+        strict: true
+        fields:
+            input:
+                description: "The expression to find the percentiles of."
+                type: IDLAnyType
+                optional: false
+            method:
+                description: "The method we will use to find the percentile."
+                type: string
+                optional: false

@@ -1,0 +1,25 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _shardsvrJoinDDLCoordinators:
+        command_name: _shardsvrJoinDDLCoordinators
+        cpp_name: ShardsvrJoinDDLCoordinators
+        description: "Waits for all ongoing ShardingCoordinators on this shard to complete"
+        namespace: ignored
+        api_version: ""
+        strict: false
+        fields:
+            types:
+                type: array<string>
+                description: >-
+                    Array with values from the enumeration CoordinatorTypeEnum. If present, only
+                    coordinators of these types will be waited for.
+                optional: true

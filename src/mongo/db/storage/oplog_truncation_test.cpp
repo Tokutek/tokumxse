@@ -1,0 +1,1143 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/oplog_truncation.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <boost/container/vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+namespace repl {
+const auto& oplogNs = NamespaceString::kRsOplogNamespace;
+
+class OplogTruncationTest : public ServiceContextMongoDTest {
+protected:
+    OperationContext* getOperationContext() {
+        return _opCtx.get();
+    }
+
+    StorageInterface& getStorage() {
+        return _storage;
+    }
+
+    ReplicationConsistencyMarkers* getConsistencyMarkers() {
+        return _consistencyMarkers.get();
+    }
+
+    BSONObj makeBSONObjWithSize(unsigned int seconds, unsigned int t, int size, char fill = 'x') {
+        Timestamp opTime{seconds, t};
+        Date_t wallTime = Date_t::fromMillisSinceEpoch(t);
+        BSONObj objTemplate = BSON("ts" << opTime << "wall" << wallTime << "str"
+                                        << "");
+        EXPECT_LE(objTemplate.objsize(), size);
+        std::string str(size - objTemplate.objsize(), fill);
+
+        BSONObj obj = BSON("ts" << opTime << "wall" << wallTime << "str" << str);
+        EXPECT_EQ(size, obj.objsize());
+
+        return obj;
+    }
+
+    BSONObj makeBSONObjWithSize(unsigned int t, int size, char fill = 'x') {
+        return makeBSONObjWithSize(1, t, size, fill);
+    }
+
+    BSONObj insertOplog(unsigned int seconds, unsigned int t, int size) {
+        auto obj = makeBSONObjWithSize(seconds, t, size);
+        AutoGetOplogFastPath oplogWrite(_opCtx.get(), OplogAccessMode::kWrite);
+        const auto& oplog = oplogWrite.getCollection();
+        std::vector<Record> records{{RecordId(), RecordData(obj.objdata(), obj.objsize())}};
+        std::vector<Timestamp> timestamps{Timestamp()};
+        WriteUnitOfWork wuow(_opCtx.get());
+        ASSERT_OK(internal::insertDocumentsForOplog(_opCtx.get(), oplog, &records, timestamps));
+        wuow.commit();
+        return obj;
+    }
+
+    BSONObj insertOplog(unsigned int t, int size) {
+        return insertOplog(1, t, size);
+    }
+
+    /**
+     * Advances the stable timestamp of the engine.
+     */
+    void advanceStableTimestamp(Timestamp newTimestamp) {
+        // Disable the callback for oldest active transaction as it blocks the timestamps from
+        // advancing.
+        auto service = getServiceContext();
+        service->getStorageEngine()->setOldestActiveTransactionTimestampCallback(
+            StorageEngine::OldestActiveTransactionTimestampCallback{});
+        _storage.setInitialDataTimestamp(service, newTimestamp);
+        _storage.setStableTimestamp(service, newTimestamp, true);
+        service->getStorageEngine()->checkpoint();
+    }
+
+    struct FourMarkerOplog {
+        RecordStore* rs;
+        std::shared_ptr<OplogTruncateMarkers> truncateMarkers;
+        RecordId mayTruncateUpTo;
+    };
+
+    /**
+     * Sets up an oplog holding three full truncate markers, plus a fourth so that the oldest three
+     * may all be truncated, and advances the stable timestamp past all of them.
+     */
+    FourMarkerOplog setUpFourMarkers() {
+        auto opCtx = getOperationContext();
+        auto* rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+        auto truncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+        EXPECT_TRUE(truncateMarkers != nullptr);
+
+        EXPECT_TRUE(rs->oplog()->updateSize(230).isOK());
+        truncateMarkers->setMinBytesPerMarker(100);
+
+        insertOplog(1, 100);
+        insertOplog(2, 110);
+        insertOplog(3, 120);
+        insertOplog(4, 130);
+        EXPECT_EQ(4U, truncateMarkers->numMarkers());
+
+        advanceStableTimestamp(Timestamp(1, 4));
+        auto mayTruncateUpTo =
+            RecordId(getServiceContext()->getStorageEngine()->getPinnedOplog().asULL());
+
+        return {rs, std::move(truncateMarkers), mayTruncateUpTo};
+    }
+
+private:
+    void setUp() override {
+        ServiceContextMongoDTest::setUp();
+        _opCtx = cc().makeOperationContext();
+        _consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
+        auto service = getServiceContext();
+        auto replCoord = std::make_unique<ReplicationCoordinatorMock>(service);
+        ReplicationCoordinator::set(service, std::move(replCoord));
+        // Turn off async sampling before creating the oplog so we get the right value of
+        // needsTruncateMarkers in setRecordStore.
+        unittest::ServerParameterGuard oplogSamplingAsyncEnabledController(
+            "oplogSamplingAsyncEnabled", false);
+        repl::createOplog(_opCtx.get());
+    }
+
+    void tearDown() override {
+        _opCtx.reset(nullptr);
+        _consistencyMarkers.reset();
+        ServiceContextMongoDTest::tearDown();
+    }
+
+    ServiceContext::UniqueOperationContext _opCtx;
+    StorageInterfaceImpl _storage;
+    std::unique_ptr<ReplicationConsistencyMarkersMock> _consistencyMarkers;
+};
+
+/**
+ * Insert records into an oplog and verify the number of truncate markers that are created.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_CreateNewMarker) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+
+    // Inserting a record smaller than 'minBytesPerTruncateMarker' shouldn't create a new oplog
+    // truncate marker.
+    insertOplog(1, 99);
+    EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(99, oplogTruncateMarkers->currentBytes_forTest());
+
+    // Inserting another record such that their combined size exceeds
+    // 'minBytesPerTruncateMarker' should cause a new truncate marker to be created.
+    insertOplog(2, 51);
+    EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+
+    // Inserting a record such that the combined size of this record and the previously inserted
+    // one exceed 'minBytesPerTruncateMarker' shouldn't cause a new truncate marker to be
+    // created because we've started filling a new truncate marker.
+    insertOplog(3, 50);
+    EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+
+    // Inserting a record such that the combined size of this record and the previously inserted
+    // one is exactly equal to 'minBytesPerTruncateMarker' should cause a new truncate marker to
+    // be created.
+    insertOplog(4, 50);
+    EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+
+    // Inserting a single record that exceeds 'minBytesPerTruncateMarker' should cause a new
+    // truncate marker to be created.
+    insertOplog(5, 101);
+    EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+}
+
+/**
+ * Insert multiple records and truncate the oplog collection. The operation
+ * should leave no truncate markers, including the partially filled one.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_Truncate) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto& storage = getStorage();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    unsigned int count = 3;
+    int size = 50;
+    for (unsigned int t = 1; t <= count; t++) {
+        insertOplog(t, size);
+    }
+
+    EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(size, oplogTruncateMarkers->currentBytes_forTest());
+
+    EXPECT_EQ(count, rs->numRecords());
+    EXPECT_EQ(size * count, rs->dataSize());
+
+    ASSERT_OK(storage.truncateCollection(opCtx, oplogNs));
+
+    EXPECT_EQ(0, rs->dataSize());
+    EXPECT_EQ(0, rs->numRecords());
+    EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+}
+
+/**
+ * Insert records into an oplog and try to update them. The updates shouldn't succeed if the size of
+ * record is changed.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_UpdateRecord) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto& storage = getStorage();
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    // Insert two records such that one makes up a full truncate marker and the other is a part of
+    // the truncate marker currently being filled.
+    auto obj1 = insertOplog(1, 100);
+    auto obj2 = insertOplog(2, 50);
+    storage.oplogDiskLocRegister(opCtx, Timestamp{1, 2}, true);
+
+    EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+    EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+    EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+
+    // Attempts to grow the records should fail.
+    {
+        BSONObj changed1 = makeBSONObjWithSize(1, 101);
+        TimestampedBSONObj update1 = {BSON("$set" << changed1), {}};
+        ASSERT_NOT_OK(storage.updateSingleton(opCtx, oplogNs, BSON("ts" << obj1["ts"]), update1));
+
+        BSONObj changed2 = makeBSONObjWithSize(1, 51);
+        TimestampedBSONObj update2 = {BSON("$set" << changed2), {}};
+        ASSERT_NOT_OK(storage.updateSingleton(opCtx, oplogNs, BSON("ts" << obj2["ts"]), update2));
+    }
+
+    // Attempts to shrink the records should also fail.
+    {
+        BSONObj changed1 = makeBSONObjWithSize(1, 99);
+        TimestampedBSONObj update1 = {BSON("$set" << changed1), {}};
+        ASSERT_NOT_OK(storage.updateSingleton(opCtx, oplogNs, BSON("ts" << obj1["ts"]), update1));
+
+        BSONObj changed2 = makeBSONObjWithSize(1, 49);
+        TimestampedBSONObj update2 = {BSON("$set" << changed2), {}};
+        ASSERT_NOT_OK(storage.updateSingleton(opCtx, oplogNs, BSON("ts" << obj2["ts"]), update2));
+    }
+
+    // Changing the contents of the records without changing their size should succeed.
+    {
+        BSONObj changed1 = makeBSONObjWithSize(1, 100, 'y');
+        TimestampedBSONObj update1 = {BSON("$set" << changed1), {}};
+        ASSERT_OK(storage.updateSingleton(opCtx, oplogNs, BSON("ts" << obj1["ts"]), update1));
+
+        BSONObj changed2 = makeBSONObjWithSize(1, 50, 'z');
+        TimestampedBSONObj update2 = {BSON("$set" << changed2), {}};
+        ASSERT_OK(storage.updateSingleton(opCtx, oplogNs, BSON("ts" << obj2["ts"]), update2));
+
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+    }
+}
+
+/**
+ * Insert multiple records, truncate the oplog using RecordStore::Capped::truncateAfter(), and
+ * verify that the metadata for each truncate marker is updated. If a full truncate marker is
+ * partially truncated, then it should become the truncate marker currently being filled.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_CappedTruncateAfter) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto& storage = getStorage();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    oplogTruncateMarkers->setMinBytesPerMarker(1000);
+
+    {
+        insertOplog(1, 400);
+        insertOplog(2, 800);
+        insertOplog(3, 200);
+        insertOplog(4, 250);
+        insertOplog(5, 300);
+        insertOplog(6, 350);
+        insertOplog(7, 50);
+        insertOplog(8, 100);
+        insertOplog(9, 150);
+        storage.oplogDiskLocRegister(opCtx, Timestamp{1, 9}, true);
+
+        EXPECT_EQ(9, rs->numRecords());
+        EXPECT_EQ(2600, rs->dataSize());
+        EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(3, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(300, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Make sure all are visible.
+    storage.waitForAllEarlierOplogWritesToBeVisible(opCtx, rs);
+
+    // Truncate data using an inclusive RecordId that exists inside the truncate marker currently
+    // being filled.
+    {
+        WriteUnitOfWork wunit(opCtx);
+        RecordStore::Capped::TruncateAfterResult result =
+            rs->capped()->truncateAfter(opCtx,
+                                        *shard_role_details::getRecoveryUnit(opCtx),
+                                        RecordId(1, 8),
+                                        true /* inclusive */);
+        wunit.commit();
+        oplogTruncateMarkers->updateMarkersAfterCappedTruncateAfter(
+            result.recordsRemoved, result.bytesRemoved, result.firstRemovedId);
+
+        EXPECT_EQ(7, rs->numRecords());
+        EXPECT_EQ(2350, rs->dataSize());
+        EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Truncate data using an inclusive RecordId that refers to the 'lastRecord' of a full truncate
+    // marker.
+    // The truncate marker should become the one currently being filled.
+    {
+        WriteUnitOfWork wunit(opCtx);
+        RecordStore::Capped::TruncateAfterResult result =
+            rs->capped()->truncateAfter(opCtx,
+                                        *shard_role_details::getRecoveryUnit(opCtx),
+                                        RecordId(1, 6),
+                                        true /* inclusive */);
+        wunit.commit();
+        oplogTruncateMarkers->updateMarkersAfterCappedTruncateAfter(
+            result.recordsRemoved, result.bytesRemoved, result.firstRemovedId);
+
+        EXPECT_EQ(5, rs->numRecords());
+        EXPECT_EQ(1950, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(3, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(750, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Now test the high level truncateOplogToTimestamp API.
+    ReplicationRecoveryImpl recovery(&storage, getConsistencyMarkers());
+
+    // Truncate data using a non-inclusive RecordId that exists inside the truncate marker currently
+    // being filled.
+    {
+        recovery.truncateOplogToTimestamp(opCtx, Timestamp(1, 3));
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(1400, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(200, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Truncate data using a non-inclusive RecordId that refers to the 'lastRecord' of a full
+    // truncate marker.
+    // The truncate marker should remain intact.
+    {
+        recovery.truncateOplogToTimestamp(opCtx, Timestamp(1, 2));
+        EXPECT_EQ(2, rs->numRecords());
+        EXPECT_EQ(1200, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Truncate data using a non-inclusive RecordId that exists inside a full truncate marker. The
+    // truncate marker should become the one currently being filled.
+    {
+        recovery.truncateOplogToTimestamp(opCtx, Timestamp(1, 1));
+        EXPECT_EQ(1, rs->numRecords());
+        EXPECT_EQ(400, rs->dataSize());
+        EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(400, oplogTruncateMarkers->currentBytes_forTest());
+    }
+}
+
+/**
+ * Verify that oplog truncate markers are reclaimed when cappedMaxSize is exceeded.
+ */
+TEST_F(OplogTruncationTest, ReclaimTruncateMarkers) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto engine = getServiceContext()->getStorageEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    ASSERT_OK(rs->oplog()->updateSize(230));
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    {
+        insertOplog(1, 100);
+        insertOplog(2, 110);
+        insertOplog(3, 120);
+
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(330, rs->dataSize());
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Fail to truncate the truncate marker when cappedMaxSize is exceeded, but the persisted
+    // timestamp is before the truncation point (i.e: leaves a gap that replication recovery would
+    // rely on).
+    {
+        advanceStableTimestamp(Timestamp(1, 0));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 1), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(330, rs->dataSize());
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Truncate a truncate marker when cappedMaxSize is exceeded.
+    {
+        advanceStableTimestamp(Timestamp(1, 3));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(1, 1), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 2), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(2, rs->numRecords());
+        EXPECT_EQ(230, rs->dataSize());
+        EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    {
+        insertOplog(4, 130);
+        insertOplog(5, 140);
+        insertOplog(6, 50);
+
+        EXPECT_EQ(5, rs->numRecords());
+        EXPECT_EQ(550, rs->dataSize());
+        EXPECT_EQ(4U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Truncate multiple truncate markers if necessary.
+    {
+        advanceStableTimestamp(Timestamp(1, 6));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(1, 4), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 5), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(2, rs->numRecords());
+        EXPECT_EQ(190, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // No-op if dataSize <= cappedMaxSize.
+    {
+        advanceStableTimestamp(Timestamp(1, 6));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 5), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(2, rs->numRecords());
+        EXPECT_EQ(190, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Don't truncate the last truncate marker before the truncate point, even if the truncate point
+    // is ahead of it.
+    {
+        insertOplog(7, 190);
+        insertOplog(9, 120);
+
+        EXPECT_EQ(4, rs->numRecords());
+        EXPECT_EQ(500, rs->dataSize());
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+    {
+        advanceStableTimestamp(Timestamp(1, 8));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(1, 5), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 6), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(360, rs->dataSize());
+        EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // Don't truncate entire oplog.
+    {
+        insertOplog(10, 90);
+        insertOplog(11, 210);
+
+        EXPECT_EQ(5, rs->numRecords());
+        EXPECT_EQ(660, rs->dataSize());
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    {
+        advanceStableTimestamp(Timestamp(1, 12));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(1, 9), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 10), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(2, rs->numRecords());
+        EXPECT_EQ(300, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    // OK to truncate all truncate markers if there are records in the oplog that are before or at
+    // the truncate-up-to point, that have not yet created a truncate marker.
+    {
+        // Use timestamp (1, 13) as we can't commit at the stable timestamp (1, 12).
+        insertOplog(13, 90);
+
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(390, rs->dataSize());
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(90, oplogTruncateMarkers->currentBytes_forTest());
+    }
+    {
+        advanceStableTimestamp(Timestamp(1, 13));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(RecordId(1, 11), truncatedUpTo);
+        EXPECT_EQ(Timestamp(1, 13), rs->oplog()->getEarliestTimestamp(ru).getValue());
+
+        EXPECT_EQ(1, rs->numRecords());
+        EXPECT_EQ(90, rs->dataSize());
+        EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(90, oplogTruncateMarkers->currentBytes_forTest());
+    }
+}
+
+// The truncation statistics are updated once per individual marker truncated, so that an
+// observer polling them sees progress while a backlog of expired oplog is being truncated.
+TEST_F(OplogTruncationTest, TruncationStatsUpdatedOncePerMarkerTruncated) {
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto [rs, oplogTruncateMarkers, mayTruncateUpTo] = setUpFourMarkers();
+
+    const auto startingTruncateCount = oplog_truncation::getTruncateCount();
+    const auto startingTimeTruncating = oplog_truncation::getTotalTimeTruncatingMicros();
+
+    // Spend a known amount of time truncating each marker. Without this, truncating a marker in
+    // this test can complete in well under a microsecond.
+    constexpr Milliseconds kTimePerMarker{1};
+    const auto kMicrosPerMarker = durationCount<Microseconds>(kTimePerMarker);
+
+    // Record the statistics observed at the start of each individual marker truncation.
+    std::vector<int64_t> truncateCountPerMarker;
+    std::vector<int64_t> timeTruncatingPerMarker;
+    oplog_truncation::truncateByMarkerQueue(
+        opCtx,
+        *rs,
+        mayTruncateUpTo,
+        [&](OperationContext*, const CollectionTruncateMarkers::Marker&) {
+            truncateCountPerMarker.push_back(oplog_truncation::getTruncateCount());
+            timeTruncatingPerMarker.push_back(oplog_truncation::getTotalTimeTruncatingMicros());
+            sleepFor(kTimePerMarker);
+            return true;
+        });
+
+    ASSERT_EQ(3U, truncateCountPerMarker.size());
+    ASSERT_EQ(startingTruncateCount, truncateCountPerMarker[0]);
+    ASSERT_EQ(startingTruncateCount + 1, truncateCountPerMarker[1]);
+    ASSERT_EQ(startingTruncateCount + 2, truncateCountPerMarker[2]);
+    ASSERT_EQ(startingTruncateCount + 3, oplog_truncation::getTruncateCount());
+
+    // Each callback samples from inside the marker truncation it is timing, which is recorded only
+    // once that truncation returns. The first marker sees nothing accumulated, and each one after
+    // it sees at least the time spent on every preceding marker.
+    ASSERT_EQ(3U, timeTruncatingPerMarker.size());
+    ASSERT_EQ(startingTimeTruncating, timeTruncatingPerMarker[0]);
+    ASSERT_GTE(timeTruncatingPerMarker[1], startingTimeTruncating + kMicrosPerMarker);
+    ASSERT_GTE(timeTruncatingPerMarker[2], startingTimeTruncating + 2 * kMicrosPerMarker);
+    ASSERT_GTE(oplog_truncation::getTotalTimeTruncatingMicros(),
+               startingTimeTruncating + 3 * kMicrosPerMarker);
+}
+
+// Shutting down the oplog cap maintainer thread clears the truncate markers while a truncation pass
+// may still be running. A pass must notice they are gone and stop.
+TEST_F(OplogTruncationTest, TruncationPassStopsWhenTruncateMarkersCleared) {
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto [rs, oplogTruncateMarkers, mayTruncateUpTo] = setUpFourMarkers();
+
+    // Kill markers between two iterations of truncation. shutdown() clears the truncate markers
+    // before it kills the opCtx. The opCtx is deliberately left uninterrupted so that the cleared
+    // markers is what stops the truncation pass.
+    int64_t truncateCalls = 0;
+    oplog_truncation::truncateByMarkerQueue(
+        opCtx,
+        *rs,
+        mayTruncateUpTo,
+        [&](OperationContext* opCtx, const CollectionTruncateMarkers::Marker&) {
+            if (++truncateCalls == 1) {
+                oplogTruncateMarkers->kill();
+                LocalOplogInfo::get(opCtx)->setTruncateMarkers(nullptr);
+            }
+            return true;
+        });
+
+    // The pass observed the cleared markers on its next iteration and stopped.
+    ASSERT_EQ(1, truncateCalls);
+    ASSERT_FALSE(LocalOplogInfo::get(opCtx)->getTruncateMarkers());
+}
+
+// A truncation pass leaves the marker queue at a marker boundary once its opCtx is killed, rather
+// than starting another truncation it cannot finish. The cap maintainer thread's opCtx is killed on
+// every shutdown of the thread (e.g. stepdown).
+TEST_F(OplogTruncationTest, TruncationPassStopsWhenInterrupted) {
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto [rs, oplogTruncateMarkers, mayTruncateUpTo] = setUpFourMarkers();
+
+    // Simulate shutdown() while the first marker is being truncated by killing the markers and
+    // opCtx.
+    int64_t truncateCalls = 0;
+    ASSERT_THROWS_CODE(oplog_truncation::truncateByMarkerQueue(
+                           opCtx,
+                           *rs,
+                           mayTruncateUpTo,
+                           [&](OperationContext* opCtx, const CollectionTruncateMarkers::Marker&) {
+                               ++truncateCalls;
+                               oplogTruncateMarkers->kill();
+                               opCtx->markKilled(ErrorCodes::InterruptedDueToReplStateChange);
+                               return true;
+                           }),
+                       DBException,
+                       ErrorCodes::InterruptedDueToReplStateChange);
+
+    // The in-flight marker was truncated and popped, and the pass then stopped instead of starting
+    // a second truncation.
+    ASSERT_EQ(1, truncateCalls);
+    ASSERT_EQ(3U, oplogTruncateMarkers->numMarkers());
+}
+
+/**
+ * Verify that oplog truncate marker reclaim is a no-op if the rs has been truncated.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_TestReclaimOverPreviouslyTruncatedRange) {
+    // This is actually an async test but we turn async off because we simulate the asynchronous
+    // behaviour another way
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto engine = getServiceContext()->getStorageEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    ASSERT_OK(rs->oplog()->updateSize(230));
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    {
+        insertOplog(1, 100);
+        insertOplog(2, 110);
+        insertOplog(3, 120);
+
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(330, rs->dataSize());
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    {
+        Lock::GlobalLock globalLock(opCtx, MODE_X);
+        WriteUnitOfWork wuow(opCtx);
+
+        LocalOplogInfo::get(opCtx)->setTruncateMarkers(nullptr);
+
+        ASSERT_OK(rs->truncate(opCtx, ru));
+
+        LocalOplogInfo::get(opCtx)->setTruncateMarkers(oplogTruncateMarkers);
+        wuow.commit();
+
+        EXPECT_EQ(0, rs->numRecords());
+        EXPECT_EQ(0, rs->dataSize());
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+    }
+
+    {
+        insertOplog(4, 100);
+        insertOplog(5, 110);
+        insertOplog(6, 120);
+
+        EXPECT_EQ(3, rs->numRecords());
+        EXPECT_EQ(330, rs->dataSize());
+        EXPECT_EQ(6U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+
+    {
+        advanceStableTimestamp(Timestamp(1, 5));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        auto truncatedUpTo = oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+
+        EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+}
+
+
+/**
+ * Verify that oplog truncate marker reclaim is a no-op if the rs has been truncated.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_AsyncUpdateToMaxSize) {
+    // This is actually an async test but we turn async off because we simulate the asynchronous
+    // behaviour another way
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    unittest::ServerParameterGuard minMarkerCountController("minOplogTruncationPoints", 30);
+    unittest::ServerParameterGuard maxMarkerCountController("maxOplogTruncationPointsDuringStartup",
+                                                            30);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    ASSERT_OK(rs->oplog()->updateSize(230));
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    {
+        insertOplog(1, 100);
+        insertOplog(2, 110);
+        insertOplog(3, 120);
+
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+    }
+
+    {
+        AutoGetCollection coll(opCtx, oplogNs, MODE_X);
+        CollectionWriter writer{opCtx, coll};
+        WriteUnitOfWork wuow(opCtx);
+
+        LocalOplogInfo::get(opCtx)->setTruncateMarkers(nullptr);
+
+        // We forced keeping 30 markers above, so our 9000 byte oplog should have 300 bytes
+        // per marker.
+        ASSERT_OK(writer.getWritableCollection(opCtx)->updateCappedSize(
+            opCtx, 9000, /*newCappedMax=*/boost::none));
+
+        LocalOplogInfo::get(opCtx)->setTruncateMarkers(oplogTruncateMarkers);
+        wuow.commit();
+
+        EXPECT_EQ(3U, oplogTruncateMarkers->numMarkers());
+    }
+
+    {
+        insertOplog(4, 100);
+        insertOplog(5, 110);
+        insertOplog(6, 120);
+
+        EXPECT_EQ(4U, oplogTruncateMarkers->numMarkers());
+    }
+}
+
+/**
+ * Verify that an oplog truncate marker isn't created if it would cause the logical representation
+ * of the records to not be in increasing order.
+ */
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_AscendingOrder) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    oplogTruncateMarkers->setMinBytesPerMarker(100);
+
+    {
+        EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+        insertOplog(2, 2, 50);  // Timestamp(2, 2)
+        EXPECT_EQ(0U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(50, oplogTruncateMarkers->currentBytes_forTest());
+
+        // Inserting a record that has a smaller RecordId than the previously inserted record should
+        // be able to create a new truncate marker when no truncate markers already exist.
+        insertOplog(2, 1, 50);  // Timestamp(2, 1)
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+
+        // However, inserting a record that has a smaller RecordId than most recently created
+        // truncate marker's last record shouldn't cause a new truncate marker to be created, even
+        // if the size of the inserted record exceeds 'minBytesPerTruncateMarker'.
+        insertOplog(1, 100);  // Timestamp(1, 1)
+        EXPECT_EQ(1U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(1, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(100, oplogTruncateMarkers->currentBytes_forTest());
+
+        // Inserting a record that has a larger RecordId than the most recently created truncate
+        // marker's last record should then cause a new truncate marker to be created.
+        insertOplog(2, 3, 50);  // Timestamp(2, 3)
+        EXPECT_EQ(2U, oplogTruncateMarkers->numMarkers());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentRecords_forTest());
+        EXPECT_EQ(0, oplogTruncateMarkers->currentBytes_forTest());
+    }
+}
+
+// When the oplog collection is non-empty, but no OplogTruncateMarkers are
+// generated because the estimated 'dataSize' is smaller than the minimum size for a truncate
+// marker, tests that
+//  (1) The oplog is scanned
+//  (2) OplogTruncateMarkers::currentBytes_forTest() reflects the actual size of the oplog instead
+//  of the estimated size.
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_NoMarkersGeneratedFromScanning) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+
+    int realNumRecords = 4;
+    int realSizePerRecord = 100;
+    for (int i = 1; i <= realNumRecords; i++) {
+        insertOplog(i, realSizePerRecord);
+    }
+
+    // Force the estimates of 'dataSize' and 'numRecords' to be lower than the real values.
+    long long fakeNumRecords = realNumRecords - 1;
+    rs->setSize(fakeNumRecords, fakeNumRecords * realSizePerRecord);
+
+    // Re-initialize the truncate markers.
+    LocalOplogInfo::get(opCtx)->setRecordStore(opCtx, rs);
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    // Confirm that small oplogs are processed by scanning.
+    EXPECT_EQ(CollectionTruncateMarkers::MarkersCreationMethod::Scanning,
+              oplogTruncateMarkers->getMarkersCreationMethod());
+    EXPECT_GE(oplogTruncateMarkers->getCreationProcessingTime().count(), 0);
+    auto numMarkers = oplogTruncateMarkers->numMarkers();
+    EXPECT_EQ(numMarkers, 0U);
+
+    // A forced scan over the RecordStore should force the 'currentBytes' to be accurate in the
+    // truncate markers as well as the RecordStore's 'numRecords' and 'dataSize'.
+    EXPECT_EQ(oplogTruncateMarkers->currentBytes_forTest(), realNumRecords * realSizePerRecord);
+    EXPECT_EQ(rs->dataSize(), realNumRecords * realSizePerRecord);
+    EXPECT_EQ(rs->numRecords(), realNumRecords);
+}
+
+// Ensure that if we sample and create duplicate oplog truncate markers, perform truncation
+// correctly, and with no crashing behavior. This scenario may be possible if the same record is
+// sampled multiple times during startup, which can be very likely if the size storer is very
+// inaccurate.
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_Duplicates) {
+    // Turn off async mode
+    unittest::ServerParameterGuard oplogSamplingAsyncEnabledController("oplogSamplingAsyncEnabled",
+                                                                       false);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto engine = getServiceContext()->getStorageEngine();
+
+    {
+        // Before initializing the RecordStore, populate with a few records.
+        insertOplog(1, 100);
+        insertOplog(2, 100);
+        insertOplog(3, 100);
+        insertOplog(4, 100);
+    }
+
+    {
+        // Force initialize the oplog truncate markers to use sampling by providing very large,
+        // inaccurate sizes. This should cause us to over sample the records in the oplog.
+        ASSERT_OK(rs->oplog()->updateSize(1024 * 1024 * 1024));
+        rs->setSize(/*numRecords=*/1024 * 1024, /*dataSize=*/1024 * 1024 * 1024);
+    }
+
+    // Confirm that some truncate markers were generated.
+    LocalOplogInfo::get(opCtx)->setRecordStore(opCtx, rs);
+    auto oplogTruncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(oplogTruncateMarkers);
+
+    EXPECT_EQ(CollectionTruncateMarkers::MarkersCreationMethod::Sampling,
+              oplogTruncateMarkers->getMarkersCreationMethod());
+    EXPECT_GE(oplogTruncateMarkers->getCreationProcessingTime().count(), 0);
+    auto truncateMarkersBefore = oplogTruncateMarkers->numMarkers();
+    EXPECT_GT(truncateMarkersBefore, 0U);
+    EXPECT_GT(oplogTruncateMarkers->currentBytes_forTest(), 0);
+
+    {
+        // Reclaiming should do nothing because the data size is still under the maximum.
+        advanceStableTimestamp(Timestamp(1, 4));
+        auto mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+        EXPECT_EQ(truncateMarkersBefore, oplogTruncateMarkers->numMarkers());
+
+        // Reduce the oplog size to ensure we create a truncate marker and truncate on the next
+        // insert.
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+        AutoGetCollection coll(opCtx, oplogNs, MODE_X);
+        CollectionWriter writer{opCtx, coll};
+        WriteUnitOfWork wuow(opCtx);
+        ASSERT_OK(writer.getWritableCollection(opCtx)->updateCappedSize(
+            opCtx, 400, /*newCappedMax=*/boost::none));
+        wuow.commit();
+
+        // Inserting these records should meet the requirements for truncation. That is: there is a
+        // record, 5, after the last truncate marker, 4, and before the truncation point, 6.
+        insertOplog(5, 100);
+        insertOplog(6, 100);
+
+        // Ensure every truncate marker has been cleaned up except for the last one ending in 6.
+        advanceStableTimestamp(Timestamp(1, 6));
+        mayTruncateUpTo = RecordId(engine->getPinnedOplog().asULL());
+        oplog_truncation::reclaimOplog(opCtx, *rs, mayTruncateUpTo);
+        EXPECT_EQ(1, oplogTruncateMarkers->numMarkers());
+
+        // The original oplog should have rolled over and the size and count should be accurate.
+        EXPECT_EQ(1, rs->numRecords());
+        EXPECT_EQ(100, rs->dataSize());
+    }
+}
+
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_NewestExpiredWallTime) {
+    storageGlobalParams.oplogMinRetentionHours.store(24.0);
+    Date_t expected = Date_t::now() - Hours(24);
+    Date_t actual = OplogTruncateMarkers::newestExpiredWallTime(getOperationContext());
+    EXPECT_NEAR(expected.toMillisSinceEpoch(), actual.toMillisSinceEpoch(), 1000);
+    storageGlobalParams.oplogMinRetentionHours.store(0.0);
+    EXPECT_EQ(Date_t(), OplogTruncateMarkers::newestExpiredWallTime(getOperationContext()));
+}
+
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_MaxMarkerSizeCapsTheComputedMarkerSize) {
+    // A 100MB oplog would otherwise be divided into 10MB markers.
+    unittest::ServerParameterGuard maxMarkerSize("maxOplogTruncationPointSizeMB", 1);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto markers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(markers);
+
+    const int64_t maxSize = 100 * 1024 * 1024;
+    ASSERT_OK(rs->oplog()->updateSize(maxSize));
+    markers->adjust(*rs);
+
+    ASSERT_EQ(markers->minBytesPerMarker(), 1024 * 1024);
+}
+
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_MaxMarkerSizeLeavesSmallerMarkersAlone) {
+    // The 1MB oplog below yields markers well under the cap.
+    unittest::ServerParameterGuard maxMarkerSize("maxOplogTruncationPointSizeMB", 1);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto markers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(markers);
+
+    const int64_t maxSize = 1024 * 1024;
+    ASSERT_OK(rs->oplog()->updateSize(maxSize));
+    markers->adjust(*rs);
+
+    // Below ~168MB the marker count pins at minOplogTruncationPoints, so the marker size is just
+    // the oplog size divided by that count, rounded up.
+    ASSERT_EQ(markers->minBytesPerMarker(), (maxSize + 9) / 10);
+}
+
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_MaxMarkerSizeOfZeroLeavesMarkerSizeUncapped) {
+    unittest::ServerParameterGuard maxMarkerSize("maxOplogTruncationPointSizeMB", 0);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto markers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(markers);
+
+    const int64_t maxSize = 100 * 1024 * 1024;
+    ASSERT_OK(rs->oplog()->updateSize(maxSize));
+    markers->adjust(*rs);
+
+    ASSERT_EQ(markers->minBytesPerMarker(), maxSize / 10);
+}
+
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_MaxMarkerSizeOverridesTheTargetMarkerCount) {
+    unittest::ServerParameterGuard maxMarkerCount("maxOplogTruncationPointsAfterStartup", 100);
+    unittest::ServerParameterGuard maxMarkerSize("maxOplogTruncationPointSizeMB", 1024);
+
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto markers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(markers);
+
+    // Divided into the target count of 100 this oplog would need 2GB markers, so the cap binds and
+    // the oplog is instead covered by 200 markers of 1GB.
+    const int64_t maxSize = 200LL * 1024 * 1024 * 1024;
+    ASSERT_OK(rs->oplog()->updateSize(maxSize));
+    markers->adjust(*rs);
+
+    ASSERT_EQ(markers->minBytesPerMarker(), 1024LL * 1024 * 1024);
+}
+
+TEST_F(OplogTruncationTest, OplogTruncateMarkers_LoweringMaxMarkerSizeTakesEffectOnAdjust) {
+    auto opCtx = getOperationContext();
+    auto rs = LocalOplogInfo::get(opCtx)->getRecordStore();
+    auto markers = LocalOplogInfo::get(opCtx)->getTruncateMarkers();
+    ASSERT(markers);
+
+    const int64_t maxSize = 100 * 1024 * 1024;
+    ASSERT_OK(rs->oplog()->updateSize(maxSize));
+    markers->adjust(*rs);
+    ASSERT_EQ(markers->minBytesPerMarker(), maxSize / 10);
+
+    // Setting the cap at runtime is the escape hatch for a cluster already producing oversized
+    // truncates, so it must take effect on an existing marker set.
+    unittest::ServerParameterGuard maxMarkerSize("maxOplogTruncationPointSizeMB", 1);
+    markers->adjust(*rs);
+
+    ASSERT_EQ(markers->minBytesPerMarker(), 1024 * 1024);
+}
+
+}  // namespace repl
+}  // namespace mongo

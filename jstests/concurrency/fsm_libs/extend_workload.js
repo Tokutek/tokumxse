@@ -1,8 +1,7 @@
-'use strict';
+import {parseConfig} from "jstests/concurrency/fsm_libs/parse_config.js";
 
-load('jstests/concurrency/fsm_libs/parse_config.js'); // for parseConfig
-
-/** extendWorkload usage:
+/**
+ * extendWorkload usage:
  *
  * $config = extendWorkload($config, function($config, $super) {
  *   // ... modify $config ...
@@ -12,14 +11,19 @@ load('jstests/concurrency/fsm_libs/parse_config.js'); // for parseConfig
  *   return $config;
  * });
  */
-function extendWorkload($config, callback) {
-    assert.eq(2, arguments.length,
-              'extendWorkload must be called with 2 arguments: $config and callback');
-    assert.eq('function', typeof callback,
-              '2nd argument to extendWorkload must be a callback');
-    assert.eq(2, callback.length,
-              '2nd argument to extendWorkload must take 2 arguments: $config and $super');
-    var parsedSuperConfig = parseConfig($config);
-    var childConfig = Object.extend({}, parsedSuperConfig, true);
+export function extendWorkload($config, callback) {
+    assert.eq(
+        2,
+        arguments.length,
+        "extendWorkload must be called with 2 arguments: $config and callback",
+    );
+    assert.eq("function", typeof callback, "2nd argument to extendWorkload must be a callback");
+    assert.eq(
+        2,
+        callback.length,
+        "2nd argument to extendWorkload must take 2 arguments: $config and $super",
+    );
+    let parsedSuperConfig = parseConfig($config);
+    let childConfig = Object.extend({}, parsedSuperConfig, true);
     return callback(childConfig, parsedSuperConfig);
 }

@@ -1,87 +1,64 @@
-// wiredtiger_server_status.cpp
-
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/platform/basic.h"
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 
-#include "boost/scoped_ptr.hpp"
-
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/logv2/log.h"
+
+#include <wiredtiger.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
-    using std::string;
+bool WiredTigerServerStatusSection::includeByDefault() const {
+    return true;
+}
 
-    WiredTigerServerStatusSection::WiredTigerServerStatusSection(WiredTigerKVEngine* engine)
-        : ServerStatusSection(kWiredTigerEngineName),
-          _engine(engine) { }
+BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* opCtx,
+                                                       const BSONElement& configElement) const {
+    WiredTigerKVEngine* engine = checked_cast<WiredTigerKVEngine*>(
+        opCtx->getServiceContext()->getStorageEngine()->getEngine());
 
-    bool WiredTigerServerStatusSection::includeByDefault() const {
-        return true;
+    BSONObjBuilder bob;
+    if (!WiredTigerUtil::collectConnectionStatistics(*engine, bob)) {
+        LOGV2_DEBUG(7003148, 2, "WiredTiger is not ready to collect statistics.");
     }
 
-    BSONObj WiredTigerServerStatusSection::generateSection(
-                OperationContext* txn,
-                const BSONElement& configElement) const {
+    WiredTigerUtil::appendSnapshotWindowSettings(engine, &bob);
 
-        WiredTigerSession* session =
-            checked_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit())->getSession(txn);
-        invariant(session);
+    {
+        BSONObjBuilder subsection(bob.subobjStart("oplog"));
+        subsection.append("visibility timestamp",
+                          Timestamp(engine->getOplogManager()->getOplogReadTimestamp()));
+    }
 
-        WT_SESSION* s = session->getSession();
-        invariant(s);
-        const string uri = "statistics:";
-
-        BSONObjBuilder bob;
-        Status status = WiredTigerUtil::exportTableToBSON(s, uri,
-                                                          "statistics=(fast)", &bob);
-        if (!status.isOK()) {
-            bob.append("error", "unable to retrieve statistics");
-            bob.append("code", static_cast<int>(status.code()));
-            bob.append("reason", status.reason());
+    {
+        BSONObjBuilder subsection(bob.subobjStart("historyStorageStats"));
+        if (!WiredTigerUtil::historyStoreStatistics(*engine, subsection)) {
+            LOGV2_DEBUG(10100101, 2, "WiredTiger is not ready to collect statistics.");
         }
-
-        WiredTigerRecoveryUnit::appendGlobalStats(bob);
-
-        return bob.obj();
     }
+
+    {
+        BSONObjBuilder subsection(bob.subobjStart("connectionStats"));
+        subsection.appendNumber("cached idle session count",
+                                (long long)engine->getConnection().getIdleSessionsCount());
+        subsection.appendNumber(
+            "total engine time (ms)",
+            (long long)durationCount<Milliseconds>(engine->getConnection().getTotalEngineTime()));
+    }
+
+    return bob.obj();
+}
 
 }  // namespace mongo
-

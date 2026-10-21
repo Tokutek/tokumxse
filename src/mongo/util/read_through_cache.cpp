@@ -1,0 +1,92 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/read_through_cache.h"
+
+#include "mongo/db/client.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/scopeguard.h"
+
+#include <utility>
+
+namespace mongo {
+
+ReadThroughCacheBase::ReadThroughCacheBase(Service* service, ThreadPoolInterface& threadPool)
+    : _service(service), _threadPool(threadPool) {}
+
+ReadThroughCacheBase::~ReadThroughCacheBase() = default;
+
+struct ReadThroughCacheBase::CancelToken::TaskInfo {
+    TaskInfo(Service* service, std::mutex& cancelTokenMutex)
+        : service(service), cancelTokenMutex(cancelTokenMutex) {}
+
+    Service* const service;
+
+    std::mutex& cancelTokenMutex;
+    Status cancelStatus{Status::OK()};
+    OperationContext* opCtxToCancel{nullptr};
+};
+
+ReadThroughCacheBase::CancelToken::CancelToken(std::shared_ptr<TaskInfo> info)
+    : _info(std::move(info)) {}
+
+ReadThroughCacheBase::CancelToken::CancelToken(CancelToken&&) = default;
+
+ReadThroughCacheBase::CancelToken::~CancelToken() = default;
+
+void ReadThroughCacheBase::CancelToken::tryCancel() {
+    // Taking mutex in order to be mutually exclusive with _asyncWork's _threadPool.schedule lambda
+    std::lock_guard lg(_info->cancelTokenMutex);
+    _info->cancelStatus =
+        Status(ErrorCodes::ReadThroughCacheLookupCanceled, "Internal only: task canceled");
+    if (_info->opCtxToCancel) {
+        ClientLock clientLock(_info->opCtxToCancel->getClient());
+        _info->service->getServiceContext()->killOperation(
+            clientLock, _info->opCtxToCancel, _info->cancelStatus.code());
+    }
+}
+
+ReadThroughCacheBase::CancelToken ReadThroughCacheBase::_asyncWork(
+    WorkWithOpContext work) noexcept {
+    auto taskInfo = std::make_shared<CancelToken::TaskInfo>(_service, _cancelTokensMutex);
+
+    _threadPool.schedule(
+        [work = std::move(work), taskInfo](Status cancelStatusAtTaskBegin) mutable {
+            if (!cancelStatusAtTaskBegin.isOK()) {
+                work(nullptr, cancelStatusAtTaskBegin);
+                return;
+            }
+
+            // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+            ThreadClient tc(taskInfo->service, ClientOperationKillableByStepdown{false});
+            auto opCtxHolder = tc->makeOperationContext();
+
+            cancelStatusAtTaskBegin = [&] {
+                // Taking mutex in order to be mutually exclusive with
+                // any callers of `::tryCancel()`
+                std::lock_guard lg(taskInfo->cancelTokenMutex);
+                taskInfo->opCtxToCancel = opCtxHolder.get();
+                return taskInfo->cancelStatus;
+            }();
+
+            ON_BLOCK_EXIT([&] {
+                // Taking mutex in order to be mutually exclusive with
+                // any callers of `::tryCancel()`
+                std::lock_guard lg(taskInfo->cancelTokenMutex);
+                taskInfo->opCtxToCancel = nullptr;
+            });
+
+            // There is no need to take the taskInfo->cancelTokenMutex here, as we are not writing
+            // the taskInfo->opCtxToCancel in the work function and the only writers to the taskInfo
+            // structure are in this function.
+            work(taskInfo->opCtxToCancel, cancelStatusAtTaskBegin);
+        });
+
+    return CancelToken(std::move(taskInfo));
+}
+
+Date_t ReadThroughCacheBase::_now() {
+    return _service->getServiceContext()->getFastClockSource()->now();
+}
+
+}  // namespace mongo

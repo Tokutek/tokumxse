@@ -1,0 +1,458 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/optimizer/join/predicate_extractor.h"
+
+#include "mongo/db/matcher/expression_expr.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+
+namespace mongo::join_ordering {
+
+namespace {
+
+// Helper visitor to check if an expression contains any references to variables. We assume that any
+// expression which references a variable is ineligible to be a single table predicate (cannot be
+// pushed down into the find layer).
+struct SingleTablePredicateClassifier
+    : public SelectiveConstExpressionVisitorBase<SingleTablePredicateClassifier> {
+    using SelectiveConstExpressionVisitorBase<SingleTablePredicateClassifier>::visit;
+
+    void visit(const ExpressionFieldPath* expr) final {
+        referencesVariables |=
+            expr->isVariableReference() && Variables::isUserDefinedVariable(expr->getVariableId());
+    }
+
+    bool referencesVariables{false};
+};
+
+struct PredicateExtractor {
+    PredicateExtractor(const DocumentSource* source, const std::vector<LetVariable>& variables)
+        : _source{source} {
+        for (auto&& var : variables) {
+            _variables.insert(var.id);
+        }
+    }
+
+    bool isReferenceToLocalCollectionField(const ExpressionFieldPath* expr) {
+        if (!expr->isVariableReference()) {
+            return false;
+        }
+        // Verify that all variables in scope are references to the local collection.
+        auto id = expr->getVariableId();
+        return Variables::isUserDefinedVariable(id) && _variables.contains(id);
+    }
+
+    bool isReferenceToForeignCollectionField(const ExpressionFieldPath* expr) {
+        return !(expr->isVariableReference() || expr->isROOT());
+    }
+
+    // Returns true if the expression is $eq: ['$a', '$$b'] and the variable reference is refering
+    // to a let variable.
+    bool isExprEquijoin(const ExpressionCompare* expr) {
+        if (expr->getOp() != ExpressionCompare::EQ) {
+            return false;
+        }
+        auto left = dynamic_cast<const ExpressionFieldPath*>(expr->getChildren()[0].get());
+        auto right = dynamic_cast<const ExpressionFieldPath*>(expr->getChildren()[1].get());
+        if (!left || !right) {
+            return false;
+        }
+        if (isReferenceToLocalCollectionField(right)) {
+            return isReferenceToForeignCollectionField(left);
+        }
+        if (isReferenceToLocalCollectionField(left)) {
+            return isReferenceToForeignCollectionField(right);
+        }
+        return false;
+    }
+
+    std::unique_ptr<MatchExpression> aggToMatchExpr(
+        boost::intrusive_ptr<const Expression> aggExpr) {
+        boost::intrusive_ptr<ExpressionContext> expCtx(aggExpr->getExpressionContext());
+        return std::make_unique<ExprMatchExpression>(aggExpr->clone(*expCtx), expCtx);
+    }
+
+    boost::optional<SplitPredicatesResult> splitJoinAndSingleCollectionPredicates(
+        boost::intrusive_ptr<const Expression> aggExpr, const std::vector<LetVariable>& letVars) {
+        // There are three cases we need to handle for splitting agg expressions:
+        // 1. ExpressionAnd: Recursively try to split children and aggregate their join and single
+        // table predicates.
+        // 2. ExpressionCompare: Potential join predicate expressed as {$eq: ['$a', '$$a']}.
+        // 3. All other expressions: Verify it is a valid single table predicate.
+        if (auto andExpr = dynamic_cast<const ExpressionAnd*>(aggExpr.get())) {
+            SplitPredicatesResult result;
+            Expression::ExpressionVector vec;
+
+            for (auto&& child : andExpr->getChildren()) {
+                auto childRes = splitJoinAndSingleCollectionPredicates(child, letVars);
+                if (!childRes.has_value()) {
+                    return boost::none;
+                }
+                result.joinPredicates.insert(result.joinPredicates.end(),
+                                             childRes->joinPredicates.begin(),
+                                             childRes->joinPredicates.end());
+                if (childRes->singleTablePredicates) {
+                    vec.push_back(static_cast<const ExprMatchExpression*>(
+                                      childRes->singleTablePredicates.get())
+                                      ->getExpression());
+                }
+            }
+
+            if (vec.size() == 1) {
+                result.singleTablePredicates = std::make_unique<ExprMatchExpression>(
+                    std::move(vec[0]), aggExpr->getExpressionContext());
+            } else if (vec.size() > 1) {
+                auto andExpr = boost::intrusive_ptr<ExpressionAnd>(
+                    new ExpressionAnd(aggExpr->getExpressionContext(), std::move(vec)));
+                result.singleTablePredicates =
+                    std::make_unique<ExprMatchExpression>(andExpr, aggExpr->getExpressionContext());
+            }
+            return result;
+        }
+        if (auto cmp = dynamic_cast<const ExpressionCompare*>(aggExpr.get())) {
+            if (isExprEquijoin(cmp)) {
+                return SplitPredicatesResult{
+                    .joinPredicates = {ExtractedJoinPredicate::make(_source, cmp, letVars)},
+                };
+            }
+        }
+
+        SingleTablePredicateClassifier stpc;
+        stage_builder::ExpressionWalker walker{&stpc, nullptr, nullptr};
+        expression_walker::walk(aggExpr.get(), &walker);
+        if (stpc.referencesVariables) {
+            return boost::none;
+        }
+        return SplitPredicatesResult{
+            .singleTablePredicates = aggToMatchExpr(aggExpr),
+        };
+    }
+
+
+    boost::optional<SplitPredicatesResult> splitJoinAndSingleCollectionPredicates(
+        const MatchExpression* matchExpr, const std::vector<LetVariable>& variables) {
+        // There are 4 cases we need handle for splitting MatchExpressions:
+        // 1. $expr: See 'splitJoinAndSingleCollectionPredicates(Expression)'. This contains
+        // potential join and single table predicates.
+        // 2. $and: Recursively try to split children and aggregate their join and single table
+        // predicates.
+        // 3. $or, $nor and $not: Recursively try to split children. We are currently only able to
+        // handle the case where children contain exclusively single table predicates.
+        // 4. All other expressions: Single table predicates.
+        switch (matchExpr->matchType()) {
+            case MatchExpression::EXPRESSION: {
+                auto expr = static_cast<const ExprMatchExpression*>(matchExpr);
+                return splitJoinAndSingleCollectionPredicates(expr->getExpression(), variables);
+            }
+            case MatchExpression::AND: {
+                std::vector<ExtractedJoinPredicate> joinPredicates;
+                auto singleTablePreds = std::make_unique<AndMatchExpression>();
+
+                // Recursive calls to split for each child and aggregate join and residual
+                // predicates.
+                for (size_t i = 0; i < matchExpr->numChildren(); ++i) {
+                    auto childRes =
+                        splitJoinAndSingleCollectionPredicates(matchExpr->getChild(i), variables);
+                    if (!childRes.has_value()) {
+                        return boost::none;
+                    }
+                    joinPredicates.insert(joinPredicates.end(),
+                                          childRes->joinPredicates.begin(),
+                                          childRes->joinPredicates.end());
+                    if (childRes->singleTablePredicates) {
+                        singleTablePreds->add(std::move(childRes->singleTablePredicates));
+                    }
+                }
+
+                SplitPredicatesResult result{.joinPredicates = std::move(joinPredicates)};
+                if (singleTablePreds->numChildren() == 1) {
+                    result.singleTablePredicates = singleTablePreds->releaseChild(0);
+                } else if (singleTablePreds->numChildren() > 1) {
+                    result.singleTablePredicates = std::move(singleTablePreds);
+                }
+                return result;
+            }
+            case MatchExpression::OR:
+            case MatchExpression::NOR:
+            case MatchExpression::NOT: {
+                for (size_t i = 0; i < matchExpr->numChildren(); ++i) {
+                    auto childRes =
+                        splitJoinAndSingleCollectionPredicates(matchExpr->getChild(i), variables);
+                    if (!childRes.has_value()) {
+                        return boost::none;
+                    }
+                    // If we detect join predicates in our child, we have to bail out because we
+                    // don't support conjunctive or negated join predicates.
+                    if (!childRes->joinPredicates.empty()) {
+                        return boost::none;
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        // If we got here, we have a MatchExpresion which is a valid single table predicate.
+        return SplitPredicatesResult{.singleTablePredicates = matchExpr->clone()};
+    }
+
+    const DocumentSource* _source;
+    stdx::unordered_set<Variables::Id> _variables;
+};
+
+class ExtractExprPredicatesHelper {
+public:
+    explicit ExtractExprPredicatesHelper(PathResolver& pathResolver, const DocumentSource* src)
+        : _src(src),
+          _pathResolver(pathResolver),
+          _fallbackReason(boost::none),
+          _expressionIsFullyAbsorbed(true) {}
+
+    ExprPredicatesResult extract(const MatchExpression* expr) {
+        _expressionIsFullyAbsorbed = true;
+        _predicates.clear();
+        _fallbackReason = boost::none;
+        extractMatch(expr);
+
+        return {.expressionIsFullyAbsorbed = _expressionIsFullyAbsorbed,
+                .predicates = std::move(_predicates),
+                .reason = std::move(_fallbackReason)};
+    }
+
+private:
+    class ExpressionVisitor : public SelectiveConstExpressionVisitorBase<ExpressionVisitor> {
+    public:
+        explicit ExpressionVisitor(ExtractExprPredicatesHelper& helper) : _helper(helper) {}
+
+        using SelectiveConstExpressionVisitorBase<ExpressionVisitor>::visit;
+
+        void visit(const ExpressionAnd* expr) final {
+            ++_visited;
+            _helper.extractExpressionAnd(expr);
+        }
+
+        void visit(const ExpressionCompare* expr) final {
+            ++_visited;
+            _helper.extractExpressionCompare(expr);
+        }
+
+        size_t numVisitedNodes() const {
+            return _visited;
+        }
+
+    private:
+        ExtractExprPredicatesHelper& _helper;
+
+        size_t _visited{};
+    };
+
+    void extractMatch(const MatchExpression* expr) {
+        switch (expr->matchType()) {
+            case MatchExpression::AND:
+                extractMatchAnd(static_cast<const AndMatchExpression*>(expr));
+                break;
+            case MatchExpression::EXPRESSION:
+                extractMatchExpr(static_cast<const ExprMatchExpression*>(expr));
+                break;
+            default:
+                // Not a $expr- this $match can't encode a join predicate.
+                _expressionIsFullyAbsorbed = false;
+                _fallbackReason = JoinFallbackReason::kMatchNonExprPredicate;
+                break;
+        }
+    }
+
+    void extractMatchAnd(const AndMatchExpression* expr) {
+        for (size_t i = 0; i < expr->numChildren(); ++i) {
+            extractMatch(expr->getChild(i));
+        }
+    }
+
+    void extractMatchExpr(const ExprMatchExpression* expr) {
+        ExpressionVisitor visitor{*this};
+        expr->getExpression()->acceptVisitor(&visitor);
+        if (visitor.numVisitedNodes() != 1) {
+            // The visitor only visits expressions we can extract join predicates from ($and & $eq),
+            // so an unvisited node is an expression we don't support.
+            _expressionIsFullyAbsorbed = false;
+            _fallbackReason = JoinFallbackReason::kMatchUnsupportedExpression;
+        }
+    }
+
+    void extractExpressionAnd(const ExpressionAnd* expr) {
+        ExpressionVisitor visitor{*this};
+        for (const auto& child : expr->getChildren()) {
+            child->acceptVisitor(&visitor);
+        }
+        if (visitor.numVisitedNodes() != expr->getChildren().size()) {
+            // As above- some child of this $and is an expression we don't support.
+            _expressionIsFullyAbsorbed = false;
+            _fallbackReason = JoinFallbackReason::kMatchUnsupportedExpression;
+        }
+    }
+
+    // Returns the field path to pass to PathResolver::resolve(), or boost::none if 'expr' is not a
+    // plain document-field reference. System-variable references ($$NOW, $$NOW.x,
+    // $$CLUSTER_TIME.foo, …) have a non-ROOT variable ID and must be excluded; bare
+    // single-component paths ($$ROOT, $$CURRENT) have no sub-field and would crash
+    // FieldPath::tail().
+    static boost::optional<FieldPath> toResolvablePath(const ExpressionFieldPath* expr) {
+        if (expr->isVariableReference() || expr->getFieldPath().getPathLength() <= 1) {
+            return boost::none;
+        }
+        return expr->getFieldPathWithoutCurrentPrefix();
+    }
+
+    void extractExpressionCompare(const ExpressionCompare* expr) {
+        const auto& children = expr->getChildren();
+        if (expr->getOp() != ExpressionCompare::EQ || children.size() != 2) {
+            // 1. Extract equality predicates only.
+            _expressionIsFullyAbsorbed = false;
+            _fallbackReason = JoinFallbackReason::kMatchNonEqualityPredicate;
+            return;
+        }
+
+        auto left = dynamic_cast<const ExpressionFieldPath*>(children[0].get());
+        auto right = dynamic_cast<const ExpressionFieldPath*>(children[1].get());
+
+        if (left == nullptr || right == nullptr) {
+            // 2. Both sides of the equality predicate must be field paths.
+            _expressionIsFullyAbsorbed = false;
+            _fallbackReason = JoinFallbackReason::kMatchNonFieldPathOperand;
+            return;
+        }
+
+        auto leftPath = toResolvablePath(left);
+        auto rightPath = toResolvablePath(right);
+        if (!leftPath || !rightPath) {
+            // 3. Both field paths must be plain document-field references (i.e. rooted at
+            // $$CURRENT/$$ROOT). A system-variable reference such as '$$NOW.x' or a bare
+            // single-component path ('$$NOW', '$$ROOT', '$$CURRENT') cannot name a field of a
+            // collection and so cannot be a join predicate.
+            _expressionIsFullyAbsorbed = false;
+            _fallbackReason = JoinFallbackReason::kMatchVariableOperand;
+            return;
+        }
+
+        auto leftPathId = _pathResolver.resolve(*leftPath, _src, boost::none, _fallbackReason);
+        auto rightPathId = _pathResolver.resolve(*rightPath, _src, boost::none, _fallbackReason);
+        if (!leftPathId.has_value() || !rightPathId.has_value()) {
+            // 4. Both field paths must be attributable to a single node in the graph.
+            _expressionIsFullyAbsorbed = false;
+            return;
+        }
+
+        if (_pathResolver[*leftPathId].nodeId == _pathResolver[*rightPathId].nodeId) {
+            // 5. To be a proper join predicate the field paths must be from different collections.
+            _expressionIsFullyAbsorbed = false;
+            _fallbackReason = JoinFallbackReason::kMatchPredicateOnSameNode;
+            return;
+        }
+
+        _predicates.push_back(
+            {.op = JoinPredicate::ExprEq, .left = *leftPathId, .right = *rightPathId});
+    }
+
+    const DocumentSource* _src;
+    PathResolver& _pathResolver;
+    boost::optional<JoinFallbackReason> _fallbackReason;
+    std::vector<JoinPredicate> _predicates;
+    bool _expressionIsFullyAbsorbed;
+};
+
+// Checked cast which performs a tassert if it fails.
+template <typename U, typename V>
+U tassert_cast(V* v) {
+    auto ret = dynamic_cast<U>(v);
+    if (!ret) {
+        tasserted(11317202, "cast failed");
+    }
+    return ret;
+}
+
+
+/**
+ * Compute the field path which the given variable reference resolves to in the local collection of
+ * a $lookup. We assume that the given set of let variables from $lookup are all defined to be
+ * simple FieldPaths (i.e. are of the form {foo: '$foo'}). The let variable's RHS provides the base
+ * path (e.g. 'x' for {l: '$x'}); any trailing components on the variable reference itself (e.g. the
+ * '.y' in '$$l.y') are appended, since '$$l.y' semantically means "the .y subfield of whatever 'l'
+ * evaluates to".
+ */
+FieldPath localCollectionFieldPath(const std::vector<LetVariable>& letVars,
+                                   const ExpressionFieldPath* varRef) {
+    auto id = varRef->getVariableId();
+    auto varIt =
+        std::find_if(letVars.cbegin(), letVars.cend(), [&id](auto&& var) { return var.id == id; });
+    tassert(
+        11317201, "variable ID not found in given set of let variables", varIt != letVars.cend());
+    auto& var = *varIt;
+    auto localFieldPath = tassert_cast<const ExpressionFieldPath*>(var.expression.get());
+    auto baseLocalFieldPath = localFieldPath->getFieldPathWithoutCurrentPrefix();
+    if (varRef->getFieldPath().getPathLength() > 1) {
+        return baseLocalFieldPath.concat(varRef->getFieldPathWithoutCurrentPrefix());
+    }
+    return baseLocalFieldPath;
+}
+
+}  // namespace
+
+ExtractedJoinPredicate ExtractedJoinPredicate::make(const DocumentSource* source,
+                                                    const ExpressionCompare* eqNode,
+                                                    const std::vector<LetVariable>& letVars) {
+    auto left = tassert_cast<const ExpressionFieldPath*>(eqNode->getChildren()[0].get());
+    auto right = tassert_cast<const ExpressionFieldPath*>(eqNode->getChildren()[1].get());
+
+    if (left->isVariableReference()) {
+        return {true /* is $expr */,
+                localCollectionFieldPath(letVars, left),
+                right->getFieldPathWithoutCurrentPrefix(),
+                eqNode,
+                source};
+    }
+
+    tassert(11317203,
+            "Expected a variable & a field path in a join predicate",
+            right->isVariableReference());
+    return {true /* is $expr */,
+            localCollectionFieldPath(letVars, right),
+            left->getFieldPathWithoutCurrentPrefix(),
+            eqNode,
+            source};
+}
+
+ExtractedJoinPredicate ExtractedJoinPredicate::make(FieldPath localField,
+                                                    FieldPath foreignField,
+                                                    const DocumentSource* source) {
+    return {
+        false /* isn't $expr */, std::move(localField), std::move(foreignField), nullptr, source};
+}
+
+boost::optional<SplitPredicatesResult> splitJoinAndSingleCollectionPredicates(
+    const DocumentSourceMatch* match, const std::vector<LetVariable>& variables) {
+    // Verify the let variables are suitable for extracting join predicates.
+    for (auto&& variable : variables) {
+        auto rhs = dynamic_cast<ExpressionFieldPath*>(variable.expression.get());
+        // Bail out of attempting to split the expression for join predicates if any of the
+        // following are true:
+        // * RHS of the variable definition is not ExpressionFieldPath (does not reference a field
+        //   of the local collection of the $lookup)
+        // * RHS is ExpressionFieldPath but references another variables
+        // * RHS is ExpressionFieldPath but references $$ROOT
+        if (!rhs || rhs->isVariableReference() || rhs->isROOT()) {
+            return boost::none;
+        }
+        // At this point, we have verified the RHS of the variable refers to a field in the local
+        // collection, which can be used to specify a join predicate.
+    }
+    return PredicateExtractor{match, variables}.splitJoinAndSingleCollectionPredicates(
+        match->getMatchExpression(), variables);
+}
+
+ExprPredicatesResult extractExprPredicates(PathResolver& pathResolver,
+                                           const DocumentSourceMatch* match) {
+    ExtractExprPredicatesHelper helper{pathResolver, match};
+    return helper.extract(match->getMatchExpression());
+}
+};  // namespace mongo::join_ordering

@@ -1,0 +1,168 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/ttl/ttl_collection_cache.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+#include <limits>
+#include <set>
+#include <string_view>
+
+#include <boost/optional.hpp>
+
+[[MONGO_MOD_PUBLIC]];
+namespace mongo::index_key_validate {
+using namespace std::literals::string_view_literals;
+
+// TTL indexes with 'expireAfterSeconds' are repaired with this duration, which is chosen to be
+// the largest possible value for the 'safeInt' type that can be returned in the listIndexes
+// response.
+constexpr auto kExpireAfterSecondsForInactiveTTLIndex =
+    Seconds(std::numeric_limits<int32_t>::max());
+
+/**
+ * Describe which field names are considered valid options when creating an index. If the set
+ * associated with the field name is empty, the option is always valid, otherwise it will be allowed
+ * only when creating the set of index types listed in the set.
+ */
+extern const std::map<std::string_view, std::set<IndexType>> kAllowedFieldNames;
+
+const constexpr std::string_view kDeprecatedFieldNames[] = {
+    "_id"sv, "bucketSize"sv, IndexDescriptor::kNamespaceFieldName};
+
+/**
+ * Like 'allowedFieldNames', but removes deprecated fields specified in kDeprecatedFieldNames.
+ */
+extern const std::map<std::string_view, std::set<IndexType>> kNonDeprecatedAllowedFieldNames;
+
+/**
+ * Checks if the key is valid for building an index according to the validation rules for the given
+ * index version.
+ */
+Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion indexVersion);
+
+/**
+ * Checks that 'name' is usable as an index name. An index name must be non-empty and must not
+ * contain an embedded null byte.
+ *
+ * This applies to both regular indexes and the implicit index of a clustered collection.
+ */
+Status validateIndexName(std::string_view name);
+
+/**
+ * Validates the index specification 'indexSpec' and returns an equivalent index specification that
+ * has any missing attributes filled in. If the index specification is malformed, then an error
+ * status is returned.
+ *
+ * The 'isUpgradeRepair' parameter should be set to true only when this function is called during a
+ * setFCV upgrade operation. When true, certain fields that have historically been stored with
+ * invalid types on disk (e.g. a non-integer value for '2d' index 'bits') will cause a non-OK
+ * status to be returned, signaling to callers that a repair is needed.
+ * When false (the default), those same conditions are tolerated without error.
+ *
+ * TODO (SERVER-120350) Update the previous comment accordingly and consider removing the
+ * 'isUpgradeRepair' flag once 9.0 branches out.
+ */
+StatusWith<BSONObj> validateIndexSpec(
+    OperationContext* opCtx,
+    const BSONObj& indexSpec,
+    const std::map<std::string_view, std::set<IndexType>>& allowedFieldNames =
+        index_key_validate::kAllowedFieldNames,
+    bool isUpgradeRepair = false);
+
+/**
+ * Returns a new index spec with any unknown field names removed from 'indexSpec'.
+ */
+BSONObj removeUnknownFields(const NamespaceString& ns, const BSONObj& indexSpec);
+
+/**
+ * Returns a new index spec with boolean values in correct types, unknown field names removed, and
+ * also certain duplicated field names ignored.
+ */
+BSONObj repairIndexSpec(const NamespaceString& ns,
+                        const BSONObj& indexSpec,
+                        const std::map<std::string_view, std::set<IndexType>>& allowedFieldNames =
+                            index_key_validate::kAllowedFieldNames);
+
+/**
+ * Performs additional validation for _id index specifications. This should be called after
+ * validateIndexSpec().
+ */
+Status validateIdIndexSpec(const BSONObj& indexSpec);
+
+/**
+ * Confirms that 'indexSpec' contains only valid field names. Returns an error if an unexpected
+ * field name is found.
+ */
+Status validateIndexSpecFieldNames(const BSONObj& indexSpec,
+                                   const std::map<std::string_view, std::set<IndexType>>&
+                                       allowedFieldNames = index_key_validate::kAllowedFieldNames);
+
+/**
+ * Validates the 'collation' field in the index specification 'indexSpec' and fills in the full
+ * collation spec. If 'collation' is missing, fills it in with the spec for 'defaultCollator'.
+ * Returns the index specification with 'collation' filled in.
+ */
+StatusWith<BSONObj> validateIndexSpecCollation(
+    OperationContext* opCtx,
+    const BSONObj& indexSpec,
+    const CollatorInterface* defaultCollator,
+    const boost::optional<BSONObj>& newIndexSpec = boost::none);
+
+/**
+ * Validates the the 'expireAfterSeconds' value for a TTL index or clustered collection.
+ */
+enum class ValidateExpireAfterSecondsMode {
+    kSecondaryTTLIndex,
+    kClusteredTTLIndex,
+};
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds,
+                                  ValidateExpireAfterSecondsMode mode);
+
+StatusWith<TTLCollectionCache::Info::ExpireAfterSecondsType> validateExpireAfterSeconds(
+    BSONElement expireAfterSeconds, ValidateExpireAfterSecondsMode mode);
+
+/**
+ * Convenience method to extract the 'ExpireAfterSecondsType' from the
+ * `StatusWith<ExpireAfterSecondsType>` result of a 'validateExpireAfterSeconds' call, converting a
+ * non-OK status to `kInvalid`.
+ */
+TTLCollectionCache::Info::ExpireAfterSecondsType extractExpireAfterSecondsType(
+    const StatusWith<TTLCollectionCache::Info::ExpireAfterSecondsType>& swType);
+
+/**
+ * Returns true if 'indexSpec' refers to a TTL index.
+ */
+bool isIndexTTL(const BSONObj& indexSpec);
+
+/**
+ * Validates the key pattern and the 'expireAfterSeconds' duration in the index specification
+ * 'indexSpec' for a TTL index. Returns success if 'indexSpec' does not refer to a TTL index.
+ */
+Status validateIndexSpecTTL(const BSONObj& indexSpec);
+
+/**
+ * Returns whether an index is allowed in API version 1.
+ */
+bool isIndexAllowedInAPIVersion1(const IndexDescriptor& indexDesc);
+
+/**
+ * Parses the index specifications from 'indexSpecObj', validates them, and returns equivalent index
+ * specifications that have any missing attributes filled in. If any index specification is
+ * malformed, then an error status is returned.
+ */
+BSONObj parseAndValidateIndexSpecs(OperationContext* opCtx, const BSONObj& indexSpecObj);
+
+}  // namespace mongo::index_key_validate

@@ -1,0 +1,173 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <mutex>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace durable_catalog {
+
+/**
+ * Collection metadata persisted in an '_mdb_catalog' entry. Includes metadata details for each
+ * 'index' in the collection.
+ */
+struct [[MONGO_MOD_NEEDS_REPLACEMENT]] CatalogEntryMetaData {
+    /*
+     * Metadata for a given index.
+     */
+    struct IndexMetaData {
+        IndexMetaData() {}
+
+        IndexMetaData(const IndexMetaData& other)
+            : spec(other.spec), ready(other.ready), buildUUID(other.buildUUID) {
+            // We need to hold the multikey mutex when copying, someone else might be modifying this
+            std::lock_guard lock(other.multikeyMutex);
+            multikey = other.multikey;
+            multikeyPaths = other.multikeyPaths;
+        }
+
+        IndexMetaData(IndexMetaData&& other)
+            : spec(std::move(other.spec)),
+              ready(other.ready),
+              buildUUID(std::move(other.buildUUID)) {
+            // No need to hold mutex on move, there are no concurrent readers while we're moving
+            // the instance.
+            multikey = other.multikey;
+            multikeyPaths = std::move(other.multikeyPaths);
+        }
+
+        /**
+         * An index is considered present if it has a non-empty 'spec'.
+         * Invalid indexes by this definition include default constructed instances and
+         * and structs zeroed out due to index drops.
+         */
+        bool isPresent() const {
+            return !spec.isEmpty();
+        }
+
+        IndexMetaData& operator=(IndexMetaData&& rhs) {
+            if (&rhs != this) {
+                spec = std::move(rhs.spec);
+                ready = std::move(rhs.ready);
+                buildUUID = std::move(rhs.buildUUID);
+
+                // No need to hold mutex on move, there are no concurrent readers while we're moving
+                // the instance.
+                multikey = std::move(rhs.multikey);
+                multikeyPaths = std::move(rhs.multikeyPaths);
+            }
+            return *this;
+        }
+
+        void updateTTLSetting(long long newExpireSeconds);
+
+        void updateHiddenSetting(bool hidden);
+
+        void updateUniqueSetting(bool unique);
+
+        void updatePrepareUniqueSetting(bool prepareUnique);
+
+        std::string_view nameStringData() const {
+            return spec["name"].valueStringDataSafe();
+        }
+
+        BSONObj spec;
+        bool ready = false;
+
+        // If initialized, a two-phase index build is in progress.
+        boost::optional<UUID> buildUUID;
+
+        // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in
+        // the index key pattern. Each element in the vector is an ordered set of positions
+        // (starting at 0) into the corresponding indexed field that represent what prefixes of the
+        // indexed field cause the index to be multikey.
+        // multikeyMutex must be held when accessing multikey or multikeyPaths
+        mutable std::mutex multikeyMutex;
+        mutable bool multikey = false;
+        mutable MultikeyPaths multikeyPaths;
+        mutable Atomic<int32_t> concurrentWriters;
+    };
+
+
+    void parse(const BSONObj& obj);
+
+    /**
+     * If we have exclusive access to this MetaData (holding a unique copy). We don't need to
+     * hold mutexes when reading internal data.
+     */
+    BSONObj toBSON(bool hasExclusiveAccess = false) const;
+
+    /**
+     * Returns number of valid indexes.
+     */
+    int getTotalIndexCount() const;
+
+    int findIndexOffset(std::string_view name) const;
+
+    /**
+     * Inserts information about an index into the MetaData.
+     */
+    void insertIndex(IndexMetaData indexMetaData);
+
+    /**
+     * Removes information about an index from the MetaData. Returns true if an index
+     * called name existed and was deleted, and false otherwise.
+     */
+    bool eraseIndex(std::string_view name);
+
+    NamespaceString nss;
+    CollectionOptions options;
+
+    // When 'true', will use the same recordIds across all nodes in the replica set.
+    // When using disaggregated storage, will be enabled implicitly when the collection
+    // is created. The `recordIdsReplicated` option is here and not inside `options`,
+    // as it is an internal-only parameter that will be decided by the server and cannot
+    // be defined via the `createCollection` command.
+    bool recordIdsReplicated = false;
+
+    // May include empty instances which represent indexes already dropped.
+    std::vector<IndexMetaData> indexes;
+
+    // Note that collection cloning (initial sync, mongodump+mongorestore, resharding, etc.)
+    // use listCollections and listIndexes to obtain the collection metadata. Therefore, any
+    // additional field not contained inside options or indexes does not get cloned into the
+    // target collection, which is almost surely problematic; see SERVER-91195 for more details.
+
+    // Time-series collections created in versions 5.1 and earlier are allowed to contain
+    // measurements with arbitrarily mixed schema in the buckets. When upgrading from these
+    // earlier versions and setting FCV to 5.2 and up, this flag will be set to true by default
+    // for existing time-series collections. To set the flag to false, all of the buckets need
+    // to be checked for mixed-schema data. Newly created time-series collections in FCV 5.2 and
+    // up will have this flag set to false by default. This will be boost::none if this catalog
+    // entry is not representing a time-series collection or if FCV < 5.2.
+    boost::optional<bool> timeseriesBucketsMayHaveMixedSchemaData;
+
+    // Legacy time-series bucketing parameters changed flag. Due to SERVER-91193, this field is
+    // unreliable and must not be used. Use the flag stored in the collection options instead.
+    // TODO(SERVER-101423): Remove once 9.0 becomes last LTS.
+    boost::optional<bool> timeseriesBucketingParametersHaveChanged_DO_NOT_USE;
+
+    // Parsed value of the time-series mixed-schema flag stored in the backwards-compatible
+    // field in the collection options (md.options.storageEngine.wiredTiger.configString).
+    boost::optional<bool> _durableTimeseriesBucketsMayHaveMixedSchemaData;
+};
+
+}  // namespace durable_catalog
+}  // namespace mongo

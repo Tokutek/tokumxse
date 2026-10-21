@@ -1,0 +1,51 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    TestInternalTransactionsCommandReply:
+        description: "Response for internal transaction command."
+        strict: false
+        is_command_reply: true
+        fields:
+            responses:
+                description: "List of responses to commands in the transaction."
+                type: array<object>
+
+    TestInternalTransactionsCommandInfo:
+        description: "A command, its database name, and other test options."
+        strict: false
+        fields:
+            dbName:
+                type: database_name
+            command:
+                type: object_owned
+            exhaustCursor:
+                type: bool
+                optional: true
+
+commands:
+    testInternalTransactions:
+        command_name: testInternalTransactions
+        description: "The 'testInternalTransactions' command."
+        namespace: ignored
+        api_version: ""
+        fields:
+            useClusterClient:
+                description:
+                    "Whether the transaction API client used should opt into running the
+                    'cluster' versions of commands that enables a non-router node to run
+                    the router versions of commands. Only meaningful on mongod because a
+                    mongos will always run 'cluster' commands."
+                type: bool
+                default: false
+            commandInfos:
+                description: "List of TestInternalTransactionsCommandInfos to run in a single transaction."
+                type: array<TestInternalTransactionsCommandInfo>
+        reply_type: TestInternalTransactionsCommandReply

@@ -1,0 +1,155 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/query_stats/key.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/query_shape/query_shape.h"
+#include "mongo/db/query/query_shape/shape_helpers.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection_type.h"
+#include "mongo/unittest/unittest.h"
+
+namespace mongo::query_stats {
+
+namespace {
+static const NamespaceString kDefaultTestNss =
+    NamespaceString::createNamespaceString_forTest("testDB.testColl");
+
+
+struct DummyShapeSpecificComponents : public query_shape::CmdSpecificShapeComponents {
+    DummyShapeSpecificComponents() {};
+    void HashValue(absl::HashState state) const override {}
+    size_t size() const final {
+        return sizeof(DummyShapeSpecificComponents);
+    }
+};
+
+class DummyShape : public query_shape::Shape {
+public:
+    DummyShape(NamespaceStringOrUUID nssOrUUID,
+               BSONObj collation,
+               DummyShapeSpecificComponents dummyComponents)
+        : Shape(nssOrUUID, collation) {
+        components = dummyComponents;
+    }
+
+    const query_shape::CmdSpecificShapeComponents& specificComponents() const final {
+        return components;
+    }
+
+    void appendCmdSpecificShapeComponents(
+        BSONObjBuilder&,
+        OperationContext*,
+        const query_shape::SerializationOptions& opts) const final {}
+    DummyShapeSpecificComponents components;
+};
+
+struct DummyKeyComponents : public SpecificKeyComponents {
+    DummyKeyComponents() {};
+
+    void HashValue(absl::HashState state) const override {}
+    size_t size() const override {
+        return sizeof(DummyKeyComponents);
+    }
+};
+
+class DummyKey : public Key {
+public:
+    DummyKey(OperationContext* opCtx,
+             std::unique_ptr<query_shape::Shape> queryShape,
+             boost::optional<BSONObj> hint,
+             boost::optional<repl::ReadConcernArgs> readConcern,
+             bool maxTimeMS,
+             query_shape::CollectionType collectionType,
+             DummyKeyComponents dummyComponents)
+        : Key(opCtx, std::move(queryShape), hint, readConcern, maxTimeMS, collectionType) {
+        components = dummyComponents;
+    }
+    const SpecificKeyComponents& specificComponents() const override {
+        return components;
+    };
+    void appendCommandSpecificComponents(
+        BSONObjBuilder& bob, const query_shape::SerializationOptions& opts) const override {};
+    DummyKeyComponents components;
+};
+class UniversalKeyTest : public ServiceContextTest {};
+
+TEST_F(UniversalKeyTest, SizeOfUniversalComponents) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+
+    // Make shape for testing.
+    auto collation = BSONObj{};
+    auto innerComponents = std::make_unique<DummyShapeSpecificComponents>();
+    auto shape = std::make_unique<DummyShape>(kDefaultTestNss, collation, *innerComponents);
+
+    // Gather sizes and create universalComponents.
+    const auto shapeSize = shape->size();
+    auto clientMetadata = ClientMetadata::get(expCtx->getOperationContext()->getClient());
+    const auto clientMetadataSize =
+        static_cast<size_t>(clientMetadata ? clientMetadata->documentWithoutMongosInfo().objsize()
+                                           : BSONObj().objsize());
+    auto apiParams =
+        std::make_unique<APIParameters>(APIParameters::get(expCtx->getOperationContext()));
+    const auto apiParamsSize = static_cast<size_t>(
+        apiParams ? sizeof(*apiParams) + shape_helpers::optionalSize(apiParams->getAPIVersion())
+                  : 0);
+    auto universalComponents =
+        std::make_unique<UniversalKeyComponents>(std::move(shape),
+                                                 clientMetadata,
+                                                 BSONObj(),
+                                                 BSONObj(),
+                                                 BSONObj(),
+                                                 BSONObj(),
+                                                 BSONObj(),
+                                                 std::move(apiParams),
+                                                 query_shape::CollectionType::kUnknown,
+                                                 true /* maxTimeMS */);
+
+    const auto minimumUniversalKeyComponentSize = sizeof(std::unique_ptr<query_shape::Shape>) +
+        (6 * sizeof(BSONObj)) + sizeof(std::unique_ptr<APIParameters>) + sizeof(BSONElement) +
+        sizeof(query_shape::CollectionType) + sizeof(TenantId) + sizeof(unsigned long) +
+        sizeof(query_shape::QueryShapeHash) /*_originalQueryShapeHash*/ +
+        2 /*HasField: 9 bits no longer fit in 1 byte*/;
+    ASSERT_GTE(sizeof(UniversalKeyComponents), minimumUniversalKeyComponentSize);
+    ASSERT_LTE(sizeof(UniversalKeyComponents), minimumUniversalKeyComponentSize + 8 /*padding*/);
+
+    ASSERT_GT(universalComponents->size(),
+              sizeof(UniversalKeyComponents) + shapeSize + clientMetadataSize + apiParamsSize);
+    ASSERT_LTE(universalComponents->size(),
+               sizeof(UniversalKeyComponents) + shapeSize + clientMetadataSize +
+                   (5 * static_cast<size_t>(BSONObj().objsize())) + apiParamsSize);
+}
+
+TEST_F(UniversalKeyTest, SizeOfSpecificComponents) {
+    auto innerComponents = std::make_unique<DummyShapeSpecificComponents>();
+    auto keyComponents = std::make_unique<DummyKeyComponents>();
+
+    ASSERT_EQ(keyComponents->size(), sizeof(SpecificKeyComponents));
+    ASSERT_EQ(sizeof(SpecificKeyComponents), sizeof(void*) /*vtable ptr*/);
+}
+
+TEST_F(UniversalKeyTest, SizeOfKey) {
+    auto expCtx = make_intrusive<ExpressionContextForTest>();
+
+    auto collation = BSONObj{};
+    auto innerComponents = std::make_unique<DummyShapeSpecificComponents>();
+    auto shape = std::make_unique<DummyShape>(kDefaultTestNss, collation, *innerComponents);
+
+    auto keyComponents = std::make_unique<DummyKeyComponents>();
+
+    auto key = std::make_unique<DummyKey>(expCtx->getOperationContext(),
+                                          std::move(shape),
+                                          BSONObj(),
+                                          repl::ReadConcernArgs(),
+                                          false,
+                                          query_shape::CollectionType::kUnknown,
+                                          *keyComponents);
+    ASSERT_EQ(innerComponents->size(), key->specificComponents().size());
+    ASSERT_EQ(sizeof(Key), sizeof(UniversalKeyComponents) + sizeof(void*));
+    ASSERT_EQ(key->size(),
+              sizeof(Key) + key->universalComponents().size() + key->specificComponents().size());
+}
+}  // namespace
+}  // namespace mongo::query_stats

@@ -1,0 +1,71 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ExampleEnum:
+        description: ""
+        type: string
+        values:
+            Value1: "EnumValue1"
+            Value2: "EnumValue2"
+
+structs:
+    NestedStruct:
+        query_shape_component: true
+        strict: true
+        description: ""
+        fields:
+            stringField:
+                query_shape: literal
+                type: string
+            enumField:
+                query_shape: parameter
+                type: ExampleEnum
+            stringIntVariant:
+                query_shape: literal
+                type:
+                    variant: [string, int]
+            stringIntVariantEnum:
+                query_shape: parameter
+                type:
+                    variant: [string, int]
+            arrayOfInts:
+                query_shape: literal
+                type: array<int>
+            fieldpath:
+                query_shape: anonymize
+                type: string
+            fieldpathList:
+                query_shape: anonymize
+                type: array<string>
+            nss:
+                query_shape: custom
+                type: namespacestring
+            plainNss:
+                query_shape: parameter
+                type: namespacestring
+            safeInt64Field:
+                query_shape: literal
+                type: safeInt64
+            boolField:
+                query_shape: literal
+                type: bool
+
+    ParentStruct:
+        query_shape_component: true
+        strict: true
+        description: ""
+        fields:
+            nested_shape:
+                query_shape: literal
+                type: NestedStruct
+            nested_no_shape:
+                query_shape: parameter
+                type: NestedStruct

@@ -1,0 +1,98 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+        "*.defs",
+    ]),
+)
+
+# Type sources shared between WASI and non-WASI builds.
+# status.cpp is excluded because WASI and non-WASI builds use different
+# implementations (wasm stub vs common/types).
+TYPES_SRCS = [
+    "//src/mongo/scripting/mozjs/common/types:bindata.cpp",
+    "//src/mongo/scripting/mozjs/common/types:bson.cpp",
+    "//src/mongo/scripting/mozjs/common/types:code.cpp",
+    "//src/mongo/scripting/mozjs/common/types:dbpointer.cpp",
+    "//src/mongo/scripting/mozjs/common/types:dbref.cpp",
+    "//src/mongo/scripting/mozjs/common/types:maxkey.cpp",
+    "//src/mongo/scripting/mozjs/common/types:minkey.cpp",
+    "//src/mongo/scripting/mozjs/common/types:nativefunction.cpp",
+    "//src/mongo/scripting/mozjs/common/types:numberdecimal.cpp",
+    "//src/mongo/scripting/mozjs/common/types:numberint.cpp",
+    "//src/mongo/scripting/mozjs/common/types:numberlong.cpp",
+    "//src/mongo/scripting/mozjs/common/types:object.cpp",
+    "//src/mongo/scripting/mozjs/common/types:oid.cpp",
+    "//src/mongo/scripting/mozjs/common/types:regexp.cpp",
+    "//src/mongo/scripting/mozjs/common/types:timestamp.cpp",
+]
+
+mongo_cc_library(
+    name = "hex_md5",
+    srcs = [
+        "hex_md5.cpp",
+    ],
+    hdrs = [
+        "hex_md5.h",
+    ],
+    deps = [
+        "//src/mongo/util:md5",
+    ],
+)
+
+mongo_cc_library(
+    name = "mozjs_common",
+    srcs = glob(
+        ["*.cpp"],
+        exclude = ["hex_md5.cpp"],
+    ) + TYPES_SRCS,
+    copts = select({
+        "@platforms//os:windows": [
+            # The default MSVC preprocessor elides commas in some cases as a
+            # convenience, but this behavior breaks compilation of jspubtd.h.
+            # Enabling the newer preprocessor fixes the problem.
+            "/Zc:preprocessor",
+            "/wd5104",
+            "/wd5105",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        "//bazel/config:wasi": [
+            "-include",
+            "js-confdefs.h",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = select({
+        "//bazel/config:wasi": ["MONGO_MOZJS_WASI_BUILD"],
+        "//conditions:default": [],
+    }),
+    srcs_select = [
+        {
+            "//bazel/config:wasi": ["//src/mongo/scripting/mozjs/wasm:status.cpp"],
+            "//conditions:default": ["//src/mongo/scripting/mozjs/common/types:status.cpp"],
+        },
+    ],
+    textual_hdrs = glob(["*.defs"]),
+    deps = select({
+        "//bazel/config:wasi": [
+            # WASI builds don't need scripting_common (avoids networking/SSL dependencies)
+            # and use SpiderMonkey headers from @spidermonkey_wasi, not //src/third_party/mozjs
+            "//src/mongo/bson:bson_validate",
+            "//src/mongo/util:buildinfo",
+            "@spidermonkey_wasi//:headers",
+            "//src/mongo/scripting/mozjs/wasm/engine:headers",
+            "//src/mongo/scripting/mozjs/shared:mozjs_shared_types",
+        ],
+        "//conditions:default": [
+            "//src/mongo/bson:bson_validate",
+            "//src/mongo/scripting:scripting_common",
+            "//src/mongo/util:buildinfo",
+            "//src/third_party/mozjs",
+        ],
+    }),
+)

@@ -1,0 +1,791 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_benchmark", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+idl_generator(
+    name = "init_replicated_fast_count_oplog_entry_gen",
+    src = "init_replicated_fast_count_oplog_entry.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "init_replicated_fast_count_oplog_entry_idl",
+    srcs = [
+        ":init_replicated_fast_count_oplog_entry_gen",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/idl:idl_parser",
+    ],
+)
+
+idl_generator(
+    name = "durable_size_metadata_gen",
+    src = "durable_size_metadata.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "durable_size_metadata_idl",
+    srcs = [
+        ":durable_size_metadata_gen",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/idl:idl_parser",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_metrics",
+    srcs = [
+        "replicated_fast_count_metrics.cpp",
+    ],
+    deps = [
+        "//src/mongo/db/repl:repl_coordinator_interface",
+        "//src/mongo/otel/metrics:otel_metrics_service",
+    ],
+)
+
+idl_generator(
+    name = "replicated_fast_count_max_oplog_scan_lag_secs_gen",
+    src = "replicated_fast_count_max_oplog_scan_lag_secs.idl",
+)
+
+idl_generator(
+    name = "repair_replicated_metadata_gen",
+    src = "repair_replicated_metadata.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+        "//src/mongo/idl:generic_argument_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "repair_replicated_metadata_idl",
+    srcs = [
+        ":repair_replicated_metadata_gen",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/idl:idl_parser",
+    ],
+)
+
+mongo_cc_library(
+    name = "repair_replicated_metadata_command",
+    srcs = [
+        "repair_replicated_metadata_command.cpp",
+    ],
+    deps = [
+        "repair_replicated_metadata_idl",
+        "replicated_fast_count_uncommitted_changes",
+        "//src/mongo/db:commands",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/admission/execution_control:execution_admission_context",
+        "//src/mongo/db/admission/ticketing:admission_context",
+        "//src/mongo/db/auth",
+        "//src/mongo/db/op_observer",
+        "//src/mongo/db/repl:repl_coordinator_interface",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/db/shard_role/lock_manager:exception_util",
+        "//src/mongo/db/shard_role/shard_catalog:collection_catalog",
+        "//src/mongo/db/storage:write_unit_of_work",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_manager",
+    srcs = [
+        "replicated_fast_count_manager.cpp",
+        ":replicated_fast_count_max_oplog_scan_lag_secs_gen",
+    ],
+    deps = [
+        "replicated_fast_count_advance_checkpoint",
+        "replicated_fast_count_committer",
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "size_count_checkpoint_coordinator",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db/collection_crud",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:collection_options",
+        "//src/mongo/db/storage:storage_options",
+        "//src/mongo/db/update:update_common",
+        "//src/mongo/db/update:update_document_diff",
+    ],
+)
+
+# This intentionally does not depend on the replicated_fast_count_manager library, since this
+# library is depended on by the collection write path whereas the replicated_fast_count_manager
+# library depends on the collection write path.
+mongo_cc_library(
+    name = "replicated_fast_count_uncommitted_changes",
+    srcs = [
+        "replicated_fast_count_uncommitted_changes.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_committer",
+        "replicated_fast_count_enabled",
+        "//src/mongo/db/commands/server_status:server_status_metric",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_committer",
+    srcs = [
+        "replicated_fast_count_committer.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:service_context",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_init",
+    srcs = [
+        "replicated_fast_count_init.cpp",
+    ],
+    deps = [
+        "init_replicated_fast_count_oplog_entry_idl",
+        "//src/mongo/db:rw_concern_d",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db/op_observer",
+        "//src/mongo/db/repl:repl_coordinator_interface",
+        "//src/mongo/db/rss:replicated_storage_service",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_helpers",
+        "//src/mongo/db/storage:storage_engine_impl",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_delta_utils",
+    srcs = [
+        "replicated_fast_count_delta_utils.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_enabled",
+        "size_count_store",
+        ":durable_size_metadata_idl",
+        "//src/mongo/db:import_collection_oplog_entry",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/repl:apply_ops_command_info",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/repl:truncate_range_oplog_entry_idl",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:collection_options",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_streaming_oplog_delta_accumulator",
+    srcs = [
+        "replicated_fast_count_streaming_oplog_delta_accumulator.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_metrics",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/repl:apply_ops_command_info",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/storage:ident",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_advance_checkpoint",
+    srcs = [
+        "replicated_fast_count_advance_checkpoint.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "size_count_store",
+        "size_count_timestamp_store",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_checkpoint_oplog_tailer",
+    srcs = [
+        "size_count_checkpoint_oplog_tailer.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "size_count_checkpoint_buffer",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/shard_role",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_checkpoint_flusher",
+    srcs = [
+        "size_count_checkpoint_flusher.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_advance_checkpoint",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/storage:write_unit_of_work",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_checkpoint_buffer",
+    srcs = [
+        "size_count_checkpoint_buffer.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "//src/mongo/db:service_context",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_checkpoint_coordinator",
+    srcs = [
+        "size_count_checkpoint_coordinator.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_metrics",
+        "size_count_checkpoint_buffer",
+        "size_count_checkpoint_flusher",
+        "size_count_checkpoint_oplog_tailer",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/shard_role",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_checkpoint_validator",
+    srcs = [
+        "size_count_checkpoint_validator.cpp",
+    ],
+    deps = [
+        "size_count_store",
+        "//src/mongo:base",
+        "//src/mongo/db/repl:apply_ops_command_info",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/storage:ident",
+        "//src/mongo/idl:idl_parser",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_checkpoint_validator_test",
+    srcs = [
+        "size_count_checkpoint_validator_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_third_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_test_helpers",
+        "size_count_checkpoint_flusher",
+        "size_count_checkpoint_validator",
+        "//src/mongo/db:dbhelpers",
+        "//src/mongo/db/repl:apply_ops_command_info",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_helpers",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:write_unit_of_work",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_op_observer",
+    srcs = [
+        "replicated_fast_count_op_observer.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_uncommitted_changes",
+        "size_count_store",
+        "//src/mongo/db:import_collection_oplog_entry",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/op_observer",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/storage:ident",
+        "//src/mongo/db/storage:recovery_unit_base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_advance_checkpoint_test",
+    srcs = [
+        "replicated_fast_count_advance_checkpoint_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_first_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_advance_checkpoint",
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_test_helpers",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/otel/metrics:metrics_test_util",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_store",
+    srcs = [
+        "size_count_store.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/collection_crud",
+        "//src/mongo/db/collection_crud:container_write",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:collection_options",
+        "//src/mongo/db/update:update_common",
+        "//src/mongo/db/update:update_document_diff",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_timestamp_store",
+    srcs = [
+        "size_count_timestamp_store.cpp",
+    ],
+    deps = [
+        "size_count_store",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/collection_crud",
+        "//src/mongo/db/collection_crud:container_write",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:collection_options",
+        "//src/mongo/db/update:update_common",
+        "//src/mongo/db/update:update_document_diff",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_manager_test",
+    srcs = [
+        "replicated_fast_count_manager_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_third_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_manager",
+        "replicated_fast_count_test_helpers",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:recovery_unit_base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "persisted_size_count_test",
+    srcs = [
+        "persisted_size_count_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_manager",
+        "replicated_fast_count_test_helpers",
+        "size_count_store",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_helpers",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_timestamp_store_test",
+    srcs = [
+        "size_count_timestamp_store_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_test_helpers",
+        "size_count_timestamp_store",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:storage_engine_impl",
+    ],
+)
+
+mongo_cc_library(
+    name = "size_count_timestamp_store_oplog",
+    srcs = [
+        "size_count_timestamp_store_oplog.cpp",
+    ],
+    deps = [
+        "size_count_store",
+        "//src/mongo/db/repl:apply_ops_command_info",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/storage:ident",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_timestamp_store_oplog_test",
+    srcs = [
+        "size_count_timestamp_store_oplog_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+    ],
+    deps = [
+        "size_count_store",
+        "size_count_timestamp_store_oplog",
+        "//src/mongo/db:expression_context_builder",
+        "//src/mongo/db:query_matcher",
+        "//src/mongo/db/storage:ident",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_store_test",
+    srcs = [
+        "size_count_store_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_test_helpers",
+        "size_count_store",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:storage_engine_impl",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_test_helpers",
+    srcs = [
+        "replicated_fast_count_test_helpers.cpp",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_manager",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db:import_collection_oplog_entry",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/op_observer:op_observer_impl",
+        "//src/mongo/db/op_observer:operation_logger_impl",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/repl:oplog_interface_local",
+        "//src/mongo/db/repl:truncate_range_oplog_entry_idl",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_test",
+    srcs = [
+        "replicated_fast_count_init_test.cpp",
+        "replicated_fast_count_test.cpp",
+        "replicated_fast_count_txn_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_init",
+        "replicated_fast_count_test_helpers",
+        "replicated_fast_count_uncommitted_changes",
+        "//src/mongo/db:dbdirectclient",
+        "//src/mongo/db/op_observer:operation_logger_impl",
+        "//src/mongo/db/repl:mock_repl_coord_server_fixture",
+        "//src/mongo/db/repl:oplog_entry",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
+        "//src/mongo/db/storage:recovery_unit_base",
+        "//src/mongo/db/transaction",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_checkpoint_oplog_tailer_test",
+    srcs = [
+        "size_count_checkpoint_oplog_tailer_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_third_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_test_helpers",
+        "size_count_checkpoint_oplog_tailer",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/unittest:server_parameter_guard",
+        "//src/mongo/util:fail_point",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_metadata_test",
+    srcs = [
+        "replicated_metadata_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_checkpoint_buffer_test",
+    srcs = [
+        "size_count_checkpoint_buffer_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_first_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_test_helpers",
+        "size_count_checkpoint_buffer",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_checkpoint_flusher_test",
+    srcs = [
+        "size_count_checkpoint_flusher_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_test_helpers",
+        "size_count_checkpoint_flusher",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db/op_observer:op_observer_impl",
+        "//src/mongo/db/op_observer:operation_logger_impl",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/util:fail_point",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_checkpoint_coordinator_test",
+    srcs = [
+        "size_count_checkpoint_coordinator_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_test_helpers",
+        "size_count_checkpoint_coordinator",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db/op_observer:op_observer_impl",
+        "//src/mongo/db/op_observer:operation_logger_impl",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:write_unit_of_work",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/util:fail_point",
+    ],
+)
+
+mongo_cc_benchmark(
+    name = "replicated_fast_count_delta_utils_bm",
+    srcs = [
+        "replicated_fast_count_delta_utils_bm.cpp",
+    ],
+    tags = [
+        "first_half_bm",
+        "replicated_fast_count_bm",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        ":durable_size_metadata_idl",
+        "//src/mongo/db/repl:oplog_entry",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_delta_utils_test",
+    srcs = [
+        "replicated_fast_count_delta_utils_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_eighth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_enabled",
+        "replicated_fast_count_init",
+        "replicated_fast_count_manager",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "replicated_fast_count_test_helpers",
+        "replicated_fast_count_uncommitted_changes",
+        "//src/mongo/db:dbhelpers",
+        "//src/mongo/db/op_observer:operation_logger_impl",
+        "//src/mongo/db/repl:mock_repl_coord_server_fixture",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:recovery_unit_base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_streaming_oplog_delta_accumulator_test",
+    srcs = [
+        "replicated_fast_count_streaming_oplog_delta_accumulator_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_sixth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_delta_utils",
+        "replicated_fast_count_enabled",
+        "replicated_fast_count_init",
+        "replicated_fast_count_streaming_oplog_delta_accumulator",
+        "replicated_fast_count_test_helpers",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+    ],
+)
+
+mongo_cc_library(
+    name = "replicated_fast_count_enabled",
+    srcs = ["replicated_fast_count_enabled.cpp"],
+    deps = [
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db/commands:test_commands_enabled",
+        "//src/mongo/db/repl:local_oplog_info",
+        "//src/mongo/db/rss:replicated_storage_service",
+        "//src/mongo/db/storage:storage_options",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_enabled_test",
+    srcs = [
+        "replicated_fast_count_enabled_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_first_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_enabled",
+        "//src/mongo/db/commands:test_commands_enabled",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:storage_options",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_oplog_entry_test",
+    srcs = [
+        "oplog_applier_init_replicated_fast_count_test.cpp",
+        "oplog_applier_size_delta_test.cpp",
+        "replicated_fast_count_oplog_entry_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        "init_replicated_fast_count_oplog_entry_idl",
+        "//src/mongo/db/repl:oplog_applier_impl_test_fixture",
+        "//src/mongo/db/repl:oplog_entry_test_helpers",
+        "//src/mongo/unittest",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_fast_count_metrics_test",
+    srcs = [
+        "replicated_fast_count_metrics_test.cpp",
+    ],
+    tags = ["mongo_unittest_sixth_group"],
+    target_compatible_with = select({
+        "//bazel/config:build_otel_enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "replicated_fast_count_advance_checkpoint",
+        "replicated_fast_count_init",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_op_observer",
+        "replicated_fast_count_test_helpers",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:storage_engine_impl",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/unittest:server_parameter_guard",
+        "//src/mongo/util:fail_point",
+    ],
+)

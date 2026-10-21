@@ -1,0 +1,53 @@
+# TODO (SERVER-109519): Remove this file.
+- name: do_not_use_rawdata_for_legacy_timeseries
+  value:
+    executor:
+      config:
+        shell_options:
+          global_vars:
+            TestData:
+              doNotUseRawDataOperations: true
+- name: pin_fcv_to_last_continuous
+  value:
+    executor:
+      config:
+        shell_options:
+          eval: >-
+            await import("jstests/libs/override_methods/pin_fcv_to_last_continuous.js");
+- name: exclude_fcv_incompatible_tests
+  value:
+    selector:
+      exclude_with_any_tags:
+        - requires_fcv_91
+      exclude_files:
+        # This test calls checkWriteConcernBehaviorForAllCommands() with limitToTimeseriesViews=true,
+        # which internally runs setFeatureCompatibilityVersion to latestFCV. This is incompatible
+        # with suites that pin FCV to a different FCV.
+        - jstests/sharding/mongos_writes_wait_for_write_concern_timeseries.js
+- name: exclude_jscore_passthrough_base_tags
+  value:
+    selector:
+      exclude_with_any_tags:
+        - assumes_standalone_mongod
+        - assumes_against_mongod_not_mongos
+        - requires_profiling
+        - requires_fcv_91
+- name: all_jscore_timeseries_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        - jstests/core/timeseries/**/*.js
+- name: all_sharding_timeseries_tests_selector
+  value:
+    selector:
+      exclude_files: null
+      roots:
+        - jstests/sharding/analyze_shard_key/analyze_shard_key_cmd_validation.js
+        - jstests/sharding/balancer_should_return_random_migrations_failpoint.js
+        - jstests/sharding/create_unsplittable_collection.js
+        - jstests/sharding/list_cluster_catalog.js
+        - jstests/sharding/remove_shard_with_unsharded.js
+        - jstests/sharding/shard_unsplittable_collection.js
+        - jstests/sharding/*timeseries*/*.js
+        - jstests/sharding/**/*timeseries*.js

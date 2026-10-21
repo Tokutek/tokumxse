@@ -1,0 +1,230 @@
+### Overrides for some suites with change_streams ###
+- name: base_eval
+  value:
+    executor:
+      config:
+        shell_options:
+          # We do not always want all of the eval statements from the base suite so we override
+          # the ones we always want
+          eval: >-
+            globalThis.testingReplication = true;
+            await import('jstests/libs/override_methods/set_read_and_write_concerns.js');
+
+- name: causal_consistency_eval
+  value:
+    eval: await import('jstests/libs/override_methods/enable_causal_consistency_without_read_pref.js');
+
+- name: mongos_passthrough
+  value:
+    executor:
+      archive:
+        hooks:
+          - CheckReplDBHash
+          - ValidateCollections
+      hooks:
+        - class: CheckReplDBHash
+        - class: ValidateCollections
+        - class: CleanEveryN
+          n: 20
+      fixture:
+        class: ShardedClusterFixture
+        # Use two shards to make sure we will only talk to the primary shard for the database and will
+        # not delay changes to wait for notifications or a clock advancement from other shards.
+        num_shards: 2
+        num_mongos: 3
+        mongos_options:
+          bind_ip_all: ""
+          set_parameters:
+            enableTestCommands: 1
+        mongod_options:
+          set_parameters:
+            periodicNoopIntervalSecs: 1
+            writePeriodicNoops: true
+        num_nodes: null
+
+- name: mongos_passthrough_excludes
+  value:
+    exclude_with_any_tags:
+      # Exclude any that assume sharding is disabled
+      - assumes_against_mongod_not_mongos
+
+- name: sharded_collections_passthrough_excludes
+  value:
+    exclude_with_any_tags:
+      - assumes_unsharded_collection
+      - assumes_no_implicit_collection_creation_on_get_collection
+
+- name: sharded_collections_passthrough_eval
+  value:
+    eval: "await import('jstests/libs/override_methods/implicitly_shard_accessed_collections.js');"
+
+- name: change_streams_v1_eval
+  value:
+    eval: "await import('jstests/libs/override_methods/query/implicit_change_stream_v1.js');"
+
+# Contains mongos and mongod options for secondary reads testing.
+- name: secondary_reads
+  value:
+    executor:
+      fixture:
+        mongos_options:
+          set_parameters:
+            logComponentVerbosity:
+              verbosity: 0
+              command: 1
+              network:
+                verbosity: 1
+                asio: 2
+        mongod_options:
+          set_parameters:
+            logComponentVerbosity:
+              verbosity: 0
+              command: 1
+              query: 1
+              replication: 3
+        num_shards: null
+        # This suite requires w:"majority" writes to be applied on all shard secondaries.
+        # By setting shards to two node replsets, the majority is all voting nodes.
+        num_rs_nodes_per_shard: 2
+
+# Contains mongod-only options for secondary reads testing.
+- name: secondary_reads_mongod
+  value:
+    executor:
+      fixture:
+        mongod_options:
+          set_parameters:
+            logComponentVerbosity:
+              verbosity: 0
+              command: 1
+              query: 1
+              replication: 3
+
+- name: secondary_reads_excludes
+  value:
+    exclude_with_any_tags:
+      - assumes_read_preference_unchanged
+      - does_not_support_causal_consistency
+    exclude_files:
+      - jstests/change_streams/only_wake_getmore_for_relevant_changes.js
+
+- name: secondary_reads_eval
+  value:
+    eval: await import('jstests/libs/override_methods/set_read_preference_secondary.js');
+
+- name: disable_write_noops
+  value:
+    executor:
+      fixture:
+        mongod_options:
+          set_parameters:
+            periodicNoopIntervalSecs: null
+            writePeriodicNoops: null
+
+- name: whole_db_eval
+  value:
+    eval: "await import('jstests/libs/override_methods/query/implicit_whole_db_changestreams.js');"
+
+- name: whole_cluster_eval
+  value:
+    eval: "await import('jstests/libs/override_methods/query/implicit_whole_cluster_changestreams.js');"
+
+- name: direct_shard_connection_fixture
+  value:
+    executor:
+      archive:
+        hooks:
+          - CheckReplDBHash
+          - ValidateCollections
+      hooks:
+        - class: CheckReplDBHash
+        - class: ValidateCollections
+        - class: CleanEveryN
+          n: 20
+      fixture:
+        class: ShardedClusterFixture
+        # A single shard so that "watch this one shard directly" always sees 100% of the data,
+        # whether the override redirects the whole connection or just the change-stream commands.
+        num_shards: 1
+        num_mongos: 1
+        mongos_options:
+          bind_ip_all: ""
+          set_parameters:
+            enableTestCommands: 1
+        mongod_options:
+          set_parameters:
+            periodicNoopIntervalSecs: 1
+            writePeriodicNoops: true
+        num_nodes: null
+
+# ValidateCollections also runs the catalog list-operations consistency check, which is
+# incompatible with implicit_direct_to_shard_connection.js's shard-local, uncataloged-by-design
+# databases.
+- name: direct_shard_connection_fixture_no_validate
+  value:
+    executor:
+      archive:
+        hooks:
+          - CheckReplDBHash
+      hooks:
+        - class: CheckReplDBHash
+        - class: CleanEveryN
+          n: 20
+      fixture:
+        class: ShardedClusterFixture
+        # A single shard so that "watch this one shard directly" always sees 100% of the data,
+        # whether the override redirects the whole connection or just the change-stream commands.
+        num_shards: 1
+        num_mongos: 1
+        mongos_options:
+          bind_ip_all: ""
+          set_parameters:
+            enableTestCommands: 1
+        mongod_options:
+          set_parameters:
+            periodicNoopIntervalSecs: 1
+            writePeriodicNoops: true
+        num_nodes: null
+
+- name: direct_shard_connection_eval
+  value:
+    eval: "await import('jstests/libs/override_methods/query/implicit_direct_to_shard_connection.js');"
+
+- name: direct_shard_excludes
+  value:
+    exclude_with_any_tags:
+      # These tests issue real sharding operations (moveChunk, addShard, shardCollection, etc.)
+      # that require a router and/or multiple shards; neither suite's single-shard fixture can
+      # support them, and implicit_direct_to_shard_connection.js's redirected `db` (straight to a
+      # shard's mongod) additionally has no ShardingTest/mongos handle at all.
+      - requires_sharding
+      # Both direct-to-shard overrides redirect at least some traffic directly to a shardsvr, so
+      # tests that assume they are never connected directly to a shard server must be excluded.
+      - directly_against_shardsvrs_incompatible
+
+- name: direct_shard_changestream_metrics_excludes
+  value:
+    exclude_files:
+      # Asserts mongos serverStatus throughput counters (e.g. docsReturned) increase; they don't,
+      # since getMores go straight to the shard and mongos never sees them.
+      - "jstests/change_streams/change_stream_throughput_metrics.js"
+      # Asserts mongos serverStatus cursor.open counters change as cursors open/close; they don't,
+      # for the same reason.
+      - "jstests/change_streams/server_status_change_streams.js"
+      # Uses $currentOp with localOps:true on mongos to find the idle cursor; finds none because
+      # the cursor lives on the shard.
+      - "jstests/change_streams/change_stream_metrics_currentop.js"
+
+- name: direct_shard_changestream_eval
+  value:
+    eval: "await import('jstests/libs/override_methods/query/implicit_direct_to_shard_changestream_commands.js');"
+
+- name: direct_shard_connection_excludes_files
+  value:
+    exclude_files:
+      # compactStructuredEncryptionData (and similarly router-only admin commands) must run
+      # through mongos in a sharded cluster; there is no retry that fixes this for a client
+      # connected directly to a shard.
+      - "jstests/change_streams/queryable_encryption_change_stream.js"
+      # TODO SERVER-135713: test fails in burn-in.
+      - "jstests/change_streams/change_stream_response_deadline.js"

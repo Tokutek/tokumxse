@@ -1,0 +1,24 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "run",
+    srcs = [
+        "__init__.py",
+        "generate_multiversion_exclude_tags.py",
+        "list_tags.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/ciconfig",
+        "//buildscripts/util",
+        dependency(
+            "requests",
+            group = "core",
+        ),
+        dependency(
+            "pygithub",
+            group = "testing",
+        ),
+    ],
+)

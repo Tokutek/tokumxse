@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::write_ops"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/query/client_cursor/cursor_response.idl"
+
+structs:
+    QueryStatsMetrics:
+        description: "Query stats metrics relevant to a single write."
+        fields:
+            originalOpIndex:
+                type: int
+                description: "The index of the statement in the original client write command."
+                stability: internal
+            metrics:
+                description: "Metrics for a single write."
+                type: CursorMetrics
+                stability: internal

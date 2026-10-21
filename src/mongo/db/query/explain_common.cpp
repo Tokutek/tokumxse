@@ -1,76 +1,124 @@
-/**
- *    Copyright (C) 2013-2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/platform/basic.h"
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/explain_common.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/version_context.h"
+#include "mongo/util/net/socket_utils.h"
+#include "mongo/util/str.h"
+#include "mongo/util/version.h"
 
-namespace mongo {
+#include <string_view>
 
-    // static
-    const char* ExplainCommon::verbosityString(ExplainCommon::Verbosity verbosity) {
-        switch (verbosity) {
-        case QUERY_PLANNER:
-            return "queryPlanner";
-        case EXEC_STATS:
-            return "executionStats";
-        case EXEC_ALL_PLANS:
-            return "allPlansExecution";
-        default:
-            invariant(0);
-            return "unknown";
-        }
+namespace mongo::explain_common {
+namespace append_if_room {
+/*
+ * This constant restricts the maximum output object size for 'appendIfRoom' functions. By setting
+ * it slightly lower than 'BSONObjMaxUserSize', we ensure the final output stays within limits even
+ * after adding mandatory small fields that are not individually size-checked.
+ *
+ * Assumption: BSONObjMaxUserSize will never be below 10KB.
+ */
+constexpr int OutputObjectMaxSize = BSONObjMaxUserSize - 10 * 1024;
+
+void appendWarningMessage(std::string_view fieldName, BSONObjBuilder* out) {
+    constexpr int kWarningMsgOverhead = 60;
+    // The reserved buffer size for the warning message if 'out' exceeds the max BSON user size.
+    const int warningMsgSize = fieldName.size() + kWarningMsgOverhead;
+
+    // Unless 'out' has already exceeded the max BSON user size, add a warning indicating
+    // that data has been truncated.
+    if (out->len() < OutputObjectMaxSize - warningMsgSize) {
+        out->append("warning",
+                    str::stream() << "'" << fieldName << "'"
+                                  << " has been omitted due to BSON size limit");
+    }
+}
+}  // namespace append_if_room
+
+void generateServerInfo(BSONObjBuilder* out) {
+    BSONObjBuilder serverBob(out->subobjStart("serverInfo"));
+    serverBob.append("host", getHostNameCached());
+    serverBob.appendNumber("port", serverGlobalParams.port);
+    auto&& vii = VersionInfoInterface::instance();
+    serverBob.append("version", vii.version());
+    serverBob.append("gitVersion", vii.gitVersion());
+    serverBob.doneFast();
+}
+
+void generateServerParameters(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              BSONObjBuilder* out) {
+    BSONObjBuilder serverBob(out->subobjStart("serverParameters"));
+    serverBob.appendNumber("internalQueryFacetMaxOutputDocSizeBytes",
+                           internalQueryFacetMaxOutputDocSizeBytes.load());
+    serverBob.appendNumber("internalLookupStageIntermediateDocumentMaxSizeBytes",
+                           internalLookupStageIntermediateDocumentMaxSizeBytes.load());
+    serverBob.appendNumber("internalQueryProhibitBlockingMergeOnMongoS",
+                           internalQueryProhibitBlockingMergeOnMongoS.load());
+    const auto& knobs = expCtx->getQueryKnobConfiguration();
+    serverBob.append("internalQueryFrameworkControl",
+                     idl::serialize(knobs.getInternalQueryFrameworkControlForOp()));
+    serverBob.appendNumber("internalQueryPlannerIgnoreIndexWithCollationForRegex",
+                           internalQueryPlannerIgnoreIndexWithCollationForRegex.load());
+    serverBob.append("internalQueryPlanRanker", idl::serialize(knobs.getPlanRanker()));
+    serverBob.append("internalQueryCBRCEMode", idl::serialize(knobs.getCBRCEMode()));
+    serverBob.append("internalQueryMixedPlanRankingStrategy",
+                     idl::serialize(knobs.getMixedPlanRankingStrategy()));
+    serverBob.appendBool("featureFlagCostBasedRanker",
+                         feature_flags::gFeatureFlagCostBasedRanker.checkEnabled());
+    serverBob.doneFast();
+}
+
+void generateQueryKnobs(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        BSONObjBuilder* out) {
+    auto serializedKnobs = expCtx->getQueryKnobConfiguration().serializeForExplain();
+    if (!serializedKnobs.isEmpty()) {
+        appendIfRoom(serializedKnobs, "queryKnobs", out);
+    }
+}
+
+void generateQueryShapeHash(OperationContext* opCtx, BSONObjBuilder* out) {
+    // TODO SERVER-132079: source the hash from the query itself instead of the per-operation
+    // diagnostics state.
+    if (auto&& queryShapeHash = mongo::CurOp::get(opCtx)->debug().getQueryShapeHash()) {
+        out->append("queryShapeHash", queryShapeHash->toHexString());
+    }
+}
+
+void generatePeakTrackedMemBytes(const OperationContext* opCtx, BSONObjBuilder* out) {
+    if (int64_t peakTrackedMemBytes = mongo::CurOp::get(opCtx)->getPeakTrackedMemoryBytes()) {
+        out->append("peakTrackedMemBytes", peakTrackedMemBytes);
+    }
+}
+
+bool appendIfRoom(const BSONObj& toAppend, std::string_view fieldName, BSONObjBuilder* out) {
+    if ((out->len() + toAppend.objsize()) < append_if_room::OutputObjectMaxSize) {
+        out->append(fieldName, toAppend);
+        return true;
     }
 
-    // static
-    Status ExplainCommon::parseCmdBSON(const BSONObj& cmdObj, ExplainCommon::Verbosity* verbosity) {
-        if (Object != cmdObj.firstElement().type()) {
-            return Status(ErrorCodes::BadValue, "explain command requires a nested object");
-        }
+    append_if_room::appendWarningMessage(fieldName, out);
 
-        *verbosity = ExplainCommon::EXEC_ALL_PLANS;
-        if (!cmdObj["verbosity"].eoo()) {
-            const char* verbStr = cmdObj["verbosity"].valuestrsafe();
-            if (mongoutils::str::equals(verbStr, "queryPlanner")) {
-                *verbosity = ExplainCommon::QUERY_PLANNER;
-            }
-            else if (mongoutils::str::equals(verbStr, "executionStats")) {
-                *verbosity = ExplainCommon::EXEC_STATS;
-            }
-            else if (!mongoutils::str::equals(verbStr, "allPlansExecution")) {
-                return Status(ErrorCodes::BadValue, "verbosity string must be one of "
-                    "{'queryPlanner', 'executionStats', 'allPlansExecution'}");
-            }
-        }
+    return false;
+}
 
-        return Status::OK();
+bool appendIfRoom(const BSONArray& toAppend, std::string_view fieldName, BSONObjBuilder* out) {
+    if ((out->len() + toAppend.objsize()) < append_if_room::OutputObjectMaxSize) {
+        out->appendArray(fieldName, toAppend);
+        return true;
     }
 
-} // namespace mongo
+    append_if_room::appendWarningMessage(fieldName, out);
+
+    return false;
+}
+}  // namespace mongo::explain_common

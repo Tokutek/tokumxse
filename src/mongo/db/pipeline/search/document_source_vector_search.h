@@ -1,0 +1,254 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/search/lite_parsed_search.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/search/internal_search_mongot_remote_spec_gen.h"
+#include "mongo/util/modules.h"
+
+#include <functional>
+#include <memory>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+DECLARE_STAGE_PARAMS_DERIVED_DEFAULT(VectorSearch);
+class VectorSearchLiteParsed final : public LiteParsedSearchStage<VectorSearchLiteParsed> {
+public:
+    VectorSearchLiteParsed(const BSONElement& originalBson, NamespaceString nss)
+        : LiteParsedSearchStage(originalBson, std::move(nss)) {}
+
+    static std::unique_ptr<VectorSearchLiteParsed> parse(const NamespaceString& nss,
+                                                         const BSONElement& spec,
+                                                         const LiteParserOptions& options) {
+        return std::make_unique<VectorSearchLiteParsed>(spec, nss);
+    }
+
+    std::unique_ptr<StageParams> getStageParams() const final {
+        return std::make_unique<VectorSearchStageParams>(_originalBson);
+    }
+
+    // Override the base LiteParsedSearchStage::validate to check only the 'view' field.
+    // $vectorSearch's user spec has fields (e.g. 'limit') that share names with internal
+    // InternalSearchMongotRemoteSpec fields used by $search/$searchMeta but are user-facing on
+    // this stage. Applying the full internal-field list here would reject legitimate queries.
+    void validate(const OperationContext* opCtx) const final {
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << this->getParseTimeName() << " value must be an object. Found: "
+                              << typeName(this->_originalBson.type()),
+                this->_originalBson.type() == BSONType::object);
+        const auto spec = this->_originalBson.embeddedObject();
+        if (spec.hasField(search_helpers::kViewFieldName)) {
+            assertAllowedInternalIfRequired(
+                opCtx, search_helpers::kViewFieldName, AllowedWithClientType::kInternal);
+        }
+    }
+
+    // $vectorSearch produces $sortKey metadata.
+    bool isRankedStage() const final {
+        return true;
+    }
+
+    // $vectorSearch produces $vectorSearchScore metadata.
+    bool isScoredStage() const final {
+        return true;
+    }
+
+    // $vectorSearch is not a selection stage when returnStoredSource is true since it might have an
+    // implicit projection applied.
+    bool isSelectionStage() const final {
+        return !hasReturnStoredSource();
+    }
+};
+
+/**
+ * Interface used to retrieve the execution stats of explain().
+ *
+ * Used to decouple the execution code from the optimization one (so the optimization code does not
+ * need a TaskExecutorCursor for example).
+ * TODO SERVER-107930: It can go away once VectorSearchStage::getExplainOutput() is implemented.
+ */
+class DSVectorSearchExecStatsWrapper {
+public:
+    class StatsProvider {
+    public:
+        virtual boost::optional<BSONObj> getStats() = 0;
+        virtual ~StatsProvider() = default;
+    };
+
+    /**
+     * Retrieves the execution statistics.
+     */
+    boost::optional<BSONObj> getExecStats() {
+        if (!_provider) {
+            return boost::none;
+        }
+        return _provider->getStats();
+    }
+
+    void setStatsProvider(std::unique_ptr<StatsProvider> provider) {
+        _provider = std::move(provider);
+    }
+
+private:
+    std::unique_ptr<StatsProvider> _provider{nullptr};
+};
+
+/**
+ * A class to retrieve vector search results from a mongot process.
+ */
+class DocumentSourceVectorSearch : public DocumentSource {
+public:
+    const BSONObj kSortSpec = BSON("$vectorSearchScore" << -1);
+    static constexpr std::string_view kStageName = "$vectorSearch"sv;
+    static constexpr std::string_view kLimitFieldName = "limit"sv;
+    static constexpr std::string_view kFilterFieldName = "filter"sv;
+    static constexpr std::string_view kIndexFieldName = "index"sv;
+    static constexpr std::string_view kNumCandidatesFieldName = "numCandidates"sv;
+    static constexpr std::string_view kViewFieldName = "view"sv;
+    static constexpr std::string_view kReturnStoredSourceFieldName = "returnStoredSource"sv;
+
+    DocumentSourceVectorSearch(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                               std::shared_ptr<executor::TaskExecutor> taskExecutor,
+                               BSONObj originalSpec);
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    std::list<boost::intrusive_ptr<DocumentSource>> desugar();
+
+    std::string_view getSourceName() const override {
+        return kStageName;
+    }
+
+    /**
+     * This method is used exclusively by query analysis to replace the filter predicate in the
+     * original spec with the filter rewritten with encryption placeholders. This method returns
+     * true if the stage's filter is replaced, otherwise it returns false.
+     *
+     * Callers of this method provide a functor which accepts a MatchExpression, and returns the
+     * rewritten expression with encryption placeholders as serialized BSON. If no rewrites took
+     * place, the functor returns an empty BSONObj.
+     *
+     * Note, the filter specification in the _stageSpec BSON is also replaced to reflect the updated
+     * filter. This is necessary because we must not operate on the unencrypted plain-text secure
+     * payloads.
+     */
+    bool rebuildWithNewFilterForFLE(std::function<BSONObj(const MatchExpression&)> fn);
+
+    bool isStoredSource() const {
+        // If the user specifies storedSource: true and the knob is off, we will not error and
+        // simply return false.
+        bool isVectorSearchStoredSourceEnabled =
+            ServerParameterSet::getClusterParameterSet()
+                ->get<ClusterParameterWithStorage<InternalVectorSearchStoredSource>>(
+                    "internalVectorSearchStoredSource")
+                ->getValue(getExpCtx()->getNamespaceString().tenantId())
+                .getEnabled();
+        return isVectorSearchStoredSourceEnabled
+            ? _stageSpec.getBoolField(kReturnStoredSourceFieldName)
+            : false;
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    bool providesSortKeyMetadata() const override {
+        return true;
+    }
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic(
+        const DistributedPlanContext* ctx) override {
+        DistributedPlanLogic logic;
+        logic.shardsStage = this;
+        if (_limit) {
+            logic.mergingStages = {DocumentSourceLimit::create(getExpCtx(), *_limit)};
+        }
+        logic.mergeSortPattern = kSortSpec;
+        return logic;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        // This stage doesn't currently support tracking field dependencies since mongot is
+        // responsible for determining what fields to return. We do need to track metadata
+        // dependencies though, so downstream stages know they are allowed to access
+        // "vectorSearchScore" metadata.
+        // TODO SERVER-101100 Implement logic for dependency analysis.
+
+        deps->setMetadataAvailable(DocumentMetadataFields::kVectorSearchScore);
+        return DepsTracker::State::NOT_SUPPORTED;
+    }
+
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const override {
+        auto expCtx = newExpCtx ? newExpCtx : getExpCtx();
+        return make_intrusive<DocumentSourceVectorSearch>(expCtx, _taskExecutor, _stageSpec.copy());
+    }
+
+    StageConstraints constraints(PipelineSplitState pipeState) const final;
+
+    DocumentSourceContainer::iterator optimizeAt(DocumentSourceContainer::iterator itr,
+                                                 DocumentSourceContainer* container);
+
+protected:
+    Value serialize(const query_shape::SerializationOptions& opts) const override;
+
+private:
+    friend boost::intrusive_ptr<exec::agg::Stage> documentSourceVectorSearchToStageFn(
+        const boost::intrusive_ptr<DocumentSource>&);
+
+    // Initialize metrics related to the $vectorSearch stage on the OpDebug object.
+    void initializeOpDebugVectorSearchMetrics();
+
+    /**
+     * Attempts a pipeline optimization that removes a $sort stage that comes after the output of
+     * of mongot, if the resulting documents from mongot are sorted by the same criteria as the
+     * $sort ('vectorSearchScore').
+     *
+     * Also, this optimization only applies to cases where the $sort comes directly after this
+     * stage.
+     *
+     * Returns a pair of the iterator to return to the optimizer, and a bool of whether or not the
+     * optimization was successful. If optimization was successful, the container will be modified
+     * appropriately.
+     */
+    std::pair<DocumentSourceContainer::iterator, bool> _attemptSortAfterVectorSearchOptimization(
+        DocumentSourceContainer::iterator itr, DocumentSourceContainer* container);
+
+    std::unique_ptr<MatchExpression> _filterExpr;
+
+    std::shared_ptr<executor::TaskExecutor> _taskExecutor;
+
+    // Set when the execution stage is created.
+    // TODO SERVER-107930: Remove it when SourceVectorSearch::getExplainOutput() is
+    // implemented.
+    std::weak_ptr<DSVectorSearchExecStatsWrapper> _execStatsWrapper;
+
+    // Limit value for the pipeline as a whole. This is not the limit that we send to mongot,
+    // rather, it is used when adding the $limit stage to the merging pipeline in a sharded cluster.
+    // This allows us to limit the documents that are returned from the shards as much as possible
+    // without adding complicated rules for pipeline splitting.
+    // The limit that we send to mongot is received and stored on the '_request' object above.
+    boost::optional<long long> _limit;
+
+    // Keep track of the request BSONObj's extra fields in case there were fields mongod
+    // doesn't know about that mongot will need later.
+    BSONObj _stageSpec;
+};
+}  // namespace mongo

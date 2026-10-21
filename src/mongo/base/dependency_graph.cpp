@@ -1,0 +1,189 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/dependency_graph.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/string_map.h"
+
+#include <algorithm>
+#include <compare>
+#include <iterator>
+#include <random>
+#include <string_view>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>  // IWYU pragma: keep
+
+namespace mongo::initializer_details {
+
+void DependencyGraph::addNode(const std::string& name,
+                              const std::vector<std::string>& prerequisites,
+                              const std::vector<std::string>& dependents,
+                              std::unique_ptr<Payload> payload) {
+    if (!payload) {
+        struct DummyPayload : Payload {};
+        payload = std::make_unique<DummyPayload>();
+    }
+    auto& newNode = _nodes[name];
+    uassert(ErrorCodes::Error(50999), name, !newNode.payload);  // collision
+    for (auto& otherNode : prerequisites)
+        newNode.prerequisites.insert(otherNode);
+    for (auto& otherNode : dependents)
+        _nodes[otherNode].prerequisites.insert(name);
+    newNode.payload = std::move(payload);
+}
+
+namespace {
+
+
+template <typename Seq>
+void strAppendJoin(std::string& out, std::string_view separator, const Seq& sequence) {
+    std::string_view currSep;
+    for (std::string_view str : sequence) {
+        out.append(currSep.data(), currSep.size());
+        out.append(str.data(), str.size());
+        currSep = separator;
+    }
+}
+
+// In the case of a cycle, copy the cycle node names into `*cycle`.
+template <typename Iter>
+void throwGraphContainsCycle(Iter first, Iter last, std::vector<std::string>* cycle) {
+    std::vector<std::string> names;
+    std::transform(first, last, std::back_inserter(names), [](auto& e) { return e->name(); });
+    if (cycle)
+        *cycle = names;
+    names.push_back((*first)->name());
+    uasserted(ErrorCodes::GraphContainsCycle,
+              fmt::format("Cycle in dependency graph: {}", fmt::join(names, " -> ")));
+}
+
+}  // namespace
+
+std::vector<std::string> DependencyGraph::topSort(unsigned randomSeed,
+                                                  std::vector<std::string>* cycle) const {
+    // Topological sort via repeated depth-first traversal.
+    // All nodes must have an initFn before running topSort, or we return BadValue.
+    struct Element {
+        const std::string& name() const {
+            return nodeIter->first;
+        }
+        std::map<std::string, Node>::const_iterator nodeIter;
+        std::vector<Element*> children;
+        std::vector<Element*>::iterator membership;  // Position of this in `elements`.
+    };
+
+    std::vector<Element> elementsStore;
+    std::vector<Element*> elements;
+
+    // Swap the pointers in the `elements` vector that point to `a` and `b`.
+    // Update their 'membership' data members to reflect the change.
+    auto swapPositions = [](Element& a, Element& b) {
+        if (&a == &b) {
+            return;
+        }
+        using std::swap;
+        swap(*a.membership, *b.membership);
+        swap(a.membership, b.membership);
+    };
+
+    elementsStore.reserve(_nodes.size());
+    for (auto iter = _nodes.begin(); iter != _nodes.end(); ++iter) {
+        uassert(ErrorCodes::BadValue,
+                fmt::format("node {} was mentioned but never added", iter->first),
+                iter->second.payload);
+        elementsStore.push_back(Element{iter});
+    }
+
+    // Wire up all the child relationships by pointer rather than by string names.
+    {
+        StringMap<Element*> byName;
+        for (Element& e : elementsStore)
+            byName[e.name()] = &e;
+        for (Element& element : elementsStore) {
+            const auto& prereqs = element.nodeIter->second.prerequisites;
+            std::transform(prereqs.begin(),
+                           prereqs.end(),
+                           std::back_inserter(element.children),
+                           [&](std::string_view childName) {
+                               auto iter = byName.find(childName);
+                               uassert(ErrorCodes::BadValue,
+                                       fmt::format("node {} depends on missing node {}",
+                                                   element.nodeIter->first,
+                                                   childName),
+                                       iter != byName.end());
+                               return iter->second;
+                           });
+        }
+    }
+
+    elements.reserve(_nodes.size());
+    std::transform(elementsStore.begin(),
+                   elementsStore.end(),
+                   std::back_inserter(elements),
+                   [](auto& e) { return &e; });
+
+    // Shuffle the inputs to improve test coverage of undeclared dependencies.
+    {
+        std::mt19937 generator(randomSeed);
+        std::shuffle(elements.begin(), elements.end(), generator);
+        for (Element* e : elements)
+            std::shuffle(e->children.begin(), e->children.end(), generator);
+    }
+
+    // Initialize all the `membership` iterators. Must only happen after shuffle.
+    for (auto iter = elements.begin(); iter != elements.end(); ++iter)
+        (*iter)->membership = iter;
+
+    // The `elements` sequence is divided into 3 regions:
+    // elements:        [ sorted | unsorted | stack ]
+    //          unsortedBegin => [          )  <= unsortedEnd
+    // Each element of the stack region is a prerequisite of its neighbor to the right. Through
+    // 'swapPositions' calls and boundary increments, elements will transition from unsorted to
+    // stack to sorted. The unsorted region shinks to ultimately become an empty region on the
+    // right. No other moves are permitted.
+    auto unsortedBegin = elements.begin();
+    auto unsortedEnd = elements.end();
+
+    while (unsortedBegin != elements.end()) {
+        if (unsortedEnd == elements.end()) {
+            // The stack is empty but there's more work to do. Grow the stack region to enclose
+            // the rightmost unsorted element. Equivalent to pushing it.
+            --unsortedEnd;
+        }
+        auto top = unsortedEnd;
+        auto& children = (*top)->children;
+        if (!children.empty()) {
+            Element* picked = children.back();
+            children.pop_back();
+            if (picked->membership < unsortedBegin)
+                continue;
+            if (picked->membership >= unsortedEnd) {  // O(1) cycle detection
+                throwGraphContainsCycle(unsortedEnd, elements.end(), cycle);
+            }
+            swapPositions(**--unsortedEnd, *picked);  // unsorted push to stack
+            continue;
+        }
+        swapPositions(**unsortedEnd++, **unsortedBegin++);  // pop from stack to sorted
+    }
+    std::vector<std::string> sortedNames;
+    sortedNames.reserve(_nodes.size());
+    std::transform(elements.begin(),
+                   elements.end(),
+                   std::back_inserter(sortedNames),
+                   [](const Element* e) { return e->name(); });
+    return sortedNames;
+}
+
+DependencyGraph::Payload* DependencyGraph::find(const std::string& name) {
+    auto iter = _nodes.find(name);
+    return (iter == _nodes.end()) ? nullptr : iter->second.payload.get();
+}
+
+}  // namespace mongo::initializer_details

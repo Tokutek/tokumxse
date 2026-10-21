@@ -1,0 +1,37 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file describes the BSON format for a LogicalSessionId, and
+# handles the serialization to and deserialization from its BSON representation
+# for that class.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    TransactionRuntimeContext:
+        description: "Contains context fields of a transaction"
+        strict: false
+        fields:
+            placementConflictTime:
+                description:
+                    "This optional value represents a conservative upper bound for placement
+                    changes (i.e., chunk migrations) for any collection which might be accessed
+                    for the lifetime of the transaction. If specified, transactions will fail with
+                    a retryable MigrationConflict error if any placement changes have committed
+                    since this time."
+                type: logicalTime
+                optional: true
+            createdDatabases:
+                description:
+                    "Used to propagate knowledge about what databases were created by the transaction
+                    running on the top router (where the client is connected). This is used later to
+                    ignore the placementConflictTime check for those databases. This parameter must
+                    be empty for commands that doesn't run within a transaction, and it's only used
+                    on internal commands only."
+                type: array<database_name>
+                optional: false

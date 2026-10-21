@@ -1,0 +1,41 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    fsync:
+        description: "Flushes all pending writes from the storage layer to disk."
+        command_name: fsync
+        cpp_name: FSyncRequest # since "struct Fsync" is pretty unhelpful.
+        namespace: ignored
+        api_version: ""
+        strict: true
+        mod_visibility: private
+        fields:
+            lock:
+                description: "Takes a lock on the server or cluster and blocks all write operations."
+                type: safeBool
+                default: false
+            fsyncLockAcquisitionTimeoutMillis:
+                description: "Specifies the amount of time in milliseconds to wait to acquire locks."
+                type: int
+                default: 90000
+            forBackup:
+                description: >-
+                    When locking the DB for the purpose of taking a backup, ensures that additional
+                    checks are taken to ensure concurrent operations are not underway. Only used
+                    when 'lock' is set.
+                type: safeBool
+                default: false
+            allowFsyncFailure:
+                description: >-
+                    Ignores failures flushing to the disk, i.e. when using fsync+lock to prevent
+                    modifications to the DB, even if it hasn't been persisted to disk correctly.
+                    Only used when 'lock' is set.
+                type: safeBool
+                default: false

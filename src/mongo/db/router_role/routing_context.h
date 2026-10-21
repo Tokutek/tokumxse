@@ -1,0 +1,268 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/util/modules.h"
+
+[[MONGO_MOD_PUBLIC]];
+
+namespace mongo {
+/**
+ * Holds a routing table and whether it has been validated by a shard.
+ */
+struct RoutingInfoEntry {
+    CollectionRoutingInfo cri;
+    bool validated;
+};
+
+/**
+ * RoutingContext provides a structured interface for accessing routing table information via the
+ * CatalogCache during a routing operation. It should be instantiated at the start of a query
+ * routing operation to safely acquire routing information for a list of namespaces. The routing
+ * table data is immutable once the context is created. Its lifetime spans the duration of the
+ * operation and must persist until the routing tables have been validated by issuing a versioned
+ * request to a shard.
+ */
+class RoutingContext {
+public:
+    /**
+     * Initialize and acquire the routing tables from a list of given namespaces. If
+     * 'checkTimeseriesBucketsNss' is set to true, then it will also check the timeseries buckets
+     * namespace and acquire their routing tables.
+     */
+    // TODO SERVER-102931: Integrate the RouterAcquisitionSnapshot
+    RoutingContext(OperationContext* opCtx,
+                   const std::vector<NamespaceString>&
+                       nssList,  // list of required namespaces for the routing operation
+                   bool allowLocks = false,
+                   bool checkTimeseriesBucketsNss = false);
+
+    // TODO SERVER-102931: Integrate the RouterAcquisitionSnapshot
+    /**
+     * Constructs a RoutingContext from pre-acquired routing tables.
+     */
+    RoutingContext(OperationContext* opCtx,
+                   const stdx::unordered_map<NamespaceString, CollectionRoutingInfo>& nssToCriMap);
+
+    // Non-copyable, non-movable
+    RoutingContext(const RoutingContext&) = delete;
+    RoutingContext& operator=(const RoutingContext&) = delete;
+
+    /**
+     * Create a RoutingContext with a synthetic routing table (without using a CatalogCache). Use
+     * this for testing or specific cases where fetching from the cache is not required.
+     */
+    static std::unique_ptr<RoutingContext> createSynthetic(
+        stdx::unordered_map<NamespaceString, CollectionRoutingInfo> nssMap);
+
+    /**
+     * Returns the routing table mapped to a namespace. This is initialized at construction time
+     * and remains the same throughout the routing operation.
+     */
+    const CollectionRoutingInfo& getCollectionRoutingInfo(const NamespaceString& nss) const;
+
+    /**
+     * Returns true if the RoutingContext contains the specified NamespaceString.
+     */
+    bool hasNss(const NamespaceString& nss) const;
+
+    /**
+     * Returns a vector of all the NamespaceStrings contained within this RoutingContext.
+     */
+    std::vector<NamespaceString> getNssList() const;
+
+    /**
+     * Record that a versioned request for a namespace was sent to a shard. The namespace is
+     * considered validated.
+     */
+    virtual void onRequestSentForNss(const NamespaceString& nss);
+
+    /**
+     * Utility to trigger CatalogCache refreshes for staleness errors directly from the
+     * RoutingContext.
+     *
+     * This method should only be called with errors of category StaleShardVersionError or
+     * StaleDbVersion. It processes the error's ExtraInfo to determine which routing information
+     * needs to be refreshed.
+     *
+     * @param status - A Status object containing a StaleShardVersionError or StaleDbVersion error.
+     *                 Must be one of:
+     *                 - ErrorCodes::StaleDbVersion (with StaleDbRoutingVersion ExtraInfo)
+     *                 - ErrorCodes::StaleConfig (with StaleConfigInfo ExtraInfo)
+     *                 - ErrorCodes::StaleEpoch (with optional StaleEpochInfo ExtraInfo)
+     *                 Other error codes will trigger a tassert failure.
+     *
+     * @param nss - Optional namespace to invalidate. This parameter exists to handle legacy
+     *              StaleEpoch errors that may not contain ExtraInfo with namespace information.
+     *
+     *              This parameter is only consulted for StaleEpoch errors without ExtraInfo.
+     *              For errors with ExtraInfo (StaleConfigInfo, StaleEpochInfo,
+     *              StaleDbRoutingVersion), the namespace is extracted from the ExtraInfo
+     *              and this parameter is ignored.
+     *
+     * @note TODO(SERVER-109793): Remove the nss parameter once all StaleShardVersion errors
+     *       are guaranteed to contain ExtraInfo with namespace information.
+     */
+    virtual void onStaleError(const Status& status,
+                              boost::optional<const NamespaceString&> nss = boost::none);
+
+    /**
+     * Informs the RoutingContext of a StaleConfig error (similar to onStaleError()), but does not
+     * require a StaleConfig Status to be passed in. Where possible, using onStaleError() should be
+     * preferred over using this method.
+     */
+    virtual void onStaleShardVersionError(const NamespaceString& nss,
+                                          const boost::optional<ShardVersion>& wantedVersion);
+
+    /**
+     * By default, the RoutingContext should be validated by running validateOnContextEnd() at the
+     * end of a routing operation. This sets _skipValidation to true if it is not a correctness bug
+     * for the RoutingContext to terminate without sending a request to a shard.
+     */
+    void skipValidation();
+
+    /**
+     * Sometimes a RoutingContext is needed to determine if a request to a shard will actually need
+     * metadata for a request. If the routing operation decides it no longer needs that metadata
+     * then this method releases it so it can't be used.
+     */
+    void release(const NamespaceString& nss);
+
+    /**
+     * Validate the RoutingContext prior to destruction to ensure that either:
+     * 1. All declared namespaces have had their routing tables validated by sending a versioned
+     * request to a shard.
+     * 2. An exception is thrown (i.e. if the collection generation has changed) and will be
+     * propagated up the stack.
+     *
+     * It is considered a logic bug if a RoutingContext goes out of scope and neither of the above
+     * are true, unless skipValidation() is explicitly set.
+     */
+    void validateOnContextEnd() const;
+
+    virtual ~RoutingContext() = default;
+
+protected:
+    RoutingContext(stdx::unordered_map<NamespaceString, CollectionRoutingInfo> nssMap);
+
+private:
+    /**
+     * Obtain the routing table associated with a namespace from the CatalogCache. This returns the
+     * latest routing table unless the read concern is snapshot with "atClusterTime" set. If an
+     * error occurs, this returns a failed status.
+     */
+    StatusWith<CollectionRoutingInfo> _getCollectionRoutingInfo(OperationContext* opCtx,
+                                                                const NamespaceString& nss,
+                                                                bool allowLocks) const;
+
+    CatalogCache* _catalogCache;
+
+    using NssRoutingInfoMap = stdx::unordered_map<NamespaceString, RoutingInfoEntry>;
+    NssRoutingInfoMap _nssRoutingInfoMap;
+    stdx::unordered_set<NamespaceString> _releasedNssList;
+
+    // If set, skip validation prior to destruction that the RoutingContext has had its routing
+    // tables validated by sending a versioned request to a shard
+    bool _skipValidation = false;
+
+    // TODO SERVER-106874 remove the namespace translation check entirely once 9.0 becomes
+    // last LTS. By then we will only have viewless timeseries that do not require nss
+    // translation.
+    bool _checkTimeseriesBucketsNss = false;
+};
+
+class MockRoutingContext : public RoutingContext {
+public:
+    MockRoutingContext(stdx::unordered_map<NamespaceString, CollectionRoutingInfo> map = {})
+        : RoutingContext(map) {}
+    // TODO SERVER-102931: Integrate the RouterAcquisitionSnapshot
+    MockRoutingContext(OperationContext* opCtx,
+                       const std::vector<NamespaceString>&
+                           nssList,  // list of required namespaces for the routing operation
+                       bool allowLocks = false)
+        : RoutingContext(opCtx, nssList, allowLocks) {}
+
+    // TODO SERVER-102931: Integrate the RouterAcquisitionSnapshot
+    MockRoutingContext(
+        OperationContext* opCtx,
+        const stdx::unordered_map<NamespaceString, CollectionRoutingInfo>& nssToCriMap)
+        : RoutingContext(opCtx, nssToCriMap) {}
+
+    // Non-copyable, non-movable
+    MockRoutingContext(const RoutingContext&) = delete;
+    MockRoutingContext& operator=(const RoutingContext&) = delete;
+
+    void onRequestSentForNss(const NamespaceString& nss) override {}
+    void onStaleError(const Status& status, boost::optional<const NamespaceString&> nss) override {
+        errors.emplace_back(status);
+    };
+    std::vector<Status> errors;
+};
+
+namespace routing_context_utils {
+/*
+ * Invoke a callback with a RoutingContext and call validateOnContextEnd() if it successfully
+ * finishes to ensure every declared namespace had its routing table validated by sending a
+ * versioned request to a shard.
+ */
+template <class Fn>
+auto runAndValidate(RoutingContext& routingCtx, Fn&& fn) {
+    using ReturnType = std::invoke_result_t<Fn, RoutingContext&>;
+    if constexpr (std::is_void_v<ReturnType>) {
+        fn(routingCtx);
+        routingCtx.validateOnContextEnd();
+    } else {
+        ReturnType res = fn(routingCtx);
+        routingCtx.validateOnContextEnd();
+        return res;
+    }
+}
+
+/*
+ * Construct a RoutingContext directly for a list of namespaces, run the callback, and check that
+ * all acquired routing tables were validated against a shard.
+ */
+template <class Fn>
+auto withValidatedRoutingContext(OperationContext* opCtx,
+                                 const std::vector<NamespaceString>& nssList,
+                                 Fn&& fn) {
+    RoutingContext routingCtx(opCtx, nssList);
+    return runAndValidate(routingCtx, std::forward<Fn>(fn));
+}
+
+/*
+ * Same as above, but checks whether locks are allowed if we are in a transaction.
+ */
+template <class Fn>
+auto withValidatedRoutingContextForTxnCmd(OperationContext* opCtx,
+                                          const std::vector<NamespaceString>& nssList,
+                                          Fn&& fn) {
+    // When in a multi-document transaction, allow getting routing info from the
+    // CatalogCache even though locks may be held. The CatalogCache will throw
+    // CannotRefreshDueToLocksHeld if the entry is not already cached.
+    const auto allowLocks =
+        opCtx->inMultiDocumentTransaction() && shard_role_details::getLocker(opCtx)->isLocked();
+    RoutingContext routingCtx(opCtx, nssList, allowLocks);
+    return runAndValidate(routingCtx, std::forward<Fn>(fn));
+}
+
+/*
+ * Construct a RoutingContext directly from a pre-computed map of nss->CollectionRoutingInfo pairs,
+ * run the callback, and check that all acquired routing tables were validated against a shard.
+ */
+template <class Fn>
+auto withValidatedRoutingContext(
+    OperationContext* opCtx,
+    const stdx::unordered_map<NamespaceString, CollectionRoutingInfo>& nssToCriMap,
+    Fn&& fn) {
+    RoutingContext routingCtx(opCtx, nssToCriMap);
+    return runAndValidate(routingCtx, std::forward<Fn>(fn));
+}
+}  // namespace routing_context_utils
+}  // namespace mongo

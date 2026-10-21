@@ -1,0 +1,131 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/util/modules.h"
+
+namespace mongo {
+namespace resharding_metrics {
+namespace field_names {
+
+constexpr auto kType = "type";
+constexpr auto kDescription = "desc";
+constexpr auto kNamespace = "ns";
+constexpr auto kOp = "op";
+constexpr auto kOriginatingCommand = "originatingCommand";
+constexpr auto kOpTimeElapsed = "totalOperationTimeElapsedSecs";
+constexpr auto kRemainingOpTimeEstimated = "remainingOperationTimeEstimatedSecs";
+constexpr auto kCountWritesToStashCollections = "countWritesToStashCollections";
+constexpr auto kCountWritesDuringCriticalSection = "countWritesDuringCriticalSection";
+constexpr auto kCountReadsDuringCriticalSection = "countReadsDuringCriticalSection";
+constexpr auto kCoordinatorState = "coordinatorState";
+constexpr auto kDonorState = "donorState";
+constexpr auto kRecipientState = "recipientState";
+constexpr auto kAllShardsLowestRemainingOperationTimeEstimatedSecs =
+    "allShardsLowestRemainingOperationTimeEstimatedSecs";
+constexpr auto kAllShardsHighestRemainingOperationTimeEstimatedSecs =
+    "allShardsHighestRemainingOperationTimeEstimatedSecs";
+
+constexpr auto kApproxDocumentsToCopy = "approxDocumentsToCopy";
+constexpr auto kApproxBytesToCopy = "approxBytesToCopy";
+constexpr auto kDocumentsCopied = "documentsCopied";
+constexpr auto kBytesCopied = "bytesCopied";
+
+constexpr auto kIsSameKeyResharding = "isSameKeyResharding";
+constexpr auto kIndexesToBuild = "indexesToBuild";
+constexpr auto kIndexesBuilt = "indexesBuilt";
+constexpr auto kIndexBuildTimeElapsed = "indexBuildTimeElapsedSecs";
+
+constexpr auto kOplogEntriesFetched = "oplogEntriesFetched";
+constexpr auto kOplogEntriesApplied = "oplogEntriesApplied";
+constexpr auto kInsertsApplied = "insertsApplied";
+constexpr auto kUpdatesApplied = "updatesApplied";
+constexpr auto kDeletesApplied = "deletesApplied";
+
+constexpr auto kCountStarted = "countStarted";
+constexpr auto kCountSucceeded = "countSucceeded";
+constexpr auto kCountFailed = "countFailed";
+constexpr auto kCountCanceled = "countCanceled";
+constexpr auto kCountSameKeyStarted = "countSameKeyStarted";
+constexpr auto kCountSameKeySucceeded = "countSameKeySucceeded";
+constexpr auto kCountSameKeyFailed = "countSameKeyFailed";
+constexpr auto kCountSameKeyCanceled = "countSameKeyCanceled";
+constexpr auto kCountSearchIndexAborts = "countSearchIndexAborts";
+
+constexpr auto kLastOpEndingChunkImbalance = "lastOpEndingChunkImbalance";
+constexpr auto kCoordinatorAllShardsLowestRemainingOperationTimeEstimatedMillis =
+    "coordinatorAllShardsLowestRemainingOperationTimeEstimatedMillis";
+constexpr auto kCoordinatorAllShardsHighestRemainingOperationTimeEstimatedMillis =
+    "coordinatorAllShardsHighestRemainingOperationTimeEstimatedMillis";
+constexpr auto kRecipientRemainingOperationTimeEstimatedMillis =
+    "recipientRemainingOperationTimeEstimatedMillis";
+constexpr auto kCollectionCloningTotalRemoteBatchRetrievalTimeMillis =
+    "collectionCloningTotalRemoteBatchRetrievalTimeMillis";
+constexpr auto kCollectionCloningTotalRemoteBatchesRetrieved =
+    "collectionCloningTotalRemoteBatchesRetrieved";
+constexpr auto kCollectionCloningTotalLocalInsertTimeMillis =
+    "collectionCloningTotalLocalInsertTimeMillis";
+constexpr auto kCollectionCloningTotalLocalInserts = "collectionCloningTotalLocalInserts";
+
+constexpr auto kOplogFetchingTotalRemoteBatchRetrievalTimeMillis =
+    "oplogFetchingTotalRemoteBatchRetrievalTimeMillis";
+constexpr auto kOplogFetchingTotalRemoteBatchesRetrieved =
+    "oplogFetchingTotalRemoteBatchesRetrieved";
+constexpr auto kOplogFetchingTotalLocalInsertTimeMillis = "oplogFetchingTotalLocalInsertTimeMillis";
+constexpr auto kOplogFetchingTotalLocalInserts = "oplogFetchingTotalLocalInserts";
+constexpr auto kOplogApplyingTotalLocalBatchRetrievalTimeMillis =
+    "oplogApplyingTotalLocalBatchRetrievalTimeMillis";
+constexpr auto kOplogApplyingTotalLocalBatchesRetrieved = "oplogApplyingTotalLocalBatchesRetrieved";
+constexpr auto kOplogApplyingTotalLocalBatchApplyTimeMillis =
+    "oplogApplyingTotalLocalBatchApplyTimeMillis";
+constexpr auto kOplogApplyingTotalLocalBatchesApplied = "oplogApplyingTotalLocalBatchesApplied";
+
+// Change stream monitor metrics (donors and recipients).
+constexpr auto kChangeStreamMonitorLagSecs = "changeStreamMonitorLagSecs";
+// Donor-specific: time from when the donor entered "blocking-writes" until the change stream
+// monitor completed.
+constexpr auto kBlockingWritesToMonitorCompletionSecs = "blockingWritesToMonitorCompletionSecs";
+// Recipient-specific: time from when the recipient entered "strict-consistency" until the change
+// stream monitor completed.
+constexpr auto kStrictConsistencyToMonitorCompletionSecs =
+    "strictConsistencyToMonitorCompletionSecs";
+
+// Cumulative verification metrics — pre-apply (cloning) and pre-commit (final) tracked separately.
+constexpr auto kCountPreApplyVerificationSucceeded = "countPreApplyVerificationSucceeded";
+constexpr auto kCountPreApplyVerificationFailed = "countPreApplyVerificationFailed";
+constexpr auto kCountPreApplyVerificationSkipped = "countPreApplyVerificationSkipped";
+constexpr auto kCountPreApplyVerificationTimedOut = "countPreApplyVerificationTimedOut";
+constexpr auto kCountPreApplyVerificationRetried = "countPreApplyVerificationRetried";
+constexpr auto kCountPreCommitVerificationSucceeded = "countPreCommitVerificationSucceeded";
+constexpr auto kCountPreCommitVerificationFailed = "countPreCommitVerificationFailed";
+constexpr auto kCountPreCommitVerificationSkipped = "countPreCommitVerificationSkipped";
+constexpr auto kCountPreCommitVerificationTimedOut = "countPreCommitVerificationTimedOut";
+constexpr auto kCountPreCommitDonorVerificationRetried = "countPreCommitDonorVerificationRetried";
+constexpr auto kCountPreCommitRecipientVerificationRetried =
+    "countPreCommitRecipientVerificationRetried";
+
+// serverStatus oldestActive diagnostic fields (milliseconds, role-prefixed).
+// Donor fields.
+constexpr auto kDonorChangeStreamMonitorLagMillis = "donorChangeStreamMonitorLagMillis";
+constexpr auto kDonorBlockingWritesToMonitorCompletionMillis =
+    "donorBlockingWritesToMonitorCompletionMillis";
+constexpr auto kDonorChangeStreamMonitorTotalTimeElapsedMillis =
+    "donorChangeStreamMonitorTotalTimeElapsedMillis";
+// Recipient fields.
+constexpr auto kRecipientChangeStreamMonitorLagMillis = "recipientChangeStreamMonitorLagMillis";
+constexpr auto kRecipientStrictConsistencyToMonitorCompletionMillis =
+    "recipientStrictConsistencyToMonitorCompletionMillis";
+constexpr auto kRecipientChangeStreamMonitorTotalTimeElapsedMillis =
+    "recipientChangeStreamMonitorTotalTimeElapsedMillis";
+// Coordinator fields.
+constexpr auto kCoordinatorDonorCloneCountFetchTimeElapsedMillis =
+    "coordinatorDonorCloneCountFetchTimeElapsedMillis";
+constexpr auto kCoordinatorVerificationPreApplyingTimeElapsedMillis =
+    "coordinatorVerificationPreApplyingTimeElapsedMillis";
+constexpr auto kCoordinatorVerificationPreCommitTimeElapsedMillis =
+    "coordinatorVerificationPreCommitTimeElapsedMillis";
+
+}  // namespace field_names
+}  // namespace resharding_metrics
+}  // namespace mongo

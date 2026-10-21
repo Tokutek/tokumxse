@@ -1,0 +1,187 @@
+/**
+ * Test releaseMemory command for cursors with sort stages.
+ * @tags: [
+ *   assumes_read_preference_unchanged,
+ *   assumes_superuser_permissions,
+ *   does_not_support_transactions,
+ *   not_allowed_with_signed_security_token,
+ *   requires_fcv_83,
+ *   requires_getmore,
+ *   uses_getmore_outside_of_transaction,
+ *   # This test relies on query commands returning specific batch-sized responses.
+ *   assumes_no_implicit_cursor_exhaustion,
+ *   # This test sets a server parameter via setParameterOnAllNonConfigNodes. To keep the host list
+ *   # consistent, no add/remove shard operations should occur during the test.
+ *   assumes_stable_shard_list,
+ * ]
+ */
+
+import {
+    accumulateServerStatusMetric,
+    assertReleaseMemoryFailedWithCode,
+    runReleaseMemoryTestWithRetries,
+    setAvailableDiskSpaceMode,
+} from "jstests/libs/release_memory_util.js";
+import {setParameterOnAllNonConfigNodes} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
+import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
+
+function getServerParameter(knob) {
+    return assert.commandWorked(db.adminCommand({getParameter: 1, [knob]: 1}))[knob];
+}
+
+function setServerParameter(knob, value) {
+    setParameterOnAllNonConfigNodes(db.getMongo(), knob, value);
+}
+
+const sortMemoryLimitKnob = "internalQueryMaxBlockingSortMemoryUsageBytes";
+
+db.dropDatabase();
+const coll = db[jsTestName()];
+
+// The SBE plan cache only needs to be cleared explicitly when SBE is fully enabled (see the clear
+// below); under the classic engine the test must keep its original behavior so it still exercises
+// the classic plan cache.
+const sbeFullyEnabled = checkSbeFullyEnabled(db);
+
+function getSortSpillCounter() {
+    return accumulateServerStatusMetric(db, (metrics) => metrics.query.sort.spillToDisk);
+}
+
+const kDocCount = 40;
+for (let i = 0; i < kDocCount; ++i) {
+    assert.commandWorked(coll.insertOne({index: i, padding: "X".repeat(1024 * 1024)}));
+}
+
+function assertCursorSortedByIndex(cursor) {
+    for (let i = 0; i < kDocCount; ++i) {
+        const doc = cursor.next();
+        assert.eq(doc.index, i);
+    }
+    assert.eq(cursor.hasNext(), false);
+}
+
+// Some background queries can use $group and classic $group uses sorter to spill, so this
+// background spills can affect server status metrics.
+const classicGroupIncreasedSpillingKnob = "internalQueryEnableAggressiveSpillsInGroup";
+const classicGroupIncreasedSpillingInitialValue = getServerParameter(
+    classicGroupIncreasedSpillingKnob,
+);
+setServerParameter(classicGroupIncreasedSpillingKnob, false);
+
+const pipelines = [
+    [
+        {$sort: {index: 1, padding: 1}}, // Will be pushed down to find.
+        {$project: {padding: 0}}, // Secondary sort on padding prevents projection pushdown.
+    ],
+    [
+        {
+            $_internalInhibitOptimization: {},
+        }, // Prevents $sort pushdown to find, allowing to test DocumentSourceSort.
+        {$sort: {index: 1, padding: 1}},
+        {$project: {padding: 0}}, // Secondary sort on padding prevents projection pushdown.
+    ],
+    [
+        {$sort: {index: 1, padding: 1}}, // Will be pushed down to find.
+        {$project: {padding: 0}}, // Secondary sort on padding prevents projection pushdown.
+        {$_internalInhibitOptimization: {}}, // Prevents the pipeline from being eliminated.
+    ],
+];
+
+for (let pipeline of pipelines) {
+    jsTest.log.info("Testing pipeline: ", pipeline);
+
+    // Verify that a full aggregate without releaseMemory does not spill. Wrapped in retries
+    // because background $group operations (which use the sorter) can increment the sort spill
+    // counter and cause false failures, especially in slow builds like TSAN.
+    runReleaseMemoryTestWithRetries(() => {
+        let previousSpillCount = getSortSpillCounter();
+        assertCursorSortedByIndex(coll.aggregate(pipeline));
+        assert.eq(previousSpillCount, getSortSpillCounter());
+    });
+
+    // Verify that releaseMemory spills the cursor's sort data. Each sub-test reads its own
+    // baseline to avoid cross-contamination from background spill activity.
+    runReleaseMemoryTestWithRetries(() => {
+        let previousSpillCount = getSortSpillCounter();
+
+        const cursor = coll.aggregate(pipeline, {cursor: {batchSize: 1}});
+        const cursorId = cursor.getId();
+        assert.eq(previousSpillCount, getSortSpillCounter());
+
+        const releaseMemoryRes = db.runCommand({releaseMemory: [cursorId]});
+        assert.commandWorked(releaseMemoryRes);
+        assert.eq(releaseMemoryRes.cursorsReleased, [cursorId], releaseMemoryRes);
+        assert.lt(previousSpillCount, getSortSpillCounter());
+
+        assertCursorSortedByIndex(cursor);
+    });
+
+    {
+        const cursor = coll.aggregate(pipeline, {cursor: {batchSize: 1}, allowDiskUse: false});
+        const cursorId = cursor.getId();
+
+        const releaseMemoryRes = db.runCommand({releaseMemory: [cursorId]});
+        assert.commandWorked(releaseMemoryRes);
+        assertReleaseMemoryFailedWithCode(releaseMemoryRes, cursorId, [
+            ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed,
+            ErrorCodes.ReleaseMemoryShardError,
+        ]);
+
+        assertCursorSortedByIndex(cursor);
+    }
+
+    // Verify behavior with a reduced sort memory limit. Use try-finally to guarantee the limit
+    // is restored even if an assertion fails inside the block.
+    {
+        const originalKnobValue = getServerParameter(sortMemoryLimitKnob);
+        setServerParameter(sortMemoryLimitKnob, 5 * 1024 * 1024);
+        // TODO SERVER-67035: Remove this explicit plan cache clear once 'featureFlagSbeFull' is removed.
+        // Under SBE full, changing the sort memory limit no longer implicitly clears the SBE plan
+        // cache, so clear it explicitly to force a replan with the new limit (otherwise a cached plan
+        // built with the previous limit would be reused and would not spill). Gated on SBE full so we
+        // don't mask classic plan cache behavior.
+        if (sbeFullyEnabled) {
+            coll.getPlanCache().clear();
+        }
+        try {
+            runReleaseMemoryTestWithRetries(() => {
+                let previousSpillCount = getSortSpillCounter();
+
+                const cursor = coll.aggregate(pipeline, {cursor: {batchSize: 1}});
+                const cursorId = cursor.getId();
+                assert.lt(previousSpillCount, getSortSpillCounter());
+                previousSpillCount = getSortSpillCounter();
+
+                const releaseMemoryRes = db.runCommand({releaseMemory: [cursorId]});
+                assert.commandWorked(releaseMemoryRes);
+                assert.eq(releaseMemoryRes.cursorsReleased, [cursorId], releaseMemoryRes);
+                assert.eq(previousSpillCount, getSortSpillCounter());
+
+                assertCursorSortedByIndex(cursor);
+            });
+        } finally {
+            setServerParameter(sortMemoryLimitKnob, originalKnobValue);
+        }
+    }
+
+    // No disk space available for spilling.
+    {
+        jsTest.log(`Running releaseMemory with no disk space available`);
+        const cursor = coll.aggregate(pipeline, {"allowDiskUse": true, cursor: {batchSize: 1}});
+        const cursorId = cursor.getId();
+
+        // Release memory (i.e., spill)
+        setAvailableDiskSpaceMode(db.getSiblingDB("admin"), "alwaysOn");
+        const releaseMemoryCmd = {releaseMemory: [cursorId]};
+        jsTest.log.info("Running releaseMemory: ", releaseMemoryCmd);
+        const releaseMemoryRes = db.runCommand(releaseMemoryCmd);
+        assert.commandWorked(releaseMemoryRes);
+        assertReleaseMemoryFailedWithCode(releaseMemoryRes, cursorId, ErrorCodes.OutOfDiskSpace);
+        setAvailableDiskSpaceMode(db.getSiblingDB("admin"), "off");
+
+        jsTest.log.info("Running getMore");
+        assert.throwsWithCode(() => cursor.toArray(), ErrorCodes.CursorNotFound);
+    }
+}
+
+setServerParameter(classicGroupIncreasedSpillingKnob, classicGroupIncreasedSpillingInitialValue);

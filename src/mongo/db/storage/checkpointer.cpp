@@ -1,0 +1,191 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/db/storage/checkpointer.h"
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_enabled.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+
+#include <chrono>
+#include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
+namespace mongo {
+
+namespace {
+
+const auto getCheckpointer = ServiceContext::declareDecoration<std::unique_ptr<Checkpointer>>();
+
+MONGO_FAIL_POINT_DEFINE(pauseCheckpointThread);
+
+}  // namespace
+
+Checkpointer* Checkpointer::get(ServiceContext* serviceCtx) {
+    return getCheckpointer(serviceCtx).get();
+}
+
+Checkpointer* Checkpointer::get(OperationContext* opCtx) {
+    return get(opCtx->getServiceContext());
+}
+
+void Checkpointer::set(ServiceContext* serviceCtx, std::unique_ptr<Checkpointer> newCheckpointer) {
+    auto& checkpointer = getCheckpointer(serviceCtx);
+    if (checkpointer) {
+        invariant(!checkpointer->running(),
+                  "Tried to reset the Checkpointer without shutting down the original instance.");
+    }
+    checkpointer = std::move(newCheckpointer);
+}
+
+void Checkpointer::run() {
+    ThreadClient tc(
+        name(), getGlobalServiceContext()->getService(), ClientOperationKillableByStepdown{false});
+    LOGV2_DEBUG(22307, 1, "Starting thread", "threadName"_attr = name());
+
+    while (true) {
+        auto opCtx = tc->makeOperationContext();
+
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+
+            // Delegate the wait logic to the injected policy.
+            _policy->waitUntilReady(lock, _sleepCV, [&] {
+                return _shuttingDown || _triggerCheckpoint || _pauseRequested;
+            });
+
+            if (_shuttingDown) {
+                invariant(!_shutdownReason.isOK());
+                LOGV2_DEBUG(22309,
+                            1,
+                            "Stopping thread",
+                            "threadName"_attr = name(),
+                            "reason"_attr = _shutdownReason);
+                return;
+            }
+
+            if (_pauseRequested) {
+                // Don't allow checkpointer thread to run until resumeCheckpointing() is
+                // called.
+                _isPaused = true;
+                _waitForPauseCV.notify_all();
+                LOGV2(12887901,
+                      "Checkpointer thread is now blocked waiting for the first checkpoint to be "
+                      "taken after step-up.");
+                _sleepCV.wait(lock, [&] { return !_pauseRequested || _shuttingDown; });
+                _isPaused = false;
+                continue;
+            }
+
+            // Clear the trigger so we do not immediately checkpoint again after this.
+            _triggerCheckpoint = false;
+        }
+
+        pauseCheckpointThread.pauseWhileSet();
+
+        const Date_t startTime = Date_t::now();
+
+        opCtx->getServiceContext()->getStorageEngine()->checkpoint();
+
+        if (isReplicatedFastCountEnabled(opCtx.get())) {
+            replicated_fast_count::ReplicatedFastCountManager::get(opCtx->getServiceContext())
+                .flushAsync();
+        }
+
+        const auto secondsElapsed = durationCount<Seconds>(Date_t::now() - startTime);
+        if (secondsElapsed >= 30) {
+            LOGV2_DEBUG(22308,
+                        1,
+                        "Checkpoint was slow to complete",
+                        "secondsElapsed"_attr = secondsElapsed);
+        }
+    }
+}
+
+void Checkpointer::pauseCheckpointing() {
+    LOGV2(12887900, "Blocking checkpoint thread until the first checkpoint is taken after step-up");
+    std::unique_lock<std::mutex> lock(_mutex);
+    _pauseRequested = true;
+    _sleepCV.notify_one();
+    // A checkpointer thread cannot progress until resume is called.
+    _waitForPauseCV.wait(lock, [&] { return _isPaused || _shuttingDown; });
+}
+
+void Checkpointer::resumeCheckpointing() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _pauseRequested = false;
+    _sleepCV.notify_one();
+}
+
+bool Checkpointer::isPauseRequested() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _pauseRequested;
+}
+
+void Checkpointer::triggerFirstStableCheckpoint(Timestamp prevStable,
+                                                Timestamp initialData,
+                                                Timestamp currStable) {
+    std::unique_lock<std::mutex> lock(_mutex);
+    invariant(!_hasTriggeredFirstStableCheckpoint);
+    if (prevStable < initialData && currStable >= initialData) {
+        LOGV2(22310,
+              "Triggering the first stable checkpoint",
+              "initialDataTimestamp"_attr = initialData,
+              "prevStableTimestamp"_attr = prevStable,
+              "currStableTimestamp"_attr = currStable);
+        _hasTriggeredFirstStableCheckpoint = true;
+        _triggerCheckpoint = true;
+        _sleepCV.notify_one();
+    }
+}
+
+bool Checkpointer::hasTriggeredFirstStableCheckpoint() {
+    std::unique_lock<std::mutex> lock(_mutex);
+    return _hasTriggeredFirstStableCheckpoint;
+}
+
+void Checkpointer::shutdown(const Status& reason) {
+    LOGV2(22322, "Shutting down checkpoint thread");
+
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _shuttingDown = true;
+        _shutdownReason = reason;
+
+        // Wake up the checkpoint thread early, to take a final checkpoint before shutting down, if
+        // one has not coincidentally just been taken.
+        _sleepCV.notify_one();
+        // Also wake any thread blocked in pauseCheckpointing() since it blocks on a separate CV
+        // which includes _shuttingDown, so it would otherwise miss this state change and hang.
+        _waitForPauseCV.notify_all();
+    }
+
+    wait();
+    LOGV2(22323, "Finished shutting down checkpoint thread");
+}
+
+void Checkpointer::notifyOplogWrite(int64_t bytes) {
+    // accumulateOplogBytes() is lock-free. Returns true only the first time accumulated bytes
+    // cross the threshold in a given checkpoint cycle; notify_one() wakes Phase 2.
+    if (_policy->accumulateOplogBytes(bytes)) {
+        _sleepCV.notify_one();
+    }
+}
+
+}  // namespace mongo

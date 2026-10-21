@@ -1,0 +1,144 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "cluster_find_util",
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/auth:authprivilege",
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/pipeline:aggregation_request_helper",
+        "//src/mongo/db/pipeline/process_interface:mongo_process_interface",
+        "//src/mongo/db/query/query_settings",
+        "//src/mongo/s/query/planner:cluster_aggregate",
+    ],
+)
+
+mongo_cc_library(
+    name = "jparse_util",
+    srcs = [
+        "jparse_util.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/query/datetime:date_time_support",
+    ],
+)
+
+mongo_cc_library(
+    name = "query_string_util",
+    srcs = [
+        "string_util.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "throughput_gauge",
+    srcs = [
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "stop_token",
+    srcs = [
+    ],
+)
+
+mongo_cc_library(
+    name = "validate_id",
+    srcs = [
+        "validate_id.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "field_set",
+    srcs = [
+        "field_set.cpp",
+    ],
+    hdrs = [
+        "field_set.h",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "query_util_bitset",
+    srcs = [
+    ],
+    hdrs = [
+        "bitset_util.h",
+    ],
+)
+
+mongo_cc_library(
+    name = "represent_as_util",
+    hdrs = [
+        "represent_as_util.h",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "query_util_disjoint_set",
+    srcs = [
+        "disjoint_set.cpp",
+    ],
+    hdrs = [
+        "disjoint_set.h",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "query_util_test",
+    srcs = [
+        "bitset_util_test.cpp",
+        "cartesian_product_test.cpp",
+        "deferred_test.cpp",
+        "disjoint_set_test.cpp",
+        "hash_roaring_set_test.cpp",
+        "jparse_util_test.cpp",
+        "memory_util_test.cpp",
+        "named_enum_test.cpp",
+        "retry_test.cpp",
+        "scoped_timer_metric_test.cpp",
+        "stop_token_test.cpp",
+        "string_util_test.cpp",
+        "throughput_gauge_test.cpp",
+        "validate_id_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_third_group",
+    ],
+    deps = [
+        ":jparse_util",
+        ":query_util_bitset",
+        ":query_util_disjoint_set",
+        ":throughput_gauge",
+        "//src/mongo/db:query_exec",
+        "//src/mongo/util:clock_source_mock",
+    ],
+)

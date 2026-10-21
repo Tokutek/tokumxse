@@ -1,0 +1,713 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/commands.h"
+
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/authorization_backend_interface.h"
+#include "mongo/db/auth/authorization_backend_mock.h"
+#include "mongo/db/auth/authorization_client_handle_shard.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_factory_mock.h"
+#include "mongo/db/auth/authorization_manager_impl.h"
+#include "mongo/db/auth/authorization_router_impl.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/auth/user.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/commands_test_example.h"
+#include "mongo/db/commands_test_example_gen.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/service_entry_point_shard_role.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/otel/traces/sampler/sampler.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_mock.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/sockaddr.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+
+using service_context_test::RoleOverride;
+using service_context_test::ServerRoleIndex;
+
+TEST(Commands, CommandNameAtom) {
+    CommandNameAtom foo("foo"sv), bar("bar"sv), baz("baz"sv), foo2("foo"sv), baz2("baz"sv),
+        bar2("bar"sv);
+
+    ASSERT_EQ(foo, foo2);
+    ASSERT_EQ(bar, bar2);
+    ASSERT_EQ(baz, baz2);
+    ASSERT_LT(foo, bar);
+    ASSERT_LT(foo, baz);
+    ASSERT_LT(bar, baz);
+}
+
+TEST(Commands, appendCommandStatusOK) {
+    BSONObjBuilder actualResult;
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, Status::OK());
+
+    BSONObjBuilder expectedResult;
+    expectedResult.append("ok", 1.0);
+
+    ASSERT_BSONOBJ_EQ(actualResult.obj(), expectedResult.obj());
+}
+
+TEST(Commands, appendCommandStatusError) {
+    BSONObjBuilder actualResult;
+    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
+
+    BSONObjBuilder expectedResult;
+    expectedResult.append("ok", 0.0);
+    expectedResult.append("errmsg", status.reason());
+    expectedResult.append("code", status.code());
+    expectedResult.append("codeName", ErrorCodes::errorString(status.code()));
+
+    ASSERT_BSONOBJ_EQ(actualResult.obj(), expectedResult.obj());
+}
+
+TEST(Commands, appendCommandStatusNoOverwrite) {
+    BSONObjBuilder actualResult;
+    actualResult.append("a", "b");
+    actualResult.append("c", "d");
+    actualResult.append("ok", 0.0);
+    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
+
+    BSONObjBuilder expectedResult;
+    expectedResult.append("a", "b");
+    expectedResult.append("c", "d");
+    expectedResult.append("ok", 0.0);
+    expectedResult.append("errmsg", status.reason());
+    expectedResult.append("code", status.code());
+    expectedResult.append("codeName", ErrorCodes::errorString(status.code()));
+
+    ASSERT_BSONOBJ_EQ(actualResult.obj(), expectedResult.obj());
+}
+
+TEST(Commands, appendCommandStatusErrorExtraInfo) {
+    BSONObjBuilder actualResult;
+    const Status status(ErrorExtraInfoExample(123), "not again!");
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
+
+    BSONObjBuilder expectedResult;
+    expectedResult.append("ok", 0.0);
+    expectedResult.append("errmsg", status.reason());
+    expectedResult.append("code", status.code());
+    expectedResult.append("codeName", ErrorCodes::errorString(status.code()));
+    expectedResult.append("data", 123);
+
+    ASSERT_BSONOBJ_EQ(actualResult.obj(), expectedResult.obj());
+}
+
+DEATH_TEST(CommandsDeathTest, appendCommandStatusInvalidOkValue, "invariant") {
+    BSONObjBuilder actualResult;
+    actualResult.append("a", "b");
+    actualResult.append("c", "d");
+    actualResult.append("ok", "yes");
+    const Status status(ErrorCodes::InvalidLength, "fake error for test");
+
+    // An "ok" value other than 1.0 or 0.0 is not allowed and should crash.
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
+}
+
+DEATH_TEST(CommandsDeathTest, appendCommandStatusNoCodeName, "invariant") {
+    BSONObjBuilder actualResult;
+    actualResult.append("a", "b");
+    actualResult.append("code", ErrorCodes::InvalidLength);
+    actualResult.append("ok", 1.0);
+    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
+
+    // If the result already has an error code, we don't move any code or codeName over from the
+    // status. Therefore, if the result has an error code but no codeName, we're missing a
+    // required field and should crash.
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
+}
+
+TEST(ParseNamespaceFromCommand, String) {
+    EXPECT_EQ(CommandHelpers::parseNsFromCommand(
+                  DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                  BSON("command" << "coll")),
+              NamespaceString::createNamespaceString_forTest("test.coll"));
+}
+
+TEST(ParseNamespaceFromCommand, Symbol) {
+    BSONObjBuilder builder;
+    builder.appendSymbol("command", "coll");
+    EXPECT_EQ(CommandHelpers::parseNsFromCommand(
+                  DatabaseName::createDatabaseName_forTest(boost::none, "test"), builder.obj()),
+              NamespaceString::createNamespaceString_forTest("test.coll"));
+}
+
+TEST(ParseNamespaceFromCommand, OtherTypes) {
+    auto dbName = DatabaseName::createDatabaseName_forTest(boost::none, "test");
+    EXPECT_EQ(CommandHelpers::parseNsFromCommand(dbName, BSON("command" << 1)),
+              NamespaceString{dbName});
+    EXPECT_EQ(CommandHelpers::parseNsFromCommand(dbName, BSON("command" << BSONObj())),
+              NamespaceString{dbName});
+}
+
+class ParseNsOrUUID : public ServiceContextTest {
+public:
+    ParseNsOrUUID() : opCtxPtr(makeOperationContext()), opCtx(opCtxPtr.get()) {}
+    ServiceContext::UniqueOperationContext opCtxPtr;
+    OperationContext* opCtx;
+};
+
+TEST_F(ParseNsOrUUID, FailWrongType) {
+    auto cmd = BSON("query" << BSON("a" << BSON("$gte" << 11)));
+    ASSERT_THROWS_CODE(CommandHelpers::parseNsOrUUID(
+                           DatabaseName::createDatabaseName_forTest(boost::none, "db"), cmd),
+                       DBException,
+                       ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ParseNsOrUUID, FailEmptyDbName) {
+    auto cmd = BSON("query" << "coll");
+    ASSERT_THROWS_CODE(CommandHelpers::parseNsOrUUID(DatabaseName(), cmd),
+                       DBException,
+                       ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ParseNsOrUUID, FailInvalidDbName) {
+    auto cmd = BSON("query" << "coll");
+    ASSERT_THROWS_CODE(CommandHelpers::parseNsOrUUID(
+                           DatabaseName::createDatabaseName_forTest(boost::none, "test.coll"), cmd),
+                       DBException,
+                       ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ParseNsOrUUID, FailInvalidCollectionNameContainsDollar) {
+    auto cmd = BSON("query" << "$coll");
+    ASSERT_THROWS_CODE(CommandHelpers::parseNsOrUUID(
+                           DatabaseName::createDatabaseName_forTest(boost::none, "test"), cmd),
+                       DBException,
+                       ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ParseNsOrUUID, ParseValidColl) {
+    auto cmd = BSON("query" << "coll");
+    auto parsedNss = CommandHelpers::parseNsOrUUID(
+        DatabaseName::createDatabaseName_forTest(boost::none, "test"), cmd);
+    ASSERT_EQ(parsedNss.nss(), NamespaceString::createNamespaceString_forTest("test.coll"));
+}
+
+TEST_F(ParseNsOrUUID, ParseValidCollLocalOpLogDollarMain) {
+    auto cmd = BSON("query" << "oplog.$main");
+    auto parsedNss = CommandHelpers::parseNsOrUUID(
+        DatabaseName::createDatabaseName_forTest(
+            boost::none, NamespaceString::kLocalOplogDollarMain.db(omitTenant)),
+        cmd);
+    ASSERT_EQ(parsedNss.nss(), NamespaceString::kLocalOplogDollarMain);
+}
+
+TEST_F(ParseNsOrUUID, ParseValidUUID) {
+    const UUID uuid = UUID::gen();
+    auto cmd = BSON("query" << uuid);
+    auto parsedNsOrUUID = CommandHelpers::parseNsOrUUID(
+        DatabaseName::createDatabaseName_forTest(boost::none, "test"), cmd);
+    ASSERT_EQUALS(uuid, parsedNsOrUUID.uuid());
+}
+
+MONGO_REGISTER_COMMAND(commands_test_example::ExampleIncrementCommand).forShard();
+
+MONGO_REGISTER_COMMAND(commands_test_example::ExampleMinimalCommand).forShard();
+
+MONGO_REGISTER_COMMAND(commands_test_example::ExampleVoidCommand).forShard();
+
+MONGO_REGISTER_COMMAND(commands_test_example::ThrowsStatusCommand).forShard();
+
+MONGO_REGISTER_COMMAND(commands_test_example::UnauthorizedCommand).forShard();
+
+class TypedCommandTest : public ServiceContextMongoDTest {
+public:
+    void setUp() override {
+        ServiceContextMongoDTest::setUp();
+
+        // Setup the repl coordinator in standalone mode so we don't need an oplog etc.
+        repl::ReplicationCoordinator::set(getServiceContext(),
+                                          std::make_unique<repl::ReplicationCoordinatorMock>(
+                                              getServiceContext(), repl::ReplSettings()));
+
+        // Set up the auth subsystem to authorize the command.
+        _mockBackend = reinterpret_cast<auth::AuthorizationBackendMock*>(
+            auth::AuthorizationBackendInterface::get(getService()));
+        AuthorizationManager::get(getServiceContext()->getService())->setAuthEnabled(true);
+
+        _session = _transportLayer.createSession();
+        _client = getServiceContext()->getService()->makeClient("testClient", _session);
+        _registry = getCommandRegistry(_client->getService());
+        _authzSession = AuthorizationSession::get(_client.get());
+
+        // Insert a user document that will represent the user used for running the commands.
+        auto credentials =
+            BSON("SCRAM-SHA-1" << scram::Secrets<SHA1Block>::generateCredentials(
+                                      "a", saslGlobalParams.scramSHA1IterationCount.load())
+                               << "SCRAM-SHA-256"
+                               << scram::Secrets<SHA256Block>::generateCredentials(
+                                      "a", saslGlobalParams.scramSHA256IterationCount.load()));
+
+        BSONObj userDoc = BSON("_id"sv << "test.varun"sv
+                                       << "user"sv
+                                       << "varun"
+                                       << "db"sv
+                                       << "test"
+                                       << "credentials"sv << credentials << "roles"sv
+                                       << BSON_ARRAY(BSON("role"sv << "readWrite"sv
+                                                                   << "db"sv
+                                                                   << "test"sv)));
+
+        auto opCtx = _client->makeOperationContext();
+        ASSERT_OK(_mockBackend->insertUserDocument(opCtx.get(), userDoc, {}));
+    }
+
+    template <typename ConcreteCommand>
+    auto& fetchCommandAs(std::string_view name) {
+        return *dynamic_cast<ConcreteCommand*>(_registry->findCommand(name));
+    }
+
+    auto& throwsStatusCommand() {
+        return fetchCommandAs<commands_test_example::ThrowsStatusCommand>("throwsStatus");
+    }
+
+    auto& unauthorizedCommand() {
+        return fetchCommandAs<commands_test_example::UnauthorizedCommand>("unauthorizedCmd");
+    }
+
+    auto& exampleIncrementCommand() {
+        return fetchCommandAs<commands_test_example::ExampleIncrementCommand>("exampleIncrement");
+    }
+
+    auto& exampleMinimalCommand() {
+        return fetchCommandAs<commands_test_example::ExampleMinimalCommand>("exampleMinimal");
+    }
+
+    auto& exampleVoidCommand() {
+        return fetchCommandAs<commands_test_example::ExampleVoidCommand>("exampleVoid");
+    }
+
+protected:
+    TypedCommandTest() : ServiceContextMongoDTest(Options{}.useMockClock(true)) {}
+
+    ClockSourceMock* clockSource() {
+        return static_cast<ClockSourceMock*>(getServiceContext()->getFastClockSource());
+    }
+
+    template <typename T>
+    void runIncr(T& command, std::function<void(int, const BSONObj&)> postAssert) {
+        const NamespaceString ns = NamespaceString::createNamespaceString_forTest("testdb.coll");
+
+        for (std::int32_t i : {123, 12345, 0, -456}) {
+            const OpMsgRequest request = [&] {
+                typename T::Request incr(ns);
+                incr.setI(i);
+                incr.setDbName(ns.dbName());
+                return incr.serialize();
+            }();
+
+            auto opCtx = _client->makeOperationContext();
+            auto invocation = command.parse(opCtx.get(), request);
+
+            ASSERT_EQ(invocation->ns(), ns);
+
+            const BSONObj reply = [&] {
+                rpc::OpMsgReplyBuilder replyBuilder;
+                try {
+                    invocation->checkAuthorization(opCtx.get(), request);
+                    invocation->run(opCtx.get(), &replyBuilder);
+                    auto bob = replyBuilder.getBodyBuilder();
+                    CommandHelpers::extractOrAppendOk(bob);
+                } catch (const DBException& e) {
+                    auto bob = replyBuilder.getBodyBuilder();
+                    CommandHelpers::appendCommandStatusNoThrow(bob, e.toStatus());
+                }
+                return replyBuilder.releaseBody();
+            }();
+
+            postAssert(i, reply);
+        }
+    }
+
+protected:
+    auth::AuthorizationBackendMock* _mockBackend;
+    transport::TransportLayerMock _transportLayer;
+    std::shared_ptr<transport::Session> _session;
+    ServiceContext::UniqueClient _client;
+    AuthorizationSession* _authzSession;
+    CommandRegistry* _registry;
+};
+
+const UserName kVarunTest("varun", "test");
+
+TEST_F(TypedCommandTest, runTyped) {
+    {
+        auto opCtx = _client->makeOperationContext();
+        ASSERT_OK(_authzSession->addAndAuthorizeUser(
+            opCtx.get(),
+            std::make_unique<UserRequestGeneral>(kVarunTest, boost::none),
+            boost::none));
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(exampleIncrementCommand(), [](int i, const BSONObj& reply) {
+        ASSERT_EQ(reply["ok"].Double(), 1.0);
+        ASSERT_EQ(reply["iPlusOne"].Int(), i + 1);
+    });
+}
+
+TEST_F(TypedCommandTest, runMinimal) {
+    {
+        auto opCtx = _client->makeOperationContext();
+        ASSERT_OK(_authzSession->addAndAuthorizeUser(
+            opCtx.get(),
+            std::make_unique<UserRequestGeneral>(kVarunTest, boost::none),
+            boost::none));
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(exampleMinimalCommand(), [](int i, const BSONObj& reply) {
+        ASSERT_EQ(reply["ok"].Double(), 1.0);
+        ASSERT_EQ(reply["iPlusOne"].Int(), i + 1);
+    });
+}
+
+TEST_F(TypedCommandTest, runVoid) {
+    {
+        auto opCtx = _client->makeOperationContext();
+        ASSERT_OK(_authzSession->addAndAuthorizeUser(
+            opCtx.get(),
+            std::make_unique<UserRequestGeneral>(kVarunTest, boost::none),
+            boost::none));
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(exampleVoidCommand(), [&](int i, const BSONObj& reply) {
+        ASSERT_EQ(reply["ok"].Double(), 1.0);
+        ASSERT_EQ(exampleVoidCommand().iCapture, i + 1);
+    });
+}
+
+TEST_F(TypedCommandTest, runThrowStatus) {
+    {
+        auto opCtx = _client->makeOperationContext();
+        ASSERT_OK(_authzSession->addAndAuthorizeUser(
+            opCtx.get(),
+            std::make_unique<UserRequestGeneral>(kVarunTest, boost::none),
+            boost::none));
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(throwsStatusCommand(), [](int i, const BSONObj& reply) {
+        Status status = Status::OK();
+        try {
+            uasserted(ErrorCodes::UnknownError, "some error");
+        } catch (const DBException& e) {
+            status = e.toStatus();
+        }
+        ASSERT_EQ(reply["ok"].Double(), 0.0);
+        ASSERT_EQ(reply["errmsg"].String(), status.reason());
+        ASSERT_EQ(reply["code"].Int(), status.code());
+        ASSERT_EQ(reply["codeName"].String(), ErrorCodes::errorString(status.code()));
+    });
+}
+
+TEST_F(TypedCommandTest, runThrowDoCheckAuthorization) {
+    {
+        auto opCtx = _client->makeOperationContext();
+        ASSERT_OK(_authzSession->addAndAuthorizeUser(
+            opCtx.get(),
+            std::make_unique<UserRequestGeneral>(kVarunTest, boost::none),
+            boost::none));
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(unauthorizedCommand(), [](int i, const BSONObj& reply) {
+        Status status = Status::OK();
+        try {
+            uasserted(ErrorCodes::Unauthorized, "Not authorized");
+        } catch (const DBException& e) {
+            status = e.toStatus();
+        }
+        ASSERT_EQ(reply["ok"].Double(), 0.0);
+        ASSERT_EQ(reply["code"].Int(), status.code());
+        ASSERT_EQ(reply["codeName"].String(), ErrorCodes::errorString(status.code()));
+    });
+}
+
+TEST_F(TypedCommandTest, runThrowNoUserAuthenticated) {
+    {
+        // Don't authenticate any users.
+        auto opCtx = _client->makeOperationContext();
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(exampleIncrementCommand(), [](int i, const BSONObj& reply) {
+        ASSERT_EQ(reply["ok"].Double(), 0.0);
+        ASSERT_EQ(reply["errmsg"].String(),
+                  str::stream() << "Command exampleIncrement requires authentication");
+        ASSERT_EQ(reply["code"].Int(), ErrorCodes::Unauthorized);
+        ASSERT_EQ(reply["codeName"].String(), ErrorCodes::errorString(ErrorCodes::Unauthorized));
+    });
+}
+
+TEST_F(TypedCommandTest, runThrowAuthzSessionExpired) {
+    {
+        // Load user into the authorization session and then expire it.
+        auto opCtx = _client->makeOperationContext();
+        auto expirationTime = clockSource()->now() + Hours{1};
+        ASSERT_OK(_authzSession->addAndAuthorizeUser(
+            opCtx.get(),
+            std::make_unique<UserRequestGeneral>(kVarunTest, boost::none),
+            expirationTime));
+
+        // Fast-forward time before starting a new request.
+        clockSource()->advance(Hours(2));
+        _authzSession->startRequest(opCtx.get());
+    }
+
+    runIncr(exampleIncrementCommand(), [](int i, const BSONObj& reply) {
+        ASSERT_EQ(reply["ok"].Double(), 0.0);
+        ASSERT_EQ(
+            reply["errmsg"].String(),
+            str::stream() << "Command exampleIncrement requires reauthentication since the current "
+                             "authorization session has expired. Please re-auth.");
+        ASSERT_EQ(reply["code"].Int(), ErrorCodes::ReauthenticationRequired);
+        ASSERT_EQ(reply["codeName"].String(),
+                  ErrorCodes::errorString(ErrorCodes::ReauthenticationRequired));
+    });
+}
+
+/** Support the tests' need to make "throwaway" command registrations. */
+template <int n>
+class TrivialNopCommand : public BasicCommand {
+    static int nextSerial() {
+        static int serial = 0;
+        return ++serial;
+    }
+
+    static std::string makeName() {
+        return fmt::format("trivialNopCommand_{}_{}", n, nextSerial());
+    }
+
+public:
+    TrivialNopCommand() : BasicCommand{makeName()} {}
+    bool run(OperationContext*, const DatabaseName&, const BSONObj&, BSONObjBuilder&) override {
+        return true;
+    }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return true;
+    }
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
+};
+
+using TypeInfoSet = std::set<const std::type_info*>;
+
+TypeInfoSet getPlanEntryTypes(CommandConstructionPlan& plan) {
+    TypeInfoSet res;
+    for (const auto& e : plan.entries())
+        ASSERT_TRUE(res.insert(e->typeInfo).second);
+    return res;
+}
+
+TypeInfoSet getCommandTypes(const CommandRegistry& reg) {
+    TypeInfoSet res;
+    reg.forEachCommand([&](Command* cmd) { ASSERT_TRUE(res.insert(&typeid(*cmd)).second); });
+    return res;
+}
+
+class CommandConstructionPlanTest : public unittest::Test {
+public:
+    /**
+     * Populates `plan` with `count` registrations of generated Command types.
+     * Returns a set of the typeids of the Commands that were registered, which
+     * tests can use to make expectations.
+     */
+    template <size_t count>
+    TypeInfoSet registerSomeUniqueNops(CommandConstructionPlan& plan) {
+        TypeInfoSet typesAdded;
+        auto populateOneCommand = [&]<typename Cmd>(std::type_identity<Cmd>) {
+            *CommandConstructionPlan::EntryBuilder::make<Cmd>().setPlan_forTest(&plan);
+            typesAdded.insert(&typeid(Cmd));
+        };
+        [&]<int... i>(std::integer_sequence<int, i...>) {
+            (populateOneCommand(std::type_identity<TrivialNopCommand<i>>{}), ...);
+        }(std::make_integer_sequence<int, count>{});
+        return typesAdded;
+    }
+};
+
+TEST_F(CommandConstructionPlanTest, BuildPlan) {
+    CommandConstructionPlan plan;
+    auto fullSet = registerSomeUniqueNops<2>(plan);
+    ASSERT_EQ(getPlanEntryTypes(plan), fullSet);
+}
+
+TEST_F(CommandConstructionPlanTest, ExecutePlanPredicateTrue) {
+    CommandConstructionPlan plan;
+    auto fullSet = registerSomeUniqueNops<2>(plan);
+    CommandRegistry reg;
+    plan.execute(&reg, nullptr, [](auto&&) { return true; });
+    ASSERT_EQ(getCommandTypes(reg), fullSet);
+}
+
+TEST_F(CommandConstructionPlanTest, ExecutePlanPredicateFalse) {
+    CommandConstructionPlan plan;
+    auto fullSet = registerSomeUniqueNops<2>(plan);
+    CommandRegistry reg;
+    plan.execute(&reg, nullptr, [](auto&&) { return false; });
+    ASSERT_EQ(getCommandTypes(reg), TypeInfoSet{});
+}
+
+/** Create a ServiceContext for each supported ClusterRole mask. */
+class BasicCommandRegistryTest : public ServiceContextTest {
+public:
+    struct ExecutePlanForServiceResult {
+        TypeInfoSet fullSet;
+        TypeInfoSet commandTypes;
+    };
+
+    virtual ClusterRole serverRole() const = 0;
+
+    TypeInfoSet initPlan(CommandConstructionPlan& plan) {
+        TypeInfoSet typesAdded;
+        // Populate plan with a few commands, each configured for `serverRole()`.
+        auto populateOneCommand = [&]<typename Cmd>(std::type_identity<Cmd>) {
+            *CommandConstructionPlan::EntryBuilder::make<Cmd>()
+                 .addRoles(serverRole())
+                 .setPlan_forTest(&plan);
+            typesAdded.insert(&typeid(Cmd));
+        };
+        [&]<int... i>(std::integer_sequence<int, i...>) {
+            (populateOneCommand(std::type_identity<TrivialNopCommand<i>>{}), ...);
+        }(std::make_integer_sequence<int, 3>{});
+        return typesAdded;
+    }
+
+    TypeInfoSet getCommandsForRole(const CommandConstructionPlan& plan, ClusterRole role) {
+        Service* service = getServiceContext()->getService();
+        if (!service)
+            return {};
+        invariant(service->role().hasExclusively(role));
+        CommandRegistry reg;
+        plan.execute(&reg, service);
+        return getCommandTypes(reg);
+    }
+
+    ExecutePlanForServiceResult testExecutePlanForService(ClusterRole sourceServiceRole) {
+        ExecutePlanForServiceResult result;
+        CommandConstructionPlan plan;
+        result.fullSet = initPlan(plan);
+        result.commandTypes = getCommandsForRole(plan, sourceServiceRole);
+        return result;
+    }
+};
+
+/**
+ * Because ServiceContextTestSetup is a virtual base, its constructor happens
+ * before an ordinary generated test class constructor can intervene.
+ * To get ahead of it, we virtually inherit a `RoleOverride` to run first.
+ */
+template <ServerRoleIndex roleIndex>
+class CommandRegistryTest : public virtual RoleOverride<roleIndex>,
+                            public BasicCommandRegistryTest {
+public:
+    ClusterRole serverRole() const override {
+        return getClusterRole(roleIndex);
+    }
+};
+
+using RouterCommandRegistryTest = CommandRegistryTest<ServerRoleIndex::router>;
+
+TEST_F(RouterCommandRegistryTest, ServicesInit) {
+    auto sc = getGlobalServiceContext();
+    ASSERT(!sc->getService()->role().has(ClusterRole::ShardServer));
+    ASSERT(sc->getService()->role().has(ClusterRole::RouterServer));
+}
+
+TEST_F(RouterCommandRegistryTest, ExecutePlanForService) {
+    auto result = testExecutePlanForService(ClusterRole::RouterServer);
+    ASSERT_EQ(result.commandTypes, result.fullSet);
+}
+
+/**
+ * Check that all mongos commands are sampled by default, as a proxy for the entry points of sharded
+ * operations.
+ */
+TEST(Commands, AllRouterCommandsSampledByDefault) {
+    auto& sampler = otel::traces::TracingSampler::get();
+
+    auto savedConfig = sampler.getConfig();
+    ScopeGuard restoreConfig([&] {
+        sampler.updateInternalConfig(savedConfig.defaultSpans, savedConfig.perSpanOverrides);
+    });
+    sampler.updateInternalConfig(
+        {.factor = 1.0, .rateLimits = {.refillRate = 1e6, .maxTokens = 1'000'000}}, {});
+
+    auto* registry = getCommandRegistry(ClusterRole::RouterServer);
+
+    std::vector<std::string> checkedCommands;
+    registry->forEachCommand([&](Command* c) {
+        const auto& spanName = c->getTraceSpanName();
+        ASSERT_TRUE(sampler.shouldSample(spanName.getName(), 0))
+            << "command should be sampled: " << c->getName();
+        checkedCommands.push_back(c->getName());
+    });
+    ASSERT_GT(checkedCommands.size(), 0u);
+}
+
+using ShardCommandRegistryTest = CommandRegistryTest<ServerRoleIndex::shard>;
+
+TEST_F(ShardCommandRegistryTest, ServicesInit) {
+    auto sc = getGlobalServiceContext();
+    ASSERT(sc->getService()->role().has(ClusterRole::ShardServer));
+    ASSERT(!sc->getService()->role().has(ClusterRole::RouterServer));
+}
+
+TEST_F(ShardCommandRegistryTest, ShardExecutePlanForService) {
+    auto result = testExecutePlanForService(ClusterRole::ShardServer);
+    ASSERT_EQ(result.commandTypes, result.fullSet);
+}
+
+}  // namespace
+}  // namespace mongo

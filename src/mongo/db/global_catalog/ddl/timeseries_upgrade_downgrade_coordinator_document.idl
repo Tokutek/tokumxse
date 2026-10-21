@@ -1,0 +1,47 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# TODO (SERVER-116499): Remove this file once 9.0 becomes last LTS.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/global_catalog/type_collection.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+enums:
+    TimeseriesUpgradeDowngradeCoordinatorPhase:
+        description: "Phases of the timeseries upgrade/downgrade coordinator."
+        type: string
+        values:
+            kUnset: "unset"
+            kFreezeMigrations: "freezeMigrations"
+            kAcquireCriticalSection: "acquireCriticalSection"
+            kPrepareOnShards: "prepareOnShards"
+            kCommitOnShards: "commitOnShards"
+            kCommitOnGlobalCatalog: "commitOnGlobalCatalog"
+            kCommitOnShardCatalog: "commitOnShardCatalog"
+            kReleaseCriticalSection: "releaseCriticalSection"
+            kResumeMigrations: "resumeMigrations"
+
+structs:
+    TimeseriesUpgradeDowngradeCoordinatorDocument:
+        description: "Coordinator document for upgrading/downgrading timeseries collections between viewless and legacy formats."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            TimeseriesUpgradeDowngradeRequest: TimeseriesUpgradeDowngradeRequest
+        fields:
+            phase:
+                type: TimeseriesUpgradeDowngradeCoordinatorPhase
+                default: kUnset
+            optTrackedCollInfo:
+                type: CollectionType
+                description: "The collection entry from config.collections if the collection is tracked"
+                optional: true

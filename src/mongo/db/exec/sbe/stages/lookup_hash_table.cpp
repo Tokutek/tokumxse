@@ -1,0 +1,433 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/stages/lookup_hash_table.h"
+
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/spill_util.h"
+#include "mongo/db/storage/storage_options.h"
+
+#include <algorithm>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo::sbe {
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Class LookupHashTableIter
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void LookupHashTableIter::initSearchArray() {
+    tassert(11093505, "Outer key is not an array", _outerKeyIsArray);
+
+    value::ArrayEnumerator enumerator(_outerKey.tag, _outerKey.value);
+    while (!enumerator.atEnd()) {
+        auto elemView = enumerator.getViewOfValue();
+
+        auto hashTableMatchIter = _hashTable._memoryHt->find(elemView);
+        if (hashTableMatchIter != _hashTable._memoryHt->end()) {
+            _hashTableMatchVector.insert(_hashTableMatchVector.end(),
+                                         hashTableMatchIter->second.begin(),
+                                         hashTableMatchIter->second.end());
+        } else if (_hashTable._recordStoreHt) {
+            // The key wasn't in memory. Check the '_hashTable._recordStoreHt' disk spill.
+            auto elemColl = _hashTable.normalizeStringIfCollator(elemView);
+
+            auto indicesFromRS = _hashTable.readIndicesFromRecordStore(
+                _hashTable._recordStoreHt.get(), elemColl.view());
+            if (indicesFromRS) {
+                _hashTableMatchVector.insert(
+                    _hashTableMatchVector.end(), indicesFromRS->begin(), indicesFromRS->end());
+            }
+        }
+        enumerator.advance();
+    }  // while
+
+    // Different array elements (or the memory and disk portions of the hash table) may map to the
+    // same inner buffer index, so duplicates must be removed.
+    std::sort(_hashTableMatchVector.begin(), _hashTableMatchVector.end());
+    _hashTableMatchVector.erase(
+        std::unique(_hashTableMatchVector.begin(), _hashTableMatchVector.end()),
+        _hashTableMatchVector.end());
+
+    _hashTableMatchVectorIdx = 0;
+    _hashTableSearched = true;
+}  // LookupHashTableIter::initSearchArray
+
+void LookupHashTableIter::initSearchScalar() {
+    tassert(11093506, "Outer key is not a scalar", !_outerKeyIsArray);
+
+    auto hashTableMatchIter = _hashTable._memoryHt->find(_outerKey);
+    if (hashTableMatchIter != _hashTable._memoryHt->end()) {
+        _hashTableMatchVector = hashTableMatchIter->second;
+        _hashTableMatchVectorIdx = 0;
+    } else if (_hashTable._recordStoreHt) {
+        // The key wasn't in memory. Check the '_hashTable._recordStoreHt' disk spill.
+        auto keyColl = _hashTable.normalizeStringIfCollator(_outerKey);
+
+        auto indicesFromRS =
+            _hashTable.readIndicesFromRecordStore(_hashTable._recordStoreHt.get(), keyColl.view());
+        if (indicesFromRS) {
+            _hashTableMatchVector = std::move(indicesFromRS.get());
+            _hashTableMatchVectorIdx = 0;
+        }
+    }
+    _hashTableSearched = true;
+}  // LookupHashTableIter::initSearchScalar
+
+size_t LookupHashTableIter::getNextMatchingIndex() {
+    // Iterator over matches of an individual outer key value in '_hashTable->_memoryHt'.
+    if (MONGO_unlikely(!_hashTableSearched)) {
+        // This is the first time we are looking for this outer key. Build a sorted, de-duplicated
+        // vector of all inner matches, if any, for the outer key (scalar or array).
+        if (_outerKeyIsArray) {
+            initSearchArray();
+        } else {
+            initSearchScalar();
+        }
+    }
+
+    // Return the next match, if any.
+    if (_hashTableMatchVectorIdx < _hashTableMatchVector.size()) {
+        return _hashTableMatchVector[_hashTableMatchVectorIdx++];
+    } else {
+        return kNoMatchingIndex;
+    }
+}  // LookupHashTableIter::getNextMatchingValue
+
+void LookupHashTableIter::reset(value::TagValueView outerKey) {
+    clear();
+    _outerKey = outerKey;
+    _outerKeyIsArray = value::isArray(_outerKey.tag);
+}  // LookupHashTableIter::reset
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Class LookupHashTable
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+value::TagValueMaybeOwned LookupHashTable::normalizeStringIfCollator(
+    value::TagValueView key) const {
+    if (value::isString(key.tag) && _collator) {
+        auto [tagColl, valColl] = value::makeNewString(
+            _collator->getComparisonKey(value::getStringView(key.tag, key.value)).getKeyData());
+        return {true, tagColl, valColl};
+    }
+    return value::TagValueMaybeOwned{key};
+}
+
+bool LookupHashTable::shouldCheckDiskSpace() {
+    long long currentTotalSpilledBytes = _hashLookupStats.spillingBuffStats.getSpilledBytes() +
+        _hashLookupStats.spillingHtStats.getSpilledBytes();
+    _spilledBytesSinceLastCheck += currentTotalSpilledBytes - _totalSpilledBytes;
+    _totalSpilledBytes = currentTotalSpilledBytes;
+
+    if (_spilledBytesSinceLastCheck > kMaxSpilledBytesForDiskSpaceCheck) {
+        _spilledBytesSinceLastCheck = 0;
+    }
+
+    return _spilledBytesSinceLastCheck == 0;
+}
+
+boost::optional<RecordIndexCollection> LookupHashTable::readIndicesFromRecordStore(
+    SpillingStore* rs, value::TagValueView key) {
+
+    auto [rid, _] = serializeKeyForRecordStore(key);
+    RecordData record;
+    if (rs->findRecord(_opCtx, rid, &record)) {
+        // 'BufBuilder' writes numbers in little endian format, so must read them using the same.
+        auto valueReader = BufReader(record.data(), record.size());
+        auto nRecords = valueReader.read<LittleEndian<size_t>>();
+        RecordIndexCollection result(nRecords);
+        for (size_t i = 0; i < nRecords; ++i) {
+            auto idx = valueReader.read<LittleEndian<size_t>>();
+            result[i] = idx;
+        }
+        return result;
+    }
+    return boost::none;
+}
+
+void LookupHashTable::addHashTableEntry(value::SlotAccessor* keyAccessor, size_t valueIndex) {
+    // Adds a new key-value entry. Will attempt to move or copy from key accessor when needed.
+    // array case each elem in array we put each element into ht.
+    auto keyView = keyAccessor->getViewOfValue();
+
+    // Check to see if key is already in memory. If not, we will emplace a new key or spill to disk.
+    auto htIt = _memoryHt->find(keyView);
+    if (htIt == _memoryHt->end()) {
+        // If the key and one 'size_t' index fit into the '_memoryHt' without reaching the memory
+        // limit and we haven't spilled yet emplace into '_memoryHt'. Otherwise, we will always
+        // spill the key to the record store. The additional guard !hasSpilledHtToDisk() ensures
+        // that a key that is evicted from '_memoryHt' never ends in '_memoryHt' again.
+        const long long newMemUsage = _computedTotalMemUsage +
+            size_estimator::estimate(keyView.tag, keyView.value) + sizeof(size_t);
+
+        if (!hasSpilledHtToDisk() && newMemUsage <= _memoryUseInBytesBeforeSpill) {
+            // We have to insert an owned key, attempt a move, but force copy if necessary when we
+            // haven't spilled to the '_recordStore' yet.
+            value::FixedSizeRow<1 /*N*/> key{1};
+            key.reset(0, keyAccessor->getCopyOfValue());
+
+            auto [it, inserted] = _memoryHt->try_emplace(std::move(key));
+            tassert(11094720,
+                    "Failed to emplace materialized key into the hash table (key already exists)",
+                    inserted);
+            htIt = it;
+            htIt->second.push_back(valueIndex);
+            _computedTotalMemUsage = newMemUsage;
+        } else {
+            // Write record to rs.
+            if (!hasSpilledHtToDisk()) {
+                makeInternalRecordStore();
+            }
+
+            auto val = RecordIndexCollection{valueIndex};
+            spillIndicesToRecordStore(_recordStoreHt.get(), keyView, val);
+        }
+    } else {
+        // The key is already present in '_memoryHt' so the memory will only grow by one size_t. If
+        // we reach the memory limit, the key/value in '_memoryHt' will be evicted from memory and
+        // spilled to '_recordStoreHt' along with the new index.
+        htIt->second.push_back(valueIndex);
+        _computedTotalMemUsage += sizeof(size_t);
+        if (_computedTotalMemUsage > _memoryUseInBytesBeforeSpill) {
+            if (!hasSpilledHtToDisk()) {
+                makeInternalRecordStore();
+            }
+
+            _computedTotalMemUsage -= size_estimator::estimate(keyView.tag, keyView.value);
+
+            // Evict the hash table value.
+            _computedTotalMemUsage -= htIt->second.size() * sizeof(size_t);
+            spillIndicesToRecordStore(_recordStoreHt.get(), keyView, htIt->second);
+            _memoryHt->erase(htIt);
+        }
+    }
+    _hashLookupStats.peakTrackedMemBytes = std::max(_hashLookupStats.peakTrackedMemBytes,
+                                                    static_cast<uint64_t>(_computedTotalMemUsage));
+}  // LookupHashTable::addHashTableEntry
+
+void LookupHashTable::spillBufferedValueToDisk(SpillingStore* rs,
+                                               size_t bufferIdx,
+                                               const value::FixedSizeRow<1 /*N*/>& val) {
+    // Ensure there is sufficient disk space for spilling
+    if (shouldCheckDiskSpace()) {
+        uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+            storageGlobalParams.dbpath,
+            static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load())));
+    }
+
+    RecordId rid = getValueRecordId(bufferIdx);
+
+    BufBuilder buf;
+    val.serializeForSorter(buf);
+
+    rs->upsertToRecordStore(_opCtx, rid, buf, false);
+
+    // Add size of record ID + size of buffer.
+    int64_t spillToDiskBytes = sizeof(size_t) + buf.len();
+
+    auto& opDebug = CurOp::get(_opCtx)->debug();
+    opDebug.hashLookupSpillToDisk += 1;
+    opDebug.hashLookupSpillToDiskBytes += spillToDiskBytes;
+
+    auto spilledDataStorageIncrease = _hashLookupStats.spillingBuffStats.updateSpillingStats(
+        1, spillToDiskBytes, 1, _recordStoreBuf->storageSize(_opCtx));
+    lookupPushdownCounters.incrementPerSpilling(
+        1 /* spills */, spillToDiskBytes, 1, spilledDataStorageIncrease);
+    _recordStoreBuf->updateSpillStorageStatsForOperation(_opCtx);
+}
+
+size_t LookupHashTable::bufferValueOrSpill(value::FixedSizeRow<1 /*N*/>& value) {
+    const long long newMemUsage = _computedTotalMemUsage + size_estimator::estimate(value);
+    if (!hasSpilledBufToDisk() && newMemUsage <= _memoryUseInBytesBeforeSpill) {
+        _buffer.emplace_back(std::move(value));
+        _computedTotalMemUsage = newMemUsage;
+        _hashLookupStats.peakTrackedMemBytes = std::max(
+            _hashLookupStats.peakTrackedMemBytes, static_cast<uint64_t>(_computedTotalMemUsage));
+    } else {
+        if (!hasSpilledBufToDisk()) {
+            makeInternalRecordStore();
+        }
+        spillBufferedValueToDisk(_recordStoreBuf.get(), _valueId, value);
+    }
+    return _valueId++;
+}
+
+int64_t LookupHashTable::writeIndicesToRecordStore(SpillingStore* rs,
+                                                   value::TagValueView key,
+                                                   const RecordIndexCollection& value,
+                                                   bool update) {
+    BufBuilder buf;
+    buf.appendNum(value.size());  // number of indices
+    for (auto& idx : value) {
+        buf.appendNum(static_cast<size_t>(idx));
+    }
+
+    auto [rid, typeBits] = serializeKeyForRecordStore(key);
+
+    rs->upsertToRecordStore(_opCtx, rid, buf, typeBits, update);
+
+    int64_t spilledBytes = value.size() * sizeof(size_t);
+    if (!update) {
+        // Add the size of key (which comprises of the memory usage for the key + its type bits),
+        // as well as the size of one integer to store the length of indices vector in the value.
+        spilledBytes += rid.memUsage() + typeBits.getSize() + sizeof(size_t);
+    }
+    // Add the size of indices vector used in the hash-table value to the accounting.
+    return spilledBytes;
+}
+
+void LookupHashTable::spillIndicesToRecordStore(SpillingStore* rs,
+                                                value::TagValueView key,
+                                                const RecordIndexCollection& value) {
+    // Ensure there is sufficient disk space for spilling
+    if (shouldCheckDiskSpace()) {
+        uassertStatusOK(ensureSufficientDiskSpaceForSpilling(
+            storageGlobalParams.dbpath,
+            static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load())));
+    }
+
+    auto keyColl = normalizeStringIfCollator(key);
+    auto valFromRs = readIndicesFromRecordStore(rs, keyColl.view());
+
+    auto update = false;
+    int64_t alreadySpilledBytes = 0;
+    if (valFromRs) {
+        alreadySpilledBytes = valFromRs->size() * sizeof(size_t);
+        valFromRs->insert(valFromRs->end(), value.begin(), value.end());
+        update = true;
+    } else {
+        valFromRs = value;
+    }
+
+    auto spillToDiskBytes = writeIndicesToRecordStore(rs, keyColl.view(), *valFromRs, update);
+
+    tassert(9956400,
+            str::stream() << "Total spilled to disk bytes " << spillToDiskBytes
+                          << " is smaller than already existing bytes on disk "
+                          << alreadySpilledBytes,
+            spillToDiskBytes >= alreadySpilledBytes);
+    spillToDiskBytes -= alreadySpilledBytes;
+
+    auto& opDebug = CurOp::get(_opCtx)->debug();
+    opDebug.hashLookupSpillToDisk += 1;
+    opDebug.hashLookupSpillToDiskBytes += spillToDiskBytes;
+
+    auto spilledDataStorageIncrease = _hashLookupStats.spillingHtStats.updateSpillingStats(
+        1 /*spills*/, spillToDiskBytes, update ? 0 : 1, _recordStoreHt->storageSize(_opCtx));
+    lookupPushdownCounters.incrementPerSpilling(
+        1 /* spills */, spillToDiskBytes, update ? 0 : 1, spilledDataStorageIncrease);
+    _recordStoreHt->updateSpillStorageStatsForOperation(_opCtx);
+}
+
+void LookupHashTable::makeInternalRecordStore() {
+    tassert(8229808,
+            "HashLookupUnwindStage attempted to write to disk in an environment which is not "
+            "prepared to do so",
+            _opCtx->getServiceContext());
+    tassert(8229809,
+            "No storage engine so HashLookupUnwindStage cannot spill to disk",
+            _opCtx->getServiceContext()->getStorageEngine());
+    assertIgnorePrepareConflictsBehavior(_opCtx);
+
+    _recordStoreBuf = std::make_unique<SpillingStore>(_opCtx, KeyFormat::Long);
+    _recordStoreHt = std::make_unique<SpillingStore>(_opCtx, KeyFormat::String);
+    _hashLookupStats.usedDisk = true;
+}
+
+std::pair<RecordId, key_string::TypeBits> LookupHashTable::serializeKeyForRecordStore(
+    value::TagValueView key) const {
+    key_string::Builder kb{key_string::Version::kLatestVersion};
+    value::FixedSizeRow<1 /*N*/> row{};
+    row.reset(0, key);
+    return encodeKeyString(kb, row);
+}
+
+boost::optional<value::TagValueView> LookupHashTable::getValueAtIndex(size_t index) {
+    if (index < _buffer.size()) {
+        // Document is in memory buffer, always in column 0.
+        return _buffer[index].getViewOfValue(0);
+    } else if (_recordStoreBuf) {
+        // Document is in disk buffer, always in column 0. The FixedSizeRow<1 /*N*/> object
+        // constructed from this must be copied to a place that does not go out of scope when this
+        // method returns, for which we use '_bufValueRecordStore'.
+        _bufValueRecordStore =
+            _recordStoreBuf->readFromRecordStore(_opCtx, LookupHashTable::getValueRecordId(index));
+        if (_bufValueRecordStore) {
+            return _bufValueRecordStore->getViewOfValue(0);
+        }
+    }
+    tasserted(8229807,
+              str::stream() << "index " << index
+                            << " not found in hash table store."
+                               " _buffer.size(): "
+                            << _buffer.size() << ", _recordStoreBuf "
+                            << (_recordStoreBuf ? "exists." : "does not exist."));
+    return boost::none;
+}  // HashLookupUnwindStage::getValueAtIndex
+
+void LookupHashTable::reset(bool fromClose) {
+    _memoryHt = boost::none;
+    _computedTotalMemUsage = 0;
+
+    if (_recordStoreHt) {
+        if (_opCtx) {
+            _hashLookupStats.spillingHtStats.updateSpilledDataStorageSize(
+                _recordStoreHt->storageSize(_opCtx));
+        }
+        _recordStoreHt.reset(nullptr);
+    }
+    if (_recordStoreBuf) {
+        if (_opCtx) {
+            _hashLookupStats.spillingBuffStats.updateSpilledDataStorageSize(
+                _recordStoreBuf->storageSize(_opCtx));
+        }
+        _recordStoreBuf.reset(nullptr);
+    }
+
+    // Erase but don't change its reference, as 'HashLookupStage::_outInnerBufferProjectAccessor'
+    // contain a reference to this buffer.
+    _buffer.clear();
+    if (fromClose) {
+        _buffer.shrink_to_fit();
+    }
+
+    _valueId = 0;
+    htIter.clear();
+
+    _spilledBytesSinceLastCheck = 0;
+    _totalSpilledBytes = 0;
+}
+
+void LookupHashTable::forceSpill() {
+    if (!_memoryHt) {
+        LOGV2_DEBUG(9916001, 2, "HashLookupStage has finished its execution");
+        return;
+    }
+
+    if (!hasSpilledHtToDisk()) {
+        makeInternalRecordStore();
+    }
+
+    // Every record in the buffer of the inner collection is assigned an index. This index is
+    // used to associate records of the inner collection to those of the outer collection. When
+    // a buffer record is spilled, the index is stored with it. Since the index is increasing as
+    // we read, the first record still in the buffer has index 0.
+    for (size_t spilledValueId = 0; spilledValueId < _buffer.size(); ++spilledValueId) {
+        spillBufferedValueToDisk(_recordStoreBuf.get(), spilledValueId, _buffer[spilledValueId]);
+    }
+    _buffer.clear();
+    _buffer.shrink_to_fit();
+
+    for (const auto& [key, value] : *_memoryHt) {
+        spillIndicesToRecordStore(_recordStoreHt.get(), key.getViewOfValue(0), value);
+    }
+    _memoryHt.reset();
+    _computedTotalMemUsage = 0;
+
+    // Initialise the _memoryHt again to make sure it is valid;
+    init();
+}
+}  // namespace mongo::sbe

@@ -1,112 +1,218 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/platform/basic.h"
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/plan_yield_policy.h"
 
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/query_knobs.h"
-#include "mongo/db/query/query_yield.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/yieldable.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    PlanYieldPolicy::PlanYieldPolicy(PlanExecutor* exec, PlanExecutor::YieldPolicy policy)
-        : _policy(policy),
-          _forceYield(false),
-          _elapsedTracker(internalQueryExecYieldIterations, internalQueryExecYieldPeriodMS),
-          _planYielding(exec) { }
+namespace {
+MONGO_FAIL_POINT_DEFINE(setPreYieldWait);
+MONGO_FAIL_POINT_DEFINE(setPreYieldWaitDeferred);
+}  // namespace
 
-    bool PlanYieldPolicy::shouldYield() {
-        if (!allowedToYield()) return false;
-        invariant(!_planYielding->getOpCtx()->lockState()->inAWriteUnitOfWork());
-        if (_forceYield) return true;
+PlanYieldPolicy::PlanYieldPolicy(OperationContext* opCtx,
+                                 YieldPolicy policy,
+                                 ClockSource* cs,
+                                 int yieldIterations,
+                                 Milliseconds yieldPeriod,
+                                 std::unique_ptr<const YieldPolicyCallbacks> callbacks)
+    : _policy(getPolicyOverrideForOperation(opCtx, policy)),
+      _callbacks(std::move(callbacks)),
+      _elapsedTracker(cs, yieldIterations, yieldPeriod),
+      _fastClock(&opCtx->fastClockSource()) {
+    // If 'internalQueryExecYieldIterations' is the default value, we will only reply on time period
+    // to check for yielding, so we can avoid do the check for every iteration instead do the check
+    // every half of the period.
+    _yieldIntervalMs = internalQueryExecYieldIterations.load() == -1
+        ? internalQueryExecYieldPeriodMS.load() / 2
+        : -1;
+}
+
+PlanYieldPolicy::YieldPolicy PlanYieldPolicy::getPolicyOverrideForOperation(
+    OperationContext* opCtx, PlanYieldPolicy::YieldPolicy desired) {
+    // We may have a null opCtx in testing.
+    if (MONGO_unlikely(!opCtx)) {
+        return desired;
+    }
+    // Multi-document transactions cannot yield locks or snapshots. We convert to a non-yielding
+    // interruptible plan.
+    if (opCtx->inMultiDocumentTransaction() &&
+        (desired == YieldPolicy::YIELD_AUTO || desired == YieldPolicy::YIELD_MANUAL ||
+         desired == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY)) {
+        return YieldPolicy::INTERRUPT_ONLY;
+    }
+
+    // If the state of our locks held is not yieldable at all, we will assume this is an internal
+    // operation that will not yield.
+    if (!shard_role_details::getLocker(opCtx)->canSaveLockState() &&
+        (desired == YieldPolicy::YIELD_AUTO || desired == YieldPolicy::YIELD_MANUAL)) {
+        return YieldPolicy::INTERRUPT_ONLY;
+    }
+
+    return desired;
+}
+
+bool PlanYieldPolicy::doShouldYieldOrInterrupt(OperationContext* opCtx) {
+    if (_policy == YieldPolicy::INTERRUPT_ONLY) {
         return _elapsedTracker.intervalHasElapsed();
     }
+    if (!canAutoYield())
+        return false;
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
+    if (_forceYield)
+        return true;
+    return _elapsedTracker.intervalHasElapsed();
+}
 
-    void PlanYieldPolicy::resetTimer() {
-        _elapsedTracker.resetLastTime();
+void PlanYieldPolicy::resetTimer() {
+    _elapsedTracker.resetLastTime();
+}
+
+Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
+                                         const std::function<void()>& whileYieldingFn,
+                                         RestoreContext::RestoreType restoreType,
+                                         const std::function<void()>& afterSnapshotAbandonFn) {
+    tassert(11321328, "opCtx must not be null", opCtx);
+    setPreYieldWait.executeIf(
+        [&](const BSONObj& data) {
+            if (auto e = data["waitForMillis"]; !e.eoo()) {
+                sleepFor(Milliseconds(e.numberInt()));
+            }
+            // Pause after setPreYieldWaitDeferred's skip count is exhausted.
+            setPreYieldWaitDeferred.pauseWhileSet(opCtx);
+        },
+        [&](const BSONObj& config) {
+            if (config.hasField("comment") && opCtx->getComment()) {
+                return opCtx->getComment()->String() == config.getStringField("comment");
+            }
+            return false;
+        });
+
+    // After we finish yielding (or in any early return), call resetTimer() to prevent yielding
+    // again right away. We delay the resetTimer() call so that the clock doesn't start ticking
+    // until after we return from the yield.
+    ON_BLOCK_EXIT([this]() { resetTimer(); });
+
+    if (_policy == YieldPolicy::INTERRUPT_ONLY) {
+        if (_callbacks) {
+            _callbacks->preCheckInterruptOnly(opCtx);
+        }
+        if (Status status = opCtx->checkForInterruptNoAssert(); !status.isOK()) {
+            return status;
+        }
+        // Query-memory load shedding for classic PlanStages and interrupt-only SBE execution.
+        return queryMemoryCheckLoadShedding(opCtx);
     }
 
-    bool PlanYieldPolicy::yield(RecordFetcher* fetcher) {
-        invariant(_planYielding);
-        invariant(allowedToYield());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
-        _forceYield = false;
+    _forceYield = false;
 
-        OperationContext* opCtx = _planYielding->getOpCtx();
-        invariant(opCtx);
-        invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    for (int attempt = 1; true; attempt++) {
+        try {
+            saveState(opCtx);
 
-        // Can't use MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN/END since we need to call saveState
-        // before reseting the transaction.
-        for (int attempt = 1; true; attempt++) {
-            try {
-                // All YIELD_AUTO plans will get here eventually when the elapsed tracker triggers
-                // that it's time to yield. Whether or not we will actually yield, we need to check
-                // if this operation has been interrupted. Throws if the interrupt flag is set.
-                if (_policy == PlanExecutor::YIELD_AUTO) {
-                    opCtx->checkForInterrupt();
+            // TODO SERVER-103267: Remove setAbandonSnapshotMode() and related.
+
+            if (getPolicy() == PlanYieldPolicy::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY) {
+                // This yield policy doesn't release locks, but it does relinquish our storage
+                // snapshot.
+                tassert(11321329,
+                        "Invalid use of YieldPolicy::WRITE_CONFLICT_RETRY_ONLY on lock free reads",
+                        !opCtx->isLockFreeReadsOp());
+                shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+                if (afterSnapshotAbandonFn) {
+                    afterSnapshotAbandonFn();
                 }
-
-                // No need to yield if the collection is NULL.
-                if (NULL == _planYielding->collection()) {
-                    return true;
-                }
-
-                try {
-                    _planYielding->saveState();
-                }
-                catch (const WriteConflictException& wce) {
-                    invariant(!"WriteConflictException not allowed in saveState");
-                }
-
-                if (_policy == PlanExecutor::WRITE_CONFLICT_RETRY_ONLY) {
-                    // Just reset the snapshot. Leave all LockManager locks alone.
-                    opCtx->recoveryUnit()->commitAndRestart();
-                }
-                else {
-                    // Release and reacquire locks.
-                    QueryYield::yieldAllLocks(opCtx, fetcher);
-                }
-
-                return _planYielding->restoreStateWithoutRetrying(opCtx);
+            } else {
+                performYieldWithAcquisitions(opCtx, whileYieldingFn, afterSnapshotAbandonFn);
             }
-            catch (const WriteConflictException& wce) {
-                opCtx->getCurOp()->debug().writeConflicts++;
-                WriteConflictException::logAndBackoff(attempt,
-                                                      "plan execution restoreState",
-                                                      _planYielding->collection()->ns().ns());
-                // retry
-            }
+
+            restoreState(opCtx, nullptr, restoreType);
+            return Status::OK();
+        } catch (const StorageUnavailableException& e) {
+            // Restore '_yieldable' before the retry.
+            logAndRecordWriteConflictAndBackoff(opCtx,
+                                                attempt,
+                                                "query yield",
+                                                e.reason(),
+                                                NamespaceStringOrUUID(NamespaceString::kEmpty));
+            // Retry the yielding process.
+        } catch (...) {
+            // Errors other than write conflicts don't get retried, and should instead result in
+            // the PlanExecutor dying. We propagate all such errors as status codes.
+            return exceptionToStatus();
         }
     }
 
-} // namespace mongo
+    MONGO_UNREACHABLE;
+}
+
+void PlanYieldPolicy::performYieldWithAcquisitions(OperationContext* opCtx,
+                                                   std::function<void()> whileYieldingFn,
+                                                   std::function<void()> afterSnapshotAbandonFn) {
+    // Things have to happen here in a specific order:
+    //   * Remove all references to the CollectionPtrs to avoid holding stale references.
+    //   * Abandon the current storage engine snapshot.
+    //   * Check for interrupt if the yield policy requires.
+    //   * Yield the acquired TransactionResources
+    //   * Restore the yielded TransactionResources
+    tassert(1321331,
+            fmt::format("Unexpected yield policy {} during performYieldWithAcquisitions()",
+                        serializeYieldPolicy(_policy)),
+            canReleaseLocksDuringExecution());
+
+    // Remove stale CollectionPtr references from the acquisitions.
+    auto preparedForYieldToken = prepareForYieldingTransactionResources(opCtx);
+
+    // Release any storage engine resources. This requires holding a global lock to correctly
+    // synchronize with states such as shutdown and rollback.
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+
+    // Check for interrupt before releasing locks. This avoids the complexities of having to
+    // re-acquire locks to clean up when we are interrupted. This is the main interrupt check during
+    // query execution. Yield points and interrupt points are one and the same.
+    if (getPolicy() == PlanYieldPolicy::YieldPolicy::YIELD_AUTO) {
+        opCtx->checkForInterrupt();  // throws
+        // Query-memory load shedding for classic PlanStages and yielding SBE execution.
+        uassertStatusOK(queryMemoryCheckLoadShedding(opCtx));
+    }
+
+    // After we've abandoned our snapshot, perform any work before yielding transaction resources.
+    if (afterSnapshotAbandonFn) {
+        afterSnapshotAbandonFn();
+    }
+
+    auto yieldedTransactionResources =
+        yieldTransactionResourcesFromOperationContext(opCtx, preparedForYieldToken);
+    ScopeGuard yieldFailedScopeGuard(
+        [&] { yieldedTransactionResources.transitionTransactionResourcesToFailedState(opCtx); });
+
+    if (_callbacks) {
+        _callbacks->duringYield(opCtx);
+    }
+
+    if (whileYieldingFn) {
+        whileYieldingFn();
+    }
+
+    yieldFailedScopeGuard.dismiss();
+    restoreTransactionResourcesToOperationContext(opCtx, std::move(yieldedTransactionResources));
+}
+
+}  // namespace mongo

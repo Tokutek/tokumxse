@@ -1,0 +1,75 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.rangeDeletions. Each document
+# represents a chunk range to be deleted by the CollectionRangeDeleter.
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/keypattern.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/global_catalog/chunk_range.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+enums:
+    CleanWhen:
+        mod_visibility: public
+        description: "When to cleanup ranges."
+        type: string
+        values:
+            kNow: "now"
+            kDelayed: "delayed"
+
+structs:
+    rangeDeletionTask:
+        # TODO SERVER-114753: Put all interactions with this on-disk state behind public functions in this module.
+        mod_visibility: needs_replacement
+        description: "Represents a chunk range to be deleted by the range deleter."
+        strict: false
+        fields:
+            _id:
+                type: uuid
+                description: "A unique identifier for the migration."
+                cpp_name: id
+            nss:
+                type: namespacestring
+                description: "The namespace of the collection that the chunk belongs to."
+            collectionUuid:
+                type: uuid
+                description: "The UUID of the collection that the chunk belongs to."
+            donorShardId:
+                type: shard_id
+                description: "The shard from which the chunk was migrated."
+            range:
+                type: chunk_range
+                description: "The range to be deleted."
+            pending:
+                type: bool
+                description: "Flag that is present if the range is not yet ready for deletion"
+                optional: true
+            processing:
+                type: optionalBool
+                description: "Flag that is present if the range is currently being deleted"
+            whenToClean:
+                type: CleanWhen
+                description: "Enumeration that defines when to cleanup the range."
+            timestamp:
+                type: timestamp
+                description: "The timestamp the task was created."
+                optional: true
+            numOrphanDocs:
+                type: safeInt64
+                description: "The estimated number of orphaned documents in the range"
+                default: 0
+            keyPattern:
+                type: KeyPattern
+                description: "The shard key pattern at the moment the range deletion task was created"
+                optional: true
+            preMigrationShardVersion:
+                type: ChunkVersion
+                description: "The shard version prior to the migration that caused this range deletion task."
+                optional: true

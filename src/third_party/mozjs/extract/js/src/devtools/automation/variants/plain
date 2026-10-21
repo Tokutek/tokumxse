@@ -1,0 +1,9 @@
+{
+    "configure-args": "--enable-rust-simd",
+    "optimize": true,
+    "compiler": "gcc",
+    "extra-args": {
+        "jstests": ["--jitflags=jstests", "--run-slow-tests"],
+        "jit-test": ["--slow"]
+    }
+}

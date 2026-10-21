@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    SetMultikeyMetadataOplogEntry:
+        description: "The object field of a setMultikeyMetadata oplog entry"
+        strict: false
+        fields:
+            setMultikeyMetadata:
+                description: "Full namespace of the indexed collection"
+                type: namespacestring
+            idxName:
+                description: "The index name"
+                type: string
+            paths:
+                description: "The to-be-set multikey paths. If empty, it only sets the multikey flag."
+                type: object

@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _configsvrRunRestore:
+        command_name: _configsvrRunRestore
+        cpp_name: ConfigsvrRunRestore
+        description: "The internal _configsvrRunRestore command to restore collection metadata in the config database."
+        namespace: ignored
+        api_version: ""
+        strict: false

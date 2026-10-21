@@ -1,0 +1,845 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/admission/ingress_admission_context.h"
+#include "mongo/db/admission/ingress_request_admission_context.h"
+#include "mongo/db/admission/write_throttler_admission_context.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/operation_context_options_gen.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/storage/execution_context.h"
+#include "mongo/db/storage/prepare_conflict_tracker.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/tick_source_mock.h"
+
+#include <mutex>
+namespace mongo {
+
+namespace {
+
+class CurOpStatsTest : public ServiceContextTest {
+protected:
+    CurOpStatsTest()
+        : ServiceContextTest(
+              std::make_unique<ScopedGlobalServiceContextForTest>(ServiceContext::make(
+                  nullptr, nullptr, std::make_unique<TickSourceMock<Microseconds>>()))) {}
+
+    void advanceTime(Microseconds amount) {
+        tickSource()->advance(amount);
+    }
+
+    TickSourceMock<Microseconds>* tickSource() {
+        return checked_cast<decltype(tickSource())>(getServiceContext()->getTickSource());
+    }
+
+    void updateStatsOnTransactionUnstashWithLock(OperationContext* opCtx, CurOp* curop) {
+        ClientLock lk(opCtx->getClient());
+        curop->updateStatsOnTransactionUnstash(lk);
+    }
+
+    void updateStatsOnTransactionStashWithLock(OperationContext* opCtx, CurOp* curop) {
+        ClientLock lk(opCtx->getClient());
+        curop->updateStatsOnTransactionStash(lk);
+    }
+};
+
+int64_t addWaitForLock(OperationContext* opCtx,
+                       ServiceContext* svcCtx,
+                       Locker* locker,
+                       Milliseconds wait) {
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "CurOpStatsTest.WaitForLock"));
+    resetGlobalLockStats_forTest();
+
+    Locker lockerConflict(svcCtx);
+    lockerConflict.lockGlobal(opCtx, MODE_IX);
+    ON_BLOCK_EXIT([&] { lockerConflict.unlockGlobal(); });
+    lockerConflict.lock(opCtx, resId, MODE_X);
+    {
+        // This will be blocked
+        locker->lockGlobal(opCtx, MODE_IX);
+        ON_BLOCK_EXIT([&] { locker->unlockGlobal(); });
+        ASSERT_THROWS_CODE(locker->lock(opCtx, resId, MODE_S, Date_t::now() + wait),
+                           AssertionException,
+                           ErrorCodes::LockTimeout);
+    }
+    SingleThreadedLockStats stats;
+    reportGlobalLockingStats(&stats);
+    return stats.get(resId, MODE_S).combinedWaitTimeMicros;
+}
+
+void addTicketQueueTime(AdmissionContext* admCtx,
+                        TickSourceMock<Microseconds>* tickSource,
+                        Milliseconds& executionTime,
+                        Milliseconds waitForTickets) {
+    WaitingForAdmissionGuard waitForAdmission(admCtx, tickSource);
+    tickSource->advance(waitForTickets);
+    executionTime += waitForTickets;
+}
+
+// Records finished admissions with queueing time at the ingress and execution gates. The other two
+// gates are deliberately left untouched, so the reporting paths are also exercised for queues the
+// operation never waited at.
+void recordQueueingAtIngressAndExecution(OperationContext* opCtx,
+                                         TickSourceMock<Microseconds>* tickSource) {
+    auto* ingressAdmCtx = &IngressAdmissionContext::get(opCtx);
+    ingressAdmCtx->setAdmission_forTest(5);
+    auto* executionAdmCtx = &ExecutionAdmissionContext::get(opCtx);
+    executionAdmCtx->setAdmission_forTest(7);
+
+    Milliseconds executionTime{0};
+    addTicketQueueTime(ingressAdmCtx, tickSource, executionTime, Milliseconds(2));
+    addTicketQueueTime(executionAdmCtx, tickSource, executionTime, Milliseconds(5));
+}
+
+// The breakdown the queues primed above should be reported as. Note that a queue with no admissions
+// is rendered as an empty sub-object rather than left out.
+BSONObj expectedQueueStatsForIngressAndExecution() {
+    return BSON("execution" << BSON("admissions" << 7 << "totalTimeQueuedMicros" << 5000)
+                            << "ingress"
+                            << BSON("admissions" << 5 << "totalTimeQueuedMicros" << 2000)
+                            << "ingress_request" << BSONObj() << "writeThrottle" << BSONObj());
+}
+
+TEST_F(CurOpStatsTest, CheckWorkingMillisValue) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    auto* admCtx = &ExecutionAdmissionContext::get(opCtx.get());
+
+    Milliseconds executionTime = Milliseconds(512);
+    Milliseconds waitForTickets = Milliseconds(2);
+    Milliseconds waitForFlowControlTicket = Milliseconds(4);
+
+    // The prepare conflict tracker uses the service context's tick source to measure time,
+    // so we'll make the service context and curop have the same tick source.
+    // The tick source is set to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    advanceTime(Milliseconds{100});
+    curop->setTickSource_forTest(tickSource());
+
+    // Check that execution time advances as expected
+    curop->ensureStarted();
+    advanceTime(executionTime);
+    curop->done();
+    ASSERT_EQ(duration_cast<Milliseconds>(curop->elapsedTimeExcludingPauses()), executionTime);
+
+    // Check that workingTimeMillis correctly accounts for ticket wait time
+    auto locker = shard_role_details::getLocker(opCtx.get());
+    addTicketQueueTime(admCtx, tickSource(), executionTime, waitForTickets);
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop->debug().workingTimeMillis, executionTime - waitForTickets);
+
+    // Check that workingTimeMillis correctly account for time acquiring flow control tickets
+    locker->addFlowControlTicketQueueTime(waitForFlowControlTicket);
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket);
+
+    // Check that workingTimeMillis correctly accounts for lock wait time
+    Milliseconds waitForLocks = duration_cast<Milliseconds>(
+        Microseconds(addWaitForLock(opCtx.get(), getServiceContext(), locker, Milliseconds(8))));
+
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket - waitForLocks);
+
+    // Check that workingTimeMillis correctly excludes time spent waiting for prepare conflicts.
+    // Simulate a prepare conflict and check that workingMillis is the same as before.
+    StorageExecutionContext::get(opCtx.get())
+        ->getPrepareConflictTracker()
+        .beginPrepareConflict(*tickSource());
+    advanceTime(Milliseconds(1000));
+    StorageExecutionContext::get(opCtx.get())
+        ->getPrepareConflictTracker()
+        .endPrepareConflict(*tickSource());
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    // This wait time should be excluded from workingTimeMillis.
+    ASSERT_EQ(curop->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket - waitForLocks);
+}
+
+TEST_F(CurOpStatsTest, WorkingMillisAccountsForEveryAdmissionQueue) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    auto* executionAdmCtx = &ExecutionAdmissionContext::get(opCtx.get());
+    auto* ingressRequestAdmCtx = &IngressRequestAdmissionContext::get(opCtx.get());
+    auto* ingressAdmCtx = &IngressAdmissionContext::get(opCtx.get());
+    auto* writeThrottleAdmCtx = &WriteThrottlerAdmissionContext::get(opCtx.get());
+
+    Milliseconds executionTime = Milliseconds(512);
+    Milliseconds waitForExecutionTickets = Milliseconds(3);
+    Milliseconds waitForIngressRequestTickets = Milliseconds(5);
+    Milliseconds waitForIngressTickets = Milliseconds(6);
+    Milliseconds waitForWriteThrottleTickets = Milliseconds(7);
+
+    advanceTime(Milliseconds{100});
+    curop->setTickSource_forTest(tickSource());
+
+    curop->ensureStarted();
+    advanceTime(executionTime);
+    curop->done();
+    ASSERT_EQ(duration_cast<Milliseconds>(curop->elapsedTimeExcludingPauses()), executionTime);
+
+    // Add queue wait at each of the four registry admission gates.
+    addTicketQueueTime(executionAdmCtx, tickSource(), executionTime, waitForExecutionTickets);
+    addTicketQueueTime(
+        ingressRequestAdmCtx, tickSource(), executionTime, waitForIngressRequestTickets);
+    addTicketQueueTime(ingressAdmCtx, tickSource(), executionTime, waitForIngressTickets);
+    addTicketQueueTime(
+        writeThrottleAdmCtx, tickSource(), executionTime, waitForWriteThrottleTickets);
+
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+
+    // workingMillis must exclude the wait at every gate, not just the ExecutionAdmissionContext.
+    ASSERT_EQ(curop->debug().workingTimeMillis,
+              executionTime - waitForExecutionTickets - waitForIngressRequestTickets -
+                  waitForIngressTickets - waitForWriteThrottleTickets);
+}
+
+TEST_F(CurOpStatsTest, UnstashingAndStashingTransactionResource) {
+    // Initialize two operation contexts.
+    auto serviceContext = getGlobalServiceContext();
+    auto client1 = serviceContext->getService()->makeClient("client1");
+    auto client2 = serviceContext->getService()->makeClient("client2");
+    auto opCtx1 = client1->makeOperationContext();
+    auto opCtx2 = client2->makeOperationContext();
+    auto curop1 = CurOp::get(*opCtx1);
+    auto curop2 = CurOp::get(*opCtx2);
+    auto* admCtx1 = &ExecutionAdmissionContext::get(opCtx1.get());
+    auto* admCtx2 = &ExecutionAdmissionContext::get(opCtx2.get());
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+    curop1->setTickSource_forTest(tickSourceMock.get());
+    curop2->setTickSource_forTest(tickSourceMock.get());
+
+    // Advance execution time.
+    Milliseconds executionTime = Milliseconds(1024);
+    curop1->ensureStarted();
+    curop2->ensureStarted();
+    tickSourceMock->advance(executionTime);
+    curop1->done();
+    curop2->done();
+    ASSERT_EQ(duration_cast<Milliseconds>(curop1->elapsedTimeExcludingPauses()), executionTime);
+    ASSERT_EQ(duration_cast<Milliseconds>(curop2->elapsedTimeExcludingPauses()), executionTime);
+
+    // Swap out opCtx1's locker with std::unique_ptr<Locker> so we can swap it around later on.
+    shard_role_details::swapLocker(opCtx1.get(),
+                                   std::make_unique<Locker>(opCtx1->getServiceContext()));
+
+    // Check that ticket wait time on curop1 is not reported on curop2.
+    Milliseconds waitForTickets = Milliseconds(2);
+    addTicketQueueTime(admCtx1, tickSourceMock.get(), executionTime, waitForTickets);
+    curop1->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(admCtx1->totalTimeQueuedMicros(), waitForTickets);
+    ASSERT_EQ(curop1->debug().workingTimeMillis, executionTime - waitForTickets);
+    ASSERT_EQ(curop2->debug().workingTimeMillis, executionTime);
+
+    // Check that flow control ticket wait time on curop1 is not reported on curop2.
+    Milliseconds waitForFlowControlTicket = Milliseconds(32);
+    auto lockerOp1 = shard_role_details::getLocker(opCtx1.get());
+    lockerOp1->addFlowControlTicketQueueTime(waitForFlowControlTicket);
+    curop1->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(duration_cast<Milliseconds>(
+                  Microseconds(lockerOp1->getFlowControlStats().timeAcquiringMicros)),
+              waitForFlowControlTicket);
+    ASSERT_EQ(curop1->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket);
+    ASSERT_EQ(curop2->debug().workingTimeMillis, executionTime);
+
+    // Check that lock wait time on curop1 is not reported on curop2.
+    int64_t waitForLocks =
+        addWaitForLock(opCtx1.get(), opCtx1->getServiceContext(), lockerOp1, Milliseconds(4));
+    curop1->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(lockerOp1->getLockerInfo(boost::none).stats.getCumulativeWaitTimeMicros(),
+              waitForLocks);
+    ASSERT_EQ(curop1->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket -
+                  duration_cast<Milliseconds>(Microseconds(waitForLocks)));
+    ASSERT_EQ(curop2->debug().workingTimeMillis, executionTime);
+
+    // Simulate stashing locker from opCtx1. Check that wait times after stashing are still reported
+    // on opCtx1.
+    updateStatsOnTransactionStashWithLock(opCtx1.get(), curop1);
+    auto locker = shard_role_details::swapLocker(
+        opCtx1.get(), std::make_unique<Locker>(opCtx1->getServiceContext()));
+    curop1->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(duration_cast<Milliseconds>(
+                  Microseconds(locker->getFlowControlStats().timeAcquiringMicros)),
+              waitForFlowControlTicket);
+    ASSERT_EQ(curop1->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket -
+                  duration_cast<Milliseconds>(Microseconds(waitForLocks)));
+
+    // Simulate unstashing transaction resources to opCtx2. Check that lock wait time on
+    // unstashed locker is not considered blocked for opCtx2.
+    shard_role_details::swapLocker(opCtx2.get(), std::move(locker));
+    auto lockerOp2 = shard_role_details::getLocker(opCtx2.get());
+    updateStatsOnTransactionUnstashWithLock(opCtx2.get(), curop2);
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(lockerOp2->getLockerInfo(boost::none).stats.getCumulativeWaitTimeMicros(),
+              waitForLocks);
+    ASSERT_EQ(curop2->debug().workingTimeMillis, executionTime);
+
+    // Check that workingTimeMillis correctly accounts for ticket wait duration on opCtx2.
+    Milliseconds waitForTicketsOnOp2 = Milliseconds(8);
+    addTicketQueueTime(admCtx2, tickSourceMock.get(), executionTime, waitForTicketsOnOp2);
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(admCtx2->totalTimeQueuedMicros(), waitForTicketsOnOp2);
+    ASSERT_EQ(curop2->debug().workingTimeMillis, executionTime - waitForTicketsOnOp2);
+
+    // Check that workingTimeMillis correctly accounts for flow control ticket wait duration on
+    // opCtx2.
+    Milliseconds waitForFlowControlTicketsOnOp2 = Milliseconds(64);
+    lockerOp2->addFlowControlTicketQueueTime(waitForFlowControlTicketsOnOp2);
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ((duration_cast<Milliseconds>(
+                  Microseconds(lockerOp2->getFlowControlStats().timeAcquiringMicros))),
+              waitForFlowControlTicket + waitForFlowControlTicketsOnOp2);
+    ASSERT_EQ(curop2->debug().workingTimeMillis,
+              executionTime - waitForTicketsOnOp2 - waitForFlowControlTicketsOnOp2);
+
+    // Check that workingTimeMillis correctly accounts for lock wait duration on opCtx2.
+    int64_t waitForLocksOnOp2 =
+        addWaitForLock(opCtx2.get(), opCtx2->getServiceContext(), lockerOp2, Milliseconds(16));
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(lockerOp2->getLockerInfo(boost::none).stats.getCumulativeWaitTimeMicros(),
+              waitForLocks + waitForLocksOnOp2);
+    ASSERT_EQ(curop2->debug().workingTimeMillis,
+              executionTime - waitForTicketsOnOp2 - waitForFlowControlTicketsOnOp2 -
+                  duration_cast<Milliseconds>(Microseconds(waitForLocksOnOp2)));
+
+    // Simulate stashing locker from opCtx2. Check that ticket and lock wait time after stashing is
+    // still reported on opCtx2.
+    updateStatsOnTransactionStashWithLock(opCtx2.get(), curop2);
+    locker = shard_role_details::swapLocker(opCtx2.get(),
+                                            std::make_unique<Locker>(opCtx2->getServiceContext()));
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop2->debug().workingTimeMillis,
+              executionTime - waitForTicketsOnOp2 - waitForFlowControlTicketsOnOp2 -
+                  duration_cast<Milliseconds>(Microseconds(waitForLocksOnOp2)));
+
+    // Confirm stats are correctly accounted for even when we try unstashing the locker again.
+    shard_role_details::swapLocker(opCtx2.get(), std::move(locker));
+    updateStatsOnTransactionUnstashWithLock(opCtx2.get(), curop2);
+    lockerOp2 = shard_role_details::getLocker(opCtx2.get());
+    int64_t waitForLocksOnOp3 =
+        addWaitForLock(opCtx2.get(), opCtx2->getServiceContext(), lockerOp2, Milliseconds(1));
+    curop2->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop2->debug().workingTimeMillis,
+              executionTime - waitForTicketsOnOp2 - waitForFlowControlTicketsOnOp2 -
+                  duration_cast<Milliseconds>(Microseconds(waitForLocksOnOp2 + waitForLocksOnOp3)));
+}
+
+TEST_F(CurOpStatsTest, CheckWorkingMillisWithBlockedTimeAtStart) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    auto* admCtx = &ExecutionAdmissionContext::get(opCtx.get());
+
+    Milliseconds executionTime = Milliseconds(512);
+    Milliseconds waitForTickets = Milliseconds(2);
+    Milliseconds waitForFlowControlTicket = Milliseconds(4);
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+    curop->setTickSource_forTest(tickSourceMock.get());
+
+    // Add blocked time before curop timer starts.
+    auto locker = shard_role_details::getLocker(opCtx.get());
+
+    addTicketQueueTime(admCtx, tickSourceMock.get(), executionTime, waitForTickets);
+    ASSERT_EQ(admCtx->totalTimeQueuedMicros(), waitForTickets);
+
+    locker->addFlowControlTicketQueueTime(waitForFlowControlTicket);
+    ASSERT_EQ(duration_cast<Milliseconds>(
+                  Microseconds(locker->getFlowControlStats().timeAcquiringMicros)),
+              waitForFlowControlTicket);
+
+    int64_t waitForLocks =
+        addWaitForLock(opCtx.get(), getServiceContext(), locker, Milliseconds(8));
+    ASSERT_EQ(locker->getLockerInfo(boost::none).stats.getCumulativeWaitTimeMicros(), waitForLocks);
+
+    // Advance execution time.
+    curop->ensureStarted();
+    tickSourceMock->advance(executionTime);
+    curop->done();
+    ASSERT_EQ(duration_cast<Milliseconds>(curop->elapsedTimeExcludingPauses()), executionTime);
+
+    // Check that time blocked before curop timer starts is not subtracted from workingTimeMillis.
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop->debug().workingTimeMillis, executionTime);
+
+    // Add blocked time after timer starts.
+    addTicketQueueTime(admCtx, tickSourceMock.get(), executionTime, waitForTickets);
+    locker->addFlowControlTicketQueueTime(waitForFlowControlTicket);
+    waitForLocks = addWaitForLock(opCtx.get(), getServiceContext(), locker, Milliseconds(16));
+
+    // Check that workingTimeMillis only accounts for blocked times after timer started.
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_APPROX_EQUAL(curop->debug().workingTimeMillis.count(),
+                        (executionTime -
+                         (waitForTickets + waitForFlowControlTicket +
+                          duration_cast<Milliseconds>(Microseconds(waitForLocks))))
+                            .count(),
+                        1);
+}
+
+TEST_F(CurOpStatsTest, MultipleUnstashingAndStashingTransaction) {
+    auto serviceContext = getGlobalServiceContext();
+    auto client1 = serviceContext->getService()->makeClient("client1");
+    auto opCtx1 = client1->makeOperationContext();
+    auto curop1 = CurOp::get(*opCtx1);
+    auto lockerOp1 = shard_role_details::getLocker(opCtx1.get());
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{123});
+    curop1->setTickSource_forTest(tickSourceMock.get());
+
+    // Advance execution time.
+    curop1->ensureStarted();
+    tickSourceMock->advance(Milliseconds{1000});
+    lockerOp1->addFlowControlTicketQueueTime(Milliseconds{20});
+
+    // Advance counters while stashed
+    updateStatsOnTransactionStashWithLock(opCtx1.get(), curop1);
+    tickSourceMock->advance(Milliseconds{1000});
+    lockerOp1->addFlowControlTicketQueueTime(Milliseconds{30});
+    updateStatsOnTransactionUnstashWithLock(opCtx1.get(), curop1);
+
+    // Advance counters while not stashed
+    tickSourceMock->advance(Milliseconds{1000});
+    lockerOp1->addFlowControlTicketQueueTime(Milliseconds{40});
+
+    // Advance counters while stashed
+    updateStatsOnTransactionStashWithLock(opCtx1.get(), curop1);
+    tickSourceMock->advance(Milliseconds{1000});
+    lockerOp1->addFlowControlTicketQueueTime(Milliseconds{50});
+    updateStatsOnTransactionUnstashWithLock(opCtx1.get(), curop1);
+
+    // Advance counters while not stashed
+    tickSourceMock->advance(Milliseconds{1000});
+    lockerOp1->addFlowControlTicketQueueTime(Milliseconds{60});
+    curop1->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+
+    // Verify that 120ms are excluded from 5000 execution time.
+    // Out of 200ms of locker queue time, only 120ms happened while the locker was not stashed.
+    ASSERT_EQ(curop1->debug().workingTimeMillis, Milliseconds(4880));
+}
+
+TEST_F(CurOpStatsTest, SubOperationStats) {
+    auto opCtx = makeOperationContext();
+    auto* admCtx = &ExecutionAdmissionContext::get(opCtx.get());
+    auto locker = shard_role_details::getLocker(opCtx.get());
+    auto curop1 = CurOp::get(*opCtx);
+
+    Milliseconds executionTime = Milliseconds(512);
+    Milliseconds waitForTickets = Milliseconds(2);
+    Milliseconds waitForFlowControlTicket = Milliseconds(4);
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+    curop1->setTickSource_forTest(tickSourceMock.get());
+
+    // Advance execution time.
+    curop1->ensureStarted();
+    tickSourceMock->advance(executionTime);
+    curop1->done();
+    ASSERT_EQ(duration_cast<Milliseconds>(curop1->elapsedTimeExcludingPauses()), executionTime);
+
+    // Add blocked time to curop1.
+    addTicketQueueTime(admCtx, tickSourceMock.get(), executionTime, waitForTickets);
+    locker->addFlowControlTicketQueueTime(waitForFlowControlTicket);
+    Milliseconds waitForLocks = duration_cast<Milliseconds>(
+        Microseconds(addWaitForLock(opCtx.get(), getServiceContext(), locker, Milliseconds(8))));
+    curop1->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop1->debug().workingTimeMillis,
+              executionTime - waitForTickets - waitForFlowControlTicket - waitForLocks);
+
+    // Add new curop to top of curop stack using the same opCtx.
+    CurOp curop2;
+    curop2.push(opCtx.get());
+    curop2.setTickSource_forTest(tickSourceMock.get());
+    curop2.ensureStarted();
+
+    // Check that curop2 only reports execution time that elapsed after it started without deducting
+    // any blocked time from preceding operations in the stack.
+    Milliseconds executionTime2 = Milliseconds(1024);
+    tickSourceMock->advance(executionTime2);
+    curop2.completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop2.debug().workingTimeMillis, executionTime2);
+
+    // Add blocked time to curop2 and verify blocked time from curop1 is still not reported.
+    Milliseconds waitForTickets2 = Milliseconds(16);
+    Milliseconds waitForFlowControlTicket2 = Milliseconds(32);
+    addTicketQueueTime(admCtx, tickSourceMock.get(), executionTime2, waitForTickets2);
+    locker->addFlowControlTicketQueueTime(waitForFlowControlTicket2);
+    auto waitForLocks2 = duration_cast<Milliseconds>(
+        Microseconds(addWaitForLock(opCtx.get(), getServiceContext(), locker, Milliseconds(64))));
+    curop2.completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(curop2.debug().workingTimeMillis,
+              executionTime2 - waitForTickets2 - waitForFlowControlTicket2 - waitForLocks2);
+}
+
+TEST_F(CurOpStatsTest, CheckAdmissionQueueStats) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    Milliseconds waitForIngressAdmission = Milliseconds(2);
+    auto* ingressAdmCtx = &IngressAdmissionContext::get(opCtx.get());
+    ingressAdmCtx->setAdmission_forTest(5);
+
+    Milliseconds waitForExecutionTicket = Milliseconds(5);
+    auto* executionAdmCtx = &ExecutionAdmissionContext::get(opCtx.get());
+    executionAdmCtx->setAdmission_forTest(7);
+
+    // initialize timer to non-zero value
+    advanceTime(Milliseconds{100});
+    curop->setTickSource_forTest(tickSource());
+
+    Milliseconds executionTime = Milliseconds(512);
+    advanceTime(executionTime);
+    curop->done();
+
+    // Add queueing time for ingress admission control
+    addTicketQueueTime(ingressAdmCtx, tickSource(), executionTime, waitForIngressAdmission);
+
+    BSONObjBuilder builder;
+    SerializationContext sc = SerializationContext::stateCommandReply();
+    sc.setPrefixState(false);
+    {
+        // Simulate operation currently waiting in execution control queue
+        WaitingForAdmissionGuard waitForAdmission(executionAdmCtx, tickSource());
+        tickSource()->advance(waitForExecutionTicket);
+        executionTime += waitForExecutionTicket;
+
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportState(&builder, sc);
+    }
+    auto bsonObj = builder.done();
+    BSONObj currentQueue = bsonObj.getObjectField("currentQueue");
+    BSONObj queueStats = bsonObj.getObjectField("queues");
+
+    auto expectedCurrentQueue = BSON("name" << "execution"
+                                            << "timeQueuedMicros" << 5000);
+    auto expectedQueueStats = BSON(
+        "execution"
+        << BSON("admissions" << 7 << "totalTimeQueuedMicros" << 5000 << "isHoldingTicket" << false)
+        << "ingress"
+        << BSON("admissions" << 5 << "totalTimeQueuedMicros" << 2000 << "isHoldingTicket" << false)
+        << "ingress_request"
+        << BSON("admissions" << 0 << "totalTimeQueuedMicros" << 0 << "isHoldingTicket" << false)
+        << "writeThrottle"
+        << BSON("admissions" << 0 << "totalTimeQueuedMicros" << 0 << "isHoldingTicket" << false));
+
+    ASSERT_BSONOBJ_EQ(currentQueue, expectedCurrentQueue);
+    ASSERT_BSONOBJ_EQ_UNORDERED(queueStats, expectedQueueStats);
+}
+
+TEST_F(CurOpStatsTest, EndOfOpMetricsAccountForEveryAdmissionQueue) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    advanceTime(Milliseconds{100});
+    curop->setTickSource_forTest(tickSource());
+
+    auto* executionAdmCtx = &ExecutionAdmissionContext::get(opCtx.get());
+    auto* ingressRequestAdmCtx = &IngressRequestAdmissionContext::get(opCtx.get());
+    auto* ingressAdmCtx = &IngressAdmissionContext::get(opCtx.get());
+    auto* writeThrottleAdmCtx = &WriteThrottlerAdmissionContext::get(opCtx.get());
+
+    executionAdmCtx->setAdmission_forTest(2);
+    ingressRequestAdmCtx->setAdmission_forTest(3);
+    ingressAdmCtx->setAdmission_forTest(4);
+    writeThrottleAdmCtx->setAdmission_forTest(5);
+
+    ingressAdmCtx->recordLowAdmission();
+    ingressAdmCtx->recordOperationLoadShed();
+
+    Milliseconds executionTime{0};
+    addTicketQueueTime(executionAdmCtx, tickSource(), executionTime, Milliseconds(3));
+    addTicketQueueTime(ingressRequestAdmCtx, tickSource(), executionTime, Milliseconds(5));
+    addTicketQueueTime(ingressAdmCtx, tickSource(), executionTime, Milliseconds(6));
+    addTicketQueueTime(writeThrottleAdmCtx, tickSource(), executionTime, Milliseconds(7));
+
+    curop->ensureStarted();
+    curop->done();
+
+    curop->debug().getQueryStatsInfo().metricsRequested = true;
+    curop->setEndOfOpMetrics(0);
+
+    const auto& metrics = curop->debug().getAdditiveMetrics();
+    ASSERT_TRUE(metrics.totalTimeQueuedMicros.has_value());
+    ASSERT_EQ(*metrics.totalTimeQueuedMicros, Milliseconds(21));
+    ASSERT_TRUE(metrics.totalAdmissions.has_value());
+    ASSERT_EQ(*metrics.totalAdmissions, 14ULL);
+    ASSERT_TRUE(metrics.totalLowPriorityAdmissions.has_value());
+    ASSERT_EQ(*metrics.totalLowPriorityAdmissions, 1ULL);
+    ASSERT_TRUE(metrics.totalNormalPriorityAdmissions.has_value());
+    ASSERT_EQ(*metrics.totalNormalPriorityAdmissions, 13ULL);
+    ASSERT_TRUE(metrics.wasLoadShed.has_value());
+    ASSERT_TRUE(*metrics.wasLoadShed);
+}
+
+TEST_F(CurOpStatsTest, EndOfOpMetricsReportedWhenOnlyNonExecutionGatesAdmitted) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    advanceTime(Milliseconds{100});
+    curop->setTickSource_forTest(tickSource());
+
+    auto* ingressAdmCtx = &IngressAdmissionContext::get(opCtx.get());
+    ingressAdmCtx->setAdmission_forTest(1);
+    ASSERT_EQ(ExecutionAdmissionContext::get(opCtx.get()).getAdmissions(), 0);
+
+    Milliseconds executionTime{0};
+    addTicketQueueTime(ingressAdmCtx, tickSource(), executionTime, Milliseconds(4));
+
+    curop->ensureStarted();
+    curop->done();
+
+    curop->debug().getQueryStatsInfo().metricsRequested = true;
+    curop->setEndOfOpMetrics(0);
+
+    const auto& metrics = curop->debug().getAdditiveMetrics();
+    ASSERT_TRUE(metrics.totalTimeQueuedMicros.has_value());
+    ASSERT_EQ(*metrics.totalTimeQueuedMicros, Milliseconds(4));
+    ASSERT_TRUE(metrics.totalAdmissions.has_value());
+    ASSERT_EQ(*metrics.totalAdmissions, 1ULL);
+}
+
+TEST_F(CurOpStatsTest, CurrentOpSummarizesAdmissionStatsFromEveryQueue) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    advanceTime(Milliseconds{100});
+    curop->setTickSource_forTest(tickSource());
+
+    auto* ingressAdmCtx = &IngressAdmissionContext::get(opCtx.get());
+    ingressAdmCtx->setAdmission_forTest(5);
+    ingressAdmCtx->recordOperationLoadShed();
+    auto* executionAdmCtx = &ExecutionAdmissionContext::get(opCtx.get());
+    executionAdmCtx->setAdmission_forTest(7);
+
+    Milliseconds executionTime{0};
+    addTicketQueueTime(ingressAdmCtx, tickSource(), executionTime, Milliseconds(2));
+    addTicketQueueTime(executionAdmCtx, tickSource(), executionTime, Milliseconds(5));
+
+    curop->ensureStarted();
+
+    BSONObjBuilder builder;
+    SerializationContext sc = SerializationContext::stateCommandReply();
+    sc.setPrefixState(false);
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportState(&builder, sc);
+    }
+    auto reported = builder.done();
+
+    ASSERT_TRUE(reported.hasField("totalAdmissions"));
+    ASSERT_EQ(reported["totalAdmissions"].numberInt(), 12);
+    ASSERT_EQ(reported["totalTimeQueuedMicros"].numberLong(),
+              durationCount<Microseconds>(Milliseconds(7)));
+    ASSERT_TRUE(reported["wasLoadShed"].Bool());
+}
+
+TEST_F(CurOpStatsTest, ProfilerEntryReportsAdmissionQueueStats) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSource());
+
+    recordQueueingAtIngressAndExecution(opCtx.get(), tickSource());
+
+    // The profiler entry is meant to be a superset of the slow query log line, which reports this
+    // same per-gate breakdown.
+    BSONObjBuilder builder;
+    SingleThreadedLockStats lockStats;
+    curop->debug().append(opCtx.get(), lockStats, {}, {}, 0, true /*omitCommand*/, builder);
+
+    ASSERT_BSONOBJ_EQ_UNORDERED(builder.done().getObjectField("queues"),
+                                expectedQueueStatsForIngressAndExecution());
+}
+
+TEST_F(CurOpStatsTest, ProfileFilterCanMatchOnAdmissionQueueStats) {
+    auto opCtx = makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSource());
+
+    recordQueueingAtIngressAndExecution(opCtx.get(), tickSource());
+
+    // Whatever the profiler records has to be reachable from a profile filter as well, which
+    // evaluates against the document staged here rather than against the one append() builds.
+    auto makeDoc = OpDebug::appendStaged(opCtx.get(), {"queues"}, false /*needWholeDocument*/);
+    BSONObj staged = makeDoc(OpDebug::AppendArgs{opCtx.get(), curop->debug(), *curop});
+
+    ASSERT_BSONOBJ_EQ_UNORDERED(staged.getObjectField("queues"),
+                                expectedQueueStatsForIngressAndExecution());
+}
+
+TEST(CurOpTest, DelinquentInterruptChecksNotDoubleCounted) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+
+    auto& totalInterruptChecks = CurOp::totalInterruptChecks_forTest();
+    const auto interruptChecksAtStart = totalInterruptChecks.get();
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->ensureStarted();
+
+    const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+
+    serviceContext.tickSource()->advance(interval * 2);
+    opCtx->checkForInterrupt();
+
+    // Now push another operation onto the curop stack.
+    {
+        CurOp subOp;
+        subOp.push(opCtx.get());
+
+        for (size_t i = 0; i < 10; ++i) {
+            serviceContext.tickSource()->advance(interval * 10);
+            opCtx->checkForInterrupt();
+        }
+
+        subOp.completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    }
+
+    curop->done();
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+
+    ASSERT_EQ(totalInterruptChecks.get() - interruptChecksAtStart, 11);
+}
+
+TEST(CurOpTest, OpWhichNeverChecksForInterruptBumpsDelinquentCounter) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+
+    auto& opsWithOverdueInterruptCheck = CurOp::opsWithOverdueInterruptCheck_forTest();
+    const auto overdueOpsAtStart = opsWithOverdueInterruptCheck.get();
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    curop->setTickSource_forTest(serviceContext.tickSource());
+    curop->ensureStarted();
+
+    // OpCtx should be set up to track interrupts.
+    ASSERT(opCtx->overdueInterruptCheckStats());
+
+    // The operation never checks for interrupt. It should still be marked as overdue though.
+    const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+    serviceContext.tickSource()->advance(interval * 2);
+
+    curop->completeAndLogOperation({logv2::LogComponent::kTest}, nullptr);
+    ASSERT_EQ(opCtx->overdueInterruptCheckStats()->overdueInterruptChecks.loadRelaxed(), 1);
+
+    ASSERT_EQ(opsWithOverdueInterruptCheck.get() - overdueOpsAtStart, 1);
+}
+
+TEST(CurOpTest, InterruptChecksSamplingRespectsFeatureFlag) {
+    // When the feature flag is set to false, we should never sample an operation, even if the
+    // sampling rate is set to 1.0
+    unittest::ServerParameterGuard disableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                             false);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate", 1);
+
+    QueryTestServiceContext serviceContext;
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    curop->ensureStarted();
+    opCtx->checkForInterrupt();
+
+    // Simulate advancing the mock clock.
+    const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+    serviceContext.tickSource()->advance(interval * 5);
+
+    // Verify that delinquent stats are not recorded due to the feature flag being disabled.
+    ASSERT(!opCtx->overdueInterruptCheckStats());
+    ASSERT_EQ(opCtx->numInterruptChecks(), 1);
+}
+
+TEST(CurOpTest, InterruptCheckTrackingWithSamplingRateZero) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    // When the sampling rate is 0, an operation should not track interrupts, but should
+    // otherwise behave normally.
+    unittest::ServerParameterGuard neverTrackInterrupts("overdueInterruptCheckSamplingRate", 0);
+
+    QueryTestServiceContext serviceContext;
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    curop->ensureStarted();
+    opCtx->checkForInterrupt();
+
+    // Simulate advancing the mock clock.
+    const Milliseconds interval{gOverdueInterruptCheckIntervalMillis.load()};
+    serviceContext.tickSource()->advance(interval * 5);
+
+    // Verify that overdue interrupt check stats are not tracked due to sampling rate being 0.
+    ASSERT(!opCtx->overdueInterruptCheckStats());
+    ASSERT_EQ(opCtx->numInterruptChecks(), 1);
+}
+
+TEST(CurOpTest, InterruptCheckTrackingIsSampled) {
+    unittest::ServerParameterGuard enableDelinquentTracking("featureFlagRecordDelinquentMetrics",
+                                                            true);
+    unittest::ServerParameterGuard alwaysTrackInterrupts("overdueInterruptCheckSamplingRate",
+                                                         1.0 / 1000.0);
+
+    QueryTestServiceContext serviceContext;
+
+    size_t iters = 0;
+    size_t nSampled = 0;
+
+    do {
+        auto opCtx = serviceContext.makeOperationContext();
+        auto curop = CurOp::get(*opCtx);
+
+        curop->ensureStarted();
+        opCtx->checkForInterrupt();
+
+        if (opCtx->overdueInterruptCheckStats()) {
+            // Found an operation which was sampled.
+            nSampled++;
+            break;
+        }
+
+        ++iters;
+    } while (iters < 100'000);
+
+    // If this assertion fails, it means none of the CurOps we generated were selected
+    // for sampling. This should be statistically impossible (around 1 in 10^44) assuming
+    // 1 in 1000 ops gets randomly sampled, and indicates there's likely a problem
+    // with the sampling mechanism (or you are very unlucky).
+    ASSERT_GT(nSampled, 0);
+}
+
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,99 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: mongo
+
+server_parameters:
+    metadataRefreshInTransactionMaxWaitMS:
+        description: >-
+            Maximum time in milliseconds to wait on a blocking operation when refreshing the filtering 
+            metadata within a transaction.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: metadataRefreshInTransactionMaxWaitMS
+        deprecated_name: metadataRefreshInTransactionMaxWaitBehindCritSecMS
+        validator:
+            gte: 0
+        default: 500
+        redact: false
+
+    directConnectionChecksWithSingleShard:
+        description: >-
+            Controls whether warnings should be emitted for direct connection operations when there is
+            only a single shard in the cluster. Will have no effect on the behavior in clusters with
+            two or more shards.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: directConnectionChecksWithSingleShard
+        default: true
+        redact: false
+
+    enableDirectShardDDLOperations:
+        description: >-
+            Enables the user to run direct shard DDL operations on a sharded cluster, bypassing the
+            direct shard DDL checks. This should only be used in extreme cases, e.g., restore a
+            sharded cluster backup to a replica set.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: enableDirectShardDDLOperations
+        default: false
+        redact: false
+
+    disableTransitionFromLastLTSToLastContinuousWithUserData:
+        description: >-
+            Prohibits upgrading from last LTS FCV to last continuous FCV if the replica set contains
+            user data during addShard. **Not a supported feature**. For emergency use only.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: disableTransitionFromLastLTSToLastContinuousWithUserData
+        default: true
+        redact: false
+
+    maxShardStaleMetadataRetryAttempts:
+        description: >-
+            Maximum number of times a shard will retry a ShardRole operation after detecting stale
+            or missing sharding metadata.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: maxShardStaleMetadataRetryAttempts
+        validator:
+            gte: 1
+        default: 10
+        redact: false
+
+    # TODO (SERVER-132182): Remove this server parameter. No usages; do not use.
+    maxShardMetadataDiskRecoveryAttempts:
+        description: >-
+            Unused. Do not use. Kept only for IDL compatibility with 9.0.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: maxShardMetadataDiskRecoveryAttempts
+        validator:
+            gte: 1
+        default: 10
+        redact: false
+
+    enableIncomparableShardVersionRouterBounce:
+        description: >-
+            When enabled, a shard that detects an incomparable shard version and cannot advance
+            configTime via a noop write (e.g. no reachable primary, as on a readable-standby
+            cluster) surfaces a StaleConfig on the router's first attempt so the router refreshes and
+            retries, instead of blocking on the configTime wait.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: enableIncomparableShardVersionRouterBounce
+        default: false
+        redact: false
+
+    # TODO (SERVER-112793) Remove once v9.0 branches out
+    enableCompoundWildcardIndexLog:
+        description: >-
+            Enable logging whether a compound wildcard index prefixed by the shard key exists
+            when a shard key index is fetched for a sharded collection.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: enableCompoundWildcardIndexLog
+        default: true
+        redact: false

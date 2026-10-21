@@ -1,95 +1,101 @@
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <string>
-
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
+using namespace std::literals::string_view_literals;
 
-    class StorageEngineLockFile {
-        MONGO_DISALLOW_COPYING(StorageEngineLockFile);
-    public:
+[[MONGO_MOD_FILE_PRIVATE]] constexpr std::string_view kLockFileBasename = "mongod.lock"sv;
 
-        /**
-         * Checks existing lock file, if present, to see if it contains data from a previous
-         * unclean shutdown. A clean shutdown should have produced a zero length lock file.
-         * Uses open() to read existing lock file or create new file.
-         * Uses boost::filesystem to check lock file so may throw boost::exception.
-         */
-        StorageEngineLockFile(const std::string& dbpath);
+class [[MONGO_MOD_PUBLIC]] StorageEngineLockFile {
+    StorageEngineLockFile(const StorageEngineLockFile&) = delete;
+    StorageEngineLockFile& operator=(const StorageEngineLockFile&) = delete;
 
-        virtual ~StorageEngineLockFile();
+public:
+    static boost::optional<StorageEngineLockFile>& get(ServiceContext* service);
 
-        /**
-         * Returns the path to the lock file.
-         */
-        std::string getFilespec() const;
+    /**
+     * Returns the path where a lockfile would be expected to live given the dbpath.
+     */
+    static std::string lockFilePath(std::string_view dbpath,
+                                    std::string_view fileName = kLockFileBasename);
 
-        /**
-         * Returns true if lock file was not zeroed out due to previous unclean shutdown.
-         * This state is evaluated at object initialization to allow storage engine
-         * to make decisions on recovery based on this information after open() has been called.
-         */
-        bool createdByUncleanShutdown() const;
+    /**
+     * Creates the lock file used to prevent concurrent processes from accessing the data files,
+     * as appropriate.
+     */
+    static void create(ServiceContext* service, std::string_view dbpath);
 
-        /**
-         * Opens and locks 'mongod.lock' in 'dbpath' directory.
-         */
-        Status open();
+    /**
+     * Checks existing lock file, if present, to see if it contains data from a previous
+     * unclean shutdown. A clean shutdown should have produced a zero length lock file.
+     * Uses open() to read existing lock file or create new file.
+     * Uses boost::filesystem to check lock file so may throw boost::exception.
+     */
+    StorageEngineLockFile(std::string_view dbpath, std::string_view fileName = kLockFileBasename);
 
-        /**
-         * Closes lock file handles.
-         */
-        void close();
+    virtual ~StorageEngineLockFile();
 
-        /**
-         * Writes current process ID to file.
-         * Fails if lock file has not been opened.
-         */
-        Status writePid();
+    /**
+     * Returns the path to the lock file.
+     */
+    std::string getFilespec() const;
 
-        /**
-         * Truncates file contents and releases file locks.
-         */
-        void clearPidAndUnlock();
+    /**
+     * Returns true if lock file was not zeroed out due to previous unclean shutdown.
+     * This state is evaluated at object initialization to allow storage engine
+     * to make decisions on recovery based on this information after open() has been called.
+     */
+    bool createdByUncleanShutdown() const;
 
-    private:
-        std::string _dbpath;
-        std::string _filespec;
-        bool _uncleanShutdown;
+    /**
+     * Opens and locks 'mongod.lock' in 'dbpath' directory.
+     */
+    Status open();
 
-        class LockFileHandle;
-        boost::scoped_ptr<LockFileHandle> _lockFileHandle;
-    };
+    /**
+     * Closes lock file handles.
+     */
+    void close();
+
+    /**
+     * Writes current process ID to file.
+     * Fails if lock file has not been opened.
+     */
+    Status writePid();
+
+    /**
+     * Writes the string to file.
+     * Fails if lock file has not been opened.
+     */
+    Status writeString(std::string_view str);
+
+    /**
+     * Truncates file contents and releases file locks.
+     */
+    void clearPidAndUnlock();
+
+private:
+    std::string _getNonExistentPathMessage() const;
+
+    std::string _dbpath;
+    std::string _filespec;
+    bool _uncleanShutdown;
+
+    class LockFileHandle;
+    std::unique_ptr<LockFileHandle> _lockFileHandle;
+};
 
 }  // namespace mongo

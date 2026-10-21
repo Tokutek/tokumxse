@@ -1,0 +1,476 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines types used among various resharding-related IDL structs.
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/keypattern.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+enums:
+    CoordinatorState:
+        description: "The current state of a resharding operation on the coordinator."
+        mod_visibility: public
+        type: string
+        values:
+            kUnused: "unused"
+            kInitializing: "initializing"
+            kPreparingToDonate: "preparing-to-donate"
+            kCloning: "cloning"
+            kApplying: "applying"
+            kBlockingWrites: "blocking-writes"
+            kAborting: "aborting"
+            kCommitting: "committing"
+            kQuiesced: "quiesced"
+            kDone: "done"
+
+    DonorState:
+        description: "The current state of a donor shard for a resharding operation."
+        mod_visibility: public
+        type: string
+        values:
+            kUnused: "unused"
+            kPreparingToDonate: "preparing-to-donate"
+            kDonatingInitialData: "donating-initial-data"
+            kDonatingOplogEntries: "donating-oplog-entries"
+            kPreparingToBlockWrites: "preparing-to-block-writes"
+            kError: "error"
+            kBlockingWrites: "blocking-writes"
+            kDone: "done"
+
+    RecipientState:
+        description: "The current state of a recipient shard for a resharding operation."
+        mod_visibility: public
+        type: string
+        values:
+            kUnused: "unused"
+            kAwaitingFetchTimestamp: "awaiting-fetch-timestamp"
+            kCreatingCollection: "creating-collection"
+            kCloning: "cloning"
+            kBuildingIndex: "building-index"
+            kApplying: "applying"
+            kError: "error"
+            kStrictConsistency: "strict-consistency"
+            kDone: "done"
+
+    ReshardingOperationStatus:
+        description: "The status of the current or most recent resharding operation."
+        mod_visibility: public
+        type: string
+        values:
+            kSuccess: "success"
+            kFailure: "failure"
+            kCanceled: "canceled"
+            kRunning: "running"
+            kInactive: "inactive"
+
+    # TODO (SERVER-98118): Remove this enum once v9.0 become last-lts.
+    # Note: This is an exact copy of AuthoritativeMetadataAccessLevel in order to avoid a linking shuffle.
+    # Ideally we should instead rely on the existing enum but that's present on the Sharding Coordinator IDL file which
+    # would cause a lot of linking churn just to make the various resharding libraries use it since the sharding
+    # coordinator usages are all linked in a single big library.
+    ReshardingAuthoritativeMetadataAccessLevel:
+        description: >-
+            Indicates the level of access to authoritative metadata granted by the FCV state at the
+            time of DDL document creation. The possible values are:
+                - `kNone`: No access to authoritative metadata. The DDL operates in a
+                    non-authoritative mode.
+                - `kWritesAllowed`: Write operations are permitted on authoritative metadata, but
+                    read access remains restricted. In this phase, the DDL is responsible for
+                    cloning the authoritative metadata from the global catalog to the shard catalog
+                    and committing changes to both catalogs.
+                - `kWritesAndReadsAllowed`: Both read and write operations are fully enabled. The
+                    DDL must still commit to both catalogs, but cloning is no longer required, as
+                    authoritative metadata is already present and reliable.
+        type: string
+        mod_visibility: private
+        values:
+            kNone: "none"
+            kWritesAllowed: "writesAllowed"
+            kWritesAndReadsAllowed: "writesAndReadsAllowed"
+
+structs:
+    CommonReshardingMetadata:
+        description: "Immutable metadata shared across all node types for a resharding operation."
+        mod_visibility: private
+        generate_comparison_operators: false
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            _id:
+                cpp_name: reshardingUUID
+                type: uuid
+                description: "A unique identifier for the resharding operation."
+            ns:
+                cpp_name: sourceNss
+                type: namespacestring
+                description: "The namespace of the collection being resharded."
+            ui:
+                cpp_name: sourceUUID
+                type: uuid
+                description: "The UUID of the original collection being resharded."
+            tempNs:
+                cpp_name: tempReshardingNss
+                type: namespacestring
+                description:
+                    "The namespace of the temporary resharding collection that exists on
+                    recipient shards."
+            reshardingKey:
+                type: KeyPattern
+                description: "The index specification document to use as the new shard key."
+            startTime:
+                type: date
+                description: "Operation start time."
+                optional: true
+            userReshardingUUID:
+                type: uuid
+                optional: true
+                description: >-
+                    The resharding UUID provided by the user, used to identify retries.
+            provenance:
+                type: ReshardingProvenance
+                description: "The source operation that called this resharding operation."
+                optional: true
+            performVerification:
+                type: optionalBool
+                description: "Whether to perform data comparison verification."
+            telemetryContext:
+                type: object_owned
+                optional: true
+                description: "Tracing context for distributed tracing across all participants."
+            forwardableOpMetadata:
+                type: ForwardableOperationMetadata
+                description: >-
+                    Operation metadata (including the FCV snapshot) captured when the resharding
+                    operation was initiated. Used to evaluate feature flags consistently throughout
+                    the operation lifetime, even across FCV transitions (e.g. downgrades).
+                optional: true
+            primaryShardId:
+                type: shard_id
+                description: Primary shard id for the given namespace being resharded
+                optional: true
+            startingFCV:
+                type: fcv_string
+                description: "The FCV when the coordinator doc was created."
+                optional: true
+
+            authoritativeMetadataAccessLevel:
+                type: ReshardingAuthoritativeMetadataAccessLevel
+                description: "The access level to authoritative metadata granted by the FCV state at the creation of this document."
+                default: kNone
+
+    AbortReason:
+        description: "Not meant to be used directly. Only use internal fields."
+        mod_visibility: private
+        # Use strict:false to avoid complications around upgrade/downgrade. This setting has no
+        # practical effect because this type is only meant to be used as a chained struct with
+        # inline_chained_structs:true and only the strictness setting of the wrapping struct type
+        # applies.
+        strict: false
+        fields:
+            abortReason:
+                type: object_owned
+                description:
+                    "The error that caused the node to abort the resharding operation. In
+                    this case, the node may be a donor shard, recipient shard, or the
+                    coordinator itself."
+                optional: true
+
+    ReshardingMetricsTimeInterval:
+        description: "Contains the start and stop time of a resharding operation phase."
+        mod_visibility: private
+        strict: false
+        fields:
+            start:
+                type: date
+                description: "The start timestamp."
+                optional: true
+            stop:
+                type: date
+                description: "The stop timestamp."
+                optional: true
+
+    DonorShardContext:
+        description:
+            "Mutable state for a donor shard tracked both locally by a donor shard and
+            remotely by the resharding coordinator."
+        mod_visibility: private
+        inline_chained_structs: true
+        chained_structs:
+            AbortReason: AbortReasonStruct
+        generate_comparison_operators: false
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            state:
+                type: DonorState
+                default: kUnused
+            minFetchTimestamp:
+                type: timestamp
+                description:
+                    "Timestamp after which this donor shard has guaranteed that oplog
+                    entries contain recipient shard information."
+                optional: true
+            bytesToClone:
+                type: long
+                description:
+                    "Number of bytes on this donor shard in the collection being
+                    resharded."
+                optional: true
+            documentsToClone:
+                type: long
+                description:
+                    "Number of documents on this donor shard in the collection being
+                    resharded."
+                optional: true
+            indexCount:
+                type: long
+                description: "Number of indexes on this donor shard in the collection being resharded."
+                optional: true
+            writesDuringCriticalSection:
+                type: long
+                description: "Number of writes during critical section on this donor shard."
+                optional: true
+            phaseDurations:
+                type: object_owned
+                description: "Time spent in each phase so far."
+                optional: true
+            criticalSectionInterval:
+                type: ReshardingMetricsTimeInterval
+                description: Start and end times for the critical section.
+                optional: true
+
+    DonorShardFetchTimestamp:
+        description: "Used for tracking donor min fetch timestamp"
+        mod_visibility: private
+        strict: false
+        generate_comparison_operators: false
+        fields:
+            shardId:
+                type: shard_id
+                description: "A shard identifier."
+            minFetchTimestamp:
+                type: timestamp
+                optional: true
+                description:
+                    "Timestamp after which this donor shard has guaranteed that oplog
+                    entries contain recipient shard information."
+
+    ReshardingRecipientOptions:
+        description: "Immutable options relevant only to recipient shards."
+        mod_visibility: private
+        strict: false
+        fields:
+            donorShards:
+                type: array<DonorShardFetchTimestamp>
+                description: "The list of donor shards that report to this recipient."
+            minimumOperationDurationMillis:
+                type: long
+            oplogBatchTaskCount:
+                type: long
+                description: >-
+                    The number of subtasks to divide a single oplog batch into,
+                    so that it may be applied concurrently by multiple threads.
+                optional: true
+            relaxed:
+                type: optionalBool
+                description: >-
+                    Runs the cloner aggregation without specifying a collection
+                    UUID to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards.
+            skipCloningAndApplying:
+                type: optionalBool
+                description:
+                    "Whether this recipient can skip cloning documents and
+                    fetching/applying oplog entries because it is not going to own any
+                    chunks for the collection after resharding."
+            skipCloning:
+                type: optionalBool
+                description:
+                    "Whether this recipient can skip cloning documents because it is not going to
+                    own any chunks for the collection after resharding."
+            skipBuildingIndexes:
+                type: optionalBool
+                description:
+                    "Whether this recipient can skip building indexes because it is not going to
+                    own any chunks for the collection after resharding."
+            storeOplogFetcherProgress:
+                type: optionalBool
+                description:
+                    "Whether this recipient should store the count of oplog entries
+                    fetched in a progress document and use this count instead of the fast
+                    count to recover metrics upon recovery."
+
+    RecipientShardContext:
+        description:
+            "Mutable state for a recipient shard tracked both locally by a recipient shard
+            and remotely by the resharding coordinator."
+        mod_visibility: private
+        inline_chained_structs: true
+        chained_structs:
+            AbortReason: AbortReasonStruct
+        generate_comparison_operators: false
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            state:
+                type: RecipientState
+                default: kUnused
+            bytesCopied:
+                type: long
+                description: "Number of bytes copied on this recipient shard."
+                optional: true
+            oplogFetched:
+                type: long
+                description: "Number of oplog entries fetched on this recipient shard."
+                optional: true
+            oplogApplied:
+                type: long
+                description: "Number of oplog entries applied on this recipient shard."
+                optional: true
+            numDocumentsCloned:
+                type: long
+                description: "Number of documents cloned to this recipient shard during the cloning phase."
+                optional: true
+            totalNumDocuments:
+                type: long
+                description: "Number of documents on this recipient shard for the resharded collection."
+                optional: true
+            totalDocumentSize:
+                type: long
+                description: "Total size of all documents on this recipient shard for the resharded collection."
+                optional: true
+            numOfIndexes:
+                type: long
+                description: "Number of indexes on this recipient shard for the resharded collection."
+                optional: true
+            phaseDurations:
+                type: object_owned
+                description: "Time spent in each phase so far."
+                optional: true
+
+    ReshardingApproxCopySize:
+        description: "Not meant to be used directly. Only use internal fields."
+        mod_visibility: private
+        # Use strict:false to avoid complications around upgrade/downgrade. This setting has no
+        # practical effect because this type is only meant to be used as a chained struct with
+        # inline_chained_structs:true and only the strictness setting of the wrapping struct type
+        # applies.
+        strict: false
+        fields:
+            approxDocumentsToCopy:
+                type: long
+                optional: true
+            approxBytesToCopy:
+                type: long
+                optional: true
+
+    ReshardingSourceId:
+        description: "Identifier for a shard involved in a particular resharding operation."
+        mod_visibility: private
+        # Use strict:true because this type is used as the structure for the _id value in documents
+        # and requires being an exact match.
+        strict: true
+        fields:
+            reshardingUUID:
+                type: uuid
+                description: "Identifier for a resharding operation."
+            shardId:
+                type: shard_id
+                description: "A shard identifier."
+
+    ReshardingZoneType:
+        description: >-
+            Object describing a zone for the collection being resharded using the new shard key.
+        mod_visibility: needs_replacement
+        # Use strict:false to avoid complications around upgrade/downgrade.
+        strict: false
+        fields:
+            zone:
+                type: string
+                description: "The zone name."
+            min:
+                type: object_owned
+                description: "The min key of the chunk range assigned to the zone."
+            max:
+                type: object_owned
+                description: "The max key of the chunk range assigned to the zone."
+
+    ReshardedChunk:
+        description: "ReshardedChunk"
+        mod_visibility: needs_replacement
+        fields:
+            recipientShardId:
+                type: shard_id
+                description: "The id of the recipient shard."
+            min:
+                type: object_owned
+                description: "The min key of the chunk range."
+            max:
+                type: object_owned
+                description: "The max key of the chunk range."
+
+    DocumentSourceReshardingOwnershipMatchSpec:
+        description:
+            "A struct representing the information needed for a resharding pipeline to
+            determine which documents belong to a particular shard."
+        mod_visibility: private
+        strict: true
+        query_shape_component: true
+        fields:
+            recipientShardId:
+                type: shard_id
+                description: "The id of the recipient shard."
+                query_shape: anonymize
+            reshardingKey:
+                type: KeyPattern
+                description: "The index specification document to use as the new shard key."
+                query_shape: custom
+            temporaryReshardingNamespace:
+                type: namespacestring
+                description:
+                    "The namespace of the temporary resharding collection that exists on
+                    recipient shards."
+                query_shape: custom
+                optional: true
+    ShardKeyRange:
+        description: "A struct to represent the key ranges of shards."
+        mod_visibility: needs_replacement
+        fields:
+            min:
+                type: object_owned
+                description: "The min key of this shard key range."
+                optional: true
+            max:
+                type: object_owned
+                description: "The max key of this shard key range."
+                optional: true
+            shard:
+                type: shard_id
+                description: "Id of the shard for this shard key range."
+    ChangeStreamsMonitorContext:
+        description: "Contains information about the change stream monitor's progress"
+        mod_visibility: private
+        strict: false
+        fields:
+            startAtOperationTime:
+                type: timestamp
+            resumeToken:
+                type: object_owned
+                optional: true
+            documentsDelta:
+                type: long
+            completed:
+                type: bool
+                default: false

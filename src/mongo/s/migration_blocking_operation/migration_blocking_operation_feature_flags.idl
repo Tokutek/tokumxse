@@ -1,0 +1,20 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::migration_blocking_operation"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+feature_flags:
+    featureFlagPauseMigrationsDuringMultiUpdatesAvailable:
+        description:
+            "Feature flag indicating whether or not the pauseMigrationsDuringMultiUpdates
+            cluster parameter is available."
+        cpp_varname: gFeatureFlagPauseMigrationsDuringMultiUpdatesAvailable
+        default: true
+        version: 8.0
+        fcv_gated: true
+        check_against_fcv: legacy_fcv_snapshot_only

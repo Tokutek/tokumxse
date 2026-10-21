@@ -1,0 +1,34 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    internalRenameIfOptionsAndIndexesMatch:
+        description:
+            "An internal command that does a rename, but first checks to make sure the
+            indexes and collection options on the destination match those given in the
+            command."
+        command_name: internalRenameIfOptionsAndIndexesMatch
+        # TODO (SERVER-104891): make this alias the command_name when 9.0 becomes last LTS
+        command_alias: _renameIfOptionsAndIndexesMatch
+        namespace: ignored
+        api_version: ""
+        fields:
+            from:
+                type: namespacestring
+            to:
+                type: namespacestring
+            collectionOptions:
+                description:
+                    "An object representing the options on the from collection with the
+                    same format as the options from the listCollections command."
+                type: object
+            indexes:
+                description: "An object with form {indexName: {spec}, indexName: {spec}, ...}"
+                type: array<object>

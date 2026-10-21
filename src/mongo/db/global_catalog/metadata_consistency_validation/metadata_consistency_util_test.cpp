@@ -1,0 +1,3220 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_util.h"
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/global_catalog/metadata_consistency_validation/check_metadata_consistency_statistics.h"
+#include "mongo/db/global_catalog/sharding_catalog_client_mock.h"
+#include "mongo/db/global_catalog/type_database_gen.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/query/collation/collator_factory_icu.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_catalog/database_sharding_state_mock.h"
+#include "mongo/db/shard_role/shard_catalog/metadata_consistency_checks/collection_metadata_checks.h"
+#include "mongo/db/sharding_environment/shard_server_test_fixture.h"
+#include "mongo/db/timeseries/timeseries_options.h"
+#include "mongo/db/timeseries/timeseries_test_util.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/random.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+const ShardId kShard0{"shard0"};
+const ShardId kShard1{"shard1"};
+const std::vector<ChunkHistory> kShard0History{ChunkHistory(Timestamp(1, 0), kShard0)};
+const std::vector<ChunkHistory> kShard1History{ChunkHistory(Timestamp(1, 0), kShard1)};
+
+ChunkType generateChunk(const UUID& collUuid,
+                        const ShardId& shardId,
+                        const BSONObj& minKey,
+                        const BSONObj& maxKey,
+                        const std::vector<ChunkHistory>& history,
+                        const OID& epoch = OID::gen()) {
+    ChunkType chunkType;
+    chunkType.setName(OID::gen());
+    chunkType.setCollectionUUID(collUuid);
+    chunkType.setVersion(ChunkVersion({epoch, Timestamp(1, 1)}, {1, 0}));
+    chunkType.setShard(shardId);
+    chunkType.setRange({minKey, maxKey});
+    chunkType.setOnCurrentShardSince(Timestamp(1, 0));
+    chunkType.setHistory(history);
+    return chunkType;
+}
+
+// Generates a chunk whose version round-trips through parseFromConfigBSON using the collection's
+// epoch and timestamp (required for durable shard-catalog tests with strict chunk validation).
+ChunkType generateChunkForCollection(const CollectionType& coll,
+                                     const ShardId& shardId,
+                                     const BSONObj& minKey,
+                                     const BSONObj& maxKey,
+                                     const std::vector<ChunkHistory>& history) {
+    ChunkType chunkType;
+    chunkType.setName(OID::gen());
+    chunkType.setCollectionUUID(coll.getUuid());
+    chunkType.setVersion(ChunkVersion({coll.getEpoch(), coll.getTimestamp()}, {1, 0}));
+    chunkType.setShard(shardId);
+    chunkType.setRange({minKey, maxKey});
+    chunkType.setOnCurrentShardSince(Timestamp(1, 0));
+    chunkType.setHistory(history);
+    return chunkType;
+}
+
+TagsType generateZone(const NamespaceString& nss, const BSONObj& minKey, const BSONObj& maxKey) {
+    TagsType tagType;
+    tagType.setTag(OID::gen().toString());
+    tagType.setNS(nss);
+    tagType.setRange({minKey, maxKey});
+    return tagType;
+}
+
+TimeseriesOptions generateTimeseriesOptions(
+    const std::string& timeField,
+    const boost::optional<std::string_view> metaField = boost::none,
+    const boost::optional<BucketGranularityEnum> granularity = boost::none,
+    const boost::optional<int32_t>& bucketMaxSpanSeconds = boost::none,
+    const boost::optional<int32_t>& bucketRoundingSeconds = boost::none) {
+    TimeseriesOptions options{timeField};
+    options.setMetaField(metaField);
+    options.setGranularity(granularity);
+    options.setBucketMaxSpanSeconds(bucketMaxSpanSeconds);
+    options.setBucketRoundingSeconds(bucketRoundingSeconds);
+    return options;
+}
+
+std::pair<const std::shared_ptr<const CollectionCatalog>, std::vector<CollectionPtr>>
+getLocalCatalog(OperationContext* opCtx, const NamespaceString& nss) {
+    std::vector<CollectionPtr> localCatalogCollections;
+    auto collCatalogSnapshot = [&] {
+        AutoGetCollection coll(opCtx,
+                               nss,
+                               MODE_IS,
+                               auto_get_collection::Options{}.viewMode(
+                                   auto_get_collection::ViewMode::kViewsPermitted));
+        return CollectionCatalog::get(opCtx);
+    }();
+
+    if (auto coll = collCatalogSnapshot->lookupCollectionByNamespace(opCtx, nss)) {
+        // The lifetime of the collection returned by the lookup is guaranteed to be valid as
+        // it's controlled by the test. The initialization is therefore safe.
+        localCatalogCollections.emplace_back(CollectionPtr::CollectionPtr_UNSAFE(coll));
+    }
+    return {collCatalogSnapshot, std::move(localCatalogCollections)};
+}
+
+class CatalogClientWithChunks : public ShardingCatalogClientMock {
+public:
+    void setCollectionsToReturn(std::vector<CollectionType> collections) {
+        _collections = std::move(collections);
+    }
+
+    void setChunksToReturn(std::vector<ChunkType> chunks) {
+        _chunks = std::move(chunks);
+    }
+
+    void setOnGetChunksCallback(std::function<void(OperationContext*)> callback) {
+        _onGetChunksCallback = std::move(callback);
+    }
+
+    DatabaseType getDatabase(OperationContext* opCtx,
+                             const DatabaseName& db,
+                             repl::ReadConcernArgs readConcern) override {
+        return DatabaseType{db, kShard1, {UUID::gen(), Timestamp(1, 0)}};
+    }
+
+    StatusWith<std::vector<ChunkType>> getChunks(OperationContext* opCtx,
+                                                 const BSONObj& filter,
+                                                 const BSONObj& sort,
+                                                 boost::optional<int> limit,
+                                                 repl::OpTime* opTime,
+                                                 const OID& epoch,
+                                                 const Timestamp& timestamp,
+                                                 repl::ReadConcernArgs readConcern,
+                                                 const boost::optional<BSONObj>& hint) override {
+        if (_onGetChunksCallback) {
+            _onGetChunksCallback(opCtx);
+        }
+        return _chunks;
+    }
+
+    std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                               const DatabaseName& dbName,
+                                               repl::ReadConcernArgs readConcern,
+                                               const BSONObj& sort) override {
+        return _collections;
+    }
+
+private:
+    std::vector<CollectionType> _collections;
+    std::vector<ChunkType> _chunks;
+    std::function<void(OperationContext*)> _onGetChunksCallback;
+};
+
+class MetadataConsistencyTest : public ShardServerTestFixture {
+protected:
+    void setUp() override {
+        ShardServerTestFixture::setUp();
+        _catalogClient =
+            dynamic_cast<CatalogClientWithChunks*>(Grid::get(operationContext())->catalogClient());
+        invariant(_catalogClient);
+        // TODO(SERVER-98118): for `OptimisticFCVFeatureFlagGuard`, remove once 9.0 is last LTS
+        // (Generic FCV reference): used for testing
+        FeatureCompatibilityVersion::setIfCleanStartup(
+            operationContext(),
+            repl::StorageInterface::get(getServiceContext()),
+            multiversion::GenericFCV::kLatest);
+    }
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
+        return std::make_unique<CatalogClientWithChunks>();
+    }
+
+    CatalogClientWithChunks* _catalogClient = nullptr;
+
+    const ShardId _shardId = kShard0;
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
+    const DatabaseName _dbName = _nss.dbName();
+    const UUID _collUuid = UUID::gen();
+    const UUID _dbUuid = UUID::gen();
+    const KeyPattern _keyPattern{BSON("x" << 1)};
+    const CollectionType _coll{
+        _nss, OID::gen(), Timestamp(1), Date_t::now(), _collUuid, _keyPattern};
+    const unittest::ServerParameterGuard disableRandomRecovery{
+        "probabilityTriggerShardFilteringRecoveryDuringCheckMetadataConsistency", 0.0};
+
+    CollectionType generateCollectionType(const NamespaceString& nss,
+                                          const UUID& uuid,
+                                          const KeyPattern& keyPattern = KeyPattern(BSON("_id"
+                                                                                         << 1))) {
+        return CollectionType{nss, OID::gen(), Timestamp(1), Date_t::now(), uuid, keyPattern};
+    }
+
+    void updateConfigChunks(const std::vector<ChunkType>& chunks) {
+        DBDirectClient client(operationContext());
+
+        // Remove all chunks
+        const auto resRemove = client.remove(write_ops::DeleteCommandRequest{
+            NamespaceString::kConfigsvrChunksNamespace,
+            {write_ops::DeleteOpEntry{BSONObj(), true /* multi */}}});
+        write_ops::checkWriteErrors(resRemove);
+
+        // Insert the given chunks
+        if (chunks.size()) {
+            std::vector<BSONObj> docs;
+            for (auto& chunk : chunks) {
+                docs.emplace_back(chunk.toConfigBSON());
+            }
+            const auto resInsert = client.insert(
+                write_ops::InsertCommandRequest{NamespaceString::kConfigsvrChunksNamespace, docs});
+            write_ops::checkWriteErrors(resInsert);
+        }
+    }
+
+    void assertOneInconsistencyFound(
+        const MetadataInconsistencyTypeEnum& type,
+        const std::vector<MetadataInconsistencyItem>& inconsistencies) {
+        ASSERT_EQ(1, inconsistencies.size());
+        ASSERT_EQ(type, inconsistencies[0].getType());
+    }
+
+    void assertCollectionOptionsMismatchInconsistencyFound(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies,
+        const BSONObj& localOptions,
+        const BSONObj& configOptions) {
+        ASSERT_GT(inconsistencies.size(), 0);
+        ASSERT_TRUE(std::any_of(
+            inconsistencies.begin(), inconsistencies.end(), [&](const auto& inconsistency) {
+                if (inconsistency.getType() !=
+                    MetadataInconsistencyTypeEnum::kCollectionOptionsMismatch) {
+                    return false;
+                }
+
+                const auto& allOptions = inconsistency.getDetails().getField("options").Array();
+                if (std::none_of(allOptions.begin(), allOptions.end(), [&](const BSONElement& o) {
+                        return localOptions.woCompare(o.Obj().getField("options").Obj()) == 0;
+                    })) {
+                    return false;
+                }
+                if (std::none_of(allOptions.begin(), allOptions.end(), [&](const BSONElement& o) {
+                        return configOptions.woCompare(o.Obj().getField("options").Obj()) == 0;
+                    })) {
+                    return false;
+                }
+                return true;
+            }));
+    }
+
+    void assertNoCollectionOptionsMismatchInconsistencyFound(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies) {
+        ASSERT_TRUE(std::none_of(
+            inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+                return inconsistency.getType() ==
+                    MetadataInconsistencyTypeEnum::kCollectionOptionsMismatch;
+            }));
+    }
+};
+
+class MetadataConsistencyConfigTest : public MetadataConsistencyTest {
+protected:
+    void setUp() override {
+        // The ShardingState must be set to 'config' to be able to call
+        // metadata_consistency_util::checkChunksConsistency()
+        kMyShardName = ShardId::kConfigServerId;
+        MetadataConsistencyTest::setUp();
+    }
+};
+
+TEST_F(MetadataConsistencyConfigTest, FindRoutingTableRangeGapInconsistency) {
+    const auto chunk1 = generateChunk(_collUuid,
+                                      _shardId,
+                                      _keyPattern.globalMin(),
+                                      BSON("x" << 0),
+                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
+
+    const auto chunk2 = generateChunk(_collUuid,
+                                      _shardId,
+                                      BSON("x" << 1),
+                                      _keyPattern.globalMax(),
+                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
+    updateConfigChunks({chunk1, chunk2});
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableRangeGap,
+                                inconsistencies);
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindMissingChunkWithMaxKeyInconsistency) {
+    const auto chunk = generateChunk(_collUuid,
+                                     _shardId,
+                                     _keyPattern.globalMin(),
+                                     BSON("x" << 0),
+                                     {ChunkHistory(Timestamp(1, 0), _shardId)});
+    updateConfigChunks({chunk});
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableMissingMaxKey,
+                                inconsistencies);
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindMissingChunkWithMinKeyInconsistency) {
+    const auto chunk = generateChunk(_collUuid,
+                                     _shardId,
+                                     BSON("x" << 0),
+                                     _keyPattern.globalMax(),
+                                     {ChunkHistory(Timestamp(1, 0), _shardId)});
+    updateConfigChunks({chunk});
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableMissingMinKey,
+                                inconsistencies);
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindRoutingTableRangeOverlapInconsistency) {
+    const auto chunk1 = generateChunk(_collUuid,
+                                      _shardId,
+                                      _keyPattern.globalMin(),
+                                      BSON("x" << 0),
+                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
+
+    const auto chunk2 = generateChunk(_collUuid,
+                                      _shardId,
+                                      BSON("x" << -10),
+                                      _keyPattern.globalMax(),
+                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
+    updateConfigChunks({chunk1, chunk2});
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kRoutingTableRangeOverlap,
+                                inconsistencies);
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindCorruptedChunkShardKeyInconsistency) {
+    const auto chunk1 = generateChunk(_collUuid,
+                                      _shardId,
+                                      _keyPattern.globalMin(),
+                                      BSON("x" << 0),
+                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
+
+    const auto chunk2 = generateChunk(_collUuid,
+                                      _shardId,
+                                      BSON("y" << 0),
+                                      _keyPattern.globalMax(),
+                                      {ChunkHistory(Timestamp(1, 0), _shardId)});
+    updateConfigChunks({chunk1, chunk2});
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    ASSERT_EQ(2, inconsistencies.size());
+    ASSERT_EQ(MetadataInconsistencyTypeEnum::kCorruptedChunkShardKey, inconsistencies[0].getType());
+    ASSERT_EQ(MetadataInconsistencyTypeEnum::kRoutingTableRangeGap, inconsistencies[1].getType());
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindCorruptedZoneShardKeyInconsistency) {
+    const auto zone1 = generateZone(_nss, _keyPattern.globalMin(), BSON("x" << 0));
+
+    const auto zone2 = generateZone(_nss, BSON("y" << 0), _keyPattern.globalMax());
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkZonesConsistency(operationContext(), _coll, {zone1, zone2});
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kCorruptedZoneShardKey,
+                                inconsistencies);
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindZoneRangeOverlapInconsistency) {
+    const auto zone1 = generateZone(_nss, _keyPattern.globalMin(), BSON("x" << 0));
+
+    const auto zone2 = generateZone(_nss, BSON("x" << -10), _keyPattern.globalMax());
+
+    const auto inconsistencies =
+        metadata_consistency_util::checkZonesConsistency(operationContext(), _coll, {zone1, zone2});
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kZonesRangeOverlap, inconsistencies);
+}
+
+TEST_F(MetadataConsistencyConfigTest, FindCorruptedShardKeyInconsistencyForUnsplittableCollection) {
+    const NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestCollUnsplittable");
+    const UUID collUuid = UUID::gen();
+    const KeyPattern keyPattern{BSON("x" << 1)};
+    CollectionType coll{nss, OID::gen(), Timestamp(1), Date_t::now(), collUuid, keyPattern};
+    coll.setUnsplittable(true);
+    const auto inconsistencies =
+        metadata_consistency_util::checkCollectionShardingMetadataConsistency(operationContext(),
+                                                                              coll);
+    assertOneInconsistencyFound(
+        MetadataInconsistencyTypeEnum::kTrackedUnshardedCollectionHasInvalidKey, inconsistencies);
+}
+
+TEST_F(MetadataConsistencyTest, CappedAndShardedCollection) {
+    OperationContext* opCtx = operationContext();
+
+    // Create a capped local collection.
+    CreateCommand cmd(_nss);
+    cmd.getCreateCollectionRequest().setCapped(true);
+    cmd.getCreateCollectionRequest().setSize(100);
+    createTestCollection(opCtx, _nss, cmd.toBSON());
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    // Create a CollectionType for a non-unsplittable collection to mock the collection info
+    // fetched from the config server.
+    auto configColl = generateCollectionType(_nss, localCatalogCollections[0]->uuid());
+
+    // Catch the inconsistency.
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+    assertCollectionOptionsMismatchInconsistencyFound(
+        inconsistencies,
+        BSON("capped" << true),
+        BSON("capped" << false << "unsplittable" << false));
+}
+
+TEST_F(MetadataConsistencyTest, DefaultCollationMismatchBetweenLocalAndShardingCatalog) {
+    OperationContext* opCtx = operationContext();
+
+    auto convertToCatalogCollationBSON = [&opCtx](const Collation& collation) {
+        // The collation sent to the create cmd is slightly different to the one stored in the
+        // Catalog.
+        const auto collator =
+            uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                ->makeFromBSON(collation.toBSON()));
+        if (!collator) {
+            // Case when collation is {locale: 'simple'}
+            return BSONObj();
+        }
+        return collator->getSpec().toBSON();
+    };
+
+    const auto testCollationMismatch = [&](const NamespaceString& nss,
+                                           const boost::optional<Collation>& localCollation,
+                                           const boost::optional<Collation>& configCollation,
+                                           bool expectInconsistencies) {
+        // Create a local collection with the given collation.
+        CreateCommand cmd(nss);
+        if (localCollation) {
+            cmd.getCreateCollectionRequest().setCollation(*localCollation);
+        }
+        createTestCollection(opCtx, nss, cmd.toBSON());
+
+        const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, nss);
+        ASSERT_EQ(1, localCatalogCollections.size());
+
+        // Create a CollectionType to mock the collection metadata fetched from the config server.
+        auto configColl = generateCollectionType(nss, localCatalogCollections[0]->uuid());
+        if (configCollation) {
+            configColl.setDefaultCollation(convertToCatalogCollationBSON(*configCollation));
+        }
+
+        // Check the inconsistencies.
+        const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+            opCtx,
+            _shardId,
+            _shardId,
+            {configColl},
+            localCatalogSnapshot,
+            localCatalogCollections,
+            false /*checkRangeDeletionIndexes*/,
+            false /*optionalCheckIndexes*/,
+            0x1000000000000000);
+
+        if (expectInconsistencies) {
+            BSONObj collationLocalCatalog =
+                localCollation ? convertToCatalogCollationBSON(*localCollation) : BSONObj();
+            assertCollectionOptionsMismatchInconsistencyFound(
+                inconsistencies,
+                BSON(CollectionType::kDefaultCollationFieldName << collationLocalCatalog),
+                BSON(CollectionType::kDefaultCollationFieldName
+                     << configColl.getDefaultCollation()));
+        } else {
+            assertNoCollectionOptionsMismatchInconsistencyFound(inconsistencies);
+        }
+    };
+
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl1"),
+                          Collation("es"),
+                          Collation("ar"),
+                          true);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl2"),
+                          boost::none,
+                          Collation("ar"),
+                          true);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl3"),
+                          Collation("ca"),
+                          boost::none,
+                          true);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl4"),
+                          Collation("simple"),
+                          Collation("simple"),
+                          false);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl5"),
+                          Collation("az"),
+                          Collation("az"),
+                          false);
+    testCollationMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl6"),
+                          boost::none,
+                          boost::none,
+                          false);
+}
+
+TEST_F(MetadataConsistencyTest, TimeseriesOptionsMismatchBetweenLocalAndShardingCatalog) {
+    OperationContext* opCtx = operationContext();
+
+    const auto convertToCatalogTimeseriesOptions = [](TimeseriesOptions timeseriesOptions) {
+        // The TimeseriesOptions sent to the create cmd are slightly different to the ones stored in
+        // the Catalog.
+        uassertStatusOK(timeseries::validateAndSetBucketingParameters(timeseriesOptions));
+        // Mirror what collection creation does: default 'fixedBucketing' to true for new viewless
+        // time-series collections when the FixedBucketingCatalog feature flag is on.
+        // (Ignore FCV check): the test runs at the latest FCV, so the feature flags' enabled state
+        // is all that matters here.
+        if (gFeatureFlagCreateViewlessTimeseriesCollections.isEnabledAndIgnoreFCVUnsafe()) {
+            timeseries::setFixedBucketingDefaultForNewCollection(
+                timeseriesOptions, gFeatureFlagFixedBucketingCatalog.isEnabledAndIgnoreFCVUnsafe());
+        }
+        return timeseriesOptions;
+    };
+
+    const auto testTimeseriesMismatch =
+        [&](const NamespaceString& nss,
+            const boost::optional<TimeseriesOptions>& localTimeseries,
+            const boost::optional<TimeseriesOptions>& configTimeseries,
+            bool expectInconsistencies) {
+            // Create a local collection with the given collation.
+            CreateCommand cmd(nss);
+            if (localTimeseries) {
+                cmd.getCreateCollectionRequest().setTimeseries(localTimeseries);
+            }
+            createTestCollection(opCtx, nss, cmd.toBSON());
+
+            auto actualNss =
+                localTimeseries ? timeseries::test_util::resolveTimeseriesNss(nss) : nss;
+
+            const auto [localCatalogSnapshot, localCatalogCollections] =
+                getLocalCatalog(opCtx, actualNss);
+            ASSERT_EQ(1, localCatalogCollections.size());
+
+            // Create a CollectionType to mock the collection metadata fetched from the config
+            // server.
+            auto configColl = generateCollectionType(actualNss, localCatalogCollections[0]->uuid());
+            if (configTimeseries) {
+                TypeCollectionTimeseriesFields timeseriesFields;
+                timeseriesFields.setTimeseriesOptions(
+                    convertToCatalogTimeseriesOptions(*configTimeseries));
+                configColl.setTimeseriesFields(std::move(timeseriesFields));
+            }
+
+            // Check the inconsistencies.
+            const auto inconsistencies =
+                metadata_consistency_util::checkCollectionMetadataConsistency(
+                    opCtx,
+                    _shardId,
+                    _shardId,
+                    {configColl},
+                    localCatalogSnapshot,
+                    localCatalogCollections,
+                    false /*checkRangeDeletionIndexes*/,
+                    false /*optionalCheckIndexes*/,
+                    0x1000000000000000);
+
+            if (expectInconsistencies) {
+                const BSONObj& localCatalogBSON =
+                    (localTimeseries ? convertToCatalogTimeseriesOptions(*localTimeseries).toBSON()
+                                     : BSONObj());
+                const BSONObj& configCatalogBSON = configColl.getTimeseriesFields()
+                    ? configColl.getTimeseriesFields()->toBSON()
+                    : BSONObj();
+                assertCollectionOptionsMismatchInconsistencyFound(
+                    inconsistencies,
+                    BSON(CollectionType::kTimeseriesFieldsFieldName << localCatalogBSON),
+                    BSON(CollectionType::kTimeseriesFieldsFieldName << configCatalogBSON));
+            } else {
+                assertNoCollectionOptionsMismatchInconsistencyFound(inconsistencies);
+            }
+        };
+
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl1"),
+                           boost::none,
+                           generateTimeseriesOptions("time"),
+                           true);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl2"),
+                           generateTimeseriesOptions("time", "meta"sv),
+                           boost::none,
+                           true);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl3"),
+                           generateTimeseriesOptions("time"),
+                           generateTimeseriesOptions("x"),
+                           true);
+    testTimeseriesMismatch(
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl4"),
+        generateTimeseriesOptions("time", "meta"sv, BucketGranularityEnum::Minutes),
+        generateTimeseriesOptions("time", "metaDiff"sv, BucketGranularityEnum::Minutes),
+        true);
+    testTimeseriesMismatch(
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl5"),
+        generateTimeseriesOptions("time", "meta"sv, BucketGranularityEnum::Minutes),
+        generateTimeseriesOptions("time", "meta"sv, BucketGranularityEnum::Hours),
+        true);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl6"),
+                           generateTimeseriesOptions("time", "meta"sv, boost::none, 111, 111),
+                           generateTimeseriesOptions("time", "meta"sv, boost::none, 222, 222),
+                           true);
+    testTimeseriesMismatch(
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl7"),
+        generateTimeseriesOptions("time", "meta"sv, BucketGranularityEnum::Hours),
+        generateTimeseriesOptions("time", "meta"sv, BucketGranularityEnum::Hours),
+        false);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl8"),
+                           generateTimeseriesOptions("time", "meta"sv, boost::none, 3333, 3333),
+                           generateTimeseriesOptions("time", "meta"sv, boost::none, 3333, 3333),
+                           false);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl9"),
+                           boost::none,
+                           boost::none,
+                           false);
+    testTimeseriesMismatch(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl10"),
+                           generateTimeseriesOptions("x"),
+                           generateTimeseriesOptions("x"),
+                           false);
+}
+
+TEST_F(MetadataConsistencyTest, ShardUntrackedCollectionInconsistencyTest) {
+    // This test exercises the legacy (non-authoritative) trackedness mismatch detection. With
+    // authoritative shards, a primary holding no routing table for a globally-tracked collection is
+    // an expected transient state that is validated against the durable shard catalog instead.
+    // TODO (SERVER-98118): adapt this unit test to work with authoritative shards.
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         false);
+
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    auto configColl = generateCollectionType(_nss, localCatalogCollections[0]->uuid());
+
+    auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+    assertOneInconsistencyFound(
+        MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata,
+        inconsistencies);
+    ASSERT_EQ("isTracked"sv,
+              inconsistencies[0].getDetails().getObjectField("details").getStringField("field"));
+
+    // Clear the filtering information and check that no inconsistency is reported for unknown
+    // filtering information.
+    {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(opCtx, _nss);
+        scopedCSR->clearCollectionMetadata(opCtx);
+    }
+    inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+    ASSERT_EQ(0, inconsistencies.size());
+}
+
+TEST_F(MetadataConsistencyTest, ShardTrackedCollectionInconsistencyTest) {
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    {
+        auto chunk = generateChunk(localCatalogCollections[0]->uuid(),
+                                   _shardId,
+                                   _keyPattern.globalMin(),
+                                   _keyPattern.globalMax(),
+                                   {ChunkHistory(Timestamp(1, 0), _shardId)});
+        auto rt = RoutingTableHistory::makeNew(_nss,
+                                               localCatalogCollections[0]->uuid(),
+                                               _keyPattern,
+                                               false, /* unsplittable */
+                                               nullptr,
+                                               false,
+                                               chunk.getVersion().epoch(),
+                                               chunk.getVersion().getTimestamp(),
+                                               boost::none /* timeseriesFields */,
+                                               boost::none /* resharding Fields */,
+                                               true /* allowMigrations */,
+                                               {chunk});
+
+        const auto version = rt.getVersion();
+        const auto rtHandle = RoutingTableHistoryValueHandle(
+            std::make_shared<RoutingTableHistory>(std::move(rt)),
+            ComparableChunkVersion::makeComparableChunkVersion(version));
+
+        const auto collectionMetadata = CollectionMetadata(CurrentChunkManager(rtHandle), _shardId);
+
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(opCtx, _nss);
+        scopedCSR->setCollectionMetadata(opCtx, collectionMetadata);
+    }
+
+    auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+    assertOneInconsistencyFound(
+        MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata,
+        inconsistencies);
+    ASSERT_EQ("isTracked"sv,
+              inconsistencies[0].getDetails().getObjectField("details").getStringField("field"));
+
+    // Clear the filtering information and check that no inconsistency is reported for unknown
+    // filtering information.
+    {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(opCtx, _nss);
+        scopedCSR->clearCollectionMetadata(opCtx);
+    }
+    inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+    ASSERT_EQ(0, inconsistencies.size());
+}
+
+void assertIncompatibleUniqueIndexFound(
+    const std::vector<MetadataInconsistencyItem>& inconsistencies) {
+    ASSERT_TRUE(std::any_of(inconsistencies.begin(), inconsistencies.end(), [](const auto& item) {
+        return item.getType() ==
+            MetadataInconsistencyTypeEnum::kIncompatibleUniqueIndexOnShardedCollection;
+    }));
+}
+
+void assertNoIncompatibleUniqueIndexFound(
+    const std::vector<MetadataInconsistencyItem>& inconsistencies) {
+    ASSERT_TRUE(std::none_of(inconsistencies.begin(), inconsistencies.end(), [](const auto& item) {
+        return item.getType() ==
+            MetadataInconsistencyTypeEnum::kIncompatibleUniqueIndexOnShardedCollection;
+    }));
+}
+
+TEST_F(MetadataConsistencyTest,
+       UniqueIndexWithNonSimpleCollationOnShardKeyPrefixReportsInconsistency) {
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    DBDirectClient client(opCtx);
+    client.createIndexes(
+        _nss,
+        {BSON("key" << BSON("x" << 1) << "name"
+                    << "x_1_en_unique"
+                    << "unique" << true << "collation" << BSON("locale" << "en"))});
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    auto configColl = generateCollectionType(
+        _nss, localCatalogCollections[0]->uuid(), KeyPattern(BSON("x" << 1)));
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        true /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    assertIncompatibleUniqueIndexFound(inconsistencies);
+}
+
+TEST_F(MetadataConsistencyTest, NonUniqueIndexWithNonSimpleCollationDoesNotReportInconsistency) {
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    DBDirectClient client(opCtx);
+    client.createIndexes(_nss,
+                         {BSON("key" << BSON("x" << 1) << "name"
+                                     << "x_1_en"
+                                     << "collation" << BSON("locale" << "en"))});
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    auto configColl = generateCollectionType(
+        _nss, localCatalogCollections[0]->uuid(), KeyPattern(BSON("x" << 1)));
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        true /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    assertNoIncompatibleUniqueIndexFound(inconsistencies);
+}
+
+TEST_F(MetadataConsistencyTest, UniqueIndexWithSimpleCollationDoesNotReportInconsistency) {
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    DBDirectClient client(opCtx);
+    client.createIndexes(_nss,
+                         {BSON("key" << BSON("x" << 1) << "name"
+                                     << "x_1_unique"
+                                     << "unique" << true)});
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    auto configColl = generateCollectionType(
+        _nss, localCatalogCollections[0]->uuid(), KeyPattern(BSON("x" << 1)));
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        true /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    assertNoIncompatibleUniqueIndexFound(inconsistencies);
+}
+
+TEST_F(MetadataConsistencyTest,
+       UniqueIndexWithNonSimpleCollationNotReportedWhenOptionalCheckIndexesFalse) {
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    DBDirectClient client(opCtx);
+    client.createIndexes(
+        _nss,
+        {BSON("key" << BSON("x" << 1) << "name"
+                    << "x_1_en_unique"
+                    << "unique" << true << "collation" << BSON("locale" << "en"))});
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    auto configColl = generateCollectionType(
+        _nss, localCatalogCollections[0]->uuid(), KeyPattern(BSON("x" << 1)));
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    assertNoIncompatibleUniqueIndexFound(inconsistencies);
+}
+
+TEST_F(MetadataConsistencyTest, UniqueIndexWithNonSimpleCollationAllowedInUnsplittableCollections) {
+    OperationContext* opCtx = operationContext();
+
+    createTestCollection(opCtx, _nss);
+
+    DBDirectClient client(opCtx);
+    client.createIndexes(
+        _nss,
+        {BSON("key" << BSON("x" << 1) << "name"
+                    << "x_1_en_unique"
+                    << "unique" << true << "collation" << BSON("locale" << "en"))});
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    auto configColl = generateCollectionType(
+        _nss, localCatalogCollections[0]->uuid(), KeyPattern(BSON("_id" << 1)));
+    configColl.setUnsplittable(true);
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        true /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    assertNoIncompatibleUniqueIndexFound(inconsistencies);
+}
+
+class MetadataConsistencyRandomRoutingTableTest : public MetadataConsistencyConfigTest {
+protected:
+    inline const static auto _shards = std::vector<ShardId>{kShard0, kShard1};
+    PseudoRandom _random{SecureRandom().nextInt64()};
+
+    std::vector<ChunkType> getRandomRoutingTable() {
+        int numChunks = _random.nextInt32(9) + 1;  // minimum 1 chunks, maximum 10 chunks
+        std::vector<ChunkType> chunks;
+
+        // Loop generating random routing table: [MinKey, 0), [1, 2), [2, 3), ... [x, MaxKey]
+        int nextMin;
+        for (int nextMax = 0; nextMax < numChunks; nextMax++) {
+            auto randomShard = _shards.at(_random.nextInt64(_shards.size()));
+            // set min as `MinKey` during first iteration, otherwise next min
+            auto min = nextMax == 0 ? _keyPattern.globalMin() : BSON("x" << nextMin);
+            // set max as `MaxKey` during last iteration, otherwise next max
+            auto max = nextMax == numChunks - 1 ? _keyPattern.globalMax() : BSON("x" << nextMax);
+            auto chunk = generateChunk(
+                _collUuid, randomShard, min, max, {ChunkHistory(Timestamp(1, 0), randomShard)});
+            nextMin = nextMax;
+            chunks.push_back(chunk);
+        }
+
+        return chunks;
+    };
+};
+
+/*
+ * Test function to check the correct behaviour of finding range gaps inconsistencies with random
+ * ranges. In order to introduce inconsistencies, a random number of chunks are removed from the the
+ * routing table to create range gaps.
+ */
+TEST_F(MetadataConsistencyRandomRoutingTableTest, FindRoutingTableRangeGapInconsistency) {
+    auto chunks = getRandomRoutingTable();
+    updateConfigChunks(chunks);
+
+    // Check that there are no inconsistencies in the routing table
+    auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+    ASSERT_EQ(0, inconsistencies.size());
+
+    // Remove randoms chunk from the routing table
+    const auto kNumberOfChunksToRemove = _random.nextInt64(chunks.size()) + 1;
+    for (int i = 0; i < kNumberOfChunksToRemove; i++) {
+        const auto itChunkToRemove = _random.nextInt64(chunks.size());
+        chunks.erase(chunks.begin() + itChunkToRemove);
+    }
+    updateConfigChunks(chunks);
+
+    inconsistencies = metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    // Assert that there is at least one gap inconsistency
+    try {
+        ASSERT_LTE(1, inconsistencies.size());
+        for (const auto& inconsistency : inconsistencies) {
+            const auto type = inconsistency.getType();
+            ASSERT_TRUE(type == MetadataInconsistencyTypeEnum::kRoutingTableRangeGap ||
+                        type == MetadataInconsistencyTypeEnum::kRoutingTableMissingMinKey ||
+                        type == MetadataInconsistencyTypeEnum::kRoutingTableMissingMaxKey ||
+                        type == MetadataInconsistencyTypeEnum::kMissingRoutingTable);
+        }
+    } catch (...) {
+        LOGV2_INFO(7424600,
+                   "Expecting gap inconsistencies",
+                   "numberOfInconsistencies"_attr = inconsistencies.size(),
+                   "inconsistencies"_attr = inconsistencies);
+        throw;
+    }
+}
+
+/*
+ * Test function to check the correct behaviour of finding range overlaps inconsistencies with
+ * random ranges. In order to introduce inconsistencies, one chunk is randomly selected and its max
+ * or min bound is set to a random bigger or lower value, respectively.
+ */
+TEST_F(MetadataConsistencyRandomRoutingTableTest, FindRoutingTableRangeOverlapInconsistency) {
+    auto chunks = getRandomRoutingTable();
+    updateConfigChunks(chunks);
+
+    // Check that there are no inconsistencies in the routing table
+    auto inconsistencies =
+        metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+    ASSERT_EQ(0, inconsistencies.size());
+
+    // If there is only one chunk, we can't introduce an overlap
+    if (chunks.size() == 1) {
+        return;
+    }
+
+    const auto chunkIdx = static_cast<size_t>(_random.nextInt64(chunks.size()));
+    auto& chunk = chunks.at(chunkIdx);
+
+    auto overlapMax = [&]() {
+        auto newMax = [&] {
+            if (_random.nextInt64(10) == 0) {
+                // With 1/10 probability, set max to MaxKey
+                return _keyPattern.globalMax();
+            } else {
+                // Otherwise, set max to a random value bigger than actual
+                auto max = chunk.getMax()["x"].numberInt();
+                return BSON("x" << max + _random.nextInt64(10) + 1);
+            }
+        }();
+
+        chunk.setRange({chunk.getMin(), newMax});
+    };
+
+    auto overlapMin = [&]() {
+        auto newMin = [&] {
+            if (_random.nextInt64(10) == 0) {
+                // With 1/10 probability, set min to MinKey
+                return _keyPattern.globalMin();
+            } else {
+                // Otherwise, set min to a random value smaller than actual
+                auto min = chunk.getMin()["x"].numberInt();
+                return BSON("x" << min - _random.nextInt64(10) - 1);
+            }
+        }();
+        chunk.setRange({newMin, chunk.getMax()});
+    };
+
+    if (chunkIdx == 0) {
+        overlapMax();
+    } else if (chunkIdx == (chunks.size() - 1)) {
+        overlapMin();
+    } else {
+        // With 1/2 probability, overlap min or max
+        if (_random.nextInt64(2) == 0) {
+            overlapMin();
+        } else {
+            overlapMax();
+        }
+    }
+
+    updateConfigChunks(chunks);
+    inconsistencies = metadata_consistency_util::checkChunksConsistency(operationContext(), _coll);
+
+    // Assert that there is at least one overlap inconsistency
+    try {
+        ASSERT_LTE(1, inconsistencies.size());
+        ASSERT_TRUE(std::any_of(
+            inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+                return inconsistency.getType() ==
+                    MetadataInconsistencyTypeEnum::kRoutingTableRangeOverlap;
+            }));
+    } catch (...) {
+        LOGV2_INFO(7424601,
+                   "Expecting overlap inconsistencies",
+                   "numberOfInconsistencies"_attr = inconsistencies.size(),
+                   "inconsistencies"_attr = inconsistencies);
+        throw;
+    }
+}
+
+class MetadataConsistencyShardCatalogTest : public MetadataConsistencyTest {
+protected:
+    UUID setUpLocalCollection() {
+        return setUpLocalCollection(_nss);
+    }
+
+    UUID setUpLocalCollection(const NamespaceString& nss) {
+        createTestCollection(operationContext(), nss);
+        std::tie(_localCatalogSnapshot, _localCatalogCollections) =
+            getLocalCatalog(operationContext(), nss);
+        ASSERT_EQ(1, _localCatalogCollections.size());
+        return _localCatalogCollections[0]->uuid();
+    }
+
+    void setAuthoritativeShardCatalogMetadata(const UUID& uuid,
+                                              const KeyPattern& keyPattern,
+                                              const std::vector<ChunkType>& chunks) {
+        setAuthoritativeShardCatalogMetadata(_nss, uuid, keyPattern, chunks);
+    }
+
+    void setAuthoritativeShardCatalogMetadata(const NamespaceString& nss,
+                                              const UUID& uuid,
+                                              const KeyPattern& keyPattern,
+                                              const std::vector<ChunkType>& chunks) {
+        auto rt = RoutingTableHistory::makeNewAllowingGaps(nss,
+                                                           uuid,
+                                                           keyPattern,
+                                                           false,
+                                                           nullptr,
+                                                           false,
+                                                           chunks[0].getVersion().epoch(),
+                                                           chunks[0].getVersion().getTimestamp(),
+                                                           boost::none,
+                                                           boost::none,
+                                                           true,
+                                                           chunks);
+        const auto version = rt.getVersion();
+        const auto rtHandle = RoutingTableHistoryValueHandle(
+            std::make_shared<RoutingTableHistory>(std::move(rt)),
+            ComparableChunkVersion::makeComparableChunkVersion(version));
+        const auto collectionMetadata = CollectionMetadata(CurrentChunkManager(rtHandle), _shardId);
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), nss);
+        scopedCSR->setCollectionMetadata(operationContext(),
+                                         collectionMetadata,
+                                         CollectionShardingRuntime::NoRoutingTableAs::kUntracked);
+    }
+
+    void setShardCatalogMetadata(const UUID& uuid,
+                                 const KeyPattern& keyPattern,
+                                 const std::vector<ChunkType>& chunks) {
+        setShardCatalogMetadata(operationContext(), uuid, keyPattern, chunks);
+    }
+
+    void setShardCatalogMetadata(OperationContext* opCtx,
+                                 const UUID& uuid,
+                                 const KeyPattern& keyPattern,
+                                 const std::vector<ChunkType>& chunks) {
+        auto rt = RoutingTableHistory::makeNew(_nss,
+                                               uuid,
+                                               keyPattern,
+                                               false,
+                                               nullptr,
+                                               false,
+                                               chunks[0].getVersion().epoch(),
+                                               chunks[0].getVersion().getTimestamp(),
+                                               boost::none,
+                                               boost::none,
+                                               true,
+                                               chunks);
+        const auto version = rt.getVersion();
+        const auto rtHandle = RoutingTableHistoryValueHandle(
+            std::make_shared<RoutingTableHistory>(std::move(rt)),
+            ComparableChunkVersion::makeComparableChunkVersion(version));
+        const auto collectionMetadata = CollectionMetadata(CurrentChunkManager(rtHandle), _shardId);
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(opCtx, _nss);
+        scopedCSR->setCollectionMetadata(opCtx, collectionMetadata);
+    }
+
+    void setCSRAuthoritativeNoRoutingTable() {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        scopedCSR->setCollectionMetadata(operationContext(),
+                                         CollectionMetadata::UNTRACKED(),
+                                         CollectionShardingRuntime::NoRoutingTableAs::kUntracked);
+    }
+
+    std::vector<MetadataInconsistencyItem> checkConsistency(
+        const std::vector<CollectionType>& globalCatalogCollections,
+        const ShardId& primaryId = kShard0) {
+        return metadata_consistency_util::checkCollectionMetadataConsistency(
+            operationContext(),
+            _shardId,
+            primaryId,
+            globalCatalogCollections,
+            _localCatalogSnapshot,
+            _localCatalogCollections,
+            false /*checkRangeDeletionIndexes*/,
+            false /*optionalCheckIndexes*/,
+            0x1000000000000000);
+    }
+
+    std::vector<MetadataInconsistencyItem> checkConsistency(const CollectionType& globalCatalogColl,
+                                                            const ShardId& primaryId = kShard0) {
+        std::vector<CollectionType> globalCatalogCollections{globalCatalogColl};
+        return checkConsistency(globalCatalogCollections, primaryId);
+    }
+
+    void assertStrictChunksReportsMismatchedField(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies,
+        std::string_view expectedField) {
+        ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+        const auto chunksInconsistency = std::find_if(
+            inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+                return inconsistency.getType() ==
+                    MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata &&
+                    inconsistency.getDetails().getObjectField("details").getStringField("field") ==
+                    "chunks";
+            });
+        ASSERT(chunksInconsistency != inconsistencies.end());
+        const auto mismatch =
+            chunksInconsistency->getDetails().getObjectField("details").getObjectField("mismatch");
+        ASSERT_EQ(mismatch.getStringField("mismatchedField"), expectedField);
+        ASSERT_EQ(mismatch.getStringField("reason"), "chunkFieldsMismatch");
+    }
+
+    void assertStrictChunksReportsMismatchedCount(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies,
+        int expectedOwnedChunksInShardCatalog,
+        int expectedOwnedChunksInGlobalCatalog) {
+        ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+        const auto chunksInconsistency = std::find_if(
+            inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+                return inconsistency.getType() ==
+                    MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata &&
+                    inconsistency.getDetails().getObjectField("details").getStringField("field") ==
+                    "chunks";
+            });
+        ASSERT(chunksInconsistency != inconsistencies.end());
+        const auto mismatch =
+            chunksInconsistency->getDetails().getObjectField("details").getObjectField("mismatch");
+        ASSERT_EQ(mismatch.getStringField("reason"), "chunkCountMismatch");
+        ASSERT_EQ(mismatch.getIntField("shardCatalogCount"), expectedOwnedChunksInShardCatalog);
+        ASSERT_EQ(mismatch.getIntField("globalCatalogCount"), expectedOwnedChunksInGlobalCatalog);
+    }
+
+    std::pair<ChunkType, ChunkType> makeMatchingStrictChunks(const UUID& localUuid,
+                                                             const OID& epoch) {
+        auto shardChunk = generateChunk(localUuid,
+                                        _shardId,
+                                        _keyPattern.globalMin(),
+                                        _keyPattern.globalMax(),
+                                        kShard0History,
+                                        epoch);
+        auto globalChunk = generateChunk(localUuid,
+                                         _shardId,
+                                         _keyPattern.globalMin(),
+                                         _keyPattern.globalMax(),
+                                         kShard0History,
+                                         epoch);
+        return {std::move(shardChunk), std::move(globalChunk)};
+    }
+
+
+    size_t countInconsistenciesWithDetailField(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies,
+        std::string_view fieldValue) {
+        return std::count_if(
+            inconsistencies.begin(),
+            inconsistencies.end(),
+            [&fieldValue](const auto& inconsistency) {
+                if (inconsistency.getType() !=
+                    MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata) {
+                    return false;
+                }
+                return inconsistency.getDetails().getObjectField("details").getStringField(
+                           "field") == fieldValue;
+            });
+    }
+
+    size_t countInconsistenciesWithReasonField(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies) {
+        return std::count_if(
+            inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+                if (inconsistency.getType() !=
+                    MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata) {
+                    return false;
+                }
+                return inconsistency.getDetails().getObjectField("details").hasField("reason");
+            });
+    }
+
+    size_t countInconsistenciesWithDetailFieldAndSource(
+        const std::vector<MetadataInconsistencyItem>& inconsistencies,
+        std::string_view fieldValue,
+        std::string_view sourceValue) {
+        return std::count_if(
+            inconsistencies.begin(), inconsistencies.end(), [&](const auto& inconsistency) {
+                if (inconsistency.getType() !=
+                    MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata) {
+                    return false;
+                }
+                auto details = inconsistency.getDetails().getObjectField("details");
+                return details.getStringField("field") == fieldValue &&
+                    details.getStringField("source") == sourceValue;
+            });
+    }
+
+    void setCSRAuthoritative() {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        auto metadata = scopedCSR->getCurrentMetadataIfKnown();
+        if (metadata) {
+            scopedCSR->setCollectionMetadata(
+                operationContext(),
+                *metadata,
+                CollectionShardingRuntime::NoRoutingTableAs::kUntracked);
+        } else {
+            scopedCSR->clearCollectionMetadata(operationContext());
+        }
+    }
+
+    void setCSRUnowned() {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        scopedCSR->setCollectionMetadata(operationContext(),
+                                         CollectionMetadata::UNTRACKED(),
+                                         CollectionShardingRuntime::NoRoutingTableAs::kUnowned);
+    }
+
+    void clearCSR(bool collIsDropped) {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        scopedCSR->clearCollectionMetadata(operationContext(), collIsDropped);
+    }
+
+    void insertDurableShardCatalogCollection(const CollectionType& coll) {
+        insertDurableShardCatalogCollectionDoc(coll.toBSON());
+    }
+
+    void insertDurableShardCatalogCollectionDoc(const BSONObj& doc) {
+        DBDirectClient client(operationContext());
+        auto res = client.insert(write_ops::InsertCommandRequest{
+            NamespaceString::kConfigShardCatalogCollectionsNamespace, {doc}});
+        write_ops::checkWriteErrors(res);
+    }
+
+    void insertDurableShardCatalogChunks(const std::vector<ChunkType>& chunks) {
+        DBDirectClient client(operationContext());
+        std::vector<BSONObj> docs;
+        for (const auto& chunk : chunks) {
+            docs.emplace_back(chunk.toConfigBSON());
+        }
+        auto res = client.insert(write_ops::InsertCommandRequest{
+            NamespaceString::kConfigShardCatalogChunksNamespace, docs});
+        write_ops::checkWriteErrors(res);
+    }
+
+    void insertDurableShardCatalogChunkDocs(const std::vector<BSONObj>& docs) {
+        DBDirectClient client(operationContext());
+        auto res = client.insert(write_ops::InsertCommandRequest{
+            NamespaceString::kConfigShardCatalogChunksNamespace, docs});
+        write_ops::checkWriteErrors(res);
+    }
+
+    void assertDurableCatalogCollectionReadErrorIsRethrown(ErrorCodes::Error errorCode) {
+        const auto localUuid = setUpLocalCollection();
+        auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+        auto chunk = generateChunkForCollection(globalCatalogColl,
+                                                _shardId,
+                                                _keyPattern.globalMin(),
+                                                _keyPattern.globalMax(),
+                                                kShard0History);
+
+        setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+        setCSRAuthoritative();
+
+        insertDurableShardCatalogCollection(globalCatalogColl);
+        insertDurableShardCatalogChunks({chunk});
+        _catalogClient->setChunksToReturn({chunk});
+
+        FailPointEnableBlock failDurableRead(
+            "failCommand",
+            BSON("failCommands"
+                 << BSON_ARRAY("find") << "namespace"
+                 << NamespaceString::kConfigShardCatalogCollectionsNamespace.toStringForErrorMsg()
+                 << "failLocalClients" << true << "failInternalCommands" << true << "errorCode"
+                 << errorCode));
+
+        ASSERT_THROWS_CODE(checkConsistency(globalCatalogColl), DBException, errorCode);
+    }
+
+    void clearDurableShardCatalog() {
+        DBDirectClient client(operationContext());
+        client.remove(write_ops::DeleteCommandRequest{
+            NamespaceString::kConfigShardCatalogCollectionsNamespace,
+            {write_ops::DeleteOpEntry{BSONObj(), true}}});
+        client.remove(
+            write_ops::DeleteCommandRequest{NamespaceString::kConfigShardCatalogChunksNamespace,
+                                            {write_ops::DeleteOpEntry{BSONObj(), true}}});
+    }
+
+    std::vector<MetadataInconsistencyItem> runDatabaseLevelCheck() {
+        return metadata_consistency_util::runCheckMetadataConsistencyOnParticipant(
+                   operationContext(),
+                   NamespaceString::makeCollectionlessAggregateNSS(_dbName),
+                   kShard1,
+                   false /*checkRangeDeletionIndexes*/,
+                   false /*checkIndexes*/,
+                   0x1000000000000000,
+                   metadata_consistency_util::RSNodeMode::kPrimary)
+            .first;
+    }
+
+private:
+    std::shared_ptr<const CollectionCatalog> _localCatalogSnapshot;
+    std::vector<CollectionPtr> _localCatalogCollections;
+};
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnmatchedCssCollectionReportsTrackednessMismatch) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         false);
+    const auto chunk = generateChunk(
+        _collUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    setShardCatalogMetadata(_collUuid, _keyPattern, {chunk});
+    _catalogClient->setCollectionsToReturn({});
+
+    const auto inconsistencies = runDatabaseLevelCheck();
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "isTracked"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UntrackedCssOnNonPrimaryReportsPrimaryMismatch) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    setCSRAuthoritativeNoRoutingTable();
+    _catalogClient->setCollectionsToReturn({});
+
+    const auto inconsistencies = runDatabaseLevelCheck();
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+    ASSERT_EQ("CSS reports the collection as UNTRACKED on a non-DB-primary shard",
+              inconsistencies[0].getDetails().getObjectField("details").getStringField("reason"));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnmatchedDurableCollectionReportsUnexpectedEntry) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    _catalogClient->setCollectionsToReturn({});
+    insertDurableShardCatalogCollection(generateCollectionType(_nss, _collUuid, _keyPattern));
+
+    const auto inconsistencies = runDatabaseLevelCheck();
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+    ASSERT_EQ(
+        "Collection entry unexpectedly found in the durable shard catalog "
+        "(config.shard.catalog.collections)",
+        inconsistencies[0].getDetails().getObjectField("details").getStringField("reason"));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnmatchedMalformedDurableCollectionIsInconsistency) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    _catalogClient->setCollectionsToReturn({});
+    insertDurableShardCatalogCollectionDoc(generateCollectionType(_nss, _collUuid, _keyPattern)
+                                               .toBSON()
+                                               .removeField(CollectionType::kUuidFieldName));
+
+    const auto inconsistencies = runDatabaseLevelCheck();
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+    ASSERT_STRING_CONTAINS(
+        inconsistencies[0].getDetails().getObjectField("details").getStringField("reason"),
+        CollectionType::kUuidFieldName);
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_AllMatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    _catalogClient->setChunksToReturn({chunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "uuid"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "shardKeyPattern"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_UuidMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const auto differentUuid = UUID::gen();
+    auto shardCatalogChunk = generateChunk(
+        differentUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(differentUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "shardCatalogEntry"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_ShardKeyMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    const KeyPattern globalCatalogKeyPattern{BSON("y" << 1)};
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, globalCatalogKeyPattern);
+
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk = generateChunk(localUuid,
+                                            _shardId,
+                                            globalCatalogKeyPattern.globalMin(),
+                                            globalCatalogKeyPattern.globalMax(),
+                                            kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "shardCatalogEntry"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_UuidAndShardKeyMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    const KeyPattern globalCatalogKeyPattern{BSON("y" << 1)};
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, globalCatalogKeyPattern);
+
+    const auto differentUuid = UUID::gen();
+    auto shardCatalogChunk = generateChunk(
+        differentUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk = generateChunk(localUuid,
+                                            _shardId,
+                                            globalCatalogKeyPattern.globalMin(),
+                                            globalCatalogKeyPattern.globalMax(),
+                                            kShard0History);
+
+    setShardCatalogMetadata(differentUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "shardCatalogEntry"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_Authoritative_SplitChunksSameDomain) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: one chunk [MinKey, MaxKey). Global catalog: two finer splits.
+    // Both cover the same domain, but strict per-chunk validation should fail.
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk1 =
+        generateChunk(localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History);
+    auto globalCatalogChunk2 =
+        generateChunk(localUuid, _shardId, BSON("x" << 0), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardCatalogChunk});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({globalCatalogChunk1, globalCatalogChunk2});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_AllFieldsMatch) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epoch = OID::gen();
+    auto shardChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History, epoch);
+    auto shardChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 0), _keyPattern.globalMax(), kShard0History, epoch);
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk1, shardChunk2});
+    _catalogClient->setChunksToReturn({shardChunk1, shardChunk2});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_ReportsMismatchedField_Min) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    const OID epoch = OID::gen();
+
+    auto [shardChunk, globalChunk] = makeMatchingStrictChunks(localUuid, epoch);
+    globalChunk.setRange({BSON("x" << 0), globalChunk.getMax()});
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    assertStrictChunksReportsMismatchedField(checkConsistency(globalCatalogColl),
+                                             ChunkType::min.name());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_ReportsMismatchedField_Max) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    const OID epoch = OID::gen();
+
+    auto [shardChunk, globalChunk] = makeMatchingStrictChunks(localUuid, epoch);
+    globalChunk.setRange({globalChunk.getMin(), BSON("x" << 0)});
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    assertStrictChunksReportsMismatchedField(checkConsistency(globalCatalogColl),
+                                             ChunkType::max.name());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_ReportsChunkCountMismatchForShardOwner) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    const OID epoch = OID::gen();
+
+    auto [shardChunk, globalChunk] = makeMatchingStrictChunks(localUuid, epoch);
+    // Same chunk range, but global config.chunks says kShard1 owns it while the in-memory
+    // shard catalog on kShard0 still lists it as owned by kShard0.
+    globalChunk.setShard(kShard1);
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    // checkConsistency runs on kShard0:
+    // CSR has 1 chunk with shard=kShard0;
+    // global side has 0 chunks left on shard=kShard0.
+    assertStrictChunksReportsMismatchedCount(
+        checkConsistency(globalCatalogColl), 1 /*shard catalog count*/, 0 /*global catalog count*/);
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_ReportsMismatchedField_Lastmod) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    const OID epoch = OID::gen();
+
+    auto [shardChunk, globalChunk] = makeMatchingStrictChunks(localUuid, epoch);
+    globalChunk.setVersion(ChunkVersion({epoch, Timestamp(2, 2)}, {2, 0}));
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    assertStrictChunksReportsMismatchedField(checkConsistency(globalCatalogColl),
+                                             ChunkType::lastmod.name());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_ReportsMismatchedField_OnCurrentShardSince) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    const OID epoch = OID::gen();
+
+    auto [shardChunk, globalChunk] = makeMatchingStrictChunks(localUuid, epoch);
+    globalChunk.setOnCurrentShardSince(Timestamp(2, 0));
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    assertStrictChunksReportsMismatchedField(checkConsistency(globalCatalogColl),
+                                             ChunkType::onCurrentShardSince.name());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_IgnoresJumboMismatch) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epoch = OID::gen();
+    auto shardChunk = generateChunk(localUuid,
+                                    _shardId,
+                                    _keyPattern.globalMin(),
+                                    _keyPattern.globalMax(),
+                                    kShard0History,
+                                    epoch);
+    auto globalChunk = generateChunk(localUuid,
+                                     _shardId,
+                                     _keyPattern.globalMin(),
+                                     _keyPattern.globalMax(),
+                                     kShard0History,
+                                     epoch);
+    shardChunk.setJumbo(false);
+    globalChunk.setJumbo(true);
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_IgnoresEstimatedSizeBytes) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epoch = OID::gen();
+    auto shardChunk = generateChunk(localUuid,
+                                    _shardId,
+                                    _keyPattern.globalMin(),
+                                    _keyPattern.globalMax(),
+                                    kShard0History,
+                                    epoch);
+    auto globalChunk = generateChunk(localUuid,
+                                     _shardId,
+                                     _keyPattern.globalMin(),
+                                     _keyPattern.globalMax(),
+                                     kShard0History,
+                                     epoch);
+    shardChunk.setEstimatedSizeBytes(1024);
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_StrictChunks_ExtraShardChunk) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epoch = OID::gen();
+    auto shardChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History, epoch);
+    auto shardChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 0), _keyPattern.globalMax(), kShard0History, epoch);
+    auto globalChunk = generateChunk(localUuid,
+                                     _shardId,
+                                     _keyPattern.globalMin(),
+                                     _keyPattern.globalMax(),
+                                     kShard0History,
+                                     epoch);
+
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {shardChunk1, shardChunk2});
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_Authoritative_KeepsDomainCoverage) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epoch = OID::gen();
+    auto shardChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 5), kShard0History, epoch);
+    auto shardChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 5), _keyPattern.globalMax(), kShard0History, epoch);
+    auto globalChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 10), kShard0History);
+    auto globalChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 10), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardChunk1, shardChunk2});
+    _catalogClient->setChunksToReturn({globalChunk1, globalChunk2});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_ChunkDomainMismatch_FoundChunksExhausted) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: [MinKey, MaxKey), global catalog: [MinKey, 0).
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk =
+        generateChunk(localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_ChunkDomainMismatch_MinBoundary) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: [MinKey, MaxKey), global catalog: [{x:5}, MaxKey).
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk =
+        generateChunk(localUuid, _shardId, BSON("x" << 5), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_ChunkDomainMismatch_GapInExpectedChunks) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: [MinKey, MaxKey), global catalog: [MinKey, 10) + [20, MaxKey).
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 10), kShard0History);
+    auto globalCatalogChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 20), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk1, globalCatalogChunk2});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_ChunkDomainMismatch_GapInShardCatalogChunks) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: this shard owns [MinKey, 10) + [20, MaxKey) with kShard1 owning [10, 20).
+    // Global catalog says this shard owns the entire [MinKey, MaxKey).
+    const OID epoch = OID::gen();
+    auto rtChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 10), kShard0History, epoch);
+    auto rtChunk2 =
+        generateChunk(localUuid, kShard1, BSON("x" << 10), BSON("x" << 20), kShard1History, epoch);
+    auto rtChunk3 = generateChunk(
+        localUuid, _shardId, BSON("x" << 20), _keyPattern.globalMax(), kShard0History, epoch);
+    auto globalCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {rtChunk1, rtChunk2, rtChunk3});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_NotOwnedChunksDisallowed_DurableAuthoritativeShardCatalogChunks) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epoch = OID::gen();
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 10), kShard0History, epoch);
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+
+    _catalogClient->setChunksToReturn({chunk});
+    insertDurableShardCatalogCollection(globalCatalogColl);
+
+    auto foreignChunk =
+        generateChunk(localUuid, kShard1, BSON("x" << 10), BSON("x" << 20), kShard1History, epoch);
+    insertDurableShardCatalogChunks({chunk, foreignChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunkHistory"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_MultipleSplitChunksBothSides_SameDomain) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: [MinKey, 5) + [5, MaxKey) both owned by this shard.
+    // Global catalog: [MinKey, 10) + [10, MaxKey) both owned by this shard.
+    // Both cover [MinKey, MaxKey) but with different split points.
+    const OID epoch = OID::gen();
+    auto shardChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 5), kShard0History, epoch);
+    auto shardChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 5), _keyPattern.globalMax(), kShard0History, epoch);
+    auto globalChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 10), kShard0History, epoch);
+    auto globalChunk2 = generateChunk(
+        localUuid, _shardId, BSON("x" << 10), _keyPattern.globalMax(), kShard0History, epoch);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardChunk1, shardChunk2});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({globalChunk1, globalChunk2});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_ChunkDomainMismatch_ExtraGlobalCatalogChunks) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: this shard owns [MinKey, 0), kShard1 owns [0, MaxKey).
+    // Global catalog: this shard owns [MinKey, MaxKey).
+    const OID epoch = OID::gen();
+    auto rtChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History, epoch);
+    auto rtChunk2 = generateChunk(
+        localUuid, kShard1, BSON("x" << 0), _keyPattern.globalMax(), kShard1History, epoch);
+    auto globalCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {rtChunk1, rtChunk2});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_EmptyGlobalCatalogChunks) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    // When the global catalog returns no chunks for this shard, the shard catalog still has chunks,
+    // so a chunks mismatch should be reported (extraShardCatalogChunks).
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_MaxBoundaryMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Shard catalog: this shard owns [MinKey, 10), kShard1 owns [10, MaxKey).
+    // Global catalog: this shard owns [MinKey, 20).
+    const OID epoch = OID::gen();
+    auto rtChunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 10), kShard0History, epoch);
+    auto rtChunk2 = generateChunk(
+        localUuid, kShard1, BSON("x" << 10), _keyPattern.globalMax(), kShard1History, epoch);
+    auto globalCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 20), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {rtChunk1, rtChunk2});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, ValidateCollectionMetadata_SkipsWhenMetadataUnknown) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Set up tracked metadata then clear it to make it unknown.
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+
+    {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        scopedCSR->clearCollectionMetadata(operationContext());
+    }
+
+    _catalogClient->setChunksToReturn({chunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    // When metadata is unknown, no shard catalog inconsistencies should be reported.
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "uuid"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "shardKeyPattern"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "isTracked"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_SkipsWhenCriticalSectionActive) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // Intentionally use a different UUID in shard catalog to create a detectable mismatch.
+    const auto differentUuid = UUID::gen();
+    auto shardCatalogChunk = generateChunk(
+        differentUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    auto globalCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    setShardCatalogMetadata(differentUuid, _keyPattern, {shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    // Acquire the critical section to simulate a migration in progress.
+    {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        scopedCSR->enterCriticalSectionCatchUpPhase(operationContext(), BSON("reason" << "test"));
+        scopedCSR->enterCriticalSectionCommitPhase(operationContext(), BSON("reason" << "test"));
+    }
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    // No shard catalog inconsistencies should be reported because the critical section is active.
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "uuid"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "shardKeyPattern"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunks"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "isTracked"sv));
+
+    // Clean up the critical section.
+    {
+        auto scopedCSR = CollectionShardingRuntime::acquireExclusive(operationContext(), _nss);
+        scopedCSR->exitCriticalSectionNoChecks(operationContext());
+    }
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_DurablePathGuardedByFeatureFlag) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         false);
+
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Both catalogs are consistent, and the durable shard catalog is intentionally left empty.
+    // With the feature flag disabled, the durable path should be skipped entirely, and the
+    // in-memory path should find no issues.
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "uuid"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "shardKeyPattern"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "isTracked"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_AllMatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunkForCollection(globalCatalogColl,
+                                            _shardId,
+                                            _keyPattern.globalMin(),
+                                            _keyPattern.globalMax(),
+                                            kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    insertDurableShardCatalogChunks({chunk});
+    _catalogClient->setChunksToReturn({chunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "uuid"sv, "durableShardCatalog"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "shardKeyPattern"sv, "durableShardCatalog"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunksDomain"sv, "durableShardCatalog"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunks"sv, "durableShardCatalog"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunks"sv, "inMemoryShardCatalog"sv));
+    ASSERT_EQ(0, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_MalformedChunkDocumentIsInconsistency) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunkForCollection(globalCatalogColl,
+                                            _shardId,
+                                            _keyPattern.globalMin(),
+                                            _keyPattern.globalMax(),
+                                            kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    insertDurableShardCatalogChunkDocs({chunk.toConfigBSON().removeField(ChunkType::shard())});
+    _catalogClient->setChunksToReturn({chunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+    ASSERT_STRING_CONTAINS(
+        inconsistencies[0].getDetails().getObjectField("details").getStringField("reason"),
+        ChunkType::shard());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       DurablePath_MalformedCollectionDocumentIsInconsistency) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunkForCollection(globalCatalogColl,
+                                            _shardId,
+                                            _keyPattern.globalMin(),
+                                            _keyPattern.globalMax(),
+                                            kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+
+    insertDurableShardCatalogCollectionDoc(
+        globalCatalogColl.toBSON().removeField(CollectionType::kUuidFieldName));
+    insertDurableShardCatalogChunks({chunk});
+    _catalogClient->setChunksToReturn({chunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+    ASSERT_STRING_CONTAINS(
+        inconsistencies[0].getDetails().getObjectField("details").getStringField("reason"),
+        CollectionType::kUuidFieldName);
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_TransientInterruptionIsRethrown) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    insertDurableShardCatalogChunks({chunk});
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Simulate a stepdown happening while the metadata consistency check reads the durable shard
+    // catalog. The read against config.shard.catalog.* is the first interruptible operation on this
+    // path, so it fails with InterruptedDueToReplStateChange. Such transient interruptions are not
+    // genuine metadata inconsistencies: they must be rethrown so the command fails with a retriable
+    // error (and callers retry) rather than being reported as a spurious
+    // InconsistentShardCatalogCollectionMetadata inconsistency.
+    operationContext()->markKilled(ErrorCodes::InterruptedDueToReplStateChange);
+
+    ASSERT_THROWS_CODE(checkConsistency(globalCatalogColl),
+                       DBException,
+                       ErrorCodes::InterruptedDueToReplStateChange);
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_SnapshotReadErrorIsRethrown) {
+    assertDurableCatalogCollectionReadErrorIsRethrown(ErrorCodes::SnapshotTooOld);
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_ShutdownReadErrorIsRethrown) {
+    assertDurableCatalogCollectionReadErrorIsRethrown(ErrorCodes::ShutdownInProgress);
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_UuidMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Insert a durable shard catalog collection with a DIFFERENT UUID.
+    const auto differentUuid = UUID::gen();
+    auto durableColl = generateCollectionType(_nss, differentUuid, _keyPattern);
+    insertDurableShardCatalogCollection(durableColl);
+    auto durableChunk = generateChunk(
+        differentUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    insertDurableShardCatalogChunks({durableChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "shardCatalogEntry"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_ShardKeyMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Insert a durable shard catalog collection with a DIFFERENT shard key.
+    const KeyPattern differentKeyPattern{BSON("y" << 1)};
+    auto durableColl = generateCollectionType(_nss, localUuid, differentKeyPattern);
+    insertDurableShardCatalogCollection(durableColl);
+    auto durableChunk = generateChunk(localUuid,
+                                      _shardId,
+                                      differentKeyPattern.globalMin(),
+                                      differentKeyPattern.globalMax(),
+                                      kShard0History);
+    insertDurableShardCatalogChunks({durableChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "shardCatalogEntry"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_ChunksDomainMismatch) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Insert a durable shard catalog with a shorter chunk range (domain mismatch).
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    auto durableChunk =
+        generateChunk(localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History);
+    insertDurableShardCatalogChunks({durableChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunks"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_PreviouslyOwnedChunkIgnoredInDomainCheck) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // This shard currently owns chunk1 only. The in-memory authoritative routing table tracks
+    // only that chunk.
+    const OID epoch = OID::gen();
+    auto chunk1 = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History, epoch);
+    setAuthoritativeShardCatalogMetadata(localUuid, _keyPattern, {chunk1});
+    _catalogClient->setChunksToReturn({chunk1});
+
+    // The durable shard catalog still retains a chunk that was previously owned by this shard
+    // and has since migrated to another shard. The chunk is allowed to remain because this shard
+    // appears in its history, but the global catalog no longer associates it with this shard.
+    // The first history entry's timestamp must match `onCurrentShardSince` (which `generateChunk`
+    // sets to Timestamp(1, 0)); the earlier history record uses an older timestamp.
+    const std::vector<ChunkHistory> previouslyOwnedHistory{ChunkHistory(Timestamp(1, 0), kShard1),
+                                                           ChunkHistory(Timestamp(0, 1), _shardId)};
+    auto previouslyOwnedChunk = generateChunk(
+        localUuid, kShard1, BSON("x" << 0), _keyPattern.globalMax(), previouslyOwnedHistory, epoch);
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    insertDurableShardCatalogChunks({chunk1, previouslyOwnedChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    // Filtering both sides of the domain coverage check to currently-owned chunks must drop the
+    // previously-owned chunk from the durable list; otherwise the durable catalog would falsely
+    // appear to cover more of the key space than the global catalog returns for this shard.
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunksDomain"sv, "durableShardCatalog"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "chunkHistory"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_MissingCollectionInDurableCatalog) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Intentionally leave the durable shard catalog empty (no collection entry).
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       DurablePath_MissingConfigSystemSessionsCollectionInDurableCatalog) {
+    const auto& nss = NamespaceString::kLogicalSessionsNamespace;
+    const auto localUuid = setUpLocalCollection(nss);
+    auto globalCatalogColl = generateCollectionType(nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setAuthoritativeShardCatalogMetadata(nss, localUuid, _keyPattern, {chunk});
+    _catalogClient->setChunksToReturn({chunk});
+
+    // The config server is the DB primary for config.system.sessions, but this data shard owns a
+    // chunk. Owning shards must still carry durable shard catalog metadata for the collection.
+    const auto inconsistencies = checkConsistency(globalCatalogColl, ShardId::kConfigServerId);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+    ASSERT_TRUE(
+        std::any_of(inconsistencies.begin(), inconsistencies.end(), [&](const auto& inconsistency) {
+            if (inconsistency.getType() !=
+                MetadataInconsistencyTypeEnum::kInconsistentShardCatalogCollectionMetadata) {
+                return false;
+            }
+
+            const auto details = inconsistency.getDetails().getObjectField("details");
+            return inconsistency.getDetails().getStringField("namespace") ==
+                nss.toStringForErrorMsg() &&
+                details.hasField("reason") &&
+                details.getStringField("reason").find(
+                    "Collection entry not found in the durable shard catalog") != std::string::npos;
+        }));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, DurablePath_MissingChunksInDurableCatalog) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({chunk});
+
+    // Insert the collection entry but NO chunks in the durable catalog.
+    insertDurableShardCatalogCollection(globalCatalogColl);
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    // Should report that no chunks were found in the durable shard catalog.
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, OrphanCollectrionEntryInUntrackedCollection) {
+    OperationContext* opCtx = operationContext();
+    createTestCollection(opCtx, _nss);
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    const auto localUuid = localCatalogCollections[0]->uuid();
+    setCSRAuthoritative();
+    insertDurableShardCatalogCollection(generateCollectionType(_nss, localUuid, _keyPattern));
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, OrphanChunkEntryInUntrackedCollection) {
+    OperationContext* opCtx = operationContext();
+    createTestCollection(opCtx, _nss);
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    const auto localUuid = localCatalogCollections[0]->uuid();
+
+    auto chunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    setCSRAuthoritative();
+    insertDurableShardCatalogChunks({chunk});
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, OrphanChunkEntryInTrackedCollection) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    auto outdatedChunkInfo = generateChunk(localUuid,
+                                           _shardId,
+                                           _keyPattern.globalMin(),
+                                           _keyPattern.globalMax(),
+                                           {ChunkHistory(Timestamp(1, 0), _shardId)});
+    auto previouslyOwnedChunk = generateChunk(
+        localUuid,
+        kShard0,
+        _keyPattern.globalMin(),
+        _keyPattern.globalMax(),
+        {ChunkHistory(Timestamp(1, 0), _shardId), ChunkHistory(Timestamp(2, 0), kShard0)});
+
+    setShardCatalogMetadata(localUuid, _keyPattern, {outdatedChunkInfo});
+    setCSRAuthoritative();
+    insertDurableShardCatalogChunks({outdatedChunkInfo});
+
+    _catalogClient->setChunksToReturn({previouslyOwnedChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       OrphanNoCurrentChunkEntriesButCollectionEntryInTrackedCollectionAccepted) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    setCSRAuthoritative();
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       OrphanNoCurrentChunkEntriesAndCollectionEntryInTrackedCollectionAccepted) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    setCSRAuthoritative();
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnownedCSR_NonPrimaryWithNoOwnedChunksIsAccepted) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    setCSRUnowned();
+    _catalogClient->setChunksToReturn({});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl, kShard1);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "isTracked"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "isPrimary"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "ownedChunks"sv, "inMemoryShardCatalog"sv));
+    ASSERT_EQ(0,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "ownedChunks"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       UnownedCSR_PrimaryIsReportedWhenGlobalCatalogUntracked) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+
+    setUpLocalCollection();
+
+    setCSRUnowned();
+
+    const auto inconsistencies =
+        checkConsistency(std::vector<CollectionType>{} /* globalCatalogCollections */, _shardId);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "isPrimary"sv, "inMemoryShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnownedCSR_PrimaryIsReportedWhenGlobalCatalogTracked) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    setCSRUnowned();
+    _catalogClient->setChunksToReturn({});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl, _shardId);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "isPrimary"sv, "inMemoryShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnownedCSR_GlobalCatalogOwnedChunksAreReported) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto globalChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setCSRUnowned();
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl, kShard1);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "ownedChunks"sv, "inMemoryShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest, UnownedCSR_DurableOwnedChunksAreReported) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto durableChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+
+    setCSRUnowned();
+    insertDurableShardCatalogChunks({durableChunk});
+    _catalogClient->setChunksToReturn({});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl, kShard1);
+
+    ASSERT_EQ(1,
+              countInconsistenciesWithDetailFieldAndSource(
+                  inconsistencies, "ownedChunks"sv, "durableShardCatalog"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       PrimaryHasNoCollectionEntryForChunklessCollectionGlobalCatalogHas) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    setCSRAuthoritative();
+    _catalogClient->setChunksToReturn({});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       GlobalCatalogHasNoCollectionEntryForChunklessCollectionPrimaryHas) {
+    OperationContext* opCtx = operationContext();
+    createTestCollection(opCtx, _nss);
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, _nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    const auto localUuid = localCatalogCollections[0]->uuid();
+
+    setCSRAuthoritative();
+    insertDurableShardCatalogCollection(generateCollectionType(_nss, localUuid, _keyPattern));
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    ASSERT_EQ(1, countInconsistenciesWithReasonField(inconsistencies));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_SkipsValidationWhenPlacementVersionUnset) {
+    // Simulate a shard that retains a routing table with stale metadata (e.g., after
+    // moveCollection moved the collection away) but owns no chunks. The shard key in the shard
+    // catalog ({x:1}) differs from the global catalog ({y:1}), but since the shard's placement
+    // version is {0,0}, no inconsistency should be reported.
+    const auto localUuid = setUpLocalCollection();
+    const KeyPattern globalCatalogKeyPattern{BSON("y" << 1)};
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, globalCatalogKeyPattern);
+
+    // All chunks on shard1, shard0 has placement version {0,0}.
+    auto chunk = generateChunk(
+        localUuid, kShard1, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard1History);
+    setShardCatalogMetadata(localUuid, _keyPattern, {chunk});
+
+    // Global catalog has no chunks for shard0.
+    _catalogClient->setChunksToReturn({});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "shardKeyPattern"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "chunksDomain"sv));
+    ASSERT_EQ(0, countInconsistenciesWithDetailField(inconsistencies, "ownedChunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       ValidateCollectionMetadata_OwnedChunksMismatchWhenPlacementVersionUnset) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    // All chunks on shard1, shard0 has placement version {0,0}.
+    auto rtChunk = generateChunk(
+        localUuid, kShard1, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard1History);
+    setShardCatalogMetadata(localUuid, _keyPattern, {rtChunk});
+
+    // Global catalog says shard0 owns a chunk.
+    auto globalChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+
+    ASSERT_EQ(1, countInconsistenciesWithDetailField(inconsistencies, "ownedChunks"sv));
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       SkipsValidationWhenVersionChangesAfterGlobalCatalogRead) {
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+
+    const OID epochV1 = OID::gen();
+    auto csrChunk = generateChunk(localUuid,
+                                  _shardId,
+                                  _keyPattern.globalMin(),
+                                  _keyPattern.globalMax(),
+                                  kShard0History,
+                                  epochV1);
+    setShardCatalogMetadata(localUuid, _keyPattern, {csrChunk});
+
+    // Global catalog chunk has a different collection UUID, mismatching the CSR entry.
+    const auto differentUuid = UUID::gen();
+    auto globalChunk = generateChunk(
+        differentUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    // Simulating a migration, while fetching chunks from global catalog, by bumping a collection
+    // version
+    _catalogClient->setOnGetChunksCallback([this, localUuid, epochV1](OperationContext* opCtx) {
+        auto migratedChunk = generateChunk(localUuid,
+                                           kShard1,
+                                           _keyPattern.globalMin(),
+                                           _keyPattern.globalMax(),
+                                           kShard1History,
+                                           epochV1);
+        migratedChunk.setVersion(ChunkVersion({epochV1, Timestamp(1, 1)}, {2, 0}));
+        setShardCatalogMetadata(opCtx, localUuid, _keyPattern, {migratedChunk});
+    });
+
+    // No inconsistency should be reported due to version mismatch, triggering early exit
+    // from check metadata inconsistency.
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+    ASSERT_EQ(0, inconsistencies.size());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       InconsistencyIsReportedEvenIfUnknownDueToRandomRecovery) {
+    const auto localUuid = setUpLocalCollection();
+    auto shardCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    auto shardCatalogChunk = generateChunk(
+        localUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+    const KeyPattern globalCatalogKeyPattern{BSON("y" << 1)};
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, globalCatalogKeyPattern);
+    auto globalCatalogChunk = generateChunk(localUuid,
+                                            _shardId,
+                                            globalCatalogKeyPattern.globalMin(),
+                                            globalCatalogKeyPattern.globalMax(),
+                                            kShard0History);
+
+    insertDurableShardCatalogCollection(shardCatalogColl);
+    insertDurableShardCatalogChunks({shardCatalogChunk});
+    _catalogClient->setChunksToReturn({globalCatalogChunk});
+
+    clearCSR(true);
+
+    // At this point the check should do an early return since no sharding metadata is in memory.
+    // This means no inconsistencies are reported even if the entire durable state is wrong.
+    {
+        const auto inconsistencies = checkConsistency(globalCatalogColl, kShard1);
+        ASSERT_TRUE(inconsistencies.empty());
+    }
+
+    // Trigger a random recovery, this should populate the in-memory state in order to detect
+    // inconsistencies.
+    const unittest::ServerParameterGuard enableRandomRecovery{
+        "probabilityTriggerShardFilteringRecoveryDuringCheckMetadataConsistency", 1.0};
+    const auto inconsistencies = checkConsistency(globalCatalogColl, kShard1);
+    ASSERT_FALSE(inconsistencies.empty());
+}
+
+TEST_F(MetadataConsistencyShardCatalogTest,
+       SkipsValidationWhenVersionChangesAfterGlobalCatalogRead_PrimaryWithNoRoutingTable) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagAuthoritativeShardsCRUD",
+                                                         true);
+
+    const auto localUuid = setUpLocalCollection();
+    auto globalCatalogColl = generateCollectionType(_nss, localUuid, _keyPattern);
+    setCSRAuthoritativeNoRoutingTable();
+
+    // Durable catalog has chunk [0, max]
+    auto durableChunk =
+        generateChunk(localUuid, _shardId, BSON("x" << 0), _keyPattern.globalMax(), kShard0History);
+    insertDurableShardCatalogCollection(globalCatalogColl);
+    insertDurableShardCatalogChunks({durableChunk});
+
+    // Global catalog has chunk [min, 0]
+    auto globalChunk =
+        generateChunk(localUuid, _shardId, _keyPattern.globalMin(), BSON("x" << 0), kShard0History);
+    _catalogClient->setChunksToReturn({globalChunk});
+
+    // Simulating a migration, while fetching chunks from global catalog, resulting CSR in gaining
+    // a routing table owned by kShard1.
+    _catalogClient->setOnGetChunksCallback([this, localUuid](OperationContext* opCtx) {
+        auto migratedChunk = generateChunk(
+            localUuid, kShard1, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard1History);
+        setShardCatalogMetadata(opCtx, localUuid, _keyPattern, {migratedChunk});
+    });
+
+    // No inconsistency should be reported due to version mismatch, triggering early exit
+    // from check metadata inconsistency.
+    const auto inconsistencies = checkConsistency(globalCatalogColl);
+    ASSERT_EQ(0, inconsistencies.size());
+}
+
+class checkNoMetadataForNonExistentDatabaseTest : public MetadataConsistencyShardCatalogTest {
+protected:
+    std::vector<MetadataInconsistencyItem> checkNoMetadataForNonExistentDatabase(
+        const stdx::unordered_set<DatabaseName>& dbNamesInGlobalCatalog =
+            stdx::unordered_set<DatabaseName>{},
+        metadata_consistency_util::RSNodeMode rsMode =
+            metadata_consistency_util::RSNodeMode::kPrimary) {
+        return collection_metadata_consistency_checks::checkNoMetadataForNonExistentDatabase(
+            operationContext(), _shardId, rsMode, dbNamesInGlobalCatalog);
+    }
+
+    ChunkType makeChunk(Timestamp timestamp = Timestamp{1, 1}) {
+        auto chunk = generateChunk(
+            _collUuid, _shardId, _keyPattern.globalMin(), _keyPattern.globalMax(), kShard0History);
+        chunk.setVersion(ChunkVersion({chunk.getVersion().epoch(), timestamp}, {1, 0}));
+        return chunk;
+    }
+};
+
+// -----------------------------------------------------------------------------------------------
+// Tests for checkNoMetadataForNonExistentDatabase (durable shard catalog)
+// -----------------------------------------------------------------------------------------------
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest,
+       WhenDurableMetadataForNonExistentDb_ThenInconsistency) {
+    insertDurableShardCatalogCollection(generateCollectionType(_nss, _collUuid, _keyPattern));
+
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase();
+
+    assertOneInconsistencyFound(
+        MetadataInconsistencyTypeEnum::kCollectionMetadataForNonExistingDatabaseInShardCatalog,
+        inconsistencies);
+}
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest,
+       WhenNoDurableMetadataForNonExistent_ThenNoInconsistency) {
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase();
+
+    ASSERT_TRUE(inconsistencies.empty());
+}
+
+// -----------------------------------------------------------------------------------------------
+// Tests for checkNoMetadataForNonExistentDatabase (in-memory CSS)
+// -----------------------------------------------------------------------------------------------
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest,
+       WhenInMemoryTrackedMetadataForNonExistentDb_ThenInconsistency) {
+    setShardCatalogMetadata(_collUuid, _keyPattern, {makeChunk()});
+
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase();
+
+    assertOneInconsistencyFound(
+        MetadataInconsistencyTypeEnum::kCollectionMetadataForNonExistingDatabaseInShardCatalogCache,
+        inconsistencies);
+}
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest,
+       WhenNoInMemoryMetadataForNonExistent_ThenNoInconsistency) {
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase();
+
+    ASSERT_TRUE(inconsistencies.empty());
+}
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest, WhenInMemoryUnowned_ThenNoInconsistency) {
+    setCSRUnowned();
+
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase();
+
+    ASSERT_TRUE(inconsistencies.empty());
+}
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest, WhenInMemoryUntracked_ThenNoInconsistency) {
+    setCSRAuthoritativeNoRoutingTable();
+
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase();
+
+    ASSERT_TRUE(inconsistencies.empty());
+}
+
+TEST_F(checkNoMetadataForNonExistentDatabaseTest, WhenCollectionInExistingDb_ThenNoInconsistency) {
+    insertDurableShardCatalogCollection(generateCollectionType(_nss, _collUuid, _keyPattern));
+    setShardCatalogMetadata(_collUuid, _keyPattern, {makeChunk()});
+
+    const auto inconsistencies = checkNoMetadataForNonExistentDatabase({_dbName});
+
+    ASSERT_TRUE(inconsistencies.empty());
+}
+
+class MakeInconsistencySeverityTest : public unittest::Test {
+protected:
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
+    const UUID _uuid = UUID::gen();
+
+    MissingRoutingTableDetails makeDetails() {
+        MissingRoutingTableDetails details;
+        details.setNss(_nss);
+        details.setCollectionUUID(_uuid);
+        return details;
+    }
+};
+
+TEST_F(MakeInconsistencySeverityTest, NoSeverityByDefault) {
+    const auto item = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable, makeDetails());
+    ASSERT_FALSE(item.getSeverity().has_value());
+}
+
+TEST_F(MakeInconsistencySeverityTest, SeverityHighIsPreserved) {
+    const auto item = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable,
+        makeDetails(),
+        MetadataInconsistencySeverityEnum::kHigh);
+    ASSERT_TRUE(item.getSeverity().has_value());
+    ASSERT_EQ(MetadataInconsistencySeverityEnum::kHigh, item.getSeverity().value());
+}
+
+TEST_F(MakeInconsistencySeverityTest, SeverityMediumIsPreserved) {
+    const auto item = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable,
+        makeDetails(),
+        MetadataInconsistencySeverityEnum::kMedium);
+    ASSERT_TRUE(item.getSeverity().has_value());
+    ASSERT_EQ(MetadataInconsistencySeverityEnum::kMedium, item.getSeverity().value());
+}
+
+TEST_F(MakeInconsistencySeverityTest, SeverityLowIsPreserved) {
+    const auto item = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable,
+        makeDetails(),
+        MetadataInconsistencySeverityEnum::kLow);
+    ASSERT_TRUE(item.getSeverity().has_value());
+    ASSERT_EQ(MetadataInconsistencySeverityEnum::kLow, item.getSeverity().value());
+}
+
+TEST_F(MakeInconsistencySeverityTest, ExplicitNoneSeverityIsAbsent) {
+    const auto item = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable, makeDetails(), boost::none);
+    ASSERT_FALSE(item.getSeverity().has_value());
+}
+
+TEST_F(MakeInconsistencySeverityTest, AbsentSeverityRoundTripsViaBSON) {
+    const auto original = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable, makeDetails());
+    const auto roundTripped = MetadataInconsistencyItem::parse(original.toBSON());
+    ASSERT_FALSE(roundTripped.getSeverity().has_value());
+}
+
+TEST_F(MakeInconsistencySeverityTest, SeverityRoundTripsViaBSON) {
+    const auto original = metadata_consistency_util::makeInconsistency(
+        MetadataInconsistencyTypeEnum::kMissingRoutingTable,
+        makeDetails(),
+        MetadataInconsistencySeverityEnum::kHigh);
+    const auto roundTripped = MetadataInconsistencyItem::parse(original.toBSON());
+    ASSERT_TRUE(roundTripped.getSeverity().has_value());
+    ASSERT_EQ(MetadataInconsistencySeverityEnum::kHigh, roundTripped.getSeverity().value());
+}
+
+TEST_F(MetadataConsistencyTest,
+       MisplacedCollectionOnEmptySessionsNamespaceIsIgnoredWhenNotDbPrimary) {
+    OperationContext* opCtx = operationContext();
+    const auto& nss = NamespaceString::kLogicalSessionsNamespace;
+    const ShardId primaryShardId = ShardId::kConfigServerId;
+
+    createTestCollection(opCtx, nss);
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        primaryShardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /* checkRangeDeletionIndexes */,
+        false /* optionalCheckIndexes */,
+        0x1000000000000000);
+
+    ASSERT_TRUE(
+        std::none_of(inconsistencies.begin(), inconsistencies.end(), [](const auto& inconsistency) {
+            return inconsistency.getType() == MetadataInconsistencyTypeEnum::kMisplacedCollection;
+        }));
+}
+
+TEST_F(MetadataConsistencyTest,
+       MisplacedCollectionOnNonemptySessionsNamespaceIsReportedWhenNotDbPrimary) {
+    OperationContext* opCtx = operationContext();
+    const auto& nss = NamespaceString::kLogicalSessionsNamespace;
+    const ShardId primaryShardId = ShardId::kConfigServerId;
+
+    createTestCollection(opCtx, nss);
+    DBDirectClient client(opCtx);
+    write_ops::checkWriteErrors(
+        client.insert(write_ops::InsertCommandRequest{nss, {BSON("_id" << 1)}}));
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        primaryShardId,
+        {} /* shardingCatalogCollections */,
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /* checkRangeDeletionIndexes */,
+        false /* optionalCheckIndexes */,
+        0x1000000000000000);
+
+    assertOneInconsistencyFound(MetadataInconsistencyTypeEnum::kMisplacedCollection,
+                                inconsistencies);
+}
+
+// Tests for low severity on config.system.sessions inconsistencies.
+
+TEST_F(MetadataConsistencyTest, CollectionUUIDMismatchOnSessionsNamespaceHasLowSeverity) {
+    OperationContext* opCtx = operationContext();
+    const auto& nss = NamespaceString::kLogicalSessionsNamespace;
+
+    createTestCollection(opCtx, nss);
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    // Use a different UUID to trigger a CollectionUUIDMismatch.
+    auto configColl = generateCollectionType(nss, UUID::gen());
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    const auto it =
+        std::find_if(inconsistencies.begin(), inconsistencies.end(), [](const auto& item) {
+            return item.getType() == MetadataInconsistencyTypeEnum::kCollectionUUIDMismatch;
+        });
+    ASSERT_NE(it, inconsistencies.end());
+    ASSERT_TRUE(it->getSeverity().has_value());
+    ASSERT_EQ(MetadataInconsistencySeverityEnum::kLow, it->getSeverity().value());
+}
+
+TEST_F(MetadataConsistencyTest, CollectionOptionsMismatchOnSessionsNamespaceHasLowSeverity) {
+    OperationContext* opCtx = operationContext();
+    const auto& nss = NamespaceString::kLogicalSessionsNamespace;
+
+    // Create a capped local collection to trigger CollectionOptionsMismatch.
+    CreateCommand cmd(nss);
+    cmd.getCreateCollectionRequest().setCapped(true);
+    cmd.getCreateCollectionRequest().setSize(100);
+    createTestCollection(opCtx, nss, cmd.toBSON());
+
+    const auto [localCatalogSnapshot, localCatalogCollections] = getLocalCatalog(opCtx, nss);
+    ASSERT_EQ(1, localCatalogCollections.size());
+
+    // Config entry has the same UUID but does not mark it as unsplittable, triggering the mismatch.
+    auto configColl = generateCollectionType(nss, localCatalogCollections[0]->uuid());
+
+    const auto inconsistencies = metadata_consistency_util::checkCollectionMetadataConsistency(
+        opCtx,
+        _shardId,
+        _shardId,
+        {configColl},
+        localCatalogSnapshot,
+        localCatalogCollections,
+        false /*checkRangeDeletionIndexes*/,
+        false /*optionalCheckIndexes*/,
+        0x1000000000000000);
+
+    const auto it =
+        std::find_if(inconsistencies.begin(), inconsistencies.end(), [](const auto& item) {
+            return item.getType() == MetadataInconsistencyTypeEnum::kCollectionOptionsMismatch;
+        });
+    ASSERT_NE(it, inconsistencies.end());
+    ASSERT_TRUE(it->getSeverity().has_value());
+    ASSERT_EQ(MetadataInconsistencySeverityEnum::kLow, it->getSeverity().value());
+}
+
+// Tests for the CheckMetadataConsistencyStatistics observability metrics. The statistics object is
+// standalone, so these tests exercise it directly rather than through the shard server fixture.
+class CheckMetadataConsistencyStatisticsTest : public unittest::Test {
+protected:
+    // Serializes the statistics into a BSONObj by calling report().
+    BSONObj report() const {
+        BSONObjBuilder builder;
+        _stats.report(builder);
+        return builder.obj();
+    }
+
+    CheckMetadataConsistencyStatistics _stats;
+};
+
+TEST_F(CheckMetadataConsistencyStatisticsTest, NumberOfChunksCheckedIsCorrect) {
+    ASSERT_EQ(0, report()["numberOfChunksChecked"].numberLong());
+
+    // The default increment is 1.
+    _stats.registerChunksChecked();
+    ASSERT_EQ(1, report()["numberOfChunksChecked"].numberLong());
+
+    // Batches of chunks are accumulated.
+    _stats.registerChunksChecked(10);
+    ASSERT_EQ(11, report()["numberOfChunksChecked"].numberLong());
+
+    _stats.registerChunksChecked(0);
+    ASSERT_EQ(11, report()["numberOfChunksChecked"].numberLong());
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest, NumberOfCollectionsCheckedIsCorrect) {
+    ASSERT_EQ(0, report()["numberOfCollectionsChecked"].numberLong());
+
+    for (int i = 1; i <= 5; ++i) {
+        _stats.registerCollectionChecked();
+        ASSERT_EQ(i, report()["numberOfCollectionsChecked"].numberLong());
+    }
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest,
+       NumberOfDatabasesCheckedIsCorrectAndCountsInnerCollections) {
+    ASSERT_EQ(0, report()["numberOfDatabasesChecked"].numberLong());
+    ASSERT_EQ(0, report()["numberOfCollectionsChecked"].numberLong());
+
+    // Simulate checking 2 databases, each holding some collections. Every collection checked within
+    // a database must also be reflected in the collection counter.
+    constexpr int kNumDatabases = 2;
+    constexpr int kCollectionsPerDatabase = 3;
+    for (int db = 0; db < kNumDatabases; ++db) {
+        _stats.registerDatabaseChecked();
+        for (int coll = 0; coll < kCollectionsPerDatabase; ++coll) {
+            _stats.registerCollectionChecked();
+        }
+    }
+
+    ASSERT_EQ(kNumDatabases, report()["numberOfDatabasesChecked"].numberLong());
+    ASSERT_EQ(kNumDatabases * kCollectionsPerDatabase,
+              report()["numberOfCollectionsChecked"].numberLong());
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest, ActiveDatabaseDdlLockCountIsCorrect) {
+    ASSERT_EQ(0, report()["activeDdlLocksHeldForDatabase"].numberLong());
+
+    {
+        auto recorder1 = _stats.registerDatabaseDDLLockForStatistics();
+        ASSERT_EQ(1, report()["activeDdlLocksHeldForDatabase"].numberLong());
+
+        {
+            auto recorder2 = _stats.registerDatabaseDDLLockForStatistics();
+            ASSERT_EQ(2, report()["activeDdlLocksHeldForDatabase"].numberLong());
+        }
+
+        // Releasing the inner lock brings the active count back down.
+        ASSERT_EQ(1, report()["activeDdlLocksHeldForDatabase"].numberLong());
+    }
+
+    ASSERT_EQ(0, report()["activeDdlLocksHeldForDatabase"].numberLong());
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest, ActiveCollectionDdlLockCountIsCorrect) {
+    ASSERT_EQ(0, report()["activeDdlLocksHeldForCollection"].numberLong());
+
+    {
+        auto recorder1 = _stats.registerCollectionDDLLockForStatistics();
+        auto recorder2 = _stats.registerCollectionDDLLockForStatistics();
+        ASSERT_EQ(2, report()["activeDdlLocksHeldForCollection"].numberLong());
+    }
+
+    ASSERT_EQ(0, report()["activeDdlLocksHeldForCollection"].numberLong());
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest, ActiveDdlLockDurationKeepsIncreasing) {
+    auto recorder = _stats.registerDatabaseDDLLockForStatistics();
+
+    const auto firstDuration = report()["activeDdlLocksHeldForDatabaseDurationMillis"].numberLong();
+    sleepFor(Milliseconds(5));
+    const auto secondDuration =
+        report()["activeDdlLocksHeldForDatabaseDurationMillis"].numberLong();
+
+    // While the lock is held, the reported duration must keep growing.
+    ASSERT_GTE(secondDuration, firstDuration);
+    ASSERT_GT(report()["activeDdlLocksHeldForDatabaseDurationMillis"].numberLong(), 0);
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest,
+       DatabaseDdlLockDurationIsAddedToCumulativeTotalOnRelease) {
+    ASSERT_EQ(0, report()["ddlLockHeldForDatabaseDurationMillis"].numberLong());
+
+    {
+        auto recorder = _stats.registerDatabaseDDLLockForStatistics();
+        sleepFor(Milliseconds(5));
+
+        // While the lock is held nothing is added to the cumulative total; the time is only tracked
+        // in the active-duration metric.
+        ASSERT_EQ(0, report()["ddlLockHeldForDatabaseDurationMillis"].numberLong());
+        ASSERT_EQ(1, report()["activeDdlLocksHeldForDatabase"].numberLong());
+    }
+
+    // Once released, the held time is accumulated and the lock is no longer active.
+    ASSERT_EQ(0, report()["activeDdlLocksHeldForDatabase"].numberLong());
+    const auto firstCumulative = report()["ddlLockHeldForDatabaseDurationMillis"].numberLong();
+    ASSERT_GT(firstCumulative, 0);
+
+    // A second lock adds on top of the existing cumulative total.
+    {
+        auto recorder = _stats.registerDatabaseDDLLockForStatistics();
+        sleepFor(Milliseconds(5));
+    }
+    ASSERT_GTE(report()["ddlLockHeldForDatabaseDurationMillis"].numberLong(), firstCumulative);
+}
+
+TEST_F(CheckMetadataConsistencyStatisticsTest,
+       CollectionDdlLockDurationIsAddedToCumulativeTotalOnRelease) {
+    ASSERT_EQ(0, report()["ddlLockHeldForCollectionDurationMillis"].numberLong());
+
+    {
+        auto recorder = _stats.registerCollectionDDLLockForStatistics();
+        sleepFor(Milliseconds(5));
+        ASSERT_EQ(0, report()["ddlLockHeldForCollectionDurationMillis"].numberLong());
+    }
+
+    ASSERT_EQ(0, report()["activeDdlLocksHeldForCollection"].numberLong());
+    ASSERT_GT(report()["ddlLockHeldForCollectionDurationMillis"].numberLong(), 0);
+}
+
+}  // namespace
+}  // namespace mongo

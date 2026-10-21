@@ -1,0 +1,168 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/modules.h"
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+class ExpressionInternalOwningShard final
+    : public ExpressionFixedArity<ExpressionInternalOwningShard, 1> {
+public:
+    static constexpr const char* const opName = "$_internalOwningShard";
+
+    ExpressionInternalOwningShard(ExpressionContext* const expCtx)
+        : ExpressionFixedArity<ExpressionInternalOwningShard, 1>(expCtx) {
+        expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+    }
+
+    ExpressionInternalOwningShard(ExpressionContext* const expCtx,
+                                  Expression::ExpressionVector&& children)
+        : ExpressionFixedArity<ExpressionInternalOwningShard, 1>(expCtx, std::move(children)) {
+        expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+    }
+
+    Value evaluate(const Document& root,
+                   Variables* variables,
+                   const EvaluationContext& ctx) const final;
+
+    const char* getOpName() const final {
+        return opName;
+    }
+
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
+        return visitor->visit(this);
+    }
+
+    boost::intrusive_ptr<Expression> clone(ExpressionContext& expCtx) const final {
+        return make_intrusive<ExpressionInternalOwningShard>(&expCtx, cloneChildren(expCtx));
+    }
+};
+
+/**
+ * The expression '$_internalIndexKey' is used to generate index keys documents for the provided
+ * document 'doc' using the index specification 'spec'. The 'doc' field can be an arbitrary
+ * expression, including a field path or variable like '$$ROOT'. The 'spec' field is aligned with
+ * that of the 'createIndex' command and is treated as a constant expression, as if it had been
+ * supplied by the client as '$literal'.
+ *
+ * The expression specification is a follows:
+ * {
+ *     $_internalIndexKey: {
+ *         doc: <document | expression | field-path | variable>,
+ *         spec: <document>
+ *     }
+ * }
+ *
+ * Returns: A 'Value' which is an array of 'BSONObj' document, where each document represents the
+ * generated index keys object.
+ *
+ * Note that this expression does not inherit the collation from the collection. A collation must be
+ * explicitly provided in the index spec 'spec'.
+ *
+ * Examples:
+ * Case 1: The 'doc' field is a document.
+ * Input1:
+ * {
+ *     $_internalIndexKey: {
+ *         doc: {a: 4, b: 5},
+ *         spec: {key: {a: 1}, name: "exampleIndex"}
+ *     }
+ * }
+ * Output1: [{a: 4}]
+ *
+ * Case 2: The 'doc' field is '$$ROOT' and the current document been processed by the pipeline is
+ * '{a: 4, b: 5}'.
+ * Input2:
+ * {
+ *     $_internalIndexKey: {
+ *         doc: '$$ROOT',
+ *         spec: {key: {a: 1}, name: "exampleIndex"}
+ *     }
+ * }
+ * Output2: [{a: 4}]
+ *
+ * Case 3: The 'doc' field is an expression.
+ * Input3:
+ * {
+ *     $_internalIndexKey: {
+ *         doc: {$literal: {a: 4, b: 5}},
+ *         spec: {key: {a: 1}, name: "exampleIndex"}
+ *     }
+ * }
+ * Output3: [{a: 4}]
+ */
+class ExpressionInternalIndexKey final : public Expression {
+public:
+    static constexpr const char* const opName = "$_internalIndexKey";
+    static constexpr auto kIndexSpecKeyField = "key"sv;
+
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* expCtx,
+                                                  BSONElement bsonExpr,
+                                                  const VariablesParseState& vps);
+
+    ExpressionInternalIndexKey(ExpressionContext* expCtx,
+                               boost::intrusive_ptr<Expression> doc,
+                               boost::intrusive_ptr<Expression> spec);
+
+    boost::intrusive_ptr<Expression> optimize() final;
+
+    Value serialize(const query_shape::SerializationOptions& options) const final;
+
+    Value evaluate(const Document& root,
+                   Variables* variables,
+                   const EvaluationContext& ctx) const final;
+
+    const char* getOpName() const {
+        return opName;
+    }
+
+    void acceptVisitor(ExpressionMutableVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    void acceptVisitor(ExpressionConstVisitor* visitor) const final {
+        return visitor->visit(this);
+    }
+
+    const Expression* getDoc() const {
+        return _doc.get();
+    }
+
+    const Expression* getSpec() const {
+        return _spec.get();
+    }
+
+
+    boost::intrusive_ptr<Expression> clone(ExpressionContext& expCtx) const final {
+        return make_intrusive<ExpressionInternalIndexKey>(
+            &expCtx, cloneChild(_kDocExpr, expCtx), cloneChild(_kSpecExpr, expCtx));
+    }
+
+private:
+    static constexpr size_t _kDocExpr = 0;
+    static constexpr size_t _kSpecExpr = 1;
+    constexpr static auto kDocField = "doc"sv;
+    constexpr static auto kSpecField = "spec"sv;
+
+    boost::intrusive_ptr<Expression> _doc;
+    boost::intrusive_ptr<Expression> _spec;
+};
+
+}  // namespace mongo

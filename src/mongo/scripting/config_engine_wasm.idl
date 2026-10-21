@@ -1,0 +1,33 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Server parameters that are ONLY registered when the Wasmtime JS engine is active.
+# This file is compiled exclusively into the WASM bridge library so that
+# getParameter:{wasmtimeStoreMemoryLimitMB:1} returns ok:0 on legacy MozJS builds,
+# allowing JS tests to reliably detect which engine is in use.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+server_parameters:
+    wasmtimeStoreMemoryLimitMB:
+        description: >-
+            Maximum size in MB that a Wasmtime store's linear memory is allowed
+            to grow to. Each JavaScript execution scope (e.g. every $where,
+            $function, or MapReduce invocation) creates its own store, so this
+            limit applies independently to every concurrent JS evaluation.
+            Must be greater than jsHeapLimitMB because the JS heap lives inside
+            WASM linear memory alongside SpiderMonkey runtime overhead (stack,
+            GC metadata, self-hosted code, malloc arena). The default includes
+            a 10% overhead margin above the default jsHeapLimitMB.
+            Because this parameter is settable at runtime, changes do not
+            affect already-running JS scopes; the new value is picked up the
+            next time a WASM bridge is instantiated.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gWasmtimeStoreMemoryLimitMB
+        default: 1210
+        validator:
+            gt: 0
+        redact: false

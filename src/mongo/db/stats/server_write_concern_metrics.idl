@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo
+    mod_visibility: private
+
+server_parameters:
+    reportOpWriteConcernCountersInServerStatus:
+        description: >-
+            opWriteConcernCounters are not tracked unless this is true. This is false by default
+            because the mutex acquisition impacts performance when SSL is disabled. (When SSL is
+            enabled, other mutexes dominate.)
+        set_at: [startup]
+        cpp_vartype: bool
+        cpp_varname: reportOpWriteConcernCountersInServerStatus
+        default: false
+        redact: false

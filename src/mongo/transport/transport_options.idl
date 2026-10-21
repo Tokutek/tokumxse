@@ -1,0 +1,203 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::transport"
+    cpp_includes:
+        - "mongo/db/server_options.h"
+        - "mongo/transport/transport_options.h"
+
+server_parameters:
+    # Options to configure inbound TFO connections.
+    tcpFastOpenServer:
+        description: Enable TCP Fast Open for inbound connections
+        set_at: startup
+        cpp_varname: gTCPFastOpenServer
+        cpp_vartype: bool
+        default: true
+        redact: false
+
+    tcpFastOpenQueueSize:
+        description: TCP Fast Open queue length
+        set_at: startup
+        cpp_varname: gTCPFastOpenQueueSize
+        cpp_vartype: int
+        default: 1024
+        validator:
+            gt: 0
+        redact: false
+
+    # Options to configure outbound TFO connections.
+    tcpFastOpenClient:
+        description: Enable TCP Fast Open when connecting to remote servers
+        set_at: startup
+        cpp_varname: gTCPFastOpenClient
+        cpp_vartype: bool
+        default: true
+        redact: false
+
+    maxIncomingConnectionsOverride:
+        description: "CIDR ranges that are exempt from the maxIncomingConnections limit"
+        set_at: runtime # Use the configuration option for setting this at startup.
+        cpp_class:
+            name: "MaxIncomingConnectionsOverrideServerParameter"
+            # Expects the payload to be an instance of `CIDRRangeListParameters`.
+            override_set: true
+        redact: false
+
+    ingressConnectionEstablishmentRateLimiterBypass:
+        description: "A list of CIDRs to be exempted from the ingress connection establishment rate limit"
+        set_at: [startup, runtime]
+        cpp_class:
+            name: "MaxEstablishingConnectionsOverrideServerParameter"
+            # Expects the payload to be an instance of `CIDRRangeListParameters`.
+            override_set: true
+        redact: false
+
+    ingressConnectionEstablishmentRateLimiterEnabled:
+        description: "Whether the ingress connection establishment rate limiter is enabled or not"
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentRateLimiterEnabled
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
+    ingressConnectionEstablishmentRatePerSec:
+        description: "The number of new ingress connections that will be allowed to establish per second"
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentRatePerSec
+        cpp_vartype: Atomic<int32_t>
+        on_update: transport::onUpdateEstablishmentRefreshRate
+        default:
+            expr: std::numeric_limits<int>::max()
+        validator: {gte: 1}
+        redact: false
+
+    ingressConnectionEstablishmentBurstCapacitySecs:
+        description: >-
+            Describes how many seconds worth of unutilized rate limit can be stored away for use 
+            to admit additional connection establishment requests during periods where the rate 
+            limit is temporarily exceeded.
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentBurstCapacitySecs
+        cpp_vartype: Atomic<double>
+        on_update: transport::onUpdateEstablishmentBurstCapacitySecs
+        default:
+            expr: std::numeric_limits<double>::max()
+        validator: {gt: 0}
+        redact: false
+
+    ingressConnectionEstablishmentMaxQueueDepth:
+        description: >-
+            The maximum size of the connection establishment queue, after which the server will begin 
+            rejecting new ingress connections. A queue size of 0 indicates that connections will be 
+            rejected if they cannot immediately be admitted.
+        set_at: [startup, runtime]
+        cpp_varname: gIngressConnectionEstablishmentMaxQueueDepth
+        cpp_vartype: Atomic<int32_t>
+        on_update: transport::onUpdateEstablishmentMaxQueueDepth
+        default: 0
+        validator: {gte: 0}
+        redact: false
+
+    pessimisticConnectivityCheckForAcceptedConnections:
+        description: >-
+            Instructs the server to check connectivity of accepted connections before further 
+            processing and discard those that are terminated by the client. This parameter has no 
+            effect on non-Linux platforms.
+        set_at: [startup, runtime]
+        cpp_varname: gPessimisticConnectivityCheckForAcceptedConnections
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+
+    proxyProtocolMaximumWaitBackoffMillis:
+        description: >-
+            The listener thread exponentially increases the wait between checking for the proxy header
+            on an accepted socket. This value decided the maximum wait time (in milliseconds).
+        set_at: [startup, runtime]
+        cpp_varname: gProxyProtocolMaximumWaitBackoffMillis
+        cpp_vartype: Atomic<int32_t>
+        default: 200
+        validator: {gte: 0}
+        redact: false
+
+    proxyProtocolTimeoutSecs:
+        description: >-
+            The maximum wait time (in seconds) before expiring accepted sockets from the proxy port,
+            unless the proxy protocol header is presented to the server before that. A value of 0
+            means expire immediately if the complete header is not already buffered in the socket
+            at the time of the first read attempt.
+        set_at: [startup, runtime]
+        cpp_varname: gProxyProtocolTimeoutSecs
+        cpp_vartype: Atomic<int32_t>
+        default: 120
+        validator: {gte: 0}
+        redact: false
+
+    proxyProtocolMaximumPendingConnections:
+        description: >-
+            Decides the maximum number of connections accepted from the proxy port that are yet to 
+            provide the proxy protocol header. Once the server reaches this threshold, it will 
+            reject new connections accepted from the proxy port.
+        set_at: [startup, runtime]
+        cpp_varname: gProxyProtocolMaximumPendingConnections
+        cpp_vartype: Atomic<int32_t>
+        default: 16000
+        validator: {gte: 0}
+        redact: false
+
+    proxyUnixSocketMaximumHeaderSize:
+        description: >-
+            When connected to a proxy Unix domain socket, the server will read at most
+            proxyUnixSocketMaximumHeaderSize bytes to parse the proxy protocol v2 header.
+        set_at: [startup, runtime]
+        cpp_varname: proxyUnixSocketMaximumHeaderSize
+        cpp_vartype: Atomic<int>
+        default: 4096
+        validator: {gte: 536, lt: 16384}
+        redact: false
+
+    proxyUnixSocketCheckPermissions:
+        description: >-
+            Formerly controlled whether the connecting process's GID was checked against
+            proxyUnixSocketFileGroupId. GID validation is now mandatory, so this is a no-op
+            retained only so that existing configurations continue to start.
+        set_at: [startup, runtime]
+        cpp_varname: gProxyUnixSocketCheckPermissions
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+    preAuthMaximumMessageSizeBytes:
+        description: >-
+            The maximum size of a message that can be sent before the session is authenticated.
+        set_at: [startup, runtime]
+        cpp_varname: gPreAuthMaximumMessageSizeBytes
+        cpp_vartype: Atomic<int32_t>
+        default: 16384 # 16KB
+        validator: {gte: 1024} # 1KB
+        redact: false
+
+    messageSizeErrorRateSec:
+        description: >-
+            The rate, in seconds, at which message size errors are logged at the Info level.
+        set_at: [startup]
+        cpp_varname: gMessageSizeErrorRateSec
+        cpp_vartype: int32_t
+        default: 5
+        validator: {gte: 0}
+        redact: false
+
+    capMemoryConsumptionForPreAuthBuffers:
+        description: >-
+            Adjusts the maximum number of connections accepted by the server, if needed, to ensure 
+            the total memory allocated to pre-auth buffers does not exceed X% of total memory 
+            available to the server, where X is set to 20 by default. Accepts values in percentages 
+            and setting it to 100 disables this limitation.
+        set_at: [startup]
+        cpp_varname: gMemoryCapPercentageForPreAuthBuffers
+        cpp_vartype: int
+        default: 20
+        validator: {gt: 0, lte: 100}
+        redact: false

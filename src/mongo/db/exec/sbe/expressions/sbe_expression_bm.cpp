@@ -1,0 +1,197 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/expression_bm_fixture.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
+#include "mongo/db/exec/sbe/stages/bson_scan.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/query/stage_builder/sbe/builder.h"
+#include "mongo/db/query/stage_builder/sbe/gen_expression.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/util/intrusive_counter.h"
+
+#include <algorithm>
+#include <iterator>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <benchmark/benchmark.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+template <typename T>
+std::string debugPrintStage(const T* stage) {
+    sbe::DebugPrintInfo debugPrintInfo{};
+    return stage ? sbe::DebugPrinter{}.print(stage->debugPrint(debugPrintInfo)) : std::string();
+}
+
+template <typename T>
+std::string debugPrintExpr(const T* expr) {
+    return expr ? sbe::DebugPrinter{}.print(expr->debugPrint()) : std::string();
+}
+
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.bm");
+
+class SbeExpressionBenchmarkFixture : public ExpressionBenchmarkFixture {
+public:
+    SbeExpressionBenchmarkFixture() : _env(std::make_unique<sbe::RuntimeEnvironment>()) {
+        _inputSlotId = _env->registerSlot(
+            "input"sv, sbe::value::TypeTags::Nothing, 0, false, &_slotIdGenerator);
+        _timeZoneDB = std::make_unique<TimeZoneDatabase>();
+        _env->registerSlot("timeZoneDB"sv,
+                           sbe::value::TypeTags::timeZoneDB,
+                           sbe::value::bitcastFrom<TimeZoneDatabase*>(_timeZoneDB.get()),
+                           false,
+                           &_slotIdGenerator);
+        _inputSlotAccessor = _env->getAccessor(_inputSlotId);
+    }
+
+    void benchmarkExpression(BSONObj expressionSpec,
+                             benchmark::State& benchmarkState,
+                             const std::vector<Document>& documents) final {
+        // TODO SERVER-100579 Remove this when feature flag is removed
+        unittest::ServerParameterGuard sbeUpgradeBinaryTreesFeatureFlag{
+            "featureFlagSbeUpgradeBinaryTrees", true};
+
+        auto opCtx = getServiceContext()->makeOperationContext();
+        auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), kNss);
+        auto expression =
+            Expression::parseExpression(expCtx.get(), expressionSpec, expCtx->variablesParseState);
+
+        if (expCtx->getSbeCompatibility() == SbeCompatibility::notCompatible) {
+            benchmarkState.SkipWithError("expression is not supported by SBE");
+            return;
+        }
+
+        expression = expression->optimize();
+
+        LOGV2_DEBUG(6979800,
+                    1,
+                    "running sbe expression benchmark on expression",
+                    "expression"_attr = expression
+                                            ->serialize(query_shape::SerializationOptions{
+                                                .verbosity = boost::make_optional(
+                                                    ExplainOptions::Verbosity::kQueryPlanner)})
+                                            .toString());
+
+        // This stage makes it possible to execute the benchmark in cases when
+        // stage_builder::generateExpression adds more stages.
+        // There is 10 ns overhead for using PlanStage instead of executing
+        // expressions directly.
+        // It can be removed when stage_builder::generateExpressions
+        // always return EExpression.
+        auto stage = sbe::makeS<sbe::BSONScanStage>(
+            convertToBson(documents), boost::make_optional(_inputSlotId), kEmptyPlanNodeId);
+
+        stage_builder::StageBuilderState state{opCtx.get(),
+                                               _env,
+                                               _planStageData.get(),
+                                               _variables,
+                                               nullptr /* yieldPolicy */,
+                                               &_slotIdGenerator,
+                                               &_frameIdGenerator,
+                                               &_spoolIdGenerator,
+                                               &_inListsMap,
+                                               &_collatorsMap,
+                                               &_sortSpecMap,
+                                               _expCtx,
+                                               false /* needsMerge */,
+                                               false /* allowDiskUse */,
+                                               *expCtx->getIfrContext()};
+
+        auto rootSlot =
+            stage_builder::SbSlot{_inputSlotId, stage_builder::TypeSignature::kAnyScalarType};
+
+        stage_builder::PlanStageSlots slots;
+        slots.setResultObj(rootSlot);
+
+        auto evalExpr = stage_builder::generateExpression(state, expression.get(), rootSlot, slots);
+
+        LOGV2_DEBUG(6979801,
+                    1,
+                    "sbe expression benchmark PlanStage",
+                    "stage"_attr = debugPrintStage(stage.get()));
+
+        auto expr = evalExpr.lower(state);
+        LOGV2_DEBUG(6979802,
+                    1,
+                    "sbe expression benchmark EExpression",
+                    "expression"_attr = debugPrintExpr(expr.get()));
+
+        stage->attachToOperationContext(opCtx.get());
+        stage->prepare(_env.ctx);
+
+        _env.ctx.root = stage.get();
+        sbe::vm::CodeFragment code = expr->compileDirect(_env.ctx);
+        sbe::vm::ByteCode vm;
+        stage->open(/*reopen =*/false);
+        for (auto keepRunning : benchmarkState) {
+            for (auto st = stage->getNext(); st == sbe::PlanState::ADVANCED;
+                 st = stage->getNext()) {
+                executeExpr(vm, &code);
+            }
+            benchmark::ClobberMemory();
+            stage->open(/*reopen = */ true);
+        }
+    }
+
+private:
+    std::vector<BSONObj> convertToBson(const std::vector<Document>& documents) {
+        std::vector<BSONObj> result;
+        result.reserve(documents.size());
+        std::transform(documents.begin(),
+                       documents.end(),
+                       std::back_inserter(result),
+                       [](const auto& doc) { return doc.toBson(); });
+        return result;
+    }
+
+    void executeExpr(sbe::vm::ByteCode& vm, const sbe::vm::CodeFragment* compiledExpr) const {
+        auto result = vm.run(compiledExpr);
+    }
+
+    stage_builder::Environment _env;
+    std::unique_ptr<stage_builder::PlanStageStaticData> _planStageData;
+    Variables _variables;
+    sbe::value::SlotIdGenerator _slotIdGenerator;
+    sbe::value::FrameIdGenerator _frameIdGenerator;
+    sbe::value::SpoolIdGenerator _spoolIdGenerator;
+    stage_builder::StageBuilderState::InListsMap _inListsMap;
+    stage_builder::StageBuilderState::CollatorsMap _collatorsMap;
+    stage_builder::StageBuilderState::SortSpecMap _sortSpecMap;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+    sbe::value::SlotId _inputSlotId;
+    std::unique_ptr<TimeZoneDatabase> _timeZoneDB;
+    sbe::RuntimeEnvironment::Accessor* _inputSlotAccessor;
+};
+
+BENCHMARK_EXPRESSIONS(SbeExpressionBenchmarkFixture)
+
+}  // namespace
+}  // namespace mongo

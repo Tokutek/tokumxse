@@ -1,0 +1,222 @@
+"""FCV and Server binary version constants used for multiversion testing."""
+
+import functools
+import glob
+import http
+import os
+import shutil
+from subprocess import DEVNULL, STDOUT, call, check_output
+
+import requests
+import structlog
+import yaml
+from retry import retry
+
+import buildscripts.resmokelib.config as _config
+from buildscripts.resmokelib.multiversion.multiversion_service import (
+    MongoReleases,
+    MongoVersion,
+    MultiversionService,
+)
+from buildscripts.resmokelib.multiversionsetupconstants import USE_EXISTING_RELEASES_FILE
+from buildscripts.util.expansions import get_expansion
+
+RELEASES_LOCAL_FILE = os.path.join(
+    _config.RESMOKE_ROOT, "src", "mongo", "util", "version", "releases.yml"
+)
+# We use the "releases.yml" file from "master" because it is guaranteed to be up-to-date
+# with the latest EOL versions. If a "last-continuous" version is EOL, we don't include
+# it in the multiversion config and therefore don't test against it.
+MASTER_RELEASES_REMOTE_FILE = (
+    "https://raw.githubusercontent.com/mongodb/mongo/master/src/mongo/util/version/releases.yml"
+)
+
+LOGGER = structlog.getLogger(__name__)
+
+
+BAZELRC_DEFAULT_MONGO_VERSION = ".bazelrc.target_mongo_version"
+
+
+def generate_mongo_version_file():
+    """Generate the mongo version data file. Should only be called in the root of the mongo directory."""
+    # Read the MONGO_VERSION from .bazelrc.target_mongo_version
+    # The file contains a line like: common --define=MONGO_VERSION=8.2.2
+    try:
+        with open(BAZELRC_DEFAULT_MONGO_VERSION, "r") as f:
+            for line in f:
+                if "MONGO_VERSION=" in line:
+                    # Extract the version after "MONGO_VERSION="
+                    version = line.split("MONGO_VERSION=")[1].strip()
+                    break
+            else:
+                raise ValueError(f"MONGO_VERSION not found in {BAZELRC_DEFAULT_MONGO_VERSION}")
+    except FileNotFoundError as exp:
+        raise FileNotFoundError(
+            f"Failed to read version from {BAZELRC_DEFAULT_MONGO_VERSION}"
+        ) from exp
+
+    # Write the current MONGO_VERSION to a data file.
+    with open(_config.MONGO_VERSION_FILE, "w", encoding="utf-8") as mongo_version_fh:
+        # E.g. version = '8.2.2'
+        mongo_version_fh.write("mongo_version: " + version + "\n")
+
+
+@retry(tries=5, delay=3)
+def get_releases_file_from_remote():
+    """Get the latest releases.yml from github."""
+    try:
+        with open(_config.RELEASES_FILE, "wb") as file:
+            response = requests.get(MASTER_RELEASES_REMOTE_FILE)
+            if response.status_code != http.HTTPStatus.OK:
+                raise RuntimeError(
+                    f"Fetching releases.yml file returned unsuccessful status: {response.status_code}, "
+                    f"response body: {response.text}\n"
+                )
+            file.write(response.content)
+        LOGGER.info(f"Got releases.yml file remotely: {MASTER_RELEASES_REMOTE_FILE}")
+    except Exception as exc:
+        LOGGER.warning(f"Could not get releases.yml file remotely: {MASTER_RELEASES_REMOTE_FILE}")
+        raise exc
+
+
+def get_releases_file_locally_or_fallback_to_remote():
+    """Get the latest releases.yml locally or fallback to getting it from github."""
+    if os.path.exists(RELEASES_LOCAL_FILE):
+        LOGGER.info(f"Found releases.yml file locally: {RELEASES_LOCAL_FILE}")
+        shutil.copyfile(RELEASES_LOCAL_FILE, _config.RELEASES_FILE)
+
+    else:
+        LOGGER.warning(f"Could not find releases.yml file locally: {RELEASES_LOCAL_FILE}")
+        get_releases_file_from_remote()
+
+
+def generate_releases_file():
+    """Generate the releases constants file."""
+
+    # If we are not in master, we want to grab the releases file from master as a source of truth.
+    # If we are on master in CI, we can grab it locally to accommodate any changes made for testing.
+    # On older versions we use the master releases.yml file to ensure we do not run multiversion
+    # testing against eol versions.
+    if _config.EVERGREEN_TASK_ID and get_expansion("branch_name") != "master":
+        get_releases_file_from_remote()
+    else:
+        get_releases_file_locally_or_fallback_to_remote()
+
+
+def in_git_root_dir():
+    """Return True if we are in the root of a git directory."""
+    try:
+        if call(["git", "branch"], stderr=STDOUT, stdout=DEVNULL) != 0:
+            # We are not in a git directory.
+            return False
+    except FileNotFoundError:
+        # Git is not even installed.
+        return False
+
+    git_root_dir = os.path.realpath(
+        check_output("git rev-parse --show-toplevel", shell=True, text=True).strip()
+    )
+    curr_dir = os.path.realpath(os.getcwd())
+    return git_root_dir == curr_dir
+
+
+# Check for the source dir that exists on spawnhosts
+def in_spawn_host():
+    if glob.glob("/data/mci/source*"):
+        return True
+    return False
+
+
+_version_file_explicitly_set = _config.MONGO_VERSION_FILE != os.path.join(
+    _config.RESMOKE_ROOT, ".resmoke_mongo_version.yml"
+)
+if (
+    not _version_file_explicitly_set
+    and (in_git_root_dir() or "BUILD_WORKSPACE_DIRECTORY" in os.environ)
+    and not in_spawn_host()
+):
+    generate_mongo_version_file()
+else:
+    LOGGER.info("Skipping generating mongo version file since we're not in the root of a git repo")
+
+# Avoiding regenerating the releases file if this flag is set. Should only be set if there are
+# multiple processes attempting to set up multiversion concurrently.
+if not USE_EXISTING_RELEASES_FILE:
+    generate_releases_file()
+else:
+    LOGGER.info(
+        "Skipping generating releases file since the --useExistingReleasesFile flag has been set"
+    )
+
+
+def evg_project_str(version):
+    """Return the evergreen project name for the given version."""
+    return "mongodb-mongo-v{}.{}".format(version.major, version.minor)
+
+
+multiversion_service = MultiversionService(
+    mongo_version=MongoVersion.from_yaml_file(_config.MONGO_VERSION_FILE),
+    mongo_releases=MongoReleases.from_yaml_file(_config.RELEASES_FILE),
+)
+
+version_constants = multiversion_service.get_version_constants()
+
+LAST_LTS_FCV = version_constants.get_last_lts_fcv()
+LAST_CONTINUOUS_FCV = version_constants.get_last_continuous_fcv()
+LATEST_FCV = version_constants.get_latest_fcv()
+
+# Last patch release info (e.g. version '8.3.1', FCV '8.3') is derived from
+# git tag history. Resolution is on-demand and memoized: callers reach it via
+# multiversion_service.get_last_patch_version() / .get_last_patch_fcv() to
+# keep import-time free of git work.
+
+REQUIRES_FCV_TAG_LATEST = version_constants.get_latest_tag()
+
+# Generate tags for all FCVS in (lastLTS, latest].
+# All multiversion tests should be run with these tags excluded.
+REQUIRES_FCV_TAG = version_constants.get_fcv_tag_list()
+
+REQUIRES_FCV_TAGS_LESS_THAN_LATEST = version_constants.get_fcv_tags_less_than_latest()
+
+EXPLICIT_MULTIVERSION_SUITE_FILE = os.path.join(
+    "buildscripts", "resmokeconfig", "suites", "multiversion.yml"
+)
+
+
+@functools.cache
+def get_explicit_multiversion_tests() -> frozenset[str]:
+    """Get the tests selected by the roots of the explicit multiversion suite.
+
+    These tests explicitly pick the binary versions they run against and set up their own
+    mixed-version topologies, unlike the implicit multiversion suites, where the fixture supplies
+    the old binaries and the tests also run in a single-version suite. Because they run in no
+    single-version suite, a `REQUIRES_FCV_TAG` tag on one of them excludes it from every suite. The
+    multiversion_auth and feature_flag_multiversion suites select from the same roots, so this
+    suite covers them too.
+    """
+    with open(os.path.join(_config.RESMOKE_ROOT, EXPLICIT_MULTIVERSION_SUITE_FILE)) as fh:
+        roots = yaml.safe_load(fh)["selector"]["roots"]
+    return frozenset(
+        test
+        for root in roots
+        for test in glob.glob(root, root_dir=_config.RESMOKE_ROOT, recursive=True)
+    )
+
+
+def is_explicit_multiversion_test(test: str) -> bool:
+    """Return True if the test only runs in an explicit multiversion suite."""
+    return test in get_explicit_multiversion_tests()
+
+
+# Generate evergreen project names for all FCVs less than latest.
+EVERGREEN_PROJECTS = ["mongodb-mongo-master"]
+EVERGREEN_PROJECTS.extend([evg_project_str(fcv) for fcv in version_constants.fcvs_less_than_latest])
+
+
+def log_constants(exec_log):
+    """Log FCV constants."""
+    exec_log.info("Last LTS FCV: {}".format(LAST_LTS_FCV))
+    exec_log.info("Last Continuous FCV: {}".format(LAST_CONTINUOUS_FCV))
+    exec_log.info("Latest FCV: {}".format(LATEST_FCV))
+    exec_log.info("Requires FCV Tag Latest: {}".format(REQUIRES_FCV_TAG_LATEST))
+    exec_log.info("Requires FCV Tag: {}".format(REQUIRES_FCV_TAG))

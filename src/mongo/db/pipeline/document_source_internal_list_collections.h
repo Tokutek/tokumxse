@@ -1,0 +1,149 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+DECLARE_STAGE_PARAMS_DERIVED_DEFAULT(InternalListCollections);
+
+/**
+ * Provides a document source interface to get a list of collections. If the targeted database is
+ * `admin`, it will return all the collections of the cluster. Otherwise, it will return all the
+ * collections of the targeted database.
+ */
+class DocumentSourceInternalListCollections final : public DocumentSource {
+public:
+    static constexpr std::string_view kStageName = "$_internalListCollections"sv;
+
+    DocumentSourceInternalListCollections(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    class LiteParsed final : public LiteParsedDocumentSourceDefault<LiteParsed> {
+    public:
+        static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
+                                                 const BSONElement& spec,
+                                                 const LiteParserOptions& options) {
+            return std::make_unique<LiteParsed>(spec, nss.tenantId());
+        }
+
+        LiteParsed(const BSONElement& spec, const boost::optional<TenantId>& tenantId)
+            : LiteParsedDocumentSourceDefault(spec),
+              _privileges({Privilege(ResourcePattern::forClusterResource(tenantId),
+                                     ActionType::internal)}) {}
+
+        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
+            return stdx::unordered_set<NamespaceString>();
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos,
+                                           bool bypassDocumentValidation) const final {
+            return _privileges;
+        }
+
+        bool isInitialSource() const final {
+            return true;
+        }
+
+        std::unique_ptr<StageParams> getStageParams() const final {
+            return std::make_unique<InternalListCollectionsStageParams>(_originalBson);
+        }
+
+        bool generatesOwnDataOnce() const final {
+            return true;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const override {
+            // The listCollections command that runs under the hood only accepts 'local' read
+            // concern.
+            return onlyReadConcernLocalSupported(kStageName, level, isImplicitDefault);
+        }
+
+    private:
+        const PrivilegeVector _privileges;
+    };
+
+    std::string_view getSourceName() const final;
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {};
+
+    Value serialize(const query_shape::SerializationOptions& opts =
+                        query_shape::SerializationOptions{}) const final {
+        // Since this DocumentSource is serialized to more than one stage, the single-stage has no
+        // way to return the right answer, therefore we should not use it.
+        MONGO_UNREACHABLE_TASSERT(9741504);
+    }
+
+    void serializeToArray(std::vector<Value>& array,
+                          const query_shape::SerializationOptions& opts) const final;
+
+    StageConstraints constraints(PipelineSplitState pipeState) const override {
+        StageConstraints constraints{StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kCollectionlessSourceRunOnceAnyNode,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kNotAllowed,
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed};
+        constraints.isIndependentOfAnyCollection = true;
+        constraints.setConstraintsForNoInputSources();
+        return constraints;
+    }
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic(
+        const DistributedPlanContext* ctx) final {
+        // This stage will run once on the entire cluster since we've set
+        // `kCollectionlessSourceRunOnceAnyNode` as the `HostTypeRequirement` constraint.
+        return boost::none;
+    }
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    DocumentSourceContainer::iterator optimizeAt(DocumentSourceContainer::iterator itr,
+                                                 DocumentSourceContainer* container);
+
+private:
+    friend boost::intrusive_ptr<exec::agg::Stage> documentSourceInternalListCollectionsToStageFn(
+        const boost::intrusive_ptr<DocumentSource>& documentSource);
+
+    // A $match stage can be absorbed in order to avoid unnecessarily computing the databases
+    // that do not match that predicate.
+    boost::intrusive_ptr<DocumentSourceMatch> _absorbedMatch;
+};
+}  // namespace mongo

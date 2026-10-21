@@ -1,0 +1,37 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/global_catalog/types_validators.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+structs:
+    DatabaseType:
+        description:
+            "Represents the layout and contents of documents contained in the config
+            server's config.databases and the primary shard's config.shard.catalog.databases collection."
+        strict: false
+        fields:
+            _id:
+                description: "Database name."
+                cpp_name: dbName
+                type: database_name
+                validator:
+                    callback: "validateDatabaseName"
+                optional: false
+            primary:
+                description: "Primary shard for this database."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+                optional: false
+            version:
+                description: "Version of the database."
+                type: database_version
+                optional: false

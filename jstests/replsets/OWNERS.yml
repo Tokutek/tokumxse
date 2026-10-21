@@ -1,0 +1,62 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "*capped*":
+    approvers:
+      - 10gen/server-collection-write-path
+  - "*initial_sync*":
+    approvers:
+      - 10gen/server-initial-sync
+  - "*initialsync*":
+    approvers:
+      - 10gen/server-initial-sync
+  - "*read_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "*write_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "*rwconcern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "*replication_recovery*":
+    approvers:
+      - 10gen/server-recovery
+  - "standalone_recover_to_oplog_timestamp.js":
+    approvers:
+      - 10gen/server-recovery
+  - "standalone_recover_to_oplog_timestamp_multikey_metadata.js":
+    approvers:
+      - 10gen/server-recovery
+  - "*startup_recovery*":
+    approvers:
+      - 10gen/server-recovery
+  - "*fcv*":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "rollback_set_multikey_metadata.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "*record_ids*":
+    approvers:
+      - 10gen/server-collection-write-path
+  - "all_commands_downgrading_to_upgraded.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "profile_or_find_no_such_db_secondary.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "profile_secondary_differ_case_lazy_init.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "profile_stepdown_race_condition.js":
+    approvers:
+      - 10gen/query-integration-observability
+  - "*change_stream*":
+    approvers:
+      - 10gen/query-execution-change-streams
+  - "v2_delta_oplog_entries.js":
+    approvers:
+      - 10gen/query-execution

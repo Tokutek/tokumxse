@@ -1,0 +1,301 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#define LOGV2_FOR_RECOVERY(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(ID, DLEVEL, {logv2::LogComponent::kStorageRecovery}, MESSAGE, ##__VA_ARGS__)
+
+#include "mongo/db/shard_role/shard_catalog/catalog_control.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/index_builds/index_builds_common.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/index_builds/primary_driven/enabled.h"
+#include "mongo/db/index_builds/primary_driven/registry.h"
+#include "mongo/db/index_builds/primary_driven/util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_repair.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_stats.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/historical_catalogid_tracker.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+namespace mongo {
+namespace catalog {
+namespace {
+
+bool isCatalogOpen(OperationContext* opCtx) {
+    invariant(shard_role_details::getLocker(opCtx)->isW());
+    return opCtx->getServiceContext()->getStorageEngine()->isMDBCatalogOpen();
+}
+
+}  // namespace
+
+// Class since it accesses the internal
+// CollectionCatalog::lookupCollectionByNamespaceForMetadataWrite method. This is possible because
+// this class is actually a friend class with a forward declaration in collection_catalog.h. Note
+// that this class is not exposed to the public and can only be used in this file.
+class CatalogControlUtils {
+public:
+    static void reopenAllDatabasesAndReloadCollectionCatalog(
+        OperationContext* opCtx,
+        StorageEngine* storageEngine,
+        const PreviousCatalogState& previousCatalogState,
+        Timestamp stableTimestamp) {
+
+        // Open all databases and repopulate the CollectionCatalog.
+        LOGV2(20276, "reopenAllDatabasesAndReloadCollectionCatalog: reopening all databases");
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        std::vector<DatabaseName> databasesToOpen = catalog::listDatabases();
+        for (auto&& dbName : databasesToOpen) {
+            LOGV2_FOR_RECOVERY(
+                23992,
+                1,
+                "reopenAllDatabasesAndReloadCollectionCatalog: dbholder reopening database",
+                logAttrs(dbName));
+            auto db = databaseHolder->openDb(opCtx, dbName);
+            invariant(
+                db, str::stream() << "failed to reopen database " << dbName.toStringForErrorMsg());
+            for (auto&& collNss :
+                 CollectionCatalog::get(opCtx)->getAllCollectionNamesFromDb(opCtx, dbName)) {
+                // Note that the collection name already includes the database component.
+                auto collection =
+                    CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(
+                        opCtx, collNss);
+                invariant(collection,
+                          str::stream() << "failed to get valid collection pointer for namespace "
+                                        << collNss.toStringForErrorMsg());
+
+                if (auto it = previousCatalogState.minValidTimestampMap.find(collection->uuid());
+                    it != previousCatalogState.minValidTimestampMap.end()) {
+                    // After rolling back to a stable timestamp T, the minimum valid timestamp for
+                    // each collection must be reset to (at least) its value at T. When the min
+                    // valid timestamp is clamped to the stable timestamp we may end up with a
+                    // pessimistic minimum valid timestamp set where the last DDL operation occurred
+                    // earlier. This is fine as this is just an optimization when to avoid reading
+                    // the catalog from WT.
+                    auto minValid = std::min(stableTimestamp, it->second);
+
+                    collection->setMinimumValidSnapshot(minValid);
+                }
+
+                if (collection->getTimeseriesOptions()) {
+                    bool extendedRangeSetting;
+                    if (auto it =
+                            previousCatalogState.requiresTimestampExtendedRangeSupportMap.find(
+                                collection->uuid());
+                        it != previousCatalogState.requiresTimestampExtendedRangeSupportMap.end()) {
+                        extendedRangeSetting = it->second;
+                    } else {
+                        extendedRangeSetting = timeseries::collectionMayRequireExtendedRangeSupport(
+                            opCtx, *collection);
+                    }
+
+                    if (extendedRangeSetting) {
+                        collection->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+                    }
+                }
+
+                // If this is the oplog collection, re-establish the replication system's cached
+                // pointer to the oplog.
+                if (collNss.isOplog()) {
+                    LOGV2(20277,
+                          "reopenAllDatabasesAndReloadCollectionCatalog: updating cached oplog "
+                          "pointer");
+                    repl::establishOplogRecordStoreForLogging(opCtx, collection->getRecordStore());
+                }
+            }
+        }
+
+        // Opening CollectionCatalog: The collection catalog is now in sync with the storage engine
+        // catalog. Clear the pre-closing state.
+        CollectionCatalog::write(opCtx,
+                                 [&](CollectionCatalog& catalog) { catalog.onOpenCatalog(); });
+        LOGV2(
+            20278,
+            "reopenAllDatabasesAndReloadCollectionCatalog: finished reloading collection catalog");
+    }
+};
+
+PreviousCatalogState closeCatalog(OperationContext* opCtx) {
+    invariant(shard_role_details::getLocker(opCtx)->isW());
+    invariant(isCatalogOpen(opCtx));
+
+    // Primary-driven index builds are tracked outside of the catalog, so clear them here. This has
+    // to happen before the assertion and the database closes below, both of which refuse to
+    // proceed while index builds exist. Restore the entries if we do not successfully close the
+    // catalog.
+    auto& primaryDrivenRegistry =
+        index_builds::primary_driven::registry(opCtx->getServiceContext());
+    auto previousPrimaryDrivenBuilds = primaryDrivenRegistry.all();
+    primaryDrivenRegistry.clear();
+    ScopeGuard restorePrimaryDrivenRegistryOnFailure([&] {
+        for (auto&& [buildUUID, build] : previousPrimaryDrivenBuilds) {
+            primaryDrivenRegistry.add(buildUUID,
+                                      build.dbName,
+                                      build.collectionUUID,
+                                      build.indexes,
+                                      build.indexBuildIdent);
+        }
+    });
+
+    IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgress();
+
+    PreviousCatalogState previousCatalogState;
+    std::vector<DatabaseName> allDbs = catalog::listDatabases();
+
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto catalog = CollectionCatalog::get(opCtx);
+    for (auto&& dbName : allDbs) {
+        for (auto&& coll : catalog->range(dbName)) {
+            if (!coll) {
+                break;
+            }
+
+            // If there's a minimum valid, invariant there's also a UUID.
+            boost::optional<Timestamp> minValid = coll->getMinimumValidSnapshot();
+            if (minValid) {
+                LOGV2_DEBUG(6825500,
+                            1,
+                            "closeCatalog: preserving min valid timestamp.",
+                            "ns"_attr = coll->ns(),
+                            "uuid"_attr = coll->uuid(),
+                            "minValid"_attr = minValid);
+                previousCatalogState.minValidTimestampMap[coll->uuid()] = *minValid;
+            }
+
+            if (coll->getTimeseriesOptions()) {
+                previousCatalogState.requiresTimestampExtendedRangeSupportMap[coll->uuid()] =
+                    coll->getRequiresTimeseriesExtendedRangeSupport();
+            }
+        }
+    }
+
+    // Need to mark the CollectionCatalog as open if we our closeAll fails, dismissed if successful.
+    ScopeGuard reopenOnFailure([opCtx] {
+        CollectionCatalog::write(opCtx,
+                                 [](CollectionCatalog& catalog) { catalog.onOpenCatalog(); });
+    });
+    // Closing CollectionCatalog: only lookupNSSByUUID will fall back to using pre-closing state to
+    // allow authorization for currently unknown UUIDs. This is needed because authorization needs
+    // to work before acquiring locks, and might otherwise spuriously regard a UUID as unknown
+    // while reloading the catalog.
+    CollectionCatalog::write(opCtx, [](CollectionCatalog& catalog) { catalog.onCloseCatalog(); });
+
+    LOGV2_DEBUG(20270, 1, "closeCatalog: closing collection catalog");
+
+    // Close all databases.
+    LOGV2(20271, "closeCatalog: closing all databases");
+    databaseHolder->closeAll(opCtx);
+
+    if (auto truncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers()) {
+        truncateMarkers->kill();
+    }
+
+    CollectionCatalog::write(opCtx, [opCtx](CollectionCatalog& catalog) {
+        catalog.deregisterAllCollectionsAndViews(opCtx->getServiceContext());
+    });
+
+    // Close the storage engine's catalog.
+    LOGV2(20272, "closeCatalog: closing storage engine catalog");
+    opCtx->getServiceContext()->getStorageEngine()->closeMDBCatalog(opCtx);
+
+    // Reset the stats counter for extended range time-series collections. This is maintained
+    // outside the catalog itself.
+    catalog_stats::requiresTimeseriesExtendedRangeSupport.storeRelaxed(0);
+
+    reopenOnFailure.dismiss();
+    restorePrimaryDrivenRegistryOnFailure.dismiss();
+    return previousCatalogState;
+}
+
+void openCatalogAfterRollbackToStable(OperationContext* opCtx,
+                                      const PreviousCatalogState& previousCatalogState,
+                                      Timestamp stableTimestamp) {
+    invariant(shard_role_details::getLocker(opCtx)->isW());
+    invariant(!isCatalogOpen(opCtx));
+
+    // Load the catalog in the storage engine.
+    LOGV2(20273, "openCatalogAfterRollbackToStable: loading storage engine catalog");
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
+    // Ignore orphaned idents because this function is used during rollback and not at
+    // startup recovery, when we may try to recover orphaned idents.
+    storageEngine->loadMDBCatalog(opCtx, StorageEngine::LastShutdownState::kClean);
+    catalog::initializeCollectionCatalog(
+        opCtx, storageEngine, InitMode::kRollback, stableTimestamp);
+
+    LOGV2(20274, "openCatalogAfterRollbackToStable: reconciling catalog and idents");
+    auto reconcileResult =
+        fassert(40688,
+                catalog_repair::reconcileCatalogAndIdents(opCtx,
+                                                          storageEngine,
+                                                          stableTimestamp,
+                                                          StorageEngine::LastShutdownState::kClean,
+                                                          false /* forRepair */));
+
+    if (index_builds::primary_driven::enabled(
+            opCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        for (auto&& [buildUUID, entry] : reconcileResult.indexBuildsToRestart) {
+            std::vector<IndexBuildInfo> builds;
+            builds.reserve(entry.indexSpecsAndIdents.size());
+            for (auto&& [spec, ident] : entry.indexSpecsAndIdents) {
+                builds.emplace_back(spec, ident, *storageEngine);
+            }
+            index_builds::primary_driven::registry(opCtx->getServiceContext())
+                .add(buildUUID,
+                     entry.dbName,
+                     entry.collUUID,
+                     std::move(builds),
+                     ident::generateNewIndexBuildIdent(buildUUID));
+        }
+    } else {
+        // Once all unfinished index builds have been dropped and the catalog has been reloaded,
+        // resume or restart any unfinished index builds. This will not resume/restart any index
+        // builds to completion, but rather start the background thread, build the index, and wait
+        // for a replicated commit or abort oplog entry.
+        IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
+            opCtx, reconcileResult.indexBuildsToRestart, reconcileResult.indexBuildsToResume);
+    }
+
+    CatalogControlUtils::reopenAllDatabasesAndReloadCollectionCatalog(
+        opCtx, storageEngine, previousCatalogState, stableTimestamp);
+}
+
+void openCatalogAfterStorageChange(OperationContext* opCtx) {
+    invariant(shard_role_details::getLocker(opCtx)->isW());
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    CatalogControlUtils::reopenAllDatabasesAndReloadCollectionCatalog(opCtx, storageEngine, {}, {});
+}
+
+}  // namespace catalog
+}  // namespace mongo

@@ -1,0 +1,56 @@
+import {ContinuousStepdown} from "jstests/libs/override_methods/continuous_stepdown.js";
+import "jstests/libs/override_methods/implicitly_retry_on_config_stepdowns.js";
+import {
+    kOverrideConstructor as kOverrideConstructorForRST,
+    ReplSetTest,
+} from "jstests/libs/replsettest.js";
+import {
+    kOverrideConstructor as kOverrideConstructorForST,
+    ShardingTest,
+} from "jstests/libs/shardingtest.js";
+
+const stepdownIntervalMS = 8 * 1000;
+
+const {ReplSetTestWithContinuousPrimaryStepdown, ShardingTestWithContinuousPrimaryStepdown} =
+    ContinuousStepdown.configure(
+        {
+            configStepdown: true,
+            electionTimeoutMS: 5 * 1000,
+            shardStepdown: false,
+            stepdownDurationSecs: 10,
+            stepdownIntervalMS: stepdownIntervalMS,
+        },
+        {
+            verbositySetting: {
+                verbosity: 0,
+                command: {verbosity: 1},
+                network: {verbosity: 1, asio: {verbosity: 2}},
+            },
+        },
+    );
+
+ReplSetTest[kOverrideConstructorForRST] = ReplSetTestWithContinuousPrimaryStepdown;
+ShardingTest[kOverrideConstructorForST] = class ShardingTestWithContinuousFailover extends (
+    ShardingTestWithContinuousPrimaryStepdown
+) {
+    /**
+     * Override to use a shorter per-attempt timeout with retries, avoiding a
+     * hang from _configsvrBalancerStop's joinCurrentRound() when the config
+     * server is still stabilizing during startup.
+     */
+    _stopBalancerForInit() {
+        retryOnRetryableError(() => this.stopBalancer(10000), 10, 2000, [
+            ErrorCodes.FailedToSatisfyReadPreference,
+        ]);
+    }
+
+    constructor(params) {
+        super(params);
+        // Set the feature on the test configuration; this will allow js tests to selectively
+        // skip/alter test cases.
+        TestData.runningWithConfigStepdowns = true;
+        this.setServerParameters();
+        // Automatically start the continuous stepdown thread on the config server replica set.
+        this.startContinuousFailover();
+    }
+};

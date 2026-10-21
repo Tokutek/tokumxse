@@ -1,0 +1,43 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    GetClusterParameterReply:
+        description: "Reply to getClusterParameter command"
+        is_command_reply: true
+        fields:
+            clusterParameters: array<object>
+
+commands:
+    setClusterParameter:
+        description: "Command to set a ClusterServerParameter"
+        command_name: setClusterParameter
+        cpp_name: SetClusterParameter
+        api_version: ""
+        namespace: type
+        type: object
+        strict: false
+
+    getClusterParameter:
+        description: "Retrieves the in-memory value of the specified cluster server parameter(s)"
+        command_name: getClusterParameter
+        cpp_name: GetClusterParameter
+        api_version: ""
+        namespace: type
+        type:
+            variant: [string, array<string>]
+        fields:
+            omitInFTDC:
+                description: >-
+                    Indicates that getClusterParameter should omit any CSPs with omitInFTDC=true
+                type: bool
+                default: false
+        reply_type: GetClusterParameterReply
+        strict: false

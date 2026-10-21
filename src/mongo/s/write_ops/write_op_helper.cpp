@@ -1,0 +1,320 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/s/write_ops/write_op_helper.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/shard_role/shard_catalog/collection_uuid_mismatch_info.h"
+#include "mongo/db/topology/cluster_parameters/sharding_cluster_parameters_gen.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+
+namespace mongo {
+namespace write_op_helpers {
+
+bool isRetryErrCode(int errCode) {
+    return errCode == ErrorCodes::StaleConfig || errCode == ErrorCodes::StaleDbVersion ||
+        errCode == ErrorCodes::ShardCannotRefreshDueToLocksHeld ||
+        errCode == ErrorCodes::CannotImplicitlyCreateCollection;
+}
+
+bool isOnlyTargetDataOwningShardsForMultiWritesEnabled() {
+    auto* clusterParam =
+        ServerParameterSet::getClusterParameterSet()
+            ->get<ClusterParameterWithStorage<OnlyTargetDataOwningShardsForMultiWritesParam>>(
+                "onlyTargetDataOwningShardsForMultiWrites");
+    return clusterParam->getValue(boost::none).getEnabled();
+}
+
+bool isCollUUIDMismatchWithoutActualNamespace(const Status& status) {
+    return status.code() == ErrorCodes::CollectionUUIDMismatch &&
+        !status.extraInfo<CollectionUUIDMismatchInfo>()->actualCollection();
+}
+
+int computeBaseSizeEstimate(OperationContext* opCtx, const BulkWriteCommandRequest& clientRequest) {
+    // For simplicity, we build a dummy bulk write command request that contains all the common
+    // fields and serialize it to get the base command size. We only bother to copy over variable
+    // size and/or optional fields, since the value of fields that are fixed-size and always present
+    // (e.g. 'ordered') won't affect the size calculation.
+    BulkWriteCommandRequest request;
+
+    // We'll account for the size to store each individual nsInfo as we add them, so just put an
+    // empty vector as a placeholder for the array. This will ensure we properly count the size of
+    // the field name and the empty array.
+    request.setNsInfo({});
+
+    // Bulk writes are executed against the admin database.
+    request.setDbName(DatabaseName::kAdmin);
+    request.setLet(clientRequest.getLet());
+
+    // We'll account for the size to store each individual op as we add them, so just put an empty
+    // vector as a placeholder for the array. This will ensure we properly count the size of the
+    // field name and the empty array.
+    request.setOps({});
+
+    if (opCtx->isRetryableWrite()) {
+        // We'll account for the size to store each individual stmtId as we add ops, so similar to
+        // above with ops, we just put an empty vector as a placeholder for now.
+        request.setStmtIds({});
+    }
+
+    request.setBypassEmptyTsReplacement(clientRequest.getBypassEmptyTsReplacement());
+
+
+    request.setComment(clientRequest.getComment());
+
+    BSONObjBuilder builder;
+    request.serialize(&builder);
+    // Add writeConcern and lsid/txnNumber to ensure we save space for them.
+    logical_session_id_helpers::serializeLsidAndTxnNumber(opCtx, &builder);
+    builder.append(WriteConcernOptions::kWriteConcernField, opCtx->getWriteConcern().toBSON());
+
+    return builder.obj().objsize();
+}
+BulkCommandSizeEstimator::BulkCommandSizeEstimator(OperationContext* opCtx,
+                                                   const BulkWriteCommandRequest& clientRequest)
+    : _clientRequest(clientRequest),
+      _isRetryableWriteOrInTransaction(opCtx->getTxnNumber().has_value()),
+      _baseSizeEstimate(computeBaseSizeEstimate(opCtx, _clientRequest)) {}
+
+int BulkCommandSizeEstimator::getBaseSizeEstimate() const {
+    return _baseSizeEstimate;
+}
+
+int BulkCommandSizeEstimator::getOpSizeEstimate(int opIdx, const ShardId& shardId) const {
+    const auto op = WriteOpRef{_clientRequest, opIdx};
+
+    // If retryable writes are used, MongoS needs to send an additional array of stmtId(s)
+    // corresponding to the statements that got routed to each individual shard, so they need to
+    // be accounted in the potential request size so it does not exceed the max BSON size.
+    int writeSizeBytes = op.estimateOpSizeInBytes() +
+        write_ops::kWriteCommandBSONArrayPerElementOverheadBytes +
+        (_isRetryableWriteOrInTransaction
+             ? write_ops::kStmtIdSize + write_ops::kWriteCommandBSONArrayPerElementOverheadBytes
+             : 0);
+
+    // Get the set of nsInfos we've accounted for on this shardId.
+    auto iter = _accountedForNsInfos.find(shardId);
+
+    // If we have not accounted for this one already then increase the write size estimate by the
+    // nsInfo size and store this index so it does not get counted again.
+    const auto nss = op.getNss();
+    if (iter == _accountedForNsInfos.end() || !iter->second.contains(nss)) {
+        // Account for optional fields that can be set per namespace to have a conservative
+        // estimate.
+        const ShardVersion mockShardVersion =
+            ShardVersionFactory::make(CollectionMetadata::UNTRACKED(), nss);
+        static const DatabaseVersion mockDBVersion = DatabaseVersion(UUID::gen(), Timestamp());
+
+        NamespaceInfoEntry nsEntry(nss);
+        nsEntry.setCollectionUUID(op.getCollectionUUID());
+        nsEntry.setEncryptionInformation(op.getEncryptionInformation());
+
+        nsEntry.setShardVersion(mockShardVersion);
+        nsEntry.setDatabaseVersion(mockDBVersion);
+        if (!nsEntry.getNs().isTimeseriesBucketsCollection()) {
+            // This could be a timeseries view. To be conservative about the estimate, we
+            // speculatively account for the additional size needed for the timeseries bucket
+            // translation and the 'isTimeseriesCollection' field.
+            nsEntry.setNs(nsEntry.getNs().makeTimeseriesBucketsNamespace());
+            nsEntry.setIsTimeseriesNamespace(true);
+        }
+
+        writeSizeBytes +=
+            nsEntry.toBSON().objsize() + write_ops::kWriteCommandBSONArrayPerElementOverheadBytes;
+    }
+
+    return writeSizeBytes;
+}
+
+void BulkCommandSizeEstimator::addOpToBatch(int opIdx, const ShardId& shardId) {
+    // Get the set of nsInfos we've accounted for on this shardId.
+    _accountedForNsInfos.try_emplace(shardId, absl::flat_hash_set<NamespaceString>());
+    auto iter = _accountedForNsInfos.find(shardId);
+    tassert(10414702,
+            "Expected to find namespace in accounted for namespaces",
+            iter != _accountedForNsInfos.end());
+
+    // If we have not accounted for this one already then store the namespace so it doesn't get
+    // counted again.
+    const auto op = WriteOpRef{_clientRequest, opIdx};
+    iter->second.insert(op.getNss());
+}
+
+namespace {
+
+int getEncryptionInformationSize(const BatchedCommandRequest& req) {
+    if (!req.getWriteCommandRequestBase().getEncryptionInformation()) {
+        return 0;
+    }
+    return req.getWriteCommandRequestBase().getEncryptionInformation().value().toBSON().objsize();
+}
+}  // namespace
+
+BatchedCommandSizeEstimator::BatchedCommandSizeEstimator(OperationContext* opCtx,
+                                                         const BatchedCommandRequest& clientRequest)
+    : _clientRequest(clientRequest),
+      _isRetryableWriteOrInTransaction(opCtx->getTxnNumber().has_value()),
+      _baseSizeEstimate(clientRequest.getBaseCommandSizeEstimate(opCtx)) {}
+
+int BatchedCommandSizeEstimator::getBaseSizeEstimate() const {
+    return _baseSizeEstimate;
+}
+
+int BatchedCommandSizeEstimator::getOpSizeEstimate(int opIdx, const ShardId& shardId) const {
+    // If retryable writes are used, MongoS needs to send an additional array of stmtId(s)
+    // corresponding to the statements that got routed to each individual shard, so they
+    // need to be accounted in the potential request size so it does not exceed the max BSON
+    // size.
+    const int writeSizeBytes = BatchItemRef{&_clientRequest, opIdx}.estimateOpSizeInBytes() +
+        getEncryptionInformationSize(_clientRequest) +
+        write_ops::kWriteCommandBSONArrayPerElementOverheadBytes +
+        (_isRetryableWriteOrInTransaction
+             ? write_ops::kStmtIdSize + write_ops::kWriteCommandBSONArrayPerElementOverheadBytes
+             : 0);
+
+    // For unordered writes, the router must return an entry for each failed write. This
+    // constant is a pessimistic attempt to ensure that if a request to a shard hits
+    // "retargeting needed" error and has to return number of errors equivalent to the
+    // number of writes in the batch, the response size will not exceed the max BSON size.
+    //
+    // The constant of 272 is chosen as an approximation of the size of the BSON
+    // representation of the StaleConfigInfo (which contains the shard id) and the adjacent
+    // error message.
+    const bool ordered = _clientRequest.getWriteCommandRequestBase().getOrdered();
+    const int errorResponsePotentialSizeBytes =
+        ordered ? 0 : write_ops::kWriteCommandBSONArrayPerElementOverheadBytes + 272;
+    return std::max(writeSizeBytes, errorResponsePotentialSizeBytes);
+}
+
+BulkWriteUpdateOp toBulkWriteUpdate(const write_ops::UpdateOpEntry& op) {
+    // TODO SERVER-107545: Move this check to parse time and potentially convert this to a tassert.
+    uassert(ErrorCodes::FailedToParse,
+            "Cannot specify sort with multi=true",
+            !op.getSort() || !op.getMulti());
+
+    BulkWriteUpdateOp update;
+
+    // Set 'nsInfoIdx' to 0, as there is only one namespace in a regular update.
+    update.setNsInfoIdx(0);
+    update.setFilter(op.getQ());
+    update.setMulti(op.getMulti());
+    update.setConstants(op.getC());
+    update.setUpdateMods(op.getU());
+    update.setSort(op.getSort());
+    update.setHint(op.getHint());
+    update.setCollation(op.getCollation());
+    update.setArrayFilters(op.getArrayFilters());
+    update.setUpsert(op.getUpsert());
+    update.setUpsertSupplied(op.getUpsertSupplied());
+    update.setSampleId(op.getSampleId());
+    update.setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(
+        op.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery());
+    return update;
+}
+
+BulkWriteDeleteOp toBulkWriteDelete(const write_ops::DeleteOpEntry& op) {
+    BulkWriteDeleteOp deleteOp;
+
+    // Set 'nsInfoIdx' to 0, as there is only one namespace in a regular delete.
+    deleteOp.setNsInfoIdx(0);
+    if (op.getCollation()) {
+        deleteOp.setCollation(op.getCollation());
+    }
+    deleteOp.setHint(op.getHint());
+    deleteOp.setMulti(op.getMulti());
+    deleteOp.setFilter(op.getQ());
+    return deleteOp;
+}
+
+BulkWriteOpVariant getOrMakeBulkWriteOp(WriteOpRef op) {
+    tassert(10394907,
+            "Unexpected findAndModify command to convert to bulkWrite op",
+            !op.isFindAndModify());
+    return op.visitOpData(OverloadedVisitor{
+        [&](const BSONObj& insertDoc) -> BulkWriteOpVariant {
+            return BulkWriteInsertOp(0, insertDoc);
+        },
+        [&](const write_ops::UpdateOpEntry& updateOp) -> BulkWriteOpVariant {
+            return write_op_helpers::toBulkWriteUpdate(updateOp);
+        },
+        [&](const write_ops::DeleteOpEntry& deleteOp) -> BulkWriteOpVariant {
+            return write_op_helpers::toBulkWriteDelete(deleteOp);
+        },
+        [&](const mongo::BulkWriteInsertOp& insertOp) -> BulkWriteOpVariant { return insertOp; },
+        [&](const mongo::BulkWriteUpdateOp& updateOp) -> BulkWriteOpVariant { return updateOp; },
+        [&](const mongo::BulkWriteDeleteOp& deleteOp) -> BulkWriteOpVariant { return deleteOp; },
+        [&](const write_ops::FindAndModifyCommandRequest&) -> BulkWriteOpVariant {
+            MONGO_UNREACHABLE;
+        }});
+}
+
+write_ops::UpdateOpEntry getOrMakeUpdateOpEntry(UpdateOpRef updateOp) {
+    auto cmdRef = updateOp.getCommand();
+
+    if (cmdRef.isBatchWriteCommand()) {
+        auto batchType = cmdRef.getBatchedCommandRequest().getBatchType();
+        tassert(11468100, "Expected update", batchType == BatchedCommandRequest::BatchType_Update);
+
+        const auto& request = cmdRef.getBatchedCommandRequest().getUpdateRequest();
+        auto idx = updateOp.getIndex();
+        const bool inBounds = (idx >= 0 && static_cast<size_t>(idx) < request.getUpdates().size());
+        tassert(11468113, "Expected index to be in bounds", inBounds);
+
+        return request.getUpdates()[idx];
+    }
+
+    // TODO SERVER-107545: Move this check to parse time and potentially convert this to a
+    // tassert.
+    uassert(ErrorCodes::FailedToParse,
+            "Cannot specify sort with multi=true",
+            !updateOp.getSort() || !updateOp.getMulti());
+
+    write_ops::UpdateOpEntry updateOpEntry;
+    updateOpEntry.setQ(updateOp.getFilter());
+    updateOpEntry.setMulti(updateOp.getMulti());
+    updateOpEntry.setC(updateOp.getConstants());
+    updateOpEntry.setU(updateOp.getUpdateMods());
+    updateOpEntry.setSort(updateOp.getSort());
+    updateOpEntry.setHint(updateOp.getHint());
+    updateOpEntry.setCollation(updateOp.getCollation());
+    updateOpEntry.setArrayFilters(updateOp.getArrayFilters());
+    updateOpEntry.setUpsert(updateOp.getUpsert());
+    updateOpEntry.setUpsertSupplied(updateOp.getUpsertSupplied());
+    updateOpEntry.setIncludeQueryStatsMetricsForOpIndex(
+        updateOp.getIncludeQueryStatsMetricsForOpIndex());
+    updateOpEntry.setSampleId(updateOp.getSampleId());
+    updateOpEntry.setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(
+        updateOp.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery());
+
+    return updateOpEntry;
+}
+
+write_ops::DeleteOpEntry getOrMakeDeleteOpEntry(DeleteOpRef deleteOp) {
+    auto cmdRef = deleteOp.getCommand();
+
+    if (cmdRef.isBatchWriteCommand()) {
+        auto batchType = cmdRef.getBatchedCommandRequest().getBatchType();
+        tassert(11468101, "Expected delete", batchType == BatchedCommandRequest::BatchType_Delete);
+
+        const auto& request = cmdRef.getBatchedCommandRequest().getDeleteRequest();
+        auto idx = deleteOp.getIndex();
+        const bool inBounds = (idx >= 0 && static_cast<size_t>(idx) < request.getDeletes().size());
+        tassert(11468114, "Expected index to be in bounds", inBounds);
+
+        return request.getDeletes()[idx];
+    }
+
+    write_ops::DeleteOpEntry deleteOpEntry;
+    deleteOpEntry.setQ(deleteOp.getFilter());
+    deleteOpEntry.setMulti(deleteOp.getMulti());
+    deleteOpEntry.setHint(deleteOp.getHint());
+    deleteOpEntry.setCollation(deleteOp.getCollation());
+    deleteOpEntry.setSampleId(deleteOp.getSampleId());
+    deleteOpEntry.setIncludeQueryStatsMetricsForOpIndex(
+        deleteOp.getIncludeQueryStatsMetricsForOpIndex());
+
+    return deleteOpEntry;
+}
+
+}  // namespace write_op_helpers
+}  // namespace mongo

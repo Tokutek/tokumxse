@@ -1,0 +1,57 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# applyOps IDL File
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ApplyOpsCommandInfoBase:
+        description: A document that represents an applyOps command.
+        immutable: true
+        strict: false
+        fields:
+            applyOps:
+                cpp_name: operations
+                type: array<object>
+                description: "The operations to apply"
+
+            alwaysUpsert:
+                cpp_name: alwaysUpsert
+                type: bool
+                default: false
+                description:
+                    "No longer supported, but kept here to improve the error message
+                    returned to the client. Affects update operations. Defaults to false."
+            preCondition:
+                cpp_name: preCondition
+                type: array<object>
+                optional: true
+                description:
+                    "No longer supported, but kept here to improve the error message
+                    returned to the client. In older versions, applyOps used to support
+                    checking the documents of existing collections before proceeding to
+                    execute the given operations."
+
+            prepare:
+                type: bool
+                optional: true
+                description: "Specifies that this operation should be put into a 'prepare' state"
+
+            partialTxn:
+                type: bool
+                optional: true
+                description:
+                    "Specifies that this applyOps command is part of a multi-statement
+                    transaction that has not yet been committed or prepared."
+            count:
+                type: safeInt64
+                optional: true
+                description:
+                    "The number of operations contained in this multi-oplog-entry
+                    transaction."

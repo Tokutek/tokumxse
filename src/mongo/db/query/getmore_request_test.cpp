@@ -1,157 +1,87 @@
-/**
- *    Copyright 2015 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/getmore_command_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/unittest/unittest.h"
 
+#include <cstdint>
 #include <string>
 
-#include "mongo/db/query/getmore_request.h"
-#include "mongo/db/jsobj.h"
-
-#include "mongo/unittest/unittest.h"
+#include <boost/cstdint.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace {
 
-    using namespace mongo;
+using namespace mongo;
 
-    TEST(GetMoreRequestTest, parseFromBSONEmptyCommandObject) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON("db", BSONObj());
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::FailedToParse, result.getStatus().code());
-    }
+GetMoreCommandRequest createGetMoreCommandRequest(
+    std::string collection,
+    std::int64_t cursorId,
+    boost::optional<std::int64_t> sizeOfBatch = boost::none,
+    boost::optional<std::int64_t> awaitDataTimeout = boost::none,
+    boost::optional<std::int64_t> term = boost::none,
+    boost::optional<repl::OpTime> lastKnownCommittedOpTime = boost::none) {
+    GetMoreCommandRequest request(cursorId, collection);
+    request.setBatchSize(sizeOfBatch);
+    request.setMaxTimeMS(awaitDataTimeout);
+    request.setTerm(term);
+    request.setLastKnownCommittedOpTime(lastKnownCommittedOpTime);
+    return request;
+}
 
-    TEST(GetMoreRequestTest, parseFromBSONCursorIdNotNumeric) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << "not a number" <<
-                 "collection" << "coll"));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
-    }
+std::unique_ptr<GetMoreCommandRequest> parseFromBSON(const BSONObj& cmdObj) {
+    return std::make_unique<GetMoreCommandRequest>(
+        GetMoreCommandRequest::parse(cmdObj, IDLParserContext("GetMoreCommandRequest")));
+}
 
-    TEST(GetMoreRequestTest, parseFromBSONCursorIdNotLongLong) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << "not a number" <<
-                 "collection" << 123));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
-    }
+TEST(GetMoreRequestTest, ShouldParseAllKnownOptions) {
+    repl::OpTime optime{Timestamp{0, 100}, 2};
+    BSONObj inputBson = BSON("getMore" << CursorId(123) << "collection"
+                                       << "testcoll"
+                                       << "$db"
+                                       << "testdb"
+                                       << "batchSize" << 99 << "maxTimeMS" << 789 << "term" << 1LL
+                                       << "lastKnownCommittedOpTime" << optime.toBSON()
+                                       << "includeQueryStatsMetrics" << true);
 
-    TEST(GetMoreRequestTest, parseFromBSONMissingCollection) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123)));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
-    }
+    auto request = parseFromBSON(inputBson);
 
-    TEST(GetMoreRequestTest, parseFromBSONCollectionNotString) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123) << "collection" << 456));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
-    }
+    ASSERT_TRUE(request->getBatchSize());
+    ASSERT_TRUE(request->getMaxTimeMS());
+    ASSERT_TRUE(request->getTerm());
+    ASSERT_TRUE(request->getLastKnownCommittedOpTime());
 
-    TEST(GetMoreRequestTest, parseFromBSONBatchSizeNotInteger) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123) <<
-                 "collection" << "coll" <<
-                 "batchSize" << "not a number"));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::TypeMismatch, result.getStatus().code());
-    }
+    ASSERT_EQ(*request->getBatchSize(), 99);
+    ASSERT_EQ(*request->getMaxTimeMS(), 789);
+    ASSERT_EQ(*request->getTerm(), 1LL);
+    ASSERT_EQ(*request->getLastKnownCommittedOpTime(), optime);
+    ASSERT_TRUE(request->getIncludeQueryStatsMetrics());
+}
 
-    TEST(GetMoreRequestTest, parseFromBSONInvalidDbName) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "",
-            BSON("getMore" << CursorId(123) << "collection" << "coll"));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
-    }
+TEST(GetMoreRequestTest, toBSONMissingOptionalFields) {
+    GetMoreCommandRequest request = createGetMoreCommandRequest("testcoll", 123);
+    BSONObj requestObj = request.toBSON();
+    BSONObj expectedRequest = BSON("getMore" << CursorId(123) << "collection"
+                                             << "testcoll");
+    ASSERT_BSONOBJ_EQ(requestObj, expectedRequest);
+}
 
-    TEST(GetMoreRequestTest, parseFromBSONInvalidCursorId) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(0) << "collection" << "coll"));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
-    }
+TEST(GetMoreRequestTest, toBSONNoMissingFields) {
+    GetMoreCommandRequest request =
+        createGetMoreCommandRequest("testcoll", 123, 99, 789, 1, repl::OpTime(Timestamp(0, 10), 2));
+    BSONObj requestObj = request.toBSON();
+    BSONObj expectedRequest = BSON("getMore" << CursorId(123) << "collection"
+                                             << "testcoll"
+                                             << "batchSize" << 99 << "maxTimeMS" << 789 << "term"
+                                             << 1 << "lastKnownCommittedOpTime"
+                                             << BSON("ts" << Timestamp(0, 10) << "t" << 2LL));
+    ASSERT_BSONOBJ_EQ_UNORDERED(requestObj, expectedRequest);
+}
 
-    TEST(GetMoreRequestTest, parseFromBSONNegativeCursorId) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(-123) << "collection" << "coll"));
-        ASSERT_OK(result.getStatus());
-        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
-        ASSERT_EQUALS(CursorId(-123), result.getValue().cursorid);
-        ASSERT_EQUALS(GetMoreRequest::kDefaultBatchSize, result.getValue().batchSize);
-    }
-
-    TEST(GetMoreRequestTest, parseFromBSONUnrecognizedFieldName) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123) <<
-                 "collection" << "coll" <<
-                 "unknown_field" << 1));
-        ASSERT_OK(result.getStatus());
-        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
-        ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
-        ASSERT_EQUALS(GetMoreRequest::kDefaultBatchSize, result.getValue().batchSize);
-    }
-
-    TEST(GetMoreRequestTest, parseFromBSONInvalidBatchSize) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123) << "collection" << "coll" << "batchSize" << -1));
-        ASSERT_NOT_OK(result.getStatus());
-        ASSERT_EQUALS(ErrorCodes::BadValue, result.getStatus().code());
-    }
-
-    TEST(GetMoreRequestTest, parseFromBSONDefaultBatchSize) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123) << "collection" << "coll"));
-        ASSERT_OK(result.getStatus());
-        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
-        ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
-        ASSERT_EQUALS(GetMoreRequest::kDefaultBatchSize, result.getValue().batchSize);
-    }
-
-    TEST(GetMoreRequestTest, parseFromBSONBatchSizeProvided) {
-        StatusWith<GetMoreRequest> result = GetMoreRequest::parseFromBSON(
-            "db",
-            BSON("getMore" << CursorId(123) << "collection" << "coll" << "batchSize" << 200));
-        ASSERT_EQUALS("db.coll", result.getValue().nss.toString());
-        ASSERT_EQUALS(CursorId(123), result.getValue().cursorid);
-        ASSERT_EQUALS(200, result.getValue().batchSize);
-    }
-
-} // namespace
+}  // namespace

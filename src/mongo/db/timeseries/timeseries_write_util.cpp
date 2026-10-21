@@ -1,0 +1,393 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/timeseries/timeseries_write_util.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/query/write_ops/delete_request_gen.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/write_ops_exec_util.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/shard_role/shard_catalog/collection_operation_source.h"
+#include "mongo/db/shard_role/shard_catalog/document_validation.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/bucket_catalog/bucket_catalog.h"
+#include "mongo/db/timeseries/bucket_catalog/bucket_identifiers.h"
+#include "mongo/db/timeseries/bucket_catalog/global_bucket_catalog.h"
+#include "mongo/db/timeseries/bucket_catalog/reopening.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_update_delete_util.h"
+#include "mongo/db/timeseries/write_ops/timeseries_write_ops_utils_internal.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/db/version_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
+namespace mongo::timeseries {
+namespace {
+
+// Performs the storage write of an update to a time-series bucket document.
+void updateTimeseriesDocument(OperationContext* opCtx,
+                              const CollectionPtr& coll,
+                              const write_ops::UpdateCommandRequest& op,
+                              OpDebug* opDebug,
+                              bool fromMigrate,
+                              StmtId stmtId) {
+    invariant(op.getUpdates().size() == 1);
+    auto& update = op.getUpdates().front();
+
+    invariant(coll->isClustered());
+    auto recordId = record_id_helpers::keyForOID(update.getQ()["_id"].OID());
+
+    auto original = coll->docFor(opCtx, recordId);
+
+    CollectionUpdateArgs args{original.value()};
+    args.criteria = update.getQ();
+    args.stmtIds = {stmtId};
+    if (fromMigrate) {
+        args.source = OperationSource::kFromMigrate;
+    }
+
+    BSONObj updated;
+    BSONObj diffFromUpdate;
+    const BSONObj* diffOnIndexes =
+        collection_internal::kUpdateAllIndexes;  // Assume all indexes are affected.
+    if (update.getU().type() == write_ops::UpdateModification::Type::kDelta) {
+        diffFromUpdate = update.getU().getDiff();
+        updated = doc_diff::applyDiff(
+            original.value(), diffFromUpdate, false, update.getU().verifierFunction);
+        diffOnIndexes = &diffFromUpdate;
+        args.update = update_oplog_entry::makeDeltaOplogEntry(diffFromUpdate);
+    } else if (update.getU().type() == write_ops::UpdateModification::Type::kReplacement) {
+        updated = update.getU().getUpdateReplacement();
+        args.update = update_oplog_entry::makeReplacementOplogEntry(updated);
+    } else {
+        invariant(false, "Unexpected update type");
+    }
+
+    // Verify that control.min.time has not changed between the original and updated bucket
+    // documents. For time-series collections sharded on time, control.min.time is the shard key.
+    // Changing it would orphan the bucket.
+    if constexpr (kDebugBuild) {
+        if (auto tsOptions = coll->getTimeseriesOptions()) {
+            auto timeField = tsOptions->getTimeField();
+            auto originalMin = original.value()
+                                   .getObjectField(kBucketControlFieldName)
+                                   .getObjectField(kBucketControlMinFieldName);
+            auto updatedMin = updated.getObjectField(kBucketControlFieldName)
+                                  .getObjectField(kBucketControlMinFieldName);
+            auto originalMinTime = originalMin.getField(timeField);
+            auto updatedMinTime = updatedMin.getField(timeField);
+            invariant(originalMinTime.binaryEqualValues(updatedMinTime),
+                      "control.min.time must not change in a bucket update");
+        }
+    }
+
+    collection_internal::updateDocument(opCtx,
+                                        coll,
+                                        recordId,
+                                        original,
+                                        updated,
+                                        diffOnIndexes,
+                                        nullptr /*indexesAffected*/,
+                                        opDebug,
+                                        &args);
+}
+
+uint64_t getStorageCacheSizeBytes(OperationContext* opCtx) {
+    return opCtx->getServiceContext()->getStorageEngine()->getEngine()->getCacheSizeMB() * 1024 *
+        1024;
+}
+}  // namespace
+
+
+void assertTimeseriesBucketsCollection(const Collection* bucketsColl) {
+    uassert(
+        8555700,
+        "Catalog changed during operation, could not find time series buckets collection for write",
+        bucketsColl);
+    uassert(8555701,
+            "Catalog changed during operation, missing time-series options",
+            bucketsColl->getTimeseriesOptions());
+}
+
+void performAtomicWrites(
+    OperationContext* opCtx,
+    const CollectionPtr& coll,
+    const RecordId& recordId,
+    const boost::optional<std::variant<write_ops::UpdateCommandRequest,
+                                       write_ops::DeleteCommandRequest>>& modificationOp,
+    const std::vector<write_ops::InsertCommandRequest>& insertOps,
+    const std::vector<write_ops::UpdateCommandRequest>& updateOps,
+    bool fromMigrate,
+    StmtId stmtId) {
+    tassert(
+        7655102, "must specify at least one type of write", modificationOp || !insertOps.empty());
+    NamespaceString ns = coll->ns();
+
+    DisableDocumentValidationForInternalOp disableDocumentValidation{opCtx};
+
+    write_ops_exec::LastOpFixer lastOpFixer{opCtx};
+    lastOpFixer.startingOp(ns);
+
+    auto curOp = CurOp::get(opCtx);
+    curOp->raiseDbProfileLevel(DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                   .getDatabaseProfileLevel(ns.dbName()));
+
+    // Groups all operations in one or several chained oplog entries to ensure the writes are
+    // replicated atomically.
+    auto groupOplogEntries =
+        !opCtx->getTxnNumber() && (!insertOps.empty() || !updateOps.empty()) && modificationOp
+        ? WriteUnitOfWork::atomicGroup
+        : WriteUnitOfWork::noGroup;
+    WriteUnitOfWork wuow{opCtx, groupOplogEntries};
+
+    if (modificationOp) {
+        visit(
+            OverloadedVisitor{[&](const write_ops::UpdateCommandRequest& updateOp) {
+                                  updateTimeseriesDocument(
+                                      opCtx, coll, updateOp, &curOp->debug(), fromMigrate, stmtId);
+                              },
+                              [&](const write_ops::DeleteCommandRequest& deleteOp) {
+                                  invariant(deleteOp.getDeletes().size() == 1);
+                                  auto deleteId = record_id_helpers::keyForOID(
+                                      deleteOp.getDeletes().front().getQ()["_id"].OID());
+                                  invariant(recordId == deleteId);
+                                  collection_internal::deleteDocument(
+                                      opCtx, coll, stmtId, recordId, &curOp->debug(), fromMigrate);
+                              }},
+            *modificationOp);
+    }
+
+    if (!insertOps.empty()) {
+        std::vector<InsertStatement> insertStatements;
+        for (auto& op : insertOps) {
+            invariant(op.getDocuments().size() == 1);
+            if (modificationOp) {
+                insertStatements.emplace_back(op.getDocuments().front());
+            } else {
+                // Appends the stmtId for upsert.
+                insertStatements.emplace_back(stmtId, op.getDocuments().front());
+            }
+        }
+        uassertStatusOK(collection_internal::insertDocuments(
+            opCtx, coll, insertStatements.begin(), insertStatements.end(), &curOp->debug()));
+    }
+
+    for (auto& updateOp : updateOps) {
+        updateTimeseriesDocument(opCtx, coll, updateOp, &curOp->debug(), fromMigrate, stmtId);
+    }
+
+    wuow.commit();
+
+    lastOpFixer.finishedOpSuccessfully();
+}
+
+namespace {
+void commitTimeseriesBucketsAtomically(
+    OperationContext* opCtx,
+    bucket_catalog::BucketCatalog& sideBucketCatalog,
+    const CollectionPtr& coll,
+    const RecordId& recordId,
+    const boost::optional<std::variant<write_ops::UpdateCommandRequest,
+                                       write_ops::DeleteCommandRequest>>& modificationOp,
+    bucket_catalog::TimeseriesWriteBatches& batches,
+    const NamespaceString& bucketsNs,
+    bool fromMigrate,
+    StmtId stmtId,
+    std::set<bucket_catalog::BucketId>* bucketIds) {
+
+    if (batches.empty()) {
+        return;
+    }
+
+    bucket_catalog::sortBatchesForCommit(batches);
+
+    std::vector<write_ops::InsertCommandRequest> insertOps;
+    std::vector<write_ops::UpdateCommandRequest> updateOps;
+    auto& mainBucketCatalog = bucket_catalog::GlobalBucketCatalog::get(opCtx->getServiceContext());
+    for (auto& batch : batches) {
+        uassertStatusOK(prepareCommit(sideBucketCatalog, batch, coll->getDefaultCollator()));
+
+        write_ops_utils::makeWriteRequestFromBatch(opCtx, batch, bucketsNs, &insertOps, &updateOps);
+
+        // Starts tracking the newly inserted bucket in the main bucket catalog as a direct
+        // write to prevent other writers from modifying it.
+        if (batch->numPreviouslyCommittedMeasurements == 0) {
+            directWriteStart(mainBucketCatalog.bucketStateRegistry, batch->bucketId);
+            bucketIds->insert(batch->bucketId);
+        }
+    }
+
+    performAtomicWrites(
+        opCtx, coll, recordId, modificationOp, insertOps, updateOps, fromMigrate, stmtId);
+
+    for (auto& batch : batches) {
+        finish(sideBucketCatalog, batch);
+        batch.reset();
+    }
+}
+}  // namespace
+
+void performAtomicWritesForDelete(OperationContext* opCtx,
+                                  const CollectionPtr& coll,
+                                  const RecordId& recordId,
+                                  const std::vector<BSONObj>& unchangedMeasurements,
+                                  bool fromMigrate,
+                                  StmtId stmtId,
+                                  Date_t currentMinTime) {
+    OID bucketId = record_id_helpers::toBSONAs(recordId, "_id")["_id"].OID();
+    auto modificationOp =
+        write_ops_utils::makeModificationOp(bucketId, coll, unchangedMeasurements, currentMinTime);
+    performAtomicWrites(opCtx, coll, recordId, modificationOp, {}, {}, fromMigrate, stmtId);
+}
+
+void performAtomicWritesForUpdate(
+    OperationContext* opCtx,
+    const CollectionPtr& coll,
+    const RecordId& recordId,
+    const boost::optional<std::vector<BSONObj>>& unchangedMeasurements,
+    const std::vector<BSONObj>& modifiedMeasurements,
+    bucket_catalog::BucketCatalog& sideBucketCatalog,
+    bool fromMigrate,
+    StmtId stmtId,
+    std::set<bucket_catalog::BucketId>* bucketIds,
+    const boost::optional<Date_t> currentMinTime) {
+    auto timeseriesOptions = *coll->getTimeseriesOptions();
+    auto storageCacheSizeBytes = getStorageCacheSizeBytes(opCtx);
+
+    bucket_catalog::TimeseriesWriteBatches batches;
+    try {
+        std::vector<bucket_catalog::WriteStageErrorAndIndex> errorsAndIndices;
+        auto status = bucket_catalog::prepareInsertsToBuckets(
+            opCtx,
+            sideBucketCatalog,
+            coll.get(),
+            timeseriesOptions,
+            opCtx->getOpID(),
+            coll->getDefaultCollator(),
+            storageCacheSizeBytes,
+            /*earlyReturnOnError=*/true,
+            /*compressAndWriteBucketFunc=*/nullptr,
+            modifiedMeasurements,
+            0,
+            modifiedMeasurements.size(),
+            {},
+            bucket_catalog::AllowQueryBasedReopening::kAllow,
+            errorsAndIndices,
+            batches);
+        uassertStatusOK(status);
+        invariant(errorsAndIndices.empty());
+
+        auto modificationRequest = unchangedMeasurements.map([&](auto&& unchangedMeasurements) {
+            return write_ops_utils::makeModificationOp(
+                record_id_helpers::toBSONAs(recordId, "_id")["_id"].OID(),
+                coll,
+                unchangedMeasurements,
+                currentMinTime);
+        });
+        commitTimeseriesBucketsAtomically(opCtx,
+                                          sideBucketCatalog,
+                                          coll,
+                                          recordId,
+                                          modificationRequest,
+                                          batches,
+                                          coll->ns(),
+                                          fromMigrate,
+                                          stmtId,
+                                          bucketIds);
+    } catch (...) {
+        bucket_catalog::abortWriteBatches(sideBucketCatalog, batches, exceptionToStatus());
+        throw;
+    }
+}
+
+BSONObj timeseriesViewCommand(const BSONObj& cmd, std::string cmdName, std::string_view viewNss) {
+    BSONObjBuilder b;
+    for (auto&& e : cmd) {
+        if (e.fieldNameStringData() == cmdName) {
+            b.append(cmdName, viewNss);
+        } else {
+            b.append(e);
+        }
+    }
+    return b.obj();
+}
+
+void deleteRequestCheckFunction(const VersionContext& vCtx,
+                                DeleteRequest* request,
+                                const TimeseriesOptions& options) {
+    if (!feature_flags::gTimeseriesDeletesSupport.isEnabled(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot perform a delete with a non-empty query on a time-series "
+                "collection that "
+                "does not have a metaField ",
+                options.getMetaField() || request->getQuery().isEmpty());
+
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot perform a non-multi delete on a time-series collection",
+                request->getMulti());
+        if (auto metaField = options.getMetaField()) {
+            request->setQuery(timeseries::translateQuery(request->getQuery(), *metaField));
+        }
+    }
+}
+
+void updateRequestCheckFunction(const VersionContext& vCtx,
+                                UpdateRequest* request,
+                                const TimeseriesOptions& options) {
+    if (!feature_flags::gTimeseriesUpdatesSupport.isEnabled(
+            vCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot perform a non-multi update on a time-series collection",
+                request->isMulti());
+
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot perform an upsert on a time-series collection",
+                !request->isUpsert());
+
+        auto metaField = options.getMetaField();
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot perform an update on a time-series collection that does not have a "
+                "metaField",
+                options.getMetaField());
+
+        timeseriesCounters.incrementMetaUpdate();
+
+        request->setQuery(timeseries::translateQuery(request->getQuery(), *metaField));
+        auto modification = uassertStatusOK(
+            timeseries::translateUpdate(request->getUpdateModification(), *metaField));
+        request->setUpdateModification(modification);
+    }
+}
+}  // namespace mongo::timeseries

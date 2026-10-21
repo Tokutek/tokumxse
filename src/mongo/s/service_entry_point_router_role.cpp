@@ -1,0 +1,210 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/s/service_entry_point_router_role.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/curop_metrics.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/request_execution_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/message.h"
+#include "mongo/s/commands/strategy.h"
+#include "mongo/s/load_balancer_support.h"
+#include "mongo/s/query/exec/cluster_cursor_manager.h"
+#include "mongo/s/query/exec/collect_query_stats_mongos.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
+namespace mongo {
+
+// Allows for decomposing `handleRequest` into parts and simplifies its execution.
+struct HandleRequest {
+    HandleRequest(OperationContext* opCtx, const Message& message, Date_t started)
+        : rec(opCtx, message, started),
+          op(message.operation()),
+          msgId(message.header().getId()),
+          nsString(getNamespaceString(rec.getDbMessage())) {}
+
+    // Prepares the environment for handling the request.
+    void setupEnvironment();
+
+    // Performs the heavy lifting of running client commands.
+    DbResponse handleRequest();
+
+    // Runs on successful execution of `handleRequest`.
+    void onSuccess(const DbResponse&);
+
+    // Handles the request and fully prepares the response.
+    DbResponse run();
+
+    static NamespaceString getNamespaceString(const DbMessage& dbmsg) {
+        if (!dbmsg.messageShouldHaveNs())
+            return {};
+        return NamespaceStringUtil::deserialize(
+            boost::none, dbmsg.getns(), SerializationContext::stateDefault());
+    }
+
+    RequestExecutionContext rec;
+    const NetworkOp op;
+    const int32_t msgId;
+    const NamespaceString nsString;
+
+    boost::optional<long long> slowMsOverride;
+};
+
+void HandleRequest::setupEnvironment() {
+    auto opCtx = rec.getOpCtx();
+
+    // This exception will not be returned to the caller, but will be logged and will close the
+    // connection
+    uassert(ErrorCodes::IllegalOperation,
+            fmt::format("Message type {} is not supported.", fmt::underlying(op)),
+            isSupportedRequestNetworkOp(op) &&
+                op != dbCompressed);  // Decompression should be handled above us.
+
+    // Start a new NotPrimaryErrorTracker session. Any exceptions thrown from here onwards will be
+    // returned to the caller (if the type of the message permits it).
+    auto client = opCtx->getClient();
+    CurOp::get(opCtx)->ensureStarted();
+    NotPrimaryErrorTracker::get(client).startRequest();
+    AuthorizationSession::get(client)->startRequest(opCtx);
+}
+
+DbResponse HandleRequest::handleRequest() {
+    switch (op) {
+        case dbQuery:
+            if (!nsString.isCommand()) {
+                return makeErrorResponseToUnsupportedOpQuery("OP_QUERY is no longer supported");
+            }
+            [[fallthrough]];  // It's a query containing a command
+        case dbMsg:
+            return Strategy::clientCommand(&rec);
+        case dbGetMore: {
+            return makeErrorResponseToUnsupportedOpQuery("OP_GET_MORE is no longer supported");
+        }
+        case dbKillCursors:
+            uasserted(5745707, "OP_KILL_CURSORS is no longer supported");
+        case dbInsert: {
+            uasserted(5745706, "OP_INSERT is no longer supported");
+        }
+        case dbUpdate:
+            uasserted(5745705, "OP_UPDATE is no longer supported");
+        case dbDelete:
+            uasserted(5745704, "OP_DELETE is no longer supported");
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+void HandleRequest::onSuccess(const DbResponse& dbResponse) {
+    auto opCtx = rec.getOpCtx();
+    const auto currentOp = CurOp::get(opCtx);
+
+    // Mark the op as complete, populate the response length, and log it if appropriate.
+    currentOp->completeAndLogOperation({logv2::LogComponent::kCommand},
+                                       DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                           .getDatabaseProfileSettings(currentOp->getNSS().dbName())
+                                           .filter,
+                                       dbResponse.response.size(),
+                                       slowMsOverride);
+
+    recordCurOpMetrics(opCtx);
+
+    // Update the source of stats shown in the db.serverStatus().opLatencies section.
+    ServiceLatencyTracker::getDecoration(opCtx->getService())
+        .increment(opCtx,
+                   currentOp->elapsedTimeExcludingPauses(),
+                   currentOp->debug().workingTimeMillis,
+                   currentOp->getReadWriteType());
+
+    if (const auto& errInfo = currentOp->debug().errInfo; !errInfo.isOK()) {
+        try {
+            collectQueryStatsMongosReadErrored(opCtx, errInfo.code());
+        } catch (const DBException& ex) {
+            // Failing to collect query stats for an errored operation is a bug. Surface a BF/AF,
+            // but swallow it and fire once per process to avoid any negative impact on the cluster.
+            static std::once_flag once;
+            std::call_once(once, [&] {
+                try {
+                    tasserted(13192600,
+                              str::stream()
+                                  << "Failed to collect query stats for an errored operation: "
+                                  << redact(ex));
+                } catch (const DBException&) {
+                }
+            });
+        }
+    }
+}
+
+DbResponse HandleRequest::run() {
+    setupEnvironment();
+    auto dbResponse = handleRequest();
+    onSuccess(dbResponse);
+    return dbResponse;
+}
+
+Future<DbResponse> ServiceEntryPointRouterRole::handleRequestImpl(OperationContext* opCtx,
+                                                                  const Message& message,
+                                                                  Date_t started) try {
+    auto hr = HandleRequest(opCtx, message, started);
+    return hr.run();
+} catch (const DBException& ex) {
+    auto status = ex.toStatus();
+    LOGV2(4879803, "Failed to handle request", "error"_attr = redact(status));
+    return status;
+} catch (...) {
+    auto error = exceptionToStatus();
+    LOGV2_FATAL(
+        9431601, "Request handling produced unhandled exception", "error"_attr = redact(error));
+}
+
+Future<DbResponse> ServiceEntryPointRouterRole::handleRequest(OperationContext* opCtx,
+                                                              const Message& message,
+                                                              Date_t started) {
+    tassert(9391502,
+            "Invalid ClusterRole in ServiceEntryPointRouterRole",
+            opCtx->getService()->role().hasExclusively(ClusterRole::RouterServer));
+    return handleRequestImpl(opCtx, message, started);
+}
+
+}  // namespace mongo

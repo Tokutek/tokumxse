@@ -1,0 +1,106 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+class Collection;
+class CollectionPtr;
+class NamespaceString;
+class OperationContext;
+
+/**
+ * Applies an operation from an oplog entry using special rules that apply to resharding.
+ */
+class ReshardingOplogApplicationRules {
+public:
+    ReshardingOplogApplicationRules(NamespaceString outputNss,
+                                    std::vector<NamespaceString> allStashNss,
+                                    size_t myStashIdx,
+                                    ShardId donorShardId,
+                                    ChunkManager sourceChunkMgr,
+                                    ReshardingOplogApplierMetrics* applierMetrics,
+                                    bool isCapped = false);
+
+    const NamespaceString& getOutputNss() const {
+        return _outputNss;
+    }
+
+    /**
+     * Wraps the op application in a writeConflictRetry loop and is responsible for creating and
+     * committing the WUOW.
+     */
+    Status applyOperation(OperationContext* opCtx, const repl::OplogEntry& op) const;
+
+private:
+    // Applies an insert or update operation
+    void _applyInsertOrUpdate(OperationContext* opCtx, const repl::OplogEntry& op) const;
+    // Applies an insert operation
+    void _applyInsert_inlock(OperationContext* opCtx,
+                             CollectionAcquisition& outputColl,
+                             CollectionAcquisition& stashColl,
+                             const repl::OplogEntry& op) const;
+
+    // Applies an update operation
+    void _applyUpdate_inlock(OperationContext* opCtx,
+                             CollectionAcquisition& outputColl,
+                             CollectionAcquisition& stashColl,
+                             const repl::OplogEntry& op) const;
+
+    // Applies a delete operation
+    void _applyDelete(OperationContext* opCtx, const repl::OplogEntry& op) const;
+
+    // Queries '_stashNss' using 'idQuery'.
+    BSONObj _queryStashCollById(OperationContext* opCtx,
+                                const CollectionPtr& coll,
+                                const BSONObj& idQuery) const;
+
+    // Namespace where operations should be applied, unless there is an _id conflict.
+    const NamespaceString _outputNss;
+
+    // The namespaces of all stash collections, including the stash collection for this donor.
+    const std::vector<NamespaceString> _allStashNss;
+
+    // Index into _allStashNss for the namespace where operations are applied if there is an _id
+    // conflict.
+    const size_t _myStashIdx;
+
+    // Namespace where operations are applied if there is an _id conflict.
+    const NamespaceString& _myStashNss;
+
+    // ShardId of the donor shard that the operations being applied originate from.
+    const ShardId _donorShardId;
+
+    // The chunk manager for the source namespace and original shard key.
+    const ChunkManager _sourceChunkMgr;
+
+    ReshardingOplogApplierMetrics* _applierMetrics;
+
+    const bool _isCapped;
+};
+
+}  // namespace mongo

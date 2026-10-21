@@ -1,0 +1,1052 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/metadata/path_arrayness.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/compiler/metadata/path_arrayness_test_helpers.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <limits>
+#include <string_view>
+
+namespace mongo {
+
+TEST(PathArraynessTest, InsertIntoPathArraynessPredefined) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Array: ["a"]
+    FieldPath field_A("a");
+    MultikeyComponents multikeyPaths_A{0U};
+
+    // Array: ["a", "a.b.c"]
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{{0U, 2U}};
+
+    // Array: ["a", "a.b.d"]
+    FieldPath field_ABD("a.b.d");
+    MultikeyComponents multikeyPaths_ABD{{0U, 2U}};
+
+    // Array: ["a", "a.b.c"]
+    FieldPath field_ABCJ("a.b.c.j");
+    MultikeyComponents multikeyPaths_ABCJ{{0U, 2U}};
+
+    // Array: ["a", "a.b.d"]
+    FieldPath field_ABDE("a.b.d.e");
+    MultikeyComponents multikeyPaths_ABDE{0U, 2U};
+
+    // Array: []
+    FieldPath field_BDE("b.d.e");
+    MultikeyComponents multikeyPaths_BDE{};
+
+    // Array: ["b.d.e.f"] (Only final component is array)
+    FieldPath field_BDEF("b.d.e.f");
+    MultikeyComponents multikeyPaths_BDEF{3U};
+
+    std::vector<FieldPath> fields{
+        field_A, field_ABC, field_ABD, field_ABCJ, field_ABDE, field_BDE, field_BDEF};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_A,
+                                                 multikeyPaths_ABC,
+                                                 multikeyPaths_ABD,
+                                                 multikeyPaths_ABCJ,
+                                                 multikeyPaths_ABDE,
+                                                 multikeyPaths_BDE,
+                                                 multikeyPaths_BDEF};
+
+    auto pathsToInsert = combineVectors(fields, multikeyness);
+    auto arraynessMapInitial = tranformVectorToMap(pathsToInsert);
+
+    PathArrayness pathArrayness;
+    for (auto&& [fieldPath, multikey] : pathsToInsert) {
+        pathArrayness.addPath(fieldPath, multikey, true);
+    }
+
+    auto arraynessMapExported = pathArrayness.exportToMap_forTest();
+
+    ASSERT_EQ(arraynessMapInitial, arraynessMapExported);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_A, &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABC, &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABD, &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABCJ, &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABDE, &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_BDE, &expCtx), false);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_BDEF, &expCtx), true);
+}
+
+TEST(PathArraynessTest, InsertIntoPathArraynessGenerated) {
+    size_t seed = 1354754;
+    size_t seed2 = 3421354754;
+
+    // Number of paths to insert.
+    int numberOfPaths = 10;
+
+    // Number of distinct lengths of paths.
+    // by default we chose that we have 5 field paths for each length.
+    auto ndvLengths = numberOfPaths / 5;
+    // Maximum length of dotted field paths.
+    int maxLength = 100;
+
+    std::vector<std::pair<std::string, MultikeyComponents>> pathsToInsert =
+        generateRandomFieldPathsWithArraynessInfo(
+            numberOfPaths, maxLength, ndvLengths, seed, seed2);
+
+    auto arraynessMapInitial = tranformVectorToMap(pathsToInsert);
+
+    PathArrayness pathArrayness;
+    for (auto&& [fieldPath, multikey] : pathsToInsert) {
+        pathArrayness.addPath(fieldPath, multikey, true);
+    }
+
+    auto arraynessMapExported = pathArrayness.exportToMap_forTest();
+
+    ASSERT_EQ(arraynessMapInitial, arraynessMapExported);
+}
+
+TEST(PathArraynessTest, BuildAndLookupNonExistingFields) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Array: ["a", "a.b", "a.b.c"]
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{0U, 1U, 2U};
+
+    // We will not insert "a.b.c.d" into the trie.
+    FieldPath field_ABCD("a.b.c.d");
+
+    std::vector<FieldPath> fields{field_ABC};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_ABC};
+
+    PathArrayness pathArrayness;
+
+    for (size_t i = 0; i < fields.size(); i++) {
+        pathArrayness.addPath(fields[i], multikeyness[i], true);
+    }
+
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABC, &expCtx), true);
+
+    // Path component "d" does not exist but it has prefix "a", "a.b" and "a.b.c" that are
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABCD, &expCtx), true);
+}
+
+TEST(PathArraynessTest, LookupEmptyTrie) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // We will not insert any fields into the trie.
+    FieldPath field_A("a");
+    FieldPath field_ABCD("a.b.c.d");
+    std::vector<FieldPath> fields{field_A, field_ABCD};
+
+    PathArrayness pathArrayness;
+
+    // Neither of these fields or their prefixes are in the trie, so assume arrays.
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_A, &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_ABCD, &expCtx), true);
+}
+
+// When fully rebuilding the trie, we err on the side of non-arrayness when conflicts occur.
+TEST(ArraynessTrie, FullyRebuildAndLookupTrieWithConflictingArrayInformation) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Array: ["a.b"]
+    FieldPath field_AB("a.b");
+    MultikeyComponents multikeyPaths_AB{1U};
+
+    // Array: ["a.b.c"]. Note in this case "a.b" is not an array.
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{2U};
+
+    // First add field_AB to trie and then add field_ABC to trie.
+    std::vector<FieldPath> fields{field_AB, field_ABC};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_AB, multikeyPaths_ABC};
+
+    PathArrayness pathArrayness;
+
+    pathArrayness.addPath(field_AB, multikeyPaths_AB, true);
+    pathArrayness.addPath(field_ABC, multikeyPaths_ABC, true);
+
+    // In the case of conflicts, we assume multikeyness.
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_AB, &expCtx), false);
+
+    // Now let's flip the insertion order.
+    PathArrayness pathArrayness1;
+    pathArrayness1.addPath(field_ABC, multikeyPaths_ABC, true);
+    pathArrayness1.addPath(field_AB, multikeyPaths_AB, true);
+
+    // We should still get the same result.
+    ASSERT_EQ(pathArrayness1.canPathBeArray(field_AB, &expCtx), false);
+}
+
+// When updating the trie due to an index catalog update following a write operation, we err on the
+// side of arrayness when conflicts occur.
+TEST(ArraynessTrie, UpdateAndLookupTrieWithConflictingArrayInformation) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Array: ["a.b"]
+    FieldPath field_AB("a.b");
+    MultikeyComponents multikeyPaths_AB{1U};
+
+    // Array: ["a.b.c"]. Note in this case "a.b" is not an array.
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{2U};
+
+    // First add field_AB to trie and then add field_ABC to trie.
+    std::vector<FieldPath> fields{field_AB, field_ABC};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_AB, multikeyPaths_ABC};
+
+    PathArrayness pathArrayness;
+
+    pathArrayness.addPath(field_AB, multikeyPaths_AB, false);
+    pathArrayness.addPath(field_ABC, multikeyPaths_ABC, false);
+
+    // In the case of conflicts, we assume multikeyness.
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_AB, &expCtx), true);
+
+    // Now let's flip the insertion order.
+    PathArrayness pathArrayness1;
+    pathArrayness1.addPath(field_ABC, multikeyPaths_ABC, false);
+    pathArrayness1.addPath(field_AB, multikeyPaths_AB, false);
+
+    // We should still get the same result.
+    ASSERT_EQ(pathArrayness1.canPathBeArray(field_AB, &expCtx), true);
+}
+
+TEST(ArraynessTrie, BuildAndLookupTrieWithSameArrayInformation) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Array: ["a.b"]
+    FieldPath field_AB("a.b");
+    MultikeyComponents multikeyPaths_AB{1U};
+
+    // Array: ["a.b"]. Note in this case "a.b" is not an array.
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{1U};
+
+    // Note "a" is not an array in field_AB or field_ABC examples above.
+    FieldPath field_A("a");
+
+    // First add field_AB to trie and then add field_ABC to trie.
+    std::vector<FieldPath> fields{field_AB, field_ABC};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_AB, multikeyPaths_ABC};
+
+    PathArrayness pathArrayness;
+
+    pathArrayness.addPath(field_AB, multikeyPaths_AB, true);
+    pathArrayness.addPath(field_ABC, multikeyPaths_ABC, true);
+
+    // Path "a.b" is an array in both of the paths inserted into the trie.
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_AB, &expCtx), true);
+    // Path "a" is not an array in either of the paths inserted into the trie.
+    ASSERT_EQ(pathArrayness.canPathBeArray(field_A, &expCtx), false);
+}
+
+
+/**
+ * Test that FieldRef conversion to FieldPath is handled correctly
+ * Since FieldPath has stricter validation than FieldRef, a path that is valid by FieldRef
+ * standards but not by FieldPath standards should not be added to the trie on insert and on
+ * lookup should always conservatively return true for arrayness.
+ */
+
+// FieldRef allows empty string, but FieldPath does not.
+TEST(PathArraynessTest, FieldRefEmptyString) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    FieldRef emptyFieldRef("");
+    MultikeyComponents multikeyPaths{0U};
+
+    PathArrayness pathArrayness;
+
+    // Lookup should conservatively return true for invalid FieldPath.
+    ASSERT_EQ(pathArrayness.canPathBeArray(emptyFieldRef, &expCtx), true);
+}
+
+// FieldRef allows paths ending with a dot, but FieldPath does not.
+TEST(PathArraynessTest, FieldRefEndsWithDot) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    FieldRef fieldRefWithDot("a.b.");
+    MultikeyComponents multikeyPaths{0U};
+
+    PathArrayness pathArrayness;
+
+    // Lookup should conservatively return true for invalid FieldPath.
+    ASSERT_EQ(pathArrayness.canPathBeArray(fieldRefWithDot, &expCtx), true);
+}
+
+// FieldRef allows empty field names between dots (e.g., "a..b"), but FieldPath does not.
+TEST(PathArraynessTest, FieldRefEmptyFieldNameBetweenDots) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    FieldRef fieldRefWithEmpty("a..b");
+    MultikeyComponents multikeyPaths{0U};
+
+    PathArrayness pathArrayness;
+
+    // Lookup should conservatively return true for invalid FieldPath.
+    ASSERT_EQ(pathArrayness.canPathBeArray(fieldRefWithEmpty, &expCtx), true);
+}
+
+// FieldRef allows up to 255 components, but FieldPath only allows 200.
+TEST(PathArraynessTest, FieldRefTooManyComponents) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Create a path with 201 components (exceeding FieldPath limit).
+    std::string longPath = "a";
+    for (int i = 0; i < BSONDepth::kDefaultMaxAllowableDepth; ++i) {
+        longPath += ".b";
+    }
+    // Now longPath has 1 + 200 = 201 components, which exceeds the FieldPath limit of 200.
+
+    FieldRef fieldRefLong(longPath);
+    MultikeyComponents multikeyPaths{0U};
+
+    PathArrayness pathArrayness;
+
+    // Lookup should conservatively return true for invalid FieldPath.
+    ASSERT_EQ(pathArrayness.canPathBeArray(fieldRefLong, &expCtx), true);
+}
+
+// A durably-committed index can contain an over-deep dotted field name (more path components than
+// maxBSONDepth allows) if it was created with an elevated maxBSONDepth. addPathsFromIndexKeyPattern
+// must not throw on such a key pattern (which would crash the server on startup); it should skip
+// the offending path conservatively.
+TEST(PathArraynessTest, AddPathsFromIndexKeyPatternSkipsOverDeepFieldName) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Build a dotted field name with more components than the FieldPath limit of 200.
+    std::string overDeepField = "x";
+    for (int i = 0; i < BSONDepth::kDefaultMaxAllowableDepth + 10; ++i) {
+        overDeepField += ".x";
+    }
+
+    BSONObj keyPattern = BSON(overDeepField << 1);
+    MultikeyPaths multikeyPaths{MultikeyComponents{0U}};
+
+    PathArrayness pathArrayness;
+    auto initialState = pathArrayness.exportToMap_forTest();
+
+    // Must not throw even though the field name exceeds the FieldPath depth limit.
+    ASSERT_DOES_NOT_THROW(pathArrayness.addPathsFromIndexKeyPattern(
+        keyPattern, multikeyPaths, true /* isFullRebuild */));
+
+    // The over-deep path is skipped, so the trie is unchanged.
+    ASSERT_EQ(initialState, pathArrayness.exportToMap_forTest());
+
+    // Looking up the (absent) path conservatively reports it can be an array.
+    FieldRef overDeepRef(overDeepField);
+    ASSERT_EQ(pathArrayness.canPathBeArray(overDeepRef, &expCtx), true);
+}
+
+// A compound index that mixes a valid field with an over-deep field should still add the valid
+// field to the trie while skipping only the over-deep one.
+TEST(PathArraynessTest, AddPathsFromIndexKeyPatternSkipsOnlyOverDeepComponent) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    std::string overDeepField = "x";
+    for (int i = 0; i < BSONDepth::kDefaultMaxAllowableDepth + 10; ++i) {
+        overDeepField += ".x";
+    }
+
+    // Compound: {"a": 1, "<overDeep>": 1}. "a" is non-multikey (empty components).
+    BSONObj keyPattern = BSON("a" << 1 << overDeepField << 1);
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, MultikeyComponents{0U}};
+
+    PathArrayness pathArrayness;
+    ASSERT_DOES_NOT_THROW(pathArrayness.addPathsFromIndexKeyPattern(
+        keyPattern, multikeyPaths, true /* isFullRebuild */));
+
+    auto state = pathArrayness.exportToMap_forTest();
+    // Only the valid "a" component was added.
+    ASSERT_EQ(state.size(), 1U);
+    ASSERT_EQ(state["a"], false);
+
+    FieldRef aRef("a");
+    ASSERT_EQ(pathArrayness.canPathBeArray(aRef, &expCtx), false);
+}
+
+// FieldRef allows any field name starting with $, but FieldPath only allows certain
+// dollar-prefixed fields (like "$ref", "$id", etc.). A field like "$invalidField" should fail
+// FieldPath validation.
+TEST(PathArraynessTest, FieldRefInvalidDollarPrefix) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    FieldRef fieldRefWithInvalidDollar("a.$invalidField");
+    MultikeyComponents multikeyPaths{1U};
+
+    PathArrayness pathArrayness;
+
+    // Lookup should conservatively return true for invalid FieldPath.
+    ASSERT_EQ(pathArrayness.canPathBeArray(fieldRefWithInvalidDollar, &expCtx), true);
+}
+
+// Test that a FieldRef that is also a valid FieldPath works correctly.
+TEST(PathArraynessTest, FieldRefValidPath) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Arrays: ["a.b", "a.b.c"]
+    std::string validFieldRefString("a.b.c");
+    MultikeyComponents multikeyPaths{1U, 2U};
+
+    PathArrayness pathArrayness;
+    auto initialState = pathArrayness.exportToMap_forTest();
+
+    // Insert valid path - should succeed and be added to trie.
+    pathArrayness.addPath(FieldPath(validFieldRefString), multikeyPaths, true);
+    auto afterInsertState = pathArrayness.exportToMap_forTest();
+
+    // Trie should have changed since the path is valid and was added.
+    ASSERT_NE(initialState, afterInsertState);
+    // Should have "a", "a.b", and "a.b.c" entries (all nodes in the path)
+    ASSERT_EQ(afterInsertState.size(), 3U);
+    ASSERT_EQ(afterInsertState["a"], false);     // Component 0 is array
+    ASSERT_EQ(afterInsertState["a.b"], true);    // Component 1 is array
+    ASSERT_EQ(afterInsertState["a.b.c"], true);  // Component 2 is not array
+
+    // Lookup should work correctly - "a.b.c" has array prefix, so it's considered an array.
+    FieldRef validFieldRef = FieldRef(validFieldRefString);
+    ASSERT_EQ(pathArrayness.canPathBeArray(validFieldRef, &expCtx), true);
+
+    // Test lookup of a prefix that is an array.
+    FieldRef prefixFieldRef("a.b");
+    ASSERT_EQ(pathArrayness.canPathBeArray(prefixFieldRef, &expCtx), true);
+
+    // Test lookup of a prefix that is not an array.
+    FieldRef fieldRef("a");
+    ASSERT_EQ(pathArrayness.canPathBeArray(fieldRef, &expCtx), false);
+}
+
+/**
+ * Test that the enablePathArrayness query knob works
+ * When disabled, lookups should always conservatively return true.
+ * The value of the knob is cached on first access, so changing the value at runtime should not
+ * affect the value PathArrayness sees for a given query.
+ */
+
+TEST(ArraynessTrie, LookupTrieWithQueryKnobDisabled) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Disable query knob
+    unittest::ServerParameterGuard queryKnobController("internalEnablePathArrayness", false);
+
+    // Array: ["a.b"]
+    FieldPath field_AB("a.b");
+    MultikeyComponents multikeyPaths_AB{1U};
+
+    // Array: ["a.b"]. Note in this case "a.b" is not an array.
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{1U};
+
+    // Note "a" is not an array in field_AB or field_ABC examples above.
+    std::string fieldPathString_A = "a";
+
+    // First add field_AB to trie and then add field_ABC to trie.
+    std::vector<FieldPath> fields{field_AB, field_ABC};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_AB, multikeyPaths_ABC};
+
+    PathArrayness pathArrayness;
+
+    pathArrayness.addPath(field_AB, multikeyPaths_AB, true);
+    pathArrayness.addPath(field_ABC, multikeyPaths_ABC, true);
+
+    // Path "a" is not an array in either of the paths inserted into the trie, but since the
+    // query knob is disabled PathArrayness should conservatively return true.
+    // Test for both FieldPath and FieldRef.
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath(fieldPathString_A), &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldRef(fieldPathString_A), &expCtx), true);
+
+    // Enable query knob
+    queryKnobController = unittest::ServerParameterGuard("internalEnablePathArrayness", true);
+
+    // The original value of the query knob is cached in the ExpressionContext, so even though
+    // the query knob has now been enabled PathArrayness will still use the cached value
+    // (disabled) and conservatively return true. This ensures consistent results during the
+    // lifetime of any given query.
+    // Test for both FieldPath and FieldRef.
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath(fieldPathString_A), &expCtx), true);
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldRef(fieldPathString_A), &expCtx), true);
+}
+
+TEST(ArraynessTrie, LookupTrieWithQueryKnobEnabled) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    // Disable query knob
+    unittest::ServerParameterGuard queryKnobController("internalEnablePathArrayness", true);
+
+    // Array: ["a.b"]
+    FieldPath field_AB("a.b");
+    MultikeyComponents multikeyPaths_AB{1U};
+
+    // Array: ["a.b"]. Note in this case "a.b" is not an array.
+    FieldPath field_ABC("a.b.c");
+    MultikeyComponents multikeyPaths_ABC{1U};
+
+    // Note "a" is not an array in field_AB or field_ABC examples above.
+    std::string fieldPathString_A = "a";
+
+    // First add field_AB to trie and then add field_ABC to trie.
+    std::vector<FieldPath> fields{field_AB, field_ABC};
+    std::vector<MultikeyComponents> multikeyness{multikeyPaths_AB, multikeyPaths_ABC};
+
+    PathArrayness pathArrayness;
+
+    pathArrayness.addPath(field_AB, multikeyPaths_AB, true);
+    pathArrayness.addPath(field_ABC, multikeyPaths_ABC, true);
+
+    // Path "a" is not an array in either of the paths inserted into the trie and the query knob is
+    // enabled so we should see that the path is not an array.
+    // Test for both FieldPath and FieldRef.
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath(fieldPathString_A), &expCtx), false);
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldRef(fieldPathString_A), &expCtx), false);
+
+    // Enable query knob
+    queryKnobController = unittest::ServerParameterGuard("internalEnablePathArrayness", false);
+
+    // The original value of the query knob is cached in the ExpressionContext, so even though
+    // the query knob has now been disabled PathArrayness will still use the cached value
+    // (enabled) and search the trie for arrayness values. This ensures consistent results during
+    // the lifetime of any given query.
+    // Test for both FieldPath and FieldRef.
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath(fieldPathString_A), &expCtx), false);
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldRef(fieldPathString_A), &expCtx), false);
+}
+
+// An index on "e.0" uses positional access and is not marked multikey at "e", but "e" itself can
+// still be an array. PathArrayness should not conclude otherwise.
+TEST(PathArraynessTest, PositionalIndexPathShouldNotMarkParentAsNonArray) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    FieldPath field_E0("e.0");
+    MultikeyComponents multikeyPaths_E0{};
+
+    PathArrayness pathArrayness;
+    pathArrayness.addPath(field_E0, multikeyPaths_E0, true);
+
+    // TODO 127304: Re-enable once PathArrayness handles positional paths correctly.
+    // FieldPath field_E("e");
+    // ASSERT_EQ(pathArrayness.canPathBeArray(field_E, &expCtx),true);
+    GTEST_SKIP();
+}
+
+// Compound index {a: 1, "c.d": 1, "e.0": 1}: only "e.0" has the positional issue.
+TEST(PathArraynessTest, CompoundIndexWithPositionalPathDoesNotAffectParentArrayness) {
+    ExpressionContextForTest expCtx = ExpressionContextForTest();
+
+    PathArrayness pathArrayness;
+    pathArrayness.addPath(FieldPath("a"), MultikeyComponents{}, true);
+    pathArrayness.addPath(FieldPath("c.d"), MultikeyComponents{}, true);
+    pathArrayness.addPath(FieldPath("e.0"), MultikeyComponents{}, true);
+
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath("a"), &expCtx), false);
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath("c"), &expCtx), false);
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath("c.d"), &expCtx), false);
+
+    // TODO 127304: Re-enable once PathArrayness handles positional paths correctly.
+    // ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath("e"), &expCtx), true);
+
+    ASSERT_EQ(pathArrayness.canPathBeArray(FieldPath("e.0"), &expCtx), false);
+}
+
+
+class PathArraynessInvalidationTest : public unittest::Test {
+protected:
+    PathArraynessInvalidationTest() {
+        _expCtx.setPathArraynessForNss(_expCtx.getNamespaceString(), _oldPathArrayness);
+    }
+
+    void addOldPath(std::string_view path, MultikeyComponents mk = {}) {
+        _oldPathArrayness->addPath(FieldPath(path), mk, true);
+    }
+
+    bool canPathBeArray(std::string_view path) {
+        return _expCtx.canPathBeArrayForNss(FieldPath(path), _expCtx.getNamespaceString());
+    }
+
+    void addCurrentPath(std::string_view path, MultikeyComponents mk = {}) {
+        _current.addPath(FieldPath(path), mk, true);
+    }
+
+    bool hasInvalidatedPaths() {
+        return PathArrayness::getFirstInvalidatedPath(
+                   _expCtx.nonArrayPathsForNss(_expCtx.getNamespaceString()),
+                   _current,
+                   _expCtx.getNamespaceString())
+            .has_value();
+    }
+
+private:
+    std::shared_ptr<PathArrayness> _oldPathArrayness = std::make_shared<PathArrayness>();
+    ExpressionContextForTest _expCtx;
+    PathArrayness _current;
+};
+
+TEST_F(PathArraynessInvalidationTest, NoInvalidationWhenTriesAreIdentical) {
+    addOldPath("a.b");
+    ASSERT_FALSE(canPathBeArray("a.b"));
+
+    addCurrentPath("a.b");
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, NoInvalidationWhenPathComponentBecomesNonArray) {
+    addOldPath("a.b");
+    addOldPath("x.y", {0, 1});
+    ASSERT_FALSE(canPathBeArray("a.b"));
+    ASSERT_TRUE(canPathBeArray("x.y"));
+
+    addCurrentPath("a.b");
+    addCurrentPath("x.y", {0});
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, InvalidationWhenNonArrayBecomesArray) {
+    addOldPath("a.b");
+    ASSERT_FALSE(canPathBeArray("a.b"));
+
+    addCurrentPath("a.b", {1});
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, InvalidationWhenPathDisappears) {
+    addOldPath("a.b");
+    ASSERT_FALSE(canPathBeArray("a.b"));
+
+    // current trie is empty — path is gone.
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, NoInvalidationWhenAllPathsWereAlreadyArray) {
+    addOldPath("a.b", {0, 1});
+    ASSERT_TRUE(canPathBeArray("a.b"));
+
+    addCurrentPath("a.b.c", {0, 1, 2});
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, InvalidationOnPrefixOfDottedPath) {
+    addOldPath("a.b.c", {2});
+    ASSERT_FALSE(canPathBeArray("a.b"));
+
+    addCurrentPath("a.b.c", {1, 2});
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, InvalidationWhenLeafFlipsToArray) {
+    addOldPath("a.b.c");
+    ASSERT_FALSE(canPathBeArray("a.b.c"));
+
+    addCurrentPath("a.b.c", {2});
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, NoInvalidationOnEmptyOldTrie) {
+    addCurrentPath("a.b", {0, 1});
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, NoInvalidationWhenBothEmpty) {
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, MultiplePathsOneInvalidated) {
+    addOldPath("a");
+    addOldPath("b");
+    ASSERT_FALSE(canPathBeArray("a"));
+    ASSERT_FALSE(canPathBeArray("b"));
+
+    addCurrentPath("a");
+    addCurrentPath("b", {0});
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, NoInvalidationWhenNonArrayPathInvalidatedButNeverQueried) {
+    addOldPath("a");
+    addOldPath("b");
+    // Only query "a", not "b".
+    ASSERT_FALSE(canPathBeArray("a"));
+
+    addCurrentPath("a");
+    addCurrentPath("b", {0});
+    // Did not use "b". No need to invalidate.
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, DeepPathPrefixInvalidation) {
+    addOldPath("a.b.c.d.e");
+    ASSERT_FALSE(canPathBeArray("a.b.c.d.e"));
+
+    addCurrentPath("a.b.c.d.e", {1});
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, InvalidationWhenOldPathMissingFromCurrent) {
+    addOldPath("x.y");
+    ASSERT_FALSE(canPathBeArray("x.y"));
+
+    addCurrentPath("a.b");
+    ASSERT_TRUE(hasInvalidatedPaths());
+}
+
+TEST_F(PathArraynessInvalidationTest, OldPathArrayCurrentPathNonArray) {
+    addOldPath("a", {0});
+    // "a" is array, so it won't be recorded as non-array.
+    ASSERT_TRUE(canPathBeArray("a"));
+
+    addCurrentPath("a");
+    ASSERT_FALSE(hasInvalidatedPaths());
+}
+
+TEST(PathArraynessInvalidation, SharedPathArraynessDoesNotLeakNonArrayPathsAcrossQueries) {
+    QueryTestServiceContext testServiceCtx;
+    auto opCtx = testServiceCtx.makeOperationContext();
+    auto nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+
+    auto pa = std::make_shared<PathArrayness>();
+    pa->addPath(FieldPath("a"), MultikeyComponents{}, true);
+    pa->addPath(FieldPath("b"), MultikeyComponents{}, true);
+    pa->addPath(FieldPath("c"), MultikeyComponents{}, true);
+    auto sharedPA = std::shared_ptr<const PathArrayness>(std::move(pa));
+
+    auto buildExpCtx = [&] {
+        stdx::unordered_map<NamespaceString, std::shared_ptr<const PathArrayness>> map;
+        map.emplace(nss, sharedPA);
+        return ExpressionContextBuilder{}
+            .opCtx(opCtx.get())
+            .ns(nss)
+            .pathArraynessForNss(std::move(map))
+            .build();
+    };
+    auto expCtx1 = buildExpCtx();
+    auto expCtx2 = buildExpCtx();
+
+    // Query 1 uses "a", Query 2 uses "b".
+    ASSERT_FALSE(expCtx1->canPathBeArrayForNss(FieldPath("a"), nss));
+    ASSERT_FALSE(expCtx2->canPathBeArrayForNss(FieldPath("b"), nss));
+
+    // Each ExpressionContext tracks non-array paths independently.
+    const auto& nonArrayPaths1 = expCtx1->nonArrayPathsForNss(nss);
+    const auto& nonArrayPaths2 = expCtx2->nonArrayPathsForNss(nss);
+
+    int count1 = 0, count2 = 0;
+    for (const auto& p : nonArrayPaths1) {
+        count1++;
+        ASSERT_EQ(p, FieldPath("a"));
+    }
+    for (const auto& p : nonArrayPaths2) {
+        count2++;
+        ASSERT_EQ(p, FieldPath("b"));
+    }
+    ASSERT_EQ(count1, 1);
+    ASSERT_EQ(count2, 1);
+
+    // "b" becomes array. Query 1 (which only used "a") should NOT invalidate.
+    PathArrayness current;
+    current.addPath(FieldPath("a"), MultikeyComponents{}, true);
+    current.addPath(FieldPath("b"), MultikeyComponents{0}, true);
+    current.addPath(FieldPath("c"), MultikeyComponents{}, true);
+
+    ASSERT_FALSE(PathArrayness::getFirstInvalidatedPath(nonArrayPaths1, current, nss).has_value());
+    ASSERT_TRUE(PathArrayness::getFirstInvalidatedPath(nonArrayPaths2, current, nss).has_value());
+}
+
+TEST(ExpressionContextFieldRefOverload, InvalidEmptyPath) {
+    ExpressionContextForTest expCtx;
+    auto pa = std::make_shared<PathArrayness>();
+    expCtx.setPathArraynessForNss(expCtx.getNamespaceString(), pa);
+    ASSERT_TRUE(expCtx.canPathBeArrayForNss(FieldRef(""), expCtx.getNamespaceString()));
+}
+
+TEST(ExpressionContextFieldRefOverload, InvalidTrailingDot) {
+    ExpressionContextForTest expCtx;
+    auto pa = std::make_shared<PathArrayness>();
+    expCtx.setPathArraynessForNss(expCtx.getNamespaceString(), pa);
+    ASSERT_TRUE(expCtx.canPathBeArrayForNss(FieldRef("a."), expCtx.getNamespaceString()));
+}
+
+TEST(ExpressionContextFieldRefOverload, InvalidDollarPrefixed) {
+    ExpressionContextForTest expCtx;
+    auto pa = std::make_shared<PathArrayness>();
+    expCtx.setPathArraynessForNss(expCtx.getNamespaceString(), pa);
+    ASSERT_TRUE(expCtx.canPathBeArrayForNss(FieldRef("$foo"), expCtx.getNamespaceString()));
+}
+
+TEST(ExpressionContextFieldRefOverload, ValidPathDelegatesToFieldPathOverload) {
+    ExpressionContextForTest expCtx;
+    auto pa = std::make_shared<PathArrayness>();
+    pa->addPath(FieldPath("a.b"), MultikeyComponents{}, true);
+    expCtx.setPathArraynessForNss(expCtx.getNamespaceString(), pa);
+    ASSERT_FALSE(expCtx.canPathBeArrayForNss(FieldRef("a.b"), expCtx.getNamespaceString()));
+}
+
+TEST(CanPathBeArrayForNss, UnknownNssReturnsConservativeTrue) {
+    QueryTestServiceContext testServiceCtx;
+    auto opCtx = testServiceCtx.makeOperationContext();
+    auto mainNss = NamespaceString::createNamespaceString_forTest("test", "main_coll");
+    auto unknownNss = NamespaceString::createNamespaceString_forTest("test", "unknown_coll");
+
+    auto mainPA = std::make_shared<PathArrayness>();
+    mainPA->addPath(FieldPath("a"), MultikeyComponents{}, true);
+
+    stdx::unordered_map<NamespaceString, std::shared_ptr<const PathArrayness>> map;
+    map.emplace(mainNss, std::shared_ptr<const PathArrayness>(std::move(mainPA)));
+
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(mainNss)
+                      .pathArraynessForNss(std::move(map))
+                      .build();
+
+    ASSERT_TRUE(expCtx->canPathBeArrayForNss(FieldPath("a"), unknownNss));
+}
+
+TEST(CanPathBeArrayForNss, FieldRefOverloadDelegatesToMainForMainNss) {
+    QueryTestServiceContext testServiceCtx;
+    auto opCtx = testServiceCtx.makeOperationContext();
+    auto nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+
+    auto mainPA = std::make_shared<PathArrayness>();
+    mainPA->addPath(FieldPath("a.b"), MultikeyComponents{}, true);
+
+    stdx::unordered_map<NamespaceString, std::shared_ptr<const PathArrayness>> map;
+    map.emplace(nss, std::shared_ptr<const PathArrayness>(std::move(mainPA)));
+
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(nss)
+                      .pathArraynessForNss(std::move(map))
+                      .build();
+
+    ASSERT_FALSE(expCtx->canPathBeArrayForNss(FieldRef("a.b"), nss));
+    // Invalid FieldRef returns conservative true.
+    ASSERT_TRUE(expCtx->canPathBeArrayForNss(FieldRef(""), nss));
+}
+
+TEST(PathArraynessEpoch, DefaultEpochIsZero) {
+    PathArrayness pa;
+    ASSERT_EQ(pa.epoch(), 0u);
+}
+
+TEST(PathArraynessEpoch, ExplicitEpoch) {
+    PathArrayness pa(42);
+    ASSERT_EQ(pa.epoch(), 42u);
+}
+
+TEST(PathArraynessEpoch, CopyPreservesEpoch) {
+    PathArrayness original(7);
+    PathArrayness copy(original);
+    ASSERT_EQ(copy.epoch(), 7u);
+}
+
+TEST(PathArraynessEpoch, IncrementEpoch) {
+    PathArrayness pa(5);
+    pa.incrementEpoch();
+    ASSERT_EQ(pa.epoch(), 6u);
+}
+
+TEST(PathArraynessEpoch, IncrementEpochWrapsToZeroOnOverflow) {
+    PathArrayness pa(std::numeric_limits<uint64_t>::max());
+    pa.incrementEpoch();
+    ASSERT_EQ(pa.epoch(), 0u);
+}
+
+TEST(UassertIfInvalidatedPaths, NoPrevEpochCanThrow) {
+    MonotonicallyIncreasingFieldPathSet nonArrayPaths;
+    nonArrayPaths.insert(FieldPath("a.b"));
+
+    PathArrayness current(5);
+    current.addPath(FieldPath("a.b"), MultikeyComponents{1}, true);
+
+    PathArraynessChecker checker{nonArrayPaths, boost::none};
+    ASSERT_THROWS_CODE(checker.uassertIfInvalidatedAndSyncEpoch(
+                           current, NamespaceString::createNamespaceString_forTest("test.coll")),
+                       DBException,
+                       ErrorCodes::QueryPlanKilled);
+}
+
+TEST(UassertIfInvalidatedPaths, IfPrevEpochMatchesInvalidationIsSkipped) {
+    MonotonicallyIncreasingFieldPathSet nonArrayPaths;
+    nonArrayPaths.insert(FieldPath("a.b"));
+
+    PathArrayness current(7);
+    current.addPath(FieldPath("a.b"), MultikeyComponents{1}, true);
+
+    // Degenerate case, where the epoch matches but the underlying arrayness differs.
+    PathArraynessChecker checker{nonArrayPaths, 7u};
+    checker.uassertIfInvalidatedAndSyncEpoch(
+        current, NamespaceString::createNamespaceString_forTest("test.coll"));
+}
+
+TEST(UassertIfInvalidatedPaths, EpochIsUpdated) {
+    MonotonicallyIncreasingFieldPathSet nonArrayPaths;
+    nonArrayPaths.insert(FieldPath("a.b"));
+
+    PathArrayness current(10);
+    current.addPath(FieldPath("a.b"), MultikeyComponents{}, true);
+
+    PathArraynessChecker checker{nonArrayPaths, 9u};
+    checker.uassertIfInvalidatedAndSyncEpoch(
+        current, NamespaceString::createNamespaceString_forTest("test.coll"));
+    ASSERT_EQ(*checker.prevEpoch, 10u);
+}
+
+TEST(UassertIfInvalidatedPaths, InvalidationRunsWhenEpochIsStale) {
+    MonotonicallyIncreasingFieldPathSet nonArrayPaths;
+    nonArrayPaths.insert(FieldPath("a.b"));
+
+    PathArrayness current(10);
+    current.addPath(FieldPath("a.b"), MultikeyComponents{1}, true);
+
+    PathArraynessChecker checker{nonArrayPaths, 9u};
+    ASSERT_THROWS_CODE(checker.uassertIfInvalidatedAndSyncEpoch(
+                           current, NamespaceString::createNamespaceString_forTest("test.coll")),
+                       DBException,
+                       ErrorCodes::QueryPlanKilled);
+}
+
+TEST(NonArrayPathsForNssFrom, CopiesNonArrayPathsToNewContext) {
+    QueryTestServiceContext testServiceCtx;
+    auto opCtx = testServiceCtx.makeOperationContext();
+    auto nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+
+    auto pa = std::make_shared<PathArrayness>();
+    pa->addPath(FieldPath("a"), MultikeyComponents{}, true);
+    pa->addPath(FieldPath("b"), MultikeyComponents{}, true);
+
+    stdx::unordered_map<NamespaceString, std::shared_ptr<const PathArrayness>> map;
+    map.emplace(nss, std::shared_ptr<const PathArrayness>(std::move(pa)));
+
+    auto src = ExpressionContextBuilder{}
+                   .opCtx(opCtx.get())
+                   .ns(nss)
+                   .pathArraynessForNss(std::move(map))
+                   .build();
+    ASSERT_FALSE(src->canPathBeArrayForNss(FieldPath("a"), nss));
+
+    auto derived =
+        ExpressionContextBuilder{}.opCtx(opCtx.get()).ns(nss).nonArrayPathsForNssFrom(*src).build();
+
+    const auto& srcPaths = src->nonArrayPathsForNss(nss);
+    const auto& derivedPaths = derived->nonArrayPathsForNss(nss);
+
+    int srcCount = 0, derivedCount = 0;
+    for (const auto& p : srcPaths) {
+        ++srcCount;
+        ASSERT_EQ(p, FieldPath("a"));
+    }
+    for (const auto& p : derivedPaths) {
+        ++derivedCount;
+        ASSERT_EQ(p, FieldPath("a"));
+    }
+    ASSERT_EQ(srcCount, 1);
+    ASSERT_EQ(derivedCount, 1);
+}
+
+TEST(MakeCopyFromExpressionContext, CopiesNonArrayPathsForNss) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagPathArrayness", true);
+    QueryTestServiceContext testServiceCtx;
+    auto opCtx = testServiceCtx.makeOperationContext();
+    auto nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+
+    auto pa = std::make_shared<PathArrayness>();
+    pa->addPath(FieldPath("a"), MultikeyComponents{}, true);
+    pa->addPath(FieldPath("b"), MultikeyComponents{}, true);
+
+    stdx::unordered_map<NamespaceString, std::shared_ptr<const PathArrayness>> map;
+    map.emplace(nss, std::shared_ptr<const PathArrayness>(std::move(pa)));
+
+    auto src = ExpressionContextBuilder{}
+                   .opCtx(opCtx.get())
+                   .ns(nss)
+                   .pathArraynessForNss(std::move(map))
+                   .build();
+
+    ASSERT_FALSE(src->canPathBeArrayForNss(FieldPath("a"), nss));
+
+    auto copy = makeCopyFromExpressionContext(src, nss);
+
+    const auto& copyPaths = copy->nonArrayPathsForNss(nss);
+    int count = 0;
+    for (const auto& p : copyPaths) {
+        ++count;
+        ASSERT_EQ(p, FieldPath("a"));
+    }
+    ASSERT_EQ(count, 1);
+}
+
+// Tests for PathArrayness::isIndexEligibleToAddToPathArrayness.
+// Only BTREE indexes that are neither partial nor hidden are eligible.
+
+TEST(PathArraynessIndexEligibilityTest, BtreeIsEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("a" << 1) << "name" << "a_1");
+    IndexDescriptor desc(IndexNames::BTREE, spec);
+    ASSERT_TRUE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, BtreePartialIsNotEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                            << "a_1_partial"
+                            << "partialFilterExpression" << BSON("b" << BSON("$gt" << 5)));
+    IndexDescriptor desc(IndexNames::BTREE, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, BtreeHiddenIsNotEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
+                            << "a_1_hidden"
+                            << "hidden" << true);
+    IndexDescriptor desc(IndexNames::BTREE, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, TwoDSphereIsNotEligible) {
+    BSONObj spec = BSON("v" << 3 << "key" << BSON("loc" << "2dsphere") << "name" << "loc_2dsphere");
+    IndexDescriptor desc(IndexNames::GEO_2DSPHERE, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, TextIsNotEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("t" << "text") << "name" << "t_text");
+    IndexDescriptor desc(IndexNames::TEXT, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, HashedIsNotEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("a" << "hashed") << "name" << "a_hashed");
+    IndexDescriptor desc(IndexNames::HASHED, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, WildcardIsNotEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("$**" << 1) << "name" << "wildcard");
+    IndexDescriptor desc(IndexNames::WILDCARD, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, TwoDIsNotEligible) {
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("loc" << "2d") << "name" << "loc_2d");
+    IndexDescriptor desc(IndexNames::GEO_2D, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, NumericPathComponentIsNotEligible) {
+    // An index on "a.0.x" accesses array elements positionally, so its multikey metadata does not
+    // reliably reflect whether "a" is an array. It must not be added to the trie.
+    BSONObj spec = BSON("v" << 2 << "key" << BSON("a.0.x" << 1) << "name" << "a.0.x_1");
+    IndexDescriptor desc(IndexNames::BTREE, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+
+TEST(PathArraynessIndexEligibilityTest, NumericPathComponentInCompoundIndexIsNotEligible) {
+    // If any indexed field contains a numeric path component, the whole index is excluded.
+    BSONObj spec =
+        BSON("v" << 2 << "key" << BSON("b" << 1 << "a.0.x" << 1) << "name" << "b_1_a.0.x_1");
+    IndexDescriptor desc(IndexNames::BTREE, spec);
+    ASSERT_FALSE(PathArrayness::isIndexEligibleToAddToPathArrayness(desc));
+}
+}  // namespace mongo

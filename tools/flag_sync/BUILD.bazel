@@ -1,0 +1,46 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+py_binary(
+    name = "client",
+    srcs = [
+        "client.py",
+        "flag.py",
+        "namespace.py",
+    ],
+    main = "client.py",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":util",
+        dependency(
+            "typer",
+            group = "core",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+        dependency(
+            "boto3",
+            group = "aws",
+        ),
+    ],
+)
+
+py_library(
+    name = "util",
+    srcs = [
+        "util.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "retry",
+            group = "testing",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+    ],
+)

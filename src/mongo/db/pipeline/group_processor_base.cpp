@@ -1,0 +1,235 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/group_processor_base.h"
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+
+namespace mongo {
+
+GroupProcessorBase::GroupProcessorBase(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       MemoryUsageLimit maxMemoryUsageBytes)
+    : _expCtx(expCtx),
+      _memoryTracker{OperationMemoryUsageTracker::createChunkedMemoryUsageTrackerForStage(
+          *expCtx, expCtx->getAllowDiskUse() && !expCtx->getInRouter(), maxMemoryUsageBytes)},
+      _groups(expCtx->getValueComparator().makeUnorderedValueMap<Accumulators>()) {}
+
+GroupProcessorBase::GroupProcessorBase(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                       MemoryUsageTracker memoryTracker)
+    : _expCtx(std::move(expCtx)),
+      _memoryTracker(std::move(memoryTracker)),
+      _groups(_expCtx->getValueComparator().makeUnorderedValueMap<Accumulators>()) {}
+
+GroupProcessorBase GroupProcessorBase::makeFreshGroupProcessorBase() const {
+    GroupProcessorBase fresh(_expCtx, _memoryTracker.makeFreshMemoryUsageTracker());
+    fresh._idFieldNames = _idFieldNames;
+    fresh._idExpressions = _idExpressions;
+    fresh._accumulatedFields = _accumulatedFields;
+    fresh._doingMerge = _doingMerge;
+    fresh._willBeMerged = _willBeMerged;
+    return fresh;
+}
+
+void GroupProcessorBase::addAccumulationStatement(AccumulationStatement accumulationStatement) {
+    tassert(7801002, "Can't mutate accumulated fields after initialization", !_executionStarted);
+    _accumulatedFields.push_back(accumulationStatement);
+}
+
+void GroupProcessorBase::setExecutionStarted() {
+    if (!_executionStarted) {
+        _memoryTracker.clear();
+        tassert(11282941,
+                "Expect memory trackers list to be empty at the start of execution",
+                _accumulatedFieldMemoryTrackers.empty());
+        for (const auto& accum : _accumulatedFields) {
+            _accumulatedFieldMemoryTrackers.push_back(&_memoryTracker[accum.fieldName]);
+        }
+    }
+    _executionStarted = true;
+}
+
+void GroupProcessorBase::freeMemory() {
+    for (auto& group : _groups) {
+        for (size_t i = 0; i < group.second.size(); ++i) {
+            // Subtract the current usage.
+            _accumulatedFieldMemoryTrackers[i]->add(-1 * group.second[i]->getMemUsage());
+
+            group.second[i]->reduceMemoryConsumptionIfAble();
+
+            // Update the memory usage for this AccumulationStatement.
+            _accumulatedFieldMemoryTrackers[i]->add(group.second[i]->getMemUsage());
+        }
+    }
+}
+
+void GroupProcessorBase::setIdExpression(const boost::intrusive_ptr<Expression> idExpression) {
+    tassert(7801001, "Can't mutate _id fields after initialization", !_executionStarted);
+
+
+    auto object = dynamic_cast<ExpressionObject*>(idExpression.get());
+    if (!object || object->getChildExpressions().empty()) {
+        // Any single expression (including an empty object) can be directly computed and output
+        // without any custom handling or transformations. Note that we don't expect the parser to
+        // produce an empty object ExpressionObject (it should produce an ExpressionConstant
+        // instead), but we have been mistaken about that before in SERVER-89611, so we will handle
+        // this special case as well.
+        _idExpressions.push_back(idExpression);
+        return;
+    }
+
+    // For objects (e.g. from parsing {$group: {_id: {a: "$a",  b: "$b"}}}), we do the following
+    // optimization to perform grouping on an "artificial" object. Rather than create the object for
+    // each input in initialize(), instead group on the output of the raw expressions.  The
+    // artificial object will be created at the end in makeDocument() while outputting results.
+    auto& childExpressions = object->getChildExpressions();
+
+    for (auto&& childExpPair : childExpressions) {
+        _idFieldNames.push_back(childExpPair.first);
+        _idExpressions.push_back(childExpPair.second);
+    }
+}
+
+boost::intrusive_ptr<Expression> GroupProcessorBase::getIdExpression() const {
+    // _idFieldNames is empty and _idExpressions has one element when the _id expression is not an
+    // object expression.
+    if (_idFieldNames.empty() && _idExpressions.size() == 1) {
+        return _idExpressions[0];
+    }
+
+    tassert(6586300,
+            "Field and its expression must be always paired in ExpressionObject",
+            _idFieldNames.size() > 0 && _idFieldNames.size() == _idExpressions.size());
+
+    // Each expression in '_idExpressions' may have been optimized and so, compose the object _id
+    // expression out of the optimized expressions.
+    std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>> fieldsAndExprs;
+    for (size_t i = 0; i < _idExpressions.size(); ++i) {
+        fieldsAndExprs.emplace_back(_idFieldNames[i], _idExpressions[i]);
+    }
+
+    return ExpressionObject::create(_idExpressions[0]->getExpressionContext(),
+                                    std::move(fieldsAndExprs));
+}
+
+void GroupProcessorBase::reset() {
+    // Before we clear the memory tracker, update GroupStats so explain has $group-level statistics.
+    _stats.peakTrackedMemBytes = _memoryTracker.peakTrackedMemoryBytes();
+
+    // Free our resources.
+    _groups = _expCtx->getValueComparator().makeUnorderedValueMap<Accumulators>();
+    _memoryTracker.resetCurrent();
+}
+
+Value GroupProcessorBase::computeGroupKey(const Document& root) const {
+    // If only one expression, return result directly
+    if (_idExpressions.size() == 1) {
+        Value retValue = _idExpressions[0]->evaluate(root, &_expCtx->variables);
+        return retValue.missing() ? Value(BSONNULL) : std::move(retValue);
+    } else {
+        // Multiple expressions get results wrapped in a vector
+        std::vector<Value> vals;
+        vals.reserve(_idExpressions.size());
+        for (size_t i = 0; i < _idExpressions.size(); i++) {
+            vals.push_back(_idExpressions[i]->evaluate(root, &_expCtx->variables));
+        }
+        return Value(std::move(vals));
+    }
+}
+
+std::pair<GroupProcessorBase::GroupsMap::iterator, bool> GroupProcessorBase::findOrCreateGroup(
+    const Value& key) {
+    auto emplaceResult = _groups.try_emplace(key);
+    auto& group = emplaceResult.first->second;
+
+    const size_t numAccumulators = _accumulatedFields.size();
+    if (emplaceResult.second) {
+        _memoryTracker.add(key.getApproximateSize());
+
+        // Initialize and add the accumulators
+        Value expandedId = expandId(key);
+        Document idDoc =
+            expandedId.getType() == BSONType::object ? expandedId.getDocument() : Document();
+        group.reserve(numAccumulators);
+        for (size_t i = 0; i < numAccumulators; i++) {
+            const auto& accumulatedField = _accumulatedFields[i];
+            auto accum = accumulatedField.makeAccumulator();
+            Value initializerValue =
+                accumulatedField.expr.initializer->evaluate(idDoc, &_expCtx->variables);
+            accum->startNewGroup(initializerValue);
+            _accumulatedFieldMemoryTrackers[i]->add(accum->getMemUsage());
+            group.push_back(std::move(accum));
+        }
+    }
+    // Check that we have accumulated state for each of the accumulation statements.
+    dassert(numAccumulators == group.size());
+
+    return emplaceResult;
+}
+
+void GroupProcessorBase::accumulate(GroupsMap::iterator groupIter,
+                                    size_t accumulatorIdx,
+                                    Value accumulatorArg) {
+    const size_t numAccumulators = _accumulatedFields.size();
+    tassert(11282940,
+            "Expect the number of accumulated fields to match the number of accumulators",
+            numAccumulators == groupIter->second.size());
+    tassert(11282911,
+            str::stream() << "Out of bounds access to accumulator states. Idx=" << accumulatorIdx
+                          << "; Number of accumulators=" << numAccumulators,
+            accumulatorIdx < numAccumulators);
+
+    auto& accumulator = groupIter->second[accumulatorIdx];
+    const auto prevMemUsage = accumulator->getMemUsage();
+    accumulator->process(accumulatorArg, _doingMerge);
+    _accumulatedFieldMemoryTrackers[accumulatorIdx]->add(accumulator->getMemUsage() - prevMemUsage);
+}
+
+Value GroupProcessorBase::expandId(const Value& val) {
+    // _id doesn't get wrapped in a document
+    if (_idFieldNames.empty())
+        return val;
+
+    // _id is a single-field document containing val
+    if (_idFieldNames.size() == 1)
+        return Value(DOC(_idFieldNames[0] << val));
+
+    // _id is a multi-field document containing the elements of val
+    const std::vector<Value>& vals = val.getArray();
+    tassert(11282939,
+            "Expect the number of field names to match the number of fields in the group id",
+            _idFieldNames.size() == vals.size());
+    MutableDocument md(vals.size());
+    for (size_t i = 0; i < vals.size(); i++) {
+        md[_idFieldNames[i]] = vals[i];
+    }
+    return md.freezeToValue();
+}
+
+Document GroupProcessorBase::makeDocument(const Value& id, const Accumulators& accums) {
+    const size_t n = _accumulatedFields.size();
+    MutableDocument out(1 + n);
+
+    // Add the _id field.
+    out.addField("_id", expandId(id));
+
+    // Add the rest of the fields.
+    for (size_t i = 0; i < n; ++i) {
+        Value val = accums[i]->getValue(_willBeMerged);
+        if (val.missing()) {
+            // we return null in this case so return objects are predictable
+            out.addField(_accumulatedFields[i].fieldName, Value(BSONNULL));
+        } else {
+            out.addField(_accumulatedFields[i].fieldName, std::move(val));
+        }
+    }
+
+    _stats.totalOutputDataSizeBytes += out.getApproximateSize();
+    return out.freeze();
+}
+
+}  // namespace mongo

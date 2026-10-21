@@ -1,0 +1,263 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/platform/waitable_atomic.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/tick_source.h"
+
+#include <cstdint>
+#include <string_view>
+
+#include <boost/optional.hpp>
+
+namespace mongo {
+
+class OperationContext;
+
+/**
+ * Stores state and statistics related to admission control for a given transactional context.
+ */
+class [[MONGO_MOD_OPEN]] AdmissionContext {
+public:
+    AdmissionContext(const AdmissionContext& other);
+    AdmissionContext& operator=(const AdmissionContext& other);
+    virtual ~AdmissionContext() = default;
+
+    /**
+     * Classifies the priority that an operation acquires a ticket when the system is under high
+     * load (operations are throttled waiting for a ticket). Only applicable when there are no
+     * available tickets.
+     *
+     *
+     * 'kNormal': It's important that the operation be throttled under load. If this operation is
+     * throttled, it will not affect system availability or observability. Most operations, both
+     * user and internal, should use this priority unless they qualify as 'kExempt'
+     * priority.
+     *
+     * 'kLow': It's of low importance that the operation acquires a ticket. These low-priority
+     * operations are reserved for background tasks that have no other operations dependent on them.
+     * These operations may be throttled under load and make significantly less progress as compared
+     * to operations of a higher priority.
+     *
+     * 'kExempt': It's crucial that the operation makes forward progress - bypasses the ticketing
+     * mechanism.
+     *
+     * Reserved for operations critical to availability (e.g. replication workers) or observability
+     * (e.g. FTDC), and any operation that is releasing resources (e.g. committing or aborting
+     * prepared transactions). Should be used sparingly.
+     */
+    enum class Priority {
+        kExempt = 0,
+        kNormal,
+        kLow,
+
+        /**
+         * Number of priorities.
+         * Always add new priorities above this entry.
+         */
+        kPrioritiesCount
+    };
+
+    /**
+     * Returns the total time this admission context has ever waited in a queue.
+     */
+    Microseconds totalTimeQueuedMicros() const;
+
+    /**
+     * Returns total admission queueing time accumulated in the per-operation aggregate counter for
+     * this OperationContext.
+     */
+    static Microseconds getTotalTimeQueuedForAdmission(const OperationContext* opCtx);
+
+    /** Returns the operation context associated with this admission context, if any. */
+    virtual OperationContext* getOperationContext() {
+        return nullptr;
+    }
+
+    /**
+     * Returns the time this admission context started waiting to be queued, if it is currently
+     * queued.
+     */
+    boost::optional<TickSource::Tick> startQueueingTime() const;
+
+    /**
+     * Returns the number of times this context has taken a ticket.
+     */
+    std::int32_t getAdmissions() const;
+
+    /**
+     * Returns the number of times this context has taken a low priority ticket.
+     */
+    std::int32_t getLowAdmissions() const;
+
+    /**
+     * Returns the number of times this context has taken an exempt ticket.
+     */
+    std::int32_t getExemptedAdmissions() const;
+
+    /**
+     * Returns true if the operation was load shed due to queue overflow.
+     */
+    bool getLoadShed() const;
+
+    /**
+     * Returns true if the operation is already holding a ticket.
+     */
+    bool isHoldingTicket() const {
+        return _holdingTicket.loadRelaxed();
+    }
+
+    Priority getPriority() const;
+
+    void recordAdmission();
+
+    void recordLowAdmission();
+
+    void recordExemptedAdmission();
+
+    void recordOperationLoadShed();
+
+    void markTicketHeld() {
+        tassert(
+            9150200,
+            "Operation may not hold more than one ticket at a time for the same admission context",
+            !_holdingTicket.loadRelaxed());
+        _holdingTicket.store(true);
+    }
+
+    void markTicketReleased() {
+        _holdingTicket.store(false);
+    }
+
+    /**
+     * Prevent the admission control mechanisms from load shedding the operation.
+     */
+    virtual bool isLoadShedExempt() const {
+        return false;
+    }
+
+    /**
+     * Setters for queue statistics to be used in unit tests only
+     */
+    [[MONGO_MOD_PUBLIC]] void setAdmission_forTest(int32_t admissions);
+
+    [[MONGO_MOD_PUBLIC]] void setTotalTimeQueuedMicros_forTest(int64_t micros);
+
+    // Block until this AdmissionContext is queued waiting on a ticket or the timeout expires.
+    // Returns true if we got queued, or false if the timeout expired.
+    [[MONGO_MOD_PUBLIC]] bool waitUntilQueued_forTest(Nanoseconds timeout);
+
+protected:
+    friend class ScopedAdmissionPriorityBase;
+    friend class WaitingForAdmissionGuard;
+
+    AdmissionContext() = default;
+
+    constexpr static TickSource::Tick kNotQueueing = -1;
+
+    [[MONGO_MOD_PRIVATE]] Atomic<std::int32_t> _exemptedAdmissions{0};
+    [[MONGO_MOD_PRIVATE]] Atomic<std::int32_t> _lowAdmissions{0};
+    [[MONGO_MOD_PRIVATE]] Atomic<std::int32_t> _admissions{0};
+    [[MONGO_MOD_PRIVATE]] Atomic<Priority> _priority{Priority::kNormal};
+    [[MONGO_MOD_PRIVATE]] Atomic<std::int64_t> _totalTimeQueuedMicros;
+    [[MONGO_MOD_PRIVATE]] WaitableAtomic<TickSource::Tick> _startQueueingTime{kNotQueueing};
+    [[MONGO_MOD_PRIVATE]] Atomic<bool> _holdingTicket;
+    [[MONGO_MOD_PRIVATE]] Atomic<bool> _loadShed;
+};
+
+/**
+ * Default-constructible admission context to use for testing purposes.
+ */
+class [[MONGO_MOD_PUBLIC]] MockAdmissionContext : public AdmissionContext {
+public:
+    MockAdmissionContext() = default;
+
+    void recordDelinquentAcquisition(Milliseconds delay) {
+        ++delinquentAcquisitions;
+        totalAcquisitionDelinquencyMillis += delay.count();
+        maxAcquisitionDelinquencyMillis = std::max(maxAcquisitionDelinquencyMillis, delay.count());
+    }
+
+    int64_t delinquentAcquisitions{0};
+    int64_t totalAcquisitionDelinquencyMillis{0};
+    int64_t maxAcquisitionDelinquencyMillis{0};
+};
+
+/**
+ * RAII-style class to set the priority for the ticket admission mechanism when acquiring a global
+ * lock.
+ */
+class [[MONGO_MOD_PUBLIC]] ScopedAdmissionPriorityBase {
+public:
+    explicit ScopedAdmissionPriorityBase(OperationContext* opCtx,
+                                         AdmissionContext& admCtx,
+                                         AdmissionContext::Priority priority);
+    ScopedAdmissionPriorityBase(const ScopedAdmissionPriorityBase&) = delete;
+    ScopedAdmissionPriorityBase& operator=(const ScopedAdmissionPriorityBase&) = delete;
+    ~ScopedAdmissionPriorityBase();
+
+private:
+    OperationContext* const _opCtx;
+    AdmissionContext* const _admCtx;
+    AdmissionContext::Priority _originalPriority;
+};
+
+template <typename AdmissionContextType>
+class [[MONGO_MOD_PUBLIC]] ScopedAdmissionPriority : public ScopedAdmissionPriorityBase {
+public:
+    explicit ScopedAdmissionPriority(OperationContext* opCtx, AdmissionContext::Priority priority)
+        : ScopedAdmissionPriorityBase(opCtx, AdmissionContextType::get(opCtx), priority) {}
+    ~ScopedAdmissionPriority() = default;
+};
+
+class [[MONGO_MOD_PUBLIC]] WaitingForAdmissionGuard {
+public:
+    explicit WaitingForAdmissionGuard(AdmissionContext* admCtx, TickSource* tickSource);
+    ~WaitingForAdmissionGuard();
+
+private:
+    AdmissionContext* _admCtx;
+    TickSource* _tickSource;
+};
+
+[[MONGO_MOD_PUBLIC]] std::string_view toString(AdmissionContext::Priority priority);
+
+[[MONGO_MOD_PUBLIC]] inline int compare(AdmissionContext::Priority lhs,
+                                        AdmissionContext::Priority rhs) {
+    using enum_t = std::underlying_type_t<AdmissionContext::Priority>;
+    return static_cast<enum_t>(lhs) - static_cast<enum_t>(rhs);
+}
+
+[[MONGO_MOD_PUBLIC]] inline bool operator==(AdmissionContext::Priority lhs,
+                                            AdmissionContext::Priority rhs) {
+    return compare(lhs, rhs) == 0;
+}
+
+[[MONGO_MOD_PUBLIC]] inline bool operator!=(AdmissionContext::Priority lhs,
+                                            AdmissionContext::Priority rhs) {
+    return compare(lhs, rhs) != 0;
+}
+
+[[MONGO_MOD_PUBLIC]] inline bool operator<(AdmissionContext::Priority lhs,
+                                           AdmissionContext::Priority rhs) {
+    return compare(lhs, rhs) < 0;
+}
+
+[[MONGO_MOD_PUBLIC]] inline bool operator>(AdmissionContext::Priority lhs,
+                                           AdmissionContext::Priority rhs) {
+    return compare(lhs, rhs) > 0;
+}
+
+[[MONGO_MOD_PUBLIC]] inline bool operator<=(AdmissionContext::Priority lhs,
+                                            AdmissionContext::Priority rhs) {
+    return compare(lhs, rhs) <= 0;
+}
+
+[[MONGO_MOD_PUBLIC]] inline bool operator>=(AdmissionContext::Priority lhs,
+                                            AdmissionContext::Priority rhs) {
+    return compare(lhs, rhs) >= 0;
+}
+
+}  // namespace mongo

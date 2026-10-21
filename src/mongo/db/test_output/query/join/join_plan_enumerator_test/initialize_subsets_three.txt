@@ -1,0 +1,450 @@
+LEFT DEEP, 3 Nodes
+HJ order pruning enabled: 0
+numHashJoins: 4
+numNestedLoopJoins: 0
+numIndexedNestedLoopJoins: 0
+numRejectedNodes: 14
+numNodes: 7
+Level 0:
+001, 010, 100
+Level 1:
+011, 101, 110
+Level 2:
+111
+
+Output plans (best plan 0):
+0.(130.805)[111] HJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+RIGHT DEEP, 3 Nodes
+HJ order pruning enabled: 0
+numHashJoins: 4
+numNestedLoopJoins: 0
+numIndexedNestedLoopJoins: 0
+numRejectedNodes: 11
+numNodes: 7
+Level 0:
+001, 010, 100
+Level 1:
+011, 101, 110
+Level 2:
+111
+
+Output plans (best plan 0):
+0.(130.805)[111] HJ
+ -> left:
+    (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+
+ZIG ZAG, 3 Nodes
+HJ order pruning enabled: 0
+numHashJoins: 4
+numNestedLoopJoins: 0
+numIndexedNestedLoopJoins: 0
+numRejectedNodes: 17
+numNodes: 7
+Level 0:
+001, 010, 100
+Level 1:
+011, 101, 110
+Level 2:
+111
+
+Output plans (best plan 0):
+0.(130.805)[111] HJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+All plans enumeration mode
+HJ order pruning enabled: 0
+numHashJoins: 30
+numNestedLoopJoins: 18
+numIndexedNestedLoopJoins: 0
+numRejectedNodes: 0
+numNodes: 51
+Level 0:
+001, 010, 100
+Level 1:
+011, 101, 110
+Level 2:
+111
+
+Output plans (best plan 0):
+0.(130.805)[111] HJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+1.(146.762)[111] HJ
+ -> left:
+    (18.3664)[011] NLJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+2.(130.805)[111] HJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+3.(147.575)[111] HJ
+ -> left:
+    (19.1796)[011] NLJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+4.(3697.2)[111] NLJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+5.(3713.16)[111] NLJ
+ -> left:
+    (18.3664)[011] NLJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+6.(3697.2)[111] NLJ
+ -> left:
+    (2.40907)[011] HJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+7.(3713.97)[111] NLJ
+ -> left:
+    (19.1796)[011] NLJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (2.30508)[100][test.nss2] COLLSCAN
+
+8.(130.805)[111] HJ
+ -> left:
+    (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (2.40907)[011] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+
+9.(146.762)[111] HJ
+ -> left:
+    (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (18.3664)[011] NLJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+
+10.(130.805)[111] HJ
+ -> left:
+    (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (2.40907)[011] HJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+
+11.(147.575)[111] HJ
+ -> left:
+    (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (19.1796)[011] NLJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+
+12.(132.029)[111] HJ
+ -> left:
+    (4.78255)[101] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+13.(163.839)[111] HJ
+ -> left:
+    (36.5932)[101] NLJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+14.(132.029)[111] HJ
+ -> left:
+    (4.78255)[101] HJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+15.(165.421)[111] HJ
+ -> left:
+    (38.1746)[101] NLJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+16.(3694.2)[111] NLJ
+ -> left:
+    (4.78255)[101] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+17.(3726.01)[111] NLJ
+ -> left:
+    (36.5932)[101] NLJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+18.(3694.2)[111] NLJ
+ -> left:
+    (4.78255)[101] HJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+19.(3727.59)[111] NLJ
+ -> left:
+    (38.1746)[101] NLJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (1.1556)[010][test.nss1] COLLSCAN
+
+20.(132.029)[111] HJ
+ -> left:
+    (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (4.78255)[101] HJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+
+21.(163.839)[111] HJ
+ -> left:
+    (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (36.5932)[101] NLJ
+     -> left:
+        (0.0111135)[001][test.nss0] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+
+22.(132.029)[111] HJ
+ -> left:
+    (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (4.78255)[101] HJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+
+23.(165.421)[111] HJ
+ -> left:
+    (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (38.1746)[101] NLJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (0.0111135)[001][test.nss0] COLLSCAN
+
+24.(1114.25)[111] HJ
+ -> left:
+    (129.551)[110] HJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+25.(4680.65)[111] HJ
+ -> left:
+    (3695.95)[110] NLJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+26.(1114.25)[111] HJ
+ -> left:
+    (129.551)[110] HJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+27.(4676.42)[111] HJ
+ -> left:
+    (3691.72)[110] NLJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+28.(3752.37)[111] NLJ
+ -> left:
+    (129.551)[110] HJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+29.(7318.77)[111] NLJ
+ -> left:
+    (3695.95)[110] NLJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+30.(3752.37)[111] NLJ
+ -> left:
+    (129.551)[110] HJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+31.(7314.54)[111] NLJ
+ -> left:
+    (3691.72)[110] NLJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+ -> right:
+    (0.0111135)[001][test.nss0] COLLSCAN
+
+32.(378.053)[111] HJ
+ -> left:
+    (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (129.551)[110] HJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+
+33.(3944.45)[111] HJ
+ -> left:
+    (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (3695.95)[110] NLJ
+     -> left:
+        (1.1556)[010][test.nss1] COLLSCAN
+     -> right:
+        (2.30508)[100][test.nss2] COLLSCAN
+
+34.(378.053)[111] HJ
+ -> left:
+    (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (129.551)[110] HJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+
+35.(3940.22)[111] HJ
+ -> left:
+    (0.0111135)[001][test.nss0] COLLSCAN
+ -> right:
+    (3691.72)[110] NLJ
+     -> left:
+        (2.30508)[100][test.nss2] COLLSCAN
+     -> right:
+        (1.1556)[010][test.nss1] COLLSCAN
+

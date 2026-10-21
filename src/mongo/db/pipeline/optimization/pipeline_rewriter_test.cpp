@@ -1,0 +1,511 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/feature_flag_test_gen.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_skip.h"
+#include "mongo/db/pipeline/optimization/rule_based_rewriter.h"
+#include "mongo/db/pipeline/pipeline_factory.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string_view>
+
+namespace mongo::rule_based_rewrites::pipeline {
+namespace {
+
+class PipelineRewriteEngineTest : public AggregationContextFixture {
+public:
+    PipelineRewriteEngineTest() {
+        registration_detail::clearRulesForTest(getServiceContext());
+    }
+};
+
+#define REGISTER_TEST_RULES(DS, ...) REGISTER_TEST_RULES_WITH_FEATURE_FLAG(DS, nullptr, __VA_ARGS__)
+
+#define REGISTER_TEST_RULES_WITH_FEATURE_FLAG(DS, featureFlag, ...)                 \
+    {                                                                               \
+        auto* serviceCtx = getExpCtx()->getOperationContext()->getServiceContext(); \
+        _REGISTER_RULES_HELPER(DS, serviceCtx, featureFlag, __VA_ARGS__)            \
+    }
+
+void runTest(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+             std::vector<std::string_view> input,
+             std::vector<std::string_view> expected) {
+    auto makePipeline = [&](std::vector<std::string_view> stages) {
+        std::vector<BSONObj> bsonStages;
+        for (auto&& stage : stages) {
+            bsonStages.push_back(fromjson(stage));
+        }
+        return pipeline_factory::makePipeline(
+            bsonStages, expCtx, pipeline_factory::kOptionsMinimal);
+    };
+
+    auto pipeline = makePipeline(input);
+    PipelineRewriteEngine engine({*pipeline},
+                                 static_cast<size_t>(internalQueryMaxPipelineRewrites.load()));
+
+    engine.applyRules();
+
+    Value actualPipeline{pipeline->serializeToBson()};
+    Value expectedPipeline{makePipeline(expected)->serializeToBson()};
+
+    ASSERT_BSONOBJ_EQ(BSON_ARRAY(actualPipeline), BSON_ARRAY(expectedPipeline));
+}
+
+bool shouldNeverRun(PipelineRewriteContext&) {
+    MONGO_UNREACHABLE;
+}
+
+bool alwaysFalse(PipelineRewriteContext&) {
+    return false;
+}
+
+TEST_F(PipelineRewriteEngineTest, RespectPrecondition) {
+    REGISTER_TEST_RULES(DocumentSourceLimit, {"CRASH_WHEN_RUN", alwaysFalse, shouldNeverRun, 1.0});
+
+    runTest(getExpCtx(), {"{$limit: 1}"}, {"{$limit: 1}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, RespectType) {
+    REGISTER_TEST_RULES(DocumentSourceLimit, {"CRASH_WHEN_RUN", alwaysTrue, shouldNeverRun, 1.0});
+
+    runTest(getExpCtx(), {"{$match: {a: 1}}"}, {"{$match: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, RespectPriority) {
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"CRASH_WHEN_RUN", alwaysTrue, shouldNeverRun, 1.0},
+                        {"REMOVE_MATCH", alwaysTrue, Transforms::eraseCurrent, 2.0});
+
+    runTest(getExpCtx(), {"{$match: {a: 1}}"}, {});
+}
+
+TEST_F(PipelineRewriteEngineTest, RespectMaxRewritesQueryKnob) {
+    unittest::ServerParameterGuard controller("internalQueryMaxPipelineRewrites", 2);
+
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"CRASH_WHEN_RUN", alwaysTrue, shouldNeverRun, 1.0},
+                        {"NOOP1", alwaysTrue, Transforms::noop, 2.0},
+                        {"NOOP2", alwaysTrue, Transforms::noop, 3.0});
+
+    runTest(getExpCtx(), {"{$match: {a: 1}}"}, {"{$match: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, ApplySingleRuleInPlace) {
+    static auto setLimitTo1 = [](PipelineRewriteContext& ctx) {
+        ctx.currentAs<DocumentSourceLimit>().setLimit(1);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceLimit, {"SET_LIMIT_TO_1", alwaysTrue, setLimitTo1, 1.0});
+
+    runTest(getExpCtx(), {"{$limit: 10}"}, {"{$limit: 1}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, EraseFirstStage) {
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"REMOVE_MATCH", alwaysTrue, Transforms::eraseCurrent, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$match: {a: 1}}",
+                "{$sort: {a: 1}}",
+            },
+            {"{$sort: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, EraseLastStage) {
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"REMOVE_SORT", alwaysTrue, Transforms::eraseCurrent, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$match: {a: 1}}",
+                "{$sort: {a: 1}}",
+            },
+            {"{$match: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, EraseNextStage) {
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"REMOVE_NEXT", alwaysTrue, Transforms::eraseNext, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$match: {a: 1}}",
+                "{$sort: {a: 1}}",
+            },
+            {"{$match: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, InsertStageBeforeCurrent) {
+    static auto prevIsNotMatch = [](PipelineRewriteContext& ctx) {
+        return ctx.atFirstStage() || !ctx.prevStage()->isInstanceOf<DocumentSourceMatch>();
+    };
+    static auto insertMatchBefore = [](PipelineRewriteContext& ctx) {
+        auto filter = ctx.currentAs<DocumentSourceSort>()
+                          .getSortPattern()
+                          .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
+                          .toBson();
+        auto matchStage = DocumentSourceMatch::create(filter, ctx.current().getExpCtx());
+        return Transforms::insertBefore(ctx, *matchStage);
+    };
+
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"INSERT_MATCH_BEFORE_SORT", prevIsNotMatch, insertMatchBefore, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$sort: {a: 1}}",
+                "{$sort: {b: 1}}",
+            },
+            {
+                "{$match: {a: 1}}",
+                "{$sort: {a: 1}}",
+                "{$match: {b: 1}}",
+                "{$sort: {b: 1}}",
+            });
+}
+
+TEST_F(PipelineRewriteEngineTest, PushStageToFront) {
+    static auto prevIsNotSort = [](PipelineRewriteContext& ctx) {
+        return !ctx.atFirstStage() && !ctx.prevStage()->isInstanceOf<DocumentSourceSort>();
+    };
+
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"SWAP_SORT_WITH_PREV", prevIsNotSort, Transforms::swapStageWithPrev, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$sort: {a: 1}}",
+                "{$addFields: {a: 1}}",
+                "{$sort: {b: 1}}",
+                "{$addFields: {b: 1}}",
+                "{$match: {a: 1}}",
+                "{$sort: {c: 1}}",
+            },
+            {
+                "{$sort: {a: 1}}",
+                "{$sort: {b: 1}}",
+                "{$sort: {c: 1}}",
+                "{$addFields: {a: 1}}",
+                "{$addFields: {b: 1}}",
+                "{$match: {a: 1}}",
+            });
+}
+
+TEST_F(PipelineRewriteEngineTest, PushStageToBack) {
+    static auto nextIsNotSort = [](PipelineRewriteContext& ctx) {
+        return !ctx.atLastStage() && !ctx.nextStage()->isInstanceOf<DocumentSourceSort>();
+    };
+
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"SWAP_SORT_WITH_NEXT", nextIsNotSort, Transforms::swapStageWithNext, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$sort: {a: 1}}",
+                "{$addFields: {a: 1}}",
+                "{$sort: {b: 1}}",
+                "{$addFields: {b: 1}}",
+                "{$match: {a: 1}}",
+                "{$sort: {c: 1}}",
+            },
+            {
+                "{$addFields: {a: 1}}",
+                "{$addFields: {b: 1}}",
+                "{$match: {a: 1}}",
+                "{$sort: {a: 1}}",
+                "{$sort: {b: 1}}",
+                "{$sort: {c: 1}}",
+            });
+}
+
+TEST_F(PipelineRewriteEngineTest, EnqueueAdditionalRulesFromPrecondition) {
+    static const std::vector<PipelineRewriteRule> kSwapWithNext{
+        {"SWAP_WITH_NEXT", alwaysTrue, Transforms::swapStageWithNext, 2.0}};
+
+    static auto swapIfFirstStage = [](PipelineRewriteContext& ctx) {
+        if (ctx.atFirstStage()) {
+            ctx.addRules(kSwapWithNext);
+            return true;
+        }
+        return false;
+    };
+
+    static auto insertLimit = [](PipelineRewriteContext& ctx) {
+        auto limitStage = DocumentSourceLimit::create(ctx.current().getExpCtx(), 10);
+        Transforms::insertAfter(ctx, *limitStage);
+        return false;
+    };
+
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"INSERT_LIMIT_THEN_SWAP", swapIfFirstStage, insertLimit, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$sort: {a: 1}}",
+            },
+            {
+                "{$limit: 10}",
+                "{$sort: {a: 1}}",
+            });
+}
+
+TEST_F(PipelineRewriteEngineTest, EnqueueAdditionalRulesFromTransform) {
+    static auto isFirstStage = [](PipelineRewriteContext& ctx) {
+        return ctx.atFirstStage();
+    };
+
+    static const std::vector<PipelineRewriteRule> kSwapWithNext{
+        {"SWAP_WITH_NEXT", alwaysTrue, Transforms::swapStageWithNext, 2.0}};
+
+    static auto insertLimitThenSwap = [](PipelineRewriteContext& ctx) {
+        ctx.addRules(kSwapWithNext);
+
+        auto limitStage = DocumentSourceLimit::create(ctx.current().getExpCtx(), 10);
+        Transforms::insertAfter(ctx, *limitStage);
+        return false;
+    };
+
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"INSERT_LIMIT_THEN_SWAP", isFirstStage, insertLimitThenSwap, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$sort: {a: 1}}",
+            },
+            {
+                "{$limit: 10}",
+                "{$sort: {a: 1}}",
+            });
+}
+
+TEST_F(PipelineRewriteEngineTest, ApplyMultipleRulesDifferentTypesDifferentPriorities) {
+    // Preconditions
+    static auto isLimit10 = [](PipelineRewriteContext& ctx) {
+        return ctx.currentAs<DocumentSourceLimit>().getLimit() == 10;
+    };
+    static auto nextIsLimit = [](PipelineRewriteContext& ctx) {
+        return !ctx.atFirstStage() && ctx.nextStage()->isInstanceOf<DocumentSourceLimit>();
+    };
+    static auto betweenMatchAndSort = [](PipelineRewriteContext& ctx) {
+        return !ctx.atFirstStage() && !ctx.atLastStage() &&
+            ctx.prevStage()->isInstanceOf<DocumentSourceMatch>() &&
+            ctx.nextStage()->isInstanceOf<DocumentSourceSort>();
+    };
+
+    // Transforms
+    static auto insertSkipAfter = [](PipelineRewriteContext& ctx) {
+        auto skipStage = DocumentSourceSkip::create(ctx.current().getExpCtx(), 5);
+        return Transforms::insertAfter(ctx, *skipStage);
+    };
+    static auto insertLimitAfter = [](PipelineRewriteContext& ctx) {
+        auto limitStage = DocumentSourceLimit::create(ctx.current().getExpCtx(), 10);
+        return Transforms::insertAfter(ctx, *limitStage);
+    };
+    static auto setLimitTo1 = [](PipelineRewriteContext& ctx) {
+        ctx.currentAs<DocumentSourceLimit>().setLimit(1);
+        return false;
+    };
+
+    REGISTER_TEST_RULES(
+        DocumentSourceMatch,
+        {"INSERT_SKIP_AFTER_MATCH_ON_A", betweenMatchAndSort, insertSkipAfter, 1.0});
+    REGISTER_TEST_RULES(DocumentSourceSkip,
+                        {"INSERT_LIMIT_AFTER_SKIP", betweenMatchAndSort, insertLimitAfter, 2.0},
+                        {"SWAP_WITH_LIMIT", nextIsLimit, Transforms::swapStageWithNext, 1.0});
+    REGISTER_TEST_RULES(DocumentSourceLimit,
+                        {"SET_LIMIT_FROM_10_TO_1", isLimit10, setLimitTo1, 2.0},
+                        {"CRASH_WHEN_RUN", isLimit10, shouldNeverRun, 1.0});
+
+    runTest(getExpCtx(),
+            {
+                "{$match: {b: 1}}",
+                "{$match: {a: 1}}",
+                "{$sort: {a: 1}}",
+            },
+            {
+                "{$match: {b: 1}}",
+                "{$match: {a: 1}}",
+                "{$limit: 1}",
+                "{$skip: 5}",
+                "{$sort: {a: 1}}",
+            });
+}
+
+TEST_F(PipelineRewriteEngineTest, RunFeatureFlagGatedRuleWhenFlagEnabled) {
+    REGISTER_TEST_RULES_WITH_FEATURE_FLAG(
+        DocumentSourceMatch,
+        &feature_flags::gFeatureFlagBlender,
+        {"REMOVE_MATCH", alwaysTrue, Transforms::eraseCurrent, 1.0});
+
+    unittest::ServerParameterGuard controller("featureFlagBlender", true);
+    runTest(getExpCtx(), {"{$match: {a: 1}}"}, {});
+}
+
+TEST_F(PipelineRewriteEngineTest, DontRunFeatureFlagGatedRuleWhenFlagDisabled) {
+    REGISTER_TEST_RULES_WITH_FEATURE_FLAG(DocumentSourceMatch,
+                                          &feature_flags::gFeatureFlagBlender,
+                                          {"NEVER_RUN", alwaysTrue, shouldNeverRun, 1.0});
+
+    unittest::ServerParameterGuard controller("featureFlagBlender", false);
+    runTest(getExpCtx(), {"{$match: {a: 1}}"}, {"{$match: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, GetNthNextStageGetsFirstNextStage) {
+    static auto firstNextIsLimit = [](PipelineRewriteContext& ctx) {
+        return ctx.hasAtLeastNNextStages(1) &&
+            ctx.nthNextStage(1)->getSourceName() == DocumentSourceLimit::kStageName;
+    };
+    REGISTER_TEST_RULES(
+        DocumentSourceMatch,
+        {"REMOVE_MATCH_BEFORE_LIMIT", firstNextIsLimit, Transforms::eraseCurrent, 1.0});
+    runTest(getExpCtx(), {"{$match: {a: 1}}", "{$limit: 5}"}, {"{$limit: 5}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, GetNthNextStageGetsSecondNextStage) {
+    static auto secondNextIsLimit = [](PipelineRewriteContext& ctx) {
+        return ctx.hasAtLeastNNextStages(2) &&
+            ctx.nthNextStage(2)->getSourceName() == DocumentSourceLimit::kStageName;
+    };
+    REGISTER_TEST_RULES(
+        DocumentSourceMatch,
+        {"REMOVE_MATCH_BEFORE_SKIP_LIMIT", secondNextIsLimit, Transforms::eraseCurrent, 1.0});
+    runTest(getExpCtx(),
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}"},
+            {"{$skip: 5}", "{$limit: 10}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, HasAtLeastNNextStagesReturnsTrueWithinBounds) {
+    // Pipeline: [$match, $skip, $limit] — 2 next stages after $match.
+    // hasAtLeastNNextStages(2) must be true; rule erases $match only if so.
+    static auto hasTwoNext = [](PipelineRewriteContext& ctx) {
+        return ctx.hasAtLeastNNextStages(2);
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"ERASE_IF_TWO_NEXT", hasTwoNext, Transforms::eraseCurrent, 1.0});
+    runTest(getExpCtx(),
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}"},
+            {"{$skip: 5}", "{$limit: 10}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, HasAtLeastNNextStagesReturnsFalseAtBoundary) {
+    // Pipeline: [$match, $skip, $limit] — only 2 next stages after $match.
+    // hasAtLeastNNextStages(3) must be false; $match should NOT be erased.
+    // This also catches the off-by-one bug (<= N vs > N).
+    static auto hasThreeNext = [](PipelineRewriteContext& ctx) {
+        return ctx.hasAtLeastNNextStages(3);
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"ERASE_IF_THREE_NEXT", hasThreeNext, Transforms::eraseCurrent, 1.0});
+    runTest(getExpCtx(),
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}"},
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, HasAtLeastNNextStagesReturnsTrueForZeroAtLastStage) {
+    // hasAtLeastNNextStages(0) is trivially satisfied — there are always >= 0 next stages.
+    // Even at the last stage, it must return true.
+    static auto hasZeroNext = [](PipelineRewriteContext& ctx) {
+        return ctx.hasAtLeastNNextStages(0);
+    };
+    REGISTER_TEST_RULES(DocumentSourceLimit,
+                        {"ERASE_IF_ZERO_NEXT", hasZeroNext, Transforms::eraseCurrent, 1.0});
+    runTest(getExpCtx(), {"{$limit: 5}"}, {});
+}
+
+TEST_F(PipelineRewriteEngineTest, HasAtLeastNNextStagesReturnsFalseAtLastStage) {
+    static auto hasOneNext = [](PipelineRewriteContext& ctx) {
+        return ctx.hasAtLeastNNextStages(1);
+    };
+    REGISTER_TEST_RULES(DocumentSourceLimit,
+                        {"ERASE_IF_HAS_NEXT", hasOneNext, Transforms::eraseCurrent, 1.0});
+    // $limit is the last stage — hasAtLeastNNextStages(1) must be false; not erased.
+    runTest(getExpCtx(), {"{$match: {a: 1}}", "{$limit: 5}"}, {"{$match: {a: 1}}", "{$limit: 5}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, GetNthNextStageZeroReturnsCurrent) {
+    // nthNextStage(0) advances by 0, so it returns the current stage itself.
+    static auto inspectZero = [](PipelineRewriteContext& ctx) {
+        ASSERT_EQ(ctx.nthNextStage(0)->getSourceName(), DocumentSourceMatch::kStageName);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch, {"INSPECT_ZERO", alwaysTrue, inspectZero, 1.0});
+    runTest(getExpCtx(), {"{$match: {a: 1}}", "{$limit: 5}"}, {"{$match: {a: 1}}", "{$limit: 5}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, EraseStageAtZero) {
+    static auto eraseCurrent = [](PipelineRewriteContext& ctx) {
+        Transforms::eraseNthNext(ctx, 0);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"ERASE_STAGE_AT_ZERO", alwaysTrue, eraseCurrent, 1.0});
+    runTest(getExpCtx(),
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}"},
+            {"{$skip: 5}", "{$limit: 10}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, EraseSecondNextStage) {
+    static auto eraseSecondNext = [](PipelineRewriteContext& ctx) {
+        Transforms::eraseNthNext(ctx, 2);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"ERASE_SECOND_NEXT", alwaysTrue, eraseSecondNext, 1.0});
+    runTest(getExpCtx(),
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}", "{$sort: {a: 1}}"},
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$sort: {a: 1}}"});
+}
+
+TEST_F(PipelineRewriteEngineTest, EraseNthNextStageIteratorRemainsValid) {
+    // After erasing the 1st next stage, getNthNextStage(1) should return what was the 2nd.
+    static auto eraseAndInspect = [](PipelineRewriteContext& ctx) {
+        Transforms::eraseNthNext(ctx, 1);  // removes $skip
+        ASSERT_EQ(ctx.nthNextStage(1)->getSourceName(), DocumentSourceLimit::kStageName);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"ERASE_AND_INSPECT", alwaysTrue, eraseAndInspect, 1.0});
+    runTest(getExpCtx(),
+            {"{$match: {a: 1}}", "{$skip: 5}", "{$limit: 10}"},
+            {"{$match: {a: 1}}", "{$limit: 10}"});
+}
+
+using PipelineRewriteEngineTestDeathTest = PipelineRewriteEngineTest;
+DEATH_TEST_F(PipelineRewriteEngineTestDeathTest, FailsOnDuplicateRuleNames, "11010016") {
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"DUPLICATE_RULE_NAME", alwaysTrue, Transforms::noop, 1.0});
+    REGISTER_TEST_RULES(DocumentSourceSort,
+                        {"DUPLICATE_RULE_NAME", alwaysTrue, Transforms::noop, 1.0});
+}
+
+DEATH_TEST_F(PipelineRewriteEngineTestDeathTest,
+             GetNthNextStageOutOfBoundsExceedsAvailable,
+             "Expected to have") {
+    static auto getSecondNextOob = [](PipelineRewriteContext& ctx) {
+        [[maybe_unused]] auto s = ctx.nthNextStage(2);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch,
+                        {"GET_SECOND_NEXT_OOB", alwaysTrue, getSecondNextOob, 1.0});
+    runTest(getExpCtx(), {"{$match: {a: 1}}", "{$limit: 5}"}, {});
+}
+
+DEATH_TEST_F(PipelineRewriteEngineTestDeathTest, EraseNthNextStageOutOfBounds, "Expected to have") {
+    static auto eraseOob = [](PipelineRewriteContext& ctx) {
+        Transforms::eraseNthNext(ctx, 2);
+        return false;
+    };
+    REGISTER_TEST_RULES(DocumentSourceMatch, {"ERASE_OOB", alwaysTrue, eraseOob, 1.0});
+    runTest(getExpCtx(), {"{$match: {a: 1}}", "{$limit: 5}"}, {});
+}
+
+}  // namespace
+}  // namespace mongo::rule_based_rewrites::pipeline

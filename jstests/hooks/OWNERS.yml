@@ -1,0 +1,56 @@
+version: 1.0.0
+filters:
+  - "run_analyze_shard_key_background.js":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "run_fcv_upgrade_downgrade_background.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "run_fuzzer_restore_settings.js":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "run_initial_sync_node_validation.js":
+    approvers:
+      - 10gen/server-initial-sync
+  - "run_inject_hello_failures.js":
+    approvers:
+      - 10gen/server-hello
+  - "run_reconfig_background.js":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "lag_secondary_application.js":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "run_check_repl_oplogs.js":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "run_cleanup_hello_failures.js":
+    approvers:
+      - 10gen/server-hello
+  - "run_check_repl_dbhash*.js":
+    approvers:
+      - 10gen/server-dbhash
+  - "run_check_shard_filtering_metadata.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "run_validate_find_and_modify_image_collection_not_exist.js":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "*validate_collections*.js":
+    approvers:
+      - 10gen/server-validate
+  - "*check_metadata_consistency*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "run_check_list_catalog_operations_consistency.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "run_check_multikey_consistency.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "run_check_routing_table_consistency.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "run_check_orphans_are_deleted.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog

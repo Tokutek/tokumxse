@@ -1,0 +1,38 @@
+load("//bazel:mongo_js_rules.bzl", "all_subpackage_javascript_files", "mongo_js_library")
+load("//bazel/resmoke:resmoke.bzl", "resmoke_suite_test")
+load("//jstests/suites/query-execution:common.bzl", "CONCURRENCY_DATA")
+
+package(default_visibility = ["//visibility:public"])
+
+mongo_js_library(
+    name = "all_javascript_files",
+    srcs = glob([
+        "*.js",
+    ]),
+)
+
+all_subpackage_javascript_files()
+
+resmoke_suite_test(
+    name = "concurrency_simultaneous",
+    size = "large",
+    config = "//buildscripts/resmokeconfig:suites/concurrency_simultaneous.yml",
+    data = CONCURRENCY_DATA,
+    shard_count = 3,
+    tags = [
+        "ci-all-variants",
+        "common",
+        "concurrency",
+        "random_name",
+    ],
+    target_compatible_with = select({
+        "@platforms//cpu:ppc64le": ["@platforms//:incompatible"],
+        "@platforms//cpu:s390x": ["@platforms//:incompatible"],
+        "@platforms//os:macos": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//src/mongo/db:mongod",
+        "//src/mongo/shell:mongo",
+    ],
+)

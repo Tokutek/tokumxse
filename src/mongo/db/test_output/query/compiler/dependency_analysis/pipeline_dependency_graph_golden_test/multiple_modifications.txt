@@ -1,0 +1,115 @@
+VARIATION MultipleModifications
+input: {
+    "pipeline": [
+        {
+            "$set": {
+                "a": {
+                    "$const": "foo"
+                },
+                "b": {
+                    "$const": "bar"
+                }
+            }
+        },
+        {
+            "$set": {
+                "a": {
+                    "$const": "foo2"
+                }
+            }
+        },
+        {
+            "$set": {
+                "b": {
+                    "$const": "bar2"
+                }
+            }
+        },
+        {
+            "$match": {
+                "a": "foo",
+                "b": "bar"
+            }
+        }
+    ]
+}
+output: {
+    "$set:0": {
+        "scope:0": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:0": {
+                    "declaringScope": "scope:0",
+                    "dependencies": []
+                },
+                "a:1": {
+                    "declaringScope": "scope:0",
+                    "metadata": {
+                        "array": false,
+                        "constant": "foo"
+                    },
+                    "dependencies": []
+                },
+                "b:2": {
+                    "declaringScope": "scope:0",
+                    "metadata": {
+                        "array": false,
+                        "constant": "bar"
+                    },
+                    "dependencies": []
+                }
+            }
+        },
+        "dependencies": []
+    },
+    "$set:1": {
+        "scope:1": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:3": {
+                    "declaringScope": "scope:1",
+                    "dependencies": []
+                },
+                "a:4": {
+                    "declaringScope": "scope:1",
+                    "metadata": {
+                        "array": false,
+                        "constant": "foo2"
+                    },
+                    "dependencies": []
+                },
+                "b:2": "b:2"
+            }
+        },
+        "dependencies": []
+    },
+    "$set:2": {
+        "scope:2": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:5": {
+                    "declaringScope": "scope:2",
+                    "dependencies": []
+                },
+                "a:4": "a:4",
+                "b:6": {
+                    "declaringScope": "scope:2",
+                    "metadata": {
+                        "array": false,
+                        "constant": "bar2"
+                    },
+                    "dependencies": []
+                }
+            }
+        },
+        "dependencies": []
+    },
+    "$match:3": {
+        "scope:2": "scope:2",
+        "dependencies": [
+            "a:4",
+            "b:6"
+        ]
+    }
+}
+

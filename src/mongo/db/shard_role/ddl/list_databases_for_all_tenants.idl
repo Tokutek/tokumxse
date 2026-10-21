@@ -1,0 +1,80 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ListDatabasesForAllTenantsReplyItem:
+        description: "Individual result"
+        fields:
+            name:
+                type: string
+                unstable: false
+            tenantId:
+                type: tenant_id
+                optional: true
+                unstable: false
+            sizeOnDisk:
+                type: long
+                optional: true
+                unstable: false
+            empty:
+                type: bool
+                optional: true
+                unstable: false
+            shards:
+                type: object_owned
+                optional: true
+                unstable: false
+
+    ListDatabasesForAllTenantsReply:
+        description: "The listDatabasesForAllTenants command's reply."
+        fields:
+            databases:
+                type: array<ListDatabasesForAllTenantsReplyItem>
+                unstable: false
+            totalSize:
+                type: long
+                optional: true
+                unstable: false
+            totalSizeMb:
+                type: long
+                optional: true
+                unstable: false
+
+commands:
+    listDatabasesForAllTenants:
+        description:
+            "listDatabasesForAllTenants Command: lists all databases for all tenants and
+            can only be run if authenticated with internal __system role"
+        command_name: "listDatabasesForAllTenants"
+        cpp_name: ListDatabasesForAllTenantsCommand
+        namespace: ignored
+        api_version: ""
+        access_check:
+            complex:
+                - privilege:
+                      resource_pattern: cluster
+                      action_type: internal
+        strict: false
+        fields:
+            nameOnly:
+                description: "Return just the database name without metadata"
+                type: safeBool
+                default: false
+                unstable: false
+            filter:
+                description: "Filter description to limit results"
+                type: object
+                optional: true
+                unstable: false
+        reply_type: ListDatabasesForAllTenantsReply
+        # TODO (SERVER-115805): Remove this module visibility override once this command’s API and
+        # implementation are part of the same module.
+        mod_visibility: unfortunately_open

@@ -1,0 +1,412 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/convert_utils.h"
+
+#include "mongo/bson/bson_depth.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/util/overloaded_visitor.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <stack>
+#include <string_view>
+
+#include <nlohmann/json.hpp>
+
+namespace mongo::exec::expression::convert_utils {
+
+namespace {
+using namespace std::literals::string_view_literals;
+using json = nlohmann::json;
+
+class BsonSaxConsumer : public json::json_sax_t {
+public:
+    BsonSaxConsumer(int maxSize) : _maxSize(maxSize) {}
+
+    bool null() override {
+        append(Value(BSONNULL));
+        return true;
+    }
+
+    bool boolean(bool val) override {
+        append(val);
+        return true;
+    }
+
+    bool number_integer(number_integer_t val) override {
+        if (std::numeric_limits<int>::min() <= val && val <= std::numeric_limits<int>::max()) {
+            append(static_cast<int>(val));
+        } else {
+            append(static_cast<long long>(val));
+        }
+        return true;
+    }
+
+    bool number_unsigned(number_unsigned_t val) override {
+        // BSON doesn't have unsigned integer type. Explicitly convert to double if val is too
+        // large.
+        if (val <= static_cast<number_unsigned_t>(std::numeric_limits<number_integer_t>::max())) {
+            return number_integer(val);
+        } else {
+            return number_float(val, "");
+        }
+    }
+
+    bool number_float(number_float_t val, const string_t&) override {
+        append(val);
+        return true;
+    }
+
+    bool string(string_t& val) override {
+        append(std::move(val));
+        return true;
+    }
+
+    bool start_object(std::size_t) override {
+        _builders.emplace(std::make_unique<MutableDocument>());
+        uassertDepthLimit();
+        return true;
+    }
+
+    bool end_object() override {
+        endArrayOrObj([](ObjBuilder& builder) { return builder->freezeToValue(); });
+        return true;
+    }
+
+    bool start_array(std::size_t) override {
+        _builders.push(ArrBuilder{});
+        uassertDepthLimit();
+        return true;
+    }
+
+    bool end_array() override {
+        endArrayOrObj([](ArrBuilder& builder) { return Value(std::move(builder)); });
+        return true;
+    }
+
+    bool key(string_t& val) override {
+        // BSONBuilder performs a similar check, but we need to throw 'CoversionFailure' to make
+        // sure the "onError" $convert argument gets invoked.
+        uassertInvalidJson("Illegal embedded null byte", val.find('\0') == std::string::npos);
+        _keys.push(std::move(val));
+        return true;
+    }
+
+    bool binary(json::binary_t&) override {
+        MONGO_UNREACHABLE_TASSERT(10508702);
+    }
+
+    bool parse_error(std::size_t position,
+                     const std::string& last_token,
+                     const json::exception& ex) override {
+        uassertInvalidJson(""sv, false);
+        return false;
+    }
+
+    Value releaseResult() {
+        tassert(10508701, "Not done yet", _done);
+        uassertSizeLimit();
+        return std::move(_result);
+    }
+
+private:
+    // MutableDocument can't be copy or move constructed which prevents it from being able to be
+    // placed inside a variant directly. Wrap it in a unique_ptr as a workaround.
+    using ObjBuilder = std::unique_ptr<MutableDocument>;
+    using ArrBuilder = std::vector<Value>;
+    using Builder = std::variant<ObjBuilder, ArrBuilder>;
+
+    template <typename... Fs>
+    auto visitCurrentBuilder(Fs&&... fs) {
+        return visit(OverloadedVisitor{std::forward<Fs>(fs)...}, _builders.top());
+    }
+
+    template <typename Val>
+    void append(Val val) {
+        uassertInvalidJson("Unexpected standalone value", !_builders.empty());
+
+        Value docValue{std::move(val)};
+        visitCurrentBuilder(
+            [&](ObjBuilder& builder) {
+                tassert(10508707, "Missing key", !_keys.empty());
+                builder->setField(std::move(_keys.top()), std::move(docValue));
+                _keys.pop();
+            },
+            [&](ArrBuilder& builder) { builder.push_back(std::move(docValue)); });
+    }
+
+    template <typename F>
+    void endArrayOrObj(F&& releaseResult) {
+        Value result =
+            visitCurrentBuilder(std::forward<F>(releaseResult), [](auto& builder) -> Value {
+                tasserted(10508705, "Unexpected type");
+            });
+
+        _builders.pop();
+
+        if (_builders.empty()) {
+            tassert(10508704, "Expected keys to be empty", _keys.empty());
+            // If this is the last builder left, we're at the root.
+            _result = Value(std::move(result));
+            _done = true;
+        } else {
+            // Otherwise, append to parent.
+            append(std::move(result));
+        }
+    }
+
+    void uassertDepthLimit() const {
+        static auto depthLimit = BSONDepth::getMaxAllowableDepth();
+        uassertInvalidJson(str::stream() << "Result exceeds maximum depth limit of " << depthLimit
+                                         << " levels of nesting",
+                           _builders.size() <= depthLimit);
+    }
+
+    void uassertSizeLimit() const {
+        if (_result.getApproximateSize() < static_cast<size_t>(_maxSize)) {
+            return;
+        }
+
+        try {
+            // Unfortunately there is no way to accurately check the size of the serialized value
+            // without serializing it.
+            //
+            // We wouldn't have to this separately if we used the BSONBuilders instead of
+            // MutableDocument/Value, but the desired behavior for duplicate keys (keep last value)
+            // is not possible to implement efficiently with BSONBuilders. The JS/$function
+            // equivalent also ends up doing an extra (de)serialization step between JS and
+            // BSON objects, so this extra work shouldn't be catastrophically bad in comparison.
+            Document::validateDocumentBSONSize(BSON_ARRAY(_result), _maxSize);
+        } catch (ExceptionFor<ErrorCodes::BSONObjectTooLarge>& ex) {
+            uassertInvalidJson(ex.reason(), false);
+        }
+    }
+
+    void uassertInvalidJson(std::string_view reason, bool cond) const {
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Input doesn't represent valid JSON"
+                              << (reason.empty() ? "" : ": ") << reason,
+                cond);
+    }
+
+    const int _maxSize;
+
+    Value _result;
+    bool _done{false};
+    std::stack<std::string> _keys;
+    std::stack<Builder> _builders;
+};
+}  // namespace
+
+Value parseJson(std::string_view data, boost::optional<BSONType> expectedType) {
+    // The sax consumer handles errors by uasserting. It should never return false.
+    BsonSaxConsumer sax{BSONObjMaxUserSize};
+    tassert(10508706, "Unexpected parsing error", json::sax_parse(data, &sax));
+
+    Value result = sax.releaseResult();
+    if (expectedType) {
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Input doesn't match expected type '" << typeName(*expectedType)
+                              << "'",
+                result.getType() == *expectedType);
+    }
+
+    return result;
+}
+
+boost::optional<BinDataVectorView> parseBinDataVector(const BSONBinData& binData) {
+    if (binData.length == 0) {
+        return boost::none;
+    }
+
+    uassert(12325706, "binData must have vector subtype", binData.type == BinDataType::Vector);
+
+    // If the binData isn't empty, it must contain a dType and a padding byte.
+    uassert(10506601, "binData length invalid", binData.length >= 2);
+    const std::byte* dataPointer = static_cast<const std::byte*>(binData.data);
+
+    // First byte is the type.
+    auto dTypeCur = [&]() {
+        if (dataPointer[0] == kPackedBitDataTypeByte)
+            return dType::PACKED_BIT;
+        if (dataPointer[0] == kInt8DataTypeByte)
+            return dType::INT8;
+        if (dataPointer[0] == kFloat32DataTypeByte)
+            return dType::FLOAT32;
+        uasserted(10506600,
+                  "Invalid dType for provided BinData vector. Valid options are 0x10 for "
+                  "PACKED_BIT, 0x03 for INT8, or 0x27 for FLOAT32.");
+    }();
+
+    // Second byte is the padding.
+    uint8_t paddingByte;
+    std::memcpy(&paddingByte, &(dataPointer[1]), sizeof(paddingByte));
+    int padding = static_cast<int>(paddingByte);
+    uassert(10506606,
+            "Padding must be between 0 and 7 for PACKED_BIT vectors, or 0 otherwise",
+            padding == 0 || (dTypeCur == dType::PACKED_BIT && padding <= 7));
+
+    int dataLength = binData.length - 2;
+    if (dataLength == 0) {
+        return BinDataVectorView{dTypeCur, padding, dataPointer + 2, 0, 0};
+    }
+
+    size_t elementCount;
+    switch (dTypeCur) {
+        case dType::FLOAT32:
+            uassert(10506602,
+                    "BinData vector of type FLOAT32 has a length that is not a multiple of 4",
+                    dataLength % sizeof(float) == 0);
+            elementCount = dataLength / sizeof(float);
+            break;
+        case dType::INT8:
+            elementCount = dataLength;
+            break;
+        case dType::PACKED_BIT:
+            elementCount = dataLength * 8 - padding;
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    return BinDataVectorView{dTypeCur, padding, dataPointer + 2, dataLength, elementCount};
+}
+
+std::vector<Value> convertBinDataVectorToArray(const Value& val, bool isLittleEndian) {
+    auto binData = val.getBinData();
+    tassert(11300101, "Expected binData with vector subtype", binData.type == BinDataType::Vector);
+
+    auto view = parseBinDataVector(binData);
+    if (!view) {
+        // If bindata is empty, we return an empty array.
+        return {};
+    }
+
+    // The rest of the binData vector is the elements.
+    std::vector<Value> results;
+    results.reserve(view->elementCount);
+
+    const std::byte* dataPointer = view->data;
+
+    for (int i = 0; i < view->dataLength;) {
+        // Padding only applies if this is the last byte and we're in PACKED_BIT.
+        int thisPadding = 0;
+        if (view->dtype == dType::PACKED_BIT && i == view->dataLength - 1) {
+            thisPadding = view->padding;  // Number of least-significant bits that should be
+                                          // discarded at the end of the byte.
+        }
+
+        switch (view->dtype) {
+            case dType::PACKED_BIT: {
+                std::byte thisByte = dataPointer[i];
+                std::byte comparisonByte{0b10000000};
+                // Remove the extra bits.
+                thisByte = thisByte >> thisPadding;
+                comparisonByte = comparisonByte >> thisPadding;
+                for (int numDone = 0; numDone < 8 - thisPadding; ++numDone) {
+                    results.push_back(Value((thisByte & comparisonByte) != std::byte{0}));
+                    // Move the comparison byte to check the next bit. The values left of the
+                    // comparison will be zero-d out.
+                    comparisonByte = comparisonByte >> 1;
+                }
+                ++i;
+                break;
+            }
+            case dType::INT8: {
+                std::int8_t convertedVal;
+                std::memcpy(&convertedVal, &(dataPointer[i]), sizeof(convertedVal));
+                results.push_back(Value(static_cast<int>(convertedVal)));
+                i += sizeof(convertedVal);
+                break;
+            }
+            case dType::FLOAT32: {
+                ConstDataView dataView(reinterpret_cast<const char*>(&dataPointer[i]));
+                float convertedVal = isLittleEndian ? dataView.read<LittleEndian<float>>()
+                                                    : dataView.read<BigEndian<float>>();
+                results.push_back(Value(static_cast<double>(convertedVal)));
+                i += sizeof(convertedVal);
+                break;
+            }
+        }
+    }
+    return results;
+}
+
+bool isValidUserDefinedBinDataType(int typeCode) {
+    static const auto smallestUserDefinedType = BinDataType::bdtCustom;
+    static const auto largestUserDefinedType = static_cast<BinDataType>(255);
+    return (smallestUserDefinedType <= typeCode) && (typeCode <= largestUserDefinedType);
+}
+
+void uassertValidUserConstructedBinData(const BSONBinData& binData, bool allowColumn) {
+    // User-defined subtypes are opaque and always allowed.
+    if (isValidUserDefinedBinDataType(binData.type)) {
+        return;
+    }
+
+    switch (binData.type) {
+        // These subtypes have no structure to validate.
+        case BinDataType::BinDataGeneral:
+        case BinDataType::Function:
+        case BinDataType::Sensitive:
+        // Encrypt payloads are validated by their FLE consumers.
+        case BinDataType::Encrypt:
+            break;
+        case BinDataType::bdtUUID:
+        case BinDataType::newUUID:
+        case BinDataType::MD5Type:
+            uassert(13016802,
+                    str::stream() << "BinData subtype " << static_cast<int>(binData.type)
+                                  << " requires exactly " << UUID::kNumBytes << " bytes",
+                    binData.length == UUID::kNumBytes);
+            break;
+        case BinDataType::ByteArrayDeprecated:
+            uassert(12978505,
+                    "BinData subtype ByteArrayDeprecated (2) requires a valid inner length prefix",
+                    binData.length >= 4 &&
+                        ConstDataView(static_cast<const char*>(binData.data))
+                                .read<LittleEndian<int32_t>>() == binData.length - 4);
+            break;
+        case BinDataType::Vector:
+            // 'parseBinDataVector()' uasserts that the header is well formed.
+            parseBinDataVector(binData);
+            break;
+        case BinDataType::Column:
+            uassert(12978506, "BinData subtype Column (7) is not allowed", allowColumn);
+            break;
+        default:
+            // Any unassigned or future subtype is rejected.
+            uasserted(12978507,
+                      str::stream() << "BinData subtype " << static_cast<int>(binData.type)
+                                    << " is not allowed");
+    }
+}
+
+void uassertValidUserConstructedBinData(const BSONElement& elem, bool allowColumn) {
+    switch (elem.type()) {
+        case BSONType::binData: {
+            int len = 0;
+            const char* data = elem.binData(len);
+            uassertValidUserConstructedBinData(BSONBinData(data, len, elem.binDataType()),
+                                               allowColumn);
+            break;
+        }
+        case BSONType::object:
+        case BSONType::array:
+            for (const auto& child : elem.embeddedObject()) {
+                uassertValidUserConstructedBinData(child, allowColumn);
+            }
+            break;
+        case BSONType::codeWScope:
+            for (const auto& child : elem.codeWScopeObject()) {
+                uassertValidUserConstructedBinData(child, allowColumn);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+}  // namespace mongo::exec::expression::convert_utils

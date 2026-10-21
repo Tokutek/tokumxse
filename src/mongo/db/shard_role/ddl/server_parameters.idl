@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: mongo
+
+server_parameters:
+    skipDroppingHashedShardKeyIndex:
+        description: >-
+            Skips dropping hashed shard key supporting indexes when calling dropIndexes with the '*' parameter. Used for testing purposes.
+        set_at: [startup, runtime]
+        cpp_vartype: bool
+        cpp_varname: skipDroppingHashedShardKeyIndex
+        default: false
+        redact: false
+        test_only: true

@@ -1,0 +1,45 @@
+test_kind: js_test
+
+selector:
+  roots:
+    - jstests/query_golden/join_opt/plan_stability*.js
+executor:
+  config:
+    shell_options:
+      crashOnInvalidBSONError: ""
+      eval: |
+        // Keep in sync with query_golden_*.yml.
+        await import("jstests/libs/override_methods/detect_spawning_own_mongod.js");
+        await import("jstests/libs/override_methods/query/golden_overrides.js");
+        import {beginGoldenTest} from "jstests/libs/query_optimization/begin_golden_test.js";
+        beginGoldenTest("jstests/query_golden/expected_output");
+        // Enforce plain log format until json format is the default.
+        TestData.logFormat = "plain";
+  hooks:
+    - class: FsyncUnlockAfterTest
+  fixture:
+    class: MongoDFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        internalEnableJoinOptimization: true
+        # Path arrayness is required for join optimization.
+        featureFlagPathArrayness: true
+        # Deterministic sampling is required in order to get
+        # deterministic query plans in plan stability tests
+        internalQuerySamplingByStrides: true
+        # Concurrent index builds can also cause non-determinism
+        # in the in-memory or on-disk representations.
+        maxNumActiveUserIndexBuilds: 1
+        # Join optimization needs samplingCE for cardinality estimation
+        featureFlagCostBasedRanker: true
+      # Costs are sensitive to the size of the WT cache size,
+      # which is computed dynamically. Set it to a fixed value to
+      # ensure determinism.
+      wiredTigerCacheSizeGB: 1
+      # Prevent extending the WT files dynamically, as this may introduce
+      # non-determinism in their sizes
+      wiredTigerEngineConfigString: "file_extend=(data=0,log=0)"
+      # Disable compression, as for some reason it also causes non-determinism on certain platforms
+      wiredTigerCollectionBlockCompressor: none
+      wiredTigerJournalCompressor: none

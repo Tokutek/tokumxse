@@ -1,0 +1,352 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo
+    cpp_includes:
+        - "mongo/db/sharding_environment/sharding_runtime_d_params.h"
+    mod_visibility: needs_replacement
+
+server_parameters:
+    chunkMigrationConcurrency:
+        description: >-
+            The number of threads doing insertions on the recipient during a chunk migration and
+            also the number of _migrateClone requests that the recipient sends to the source in parallel.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: chunkMigrationConcurrency
+        default: 1
+        redact: false
+
+    chunkMigrationFetcherMaxBufferedSizeBytesPerThread:
+        description: >-
+            Maximum size of buffered documents that the chunk migration cloner will keep per
+            thread. A value of 0 means there will be no limit. The minimum size is the maximum
+            BSON size limit.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: chunkMigrationFetcherMaxBufferedSizeBytesPerThread
+        validator:
+            callback: validateChunkMigrationFetcherMaxBufferedSizeBytesPerThread
+        default:
+            expr: 4 * BSONObjMaxInternalSize
+        redact: false
+
+    chunkMigrationWaitForReclaimedPreparedTxnsMaxWaitMS:
+        description: >-
+            The maximum amount of time (in milliseconds) for chunk migration to wait for reclaimed 
+            prepared transactions from a precise checkpoint to resolve before timing out.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: chunkMigrationWaitForReclaimedPreparedTxnsMaxWaitMS
+        validator:
+            gt: 0
+        default: 180000
+        redact: false
+
+    rangeDeleterBatchSize:
+        description: >-
+            The maximum number of documents in each batch to delete during the cleanup stage of chunk
+            migration (or the cleanupOrphaned command). Between each batch, secondaryThrottle and
+            rangeDeleterBatchDelayMS will apply.
+
+            A value of 0 indicates that the system chooses the default value (INT_MAX).
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: rangeDeleterBatchSize
+        validator:
+            gte: 0
+        default:
+            expr: std::numeric_limits<int>::max()
+        redact: false
+
+    rangeDeleterBatchDelayMS:
+        description: >-
+            The amount of time in milliseconds to wait before the next batch of deletion during the
+            cleanup stage of chunk migration (or the cleanupOrphaned command).
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: rangeDeleterBatchDelayMS
+        validator:
+            gte: 0
+        default: 20
+        redact: false
+
+    receiveChunkWaitForRangeDeleterTimeoutMS:
+        description: >-
+            Maximum amount of time for which the start of a new chunk migration request may be deferred,
+            while pending range deletions that overlap with the request get completed/canceled.
+            If overlapping range deletions are still present upon timeout expiration, the request is aborted.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: drainOverlappingRangeDeletionsOnStartTimeoutMS
+        validator:
+            gte: 0
+        default: 10000
+        redact: false
+
+    allowMigrationsToDropRecipientPITHistory:
+        description: >-
+            When enabled, a chunk migration recipient proceeds even if committing the migration
+            would drop point-in-time (PIT) reachable ownership history from its local shard
+            catalog. By default such a migration is aborted with ConflictingOperationInProgress to
+            preserve PIT reachability of the recipient's filtering metadata. This is an escape
+            hatch for operations (such as draining a shard) that would otherwise retry the same
+            migration indefinitely; enabling it may cause PIT reads on the recipient to observe
+            incorrect chunk ownership for the affected range.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: allowMigrationsToDropRecipientPITHistory
+        default: false
+        redact: false
+
+    migrationRecipientPITHistoryToPreserveInSecs:
+        description: >-
+            TEST-ONLY. Overrides the point-in-time snapshot history, in seconds, preserved by the
+            chunk migration recipient during testing. Ignored outside of test environments,
+            where minSnapshotHistoryWindowInSeconds is used instead. Has no effect unless testing is
+            enabled. When its value is -1, it's disabled, meaning that minSnapshotHistoryWindowInSeconds
+            prevails.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMigrationRecipientPITHistoryToPreserveInSecs
+        default: -1
+        validator:
+            gte: -1
+        redact: false
+        test_only: true
+
+    migrateCloneInsertionBatchSize:
+        description: >-
+            The maximum number of documents to insert in a single batch during the cloning step of
+            the migration process. The default value of 0 indicates no maximum number of documents
+            per batch. However, in practice, this results in batches that contain up to 16 MB of
+            documents. The value 1 corresponds to MongoDB 3.4.16 (and earlier) behavior.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: migrateCloneInsertionBatchSize
+        validator:
+            gte: 0
+        default: 0
+        redact: false
+
+    migrateCloneInsertionBatchDelayMS:
+        description: >-
+            Time in milliseconds to wait between batches of insertions during cloning step of the
+            migration process. This wait is in addition to the secondaryThrottle. The default value
+            of 0 indicates no additional wait.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: migrateCloneInsertionBatchDelayMS
+        validator:
+            gte: 0
+        default: 0
+        redact: false
+
+    migrationRecipientAbortTimeoutMS:
+        description: >-
+            How long the donor waits for the recipient to acknowledge the _recvChunkAbort command
+            sent when a migration is cancelled. This command is sent asynchronously on a
+            best-effort basis, so the timeout only bounds how long the network operation may remain
+            outstanding.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMigrationRecipientAbortTimeoutMS
+        validator:
+            gte: 1
+        default: 30000
+        redact: false
+
+    migrationLockAcquisitionMaxWaitMS:
+        description: "How long to wait to acquire collection lock for migration related operations."
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: migrationLockAcquisitionMaxWaitMS
+        default: 500
+        redact: false
+
+    maxCatchUpPercentageBeforeBlockingWrites:
+        description: >-
+            The maximum percentage of untrasferred chunk mods at the end of a catch up iteration
+            that may be deferred to the next phase of the migration protocol
+            (where new writes get blocked).
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: maxCatchUpPercentageBeforeBlockingWrites
+        validator:
+            gte: 0
+            lte: 100
+        default: 10
+        redact: false
+
+    orphanCleanupDelaySecs:
+        description: How long to wait before starting cleanup of an emigrated chunk range.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: orphanCleanupDelaySecs
+        default: 3600
+        redact: false
+
+    enableMaxKeyDetection:
+        description: >-
+            When enabled, runs the one-shot MaxKey inventory scans on each primary stepup (the
+            shard-side orphan detector and the config-server Balancer zone scan). This setting is
+            checked only on stepup, so enabling it at runtime takes effect on the next primary
+            stepup. The scans run if either this parameter is true or featureFlagMaxKeyDetection is enabled.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: gEnableMaxKeyDetection
+        default: false
+        redact: false
+
+    disableResumableRangeDeleter:
+        description: >-
+            Disable the resumable range deleter. Ranges will not be submitted for deletion, and if an
+            incoming migration sees orphans in the incoming range, the migration will fail.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: disableResumableRangeDeleter
+        default: false
+        redact: false
+
+    useBatchedDeletesForRangeDeletion:
+        description: >-
+            When enabled, it changes the range deletion stage plan from DeleteStage to BatchedDeleteStage.
+            The BatchedDeleteStage will attempt to delete documents as a batch instead of one-by-one.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: useBatchedDeletesForRangeDeletion
+        default: false
+        redact: false
+
+    persistedChunkCacheUpdateMaxBatchSize:
+        description: >-
+            Maximum batch size used for updating shard persisted chunk cache.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: persistedChunkCacheUpdateMaxBatchSize
+        validator:
+            gte: 1
+        default: 1000
+        redact: false
+
+    terminateSecondaryReadsOnOrphanCleanup:
+        description: >-
+            Enables the termination of queries on a secondary node due to orphan cleanup.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: terminateSecondaryReadsOnOrphanCleanup
+        default: true
+        redact: false
+
+    enableQueryKilledByRangeDeletionLog:
+        description: >-
+            Enables the log printed when a query gets killed due to a range deletion.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: enableQueryKilledByRangeDeletionLog
+        default: true
+        redact: false
+
+    # TODO (SERVER-125033): Remove this parameter once this task gets done.
+    shardsvrMergeChunksMaxConflictRetries:
+        description: >-
+            Maximum number of times _shardsvrMergeChunks will retry when a conflicting merge
+            chunks coordinator is already running for the same namespace.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: shardsvrMergeChunksMaxConflictRetries
+        validator:
+            gt: 0
+        default: 10
+        redact: false
+
+    # TODO (SERVER-125033): Remove this parameter once this task gets done.
+    shardsvrMergeAllChunksMaxConflictRetries:
+        description: >-
+            Maximum number of times _shardsvrMergeAllChunksOnShard will retry when a conflicting
+            merge all chunks coordinator is already running for the same namespace.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: shardsvrMergeAllChunksMaxConflictRetries
+        validator:
+            gt: 0
+        default: 10
+        redact: false
+
+    # TODO (SERVER-125033): Remove this parameter once this task gets done.
+    shardsvrSplitChunkMaxConflictRetries:
+        description: >-
+            Maximum number of times _shardsvrSplitChunk will retry when a conflicting split
+            chunk coordinator is already running for the same namespace.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: shardsvrSplitChunkMaxConflictRetries
+        validator:
+            gt: 0
+        default: 10
+        redact: false
+
+    maxKeyOrphanScanThrottleMillis:
+        description: >-
+            Milliseconds the standalone MaxKey orphan detector sleeps before each per-collection
+            read of the collection entry from the config server. Throttles those reads so a primary
+            stepup across a shard with many collections does not overload the config server. Set to
+            0 to disable.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: maxKeyOrphanScanThrottleMillis
+        validator:
+            gte: 0
+        default: 10
+        redact: false
+
+    forceUnconditionalInvalidateCollectionMetadata:
+        description: >-
+            When enabled, every invalidateCollectionMetadata oplog entry unconditionally clears the
+            in-memory collection metadata on the applying node, regardless of local state.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: forceUnconditionalInvalidateCollectionMetadata
+        default: false
+        redact: false
+
+    skipRangeDeletionForMaxKeyChunks:
+        description: >-
+            Escape hatch for the MaxKey orphan delete-guard. When true (the default, and while
+            featureFlagMaxKeyOrphanGuard is enabled), for every range deletion task classified at
+            step-up as containing a pre-upgrade MaxKey orphan (see
+            config.maxKeyOrphanScanState.blockedTasks) the range deleter deletes the ordinary
+            documents in the range but PRESERVES those whose leading shard-key field is MaxKey (the
+            possibly-never-cloned orphans), leaving them on disk for out-of-band recovery. The task
+            then completes normally. Only tasks in that pre-classified set are affected; tasks
+            created afterwards (post-upgrade, by the fixed cloner) delete normally. An operator can
+            set this to false to force full deletion of the classified tasks (e.g. once the affected
+            documents have been recovered, or for testing).
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: skipRangeDeletionForMaxKeyChunks
+        default: true
+        redact: false
+
+    clearCollectionShardingRuntimesOnRecovery:
+        description: >-
+            When enabled, rollback recovery clears the in-memory CollectionShardingRuntime filtering
+            metadata. When disabled, the filtering metadata is left untouched during rollback recovery.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: gClearCollectionShardingRuntimesOnRecovery
+        default: true
+        redact: false
+
+    allowDeferredInternalCatalogIndexBuildOnNonEmptyCollectionDuringStepUp:
+        description: >-
+            TEST-ONLY. When enabled, suppresses the tassert in createIndexesOnCollectionAtStepUp for
+            missing indexes on non-empty collections during step-up. This allows step up to succeed
+            without building those indexes.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gAllowDeferredInternalCatalogIndexBuildOnNonEmptyCollectionDuringStepUp
+        default: false
+        redact: false
+        test_only: true

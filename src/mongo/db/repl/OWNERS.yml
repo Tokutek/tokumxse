@@ -1,0 +1,63 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "dbcheck*":
+    approvers:
+      - 10gen/server-dbcheck
+  - "*oplog*":
+    approvers:
+      - 10gen/server-oplog
+  - "internode_validation_hash*":
+    approvers:
+      - 10gen/server-collection-write-path
+  - "change_stream_oplog_notification*":
+    approvers:
+      - 10gen/query-execution-change-streams
+      - 10gen/server-oplog
+  - "*noop_writer*":
+    approvers:
+      - 10gen/server-oplog
+  - "*bgsync*":
+    approvers:
+      - 10gen/server-oplog
+  - "*sync_source*":
+    approvers:
+      - 10gen/server-oplog
+  - "*read_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "*write_concern*":
+    approvers:
+      - 10gen/server-rw-concerns
+  - "*replication_recovery*":
+    approvers:
+      - 10gen/server-recovery
+  - "*rollback*":
+    approvers:
+      - 10gen/server-recovery
+  - "*replica_set_aware_service*":
+    approvers:
+      - 10gen/server-rs-aware-service
+  - "*primary_only_service*":
+    approvers:
+      - 10gen/server-rs-aware-service
+  - "*replication_coordinator*":
+    approvers:
+      - 10gen/server-replication-coordinator
+  - "*external_state*":
+    approvers:
+      - 10gen/server-replication-coordinator
+  - "*heartbeat*":
+    approvers:
+      - 10gen/server-replication-coordinator
+  - "*topology_coordinator*":
+    approvers:
+      - 10gen/server-replication-coordinator
+  - "set_multikey_metadata_oplog_entry.idl":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "container_oplog_entry*":
+    approvers:
+      - 10gen/server-index-builds

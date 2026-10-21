@@ -1,0 +1,27 @@
+{
+    "bracketSpacing": false,
+    "overrides": [
+        {
+            "files": ["*.js", "*.mjs"],
+            "options": {
+                "tabWidth": 4,
+                "printWidth": 100,
+                "quoteProps": "preserve"
+            }
+        },
+        {
+            "files": "*.idl",
+            "options": {
+                "parser": "yaml",
+                "tabWidth": 4
+            }
+        },
+        {
+            "files": "*.md",
+            "options": {
+                "proseWrap": "always",
+                "printWidth": 100
+            }
+        }
+    ]
+}

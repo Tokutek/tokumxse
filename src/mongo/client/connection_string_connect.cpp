@@ -1,0 +1,165 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_rs.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/ssl_options.h"
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#ifdef MONGO_CONFIG_GRPC
+#include "mongo/client/dbclient_grpc_stream.h"
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
+namespace mongo {
+
+std::mutex ConnectionString::_connectHookMutex;
+ConnectionString::ConnectionHook* ConnectionString::_connectHook = nullptr;
+
+StatusWith<std::unique_ptr<DBClientBase>> ConnectionString::connect(
+    std::string_view applicationName,
+    double socketTimeout,
+    const MongoURI* uri,
+    const ClientAPIVersionParameters* apiParameters,
+    const TransientSSLParams* transientSSLParams) const {
+    MongoURI newURI{};
+    if (uri) {
+        newURI = *uri;
+    }
+
+    switch (_type) {
+        case ConnectionType::kStandalone: {
+            Status lastError =
+                Status(ErrorCodes::BadValue,
+                       "Invalid standalone connection string with empty server list.");
+            for (const auto& server : _servers) {
+                std::unique_ptr<DBClientSession> c;
+#ifdef MONGO_CONFIG_GRPC
+                if (newURI.isGRPC()) {
+                    c = std::make_unique<DBClientGRPCStream>(
+                        /* authToken */ boost::none,
+                        /* autoReconnect */ true,
+                        /* socket timeout */ 0,
+                        newURI,
+                        DBClientGRPCStream::HandshakeValidationHook(),
+                        apiParameters);
+                } else
+#endif
+                {
+                    c = std::make_unique<DBClientConnection>(DBClientConnectionOptions{
+                        .autoReconnect = true,
+                        .uri = newURI,
+                        .apiParameters = apiParameters,
+                    });
+
+                    c->setSoTimeout(socketTimeout);
+                }
+
+#ifdef MONGO_CONFIG_GRPC
+                LOGV2_DEBUG(8050201,
+                            1,
+                            "Creating new connection",
+                            "hostAndPort"_attr = server,
+                            "gRPC"_attr = newURI.isGRPC());
+#else
+                LOGV2_DEBUG(20109, 1, "Creating new connection", "hostAndPort"_attr = server);
+#endif
+
+                try {
+                    c->connect(server,
+                               applicationName,
+                               transientSSLParams ? boost::make_optional(*transientSSLParams)
+                                                  : boost::none);
+                } catch (const DBException& e) {
+                    lastError = e.toStatus();
+                    continue;
+                }
+
+#ifdef MONGO_CONFIG_SSL
+                invariant((transientSSLParams != nullptr) == c->isUsingTransientSSLParams());
+#endif
+                LOGV2_DEBUG(20110, 1, "Connected connection!");
+                return std::move(c);
+            }
+            return lastError;
+        }
+
+        case ConnectionType::kReplicaSet: {
+            auto set = std::make_unique<DBClientReplicaSet>(_replicaSetName,
+                                                            _servers,
+                                                            applicationName,
+                                                            socketTimeout,
+                                                            std::move(newURI),
+                                                            apiParameters);
+            auto status = set->connect();
+            if (!status.isOK()) {
+                return status.withReason(status.reason() + ", " + toString());
+            }
+
+#ifdef MONGO_CONFIG_SSL
+            invariant(!set->isUsingTransientSSLParams());  // Not implemented.
+#endif
+            return std::move(set);
+        }
+
+        case ConnectionType::kCustom: {
+            // Lock in case other things are modifying this at the same time
+            std::lock_guard<std::mutex> lk(_connectHookMutex);
+
+            // Allow the replacement of connections with other connections - useful for testing.
+
+            uassert(16335,
+                    "custom connection to " + this->toString() +
+                        " specified with no connection hook",
+                    _connectHook);
+
+            // Double-checked lock, since this will never be active during normal operation
+            std::string errmsg;
+            auto replacementConn =
+                _connectHook->connect(*this, errmsg, socketTimeout, apiParameters);
+
+            LOGV2(20111,
+                  "Replacing connection string",
+                  "oldConnString"_attr = this->toString(),
+                  "newConnString"_attr =
+                      (replacementConn ? replacementConn->getServerAddress() : "(empty)"));
+
+            if (replacementConn) {
+                return std::move(replacementConn);
+            }
+            return Status(ErrorCodes::HostUnreachable, "Connection hook error: " + errmsg);
+        }
+
+        case ConnectionType::kLocal:
+        case ConnectionType::kInvalid:
+            MONGO_UNREACHABLE;
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+}  // namespace mongo

@@ -1,0 +1,158 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/plan_yield_policy_sbe.h"
+#include "mongo/db/query/query_fcv_environment_for_test.h"
+#include "mongo/db/query/stage_builder/stage_builder_util.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+
+#include <benchmark/benchmark.h>
+
+namespace mongo {
+
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.collection");
+const double kIndexUpperBound = 0.0101;
+
+class SbeStageBuilderBenchmark : public CatalogTestFixture {
+public:
+    SbeStageBuilderBenchmark() : CatalogTestFixture() {
+        setUp();
+    }
+
+    ~SbeStageBuilderBenchmark() override {
+        tearDown();
+    }
+
+    std::unique_ptr<IndexScanNode> makeIndexScanNode(
+        std::string index,
+        std::string indexName,
+        double lowBound,
+        double highBound,
+        std::shared_ptr<const IndexCatalogEntry> iceStorage = nullptr) {
+        auto child = std::make_unique<IndexScanNode>(
+            kNss, createIndexEntry(BSON(index << 1), indexName, std::move(iceStorage)));
+        IndexBounds bounds{};
+        OrderedIntervalList oil(index);
+        oil.intervals.emplace_back(BSON("" << lowBound << "" << highBound), true, true);
+        bounds.fields.emplace_back(std::move(oil));
+        child->bounds = std::move(bounds);
+        child->sortSet = ProvidedSortSet{BSON(index << 1)};
+        return child;
+    }
+
+    BSONObj buildFilter(int numPredicates, bool includeIndex) {
+        BSONObjBuilder builder;
+        if (includeIndex) {
+            builder.append("x1", BSON("$lte" << kIndexUpperBound));
+        }
+        for (int i = 2; i <= numPredicates; ++i) {
+            builder.append("x" + std::to_string(i), BSON("$lte" << 1));
+        }
+        return builder.obj();
+    }
+
+private:
+    void TestBody() override {}
+
+    void setUp() final {
+        CatalogTestFixture::setUp();
+        QueryFCVEnvironmentForTest::setUp();
+
+        OperationContext* opCtx = operationContext();
+        ASSERT_OK(storageInterface()->createCollection(opCtx, kNss, CollectionOptions{}));
+    }
+
+    void tearDown() final {
+        CatalogTestFixture::tearDown();
+    }
+
+    IndexEntry createIndexEntry(BSONObj keyPattern,
+                                std::string indexName,
+                                std::shared_ptr<const IndexCatalogEntry> iceStorage = nullptr) {
+        return IndexEntry(keyPattern,
+                          IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                          IndexConfig::kLatestIndexVersion,
+                          false /*multikey*/,
+                          {} /*mutikeyPaths*/,
+                          {} /*multikeyPathSet*/,
+                          false /*sparse*/,
+                          false /*unique*/,
+                          IndexEntry::Identifier{indexName},
+                          BSONObj() /*infoObj*/,
+                          nullptr /*wildcardProjection*/,
+                          std::move(iceStorage));
+    }
+};
+
+void BM_Simple(benchmark::State& state) {
+    SbeStageBuilderBenchmark fixture;
+    auto opCtx = fixture.operationContext();
+
+    // Create collection and add index1, as that is the winning index.
+    auto acquisition = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, kNss, AcquisitionPrerequisites::kWrite),
+        MODE_X);
+    CollectionWriter coll(opCtx, &acquisition);
+
+    WriteUnitOfWork wunit(opCtx);
+    auto indexCatalog = coll.getWritableCollection(opCtx)->getIndexCatalog();
+    ASSERT_OK(indexCatalog
+                  ->createIndexOnEmptyCollection(opCtx,
+                                                 coll.getWritableCollection(opCtx),
+                                                 BSON("v" << IndexConfig::kLatestIndexVersion
+                                                          << "key" << BSON("x1" << 1) << "name"
+                                                          << "index1"))
+                  .getStatus());
+    wunit.commit();
+
+    MultipleCollectionAccessor collections{acquireCollectionMaybeLockFree(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, kNss, AcquisitionPrerequisites::kRead))};
+
+    // Create CanonicalQuery
+    auto findCommand = std::make_unique<FindCommandRequest>(kNss);
+    findCommand->setFilter(fixture.buildFilter(state.range(0), true));
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand)},
+    });
+    cq->setSbeCompatible(true);
+
+    // Look up the real IndexCatalogEntry so the stage builder can find it by ident.
+    std::shared_ptr<const IndexCatalogEntry> iceStorage;
+    for (auto&& ice : collections.getMainCollection()->getIndexCatalog()->getEntriesShared(
+             IndexCatalog::InclusionPolicy::kReady)) {
+        if (ice->descriptor()->indexName() == "index1") {
+            iceStorage = ice;
+            break;
+        }
+    }
+    ASSERT(iceStorage);
+
+    auto child = fixture.makeIndexScanNode("x1", "index1", -INFINITY, kIndexUpperBound, iceStorage);
+    auto root = std::make_unique<FetchNode>(std::move(child), kNss);
+
+    auto bsonObj = fixture.buildFilter(state.range(0), false);
+    root->filter = std::move(
+        MatchExpressionParser::parse(bsonObj, make_intrusive<ExpressionContextForTest>(opCtx, kNss))
+            .getValue());
+    auto solution = std::make_unique<QuerySolution>();
+    solution->setRoot(std::move(root));
+    auto yieldPolicy = PlanYieldPolicySBE::make(opCtx,
+                                                PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                                &opCtx->fastClockSource(),
+                                                0,
+                                                Milliseconds::zero());
+
+    for (auto _ : state) {
+        auto sbePlanAndData = stage_builder::buildSlotBasedExecutableTree(
+            opCtx, collections, *cq, *solution, yieldPolicy.get());
+    }
+}
+
+BENCHMARK(BM_Simple)->Arg(4)->Arg(16)->Arg(64);
+
+}  // namespace mongo

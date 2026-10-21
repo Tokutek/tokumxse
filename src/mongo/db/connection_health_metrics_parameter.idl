@@ -1,0 +1,16 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+server_parameters:
+    enableDetailedConnectionHealthMetricLogLines:
+        mod_visibility: public
+        description: >-
+            Enables detailed log lines related to connection health in a cluster.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: "gEnableDetailedConnectionHealthMetricLogLines"
+        default: true
+        redact: false

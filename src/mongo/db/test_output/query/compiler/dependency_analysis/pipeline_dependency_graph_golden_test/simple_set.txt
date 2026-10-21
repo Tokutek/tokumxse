@@ -1,0 +1,46 @@
+VARIATION SimpleSet
+input: {
+    "pipeline": [
+        {
+            "$set": {
+                "a": {
+                    "$const": "foo"
+                }
+            }
+        },
+        {
+            "$match": {
+                "a": "foo"
+            }
+        }
+    ]
+}
+output: {
+    "$set:0": {
+        "scope:0": {
+            "exhaustiveScope": "scope:-1",
+            "fields": {
+                "<missing>:0": {
+                    "declaringScope": "scope:0",
+                    "dependencies": []
+                },
+                "a:1": {
+                    "declaringScope": "scope:0",
+                    "metadata": {
+                        "array": false,
+                        "constant": "foo"
+                    },
+                    "dependencies": []
+                }
+            }
+        },
+        "dependencies": []
+    },
+    "$match:1": {
+        "scope:0": "scope:0",
+        "dependencies": [
+            "a:1"
+        ]
+    }
+}
+

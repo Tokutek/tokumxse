@@ -1,0 +1,117 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/init.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/client_strand.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/unittest/benchmark_util.h"
+
+#include <memory>
+#include <type_traits>
+
+#include <benchmark/benchmark.h>
+
+namespace mongo {
+class ServiceEntryPointBenchmarkFixture : public unittest::BenchmarkWithProfiler {
+public:
+    void setUpSharedResources(benchmark::State& state) override {
+        BenchmarkWithProfiler::setUpSharedResources(state);
+        serverGlobalParams.clusterRole = getClusterRole();
+
+        setGlobalServiceContext(ServiceContext::make());
+
+        // Minimal set up necessary for ServiceEntryPoint.
+        auto sc = getGlobalServiceContext();
+        auto service = sc->getService();
+
+        ReadWriteConcernDefaults::create(service, _lookupMock.getFetchDefaultsFn());
+        _lookupMock.setLookupCallReturnValue({});
+        setUpServiceContext(sc);
+    }
+
+    void tearDownSharedResources(benchmark::State& state) override {
+        tearDownServiceContext(getGlobalServiceContext());
+        setGlobalServiceContext({});
+        BenchmarkWithProfiler::tearDownSharedResources(state);
+    }
+
+    /** Any custom service context setup and teardown, such as attaching a ServiceEntryPoint. */
+    virtual void setUpServiceContext(ServiceContext*) {}
+    virtual void tearDownServiceContext(ServiceContext*) {}
+
+    virtual ClusterRole getClusterRole() const = 0;
+
+    void doRequest(ServiceEntryPoint* sep, Client* client, Message& msg) {
+        auto newOpCtx = client->makeOperationContext();
+        iassert(sep->handleRequest(newOpCtx.get(), msg, newOpCtx.get()->fastClockSource().now())
+                    .getNoThrow());
+    }
+
+    template <typename F>
+    requires(std::is_invocable_r_v<BSONObj, F>)
+    void runBenchmark(benchmark::State& state, F makeRequestBody) {
+        auto strand = ClientStrand::make(getGlobalServiceContext()->getService()->makeClient(
+            fmt::format("conn{}", _nextClientId.fetchAndAdd(1)), nullptr));
+        strand->run([&] {
+            auto client = strand->getClientPointer();
+            auto sep = client->getService()->getServiceEntryPoint();
+            runBenchmarkWithProfiler(
+                [&] {
+                    OpMsgRequest request;
+                    request.body = makeRequestBody();
+                    auto msg = request.serialize();
+                    doRequest(sep, client, msg);
+                },
+                state);
+        });
+    }
+
+    static auto makePingCommand() {
+        return BSON("ping" << 1 << "$db"
+                           << "admin");
+    }
+
+private:
+    Atomic<uint64_t> _nextClientId{0};
+
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+};
+
+/**
+ * ASAN can't handle the # of threads the benchmark creates.
+ * With sanitizers, run this in a diminished "correctness check" mode.
+ */
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+const auto kCommandBMMaxThreads = 1;
+#else
+/**
+ * Benchmark multithreaded case to try catch interesting contention behaviour.
+ * For example, spinlock contention.
+ */
+const auto kCommandBMMaxThreads = 16;
+#endif
+
+
+/**
+ * Required initializers, but this is a benchmark so nothing needs to be done.
+ *
+ * These should not be in a header file, but it works because it is only included in 2 files and
+ * they are never included into the same binary. If that changes, these should find a home in a new
+ * cpp file.
+ */
+MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))  // NOLINT
+(InitializerContext* context) {}
+MONGO_INITIALIZER(ServerLogRedirection)(mongo::InitializerContext*) {}  // NOLINT
+
+}  // namespace mongo

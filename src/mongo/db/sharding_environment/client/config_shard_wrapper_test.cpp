@@ -1,0 +1,187 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/sharding_environment/client/config_shard_wrapper.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/remote_command_targeter.h"
+#include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/client/retry_strategy.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/sharding_environment/shard_retry_server_parameters_gen.h"
+#include "mongo/db/sharding_environment/shard_shared_state_cache.h"
+#include "mongo/db/sharding_environment/sharding_mongos_test_fixture.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/db/topology/shard_registry.h"
+#include "mongo/db/topology/vector_clock/vector_clock.h"
+#include "mongo/unittest/unittest.h"
+
+#include <typeinfo>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+const HostAndPort kConfigHost{"configHost1"};
+ConnectionString kConfigCS{ConnectionString::forReplicaSet("configReplSet", {kConfigHost})};
+
+class MockShard : public Shard {
+    MockShard(const MockShard&) = delete;
+    MockShard& operator=(const MockShard&) = delete;
+
+public:
+    explicit MockShard(const ShardId& id)
+        : Shard(id,
+                std::make_shared<ShardSharedStateCache::State>(
+                    kShardRetryTokenBucketCapacityDefault, kShardRetryTokenReturnRateDefault)) {}
+    ~MockShard() override = default;
+
+    const ConnectionString& getConnString() const override {
+        return kConfigCS;
+    }
+
+    std::shared_ptr<RemoteCommandTargeter> getTargeter() const override {
+        return std::make_shared<RemoteCommandTargeterMock>();
+    }
+
+    void updateReplSetMonitor(const HostAndPort& remoteHost,
+                              const Status& remoteCommandStatus) override {}
+
+    std::string toString() const override {
+        return getId().toString();
+    }
+
+    bool isRetriableError(const Status& code,
+                          std::span<const std::string> errorLabels,
+                          RetryPolicy options) const final {
+        return false;
+    }
+
+    void runFireAndForgetCommand(OperationContext* opCtx,
+                                 const ReadPreferenceSetting& readPref,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) override {
+        lastReadPref = readPref;
+    }
+    RetryStrategy::Result<std::monostate> _runAggregation(
+        OperationContext* opCtx,
+        const TargetingMetadata& targetingMetadata,
+        const AggregateCommandRequest& aggRequest,
+        std::function<bool(const std::vector<BSONObj>& batch,
+                           const boost::optional<BSONObj>& postBatchResumeToken)> callback)
+        override {
+        return Status::OK();
+    }
+
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                const WriteConcernOptions& writeConcern,
+                                                RetryPolicy retryPolicy) override {
+        BatchedCommandResponse response;
+        response.setStatus(Status::OK());
+        return response;
+    }
+
+
+    ReadPreferenceSetting lastReadPref;
+
+private:
+    StatusWith<Shard::CommandResponse> _runCommand(OperationContext* opCtx,
+                                                   const ReadPreferenceSetting& readPref,
+                                                   const TargetingMetadata& targetingMetadata,
+                                                   const DatabaseName& dbName,
+                                                   Milliseconds maxTimeMSOverride,
+                                                   const BSONObj& cmdObj) final {
+        lastReadPref = readPref;
+        return Shard::CommandResponse{boost::none, BSON("ok" << 1), Status::OK(), Status::OK()};
+    }
+
+    RetryStrategy::Result<Shard::QueryResponse> _runExhaustiveCursorCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const DatabaseName& dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj) final {
+        lastReadPref = readPref;
+        return Shard::QueryResponse{std::vector<BSONObj>{}, repl::OpTime::max()};
+    }
+
+    RetryStrategy::Result<Shard::QueryResponse> _exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const repl::ReadConcernArgs& readConcern,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none,
+        const boost::optional<BSONObj>& projection = boost::none) final {
+        lastReadPref = readPref;
+        return Shard::QueryResponse{std::vector<BSONObj>{}, repl::OpTime::max()};
+    }
+};
+
+class ConfigShardWrapperTest : public ShardingTestFixture {
+protected:
+    std::shared_ptr<MockShard> _mockConfigShard;
+    std::unique_ptr<ConfigShardWrapper> _configShardWrapper;
+
+    void setUp() override {
+        serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
+
+        ShardingTestFixture::setUp();
+
+        _mockConfigShard = std::make_shared<MockShard>(ShardId(ShardId::kConfigServerId));
+        _configShardWrapper = std::make_unique<ConfigShardWrapper>(_mockConfigShard);
+    }
+
+    void tearDown() override {
+        ShardingTestFixture::tearDown();
+    }
+};
+
+TEST_F(ConfigShardWrapperTest, RunCommandAttachesMinClusterTime) {
+    const auto vcTime = VectorClock::get(operationContext())->getTime();
+    auto expectedMinClusterTime = vcTime.configTime();
+    expectedMinClusterTime.addTicks(10);
+    VectorClock::get(operationContext())->advanceConfigTime_forTest(expectedMinClusterTime);
+
+    auto result =
+        _configShardWrapper->runCommandWithIndefiniteRetries(operationContext(),
+                                                             ReadPreferenceSetting{},
+                                                             DatabaseName::kConfig,
+                                                             BSONObj{},
+                                                             Shard::RetryPolicy::kNoRetry);
+
+    ASSERT_EQ(_mockConfigShard->lastReadPref.minClusterTime, expectedMinClusterTime.asTimestamp());
+}
+
+TEST_F(ConfigShardWrapperTest, RunFireAndForgetCommandAttachesMinClusterTime) {
+    const auto vcTime = VectorClock::get(operationContext())->getTime();
+    auto expectedMinClusterTime = vcTime.configTime();
+    expectedMinClusterTime.addTicks(10);
+    VectorClock::get(operationContext())->advanceConfigTime_forTest(expectedMinClusterTime);
+
+    _configShardWrapper->runFireAndForgetCommand(
+        operationContext(), ReadPreferenceSetting{}, DatabaseName::kConfig, BSONObj{});
+
+    ASSERT_EQ(_mockConfigShard->lastReadPref.minClusterTime, expectedMinClusterTime.asTimestamp());
+}
+
+TEST_F(ConfigShardWrapperTest, GetConfigShardReturnsConfigShardWrapper) {
+    ASSERT_EQ(typeid(*shardRegistry()->getConfigShard()).name(), typeid(ConfigShardWrapper).name());
+}
+
+}  // namespace
+}  // namespace mongo

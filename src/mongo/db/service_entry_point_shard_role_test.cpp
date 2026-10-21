@@ -1,0 +1,872 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/service_entry_point_shard_role.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/admission/ingress_admission_context.h"
+#include "mongo/db/admission/ingress_request_admission_context.h"
+#include "mongo/db/admission/ingress_request_rate_limiter.h"
+#include "mongo/db/admission/rate_limiter.h"
+#include "mongo/db/admission/write_throttler.h"
+#include "mongo/db/admission/write_throttler_admission_context.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/rss/attached_storage/attached_persistence_provider.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/db/versioning_protocol/stale_exception.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/message.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/service_entry_point_test_fixture.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/tick_source_mock.h"
+
+#include <memory>
+
+#include <gmock/gmock.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::admission {
+namespace {
+
+using ::testing::_;
+using ::testing::Invoke;
+
+MONGO_REGISTER_COMMAND(TestCmdProcessInternalCommand).testOnly().forShard();
+MONGO_REGISTER_COMMAND(TestCmdProcessInternalSucceedCommand).testOnly().forShard();
+
+// Mocks the shard's response to a StaleConfig error found while recovering sharding metadata on
+// the write path, so tests can simulate e.g. the recovery being interrupted by a concurrent
+// shutdown or stepdown.
+class StaleShardVersionExceptionHandlerMock final : public StaleShardCollectionMetadataHandler {
+public:
+    MOCK_METHOD(boost::optional<ChunkVersion>,
+                handleStaleShardVersionException,
+                (OperationContext*, const StaleConfigInfo&),
+                (const, override));
+};
+
+class CollectionShardingStateFactoryMock : public CollectionShardingStateFactory {
+public:
+    explicit CollectionShardingStateFactoryMock(
+        std::shared_ptr<StaleShardCollectionMetadataHandler> staleShardExceptionHandler)
+        : _staleShardExceptionHandler(std::move(staleShardExceptionHandler)) {}
+
+    std::unique_ptr<CollectionShardingState> make(const NamespaceString&) override {
+        MONGO_UNREACHABLE;
+    }
+
+    const StaleShardCollectionMetadataHandler& getStaleShardExceptionHandler() const override {
+        return *_staleShardExceptionHandler;
+    }
+
+private:
+    std::shared_ptr<StaleShardCollectionMetadataHandler> _staleShardExceptionHandler;
+};
+
+void installWriteThrottler(ServiceContext* service) {
+    WriteThrottler::set(service, std::make_unique<WriteThrottler>(service->getTickSource()));
+}
+
+class ServiceEntryPointShardRoleTest : public ServiceEntryPointTestFixture {
+public:
+    void setUp() override {
+        ServiceEntryPointTestFixture::setUp();
+        auto shardService = getGlobalServiceContext()->getService();
+        ReadWriteConcernDefaults::create(shardService, _lookupMock.getFetchDefaultsFn());
+        _lookupMock.setLookupCallReturnValue({});
+
+        repl::ReplSettings replSettings;
+        replSettings.setReplSetString("rs0/host1");
+
+        auto replCoordMock = std::make_unique<repl::ReplicationCoordinatorMock>(
+            getGlobalServiceContext(), replSettings);
+        _replCoordMock = replCoordMock.get();
+        invariant(replCoordMock->setFollowerMode(repl::MemberState::RS_PRIMARY));
+        repl::ReplicationCoordinator::set(getGlobalServiceContext(), std::move(replCoordMock));
+
+        auto persistenceProvider = std::make_unique<rss::AttachedPersistenceProvider>();
+        rss::ReplicatedStorageService::get(getGlobalServiceContext())
+            .setPersistenceProvider(std::move(persistenceProvider));
+
+        getGlobalServiceContext()->getService()->setServiceEntryPoint(
+            std::make_unique<ServiceEntryPointShardRole>());
+    }
+
+    void testProcessInternalCommand();
+    void testCommandFailsRunInvocationWithCloseConnectionError();
+    void testCommandMaxTimeMSOpOnly();
+
+    struct NestedDeadline {
+        Date_t deadline;
+        ErrorCodes::Error timeoutError;
+    };
+    NestedDeadline runNestedDirectClientWithMaxTimeMS(OperationContext* opCtx,
+                                                      int subMaxTimeMSMillis);
+
+    void testNestedMaxTimeMSChildTightensParentDeadline();
+    void testNestedMaxTimeMSParentDeadlineTighterThanChild();
+    void testNestedMaxTimeMSWithNoParentDeadline();
+    void testNestedMaxTimeMSPreservesParentErrorCodeWhenParentTighter();
+
+protected:
+    repl::ReplicationCoordinatorMock* _replCoordMock;
+};
+
+void ServiceEntryPointShardRoleTest::testProcessInternalCommand() {
+    auto opCtx = makeOperationContext();
+    auto& admCtx = IngressAdmissionContext::get(opCtx.get());
+    // Here we send a command that will itself send another command using DBDirectClient
+    auto msg =
+        constructMessage(BSON(TestCmdProcessInternalCommand::kCommandName << 1), opCtx.get());
+    auto swDbResponse = handleRequest(msg, opCtx.get());
+    ASSERT_OK(swDbResponse);
+    const auto admissions = admCtx.getAdmissions();
+    const auto exemptedAdmissions = admCtx.getExemptedAdmissions();
+    // After sending one command, we expect two admissions since we admit the command itself and
+    // also the subcommand. However, we expect the second command to be exempted since the top level
+    // command was already admitted.
+    ASSERT_EQ(admissions, 2);
+    ASSERT_EQ(exemptedAdmissions, 1);
+}
+
+void ServiceEntryPointShardRoleTest::testCommandFailsRunInvocationWithCloseConnectionError() {
+    auto opCtx = makeOperationContext();
+    auto msg = constructMessage(
+        BSON(TestCmdFailsRunInvocationWithCloseConnectionError::kCommandName << 1), opCtx.get());
+    unittest::LogCaptureGuard logs;
+    auto swDbResponse = handleRequest(msg, opCtx.get());
+    logs.stop();
+    ASSERT_NOT_OK(swDbResponse);
+    ASSERT_EQ(swDbResponse.getStatus().code(), ErrorCodes::SplitHorizonChange);
+    ASSERT_EQ(logs.countTextContaining("Failed to handle request"), 1);
+}
+
+void ServiceEntryPointShardRoleTest::testCommandMaxTimeMSOpOnly() {
+    auto* clkSource = getGlobalServiceContext()->getFastClockSource();
+    auto initialMs = clkSource->now();
+    // Only internal clients may set maxTimeMSOpOnly.
+    getClient()->setIsInternalClient(true);
+
+    // ServiceEntryPoint uses maxTimeMSOpOnly if maxTimeMS is unset.
+    {
+        const auto requestMaxTimeMsOpOnly = Milliseconds(200);
+        auto opCtx = makeOperationContext();
+        const auto cmdBSON = BSON(TestCmdSucceeds::kCommandName << 1 << "maxTimeMSOpOnly"
+                                                                << requestMaxTimeMsOpOnly.count());
+        runCommandTestWithResponse(cmdBSON, opCtx.get());
+
+        // ServiceEntryPoint should have stored the request's maxTimeMS value, which was previously
+        // unset.
+        opCtx->restoreMaxTimeMS();
+        ASSERT_EQ(Date_t::max(), opCtx->getDeadline());
+    }
+
+    // ServiceEntryPoint uses maxTimeMs if maxTimeMs is less than maxTimeMsOpOnly.
+    {
+        const auto requestMaxTimeMsOpOnly = Milliseconds(200);
+        const auto requestMaxTimeMs = Milliseconds(100);
+        auto opCtx = makeOperationContext();
+        const auto cmdBSON = BSON(TestCmdSucceeds::kCommandName
+                                  << 1 << "maxTimeMSOpOnly" << requestMaxTimeMsOpOnly.count()
+                                  << "maxTimeMS" << requestMaxTimeMs.count());
+        runCommandTestWithResponse(cmdBSON, opCtx.get());
+
+        ASSERT_LTE(opCtx->getDeadline(), initialMs + requestMaxTimeMs + Milliseconds(1));
+
+        // ServiceEntryPoint did not store anything, the deadline remains the same.
+        opCtx->restoreMaxTimeMS();
+        // Account for mock clock precision of 1 ms, which is added when using restoreMaxTimeMS.
+        ASSERT_LTE(opCtx->getDeadline(), initialMs + requestMaxTimeMs + Milliseconds(1));
+    }
+
+    // ServiceEntryPoint uses maxTimeMsOpOnly if maxTimeMs is greater than maxTimeMsOpOnly.
+    {
+        const auto requestMaxTimeMsOpOnly = Milliseconds(200);
+        const auto requestMaxTimeMs = Milliseconds(500);
+        auto opCtx = makeOperationContext();
+        const auto cmdBSON = BSON(TestCmdSucceeds::kCommandName
+                                  << 1 << "maxTimeMSOpOnly" << requestMaxTimeMsOpOnly.count()
+                                  << "maxTimeMS" << requestMaxTimeMs.count());
+        runCommandTestWithResponse(cmdBSON, opCtx.get());
+
+        ASSERT_EQ(initialMs + requestMaxTimeMsOpOnly, opCtx->getDeadline());
+
+        // ServiceEntryPoint should have stored the request's maxTimeMS value.
+        opCtx->restoreMaxTimeMS();
+        // Account for mock clock precision of 1 ms, which is added when using restoreMaxTimeMS.
+        ASSERT_LTE(opCtx->getDeadline(), initialMs + requestMaxTimeMs + Milliseconds(1));
+    }
+}
+
+class ServiceEntryPointShardServerTest : public virtual service_context_test::ShardRoleOverride,
+                                         public ServiceEntryPointShardRoleTest {};
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandSucceeds) {
+    testCommandSucceeds();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestProcessInternalCommand) {
+    testProcessInternalCommand();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandFailsRunInvocationWithResponse) {
+    testCommandFailsRunInvocationWithResponse();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandFailsRunInvocationWithException) {
+    testCommandFailsRunInvocationWithException("Assertion while executing command");
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandFailsRunInvocationWithCloseConnectionError) {
+    testCommandFailsRunInvocationWithCloseConnectionError();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, HandleRequestException) {
+    testHandleRequestException(5745702);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, ParseCommandFailsDbQueryUnsupportedCommand) {
+    testParseCommandFailsDbQueryUnsupportedCommand("Assertion while parsing command");
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandNotFound) {
+    testCommandNotFound(true);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, HelloCmdSetsClientMetadata) {
+    testHelloCmdSetsClientMetadata();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommentField) {
+    testCommentField();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestHelpField) {
+    testHelpField();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandAdminOnlyLog) {
+    unittest::LogCaptureGuard logs;
+    runCommandTestWithResponse(BSON(TestCmdSucceedsAdminOnly::kCommandName << 1));
+    logs.stop();
+    ASSERT_EQ(logs.countTextContaining("Admin only command"), 1);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandServiceCounters) {
+    testCommandServiceCounters(ClusterRole::ShardServer);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandMaxTimeMS) {
+    testCommandMaxTimeMS();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandMaxTimeMSOpOnly) {
+    testCommandMaxTimeMSOpOnly();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestOpCtxInterrupt) {
+    testOpCtxInterrupt(true);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestReadConcernClientUnspecifiedNoDefault) {
+    testReadConcernClientUnspecifiedNoDefault();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestReadConcernClientUnspecifiedWithDefault) {
+    testReadConcernClientUnspecifiedWithDefault();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestReadConcernClientSuppliedLevelNotAllowed) {
+    testReadConcernClientSuppliedLevelNotAllowed(true);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestReadConcernClientSuppliedAllowed) {
+    testReadConcernClientSuppliedAllowed();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestReadConcernExtractedOnException) {
+    testReadConcernExtractedOnException();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestCommandInvocationHooks) {
+    testCommandInvocationHooks();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestExhaustCommandNextInvocationSet) {
+    testExhaustCommandNextInvocationSet();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestWriteConcernClientSpecified) {
+    _replCoordMock->setWriteConcernMajorityShouldJournal(false);
+    testWriteConcernClientSpecified();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestWriteConcernClientUnspecifiedNoDefault) {
+    _replCoordMock->setWriteConcernMajorityShouldJournal(false);
+    testWriteConcernClientUnspecifiedNoDefault();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TestWriteConcernClientUnspecifiedWithDefault) {
+    _replCoordMock->setWriteConcernMajorityShouldJournal(false);
+    testWriteConcernClientUnspecifiedWithDefault();
+}
+
+// A write command (supportsWriteConcern + kWrite) that succeeds and is subject to ingress
+// admission. Used as the nested DBDirectClient write to verify the write throttler does not admit a
+// re-entrant operation twice.
+class TestCmdWriteThrottlerNestedWrite : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testWriteThrottlerNestedWrite";
+    TestCmdWriteThrottlerNestedWrite() : TestCmdBase(kCommandName) {}
+
+    bool isSubjectToIngressAdmissionControl() const override {
+        return true;
+    }
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return true;
+    }
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kWrite;
+    }
+    bool runWithBuilderOnly(BSONObjBuilder&) override {
+        return true;
+    }
+};
+
+class TestCmdWriteThrottlerRead : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testWriteThrottlerRead";
+    TestCmdWriteThrottlerRead() : TestCmdBase(kCommandName) {}
+
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return true;
+    }
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
+    }
+    bool runWithBuilderOnly(BSONObjBuilder&) override {
+        return true;
+    }
+};
+
+class TestCmdWriteThrottlerCommand : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testWriteThrottlerCommand";
+    TestCmdWriteThrottlerCommand() : TestCmdBase(kCommandName) {}
+
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return true;
+    }
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kCommand;
+    }
+    bool runWithBuilderOnly(BSONObjBuilder&) override {
+        return true;
+    }
+};
+
+// A top-level write command that issues a nested write via DBDirectClient on the same opCtx.
+class TestCmdWriteThrottlerDirectClientParent : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testWriteThrottlerDirectClientParent";
+    TestCmdWriteThrottlerDirectClientParent() : TestCmdBase(kCommandName) {}
+
+    bool isSubjectToIngressAdmissionControl() const override {
+        return true;
+    }
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return true;
+    }
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kWrite;
+    }
+    bool runWithBuilderOnly(BSONObjBuilder&) override {
+        uassert(ErrorCodes::InternalError, "runWithBuilderOnly not implemented", false);
+    }
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj&,
+             BSONObjBuilder&) override {
+        BSONObj info;
+        DBDirectClient{opCtx}.runCommand(
+            DatabaseName::createDatabaseName_forTest(boost::none, "admin"),
+            BSON(TestCmdWriteThrottlerNestedWrite::kCommandName << 1),
+            info);
+        return true;
+    }
+};
+
+class TestCmdWriteThrottlerDisablesDuringRun : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testWriteThrottlerDisablesDuringRun";
+    TestCmdWriteThrottlerDisablesDuringRun() : TestCmdBase(kCommandName) {}
+
+    bool isSubjectToIngressAdmissionControl() const override {
+        return true;
+    }
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return true;
+    }
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kWrite;
+    }
+    bool runWithBuilderOnly(BSONObjBuilder&) override {
+        uassert(ErrorCodes::InternalError, "runWithBuilderOnly not implemented", false);
+    }
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj&,
+             BSONObjBuilder&) override {
+        WriteThrottlerAdmissionContext::get(opCtx).recordStorageWrites(10);
+        auto* enabledParameter =
+            ServerParameterSet::getNodeParameterSet()->get("writeThrottlerEnabled");
+        uassertStatusOK(enabledParameter->setFromString("false", boost::none));
+        return true;
+    }
+};
+
+MONGO_REGISTER_COMMAND(TestCmdWriteThrottlerNestedWrite).testOnly().forShard();
+MONGO_REGISTER_COMMAND(TestCmdWriteThrottlerRead).testOnly().forShard();
+MONGO_REGISTER_COMMAND(TestCmdWriteThrottlerCommand).testOnly().forShard();
+MONGO_REGISTER_COMMAND(TestCmdWriteThrottlerDirectClientParent).testOnly().forShard();
+MONGO_REGISTER_COMMAND(TestCmdWriteThrottlerDisablesDuringRun).testOnly().forShard();
+
+TEST_F(ServiceEntryPointShardServerTest, WriteThrottlerAdmitsWriteCommandOnceAtServiceEntry) {
+    installWriteThrottler(getGlobalServiceContext());
+    unittest::ServerParameterGuard targetRate{"writeThrottlerTargetRatePerSec",
+                                              WriteThrottler::kMaxRate};
+    unittest::ServerParameterGuard enabled{"writeThrottlerEnabled", true};
+
+    auto opCtx = makeOperationContext();
+    runCommandTestWithResponse(BSON(TestCmdWriteThrottlerNestedWrite::kCommandName << 1),
+                               opCtx.get());
+    auto& admCtx = WriteThrottlerAdmissionContext::get(opCtx.get());
+    ASSERT_EQ(admCtx.getAdmissions(), 1);
+
+    Lock::GlobalLock globalLock(opCtx.get(), MODE_IX);
+    ASSERT_EQ(admCtx.getAdmissions(), 1);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, WriteThrottlerSkipsReadCommands) {
+    installWriteThrottler(getGlobalServiceContext());
+    unittest::ServerParameterGuard targetRate{"writeThrottlerTargetRatePerSec",
+                                              WriteThrottler::kMaxRate};
+    unittest::ServerParameterGuard enabled{"writeThrottlerEnabled", true};
+
+    auto opCtx = makeOperationContext();
+    runCommandTestWithResponse(BSON(TestCmdWriteThrottlerRead::kCommandName << 1), opCtx.get());
+    ASSERT_EQ(WriteThrottlerAdmissionContext::get(opCtx.get()).getAdmissions(), 0);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, WriteThrottlerSkipsNonWriteCommands) {
+    installWriteThrottler(getGlobalServiceContext());
+    unittest::ServerParameterGuard targetRate{"writeThrottlerTargetRatePerSec",
+                                              WriteThrottler::kMaxRate};
+    unittest::ServerParameterGuard enabled{"writeThrottlerEnabled", true};
+
+    auto opCtx = makeOperationContext();
+    runCommandTestWithResponse(BSON(TestCmdWriteThrottlerCommand::kCommandName << 1), opCtx.get());
+    ASSERT_EQ(WriteThrottlerAdmissionContext::get(opCtx.get()).getAdmissions(), 0);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, WriteThrottlerSkipsDirectClientReentryWrite) {
+    installWriteThrottler(getGlobalServiceContext());
+    unittest::ServerParameterGuard targetRate{"writeThrottlerTargetRatePerSec",
+                                              WriteThrottler::kMaxRate};
+    unittest::ServerParameterGuard enabled{"writeThrottlerEnabled", true};
+
+    auto opCtx = makeOperationContext();
+    // The parent is a top-level write command that issues a nested write via DBDirectClient on the
+    // same opCtx. The top-level write is admitted exactly once; the re-entrant direct-client write
+    // must not take a second write-throttler admission.
+    runCommandTestWithResponse(BSON(TestCmdWriteThrottlerDirectClientParent::kCommandName << 1),
+                               opCtx.get());
+    auto& admCtx = WriteThrottlerAdmissionContext::get(opCtx.get());
+    ASSERT_EQ(admCtx.getAdmissions(), 1);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, WriteThrottlerFinalizesAdmissionWhenDisabledDuringRun) {
+    unittest::ServerParameterGuard enabled{"writeThrottlerEnabled", true};
+    unittest::ServerParameterGuard targetRate{"writeThrottlerTargetRatePerSec", 1};
+    unittest::ServerParameterGuard burstCapacity{"writeThrottlerBurstCapacitySecs", 100.0};
+    installWriteThrottler(getGlobalServiceContext());
+    auto* throttler = WriteThrottler::get(getGlobalServiceContext());
+
+    const auto before = throttler->tokenBalance_forTest();
+    auto opCtx = makeOperationContext();
+    runCommandTestWithResponse(BSON(TestCmdWriteThrottlerDisablesDuringRun::kCommandName << 1),
+                               opCtx.get());
+
+    auto& admCtx = WriteThrottlerAdmissionContext::get(opCtx.get());
+    ASSERT_EQ(admCtx.getAdmissions(), 1);
+    ASSERT_EQ(throttler->tokenBalance_forTest(), before - 10);
+}
+
+TEST_F(ServiceEntryPointShardServerTest,
+       PendingIngressDeferredTokenIsConsumedWhenRateLimitingDisabled) {
+    testPendingIngressDeferredTokenIsConsumedWhenRateLimitingDisabled();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, QueuedAdmissionInterrupted) {
+    testQueuedAdmissionInterrupted();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, QueuedAdmissionRespectsMaxTimeMS) {
+    testQueuedAdmissionRespectsMaxTimeMS();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, QueuedAdmissionWithLargeMaxTimeMSSucceeds) {
+    testQueuedAdmissionWithLargeMaxTimeMSSucceeds();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, TelemetryContextDeserializedFromSection) {
+    testTelemetryContextDeserializedFromSection();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, SpanNotCreatedWhenTelemetryContextNotSetInRequest) {
+    testSpanNotCreatedWhenTelemetryContextNotSetInRequest();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, IngressSpanHasServerKind) {
+    testIngressSpanHasServerKind();
+}
+
+TEST_F(ServiceEntryPointShardServerTest, IngressSpanHasConsumerKindForMoreToCome) {
+    testIngressSpanHasConsumerKindForMoreToCome();
+}
+
+class ServiceEntryPointReplicaSetTest : public virtual service_context_test::ReplicaSetRoleOverride,
+                                        public ServiceEntryPointShardRoleTest {};
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandSucceeds) {
+    testCommandSucceeds();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestProcessInternalCommand) {
+    testProcessInternalCommand();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandFailsRunInvocationWithResponse) {
+    testCommandFailsRunInvocationWithResponse();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandFailsRunInvocationWithException) {
+    testCommandFailsRunInvocationWithException("Assertion while executing command");
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandFailsRunInvocationWithCloseConnectionError) {
+    testCommandFailsRunInvocationWithCloseConnectionError();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, HandleRequestException) {
+    testHandleRequestException(5745702);
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, ParseCommandFailsDbQueryUnsupportedCommand) {
+    testParseCommandFailsDbQueryUnsupportedCommand("Assertion while parsing command");
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandNotFound) {
+    testCommandNotFound(true);
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, HelloCmdSetsClientMetadata) {
+    testHelloCmdSetsClientMetadata();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommentField) {
+    testCommentField();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestHelpField) {
+    testHelpField();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandAdminOnlyLog) {
+    unittest::LogCaptureGuard logs;
+    runCommandTestWithResponse(BSON(TestCmdSucceedsAdminOnly::kCommandName << 1));
+    logs.stop();
+    ASSERT_EQ(logs.countTextContaining("Admin only command"), 1);
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandServiceCounters) {
+    testCommandServiceCounters(ClusterRole::ShardServer);
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandMaxTimeMS) {
+    testCommandMaxTimeMS();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandMaxTimeMSOpOnly) {
+    testCommandMaxTimeMSOpOnly();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestOpCtxInterrupt) {
+    testOpCtxInterrupt(true);
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestReadConcernClientUnspecifiedNoDefault) {
+    testReadConcernClientUnspecifiedNoDefault();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestReadConcernClientUnspecifiedWithDefault) {
+    testReadConcernClientUnspecifiedWithDefault();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestReadConcernClientSuppliedLevelNotAllowed) {
+    testReadConcernClientSuppliedLevelNotAllowed(true);
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestReadConcernClientSuppliedAllowed) {
+    testReadConcernClientSuppliedAllowed();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestReadConcernExtractedOnException) {
+    testReadConcernExtractedOnException();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestCommandInvocationHooks) {
+    testCommandInvocationHooks();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestExhaustCommandNextInvocationSet) {
+    testExhaustCommandNextInvocationSet();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestWriteConcernClientSpecified) {
+    _replCoordMock->setWriteConcernMajorityShouldJournal(false);
+    testWriteConcernClientSpecified();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestWriteConcernClientUnspecifiedNoDefault) {
+    _replCoordMock->setWriteConcernMajorityShouldJournal(false);
+    testWriteConcernClientUnspecifiedNoDefault();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TestWriteConcernClientUnspecifiedWithDefault) {
+    _replCoordMock->setWriteConcernMajorityShouldJournal(false);
+    testWriteConcernClientUnspecifiedWithDefault();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, TelemetryContextDeserializedFromSection) {
+    testTelemetryContextDeserializedFromSection();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, SpanNotCreatedWhenTelemetryContextNotSetInRequest) {
+    testSpanNotCreatedWhenTelemetryContextNotSetInRequest();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, IngressSpanHasServerKind) {
+    testIngressSpanHasServerKind();
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, IngressSpanHasConsumerKindForMoreToCome) {
+    testIngressSpanHasConsumerKindForMoreToCome();
+}
+
+// Test command that returns the opCtx deadline in its response (used as the child command).
+class TestCmdReportDeadline : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testReportDeadline";
+    TestCmdReportDeadline() : TestCmdBase(kCommandName) {}
+
+    bool runWithBuilderOnly(BSONObjBuilder& result) override {
+        uassert(ErrorCodes::InternalError, "runWithBuilderOnly not implemented", false);
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj&,
+             BSONObjBuilder& result) override {
+        result.append("deadline", opCtx->getDeadline());
+        result.append("timeoutError", static_cast<int>(opCtx->getTimeoutError()));
+        return true;
+    }
+};
+
+// Test command that runs TestCmdReportDeadline via DBDirectClient with maxTimeMS,
+// and forwards the child's observed deadline in its own response.
+class TestCmdDirectClientWithMaxTimeMS : public TestCmdBase {
+public:
+    static constexpr auto kCommandName = "testDirectClientWithMaxTimeMS";
+    TestCmdDirectClientWithMaxTimeMS() : TestCmdBase(kCommandName) {}
+
+    bool runWithBuilderOnly(BSONObjBuilder& result) override {
+        uassert(ErrorCodes::InternalError, "runWithBuilderOnly not implemented", false);
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        auto subCmdBSON = BSON(TestCmdReportDeadline::kCommandName << 1 << "maxTimeMS"
+                                                                   << cmdObj["subMaxTimeMS"].Int());
+        BSONObj info;
+        DBDirectClient{opCtx}.runCommand(
+            DatabaseName::createDatabaseName_forTest(boost::none, "admin"), subCmdBSON, info);
+        result.append("childDeadline", info["deadline"].Date());
+        result.append("childTimeoutError", info["timeoutError"].Int());
+        return true;
+    }
+};
+
+MONGO_REGISTER_COMMAND(TestCmdDirectClientWithMaxTimeMS).testOnly().forShard();
+MONGO_REGISTER_COMMAND(TestCmdReportDeadline).testOnly().forShard();
+
+// Shared helper: run TestCmdDirectClientWithMaxTimeMS with the given child maxTimeMS and
+// return what the nested child command observed for its own deadline and timeout error
+// code while running inside the DBDirectClient context.
+ServiceEntryPointShardRoleTest::NestedDeadline
+ServiceEntryPointShardRoleTest::runNestedDirectClientWithMaxTimeMS(OperationContext* opCtx,
+                                                                   int subMaxTimeMSMillis) {
+    auto dbResponse = runCommandTestWithResponse(BSON(TestCmdDirectClientWithMaxTimeMS::kCommandName
+                                                      << 1 << "subMaxTimeMS" << subMaxTimeMSMillis),
+                                                 opCtx);
+    auto bson = dbResponseToBSON(dbResponse);
+    return {bson["childDeadline"].Date(),
+            static_cast<ErrorCodes::Error>(bson["childTimeoutError"].Int())};
+}
+
+// Child maxTimeMS (200ms) is shorter than parent deadline (5s): the nested child should
+// see the tighter child deadline. Before SERVER-117349, this case hit assertion 40119
+// because DBDirectClient refused to set a deadline when one already existed.
+void ServiceEntryPointShardRoleTest::testNestedMaxTimeMSChildTightensParentDeadline() {
+    auto opCtx = makeOperationContext();
+    auto now = getGlobalServiceContext()->getFastClockSource()->now();
+    opCtx->setDeadlineByDate(now + Milliseconds(5000), ErrorCodes::MaxTimeMSExpired);
+    const auto parentDeadline = opCtx->getDeadline();
+
+    auto obs = runNestedDirectClientWithMaxTimeMS(opCtx.get(), 200);
+
+    // Allow a small slack to absorb clock imprecision in the test runner.
+    ASSERT_LTE(obs.deadline, now + Milliseconds(200) + Milliseconds(100));
+    ASSERT_LT(obs.deadline, parentDeadline);
+    ASSERT_EQ(opCtx->getDeadline(), parentDeadline);
+}
+
+// Parent deadline (100ms) is tighter than child maxTimeMS (5s): the nested child should
+// see the parent's deadline, and the parent's deadline must be preserved unchanged after
+// the nested call returns.
+void ServiceEntryPointShardRoleTest::testNestedMaxTimeMSParentDeadlineTighterThanChild() {
+    auto opCtx = makeOperationContext();
+    auto now = getGlobalServiceContext()->getFastClockSource()->now();
+    opCtx->setDeadlineByDate(now + Milliseconds(100), ErrorCodes::MaxTimeMSExpired);
+    const auto parentDeadline = opCtx->getDeadline();
+
+    auto obs = runNestedDirectClientWithMaxTimeMS(opCtx.get(), 5000);
+
+    ASSERT_EQ(obs.deadline, parentDeadline);
+    ASSERT_EQ(opCtx->getDeadline(), parentDeadline);
+}
+
+// Parent has no deadline (Date_t::max()), child sets its own maxTimeMS.
+void ServiceEntryPointShardRoleTest::testNestedMaxTimeMSWithNoParentDeadline() {
+    auto opCtx = makeOperationContext();
+    auto now = getGlobalServiceContext()->getFastClockSource()->now();
+    ASSERT_EQ(opCtx->getDeadline(), Date_t::max());
+
+    auto obs = runNestedDirectClientWithMaxTimeMS(opCtx.get(), 200);
+
+    ASSERT_LTE(obs.deadline, now + Milliseconds(200) + Milliseconds(100));
+    ASSERT_GT(obs.deadline, now);
+    ASSERT_EQ(opCtx->getDeadline(), Date_t::max());
+}
+
+// Parent deadline is tighter than child maxTimeMS AND uses a non-MaxTimeMSExpired error
+// code: the nested child must observe the parent's original error code, not the child's
+// MaxTimeMSExpired.
+void ServiceEntryPointShardRoleTest::
+    testNestedMaxTimeMSPreservesParentErrorCodeWhenParentTighter() {
+    auto opCtx = makeOperationContext();
+    auto now = getGlobalServiceContext()->getFastClockSource()->now();
+    opCtx->setDeadlineByDate(now + Milliseconds(100), ErrorCodes::ExceededTimeLimit);
+    const auto parentDeadline = opCtx->getDeadline();
+
+    auto obs = runNestedDirectClientWithMaxTimeMS(opCtx.get(), 5000);
+
+    ASSERT_EQ(obs.deadline, parentDeadline);
+    ASSERT_EQ(obs.timeoutError, ErrorCodes::ExceededTimeLimit);
+    ASSERT_EQ(opCtx->getDeadline(), parentDeadline);
+    ASSERT_EQ(opCtx->getTimeoutError(), ErrorCodes::ExceededTimeLimit);
+}
+
+TEST_F(ServiceEntryPointShardServerTest, NestedMaxTimeMSChildTightensParentDeadline) {
+    testNestedMaxTimeMSChildTightensParentDeadline();
+}
+TEST_F(ServiceEntryPointShardServerTest, NestedMaxTimeMSParentDeadlineTighterThanChild) {
+    testNestedMaxTimeMSParentDeadlineTighterThanChild();
+}
+TEST_F(ServiceEntryPointShardServerTest, NestedMaxTimeMSWithNoParentDeadline) {
+    testNestedMaxTimeMSWithNoParentDeadline();
+}
+TEST_F(ServiceEntryPointShardServerTest, NestedMaxTimeMSPreservesParentErrorCodeWhenParentTighter) {
+    testNestedMaxTimeMSPreservesParentErrorCodeWhenParentTighter();
+}
+
+TEST_F(ServiceEntryPointShardServerTest,
+       WriteErrorSurvivesInterruptionDuringShardingMetadataRecovery) {
+    auto staleShardVersionHandlerMock = std::make_shared<StaleShardVersionExceptionHandlerMock>();
+    EXPECT_CALL(*staleShardVersionHandlerMock, handleStaleShardVersionException(_, _))
+        .WillOnce(
+            Invoke([](OperationContext*, const StaleConfigInfo&) -> boost::optional<ChunkVersion> {
+                uasserted(ErrorCodes::InterruptedDueToReplStateChange,
+                          "simulated interruption while recovering sharding metadata");
+            }));
+    CollectionShardingStateFactory::set(
+        getServiceContext(),
+        std::make_unique<CollectionShardingStateFactoryMock>(staleShardVersionHandlerMock));
+
+    auto opCtx = makeOperationContext();
+
+    // Simulate a write command that reported an individual write's StaleConfig error via the
+    // sharding operation state, to be handled once the command invocation returns.
+    const auto generation = CollectionGeneration(OID::gen(), Timestamp(1, 0));
+    OperationShardingState::get(opCtx.get())
+        .setShardingOperationFailedStatus(Status(
+            StaleConfigInfo(NamespaceString::createNamespaceString_forTest("testDb", "testColl"),
+                            ShardVersionFactory::make(ChunkVersion(generation, {1, 0})),
+                            boost::none,
+                            ShardId("shard0000")),
+            "simulated stale config write error"));
+
+    // Even though recovering the write's StaleConfig error is interrupted, the command's own
+    // (successful) response must not be overwritten with a top-level error.
+    runCommandTestWithResponse(BSON(TestCmdSucceeds::kCommandName << 1), opCtx.get());
+}
+
+TEST_F(ServiceEntryPointReplicaSetTest, NestedMaxTimeMSChildTightensParentDeadline) {
+    testNestedMaxTimeMSChildTightensParentDeadline();
+}
+TEST_F(ServiceEntryPointReplicaSetTest, NestedMaxTimeMSParentDeadlineTighterThanChild) {
+    testNestedMaxTimeMSParentDeadlineTighterThanChild();
+}
+TEST_F(ServiceEntryPointReplicaSetTest, NestedMaxTimeMSWithNoParentDeadline) {
+    testNestedMaxTimeMSWithNoParentDeadline();
+}
+TEST_F(ServiceEntryPointReplicaSetTest, NestedMaxTimeMSPreservesParentErrorCodeWhenParentTighter) {
+    testNestedMaxTimeMSPreservesParentErrorCodeWhenParentTighter();
+}
+
+}  // namespace
+}  // namespace mongo::admission

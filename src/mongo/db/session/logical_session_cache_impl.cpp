@@ -1,0 +1,549 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/session/logical_session_cache_impl.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/logical_session_cache_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_killer.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <iterator>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
+
+namespace mongo {
+
+namespace {
+
+void clearShardingOperationFailedStatus(OperationContext* opCtx) {
+    // We do not intend to immediately act upon sharding errors if we receive them during sessions
+    // collection operations. We will instead attempt the same operations during the next refresh
+    // cycle.
+    OperationShardingState::get(opCtx).resetShardingOperationFailedStatus();
+}
+
+}  // namespace
+
+LogicalSessionCacheImpl::LogicalSessionCacheImpl(std::unique_ptr<ServiceLiaison> service,
+                                                 std::shared_ptr<SessionsCollection> collection,
+                                                 ReapSessionsOlderThanFn reapSessionsOlderThanFn)
+    : _service(std::move(service)),
+      _sessionsColl(std::move(collection)),
+      _reapSessionsOlderThanFn(std::move(reapSessionsOlderThanFn)) {
+    _stats.setLastSessionsCollectionJobTimestamp(_service->now());
+    _stats.setLastTransactionReaperJobTimestamp(_service->now());
+    _stats.setLastTransactionReaperJobDurationUpdatedTimestamp(_service->now());
+    _stats.setLastTransactionReaperJobEntriesCleanedUpUpdatedTimestamp(_service->now());
+    _stats.setLastSessionsCollectionJobDurationMillisUpdatedTimestamp(_service->now());
+    _stats.setLastSessionsCollectionJobEntriesRefreshedUpdatedTimestamp(_service->now());
+    _stats.setLastSessionsCollectionJobEntriesEndedUpdatedTimestamp(_service->now());
+    _stats.setLastSessionsCollectionJobCursorsClosedUpdatedTimestamp(_service->now());
+
+
+    // Skip initializing this background thread when using 'recoverFromOplogAsStandalone=true',
+    // --magicRestore, or --queryableBackupMode as the server is put in read-only mode after oplog
+    // recovery.
+    if (repl::ReplSettings::shouldRecoverFromOplogAsStandalone() ||
+        storageGlobalParams.magicRestore || storageGlobalParams.queryableBackupMode) {
+        return;
+    }
+
+    if (!disableLogicalSessionCacheRefresh) {
+        _service->scheduleJob(
+            {"LogicalSessionCacheRefresh",
+             [this](Client* client) { _periodicRefresh(client); },
+             Milliseconds(logicalSessionRefreshMillis),
+             // TODO(SERVER-74659): Please revisit if this periodic job could be made killable.
+             false /*isKillableByStepdown*/});
+
+        _service->scheduleJob(
+            {"LogicalSessionCacheReap",
+             [this](Client* client) { _periodicReap(client); },
+             Milliseconds(logicalSessionRefreshMillis),
+             // TODO(SERVER-74659): Please revisit if this periodic job could be made killable.
+             false /*isKillableByStepdown*/});
+    }
+}
+
+LogicalSessionCacheImpl::~LogicalSessionCacheImpl() {
+    joinOnShutDown();
+}
+
+void LogicalSessionCacheImpl::joinOnShutDown() {
+    _service->join();
+}
+
+Status LogicalSessionCacheImpl::startSession(OperationContext* opCtx,
+                                             const LogicalSessionRecord& record) {
+    std::lock_guard lg(_mutex);
+    return _addToCacheIfNotFull(lg, record);
+}
+
+Status LogicalSessionCacheImpl::vivify(OperationContext* opCtx, const LogicalSessionId& lsid) {
+    auto parentLsid = getParentSessionId(lsid);
+
+    std::lock_guard lg(_mutex);
+
+    auto it = _activeSessions.find(parentLsid ? *parentLsid : lsid);
+    if (it == _activeSessions.end())
+        return _addToCacheIfNotFull(lg, makeLogicalSessionRecord(opCtx, lsid, _service->now()));
+
+    auto& cacheEntry = it->second;
+    cacheEntry.setLastUse(_service->now());
+
+    return Status::OK();
+}
+
+Status LogicalSessionCacheImpl::refreshNow(OperationContext* opCtx) {
+    try {
+        LOGV2_DEBUG(10720700, 1, "Refreshing logical session cache");
+        auto res = _refresh(opCtx->getClient());
+        if (!res.isOK()) {
+            LOGV2(94001001,
+                  "Failed to refresh session cache, will try again at the next refresh interval",
+                  "error"_attr = redact(res));
+        }
+        return res;
+    } catch (const DBException& ex) {
+        LOGV2(20714,
+              "Failed to refresh session cache, will try again at the next refresh interval",
+              "error"_attr = redact(ex));
+        return exceptionToStatus();
+    } catch (...) {
+        return exceptionToStatus();
+    }
+}
+
+void LogicalSessionCacheImpl::reapNow(OperationContext* opCtx) {
+    uassertStatusOK(_reap(opCtx->getClient()));
+}
+
+size_t LogicalSessionCacheImpl::size() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _activeSessions.size();
+}
+
+void LogicalSessionCacheImpl::_periodicRefresh(Client* client) {
+    try {
+        LOGV2_DEBUG(10720701, 1, "Refreshing logical session cache due to periodic refresh");
+        Status res = _refresh(client);
+        if (!res.isOK()) {
+            LOGV2(94001002,
+                  "Failed to refresh session cache, will try again at the next refresh interval",
+                  "error"_attr = redact(res));
+        }
+    } catch (const DBException& ex) {
+        LOGV2(20710,
+              "Failed to refresh session cache, will try again at the next refresh interval",
+              "error"_attr = redact(ex));
+    }
+}
+
+void LogicalSessionCacheImpl::_periodicReap(Client* client) {
+    auto res = _reap(client);
+    if (!res.isOK()) {
+        LOGV2(20711, "Failed to reap transaction table", "error"_attr = redact(res));
+    }
+
+    return;
+}
+
+Status LogicalSessionCacheImpl::_reap(Client* client) {
+    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+    auto* const opCtx = [&] {
+        if (client->getOperationContext()) {
+            return client->getOperationContext();
+        }
+
+        uniqueCtx.emplace(client->makeOperationContext());
+        return uniqueCtx->get();
+    }();
+
+    // Mark this operation as non-deprioritizable to prevent session reaping from being
+    // starved by admission control during periods of high load.
+    admission::execution_control::ScopedTaskTypeNonDeprioritizable nonDeprioritizable(opCtx);
+
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx, AdmissionContext::Priority::kExempt);
+    // Only impose a deadline when we own the opCtx (background job).  If the opCtx was
+    // supplied by the caller (e.g. reapLogicalSessionCacheNow / refreshLogicalSessionCacheNow)
+    // we leave their deadline intact.  maxTimeMS in the command BSON cannot be used here
+    // because DBDirectClient rejects it; setting the deadline directly on the opCtx is the
+    // correct mechanism for the loopback path.
+    if (uniqueCtx && logicalSessionCacheJobTimeoutEnabled) {
+        opCtx->setDeadlineAfterNowBy(Milliseconds(logicalSessionRefreshMillis) * 9 / 10,
+                                     ErrorCodes::MaxTimeMSExpired);
+    }
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord && replCoord->getSettings().isReplSet() &&
+        replCoord->getMemberState().arbiter()) {
+        return Status::OK();
+    }
+
+    // Take the lock to update some stats.
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        // Start the new run.
+        _stats.setLastTransactionReaperJobTimestamp(_service->now());
+        _stats.setTransactionReaperJobCount(_stats.getTransactionReaperJobCount() + 1);
+    }
+
+    int numReaped = 0;
+
+    try {
+        ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
+        try {
+            _sessionsColl->checkSessionsCollectionExists(opCtx);
+        } catch (const DBException& ex) {
+            LOGV2(20712,
+                  "Sessions collection is not set up; waiting until next sessions reap interval",
+                  "error"_attr = redact(ex));
+            return Status::OK();
+        }
+        numReaped = _reapSessionsOlderThanFn(opCtx,
+                                             *_sessionsColl,
+                                             _service->now() -
+                                                 Minutes(gTransactionRecordMinimumLifetimeMinutes));
+    } catch (const DBException& ex) {
+        {
+            std::lock_guard<std::mutex> lk(_mutex);
+            auto millis = _service->now() - _stats.getLastTransactionReaperJobTimestamp();
+            _stats.setLastTransactionReaperJobDurationMillis(millis.count());
+            _stats.setLastTransactionReaperJobDurationUpdatedTimestamp(_service->now());
+        }
+
+        return ex.toStatus();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        auto millis = _service->now() - _stats.getLastTransactionReaperJobTimestamp();
+        _stats.setLastTransactionReaperJobDurationMillis(millis.count());
+        _stats.setLastTransactionReaperJobDurationUpdatedTimestamp(_service->now());
+        _stats.setLastTransactionReaperJobEntriesCleanedUp(numReaped);
+        _stats.setLastTransactionReaperJobEntriesCleanedUpUpdatedTimestamp(_service->now());
+    }
+
+    return Status::OK();
+}
+
+Status LogicalSessionCacheImpl::_refresh(Client* client) {
+    // As we swap out _activeSessions during this process, without this protection, _refresh may
+    // return without all active sessions being present in the collection. There is no correctness
+    // issue without this as the backswapper is a merge operation, however, the
+    // refreshLogicalSessionCacheNow function is used in testing to ensure that sessions are present
+    // before continuing. To ensure correctness of this function, make sure that it is not running
+    // concurrently with the periodic refresh. As these are the only two usages, we do not expect
+    // any performance issues from this mutex.
+    std::lock_guard<std::mutex> refreshLock(_refreshMutex);
+    Status refreshStatus = Status::OK();
+    // get or make an opCtx
+    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+    auto* const opCtx = [&client, &uniqueCtx] {
+        if (client->getOperationContext()) {
+            return client->getOperationContext();
+        }
+
+        uniqueCtx.emplace(client->makeOperationContext());
+        return uniqueCtx->get();
+    }();
+
+    // Mark this operation as non-deprioritizable to prevent session refresh from being
+    // starved by admission control during periods of high load.
+    admission::execution_control::ScopedTaskTypeNonDeprioritizable nonDeprioritizable(opCtx);
+
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx, AdmissionContext::Priority::kExempt);
+    // Only impose a deadline when we own the opCtx (background job).  If the opCtx was
+    // supplied by the caller (e.g. reapLogicalSessionCacheNow / refreshLogicalSessionCacheNow)
+    // we leave their deadline intact.  maxTimeMS in the command BSON cannot be used here
+    // because DBDirectClient rejects it; setting the deadline directly on the opCtx is the
+    // correct mechanism for the loopback path.
+    if (uniqueCtx && logicalSessionCacheJobTimeoutEnabled) {
+        opCtx->setDeadlineAfterNowBy(Milliseconds(logicalSessionRefreshMillis) * 9 / 10,
+                                     ErrorCodes::MaxTimeMSExpired);
+    }
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord && replCoord->getSettings().isReplSet() &&
+        replCoord->getMemberState().arbiter()) {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _activeSessions.clear();
+        return refreshStatus;
+    }
+
+    // Stats for serverStatus:
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        // Start the new run.
+        _stats.setLastSessionsCollectionJobTimestamp(_service->now());
+        _stats.setSessionsCollectionJobCount(_stats.getSessionsCollectionJobCount() + 1);
+    }
+
+    // This will finish timing _refresh for our stats no matter when we return.
+    const ScopeGuard timeRefreshJob([this] {
+        std::lock_guard<std::mutex> lk(_mutex);
+        auto millis = _service->now() - _stats.getLastSessionsCollectionJobTimestamp();
+        _stats.setLastSessionsCollectionJobDurationMillis(millis.count());
+        _stats.setLastSessionsCollectionJobDurationMillisUpdatedTimestamp(_service->now());
+    });
+
+    ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
+
+    _sessionsColl->setupSessionsCollection(opCtx);
+
+    LogicalSessionIdSet staleSessions;
+    LogicalSessionIdSet explicitlyEndingSessions;
+    LogicalSessionIdMap<LogicalSessionRecord> activeSessions;
+
+    {
+        using std::swap;
+        std::lock_guard<std::mutex> lk(_mutex);
+        swap(explicitlyEndingSessions, _endingSessions);
+        swap(activeSessions, _activeSessions);
+    }
+
+    // Create guards that in the case of a exception replace the ending or active sessions that
+    // swapped out of LogicalSessionCache, and merges in any records that had been added since we
+    // swapped them out.
+    auto backSwap = [this](auto& member, auto& temp) {
+        std::lock_guard<std::mutex> lk(_mutex);
+        using std::swap;
+        swap(member, temp);
+        for (const auto& it : temp) {
+            member.emplace(it);
+        }
+    };
+    ScopeGuard activeSessionsBackSwapper([&] { backSwap(_activeSessions, activeSessions); });
+    auto explicitlyEndingBackSwapper =
+        ScopeGuard([&] { backSwap(_endingSessions, explicitlyEndingSessions); });
+
+    // remove all explicitlyEndingSessions from activeSessions
+    for (const auto& lsid : explicitlyEndingSessions) {
+        activeSessions.erase(lsid);
+    }
+
+    // Refresh all recently active sessions as well as for sessions attached to running ops.
+    LogicalSessionRecordSet activeSessionRecords;
+
+    auto runningOpSessions = _service->getActiveOpSessions();
+
+    for (const auto& it : runningOpSessions) {
+        // if a running op is the cause of an upsert, we won't have a user name for the record
+        if (explicitlyEndingSessions.count(it) > 0) {
+            continue;
+        }
+        activeSessionRecords.insert(makeLogicalSessionRecord(it, _service->now()));
+    }
+    for (const auto& it : activeSessions) {
+        activeSessionRecords.insert(it.second);
+    }
+
+    // Refresh the active sessions in the sessions collection.
+    auto refreshRes = _sessionsColl->refreshSessions(opCtx, activeSessionRecords);
+    activeSessionsBackSwapper.dismiss();
+    if (refreshRes.hasErrors()) {
+        const auto numFailed = refreshRes.failedSessions.size();
+        for (const auto& error : refreshRes.errors) {
+            LOGV2_WARNING(94001000,
+                          "Failed to refresh some active sessions, continuing without these",
+                          "numFailed"_attr = numFailed,
+                          "totalAttempted"_attr = activeSessionRecords.size(),
+                          "error"_attr = redact(error));
+        }
+        // Return the first error to the caller after logging them all.
+        refreshStatus = refreshRes.errors[0];
+    }
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+
+        // Store sessions that failed to update back in _activeSessions to be retried next time,
+        // unless the failure was specifically MaxTimeMSExpired (our own job deadline firing). In
+        // that case re-storing the backlog would just cause the next cycle to hit the same wall.
+        // For any other failure (network error, write concern timeout, etc.) we do re-store so
+        // those sessions are retried normally, regardless of whether the timeout is enabled.
+        const bool failedDueToJobTimeout = logicalSessionCacheJobTimeoutEnabled &&
+            !refreshRes.errors.empty() &&
+            refreshRes.errors[0].code() == ErrorCodes::MaxTimeMSExpired;
+        if (!failedDueToJobTimeout) {
+            LogicalSessionIdSet failedLsids;
+            for (const auto& record : refreshRes.failedSessions) {
+                failedLsids.insert(record.getId());
+            }
+
+            for (const auto& [lsid, record] : activeSessions) {
+                if (failedLsids.count(lsid) > 0) {
+                    _activeSessions.emplace(lsid, record);
+                }
+            }
+        }
+
+        size_t successCount = activeSessionRecords.size() - refreshRes.failedSessions.size();
+        _stats.setLastSessionsCollectionJobEntriesRefreshed(successCount);
+        _stats.setLastSessionsCollectionJobEntriesFailedToRefresh(refreshRes.failedSessions.size());
+        _stats.setLastSessionsCollectionJobEntriesRefreshedUpdatedTimestamp(_service->now());
+    }
+    // Remove the ending sessions from the sessions collection.
+    _sessionsColl->removeRecords(opCtx, explicitlyEndingSessions);
+    explicitlyEndingBackSwapper.dismiss();
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _stats.setLastSessionsCollectionJobEntriesEnded(explicitlyEndingSessions.size());
+        _stats.setLastSessionsCollectionJobEntriesEndedUpdatedTimestamp(_service->now());
+    }
+
+    // Find which running, but not recently active sessions, are expired, and add them
+    // to the list of sessions to kill cursors for
+
+    KillAllSessionsByPatternSet patterns;
+
+    auto openCursorSessions = _service->getOpenCursorSessions(opCtx);
+    // Exclude sessions added to _activeSessions from the openCursorSession to avoid race between
+    // killing cursors on the removed sessions and creating sessions.
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+
+        for (const auto& it : _activeSessions) {
+            auto newSessionIt = openCursorSessions.find(it.first);
+            if (newSessionIt != openCursorSessions.end()) {
+                openCursorSessions.erase(newSessionIt);
+            }
+        }
+    }
+
+    try {
+        auto removedSessions = _sessionsColl->findRemovedSessions(opCtx, openCursorSessions);
+        for (const auto& lsid : removedSessions) {
+            patterns.emplace(makeKillAllSessionsByPattern(opCtx, lsid));
+        }
+    } catch (...) {
+        // Ignore errors.
+    }
+
+    // Add all of the explicitly ended sessions to the list of sessions to kill cursors for.
+    for (const auto& lsid : explicitlyEndingSessions) {
+        patterns.emplace(makeKillAllSessionsByPattern(opCtx, lsid));
+    }
+
+    SessionKiller::Matcher matcher(std::move(patterns));
+    auto killRes = _service->killCursorsWithMatchingSessions(opCtx, std::move(matcher));
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _stats.setLastSessionsCollectionJobCursorsClosed(killRes);
+        _stats.setLastSessionsCollectionJobCursorsClosedUpdatedTimestamp(_service->now());
+    }
+    return refreshStatus;
+}
+
+void LogicalSessionCacheImpl::endSessions(const LogicalSessionIdSet& sessions) {
+    for (const auto& lsid : sessions) {
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "Cannot specify a child session id " << lsid,
+                isParentSessionId(lsid));
+    }
+    std::lock_guard<std::mutex> lk(_mutex);
+    _endingSessions.insert(begin(sessions), end(sessions));
+}
+
+LogicalSessionCacheStats LogicalSessionCacheImpl::getStats() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _stats.setActiveSessionsCount(_activeSessions.size());
+    return _stats;
+}
+
+Status LogicalSessionCacheImpl::_addToCacheIfNotFull(WithLock, LogicalSessionRecord record) {
+    if (_activeSessions.size() >= size_t(maxSessions)) {
+        Status status = {ErrorCodes::TooManyLogicalSessions,
+                         str::stream()
+                             << "Unable to add session ID " << record.getId()
+                             << " into the cache because the number of active sessions is too "
+                                "high"};
+        // Returns Info() unless it was called in the past second.
+        // In that case it will return the quieter Debug(2) */
+        static auto& bumpedSeverity = *new logv2::SeveritySuppressor{
+            Seconds{1}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
+        LOGV2_DEBUG(20715,
+                    bumpedSeverity().toInt(),
+                    "Unable to add session into the cache, too many active sessions",
+                    "sessionId"_attr = record.getId(),
+                    "sessionCount"_attr = _activeSessions.size(),
+                    "maxSessions"_attr = maxSessions);
+        return status;
+    }
+
+    _activeSessions.insert(std::make_pair(record.getId(), std::move(record)));
+
+    return Status::OK();
+}
+
+std::vector<LogicalSessionId> LogicalSessionCacheImpl::listIds() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    std::vector<LogicalSessionId> ret;
+    ret.reserve(_activeSessions.size());
+    for (const auto& id : _activeSessions) {
+        ret.push_back(id.first);
+    }
+    return ret;
+}
+
+std::vector<LogicalSessionId> LogicalSessionCacheImpl::listIds(
+    const std::vector<SHA256Block>& userDigests) const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    std::vector<LogicalSessionId> ret;
+    for (const auto& it : _activeSessions) {
+        if (std::find(userDigests.cbegin(), userDigests.cend(), it.first.getUid()) !=
+            userDigests.cend()) {
+            ret.push_back(it.first);
+        }
+    }
+    return ret;
+}
+
+boost::optional<LogicalSessionRecord> LogicalSessionCacheImpl::peekCached(
+    const LogicalSessionId& lsid) const {
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream() << "Cannot specify a child session id " << lsid,
+            isParentSessionId(lsid));
+
+    std::lock_guard<std::mutex> lk(_mutex);
+    const auto it = _activeSessions.find(lsid);
+    if (it == _activeSessions.end()) {
+        return boost::none;
+    }
+    return it->second;
+}
+
+}  // namespace mongo

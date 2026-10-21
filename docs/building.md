@@ -1,119 +1,99 @@
-Building MongoDB
-================
+# Building MongoDB
+
+Please note that prebuilt binaries are available on [mongodb.org](http://www.mongodb.org/downloads)
+and may be the easiest way to get started, rather than building from source.
 
 To build MongoDB, you will need:
 
-* A modern C++ compiler. One of the following is required.
-    * GCC 4.8.2 or newer
-    * Clang 3.4 (or Apple XCode 5.1.1 Clang) or newer
-    * Visual Studio 2013 Update 2 or newer
-* Python 2.7
-* SCons 2.3
+- A modern C++ compiler capable of compiling C++20. One of the following is required:
+  - GCC 14.2
+  - Clang 19.1
+  - Apple XCode 16.4
+  - Visual Studio 2022 version 17.0
+- On Linux and macOS, the libcurl library and header is required. MacOS includes libcurl.
+  - Fedora/RHEL - `dnf install libcurl-devel`
+  - Ubuntu/Debian - `libcurl-dev` is provided by three packages. Install one of them:
+    - `libcurl4-openssl-dev`
+    - `libcurl4-nss-dev`
+    - `libcurl4-gnutls-dev`
+  - On Ubuntu, the lzma library is required. Install `liblzma-dev`
+  - On Amazon Linux, the xz-devel library is required. `yum install xz-devel`
+- Python 3.13
+- About 13 GB of free disk space for the core binaries (`mongod`, `mongos`, and `mongo`).
 
-for the target x86, or x86-64 platform. More detailed platform instructions can be found below.
+If using a newer version of a C++ compiler than listed above, it may work. However the versions
+listed above have been verified to work.
 
-MongoDB Tools
---------------
+MongoDB supports the following architectures: arm64, ppc64le, s390x, and x86-64. More detailed
+platform instructions can be found below.
 
-The MongoDB command line tools (mongodump, mongorestore, mongoimport, mongoexport, etc)
-have been rewritten in [Go](http://golang.org/) and are no longer included in this repository.
+## Quick (re)Start
 
-The source for the tools is now available at [mongodb/mongo-tools](https://github.com/mongodb/mongo-tools).
+### Linux
 
-SCons
----------------
+```bash
+python buildscripts/install_bazel.py
+export PATH=~/.local/bin:$PATH
+bazel build install-dist-test
+bazel-bin/install/bin/mongod --version
+```
 
-For detail information about building, please see [the build manual](http://www.mongodb.org/about/contributors/tutorial/build-mongodb-from-source/)
+## Bazel
 
-If you want to build everything (mongod, mongo, tests, etc):
+If you only want to build the database server `mongod`:
 
-    $ scons all
+    $ bazel build install-mongod
 
-If you only want to build the database:
+**_Note_**: For C++ compilers that are newer than the supported version, the compiler may issue new
+warnings that cause MongoDB to fail to build since the build system treats compiler warnings as
+errors. To ignore the warnings, pass the switch `--disable_warnings_as_errors=True` to the bazel
+command.
 
-    $ scons
+    $ bazel build install-mongod --disable_warnings_as_errors=True
 
-To install
+If you want to build absolutely everything (`mongod`, `mongo`, unit tests, etc):
 
-    $ scons --prefix=/opt/mongo install
+    $ bazel build --build_tag_filters=mongo_binary //src/mongo/...
 
-Please note that prebuilt binaries are available on [mongodb.org](http://www.mongodb.org/downloads) and may be the easiest way to get started.
+## Bazel Targets
 
-SCons Targets
---------------
+The following targets can be named on the bazel command line to build and install a subset of
+components:
 
-* mongod
-* mongos
-* mongo
-* core (includes mongod, mongos, mongo)
-* all
+- `install-mongod`
+- `install-mongos`
+- `install-core` (includes _only_ `mongod` and `mongos`)
+- `install-dist` (includes all server components)
+- `install-devcore` (includes `mongod`, `mongos`, and `jstestshell` (formerly `mongo` shell))
 
-Windows
---------------
+**_NOTE_**: The `install-core` and `install-dist` targets are _not_ guaranteed to be identical. The
+`install-core` target will only ever include a minimal set of "core" server components, while
+`install-dist` is intended for a functional end-user installation. If you are testing, you should
+use the `install-devcore` or `install-dist` targets instead.
 
-See [the windows build manual](http://www.mongodb.org/about/contributors/tutorial/build-mongodb-from-source/#windows-specific-instructions)
+## Where to find Binaries
+
+The build system will produce an installation tree into `bazel-bin/install`, as well individual
+install target trees like `bazel-bin/<install-target>`.
+
+## Windows
 
 Build requirements:
-* Visual Studio 2013 Update 2 or newer
-* Python 2.7, ActiveState ActivePython 2.7.x Community Edition for Windows is recommended
-* SCons
+
+- Visual Studio 2022 version 17.0 or newer
+- Python 3.13
 
 Or download a prebuilt binary for Windows at www.mongodb.org.
 
-Debian/Ubuntu
---------------
+## Debian/Ubuntu
 
 To install dependencies on Debian or Ubuntu systems:
 
-    # aptitude install scons build-essential
-    # aptitude install libboost-filesystem-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
+    # apt-get install build-essential
 
-To run tests as well, you will need PyMongo:
+## OS X
 
-    # aptitude install python-pymongo
+Install Xcode 16.4 or newer. Make sure macOS 15.5 platform is installed.
 
-Then build as usual with `scons`:
-
-    $ scons all
-
-OS X
---------------
-
-Using [Homebrew](http://brew.sh):
-
-    $ brew install mongodb
-
-Using [MacPorts](http://www.macports.org):
-
-    $ sudo port install mongodb
-
-FreeBSD
---------------
-
-Install the following ports:
-
-  * devel/libexecinfo
-  * devel/scons
-  * lang/gcc
-  * lang/python
-
-Optional Components if you want to use system libraries instead of the libraries included with MongoDB
-
-  * archivers/snappy
-  * lang/v8
-  * devel/boost
-  * devel/pcre
-
-OpenBSD
---------------
-Install the following ports:
-
-  * devel/libexecinfo
-  * devel/scons
-  * lang/gcc
-  * lang/python
-
-Special Build Notes
---------------
-  * [open solaris on ec2](building.opensolaris.ec2.md)
-
+The LLVM toolchain is downloaded automatically by Bazel. To use a local LLVM installation instead,
+set `LLVM_PATH` to its install prefix: `bazel build --repo_env=LLVM_PATH=/path/to/llvm ...`

@@ -1,0 +1,161 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/s/write_ops/unified_write_executor/unified_write_executor.h"
+
+#include "mongo/db/fle_crud.h"
+#include "mongo/s/commands/query_cmd/populate_cursor.h"
+#include "mongo/s/query/exec/collect_query_stats_mongos.h"
+#include "mongo/s/write_ops/fle.h"
+#include "mongo/s/write_ops/unified_write_executor/stats.h"
+#include "mongo/s/write_ops/unified_write_executor/write_batch_executor.h"
+#include "mongo/s/write_ops/unified_write_executor/write_batch_response_processor.h"
+#include "mongo/s/write_ops/unified_write_executor/write_batch_scheduler.h"
+#include "mongo/s/write_ops/unified_write_executor/write_op_batcher.h"
+#include "mongo/s/write_ops/unified_write_executor/write_op_producer.h"
+#include "mongo/s/write_ops/write_cmd_query_stats_registrar.h"
+
+namespace mongo {
+namespace unified_write_executor {
+
+// Decorator used to cache the value of 'gFeatureFlagUnifiedWriteExecutor' so that it remains
+// constant across a query.
+const OperationContext::Decoration<boost::optional<bool>> useUweForOpCtx =
+    OperationContext::declareDecoration<boost::optional<bool>>();
+
+namespace {
+bool isNonVerboseWriteCommand(OperationContext* opCtx, WriteCommandRef cmdRef) {
+    // When determining if a write command is non-verbose, we follow slightly different rules
+    // for different write commands. For batch write commands, we match the existing behavior
+    // of BatchWriteOp::buildClientResponse(). For bulk write commands, we match the existing
+    // behavior of ClusterBulkWriteCmd::Invocation::_populateCursorReply(). For findAndModify
+    // commands, it is always "verbose" regardless of the write concern settings.
+    const auto& wc = opCtx->getWriteConcern();
+    return cmdRef.visitRequest(OverloadedVisitor{
+        [&](const BatchedCommandRequest&) { return !wc.requiresWriteAcknowledgement(); },
+        [&](const BulkWriteCommandRequest&) {
+            return !wc.requiresWriteAcknowledgement() &&
+                (wc.syncMode == WriteConcernOptions::SyncMode::NONE ||
+                 wc.syncMode == WriteConcernOptions::SyncMode::UNSET);
+        },
+        [&](const write_ops::FindAndModifyCommandRequest&) { return false; },
+    });
+}
+}  // namespace
+
+WriteCommandResponse executeWriteCommand(OperationContext* opCtx,
+                                         WriteCommandRef cmdRef,
+                                         unified_write_executor::Stats& stats,
+                                         BSONObj originalCommand,
+                                         boost::optional<OID> targetEpoch) {
+
+    tassert(11123700, "OperationContext must not be null", opCtx);
+
+    const bool isNonVerbose = isNonVerboseWriteCommand(opCtx, cmdRef);
+
+    // Register query stats key
+    query_stats::WriteCmdQueryStatsRegistrar::parseAndRegisterRequest(opCtx, cmdRef);
+
+    WriteOpProducer producer(cmdRef);
+    WriteOpAnalyzerImpl analyzer = WriteOpAnalyzerImpl(stats);
+
+    const bool ordered = cmdRef.getOrdered();
+
+    std::unique_ptr<WriteOpBatcher> batcher{nullptr};
+    if (ordered) {
+        batcher = std::make_unique<OrderedWriteOpBatcher>(producer, analyzer, cmdRef);
+    } else {
+        batcher = std::make_unique<UnorderedWriteOpBatcher>(producer, analyzer, cmdRef);
+    }
+
+    WriteBatchExecutor executor(cmdRef, originalCommand);
+    WriteBatchResponseProcessor processor(cmdRef, stats, isNonVerbose, originalCommand);
+    WriteBatchScheduler scheduler(cmdRef, *batcher, executor, processor, targetEpoch);
+
+    scheduler.run(opCtx);
+    auto response = processor.generateClientResponse(opCtx);
+
+    CurOp::get(opCtx)->setEndOfOpMetricsForBatchWrites();
+    collectQueryStatsMongosBatchWrites(opCtx);
+
+    return response;
+}
+
+BatchedCommandResponse write(OperationContext* opCtx,
+                             const BatchedCommandRequest& request,
+                             unified_write_executor::Stats& stats,
+                             boost::optional<OID> targetEpoch) {
+    if (prepareForFLERewrite(opCtx,
+                             request.getWriteCommandRequestBase().getEncryptionInformation())) {
+        BatchedCommandResponse response;
+        FLEBatchResult result = processFLEBatch(opCtx, request, &response);
+        if (result == FLEBatchResult::kProcessed) {
+            return response;
+        }
+        // When FLE logic determines there is no need of processing, we fall through to the normal
+        // case.
+    }
+
+    return std::get<BatchedCommandResponse>(
+        executeWriteCommand(opCtx, WriteCommandRef{request}, stats, BSONObj(), targetEpoch));
+}
+
+bulk_write_exec::BulkWriteReplyInfo bulkWrite(OperationContext* opCtx,
+                                              const BulkWriteCommandRequest& request,
+                                              unified_write_executor::Stats& stats,
+                                              BSONObj originalCommand) {
+    if (prepareForFLERewrite(opCtx, request.getNsInfo()[0].getEncryptionInformation())) {
+        auto [result, replyInfo] = attemptExecuteFLE(opCtx, request);
+        if (result == FLEBatchResult::kProcessed) {
+            return std::move(replyInfo);
+        }
+        // When FLE logic determines there is no need of processing, we fall through to the normal
+        // case.
+    }
+
+    return std::get<bulk_write_exec::BulkWriteReplyInfo>(
+        executeWriteCommand(opCtx, WriteCommandRef{request}, stats, originalCommand));
+}
+
+// TODO(SERVER-115515) Clean up FAM code in UWE (here and across files in
+// mongo/s/write_ops/unified_write_executor/*).
+FindAndModifyCommandResponse findAndModify(
+    OperationContext* opCtx,
+    const write_ops::FindAndModifyCommandRequest& originalRequest,
+    BSONObj originalCommand) {
+    // Make a copy in the event that we need to set runtime constants.
+    auto request = originalRequest;
+    if (prepareForFLERewrite(opCtx, request.getEncryptionInformation())) {
+        StatusWith<write_ops::FindAndModifyCommandReply> swReply(
+            write_ops::FindAndModifyCommandReply{});
+        boost::optional<WriteConcernErrorDetail> wce = boost::none;
+        FLEBatchResult result = processFLEFindAndModify(opCtx, request, swReply, wce);
+        if (result == FLEBatchResult::kProcessed) {
+            return {swReply, ShardId(), wce};
+        }
+        // When FLE logic determines there is no need of processing, we fall through to the normal
+        // case.
+    }
+
+    // Append mongoS' runtime constants to the command object so that we have the same values
+    // for these constants across all shards.
+    uassert(11423300,
+            "Cannot specify runtime constants option to a mongos",
+            request.getLegacyRuntimeConstants() == boost::none);
+    request.setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+
+    unified_write_executor::Stats stats;
+    return std::get<FindAndModifyCommandResponse>(
+        executeWriteCommand(opCtx, WriteCommandRef{request}, stats, originalCommand));
+}
+
+bool isEnabled(OperationContext* opCtx) {
+    // Cache the value on an opCtx decorator so that the value remains consistent accross a query.
+    if (!useUweForOpCtx(opCtx).has_value()) {
+        useUweForOpCtx(opCtx) = feature_flags::gFeatureFlagUnifiedWriteExecutor.checkEnabled();
+    }
+    return *useUweForOpCtx(opCtx);
+}
+
+}  // namespace unified_write_executor
+}  // namespace mongo

@@ -1,0 +1,83 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+// TODO SERVER-115201: Break up the utils not to cross modules
+namespace [[MONGO_MOD_NEEDS_REPLACEMENT]] change_stream_pre_image_util {
+
+/**
+ * Whether or not replicated truncates should be used for pre-images collection
+ * truncation. This will first consult the active persistence provider (for ASC
+ * or DSC) and call 'shouldUseReplicatedTruncates()' on it. If this returns
+ * true, then replicated truncates will be used. If this does not return true,
+ * the feature flag 'gFeatureFlagUseReplicatedTruncatesForDeletions' will be
+ * consulted and its value will be returned. The overload taking an
+ * 'fcvSnapshot' evaluates the feature flag against that snapshot; the overload
+ * without one uses the current FCV snapshot.
+ */
+bool shouldUseReplicatedTruncatesForPreImages(OperationContext* opCtx);
+bool shouldUseReplicatedTruncatesForPreImages(OperationContext* opCtx,
+                                              const ServerGlobalParams::FCVSnapshot& fcvSnapshot);
+
+/**
+ * If 'expireAfterSeconds' is defined for pre-images, returns its value.
+ * Otherwise, returns boost::none.
+ */
+boost::optional<Seconds> getExpireAfterSeconds(OperationContext* opCtx);
+
+/**
+ * If 'expireAfterSeconds' is defined for pre-images, returns the 'date' at
+ * which all pre-images with 'operationTime' <= 'date' are expired. Otherwise,
+ * returns boost::none.
+ */
+boost::optional<Date_t> getPreImageOpTimeExpirationDate(OperationContext* opCtx,
+                                                        Date_t currentTime);
+
+/**
+ * Truncates all pre-images with '_id.ts' <= 'expirationTimestampApproximation' using an
+ * unreplicated truncate. Only called during startup recovery, and assumes that no replicated
+ * truncates are used.
+ */
+void truncatePreImagesByTimestampExpirationApproximation(
+    OperationContext* opCtx,
+    const CollectionAcquisition& preImagesColl,
+    Timestamp expirationTimestampApproximation);
+
+/**
+ * Finds the next collection UUID in 'preImagesCollPtr' greater than
+ * 'currentNsUUID'. Returns boost::none if the next collection is not found.
+ * Stores the wall time of the first record in the next collection in
+ * 'firstDocWallTime'.
+ */
+boost::optional<UUID> findNextCollectionUUID(OperationContext* opCtx,
+                                             const CollectionAcquisition& preImagesColl,
+                                             boost::optional<UUID> currentNsUUID,
+                                             Date_t& firstDocWallTime);
+
+/**
+ * Returns the set of nsUUID's captured in the 'preImagesCollection'.
+ */
+stdx::unordered_set<UUID, UUID::Hash> getNsUUIDs(OperationContext* opCtx,
+                                                 const CollectionAcquisition& preImagesCollection);
+
+/**
+ * Preferred method for getting the current time in pre-image removal code - in
+ * testing environments, the 'changeStreamPreImageRemoverCurrentTime' failpoint
+ * can alter the return value.
+ *
+ * Returns the current time.
+ */
+Date_t getCurrentTimeForPreImageRemoval(OperationContext* opCtx);
+}  // namespace change_stream_pre_image_util
+}  // namespace mongo

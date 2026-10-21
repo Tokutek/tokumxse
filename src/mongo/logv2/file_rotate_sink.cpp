@@ -1,0 +1,238 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/logv2/file_rotate_sink.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/json_formatter.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/logv2/log_tag.h"
+#include "mongo/logv2/log_truncation.h"
+#include "mongo/logv2/shared_access_fstream.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/demangle.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/stacktrace.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+
+#include <algorithm>
+#include <exception>
+#include <fstream>  // IWYU pragma: keep
+#include <iostream>
+#include <string_view>
+#include <utility>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/exception/diagnostic_information.hpp>
+#include <boost/exception/exception.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/iterator/filter_iterator.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/iterator/transform_iterator.hpp>
+#include <boost/log/core/record_view.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/make_shared_object.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+#include <fmt/format.h>
+
+#ifdef _WIN32
+#include "mongo/logv2/log_util.h"
+#endif
+// IWYU pragma: no_include "boost/system/detail/errc.hpp"
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+
+namespace mongo::logv2 {
+namespace {
+
+#if _WIN32
+using stream_t = Win32SharedAccessOfstream;
+#else
+using stream_t = std::ofstream;
+#endif
+
+bool checkLogFileExists(const std::string& filename) {
+#ifdef _WIN32
+    if (isLogPathWindowsNul(filename)) {
+        return true;
+    }
+#endif
+    return boost::filesystem::exists(filename);
+}
+
+StatusWith<boost::shared_ptr<stream_t>> openFile(const std::string& filename, bool append) {
+    std::ios_base::openmode mode = std::ios_base::out;
+    bool exists = false;
+    if (append) {
+        mode |= std::ios_base::app;
+        exists = checkLogFileExists(filename);
+    } else
+        mode |= std::ios_base::trunc;
+    auto file = boost::make_shared<stream_t>(filename, mode);
+    if (file->fail())
+        return Status(ErrorCodes::FileNotOpen, fmt::format("Failed to open {}", filename));
+    if (append && exists)
+        file->put('\n');
+    return file;
+}
+}  // namespace
+
+struct FileRotateSink::Impl {
+    Impl(LogTimestampFormat tsFormat) : timestampFormat(tsFormat) {}
+    StringMap<boost::shared_ptr<stream_t>> files;
+    LogTimestampFormat timestampFormat;
+};
+
+FileRotateSink::FileRotateSink(LogTimestampFormat timestampFormat)
+    : _impl(std::make_unique<Impl>(timestampFormat)) {}
+FileRotateSink::~FileRotateSink() {}
+
+Status FileRotateSink::addFile(const std::string& filename, bool append) {
+    auto statusWithFile = openFile(filename, append);
+    if (statusWithFile.isOK()) {
+        add_stream(statusWithFile.getValue());
+        _impl->files[filename] = statusWithFile.getValue();
+    }
+
+    return statusWithFile.getStatus().withContext("Can't initialize rotatable log file");
+}
+void FileRotateSink::removeFile(const std::string& filename) {
+    auto it = _impl->files.find(filename);
+    if (it != _impl->files.cend()) {
+        remove_stream(it->second);
+        _impl->files.erase(it);
+    }
+}
+
+Status FileRotateSink::rotate(bool rename,
+                              std::string_view renameSuffix,
+                              std::function<void(Status)> onMinorError) {
+    for (auto& file : _impl->files) {
+        const std::string& filename = file.first;
+        if (rename) {
+            std::string renameTarget = fmt::format("{}{}", filename, renameSuffix);
+
+            auto targetExists = [&]() -> StatusWith<bool> {
+                try {
+                    return boost::filesystem::exists(renameTarget);
+                } catch (const boost::exception&) {
+                    return exceptionToStatus();
+                }
+            }();
+
+            if (!targetExists.isOK()) {
+                return Status(ErrorCodes::FileRenameFailed, targetExists.getStatus().reason())
+                    .withContext(fmt::format("Cannot verify whether destination already exists: {}",
+                                             renameTarget));
+            }
+
+            if (targetExists.getValue()) {
+                if (onMinorError) {
+                    onMinorError(
+                        {ErrorCodes::FileRenameFailed,
+                         fmt::format(
+                             "Target already exists during log rotation. Skipping this file. "
+                             "target={}, file={}",
+                             renameTarget,
+                             filename)});
+                }
+                continue;
+            }
+
+            boost::system::error_code ec;
+            boost::filesystem::rename(filename, renameTarget, ec);
+            if (ec) {
+                if (ec == boost::system::errc::no_such_file_or_directory) {
+                    if (onMinorError)
+                        onMinorError(
+                            {ErrorCodes::FileRenameFailed,
+                             fmt::format(
+                                 "Source file was missing during log rotation. Creating a new "
+                                 "one. file={}",
+                                 filename)});
+                } else {
+                    return Status(
+                        ErrorCodes::FileRenameFailed,
+                        fmt::format(
+                            "Failed to rename {} to {}: {}", filename, renameTarget, ec.message()));
+                }
+            }
+        }
+
+        auto newFile = openFile(filename, false);
+        if (newFile.isOK()) {
+            invariant(file.second);
+            remove_stream(file.second);
+            file.second->close();
+            file.second = newFile.getValue();
+            add_stream(file.second);
+        }
+        return newFile.getStatus();
+    }
+
+    return Status::OK();
+}
+
+void FileRotateSink::consume(const boost::log::record_view& rec,
+                             const string_type& formatted_string) {
+    auto isFailed = [](const auto& file) {
+        return file.second->fail();
+    };
+    boost::log::sinks::text_ostream_backend::consume(rec, formatted_string);
+    if (std::any_of(_impl->files.begin(), _impl->files.end(), isFailed)) {
+        try {
+            auto failedBegin =
+                boost::make_filter_iterator(isFailed, _impl->files.begin(), _impl->files.end());
+            auto failedEnd =
+                boost::make_filter_iterator(isFailed, _impl->files.end(), _impl->files.end());
+
+            auto getFilename = [](const auto& file) -> const auto& {
+                return file.first;
+            };
+            auto begin = boost::make_transform_iterator(failedBegin, getFilename);
+            auto end = boost::make_transform_iterator(failedEnd, getFilename);
+            auto sequence = logv2::seqLog(begin, end);
+
+            DynamicAttributes attrs;
+            attrs.add("files", sequence);
+
+            fmt::memory_buffer buffer;
+            JSONFormatter(nullptr, _impl->timestampFormat)
+                .format(buffer,
+                        LogSeverity::Severe(),
+                        LogComponent::kControl,
+                        Date_t::now(),
+                        4522200,
+                        getLogService(),
+                        getThreadName(),
+                        "Writing to log file failed, aborting application",
+                        TypeErasedAttributeStorage(attrs),
+                        LogTag::kNone,
+                        std::string() /* tenantID */,
+                        LogTruncation::Disabled);
+            // Commented out log line below to get validation of the log id with the errorcodes
+            // linter LOGV2(4522200, "Writing to log file failed, aborting application");
+            std::cerr << std::string_view(buffer.data(), buffer.size()) << std::endl;
+        } catch (const std::exception& ex) {
+            std::cerr << "Caught std::exception of type " << demangleName(typeid(ex)) << ": "
+                      << ex.what() << std::endl;
+        } catch (const boost::exception& ex) {
+            std::cerr << "Caught boost::exception of type " << demangleName(typeid(ex)) << ": "
+                      << boost::diagnostic_information(ex) << std::endl;
+        } catch (...) {
+            std::cerr << "Caught unidentified exception" << std::endl;
+        }
+
+        printStackTrace(std::cerr);
+        quickExitWithoutLogging(ExitCode::fail);
+    }
+}
+
+}  // namespace mongo::logv2

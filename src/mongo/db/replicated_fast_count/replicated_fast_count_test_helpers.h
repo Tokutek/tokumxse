@@ -1,0 +1,510 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_size_count.h"
+#include "mongo/db/replicated_fast_count/size_count_store.h"
+#include "mongo/db/replicated_fast_count/size_count_timestamp_store.h"
+#include "mongo/db/rss/stub_persistence_provider.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/uuid.h"
+
+#include <functional>
+#include <list>
+#include <memory>
+#include <utility>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/optional/optional.hpp>
+
+namespace mongo::replicated_fast_count::test_helpers {
+/**
+ * Stub persistence provider for enabling the replicated fast count collection.
+ */
+class ReplicatedFastCountTestPersistenceProvider : public rss::StubPersistenceProvider {
+    boost::optional<Timestamp> getSentinelDataTimestamp() const override {
+        return boost::none;
+    }
+
+    std::string getWiredTigerConfig(bool, bool wtLogEnabled, const std::string&) const override {
+        invariant(!wtLogEnabled);
+        return "in_memory=true,log=(enabled=false),";
+    }
+
+    std::string getMainWiredTigerTableSettings() const override {
+        return "";
+    }
+
+    bool mustUseContainerWrites() const override {
+        return true;
+    }
+
+    bool shouldUseReplicatedCatalogIdentifiers() const override {
+        return false;
+    }
+
+    // Enables replicated fast count collection for tests.
+    bool shouldUseReplicatedFastCount() const override {
+        return true;
+    }
+
+    bool shouldUseOplogWritesForFlowControlSampling() const override {
+        return false;
+    }
+
+    // The write path consults this on every operation. These tests target fast count, not
+    // continuous internode validation, so leave validation off.
+    bool shouldUseContinuousInternodeValidation() const override {
+        return false;
+    }
+
+    bool shouldUseReplicatedRecordIds() const override {
+        return false;
+    }
+
+    bool shouldDelayDataAccessDuringStartup() const override {
+        return false;
+    }
+
+    bool shouldAvoidDuplicateCheckpoints() const override {
+        return false;
+    }
+
+    bool supportsCursorReuseForExpressPathQueries() const override {
+        return false;
+    }
+
+    bool supportsLocalCollections() const override {
+        return true;
+    }
+
+    bool supportsUnstableCheckpoints() const override {
+        return false;
+    }
+
+    bool supportsTableLogging() const override {
+        return true;
+    }
+
+    bool supportsCrossShardTransactions() const override {
+        return false;
+    }
+
+    bool supportsFindAndModifyImageCollection() const override {
+        return false;
+    }
+
+    bool supportsPersistentOplogCapMaintainerThread() const override {
+        return false;
+    }
+
+    bool supportsAsyncOplogMarkerGeneration() const override {
+        return false;
+    }
+
+    bool supportsOplogSampling() const override {
+        return false;
+    }
+
+    bool supportsOplogScanning() const override {
+        return true;
+    }
+
+    bool supportsWriteConcernOptions(const WriteConcernOptions&) const override {
+        return true;
+    }
+
+    multiversion::FeatureCompatibilityVersion getMinimumRequiredFCV() const override {
+        // (Generic FCV reference): Mock storage can operate at any FCV.
+        return multiversion::GenericFCV::kLastLTS;
+    }
+
+    const char* getWTMemoryPageMaxForOplogStrValue() const override {
+        return "10m";  // 10MB
+    }
+
+    bool settingsProvideMajorityWriteJournalDurability(bool) const override {
+        return false;
+    }
+
+    bool supportsColdCollections() const override {
+        return false;
+    }
+
+    bool usesSchemaEpochs() const override {
+        return false;
+    }
+
+    bool supportsPreservingPreparedTxnInPreciseCheckpoints() const override {
+        return false;
+    }
+};
+
+/**
+ * Returns true if `uuid` is found in the fast count metadata container, and writes the value to
+ * `outDoc`.
+ */
+bool findPersistedDocInContainer(OperationContext* opCtx, const UUID& uuid, BSONObj& outDoc);
+
+/**
+ * Checks the persisted values of count and size for the given UUID in the underlying fast count
+ * store.
+ */
+void checkFastCountMetadataInInternalStore(OperationContext* opCtx,
+                                           const UUID& uuid,
+                                           bool expectPersisted,
+                                           int64_t expectedCount,
+                                           int64_t expectedSize);
+
+/**
+ * Checks the uncommitted fast count changes for the given UUID.
+ */
+void checkUncommittedSizeCount(OperationContext* opCtx,
+                               UUID uuid,
+                               CollectionSizeCount expectedSizeCount);
+
+/**
+ * Checks the committed size and count for the `RecordStore` with the provided `uuid`.
+ *
+ * It is an invariant that the provided `uuid` exists in the catalog.
+ */
+void checkCommittedSizeCount(OperationContext* opCtx,
+                             UUID uuid,
+                             CollectionSizeCount expectedSizeCount);
+
+/**
+ * Inserts the specified number of documents into the given collection, using the provided function
+ * 'makeDoc' to generate each document. Checks whether uncommitted and committed changes are updated
+ * as expected. Expected size is calculated as numDocs * size of sampleDoc, where sampleDoc is a
+ * representative document for the type of documents being inserted.
+ *
+ * If abortWithoutCommit is set to true, the WriteUnitOfWork will not be committed, simulating a
+ * rollback.
+ */
+void insertDocs(OperationContext* opCtx,
+                replicated_fast_count::ReplicatedFastCountManager* fastCountManager,
+                const NamespaceString& nss,
+                int numDocs,
+                int64_t startingCount,
+                int64_t startingSize,
+                const std::function<BSONObj(int)>& makeDoc,
+                const BSONObj& sampleDoc,
+                bool abortWithoutCommit = false);
+
+/**
+ * Updates the documents in the given collection in the id range [start, end] to the new documents
+ * generated by the 'makeUpdatedDoc' function, checking expected size and count. The expected size
+ * is calculated as sampleDoc.objsize() * numDocs, where sampleDoc is a document that is
+ * representative of what the documents we are updating look like after the update is applied.
+ */
+void updateDocs(OperationContext* opCtx,
+                replicated_fast_count::ReplicatedFastCountManager* fastCountManager,
+                const NamespaceString& nss,
+                int startIdx,
+                int endIdx,
+                int64_t startingCount,
+                int64_t startingSize,
+                const std::function<BSONObj(int)>& makeUpdatedDoc,
+                const BSONObj& sampleDocBeforeUpdate,
+                const BSONObj& sampleDocAfterUpdate);
+
+/**
+ * Deletes documents with ids in the range [startIdx, endIdx] from the given collection.
+ */
+void deleteDocsByIDRange(OperationContext* opCtx,
+                         replicated_fast_count::ReplicatedFastCountManager* fastCountManager,
+                         const NamespaceString& nss,
+                         int startIdx,
+                         int endIdx,
+                         int64_t startingCount,
+                         int64_t startingSize,
+                         const BSONObj& sampleDoc);
+
+/**
+ * Allows explicit control over the contents of the "oplog" used to aggregate size and count. This
+ * test cursor does not have visibility rules specific to the oplog, but should suffice for
+ * targeted testing of aggregation logic.
+ */
+class OplogCursorMock : public SeekableRecordCursor {
+public:
+    OplogCursorMock(std::list<repl::OplogEntry> entries);
+    /**
+     * `throwWriteConflictOnNthCall` causes the `n`-th call to next() (1-indexed) to throw a
+     * `WriteConflictException` exactly once, before consuming or returning that record.
+     */
+    OplogCursorMock(std::list<repl::OplogEntry> entries, int throwWriteConflictOnNthCall);
+
+    ~OplogCursorMock() override {}
+
+    boost::optional<Record> next() override;
+
+    boost::optional<Record> seekExact(const RecordId& id) override;
+
+    void save() override {}
+    bool restore(RecoveryUnit&, bool) override {
+        return true;
+    }
+    void detachFromOperationContext() override {}
+    void reattachToOperationContext(OperationContext*) override {}
+    void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
+
+    boost::optional<Record> seek(const RecordId& start, BoundInclusion boundInclusion) override;
+
+private:
+    bool _initialized = false;
+    std::list<std::pair<RecordId, BSONObj>> _records;
+    std::list<std::pair<RecordId, BSONObj>>::const_iterator _it;
+    boost::optional<int> _throwOnNthCall = boost::none;
+    int _nextCallCount = 0;
+};
+
+/**
+ * Return all oplog entries matching 'predicate'.
+ */
+std::vector<repl::OplogEntry> getOplogEntriesMatching(
+    OperationContext* opCtx, std::function<bool(const repl::OplogEntry&)> predicate);
+
+/**
+ * Get applyOps oplog entries on the given namespace. Returns a vector of oplog entries sorted in
+ * ascending timestamp order.
+ */
+std::vector<repl::OplogEntry> getApplyOpsForNss(OperationContext* opCtx,
+                                                const NamespaceString& innerNss);
+
+/**
+ * Returns the most recent applyOps entry that contains an inner op on 'innerNss'.
+ * Assumes getApplyOpsForNss() returns entries in ascending timestamp order.
+ */
+repl::OplogEntry getLatestApplyOpsForNss(OperationContext* opCtx, const NamespaceString& innerNss);
+
+/**
+ * Returns applyOps oplog entries that write to the replicated fast count metadata store, covering
+ * both the collection-backed path (inner ops on the fast count store NSS) and the container-backed
+ * path (inner ops whose `container` ident is a replicated fast count ident). Returns a vector of
+ * oplog entries sorted in ascending timestamp order.
+ */
+std::vector<repl::OplogEntry> getApplyOpsForFastCountStore(OperationContext* opCtx);
+
+/**
+ * Returns the most recent applyOps entry for the replicated fast count metadata store, covering
+ * both the collection-backed and container-backed paths.
+ */
+repl::OplogEntry getLatestApplyOpsForFastCountStore(OperationContext* opCtx);
+
+enum class FastCountOpType {
+    kInsert,
+    kUpdate,
+    kDelete,
+};
+
+struct ExpectedFastCountOp {
+    UUID uuid;
+    FastCountOpType opType;
+
+    boost::optional<int64_t> expectedCount;
+    boost::optional<int64_t> expectedSize;
+};
+
+/**
+ * Asserts that the given applyOps oplog entry contains fast-count operations matching the expected
+ * operations. Dispatches per-inner-op based on whether the op carries a `container` ident or a
+ * namespace. Count checks on updates are only exercised on the container path, since the
+ * collection-mode update diff does not necessarily carry a count field.
+ */
+void assertFastCountApplyOpsMatches(const repl::OplogEntry& applyOpsEntry,
+                                    const std::vector<ExpectedFastCountOp>& expectedOps);
+
+/**
+ * Expected values for validating individual operations in an oplog entry or applyOps inner ops with
+ * respect to the replicated fast count information.
+ */
+struct OpValidationSpec {
+    /**
+     * The collection UUID for the operation.
+     */
+    UUID uuid;
+
+    /**
+     * The operation type (e.g., insert, update, delete).
+     */
+    repl::OpTypeEnum opType;
+
+    /**
+     * The expected size delta for 'o2.m.sz' in the oplog entry.
+     */
+    int32_t expectedSizeDelta;
+};
+
+/**
+ * Asserts the replicated size count information in 'oplogEntry' is 'expectedSizeDelta'.
+ */
+void assertReplicatedSizeCountMeta(const repl::OplogEntry& oplogEntry, int32_t expectedSizeDelta);
+
+/**
+ * Asserts the information encoded in 'oplogEntry' aligns with that of 'entrySpecs'.
+ */
+void assertOpMatchesSpec(const repl::OplogEntry& oplogEntry, const OpValidationSpec& entrySpecs);
+void assertOpsMatchSpecs(const std::vector<repl::OplogEntry>& oplogEntries,
+                         const std::vector<OpValidationSpec>& entrySpecs);
+
+/**
+ * Gets the most recent oplog entry matching 'nss' and 'opType'.
+ */
+boost::optional<repl::OplogEntry> getMostRecentOplogEntry(OperationContext* opCtx,
+                                                          const NamespaceString& nss,
+                                                          const repl::OpTypeEnum& opType);
+
+/**
+ * Performs a scan over all the documents in 'nss' to get an accurate total size and count for the
+ * collection.
+ */
+CollectionSizeCount scanForAccurateSizeCount(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Convenience wrapper around extractReplicatedMetadataDeltasForApplyOps that constructs and returns
+ * the result map.
+ */
+absl::flat_hash_map<UUID, CollectionSizeCount> extractSizeCountDeltasForApplyOps(
+    const repl::OplogEntry& applyOpsEntry);
+
+
+/**
+ * Simple wrapper to ease creation and testing of replicated fast count and size.
+ */
+struct NsAndUUID {
+    NamespaceString nss;
+    UUID uuid;
+};
+
+/**
+ * Generates an oplog entry with the provided inputs and placeholders for all other required fields.
+ */
+repl::OplogEntry makeOplogEntry(Timestamp ts,
+                                NsAndUUID userColl,
+                                repl::OpTypeEnum opType,
+                                int32_t sizeDelta,
+                                boost::optional<int64_t> hash = boost::none);
+repl::OplogEntry makeOplogEntry(Timestamp ts, NsAndUUID userColl, repl::OpTypeEnum opType);
+
+/**
+ * Generates a synthetic top-level container-write oplog entry for the provided `containerIdent`.
+ * `opType` must be kContainerInsert, kContainerUpdate, or kContainerDelete.
+ */
+repl::OplogEntry makeContainerOplogEntry(Timestamp ts,
+                                         std::string_view containerIdent,
+                                         repl::OpTypeEnum opType);
+
+/**
+ * Generates a truncateRange command oplog entry for the given collection UUID with the specified
+ * bytesDeleted and docsDeleted values.
+ */
+repl::OplogEntry makeTruncateRangeOplogEntry(Timestamp ts,
+                                             NsAndUUID userColl,
+                                             int64_t bytesDeleted,
+                                             int64_t docsDeleted);
+/**
+ * Generates a command oplog entry representing a collection create or drop for 'userColl'.
+ */
+repl::OplogEntry makeCreateOplogEntry(Timestamp ts, NsAndUUID userColl);
+repl::OplogEntry makeDropOplogEntry(Timestamp ts, NsAndUUID userColl);
+
+/**
+ * Returns a no-op watermark oplog entry that mirrors the shape of the entry written by
+ * `flusher::writeWatermark()`.
+ */
+repl::OplogEntry makeWatermarkOplogEntry(Timestamp ts);
+
+/**
+ * Generates an importCollection command oplog entry for 'userColl' with the inputted 'numRecords',
+ * 'dataSize', and 'dryRun' values.
+ */
+repl::OplogEntry makeImportCollectionOplogEntry(
+    Timestamp ts, NsAndUUID userColl, int64_t numRecords, int64_t dataSize, bool dryRun = false);
+
+/**
+ * Inserts `oplogEntry` into the oplog collection.
+ */
+void writeToOplog(OperationContext* opCtx, const repl::OplogEntry& oplogEntry);
+
+/**
+ * Inserts an entry into `store` for the provided `uuid`.
+ */
+boost::optional<SizeCountStore::Entry> insertSizeCountEntry(OperationContext* opCtx,
+                                                            SizeCountStore& store,
+                                                            UUID uuid,
+                                                            const SizeCountStore::Entry& entry);
+
+/**
+ * Inserts a timestamp into `store`.
+ */
+// TODO(SERVER-136271): Return boost::optional<Timestamp>.
+void insertSizeCountTimestamp(OperationContext* opCtx,
+                              SizeCountTimestampStore& store,
+                              Timestamp timestamp);
+
+/**
+ * Creates a BSONObj representing a fast count metadata store entry with a fixed valid-as-of
+ * timestamp.
+ */
+BSONObj makeEntryBson(int64_t count, int64_t size);
+
+/**
+ * Creates a char span for a given UUID.
+ */
+std::span<const char> uuidSpan(const UUID& u);
+
+/**
+ * Creates a char span for a given BSONObj.
+ */
+std::span<const char> bsonSpan(const BSONObj& obj);
+
+/**
+ * The container-backed fast count stores, which are always created as a pair.
+ */
+struct ContainerFastCountStores {
+    std::unique_ptr<SizeCountStore> sizeCountStore;
+    std::unique_ptr<SizeCountTimestampStore> timestampStore;
+};
+
+/**
+ * Creates the internal fast count containers and returns container-backed stores over them.
+ *
+ * Requires a fixture whose persistence provider mandates container writes, such as
+ * `ReplicatedFastCountTestPersistenceProvider`.
+ */
+ContainerFastCountStores createContainerFastCountStores(OperationContext* opCtx);
+
+/**
+ * Registers an OpObserver so oplog writes are actually written to the oplog.
+ *
+ * This is useful in tests that call `waitForFlush()` and expect the oplog tailer to see one or more
+ * watermark entries.
+ */
+void registerOpObserverForTest(ServiceContext* service);
+
+/**
+ * Requests a flush using the `requestFlush` function until the valid-as-of timestamp in
+ * `timestampStore` advances from the value read when this function was called, then returns the
+ * new valid-as-of timestamp.
+ *
+ * This function blocks the calling thread.
+ *
+ * If the valid-as-of timestamp does not advance within 30 seconds, this function throws an
+ * exception.
+ */
+Timestamp waitForFlush(OperationContext* opCtx,
+                       SizeCountTimestampStore& timestampStore,
+                       std::function<void()> requestFlush);
+
+/**
+ * Requests a flush using the `requestFlush` function until the failpoint `fp` has been entered once
+ * more than when this function was called.
+ *
+ * This function blocks the calling thread.
+ */
+void waitForFlushFailpoint(FailPointEnableBlock& fp, std::function<void()> requestFlush);
+
+}  // namespace mongo::replicated_fast_count::test_helpers

@@ -1,0 +1,1013 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/util/assert_util.h"
+
+#include "mongo/base/static_assert.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/demangle.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/str.h"
+
+#include <csignal>
+#include <ostream>
+#include <type_traits>
+
+#include "gmock/gmock.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+namespace mongo {
+namespace {
+constexpr int kTripwireLogId = 4457000;
+
+struct PrinterMockTassert {
+    auto format(auto& fc) const {
+        tasserted(9513401, "tasserting in mock printer");
+        return fc.out();
+    }
+};
+
+struct PrinterMockUassert {
+    auto format(auto& fc) const {
+        uasserted(9513402, "uasserting in mock printer");
+        return fc.out();
+    }
+};
+
+void someRiskyBusiness() {
+    invariant(false, "ouch");
+}
+struct PrinterMockInvariant {
+    auto format(auto& fc) const {
+        someRiskyBusiness();
+        return fc.out();
+    }
+};
+
+struct MemberCallFormatter {
+    constexpr auto parse(auto& ctx) {
+        return ctx.begin();
+    }
+    auto format(const auto& obj, auto& ctx) const {
+        return obj.format(ctx);
+    }
+};
+}  // namespace
+}  // namespace mongo
+namespace fmt {
+template <>
+struct formatter<mongo::PrinterMockTassert> : mongo::MemberCallFormatter {};
+
+template <>
+struct formatter<mongo::PrinterMockUassert> : mongo::MemberCallFormatter {};
+
+template <>
+struct formatter<mongo::PrinterMockInvariant> : mongo::MemberCallFormatter {};
+}  // namespace fmt
+
+namespace mongo {
+namespace {
+
+using ::testing::ElementsAre;
+
+#define ASSERT_CATCHES(code, Type)                                         \
+    ([] {                                                                  \
+        try {                                                              \
+            uasserted(code, "");                                           \
+        } catch (const Type&) {                                            \
+            /* Success - ignore*/                                          \
+        } catch (const std::exception& ex) {                               \
+            FAIL("Expected to be able to catch " #code " as a " #Type)     \
+                << " actual exception type: " << demangleName(typeid(ex)); \
+        }                                                                  \
+    }())
+
+#define ASSERT_NOT_CATCHES(code, Type)            \
+    ([] {                                         \
+        try {                                     \
+            uasserted(code, "");                  \
+        } catch (const Type&) {                   \
+            FAIL("Caught " #code " as a " #Type); \
+        } catch (const DBException&) {            \
+            /* Success - ignore*/                 \
+        }                                         \
+    }())
+
+// BadValue - no categories
+MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::BadValue>,
+                                 error_details::CategoryList<>>());
+MONGO_STATIC_ASSERT(std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::BadValue>>());
+MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionFor<ErrorCategory::NetworkError>,
+                                     ExceptionFor<ErrorCodes::BadValue>>());
+MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionFor<ErrorCategory::NotPrimaryError>,
+                                     ExceptionFor<ErrorCodes::BadValue>>());
+
+TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
+    ASSERT_CATCHES(ErrorCodes::BadValue, DBException);
+    ASSERT_CATCHES(ErrorCodes::BadValue, AssertionException);
+    ASSERT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCodes::BadValue>);
+    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCodes::DuplicateKey>);
+    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCategory::NetworkError>);
+    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCategory::NotPrimaryError>);
+}
+
+// NotWritablePrimary - NotPrimaryError, RetriableError
+MONGO_STATIC_ASSERT(std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::NotWritablePrimary>,
+                                 error_details::CategoryList<ErrorCategory::NotPrimaryError,
+                                                             ErrorCategory::RetriableError>>());
+MONGO_STATIC_ASSERT(
+    std::is_base_of<AssertionException, ExceptionFor<ErrorCodes::NotWritablePrimary>>());
+MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionFor<ErrorCategory::NetworkError>,
+                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
+MONGO_STATIC_ASSERT(std::is_base_of<ExceptionFor<ErrorCategory::NotPrimaryError>,
+                                    ExceptionFor<ErrorCodes::NotWritablePrimary>>());
+
+TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, DBException);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, AssertionException);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionFor<ErrorCodes::NotWritablePrimary>);
+    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionFor<ErrorCodes::DuplicateKey>);
+    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionFor<ErrorCategory::NetworkError>);
+    ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionFor<ErrorCategory::NotPrimaryError>);
+}
+
+// InterruptedDueToReplStateChange - NotPrimaryError, Interruption, RetriableError
+// TODO(SERVER-56251): revise list when removing the Interruption category.
+MONGO_STATIC_ASSERT(
+    std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
+                 error_details::CategoryList<ErrorCategory::Interruption,
+                                             ErrorCategory::NotPrimaryError,
+                                             ErrorCategory::RetriableError>>());
+MONGO_STATIC_ASSERT(std::is_base_of<AssertionException,
+                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
+MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionFor<ErrorCategory::NetworkError>,
+                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
+MONGO_STATIC_ASSERT(std::is_base_of<ExceptionFor<ErrorCategory::NotPrimaryError>,
+                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
+
+TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange, DBException);
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange, AssertionException);
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
+                   ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>);
+    ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
+                       ExceptionFor<ErrorCodes::DuplicateKey>);
+    ASSERT_NOT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
+                       ExceptionFor<ErrorCategory::NetworkError>);
+    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
+                   ExceptionFor<ErrorCategory::NotPrimaryError>);
+}
+
+MONGO_STATIC_ASSERT(!error_details::isNamedCode<19999>);
+// ExceptionFor<ErrorCodes::Error19999)> invalidType;  // Must not compile.
+
+TEST(AssertUtils, UassertNumericCode) {
+    ASSERT_CATCHES(19999, DBException);
+    ASSERT_CATCHES(19999, AssertionException);
+    ASSERT_NOT_CATCHES(19999, ExceptionFor<ErrorCodes::DuplicateKey>);
+    ASSERT_NOT_CATCHES(19999, ExceptionFor<ErrorCategory::NetworkError>);
+    ASSERT_NOT_CATCHES(19999, ExceptionFor<ErrorCategory::NotPrimaryError>);
+}
+
+TEST(AssertUtils, UassertStatusOKPreservesExtraInfo) {
+    const auto status = Status(ErrorExtraInfoExample(123), "");
+
+    try {
+        uassertStatusOK(status);
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+    }
+
+    try {
+        uassertStatusOK(status);
+    } catch (const ExceptionFor<ErrorCodes::ForTestingErrorExtraInfo>& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+        ASSERT_EQ(ex->data, 123);
+    }
+}
+
+TEST(AssertUtils, UassertStatusOKWithContextPreservesExtraInfo) {
+    const auto status = Status(ErrorExtraInfoExample(123), "");
+
+    try {
+        uassertStatusOKWithContext(status, "foo");
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+    }
+
+    try {
+        uassertStatusOKWithContext(status, "foo");
+    } catch (const ExceptionFor<ErrorCodes::ForTestingErrorExtraInfo>& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+        ASSERT_EQ(ex->data, 123);
+    }
+}
+
+TEST(AssertUtils, UassertTypedExtraInfoWorks) {
+    try {
+        uasserted(ErrorExtraInfoExample(123), "");
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+    }
+
+    try {
+        uassert(ErrorExtraInfoExample(123), "", false);
+    } catch (const ExceptionFor<ErrorCodes::ForTestingErrorExtraInfo>& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+        ASSERT_EQ(ex->data, 123);
+    }
+}
+
+TEST(AssertUtils, UassertIncrementsUserAssertionCounter) {
+    auto userAssertions = assertionCount.user.load();
+    auto asserted = false;
+    try {
+        Status status{ErrorCodes::BadValue, "Test"};
+        uassertStatusOK(status);
+    } catch (const DBException&) {
+        asserted = true;
+    }
+    ASSERT(asserted);
+    ASSERT_EQ(userAssertions + 1, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithStatus) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        Status status{ErrorCodes::BadValue, "Test"};
+        iassert(status);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+
+    iassert(Status::OK());
+
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithExpression) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        iassert(48922, "Test", false);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 48922);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+
+    iassert(48923, "Another test", true);
+
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
+TEST(AssertUtils, MassertTypedExtraInfoWorks) {
+    try {
+        masserted(ErrorExtraInfoExample(123), "");
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+    }
+
+    try {
+        massert(ErrorExtraInfoExample(123), "", false);
+    } catch (const ExceptionFor<ErrorCodes::ForTestingErrorExtraInfo>& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ErrorExtraInfoExample>());
+        ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
+        ASSERT_EQ(ex->data, 123);
+    }
+}
+
+// tassert
+void doTassert() {
+    auto tripwireAssertions = assertionCount.tripwire.load();
+
+    try {
+        Status status{ErrorCodes::BadValue, "Test with Status"};
+        tassert(status);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_EQ(ex.reason(), "Test with Status");
+    }
+    ASSERT_EQ(assertionCount.tripwire.load(), tripwireAssertions + 1);
+
+    tassert(Status::OK());
+    ASSERT_EQ(assertionCount.tripwire.load(), tripwireAssertions + 1);
+
+    try {
+        tassert(4457090, "Test with expression", false);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 4457090);
+        ASSERT_EQ(ex.reason(), "Test with expression");
+    }
+    ASSERT_EQ(assertionCount.tripwire.load(), tripwireAssertions + 2);
+
+    tassert(4457091, "Another test with expression", true);
+    ASSERT_EQ(assertionCount.tripwire.load(), tripwireAssertions + 2);
+
+    try {
+        tasserted(4457092, "Test with tasserted");
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 4457092);
+        ASSERT_EQ(ex.reason(), "Test with tasserted");
+    }
+    ASSERT_EQ(assertionCount.tripwire.load(), tripwireAssertions + 3);
+}
+
+DEATH_TEST_REGEX(TassertTerminationTestDeathTest,
+                 tassertCleanLogMsg,
+                 "4457001.*Aborting process during exit due to prior failed tripwire assertions") {
+    doTassert();
+}
+
+DEATH_TEST_REGEX(TassertTerminationTestDeathTest,
+                 tassertUncleanLogMsg,
+                 "4457002.*Detected prior failed tripwire assertions") {
+    doTassert();
+    quickExit(ExitCode::abrupt);
+}
+
+DEATH_TEST(TassertTerminationTestDeathTest,
+           mongoUnreachableNonFatal,
+           "Hit a MONGO_UNREACHABLE_TASSERT!") {
+    try {
+        MONGO_UNREACHABLE_TASSERT(4457093);
+    } catch (const DBException&) {
+        // Catch the DBException, to ensure that we eventually abort during clean exit.
+    }
+}
+
+DEATH_TEST_REGEX(TassertTerminationTestDeathTest,
+                 mongoUnimplementedNonFatal,
+                 "6634500.*Hit a MONGO_UNIMPLEMENTED_TASSERT!") {
+    try {
+        MONGO_UNIMPLEMENTED_TASSERT(6634500);
+    } catch (const DBException&) {
+        // Catch the DBException, to ensure that we eventually abort during clean exit.
+    }
+}
+
+/**
+ * Resets tripwires at teardown.
+ */
+class TripwireTest : public unittest::Test {
+public:
+    void setUp() override {
+        _initialTripwireCount = _getTripwireCount();
+    }
+
+    void tearDown() override {
+        assertionCount.tripwire.store(_initialTripwireCount);
+    }
+
+protected:
+    /** Number of tripwires that occurred during the test. */
+    [[nodiscard]] int getTestTripwireCount() const {
+        return assertionCount.tripwire.load() - _initialTripwireCount;
+    }
+
+private:
+    [[nodiscard]] int _getTripwireCount() const {
+        return assertionCount.tripwire.load();
+    }
+
+    int _initialTripwireCount = 0;
+};
+
+/**
+ * Captures log and resets tripwires at teardown.
+ */
+class AssertUtilsTripwireTest : public TripwireTest {
+protected:
+    [[nodiscard]] const unittest::LogCaptureGuard& getLog() const {
+        return _logs;
+    }
+
+    /**
+     * Assert log line is generated correctly.
+     *
+     * Wrap calls in `ASSERT_NO_FATAL_FAILURE()` so test body stops running on failure.
+     */
+    void assertLogFormat(int code, std::string_view errmsg) const {
+        const auto idLines = getLog().indicesOfBSONContainingSubset(BSON("id" << kTripwireLogId));
+        ASSERT_EQ(idLines.size(), 1);
+        const size_t expectedLineIdx = idLines[0];
+
+        ASSERT_THAT(getLog().indicesOfBSONContainingSubset(
+                        BSON("attr" << BSON("error" << BSON("errmsg" << errmsg)))),
+                    ElementsAre(expectedLineIdx));
+        ASSERT_THAT(getLog().indicesOfBSONContainingSubset(
+                        BSON("attr" << BSON("error" << BSON("code" << code)))),
+                    ElementsAre(expectedLineIdx));
+    }
+    void assertLogFormat(Status status) const {
+        assertLogFormat(status.code(), status.reason());
+    }
+
+    /**
+     * Assert no log line is generated.
+     *
+     * Wrap calls in `ASSERT_NO_FATAL_FAILURE()` so test body stops running on failure.
+     */
+    void assertNoLog() const {
+        ASSERT_EQ(getLog().countBSONContainingSubset(BSON("id" << kTripwireLogId)), 0);
+    }
+
+private:
+    unittest::LogCaptureGuard _logs;
+};
+
+TEST_F(AssertUtilsTripwireTest, TassertNoThrowTestWithStatusTrigger) {
+    Status status{ErrorCodes::BadValue, "Test with Status"};
+    tassertNoThrow(status);
+    ASSERT_NO_FATAL_FAILURE(assertLogFormat(status));
+    ASSERT_EQ(getTestTripwireCount(), 1);
+}
+
+TEST_F(AssertUtilsTripwireTest, TassertNoThrowTestWithStatusNoTrigger) {
+    static constexpr Status status = Status::OK();
+    tassertNoThrow(status);
+    ASSERT_EQ(getTestTripwireCount(), 0);
+    ASSERT_NO_FATAL_FAILURE(assertNoLog());
+}
+
+TEST_F(AssertUtilsTripwireTest, TassertNoThrowTestWithExpressionTrigger) {
+    static constexpr int code = 13313500;
+    std::string_view errmsg = "Test with expression";
+    tassertNoThrow(code, errmsg, false);
+    ASSERT_NO_FATAL_FAILURE(assertLogFormat(code, errmsg));
+    ASSERT_EQ(getTestTripwireCount(), 1);
+}
+
+TEST_F(AssertUtilsTripwireTest, TassertNoThrowTestWithExpressionNoTrigger) {
+    static constexpr int code = 4457091;
+    std::string_view errmsg = "Another test with expression";
+    tassertNoThrow(code, errmsg, true);
+    ASSERT_EQ(getTestTripwireCount(), 0);
+    ASSERT_NO_FATAL_FAILURE(assertNoLog());
+}
+
+TEST_F(AssertUtilsTripwireTest, TassertedNoThrowTest) {
+    static constexpr int code = 13313501;
+    std::string_view errmsg = "Test with tassertedNoThrow";
+    tassertedNoThrow(code, errmsg);
+    ASSERT_NO_FATAL_FAILURE(assertLogFormat(code, errmsg));
+    ASSERT_EQ(getTestTripwireCount(), 1);
+}
+
+// fassert and its friends
+DEATH_TEST(FassertionTerminationTestDeathTest, BoolCondition, "40206") {
+    fassert(40206, false);
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest, Overload, "Terminating with fassert") {
+    fassert(40207, {ErrorCodes::InternalError, "Terminating with fassert"});
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest, StatusWithOverload, "Terminating with fassert") {
+    fassert(50733,
+            StatusWith<std::string>{ErrorCodes::InternalError,
+                                    "Terminating with fassertStatusWithOverload"});
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest, NoTrace, "Terminating with fassertNoTrace") {
+    fassertNoTrace(50734, Status(ErrorCodes::InternalError, "Terminating with fassertNoTrace"));
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest, NoTraceOverload, "Terminating with fassertNoTrace") {
+    fassertNoTrace(50735,
+                   StatusWith<std::string>(ErrorCodes::InternalError,
+                                           "Terminating with fassertNoTraceOverload"));
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest, FassertFailed, "40210") {
+    fassertFailed(40210);
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest, FassertFailedNoTrace, "40211") {
+    fassertFailedNoTrace(40211);
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest,
+           FassertFailedWithStatus,
+           "Terminating with fassertFailedWithStatus") {
+    fassertFailedWithStatus(
+        40212, {ErrorCodes::InternalError, "Terminating with fassertFailedWithStatus"});
+}
+
+DEATH_TEST(FassertionTerminationTestDeathTest,
+           FassertFailedWithStatusNoTrace,
+           "Terminating with fassertFailedWithStatusNoTrace") {
+    fassertFailedWithStatusNoTrace(
+        40213, {ErrorCodes::InternalError, "Terminating with fassertFailedWithStatusNoTrace"});
+}
+
+// invariant and its friends
+DEATH_TEST_REGEX(InvariantTerminationTestDeathTest,
+                 invariant,
+                 "Invariant failure.*false.*" __FILE__) {
+    invariant(false);
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest, invariantOverload, "Terminating with invariant") {
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"));
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           mongoUnimplementedFatal,
+           "Hit a MONGO_UNIMPLEMENTED!") {
+    MONGO_UNIMPLEMENTED;
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusWithOverload,
+           "Terminating with invariant") {
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError,
+                                      "Terminating with invariantStatusWithOverload"));
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    const char* msg = "Terminating with string literal invariant message";
+    invariant(false, msg);
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
+    invariant(false, msg);
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantOverloadWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"),
+              "Terminating with string literal invariant message");
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantOverloadWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
+    invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"), msg);
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusWithOverloadWithStringLiteralMsg,
+           "Terminating with string literal invariant message") {
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
+              "Terminating with string literal invariant message");
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusWithOverloadWithStdStringMsg,
+           "Terminating with std::string invariant message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string invariant message: " << 12345;
+    invariant(StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariant"),
+              msg);
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusOK,
+           "Terminating with invariantStatusOK") {
+    invariantStatusOK(Status(ErrorCodes::InternalError, "Terminating with invariantStatusOK"));
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusOKOverload,
+           "Terminating with invariantStatusOK") {
+    invariantStatusOK(
+        StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with invariantStatusOK"));
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusOKWithContext,
+           "Terminating with invariantStatusOKWithContext") {
+    invariantStatusOKWithContext(
+        Status(ErrorCodes::InternalError, "Terminating with invariantStatusOKWithContext"),
+        "Terminating with invariantStatusOKWithContext");
+}
+
+DEATH_TEST(InvariantTerminationTestDeathTest,
+           invariantStatusOKWithContextOverload,
+           "Terminating with invariantStatusOKWithContextOverload") {
+    invariantStatusOKWithContext(
+        StatusWith<std::string>(ErrorCodes::InternalError,
+                                "Terminating with invariantStatusOKWithContext"),
+        "Terminating with invariantStatusOKWithContextOverload");
+}
+
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+// dassert and its friends
+DEATH_TEST_REGEX(DassertTerminationTestDeathTest,
+                 invariant,
+                 "Invariant failure.*false.*" __FILE__) {
+    dassert(false);
+}
+
+DEATH_TEST(DassertTerminationTestDeathTest, dassertOK, "Terminating with dassertOK") {
+    dassert(Status(ErrorCodes::InternalError, "Terminating with dassertOK"));
+}
+
+DEATH_TEST(DassertTerminationTestDeathTest,
+           invariantWithStringLiteralMsg,
+           "Terminating with string literal dassert message") {
+    const char* msg = "Terminating with string literal dassert message";
+    dassert(false, msg);
+}
+
+DEATH_TEST(DassertTerminationTestDeathTest,
+           dassertWithStdStringMsg,
+           "Terminating with std::string dassert message: 12345") {
+    const std::string msg = str::stream()
+        << "Terminating with std::string dassert message: " << 12345;
+    dassert(false, msg);
+}
+#endif  // defined(MONGO_CONFIG_DEBUG_BUILD)
+
+TEST(ScopedDebugInfo, Stack) {
+    using namespace unittest::match;
+    error_details::ScopedDebugInfoStack infoStack{};  // Avoiding the tls instance for now.
+    std::vector<std::string> expected;
+    ASSERT_THAT(infoStack.getAll(), Eq(expected));
+    {
+        ScopedDebugInfo greetingGuard("greeting", "hello", &infoStack);
+        expected.push_back("greeting: hello");
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+
+        ScopedDebugInfo numberGuard("age", 123, &infoStack);
+        expected.push_back("age: 123");
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+
+        {
+            ScopedDebugInfo innerGuard("inner", 222, &infoStack);
+            expected.push_back("inner: 222");
+            ASSERT_THAT(infoStack.getAll(), Eq(expected));
+            expected.pop_back();  // innerGuard
+        }
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+        expected.pop_back();  // numberGuard
+        expected.pop_back();  // greetingGuard
+    }
+    ASSERT_THAT(infoStack.getAll(), Eq(expected));
+}
+
+DEATH_TEST(ScopedDebugInfoDeathTest, PrintedOnInvariant, "mission: ATestInjectedString") {
+    ScopedDebugInfo g("mission", "ATestInjectedString");
+    someRiskyBusiness();
+}
+
+// The following test relies on SIGSEGV which is not supported on Windows.
+#if !defined(_WIN32)
+DEATH_TEST(ScopedDebugInfoDeathTest, PrintedOnSignal, "mission: ATestInjectedString") {
+    ScopedDebugInfo g("mission", "ATestInjectedString");
+    raise(SIGSEGV);
+}
+#endif
+
+TEST(ScopedDebugInfo, FormattingCanBeCalledMoreThanOnce) {
+    using namespace unittest::match;
+    error_details::ScopedDebugInfoStack infoStack{};
+
+    ScopedDebugInfo guard("greeting", "hello", &infoStack);
+    // A second call to `getAll` returns correct results.
+    auto _ = infoStack.getAll();
+    ASSERT_THAT(infoStack.getAll(), ElementsAre(Eq("greeting: hello")));
+}
+
+// Test that we are able to incrementally log ScopedDebugInfos from the stack (if one throws an
+// exception, we are able to attempt to print the next one).
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 CorrectScopedDebugInfosOnStackAfterIncorrectOne,
+                 "(?s)tasserting in mock printer.*BACKTRACE"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    error_details::ScopedDebugInfoStack infoStack{};
+    ScopedDebugInfo greetingGuard("greeting", "hello", &infoStack);
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert(), &infoStack);
+    ScopedDebugInfo anotherGreetingGuard("greeting", "hey there", &infoStack);
+
+    using namespace unittest::match;
+    ASSERT_THAT(infoStack.getAll(), ElementsAre(Eq("greeting: hello"), Eq("greeting: hey there")));
+}
+
+// Test that if we log the `ScopedDebugInfoStack` due to a tassert, and we hit a tassert during
+// logging, we only surface the original tassert.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 TassertAndTassertDuringLogging,
+                 "(?s)tasserting in test"
+                 ".*tasserting in mock printer"
+                 ".*ScopedDebugInfo failed.*9513401") {
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert());
+    tasserted(9513403, "tasserting in test");
+}
+
+// Same as above, but with `uassert` instead of `tassert`.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 TassertAndUassertDuringLogging,
+                 "(?s)tasserting in test"
+                 ".*ScopedDebugInfo failed.*9513402") {
+    ScopedDebugInfo guardUasserts("test", PrinterMockUassert());
+    tasserted(9513404, "tasserting in test");
+}
+
+// Test that we end the process as expected due to an invariant even if we hit a tassert during
+// logging of the `ScopedDebugInfoStack`.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 InvariantAndTassertDuringLogging,
+                 "(?s)ouch.*abruptQuit"
+                 ".*tasserting in mock printer.*mongo::error_details::tassertFailed"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert());
+    someRiskyBusiness();
+}
+
+// Same as above, but with `uassert` instead of `tassert`.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 InvariantAndUassertDuringLogging,
+                 "(?s)ouch.*abruptQuit"
+                 ".*ScopedDebugInfo failed.*test.*9513402") {
+    ScopedDebugInfo guardUasserts("test", PrinterMockUassert());
+    someRiskyBusiness();
+}
+
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 InvariantAndInvariantDuringLogging,
+                 "(?s)ouch.*abruptQuit.*ouch") {
+    ScopedDebugInfo guardInvariants("test", PrinterMockInvariant());
+    someRiskyBusiness();
+}
+
+// Tests the functionality of the `signalHandlerUsesDiagnosticLogging` knob.
+// Note the regex here uses the negative lookahead operator `(?!)` in order to ensure that the
+// keyword is not found within the logs. The syntax here means: we want to match the start of
+// the string unless something after the start of the string contains the keyword.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 InvariantWhenSignalHandlerLoggingDisabled,
+                 "(?s)^(?!.*h"
+                 "ello)") {
+    unittest::ServerParameterGuard knobController("signalHandlerUsesDiagnosticLogging", false);
+    // The literal is split so it doesn't appear verbatim in stacktrace code snippet.
+    ScopedDebugInfo guard("test",
+                          "h"
+                          "ello");
+    someRiskyBusiness();
+}
+
+// The following tests relies on SIGSEGV which is not supported on Windows.
+// Test that we end the process as expected due to a seg fault even if we hit a tassert during
+// logging of the `ScopedDebugInfoStack`.
+#if !defined(_WIN32)
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 SignalAndTassertDuringLogging,
+                 "(?s)Invalid access at address.*abruptQuit"
+                 ".*tasserting in mock printer.*BACKTRACE"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert());
+    raise(SIGSEGV);
+}
+
+// Same as above, but with `uassert` instead of `tassert`.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 SignalAndUassertDuringLogging,
+                 "(?s)Invalid access at address.*abruptQuit"
+                 ".*ScopedDebugInfo failed.*test.*9513402") {
+    ScopedDebugInfo guardUasserts("test", PrinterMockUassert());
+    raise(SIGSEGV);
+}
+
+// Tests the functionality of the `signalHandlerUsesDiagnosticLogging` knob with a signal
+// raised.
+// Note the regex here uses the negative lookahead operator `(?!)` in order to ensure that the
+// keyword is not found within the logs. The syntax here means: we want to match the start of
+// the string unless something after the start of the string contains the keyword.
+DEATH_TEST_REGEX(ScopedDebugInfoDeathTest,
+                 SignalWhenSignalHandlerLoggingDisabled,
+                 "(?s)^(?!.*h"
+                 "ello)") {
+    unittest::ServerParameterGuard knobController("signalHandlerUsesDiagnosticLogging", false);
+    // The literal is split so it doesn't appear verbatim in stacktrace code snippet.
+    ScopedDebugInfo guard("test",
+                          "h"
+                          "ello");
+    raise(SIGSEGV);
+}
+#endif
+
+void mustNotCompile() {
+#if 0
+    fassert(9079709, "match");
+    fassert(true, Status::OK());
+    fassert(ErrorCodes::InternalError, "hi");
+#endif
+}
+
+
+constexpr bool checkCanUseInvariantInConstexprCode = [] {
+    invariant(true);
+    invariant(true, "with message");
+    invariant(Status::OK());
+    invariant(StatusWith(1));
+    invariant(Status::OK(), "with message");
+    invariant(StatusWith(1), "with message");
+
+    return true;
+}();
+
+constexpr bool checkCanUseUMITassertInConstexprCode = [] {
+    uassert(ErrorCodes::BadValue, "with message", true);
+    uassertStatusOK(Status::OK());
+    uassertStatusOK(StatusWith(1));
+    uassertStatusOKWithContext(Status::OK(), "context");
+    uassertStatusOKWithContext(StatusWith(1), "context");
+
+    massert(ErrorCodes::BadValue, "with message", true);
+    massertStatusOK(Status::OK());
+    massertStatusOK(StatusWith(1));
+
+    iassert(ErrorCodes::BadValue, "with message", true);
+    iassert(Status::OK());
+    iassert(StatusWith(1));
+
+    tassert(ErrorCodes::BadValue, "with message", true);
+    tassert(Status::OK());
+    tassert(StatusWith(1));
+
+    tassertNoThrow(ErrorCodes::BadValue, "with message", true);
+    tassertNoThrow(Status::OK());
+    tassertNoThrow(StatusWith(1));
+
+    return true;
+}();
+
+#define isConstexpr(expr)                       \
+    [] {                                        \
+        static const bool b = [] {              \
+            if (std::is_constant_evaluated()) { \
+                (void)expr;                     \
+                return true;                    \
+            } else {                            \
+                return false;                   \
+            }                                   \
+        }();                                    \
+        return b;                               \
+    }()
+
+TEST(AssertUtils, FailuresAreNotConstexpr) {
+    // self-test of `isConstexpr`
+    ASSERT(isConstexpr(1));
+    ASSERT(!isConstexpr(std::terminate()));
+
+    ASSERT(isConstexpr(Status::OK()));
+    ASSERT(isConstexpr(StatusWith(1)));
+    ASSERT(isConstexpr(invariant(true)));
+    ASSERT(isConstexpr([] {
+        uassert(ErrorCodes::BadValue, "", true);
+    }()));
+
+    ASSERT(!isConstexpr(Status(ErrorCodes::BadValue, "")));
+    ASSERT(!isConstexpr(StatusWith<int>(ErrorCodes::BadValue, "")));
+    ASSERT(!isConstexpr(invariant(false)));
+    ASSERT(!isConstexpr([] {
+        uassert(ErrorCodes::BadValue, "", false);
+    }()));
+}
+
+TEST(ScopedDebugInfoStack, Enabled) {
+    ASSERT(getScopedDebugInfoStackEnabled());
+    ASSERT_EQ(error_details::scopedDebugInfoStack().size(), 0);
+    ScopedDebugInfo scopedInfo("test", "hello");
+    ASSERT_EQ(error_details::scopedDebugInfoStack().size(), 1);
+}
+
+TEST(ScopedDebugInfoStack, Disabled) {
+    unittest::ServerParameterGuard knobController("enableDiagnosticLogging", false);
+    ASSERT(!getScopedDebugInfoStackEnabled());
+    ASSERT_EQ(error_details::scopedDebugInfoStack().size(), 0);
+    ScopedDebugInfo scopedInfo("test", "hello");
+    ASSERT_EQ(error_details::scopedDebugInfoStack().size(), 0);
+}
+
+// AssertionIncrementObserver tests
+//
+// Shared file-static state for observer probes. The observer typedef is a captureless function
+// pointer, so probes can't carry per-test state via lambda capture; they fan out into these.
+namespace observer_probe {
+std::atomic<int> count{0};
+std::atomic<AssertionKind> lastKind{AssertionKind::kRegular};
+
+void record(AssertionKind kind) noexcept {
+    count.fetch_add(1);
+    lastKind.store(kind);
+}
+
+void reset() {
+    count.store(0);
+    lastKind.store(AssertionKind::kRegular);
+}
+
+struct InstallGuard {
+    explicit InstallGuard(AssertionIncrementObserver observer) {
+        reset();
+        setAssertionIncrementObserver(observer);
+    }
+    ~InstallGuard() {
+        setAssertionIncrementObserver(nullptr);
+    }
+};
+}  // namespace observer_probe
+
+class AssertionIncrementObserverTripwireTest : public TripwireTest {};
+
+TEST(AssertionIncrementObserver, UassertNotifiesUser) {
+    observer_probe::InstallGuard guard(&observer_probe::record);
+    try {
+        uasserted(ErrorCodes::BadValue, "probe");
+    } catch (const DBException&) {
+    }
+    ASSERT_EQ(observer_probe::count.load(), 1);
+    ASSERT(observer_probe::lastKind.load() == AssertionKind::kUser);
+}
+
+TEST_F(AssertionIncrementObserverTripwireTest, MassertNotifiesMsg) {
+    observer_probe::InstallGuard guard(&observer_probe::record);
+    try {
+        masserted(ErrorCodes::BadValue, "probe");
+    } catch (const DBException&) {
+    }
+    ASSERT_EQ(observer_probe::count.load(), 1);
+    ASSERT(observer_probe::lastKind.load() == AssertionKind::kMsg);
+}
+
+TEST_F(AssertionIncrementObserverTripwireTest, TassertNotifiesTripwire) {
+    observer_probe::InstallGuard guard(&observer_probe::record);
+    try {
+        tasserted(Status(ErrorCodes::BadValue, "probe"));
+    } catch (const DBException&) {
+    }
+    ASSERT_EQ(observer_probe::count.load(), 1);
+    ASSERT(observer_probe::lastKind.load() == AssertionKind::kTripwire);
+}
+
+TEST_F(AssertionIncrementObserverTripwireTest, TassertNoThrowNotifiesTripwire) {
+    observer_probe::InstallGuard guard(&observer_probe::record);
+    tassertedNoThrow(ErrorCodes::BadValue, "probe");
+
+    ASSERT_EQ(observer_probe::count.load(), 1);
+    ASSERT_EQ(observer_probe::lastKind.load(), AssertionKind::kTripwire);
+}
+
+TEST(AssertionIncrementObserver, ClearingObserverStopsNotifications) {
+    {
+        observer_probe::InstallGuard guard(&observer_probe::record);
+        try {
+            uasserted(ErrorCodes::BadValue, "probe-installed");
+        } catch (const DBException&) {
+        }
+        ASSERT_EQ(observer_probe::count.load(), 1);
+    }
+    // Observer cleared on guard destruction.
+    const auto countAfterClear = observer_probe::count.load();
+    try {
+        uasserted(ErrorCodes::BadValue, "probe-cleared");
+    } catch (const DBException&) {
+    }
+    ASSERT_EQ(observer_probe::count.load(), countAfterClear);
+}
+
+namespace double_install_probe {
+void a(AssertionKind) noexcept {}
+void b(AssertionKind) noexcept {}
+}  // namespace double_install_probe
+
+DEATH_TEST_REGEX(AssertionIncrementObserverDeathTest,
+                 DoubleInstallTriggersInvariant,
+                 "observer already installed") {
+    setAssertionIncrementObserver(&double_install_probe::a);
+    setAssertionIncrementObserver(&double_install_probe::b);  // must abort.
+}
+
+}  // namespace
+}  // namespace mongo

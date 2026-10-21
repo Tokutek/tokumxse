@@ -1,0 +1,404 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/common/types/bson.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bson_comparator_interface_base.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/bsontypes.h"
+#ifndef MONGO_MOZJS_WASI_BUILD
+#include "mongo/db/pipeline/resume_token.h"
+#endif
+#include "mongo/scripting/mozjs/common/freeOpToJSContext.h"
+#include "mongo/scripting/mozjs/common/idwrapper.h"
+#include "mongo/scripting/mozjs/common/internedstring.h"
+#include "mongo/scripting/mozjs/common/jsstringwrapper.h"
+#include "mongo/scripting/mozjs/common/objectwrapper.h"
+#include "mongo/scripting/mozjs/common/runtime.h"
+#include "mongo/scripting/mozjs/common/valuereader.h"
+#include "mongo/scripting/mozjs/common/valuewriter.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/string_map.h"
+
+#include <cstddef>
+
+#include <jsapi.h>
+#if !defined(MONGO_MOZJS_WASI_BUILD)
+#include <string_view>
+
+#include <jscustomallocator.h>
+#endif
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <js/CallArgs.h>
+#include <js/Class.h>
+#include <js/Object.h>
+#include <js/PropertyDescriptor.h>
+#include <js/PropertySpec.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+
+namespace mongo {
+namespace mozjs {
+
+const char* const BSONInfo::className = "BSON";
+
+const JSFunctionSpec BSONInfo::freeFunctions[7] = {
+    MONGO_ATTACH_JS_FUNCTION(bsonWoCompare),
+    MONGO_ATTACH_JS_FUNCTION(bsonUnorderedFieldsCompare),
+    MONGO_ATTACH_JS_FUNCTION(bsonBinaryEqual),
+    MONGO_ATTACH_JS_FUNCTION(bsonObjToArray),
+    MONGO_ATTACH_JS_FUNCTION(bsonToBase64),
+    MONGO_ATTACH_JS_FUNCTION(bsonGetImmutable),
+    JS_FS_END,
+};
+
+
+namespace {
+
+BSONObj getBSONFromArg(JSContext* cx, JS::HandleValue arg, bool isBSON) {
+    if (isBSON) {
+        return ValueWriter(cx, arg).toBSON();
+    }
+    JS::RootedObject rout(cx, JS_NewPlainObject(cx));
+    ObjectWrapper object(cx, rout);
+    object.setValue("a", arg);
+    return object.toBSON();
+}
+
+/**
+ * Holder for bson objects which tracks state for the js wrapper
+ *
+ * Basically, we have read only and read/write variants, and a need to manage
+ * the appearance of mutable state on the read/write versions.
+ */
+struct BSONHolder {
+    BSONHolder(const BSONObj& obj,
+               const BSONObj* parent,
+               const MozJSCommonRuntimeInterface* runtime,
+               bool ro)
+        : _obj(obj),
+          _generation(runtime->getGeneration()),
+          _isOwned(obj.isOwned() || (parent && parent->isOwned())),
+          _resolved(false),
+          _readOnly(ro),
+          _altered(false) {
+        bool requiresOwned = runtime->requiresOwnedObjects();
+        uassert(
+            ErrorCodes::BadValue,
+            "Attempt to bind an unowned BSON Object to a JS scope marked as requiring ownership",
+            _isOwned || (!requiresOwned));
+        if (parent) {
+            _parent.emplace(*parent);
+        }
+    }
+
+    const BSONObj& getOwner() const {
+        return _parent ? *(_parent) : _obj;
+    }
+
+    void uassertValid(JSContext* cx) const {
+        if (!_isOwned && getCommonRuntime(cx)->getGeneration() != _generation)
+            uasserted(ErrorCodes::BadValue,
+                      "Attempt to access an invalidated BSON Object in JS scope");
+    }
+
+    BSONObj _obj;
+    boost::optional<BSONObj> _parent;
+    std::size_t _generation;
+    bool _isOwned;
+    bool _resolved;
+    bool _readOnly;
+    bool _altered;
+    StringSet _removed;
+};
+
+BSONHolder* getValidHolder(JSContext* cx, JSObject* obj) {
+    auto holder = JS::GetMaybePtrFromReservedSlot<BSONHolder>(obj, BSONInfo::BSONHolderSlot);
+
+    if (holder)
+        holder->uassertValid(cx);
+
+    return holder;
+}
+
+void definePropertyFromBSONElement(JSContext* cx,
+                                   BSONHolder& holder,
+                                   const BSONElement& elem,
+                                   JS::HandleObject obj,
+                                   JS::HandleId id) {
+    JS::RootedValue vp(cx);
+    ValueReader(cx, &vp).fromBSONElement(elem, holder.getOwner(), holder._readOnly);
+    ObjectWrapper o(cx, obj);
+    o.defineProperty(id, vp, JSPROP_ENUMERATE | JSPROP_RESOLVING);
+
+    if (!holder._readOnly && (elem.type() == BSONType::object || elem.type() == BSONType::array)) {
+        // if accessing a subobject, we have no way to know if
+        // modifications are being made on writable objects
+
+        holder._altered = true;
+    }
+}
+}  // namespace
+
+void BSONInfo::make(
+    JSContext* cx, JS::MutableHandleObject obj, BSONObj bson, const BSONObj* parent, bool ro) {
+    auto* runtime = getCommonRuntime(cx);
+
+    getProto<BSONInfo>(runtime).newObject(obj);
+    JS::SetReservedSlot(
+        obj,
+        BSONHolderSlot,
+        JS::PrivateValue(trackedNew<BSONHolder>(runtime, bson, parent, runtime, ro)));
+}
+
+void BSONInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto holder = JS::GetMaybePtrFromReservedSlot<BSONHolder>(obj, BSONHolderSlot);
+
+    if (!holder)
+        return;
+
+    trackedDelete(getCommonRuntime(freeOpToJSContext(gcCtx)), holder);
+}
+
+/*
+ * BSONInfo::enumerate() implements the "NewEnumerate" operation (i.e JSNewEnumerateOp). This method
+ * enumerates the keys, and resolves the lazy property values by defining them on the JSObject.
+ * Historically, the new enumerate did not resolve lazy property values, and as a result, did not
+ * service calls to Object.entries() correctly. Note, when a property value is defined (see
+ * definePropertyFromBSONElement() below), the property is defined in the underlying NativeObject.
+ * Although this is closer to the intended behaviour of the old enumerate (i.e JsEnumerateOp), we
+ * must still implement this as a "NewEnumerate" hook. During enumeration, if a JsNewEnumerateOp is
+ * not provided, the properties are enumerated in the order in which they appear in the
+ * NativeObject, which is not suitable for our use case. Consider a JSObject wrapping a
+ * BSONObj{a:"a", b:"b"}. If a new property "c" is added to the JSObject, the properties will appear
+ * in the order ["c","a","b"] instead of ["a","b","c"] during enumeration. The same issue occurs
+ * if a property of the BSONObj is modified in the JSObject (modified properties appear first in the
+ * enumeration). In contrast, when a JsNewEnumerateOp hook is provided, "extra" properties are
+ * enumerated first, followed by "native" properties. These "extra" properties correspond to the
+ * properties enumerated via the new enumerate hook below. In short, by enumerating the BSONObj as
+ * "extra" properties in the "NewEnumerate" hook, we guarantee the properties in the original
+ * BSONObj appear first during enumeration, irrespective of any updates to the JSObject.
+ */
+void BSONInfo::enumerate(JSContext* cx,
+                         JS::HandleObject obj,
+                         JS::MutableHandleIdVector properties,
+                         bool enumerableOnly) {
+    auto holder = getValidHolder(cx, obj);
+
+    if (!holder)
+        return;
+
+    BSONObjIterator i(holder->_obj);
+
+    ObjectWrapper o(cx, obj);
+    JS::RootedValue val(cx);
+    JS::RootedId id(cx);
+
+    while (i.more()) {
+        BSONElement e = i.next();
+
+        auto fieldNameStringData = e.fieldNameStringData();
+        if (holder->_removed.contains(fieldNameStringData))
+            continue;
+
+        ValueReader(cx, &val).fromStringData(fieldNameStringData);
+
+        if (!JS_ValueToId(cx, val, &id))
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to invoke JS_ValueToId");
+
+        bool isAlreadyDefined{false};
+        if (!JS_AlreadyHasOwnPropertyById(cx, obj, id, &isAlreadyDefined)) {
+            uasserted(ErrorCodes::JSInterpreterFailure,
+                      "Failed to invoke JS_AlreadyHasOwnPropertyById");
+        }
+
+        // Only define a property during enumeration if it hasn't already been defined.
+        if (!isAlreadyDefined) {
+            definePropertyFromBSONElement(cx, *holder, e, obj, id);
+        }
+
+        if (!properties.append(id))
+            uasserted(ErrorCodes::JSInterpreterFailure, "Failed to append property");
+    }
+}
+
+void BSONInfo::setProperty(JSContext* cx,
+
+                           JS::HandleObject obj,
+                           JS::HandleId id,
+                           JS::HandleValue vp,
+                           JS::HandleValue receiver,
+                           JS::ObjectOpResult& result) {
+
+    auto holder = getValidHolder(cx, obj);
+
+    if (holder) {
+        if (holder->_readOnly) {
+            uasserted(ErrorCodes::BadValue, "Read only object");
+        }
+
+        JSStringWrapper jsstr;
+        holder->_removed.erase(IdWrapper(cx, id).toStringData(&jsstr));
+
+        holder->_altered = true;
+    }
+
+    ObjectWrapper(cx, obj).defineProperty(id, vp, JSPROP_ENUMERATE);
+    result.succeed();
+}
+
+void BSONInfo::delProperty(JSContext* cx,
+                           JS::HandleObject obj,
+                           JS::HandleId id,
+                           JS::ObjectOpResult& result) {
+    auto holder = getValidHolder(cx, obj);
+
+    if (holder) {
+        if (holder->_readOnly) {
+            uasserted(ErrorCodes::BadValue, "Read only object");
+            return;
+        }
+
+        holder->_altered = true;
+
+        JSStringWrapper jsstr;
+        holder->_removed.emplace(IdWrapper(cx, id).toStringData(&jsstr));
+    }
+
+    result.succeed();
+}
+
+void BSONInfo::resolve(JSContext* cx, JS::HandleObject obj, JS::HandleId id, bool* resolvedp) {
+    auto holder = getValidHolder(cx, obj);
+
+    *resolvedp = false;
+
+    if (!holder) {
+        return;
+    }
+
+    IdWrapper idw(cx, id);
+    JSStringWrapper jsstr;
+
+    auto sname = idw.toStringData(&jsstr);
+    if (sname.find('\0') != std::string::npos)
+        return;
+    if (!holder->_readOnly && holder->_removed.contains(sname))
+        return;
+    if (!holder->_obj.hasField(sname))
+        return;
+    definePropertyFromBSONElement(cx, *holder, holder->_obj[sname], obj, id);
+    *resolvedp = true;
+    return;
+}
+
+std::tuple<BSONObj*, bool> BSONInfo::originalBSON(JSContext* cx, JS::HandleObject obj) {
+    std::tuple<BSONObj*, bool> out(nullptr, false);
+
+    if (auto holder = getValidHolder(cx, obj))
+        out = std::make_tuple(&holder->_obj, holder->_altered);
+
+    return out;
+}
+
+void BSONInfo::Functions::bsonObjToArray::call(JSContext* cx, JS::CallArgs args) {
+    uassert(ErrorCodes::BadValue, "bsonObjToArray needs 1 argument", args.length() == 1);
+    uassert(ErrorCodes::BadValue, "argument must be an object", args.get(0).isObject());
+
+    auto obj = ValueWriter(cx, args.get(0)).toBSON();
+    obj.makeOwned();
+    ValueReader(cx, args.rval()).fromBSONArray(obj, nullptr, false);
+}
+
+namespace {
+void bsonCompareCommon(JSContext* cx,
+                       JS::CallArgs args,
+                       std::string_view funcName,
+                       BSONObj::ComparisonRulesSet rules) {
+    if (args.length() != 2)
+        uasserted(ErrorCodes::BadValue, fmt::format("{} needs 2 arguments", funcName));
+
+    // If either argument is not proper BSON, then we wrap both objects.
+    auto* runtime = getCommonRuntime(cx);
+    bool isBSON = getProto<BSONInfo>(runtime).instanceOf(args.get(0)) &&
+        getProto<BSONInfo>(runtime).instanceOf(args.get(1));
+
+    BSONObj bsonObject1 = getBSONFromArg(cx, args.get(0), isBSON);
+    BSONObj bsonObject2 = getBSONFromArg(cx, args.get(1), isBSON);
+
+    args.rval().setInt32(bsonObject1.woCompare(bsonObject2, {}, rules));
+}
+}  // namespace
+
+void BSONInfo::Functions::bsonWoCompare::call(JSContext* cx, JS::CallArgs args) {
+    bsonCompareCommon(cx, args, "bsonWoCompare", BSONObj::ComparatorInterface::kConsiderFieldName);
+}
+
+void BSONInfo::Functions::bsonUnorderedFieldsCompare::call(JSContext* cx, JS::CallArgs args) {
+    bsonCompareCommon(cx,
+                      args,
+                      "bsonWoCompare",
+                      BSONObj::ComparatorInterface::kConsiderFieldName |
+                          BSONObj::ComparatorInterface::kIgnoreFieldOrder);
+}
+
+void BSONInfo::Functions::bsonBinaryEqual::call(JSContext* cx, JS::CallArgs args) {
+    if (args.length() != 2)
+        uasserted(ErrorCodes::BadValue, "bsonBinaryEqual needs 2 arguments");
+
+    // If either argument is not a proper BSON, then we wrap both objects.
+    auto* runtime = getCommonRuntime(cx);
+    bool isBSON = getProto<BSONInfo>(runtime).instanceOf(args.get(0)) &&
+        getProto<BSONInfo>(runtime).instanceOf(args.get(1));
+
+    BSONObj bsonObject1 = getBSONFromArg(cx, args.get(0), isBSON);
+    BSONObj bsonObject2 = getBSONFromArg(cx, args.get(1), isBSON);
+
+    args.rval().setBoolean(bsonObject1.binaryEqual(bsonObject2));
+}
+
+void BSONInfo::Functions::bsonToBase64::call(JSContext* cx, JS::CallArgs args) {
+    if (args.length() != 1)
+        uasserted(ErrorCodes::BadValue, "bsonToBase64 needs 1 argument");
+
+    auto* runtime = getCommonRuntime(cx);
+    bool isBSON = getProto<BSONInfo>(runtime).instanceOf(args.get(0));
+    BSONObj bsonObject = getBSONFromArg(cx, args.get(0), isBSON);
+
+    auto encoded =
+        mongo::base64::encode(std::string_view(bsonObject.objdata(), bsonObject.objsize()));
+    ValueReader(cx, args.rval()).fromStringData(encoded);
+}
+
+void BSONInfo::Functions::bsonGetImmutable::call(JSContext* cx, JS::CallArgs args) {
+    uassert(ErrorCodes::BadValue, "bsonGetImmutable needs 1 argument", args.length() == 1);
+
+    auto* runtime = getCommonRuntime(cx);
+    bool isBSON = getProto<BSONInfo>(runtime).instanceOf(args.get(0));
+    BSONObj bsonObject = getBSONFromArg(cx, args.get(0), isBSON);
+
+    // A 'BSONHolder'-managed object can store unowned BSON that references a sub-document of some
+    // parent object. The BSONHolder keeps the unowned memory valid by maintaining an owned
+    // reference to the parent BSONObj. This new object does not copy that reference, so it cannot
+    // safely store unowned BSON.
+    bsonObject.makeOwned();
+
+    ValueReader(cx, args.rval()).fromBSON(bsonObject, nullptr, true);
+}
+
+void BSONInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto) {
+    JS::RootedValue value(cx);
+    value.setBoolean(true);
+
+    ObjectWrapper(cx, proto).defineProperty(InternedString::_bson, value, 0);
+}
+
+}  // namespace mozjs
+}  // namespace mongo

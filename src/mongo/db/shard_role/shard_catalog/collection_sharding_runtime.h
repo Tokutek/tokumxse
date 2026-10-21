@@ -1,0 +1,462 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/global_catalog/ddl/sharding_migration_critical_section.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/collection_metadata.h"
+#include "mongo/db/shard_role/shard_catalog/collection_metadata_synchronizer.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/critical_section_signal.h"
+#include "mongo/db/shard_role/shard_catalog/metadata_manager.h"
+#include "mongo/db/shard_role/shard_catalog/scoped_collection_metadata.h"
+#include "mongo/db/shard_role/shard_catalog/shard_catalog_recoverer_tracker.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/waiter_list.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
+#include <cstdint>
+#include <memory>
+#include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * See the comments for CollectionShardingState for more information on how this class fits in the
+ * sharding architecture.
+ *
+ * This class is not thread-safe by itself. For this reason, it must always be accessed through
+ * ScopedSharedCollectionShardingRuntime and ScopedExclusiveCollectionShardingRuntime helper
+ * classes.
+ */
+class [[MONGO_MOD_USE_REPLACEMENT(CollectionShardingState)]] CollectionShardingRuntime final
+    : public CollectionShardingState,
+      public Decorable<CollectionShardingRuntime> {
+    CollectionShardingRuntime(const CollectionShardingRuntime&) = delete;
+    CollectionShardingRuntime& operator=(const CollectionShardingRuntime&) = delete;
+
+public:
+    CollectionShardingRuntime(ServiceContext* service, NamespaceString nss);
+    ~CollectionShardingRuntime() override;
+
+    /**
+     * Obtains the sharding runtime for the specified collection, along with a resource lock in
+     * shared mode protecting it from concurrent modifications, which will be held until the object
+     * goes out of scope.
+     *
+     * Note how this class provides only const access to the underlying CollectionShardingRuntime.
+     */
+    class ScopedSharedCollectionShardingRuntime {
+    public:
+        ScopedSharedCollectionShardingRuntime(ScopedSharedCollectionShardingRuntime&&) = default;
+
+        const CollectionShardingRuntime* operator->() const {
+            return checked_cast<const CollectionShardingRuntime*>(&*_scopedCss);
+        }
+        const CollectionShardingRuntime& operator*() const {
+            return checked_cast<const CollectionShardingRuntime&>(*_scopedCss);
+        }
+
+    private:
+        friend class CollectionShardingRuntime;
+
+        ScopedSharedCollectionShardingRuntime(ScopedCollectionShardingState&& scopedCss);
+
+        ScopedCollectionShardingState _scopedCss;
+    };
+
+    /**
+     * Obtains the sharding runtime for the specified collection, along with a resource lock in
+     * exclusive mode protecting it from concurrent modifications, which will be held until the
+     * object goes out of scope.
+     *
+     * Note how this class provides non-const access to the underlying CollectionShardingRuntime.
+     */
+    class ScopedExclusiveCollectionShardingRuntime {
+    public:
+        ScopedExclusiveCollectionShardingRuntime(ScopedExclusiveCollectionShardingRuntime&&) =
+            default;
+
+        CollectionShardingRuntime* operator->() const {
+            return checked_cast<CollectionShardingRuntime*>(&*_scopedCss);
+        }
+        CollectionShardingRuntime& operator*() const {
+            return checked_cast<CollectionShardingRuntime&>(*_scopedCss);
+        }
+
+    private:
+        friend class CollectionShardingRuntime;
+
+        ScopedExclusiveCollectionShardingRuntime(
+            ScopedExclusiveCollectionShardingState&& scopedCss);
+
+        ScopedExclusiveCollectionShardingState _scopedCss;
+    };
+
+    static ScopedSharedCollectionShardingRuntime assertCollectionLockedAndAcquireShared(
+        OperationContext* opCtx, const NamespaceString& nss);
+
+    static ScopedSharedCollectionShardingRuntime acquireShared(OperationContext* opCtx,
+                                                               const NamespaceString& nss);
+    static ScopedExclusiveCollectionShardingRuntime acquireExclusive(OperationContext* opCtx,
+                                                                     const NamespaceString& nss);
+
+    static ScopedCollectionShardingState assertCollectionLockedAndAcquire(
+        OperationContext* opCtx, const NamespaceString& nss) = delete;
+    static ScopedCollectionShardingState acquire(OperationContext* opCtx,
+                                                 const NamespaceString& nss) = delete;
+
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) const override;
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx,
+                                                         bool operationIsVersioned) const override;
+
+    ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx,
+                                              OrphanCleanupPolicy orphanCleanupPolicy,
+                                              bool supportNonVersionedOperations) const override;
+    ScopedCollectionFilter getOwnershipFilter(
+        OperationContext* opCtx,
+        OrphanCleanupPolicy orphanCleanupPolicy,
+        const ShardVersion& receivedShardVersion) const override;
+
+    void checkShardVersionOrThrow(OperationContext* opCtx) const override;
+
+    void checkShardVersionOrThrow(OperationContext* opCtx,
+                                  const ShardVersion& receivedShardVersion) const override;
+
+    void appendShardVersion(BSONObjBuilder* builder) const override;
+
+    /**
+     * Returns boost::none if the description for the collection is not known yet. Otherwise
+     * returns the most recently refreshed from the config server metadata.
+     *
+     * This method do not check for the shard version that the operation requires and should only
+     * be used for cases such as checking whether a particular config server update has taken
+     * effect.
+     */
+    boost::optional<CollectionMetadata> getCurrentMetadataIfKnown() const;
+
+    /**
+     * Returns true when the CSS state is UNOWNED: the shard does not know whether the collection
+     * is tracked or untracked. The guaranteed invariants are:
+     *   - if the collection turns out to be untracked, this shard is not the DB primary,
+     *   - if the collection turns out to be tracked, this shard holds no chunks for it.
+     */
+    bool isUnowned() const {
+        return _metadataType == MetadataType::kUnowned;
+    }
+
+    /**
+     * When `newMetadata` carries no routing table, this selects how the CSS should be classified.
+     * Ignored when `newMetadata` has a routing table (the CSS is then classified as `kTracked`).
+     */
+    enum class NoRoutingTableAs {
+        // UNTRACKED: the caller knows the collection exists, is unsharded, and is not registered
+        // in the CSRS. This state is only reachable on the DB primary shard, since an unsharded
+        // collection resides exclusively there.
+        kUntracked,
+
+        // UNOWNED: the caller does not know whether the collection is tracked or untracked.
+        // The guaranteed invariants are:
+        //   - if the collection turns out to be untracked, this shard is not the DB primary,
+        //   - if the collection turns out to be tracked, this shard holds no chunks for it.
+        // In practice, this is installed during authoritative recovery on a non-DB-primary shard
+        // when the local shard catalog has no entry for the namespace.
+        kUnowned,
+    };
+
+    /**
+     * Updates the collection's filtering metadata.
+     */
+    void setCollectionMetadata(OperationContext* opCtx,
+                               CollectionMetadata newMetadata,
+                               NoRoutingTableAs noRoutingTableAs = NoRoutingTableAs::kUntracked);
+
+    /**
+     * Marks the collection's filtering metadata as UNKNOWN, meaning that all attempts to check for
+     * shard version match will fail with StaleConfig errors in order to trigger an update.
+     *
+     * Interrupts any ongoing shard metadata refresh.
+     *
+     * It is safe to call this method with only an intent lock on the collection (as opposed to
+     * setCollectionMetadata which requires exclusive).
+     */
+    void clearCollectionMetadata(OperationContext* opCtx, bool collIsDropped = false);
+
+    /**
+     * Methods to control the collection's critical section. Methods listed below must be called
+     * with both the collection lock and CSRLock held in exclusive mode.
+     *
+     * In these methods, the CSRLock ensures concurrent access to the critical section.
+     *
+     * Entering into the Critical Section interrupts any ongoing filtering metadata refresh.
+     */
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx, const BSONObj& reason);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx, const BSONObj& reason);
+
+    /**
+     * It transitions the critical section back to the catch up phase.
+     */
+    void rollbackCriticalSectionCommitPhaseToCatchUpPhase(OperationContext* opCtx,
+                                                          const BSONObj& reason);
+
+    /**
+     * Method to control the collection's critical section. Methods listed below must be called with
+     * both the collection lock and CSR acquired in exclusive mode.
+     */
+    void exitCriticalSection(OperationContext* opCtx, const BSONObj& reason);
+
+    /**
+     * Same semantics than 'exitCriticalSection' but without doing error-checking. Only meant to be
+     * used when recovering the critical sections in the RecoverableCriticalSectionService.
+     */
+    void exitCriticalSectionNoChecks(OperationContext* opCtx);
+
+    /**
+     * If the collection is currently in a critical section, returns the critical section signal to
+     * be waited on. Otherwise, returns nullptr.
+     */
+    boost::optional<CriticalSectionSignal> getCriticalSectionSignal(
+        ShardingMigrationCriticalSection::Operation op) const;
+
+    /**
+     * Waits for all ranges deletion tasks with UUID 'collectionUuid' overlapping range
+     * 'orphanRange' to be processed, even if the collection does not exist in the storage catalog.
+     * It will block until the minimum of the operation context's timeout deadline or 'deadline' is
+     * reached.
+     *
+     * 'isAuthoritative' selects how a not-known (kUnknown) filtering metadata is treated: when
+     * true, the metadata is recovered from the durable shard catalog and the wait is retried (a
+     * concurrent metadata commit may have transiently cleared it); when false, the historical
+     * behavior of failing with ConflictingOperationInProgress is preserved. This is not derived
+     * from a local feature-flag check: the migration recipient passes whether the migration is
+     * authoritative as communicated by the donor.
+     */
+    static Status waitForClean(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               const UUID& collectionUuid,
+                               ChunkRange orphanRange,
+                               Date_t deadline,
+                               bool refreshMetadataIfUnknown = false);
+
+    /**
+     * Returns a future marked as ready when all the ongoing queries retaining the range complete
+     */
+    SharedSemiFuture<void> getOngoingQueriesCompletionFuture(const UUID& collectionUuid,
+                                                             ChunkRange const& range) const;
+
+    /**
+     * Initializes the placement version recover/refresh shared semifuture for other threads to wait
+     * on it.
+     *
+     * To invoke this method, the criticalSectionSignal must not be hold by a different thread.
+     */
+    void setPlacementVersionRecoverRefreshFuture(
+        SharedSemiFuture<void> future,
+        ShardCatalogRecovererTracker::Acquisition recovererTrackerAcquisition);
+
+    /**
+     * If there an ongoing placement version recover/refresh, it returns the shared semifuture to be
+     * waited on. Otherwise, returns boost::none.
+     */
+    boost::optional<SharedSemiFuture<void>> getMetadataRefreshFuture() const;
+
+    /**
+     * Resets the placement version recover/refresh shared semifuture to boost::none.
+     */
+    void resetPlacementVersionRecoverRefreshFuture();
+
+    /**
+     * It provides a mechanism to invalidate RangePreservers that can no longer be fulfilled because
+     * of an incoming RangeDeletion for a specified shard version. It invalidates all metadata
+     * trackers when shardVersion is lower than or equal to the given version. This method ensures
+     * that metadata operation is performed in a thread-safe manner.
+     * The invalidation will be skipped if the provided collectionUUID doesn't match the UUID of the
+     * metadataManager.
+     */
+    void invalidateRangePreserversOlderThanShardVersion(const ChunkVersion& shardVersion,
+                                                        const UUID& collectionUUID);
+
+    /*
+     * This provides a mechanism by which waiters for a given shard version can wait until the
+     * provided version becomes available on the shard.
+     *
+     * The returned future will also wait for any critical section to be released if at the time of
+     * the wait there happened to be an active critical section.
+     */
+    SharedSemiFuture<void> registerWaiterForChunkVersion(OperationContext* opCtx,
+                                                         const ShardVersion& expectedVersion) const;
+
+    void setMetadataSynchronizer(std::shared_ptr<CollectionMetadataSynchronizer> synchronizer);
+    std::shared_ptr<CollectionMetadataSynchronizer> getMetadataSynchronizer() const;
+
+    /**
+     * True when authoritative disk recovery found an empty shard catalog for this collection.
+     * While set, further recovery must serialize with the database primary critical section to
+     * classify the collection as untracked or unowned.
+     */
+    bool needsDbPrimaryClassification() const {
+        return _needsDbPrimaryClassification;
+    }
+    void setNeedsDbPrimaryClassification(bool needs) {
+        _needsDbPrimaryClassification = needs;
+    }
+
+    bool allowChunkOperations() const;
+    void setAllowChunkOperations(bool allowChunkOperations);
+
+private:
+    friend class CollectionShardingRuntimeTest;
+
+    struct PlacementVersionRecoverOrRefresh {
+    public:
+        PlacementVersionRecoverOrRefresh(
+            SharedSemiFuture<void> future,
+            ShardCatalogRecovererTracker::Acquisition recovererTrackerAcquisition)
+            : future(std::move(future)),
+              recovererTrackerAcquisition(std::move(recovererTrackerAcquisition)) {}
+
+        // Tracks ongoing placement version recover/refresh.
+        SharedSemiFuture<void> future;
+
+        // Keeps the recovery registered with ShardCatalogRecovererTracker until completion.
+        ShardCatalogRecovererTracker::Acquisition recovererTrackerAcquisition;
+    };
+
+    /**
+     * Returns the latest version of collection metadata with filtering configured for
+     * atClusterTime if specified.
+     */
+    std::shared_ptr<ScopedCollectionDescription::Impl> _getCurrentMetadataIfKnown(
+        const boost::optional<LogicalTime>& atClusterTime, bool preserveRange) const;
+
+    /**
+     * Returns the latest version of collection metadata with filtering configured for
+     * atClusterTime if specified. Throws StaleConfigInfo if the shard version attached to the
+     * operation context does not match the shard version on the active metadata object.
+     */
+    std::shared_ptr<ScopedCollectionDescription::Impl> _getMetadataWithVersionCheckAt(
+        OperationContext* opCtx,
+        const boost::optional<mongo::LogicalTime>& atClusterTime,
+        const boost::optional<ShardVersion>& optReceivedShardVersion,
+        bool preserveRange,
+        bool supportNonVersionedOperations = false) const;
+
+    /**
+     * This function cleans up some state associated with the current sharded metadata before it's
+     * replaced by the new metadata.
+     */
+    void _cleanupBeforeInstallingNewCollectionMetadata(OperationContext* opCtx);
+
+    // The service context under which this instance runs
+    ServiceContext* const _serviceContext;
+
+    // Namespace this state belongs to.
+    const NamespaceString _nss;
+
+    // Tracks the migration critical section state for this collection.
+    ShardingMigrationCriticalSection _critSec;
+
+    // Track status of filtering metadata for a specific collection.
+    enum class MetadataType {
+        kUnknown,    // metadata is not known to this node
+        kUntracked,  // collection is unsharded, and is not registered in the CSRS
+        kUnowned,    // tracked-ness is not known locally: if untracked, this shard is not the
+                     // DB primary; if tracked, this shard holds no chunks for the collection
+        kTracked     // metadata for this collection is registered in the sharding catalog
+    } _metadataType;
+
+    // If the collection state is known and is untracked or unowned, this will be nullptr.
+    //
+    // If the collection state is known and is tracked, this will point to the metadata
+    // associated with this collection.
+    //
+    // If the collection state is unknown:
+    // - If the metadata had never been set yet, this will be nullptr.
+    // - If the collection state was known and was sharded, this contains the metadata that
+    // were known for the collection before the last invocation of clearCollectionMetadata().
+    //
+    // The following matrix enumerates the valid (Y) and invalid (X) scenarios.
+    //                          ______________________________________________
+    //                         |        _metadataType (collection state)      |
+    //                         |______________________________________________|
+    //                         | UNKNOWN | UNTRACKED | UNOWNED |   TRACKED    |
+    //  _______________________|_________|___________|_________|______________|
+    // |_metadataManager unset |    Y    |     Y     |    Y    |      X       |
+    // |_______________________|_________|___________|_________|______________|
+    // |_metadataManager set   |    Y    |     X     |    X    |      Y       |
+    // |_______________________|_________|___________|_________|______________|
+    std::shared_ptr<MetadataManager> _metadataManager;
+
+    // Used for testing to check the number of times a new MetadataManager has been installed.
+    std::uint64_t _numMetadataManagerChanges{0};
+
+    // Tracks ongoing placement version recover/refresh. Holds the future to wait on and the tracker
+    // acquisition used to cancel it.
+    boost::optional<PlacementVersionRecoverOrRefresh> _placementVersionInRecoverOrRefresh;
+
+    // List of waiters currently waiting for the CSS/CSR to have the required placement version.
+    // This is mutable since we don't need to acquire the CSR in an exclusive state as it will not
+    // perform any modifications to the underlying data.
+    mutable WaiterList<ChunkVersion> _shardVersionWaiters;
+
+    // Tracks the fact that concurrent recovery of the collection's sharding metadata is taking
+    // place by a concurrent thread handling a shard version mismatch
+    std::shared_ptr<CollectionMetadataSynchronizer> _metadataSynchronizer;
+
+    // True when authoritative disk recovery found an empty shard catalog for this collection.
+    // While set, further recovery must serialize with the database primary critical section to
+    // classify the collection as untracked or unowned.
+    bool _needsDbPrimaryClassification{false};
+
+    bool _allowChunkOperations{true};
+};
+
+/**
+ * RAII-style class, which obtains a reference to the critical section for the specified collection.
+ *
+ *
+ * Placement version recovery/refresh procedures always wait for the critical section to be released
+ * in order to serialise with concurrent moveChunk/shardCollection commit operations.
+ *
+ * Entering the critical section doesn't serialise with concurrent recovery/refresh, because
+ * causally such refreshes would have happened *before* the critical section was entered.
+ */
+class [[MONGO_MOD_USE_REPLACEMENT(ShardingMigrationCriticalSection)]] CollectionCriticalSection {
+    CollectionCriticalSection(const CollectionCriticalSection&) = delete;
+    CollectionCriticalSection& operator=(const CollectionCriticalSection&) = delete;
+
+public:
+    CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss, BSONObj reason);
+    ~CollectionCriticalSection();
+
+    /**
+     * Enters the commit phase of the critical section and blocks reads.
+     */
+    void enterCommitPhase();
+
+private:
+    OperationContext* const _opCtx;
+
+    NamespaceString _nss;
+    const BSONObj _reason;
+};
+
+}  // namespace mongo

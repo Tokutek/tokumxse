@@ -1,95 +1,154 @@
-/*    Copyright 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
-
-#include "mongo/platform/basic.h"
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/client/native_sasl_client_session.h"
 
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/sasl_client_conversation.h"
+#include "mongo/client/sasl_oidc_client_conversation.h"
 #include "mongo/client/sasl_plain_client_conversation.h"
-#include "mongo/client/sasl_scramsha1_client_conversation.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/client/sasl_scram_client_conversation.h"
+#include "mongo/client/sasl_x509_client_conversation.h"
+#include "mongo/client/scram_client_cache.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/commands/server_status/server_status.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/str.h"
+
+#include <string_view>
+#include <tuple>
+
+#include <absl/container/node_hash_map.h>
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/client/sasl_aws_client_conversation.h"
+#endif
 
 namespace mongo {
+using namespace std::literals::string_view_literals;
 namespace {
 
-    SaslClientSession* createNativeSaslClientSession(const std::string mech) {
-        return new NativeSaslClientSession();
+SaslClientSession* createNativeSaslClientSession(const std::string mech) {
+    return new NativeSaslClientSession();
+}
+
+MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
+    SaslClientSession::create = createNativeSaslClientSession;
+}
+
+// Global cache for SCRAM-SHA-1/256 credentials
+auto* scramsha1ClientCache = new SCRAMClientCache<SHA1Block>;
+auto* scramsha256ClientCache = new SCRAMClientCache<SHA256Block>;
+
+template <typename HashBlock>
+void cacheToBSON(SCRAMClientCache<HashBlock>* cache,
+                 std::string_view name,
+                 BSONObjBuilder* builder) {
+    auto stats = cache->getStats();
+
+    BSONObjBuilder sub(builder->subobjStart(name));
+    sub.append("count", stats.count);
+    sub.append("hits", stats.hits);
+    sub.append("misses", stats.misses);
+}
+
+/**
+ * Output stats about the SCRAM client cache to server status.
+ */
+class ScramCacheStatsStatusSection : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return true;
     }
 
-    MONGO_INITIALIZER(NativeSaslClientContext)(InitializerContext* context) {
-        SaslClientSession::create = createNativeSaslClientSession;
-        return Status::OK();
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        BSONObjBuilder builder;
+        cacheToBSON(scramsha1ClientCache, auth::kMechanismScramSha1, &builder);
+        cacheToBSON(scramsha256ClientCache, auth::kMechanismScramSha256, &builder);
+        return builder.obj();
     }
+};
 
-} // namespace
+auto& scramCacheSection =
+    *ServerStatusSectionBuilder<ScramCacheStatsStatusSection>("scramCache").forShard().forRouter();
 
-    NativeSaslClientSession::NativeSaslClientSession() :
-            SaslClientSession(),
-            _step(0),
-            _done(false),
-            _saslConversation(NULL) {
-    }
-
-    NativeSaslClientSession::~NativeSaslClientSession() {}
-
-    Status NativeSaslClientSession::initialize() {
-        if (_saslConversation)
-            return Status(ErrorCodes::AlreadyInitialized,
-                "Cannot reinitialize NativeSaslClientSession.");
-
-        std::string mechanism = getParameter(parameterMechanism).toString();
-        if (mechanism == "PLAIN") {
-            _saslConversation.reset(new SaslPLAINClientConversation(this));
-        }
-        else if (mechanism == "SCRAM-SHA-1") {
-            _saslConversation.reset(new SaslSCRAMSHA1ClientConversation(this));
-        }
-        else {
-            return Status(ErrorCodes::BadValue,
-                mongoutils::str::stream() << "SASL mechanism " << mechanism <<
-                                             " is not supported");
-        }
-
-        return Status::OK();
-    }
-
-    Status NativeSaslClientSession::step(StringData inputData, std::string* outputData) {
-        if (!_saslConversation) {
-            return Status(ErrorCodes::BadValue,
-                mongoutils::str::stream() <<
-                "The client authentication session has not been properly initialized");
-        }
-
-        StatusWith<bool> status = _saslConversation->step(inputData, outputData);
-        if (status.isOK()) {
-            _done = status.getValue();
-        }
-        return status.getStatus();
-    }
 }  // namespace
+
+NativeSaslClientSession::NativeSaslClientSession()
+    : SaslClientSession(), _success(false), _saslConversation(nullptr) {}
+
+NativeSaslClientSession::~NativeSaslClientSession() {}
+
+Status NativeSaslClientSession::initialize() {
+    if (_saslConversation)
+        return Status(ErrorCodes::AlreadyInitialized,
+                      "Cannot reinitialize NativeSaslClientSession.");
+
+    std::string mechanism = std::string{getParameter(parameterMechanism)};
+    if (mechanism == auth::kMechanismSaslPlain) {
+        _saslConversation = std::make_unique<SaslPLAINClientConversation>(this);
+    } else if (mechanism == auth::kMechanismScramSha1) {
+        _saslConversation = std::make_unique<SaslSCRAMClientConversationImpl<SHA1Block>>(
+            this, scramsha1ClientCache);
+    } else if (mechanism == auth::kMechanismScramSha256) {
+        _saslConversation = std::make_unique<SaslSCRAMClientConversationImpl<SHA256Block>>(
+            this, scramsha256ClientCache);
+#ifdef MONGO_CONFIG_SSL
+        // AWS depends on kms-message which depends on ssl libraries
+    } else if (mechanism == auth::kMechanismMongoAWS) {
+        _saslConversation = std::make_unique<SaslAWSClientConversation>(this);
+    } else if (mechanism == auth::kMechanismMongoX509) {
+        _saslConversation = std::make_unique<SaslX509ClientConversation>(this);
+#endif
+    } else if (mechanism == auth::kMechanismMongoOIDC) {
+        auto userName = hasParameter(SaslClientSession::parameterUser)
+            ? getParameter(SaslClientSession::parameterUser)
+            : ""sv;
+        auto accessToken = hasParameter(SaslClientSession::parameterOIDCAccessToken)
+            ? getParameter(SaslClientSession::parameterOIDCAccessToken)
+            : ""sv;
+
+        _saslConversation =
+            std::make_unique<SaslOIDCClientConversation>(this, userName, accessToken);
+    } else {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "SASL mechanism " << mechanism << " is not supported");
+    }
+
+    return Status::OK();
+}
+
+Status NativeSaslClientSession::step(std::string_view inputData, std::string* outputData) {
+    if (!_saslConversation) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << "The client authentication session has not been properly initialized");
+    }
+
+    StatusWith<bool> status = _saslConversation->step(inputData, outputData);
+    if (status.isOK()) {
+        _success = status.getValue();
+    }
+    return status.getStatus();
+}
+
+boost::optional<std::uint32_t> NativeSaslClientSession::currentStep() const {
+    return _saslConversation->currentStep();
+}
+
+boost::optional<std::uint32_t> NativeSaslClientSession::totalSteps() const {
+    return _saslConversation->totalSteps();
+}
+}  // namespace mongo

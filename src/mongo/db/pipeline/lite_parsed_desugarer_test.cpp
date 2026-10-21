@@ -1,0 +1,795 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/lite_parsed_desugarer.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/extension/host/document_source_extension_optimizable.h"
+#include "mongo/db/extension/host_connector/adapter/host_services_adapter.h"
+#include "mongo/db/extension/sdk/tests/shared_test_stages.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/lite_parsed_document_source_nested_pipelines.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/owned_lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/search/document_source_internal_search_id_lookup.h"
+#include "mongo/db/pipeline/search/lite_parsed_internal_search_id_lookup.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string_view>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+// Test-only stage that lifts its subpipeline to the top level when desugared. Used to verify
+// desugaring order: if subpipelines are desugared before the stage expands (innermost-first),
+// the lifted content will already be desugared (e.g. [$match] not [$expandToHostParse]).
+static constexpr std::string_view kLiftSubpipelineStageName = "$liftSubpipeline"sv;
+
+DECLARE_STAGE_PARAMS_DERIVED_DEFAULT(LiftSubpipeline);
+ALLOCATE_STAGE_PARAMS_ID(liftSubpipeline, LiftSubpipelineStageParams::id);
+
+class LiftSubpipelineLiteParsed final
+    : public LiteParsedDocumentSourceNestedPipelines<LiftSubpipelineLiteParsed> {
+public:
+    static std::unique_ptr<LiteParsedDocumentSource> parse(const NamespaceString& nss,
+                                                           const BSONElement& spec,
+                                                           const LiteParserOptions& options) {
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << kLiftSubpipelineStageName
+                              << " stage specification must be an object",
+                spec.type() == BSONType::object);
+
+        auto pipelineElem = spec.Obj()["pipeline"];
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << kLiftSubpipelineStageName << " must have a 'pipeline' array",
+                pipelineElem && pipelineElem.type() == BSONType::array);
+
+        auto pipeline = parsePipelineFromBSON(pipelineElem);
+        auto ownedPipeline = OwnedLiteParsedPipeline(nss, pipeline, options);
+
+        return std::make_unique<LiftSubpipelineLiteParsed>(
+            spec, boost::none, std::move(ownedPipeline));
+    }
+
+    LiftSubpipelineLiteParsed(const BSONElement& spec,
+                              boost::optional<NamespaceString> foreignNss,
+                              OwnedLiteParsedPipeline pipeline)
+        : LiteParsedDocumentSourceNestedPipelines(
+              spec,
+              std::move(foreignNss),
+              std::vector<OwnedLiteParsedPipeline>{std::move(pipeline)}) {}
+
+    std::unique_ptr<StageParams> getStageParams() const override {
+        return std::make_unique<LiftSubpipelineStageParams>(this->getOriginalBson());
+    }
+
+    PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const final {
+        return requiredPrivilegesBasic(isMongos, bypassDocumentValidation);
+    }
+};
+
+size_t liftSubpipelineStageExpander(LiteParsedPipeline* pipeline,
+                                    size_t index,
+                                    LiteParsedDocumentSource& stage) {
+    auto* subpipelinesPtr = stage.getMutableSubPipelines();
+    tassert(8084900,
+            "$liftSubpipeline must have exactly one subpipeline",
+            subpipelinesPtr && subpipelinesPtr->size() == 1);
+    StageSpecs lifted;
+    for (const auto& s : (*subpipelinesPtr)[0]->getStages()) {
+        lifted.push_back(s->clone());
+    }
+    return pipeline->replaceStageWith(index, std::move(lifted));
+}
+
+REGISTER_LITE_PARSED_DESUGARER_STAGE_EXPANDER(liftSubpipeline,
+                                              LiftSubpipelineStageParams::id,
+                                              liftSubpipelineStageExpander);
+
+}  // namespace
+
+class LiteParsedDesugarerTest : public AggregationContextFixture {
+public:
+    LiteParsedDesugarerTest() : LiteParsedDesugarerTest(_nss) {}
+    explicit LiteParsedDesugarerTest(NamespaceString nsString)
+        : AggregationContextFixture(std::move(nsString)) {}
+
+    void registerParser(extension::AggStageDescriptorHandle descriptor) {
+        auto nameStringData = descriptor->getName();
+        auto stageName = std::string(nameStringData);
+
+        using LiteParseFn = std::function<std::unique_ptr<LiteParsedDocumentSource>(
+            const NamespaceString&, const BSONElement&, const LiteParserOptions&)>;
+
+        auto parser = [&]() -> LiteParseFn {
+            return [descriptor](const NamespaceString& nss,
+                                const BSONElement& spec,
+                                const LiteParserOptions& opts) {
+                return extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpandable::
+                    parse(descriptor, nss, spec, opts);
+            };
+        }();
+
+        registerParser(stageName, std::move(parser));
+    }
+
+    void registerParser(
+        const std::string& stageName,
+        std::function<std::unique_ptr<LiteParsedDocumentSource>(
+            const NamespaceString&, const BSONElement&, const LiteParserOptions&)> parser) {
+        LiteParsedDocumentSource::registerParser(
+            stageName,
+            {.parser = std::move(parser),
+             .allowedWithApiStrict = AllowedWithApiStrict::kAlways,
+             .allowedWithClientType = AllowedWithClientType::kAny});
+    }
+
+    void unregisterParser(const std::string& stageName) {
+        LiteParsedDocumentSource::unregisterParser_forTest(stageName);
+    }
+
+    void setUp() override {
+        AggregationContextFixture::setUp();
+        extension::sdk::HostServicesAPI::setHostServices(
+            &extension::host_connector::HostServicesAdapter::get());
+    }
+
+    BSONObj makeLookupWithSubpipeline(const std::vector<BSONObj>& subpipelineStages) {
+        BSONArrayBuilder arr;
+        for (const auto& stage : subpipelineStages) {
+            arr << stage;
+        }
+        return BSON("$lookup" << BSON("from" << "otherCollection"
+                                             << "let" << BSONObj() << "pipeline" << arr.arr()
+                                             << "as"
+                                             << "joined"));
+    }
+
+    void assertSubpipelineStageIsMatch(LiteParsedDocumentSource* stage,
+                                       size_t subpipelineIdx,
+                                       size_t stageIdx) {
+        auto* subpipelinesPtr = stage->getSubPipelines();
+        ASSERT_NE(subpipelinesPtr, nullptr);
+        ASSERT_LT(subpipelineIdx, subpipelinesPtr->size());
+        auto& stages = (*subpipelinesPtr)[subpipelineIdx]->getStages();
+        ASSERT_LT(stageIdx, stages.size());
+        ASSERT(dynamic_cast<MatchLiteParsed*>(stages[stageIdx].get()));
+    }
+
+protected:
+    static inline NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest(boost::none, "lite_parsed_desugarer_test");
+
+    // Test stage descriptors from the SDK test helpers.
+    extension::sdk::ExtensionAggStageDescriptorAdapter _expandToExtAstDescriptor{
+        extension::sdk::shared_test_stages::ExpandToExtAstDescriptor::make()};
+    extension::sdk::ExtensionAggStageDescriptorAdapter _expandToExtParseDescriptor{
+        extension::sdk::shared_test_stages::ExpandToExtParseDescriptor::make()};
+    extension::sdk::ExtensionAggStageDescriptorAdapter _topDescriptor{
+        extension::sdk::shared_test_stages::TopDescriptor::make()};
+    extension::sdk::ExtensionAggStageDescriptorAdapter _expandToHostParseDescriptor{
+        extension::sdk::shared_test_stages::ExpandToHostParseDescriptor::make()};
+    extension::sdk::ExtensionAggStageDescriptorAdapter _expandToMixedDescriptor{
+        extension::sdk::shared_test_stages::ExpandToMixedDescriptor::make()};
+    extension::sdk::ExtensionAggStageDescriptorAdapter _midADescriptor{
+        extension::sdk::shared_test_stages::MidADescriptor::make()};
+    extension::sdk::ExtensionAggStageDescriptorAdapter _midBDescriptor{
+        extension::sdk::shared_test_stages::MidBDescriptor::make()};
+    std::shared_ptr<IncrementalFeatureRolloutContext> _ifrContext =
+        std::make_shared<IncrementalFeatureRolloutContext>();
+};
+
+TEST_F(LiteParsedDesugarerTest, NoopOnEmptyPipeline) {
+    std::vector<BSONObj> pipelineStages;
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+    ASSERT_EQ(lpp.getStages().size(), 0);
+
+    ASSERT_FALSE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    ASSERT_EQ(lpp.getStages().size(), 0);
+}
+
+TEST_F(LiteParsedDesugarerTest, NoopOnNonExpandableStages) {
+    std::vector<BSONObj> pipelineStages;
+    pipelineStages.push_back(BSON("$match" << BSONObj()));
+    pipelineStages.push_back(BSON("$project" << BSONObj()));
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+    ASSERT_EQ(lpp.getStages().size(), 2);
+
+    ASSERT_FALSE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 2);
+    ASSERT(dynamic_cast<MatchLiteParsed*>(stages[0].get()));
+    ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[1].get()));
+}
+
+TEST_F(LiteParsedDesugarerTest, ExpandsExpandableToHostParseStage) {
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    {
+        // ExpandsSingleExpandToHostParseOnly
+        // Create [$expandToHostParse].
+        std::vector<BSONObj> pipelineStages;
+        pipelineStages.push_back(BSON(extStageName << BSONObj()));
+
+        LiteParsedPipeline lpp(_nss, pipelineStages);
+        ASSERT_EQ(lpp.getStages().size(), 1);
+
+        ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+        auto& stages = lpp.getStages();
+        ASSERT_EQ(stages.size(), 1);
+        ASSERT(dynamic_cast<MatchLiteParsed*>(stages[0].get()));
+    }
+    {
+        // ExpandsSingleExpandableToHostStageInPlace
+        // Create [$project, $expandToHostParse, $project].
+        std::vector<BSONObj> pipelineStages;
+        pipelineStages.push_back(BSON("$project" << BSONObj()));
+        pipelineStages.push_back(BSON(extStageName << BSONObj()));
+        pipelineStages.push_back(BSON("$project" << BSONObj()));
+
+        LiteParsedPipeline lpp(_nss, pipelineStages);
+        ASSERT_EQ(lpp.getStages().size(), 3);
+
+        ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+        // Expect: [$project, $match, $project].
+        auto& stages = lpp.getStages();
+        ASSERT_EQ(stages.size(), 3);
+        ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[0].get()));
+        ASSERT(dynamic_cast<MatchLiteParsed*>(stages[1].get()));
+        ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[2].get()));
+    }
+
+    {
+        // ExpandsHeadExpandableStage
+        // Create [$expandToHostParse, $project].
+        std::vector<BSONObj> pipelineStages;
+        pipelineStages.push_back(BSON(extStageName << BSONObj()));
+        pipelineStages.push_back(BSON("$project" << BSONObj()));
+
+        LiteParsedPipeline lpp(_nss, pipelineStages);
+        ASSERT_EQ(lpp.getStages().size(), 2);
+
+        ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+        // Expect: [$match, $project].
+        auto& stages = lpp.getStages();
+        ASSERT_EQ(stages.size(), 2);
+        ASSERT(dynamic_cast<MatchLiteParsed*>(stages[0].get()));
+        ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[1].get()));
+    }
+
+    {
+        // ExpandsTailExpandableStage
+        // Create [$project, $expandToHostParse].
+        std::vector<BSONObj> pipelineStages;
+        pipelineStages.push_back(BSON("$project" << BSONObj()));
+        pipelineStages.push_back(BSON(extStageName << BSONObj()));
+
+        LiteParsedPipeline lpp(_nss, pipelineStages);
+        ASSERT_EQ(lpp.getStages().size(), 2);
+
+        ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+        // Expect: [$project, $match].
+        auto& stages = lpp.getStages();
+        ASSERT_EQ(stages.size(), 2);
+        ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[0].get()));
+        ASSERT(dynamic_cast<MatchLiteParsed*>(stages[1].get()));
+    }
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, ExpandsExpandToExtAst) {
+    registerParser(extension::AggStageDescriptorHandle(&_expandToExtAstDescriptor));
+    const auto extStageName = std::string(extension::sdk::shared_test_stages::kExpandToExtAstName);
+
+    {
+        // ExpandsSingleExpandToExtAstOnly
+        // Create [$expandToExtAst].
+        std::vector<BSONObj> pipelineStages;
+        pipelineStages.push_back(BSON(extStageName << BSONObj()));
+
+        LiteParsedPipeline lpp(_nss, pipelineStages);
+        ASSERT_EQ(lpp.getStages().size(), 1);
+
+        ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+        auto& stages = lpp.getStages();
+        ASSERT_EQ(stages.size(), 1);
+
+        ASSERT(
+            dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+                stages[0].get()));
+        ASSERT_EQ(stages[0]->getParseTimeName(),
+                  extension::sdk::shared_test_stages::kTransformName);
+    }
+    {
+        // DesugaringIsIdempotentForExtensionOnlyExpansion
+        // Create [$project, $expandToExtAst, $project]. expandToExtAst -> [extExpanded].
+        std::vector<BSONObj> pipelineStages;
+        pipelineStages.push_back(BSON("$project" << BSONObj()));
+        pipelineStages.push_back(BSON(extStageName << BSONObj()));
+        pipelineStages.push_back(BSON("$project" << BSONObj()));
+
+        LiteParsedPipeline lpp(_nss, pipelineStages);
+        ASSERT_EQ(lpp.getStages().size(), 3);
+
+        auto checkLiteParsedPipelineShape = [&](const LiteParsedPipeline& lpp) {
+            auto& stages = lpp.getStages();
+            ASSERT_EQ(stages.size(), 3);
+
+            ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[0].get()));
+
+            ASSERT(dynamic_cast<
+                   extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+                stages[1].get()));
+            ASSERT_EQ(stages[1]->getParseTimeName(),
+                      extension::sdk::shared_test_stages::kTransformName);
+
+            ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[2].get()));
+        };
+
+        // First desugar pass.
+        ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+        checkLiteParsedPipelineShape(lpp);
+
+        // Second desugar pass should be a no-op.
+        ASSERT_FALSE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+        checkLiteParsedPipelineShape(lpp);
+    }
+}
+
+TEST_F(LiteParsedDesugarerTest, ExpandsSingleExpandToExtParseOnly) {
+    registerParser(extension::AggStageDescriptorHandle(&_expandToExtParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToExtParseName);
+
+    // Create [$expandToExtParse].
+    std::vector<BSONObj> pipelineStages;
+    pipelineStages.push_back(BSON(extStageName << BSONObj()));
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[0].get()));
+    ASSERT_EQ(stages[0]->getParseTimeName(), extension::sdk::shared_test_stages::kTransformName);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, ExpandsRecursiveTopToLeaves) {
+    // Create [$top]. Top -> [MidA, MidB] -> [LeafA, LeafB, LeafC, LeafD].
+    registerParser(extension::AggStageDescriptorHandle(&_topDescriptor));
+    const auto extStageName = std::string(extension::sdk::shared_test_stages::kTopName);
+
+    // Create [$expandToExtParse].
+    std::vector<BSONObj> pipelineStages;
+    pipelineStages.push_back(BSON(extStageName << BSONObj()));
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 4);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[0].get()));
+    ASSERT_EQ(stages[0]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafAName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[1].get()));
+    ASSERT_EQ(stages[1]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafBName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[2].get()));
+    ASSERT_EQ(stages[2]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafCName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[3].get()));
+    ASSERT_EQ(stages[3]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafDName);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, ExpandsMixedToMultipleStagesSplicingIntoPipeline) {
+    registerParser(extension::AggStageDescriptorHandle(&_expandToMixedDescriptor));
+    const auto extStageName = std::string(extension::sdk::shared_test_stages::kExpandToMixedName);
+
+    // Create [$project, $expandToMixed, $project]. expandToMixed -> [extNoOp, extNoOp,
+    // $match].
+    std::vector<BSONObj> pipelineStages;
+    pipelineStages.push_back(BSON("$project" << BSONObj()));
+    pipelineStages.push_back(BSON(extStageName << BSONObj()));
+    pipelineStages.push_back(BSON("$project" << BSONObj()));
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+    ASSERT_EQ(lpp.getStages().size(), 3);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Expect [$project, extNoOp, extNoOp, $match, $idLookup, $project].
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 6);
+
+    ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[0].get()));
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[1].get()));
+    ASSERT_EQ(stages[1]->getParseTimeName(), extension::sdk::shared_test_stages::kTransformName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[2].get()));
+    ASSERT_EQ(stages[2]->getParseTimeName(), extension::sdk::shared_test_stages::kTransformName);
+
+    ASSERT(dynamic_cast<MatchLiteParsed*>(stages[3].get()));
+
+    ASSERT(dynamic_cast<LiteParsedInternalSearchIdLookUp*>(stages[4].get()));
+
+    ASSERT(dynamic_cast<ProjectLiteParsed*>(stages[5].get()));
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, ExpandsMultipleExpandablesSequentially) {
+    registerParser(extension::AggStageDescriptorHandle(&_midADescriptor));
+    const auto midAStageName = std::string(extension::sdk::shared_test_stages::kMidAName);
+    registerParser(extension::AggStageDescriptorHandle(&_midBDescriptor));
+    const auto midBStageName = std::string(extension::sdk::shared_test_stages::kMidBName);
+
+    // Create [$midB, $midA] -> [LeafC, LeafD, LeafA, LeafB].
+    std::vector<BSONObj> pipelineStages;
+    pipelineStages.push_back(BSON(midBStageName << BSONObj()));
+    pipelineStages.push_back(BSON(midAStageName << BSONObj()));
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+    ASSERT_EQ(lpp.getStages().size(), 2);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Expect [LeafC, LeafD, LeafA, LeafB].
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 4);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[0].get()));
+    ASSERT_EQ(stages[0]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafCName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[1].get()));
+    ASSERT_EQ(stages[1]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafDName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[2].get()));
+    ASSERT_EQ(stages[2]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafAName);
+
+    ASSERT(dynamic_cast<extension::host::DocumentSourceExtensionOptimizable::LiteParsedExpanded*>(
+        stages[3].get()));
+    ASSERT_EQ(stages[3]->getParseTimeName(), extension::sdk::shared_test_stages::kLeafBName);
+
+    unregisterParser(midAStageName);
+    unregisterParser(midBStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, DesugarsSubpipelineWithExpandableStage) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    // Create [$lookup] with subpipeline [$expandToHostParse]. The subpipeline should be desugared
+    // to [$match].
+    auto lookupBson = makeLookupWithSubpipeline({BSON(extStageName << BSONObj())});
+    LiteParsedPipeline lpp(_nss, {lookupBson});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Main pipeline unchanged: [$lookup].
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+
+    // Subpipeline should be desugared: [$expandToHostParse] -> [$match].
+    assertSubpipelineStageIsMatch(stages[0].get(), 0, 0);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, DesugarsLookupSubpipelineWithExpandableStageWhenHybridFlagOff) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", false};
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    auto lookupStage = makeLookupWithSubpipeline({BSON(extStageName << BSONObj())});
+    LiteParsedPipeline lpp(_nss, {lookupStage});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+    assertSubpipelineStageIsMatch(stages[0].get(), 0, 0);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest,
+       DesugarsGraphLookupSubpipelineWithExpandableStageWhenHybridFlagOff) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", false};
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    auto graphLookupStage =
+        BSON("$graphLookup" << BSON("from" << "otherCollection"
+                                           << "startWith" << "$a"
+                                           << "connectFromField" << "b"
+                                           << "connectToField" << "c"
+                                           << "as" << "d"
+                                           << "$_internalFromPipeline"
+                                           << BSON_ARRAY(BSON(extStageName << BSONObj()))));
+    LiteParsedPipeline lpp(_nss, {graphLookupStage});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+    assertSubpipelineStageIsMatch(stages[0].get(), 0, 0);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, SkipsSubpipelineDesugaringWhenIfrContextIsNull) {
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    // Create [$lookup] with subpipeline [$expandToHostParse]. With a null IFR context, subpipeline
+    // desugaring is skipped, so the subpipeline should remain unchanged.
+    auto lookupStage = makeLookupWithSubpipeline({BSON(extStageName << BSONObj())});
+    LiteParsedPipeline lpp(_nss, {lookupStage});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    // desugar returns false - no top-level expandable stage, and subpipelines are skipped.
+    ASSERT_FALSE(LiteParsedDesugarer::desugar(&lpp, nullptr));
+
+    // Subpipeline unchanged: still [$expandToHostParse] (not desugared to [$match]).
+    auto* subpipelinesPtr = lpp.getStages()[0]->getSubPipelines();
+    ASSERT_NE(subpipelinesPtr, nullptr);
+    ASSERT_EQ(subpipelinesPtr->size(), 1);
+    auto& subpipelineStages = (*subpipelinesPtr)[0]->getStages();
+    ASSERT_EQ(subpipelineStages.size(), 1);
+    ASSERT_EQ(subpipelineStages[0]->getParseTimeName(), extStageName);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, NoopOnLookupSubpipelineWithNonExpandableStages) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    // Create [$lookup] with subpipeline [$match]. No expandable stages, desugar should return
+    // false.
+    auto lookupStage = makeLookupWithSubpipeline({BSON("$match" << BSON("a" << 1))});
+    LiteParsedPipeline lpp(_nss, {lookupStage});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_FALSE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Subpipeline unchanged: [$match].
+    assertSubpipelineStageIsMatch(lpp.getStages()[0].get(), 0, 0);
+}
+
+TEST_F(LiteParsedDesugarerTest, DesugarsSubpipelineAndTopLevelExpandableStage) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    // Create [$lookup with subpipeline [$expandToHostParse], $expandToHostParse]. Both the
+    // subpipeline and the top-level stage should be desugared.
+    auto lookupStage = makeLookupWithSubpipeline({BSON(extStageName << BSONObj())});
+    auto expandStage = BSON(extStageName << BSONObj());
+    LiteParsedPipeline lpp(_nss, {lookupStage, expandStage});
+    ASSERT_EQ(lpp.getStages().size(), 2);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Main pipeline: [$lookup, $match] (expandToHostParse expanded to $match).
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 2);
+    ASSERT(dynamic_cast<MatchLiteParsed*>(stages[1].get()));
+
+    // Subpipeline desugared: [$expandToHostParse] -> [$match].
+    assertSubpipelineStageIsMatch(stages[0].get(), 0, 0);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, DesugarsAllSubpipelinesInFacetStage) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    // Create [$facet] with two sub-pipelines, each containing [$expandToHostParse]. $facet has
+    // multiple sub-pipelines (one per facet), so we verify each gets desugared.
+    BSONObj expandStage = BSON(extStageName << BSONObj());
+    LiteParsedPipeline lpp(_nss,
+                           {BSON("$facet" << BSON("facetA" << BSON_ARRAY(expandStage) << "facetB"
+                                                           << BSON_ARRAY(expandStage)))});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Main pipeline unchanged: [$facet].
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+
+    // Both subpipelines should be desugared: each [$expandToHostParse] -> [$match].
+    assertSubpipelineStageIsMatch(stages[0].get(), 0, 0);
+    assertSubpipelineStageIsMatch(stages[0].get(), 1, 0);
+
+    unregisterParser(extStageName);
+}
+
+TEST_F(LiteParsedDesugarerTest, DesugarsNestedSubpipelines) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    // Create [$unionWith] whose subpipeline contains [$lookup] with its own subpipeline. This tests
+    // nested subpipelines: $unionWith -> $lookup -> $expandToHostParse. The innermost expandable
+    // stage should be desugared.
+    BSONObj lookupStage = makeLookupWithSubpipeline({BSON(extStageName << BSONObj())});
+    BSONObj unionWithStage =
+        BSON("$unionWith" << BSON("coll" << "otherCollection"
+                                         << "pipeline" << BSON_ARRAY(lookupStage)));
+    LiteParsedPipeline lpp(_nss, {unionWithStage});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // Main pipeline unchanged: [$unionWith].
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+
+    // $unionWith's subpipeline: [$lookup]. The $lookup's subpipeline should be desugared.
+    auto* unionWithSubpipelinesPtr = stages[0]->getSubPipelines();
+    ASSERT_NE(unionWithSubpipelinesPtr, nullptr);
+    ASSERT_EQ(unionWithSubpipelinesPtr->size(), 1);
+    auto& unionWithPipelineStages = (*unionWithSubpipelinesPtr)[0]->getStages();
+    ASSERT_EQ(unionWithPipelineStages.size(), 1);
+
+    // The $lookup stage's subpipeline (nested): [$expandToHostParse] -> [$match].
+    assertSubpipelineStageIsMatch(unionWithPipelineStages[0].get(), 0, 0);
+
+    unregisterParser(extStageName);
+}
+
+// Verifies that desugaring happens innermost-first by using a stage that lifts its subpipeline to
+// the top level when it expands. If the subpipeline is desugared before the lift stage expands,
+// the lifted content will be [$match] (desugared). If outermost-first, we'd lift
+// [$expandToHostParse].
+TEST_F(LiteParsedDesugarerTest, DesugaringOrderInnermostFirst) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    registerParser(std::string(kLiftSubpipelineStageName), LiftSubpipelineLiteParsed::parse);
+    registerParser(extension::AggStageDescriptorHandle(&_expandToHostParseDescriptor));
+    const auto extStageName =
+        std::string(extension::sdk::shared_test_stages::kExpandToHostParseName);
+
+    // Create [$liftSubpipeline { pipeline: [$expandToHostParse] }]. When the lift stage expands,
+    // it moves its subpipeline to the top. With innermost-first, the subpipeline was already
+    // desugared, so we lift [$match]. With outermost-first, we'd lift [$expandToHostParse].
+    std::vector<BSONObj> pipelineStages;
+    pipelineStages.push_back(BSON(std::string(kLiftSubpipelineStageName) << BSON(
+                                      "pipeline" << BSON_ARRAY(BSON(extStageName << BSONObj())))));
+
+    LiteParsedPipeline lpp(_nss, pipelineStages);
+
+    ASSERT_EQ(lpp.getStages().size(), 1);
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    // The lift stage was replaced with its subpipeline contents. With innermost-first ordering,
+    // those contents were desugared before the lift, so we get [$match] not [$expandToHostParse].
+    auto& stages = lpp.getStages();
+    ASSERT_EQ(stages.size(), 1);
+    ASSERT(dynamic_cast<MatchLiteParsed*>(stages[0].get()))
+        << "Expected [$match]; if desugaring were outermost-first, we'd have lifted "
+           "[$expandToHostParse] before it was desugared.";
+
+    unregisterParser(extStageName);
+    unregisterParser(std::string(kLiftSubpipelineStageName));
+}
+
+TEST_F(LiteParsedDesugarerTest, RankFusionExpandsWithFlagOn) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    BSONObj rankFusionSpec = fromjson(R"({
+        $rankFusion: {
+            input: {
+                pipelines: {
+                    p: [ { $sort: { a: 1 } } ]
+                }
+            }
+        }
+    })");
+    LiteParsedPipeline lpp(
+        _nss, {rankFusionSpec}, false, LiteParserOptions{.ifrContext = _ifrContext});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    for (const auto& stage : lpp.getStages()) {
+        ASSERT_NE(stage->getParseTimeName(), "$rankFusion");
+    }
+}
+
+TEST_F(LiteParsedDesugarerTest, ScoreFusionExpandsWithFlagOn) {
+    unittest::ServerParameterGuard featureFlag{"featureFlagExtensionsInsideHybridSearch", true};
+    BSONObj scoreFusionSpec = fromjson(R"({
+        $scoreFusion: {
+            input: {
+                pipelines: {
+                    p: [ { $score: { score: "$x", normalization: "none" } } ]
+                },
+                normalization: "none"
+            }
+        }
+    })");
+    LiteParsedPipeline lpp(
+        _nss, {scoreFusionSpec}, false, LiteParserOptions{.ifrContext = _ifrContext});
+    ASSERT_EQ(lpp.getStages().size(), 1);
+
+    ASSERT_TRUE(LiteParsedDesugarer::desugar(&lpp, _ifrContext));
+
+    for (const auto& stage : lpp.getStages()) {
+        ASSERT_NE(stage->getParseTimeName(), "$scoreFusion");
+    }
+}
+
+using LiteParsedDesugarerDeathTest = LiteParsedDesugarerTest;
+
+/**
+ * Test that duplicate calls to registerStageExpander() for the same stage lead to an
+ * assertion error. 'LiftSubpipelineStageParams::id' was already registered in the call
+ * to 'REGISTER_LITE_PARSED_DESUGARER_STAGE_EXPANDER' above.
+ */
+DEATH_TEST_REGEX_F(LiteParsedDesugarerDeathTest,
+                   DuplicateStageExpanderRegistrationFails,
+                   "12880500") {
+    LiteParsedDesugarer::registerStageExpander(
+        LiftSubpipelineStageParams::id, liftSubpipelineStageExpander, "liftSubpipeline");
+}
+
+DEATH_TEST_REGEX_F(LiteParsedDesugarerDeathTest,
+                   UnallocatedStageParamsIdRegistrationFails,
+                   "12880501") {
+    LiteParsedDesugarer::registerStageExpander(
+        StageParams::kUnallocatedId, liftSubpipelineStageExpander, "unallocated");
+}
+
+}  // namespace mongo

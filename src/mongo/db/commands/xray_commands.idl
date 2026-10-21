@@ -1,0 +1,31 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+# XRAY is a instrumentation tracer that is part of LLVM.
+# see https://llvm.org/docs/XRay.html for more information.
+#
+commands:
+    startXRayLogging:
+        description: "Start LLVM XRay logging"
+        command_name: startXRayLogging
+        namespace: ignored
+        api_version: ""
+        fields:
+            mode:
+                description: "Typically set to 'xray-basic'"
+                type: string
+            flags:
+                description: "For 'xray-basic', see flags in https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/xray/xray_basic_flags.inc"
+                type: string
+
+    stopXRayLogging:
+        description: "Stop LLVM Xray logging and flush log to disk"
+        command_name: stopXRayLogging
+        namespace: ignored
+        api_version: ""

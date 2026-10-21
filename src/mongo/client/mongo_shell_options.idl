@@ -1,0 +1,28 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/client/client_api_version_parameters.idl"
+    - "mongo/client/client_transient_tls_parameters.idl"
+    - "mongo/db/basic_types.idl"
+
+structs:
+    MongoShellOptions:
+        description: "The third argument to `new Mongo(...)`"
+        mod_visibility: public
+        fields:
+            api:
+                description: "API strict version parameter"
+                type: ClientAPIVersionParameters
+                optional: true
+            tls:
+                description: "TLS configuration options"
+                type: ClientTLSParameters
+                optional: true
+            gRPC:
+                description: "Set if the shell should use gRPC to connect"
+                type: bool
+                optional: true

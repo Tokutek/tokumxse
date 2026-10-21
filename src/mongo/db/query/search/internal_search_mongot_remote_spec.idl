@@ -1,0 +1,62 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/pipeline/visitors/docs_needed_bounds.idl"
+    - "mongo/db/query/search/search_query_view_spec.idl"
+
+structs:
+    InternalSearchMongotRemoteSpec:
+        description: Specification for a $_internalSearchMongotRemote stage given in the full, explicit format.
+        # Because the specification is internal only, we permit extra fields. This avoids some upgrade/downngrade
+        # concerns where a router may send a command to a node with fields not known by the node.
+        # NOTE: Every field below is router-set internal and must never be accepted from an external
+        # client. When adding a field here, also add it to getInternalOnlyFieldNames() in
+        # src/mongo/db/pipeline/search/search_helper.cpp so the LiteParse-layer check rejects it.
+        strict: false
+        fields:
+            mongotQuery:
+                description: The remote text search query.
+                optional: false
+                type: object_owned
+            metadataMergeProtocolVersion:
+                description: The mongot protocol version.
+                optional: true
+                type: int
+            mergingPipeline:
+                description: An optional pipeline to apply to the collection being unioned.
+                optional: true
+                type: array<object>
+            limit:
+                description: A limit copied from the merging part of the pipeline.
+                optional: true
+                type: long
+            requiresSearchSequenceToken:
+                description: "If true, mongot must return a searchSequenceToken with each document to allow the user to paginate results."
+                default: false
+                type: bool
+            sortSpec:
+                description: "The sort specification for this query."
+                optional: true
+                type: object
+            requiresSearchMetaCursor:
+                description: >-
+                    Flag indicating whether or not the total user pipeline references the $$SEARCH_META variable. If false, we will
+                    ignore the metadata cursor returned from mongot and not establish a search metadata pipeline.
+                default: true
+                type: bool
+            docsNeededBounds:
+                description: Bounds to describe the minimum and maximum number of documents needed from mongot to satisfy the overall query.
+                optional: true
+                type: DocsNeededBounds
+            view:
+                description: >-
+                    For requests on views over sharded collections, mongos must serialize the view NSS, the view name and pipeline as part of
+                    the mongot stage.
+                optional: true
+                type: SearchQueryViewSpec

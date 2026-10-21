@@ -1,0 +1,879 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/transport/proxy_protocol_header_parser.h"
+
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#ifndef _WIN32
+#include <sys/un.h>
+#endif
+
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::transport {
+namespace {
+using namespace std::literals::string_view_literals;
+
+using namespace unittest::match;
+
+MATCHER_P2(ProxiedEndpointsAre, src, dst, "") {
+    return ExplainMatchResult(FieldsAre(src, dst), arg, result_listener);
+}
+
+ParserResults parseAllPrefixes(std::string_view s) {
+    boost::optional<ParserResults> results;
+    for (size_t len = 0; len <= s.size(); ++len) {
+        std::string_view sub = s.substr(0, len);
+        results = parseProxyProtocolHeader(sub, false);
+        if (len < s.size()) {
+            ASSERT_FALSE(results) << fmt::format("size={}, sub={}", len, sub);
+        }
+    }
+    ASSERT_TRUE(results);
+    return *results;
+}
+
+void parseStringExpectFailure(std::string_view s, std::string regex) {
+    try {
+        parseAllPrefixes(s);
+        FAIL("Expected to throw");
+    } catch (const DBException& ex) {
+        ASSERT_THAT(ex.toStatus(), StatusIs(Eq(ErrorCodes::FailedToParse), ContainsRegex(regex)));
+    }
+}
+
+boost::optional<ProxiedEndpoints> parseStringExpectSuccess(std::string_view s) {
+    const ParserResults results = parseAllPrefixes(s);
+    ASSERT_THAT(results.bytesParsed, Eq(s.size()));
+
+    // Also test that adding garbage to the end doesn't increase the bytesParsed amount.
+    const boost::optional<ParserResults> possibleResultsWithGarbage =
+        parseProxyProtocolHeader(std::string{s} + "garbage", false);
+    ASSERT_TRUE(possibleResultsWithGarbage);
+    const ParserResults resultsWithGarbage = *possibleResultsWithGarbage;
+    ASSERT_THAT(resultsWithGarbage.bytesParsed, Eq(s.size()));
+    if (results.endpoints) {
+        ASSERT_THAT(*results.endpoints,
+                    ProxiedEndpointsAre(Eq(resultsWithGarbage.endpoints->sourceAddress),
+                                        Eq(resultsWithGarbage.endpoints->destinationAddress)));
+    } else {
+        ASSERT_FALSE(resultsWithGarbage.endpoints);
+    }
+
+    return resultsWithGarbage.endpoints;
+}
+
+TEST(ProxyProtocolHeaderParser, MalformedIpv4Addresses) {
+    std::string_view testCases[] = {"1",
+                                    "1.1",
+                                    "1.1.1",
+                                    "1.1.1.1.1",
+                                    "1.1.1.1.",
+                                    ".1.1.1.1",
+                                    "1234.1.1.1",
+                                    "1.1234.1.1",
+                                    "1.1.1234.1",
+                                    "1.1.1.1234",
+                                    "1.1.1.a",
+                                    "1.1.1.256",
+                                    "256.1.1.1",
+                                    "1.1..1.1",
+                                    "-0.1.1.1",
+                                    "-1.1.1.1",
+                                    ""};
+
+    for (const auto& testCase : testCases) {
+        try {
+            proxy_protocol_details::validateIpv4Address(testCase);
+            FAIL("Expected to throw");
+        } catch (const DBException& ex) {
+            ASSERT_THAT(ex.toStatus(),
+                        StatusIs(Eq(ErrorCodes::FailedToParse), ContainsRegex("malformed")));
+        }
+    }
+}
+
+TEST(ProxyProtocolHeaderParser, WellFormedIpv4Addresses) {
+    std::string_view testCases[] = {
+        "1.1.1.1", "0.0.0.0", "255.255.255.255", "0.255.0.255", "127.0.1.1", "1.12.123.0"};
+
+    for (const auto& testCase : testCases) {
+        proxy_protocol_details::validateIpv4Address(testCase);
+    }
+}
+
+TEST(ProxyProtocolHeaderParser, MalformedIpv6Addresses) {
+    std::string_view testCases[] = {"0000",
+                                    "0000:0000",
+                                    "0000:0000:0000",
+                                    "0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000:",
+                                    ":0000:0000:0000:0000:0000:0000:0000",
+                                    "00000:0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000:00000",
+                                    "0000:-0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:-000:0000:0000:0000:0000:0000:0000",
+                                    "000g:0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000:000g",
+                                    "0000::0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000::0000",
+                                    "0000:0000:0000:0000:0000:0000:0000:0000::",
+                                    "::0000:0000:0000:0000:0000:0000:0000:0000",
+                                    "::0000::",
+                                    "0000::0000::0000:0000:0000:0000:0000",
+                                    "0000::0000::0000:0000:0000:0000:0000:0000",
+                                    "::0000:",
+                                    "::-100",
+                                    ":0000::",
+                                    ":::",
+                                    ""};
+
+    for (const auto& testCase : testCases) {
+        try {
+            proxy_protocol_details::validateIpv6Address(testCase);
+            FAIL("Expected to throw");
+        } catch (const DBException& ex) {
+            ASSERT_THAT(ex.toStatus(),
+                        StatusIs(Eq(ErrorCodes::FailedToParse), ContainsRegex("malformed")));
+        }
+    }
+}
+
+TEST(ProxyProtocolHeaderParser, WellFormedIpv6Addresses) {
+    std::string_view testCases[] = {"::",
+                                    "::0000",
+                                    "::0000:0000",
+                                    "::0000:0000:0000",
+                                    "::0000:0000:0000:0000",
+                                    "::0000:0000:0000:0000:0000",
+                                    "::0000:0000:0000:0000:0000:0000",
+                                    "::0000:0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000::",
+                                    "0000:0000:0000:0000:0000:0000::",
+                                    "0000:0000:0000:0000:0000::",
+                                    "0000:0000:0000:0000::",
+                                    "0000:0000:0000::",
+                                    "0000:0000::",
+                                    "0000::",
+                                    "0000::0000",
+                                    "0000::0000:0000",
+                                    "0000::0000:0000:0000",
+                                    "0000::0000:0000:0000:0000",
+                                    "0000::0000:0000:0000:0000:0000",
+                                    "0000::0000:0000:0000:0000:0000:0000",
+                                    "0000:0000:0000::0000:0000:0000",
+                                    "0000:0000:0000::0000:0000",
+                                    "0000:0000:0000:0000:0000:0000:0000:0000",
+                                    "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                                    "ffff::",
+                                    "0123:4567:89ab:cdef::",
+                                    "::0123:4567:89ab:cdef",
+                                    "0123:4567::89ab:cdef"};
+
+    for (const auto& testCase : testCases) {
+        proxy_protocol_details::validateIpv6Address(testCase);
+    }
+}
+
+TEST(ProxyProtocolHeaderParser, MalformedV1Headers) {
+    std::pair<std::string, std::string> testCases[] = {
+        {"PORXY ", "header bytes invalid"},
+
+        {"PROXY " + std::string(200, '1'), "No terminating newline"},
+
+        // Even if there is a terminating newline, it has to happen before the longest possible
+        // header length is seen.
+        {"PROXY UNKNOWN " + std::string(92, '1') + "\r\n", "No terminating newline"},
+
+        {"PROXY " + std::string(50, '\r') + "1" + "\r\r\n", "address string malformed"},
+        {"PROXY TCP4 \r\n", "address string malformed"},
+        {"PROXY TCP4 1.1.1.1\r\n", "address string malformed"},
+        {"PROXY TCP4 1.1.1.1 1.1.1.1 10\r\n", "address string malformed"},
+
+        {"PROXY TCP4 12800000000 28 10 10\r\n", "malformed IPv4"},
+        {"PROXY TCP4 128 28000000000000 10 10\r\n", "malformed IPv4"},
+        {"PROXY TCP4 1.1.1.1 notanip 10 300\r\n", "malformed IPv4"},
+        {"PROXY TCP4 a:b:c:d 20 10 300\r\n", "malformed IPv4"},
+        {"PROXY TCP4 1.1.1.1 1.1.1.1 -10 300\r\n", "Negative"},
+        {"PROXY TCP4 1.1.1.1 1.1.1.1 10 -300\r\n", "Negative"},
+        {"PROXY TCP4 1.1.1.1 2.2.2.2 notaport 10\r\n", "Did not consume"},
+        {"PROXY TCP4 1.1.1.1 2.2.2.2 10 20garbage\r\n", "Did not consume"},
+
+        // Check TCP6
+        {"PROXY TCP6 \r\n", "address string malformed"},
+        {"PROXY TCP6 ::\r\n", "address string malformed"},
+        {"PROXY TCP6 :: :: 10\r\n", "address string malformed"},
+
+        {"PROXY TCP6 1.1.1.1 2.2.2.2 10 10\r\n", "malformed IPv6"},
+        {"PROXY TCP6 :: ::000g 10 10\r\n", "malformed IPv6"},
+        {"PROXY TCP6 :: :: -10 10\r\n", "Negative"},
+        {"PROXY TCP6 :: :: 10 -10\r\n", "Negative"},
+        {"PROXY TCP6 :: notanip 10 300\r\n", "malformed IPv6"},
+        {"PROXY TCP6 :: :: notaport 10\r\n", "Did not consume"},
+        {"PROXY TCP6 :: :: 10 20garbage\r\n", "Did not consume"}};
+
+    for (const auto& testCase : testCases) {
+        parseStringExpectFailure(testCase.first, testCase.second);
+    }
+}
+
+TEST(ProxyProtocolHeaderParser, WellFormedV1Headers) {
+    ASSERT_THAT(*parseStringExpectSuccess("PROXY TCP4 1.1.1.1 2.2.2.2 10 300\r\n"),
+                ProxiedEndpointsAre(Eq(SockAddr::create("1.1.1.1", 10, AF_INET)),
+                                    Eq(SockAddr::create("2.2.2.2", 300, AF_INET))));
+
+    ASSERT_THAT(*parseStringExpectSuccess("PROXY TCP4 0.0.0.128 0.0.1.44 1000 3000\r\n"),
+                ProxiedEndpointsAre(Eq(SockAddr::create("0.0.0.128", 1000, AF_INET)),
+                                    Eq(SockAddr::create("0.0.1.44", 3000, AF_INET))));
+
+    static constexpr std::string_view allFs = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"sv;
+    ASSERT_THAT(
+        *parseStringExpectSuccess(fmt::format("PROXY TCP6 {} {} 10000 30000\r\n", allFs, allFs)),
+        ProxiedEndpointsAre(Eq(SockAddr::create(allFs, 10000, AF_INET6)),
+                            Eq(SockAddr::create(allFs, 30000, AF_INET6))));
+
+    ASSERT_THAT(*parseStringExpectSuccess(fmt::format("PROXY TCP6 :: {} 1000 3000\r\n", allFs)),
+                ProxiedEndpointsAre(Eq(SockAddr::create("::", 1000, AF_INET6)),
+                                    Eq(SockAddr::create(allFs, 3000, AF_INET6))));
+
+    ASSERT_THAT(*parseStringExpectSuccess("PROXY TCP6 2001:0db8:: 0064:ff9b::0000 1000 3000\r\n"),
+                ProxiedEndpointsAre(Eq(SockAddr::create("2001:db8::", 1000, AF_INET6)),
+                                    Eq(SockAddr::create("64:ff9b::0000", 3000, AF_INET6))));
+
+    // The shortest possible V1 header
+    ASSERT_FALSE(parseStringExpectSuccess("PROXY UNKNOWN\r\n"));
+    ASSERT_FALSE(
+        parseStringExpectSuccess("PROXY UNKNOWN 2001:db8:: 64:ff9b::0.0.0.0 1000 3000\r\n"));
+    ASSERT_FALSE(parseStringExpectSuccess("PROXY UNKNOWN hot garbage\r\n"));
+    // The longest possible V1 header
+    ASSERT_FALSE(
+        parseStringExpectSuccess(fmt::format("PROXY UNKNOWN {} {} 65535 65535\r\n", allFs, allFs)));
+}
+
+struct TestV2Header {
+    std::string header;
+    std::string versionAndCommand;
+    std::string addressFamilyAndProtocol;
+    std::string length;
+    std::string firstAddr;
+    std::string secondAddr;
+    std::string tlv;
+    std::string metadata;
+
+    std::pair<sockaddr_un, sockaddr_un> unixAddrs;
+
+    std::string toString() const {
+        return fmt::format("{}{}{}{}{}{}{}{}",
+                           header,
+                           versionAndCommand,
+                           addressFamilyAndProtocol,
+                           length,
+                           firstAddr,
+                           secondAddr,
+                           tlv,
+                           metadata);
+    }
+};
+
+/**
+ * Address family used in the proxy protocol. This refers to the address family used for the
+ * connection between the client and the proxy, not the proxy and the server.
+ */
+enum class AddressFamily {
+    TCP4,
+    TCP6,
+    UNIX,
+};
+
+std::string createTestUnixPathString(std::string_view path) {
+    std::string out{path};
+    out.resize(proxy_protocol_details::kMaxUnixPathLength);
+    return out;
+}
+
+template <typename SockAddrUn = sockaddr_un>
+std::pair<SockAddrUn, SockAddrUn> createTestSockAddrUn(std::string srcPath, std::string dstPath) {
+    std::pair<SockAddrUn, SockAddrUn> addrs;
+    addrs.first.sun_family = addrs.second.sun_family = AF_UNIX;
+
+    memcpy(addrs.first.sun_path,
+           srcPath.c_str(),
+           std::min(srcPath.size(), sizeof(SockAddrUn::sun_path)));
+    memcpy(addrs.second.sun_path,
+           dstPath.c_str(),
+           std::min(dstPath.size(), sizeof(SockAddrUn::sun_path)));
+
+    return addrs;
+}
+
+std::string encodeU16BigEndian(size_t value) {
+    using namespace std::string_literals;
+    const auto v = static_cast<uint16_t>(value);
+    return "\x00\x00"s.replace(0, 1, 1, static_cast<char>((v >> 8) & 0xFF))
+        .replace(1, 1, 1, static_cast<char>(v & 0xFF));
+}
+
+TestV2Header buildValidPP2Header(AddressFamily type, std::string_view tlv = "") {
+    using namespace std::string_literals;
+
+    TestV2Header header;
+    header.header = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"s;
+    size_t baseAddrLen = 0;
+    switch (type) {
+        case (AddressFamily::TCP4): {
+            header.versionAndCommand = "\x21"s;
+            header.addressFamilyAndProtocol = "\x12"s;
+            baseAddrLen = 12;
+            header.firstAddr = "\x0C\x22\x38\x4e\xac\x10"s;
+            header.secondAddr = "\x00\x01\x04\xd2\x1f\x90"s;
+            break;
+        }
+        case (AddressFamily::TCP6): {
+            header.versionAndCommand = "\x21"s;
+            header.addressFamilyAndProtocol = "\x21"s;
+            baseAddrLen = 36;
+            header.firstAddr = "\x20\x1\xd\xb8\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x64"s;
+            header.secondAddr = "\xff\x9b\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x0\x4\xd2\x1f\x90"s;
+            break;
+        }
+        case (AddressFamily::UNIX): {
+            header.versionAndCommand = "\x21"s;
+            header.addressFamilyAndProtocol = "\x31"s;
+            baseAddrLen = 216;
+            const std::string srcPath(sizeof(sockaddr_un::sun_path) / 2, '\1');
+            const std::string dstPath(sizeof(sockaddr_un::sun_path) - 1, '\2');
+            header.firstAddr = createTestUnixPathString(srcPath);
+            header.secondAddr = createTestUnixPathString(dstPath);
+            header.unixAddrs = createTestSockAddrUn(srcPath, dstPath);
+            break;
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    header.tlv = std::string(tlv.data(), tlv.size());
+    header.length = encodeU16BigEndian(baseAddrLen + tlv.size());
+    return header;
+}  // namespace
+
+TEST(ProxyProtocolHeaderParser, MalformedV2Headers) {
+    // These strings contain null characters in them, so we need string literals.
+    using namespace std::string_literals;
+
+    TestV2Header header;
+
+    // Specify an invalid header.
+    header.header = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x48\x54\x0A"s;
+    parseStringExpectFailure(header.toString(), "header bytes invalid");
+
+    // Correct the header but break the version.
+    header.header = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"s;
+    header.versionAndCommand = "\x30";
+    parseStringExpectFailure(header.toString(), "Invalid version");
+    header.versionAndCommand = "\x22";
+    parseStringExpectFailure(header.toString(), "Invalid version");
+    // Correct the version/command but break the address family.
+    header.versionAndCommand = "\x21";
+    header.addressFamilyAndProtocol = "\x40";
+    parseStringExpectFailure(header.toString(), "Invalid address");
+    header.addressFamilyAndProtocol = "\x23";
+    parseStringExpectFailure(header.toString(), "Invalid protocol");
+
+    // TCP4
+    // Set the length to 1.
+    header.addressFamilyAndProtocol = "\x11";
+    header.length = "\x00\x01"s;
+    header.firstAddr = std::string(1, '\0');
+    parseStringExpectFailure(header.toString(), "too short");
+    // Set to the longest non-valid length (11).
+    header.length = "\x00\x0B"s;
+    header.firstAddr = std::string(6, '\0');
+    header.secondAddr = std::string(5, '\0');
+    parseStringExpectFailure(header.toString(), "too short");
+
+    // TCP6
+    // Set the length to 1.
+    header.addressFamilyAndProtocol = "\x21";
+    header.length = "\x00\x01"s;
+    header.firstAddr = std::string(1, '\0');
+    header.secondAddr = "";
+    parseStringExpectFailure(header.toString(), "too short");
+    // Set to the longest non-valid length (35).
+    header.length = "\x00\x23"s;
+    header.firstAddr = std::string(18, '\0');
+    header.secondAddr = std::string(17, '\0');
+    parseStringExpectFailure(header.toString(), "too short");
+
+    // UNIX
+    // Set the length to 1.
+    header.addressFamilyAndProtocol = "\x31";
+    header.length = "\x00\x01"s;
+    header.firstAddr = std::string(1, '\0');
+    header.secondAddr = "";
+    parseStringExpectFailure(header.toString(), "too short");
+    // Set to the longest non-valid length (35).
+    header.length = "\x00\xD7"s;
+    header.firstAddr = std::string(108, '\0');
+    header.secondAddr = std::string(107, '\0');
+    parseStringExpectFailure(header.toString(), "too short");
+}
+
+TEST(ProxyProtocolHeaderParser, WellFormedV2Headers) {
+    // These strings contain null characters in them, so we need string literals.
+    using namespace std::string_literals;
+
+    // TCP4
+    auto header = buildValidPP2Header(AddressFamily::TCP4);
+    ASSERT_THAT(*parseStringExpectSuccess(header.toString()),
+                ProxiedEndpointsAre(Eq(SockAddr::create("12.34.56.78", 1234, AF_INET)),
+                                    Eq(SockAddr::create("172.16.0.1", 8080, AF_INET))));
+
+    // We correctly ignore data at the end.
+    header.length = "\x00\x0E"s;
+    header.metadata = std::string(2, '\0');
+    ASSERT_THAT(*parseStringExpectSuccess(header.toString()),
+                ProxiedEndpointsAre(Eq(SockAddr::create("12.34.56.78", 1234, AF_INET)),
+                                    Eq(SockAddr::create("172.16.0.1", 8080, AF_INET))));
+
+    // If this is a local connection, return nothing.
+    header.versionAndCommand = "\x20"s;
+    ASSERT_FALSE(parseStringExpectSuccess(header.toString()));
+
+    // TCP6
+    header = buildValidPP2Header(AddressFamily::TCP6);
+    ASSERT_THAT(*parseStringExpectSuccess(header.toString()),
+                ProxiedEndpointsAre(Eq(SockAddr::create("2001:db8::", 1234, AF_INET6)),
+                                    Eq(SockAddr::create("64:ff9b::0.0.0.0", 8080, AF_INET6))));
+
+    // We correctly ignore data at the end.
+    header.length = "\x00\x55"s;
+    header.metadata = std::string(49, '\1');
+    ASSERT_THAT(*parseStringExpectSuccess(header.toString()),
+                ProxiedEndpointsAre(Eq(SockAddr::create("2001:db8::", 1234, AF_INET6)),
+                                    Eq(SockAddr::create("64:ff9b::0.0.0.0", 8080, AF_INET6))));
+
+    // If this is a local connection, return nothing.
+    header.versionAndCommand = "\x20"s;
+    ASSERT_FALSE(parseStringExpectSuccess(header.toString()));
+
+    // UNIX
+    header = buildValidPP2Header(AddressFamily::UNIX);
+    const auto& addrs = header.unixAddrs;
+    ASSERT_THAT(*parseStringExpectSuccess(header.toString()),
+                ProxiedEndpointsAre(Eq(SockAddr((sockaddr*)&addrs.first, sizeof(sockaddr_un))),
+                                    Eq(SockAddr((sockaddr*)&addrs.second, sizeof(sockaddr_un)))));
+
+    // We correctly ignore data at the end.
+    header.length = "\x01\x08";
+    header.metadata = std::string(48, '\0');
+    // Extraneous data at the end is correctly ingested and ignored.
+    ASSERT_THAT(*parseStringExpectSuccess(header.toString()),
+                ProxiedEndpointsAre(Eq(SockAddr((sockaddr*)&addrs.first, sizeof(sockaddr_un))),
+                                    Eq(SockAddr((sockaddr*)&addrs.second, sizeof(sockaddr_un)))));
+
+    // If this is a local connection, return nothing.
+    header.versionAndCommand = "\x20"s;
+    ASSERT_FALSE(parseStringExpectSuccess(header.toString()));
+
+    // The family is not parsed if the connection is local.
+    header.addressFamilyAndProtocol = "\xA2";
+    ASSERT_FALSE(parseStringExpectSuccess(header.toString()));
+}
+
+struct TestSockAddrUnLinux {
+    sa_family_t sun_family;
+    char sun_path[108];
+
+    friend bool operator==(const TestSockAddrUnLinux& a, const TestSockAddrUnLinux& b) {
+        return a.sun_family == b.sun_family && !memcmp(a.sun_path, b.sun_path, sizeof(sun_path));
+    }
+};
+
+TEST(ProxyProtocolHeaderParser, LinuxSockAddrUnParsing) {
+    // Test the parser against a Linux-like sockaddr_un
+    {
+        const std::string srcPath(sizeof(TestSockAddrUnLinux::sun_path) / 2, '\1');
+        const std::string dstPath(sizeof(TestSockAddrUnLinux::sun_path) - 1, '\2');
+        const auto addrs = createTestSockAddrUn<TestSockAddrUnLinux>(srcPath, dstPath);
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnLinux>(
+                        createTestUnixPathString(srcPath)),
+                    Eq(addrs.first));
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnLinux>(
+                        createTestUnixPathString(dstPath)),
+                    Eq(addrs.second));
+    }
+
+    {
+        const std::string srcPath(sizeof(TestSockAddrUnLinux::sun_path), '\0');
+        const std::string dstPath(1, '\0');
+        const auto addrs = createTestSockAddrUn<TestSockAddrUnLinux>(srcPath, dstPath);
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnLinux>(
+                        createTestUnixPathString(srcPath)),
+                    Eq(addrs.first));
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnLinux>(
+                        createTestUnixPathString(dstPath)),
+                    Eq(addrs.second));
+    }
+}
+
+struct TestSockAddrUnMac {
+    unsigned char sun_len;
+    sa_family_t sun_family;
+    char sun_path[104];
+
+    friend bool operator==(const TestSockAddrUnMac& a, const TestSockAddrUnMac& b) {
+        return a.sun_family == b.sun_family && a.sun_len == b.sun_len &&
+            !memcmp(a.sun_path, b.sun_path, a.sun_len);
+    }
+};
+
+TEST(ProxyProtocolHeaderParser, MacSockAddrUnParsing) {
+    // Test the parser against a Mac-like sockaddr_un
+    {
+        const std::string srcPath(sizeof(TestSockAddrUnMac::sun_path) / 2, '\1');
+        const std::string dstPath(sizeof(TestSockAddrUnMac::sun_path) - 1, '\2');
+        const auto addrs = createTestSockAddrUn<TestSockAddrUnMac>(srcPath, dstPath);
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnMac>(
+                        createTestUnixPathString(srcPath)),
+                    Eq(addrs.first));
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnMac>(
+                        createTestUnixPathString(dstPath)),
+                    Eq(addrs.second));
+    }
+
+    {
+        const std::string srcPath(1, '\1');
+        const std::string dstPath = "";
+        const auto addrs = createTestSockAddrUn<TestSockAddrUnMac>(srcPath, dstPath);
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnMac>(
+                        createTestUnixPathString(srcPath)),
+                    Eq(addrs.first));
+        ASSERT_THAT(proxy_protocol_details::parseSockAddrUn<TestSockAddrUnMac>(
+                        createTestUnixPathString(dstPath)),
+                    Eq(addrs.second));
+    }
+
+    try {
+        const std::string srcPath(proxy_protocol_details::kMaxUnixPathLength - 1, '\1');
+        const std::string dstPath(proxy_protocol_details::kMaxUnixPathLength - 1, '\2');
+        proxy_protocol_details::parseSockAddrUn<TestSockAddrUnMac>(
+            createTestUnixPathString(srcPath) + createTestUnixPathString(dstPath));
+        FAIL("Expected to throw");
+    } catch (const DBException& ex) {
+        ASSERT_THAT(ex.toStatus(),
+                    StatusIs(Eq(ErrorCodes::FailedToParse), ContainsRegex("longer than system")));
+    }
+
+    try {
+        const std::string srcPath(sizeof(TestSockAddrUnMac::sun_path), '\1');
+        const std::string dstPath(sizeof(TestSockAddrUnMac::sun_path), '\2');
+        proxy_protocol_details::parseSockAddrUn<TestSockAddrUnMac>(
+            createTestUnixPathString(srcPath) + createTestUnixPathString(dstPath));
+        FAIL("Expected to throw");
+    } catch (const DBException& ex) {
+        ASSERT_THAT(ex.toStatus(),
+                    StatusIs(Eq(ErrorCodes::FailedToParse), ContainsRegex("longer than system")));
+    }
+}
+
+boost::optional<ParserResults> parseWithTLV(AddressFamily type, const std::string& tlvData) {
+    auto header = buildValidPP2Header(type, tlvData);
+    return parseProxyProtocolHeader(header.toString(), true /* isProxyUnixSock */);
+}
+
+std::string buildTLV(uint8_t type, const std::string& data) {
+    std::string tlv;
+    tlv += type;
+    // Length in big-endian
+    uint16_t len = data.size();
+    tlv += (len >> 8) & 0xFF;
+    tlv += len & 0xFF;
+    tlv += data;
+    return tlv;
+}
+
+class ProxyProtocolParameterizedTestFixture : public testing::TestWithParam<AddressFamily> {};
+
+INSTANTIATE_TEST_SUITE_P(ProxyProtocolHeaderParser,
+                         ProxyProtocolParameterizedTestFixture,
+                         testing::Values(AddressFamily::TCP4,
+                                         AddressFamily::TCP6,
+                                         AddressFamily::UNIX));
+
+TEST_P(ProxyProtocolParameterizedTestFixture, TLVParsingZeroTLVs) {
+    auto tlvData = "";
+    auto type = GetParam();
+    ASSERT_THROWS_CODE(parseWithTLV(type, tlvData), DBException, ErrorCodes::FailedToParse);
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, TLVParsingOneTLV) {
+    auto tlvData = buildTLV(0x01, "testdata");
+    auto type = GetParam();
+    auto result = parseWithTLV(type, tlvData);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->endpoints);
+    ASSERT_EQ(result->tlvs.size(), 1u);
+    ASSERT_EQ(result->tlvs[0].type, 0x01);
+    ASSERT_EQ(result->tlvs[0].data, "testdata");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, TLVParsingManyTLVs) {
+    auto tlvData = buildTLV(0x01, "alpn");
+    tlvData += buildTLV(0x02, "authority.example.com");
+    tlvData += buildTLV(0x04, "noop");
+    tlvData += buildTLV(0xE0, "custom");
+    tlvData += buildTLV(0xE0, "custom");
+
+    auto type = GetParam();
+    auto result = parseWithTLV(type, tlvData);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->endpoints);
+    ASSERT_EQ(result->tlvs.size(), 5u);
+    ASSERT_EQ(result->tlvs[0].type, 0x01);
+    ASSERT_EQ(result->tlvs[0].data, "alpn");
+    ASSERT_EQ(result->tlvs[1].type, 0x02);
+    ASSERT_EQ(result->tlvs[1].data, "authority.example.com");
+    ASSERT_EQ(result->tlvs[2].type, 0x04);
+    ASSERT_EQ(result->tlvs[2].data, "noop");
+    ASSERT_EQ(result->tlvs[3].type, 0xE0);
+    ASSERT_EQ(result->tlvs[3].data, "custom");
+    ASSERT_EQ(result->tlvs[4].type, 0xE0);
+    ASSERT_EQ(result->tlvs[4].data, "custom");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, TLVParsingFails) {
+    auto type = GetParam();
+
+    // Header too small.
+    std::string tlvData1(1, '\x01');
+    ASSERT_THROWS_CODE(parseWithTLV(type, tlvData1), DBException, ErrorCodes::FailedToParse);
+
+    // Invalid types.
+    std::string tlvData2 = buildTLV(0x00, "data");
+    std::string tlvData3 = buildTLV(0x06, "data");
+    std::string tlvData4 = buildTLV(0x1F, "data");
+    ASSERT_THROWS_CODE(parseWithTLV(type, tlvData2), DBException, ErrorCodes::FailedToParse);
+    ASSERT_THROWS_CODE(parseWithTLV(type, tlvData3), DBException, ErrorCodes::FailedToParse);
+    ASSERT_THROWS_CODE(parseWithTLV(type, tlvData4), DBException, ErrorCodes::FailedToParse);
+
+    // Mismatching length and buffer size.
+    std::string tlvData5{char(0x01), char(0x00), char(0xC8)};
+    tlvData5 += "dummy";
+    ASSERT_THROWS_CODE(parseWithTLV(type, tlvData5), DBException, ErrorCodes::FailedToParse);
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, BufferIncludesDataAfterProxyProtocolNoTLV) {
+    auto type = GetParam();
+    auto header = buildValidPP2Header(type);
+    header.metadata = "Adding some junk data";
+
+    ASSERT_THROWS_CODE(parseProxyProtocolHeader(header.toString(), true /* isProxyUnixSock */),
+                       DBException,
+                       ErrorCodes::FailedToParse);
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, BufferIncludesDataAfterProxyProtocolTLV) {
+    auto type = GetParam();
+    auto tlvData = buildTLV(0x01, "alpn");
+    auto header = buildValidPP2Header(type, tlvData);
+    header.metadata = "Adding some junk data";
+
+    auto result = parseProxyProtocolHeader(header.toString(), true /* isProxyUnixSock */);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->endpoints);
+    ASSERT_EQ(result->tlvs.size(), 1u);
+    ASSERT_EQ(result->tlvs[0].type, 0x01);
+    ASSERT_EQ(result->tlvs[0].data, "alpn");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, UnixProxySocketWithV1ProtocolIsRejected) {
+    auto header = "PROXY TCP4 1.1.1.1 2.2.2.2 10 300\r\n";
+    ASSERT_THROWS_CODE(parseProxyProtocolHeader(header, true /* isProxyUnixSock */),
+                       DBException,
+                       ErrorCodes::FailedToParse);
+}
+
+// Helper to build the raw payload for an SSL TLV.
+// The payload format is: clientFlags (1 byte) + verify (4 bytes big-endian) + optional sub-TLVs.
+std::string buildSSLTLVPayload(uint8_t clientFlags,
+                               uint32_t verify,
+                               const std::string& subTlvData = "") {
+    std::string payload;
+    payload += static_cast<char>(clientFlags);
+    // verify in big-endian.
+    payload += static_cast<char>((verify >> 24) & 0xFF);
+    payload += static_cast<char>((verify >> 16) & 0xFF);
+    payload += static_cast<char>((verify >> 8) & 0xFF);
+    payload += static_cast<char>(verify & 0xFF);
+    payload += subTlvData;
+    return payload;
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsBasicNoSubTLVs) {
+    auto type = GetParam();
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x07, 0));
+    auto regularTlv = buildTLV(0x01, "data");
+    auto result = parseWithTLV(type, regularTlv + sslTlv);
+
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->endpoints);
+    ASSERT_TRUE(result->sslTlvs);
+    ASSERT_EQ(result->sslTlvs->clientFlags, 0x07);
+    ASSERT_EQ(result->sslTlvs->verify, 0u);
+    ASSERT_TRUE(result->sslTlvs->subTLVs.empty());
+    ASSERT_EQ(result->tlvs.size(), 1u);
+    ASSERT_EQ(result->tlvs[0].type, 0x01);
+    ASSERT_EQ(result->tlvs[0].data, "data");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsWithOneSubTLV) {
+    auto type = GetParam();
+    auto subTlv = buildTLV(0x21, "TLSv1.3");
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x05, 0, subTlv));
+    auto regularTlv = buildTLV(0x01, "alpn");
+    auto result = parseWithTLV(type, regularTlv + sslTlv);
+
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->sslTlvs);
+    ASSERT_EQ(result->sslTlvs->clientFlags, 0x05);
+    ASSERT_EQ(result->sslTlvs->verify, 0u);
+    ASSERT_EQ(result->sslTlvs->subTLVs.size(), 1u);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].type, 0x21);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].data, "TLSv1.3");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsWithMultipleSubTLVs) {
+    auto type = GetParam();
+    auto subTlvs = buildTLV(0x21, "TLSv1.3");
+    subTlvs += buildTLV(0x22, "example.com");
+    subTlvs += buildTLV(0x23, "ECDHE-RSA-AES128-GCM-SHA256");
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x07, 42, subTlvs));
+    auto regularTlv = buildTLV(0x01, "alpn");
+    auto result = parseWithTLV(type, regularTlv + sslTlv);
+
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->sslTlvs);
+    ASSERT_EQ(result->sslTlvs->clientFlags, 0x07);
+    ASSERT_EQ(result->sslTlvs->verify, 42u);
+    ASSERT_EQ(result->sslTlvs->subTLVs.size(), 3u);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].type, 0x21);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].data, "TLSv1.3");
+    ASSERT_EQ(result->sslTlvs->subTLVs[1].type, 0x22);
+    ASSERT_EQ(result->sslTlvs->subTLVs[1].data, "example.com");
+    ASSERT_EQ(result->sslTlvs->subTLVs[2].type, 0x23);
+    ASSERT_EQ(result->sslTlvs->subTLVs[2].data, "ECDHE-RSA-AES128-GCM-SHA256");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsMixedWithRegularTLVs) {
+    auto type = GetParam();
+    auto regularTlv1 = buildTLV(0x01, "alpn");
+    auto subTlvs = buildTLV(0x21, "TLSv1.2");
+    subTlvs += buildTLV(0xE0, "custom");
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x03, 7, subTlvs));
+    auto regularTlv2 = buildTLV(0x02, "authority");
+
+    auto result = parseWithTLV(type, regularTlv1 + sslTlv + regularTlv2);
+    ASSERT_TRUE(result);
+
+    // Regular TLVs should be in tlvs, in order.
+    ASSERT_EQ(result->tlvs.size(), 2u);
+    ASSERT_EQ(result->tlvs[0].type, 0x01);
+    ASSERT_EQ(result->tlvs[0].data, "alpn");
+    ASSERT_EQ(result->tlvs[1].type, 0x02);
+    ASSERT_EQ(result->tlvs[1].data, "authority");
+
+    ASSERT_TRUE(result->sslTlvs);
+    ASSERT_EQ(result->sslTlvs->clientFlags, 0x03);
+    ASSERT_EQ(result->sslTlvs->verify, 7u);
+    ASSERT_EQ(result->sslTlvs->subTLVs.size(), 2u);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].type, 0x21);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].data, "TLSv1.2");
+    ASSERT_EQ(result->sslTlvs->subTLVs[1].type, 0xE0);
+    ASSERT_EQ(result->sslTlvs->subTLVs[1].data, "custom");
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsTooShort) {
+    auto type = GetParam();
+    auto regularTlv = buildTLV(0x01, "data");
+
+    // Empty payload.
+    {
+        auto emptySslTlv = buildTLV(kProxyProtocolSSLTlvType, "");
+        auto tlvs = regularTlv + emptySslTlv;
+        ASSERT_THROWS_CODE(parseWithTLV(type, tlvs), DBException, ErrorCodes::FailedToParse);
+    }
+
+    // Non-empty payload but still too small.
+    {
+        std::string shortPayload(4, '\x01');
+        auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, shortPayload);
+        ASSERT_THROWS_CODE(
+            parseWithTLV(type, regularTlv + sslTlv), DBException, ErrorCodes::FailedToParse);
+    }
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsInvalidSubTLVType) {
+    auto type = GetParam();
+    auto regularTlv = buildTLV(0x01, "data");
+
+    auto invalidSubTlv = buildTLV(0x00, "bad");
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x01, 0, invalidSubTlv));
+    ASSERT_THROWS_CODE(
+        parseWithTLV(type, regularTlv + sslTlv), DBException, ErrorCodes::FailedToParse);
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParseSubTLVVectorsSubTLVLengthExceedsBuffer) {
+    auto type = GetParam();
+    auto regularTlv = buildTLV(0x01, "data");
+
+    // Create a sub-TLV whose length field claims 200 bytes but only has 5 bytes of data.
+    std::string badSubTlv;
+    badSubTlv += static_cast<char>(0x21);  // valid sub-TLV type
+    badSubTlv += static_cast<char>(0x00);  // length high byte
+    badSubTlv += static_cast<char>(0xC8);  // length low byte = 200
+    badSubTlv += "hello";                  // only 5 bytes of data
+
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x01, 0, badSubTlv));
+    ASSERT_THROWS_CODE(
+        parseWithTLV(type, regularTlv + sslTlv), DBException, ErrorCodes::FailedToParse);
+}
+
+TEST_P(ProxyProtocolParameterizedTestFixture, ParserShouldNotParseSubTLVWithinSubTLV) {
+    auto type = GetParam();
+    auto subTlv = buildTLV(0x21, "TLSv1.3");
+
+    // Append another sub tlv onto a sub tlv vector.
+    auto subSubTlv = buildTLV(0x21, "TLSv1.2");
+    subTlv += buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x01, 0, subSubTlv));
+
+    auto sslTlv = buildTLV(kProxyProtocolSSLTlvType, buildSSLTLVPayload(0x05, 0, subTlv));
+    auto regularTlv = buildTLV(0x01, "alpn");
+    auto result = parseWithTLV(type, regularTlv + sslTlv);
+
+    // We only expect the top-most sub tlv to be parsed.
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->sslTlvs);
+    ASSERT_EQ(result->sslTlvs->clientFlags, 0x05);
+    ASSERT_EQ(result->sslTlvs->verify, 0u);
+    ASSERT_EQ(result->sslTlvs->subTLVs.size(), 1u);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].type, 0x21);
+    ASSERT_EQ(result->sslTlvs->subTLVs[0].data, "TLSv1.3");
+}
+
+}  // namespace
+}  // namespace mongo::transport

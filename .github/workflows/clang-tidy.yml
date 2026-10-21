@@ -1,0 +1,228 @@
+name: clang-tidy
+
+on:
+  pull_request:
+    # Note: 'labeled' is intentionally excluded to avoid race conditions when
+    # automation (e.g., mergai) creates a PR and immediately adds labels.
+    # The 'opened' and 'labeled' events fire separately, causing duplicate runs.
+    # Instead, we query the GitHub API for fresh label data in the check-skip job.
+    # 'unlabeled' IS included so removing a skip label re-triggers the workflow.
+    types: [opened, synchronize, reopened, unlabeled]
+
+# Cancel in-progress runs only for 'synchronize' events (new commits pushed).
+# For 'unlabeled' events, we use a unique group to avoid cancelling runs from
+# other event types - this ensures removing a label always triggers a fresh run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.action == 'unlabeled' && github.run_id || 'main' }}
+  cancel-in-progress: ${{ github.event.action != 'unlabeled' }}
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  CLANG_TIDY_SARIF_VERSION: "0.8.0"
+
+jobs:
+  # Gate job that fetches current PR labels via API to avoid race conditions
+  # where the 'opened' event triggers before labels are applied
+  check-skip:
+    name: Check if workflow should be skipped
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.check.outputs.should_skip }}
+    steps:
+      - name: Check for skip label
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Fetch current PR labels via API to get fresh data
+          LABELS=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} --jq '.labels[].name' 2>/dev/null || echo "")
+          if echo "$LABELS" | grep -q "^ci-skip-clang-tidy$"; then
+            echo "Found ci-skip-clang-tidy label, skipping workflow"
+            echo "should_skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No skip label found, proceeding with workflow"
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  changed_files:
+    name: Check for changed C++ files
+    runs-on: ubuntu-latest
+    needs: check-skip
+    if: ${{ needs.check-skip.outputs.should_skip != 'true' }}
+    outputs:
+      changed_files: ${{ steps.changed.outputs.all_changed_files }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Get changed files
+        id: changed
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            **/*.cpp
+            **/*.c
+          files_ignore: |
+            src/third_party/**
+            **/*.tpl.cpp
+            **/*.tpl.c
+      - name: List changed files
+        run: |
+          echo "Changed files: ${{ steps.changed.outputs.all_changed_files }}"
+
+  analyze:
+    name: Run clang-tidy analysis
+    runs-on: ubuntu-latest
+    if: ${{ needs.check-skip.outputs.should_skip != 'true' && needs.changed_files.outputs.changed_files != '' }}
+    needs: [check-skip, changed_files]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: |
+          git fetch --tags --force origin
+          # Fetch upstream MongoDB tags (r*) needed for version detection via git describe
+          git fetch --tags --force https://github.com/mongodb/mongo.git 'refs/tags/r*:refs/tags/r*'
+          git describe --abbrev=0
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-env
+
+      - name: clang-tidy-sarif cache
+        uses: actions/cache@v4
+        id: clang_tidy_sarif_cache
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-clang-tidy-sarif-${{ env.CLANG_TIDY_SARIF_VERSION }}
+
+      - name: Install clang-tidy-sarif
+        if: steps.clang_tidy_sarif_cache.outputs.cache-hit != 'true'
+        run: cargo install clang-tidy-sarif --version "${CLANG_TIDY_SARIF_VERSION}" --locked
+
+      - name: Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/bazel-disk-cache
+          key: bazel-disk-cache-clang-tidy-${{ runner.os }}-${{ hashFiles('.github/workflows/clang-tidy.yml', 'MODULE.bazel', 'WORKSPACE', 'WORKSPACE.bazel', '**/*.bzl', '**/BUILD', '**/BUILD.bazel') }}
+          restore-keys: |
+            bazel-disk-cache-clang-tidy-${{ runner.os }}-
+
+      - name: Configure Bazel
+        run: |
+          # Set JVM heap in user bazelrc so it applies to ALL bazel invocations
+          # (including the wrapper hook's prereq install which runs before
+          # the workspace .bazelrc append below is read)
+          echo 'startup --host_jvm_args=-Xmx8g' >> ~/.bazelrc
+          # Append CI-specific settings to the workspace .bazelrc so they apply
+          # to every bazel invocation in this job without a separate --bazelrc flag.
+          # --config=local and --compiler_type=clang are already the defaults in
+          # .bazelrc; only disk_cache and build_enterprise=False need overriding.
+          {
+            echo 'common --disk_cache=/tmp/bazel-disk-cache'
+            echo 'common --bes_timeout=0s'
+            echo 'common --bes_upload_mode=nowait_for_upload_complete'
+            echo 'common --//bazel/config:build_enterprise=False'
+          } >> .bazelrc
+
+      - name: Generate compile_commands.json and build dependencies
+        run: |
+          # Compute the narrowest compiledb scope from the changed files.
+          # The new compiledb aspect builds the entire scope (default: //src/...)
+          # which is too heavy for CI without remote execution. Narrow it to only
+          # the packages containing changed files.
+          CHANGED="${{ needs.changed_files.outputs.changed_files }}"
+          # The data goes via argv (not stdin) so it doesn't collide with
+          # the heredoc that feeds the script to `python3 -`.
+          SCOPE=$(python3 - "$CHANGED" <<'PY'
+          import os, sys
+          files = [f for f in sys.argv[1].split() if f]
+          dirs = sorted(set(os.path.dirname(f) for f in files))
+          if not dirs:
+              print('//src/...')
+          else:
+              common = os.path.commonpath(dirs)
+              if common:
+                  print(f'//{common}/...')
+              else:
+                  print('//src/...')
+          PY
+          )
+          export MONGO_COMPILEDB_TARGET_SCOPE="$SCOPE"
+          echo "Compiledb scope: $SCOPE (from $(echo $CHANGED | wc -w) changed files)"
+
+          bazel \
+            --bazelrc=.bazelrc \
+            build \
+            //:compiledb
+
+          # Build the clang-tidy plugin in a separate invocation so the wrapper
+          # hook does not activate compiledb mode. When //:compiledb is present,
+          # the hook adds --build_tag_filters=mongo_compiledb which silently skips
+          # this target (it lacks that tag). The posthook suppresses the resulting
+          # build error, so the step exits 0 with no .so produced.
+          bazel \
+            --bazelrc=.bazelrc \
+            build \
+            //src/mongo/tools/mongo_tidy_checks:mongo_tidy_checks
+
+      - name: Verify clang-tidy config
+        run: |
+          # The compiledb wrapper hook should have generated .clang-tidy
+          # If not present, build and copy explicitly as fallback
+          if [ ! -f .clang-tidy ]; then
+            echo "Warning: .clang-tidy not generated by compiledb, building explicitly"
+            bazel \
+              --bazelrc=.bazelrc \
+              build \
+              //:clang_tidy_config
+            cp bazel-bin/.clang-tidy .clang-tidy
+          fi
+          # Verify the file exists
+          if [ ! -f .clang-tidy ]; then
+            echo "Error: .clang-tidy file is missing"
+            exit 1
+          fi
+          echo ".clang-tidy config is ready"
+
+      - name: Run clang-tidy
+        run: |
+          set -o pipefail
+          CHANGED="${{ needs.changed_files.outputs.changed_files }}"
+          echo "Changed C++ files: '$CHANGED'"
+          TIDY_CHECKS_LIB="bazel-bin/src/mongo/tools/mongo_tidy_checks/libmongo_tidy_checks.so"
+          if [ ! -f "$TIDY_CHECKS_LIB" ]; then
+            TIDY_CHECKS_LIB="$(find bazel-bin/src/mongo/tools/mongo_tidy_checks -maxdepth 1 -type f -name 'libmongo_tidy_checks*.so' | head -n 1)"
+          fi
+          if [ -z "$TIDY_CHECKS_LIB" ] || [ ! -f "$TIDY_CHECKS_LIB" ]; then
+            echo "Error: Could not find a loadable mongo_tidy_checks plugin shared library under bazel-bin/src/mongo/tools/mongo_tidy_checks"
+            ls -la bazel-bin/src/mongo/tools/mongo_tidy_checks || true
+            exit 1
+          fi
+          CLANG_TIDY="$(uv run --no-sync python buildscripts/mongo_toolchain.py clang-tidy)"
+          echo "Using clang-tidy: $CLANG_TIDY"
+          echo "Using clang-tidy plugin: $TIDY_CHECKS_LIB"
+          "$CLANG_TIDY" \
+            --load="$TIDY_CHECKS_LIB" \
+            $CHANGED \
+          | clang-tidy-sarif --output=clang-tidy-results.sarif
+
+      - name: Upload SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: clang-tidy-results.sarif
+          category: clang-tidy
+
+      # Also publish the SARIF file as a workflow artifact so downstream
+      # consumers can fetch it without needing Code Scanning API access.
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-results
+          path: clang-tidy-results.sarif
+          retention-days: 1

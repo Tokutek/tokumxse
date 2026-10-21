@@ -1,76 +1,108 @@
-// fts_index_format.h
-
-/**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/fts/fts_util.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/shared_buffer_fragment.h"
+
 #include <string>
 
-#include "mongo/base/string_data.h"
-#include "mongo/db/fts/fts_util.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    namespace fts {
+namespace fts {
 
-        class FTSSpec;
+class FTSSpec;
 
-        class FTSIndexFormat {
-        public:
+class FTSIndexFormat {
+public:
+    static void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                        const FTSSpec& spec,
+                        const BSONObj& document,
+                        KeyStringSet* keys,
+                        key_string::Version keyStringVersion,
+                        Ordering ordering,
+                        const boost::optional<RecordId>& id = boost::none);
 
-            static void getKeys( const FTSSpec& spec,
-                                 const BSONObj& document,
-                                 BSONObjSet* keys );
+    /**
+     * Helper method to get return entry from the FTSIndex as a BSONObj
+     * @param weight, the weight of the term in the entry
+     * @param term, the std::string term in the entry
+     * @param indexPrefix, the fields that go in the index first
+     * @param textIndexVersion, index version. affects key format.
+     */
+    static BSONObj getIndexKey(double weight,
+                               const std::string& term,
+                               const BSONObj& indexPrefix,
+                               TextIndexVersion textIndexVersion);
 
-            /**
-             * Helper method to get return entry from the FTSIndex as a BSONObj
-             * @param weight, the weight of the term in the entry
-             * @param term, the std::string term in the entry
-             * @param indexPrefix, the fields that go in the index first
-             * @param textIndexVersion, index version. affects key format.
-             */
-            static BSONObj getIndexKey( double weight,
-                                        const std::string& term,
-                                        const BSONObj& indexPrefix,
-                                        TextIndexVersion textIndexVersion );
+    /**
+     * Legacy version of getKeys that uses pre-SERVER-76875 dotted path extraction.
+     *
+     * This function generates keys using the legacy behavior where fields with embedded
+     * dots are checked before traversing nested objects. Used only for validation to
+     * detect TEXT_INDEX_VERSION_3 indexes need to be rebuilt.
+     *
+     * Should not be used for normal index operations.
+     */
+    static void getKeysLegacy_forValidationOnly(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                                const FTSSpec& spec,
+                                                const BSONObj& obj,
+                                                KeyStringSet* keys,
+                                                key_string::Version keyStringVersion,
+                                                Ordering ordering,
+                                                const boost::optional<RecordId>& id);
 
-        private:
-            /**
-             * Helper method to get return entry from the FTSIndex as a BSONObj
-             * @param b, reference to the BSONOBjBuilder
-             * @param weight, the weight of the term in the entry
-             * @param term, the std::string term in the entry
-             * @param textIndexVersion, index version. affects key format.
-             */
-            static void _appendIndexKey( BSONObjBuilder& b, double weight, const std::string& term,
-                                         TextIndexVersion textIndexVersion );
-        };
+private:
+    /**
+     * Helper method to get return entry from the FTSIndex as a BSONObj.
+     * 'b' is a reference to the BSONOBjBuilder.
+     * 'weight' is the weight of the term in the entry.
+     * 'term' is the std::string term in the entry.
+     * 'textIndexVersion' is index version, affects key format.
+     */
+    static void _appendIndexKey(BSONObjBuilder& b,
+                                double weight,
+                                const std::string& term,
+                                TextIndexVersion textIndexVersion);
 
-    }
-}
+    /**
+     * Helper method to get return entry from the FTSIndex as a BSONObj.
+     * 'keyString' is a reference to the KeyString builder.
+     * 'weight' is the weight of the term in the entry.
+     * 'term' is the std::string term in the entry.
+     * 'textIndexVersion' is index version, affects key format.
+     */
+    template <typename KeyStringBuilder>
+    static void _appendIndexKey(KeyStringBuilder& keyString,
+                                double weight,
+                                const std::string& term,
+                                TextIndexVersion textIndexVersion);
+
+    /**
+     * Common implementation for getKeys and getKeysLegacy.
+     * Extracts FTS index keys using the provided extraction function for non-FTS fields.
+     */
+    template <typename ExtractorFunction>
+    static void _getKeysImpl(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                             const FTSSpec& spec,
+                             const BSONObj& obj,
+                             KeyStringSet* keys,
+                             key_string::Version keyStringVersion,
+                             Ordering ordering,
+                             const boost::optional<RecordId>& id,
+                             ExtractorFunction extractFn);
+};
+}  // namespace fts
+}  // namespace mongo

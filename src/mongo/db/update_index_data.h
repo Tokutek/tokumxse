@@ -1,86 +1,85 @@
-// update_index_data.h
-
-/**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <set>
+#include "mongo/db/field_ref.h"
+#include "mongo/util/modules.h"
 
-#include "mongo/base/string_data.h"
+#include <string>
+#include <string_view>
+
+#include <absl/container/btree_set.h>
 
 namespace mongo {
 
+/**
+ * Holds pre-processed index spec information to allow update to quickly determine if an update
+ * can be applied as a delta to a document, or if the document must be re-indexed.
+ */
+class [[MONGO_MOD_PUBLIC]] UpdateIndexData {
+public:
+    UpdateIndexData();
+
     /**
-     * a.$ -> a
-     * @return true if out is set and we made a change
+     * Register a path.  Any update targeting this path (or a parent of this path) will
+     * trigger a recomputation of the document's index keys.
      */
-    bool getCanonicalIndexField( StringData fullName, std::string* out );
-
+    void addPath(const FieldRef& path);
 
     /**
-     * Holds pre-processed index spec information to allow update to quickly determine if an update
-     * can be applied as a delta to a document, or if the document must be re-indexed.
+     * Register a path component.  Any update targeting a path that contains this exact
+     * component will trigger a recomputation of the document's index keys.
      */
-    class UpdateIndexData {
-    public:
-        UpdateIndexData();
+    void addPathComponent(std::string_view pathComponent);
 
-        /**
-         * Register a path.  Any update targeting this path (or a parent of this path) will
-         * trigger a recomputation of the document's index keys.
-         */
-        void addPath( StringData path );
+    /**
+     * Register the "wildcard" path for wildcard indexes or wildcard text indexes.
+     * All updates of a document will trigger a recomputation of the document's index keys for this
+     * index.
+     */
+    void setAllPathsIndexed();
 
-        /**
-         * Register a path component.  Any update targeting a path that contains this exact
-         * component will trigger a recomputation of the document's index keys.
-         */
-        void addPathComponent( StringData pathComponent );
+    /**
+     * Returns whether the "wildcard" path was registered before.
+     */
+    bool allPathsIndexed() const;
 
-        /**
-         * Register the "wildcard" path.  All updates will trigger a recomputation of the document's
-         * index keys.
-         */
-        void allPathsIndexed();
+    void clear();
 
-        void clear();
+    bool mightBeIndexed(const FieldRef& path) const;
 
-        bool mightBeIndexed( StringData path ) const;
+    /**
+     * Return whether this structure has been cleared or has not been initialized yet.
+     */
+    bool isEmpty() const;
 
-    private:
+    /**
+     * Get canonical path of each indexed field.
+     */
+    const absl::btree_set<FieldRef>& getCanonicalPaths() const;
 
-        bool _startsWith( StringData a, StringData b ) const;
+    /**
+     * Get all path components.
+     * Path components contain the name(s) of the "language" field(s) in text indexes.
+     */
+    const absl::btree_set<std::string>& getPathComponents() const;
 
-        std::set<std::string> _canonicalPaths;
-        std::set<std::string> _pathComponents;
+private:
+    /**
+     * Canonicalized paths of the index fields.
+     */
+    absl::btree_set<FieldRef> _canonicalPaths;
 
-        bool _allPathsIndexed;
-    };
+    /**
+     * The name(s) of the "language" field(s) in text indexes, if any.
+     */
+    absl::btree_set<std::string> _pathComponents;
 
-}
+    /**
+     * Set to true if the index is either a wildcard index ({"$**": 0|1}) or a wildcard text index
+     * ({"$**": "text"}). In this case the index assumes responsibility for all fields.
+     */
+    bool _allPathsIndexed;
+};
+}  // namespace mongo

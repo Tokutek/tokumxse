@@ -1,0 +1,1081 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/admission/ticketing/admission_context.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/auth/authorization_checks.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/change_stream_metrics_util.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/query_cmd/acquire_locks.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/cursor_in_use_info.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/client_cursor/clientcursor.h"
+#include "mongo/db/query/client_cursor/collect_query_stats_mongod.h"
+#include "mongo/db/query/client_cursor/cursor_id.h"
+#include "mongo/db/query/client_cursor/cursor_manager.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/query/client_cursor/cursor_response_gen.h"
+#include "mongo/db/query/explain_diagnostic_printer.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/find.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/getmore_command_gen.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/db/query/query_latency_accumulator.h"
+#include "mongo/db/read_concern.h"
+#include "mongo/db/read_concern_support_result.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_network_traffic_stats.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
+#include "mongo/transport/session_manager.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+
+#include <boost/cstdint.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+namespace {
+
+
+MONGO_FAIL_POINT_DEFINE(rsStopGetMoreCmd);
+MONGO_FAIL_POINT_DEFINE(getMoreHangAfterPinCursor);
+
+// The timeout when waiting for linearizable read concern on a getMore command.
+static constexpr Milliseconds kLinearizableReadConcernTimeout{15000};
+
+// getMore can run with any readConcern, because cursor-creating commands like find can run with any
+// readConcern.  However, since getMore automatically uses the readConcern of the command that
+// created the cursor, it is not appropriate to apply the default readConcern (just as
+// client-specified readConcern isn't appropriate).
+static const ReadConcernSupportResult kSupportsReadConcernResult{
+    Status::OK(),
+    {{ErrorCodes::InvalidOptions,
+      "default read concern not permitted (getMore uses the cursor's read concern)"}}};
+
+/**
+ * For change stream cursors, validates that the current node's replica set role still matches the
+ * cursor's original readPreference. Throws InterruptedDueToReplStateChange error if the
+ * readPreference can no longer be satisfied, causing the driver or mongos to reopen the cursor on
+ * an appropriate node.
+ *
+ * This check is a no-op for non-change-stream cursors.
+ */
+void ensureChangeStreamReadPreferenceCanBeSatisfied(OperationContext* opCtx,
+                                                    ClientCursorPin& cursorPin) {
+    if (!QueryKnobConfiguration::get(opCtx).getChangeStreamRespectsReadPreference()) {
+        return;
+    }
+
+    const auto readPref = cursorPin->getReadPreferenceSetting().pref;
+
+    // Flexible preferences are always satisfiable regardless of node role.
+    if (readPref == ReadPreference::PrimaryPreferred ||
+        readPref == ReadPreference::SecondaryPreferred || readPref == ReadPreference::Nearest) {
+        return;
+    }
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    const auto memberState = replCoord->getMemberState();
+
+    const bool didTargetPrimaryButIsNoLongerPrimary =
+        readPref == ReadPreference::PrimaryOnly && !memberState.primary();
+    const bool didTargetSecondaryButBecamePrimary =
+        readPref == ReadPreference::SecondaryOnly && memberState.primary();
+    if (didTargetSecondaryButBecamePrimary || didTargetPrimaryButIsNoLongerPrimary) {
+        // Kill the cursor before throwing. Without this, the ClientCursorPin destructor would just
+        // unpin it back to idle in the CursorManager, leaking the cursor until timeout-based
+        // garbage collection. Inside acquireLocksAndIterateCursor, a ScopeGuard handles this, but
+        // we're before that point.
+        cursorPin.deleteUnderlying();
+        uasserted(ErrorCodes::InterruptedDueToReplStateChange,
+                  str::stream() << "Change stream readPreference '"
+                                << ReadPreferenceSetting(readPref).toString()
+                                << "' can no longer be satisfied after a replica set election");
+    }
+}
+
+/**
+ * For change stream cursors whose updateLookup stage was wired on the optimized (Express/SBE) path,
+ * enforces that the optimization feature flag is still enabled. If an operator has turned the flag
+ * off since the cursor was opened, kills the cursor and throws a resumable RetryChangeStream error,
+ * so the stream is reopened (built fresh with the flag's current value) on the legacy Aggregation
+ * path.
+ *
+ * This check is a no-op for cursors that never took the optimized path (non-change-stream cursors,
+ * cursors opened with the flag off, or streams that simply do not do an updateLookup).
+ */
+void ensureChangeStreamOptimizedLookupStillEnabled(OperationContext* opCtx,
+                                                   ClientCursorPin& cursorPin) {
+    if (!cursorPin->usesOptimizedUpdateLookup()) {
+        return;
+    }
+
+    // NOTE: Reading a fresh feature flag value, as opposed to snapshoted one, since we want to
+    // determine if the flag value has changed from the time the executor has been created.
+    if (feature_flags::gFeatureFlagChangeStreamOptimizedUpdateLookup.checkEnabled()) {
+        return;
+    }
+
+    // The flag got turned off after this cursor was wired on the optimized path. Kill the cursor
+    // before throwing and surface a resumable change stream error.
+    cursorPin.deleteUnderlying();
+    uasserted(ErrorCodes::RetryChangeStream,
+              "Optimized change-stream updateLookup was disabled; resuming on the legacy path");
+}
+
+/**
+ * The single method for all change-stream getMore preconditions.
+ */
+void ensureChangeStreamGetMorePreconditions(OperationContext* opCtx, ClientCursorPin& cursorPin) {
+    if (!cursorPin->isChangeStreamQuery()) {
+        return;
+    }
+
+    // Check if readPreference can still be satisfied after possible elections.
+    ensureChangeStreamReadPreferenceCanBeSatisfied(opCtx, cursorPin);
+
+    // Check if the updateLookup optimization flag was turned off on the updateLookup cursor.
+    ensureChangeStreamOptimizedLookupStillEnabled(opCtx, cursorPin);
+}
+
+/**
+ * Validates that the lsid of 'opCtx' matches that of 'cursor'. This must be called after
+ * authenticating, so that it is safe to report the lsid of 'cursor'.
+ */
+void validateLSID(OperationContext* opCtx, int64_t cursorId, const ClientCursor* cursor) {
+    uassert(50736,
+            str::stream() << "Cannot run getMore on cursor " << cursorId
+                          << ", which was not created in a session, in session "
+                          << *opCtx->getLogicalSessionId(),
+            !opCtx->getLogicalSessionId() || cursor->getSessionId());
+
+    uassert(50737,
+            str::stream() << "Cannot run getMore on cursor " << cursorId
+                          << ", which was created in session " << *cursor->getSessionId()
+                          << ", without an lsid",
+            opCtx->getLogicalSessionId() || !cursor->getSessionId());
+
+    uassert(50738,
+            str::stream() << "Cannot run getMore on cursor " << cursorId
+                          << ", which was created in session " << *cursor->getSessionId()
+                          << ", in session " << *opCtx->getLogicalSessionId(),
+            !opCtx->getLogicalSessionId() || !cursor->getSessionId() ||
+                (opCtx->getLogicalSessionId() == cursor->getSessionId()));
+}
+
+/**
+ * Validates that the txnNumber of 'opCtx' matches that of 'cursor'. This must be called after
+ * authenticating, so that it is safe to report the txnNumber of 'cursor'.
+ */
+void validateTxnNumber(OperationContext* opCtx, int64_t cursorId, const ClientCursor* cursor) {
+    // TODO SERVER-92480 The txnNumber is not unset from the opCtx when the session is yielded, so
+    // it's possible for the txnNumber to still exist despite not running in a txn. Once we unset
+    // txn info from the opCtx after yielding a session, this check can be removed.
+    if (!cursor->getTxnNumber() && !TransactionParticipant::get(opCtx)) {
+        return;
+    }
+
+    uassert(50739,
+            str::stream() << "Cannot run getMore on cursor " << cursorId
+                          << ", which was not created in a transaction, in transaction "
+                          << *opCtx->getTxnNumber(),
+            !opCtx->getTxnNumber() || cursor->getTxnNumber());
+
+    uassert(50740,
+            str::stream() << "Cannot run getMore on cursor " << cursorId
+                          << ", which was created in transaction " << *cursor->getTxnNumber()
+                          << ", without a txnNumber",
+            opCtx->getTxnNumber() || !cursor->getTxnNumber());
+
+    uassert(50741,
+            str::stream() << "Cannot run getMore on cursor " << cursorId
+                          << ", which was created in transaction " << *cursor->getTxnNumber()
+                          << ", in transaction " << *opCtx->getTxnNumber(),
+            !opCtx->getTxnNumber() || !cursor->getTxnNumber() ||
+                (*opCtx->getTxnNumber() == *cursor->getTxnNumber()));
+}
+
+/**
+ * Validate that the client has necessary privileges to call getMore on the given cursor.
+ */
+void validateAuthorization(const OperationContext* opCtx, const ClientCursor& cursor) {
+
+    auto authzSession = AuthorizationSession::get(opCtx->getClient());
+    // A user can only call getMore on their own cursor.
+    if (!authzSession->isCoauthorizedWith(cursor.getAuthenticatedUser())) {
+        uasserted(ErrorCodes::Unauthorized,
+                  str::stream() << "cursor id " << cursor.cursorid()
+                                << " was not created by the authenticated user");
+    }
+
+    // Ensure that the client still has the privileges to run the originating command.
+    if (!authzSession->isAuthorizedForPrivileges(cursor.getOriginatingPrivileges())) {
+        uasserted(ErrorCodes::Unauthorized,
+                  str::stream() << "not authorized for getMore with cursor id "
+                                << cursor.cursorid());
+    }
+}
+
+/**
+ * Validate that the command's and cursor's namespaces match.
+ */
+void validateNamespace(const NamespaceString& commandNss, const ClientCursor& cursor) {
+    uassert(ErrorCodes::Unauthorized,
+            str::stream() << "Requested getMore on namespace '" << commandNss.toStringForErrorMsg()
+                          << "', but cursor belongs to a different namespace "
+                          << cursor.nss().toStringForErrorMsg(),
+            commandNss == cursor.nss());
+
+    if (commandNss.isOplog() && MONGO_unlikely(rsStopGetMoreCmd.shouldFail())) {
+        uasserted(ErrorCodes::CommandFailed,
+                  str::stream() << "getMore on " << commandNss.toStringForErrorMsg()
+                                << " rejected due to active fail point rsStopGetMoreCmd");
+    }
+}
+
+/**
+ * Validate that the command's maxTimeMS is only set when the cursor is in awaitData mode.
+ */
+void validateMaxTimeMS(const boost::optional<std::int64_t>& commandMaxTimeMS,
+                       const ClientCursor& cursor) {
+    if (commandMaxTimeMS.has_value()) {
+        uassert(ErrorCodes::BadValue,
+                "cannot set maxTimeMS on getMore command for a non-awaitData cursor",
+                cursor.isAwaitData());
+    }
+}
+
+/**
+ * Sets a deadline on the operation if the originating command had a maxTimeMS specified or if this
+ * is a tailable, awaitData cursor.
+ */
+void setUpOperationDeadline(OperationContext* opCtx,
+                            const ClientCursor& cursor,
+                            const GetMoreCommandRequest& cmd,
+                            bool disableAwaitDataFailpointActive) {
+
+    // We assume that cursors created through a DBDirectClient are always used from their
+    // original OperationContext, so we do not need to move time to and from the cursor.
+    if (!opCtx->getClient()->isInDirectClient()) {
+        // There is no time limit set directly on this getMore command. If the cursor is
+        // awaitData, then we supply a default time of one second. Otherwise we roll over
+        // any leftover time from the maxTimeMS of the operation that spawned this cursor,
+        // applying it to this getMore.
+        if (cursor.isAwaitData() && !disableAwaitDataFailpointActive) {
+            awaitDataState(opCtx).waitForInsertsDeadline =
+                opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                Milliseconds{cmd.getMaxTimeMS().value_or(1000)};
+        } else if (cursor.getLeftoverMaxTimeMicros() < Microseconds::max()) {
+            opCtx->setDeadlineAfterNowBy(cursor.getLeftoverMaxTimeMicros(),
+                                         ErrorCodes::MaxTimeMSExpired);
+        }
+    }
+}
+/**
+ * Sets up the OperationContext in order to correctly inherit options like the read concern from the
+ * cursor to this operation. Returns a guard that runs the rest of the getMore under the cursor's
+ * QueryLifespan (restoring the opCtx's previous lifespan on destruction); the caller must hold it
+ * for the duration of the operation.
+ */
+[[nodiscard]] QueryLifespan::AlternativeQueryRegion setUpOperationContextAndCurOpStateForGetMore(
+    OperationContext* opCtx,
+    CurOp* curOp,
+    const ClientCursor& cursor,
+    const GetMoreCommandRequest& cmd,
+    bool disableAwaitDataFailpointActive) {
+    // Run the rest of the setup (and the getMore) under the cursor's lifespan.
+    auto queryLifespanRegion = cursor.bindQueryLifespan(opCtx);
+
+    // TODO(SERVER-130398): Migrate the per-getMore state setup below onto QueryLifespan.
+    applyConcernsAndReadPreference(opCtx, cursor);
+
+    // Restore rawData onto the opCtx.
+    isRawDataOperation(opCtx) = cursor.getRawData();
+
+    auto apiParamsFromClient = APIParameters::get(opCtx);
+    uassert(
+        ErrorCodes::APIMismatchError,
+        fmt::format(
+            "API parameter mismatch: getMore used params {}, the cursor-creating command used {}",
+            apiParamsFromClient.toBSON().toString(),
+            cursor.getAPIParameters().toBSON().toString()),
+        apiParamsFromClient == cursor.getAPIParameters());
+
+    setUpOperationDeadline(opCtx, cursor, cmd, disableAwaitDataFailpointActive);
+
+    auto originatingCommand = cursor.getOriginatingCommandObj();
+    if (!originatingCommand.isEmpty()) {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+
+        // Ensure that the original query or command object is available in the slow query log,
+        // profiler and currentOp.
+        curOp->setOriginatingCommand(lk, originatingCommand);
+
+        // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
+        // that if the 'getMore' command itself has a 'comment' field, we give precedence to it.
+        auto comment = originatingCommand["comment"];
+
+        if (!opCtx->getComment() && comment) {
+            opCtx->setComment(comment.wrap());
+        }
+    }
+
+    return queryLifespanRegion;
+}
+
+/**
+ * A command for running getMore() against an existing cursor registered with a CursorManager.
+ * Used to generate the next batch of results for a ClientCursor.
+ *
+ * Can be used in combination with any cursor-generating command (e.g. find, aggregate,
+ * listIndexes).
+ */
+class GetMoreCmd final : public GetMoreCmdVersion1Gen<GetMoreCmd> {
+public:
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool enableDiagnosticPrintingOnFailure() const final {
+        return true;
+    }
+
+    class Invocation final : public MinimalInvocationBase {
+    public:
+        Invocation(OperationContext* opCtx, Command* cmd, const OpMsgRequest& opMsgRequest)
+            : MinimalInvocationBase(opCtx, cmd, opMsgRequest) {
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Invalid namespace for getMore: "
+                                  << ns().toStringForErrorMsg(),
+                    ns().isValid());
+        }
+
+    private:
+        bool supportsWriteConcern() const override {
+            return false;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const override {
+            return kSupportsReadConcernResult;
+        }
+
+        bool isSubjectToIngressAdmissionControl() const override {
+            return !request().getTerm().has_value();
+        }
+
+        bool allowsAfterClusterTime() const override {
+            return false;
+        }
+
+        bool canIgnorePrepareConflicts() const override {
+            return true;
+        }
+
+        NamespaceString ns() const override {
+            return NamespaceStringUtil::deserialize(request().getDbName(),
+                                                    request().getCollection());
+        }
+
+        const DatabaseName& db() const override {
+            return request().getDbName();
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassertStatusOK(auth::checkAuthForGetMore(AuthorizationSession::get(opCtx->getClient()),
+                                                      ns(),
+                                                      request().getCommandParameter(),
+                                                      request().getTerm().has_value()));
+        }
+
+        const GenericArguments& getGenericArguments() const override {
+            return request().getGenericArguments();
+        }
+
+        bool canRetryOnStaleShardMetadataError(const OpMsgRequest& opMsgRequest) const override {
+            // Can not rerun the command when executing a GetMore command as the cursor may already
+            // be lost.
+            return false;
+        }
+
+        /**
+         * Implements populating 'nextBatch' with up to 'batchSize' documents from the plan executor
+         * 'exec'. Outputs the number of documents and relevant size statistics in 'numResults'.
+         * Returns whether or not the cursor should be saved.
+         */
+        bool batchedExecute(OperationContext* opCtx,
+                            ClientCursor* cursor,
+                            PlanExecutor* exec,
+                            const size_t batchSize,
+                            const bool isTailable,
+                            CursorResponseBuilder* nextBatch,
+                            uint64_t* numResults) {
+            BSONObj obj;
+            BSONObj pbrt = exec->getPostBatchResumeToken();
+            bool failedToAppend = false;
+
+            // Capture diagnostics to be logged in the case of a failure.
+            ScopedDebugInfo explainDiagnostics("explainDiagnostics",
+                                               diagnostic_printers::ExplainDiagnosticPrinter{exec});
+
+            // Note that unlike in find, a batch size of 0 means there is no limit on the number of
+            // documents, and we may choose to pre-allocate space for the batch after the first
+            // object.
+            if (PlanExecutor::ADVANCED == exec->getNext(&obj, nullptr)) {
+                // Reserve space based on the size of the first object. Note that we always
+                // allow the first object to be appended to the batch so we can make
+                // progress.
+                size_t objSize = obj.objsize();
+                auto bytesToReserve =
+                    FindCommon::getBytesToReserveForGetMoreReply(isTailable, objSize, batchSize);
+                nextBatch->reserveReplyBuffer(bytesToReserve);
+                // Don't check document size here before appending, since we always want to make
+                // progress.
+                nextBatch->append(obj);
+                *numResults = 1;
+
+                // As soon as we get a result, this operation no longer waits.
+                awaitDataState(opCtx).shouldWaitForInserts = false;
+
+                // If this executor produces a postBatchResumeToken, store it so we can later add it
+                // to the response.
+                pbrt = exec->getPostBatchResumeToken();
+
+                // We decrease the batch size by 1 to account for the document we just emitted via
+                // the first call to getNext() above.
+                *numResults += exec->getNextBatch(
+                    batchSize - 1,
+                    FindCommon::BSONObjCursorAppender{
+                        false /* alwaysAcceptFirstDoc */, nextBatch, pbrt, failedToAppend});
+            }
+
+            // Use the resume token generated by the last execution of the plan that didn't stash a
+            // document, or the latest resume token if we hit EOF/the end of the batch.
+            nextBatch->setPostBatchResumeToken(failedToAppend ? pbrt
+                                                              : exec->getPostBatchResumeToken());
+            return shouldSaveCursorGetMore(exec, isTailable);
+        }
+
+        /**
+         * Uses 'cursor' and 'request' to fill out 'nextBatch' with the batch of result documents to
+         * be returned by this getMore.
+         *
+         * Returns true if the cursor should be saved for subsequent getMores, and false otherwise.
+         * Fills out *numResults with the number of documents in the batch, which must be
+         * initialized to zero by the caller.
+         *
+         * Throws an exception on failure.
+         */
+        bool generateBatch(OperationContext* opCtx,
+                           ClientCursor* cursor,
+                           const GetMoreCommandRequest& cmd,
+                           const bool isTailable,
+                           CursorResponseBuilder* nextBatch,
+                           uint64_t* numResults) {
+            // Note: if an awaitData getMore is killed during this process due to our max time
+            // expiring at an interrupt point, we just continue as normal and return rather than
+            // reporting a timeout to the user.
+            PlanExecutor* exec = cursor->getExecutor();
+
+            // We intentionally set the batch size to the max size_t value for a batch size of 0 in
+            // order to simulate "no limit" on the batch size. We will run out of space in the
+            // buffer before we reach this limit anyway.
+            size_t batchSize = cmd.getBatchSize() ? static_cast<size_t>(*cmd.getBatchSize())
+                                                  : std::numeric_limits<size_t>::max();
+
+            try {
+                return batchedExecute(
+                    opCtx, cursor, exec, batchSize, isTailable, nextBatch, numResults);
+                // IMPORTANT: CloseChangeStream and ChangeStreamInvalidated must be caught before
+                // the generic DBException handler below, which calls
+                // incrementChangeStreamErrorCounters().
+                // Both are DBException subclasses and represent normal cursor lifecycle events, not
+                // errors.
+            } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
+                // This exception indicates that we should close the cursor without reporting an
+                // error.
+                return false;
+            } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+                // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+                // to the resume token of the invalidating event, and mark the cursor response as
+                // invalidated. We always expect to have ExtraInfo for this error code.
+                const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+                tassert(5493700, "Missing ChangeStreamInvalidationInfo on exception", extraInfo);
+
+                nextBatch->setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+                nextBatch->setInvalidated();
+                return false;
+            } catch (DBException& exception) {
+                if (cursor->isChangeStreamQuery()) {
+                    change_stream::incrementChangeStreamErrorCounters(exception);
+                }
+                nextBatch->abandon();
+
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                LOGV2_WARNING(20478,
+                              "getMore command executor error",
+                              "error"_attr = exception.toStatus(),
+                              "stats"_attr = redact(stats),
+                              "cmd"_attr = redact(cmd.toBSON()));
+
+                exception.addContext("Executor error during getMore");
+                throw;
+            }
+        }
+
+        void acquireLocksAndIterateCursor(OperationContext* opCtx,
+                                          rpc::ReplyBuilderInterface* reply,
+                                          ClientCursorPin& cursorPin,
+                                          CurOp* curOp,
+                                          bool disableAwaitDataFailpointActive) {
+            const auto& cmd = request();
+
+            NamespaceString nss = ns();
+            CursorLocks locks{opCtx, nss, cursorPin};
+
+            // On early return, typically due to a failed assertion, delete the cursor.
+            ScopeGuard cursorDeleter([&] {
+                cursorPin.deleteUnderlying();
+                if (locks.txnResourcesHandler) {
+                    locks.txnResourcesHandler->dismissRestoredResources();
+                }
+            });
+
+            if (MONGO_unlikely(waitAfterPinningCursorBeforeGetMoreBatch.shouldFail())) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &waitAfterPinningCursorBeforeGetMoreBatch,
+                    opCtx,
+                    "waitAfterPinningCursorBeforeGetMoreBatch",
+                    []() {}, /*empty function*/
+                    nss);
+            }
+
+            if (!cursorPin->isAwaitData()) {
+                opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+            }
+
+            PlanExecutor* exec = cursorPin->getExecutor();
+            const auto* cq = exec->getCanonicalQuery();
+            if (cq && cq->getFindCommandRequest().getReadOnce()) {
+                // The readOnce option causes any storage-layer cursors created during plan
+                // execution to assume read data will not be needed again and need not be cached.
+                shard_role_details::getRecoveryUnit(opCtx)->setReadOnce(true);
+            }
+            exec->reattachToOperationContext(opCtx);
+            exec->restoreState(nullptr);
+
+            if (cursorPin->isChangeStreamQuery()) {
+                // Initialize optime to the cursor's current position before batch generation so
+                // that $currentOp shows a non-null value while this getMore is in progress.
+                auto ts = exec->getLatestOplogTimestamp();
+                curOp->debug().changeStreamMetrics.setOptime(ts);
+            }
+
+            {
+                auto planSummary = exec->getPlanExplainer().getPlanSummary();
+
+                std::lock_guard<Client> lk(*opCtx->getClient());
+                curOp->setPlanSummary(lk, std::move(planSummary));
+
+                curOp->debug().queryFramework = exec->getQueryFramework();
+                curOp->setShouldOmitDiagnosticInformation(
+                    lk, cursorPin->shouldOmitDiagnosticInformation());
+
+                // Update the genericCursor stored in curOp with the new cursor stats.
+                curOp->setGenericCursor(lk, cursorPin->toGenericCursor());
+            }
+
+            // If the 'failGetMoreAfterCursorCheckout' failpoint is enabled, throw an exception with
+            // the given 'errorCode' value, or ErrorCodes::InternalError if 'errorCode' is omitted.
+            failGetMoreAfterCursorCheckout.executeIf(
+                [&](const BSONObj& data) {
+                    rpc::RewriteStateChangeErrors::onActiveFailCommand(opCtx, data);
+                    auto errorCode = (data["errorCode"] ? data["errorCode"].safeNumberLong()
+                                                        : ErrorCodes::InternalError);
+                    uasserted(errorCode, "Hit the 'failGetMoreAfterCursorCheckout' failpoint");
+                },
+                [&opCtx, &cursorPin](const BSONObj& data) {
+                    auto dataForFailCommand =
+                        data.addField(BSON("failCommands" << BSON_ARRAY("getMore")).firstElement());
+                    auto* getMoreCommand = CommandHelpers::findCommand(opCtx, "getMore");
+                    return CommandHelpers::shouldActivateFailCommandFailPoint(
+                        dataForFailCommand, cursorPin->nss(), getMoreCommand, opCtx->getClient());
+                });
+
+            CursorId respondWithId = 0;
+            CursorResponseBuilder::Options options;
+            if (!opCtx->inMultiDocumentTransaction()) {
+                options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+            }
+            CursorResponseBuilder nextBatch(reply, options);
+            uint64_t numResults = 0;
+
+            // We report keysExamined and docsExamined to OpDebug for a given getMore operation. To
+            // obtain these values we need to take a diff of the pre-execution and post-execution
+            // metrics, as they accumulate over the course of a cursor's lifetime.
+            PlanSummaryStats preExecutionStats;
+            exec->getPlanExplainer().getSummaryStats(&preExecutionStats);
+
+            // Mark this as an AwaitData operation if appropriate.
+            if (cursorPin->isAwaitData() && !disableAwaitDataFailpointActive) {
+                auto lastKnownCommittedOpTime = cmd.getLastKnownCommittedOpTime();
+                if (opCtx->isExhaust() && cursorPin->getLastKnownCommittedOpTime()) {
+                    // Use the commit point of the last batch for exhaust cursors.
+                    lastKnownCommittedOpTime = cursorPin->getLastKnownCommittedOpTime();
+                }
+                clientsLastKnownCommittedOpTime(opCtx) = lastKnownCommittedOpTime;
+
+                awaitDataState(opCtx).shouldWaitForInserts = true;
+            }
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &waitWithPinnedCursorDuringGetMoreBatch,
+                opCtx,
+                "waitWithPinnedCursorDuringGetMoreBatch",
+                /*whileWaiting=*/nullptr,
+                nss);
+
+            const auto shouldSaveCursor = generateBatch(opCtx,
+                                                        cursorPin.getCursor(),
+                                                        cmd,
+                                                        cursorPin->isTailable(),
+                                                        &nextBatch,
+                                                        &numResults);
+            // Unlike registerCursor(), the pipeline-level check cannot run here: the flag is only
+            // missing at this point when the mongot stage was established after registration (e.g.
+            // nested in a $lookup/$unionWith sub-pipeline built during this getMore). Testing the
+            // recorded mongotCursorId covers that case.
+            if (CurOp::get(opCtx)->debug().mongotCursorId.has_value()) {
+                cursorPin->setMayHoldMongotTaskExecutor();
+            }
+
+            const bool isChangeStream = cursorPin->isChangeStreamQuery();
+
+            if (isChangeStream) {
+                // Update optime after every getMore: reflects the last event's timestamp when
+                // events were returned, or the current high-watermark when the batch was empty.
+                auto ts = exec->getLatestOplogTimestamp();
+                curOp->debug().changeStreamMetrics.setOptime(ts);
+            }
+
+            PlanSummaryStats postExecutionStats;
+            exec->getPlanExplainer().getSummaryStats(&postExecutionStats);
+            postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
+            postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
+
+            // Attribute this getMore's time here, while the cursor's QueryLifespan is still bound:
+            // it unbinds before completeOperation, so that chokepoint can't see getMores.
+            if (auto strategy = postExecutionStats.planSelectionStrategy;
+                strategy && shouldRecordLatencyStats(opCtx)) {
+                auto& queryLatency = QueryLatencyAccumulator::get(opCtx);
+                queryLatency.recordStrategy(*strategy);
+                queryLatency.addLatency(curOp->elapsedTimeExcludingPauses());
+            }
+
+            curOp->debug().setPlanSummaryMetrics(std::move(postExecutionStats));
+
+            // We do not report 'execStats' for aggregation or other cursors with the
+            // 'kLocksInternally' policy, both in the original request and subsequent getMore. It
+            // would be useful to have this info for an aggregation, but the source PlanExecutor
+            // could be destroyed before we know if we need 'execStats' and we do not want to
+            // generate the stats eagerly for all operations due to cost.
+            if (cursorPin->getExecutor()->lockPolicy() !=
+                    PlanExecutor::LockPolicy::kLocksInternally &&
+                curOp->shouldDBProfile()) {
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                curOp->debug().execStats = std::move(stats);
+            }
+
+            if (shouldSaveCursor) {
+                respondWithId = cursorPin->cursorid();
+
+                exec->saveState();
+                exec->detachFromOperationContext();
+
+                cursorPin->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+
+                if (opCtx->isExhaust() && clientsLastKnownCommittedOpTime(opCtx)) {
+                    // Update the cursor's lastKnownCommittedOpTime to the current
+                    // lastCommittedOpTime. The lastCommittedOpTime now may be staler than the
+                    // actual lastCommittedOpTime returned in the metadata of this latest batch (see
+                    // appendReplyMetadata).  As a result, we may sometimes return more empty
+                    // batches than we need to. But it is fine to be conservative in this.
+                    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+                    auto myLastCommittedOpTime = replCoord->getLastCommittedOpTime();
+                    auto clientsLastKnownCommittedOpTime = cursorPin->getLastKnownCommittedOpTime();
+                    if (!clientsLastKnownCommittedOpTime.has_value() ||
+                        clientsLastKnownCommittedOpTime.value() < myLastCommittedOpTime) {
+                        cursorPin->setLastKnownCommittedOpTime(myLastCommittedOpTime);
+                    }
+                }
+            } else {
+                curOp->debug().cursorExhausted = true;
+            }
+
+            // Collect and increment metrics now that we have enough information. It's important
+            // we do so before generating the response so that the response can include metrics.
+            curOp->debug().getAdditiveMetrics().nBatches = 1;
+            curOp->setEndOfOpMetrics(numResults);
+            collectQueryStatsMongod(opCtx, cursorPin);
+
+            if (isChangeStream) {
+                change_stream::cursorDocsReturned().add(numResults);
+                change_stream::cursorBytesReturned().add(nextBatch.bytesUsed());
+                change_stream::cursorDocsExamined().add(
+                    curOp->debug().getAdditiveMetrics().docsExamined.value_or(0));
+                const auto* storageStats = curOp->getOperationStorageStats();
+                change_stream::cursorBytesRead().add(storageStats ? storageStats->bytesRead() : 0);
+                if (numResults > 0) {
+                    change_stream::cursorBatchesReturned().add(1);
+                }
+            }
+
+            const auto& includeMetricsOption = cmd.getIncludeMetrics();
+            const bool includeQueryStatsMetrics =
+                cmd.getIncludeQueryStatsMetrics().value_or(false) ||
+                (includeMetricsOption && includeMetricsOption->getQueryStats());
+            boost::optional<CursorMetrics> metrics = includeQueryStatsMetrics
+                ? boost::make_optional(CurOp::get(opCtx)->debug().getCursorMetrics())
+                : boost::none;
+
+            // Account the oplog batch served to a replication oplog fetcher. 'isReplOplogGetMore'
+            // is set only for getMores that carry a term, which only internal replication clients
+            // may use, so it identifies oplog fetching and excludes other oplog readers (backups,
+            // etc.).
+            if (curOp->debug().isReplOplogGetMore) {
+                repl::recordOplogBytesSent(static_cast<int64_t>(nextBatch.bytesUsed()));
+            }
+
+            nextBatch.done(respondWithId,
+                           nss,
+                           metrics,
+                           SerializationContext::stateCommandReply(cmd.getSerializationContext()));
+
+            if (respondWithId) {
+                cursorDeleter.dismiss();
+
+                if (opCtx->isExhaust()) {
+                    // Indicate that an exhaust message should be generated and the previous BSONObj
+                    // command parameters should be reused as the next BSONObj command parameters.
+                    reply->setNextInvocation(boost::none);
+                }
+            }
+        }
+
+        ClientCursorPin pinCursorWithRetry(OperationContext* opCtx,
+                                           CursorId cursorId,
+                                           const NamespaceString& nss) {
+            // Perform validation checks which don't cause the cursor to be deleted on failure.
+            auto pinCheck = [&](const ClientCursor& cc) {
+                validateLSID(opCtx, cursorId, &cc);
+                validateTxnNumber(opCtx, cursorId, &cc);
+                validateAuthorization(opCtx, cc);
+                validateNamespace(nss, cc);
+                validateMaxTimeMS(request().getMaxTimeMS(), cc);
+            };
+
+            Backoff retryBackoff{Seconds(1), Milliseconds::max()};
+
+            const size_t maxAttempts = internalQueryGetMoreMaxCursorPinRetryAttempts.loadRelaxed();
+            for (size_t attempt = 1; attempt <= maxAttempts; ++attempt) {
+                auto statusWithCursorPin = CursorManager::get(opCtx)->pinCursor(
+                    opCtx, cursorId, definition()->getName(), pinCheck);
+                auto status = statusWithCursorPin.getStatus();
+                if (status.isOK()) {
+                    return std::move(statusWithCursorPin.getValue());
+                }
+                // We only return CursorInUse errors if the command that is holding the cursor is
+                // "releaseMemory".
+                if (attempt == maxAttempts || status.code() != ErrorCodes::CursorInUse) {
+                    uassertStatusOK(status);
+                }
+                auto extraInfo = status.extraInfo<CursorInUseInfo>();
+                if (extraInfo == nullptr || extraInfo->commandName() != "releaseMemory") {
+                    uassertStatusOK(status);
+                }
+                Milliseconds sleepDuration = retryBackoff.nextSleep();
+                LOGV2_DEBUG(10116501,
+                            3,
+                            "getMore failed to pin cursor, because it is held by releaseMemory "
+                            "command. Will retry after sleep.",
+                            "sleepDuration"_attr = sleepDuration,
+                            "attempt"_attr = attempt);
+                opCtx->sleepFor(sleepDuration);
+            }
+            MONGO_UNREACHABLE_TASSERT(101165);
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
+            const auto& cmd = request();
+            // A memory shedding kill will also kill the underlying cursor, so this can free
+            markOperationQueryMemorySheddingEligible(opCtx);
+            // Gets the number of write ops in the current multidocument transaction.
+            auto getNumTxnOps = [opCtx]() -> boost::optional<size_t> {
+                if (opCtx->inMultiDocumentTransaction()) {
+                    auto participant = TransactionParticipant::get(opCtx);
+                    if (participant) {
+                        return participant.getTransactionOperationsCount();
+                    }
+                }
+                return boost::optional<size_t>{};
+            };
+
+            // Enforces that getMore does not perform any write ops when executing in a transaction.
+            auto invariantIfHasDoneWrites = [&getNumTxnOps, opCtx](boost::optional<size_t> numPre) {
+                if (numPre) {
+                    boost::optional<size_t> numTxnOps = getNumTxnOps();
+                    invariant(numPre == numTxnOps);
+                }
+            };
+
+            // Counted as a getMore, not as a command.
+            globalOpCounters().gotGetMore();
+            auto curOp = CurOp::get(opCtx);
+            NamespaceString nss = ns();
+
+            // Reads to system-critical collections issued remotely by internal clients should not
+            // be deprioritized:
+            // - Session collection reads in findRemovedSessions.
+            // - Key collection refresh.
+            // - Resharding application phase
+            // TODO (SERVER-122847): Remove this code.
+            const bool isSystemCriticalNss = (nss == NamespaceString::kLogicalSessionsNamespace ||
+                                              nss == NamespaceString::kKeysCollectionNamespace ||
+                                              nss == NamespaceString::kRsOplogNamespace);
+            boost::optional<admission::execution_control::ScopedTaskTypeNonDeprioritizable>
+                systemCriticalTaskType;
+            // Note that we exclude commands with the term attached since this is used for the oplog
+            // fetcher which is marked exempt below. Since exempt + non-deprioritizable = exempt,
+            // skipping this would be fine but it messes with our metrics by hugely inflating the
+            // number of non-deprioritized ops.
+            if (!gExecutionControlRemoteSpecification.isEnabledUseLastLTSFCVWhenUninitialized(
+                    VersionContext::getDecoration(opCtx),
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+                !cmd.getTerm() && isSystemCriticalNss && opCtx->getClient()->isInternalClient()) {
+                systemCriticalTaskType.emplace(opCtx);
+            }
+
+            int64_t cursorId = cmd.getCommandParameter();
+            curOp->debug().cursorid = cursorId;
+
+            // The presence of a term in the request indicates that this is an internal replication
+            // oplog read request.
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+            if (cmd.getTerm() && nss == NamespaceString::kRsOplogNamespace) {
+                // only mark as replication if term is not dummy value
+                if (auto* sm = transport::SessionManager::get(opCtx->getClient());
+                    *cmd.getTerm() >= 0) {
+                    sm->markReplicationSession(opCtx->getClient());
+                }
+                // Validate term before acquiring locks.
+                auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+                // Note: updateTerm returns ok if term stayed the same.
+                uassertStatusOK(replCoord->updateTerm(opCtx, *cmd.getTerm()));
+
+                // If the term field is present in an oplog request, it means this is an oplog
+                // getMore for replication oplog fetching because the term field is only allowed for
+                // internal clients (see checkAuthForGetMore).
+                curOp->debug().isReplOplogGetMore = true;
+
+                // We do not want to wait to take tickets for internal (replication) oplog reads.
+                // Stalling on ticket acquisition can cause complicated deadlocks. Primaries may
+                // depend on data reaching secondaries in order to proceed; and secondaries may get
+                // stalled replicating because of an inability to acquire a read ticket.
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
+
+            const auto& includeMetricsOption = cmd.getIncludeMetrics();
+            if (cmd.getIncludeQueryStatsMetrics().value_or(false) ||
+                (includeMetricsOption && includeMetricsOption->getQueryStats())) {
+                curOp->debug().getQueryStatsInfo().metricsRequested = true;
+            }
+
+            ClientCursorPin cursorPin = pinCursorWithRetry(opCtx, cursorId, nss);
+
+            // Run the change stream getMore preconditions before iterating the cursor.
+            ensureChangeStreamGetMorePreconditions(opCtx, cursorPin);
+
+            if (cursorPin->isChangeStreamQuery()) {
+                change_stream::recordCursorOptionMetrics(cmd.getBatchSize(), cmd.getMaxTimeMS());
+            }
+
+            // Get the read concern level here in case the cursor is exhausted while iterating.
+            const auto isLinearizableReadConcern = cursorPin->getReadConcernArgs().getLevel() ==
+                repl::ReadConcernLevel::kLinearizableReadConcern;
+
+            // If in a multi-document transaction, save the size of transactionOperations for
+            // later checking of whether this invocation performed a write.
+            boost::optional<size_t> numTxnOpsPre = getNumTxnOps();
+
+            const bool disableAwaitDataFailpointActive =
+                MONGO_unlikely(disableAwaitDataForGetMoreCmd.shouldFail());
+
+            // Inherit properties like readConcern and maxTimeMS from our originating cursor. The
+            // returned guard runs the rest of the getMore under the cursor's lifespan (restoring
+            // the opCtx's previous lifespan on return); it is held to the end of the invocation so
+            // late steps (read-concern waits, unpin failpoints) still run under it.
+            auto queryLifespanRegion = setUpOperationContextAndCurOpStateForGetMore(
+                opCtx, curOp, *cursorPin.getCursor(), cmd, disableAwaitDataFailpointActive);
+
+            acquireLocksAndIterateCursor(
+                opCtx, reply, cursorPin, curOp, disableAwaitDataFailpointActive);
+
+            if (MONGO_unlikely(getMoreHangAfterPinCursor.shouldFail())) {
+                LOGV2(20477,
+                      "getMoreHangAfterPinCursor fail point enabled. Blocking until fail "
+                      "point is disabled",
+                      "cursorId"_attr = cursorId);
+                getMoreHangAfterPinCursor.pauseWhileSet(opCtx);
+            }
+
+            if (isLinearizableReadConcern) {
+                // waitForLinearizableReadConcern performs a NoOp write and waits for that write
+                // to have been majority committed. awaitReplication requires that we release all
+                // locks to prevent blocking for a long time while doing network activity. Since
+                // getMores do not have support for a maxTimeout duration, we hardcode the timeout
+                // to avoid waiting indefinitely.
+                uassertStatusOK(
+                    mongo::waitForLinearizableReadConcern(opCtx, kLinearizableReadConcernTimeout));
+            }
+
+            // We're about to unpin or delete the cursor as the ClientCursorPin goes out of scope.
+            // If the 'waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch' failpoint is active, we
+            // set the 'msg' field of this operation's CurOp to signal that we've hit this point and
+            // then spin until the failpoint is released.
+            if (MONGO_unlikely(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch.shouldFail())) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch,
+                    opCtx,
+                    "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch");
+            }
+
+            // getMore must not write if running inside a multi-document transaction.
+            invariantIfHasDoneWrites(numTxnOpsPre);
+
+            if (getTestCommandsEnabled()) {
+                validateResult(opCtx, reply, nss.tenantId());
+            }
+        }
+
+        // TODO SERVER-121034: Remove validateResult() once CursorResponseBuilder is typed.
+        void validateResult(OperationContext* opCtx,
+                            rpc::ReplyBuilderInterface* reply,
+                            boost::optional<TenantId> tenantId) {
+            auto ret = reply->getBodyBuilder().asTempObj();
+
+            // We need to copy the serialization context from the request to the reply object
+            CursorGetMoreReply::parse(ret.removeField("ok"),
+                                      IDLParserContext("CursorGetMoreReply",
+                                                       auth::ValidatedTenancyScope::get(opCtx),
+                                                       tenantId,
+                                                       SerializationContext::stateCommandReply(
+                                                           request().getSerializationContext())));
+        }
+    };
+
+    bool maintenanceOk() const override {
+        return false;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
+    }
+
+    std::string help() const override {
+        return "retrieve more results from an existing cursor";
+    }
+
+    LogicalOp getLogicalOp() const override {
+        return LogicalOp::opGetMore;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
+    /**
+     * A getMore command increments the getMore counter, not the command counter.
+     */
+    bool shouldAffectCommandCounter() const override {
+        return false;
+    }
+
+    bool adminOnly() const override {
+        return false;
+    }
+};
+MONGO_REGISTER_COMMAND(GetMoreCmd).forShard();
+
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,47 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of movePrimary coordinator persisted documents.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+enums:
+    MovePrimaryCoordinatorPhase:
+        description: "Coordinator phase of a movePrimary operation."
+        type: string
+        values:
+            kUnset: "unset"
+            kClone: "clone"
+            kCatchup: "catchup"
+            kEnterCriticalSection: "enterCriticalSection"
+            kCommit: "commit"
+            kClean: "clean"
+            kExitCriticalSection: "exitCriticalSection"
+
+structs:
+    MovePrimaryCoordinatorDocument:
+        description: "Document representing an ongoing movePrimary operation."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                type: MovePrimaryCoordinatorPhase
+                description: "Current coordinator phase."
+                default: kUnset
+            # TODO (SERVER-82812): Chain MovePrimaryRequestBase and use its `to` field instead.
+            toShardId:
+                type: shard_id
+                description: "Destination shard of the database."
+            collectionsToClone:
+                type: array<namespacestring>
+                description: "List of collections to be cloned by the destination shard."
+                optional: true

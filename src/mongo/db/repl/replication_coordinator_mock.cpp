@@ -1,299 +1,910 @@
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/platform/basic.h"
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/repl/replication_coordinator_mock.h"
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/hello/hello_response.h"
+#include "mongo/db/repl/isself.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/session/internal_session_pool.h"
+#include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future_impl.h"
+
+#include <mutex>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 namespace mongo {
 namespace repl {
 
-    using std::vector;
+namespace {
 
-    ReplicationCoordinatorMock::ReplicationCoordinatorMock(const ReplSettings& settings) :
-            _settings(settings) {}
-    ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
+/**
+ * Helper to create default ReplSettings for tests that represents a one-node replica set.
+ */
+ReplSettings createReplSettingsForSingleNodeReplSet() {
+    ReplSettings settings;
+    settings.setOplogSizeBytes(5 * 1024 * 1024);
+    settings.setReplSetString("mySet/node1:12345");
+    return settings;
+}
 
-    void ReplicationCoordinatorMock::startReplication(OperationContext* txn) {
-        // TODO
-    }
+}  // namespace
 
-    void ReplicationCoordinatorMock::shutdown() {
-        // TODO
-    }
+ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service,
+                                                       const ReplSettings& settings)
+    : _service(service),
+      _settings(settings),
+      _splitSessionManager(InternalSessionPool::get(service)) {}
 
-    const ReplSettings& ReplicationCoordinatorMock::getSettings() const {
-        return _settings;
-    }
+ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service,
+                                                       StorageInterface* storage)
+    : ReplicationCoordinatorMock(service, createReplSettingsForSingleNodeReplSet()) {
+    _storage = storage;
+}
 
-    bool ReplicationCoordinatorMock::isReplEnabled() const {
-        return _settings.usingReplSets() || _settings.master || _settings.slave;
-    }
+ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service)
+    : ReplicationCoordinatorMock(service, createReplSettingsForSingleNodeReplSet()) {}
 
-    ReplicationCoordinator::Mode ReplicationCoordinatorMock::getReplicationMode() const {
-        return modeNone;
-    }
+ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
-    MemberState ReplicationCoordinatorMock::getMemberState() const {
-        // TODO
-        invariant(false);
-    }
+void ReplicationCoordinatorMock::startup(OperationContext* opCtx,
+                                         StorageEngine::LastShutdownState lastShutdownState) {
+    // TODO
+}
 
-    bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState() const {
-        invariant(false);
-    }
+void ReplicationCoordinatorMock::enterTerminalShutdown() {
+    // TODO
+}
 
-    Seconds ReplicationCoordinatorMock::getSlaveDelaySecs() const {
-        return Seconds(0);
-    }
+bool ReplicationCoordinatorMock::enterQuiesceModeIfSecondary(Milliseconds quiesceTime) {
+    // TODO
+    return true;
+}
 
-    void ReplicationCoordinatorMock::clearSyncSourceBlacklist() {}
+bool ReplicationCoordinatorMock::inQuiesceMode() const {
+    // TODO
+    return false;
+}
 
-    ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
-            const OperationContext* txn,
-            const OpTime& ts,
-            const WriteConcernOptions& writeConcern) {
-        // TODO
-        return StatusAndDuration(Status::OK(), Milliseconds(0));
-    }
+void ReplicationCoordinatorMock::shutdown(OperationContext*,
+                                          BSONObjBuilder* shutdownTimeElapsedBuilder) {
+    // TODO
+}
 
-    ReplicationCoordinator::StatusAndDuration
-            ReplicationCoordinatorMock::awaitReplicationOfLastOpForClient(
-                    const OperationContext* txn,
-                    const WriteConcernOptions& writeConcern) {
-        return StatusAndDuration(Status::OK(), Milliseconds(0));
-    }
+const ReplSettings& ReplicationCoordinatorMock::getSettings() const {
+    return _settings;
+}
 
-    Status ReplicationCoordinatorMock::stepDown(OperationContext* txn,
-                                                bool force,
-                                                const Milliseconds& waitTime,
-                                                const Milliseconds& stepdownTime) {
-        return Status::OK();
-    }
+MemberState ReplicationCoordinatorMock::getMemberState() const {
+    std::lock_guard<std::mutex> lk(_mutex);
 
-    bool ReplicationCoordinatorMock::isMasterForReportingPurposes() {
-        // TODO
+    return _memberState;
+}
+
+std::vector<MemberData> ReplicationCoordinatorMock::getMemberData() const {
+    MONGO_UNREACHABLE;
+    return {};
+}
+
+bool ReplicationCoordinatorMock::canAcceptNonLocalWrites() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _canAcceptNonLocalWrites;
+}
+
+void ReplicationCoordinatorMock::setCanAcceptNonLocalWrites(bool canAcceptNonLocalWrites) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _canAcceptNonLocalWrites = canAcceptNonLocalWrites;
+}
+
+Status ReplicationCoordinatorMock::waitForMemberState(Interruptible* interruptible,
+                                                      MemberState expectedState,
+                                                      Milliseconds timeout) {
+    MONGO_UNREACHABLE;
+    return Status::OK();
+}
+
+bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
+    return isInPrimaryOrSecondaryState_UNSAFE();
+}
+
+bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState_UNSAFE() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _memberState.primary() || _memberState.secondary();
+}
+
+Seconds ReplicationCoordinatorMock::getSecondaryDelaySecs() const {
+    return _secondaryDelaySecs;
+}
+
+void ReplicationCoordinatorMock::setSecondaryDelaySecs(Seconds sec) {
+    _secondaryDelaySecs = sec;
+}
+
+void ReplicationCoordinatorMock::clearSyncSourceDenylist() {}
+
+ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
+    OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    return _awaitReplicationReturnValueFunction(opCtx, opTime);
+}
+
+void ReplicationCoordinatorMock::setAwaitReplicationReturnValueFunction(
+    AwaitReplicationReturnValueFunction returnValueFunction) {
+    _awaitReplicationReturnValueFunction = std::move(returnValueFunction);
+}
+
+void ReplicationCoordinatorMock::setRunCmdOnPrimaryAndAwaitResponseFunction(
+    RunCmdOnPrimaryAndAwaitResponseFunction runCmdFunction) {
+    _runCmdOnPrimaryAndAwaitResponseFn = std::move(runCmdFunction);
+}
+
+SharedSemiFuture<void> ReplicationCoordinatorMock::awaitReplicationAsyncNoWTimeout(
+    const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    auto opCtx = cc().makeOperationContext();
+    auto result = _awaitReplicationReturnValueFunction(opCtx.get(), opTime);
+    return Future<ReplicationCoordinator::StatusAndDuration>::makeReady(result).ignoreValue();
+}
+
+void ReplicationCoordinatorMock::stepDown(OperationContext* opCtx,
+                                          bool force,
+                                          const Milliseconds& waitTime,
+                                          const Milliseconds& stepdownTime) {}
+
+bool ReplicationCoordinatorMock::isWritablePrimaryForReportingPurposes() {
+    // TODO
+    return true;
+}
+
+bool ReplicationCoordinatorMock::canAcceptWritesForDatabase(OperationContext* opCtx,
+                                                            const DatabaseName& dbName) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // Return true if we allow writes explicitly even when not in primary state, as in sharding
+    // unit tests, so that the op observers can fire but the tests don't have to set all the states
+    // as if it's in primary.
+    if (_alwaysAllowWrites) {
         return true;
     }
+    return dbName == DatabaseName::kLocal || _memberState.primary();
+}
 
-    bool ReplicationCoordinatorMock::canAcceptWritesForDatabase(StringData dbName) {
-        // TODO
-        return true;
+bool ReplicationCoordinatorMock::canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
+                                                                   const DatabaseName& dbName) {
+    return canAcceptWritesForDatabase(opCtx, dbName);
+}
+
+bool ReplicationCoordinatorMock::canAcceptWritesFor(OperationContext* opCtx,
+                                                    const NamespaceStringOrUUID& nsOrUUID) {
+    // TODO
+    return canAcceptWritesForDatabase(opCtx, nsOrUUID.dbName());
+}
+
+bool ReplicationCoordinatorMock::canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                                           const NamespaceStringOrUUID& nsOrUUID) {
+    return canAcceptWritesFor(opCtx, nsOrUUID);
+}
+
+Status ReplicationCoordinatorMock::checkCanServeReadsFor(OperationContext* opCtx,
+                                                         const NamespaceString& ns,
+                                                         bool secondaryOk) {
+    // TODO
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
+                                                                const NamespaceString& ns,
+                                                                bool secondaryOk) {
+    return checkCanServeReadsFor(opCtx, ns, secondaryOk);
+}
+
+bool ReplicationCoordinatorMock::shouldRelaxIndexConstraints(OperationContext* opCtx,
+                                                             const NamespaceString& ns) {
+    return (!canAcceptWritesFor(opCtx, ns));
+}
+
+void ReplicationCoordinatorMock::setMyHeartbeatMessage(const std::string& msg) {
+    // TODO
+}
+
+void ReplicationCoordinatorMock::_setMyLastAppliedOpTimeAndWallTime(
+    WithLock lk, const OpTimeAndWallTime& opTimeAndWallTime) {
+    _myLastAppliedOpTime = opTimeAndWallTime.opTime;
+    _myLastAppliedWallTime = opTimeAndWallTime.wallTime;
+
+    if (!_updateCommittedSnapshot) {
+        return;
     }
 
-    Status ReplicationCoordinatorMock::checkCanServeReadsFor(OperationContext* txn,
-                                                             const NamespaceString& ns,
-                                                             bool slaveOk) {
-        // TODO
-        return Status::OK();
+    if (auto storageEngine = _service->getStorageEngine()) {
+        // Use the "all durable" timestamp for the committed snapshot rather than the one provided.
+        // This ensures that we never set the committed snapshot to a timestamp that contains oplog
+        // holes.
+        auto allDurable = storageEngine->getAllDurableTimestamp();
+        _setCurrentCommittedSnapshotOpTime(lk, {allDurable, opTimeAndWallTime.opTime.getTerm()});
+        if (auto snapshotManager = storageEngine->getSnapshotManager()) {
+            snapshotManager->setCommittedSnapshot(allDurable);
+        }
+    } else {
+        _setCurrentCommittedSnapshotOpTime(lk, opTimeAndWallTime.opTime);
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastWrittenOpTime) {
+        _myLastWrittenOpTime = opTimeAndWallTime.opTime;
+        _myLastWrittenWallTime = opTimeAndWallTime.wallTime;
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastAppliedOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastAppliedOpTime) {
+        _setMyLastAppliedOpTimeAndWallTime(lk, opTimeAndWallTime);
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastDurableOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastDurableOpTime) {
+        _myLastDurableOpTime = opTimeAndWallTime.opTime;
+        _myLastDurableWallTime = opTimeAndWallTime.wallTime;
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastAppliedAndLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastWrittenOpTime) {
+        _myLastWrittenOpTime = opTimeAndWallTime.opTime;
+        _myLastWrittenWallTime = opTimeAndWallTime.wallTime;
     }
 
-    bool ReplicationCoordinatorMock::shouldIgnoreUniqueIndex(const IndexDescriptor* idx) {
-        // TODO
-        return false;
+    if (opTimeAndWallTime.opTime >= _myLastAppliedOpTime) {
+        _setMyLastAppliedOpTimeAndWallTime(lk, opTimeAndWallTime);
+    } else if (_updateCommittedSnapshot) {
+        // Potentially update the allDurable timestamp even if we did not advance lastApplied.
+        if (auto storageEngine = _service->getStorageEngine()) {
+            auto allDurable = storageEngine->getAllDurableTimestamp();
+            if (allDurable > _currentCommittedSnapshotOpTime.getTimestamp()) {
+                _setCurrentCommittedSnapshotOpTime(lk,
+                                                   {allDurable, _myLastAppliedOpTime.getTerm()});
+                if (auto snapshotManager = storageEngine->getSnapshotManager()) {
+                    snapshotManager->setCommittedSnapshot(allDurable);
+                }
+            }
+        }
+    }
+}
+
+void ReplicationCoordinatorMock::setMyLastDurableAndLastWrittenOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime& opTimeAndWallTime) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    // = is necessary here because in some unit test setup, we want to update the term while not
+    // changing the opTime.
+    if (opTimeAndWallTime.opTime >= _myLastWrittenOpTime) {
+        _myLastWrittenOpTime = opTimeAndWallTime.opTime;
+        _myLastWrittenWallTime = opTimeAndWallTime.wallTime;
     }
 
-    Status ReplicationCoordinatorMock::setLastOptimeForSlave(const OID& rid, const OpTime& ts) {
-        return Status::OK();
+    if (opTimeAndWallTime.opTime >= _myLastDurableOpTime) {
+        _myLastDurableOpTime = opTimeAndWallTime.opTime;
+        _myLastDurableWallTime = opTimeAndWallTime.wallTime;
     }
-    
-    void ReplicationCoordinatorMock::setMyHeartbeatMessage(const std::string& msg) {
-        // TODO
+}
+
+void ReplicationCoordinatorMock::resetMyLastOpTimes() {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _myLastDurableOpTime = OpTime();
+    _myLastDurableWallTime = Date_t();
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastWrittenOpTimeAndWallTime(
+    bool rollbackSafe) const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    if (rollbackSafe && _memberState.rollback()) {
+        return {};
+    }
+    return {_myLastWrittenOpTime, _myLastWrittenWallTime};
+}
+
+OpTime ReplicationCoordinatorMock::getMyLastWrittenOpTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _myLastWrittenOpTime;
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return {_myLastAppliedOpTime, _myLastAppliedWallTime};
+}
+
+OpTime ReplicationCoordinatorMock::getMyLastAppliedOpTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _myLastAppliedOpTime;
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastDurableOpTimeAndWallTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return {_myLastDurableOpTime, _myLastDurableWallTime};
+}
+
+OpTime ReplicationCoordinatorMock::getMyLastDurableOpTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _myLastDurableOpTime;
+}
+
+Status ReplicationCoordinatorMock::waitUntilMajorityOpTime(mongo::OperationContext* opCtx,
+                                                           mongo::repl::OpTime targetOpTime,
+                                                           boost::optional<Date_t> deadline) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::waitUntilOpTimeForRead(OperationContext* opCtx,
+                                                          const ReadConcernArgs& settings) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::waitUntilOpTimeForReadUntil(OperationContext* opCtx,
+                                                               const ReadConcernArgs& settings,
+                                                               boost::optional<Date_t> deadline) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::waitUntilOpTimeWrittenUntil(OperationContext* opCtx,
+                                                               LogicalTime clusterTime,
+                                                               boost::optional<Date_t> deadline) {
+    return Status::OK();
+}
+
+SharedSemiFuture<void> ReplicationCoordinatorMock::registerWaiterForMajorityReadOpTime(
+    OperationContext* opCtx, OpTime optime) {
+    return Future<void>::makeReady().share();
+}
+
+Status ReplicationCoordinatorMock::awaitTimestampCommitted(OperationContext* opCtx, Timestamp ts) {
+    return Status::OK();
+}
+
+OID ReplicationCoordinatorMock::getElectionId() {
+    // TODO
+    return OID();
+}
+
+int ReplicationCoordinatorMock::getMyId() const {
+    return 0;
+}
+
+HostAndPort ReplicationCoordinatorMock::getMyHostAndPort() const {
+    // Set to a non-empty value to satisfy the deserializer parser.
+    return HostAndPort("test1", 1234);
+}
+
+boost::optional<int> ReplicationCoordinatorMock::getMyPriorityPort() const {
+    return boost::none;
+}
+
+Status ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _memberState = newState;
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::setFollowerModeRollback(OperationContext* opCtx) {
+    return setFollowerMode(MemberState::RS_ROLLBACK);
+}
+
+void ReplicationCoordinatorMock::setOplogSyncState(const OplogSyncState& newState) {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _oplogSyncState = newState;
+}
+
+ReplicationCoordinator::OplogSyncState ReplicationCoordinatorMock::getOplogSyncState() {
+    return _oplogSyncState;
+}
+
+void ReplicationCoordinatorMock::signalWriterDrainComplete(OperationContext*, long long) noexcept {}
+
+void ReplicationCoordinatorMock::signalApplierDrainComplete(OperationContext*, long long) noexcept {
+}
+
+void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
+
+StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand() const {
+    BSONObjBuilder cmdBuilder;
+    cmdBuilder.append("replSetUpdatePosition", 1);
+    return cmdBuilder.obj();
+}
+
+ThreadPool* ReplicationCoordinatorMock::getDbWorkThreadPool() const noexcept {
+    return nullptr;
+}
+
+ReplSetConfig ReplicationCoordinatorMock::getConfig() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _getConfigReturnValue;
+}
+
+ConnectionString ReplicationCoordinatorMock::getConfigConnectionString() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _getConfigReturnValue.getConnectionString();
+}
+
+std::int64_t ReplicationCoordinatorMock::getConfigTerm() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _getConfigReturnValue.getConfigTerm();
+}
+
+std::int64_t ReplicationCoordinatorMock::getConfigVersion() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _getConfigReturnValue.getConfigVersion();
+}
+
+ConfigVersionAndTerm ReplicationCoordinatorMock::getConfigVersionAndTerm() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _getConfigReturnValue.getConfigVersionAndTerm();
+}
+
+Status ReplicationCoordinatorMock::validateWriteConcern(
+    const WriteConcernOptions& writeConcern) const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _getConfigReturnValue.validateWriteConcern(writeConcern);
+}
+
+boost::optional<MemberConfig> ReplicationCoordinatorMock::findConfigMemberByHostAndPort_deprecated(
+    const HostAndPort& hap) const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    const MemberConfig* result = _getConfigReturnValue.findMemberByHostAndPort(hap);
+    return boost::make_optional(result, *result);
+}
+
+void ReplicationCoordinatorMock::setGetConfigReturnValue(ReplSetConfig returnValue) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _getConfigReturnValue = std::move(returnValue);
+}
+
+void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result,
+                                                         bool commitmentStatus,
+                                                         bool includeNewlyAdded) {
+    // TODO
+}
+
+void ReplicationCoordinatorMock::processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) {}
+
+void ReplicationCoordinatorMock::advanceCommitPoint(
+    const OpTimeAndWallTime& committedOptimeAndWallTime, bool fromSyncSource) {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _lastCommittedOpTime = committedOptimeAndWallTime.opTime;
+    _lastCommittedWallTime = committedOptimeAndWallTime.wallTime;
+}
+
+void ReplicationCoordinatorMock::cancelAndRescheduleElectionTimeout() {}
+
+Status ReplicationCoordinatorMock::processReplSetGetStatus(OperationContext* opCtx,
+                                                           BSONObjBuilder*,
+                                                           ReplSetGetStatusResponseStyle) {
+    return Status::OK();
+}
+
+void ReplicationCoordinatorMock::appendSecondaryInfoData(BSONObjBuilder* result) {}
+
+void ReplicationCoordinatorMock::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
+}
+
+Status ReplicationCoordinatorMock::setMaintenanceMode(OperationContext* opCtx, bool activate) {
+    return Status::OK();
+}
+
+bool ReplicationCoordinatorMock::getMaintenanceMode() {
+    return false;
+}
+
+Status ReplicationCoordinatorMock::processReplSetSyncFrom(OperationContext* opCtx,
+                                                          const HostAndPort& target,
+                                                          BSONObjBuilder* resultObj) {
+    // TODO
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::processReplSetFreeze(int secs, BSONObjBuilder* resultObj) {
+    // TODO
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::processReplSetReconfig(OperationContext* opCtx,
+                                                          const ReplSetReconfigArgs& args,
+                                                          BSONObjBuilder* resultObj) {
+    std::lock_guard<std::mutex> lg(_mutex);
+    _latestReconfig = args.newConfigObj;
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
+                                                     GetNewConfigFn getNewConfig,
+                                                     bool force) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx,
+                                                         bool waitForOplogCommitment,
+                                                         long long term) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::processReplSetInitiate(OperationContext* opCtx,
+                                                          const BSONObj& configObj,
+                                                          BSONObjBuilder* resultObj) {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::processReplSetUpdatePosition(const UpdatePositionArgs& updates) {
+    // TODO
+    return Status::OK();
+}
+
+bool ReplicationCoordinatorMock::buildsIndexes() {
+    // TODO
+    return true;
+}
+
+std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op,
+                                                                       bool durablyWritten) {
+    return std::vector<HostAndPort>();
+}
+
+Status ReplicationCoordinatorMock::checkIfWriteConcernCanBeSatisfied(
+    const WriteConcernOptions& writeConcern) const {
+    return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::checkIfCommitQuorumCanBeSatisfied(
+    const CommitQuorumOptions& commitQuorum) const {
+    return Status::OK();
+}
+
+bool ReplicationCoordinatorMock::isCommitQuorumSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<mongo::HostAndPort>& members) const {
+    return true;
+}
+
+WriteConcernOptions ReplicationCoordinatorMock::getGetLastErrorDefault() {
+    return WriteConcernOptions();
+}
+
+Status ReplicationCoordinatorMock::checkReplEnabledForCommand(BSONObjBuilder* result) {
+    // TODO
+    return Status::OK();
+}
+
+HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource(const OpTime& lastOpTimeFetched) {
+    return HostAndPort();
+}
+
+void ReplicationCoordinatorMock::denylistSyncSource(const HostAndPort& host, Date_t until) {}
+
+void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* opCtx) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _resetLastOpTimesCalled = true;
+}
+
+bool ReplicationCoordinatorMock::lastOpTimesWereReset() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _resetLastOpTimesCalled;
+}
+
+ChangeSyncSourceAction ReplicationCoordinatorMock::shouldChangeSyncSource(
+    const HostAndPort& currentSource,
+    const rpc::ReplSetMetadata& replMetadata,
+    const rpc::OplogQueryMetadata& oqMetadata,
+    const OpTime& previousOpTimeFetched,
+    const OpTime& lastOpTimeFetched) const {
+    MONGO_UNREACHABLE;
+}
+
+ChangeSyncSourceAction ReplicationCoordinatorMock::shouldChangeSyncSourceOnError(
+    const HostAndPort& currentSource, const OpTime& lastOpTimeFetched) const {
+    MONGO_UNREACHABLE;
+}
+
+OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return _lastCommittedOpTime;
+}
+
+OpTimeAndWallTime ReplicationCoordinatorMock::getLastCommittedOpTimeAndWallTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return {_lastCommittedOpTime, _lastCommittedWallTime};
+}
+
+Status ReplicationCoordinatorMock::processReplSetRequestVotes(
+    OperationContext* opCtx,
+    const ReplSetRequestVotesArgs& args,
+    ReplSetRequestVotesResponse* response) {
+    return Status::OK();
+}
+
+void ReplicationCoordinatorMock::prepareReplMetadata(const GenericArguments& genericArgs,
+                                                     const OpTime& lastOpTimeFromClient,
+                                                     BSONObjBuilder* builder) const {}
+
+Status ReplicationCoordinatorMock::processHeartbeatV1(OperationContext* opCtx,
+                                                      const ReplSetHeartbeatArgsV1& args,
+                                                      ReplSetHeartbeatResponse* response) {
+    return Status::OK();
+}
+
+void ReplicationCoordinatorMock::setWriteConcernMajorityShouldJournal(bool shouldJournal) {
+    _writeConcernMajorityShouldJournal = shouldJournal;
+}
+
+bool ReplicationCoordinatorMock::getWriteConcernMajorityShouldJournal() {
+    return _writeConcernMajorityShouldJournal;
+}
+
+long long ReplicationCoordinatorMock::getTerm() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    return _term;
+}
+
+Status ReplicationCoordinatorMock::updateTerm(OperationContext* opCtx, long long term) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _term = term;
+    return Status::OK();
+}
+
+void ReplicationCoordinatorMock::clearCommittedSnapshot() {}
+
+void ReplicationCoordinatorMock::_setCurrentCommittedSnapshotOpTime(WithLock lk, OpTime time) {
+    _currentCommittedSnapshotOpTime = time;
+}
+
+void ReplicationCoordinatorMock::setCurrentCommittedSnapshotOpTime(OpTime time) {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _setCurrentCommittedSnapshotOpTime(lk, time);
+}
+
+OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return _currentCommittedSnapshotOpTime;
+}
+
+void ReplicationCoordinatorMock::waitUntilSnapshotCommitted(OperationContext* opCtx,
+                                                            const Timestamp& untilSnapshot) {}
+
+void ReplicationCoordinatorMock::createWMajorityWriteAvailabilityDateWaiter(OpTime opTime) {
+    return;
+}
+
+Status ReplicationCoordinatorMock::waitForPrimaryMajorityReadsAvailable(
+    OperationContext* opCtx) const {
+    return Status::OK();
+}
+
+WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptionsSyncMode(
+    WriteConcernOptions wc) {
+    if (wc.syncMode == WriteConcernOptions::SyncMode::UNSET) {
+        if (wc.isMajority() && getWriteConcernMajorityShouldJournal()) {
+            wc.syncMode = WriteConcernOptions::SyncMode::JOURNAL;
+        } else {
+            wc.syncMode = WriteConcernOptions::SyncMode::NONE;
+        }
+    }
+    return wc;
+}
+
+Status ReplicationCoordinatorMock::stepUpIfEligible(OperationContext* opCtx,
+                                                    bool skipDryRun,
+                                                    boost::optional<Date_t>) {
+    return Status::OK();
+}
+
+void ReplicationCoordinatorMock::alwaysAllowWrites(bool allowWrites) {
+    std::lock_guard<std::mutex> lk(_mutex);
+
+    _alwaysAllowWrites = allowWrites;
+}
+
+Status ReplicationCoordinatorMock::abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) {
+    return Status::OK();
+}
+
+void ReplicationCoordinatorMock::incrementNumCatchUpOpsIfCatchingUp(long numOps) {
+    return;
+}
+
+boost::optional<Timestamp> ReplicationCoordinatorMock::getRecoveryTimestamp() {
+    if (_storage) {
+        return _storage->getRecoveryTimestamp(getServiceContext());
+    }
+    return boost::none;
+}
+
+bool ReplicationCoordinatorMock::setContainsArbiter() const {
+    return false;
+}
+
+void ReplicationCoordinatorMock::attemptToAdvanceStableTimestamp() {
+    return;
+}
+
+void ReplicationCoordinatorMock::finishRecoveryIfEligible(OperationContext* opCtx) {
+    return;
+}
+
+void ReplicationCoordinatorMock::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
+    return;
+}
+
+TopologyVersion ReplicationCoordinatorMock::getTopologyVersion() const {
+    return TopologyVersion(repl::instanceId, 0);
+}
+
+void ReplicationCoordinatorMock::incrementTopologyVersion() {
+    return;
+}
+
+SharedSemiFuture<std::shared_ptr<const HelloResponse>>
+ReplicationCoordinatorMock::getHelloResponseFuture(
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion) {
+    auto response =
+        awaitHelloResponse(nullptr, horizonParams, clientTopologyVersion, Date_t::now());
+    return SharedSemiFuture<std::shared_ptr<const HelloResponse>>(
+        std::shared_ptr<const HelloResponse>(response));
+}
+
+std::shared_ptr<const HelloResponse> ReplicationCoordinatorMock::awaitHelloResponse(
+    OperationContext* opCtx,
+    const SplitHorizon::Parameters& horizonParams,
+    boost::optional<TopologyVersion> clientTopologyVersion,
+    boost::optional<Date_t> deadline) {
+    auto config = getConfig();
+    auto response = std::make_shared<HelloResponse>();
+    response->setReplSetVersion(config.getConfigVersion());
+    response->setIsWritablePrimary(true);
+    response->setIsSecondary(false);
+    if (config.getNumMembers() > 0) {
+        for (auto i = 0; i < config.getNumMembers(); ++i) {
+            auto hnp = config.getMemberAt(i).getHostAndPort();
+            response->addHost(hnp);
+            if (i == 0) {
+                response->setMe(hnp);
+                response->setPrimary(hnp);
+            }
+        }
+    } else {
+        response->setMe(HostAndPort::parseThrowing("localhost:27017"));
     }
 
-    void ReplicationCoordinatorMock::setMyLastOptime(const OpTime& ts) {}
+    response->setElectionId(OID::gen());
+    response->setTopologyVersion(TopologyVersion(repl::instanceId, 0));
+    return response;
+}
 
-    void ReplicationCoordinatorMock::resetMyLastOptime() {}
-
-    OpTime ReplicationCoordinatorMock::getMyLastOptime() const {
-        // TODO
-        return OpTime();
+StatusWith<OpTime> ReplicationCoordinatorMock::getLatestWriteOpTime(
+    OperationContext* opCtx) const noexcept {
+    OpTime o = getMyLastWrittenOpTime();
+    if (o.isNull()) {
+        // ErrorCodes::OplogOperationUnsupported allows the status to be transparently upgraded to
+        // OK in setLastOpToSystemLastOpTime.
+        return StatusWith<OpTime>(ErrorCodes::OplogOperationUnsupported,
+                                  "uninitialized lastWritten");
     }
+    return o;
+}
 
+HostAndPort ReplicationCoordinatorMock::getCurrentPrimaryHostAndPort() const {
+    return HostAndPort();
+}
 
-    OID ReplicationCoordinatorMock::getElectionId() {
-        // TODO
-        return OID();
+HostAndPort ReplicationCoordinatorMock::getCurrentPrimaryHostAndPortPriority() const {
+    return HostAndPort();
+}
+
+void ReplicationCoordinatorMock::cancelCbkHandle(
+    executor::TaskExecutor::CallbackHandle activeHandle) {
+    MONGO_UNREACHABLE;
+}
+
+BSONObj ReplicationCoordinatorMock::runCmdOnPrimaryAndAwaitResponse(
+    OperationContext* opCtx,
+    const DatabaseName& dbName,
+    const BSONObj& cmdObj,
+    OnRemoteCmdScheduledFn onRemoteCmdScheduled,
+    OnRemoteCmdCompleteFn onRemoteCmdComplete) {
+    if (_runCmdOnPrimaryAndAwaitResponseFn) {
+        return _runCmdOnPrimaryAndAwaitResponseFn(
+            opCtx, dbName, cmdObj, onRemoteCmdScheduled, onRemoteCmdComplete);
     }
+    return BSON("ok" << 1);
+}
+void ReplicationCoordinatorMock::restartScheduledHeartbeats_forTest() {
+    return;
+}
 
-    OID ReplicationCoordinatorMock::getMyRID() const {
-        return OID();
-    }
+void ReplicationCoordinatorMock::recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) {
+    MONGO_UNREACHABLE;
+}
 
-    int ReplicationCoordinatorMock::getMyId() const {
-        return 0;
-    }
+ReplicationCoordinatorMock::WriteConcernTagChanges*
+ReplicationCoordinatorMock::getWriteConcernTagChanges() {
+    MONGO_UNREACHABLE;
+}
 
-    bool ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) {
-        return true;
-    }
+SplitPrepareSessionManager* ReplicationCoordinatorMock::getSplitPrepareSessionManager() {
+    return &_splitSessionManager;
+}
 
-    bool ReplicationCoordinatorMock::isWaitingForApplierToDrain() {
-        return false;
-    }
+boost::optional<UUID> ReplicationCoordinatorMock::getInitialSyncId(OperationContext* opCtx) {
+    return uassertStatusOK(UUID::parse("00000000-0000-0000-0000-000000000000"));
+}
 
-    void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*) {}
+void ReplicationCoordinatorMock::setConsistentDataAvailable(OperationContext* opCtx,
+                                                            bool isDataMajorityCommitted) {
+    ReplicaSetAwareServiceRegistry::get(opCtx->getServiceContext())
+        .onConsistentDataAvailable(opCtx, isDataMajorityCommitted, getMemberState().rollback());
+}
 
-    void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
+bool ReplicationCoordinatorMock::isDataConsistent() const {
+    // Assume data is always consistent in unittests except during initial sync.
+    return !getMemberState().startup2();
+}
 
-    bool ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
-            BSONObjBuilder* cmdBuilder) {
-        return true;
-    }
+void ReplicationCoordinatorMock::clearSyncSource() {
+    MONGO_UNREACHABLE;
+}
 
-    ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
-        return ReplicaSetConfig();
-    }
-
-    void ReplicationCoordinatorMock::processReplSetGetConfig(BSONObjBuilder* result) {
-        // TODO
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder* result) {
-        return Status::OK();
-    }
-
-    void ReplicationCoordinatorMock::fillIsMasterForReplSet(IsMasterResponse* result) {}
-
-    void ReplicationCoordinatorMock::appendSlaveInfoData(BSONObjBuilder* result) {}
-
-    Status ReplicationCoordinatorMock::setMaintenanceMode(bool activate) {
-        return Status::OK();
-    }
-
-    bool ReplicationCoordinatorMock::getMaintenanceMode() {
-        return false;
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetSyncFrom(const HostAndPort& target,
-                                                              BSONObjBuilder* resultObj) {
-        // TODO
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetFreeze(int secs, BSONObjBuilder* resultObj) {
-        // TODO
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processHeartbeat(const ReplSetHeartbeatArgs& args,
-                                                        ReplSetHeartbeatResponse* response) {
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetReconfig(OperationContext* txn,
-                                                              const ReplSetReconfigArgs& args,
-                                                              BSONObjBuilder* resultObj) {
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetInitiate(OperationContext* txn,
-                                                              const BSONObj& configObj,
-                                                              BSONObjBuilder* resultObj) {
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetGetRBID(BSONObjBuilder* resultObj) {
-        return Status::OK();
-    }
-
-    void ReplicationCoordinatorMock::incrementRollbackID() {}
-
-    Status ReplicationCoordinatorMock::processReplSetFresh(const ReplSetFreshArgs& args,
-                                                           BSONObjBuilder* resultObj) {
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetElect(const ReplSetElectArgs& args,
-                                                           BSONObjBuilder* resultObj) {
-        // TODO
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processReplSetUpdatePosition(
-            const UpdatePositionArgs& updates, long long* configVersion) {
-        // TODO
-        return Status::OK();
-    }
-
-    Status ReplicationCoordinatorMock::processHandshake(OperationContext* txn,  
-                                                        const HandshakeArgs& handshake) {
-        return Status::OK();
-    }
-
-    bool ReplicationCoordinatorMock::buildsIndexes() {
-        // TODO
-        return true;
-    }
-
-    std::vector<HostAndPort> ReplicationCoordinatorMock::getHostsWrittenTo(const OpTime& op) {
-        return std::vector<HostAndPort>();
-    }
-
-    vector<HostAndPort> ReplicationCoordinatorMock::getOtherNodesInReplSet() const {
-        return std::vector<HostAndPort>();
-    }
-
-    Status ReplicationCoordinatorMock::checkIfWriteConcernCanBeSatisfied(
-            const WriteConcernOptions& writeConcern) const {
-        return Status::OK();
-    }
-
-    WriteConcernOptions ReplicationCoordinatorMock::getGetLastErrorDefault() {
-        return WriteConcernOptions();
-    }
-
-    Status ReplicationCoordinatorMock::checkReplEnabledForCommand(BSONObjBuilder* result) {
-        // TODO
-        return Status::OK();
-    }
-
-    HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource() {
-        invariant(false);
-        return HostAndPort();
-    }
-
-    void ReplicationCoordinatorMock::blacklistSyncSource(const HostAndPort& host, Date_t until) {
-        invariant(false);
-    }
-
-    void ReplicationCoordinatorMock::resetLastOpTimeFromOplog(OperationContext* txn) {
-        invariant(false);
-    }
-
-    bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource) {
-        invariant(false);
-    }
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

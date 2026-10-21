@@ -1,0 +1,816 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/write_ops/write_ops_exec.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/write_ops/parsed_writes_common.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/timeseries/timeseries_request_util.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/time_support.h"
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include <boost/cstdint.hpp>
+#include <boost/none.hpp>
+
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+class WriteOpsExecTest : public CatalogTestFixture {
+protected:
+    using CatalogTestFixture::setUp;
+
+    struct DuplicateKeyRetryCase {
+        std::string_view query;
+        std::string_view keyPattern;
+        std::string_view keyValue;
+        // Used instead of 'keyValue' when set, for values that cannot be expressed as JSON.
+        BSONObj keyValueObj;
+        std::string_view queryCollation;
+        std::string_view indexCollation;
+        bool upsert = true;
+        bool multi = false;
+        int retryAttempts = 0;
+    };
+
+    /** Returns whether an upsert failing with the given duplicate key error may be retried. */
+    bool shouldRetryDuplicateKey(const DuplicateKeyRetryCase& testCase) {
+        auto opCtx = operationContext();
+
+        // Build the upsert request.
+        auto modification =
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 1}}"));
+        write_ops::UpdateOpEntry update(fromjson(testCase.query), std::move(modification));
+        update.setUpsert(testCase.upsert);
+        update.setMulti(testCase.multi);
+        if (!testCase.queryCollation.empty()) {
+            update.setCollation(fromjson(testCase.queryCollation));
+        }
+        UpdateRequest request(update);
+        request.setNamespaceString(
+            NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test.retry"));
+
+        // CanonicalQuery reads its collator from the ExpressionContext, so the request
+        // collation must be resolved onto it for the retry check to see it.
+        std::unique_ptr<CollatorInterface> requestCollator;
+        if (const auto& collation = request.getCollation(); !collation.isEmpty()) {
+            const auto& collatorFactory = CollatorFactoryInterface::get(opCtx->getServiceContext());
+            requestCollator = uassertStatusOK(collatorFactory->makeFromBSON(collation));
+        }
+        auto expCtx = ExpressionContextBuilder{}
+                          .fromRequest(opCtx, request)
+                          .collator(std::move(requestCollator))
+                          .build();
+        auto cq = uassertStatusOK(parseWriteQueryToCQ(expCtx.get(), request));
+
+        const auto indexCollation =
+            testCase.indexCollation.empty() ? BSONObj{} : fromjson(testCase.indexCollation);
+        const auto keyValue =
+            testCase.keyValueObj.isEmpty() ? fromjson(testCase.keyValue) : testCase.keyValueObj;
+        DuplicateKeyErrorInfo dupKeyError(
+            fromjson(testCase.keyPattern), keyValue, indexCollation, std::monostate{}, boost::none);
+        return write_ops_exec::shouldRetryDuplicateKeyException(
+            opCtx, request, *cq, dupKeyError, testCase.retryAttempts);
+    }
+};
+
+TEST_F(WriteOpsExecTest, RetryDuplicateKeyWhenEqualitiesMatchKeyValues) {
+    ASSERT_TRUE(shouldRetryDuplicateKey(
+        {.query = "{a: 1, b: 2}", .keyPattern = "{a: 1, b: 1}", .keyValue = "{'': 1, '': 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyForNonUpsertUpdate) {
+    ASSERT_FALSE(shouldRetryDuplicateKey({.query = "{a: 1, b: 2}",
+                                          .keyPattern = "{a: 1, b: 1}",
+                                          .keyValue = "{'': 1, '': 2}",
+                                          .upsert = false}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenMaxRetryAttemptsExceeded) {
+    unittest::ServerParameterGuard maxRetries("upsertMaxRetryAttemptsOnDuplicateKeyError", 1);
+    ASSERT_FALSE(shouldRetryDuplicateKey({.query = "{a: 1, b: 2}",
+                                          .keyPattern = "{a: 1, b: 1}",
+                                          .keyValue = "{'': 1, '': 2}",
+                                          .retryAttempts = 2}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenQueryCoversOnlyPartOfIndexKey) {
+    ASSERT_FALSE(shouldRetryDuplicateKey(
+        {.query = "{a: 1}", .keyPattern = "{a: 1, b: 1}", .keyValue = "{'': 1, '': 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyForNonEqualityQuery) {
+    ASSERT_FALSE(shouldRetryDuplicateKey(
+        {.query = "{a: {$gt: 1}}", .keyPattern = "{a: 1, b: 1}", .keyValue = "{'': 1, '': 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenKeyValuesMismatch) {
+    ASSERT_FALSE(shouldRetryDuplicateKey(
+        {.query = "{a: 1, b: 2}", .keyPattern = "{a: 1, b: 1}", .keyValue = "{'': 1, '': 3}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyForMultiUpdate) {
+    ASSERT_FALSE(shouldRetryDuplicateKey({.query = "{a: 1, b: 2}",
+                                          .keyPattern = "{a: 1, b: 1}",
+                                          .keyValue = "{'': 1, '': 2}",
+                                          .multi = true}));
+}
+
+TEST_F(WriteOpsExecTest, RetryDuplicateKeyWithMatchingCollation) {
+    // A collated index stores collation comparison strings as keys, so the duplicate key error
+    // reports the comparison string of the offending value rather than the value itself.
+    const auto collator =
+        uassertStatusOK(CollatorFactoryInterface::get(operationContext()->getServiceContext())
+                            ->makeFromBSON(fromjson("{locale: 'en', strength: 2}")));
+    // A case-insensitive collator makes 'foo' equal to 'FOO'.
+    ASSERT_TRUE(
+        shouldRetryDuplicateKey({.query = "{a: 'foo'}",
+                                 .keyPattern = "{a: 1}",
+                                 .keyValueObj = BSON("" << collator->getComparisonString("FOO")),
+                                 .queryCollation = "{locale: 'en', strength: 2}",
+                                 .indexCollation = "{locale: 'en', strength: 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenCollatedKeyValueDiffers) {
+    const auto collator =
+        uassertStatusOK(CollatorFactoryInterface::get(operationContext()->getServiceContext())
+                            ->makeFromBSON(fromjson("{locale: 'en', strength: 2}")));
+    ASSERT_FALSE(
+        shouldRetryDuplicateKey({.query = "{a: 'foo'}",
+                                 .keyPattern = "{a: 1}",
+                                 .keyValueObj = BSON("" << collator->getComparisonString("bar")),
+                                 .queryCollation = "{locale: 'en', strength: 2}",
+                                 .indexCollation = "{locale: 'en', strength: 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenQueryAndIndexCollationsDiffer) {
+    ASSERT_FALSE(shouldRetryDuplicateKey({.query = "{a: 'foo'}",
+                                          .keyPattern = "{a: 1}",
+                                          .keyValue = "{'': 'foo'}",
+                                          .queryCollation = "{locale: 'en', strength: 2}",
+                                          .indexCollation = "{locale: 'fr', strength: 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenOnlyQueryHasCollation) {
+    ASSERT_FALSE(shouldRetryDuplicateKey({.query = "{a: 'foo'}",
+                                          .keyPattern = "{a: 1}",
+                                          .keyValue = "{'': 'foo'}",
+                                          .queryCollation = "{locale: 'en', strength: 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, DoNotRetryDuplicateKeyWhenOnlyIndexHasCollation) {
+    ASSERT_FALSE(shouldRetryDuplicateKey({.query = "{a: 'foo'}",
+                                          .keyPattern = "{a: 1}",
+                                          .keyValue = "{'': 'foo'}",
+                                          .indexCollation = "{locale: 'en', strength: 2}"}));
+}
+
+TEST_F(WriteOpsExecTest, TestUpdateSizeEstimationLogic) {
+    // Basic test case.
+    OID id = OID::createFromString("629e1e680958e279dc29a989"sv);
+    BSONObj updateStmt = fromjson("{$set: {a: 5}}");
+    write_ops::UpdateModification mod(std::move(updateStmt));
+    write_ops::UpdateOpEntry updateOpEntry(BSON("_id" << id), std::move(mod));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add 'let' constants.
+    BSONObj constants = fromjson("{constOne: 'foo'}");
+    updateOpEntry.setC(constants);
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add 'upsertSupplied'.
+    updateOpEntry.setUpsertSupplied(OptionalBool(false));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Set 'upsertSupplied' to true.
+    updateOpEntry.setUpsertSupplied(OptionalBool(true));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Set 'upsertSupplied' to boost::none.
+    updateOpEntry.setUpsertSupplied(OptionalBool(boost::none));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add a collation.
+    BSONObj collation = fromjson("{locale: 'simple'}");
+    updateOpEntry.setCollation(collation);
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add a hint.
+    BSONObj hint = fromjson("{_id: 1}");
+    updateOpEntry.setHint(hint);
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add a sort.
+    BSONObj sort = fromjson("{a: 1}");
+    updateOpEntry.setSort(sort);
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add arrayFilters.
+    auto arrayFilter = std::vector<BSONObj>{fromjson("{'x.a': {$gt: 85}}")};
+    updateOpEntry.setArrayFilters(arrayFilter);
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add a sampleId.
+    updateOpEntry.setSampleId(UUID::gen());
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Add $_allowShardKeyUpdatesWithoutFullShardKeyInQuery.
+    updateOpEntry.setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(OptionalBool(false));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Set '$_allowShardKeyUpdatesWithoutFullShardKeyInQuery' to true.
+    updateOpEntry.setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(OptionalBool(true));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+
+    // Set '$_allowShardKeyUpdatesWithoutFullShardKeyInQuery' to boost::none.
+    updateOpEntry.setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(OptionalBool(boost::none));
+    ASSERT(write_ops::verifySizeEstimate(updateOpEntry));
+}
+
+TEST_F(WriteOpsExecTest, TestDeleteSizeEstimationLogic) {
+    // Basic test case.
+    OID id = OID::createFromString("629e1e680958e279dc29a989"sv);
+    write_ops::DeleteOpEntry deleteOpEntry(BSON("_id" << id), false /* multi */);
+    ASSERT(write_ops::verifySizeEstimate(deleteOpEntry));
+
+    // Add a collation.
+    BSONObj collation = fromjson("{locale: 'simple'}");
+    deleteOpEntry.setCollation(collation);
+    ASSERT(write_ops::verifySizeEstimate(deleteOpEntry));
+
+    // Add a hint.
+    BSONObj hint = fromjson("{_id: 1}");
+    deleteOpEntry.setHint(hint);
+    ASSERT(write_ops::verifySizeEstimate(deleteOpEntry));
+
+    // Add a sampleId.
+    deleteOpEntry.setSampleId(UUID::gen());
+    ASSERT(write_ops::verifySizeEstimate(deleteOpEntry));
+
+    // Add includeQueryStatsMetricsForOpIndex.
+    deleteOpEntry.setIncludeQueryStatsMetricsForOpIndex(42);
+    ASSERT(write_ops::verifySizeEstimate(deleteOpEntry));
+
+    // Remove includeQueryStatsMetricsForOpIndex.
+    deleteOpEntry.setIncludeQueryStatsMetricsForOpIndex(boost::none);
+    ASSERT(write_ops::verifySizeEstimate(deleteOpEntry));
+}
+
+TEST_F(WriteOpsExecTest, TestInsertRequestSizeEstimationLogic) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insert_test");
+    write_ops::InsertCommandRequest insert(ns);
+    BSONObj docToInsert(fromjson("{_id: 1, foo: 1}"));
+    insert.setDocuments({docToInsert});
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // Configure different fields for 'wcb'.
+    write_ops::WriteCommandRequestBase wcb;
+
+    // stmtId
+    wcb.setStmtId(2);
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // stmtIds
+    wcb.setStmtIds(std::vector<int32_t>{2, 3});
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // isTimeseries
+    wcb.setIsTimeseriesNamespace(true);
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // collUUID
+    wcb.setCollectionUUID(UUID::gen());
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // encryptionInfo
+    wcb.setEncryptionInformation(
+        EncryptionInformation(fromjson("{schema: 'I love encrypting and protecting my data'}")));
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // originalQuery
+    wcb.setOriginalQuery(fromjson("{field: 'value'}"));
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // originalCollation
+    wcb.setOriginalCollation(fromjson("{locale: 'fr'}"));
+    insert.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+
+    // includeQueryStatsMetrics
+    insert.setIncludeQueryStatsMetrics(true);
+    ASSERT(write_ops::verifySizeEstimate(insert));
+}
+
+TEST_F(WriteOpsExecTest, TestUpdateRequestSizeEstimationLogic) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "update_test");
+    write_ops::UpdateCommandRequest update(ns);
+
+    const BSONObj updateStmt = fromjson("{$set: {a: 5}}");
+    auto mod = write_ops::UpdateModification::parseFromClassicUpdate(updateStmt);
+    write_ops::UpdateOpEntry updateOpEntry(BSON("_id" << 1), std::move(mod));
+    update.setUpdates({updateOpEntry});
+
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // Configure different fields for 'wcb'.
+    write_ops::WriteCommandRequestBase wcb;
+
+    // stmtId
+    wcb.setStmtId(2);
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // stmtIds
+    wcb.setStmtIds(std::vector<int32_t>{2, 3});
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // isTimeseries
+    wcb.setIsTimeseriesNamespace(true);
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // collUUID
+    wcb.setCollectionUUID(UUID::gen());
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // encryptionInfo
+    wcb.setEncryptionInformation(
+        EncryptionInformation(fromjson("{schema: 'I love encrypting and protecting my data'}")));
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // originalQuery
+    wcb.setOriginalQuery(fromjson("{field: 'value'}"));
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // originalCollation
+    wcb.setOriginalCollation(fromjson("{locale: 'fr'}"));
+    update.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // Configure different fields specific to 'UpdateStatementRequest'.
+    LegacyRuntimeConstants legacyRuntimeConstants;
+    const auto now = Date_t::now();
+
+    // At a minimum, $$NOW and $$CLUSTER_TIME must be set.
+    legacyRuntimeConstants.setLocalNow(now);
+    legacyRuntimeConstants.setClusterTime(Timestamp(now));
+    update.setLegacyRuntimeConstants(legacyRuntimeConstants);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // $$JS_SCOPE
+    BSONObj jsScope = fromjson("{constant: 'I love mapReduce and javascript :D'}");
+    legacyRuntimeConstants.setJsScope(jsScope);
+    update.setLegacyRuntimeConstants(legacyRuntimeConstants);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // $$IS_MR
+    legacyRuntimeConstants.setIsMapReduce(true);
+    update.setLegacyRuntimeConstants(legacyRuntimeConstants);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    // $$USER_ROLES
+    std::vector<BSONObj> roles = {fromjson("{role: 'readWriteAnyDatabase', db: 'admin'}")};
+    legacyRuntimeConstants.setUserRoles(roles);
+    update.setLegacyRuntimeConstants(legacyRuntimeConstants);
+    ASSERT(write_ops::verifySizeEstimate(update));
+
+    const std::string kLargeString(100 * 1024, 'b');
+    BSONObj letParams = BSON("largeStrParam" << kLargeString);
+    update.setLet(letParams);
+    ASSERT(write_ops::verifySizeEstimate(update));
+}
+
+TEST_F(WriteOpsExecTest, TestDeleteRequestSizeEstimationLogic) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "delete_test");
+    write_ops::DeleteCommandRequest deleteReq(ns);
+    // Basic test case.
+    write_ops::DeleteOpEntry deleteOpEntry(BSON("_id" << 1), false /* multi */);
+    deleteReq.setDeletes({deleteOpEntry});
+
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // Configure different fields for 'wcb'.
+    write_ops::WriteCommandRequestBase wcb;
+
+    // stmtId
+    wcb.setStmtId(2);
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // stmtIds
+    wcb.setStmtIds(std::vector<int32_t>{2, 3});
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // isTimeseries
+    wcb.setIsTimeseriesNamespace(true);
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // collUUID
+    wcb.setCollectionUUID(UUID::gen());
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // encryptionInfo
+    wcb.setEncryptionInformation(
+        EncryptionInformation(fromjson("{schema: 'I love encrypting and protecting my data'}")));
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // originalQuery
+    wcb.setOriginalQuery(fromjson("{field: 'value'}"));
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // originalCollation
+    wcb.setOriginalCollation(fromjson("{locale: 'fr'}"));
+    deleteReq.setWriteCommandRequestBase(wcb);
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // includeQueryStatsMetricsForOpIndex
+    deleteOpEntry.setIncludeQueryStatsMetricsForOpIndex(0);
+    deleteReq.setDeletes({deleteOpEntry});
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+
+    // Remove includeQueryStatsMetricsForOpIndex.
+    deleteOpEntry.setIncludeQueryStatsMetricsForOpIndex(boost::none);
+    deleteReq.setDeletes({deleteOpEntry});
+    ASSERT(write_ops::verifySizeEstimate(deleteReq));
+}
+
+TEST_F(WriteOpsExecTest, InsertFailsIfTimeseriesCollectionCreatedDuringInsert) {
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insertColl");
+    auto opCtx = operationContext();
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    BSONObj docToInsert(fromjson(R"({"t":{"$date":"2022-06-06T15:34:00.000Z"}, "x":1})"));
+    insertCmdReq.setDocuments({docToInsert});
+    // At this point, our collection does not exist, so we proceed to the normal insert path.
+    auto [preConditions, _] = timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
+        opCtx, ns, insertCmdReq, /*expectedUUID=*/boost::none);
+    ASSERT_FALSE(preConditions.isTimeseriesCollection());
+    ASSERT_FALSE(preConditions.exists());
+    // After this check, a concurrent operation could create a time-series collection with the same
+    // namespace.
+    auto tsOptions = TimeseriesOptions("t");
+    CreateCommand cmd = CreateCommand(ns);
+    cmd.getCreateCollectionRequest().setTimeseries(std::move(tsOptions));
+    ASSERT_OK(createCollection(opCtx, cmd));
+
+    write_ops_exec::LastOpFixer lastOpFixer(opCtx);
+    write_ops_exec::WriteResult out;
+    std::vector<InsertStatement> batch;
+    for (auto&& doc : insertCmdReq.getDocuments()) {
+        batch.emplace_back(std::vector<StmtId>{0}, doc);
+    }
+
+    // Now when we try to insert into the collection "ns", we should fail because we detect that a
+    // time-series collection was created with this same namespace. This prevents us from writing to
+    // the time-series collection as if it were a normal collection, which would result in a
+    // collection that has both bucket documents and regular documents.
+    ASSERT_THROWS_CODE(insertBatchAndHandleErrors(opCtx,
+                                                  insertCmdReq.getNamespace(),
+                                                  preConditions,
+                                                  insertCmdReq.getOrdered(),
+                                                  batch,
+                                                  OperationSource::kStandard,
+                                                  &lastOpFixer,
+                                                  &out),
+                       DBException,
+                       10685100);
+}
+
+TEST_F(WriteOpsExecTest, UpdateAppendsMetricsWhenRequested) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "updateColl");
+    auto opCtx = operationContext();
+
+    // Create the collection and insert 5 documents.
+    ASSERT_OK(createCollection(opCtx, ns.dbName(), BSON("create" << ns.coll())));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    std::vector<BSONObj> docsToInsert{fromjson("{_id: 0, x: 0}"),
+                                      fromjson("{_id: 1, x: 1}"),
+                                      fromjson("{_id: 2, x: 2}"),
+                                      fromjson("{_id: 3, x: 3}"),
+                                      fromjson("{_id: 4, x: 4}")};
+    insertCmdReq.setDocuments(docsToInsert);
+    auto insertResult = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(5, insertResult.results.size());
+
+    // Build 5 UpdateOpEntry instances. Request metrics for indices 1 and 3.
+    std::vector<write_ops::UpdateOpEntry> updateOps;
+    for (int i = 0; i < 5; ++i) {
+        auto mod = write_ops::UpdateModification::parseFromClassicUpdate(BSON("x" << (i * 10)));
+        write_ops::UpdateOpEntry entry(BSON("x" << i), std::move(mod));
+        if (i == 1 || i == 3) {
+            // Here we are saying that the i-th entry sent to a shard coorespondes to the
+            // (200 + i)th entry in the original batch that arrived at the router. The router sets
+            // this field when requesting metrics from update statements sent to shards.
+            entry.setIncludeQueryStatsMetricsForOpIndex(200 + i);
+        }
+        updateOps.push_back(std::move(entry));
+    }
+
+    write_ops::UpdateCommandRequest updateCmdReq{ns, std::move(updateOps)};
+    auto updateResult = write_ops_exec::performUpdates(
+        opCtx, updateCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+
+    // Verify all 5 updates succeeded.
+    ASSERT_EQ(updateCmdReq.getUpdates().size(), updateResult.results.size());
+    for (const auto& result : updateResult.results) {
+        ASSERT_OK(result.getStatus());
+        ASSERT_EQ(1, result.getValue().getN());
+    }
+
+    // Verify that metrics are present only for indices 1 and 3.
+    ASSERT_FALSE(updateResult.results[0].getValue().getQueryStatsMetrics().has_value());
+    ASSERT_EQ(updateResult.results[1].getValue().getQueryStatsMetrics()->getOriginalOpIndex(), 201);
+    ASSERT_FALSE(updateResult.results[2].getValue().getQueryStatsMetrics().has_value());
+    ASSERT_EQ(updateResult.results[3].getValue().getQueryStatsMetrics()->getOriginalOpIndex(), 203);
+    ASSERT_FALSE(updateResult.results[4].getValue().getQueryStatsMetrics().has_value());
+}
+
+TEST_F(WriteOpsExecTest, DeleteAppendsMetricsWhenRequested) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "deleteColl");
+    auto opCtx = operationContext();
+
+    // Create the collection and insert 5 documents.
+    ASSERT_OK(createCollection(opCtx, ns.dbName(), BSON("create" << ns.coll())));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    insertCmdReq.setDocuments({fromjson("{_id: 0, x: 0}"),
+                               fromjson("{_id: 1, x: 1}"),
+                               fromjson("{_id: 2, x: 2}"),
+                               fromjson("{_id: 3, x: 3}"),
+                               fromjson("{_id: 4, x: 4}")});
+    auto insertResult = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(5, insertResult.results.size());
+
+    // Build 5 DeleteOpEntry instances. Request metrics for indices 1 and 3.
+    std::vector<write_ops::DeleteOpEntry> deleteOps;
+    for (int i = 0; i < 5; ++i) {
+        write_ops::DeleteOpEntry entry;
+        entry.setQ(BSON("_id" << i));
+        entry.setMulti(false);
+        if (i == 1 || i == 3) {
+            // Simulate the router setting this field to request metrics from the shard.
+            // The value (200 + i) represents the op's index in the original router batch.
+            entry.setIncludeQueryStatsMetricsForOpIndex(200 + i);
+        }
+        deleteOps.push_back(std::move(entry));
+    }
+
+    write_ops::DeleteCommandRequest deleteCmdReq{ns, std::move(deleteOps)};
+    auto deleteResult = write_ops_exec::performDeletes(
+        opCtx, deleteCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+
+    // Verify all 5 deletes succeeded.
+    ASSERT_EQ(deleteCmdReq.getDeletes().size(), deleteResult.results.size());
+    for (const auto& result : deleteResult.results) {
+        ASSERT_OK(result.getStatus());
+        ASSERT_EQ(1, result.getValue().getN());
+    }
+
+    // Verify that metrics are present only for indices 1 and 3.
+    ASSERT_FALSE(deleteResult.results[0].getValue().getQueryStatsMetrics().has_value());
+    ASSERT_EQ(deleteResult.results[1].getValue().getQueryStatsMetrics()->getOriginalOpIndex(), 201);
+    ASSERT_FALSE(deleteResult.results[2].getValue().getQueryStatsMetrics().has_value());
+    ASSERT_EQ(deleteResult.results[3].getValue().getQueryStatsMetrics()->getOriginalOpIndex(), 203);
+    ASSERT_FALSE(deleteResult.results[4].getValue().getQueryStatsMetrics().has_value());
+}
+
+class OpObserverMock : public OpObserverNoop {
+public:
+    ~OpObserverMock() override {
+        ASSERT_FALSE(inBatch);
+    }
+
+    void onBatchedWriteStart(OperationContext* opCtx) override {
+        ASSERT_FALSE(inBatch);
+        inBatch = true;
+    }
+
+    void onBatchedWriteCommit(OperationContext* opCtx,
+                              WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+                              OpStateAccumulator* opStateAccumulator = nullptr) override {
+        ASSERT(inBatch);
+        inBatch = false;
+        batches.push_back(std::move(current_batch_docs));
+    }
+
+    void onBatchedWriteAbort(OperationContext* opCtx) override {
+        current_batch_docs.clear();
+        inBatch = false;
+    }
+
+    void onInserts(OperationContext* opCtx,
+                   const CollectionPtr& coll,
+                   std::vector<InsertStatement>::const_iterator begin,
+                   std::vector<InsertStatement>::const_iterator end,
+                   const std::vector<RecordId>& recordIds,
+                   const std::vector<bool>& fromMigrate,
+                   bool defaultFromMigrate,
+                   OpStateAccumulator* opAccumulator) override {
+        auto& dest = inBatch ? current_batch_docs : unbatched_docs;
+        std::for_each(begin, end, [&](const auto& insert) { dest.push_back(insert.doc); });
+    }
+
+    bool inBatch = false;
+    std::vector<BSONObj> current_batch_docs;
+    std::vector<BSONObj> unbatched_docs;
+    std::vector<std::vector<BSONObj>> batches;
+};
+
+class WriteOpsExecOplogTest : public CatalogTestFixture {
+public:
+    explicit WriteOpsExecOplogTest(Options options = {})
+        : CatalogTestFixture(options.useReplSettings(true)) {}
+
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+        auto opObserverRegistry =
+            checked_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
+        auto opObserverMock = std::make_unique<OpObserverMock>();
+        _opObserverMock = opObserverMock.get();
+        opObserverRegistry->addObserver(std::move(opObserverMock));
+    }
+
+    OpObserverMock* _opObserverMock;
+};
+
+TEST_F(WriteOpsExecOplogTest, VerifySingleInsertOplogDoesntBatch) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insertColl");
+    auto opCtx = operationContext();
+    ASSERT_OK(createCollection(opCtx, ns.dbName(), BSON("create" << ns.coll())));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    BSONObj docToInsert(fromjson("{_id: 0, foo: 1}"));
+    insertCmdReq.setDocuments({docToInsert});
+    auto result = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(1, result.results.size());
+    ASSERT_EQ(1, unittest::assertGet(result.results[0]).getN());
+
+    // We should have generated an unbatched insert.
+    ASSERT(_opObserverMock->batches.empty());
+    ASSERT_EQ(1, _opObserverMock->unbatched_docs.size());
+    ASSERT_BSONOBJ_EQ(_opObserverMock->unbatched_docs[0], docToInsert);
+}
+
+TEST_F(WriteOpsExecOplogTest, VerifyMultiInsertOplogDoesBatch) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insertColl");
+    auto opCtx = operationContext();
+    ASSERT_OK(createCollection(opCtx, ns.dbName(), BSON("create" << ns.coll())));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    std::vector<BSONObj> docsToInsert{
+        fromjson("{_id: 0, foo: 1}"), fromjson("{_id: 1, bar: 1}"), fromjson("{_id: 2, baz: 1}")};
+    insertCmdReq.setDocuments(docsToInsert);
+    auto result = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(3, result.results.size());
+    ASSERT_EQ(1, unittest::assertGet(result.results[0]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[1]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[2]).getN());
+
+    // We should have generated batched inserts.
+    ASSERT_EQ(1, _opObserverMock->batches.size());
+    ASSERT_EQ(3, _opObserverMock->batches[0].size());
+    ASSERT(_opObserverMock->unbatched_docs.empty());
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][0], docsToInsert[0]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][1], docsToInsert[1]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][2], docsToInsert[2]);
+}
+
+TEST_F(WriteOpsExecOplogTest, VerifyMultiInsertCappedOplogDoesntBatch) {
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insertColl");
+    auto opCtx = operationContext();
+    ASSERT_OK(createCollection(opCtx,
+                               ns.dbName(),
+                               BSON("create" << ns.coll() << "capped"
+                                             << "true"
+                                             << "size" << 10'000'000)));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    std::vector<BSONObj> docsToInsert{
+        fromjson("{_id: 0, foo: 1}"), fromjson("{_id: 1, bar: 1}"), fromjson("{_id: 2, baz: 1}")};
+    insertCmdReq.setDocuments(docsToInsert);
+    auto result = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(3, result.results.size());
+    ASSERT_EQ(1, unittest::assertGet(result.results[0]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[1]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[2]).getN());
+
+    // We should have generated unbatched inserts.
+    ASSERT(_opObserverMock->batches.empty());
+    ASSERT_EQ(3, _opObserverMock->unbatched_docs.size());
+    ASSERT_BSONOBJ_EQ(_opObserverMock->unbatched_docs[0], docsToInsert[0]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->unbatched_docs[1], docsToInsert[1]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->unbatched_docs[2], docsToInsert[2]);
+}
+
+TEST_F(WriteOpsExecOplogTest, VerifyMultiInsertMultipleBatches) {
+    unittest::ServerParameterGuard batchSizeController("internalInsertMaxBatchSize", 2);
+
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insertColl");
+    auto opCtx = operationContext();
+    ASSERT_OK(createCollection(opCtx, ns.dbName(), BSON("create" << ns.coll())));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    std::vector<BSONObj> docsToInsert{fromjson("{_id: 0, foo: 1}"),
+                                      fromjson("{_id: 1, bar: 1}"),
+                                      fromjson("{_id: 2, baz: 1}"),
+                                      fromjson("{_id: 3, bif: 1}")};
+    insertCmdReq.setDocuments(docsToInsert);
+    auto result = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(4, result.results.size());
+    ASSERT_EQ(1, unittest::assertGet(result.results[0]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[1]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[2]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[3]).getN());
+
+    // We should have generated batched inserts in two batches.
+    ASSERT_EQ(2, _opObserverMock->batches.size());
+    ASSERT_EQ(2, _opObserverMock->batches[0].size());
+    ASSERT_EQ(2, _opObserverMock->batches[1].size());
+    ASSERT(_opObserverMock->unbatched_docs.empty());
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][0], docsToInsert[0]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][1], docsToInsert[1]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[1][0], docsToInsert[2]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[1][1], docsToInsert[3]);
+}
+
+TEST_F(WriteOpsExecOplogTest, VerifyMultiInsertBatchedAndUnbatched) {
+    unittest::ServerParameterGuard batchSizeController("internalInsertMaxBatchSize", 2);
+
+    NamespaceString ns =
+        NamespaceString::createNamespaceString_forTest("db_write_ops_exec_test", "insertColl");
+    auto opCtx = operationContext();
+    ASSERT_OK(createCollection(opCtx, ns.dbName(), BSON("create" << ns.coll())));
+    write_ops::InsertCommandRequest insertCmdReq(ns);
+    std::vector<BSONObj> docsToInsert{
+        fromjson("{_id: 0, foo: 1}"), fromjson("{_id: 1, bar: 1}"), fromjson("{_id: 2, baz: 1}")};
+    insertCmdReq.setDocuments(docsToInsert);
+    auto result = write_ops_exec::performInserts(
+        opCtx, insertCmdReq, /*preConditions=*/boost::none, OperationSource::kStandard);
+    ASSERT_EQ(3, result.results.size());
+    ASSERT_EQ(1, unittest::assertGet(result.results[0]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[1]).getN());
+    ASSERT_EQ(1, unittest::assertGet(result.results[2]).getN());
+
+    // We should have generated one batch with two inserts, with a single insert unbatched.
+    ASSERT_EQ(1, _opObserverMock->batches.size());
+    ASSERT_EQ(2, _opObserverMock->batches[0].size());
+    ASSERT_EQ(1, _opObserverMock->unbatched_docs.size());
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][0], docsToInsert[0]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->batches[0][1], docsToInsert[1]);
+    ASSERT_BSONOBJ_EQ(_opObserverMock->unbatched_docs[0], docsToInsert[2]);
+}
+
+}  // namespace
+}  // namespace mongo

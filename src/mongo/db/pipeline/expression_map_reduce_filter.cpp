@@ -1,0 +1,464 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/expression/evaluate.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_walker.h"
+#include "mongo/db/pipeline/variable_validation.h"
+#include "mongo/util/intrusive_counter.h"
+
+#include <string_view>
+
+namespace mongo {
+
+namespace {
+
+template <typename VisitorType>
+class ExpressionWalker final {
+public:
+    ExpressionWalker(VisitorType* visitor) : _visitor{visitor} {}
+
+    void postVisit(const Expression* expr) {
+        expr->acceptVisitor(_visitor);
+    }
+
+private:
+    VisitorType* _visitor;
+};
+
+// Traverse Expression sub-tree and fill usedVariables set with ids of all used variables.
+// This is used later to remove unused variable declarations.
+void findUsedVariables(const boost::intrusive_ptr<Expression>& root,
+                       std::set<Variables::Id>& usedVariables) {
+    FieldPathVisitor visitor(
+        [&](const ExpressionFieldPath* expr) { usedVariables.insert(expr->getVariableId()); });
+    ExpressionWalker walker(&visitor);
+    expression_walker::walk(root.get(), &walker);
+}
+
+}  // namespace
+
+/* ------------------------- ExpressionMap ----------------------------- */
+
+REGISTER_STABLE_EXPRESSION(map, ExpressionMap::parse);
+boost::intrusive_ptr<Expression> ExpressionMap::parse(ExpressionContext* const expCtx,
+                                                      BSONElement expr,
+                                                      const VariablesParseState& vpsIn) {
+    MONGO_verify(expr.fieldNameStringData() == "$map");
+    uassert(16878, "$map only supports an object as its argument", expr.type() == BSONType::object);
+    expCtx->checkAndIncrementMemoryIntensiveExprCount(expr.fieldNameStringData());
+
+
+    const bool isExposeArrayIndexEnabled = expCtx->shouldParserIgnoreFeatureFlagCheck() ||
+        feature_flags::gFeatureFlagExposeArrayIndexInMapFilterReduce
+            .isEnabledUseLastLTSFCVWhenUninitialized(
+                expCtx->getVersionContext(),
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+
+    // "in" must be parsed after "as" regardless of BSON order.
+    BSONElement inputElem;
+    BSONElement asElem;
+    BSONElement inElem;
+    BSONElement arrayIndexAsElem;
+    const BSONObj args = expr.embeddedObject();
+    for (auto&& arg : args) {
+        if (arg.fieldNameStringData() == "input") {
+            inputElem = arg;
+        } else if (arg.fieldNameStringData() == "as") {
+            asElem = arg;
+        } else if (arg.fieldNameStringData() == "in") {
+            inElem = arg;
+        } else if (isExposeArrayIndexEnabled && arg.fieldNameStringData() == "arrayIndexAs") {
+            assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                           "arrayIndexAs argument of $map operator",
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           AllowedWithClientType::kAny);
+            arrayIndexAsElem = arg;
+        } else {
+            uasserted(16879,
+                      str::stream() << "Unrecognized parameter to $map: " << arg.fieldName());
+        }
+    }
+
+    uassert(16880, "Missing 'input' parameter to $map", !inputElem.eoo());
+    uassert(16882, "Missing 'in' parameter to $map", !inElem.eoo());
+
+    // "vpsSub" gets our variables, "vpsIn" doesn't.
+    VariablesParseState vpsSub(vpsIn);
+
+    // Parse "as". If "as" is not specified, then use "this" by default.
+    auto varName = asElem.eoo() ? "this" : asElem.str();
+
+    variableValidation::validateNameForUserWrite(varName);
+    Variables::Id varId = vpsSub.defineVariable(varName);
+
+    // Parse "arrayIndexAs". If "arrayIndexAs" is not specified, then write to "IDX" by default.
+    boost::optional<std::string> idxName;
+    boost::optional<Variables::Id> idxId;
+    if (isExposeArrayIndexEnabled) {
+        if (arrayIndexAsElem) {
+            idxName = arrayIndexAsElem.str();
+            variableValidation::validateNameForUserWrite(*idxName);
+
+            uassert(
+                9375801, "'as' and 'arrayIndexAs' cannot have the same name", varName != idxName);
+        }
+        idxId = vpsSub.defineVariable(!idxName ? "IDX" : *idxName);
+    }
+
+    return make_intrusive<ExpressionMap>(
+        expCtx,
+        std::move(varName),
+        varId,
+        std::move(idxName),
+        idxId,
+        parseOperand(expCtx, inputElem, vpsIn),  // Only has access to outer vars.
+        parseOperand(expCtx, inElem, vpsSub)     // Has access to "as" and "arrayIndexAs" vars.
+    );
+}
+
+ExpressionMap::ExpressionMap(ExpressionContext* const expCtx,
+                             const std::string& varName,
+                             Variables::Id varId,
+                             const boost::optional<std::string>& idxName,
+                             const boost::optional<Variables::Id>& idxId,
+                             boost::intrusive_ptr<Expression> input,
+                             boost::intrusive_ptr<Expression> each)
+    : Expression(expCtx, {std::move(input), std::move(each)}),
+      _varName(varName),
+      _varId(varId),
+      _idxName(std::move(idxName)),
+      _idxId(idxId) {
+    expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+}
+
+boost::intrusive_ptr<Expression> ExpressionMap::optimize() {
+    if (_idxId) {
+        std::set<Variables::Id> usedVariables;
+        findUsedVariables(_children[_kEach], usedVariables);
+        if (!usedVariables.contains(*_idxId))
+            _idxId.reset();
+    }
+
+    // TODO(SERVER-111215) handle when _input is constant
+    _children[_kInput] = _children[_kInput]->optimize();
+    _children[_kEach] = _children[_kEach]->optimize();
+    return this;
+}
+
+Value ExpressionMap::serialize(const query_shape::SerializationOptions& options) const {
+    return Value(
+        Document{{"$map",
+                  Document{{"input", _children[_kInput]->serialize(options)},
+                           {"as", options.serializeIdentifier(_varName)},
+                           {"arrayIndexAs",
+                            _idxName ? Value(options.serializeIdentifier(*_idxName)) : Value()},
+                           {"in", _children[_kEach]->serialize(options)}}}});
+}
+
+Value ExpressionMap::evaluate(const Document& root,
+                              Variables* variables,
+                              const EvaluationContext& ctx) const {
+    return exec::expression::evaluate(*this, root, variables, ctx);
+}
+
+/* ------------------------ ExpressionReduce ------------------------------ */
+
+REGISTER_STABLE_EXPRESSION(reduce, ExpressionReduce::parse);
+boost::intrusive_ptr<Expression> ExpressionReduce::parse(ExpressionContext* const expCtx,
+                                                         BSONElement expr,
+                                                         const VariablesParseState& vps) {
+    uassert(40075,
+            str::stream() << "$reduce requires an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == BSONType::object);
+    expCtx->checkAndIncrementMemoryIntensiveExprCount(expr.fieldNameStringData());
+
+    const bool isExposeArrayIndexEnabled = expCtx->shouldParserIgnoreFeatureFlagCheck() ||
+        feature_flags::gFeatureFlagExposeArrayIndexInMapFilterReduce
+            .isEnabledUseLastLTSFCVWhenUninitialized(
+                expCtx->getVersionContext(),
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+
+    BSONElement inputElem;
+    BSONElement initialElem;
+    BSONElement inElem;
+    BSONElement asElem;
+    BSONElement valueAsElem;
+    BSONElement arrayIndexAsElem;
+
+    for (auto&& elem : expr.Obj()) {
+        auto field = elem.fieldNameStringData();
+        if (field == "input") {
+            inputElem = elem;
+        } else if (field == "initialValue") {
+            initialElem = elem;
+        } else if (field == "in") {
+            inElem = elem;
+        } else if (isExposeArrayIndexEnabled && field == "as") {
+            assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                           "as argument of $reduce operator",
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           AllowedWithClientType::kAny);
+            asElem = elem;
+        } else if (isExposeArrayIndexEnabled && field == "valueAs") {
+            assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                           "valueAs argument of $reduce operator",
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           AllowedWithClientType::kAny);
+            valueAsElem = elem;
+        } else if (isExposeArrayIndexEnabled && field == "arrayIndexAs") {
+            assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                           "arrayIndexAs argument of $reduce operator",
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           AllowedWithClientType::kAny);
+            arrayIndexAsElem = elem;
+        } else {
+            uasserted(40076, str::stream() << "$reduce found an unknown argument: " << field);
+        }
+    }
+    uassert(40077, "$reduce requires 'input' to be specified", inputElem);
+    uassert(40078, "$reduce requires 'initialValue' to be specified", initialElem);
+    uassert(40079, "$reduce requires 'in' to be specified", inElem);
+
+    // "vpsSub" gets our variables, "vps" doesn't.
+    VariablesParseState vpsSub(vps);
+
+    auto parseVariableDefinition = [&vpsSub](const BSONElement& elem,
+                                             std::string_view defaultName) {
+        boost::optional<std::string> name;
+        if (elem) {
+            name = elem.str();
+            variableValidation::validateNameForUserWrite(*name);
+        }
+        Variables::Id id = vpsSub.defineVariable(!name ? defaultName : *name);
+        return std::make_pair(name, id);
+    };
+
+    // Parse "as". If is not specified, use "this" by default.
+    boost::optional<std::string> thisName;
+    Variables::Id thisId;
+    if (isExposeArrayIndexEnabled) {
+        std::tie(thisName, thisId) = parseVariableDefinition(asElem, "this");
+    } else {
+        // Keep previous behavior if feature flag is disabled.
+        thisId = vpsSub.defineVariable("this");
+    }
+
+    // Parse "valueAs". If is not specified, use "value" by default.
+    boost::optional<std::string> valueName;
+    Variables::Id valueId;
+    if (isExposeArrayIndexEnabled) {
+        std::tie(valueName, valueId) = parseVariableDefinition(valueAsElem, "value");
+    } else {
+        // Keep previous behavior if feature flag is disabled.
+        valueId = vpsSub.defineVariable("value");
+    }
+
+    // Parse "arrayIndexAs". If is not specified, use "IDX" by default.
+    boost::optional<std::string> idxName;
+    boost::optional<Variables::Id> idxId;
+    if (isExposeArrayIndexEnabled) {
+        std::tie(idxName, idxId) = parseVariableDefinition(arrayIndexAsElem, "IDX");
+    }
+
+    // Validate uniqueness of the user-defined variables.
+    boost::optional<std::string> repeatedName;
+    if (thisName && (thisName == valueName || thisName == idxName)) {
+        repeatedName = *thisName;
+    } else if (valueName && (valueName == idxName)) {
+        repeatedName = *valueName;
+    }
+
+    uassert(9298401,
+            str::stream() << "Cannot define variables with the same name " << *repeatedName,
+            !repeatedName.has_value());
+
+    return make_intrusive<ExpressionReduce>(expCtx,
+                                            parseOperand(expCtx, inputElem, vps),
+                                            parseOperand(expCtx, initialElem, vps),
+                                            parseOperand(expCtx, inElem, vpsSub),
+                                            std::move(idxName),
+                                            idxId,
+                                            std::move(thisName),
+                                            thisId,
+                                            std::move(valueName),
+                                            valueId);
+}
+
+Value ExpressionReduce::evaluate(const Document& root,
+                                 Variables* variables,
+                                 const EvaluationContext& ctx) const {
+    return exec::expression::evaluate(*this, root, variables, ctx);
+}
+
+boost::intrusive_ptr<Expression> ExpressionReduce::optimize() {
+    if (_idxId) {
+        std::set<Variables::Id> usedVariables;
+        findUsedVariables(_children[_kIn], usedVariables);
+        if (!usedVariables.contains(*_idxId))
+            _idxId.reset();
+    }
+
+    _children[_kInput] = _children[_kInput]->optimize();
+    _children[_kInitial] = _children[_kInitial]->optimize();
+    _children[_kIn] = _children[_kIn]->optimize();
+    return this;
+}
+
+Value ExpressionReduce::serialize(const query_shape::SerializationOptions& options) const {
+    return Value(Document{
+        {"$reduce",
+         Document{
+             {"input", _children[_kInput]->serialize(options)},
+             {"initialValue", _children[_kInitial]->serialize(options)},
+             {"as", _thisName ? Value(options.serializeIdentifier(*_thisName)) : Value()},
+             {"valueAs", _valueName ? Value(options.serializeIdentifier(*_valueName)) : Value()},
+             {"arrayIndexAs", _idxName ? Value(options.serializeIdentifier(*_idxName)) : Value()},
+             {"in", _children[_kIn]->serialize(options)}}}});
+}
+
+/* ------------------------- ExpressionFilter ----------------------------- */
+
+REGISTER_STABLE_EXPRESSION(filter, ExpressionFilter::parse);
+boost::intrusive_ptr<Expression> ExpressionFilter::parse(ExpressionContext* const expCtx,
+                                                         BSONElement expr,
+                                                         const VariablesParseState& vpsIn) {
+    MONGO_verify(expr.fieldNameStringData() == "$filter");
+
+    uassert(
+        28646, "$filter only supports an object as its argument", expr.type() == BSONType::object);
+
+    const bool isExposeArrayIndexEnabled = expCtx->shouldParserIgnoreFeatureFlagCheck() ||
+        feature_flags::gFeatureFlagExposeArrayIndexInMapFilterReduce
+            .isEnabledUseLastLTSFCVWhenUninitialized(
+                expCtx->getVersionContext(),
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+
+    // "cond" must be parsed after "as" regardless of BSON order.
+    BSONElement inputElem;
+    BSONElement asElem;
+    BSONElement condElem;
+    BSONElement limitElem;
+    BSONElement arrayIndexAsElem;
+
+    for (auto elem : expr.Obj()) {
+        if (elem.fieldNameStringData() == "input") {
+            inputElem = elem;
+        } else if (elem.fieldNameStringData() == "as") {
+            asElem = elem;
+        } else if (elem.fieldNameStringData() == "cond") {
+            condElem = elem;
+        } else if (elem.fieldNameStringData() == "limit") {
+            assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                           "limit argument of $filter operator",
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           AllowedWithClientType::kAny);
+            limitElem = elem;
+        } else if (isExposeArrayIndexEnabled && elem.fieldNameStringData() == "arrayIndexAs") {
+            assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                           "arrayIndexAs argument of $filter operator",
+                                           AllowedWithApiStrict::kNeverInVersion1,
+                                           AllowedWithClientType::kAny);
+            arrayIndexAsElem = elem;
+        } else {
+            uasserted(28647,
+                      str::stream() << "Unrecognized parameter to $filter: " << elem.fieldName());
+        }
+    }
+
+    uassert(28648, "Missing 'input' parameter to $filter", !inputElem.eoo());
+    uassert(28650, "Missing 'cond' parameter to $filter", !condElem.eoo());
+
+    // "vpsSub" gets our variables, "vpsIn" doesn't.
+    VariablesParseState vpsSub(vpsIn);
+
+    // Parse "as". If "as" is not specified, then use "this" by default.
+    auto varName = asElem.eoo() ? "this" : asElem.str();
+
+    variableValidation::validateNameForUserWrite(varName);
+    Variables::Id varId = vpsSub.defineVariable(varName);
+
+    // Parse "arrayIndexAs". If "arrayIndexAs" is not specified, then write to "IDX" by default.
+    boost::optional<std::string> idxName;
+    boost::optional<Variables::Id> idxId;
+    if (isExposeArrayIndexEnabled) {
+        if (arrayIndexAsElem) {
+            idxName = arrayIndexAsElem.str();
+            variableValidation::validateNameForUserWrite(*idxName);
+
+            uassert(
+                9375802, "'as' and 'arrayIndexAs' cannot have the same name", varName != idxName);
+        }
+        idxId = vpsSub.defineVariable(!idxName ? "IDX" : *idxName);
+    }
+
+    boost::intrusive_ptr<Expression> limit;
+    if (limitElem) {
+        limit = parseOperand(expCtx, limitElem, vpsIn);
+    }
+    return make_intrusive<ExpressionFilter>(
+        expCtx,
+        std::move(varName),
+        varId,
+        std::move(idxName),
+        idxId,
+        parseOperand(expCtx, inputElem, vpsIn),  // Only has access to outer vars.
+        parseOperand(expCtx, condElem, vpsSub),  // Has access to "as" and "arrayIndexAs" vars.
+        std::move(limit));
+}
+
+ExpressionFilter::ExpressionFilter(ExpressionContext* const expCtx,
+                                   std::string varName,
+                                   Variables::Id varId,
+                                   const boost::optional<std::string>& idxName,
+                                   const boost::optional<Variables::Id>& idxId,
+                                   boost::intrusive_ptr<Expression> input,
+                                   boost::intrusive_ptr<Expression> cond,
+                                   boost::intrusive_ptr<Expression> limit)
+    : Expression(expCtx,
+                 limit ? makeVector(std::move(input), std::move(cond), std::move(limit))
+                       : makeVector(std::move(input), std::move(cond))),
+      _varName(std::move(varName)),
+      _varId(varId),
+      _idxName(std::move(idxName)),
+      _idxId(idxId),
+      _limit(_children.size() == 3 ? 2 : boost::optional<size_t>(boost::none)) {
+    expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+}
+
+boost::intrusive_ptr<Expression> ExpressionFilter::optimize() {
+    if (_idxId) {
+        std::set<Variables::Id> usedVariables;
+        findUsedVariables(_children[_kCond], usedVariables);
+        if (!usedVariables.contains(*_idxId))
+            _idxId.reset();
+    }
+
+    // TODO(SERVER-111215) handle when _input is constant.
+    _children[_kInput] = _children[_kInput]->optimize();
+    _children[_kCond] = _children[_kCond]->optimize();
+    if (_limit)
+        _children[*_limit] = (_children[*_limit])->optimize();
+
+    return this;
+}
+
+Value ExpressionFilter::serialize(const query_shape::SerializationOptions& options) const {
+    return Value(
+        Document{{"$filter",
+                  Document{{"input", _children[_kInput]->serialize(options)},
+                           {"as", options.serializeIdentifier(_varName)},
+                           {"arrayIndexAs",
+                            _idxName ? Value(options.serializeIdentifier(*_idxName)) : Value()},
+                           {"cond", _children[_kCond]->serialize(options)},
+                           {"limit", _limit ? _children[*_limit]->serialize(options) : Value()}}}});
+}
+
+Value ExpressionFilter::evaluate(const Document& root,
+                                 Variables* variables,
+                                 const EvaluationContext& ctx) const {
+    return exec::expression::evaluate(*this, root, variables, ctx);
+}
+
+}  // namespace mongo

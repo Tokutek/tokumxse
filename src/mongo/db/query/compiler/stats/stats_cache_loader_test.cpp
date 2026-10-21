@@ -1,0 +1,199 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/stats/stats_cache_loader.h"
+
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/compiler/stats/ce_histogram.h"
+#include "mongo/db/query/compiler/stats/max_diff.h"
+#include "mongo/db/query/compiler/stats/scalar_histogram.h"
+#include "mongo/db/query/compiler/stats/stats_cache_loader_impl.h"
+#include "mongo/db/query/compiler/stats/stats_cache_loader_test_fixture.h"
+#include "mongo/db/query/compiler/stats/value_utils.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/future.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr.hpp>
+
+namespace mongo::stats {
+namespace {
+
+class StatsCacheLoaderTest : public StatsCacheLoaderTestFixture {
+protected:
+    void createStatsCollection(NamespaceString nss);
+    StatsCacheLoaderImpl _statsCacheLoader;
+};
+
+void StatsCacheLoaderTest::createStatsCollection(NamespaceString nss) {
+    auto opCtx = operationContext();
+    WriteUnitOfWork wuow(opCtx);
+    AutoGetDb db(opCtx, nss.dbName(), MODE_IX);
+    auto coll = acquireCollection(
+        operationContext(),
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(operationContext()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(db.ensureDbExists(opCtx)->createCollection(opCtx, nss));
+    wuow.commit();
+}
+
+TEST_F(StatsCacheLoaderTest, VerifyStatsLoadsScalar) {
+    // Initialize histogram buckets.
+    constexpr double doubleCount = 15.0;
+    constexpr double trueCount = 12.0;
+    constexpr double falseCount = 16.0;
+    constexpr double numDocs = doubleCount + trueCount + falseCount;
+    std::vector<Bucket> buckets{
+        Bucket{1.0, 0.0, 1.0, 0.0, 1.0},
+        Bucket{2.0, 5.0, 8.0, 1.0, 3.0},
+        Bucket{3.0, 4.0, 15.0, 2.0, 6.0},
+    };
+
+    // Initialize histogram bounds.
+    sbe::value::TagValueOwned boundsArray =
+        sbe::value::TagValueOwned::fromRaw(sbe::value::makeNewArray());
+    auto bounds = sbe::value::getArrayView(boundsArray.value());
+    bounds->push_back_raw(sbe::value::TypeTags::NumberDouble, 1.0);
+    bounds->push_back_raw(sbe::value::TypeTags::NumberDouble, 2.0);
+    bounds->push_back_raw(sbe::value::TypeTags::NumberDouble, 3.0);
+
+    // Create a scalar histogram.
+    TypeCounts tc{
+        {sbe::value::TypeTags::NumberDouble, doubleCount},
+        {sbe::value::TypeTags::Boolean, trueCount + falseCount},
+    };
+    auto ceHist = CEHistogram::make(
+        ScalarHistogram::make(*bounds, buckets), tc, numDocs, trueCount, falseCount);
+    auto expectedSerialized = ceHist->serialize();
+
+    // Serialize histogram into a stats path.
+    std::string path = "somePath";
+    constexpr double sampleRate = 1.0;
+    auto serialized = stats::makeStatsPath(path, numDocs, sampleRate, ceHist);
+
+    // Initalize stats collection.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "stats");
+    std::string statsColl(std::string(StatsCacheLoader::kStatsPrefix) + "." +
+                          std::string(nss.coll()));
+    NamespaceString statsNss =
+        NamespaceString::createNamespaceString_forTest(nss.db_forTest(), statsColl);
+    createStatsCollection(statsNss);
+
+    // Write serialized stats path to collection.
+    auto coll = acquireCollection(
+        operationContext(),
+        CollectionAcquisitionRequest(statsNss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(operationContext()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    {
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(Helpers::insert(operationContext(), coll.getCollectionPtr(), serialized));
+        wuow.commit();
+    }
+
+    // Read stats path & verify values are consistent with what we expect.
+    auto actualAH = _statsCacheLoader.getStats(operationContext(), std::make_pair(nss, path)).get();
+    auto actualSerialized = actualAH->serialize();
+
+    ASSERT_BSONOBJ_EQ(expectedSerialized, actualSerialized);
+}
+
+TEST_F(StatsCacheLoaderTest, VerifyStatsLoadsArray) {
+    constexpr double numDocs = 13.0;
+
+    auto nonEmptyArrayVal = sbe::value::makeNewArray().second;
+    auto nonEmptyArray = sbe::value::getArrayView(nonEmptyArrayVal);
+    nonEmptyArray->push_back_raw(sbe::value::TypeTags::NumberDouble, 1.0);
+    nonEmptyArray->push_back_raw(sbe::value::TypeTags::NumberDouble, 2.0);
+    nonEmptyArray->push_back_raw(sbe::value::TypeTags::NumberDouble, 3.0);
+
+    auto emptyArray1Val = sbe::value::makeNewArray().second;
+    auto emptyArray2Val = sbe::value::makeNewArray().second;
+    auto emptyArray3Val = sbe::value::makeNewArray().second;
+
+    // Create a small CEHistogram with boolean & empty array counts using maxdiff.
+    const std::vector<SBEValue> values{
+        // Scalar doubles: 1, 2, 3.
+        SBEValue{sbe::value::TypeTags::NumberDouble, sbe::value::bitcastFrom<double>(1.0)},
+        SBEValue{sbe::value::TypeTags::NumberDouble, sbe::value::bitcastFrom<double>(2.0)},
+        SBEValue{sbe::value::TypeTags::NumberDouble, sbe::value::bitcastFrom<double>(3.0)},
+        // 5x booleans: 2 true, 4 false.
+        SBEValue{sbe::value::TypeTags::Boolean, true},
+        SBEValue{sbe::value::TypeTags::Boolean, true},
+        SBEValue{sbe::value::TypeTags::Boolean, false},
+        SBEValue{sbe::value::TypeTags::Boolean, false},
+        SBEValue{sbe::value::TypeTags::Boolean, false},
+        SBEValue{sbe::value::TypeTags::Boolean, false},
+        // 3x empty arrays.
+        SBEValue{sbe::value::TypeTags::Array, emptyArray1Val},
+        SBEValue{sbe::value::TypeTags::Array, emptyArray2Val},
+        SBEValue{sbe::value::TypeTags::Array, emptyArray3Val},
+        // A non-empty array.
+        SBEValue{sbe::value::TypeTags::Array, nonEmptyArrayVal},
+    };
+    auto ceHist = createCEHistogram(values, numDocs);
+    auto expectedSerialized = ceHist->serialize();
+
+    // Sanity check counters.
+    ASSERT_EQ(ceHist->getTrueCount(), 2.0);
+    ASSERT_EQ(ceHist->getFalseCount(), 4.0);
+    ASSERT_EQ(ceHist->getEmptyArrayCount(), 3.0);
+
+    // Serialize histogram into a stats path.
+    std::string path = "somePath";
+    constexpr double sampleRate = 1.0;
+    auto serialized = stats::makeStatsPath(path, numDocs, sampleRate, ceHist);
+
+    // Initalize stats collection.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "stats");
+    std::string statsColl(std::string(StatsCacheLoader::kStatsPrefix) + "." +
+                          std::string(nss.coll()));
+    NamespaceString statsNss =
+        NamespaceString::createNamespaceString_forTest(nss.db_forTest(), statsColl);
+    createStatsCollection(statsNss);
+
+    // Write serialized stats path to collection.
+    auto coll = acquireCollection(
+        operationContext(),
+        CollectionAcquisitionRequest(statsNss,
+                                     PlacementConcern(boost::none, ShardVersion::UNTRACKED()),
+                                     repl::ReadConcernArgs::get(operationContext()),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    {
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(Helpers::insert(operationContext(), coll.getCollectionPtr(), serialized));
+        wuow.commit();
+    }
+
+    // Read stats path & verify values are consistent with what we expect.
+    auto actualAH = _statsCacheLoader.getStats(operationContext(), std::make_pair(nss, path)).get();
+    auto actualSerialized = actualAH->serialize();
+
+    // Sanity check counters.
+    ASSERT_EQ(actualAH->getTrueCount(), 2.0);
+    ASSERT_EQ(actualAH->getFalseCount(), 4.0);
+    ASSERT_EQ(actualAH->getEmptyArrayCount(), 3.0);
+
+    ASSERT_BSONOBJ_EQ(expectedSerialized, actualSerialized);
+}
+
+}  // namespace
+}  // namespace mongo::stats

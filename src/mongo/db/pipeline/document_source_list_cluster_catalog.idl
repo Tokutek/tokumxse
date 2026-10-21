@@ -1,0 +1,30 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Document source out stage IDL file
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    DocumentSourceListClusterCatalogSpec:
+        description: "$listClusterCatalog pipeline spec"
+        strict: true
+        query_shape_component: true
+        fields:
+            shards:
+                description: "If true, reports the list of shards that own the collection."
+                type: optionalBool
+                query_shape: literal
+            balancingConfiguration:
+                description: "If true, reports some balancing related configuration."
+                type: optionalBool
+                query_shape: literal
+            tracked:
+                description: "If true, reports whether the collection is tracked."
+                type: optionalBool
+                query_shape: literal

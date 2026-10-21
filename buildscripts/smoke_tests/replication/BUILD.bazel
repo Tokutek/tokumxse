@@ -1,0 +1,80 @@
+load("//bazel/resmoke:resmoke.bzl", "resmoke_suite_test")
+
+# THE TESTS IN EACH SUITE ARE GENERATED - DO NOT MODIFY
+
+resmoke_suite_test(
+    name = "replica_sets_initsync_static_jscore_passthrough",
+    srcs = [
+        # failed 53.0:13023 times, success p90 => 1.660s, score => 31.919
+        "//jstests/core/timeseries/query:timeseries_ixscan_clusteredidxscan_union.js",
+        # failed 10.0:10821 times, success p90 => 0.399s, score => 25.077
+        "//jstests/core/replicate_record_ids:allow_capped.js",
+        # failed 19.0:13032 times, success p90 => 0.766s, score => 24.791
+        "//jstests/core/shell:shelltypes.js",
+        # failed 22.0:13021 times, success p90 => 0.902s, score => 24.393
+        "//jstests/core/txns:disallow_operations_on_prepared_transaction.js",
+        # failed 40.0:3348 times, success p90 => 1.777s, score => 22.513
+        "//jstests/core/query/find_and_modify:find_and_modify_metrics.js",
+        # failed 7.0:10821 times, success p90 => 0.316s, score => 22.119
+        "//jstests/core/replicate_record_ids:replicate_record_ids_collection_creation.js",
+        # failed 19.0:13037 times, success p90 => 0.863s, score => 22.020
+        "//jstests/core/txns:no_writes_to_config_transactions_with_prepared_transaction.js",
+        # failed 7.0:10817 times, success p90 => 0.324s, score => 21.612
+        "//jstests/core/replicate_record_ids:collmod_removes_replicate_record_ids.js",
+        # failed 18.0:13026 times, success p90 => 0.876s, score => 20.547
+        "//jstests/core/txns:commit_prepared_transaction.js",
+        # failed 12.0:10795 times, success p90 => 0.588s, score => 20.420
+        "//src/mongo/db/modules/enterprise/jstests/fle2:basic_create_collection_text.js",
+        # failed 17.0:8699 times, success p90 => 0.838s, score => 20.280
+        "//jstests/core/shell:role_management_helpers.js",
+        # failed 16.0:8696 times, success p90 => 0.796s, score => 20.099
+        "//jstests/core/administrative:roles_info.js",
+        # failed 19.0:13031 times, success p90 => 0.947s, score => 20.060
+        "//jstests/core/index/fts:fts_proj.js",
+        # failed 18.0:13026 times, success p90 => 0.901s, score => 19.971
+        "//jstests/core/write/bulk:bulk_write_timeseries_basic.js",
+        # failed 19.0:13030 times, success p90 => 0.970s, score => 19.590
+        "//jstests/core/timeseries/geo:timeseries_geonear_mindistance_and_maxdistance.js",
+        # failed 19.0:13039 times, success p90 => 0.976s, score => 19.461
+        "//jstests/core/index/fts:fts_score_sort.js",
+        # failed 18.0:13025 times, success p90 => 0.963s, score => 18.687
+        "//jstests/core/index/geo:geo_update_btree2.js",
+        # failed 10.0:7115 times, success p90 => 0.583s, score => 17.164
+        "//src/mongo/db/modules/enterprise/jstests/fle2:bulk_write_insert_text.js",
+        # failed 10.0:10821 times, success p90 => 0.596s, score => 16.767
+        "//jstests/core/timeseries/write:timeseries_update_compressed_buckets.js",
+        # failed 13.0:13022 times, success p90 => 0.792s, score => 16.419
+        "//jstests/core/txns:prepare_prepared_transaction.js",
+        # failed 19.0:2582 times, success p90 => 1.199s, score => 15.849
+        "//jstests/core/catalog:db_stats.js",
+        # failed 14.0:13047 times, success p90 => 0.894s, score => 15.667
+        "//jstests/core/txns:aggregation_in_transaction.js",
+        # failed 12.0:13033 times, success p90 => 0.811s, score => 14.790
+        "//jstests/core/txns:transaction_error_handling.js",
+        # failed 12.0:13046 times, success p90 => 0.815s, score => 14.722
+        "//jstests/core/txns:prepare_nonexistent_transaction.js",
+        # failed 10.0:8692 times, success p90 => 0.706s, score => 14.171
+        "//jstests/core/shell:connection_string_validation.js",
+        # failed 11.0:13036 times, success p90 => 0.793s, score => 13.868
+        "//jstests/core/txns:list_collections_not_blocked_by_txn.js",
+        # failed 11.0:13026 times, success p90 => 0.802s, score => 13.723
+        "//jstests/core/txns:prepare_transaction_fails_on_temp_collections.js",
+    ],
+    config = "//buildscripts/resmokeconfig:suites/replica_sets_initsync_static_jscore_passthrough.yml",
+    data = [
+        "//jstests/concurrency/fsm_workload_helpers:all_javascript_files",
+        "//jstests/core/libs:raw_operation_utils.js",
+        "//jstests/core/timeseries/libs:all_javascript_files",
+        "//jstests/core/txns/libs:all_javascript_files",
+        "//jstests/fle2/libs:all_javascript_files",
+    ],
+    resmoke_args = ["--runAllFeatureFlagTests"],
+    tags = [
+        "ci-development-critical-single-variant",
+        "replication-smoke",
+    ],
+    deps = [
+        "//src/mongo/db:mongod",
+        "//src/mongo/shell:mongo",
+    ],
+)

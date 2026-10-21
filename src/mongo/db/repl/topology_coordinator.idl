@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+server_parameters:
+    priorityTakeoverFreshnessWindowSeconds:
+        description: >-
+            Controls how caught up in replication a secondary with higher priority than the 
+            current primary must be before it will call for a priority takeover election.
+        set_at: [startup]
+        cpp_vartype: int
+        cpp_varname: gPriorityTakeoverFreshnessWindowSeconds
+        default: 2
+        redact: false

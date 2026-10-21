@@ -1,0 +1,11 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-programmability
+  - "certs_are_generated.js":
+    approvers:
+      - 10gen/server-security
+  - "mixed_version_replica_set.js":
+    approvers:
+      - 10gen/server-replication-reviewers

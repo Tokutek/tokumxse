@@ -1,0 +1,38 @@
+version: 1.0.0
+filters:
+  - "timeseries_update_multi_util.js":
+    approvers:
+      - 10gen/query-timeseries
+  - "chunk_bounds_util.js":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "update_shard_key_helpers.js":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "zone_changes_util.js":
+    approvers:
+      - 10gen/server-cluster-scalability
+  - "mongos_api_params_util.js":
+    approvers:
+      - 10gen/query-optimization
+  - "create_sharded_collection_util.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "remove_shard_util.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "last_lts_mongod_commands.js":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "last_lts_mongos_commands.js":
+    approvers:
+      - 10gen/server-catalog-and-routing
+  - "*proxy_protocol*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "set_allow_chunk_operations_util.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "shard_versioning_util.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology

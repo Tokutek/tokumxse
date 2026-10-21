@@ -1,0 +1,245 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/s/range_deleter_service.h"
+#include "mongo/db/s/range_deleter_service_test.h"
+#include "mongo/db/s/range_deletion_task_gen.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/uuid.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <map>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ *  RangeDeletionWithOngoingQueries implementation
+ */
+RangeDeletionWithOngoingQueries::RangeDeletionWithOngoingQueries(const RangeDeletionTask& t)
+    : _task(t) {}
+
+RangeDeletionTask RangeDeletionWithOngoingQueries::getTask() {
+    return _task;
+}
+
+void RangeDeletionWithOngoingQueries::drainOngoingQueries() {
+    _ongoingQueries.setFrom(Status::OK());
+}
+
+SemiFuture<void> RangeDeletionWithOngoingQueries::getOngoingQueriesFuture() {
+    return _ongoingQueries.getFuture().semi();
+}
+
+/**
+ * Utils
+ */
+RangeDeletionTask createRangeDeletionTask(const UUID& collectionUUID,
+                                          const BSONObj& min,
+                                          const BSONObj& max,
+                                          CleanWhenEnum whenToClean,
+                                          bool pending,
+                                          boost::optional<KeyPattern> keyPattern,
+                                          const ChunkVersion& shardVersion) {
+    RangeDeletionTask rdt;
+    rdt.setId(UUID::gen());
+    rdt.setNss(RangeDeleterServiceTest::nssWithUuid[collectionUUID]);
+    rdt.setDonorShardId(ShardId("shard0"));
+    rdt.setCollectionUuid(collectionUUID);
+    rdt.setRange(ChunkRange(min, max));
+    rdt.setWhenToClean(whenToClean);
+    rdt.setPending(pending);
+    rdt.setKeyPattern(keyPattern);
+    rdt.setPreMigrationShardVersion(shardVersion);
+
+    return rdt;
+}
+
+std::shared_ptr<RangeDeletionWithOngoingQueries> createRangeDeletionTaskWithOngoingQueries(
+    const UUID& collectionUUID,
+    const BSONObj& min,
+    const BSONObj& max,
+    CleanWhenEnum whenToClean,
+    bool pending,
+    boost::optional<KeyPattern> keyPattern,
+    const ChunkVersion& collectionVersion) {
+    return std::make_shared<RangeDeletionWithOngoingQueries>(createRangeDeletionTask(
+        collectionUUID, min, max, whenToClean, pending, keyPattern, collectionVersion));
+}
+
+SharedSemiFuture<void> registerAndCreatePersistentTask(
+    OperationContext* opCtx,
+    const RangeDeletionTask& rdt,
+    SemiFuture<void>&& waitForActiveQueriesToComplete,
+    bool ready) {
+    auto rds = RangeDeleterService::get(opCtx);
+
+    // Register task as `pending` in order to block it until the persistent document is non-pending
+    auto completionFuture = rds->registerTask(
+        rdt, std::move(waitForActiveQueriesToComplete), RangeDeleterService::TaskPending::kPending);
+
+    // Range deletion task will only proceed if persistent doc exists and its `pending` field
+    // doesn't exist
+    insertRangeDeletionTaskDocument(opCtx, rdt);
+    if (ready) {
+        removePendingField(opCtx, rdt.getId());
+    }
+
+    return completionFuture;
+}
+
+int insertDocsWithinRange(
+    OperationContext* opCtx, const NamespaceString& nss, int min, int max, int maxCount) {
+
+    DBDirectClient dbclient(opCtx);
+    for (auto i = 0; i < maxCount; ++i) {
+        const int nextI = min + i;
+        if (nextI == max) {
+            return i;
+        }
+        dbclient.insert(nss, BSON(RangeDeleterServiceTest::kShardKey << nextI));
+    }
+    return maxCount;
+}
+
+void insertRangeDeletionTaskDocument(OperationContext* opCtx, const RangeDeletionTask& rdt) {
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    // Randomly persist document via insert or upsert. Testing both scenarios because migrations
+    // insert/update range deletion documents while rename participants could potentially insert
+    // via upsert. This is a safeguard test to make sure that the insert observer is properly
+    // invoked in both cases: if at some point inserts via upserts would not be observed anymore
+    // as normal inserts, the range deleter would break.
+    PseudoRandom random(SecureRandom().nextInt64());
+    if (random.nextInt32() % 2) {
+        store.add(opCtx, rdt);
+    } else {
+        store.upsert(opCtx,
+                     BSON(RangeDeletionTask::kIdFieldName << rdt.getId()),
+                     BSON("$set" << rdt.toBSON()));
+    }
+}
+
+void updatePendingField(OperationContext* opCtx, UUID rdtId, bool pending) {
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    store.update(opCtx,
+                 BSON(RangeDeletionTask::kIdFieldName << rdtId),
+                 BSON("$set" << BSON(RangeDeletionTask::kPendingFieldName << pending)));
+}
+
+void removePendingField(OperationContext* opCtx, UUID rdtId) {
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    store.update(opCtx,
+                 BSON(RangeDeletionTask::kIdFieldName << rdtId),
+                 BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << "")));
+}
+
+void deleteRangeDeletionTaskDocument(OperationContext* opCtx, UUID rdtId) {
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    store.remove(opCtx, BSON(RangeDeletionTask::kIdFieldName << rdtId));
+}
+
+
+range_deletions::detail::CollectionToTasks dumpStateAsMap(OperationContext* opCtx) {
+    // Rehydrate state based on the result of dumpState(). The ordering of the chunk ranges within
+    // the collection arrays is arbitrary, so we need to rebuild the map instead of
+    // comparing BSONObjs with the expected state directly.
+    auto rds = RangeDeleterService::get(opCtx);
+    BSONObj stateBSON = rds->dumpState();
+    range_deletions::detail::CollectionToTasks state;
+    for (const auto& collection : stateBSON) {
+        auto uuid = uassertStatusOK(UUID::parse(collection.fieldName()));
+        auto& tasks = state[uuid];
+        for (const auto& range : collection.Array()) {
+            tasks[ChunkRange::fromBSON(range.Obj())] = nullptr;
+        }
+    }
+    return state;
+}
+
+/**
+ * Ensure that `expectedChunkRanges` range deletion tasks are scheduled for collection with UUID
+ * `uuidColl`
+ */
+void verifyRangeDeletionTasks(OperationContext* opCtx,
+                              UUID uuidColl,
+                              std::vector<ChunkRange> expectedChunkRanges) {
+    auto state = dumpStateAsMap(opCtx);
+    auto it = state.find(uuidColl);
+    if (it == state.end() && expectedChunkRanges.empty()) {
+        return;
+    }
+    ASSERT(it != state.end()) << "Expected to find range deletion tasks from collection "
+                              << uuidColl.toString();
+    const auto& tasks = it->second;
+    ASSERT_EQ(tasks.size(), expectedChunkRanges.size());
+    for (const auto& range : expectedChunkRanges) {
+        ASSERT(tasks.contains(range)) << range.toBSON();
+    }
+}
+
+void verifyProcessingFlag(OperationContext* opCtx,
+                          UUID uuidColl,
+                          const ChunkRange& range,
+                          bool processingExpected) {
+    DBDirectClient client(opCtx);
+
+    const auto query =
+        BSON(RangeDeletionTask::kCollectionUuidFieldName
+             << uuidColl
+             << fmt::format("{}.{}", RangeDeletionTask::kRangeFieldName, ChunkRange::kMinFieldName)
+             << range.getMin()
+             << fmt::format("{}.{}", RangeDeletionTask::kRangeFieldName, ChunkRange::kMaxFieldName)
+             << range.getMax());
+
+    FindCommandRequest findRequest{NamespaceString::kRangeDeletionNamespace};
+    findRequest.setFilter(query);
+    auto doc = client.findOne(std::move(findRequest));
+
+    ASSERT(!doc.isEmpty()) << "Chunk '" << query << "' not found";
+
+    if (processingExpected) {
+        ASSERT_EQ(true, doc.getField(RangeDeletionTask::kProcessingFieldName).booleanSafe())
+            << "The `processing` field was expected to be true for that chunk. Chunk doc found: "
+            << doc;
+    } else {
+        ASSERT(!doc.hasField(RangeDeletionTask::kProcessingFieldName))
+            << "The `processing` field was not expected to be present for that chunk. Chunk doc "
+               "found: "
+            << doc;
+    }
+}
+
+void _clearFilteringMetadataByUUID(OperationContext* opCtx, const UUID& uuid) {
+    NamespaceString nss = RangeDeleterServiceTest::nssWithUuid[uuid];
+
+    auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+    scopedCsr->clearCollectionMetadata(opCtx);
+}
+
+}  // namespace mongo

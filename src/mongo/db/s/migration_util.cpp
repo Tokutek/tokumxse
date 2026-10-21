@@ -1,0 +1,684 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/s/migration_util.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/ddl/sharding_util.h"
+#include "mongo/db/global_catalog/sharding_catalog_client.h"
+#include "mongo/db/global_catalog/type_chunk.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/change_stream_oplog_notification.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/s/active_migrations_registry.h"
+#include "mongo/db/s/migration_coordinator.h"
+#include "mongo/db/s/migration_destination_manager.h"
+#include "mongo/db/s/migration_source_manager.h"
+#include "mongo/db/s/range_deleter_service.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/shard_filtering_metadata_refresh.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/sharding_environment/sharding_statistics.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/topology/shard_registry.h"
+#include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <functional>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
+
+namespace mongo {
+namespace migrationutil {
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeFilteringMetadataRefresh);
+MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateCommitDecisionInterruptible);
+MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible);
+MONGO_FAIL_POINT_DEFINE(hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible);
+MONGO_FAIL_POINT_DEFINE(hangInAdvanceTxnNumInterruptible);
+MONGO_FAIL_POINT_DEFINE(hangInAdvanceTxnNumThenSimulateErrorUninterruptible);
+
+const char kSourceShard[] = "source";
+const char kDestinationShard[] = "destination";
+const char kIsDonorShard[] = "isDonorShard";
+const char kChunk[] = "chunk";
+const char kCollection[] = "collection";
+const char kSessionOplogEntriesMigrated[] = "sessionOplogEntriesMigrated";
+const char ksessionOplogEntriesSkippedSoFarLowerBound[] =
+    "sessionOplogEntriesSkippedSoFarLowerBound";
+const char ksessionOplogEntriesToBeMigratedSoFar[] = "sessionOplogEntriesToBeMigratedSoFar";
+const Backoff kExponentialBackoff(Seconds(10), Milliseconds::max());
+
+const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                WriteConcernOptions::kNoTimeout);
+
+}  // namespace
+
+BSONObj makeCriticalSectionReasonForMoveRange(const ShardsvrMoveRangeRequest& request,
+                                              const UUID& migrationId) {
+    return BSON("command" << "moveChunk" << "fromShard" << request.getFromShard() << "toShard"
+                          << request.getToShard() << "migrationId" << migrationId);
+}
+
+void refreshFilteringMetadataUntilSuccess(OperationContext* opCtx, const NamespaceString& nss) {
+    hangBeforeFilteringMetadataRefresh.pauseWhileSet();
+
+    sharding_util::retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
+        opCtx, "refreshFilteringMetadataUntilSuccess", [&nss](OperationContext* newOpCtx) {
+            hangInRefreshFilteringMetadataUntilSuccessInterruptible.pauseWhileSet(newOpCtx);
+
+            try {
+                uassertStatusOK(FilteringMetadataCache::get(newOpCtx)->onShardVersionMismatch(
+                    newOpCtx, nss, boost::none));
+            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // Can throw NamespaceNotFound if the collection/database was dropped
+            }
+
+            if (hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
+                    .shouldFail()) {
+                hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
+                    .pauseWhileSet();
+                uasserted(ErrorCodes::InternalError,
+                          "simulate an error response for onShardVersionMismatch");
+            }
+        });
+}
+
+void registerMigrationRecoveryJobs(OperationContext* opCtx, long long term) {
+    // Reset the stat before either recovery path (standalone batch or MoveRangeCoordinator batch)
+    // contributes its count via fetchAndAdd on onStepUpComplete.
+    ShardingStatistics::get(opCtx).unfinishedMigrationFromPreviousPrimary.store(0);
+
+    // Register a recovery job for migrationutil::resumeMigrationCoordinationsOnStepUp(), which
+    // recovers all standalone MigrationCoordinators as a single batch and calls
+    // notifyRecoveryJobComplete once when the entire batch finishes.
+    RangeDeleterService::get(opCtx)->registerRecoveryJob(term, RecoveryJob::kLegacyMigration);
+
+    // Register one recovery job for the MoveRangeCoordinator recovered from disk. If there is no
+    // such coordinator, ShardingCoordinatorService resolves this job during its rebuild.
+    RangeDeleterService::get(opCtx)->registerRecoveryJob(term, RecoveryJob::kMoveRangeCoordinator);
+}
+
+BSONObj getQueryFilterForRangeDeletionTask(const UUID& collectionUuid, const ChunkRange& range) {
+    return BSON(RangeDeletionTask::kCollectionUuidFieldName
+                << collectionUuid
+                << std::string{RangeDeletionTask::kRangeFieldName} + "." +
+                    std::string{ChunkRange::kMinFieldName}
+                << range.getMin()
+                << std::string{RangeDeletionTask::kRangeFieldName} + "." +
+                    std::string{ChunkRange::kMaxFieldName}
+                << range.getMax());
+}
+
+// TODO SERVER-103838 Remove this function and replace any call with 'coordinatorDoc.toBSON()'
+// once 9.0 becomes LTS.
+BSONObj serializeAndRedactCoordinatorDocument(OperationContext* opCtx,
+                                              const MigrationCoordinatorDocument& coordinatorDoc) {
+    // Only persist the backwards-incompatible transfersFirstCollectionChunkToRecipient field if
+    // the current FCV supports the needed recovery document schema.
+    if (feature_flags::gPersistRecipientPlacementInfoInMigrationRecoveryDoc.isEnabled(
+            VersionContext::getDecoration(opCtx),
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        return coordinatorDoc.toBSON();
+    }
+
+    auto redactedCoordinatorDoc = coordinatorDoc;
+    redactedCoordinatorDoc.setTransfersFirstCollectionChunkToRecipient(boost::none);
+    return redactedCoordinatorDoc.toBSON();
+}
+
+BSONObjBuilder _makeMigrationStatusDocumentCommon(const NamespaceString& nss,
+                                                  const ShardId& fromShard,
+                                                  const ShardId& toShard,
+                                                  const bool& isDonorShard,
+                                                  const BSONObj& min,
+                                                  const BSONObj& max) {
+    BSONObjBuilder builder;
+    builder.append(kSourceShard, fromShard.toString());
+    builder.append(kDestinationShard, toShard.toString());
+    builder.append(kIsDonorShard, isDonorShard);
+    builder.append(kChunk, BSON(ChunkType::min(min) << ChunkType::max(max)));
+    builder.append(kCollection,
+                   NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    return builder;
+}
+
+BSONObj makeMigrationStatusDocumentSource(
+    const NamespaceString& nss,
+    const ShardId& fromShard,
+    const ShardId& toShard,
+    const bool& isDonorShard,
+    const BSONObj& min,
+    const BSONObj& max,
+    boost::optional<long long> sessionOplogEntriesToBeMigratedSoFar,
+    boost::optional<long long> sessionOplogEntriesSkippedSoFarLowerBound) {
+    BSONObjBuilder builder =
+        _makeMigrationStatusDocumentCommon(nss, fromShard, toShard, isDonorShard, min, max);
+    if (sessionOplogEntriesToBeMigratedSoFar) {
+        builder.append(ksessionOplogEntriesToBeMigratedSoFar,
+                       sessionOplogEntriesToBeMigratedSoFar.value());
+    }
+    if (sessionOplogEntriesSkippedSoFarLowerBound) {
+        builder.append(ksessionOplogEntriesSkippedSoFarLowerBound,
+                       sessionOplogEntriesSkippedSoFarLowerBound.value());
+    }
+    return builder.obj();
+}
+
+BSONObj makeMigrationStatusDocumentDestination(
+    const NamespaceString& nss,
+    const ShardId& fromShard,
+    const ShardId& toShard,
+    const bool& isDonorShard,
+    const BSONObj& min,
+    const BSONObj& max,
+    boost::optional<long long> sessionOplogEntriesMigrated) {
+    BSONObjBuilder builder =
+        _makeMigrationStatusDocumentCommon(nss, fromShard, toShard, isDonorShard, min, max);
+    if (sessionOplogEntriesMigrated) {
+        builder.append(kSessionOplogEntriesMigrated, sessionOplogEntriesMigrated.value());
+    }
+    return builder.obj();
+}
+
+bool deletionTaskUuidMatchesFilteringMetadataUuid(
+    OperationContext* opCtx,
+    const boost::optional<mongo::CollectionMetadata>& optCollDescr,
+    const RangeDeletionTask& deletionTask) {
+    return optCollDescr && optCollDescr->isSharded() &&
+        optCollDescr->uuidMatches(deletionTask.getCollectionUuid());
+}
+
+void insertMigrationCoordinatorDoc(OperationContext* opCtx,
+                                   const MigrationCoordinatorDocument& migrationDoc) {
+    // The transfersFirstCollectionChunkToRecipient is an optional, FCV gated field that is expected
+    // to be only persisted through the migrationutil::updateMigrationCoordinatorDoc() method.
+    // TODO SERVER-103838 remove the invariant once 9.0 becomes LTS.
+    invariant(!migrationDoc.getTransfersFirstCollectionChunkToRecipient().has_value());
+
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+    try {
+        store.add(opCtx, migrationDoc);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+        // Convert a DuplicateKey error to an anonymous error.
+        uasserted(
+            31374,
+            str::stream() << "While attempting to write migration information for migration "
+                          << ", found document with the same migration id. Attempted migration: "
+                          << migrationDoc.toBSON());
+    }
+}
+
+void updateMigrationCoordinatorDoc(OperationContext* opCtx,
+                                   const MigrationCoordinatorDocument& migrationDoc) {
+    const auto& docId = migrationDoc.getId();
+    const auto serializedDoc = serializeAndRedactCoordinatorDocument(opCtx, migrationDoc);
+
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+    store.update(opCtx, BSON(MigrationCoordinatorDocument::kIdFieldName << docId), serializedDoc);
+}
+
+void persistCommitDecision(OperationContext* opCtx,
+                           const MigrationCoordinatorDocument& migrationDoc) {
+    invariant(migrationDoc.getDecision() &&
+              *migrationDoc.getDecision() == DecisionEnum::kCommitted);
+
+    hangInPersistMigrateCommitDecisionInterruptible.pauseWhileSet(opCtx);
+    try {
+        updateMigrationCoordinatorDoc(opCtx, migrationDoc);
+        ShardingStatistics::get(opCtx).countDonorMoveChunkCommitted.addAndFetch(1);
+    } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
+        LOGV2_ERROR(6439800,
+                    "No coordination doc found on disk for migration",
+                    "migration"_attr = redact(migrationDoc.toBSON()));
+    }
+
+    if (hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible.shouldFail()) {
+        hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
+        uasserted(ErrorCodes::InternalError,
+                  "simulate an error response when persisting migrate commit decision");
+    }
+}
+
+void persistAbortDecision(OperationContext* opCtx,
+                          const MigrationCoordinatorDocument& migrationDoc) {
+    invariant(migrationDoc.getDecision() && *migrationDoc.getDecision() == DecisionEnum::kAborted);
+
+    try {
+        updateMigrationCoordinatorDoc(opCtx, migrationDoc);
+        ShardingStatistics::get(opCtx).countDonorMoveChunkAborted.addAndFetch(1);
+    } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
+        LOGV2(6439801,
+              "No coordination doc found on disk for migration",
+              "migration"_attr = redact(migrationDoc.toBSON()));
+    }
+
+    if (hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.shouldFail()) {
+        hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
+        uasserted(ErrorCodes::InternalError,
+                  "simulate an error response when persisting migrate abort decision");
+    }
+}
+
+void advanceTransactionOnRecipient(OperationContext* opCtx,
+                                   const ShardId& recipientId,
+                                   const LogicalSessionId& lsid,
+                                   TxnNumber currentTxnNumber) {
+    write_ops::UpdateCommandRequest updateOp(NamespaceString::kServerConfigurationNamespace);
+    auto queryFilter = BSON("_id" << "migrationCoordinatorStats");
+    auto updateModification = write_ops::UpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(BSON("$inc" << BSON("count" << 1))));
+
+    write_ops::UpdateOpEntry updateEntry(queryFilter, updateModification);
+    updateEntry.setMulti(false);
+    updateEntry.setUpsert(true);
+    updateOp.setUpdates({updateEntry});
+
+    updateOp.setWriteConcern(defaultMajorityWriteConcernDoNotUse());
+    updateOp.setLsid(generic_argument_util::toLogicalSessionFromClient(lsid));
+    updateOp.setTxnNumber(currentTxnNumber + 1);
+
+    hangInAdvanceTxnNumInterruptible.pauseWhileSet(opCtx);
+    sharding_util::invokeCommandOnShardWithIdempotentRetryPolicy(
+        opCtx,
+        recipientId,
+        NamespaceString::kServerConfigurationNamespace.dbName(),
+        updateOp.toBSON());
+
+    if (hangInAdvanceTxnNumThenSimulateErrorUninterruptible.shouldFail()) {
+        hangInAdvanceTxnNumThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
+        uasserted(ErrorCodes::InternalError,
+                  "simulate an error response when initiating range deletion locally");
+    }
+}
+
+void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx, long long term) {
+    LOGV2_DEBUG(4798510, 2, "Starting migration coordinator step-up recovery", "term"_attr = term);
+
+    const auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    std::vector<ExecutorFuture<void>> recoveryFutures;
+
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+    store.forEach(
+        opCtx,
+        BSONObj{},
+        [opCtx, term, &executor, &recoveryFutures](const MigrationCoordinatorDocument& doc) {
+            if (doc.getManagementMode().value_or(ManagementModeEnum::kStandalone) !=
+                ManagementModeEnum::kStandalone) {
+                LOGV2_DEBUG(12723000,
+                            3,
+                            "Skipping legacy recovery for non-standalone migration",
+                            "migrationId"_attr = doc.getId(),
+                            logAttrs(doc.getNss()));
+                return true;
+            }
+
+            const auto& nss = doc.getNss();
+
+            // Clear the collection metadata to avoid data loss if a failover interrupts the
+            // migration. Otherwise, secondaries could serve queries with a stale ShardVersion.
+            // This is required for legacy migrations, where the critical section is in memory and
+            // unreplicated. Thus, the new node stepping up must resolve the legacy migration before
+            // serving any CRUD operation.
+            {
+                auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+                scopedCsr->clearCollectionMetadata(opCtx);
+            }
+
+            LOGV2_DEBUG(4798511,
+                        3,
+                        "Found unfinished migration on step-up",
+                        "term"_attr = term,
+                        "migrationCoordinatorDoc"_attr = redact(doc.toBSON()),
+                        "unfinishedMigrationsCount"_attr = recoveryFutures.size() + 1);
+
+            recoveryFutures.emplace_back(
+                asyncRecoverMigrationUntilSuccessOrStepDown(opCtx, nss).thenRunOn(executor));
+
+            return true;
+        });
+
+    ShardingStatistics::get(opCtx).unfinishedMigrationFromPreviousPrimary.fetchAndAdd(
+        recoveryFutures.size());
+
+    LOGV2_DEBUG(4798513,
+                2,
+                "Finished scheduling migration coordinator step-up recovery tasks",
+                "term"_attr = term,
+                "unfinishedMigrationsCount"_attr = recoveryFutures.size());
+
+    [&executor, futures = std::move(recoveryFutures)]() mutable {
+        if (futures.empty()) {
+            return ExecutorFuture{executor};
+        }
+        return whenAll(std::move(futures)).ignoreValue().thenRunOn(executor);
+    }()
+        .onCompletion([term](const auto&) {
+            RangeDeleterService::get(getGlobalServiceContext())
+                ->notifyRecoveryJobComplete(term, RecoveryJob::kLegacyMigration);
+            LOGV2_DEBUG(11420100,
+                        2,
+                        "Finished all migration coordinator step-up recovery tasks",
+                        "term"_attr = term);
+        })
+        .getAsync([](const auto&) {});
+}
+
+ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
+    OperationContext* opCtx,
+    const ShardId& recipientShardId,
+    const NamespaceString& nss,
+    const MigrationSessionId& sessionId,
+    bool clearShardCatalogCache) {
+    const auto serviceContext = opCtx->getServiceContext();
+    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+
+    return ExecutorFuture<void>(executor).then([=] {
+        ThreadClient tc("releaseRecipientCritSec", serviceContext->getService());
+        auto uniqueOpCtx = tc->makeOperationContext();
+        auto opCtx = uniqueOpCtx.get();
+
+        BSONObjBuilder builder;
+        builder.append("_recvChunkReleaseCritSec",
+                       NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+        sessionId.append(&builder);
+        builder.append("clearShardCatalogCache", clearShardCatalogCache);
+        builder.append(WriteConcernOptions::kWriteConcernField,
+                       defaultMajorityWriteConcernDoNotUse().toBSON());
+        const auto commandObj = builder.obj();
+
+        sharding_util::retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
+            opCtx,
+            "release migration critical section on recipient",
+            [&](OperationContext* newOpCtx) {
+                try {
+                    const auto recipientShard = uassertStatusOK(
+                        Grid::get(opCtx)->shardRegistry()->getShard(opCtx, recipientShardId));
+
+                    const auto response = recipientShard->runCommand(
+                        newOpCtx,
+                        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                        DatabaseName::kAdmin,
+                        commandObj,
+                        Shard::RetryPolicy::kIdempotent);
+
+                    uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(response));
+                } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& exShardNotFound) {
+                    LOGV2(5899106,
+                          "Failed to release critical section on recipient",
+                          "shardId"_attr = recipientShardId,
+                          "sessionId"_attr = sessionId,
+                          logAttrs(nss),
+                          "error"_attr = exShardNotFound);
+                }
+            },
+            Backoff(Seconds(1), Milliseconds::max()));
+    });
+}
+
+void notifyChangeStreamsOnChunkMigrationCommitted(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const UUID& collectionUuid,
+                                                  const ShardId& fromShard,
+                                                  const ShardId& toShard,
+                                                  bool transfersFirstChunkToRecipient) {
+    // The authoritative post-commit placement lives on the config server. Read it from the catalog
+    // cache to decide whether the donor still owns any chunk of the collection.
+    const auto cm = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getCollectionPlacementInfoWithRefresh(opCtx, nss));
+    const bool noMoreCollectionChunksOnDonor = !cm.getVersion(fromShard).isSet();
+    notifyChangeStreamsOnChunkMigrated(opCtx,
+                                       nss,
+                                       collectionUuid,
+                                       fromShard,
+                                       toShard,
+                                       noMoreCollectionChunksOnDonor,
+                                       transfersFirstChunkToRecipient);
+}
+
+void persistMigrationRecipientRecoveryDocument(
+    OperationContext* opCtx, const MigrationRecipientRecoveryDocument& migrationRecipientDoc) {
+    PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
+        NamespaceString::kMigrationRecipientsNamespace);
+    try {
+        store.add(opCtx, migrationRecipientDoc);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+        // Convert a DuplicateKey error to an anonymous error.
+        uasserted(6064502,
+                  str::stream()
+                      << "While attempting to write migration recipient information for migration "
+                      << ", found document with the same migration id. Attempted migration: "
+                      << migrationRecipientDoc.toBSON());
+    }
+}
+
+void deleteMigrationRecipientRecoveryDocument(OperationContext* opCtx, const UUID& migrationId) {
+    // Before deleting the migration recipient recovery document, ensure that in the case of a
+    // crash, the node will start-up from a configTime that is inclusive of the migration that was
+    // committed during the critical section.
+    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+
+    PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
+        NamespaceString::kMigrationRecipientsNamespace);
+    store.remove(opCtx,
+                 BSON(MigrationRecipientRecoveryDocument::kIdFieldName << migrationId),
+                 defaultMajorityWriteConcernDoNotUse());
+}
+
+void resumeMigrationRecipientsOnStepUp(OperationContext* opCtx) {
+    LOGV2_DEBUG(6064504, 2, "Starting migration recipient step-up recovery");
+
+    unsigned long long ongoingMigrationRecipientsCount = 0;
+
+    PersistentTaskStore<MigrationRecipientRecoveryDocument> store(
+        NamespaceString::kMigrationRecipientsNamespace);
+
+    store.forEach(
+        opCtx,
+        BSONObj{},
+        [&opCtx, &ongoingMigrationRecipientsCount](const MigrationRecipientRecoveryDocument& doc) {
+            invariant(ongoingMigrationRecipientsCount == 0,
+                      str::stream()
+                          << "Upon step-up a second migration recipient recovery document was found"
+                          << redact(doc.toBSON()));
+            ongoingMigrationRecipientsCount++;
+            LOGV2_DEBUG(5899102,
+                        3,
+                        "Found ongoing migration recipient critical section on step-up",
+                        "migrationRecipientCoordinatorDoc"_attr = redact(doc.toBSON()));
+
+            const auto& nss = doc.getNss();
+
+            // Register this receiveChunk on the ActiveMigrationsRegistry before completing step-up
+            // to prevent a new migration from starting while a receiveChunk was ongoing. Wait for
+            // any migrations that began in a previous term to complete if there are any.
+            //
+            // Bypass the registry's waitForRecovery() hook: this code runs synchronously on the
+            // OplogApplier thread during step-up, before ShardingCoordinatorService has had a
+            // chance to transition out of kPaused. Without the bypass, the registry's recovery
+            // wait would uassert NotWritablePrimary and crash the node. The bypass is safe here
+            // because the recipient recovery executes before the node accepts client writes that
+            // could submit new chunk operations, so the ordering invariant the wait normally
+            // protects is preserved by construction.
+            auto scopedReceiveChunk(
+                uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerReceiveChunk(
+                    opCtx,
+                    nss,
+                    doc.getRange(),
+                    doc.getDonorShardIdForLoggingPurposesOnly(),
+                    true /* waitForCompletionOfMigrationOps */,
+                    ActiveMigrationsRegistry::BypassRecoveryWait{})));
+
+            const auto mdm = MigrationDestinationManager::get(opCtx);
+            uassertStatusOK(
+                mdm->restoreRecoveredMigrationState(opCtx, std::move(scopedReceiveChunk), doc));
+
+            return true;
+        });
+
+    LOGV2_DEBUG(6064505,
+                2,
+                "Finished migration recipient step-up recovery",
+                "ongoingRecipientCritSecCount"_attr = ongoingMigrationRecipientsCount);
+}
+
+void drainMigrationsPendingRecovery(OperationContext* opCtx) {
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+
+    while (store.count(opCtx)) {
+        store.forEach(opCtx, BSONObj(), [opCtx](const MigrationCoordinatorDocument& doc) {
+            try {
+                uassertStatusOK(FilteringMetadataCache::get(opCtx)->onShardVersionMismatch(
+                    opCtx, doc.getNss(), boost::none));
+            } catch (DBException& ex) {
+                ex.addContext(str::stream() << "Failed to recover pending migration for document "
+                                            << doc.toBSON());
+                throw;
+            }
+            return true;
+        });
+    }
+}
+
+void assertNoMigrationsRemaining(OperationContext* opCtx) {
+    PersistentTaskStore<MigrationCoordinatorDocument> migrationCoordinators(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+    tassert(12952700,
+            "Found migration coordinator documents on disk",
+            migrationCoordinators.count(opCtx) == 0);
+
+    tassert(12952702,
+            "Found ongoing migrations in the ActiveMigrationsRegistry",
+            ActiveMigrationsRegistry::get(opCtx).getActiveMigrationStatusReport(opCtx).isEmpty());
+}
+
+SemiFuture<void> asyncRecoverMigrationUntilSuccessOrStepDown(OperationContext* opCtx,
+                                                             const NamespaceString& nss) {
+    tassert(12795310,
+            "Legacy asynchronous migration recovery must not run when AuthoritativeShardsDDL is "
+            "enabled; the MoveRangeCoordinator drives migration recovery instead",
+            !feature_flags::gAuthoritativeShardsDDL.isEnabled(
+                VersionContext::getDecoration(opCtx),
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
+    return ExecutorFuture<void>{Grid::get(opCtx)->getExecutorPool()->getFixedExecutor()}
+        .then([svcCtx{opCtx->getServiceContext()}, nss] {
+            ThreadClient tc{"MigrationRecovery", svcCtx->getService()};
+            auto uniqueOpCtx{tc->makeOperationContext()};
+            auto opCtx{uniqueOpCtx.get()};
+
+            try {
+                refreshFilteringMetadataUntilSuccess(opCtx, nss);
+            } catch (const DBException& ex) {
+                // This is expected in the event of a stepdown.
+                LOGV2(6316100,
+                      "Interrupted deferred migration recovery",
+                      logAttrs(nss),
+                      "error"_attr = redact(ex));
+            }
+        })
+        .semi();
+}
+
+void drainMigrationsOnFcvDowngrade(OperationContext* opCtx) {
+    // Chunk migrations that started under FCV >= 8.2 contain a
+    // 'transfersFirstCollectionChunkToRecipient' field in their recovery document that (due to a
+    // 'schema strictness' constraint present in previous binaries) is backwards incompatible.
+    // Ensure that these operations get drained before completing the downgrade.
+
+    // 1. If this shard is currently donating a chunk, abort the operation.
+    auto& activeMigrationRegistry = ActiveMigrationsRegistry::get(opCtx);
+    boost::optional<SharedSemiFuture<void>> abortingMigrationFuture;
+    if (const auto collNameBeingTargetedByChunkDonation =
+            activeMigrationRegistry.getActiveDonateChunkNss();
+        collNameBeingTargetedByChunkDonation.has_value()) {
+        const auto scopedCsr =
+            CollectionShardingRuntime::acquireShared(opCtx, *collNameBeingTargetedByChunkDonation);
+        if (auto msm = MigrationSourceManager::get(*scopedCsr)) {
+            abortingMigrationFuture = msm->abort();
+        }
+    }
+    if (abortingMigrationFuture) {
+        // Drain the abortion after releasing the CSR.
+        abortingMigrationFuture->get(opCtx);
+    }
+
+    // 2. If this shard has still to recover any migration containing with backwards
+    // incompatible metadata, do that now.
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+    const auto incompatibleMigrationsFilter =
+        BSON(MigrationCoordinatorDocument::kTransfersFirstCollectionChunkToRecipientFieldName
+             << BSON("$ne" << BSONNULL));
+    store.forEach(opCtx,
+                  incompatibleMigrationsFilter,
+                  [&](const MigrationCoordinatorDocument& migrationToRecover) {
+                      migrationutil::asyncRecoverMigrationUntilSuccessOrStepDown(
+                          opCtx, migrationToRecover.getNss())
+                          .get(opCtx);
+                      return true;  // keep iterating
+                  });
+}
+
+
+}  // namespace migrationutil
+}  // namespace mongo

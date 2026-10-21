@@ -1,0 +1,578 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/version_context.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/join_thread.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/scopeguard.h"
+
+namespace mongo {
+namespace {
+// (Generic FCV reference): used for testing, should exist across LTS binary versions
+static const VersionContext kLatestVersionContext{multiversion::GenericFCV::kLatest};
+static const VersionContext kLastLTSVersionContext{multiversion::GenericFCV::kLastLTS};
+
+class VersionContextDecorationTest : public ServiceContextTest {
+public:
+    ServiceContext::UniqueOperationContext opCtxHolder{makeOperationContext()};
+    OperationContext* opCtx{opCtxHolder.get()};
+};
+
+TEST_F(VersionContextDecorationTest, GetDecorationDefault) {
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+}
+
+TEST_F(VersionContextDecorationTest, SetDecoration) {
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::setDecoration(lk, opCtx, kLatestVersionContext);
+    }
+    ASSERT_EQ(kLatestVersionContext, VersionContext::getDecoration(opCtx));
+}
+
+TEST_F(VersionContextDecorationTest, ScopedSetDecoration) {
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+    {
+        VersionContext::ScopedSetDecoration scopedSetDecoration(opCtx, kLastLTSVersionContext);
+        ASSERT_EQ(kLastLTSVersionContext, VersionContext::getDecoration(opCtx));
+    }
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+}
+
+using VersionContextDecorationTestDeathTest = VersionContextDecorationTest;
+DEATH_TEST_F(VersionContextDecorationTestDeathTest,
+             ScopedSetDecorationRecursive,
+             "Refusing to set a VersionContext on an operation that already has one") {
+    VersionContext::ScopedSetDecoration scopedVCtx(opCtx, kLastLTSVersionContext);
+    VersionContext::ScopedSetDecoration(opCtx, kLastLTSVersionContext);
+}
+
+TEST_F(VersionContextDecorationTest, FixedOperationFCVRegion) {
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+
+    {
+        // OFCV set while `FixedOperationFCVRegion` is in scope
+        VersionContext expectedVc{serverGlobalParams.featureCompatibility.acquireFCVSnapshot()};
+        VersionContext::FixedOperationFCVRegion fixedOperationFcvRegion(opCtx);
+        ASSERT_EQ(expectedVc, VersionContext::getDecoration(opCtx));
+    }
+
+    // No OFCV after `FixedOperationFCVRegion` gets out of scope
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+}
+
+
+TEST_F(VersionContextDecorationTest, FixedOperationFCVRegionWithUninitializedFCV) {
+    // (Generic FCV reference): used for testing
+    serverGlobalParams.mutableFCV.setVersion(
+        multiversion::FeatureCompatibilityVersion::kUnsetDefaultLastLTSBehavior);
+    VersionContext::FixedOperationFCVRegion fixedOperationFcvRegion(opCtx);
+    ASSERT_EQ(
+        VersionContext{multiversion::FeatureCompatibilityVersion::kUnsetDefaultLastLTSBehavior},
+        VersionContext::getDecoration(opCtx));
+}
+
+TEST_F(VersionContextDecorationTest, FixedOperationFCVRegionReentrancy) {
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+
+    {
+        // (Generic FCV reference): used for testing
+        serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
+        VersionContext expectedVc{multiversion::GenericFCV::kLatest};
+
+        // Set latest OFCV on the operation context
+        VersionContext::FixedOperationFCVRegion fixedOperationFcvRegion0(opCtx);
+        ASSERT_EQ(expectedVc, VersionContext::getDecoration(opCtx));
+
+        {
+            // The original OFCV is preserved even though the FCV snapshot changed
+            serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLastLTS);
+            VersionContext::FixedOperationFCVRegion fixedOperationFcvRegion1(opCtx);
+            ASSERT_EQ(expectedVc, VersionContext::getDecoration(opCtx));
+        }
+
+        // The OFCV is not unset when the second scoped object gets out of scope
+        ASSERT_EQ(expectedVc, VersionContext::getDecoration(opCtx));
+    }
+
+    // No OFCV after all `FixedOperationFCVRegion` objects got out of scope
+    ASSERT_EQ(VersionContext{}, VersionContext::getDecoration(opCtx));
+}
+
+TEST_F(VersionContextDecorationTest, FixedOperationFCVRegionSetDuringFcvTransition) {
+    auto failPoint = globalFailPointRegistry().find("waitBeforeFixedOperationFCVRegionRaceCheck");
+    FailPointEnableBlock failPointBlock(failPoint);
+
+    // (Generic FCV reference): used for testing
+    // Set FCV to last-lts
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLastLTS);
+
+    // Make the FixedOperationFCVRegion constructor race with a FCV transition (last-lts to latest),
+    // then check that the target FCV version has been set
+    unittest::JoinThread setFcvToLatestThread([&] {
+        failPointBlock.waitForOneNewEntry();
+
+        serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
+        // Explicitly disable to release the blocked FixedOperationFCVRegion constructor.
+        // `failPointBlock` only provides cleanup if the test exits early.
+        failPoint->setMode(FailPoint::off);
+    });
+
+    VersionContext expectedVc = kLatestVersionContext;
+    VersionContext::FixedOperationFCVRegion fixedOperationFcvRegion(opCtx);
+    ASSERT_EQ(expectedVc, VersionContext::getDecoration(opCtx));
+}
+
+class VersionContextDrainTest : public ServiceContextTest {
+public:
+    // We need to hold both the client and the operation context in scope in order for the OFCV to
+    // be in use
+    using ScopedHoldOperation =
+        std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>;
+
+    const VersionContext kStaleVersion{kLatestVersionContext};
+    const VersionContext kCurrentVersion{kLastLTSVersionContext};
+
+    auto makeClient(std::string desc = "client") {
+        return getServiceContext()->getService()->makeClient(desc, nullptr /* session */);
+    }
+
+    [[nodiscard]] ScopedHoldOperation getRunningOperationWithStaleOfcv() {
+        auto client = makeClient("clientWithStaleOFCV");
+        auto opCtx = client->makeOperationContext();
+
+        {
+            ClientLock lk(opCtx->getClient());
+            VersionContext::setDecoration(lk, opCtx.get(), kStaleVersion);
+        }
+
+        return {std::move(client), std::move(opCtx)};
+    }
+
+    [[nodiscard]] ScopedHoldOperation getRunningOperationWithCurrentOrWithoutOfcv() {
+        auto client = makeClient("clientWithoutStaleOFCV");
+        auto opCtx = client->makeOperationContext();
+
+        if (SecureRandom().nextInt64() % 2) {
+            ClientLock lk(opCtx->getClient());
+            VersionContext::setDecoration(lk, opCtx.get(), kCurrentVersion);
+        }
+
+        return {std::move(client), std::move(opCtx)};
+    }
+
+    VersionContextDrainTest() : _client(makeClient("VersionContextDrainTest")) {
+        _uniqueOpCtx = _client->makeOperationContext();
+    }
+
+    OperationContext* operationContext() {
+        return _uniqueOpCtx.get();
+    }
+
+private:
+    ServiceContext::UniqueClient _client;
+    ServiceContext::UniqueOperationContext _uniqueOpCtx;
+};
+
+TEST_F(VersionContextDrainTest, NoOperationAtAll) {
+    waitForOperationsNotMatchingVersionContextToComplete(operationContext(), kCurrentVersion);
+    waitForOperationsNotMatchingVersionContextToComplete(
+        operationContext(), kCurrentVersion, Date_t::now());
+}
+
+TEST_F(VersionContextDrainTest, NoOperationToWaitOn) {
+    auto client = makeClient();
+    auto opCtx = client->makeOperationContext();
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::setDecoration(lk, opCtx.get(), kCurrentVersion);
+    }
+
+    waitForOperationsNotMatchingVersionContextToComplete(operationContext(), kCurrentVersion);
+    waitForOperationsNotMatchingVersionContextToComplete(
+        operationContext(), kCurrentVersion, Date_t::now());
+}
+
+TEST_F(VersionContextDrainTest, NoWaitOnKilledOperation) {
+    auto client = makeClient();
+    auto opCtx = client->makeOperationContext();
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::setDecoration(lk, opCtx.get(), kStaleVersion);
+    }
+    opCtx->markKilled(ErrorCodes::Interrupted);
+
+    waitForOperationsNotMatchingVersionContextToComplete(operationContext(), kCurrentVersion);
+}
+
+TEST_F(VersionContextDrainTest, OneOperationToWaitOn) {
+    SharedPromise<void> operationWithStaleVersionInitialized;
+    SharedPromise<void> drainOperationWithStaleVersion;
+
+    unittest::JoinThread threadOpWithStaleOFCV([&] {
+        auto holdClientAndOpctx = getRunningOperationWithStaleOfcv();
+        // Signal that the operation with stale OFCV has been initialized
+        operationWithStaleVersionInitialized.emplaceValue();
+        // Wait for signal to drain operations
+        drainOperationWithStaleVersion.getFuture().get();
+    });
+
+    // Wait for `threadOpWithStaleOFCV` to finish initializing the operation with stale OFCV
+    operationWithStaleVersionInitialized.getFuture().get();
+
+    unittest::JoinThread asyncWaitForOpToDrain([&] {
+        // All possible interleavings will be covered by multiple test runs since this
+        // async wait may start before/during/after drain.
+        auto client = makeClient("asyncWaitForOpsToDrain");
+        auto opCtx = client->makeOperationContext();
+        waitForOperationsNotMatchingVersionContextToComplete(opCtx.get(), kCurrentVersion);
+    });
+
+    // Also initialize an opCtx that should NOT be drained, it should not influence the wait
+    auto client = makeClient();
+    auto opCtx = client->makeOperationContext();
+    ASSERT_THROWS_CODE(waitForOperationsNotMatchingVersionContextToComplete(
+                           operationContext(), kCurrentVersion, Date_t::now() + Milliseconds(50)),
+                       DBException,
+                       ErrorCodes::ExceededTimeLimit);
+
+    // Signal thread that the operation with stale OFCV can drain
+    drainOperationWithStaleVersion.emplaceValue();
+    auto ignoredOpWithoutStaleOfcv = getRunningOperationWithCurrentOrWithoutOfcv();
+    waitForOperationsNotMatchingVersionContextToComplete(operationContext(), kCurrentVersion);
+}
+
+/**
+ * Reduce the internal recheck interval to 10ms, then wait for an operation to drain requiring at
+ * least 100ms. Regression test to make sure internal retries don't throw.
+ */
+TEST_F(VersionContextDrainTest, LowerRecheckOperationContextsInterval) {
+    auto failPoint = globalFailPointRegistry().find("reduceWaitForOfcvInternalIntervalTo10Ms");
+    failPoint->setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([failPoint]() { failPoint->setMode(FailPoint::off); });
+
+    SharedPromise<void> operationWithStaleVersionInitialized;
+    SharedPromise<void> startWaitingForOperationsToDrain;
+    SharedPromise<void> drainOperationWithStaleVersion;
+
+    unittest::JoinThread threadOpWithStaleOFCV([&] {
+        auto holdClientAndOpctx = getRunningOperationWithStaleOfcv();
+        // Signal that the operation with stale OFCV has been initialized
+        operationWithStaleVersionInitialized.emplaceValue();
+        // Wait for signal to drain operations
+        drainOperationWithStaleVersion.getFuture().get();
+    });
+
+    // Wait for `threadOpWithStaleOFCV` to finish initializing the operation with stale OFCV
+    operationWithStaleVersionInitialized.getFuture().get();
+
+    unittest::JoinThread asyncWaitForOpToDrain([&] {
+        auto client = makeClient("asyncWaitForOpsToDrain");
+        auto opCtx = client->makeOperationContext();
+        // Future not exactly ready when starting waiting, but just before
+        startWaitingForOperationsToDrain.emplaceValue();
+        waitForOperationsNotMatchingVersionContextToComplete(opCtx.get(), kCurrentVersion);
+    });
+
+    startWaitingForOperationsToDrain.getFuture().get();
+    sleepFor(Milliseconds(100));
+
+    // Signal thread that the operation with stale OFCV can drain
+    drainOperationWithStaleVersion.emplaceValue();
+}
+
+/**
+ * Checks that when an operation context releases the OFCV, the wait finishes despite the operation
+ * context being still alive.
+ */
+TEST_F(VersionContextDrainTest, OperationContextIgnoredWhenScopedOfcvReleased) {
+    auto failPoint = globalFailPointRegistry().find("reduceWaitForOfcvInternalIntervalTo10Ms");
+    failPoint->setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([failPoint]() { failPoint->setMode(FailPoint::off); });
+
+    SharedPromise<void> operationWithScopedStaleOfcvInitialized;
+    SharedPromise<void> releaseScopedOfcv;
+    SharedPromise<void> drainOperationContext;
+
+    unittest::JoinThread threadOpWithScopedStaleOFCV([&] {
+        auto client = makeClient("threadOpWithStaleOFCV");
+        auto opCtx = client->makeOperationContext();
+
+        {
+            VersionContext::ScopedSetDecoration scopedSetDecoration(opCtx.get(), kStaleVersion);
+            // Signal that the operation with scoped stale OFCV has been initialized
+            operationWithScopedStaleOfcvInitialized.emplaceValue();
+            // Wait for signal to release the scoped OFCV
+            releaseScopedOfcv.getFuture().get();
+        }
+
+        // Wait before releasing the operation context
+        drainOperationContext.getFuture().get();
+    });
+
+    operationWithScopedStaleOfcvInitialized.getFuture().get();
+
+    unittest::JoinThread asyncWaitForOfcvToBeReleased([&] {
+        auto client = makeClient("asyncWaitForOpsToDrain");
+        auto opCtx = client->makeOperationContext();
+
+        // All possible interleavings will be covered by multiple test runs since this
+        // async wait may start before/during/after the scoped OFCV is released.
+        waitForOperationsNotMatchingVersionContextToComplete(opCtx.get(), kCurrentVersion);
+        drainOperationContext.emplaceValue();
+    });
+
+    // Signal thread that the operation with stale OFCV can release it
+    releaseScopedOfcv.emplaceValue();
+}
+
+TEST_F(VersionContextDrainTest, RandomNoOperationToWaitOn) {
+    std::vector<ScopedHoldOperation> ops;
+    const int nOps = SecureRandom().nextInt64() % 5;
+    for (int i = 0; i < nOps; i++) {
+        ops.emplace_back(getRunningOperationWithCurrentOrWithoutOfcv());
+    }
+
+    waitForOperationsNotMatchingVersionContextToComplete(operationContext(), kCurrentVersion);
+    waitForOperationsNotMatchingVersionContextToComplete(
+        operationContext(), kCurrentVersion, Date_t::now());
+}
+
+TEST_F(VersionContextDrainTest, RandomOperationsToWaitOn) {
+    std::vector<ScopedHoldOperation> ops;
+    const int nOps = SecureRandom().nextInt64() % 5;
+    for (int i = 0; i < nOps; i++) {
+        ops.emplace_back(getRunningOperationWithStaleOfcv());
+    }
+
+    for (int i = 0; i < nOps; i++) {
+        ASSERT_THROWS_CODE(waitForOperationsNotMatchingVersionContextToComplete(
+                               operationContext(), kCurrentVersion, Date_t::now()),
+                           DBException,
+                           ErrorCodes::ExceededTimeLimit);
+        ops.pop_back();
+    }
+
+    waitForOperationsNotMatchingVersionContextToComplete(
+        operationContext(), kCurrentVersion, Date_t::now());
+}
+
+TEST_F(VersionContextDrainTest, RandomMixedOperations) {
+    std::vector<ScopedHoldOperation> ops;
+    const int nOps = SecureRandom().nextInt64() % 5;
+
+    // Random running/killed operations running with or without stale OFCV
+    int nRunningOpsStaleOfcv = 0;
+    for (int i = 0; i < nOps; i++) {
+        bool opWithStaleOfcv = SecureRandom().nextInt64() % 2;
+        bool killedOp = SecureRandom().nextInt64() % 2;
+
+        if (opWithStaleOfcv) {
+            ops.emplace_back(getRunningOperationWithStaleOfcv());
+        } else {
+            ops.emplace_back(getRunningOperationWithCurrentOrWithoutOfcv());
+        }
+
+        if (killedOp) {
+            ops.back().second->markKilled(ErrorCodes::CursorKilled);
+        }
+
+        if (opWithStaleOfcv && !killedOp) {
+            nRunningOpsStaleOfcv++;
+        }
+    }
+
+    // Check that waiting with a deadline fails as long as at least one operation
+    // with stale OFCV is running
+    for (int i = 0; i < nOps; i++) {
+        if (nRunningOpsStaleOfcv == 0) {
+            break;
+        }
+
+        ASSERT_THROWS_CODE(waitForOperationsNotMatchingVersionContextToComplete(
+                               operationContext(), kCurrentVersion, Date_t::now()),
+                           DBException,
+                           ErrorCodes::ExceededTimeLimit);
+
+        const ScopedHoldOperation op = std::move(ops.back());
+        ops.pop_back();
+
+        OperationContext* opCtx = op.first->getOperationContext();
+        invariant(opCtx);
+
+        const bool notKillPending = !opCtx->isKillPending();
+        const bool withStaleVersion = VersionContext::getDecoration(opCtx) == kStaleVersion;
+
+        if (notKillPending && withStaleVersion) {
+            nRunningOpsStaleOfcv--;
+        }
+    }
+
+    waitForOperationsNotMatchingVersionContextToComplete(
+        operationContext(), kCurrentVersion, Date_t::now());
+}
+
+/**
+ * Verifies that waitForOperationsNotMatchingVersionContextToComplete throws
+ * BackgroundOperationInProgressForNamespace immediately when a stale-OFCV operation is marked as a
+ * long-running operation, rather than blocking until the operation completes.
+ */
+TEST_F(VersionContextDrainTest, LongRunningOperationFailsFast) {
+    SharedPromise<void> buildStarted;
+    SharedPromise<void> allowBuildToFinish;
+
+    unittest::JoinThread indexBuildThread([&] {
+        auto [client, opCtx] = getRunningOperationWithStaleOfcv();
+        {
+            ClientLock lk(opCtx->getClient());
+            VersionContext::markDecorationAsLongRunning(lk, opCtx.get());
+        }
+
+        buildStarted.emplaceValue();
+        allowBuildToFinish.getFuture().get();
+    });
+    ScopeGuard finishBuild([&] { allowBuildToFinish.emplaceValue(); });
+
+    buildStarted.getFuture().get();
+
+    ASSERT_THROWS_CODE(
+        waitForOperationsNotMatchingVersionContextToComplete(operationContext(), kCurrentVersion),
+        DBException,
+        ErrorCodes::BackgroundOperationInProgressForNamespace);
+}
+
+/**
+ * Verifies the full contract of _isLongRunningOperation: default false, propagates through copy
+ * and assignment, cleared by resetToOperationWithoutOFCV, excluded from equality and toBSON.
+ */
+TEST_F(VersionContextDecorationTest, LongRunningOperationFlagContract) {
+    // Flag defaults to false on a fresh decoration.
+    ASSERT_FALSE(VersionContext::getDecoration(opCtx).isLongRunningOperation());
+
+    // Set OFCV (required before marking as long-running), then mark.
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::setDecoration(lk, opCtx, kLatestVersionContext);
+        VersionContext::markDecorationAsLongRunning(lk, opCtx);
+    }
+    ASSERT_TRUE(VersionContext::getDecoration(opCtx).isLongRunningOperation());
+
+    // The flag is not considered in equality comparisons.
+    ASSERT_EQ(kLatestVersionContext, VersionContext::getDecoration(opCtx));
+
+    // The flag is not serialized to BSON (and therefore not restored from it).
+    ASSERT_BSONOBJ_EQ(kLatestVersionContext.toBSON(),
+                      VersionContext::getDecoration(opCtx).toBSON());
+    ASSERT_FALSE(
+        VersionContext{VersionContext::getDecoration(opCtx).toBSON()}.isLongRunningOperation());
+
+    // Copy and assignment propagate the flag.
+    VersionContext copied = VersionContext::getDecoration(opCtx);
+    ASSERT_TRUE(copied.isLongRunningOperation());
+
+    VersionContext assigned;
+    assigned = VersionContext::getDecoration(opCtx);
+    ASSERT_TRUE(assigned.isLongRunningOperation());
+
+    // ScopedSetDecoration destructor calls resetToOperationWithoutOFCV, which must clear the flag.
+    // A fresh client+opCtx is required since the fixture's client already holds an opCtx.
+    auto freshClient =
+        getServiceContext()->getService()->makeClient("contractFreshClient", nullptr);
+    auto freshOpCtxHolder = freshClient->makeOperationContext();
+    auto* freshOpCtx = freshOpCtxHolder.get();
+    {
+        VersionContext::ScopedSetDecoration scopedDecor(freshOpCtx, kLatestVersionContext);
+        {
+            ClientLock lk(freshOpCtx->getClient());
+            VersionContext::markDecorationAsLongRunning(lk, freshOpCtx);
+        }
+        ASSERT_TRUE(VersionContext::getDecoration(freshOpCtx).isLongRunningOperation());
+    }
+    ASSERT_FALSE(VersionContext::getDecoration(freshOpCtx).isLongRunningOperation());
+}
+
+/**
+ * Verifies that clearDecorationLongRunningMarker removes only the long-running marker while
+ * preserving the pinned Operation FCV.
+ */
+TEST_F(VersionContextDecorationTest, ClearDecorationLongRunningMarkerPreservesOfcv) {
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::setDecoration(lk, opCtx, kLatestVersionContext);
+        VersionContext::markDecorationAsLongRunning(lk, opCtx);
+    }
+    ASSERT_TRUE(VersionContext::getDecoration(opCtx).isLongRunningOperation());
+
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::clearDecorationLongRunningMarker(lk, opCtx);
+    }
+    ASSERT_FALSE(VersionContext::getDecoration(opCtx).isLongRunningOperation());
+    ASSERT_TRUE(VersionContext::getDecoration(opCtx).hasOperationFCV());
+    ASSERT_EQ(kLatestVersionContext, VersionContext::getDecoration(opCtx));
+    ASSERT_BSONOBJ_EQ(kLatestVersionContext.toBSON(),
+                      VersionContext::getDecoration(opCtx).toBSON());
+}
+
+/**
+ * Verifies that ForwardableOperationMetadata::setOn propagates _isLongRunningOperation to the
+ * target opCtx. This is the production path for background index build threads: the primary
+ * opCtx marks itself as long-running, and the async thread inherits the flag via setOn.
+ */
+TEST_F(VersionContextDecorationTest, LongRunningOperationFlagPropagatesViaForwardableMetadata) {
+    // Set OFCV and mark as long-running on the source opCtx.
+    {
+        ClientLock lk(opCtx->getClient());
+        VersionContext::setDecoration(lk, opCtx, kLatestVersionContext);
+        VersionContext::markDecorationAsLongRunning(lk, opCtx);
+    }
+    ASSERT_TRUE(VersionContext::getDecoration(opCtx).isLongRunningOperation());
+
+    // Capture the ForwardableOperationMetadata from the marked opCtx (in-process path).
+    ForwardableOperationMetadata fom(opCtx);
+
+    // Apply to a fresh opCtx (on a new client — fixture client already holds an opCtx).
+    auto asyncClient =
+        getServiceContext()->getService()->makeClient("asyncIndexBuildClient", nullptr);
+    auto asyncOpCtxHolder = asyncClient->makeOperationContext();
+    auto* asyncOpCtx = asyncOpCtxHolder.get();
+    fom.setOn(asyncOpCtx);
+
+    ASSERT_TRUE(VersionContext::getDecoration(asyncOpCtx).isLongRunningOperation());
+    ASSERT_EQ(kLatestVersionContext, VersionContext::getDecoration(asyncOpCtx));
+}
+
+/**
+ * Verifies that a stale-OFCV operation that is NOT marked as a long-running index build is still
+ * waited on (not prematurely failed).
+ */
+TEST_F(VersionContextDrainTest, UnmarkedStaleOfcvOpIsWaitedOn) {
+    auto failPoint = globalFailPointRegistry().find("reduceWaitForOfcvInternalIntervalTo10Ms");
+    failPoint->setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([failPoint]() { failPoint->setMode(FailPoint::off); });
+
+    SharedPromise<void> opStarted;
+    SharedPromise<void> allowOpToFinish;
+
+    unittest::JoinThread opThread([&] {
+        auto [client, opCtx] = getRunningOperationWithStaleOfcv();
+        // Deliberately NOT marking this opCtx as a long-running index build.
+
+        opStarted.emplaceValue();
+        allowOpToFinish.getFuture().get();
+    });
+    ScopeGuard finishBuild([&] { allowOpToFinish.emplaceValue(); });
+
+    opStarted.getFuture().get();
+
+    // The drain should block (not throw), so we verify it times out rather than failing fast.
+    ASSERT_THROWS_CODE(waitForOperationsNotMatchingVersionContextToComplete(
+                           operationContext(), kCurrentVersion, Date_t::now() + Milliseconds(50)),
+                       DBException,
+                       ErrorCodes::ExceededTimeLimit);
+}
+
+}  // namespace
+}  // namespace mongo

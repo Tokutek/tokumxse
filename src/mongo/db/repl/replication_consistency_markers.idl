@@ -1,0 +1,59 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Replication Consistency Markers IDL File
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public_for_technical_reasons
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/repl/replication_types.idl"
+
+structs:
+    MinValidDocument:
+        description: A document in which the server stores its minValid and appliedThrough information.
+        fields:
+            ts:
+                cpp_name: minValidTimestamp
+                type: timestamp
+                description: "The timestamp for the OpTime at which the data on disk will be consistent"
+            t:
+                cpp_name: minValidTerm
+                type: safeInt64
+                description: "The term for the OpTime at which the data on disk will be consistent; -1 for PV0."
+            begin:
+                cpp_name: appliedThrough
+                type: optime
+                optional: true # This field is unset when we want to mark that we are consistent at the top of the oplog
+                description: "The OpTime of the last oplog entry we applied"
+            doingInitialSync:
+                cpp_name: initialSyncFlag
+                type: bool
+                optional: true # This field is unset when we are not doing initial sync
+                description: "A flag for if we are in the middle of initial sync"
+            _id:
+                type: objectid
+                optional: true # This is automatically created when the document is upserted
+                description: "An objectid that is not used but is automatically generated"
+    OplogTruncateAfterPointDocument:
+        description: A document in which the server stores information on where to truncate the oplog on unclean shutdown.
+        fields:
+            oplogTruncateAfterPoint:
+                type: timestamp
+                description: "The timestamp of an oplog entry after which the oplog may be inconsistent (have holes due to parallel writes)."
+            _id:
+                type: string
+                description: "Always set to 'oplogTruncateAfterPoint' to easily retrieve it."
+
+    InitialSyncIdDocument:
+        description: A document in which the server stores data related to the initial sync of the server.
+        fields:
+            _id:
+                type: uuid
+                description: "An arbitrary unique identifier associated with the initial sync of the server."
+            wallTime:
+                type: date
+                optional: true
+                description: "The walltime at which the initial sync document was written."

@@ -1,0 +1,291 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/index_builds/skipped_record_tracker.h"
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/collection_crud/container_write.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/preallocated_container_pool.h"
+#include "mongo/db/index_builds/primary_driven/enabled.h"
+#include "mongo/db/multi_key_path_tracker.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/lazy_record_store.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/progress_meter.h"
+#include "mongo/util/shared_buffer_fragment.h"
+
+#include <string_view>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
+
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+static constexpr std::string_view kRecordIdField = "recordId"sv;
+}  // namespace
+
+SkippedRecordTracker::SkippedRecordTracker(OperationContext* opCtx,
+                                           std::string_view ident,
+                                           LazyRecordStore::CreateMode createMode)
+    : _skippedRecordsTable(opCtx, ident, createMode) {}
+
+void SkippedRecordTracker::createDeferredTable(OperationContext* opCtx) {
+    _skippedRecordsTable.getOrCreateTable(opCtx);
+}
+
+void SkippedRecordTracker::record(OperationContext* opCtx,
+                                  const CollectionPtr& coll,
+                                  const RecordId& recordId) {
+    BSONObjBuilder builder;
+    recordId.serializeToken(kRecordIdField, &builder);
+    BSONObj toInsert = builder.obj();
+
+    auto& rs = _skippedRecordsTable.getOrCreateTable(opCtx);
+
+    writeConflictRetry(
+        opCtx, "recordSkippedRecordTracker", NamespaceString::kIndexBuildEntryNamespace, [&]() {
+            WriteUnitOfWork wuow(opCtx);
+            if (index_builds::primary_driven::enabled(
+                    opCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                LOGV2_DEBUG(
+                    10966701,
+                    1,
+                    "Index build: writing to skipped record tracker container for primary-driven "
+                    "index build.");
+
+                // We guarantee that the container is an integer container because the skipped
+                // record tracker initialized above has KeyFormat::Long.
+                invariant(rs.keyFormat() == KeyFormat::Long);
+                IntegerKeyedContainer& container =
+                    std::get<std::reference_wrapper<IntegerKeyedContainer>>(rs.getContainer())
+                        .get();
+
+                std::vector<RecordId> reservedRidBlock;
+                rs.reserveRecordIds(
+                    opCtx, *shard_role_details::getRecoveryUnit(opCtx), &reservedRidBlock, 1);
+                invariant(reservedRidBlock.size() == 1);
+
+                uassertStatusOK(container_write::insert(
+                    opCtx,
+                    *shard_role_details::getRecoveryUnit(opCtx),
+                    container,
+                    reservedRidBlock[0].getLong(),
+                    std::span<const char>(toInsert.objdata(), toInsert.objsize()),
+                    boost::none,
+                    container_write::NonexistentKeyGuarantee{}));
+            } else {
+                uassertStatusOK(rs.insertRecord(opCtx,
+                                                *shard_role_details::getRecoveryUnit(opCtx),
+                                                toInsert.objdata(),
+                                                toInsert.objsize(),
+                                                Timestamp::min())
+                                    .getStatus());
+            }
+            wuow.commit();
+        });
+}
+
+bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
+    if (!_skippedRecordsTable.tableExists()) {
+        return true;
+    }
+    auto& rs = _skippedRecordsTable.getTableOrThrow();
+    auto cursor = rs.getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx));
+    // The table is empty only when all writes are applied.
+    return !cursor->next();
+}
+
+Status SkippedRecordTracker::retrySkippedRecords(
+    OperationContext* opCtx,
+    const CollectionPtr& collection,
+    const IndexCatalogEntry* indexCatalogEntry,
+    const OnMultikeyPathsRecordedFn& onMultikeyPathsRecorded,
+    RetrySkippedRecordMode mode) {
+
+    const bool keyGenerationOnly = mode == RetrySkippedRecordMode::kKeyGeneration;
+
+    dassert(shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(
+        collection->ns(), keyGenerationOnly ? MODE_IX : MODE_X));
+
+    if (!_skippedRecordsTable.tableExists()) {
+        return Status::OK();
+    }
+    auto& recordStore = _skippedRecordsTable.getTableOrThrow();
+
+    InsertDeleteOptions options;
+    collection->getIndexCatalog()->prepareInsertDeleteOptions(
+        opCtx,
+        indexCatalogEntry->getNSSFromCatalog(opCtx),
+        indexCatalogEntry->descriptor(),
+        &options);
+
+    // This should only be called when constraints are being enforced, on a primary. It does not
+    // make sense, nor is it necessary for this to be called on a secondary.
+    invariant(options.getKeysMode ==
+              InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints);
+
+    static const char* curopMessage = "Index Build: retrying skipped records";
+    ProgressMeterHolder progress;
+    {
+        std::unique_lock<Client> lk(*opCtx->getClient());
+        progress.set(
+            lk,
+            CurOp::get(opCtx)->setProgress(lk, curopMessage, _skippedRecordCounter.load(), 1),
+            opCtx);
+    }
+
+    int resolved = 0;
+    const auto onResolved = [&]() {
+        resolved++;
+
+        std::unique_lock<Client> lk(*opCtx->getClient());
+        progress.get(lk)->hit();
+    };
+
+    SharedBufferFragmentBuilder pooledBuilder(key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
+    auto& containerPool = PreallocatedContainerPool::get(opCtx);
+
+    auto cursor = recordStore.getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx));
+    while (auto record = cursor->next()) {
+        const BSONObj doc = record->data.toBson();
+
+        // This is the RecordId of the skipped record from the collection.
+        RecordId skippedRecordId = RecordId::deserializeToken(doc[kRecordIdField]);
+        boost::optional<WriteUnitOfWork> wuow;
+        if (!keyGenerationOnly) {
+            wuow.emplace(opCtx);
+        }
+
+        // If the record still exists, get a potentially new version of the document to index.
+        auto collCursor = collection->getCursor(opCtx);
+        auto skippedRecord = collCursor->seekExact(skippedRecordId);
+        if (keyGenerationOnly && !skippedRecord) {
+            continue;
+        } else if (skippedRecord) {
+            const auto skippedDoc = skippedRecord->data.toBson();
+            LOGV2_DEBUG(23882,
+                        2,
+                        "reapplying skipped RecordID {skippedRecordId}: {skippedDoc}",
+                        "skippedRecordId"_attr = skippedRecordId,
+                        "skippedDoc"_attr = skippedDoc);
+
+            auto keys = containerPool.keys();
+            auto multikeyMetadataKeys = containerPool.multikeyMetadataKeys();
+            auto multikeyPaths = containerPool.multikeyPaths();
+            auto iam = indexCatalogEntry->accessMethod()->asSortedData();
+
+            try {
+                // Because constraint enforcement is set, this will throw if there are any indexing
+                // errors, instead of writing back to the skipped records table, which would
+                // normally happen if constraints were relaxed.
+                iam->getKeys(opCtx,
+                             collection,
+                             indexCatalogEntry,
+                             pooledBuilder,
+                             skippedDoc,
+                             options.getKeysMode,
+                             SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                             keys.get(),
+                             multikeyMetadataKeys.get(),
+                             multikeyPaths.get(),
+                             skippedRecordId);
+
+                if (keyGenerationOnly) {
+                    // On dry runs we can skip everything else that comes after key generation.
+                    onResolved();
+                    continue;
+                }
+                auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+                auto status = iam->insertKeys(
+                    opCtx, ru, collection, indexCatalogEntry, *keys, options, nullptr, nullptr);
+                if (!status.isOK()) {
+                    return status;
+                }
+
+                status = iam->insertKeys(opCtx,
+                                         ru,
+                                         collection,
+                                         indexCatalogEntry,
+                                         *multikeyMetadataKeys,
+                                         options,
+                                         nullptr,
+                                         nullptr);
+                if (!status.isOK()) {
+                    return status;
+                }
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+
+            if (iam->shouldMarkIndexAsMultikey(
+                    keys->size(), *multikeyMetadataKeys, *multikeyPaths)) {
+                if (!_multikeyPaths) {
+                    _multikeyPaths = *multikeyPaths;
+                }
+
+                MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.value(), *multikeyPaths);
+
+                if (onMultikeyPathsRecorded) {
+                    if (auto status = onMultikeyPathsRecorded(opCtx, *_multikeyPaths);
+                        !status.isOK()) {
+                        return status;
+                    }
+                }
+            }
+        }
+
+        // Delete the record so that it is not applied more than once.
+        recordStore.deleteRecord(opCtx, *shard_role_details::getRecoveryUnit(opCtx), record->id);
+
+        cursor->save();
+        wuow->commit();
+        cursor->restore(*shard_role_details::getRecoveryUnit(opCtx));
+
+        onResolved();
+    }
+
+    {
+        std::unique_lock<Client> lk(*opCtx->getClient());
+        progress.get(lk)->finished();
+    }
+
+    int logLevel = (resolved > 0) ? 0 : 1;
+    if (keyGenerationOnly) {
+        LOGV2_DEBUG(7333101,
+                    logLevel,
+                    "Index build: verified key generation for skipped records",
+                    "index"_attr = indexCatalogEntry->descriptor()->indexName(),
+                    "numResolved"_attr = resolved);
+    } else {
+        LOGV2_DEBUG(23883,
+                    logLevel,
+                    "Index build: reapplied skipped records",
+                    "index"_attr = indexCatalogEntry->descriptor()->indexName(),
+                    "numResolved"_attr = resolved);
+    }
+    return Status::OK();
+}
+
+}  // namespace mongo

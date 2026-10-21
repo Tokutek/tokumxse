@@ -1,148 +1,268 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
 
-/*
- * Tuning constants: I hesitate to call this tuning, but we want to review some
- * number of pages from each file's in-memory tree for each page we evict.
- */
-#define	WT_EVICT_INT_SKEW  (1<<20)	/* Prefer leaf pages over internal
-					   pages by this many increments of the
-					   read generation. */
-#define	WT_EVICT_WALK_PER_FILE	 10	/* Pages to queue per file */
-#define	WT_EVICT_MAX_PER_FILE	100	/* Max pages to visit per file */
-#define	WT_EVICT_WALK_BASE	300	/* Pages tracked across file visits */
-#define	WT_EVICT_WALK_INCR	100	/* Pages added each walk */
+#pragma once
 
-#define	WT_EVICT_PASS_AGGRESSIVE	0x01
-#define	WT_EVICT_PASS_ALL		0x02
-#define	WT_EVICT_PASS_DIRTY		0x04
-#define	WT_EVICT_PASS_WOULD_BLOCK	0x08
+/* Cache operations. */
+typedef enum __wt_cache_op {
+    WT_SYNC_CHECKPOINT,
+    WT_SYNC_CLOSE,
+    WT_SYNC_DISCARD,
+    WT_SYNC_WRITE_LEAVES
+} WT_CACHE_OP;
+
+#define WT_HS_FILE_MIN (100 * WT_MEGABYTE)
 
 /*
- * WT_EVICT_ENTRY --
- *	Encapsulation of an eviction candidate.
+ * WT_CACHE_EVICTION_CONTROLS --
+ *  Cache eviction controls configuration.
+ *  WT_CACHE_EVICT_INCREMENTAL_APP: Only a part of application threads will participate in cache
+ * management when a cache threshold reaches its trigger limit. WT_CACHE_PREFER_SCRUB_EVICTION:
+ * Change the eviction strategy to scrub eviction when the cache usage is under the target limit.
  */
-struct __wt_evict_entry {
-	WT_BTREE *btree;			/* Enclosing btree object */
-	WT_REF	 *ref;				/* Page to flush/evict */
+struct __wt_cache_eviction_controls {
+    wt_shared uint8_t cache_tolerance_for_app_eviction; /* cache tolerance for app eviction.*/
+
+    wt_shared uint8_t
+      app_eviction_min_cache_fill_ratio; /* Application eviction minimum cache fill ratio */
+
+/* Configuration control for checkpoint scrub-evicting reconciled leaf pages. */
+#define WT_CACHE_CHECKPOINT_SCRUB_EVICT_AUTO 0
+#define WT_CACHE_CHECKPOINT_SCRUB_EVICT_OFF 1
+#define WT_CACHE_CHECKPOINT_SCRUB_EVICT_ON 2
+    wt_shared uint8_t checkpoint_scrub_eviction;
+
+    /* Percentage of the cache checkpoint may fill with retained scrub images. */
+    wt_shared uint8_t checkpoint_scrub_image_max;
+
+/* cache eviction controls bit positions */
+#define WT_CACHE_EVICT_INCREMENTAL_APP 0x1u
+#define WT_CACHE_PREFER_SCRUB_EVICTION 0x2u
+#define WT_CACHE_SKIP_UPDATE_OBSOLETE_CHECK 0x4u
+    wt_shared uint32_t flags_atomic;
+};
+
+struct __wt_shared_dsk_item {
+    LIST_ENTRY(__wt_shared_dsk_item) hashq;
+
+    void *data;
+    uint32_t data_size;
+
+    /*
+     * Reference count tracking how many pages share this disk image. Incremented on get or put
+     * collision, decremented on release. The entry is removed from the hash table when the count
+     * drops to zero. All accesses must be protected by the lock.
+     */
+    int32_t ref_count;
+
+    WT_PAGE_BLOCK_META block_meta; /* Block metadata, used for page disagg_info. */
+    uint32_t fid;                  /* File ID */
+    uint8_t addr_size;             /* Address cookie */
+    uint8_t addr[];
 };
 
 /*
- * WT_EVICT_WORKER --
- *	Encapsulation of an eviction worker thread.
+ * Best-effort sizing: budget 0.2% of the cache and assume one item per bucket, so dividing that
+ * budget by the per-bucket cost gives the count, with a floor of a thousand buckets.
  */
-struct __wt_evict_worker {
-	WT_SESSION_IMPL *session;
-	u_int id;
-	wt_thread_t tid;
-#define	WT_EVICT_WORKER_RUN	0x01
-	uint32_t flags;
+#define WT_SHARED_DSK_CACHE_DEFAULT_HASH_SIZE(session)                                      \
+    ((u_int)WT_MAX(S2C(session)->cache_size / 500 /                                         \
+        (sizeof(WT_SHARED_DSK_ITEM) + sizeof(*S2C(session)->cache->shared_dsk_cache.hash)), \
+      WT_THOUSAND))
+
+/* Shared disk cache state. */
+typedef enum {
+    WT_DSK_CACHE_OFF = 0,  /* No table: a leader that has never been a standby, or non-disagg. */
+    WT_DSK_CACHE_ACTIVE,   /* Standby: allow reads and puts. */
+    WT_DSK_CACHE_READONLY, /* Stepped-up leader: allow reads only. */
+    WT_DSK_CACHE_DEAD      /* Drained on a leader: both reads and writes are disabled. */
+} WT_DSK_CACHE_STATE;
+
+#define WT_DSK_CACHE_READABLE(state) \
+    ((state) == WT_DSK_CACHE_ACTIVE || (state) == WT_DSK_CACHE_READONLY)
+
+#define WT_DSK_CACHE_CAN_READ(state, btree)                                    \
+    (WT_DSK_CACHE_READABLE(state) && F_ISSET(btree, WT_BTREE_DISAGGREGATED) && \
+      !WT_DHANDLE_IS_CHECKPOINT((btree)->dhandle))
+
+#define WT_DSK_CACHE_CAN_WRITE(state, btree)                                     \
+    ((state) == WT_DSK_CACHE_ACTIVE && F_ISSET(btree, WT_BTREE_DISAGGREGATED) && \
+      !WT_DHANDLE_IS_CHECKPOINT((btree)->dhandle))
+struct __wt_shared_dsk_cache {
+    wt_shared uint8_t state;
+    wt_shared uint64_t readonly_since; /* Seconds when the cache went read-only on step-up. */
+
+    LIST_HEAD(__wt_shared_dsk_hash, __wt_shared_dsk_item) * hash;
+    WT_SPINLOCK *hash_locks;
+    u_int hash_size;
+    u_int hash_lock_size;
+#ifdef HAVE_DIAGNOSTIC
+    int32_t max_ref_count;
+    uint32_t max_bucket_walk;
+#endif
 };
 
 /*
  * WiredTiger cache structure.
  */
 struct __wt_cache {
-	/*
-	 * Different threads read/write pages to/from the cache and create pages
-	 * in the cache, so we cannot know precisely how much memory is in use
-	 * at any specific time.  However, even though the values don't have to
-	 * be exact, they can't be garbage, we track what comes in and what goes
-	 * out and calculate the difference as needed.
-	 */
-	uint64_t bytes_inmem;		/* Bytes/pages in memory */
-	uint64_t pages_inmem;
-	uint64_t bytes_internal;	/* Bytes of internal pages */
-	uint64_t bytes_overflow;	/* Bytes of overflow pages */
-	uint64_t bytes_evict;		/* Bytes/pages discarded by eviction */
-	uint64_t pages_evict;
-	uint64_t bytes_dirty;		/* Bytes/pages currently dirty */
-	uint64_t pages_dirty;
-	uint64_t bytes_read;		/* Bytes read into memory */
+    /*
+     * Different threads read/write pages to/from the cache and create pages in the cache, so we
+     * cannot know precisely how much memory is in use at any specific time. However, even though
+     * the values don't have to be exact, they can't be garbage, we track what comes in and what
+     * goes out and calculate the difference as needed.
+     */
 
-	uint64_t evict_max_page_size;	/* Largest page seen at eviction */
+    wt_shared uint64_t bytes_dirty_intl; /* Bytes/pages currently dirty */
+    wt_shared uint64_t bytes_dirty_intl_ingest;
+    wt_shared uint64_t bytes_dirty_intl_stable;
+    wt_shared uint64_t bytes_dirty_leaf;
+    wt_shared uint64_t bytes_dirty_leaf_ingest;
+    wt_shared uint64_t bytes_dirty_leaf_stable;
+    wt_shared uint64_t bytes_dirty_total;
+    wt_shared uint64_t bytes_evict;      /* Bytes/pages discarded by eviction */
+    wt_shared uint64_t bytes_image_intl; /* Bytes of disk images (internal) */
+    wt_shared uint64_t bytes_image_intl_ingest;
+    wt_shared uint64_t bytes_image_intl_stable;
+    wt_shared uint64_t bytes_image_leaf; /* Bytes of disk images (leaf) */
+    wt_shared uint64_t bytes_image_leaf_ingest;
+    wt_shared uint64_t bytes_image_leaf_stable;
+    /* Clean re-instantiation images retained in cache by checkpoint scrub. */
+    wt_shared uint64_t bytes_scrub_image;
+    wt_shared uint64_t pages_scrub_image;
+    /* Shared disk image bytes charged to more than one btree's in-memory total. */
+    wt_shared uint64_t bytes_shared_dsk_duplicate;
+    wt_shared uint64_t bytes_inmem; /* Bytes/pages in memory */
+    wt_shared uint64_t bytes_inmem_ingest;
+    wt_shared uint64_t bytes_inmem_stable;
+    wt_shared uint64_t bytes_internal; /* Bytes of internal pages */
+    wt_shared uint64_t bytes_internal_ingest;
+    wt_shared uint64_t bytes_internal_stable;
+    wt_shared uint64_t bytes_read;    /* Bytes read into memory */
+    wt_shared uint64_t bytes_updates; /* Bytes of updates to pages */
+    wt_shared uint64_t bytes_updates_ingest;
+    wt_shared uint64_t bytes_updates_stable;
+    wt_shared uint64_t bytes_written;
 
-	/*
-	 * Read information.
-	 */
-	uint64_t   read_gen;		/* Page read generation (LRU) */
+    WT_CACHE_EVICTION_CONTROLS cache_eviction_controls;
 
-	/*
-	 * Eviction thread information.
-	 */
-	WT_CONDVAR *evict_cond;		/* Eviction server condition */
-	WT_SPINLOCK evict_lock;		/* Eviction LRU queue */
-	WT_SPINLOCK evict_walk_lock;	/* Eviction walk location */
-	/* Condition signalled when the eviction server populates the queue */
-	WT_CONDVAR *evict_waiter_cond;
+    WT_CACHE_TOP cache_top; /* Largest cache consumers, by tree. */
 
-	u_int eviction_trigger;		/* Percent to trigger eviction */
-	u_int eviction_target;		/* Percent to end eviction */
-	u_int eviction_dirty_target;    /* Percent to allow dirty */
+    /*
+     * History store cache usage. TODO: The values for these variables are cached and potentially
+     * outdated.
+     */
+    wt_shared uint64_t bytes_hs;         /* History store bytes inmem */
+    wt_shared uint64_t bytes_hs_dirty;   /* History store bytes inmem dirty */
+    wt_shared uint64_t bytes_hs_updates; /* History store bytes inmem updates */
 
-	u_int overhead_pct;	        /* Cache percent adjustment */
+    wt_shared uint64_t pages_dirty_intl;
+    wt_shared uint64_t pages_dirty_intl_ingest;
+    wt_shared uint64_t pages_dirty_intl_stable;
+    wt_shared uint64_t pages_dirty_leaf;
+    wt_shared uint64_t pages_dirty_leaf_ingest;
+    wt_shared uint64_t pages_dirty_leaf_stable;
+    wt_shared uint64_t pages_evicted;
+    wt_shared uint64_t pages_evicted_ingest;
+    wt_shared uint64_t pages_evicted_leaf;
+    wt_shared uint64_t pages_evicted_stable;
+    wt_shared uint64_t pages_inmem;
+    wt_shared uint64_t pages_inmem_ingest;
+    wt_shared uint64_t pages_inmem_leaf;
+    wt_shared uint64_t pages_inmem_stable;
 
-	/*
-	 * LRU eviction list information.
-	 */
-	WT_EVICT_ENTRY *evict;		/* LRU pages being tracked */
-	WT_EVICT_ENTRY *evict_current;	/* LRU current page to be evicted */
-	uint32_t evict_candidates;	/* LRU list pages to evict */
-	uint32_t evict_entries;		/* LRU entries in the queue */
-	volatile uint32_t evict_max;	/* LRU maximum eviction slot used */
-	uint32_t evict_slots;		/* LRU list eviction slots */
-	WT_DATA_HANDLE
-		*evict_file_next;	/* LRU next file to search */
+    u_int overhead_pct; /* Cache percent adjustment */
 
-	/*
-	 * Sync/flush request information.
-	 */
-	volatile uint64_t sync_request;	/* File sync requests */
-	volatile uint64_t sync_complete;/* File sync requests completed */
+    uint32_t hs_fileid; /* History store table file ID */
 
-	/*
-	 * Cache pool information.
-	 */
-	uint64_t cp_saved_read;		/* Read count from last pass */
-	uint64_t cp_current_read;	/* Read count from current pass */
-	uint32_t cp_skip_count;		/* Post change stabilization */
-	uint64_t cp_reserved;		/* Base size for this cache */
-	WT_SESSION_IMPL *cp_session;	/* May be used for cache management */
-	wt_thread_t cp_tid;		/* Thread ID for cache pool manager */
+    /*
+     * The "history_activity" verbose messages are throttled to once per checkpoint. To accomplish
+     * this we track the checkpoint generation for the most recent read and write verbose messages.
+     */
+    uint64_t hs_verb_gen_read;
+    wt_shared uint64_t hs_verb_gen_write;
 
-	/*
-	 * Flags.
-	 */
-#define	WT_CACHE_POOL_MANAGER	0x01	/* The active cache pool manager */
-#define	WT_CACHE_POOL_RUN	0x02	/* Cache pool thread running */
-#define	WT_CACHE_CLEAR_WALKS	0x04	/* Clear eviction walks */
-#define	WT_CACHE_STUCK		0x08	/* Eviction server is stuck */
-#define	WT_CACHE_WALK_REVERSE	0x10	/* Scan backwards for candidates */
-#define	WT_CACHE_WOULD_BLOCK	0x20	/* Pages that would block apps */
-	uint32_t flags;
+    /*
+     * Cache pool information.
+     */
+    uint64_t cp_pass_pressure;   /* Calculated pressure from this pass */
+    uint64_t cp_quota;           /* Maximum size for this cache */
+    uint64_t cp_reserved;        /* Base size for this cache */
+    WT_SESSION_IMPL *cp_session; /* May be used for cache management */
+    uint32_t cp_skip_count;      /* Post change stabilization */
+    wt_thread_t cp_tid;          /* Thread ID for cache pool manager */
+    /* State seen at the last pass of the shared cache manager */
+    uint64_t cp_saved_app_evicts; /* User eviction count at last review */
+    uint64_t cp_saved_app_waits;  /* User wait count at last review */
+    uint64_t cp_saved_read;       /* Read count at last review */
+
+/*
+ * Flags.
+ */
+/* AUTOMATIC FLAG VALUE GENERATION START 0 */
+#define WT_CACHE_POOL_MANAGER 0x1u        /* The active cache pool manager */
+#define WT_CACHE_POOL_RUN 0x2u            /* Cache pool thread running */
+                                          /* AUTOMATIC FLAG VALUE GENERATION STOP 32 */
+    wt_shared uint16_t pool_flags_atomic; /* Cache pool flags */
+
+    WT_SHARED_DSK_CACHE shared_dsk_cache;
 };
+
+/*
+ * On disaggregated storage each cache byte counter has an ingest and a stable variant that we
+ * mirror based on the btree's role. These macros update the base counter and the right variant in
+ * one place. The field argument is the base member name, and we build the variant names by token
+ * pasting, so all three members need to follow the base/_ingest/_stable naming.
+ */
+#define WT_CACHE_INCR(is_disagg, btree, cache, field, size)                             \
+    do {                                                                                \
+        (void)__wt_atomic_add_uint64_relaxed(&(cache)->field, (size));                  \
+        if (is_disagg) {                                                                \
+            if (F_ISSET(btree, WT_BTREE_GARBAGE_COLLECT))                               \
+                (void)__wt_atomic_add_uint64_relaxed(&(cache)->field##_ingest, (size)); \
+            else if (F_ISSET(btree, WT_BTREE_DISAGGREGATED))                            \
+                (void)__wt_atomic_add_uint64_relaxed(&(cache)->field##_stable, (size)); \
+        }                                                                               \
+    } while (0)
+
+#define WT_CACHE_DECR(session, is_disagg, btree, cache, field, size)                        \
+    do {                                                                                    \
+        __wt_cache_decr_check_uint64(session, &(cache)->field, (size), "WT_CACHE." #field); \
+        if (is_disagg) {                                                                    \
+            if (F_ISSET(btree, WT_BTREE_GARBAGE_COLLECT))                                   \
+                __wt_cache_decr_check_uint64(                                               \
+                  session, &(cache)->field##_ingest, (size), "WT_CACHE." #field "_ingest"); \
+            else if (F_ISSET(btree, WT_BTREE_DISAGGREGATED))                                \
+                __wt_cache_decr_check_uint64(                                               \
+                  session, &(cache)->field##_stable, (size), "WT_CACHE." #field "_stable"); \
+        }                                                                                   \
+    } while (0)
 
 /*
  * WT_CACHE_POOL --
  *	A structure that represents a shared cache.
  */
 struct __wt_cache_pool {
-	WT_SPINLOCK cache_pool_lock;
-	WT_CONDVAR *cache_pool_cond;
-	const char *name;
-	uint64_t size;
-	uint64_t chunk;
-	uint64_t currently_used;
-	uint32_t refs;		/* Reference count for structure. */
-	/* Locked: List of connections participating in the cache pool. */
-	TAILQ_HEAD(__wt_cache_pool_qh, __wt_connection_impl) cache_pool_qh;
+    WT_SPINLOCK cache_pool_lock;
+    WT_CONDVAR *cache_pool_cond;
+    const char *name;
+    uint64_t size;
+    uint64_t chunk;
+    uint64_t quota;
+    uint64_t currently_used;
+    uint32_t refs; /* Reference count for structure. */
+    /* Locked: List of connections participating in the cache pool. */
+    TAILQ_HEAD(__wt_cache_pool_qh, __wt_connection_impl) cache_pool_qh;
 
-#define	WT_CACHE_POOL_MANAGED	0x01	/* Cache pool has a manager thread */
-#define	WT_CACHE_POOL_ACTIVE	0x02	/* Cache pool is active */
-	uint8_t flags_atomic;
+    wt_shared uint8_t pool_managed; /* Cache pool has a manager thread */
+
+/* AUTOMATIC FLAG VALUE GENERATION START 0 */
+#define WT_CACHE_POOL_ACTIVE 0x1u /* Cache pool is active */
+                                  /* AUTOMATIC FLAG VALUE GENERATION STOP 8 */
+    uint8_t flags;
 };

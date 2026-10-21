@@ -1,0 +1,94 @@
+/**
+ * @tags: [
+ *   requires_fcv_90,
+ * ]
+ */
+import {getPlanRankerConfig, setPlanRankerConfig} from "jstests/libs/query/cbr_utils.js";
+
+const coll = db[jsTestName()];
+
+function triviallyTrue() {
+    assert(coll.drop());
+    assert.commandWorked(coll.createIndex({a: 1}));
+    assert.commandWorked(coll.insertOne({}));
+
+    const queries = [
+        () => coll.find().limit(5),
+        () => coll.find().sort({a: 1}),
+        () => coll.find().sort({b: 1}),
+        () => coll.find().sort({a: 1}).limit(5),
+        () => coll.find().sort({b: 1}).limit(5),
+    ];
+
+    for (const query of queries) {
+        const winningPlan = query().explain().queryPlanner.winningPlan;
+        if ("estimatesMetadata" in winningPlan) {
+            assert.eq(winningPlan.estimatesMetadata.ceSource, "Metadata");
+            assert.eq(winningPlan.cardinalityEstimate, 1);
+        }
+        const res = query().toArray();
+        assert.eq(res.length, 1);
+    }
+}
+
+function triviallyFalse() {
+    assert(coll.drop());
+    assert.commandWorked(coll.createIndex({a: 1}));
+    assert.commandWorked(coll.insertOne({}));
+
+    const winningPlan = coll.find({$expr: false}).explain().queryPlanner.winningPlan;
+    if ("estimatesMetadata" in winningPlan) {
+        assert.eq(winningPlan.estimatesMetadata.ceSource, "Code");
+        assert.eq(winningPlan.cardinalityEstimate, 0);
+        // The EOF stage has a Code-sourced zero CE that clampZeroEstimates leaves at 0, so all
+        // costs collapse to zero. The additive per-stage minimum in the cost model still
+        // guarantees a strictly positive cost for the plan.
+        assert.gt(winningPlan.costEstimate, 0, winningPlan);
+    }
+    const res = coll.find({$expr: false}).toArray();
+    assert.eq(res.length, 0);
+}
+
+function multiKey() {
+    assert(coll.drop());
+    assert.commandWorked(coll.createIndex({a: 1}));
+    assert.commandWorked(coll.insertOne({a: [1, 2]}));
+
+    const query = () => coll.find().sort({a: 1});
+    const winningPlan = query().explain("executionStats").queryPlanner.winningPlan;
+    if ("estimatesMetadata" in winningPlan) {
+        // With only one document in the collection the sampler observes every document, so
+        // SamplingEstimatorImpl::makeScaledEstimate tags the CE as 'Code' (authoritative)
+        // rather than 'Sampling'.
+        assert.eq(winningPlan.estimatesMetadata.ceSource, "Code");
+        assert.eq(winningPlan.cardinalityEstimate, 1);
+        assert.eq(winningPlan.stage, "FETCH");
+        assert.eq(winningPlan.inputStage.numKeysEstimate, 2);
+        assert.eq(winningPlan.inputStage.cardinalityEstimate, 1);
+    }
+    const res = query().toArray();
+    assert.eq(res.length, 1);
+}
+
+const oldCBRConfig = getPlanRankerConfig(db);
+
+try {
+    const configs = [
+        {featureFlagCostBasedRanker: true, internalQueryPlanRanker: "mixed"},
+        {
+            featureFlagCostBasedRanker: true,
+            internalQueryPlanRanker: "costBased",
+            internalQueryCBRCEMode: "samplingCE",
+        },
+    ];
+
+    for (const config of configs) {
+        setPlanRankerConfig(db, config);
+
+        triviallyTrue();
+        triviallyFalse();
+        multiKey();
+    }
+} finally {
+    setPlanRankerConfig(db, oldCBRConfig);
+}

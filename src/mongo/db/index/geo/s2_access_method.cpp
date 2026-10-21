@@ -1,0 +1,342 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/index/geo/s2_access_method.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/index/expression_keys_private.h"
+#include "mongo/db/index/expression_params.h"
+#include "mongo/db/index/geo/s2_common.h"
+#include "mongo/db/index/geo/s2_key_generator.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/version_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <cmath>
+#include <string>
+#include <utility>
+
+#include <s2cellid.h>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
+
+
+namespace mongo {
+
+namespace {
+
+/**
+ * Generates 2dsphere keys for validation. If 'overrideIndexVersion' is set, it replaces the
+ * version taken from 'indexSpec' after initialize2dsphereParams.
+ */
+KeyStringSet generateS2KeysForValidationImpl(const BSONObj& indexSpec,
+                                             const CollatorInterface* collator,
+                                             const BSONObj& document,
+                                             Ordering ordering,
+                                             const boost::optional<RecordId>& recordId,
+                                             key_string::Version keyStringVersion,
+                                             boost::optional<S2IndexVersion> overrideIndexVersion) {
+    S2IndexingParams params;
+    index2dsphere::initialize2dsphereParams(indexSpec, collator, &params);
+    if (overrideIndexVersion) {
+        params.indexVersion = *overrideIndexVersion;
+    }
+
+    SharedBufferFragmentBuilder pool(key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
+    KeyStringSet keys;
+    MultikeyPaths multikeyPaths;
+
+    BSONObj keyPattern = indexSpec.getObjectField("key");
+    index2dsphere::getS2Keys(pool,
+                             document,
+                             keyPattern,
+                             params,
+                             &keys,
+                             &multikeyPaths,
+                             keyStringVersion,
+                             SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                             ordering,
+                             recordId);
+
+    return keys;
+}
+
+}  // namespace
+
+static const string kIndexVersionFieldName("2dsphereIndexVersion");
+
+S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState,
+                               std::unique_ptr<SortedDataInterface> btree,
+                               const std::string& indexName)
+    : SortedDataIndexAccessMethod(btreeState, std::move(btree)) {
+    const IndexDescriptor* descriptor = btreeState->descriptor();
+
+    index2dsphere::initialize2dsphereParams(
+        descriptor->infoObj(), btreeState->getCollator(), &_params);
+
+    int geoFields = 0;
+
+    // Categorize the fields we're indexing and make sure we have a geo field.
+    BSONObjIterator i(descriptor->keyPattern());
+    while (i.more()) {
+        BSONElement e = i.next();
+        if (e.type() == BSONType::string && indexName == e.String()) {
+            ++geoFields;
+        } else {
+            // We check for numeric in 2d, so that's the check here
+            uassert(16823,
+                    (string) "Cannot use " + indexName +
+                        " index with other special index types: " + e.toString(),
+                    e.isNumber());
+        }
+    }
+
+    uassert(16750,
+            "Expect at least one geo field, spec=" + descriptor->keyPattern().toString(),
+            geoFields >= 1);
+
+    if (descriptor->isSetSparseByUser()) {
+        LOGV2_WARNING(23742,
+                      "Sparse option ignored for index spec",
+                      "indexSpec"_attr = descriptor->keyPattern());
+    }
+}
+
+std::string formatAllowedVersions(const std::set<long long>& allowedVersions) {
+    std::string result;
+    bool first = true;
+    for (long long version : allowedVersions) {
+        if (!first) {
+            result += ",";
+        }
+        result += std::to_string(version);
+        first = false;
+    }
+    return result;
+}
+
+StatusWith<BSONObj> cannotCreateIndexStatus(BSONElement indexVersionElt,
+                                            const std::string& message,
+                                            const std::string& expectedVersions = str::stream()
+                                                << S2_INDEX_VERSION_1 << "," << S2_INDEX_VERSION_2
+                                                << "," << S2_INDEX_VERSION_3 << ","
+                                                << S2_INDEX_VERSION_4,
+                                            const std::string& extraMessage = "") {
+    return {ErrorCodes::CannotCreateIndex,
+            str::stream() << message << " { " << kIndexVersionFieldName << " : " << indexVersionElt
+                          << " }, only versions: [" << expectedVersions << "] are supported"
+                          << extraMessage};
+}
+
+StatusWith<BSONObj> S2AccessMethod::_fixSpecHelper(
+    const BSONObj& specObj,
+    const VersionContext& versionContext,
+    boost::optional<std::set<long long>> allowedVersions) {
+    // If the spec object doesn't have field "2dsphereIndexVersion", add the default version
+    // based on the feature flag. Consult 'versionContext' so that an in-flight createIndex
+    // command with a pinned Operation FCV evaluates the flag against its captured FCV instead
+    // of the live FCV. Without this, a concurrent setFCV transition could change the live FCV
+    // between primary spec validation and oplog application on a secondary, causing the
+    // secondary to fatal-assert on a v4 spec it should accept (SERVER-125400).
+    BSONElement indexVersionElt = specObj[kIndexVersionFieldName];
+    long long defaultVersion =
+        static_cast<long long>(index2dsphere::getDefaultS2IndexVersion(versionContext));
+    if (indexVersionElt.eoo()) {
+        // Validate the default version against allowed versions if provided.
+        if (allowedVersions && !allowedVersions->contains(defaultVersion)) {
+            return {ErrorCodes::CannotCreateIndex,
+                    str::stream() << "Default geo index version " << defaultVersion
+                                  << " is not in the allowed set: ["
+                                  << formatAllowedVersions(*allowedVersions) << "]"};
+        }
+        BSONObjBuilder bob;
+        bob.appendElements(specObj);
+        bob.append(kIndexVersionFieldName, defaultVersion);
+        return bob.obj();
+    }
+
+    // Otherwise, validate the index version.
+    if (!indexVersionElt.isNumber()) {
+        return cannotCreateIndexStatus(indexVersionElt, "Invalid type for geo index version");
+    }
+
+    if (indexVersionElt.type() == BSONType::numberDouble &&
+        !std::isnormal(indexVersionElt.numberDouble())) {
+        return cannotCreateIndexStatus(indexVersionElt, "Invalid value for geo index version");
+    }
+
+    long long indexVersion = indexVersionElt.safeNumberLong();
+
+    if (allowedVersions && !allowedVersions->contains(indexVersion)) {
+        // If we have allowedVersions, validate that the index version is in the set.
+        return cannotCreateIndexStatus(indexVersionElt,
+                                       "unsupported geo index version",
+                                       formatAllowedVersions(*allowedVersions),
+                                       "");
+    } else {
+        // Index version must be either 1, 2, 3, or 4.
+        switch (indexVersion) {
+            case S2_INDEX_VERSION_1:
+            case S2_INDEX_VERSION_2:
+            case S2_INDEX_VERSION_3:
+                break;
+            case S2_INDEX_VERSION_4: {
+                // Gate version 4 behind feature flag, consulting 'versionContext' so a
+                // captured Operation FCV (if any) is honored.
+                if (index2dsphere::getDefaultS2IndexVersion(versionContext) != S2_INDEX_VERSION_4) {
+                    return Status(ErrorCodes::CannotCreateIndex,
+                                  "2dsphereIndexVersion 4 requires feature flag "
+                                  "'featureFlag2dsphereIndexVersion4' to be enabled");
+                }
+                break;
+            }
+            default:
+                return cannotCreateIndexStatus(indexVersionElt, "unsupported geo index version");
+        }
+    }
+    return specObj;
+}
+
+// static
+StatusWith<BSONObj> S2AccessMethod::fixSpec(const BSONObj& specObj,
+                                            const VersionContext& versionContext) {
+    return S2AccessMethod::_fixSpecHelper(specObj, versionContext);
+}
+
+// static
+bool S2AccessMethod::isVersion3(const BSONObj& indexSpec) {
+    BSONElement versionElt = indexSpec["2dsphereIndexVersion"];
+    return versionElt.isNumber() && versionElt.numberInt() == S2_INDEX_VERSION_3;
+}
+
+bool S2AccessMethod::shouldCheckMissingIndexEntryAlternative(OperationContext* opCtx,
+                                                             const IndexCatalogEntry& entry) const {
+    // Only proceed with expensive record lookup for version 3 indexes, which may need
+    // to be checked for version 4 upgrade scenarios.
+    return isVersion3(entry.descriptor()->infoObj());
+}
+
+boost::optional<std::pair<std::string, std::string>>
+S2AccessMethod::checkMissingIndexEntryAlternative(OperationContext* opCtx,
+                                                  const IndexCatalogEntry& entry,
+                                                  const key_string::Value& missingKey,
+                                                  const RecordId& recordId,
+                                                  const BSONObj& document) const {
+    // Only check for version 3 to version 4 upgrade scenarios.
+    if (!isVersion3(entry.descriptor()->infoObj())) {
+        return boost::none;
+    }
+
+    try {
+        const auto& indexSpec = entry.descriptor()->infoObj();
+        const auto ksVersion = getSortedDataInterface()->getKeyStringVersion();
+        const auto ordering = getSortedDataInterface()->getOrdering();
+
+        KeyStringSet keysV3 = generateS2KeysForValidationImpl(
+            indexSpec, entry.getCollator(), document, ordering, recordId, ksVersion, boost::none);
+        KeyStringSet keysV4 =
+            generateS2KeysForValidationImpl(indexSpec,
+                                            entry.getCollator(),
+                                            document,
+                                            ordering,
+                                            recordId,
+                                            ksVersion,
+                                            boost::optional<S2IndexVersion>(S2_INDEX_VERSION_4));
+
+        // The missing key must be one we expect under v3 parsing (current catalog version).
+        if (!keysV3.contains(missingKey)) {
+            return boost::none;
+        }
+
+        // If v4 would still expect this same KeyString, the inconsistency is not the v3-vs-v4
+        // semantic fork (e.g. partial multikey index corruption).
+        if (keysV4.contains(missingKey)) {
+            return boost::none;
+        }
+
+        // Check if a v4-only key (not also produced under v3) exists in the index for this record.
+        // Keys that appear in both sets can still be present for unrelated reasons (e.g. another
+        // geometry that parses the same under v3 and v4); matching those would false-positive after
+        // a partial multikey miss of the forked key only.
+        if (!keysV4.empty()) {
+            auto sortedDataInterface = getSortedDataInterface();
+            auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+            auto cursor = sortedDataInterface->newCursor(opCtx, ru);
+            bool foundMatchingKey =
+                std::any_of(keysV4.begin(), keysV4.end(), [&](const auto& keyV4) {
+                    if (keysV3.contains(keyV4)) {
+                        return false;
+                    }
+                    // seekForKeyString checks if the key exists in the index and
+                    // returns the KeyStringEntry with the RecordId if found.
+                    auto ksEntry = cursor->seekForKeyString(ru, keyV4.getView());
+                    return ksEntry && ksEntry->loc == recordId;
+                });
+
+            if (foundMatchingKey) {
+                const std::string indexName = entry.descriptor()->indexName();
+                std::string errorMsg = "Index '" + indexName +
+                    "' was created with 2dsphereIndexVersion 3, but validation indicates it should "
+                    "be "
+                    "rebuilt with version 4. Please drop and recreate this index with version 4.";
+                std::string warningMsg =
+                    "Index '" + indexName + "' needs to be rebuilt with 2dsphereIndexVersion 4.";
+                return std::make_pair(errorMsg, warningMsg);
+            }
+        }
+    } catch (...) {
+        // If key generation fails, continue with normal error reporting.
+    }
+
+    return boost::none;
+}
+
+void S2AccessMethod::validateDocument(const CollectionPtr& collection,
+                                      const BSONObj& obj,
+                                      const BSONObj& keyPattern) const {
+    ExpressionKeysPrivate::validateDocumentCommon(collection, obj, keyPattern);
+}
+
+void S2AccessMethod::doGetKeys(OperationContext* opCtx,
+                               const CollectionPtr& collection,
+                               const IndexCatalogEntry* entry,
+                               SharedBufferFragmentBuilder& pooledBufferBuilder,
+                               const BSONObj& obj,
+                               GetKeysContext context,
+                               KeyStringSet* keys,
+                               KeyStringSet* multikeyMetadataKeys,
+                               MultikeyPaths* multikeyPaths,
+                               const boost::optional<RecordId>& id) const {
+    uassert(12113200,
+            str::stream() << IndexNames::GEO_2DSPHERE_BUCKET
+                          << " indexes are only supported on time-series collections",
+            entry->descriptor()->getIndexType() != IndexType::INDEX_2DSPHERE_BUCKET ||
+                collection->isTimeseriesCollection());
+
+    index2dsphere::getS2Keys(pooledBufferBuilder,
+                             obj,
+                             entry->descriptor()->keyPattern(),
+                             _params,
+                             keys,
+                             multikeyPaths,
+                             getSortedDataInterface()->getKeyStringVersion(),
+                             context,
+                             getSortedDataInterface()->getOrdering(),
+                             id);
+}
+
+}  // namespace mongo

@@ -1,0 +1,292 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/agg/exec_pipeline.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/lite_parsed_document_source_nested_pipelines.h"
+#include "mongo/db/pipeline/lite_parsed_union_with.h"
+#include "mongo/db/pipeline/optimization/optimize.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/stage_params.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <list>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+struct UnionWithSharedState {
+    enum class ExecutionProgress {
+        // We haven't yet iterated 'pSource' to completion.
+        kIteratingSource,
+
+        // We finished iterating 'pSource', but haven't started on the sub pipeline and need to do
+        // some setup first.
+        kStartingSubPipeline,
+
+        // We finished iterating 'pSource' and are now iterating '_pipeline', but haven't finished
+        // yet.
+        kIteratingSubPipeline,
+
+        // There are no more results.
+        kFinished
+    };
+
+    UnionWithSharedState(std::unique_ptr<Pipeline> pipeline,
+                         std::unique_ptr<exec::agg::Pipeline> execPipeline,
+                         ExecutionProgress executionState = ExecutionProgress::kIteratingSource);
+
+    // This pipeline will not be translated nor optimized, but the view will be resolved and stages
+    // desugared. Pre-optimization rewrites and optimizations will happen right before the
+    // subpipeline is executed in 'UnionWithStage::doGetNext'.
+    std::unique_ptr<Pipeline> _pipeline;
+    std::unique_ptr<exec::agg::Pipeline> _execPipeline;
+    // The aggregation pipeline defined with the user request, prior to optimization and view
+    // resolution.
+    ExecutionProgress _executionState = ExecutionProgress::kIteratingSource;
+
+    // $unionWith will execute the subpipeline twice for explain with execution stats - once for
+    // results and once for explain info. During the first execution, built in variables (such as
+    // SEARCH_META) might be set, which are not allowed to be set at the start of the second
+    // execution. We need to store the initial state of the variables to reset them for the second
+    // execution
+    Variables _variables;
+    VariablesParseState _variablesParseState;
+};
+
+
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] DocumentSourceUnionWith final : public DocumentSource {
+public:
+    static constexpr std::string_view kStageName = "$unionWith"sv;
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    // Builds a DocumentSourceUnionWith from pre-parsed StageParams.
+    // Performs expCtx-dependent validations (hybrid search timeseries).
+    static DocumentSourceContainer createFromStageParams(
+        UnionWithStageParams& params, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            NamespaceString unionNss,
+                            std::vector<BSONObj> pipeline);
+
+    // Constructor used by createFromStageParams(): accepts pre-parsed StageParams for the
+    // subpipeline together with the user-facing fields that the copy constructor and serialize()
+    // require. 'resolvedBackingNss' is the resolved backing namespace recorded by
+    // bindResolvedNamespace at parse time; when it is a view (involvedNamespaceIsAView), it
+    // short-circuits the expCtx->getResolvedNamespaces() lookup because the view was already
+    // resolved.
+    DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            NamespaceString unionNss,
+                            StageParamsPipeline subpipelineStageParams,
+                            std::vector<BSONObj> userPipeline,
+                            ResolvedNamespace resolvedBackingNss);
+
+    // Expose a constructor that skips the parsing step for testing purposes.
+    DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            std::unique_ptr<Pipeline> pipeline);
+
+    // Copy constructor used for clone().
+    DocumentSourceUnionWith(const DocumentSourceUnionWith& original,
+                            const boost::intrusive_ptr<ExpressionContext>& newExpCtx);
+
+    ~DocumentSourceUnionWith() override;
+
+    std::string_view getSourceName() const final {
+        return kStageName;
+    }
+
+    static const Id& id;
+
+    Id getId() const override {
+        return id;
+    }
+
+    GetModPathsReturn getModifiedPaths() const final {
+        // Since we might have a document arrive from the foreign pipeline with the same path as a
+        // document in the main pipeline. Without introspecting the sub-pipeline, we must report
+        // that all paths have been modified.
+        return {GetModPathsReturn::Type::kAllPaths, {}, {}};
+    }
+
+    StageConstraints constraints(PipelineSplitState) const final {
+        StageConstraints unionConstraints(
+            StreamType::kStreaming,
+            PositionRequirement::kNone,
+            HostTypeRequirement::kTargetedShards,
+            DiskUseRequirement::kNoDiskUse,
+            FacetRequirement::kAllowed,
+            TransactionRequirement::kNotAllowed,
+            // The check to disallow $unionWith on a sharded collection within $lookup happens
+            // outside of the constraints as long as the involved namespaces are reported correctly.
+            LookupRequirement::kAllowed,
+            UnionRequirement::kAllowed);
+
+        if (_sharedState->_pipeline) {
+            // The constraints of the sub-pipeline determine the constraints of the $unionWith
+            // stage. We want to forward the strictest requirements of the stages in the
+            // sub-pipeline.
+            unionConstraints = StageConstraints::getStrictestConstraints(
+                _sharedState->_pipeline->getSources(), unionConstraints);
+        }
+        // unionWith alters the number of documents compared to the main collection. Thus, we set
+        // that it doesn't preserve cardinality.
+        unionConstraints.preservesCardinality = false;
+        // DocumentSourceUnionWith cannot directly swap with match but it contains custom logic in
+        // the optimizeAt() member function to allow itself to duplicate any match ahead in the
+        // current pipeline and place one copy inside its sub-pipeline and one copy behind in the
+        // current pipeline.
+        unionConstraints.canSwapWithMatch = false;
+        return unionConstraints;
+    }
+
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
+    boost::optional<DistributedPlanLogic> distributedPlanLogic(
+        const DistributedPlanContext* ctx) final {
+        // {shardsStage, mergingStage, sortPattern}
+        return DistributedPlanLogic{nullptr, this, boost::none};
+    }
+
+    void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
+
+    void detachSourceFromOperationContext() final;
+
+    void reattachSourceToOperationContext(OperationContext* opCtx) final;
+
+    bool validateSourceOperationContext(const OperationContext* opCtx) const final;
+
+    bool hasNonEmptyPipeline() const {
+        return _sharedState->_pipeline && !_sharedState->_pipeline->empty();
+    }
+
+    const Pipeline& getPipeline() const {
+        tassert(7113100, "Pipeline has been already disposed", _sharedState->_pipeline);
+        return *_sharedState->_pipeline;
+    }
+
+    Pipeline& getPipeline() {
+        tassert(7113101, "Pipeline has been already disposed", _sharedState->_pipeline);
+        return *_sharedState->_pipeline;
+    }
+
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final;
+
+    const DocumentSourceContainer* getSubPipeline() const final {
+        if (_sharedState->_pipeline) {
+            return &_sharedState->_pipeline->getSources();
+        }
+        return nullptr;
+    }
+
+    boost::intrusive_ptr<ExpressionContext> getSubpipelineExpCtx() const final {
+        if (_sharedState->_pipeline) {
+            return _sharedState->_pipeline->getContext();
+        }
+        return nullptr;
+    }
+
+    std::shared_ptr<UnionWithSharedState> getSharedState() const {
+        return _sharedState;
+    }
+
+    // 'isHybridSearch' forces the sub-pipeline expCtx to be marked hybrid when 'currentPipeline'
+    // is already desugared (explain-serialize reparse) and shape detection cannot tell.
+    static std::unique_ptr<Pipeline> parsePipelineWithMaybeViewDefinition(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const ResolvedNamespace& resolvedNs,
+        std::vector<BSONObj> currentPipeline,
+        const NamespaceString& userNss,
+        bool isHybridSearch = false);
+
+    static std::unique_ptr<Pipeline> parsePipelineFromStageParamsWithMaybeViewDefinition(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const ResolvedNamespace& resolvedNs,
+        StageParamsPipeline stageParams,
+        const std::vector<BSONObj>& rawPipeline,
+        const NamespaceString& userNss);
+
+    DocumentSourceContainer::iterator optimizeAt(DocumentSourceContainer::iterator itr,
+                                                 DocumentSourceContainer* container);
+
+    boost::intrusive_ptr<DocumentSource> optimize() {
+        pipeline_optimization::optimizePipeline(*_sharedState->_pipeline);
+        return this;
+    }
+
+private:
+    friend exec::agg::StagePtr documentSourceUnionWithToStageFn(
+        const boost::intrusive_ptr<const DocumentSource>& documentSource);
+
+    Value serialize(const query_shape::SerializationOptions& opts =
+                        query_shape::SerializationOptions{}) const final;
+
+    // Builds the complete {$unionWith: {coll: ..., pipeline: ...}} Value from
+    // pre-computed components. Handles collectionless variations.
+    Value buildUnionWithResult(Value pipelineValue, Value coll) const;
+
+    // TODO SERVER-121094: Remove when featureFlagExtensionsInsideHybridSearch is removed.
+    Value legacyUnionWithSerialize(const query_shape::SerializationOptions& opts) const;
+
+    // Appends the internal-only isHybridSearch flag to a serialized spec when appropriate.
+    void appendIsHybridSearchFlag(MutableDocument& spec,
+                                  const query_shape::SerializationOptions& opts) const;
+
+    std::shared_ptr<UnionWithSharedState> _sharedState;
+
+    // The original, unresolved namespace to union.
+    NamespaceString _userNss;
+
+    // The aggregation pipeline defined with the user request, prior to optimization and view
+    // resolution.
+    std::vector<BSONObj> _userPipeline;
+    // Cached hybrid_scoring_util::isHybridSearchPipeline(_userPipeline); kept in sync with
+    // '_userPipeline' assignments.
+    bool _userPipelineIsHybridSearch = false;
+
+    // Match and/or project stages after a $unionWith can be pushed down into the $unionWith (and
+    // the head of the pipeline). If we're doing an explain with execution stats, we will need
+    // copies of these stages as they may be pushed down to the find layer.
+    std::vector<BSONObj> _pushedDownStages;
+
+    // State that we preserve in the case where we are running explain with 'executionStats' on a
+    // $unionWith with a view. Otherwise we wouldn't be able to see details about the execution of
+    // the view pipeline in the explain result.
+    boost::optional<ResolvedNamespace> _resolvedNsForView;
+
+    bool _fromNsIsAView = false;
+};
+
+}  // namespace mongo

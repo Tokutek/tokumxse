@@ -18,9 +18,6 @@ using std::vector;
 #include "s2latlng.h"
 #include "s2edgeutil.h"
 
-#include "mongo/util/mongoutils/str.h"
-using mongoutils::str::stream;
-
 static const unsigned char kCurrentEncodingVersionNumber = 1;
 
 S2Polyline::S2Polyline()
@@ -54,7 +51,9 @@ void S2Polyline::Init(vector<S2Point> const& vertices) {
   vertices_ = new S2Point[num_vertices_];
   // Check (num_vertices_ > 0) to avoid invalid reference to vertices[0].
   if (num_vertices_ > 0) {
-    memcpy(vertices_, &vertices[0], num_vertices_ * sizeof(vertices_[0]));
+    // mongodb: void* casts to silence a -Wclass-memaccess warning.
+    memcpy(static_cast<void*>(vertices_), static_cast<const void*>(&vertices[0]),
+           num_vertices_ * sizeof(vertices_[0]));
   }
 }
 
@@ -78,7 +77,7 @@ bool S2Polyline::IsValid(vector<S2Point> const& v, string* err) {
     if (!S2::IsUnitLength(v[i])) {
       S2LOG(INFO) << "Vertex " << i << " is not unit length";
       if (err) {
-        *err = stream() << "Vertex " << i << " is not unit length";
+        *err = s2_env::StringStream() << "Vertex " << i << " is not unit length";
       }
       return false;
     }
@@ -90,7 +89,7 @@ bool S2Polyline::IsValid(vector<S2Point> const& v, string* err) {
       S2LOG(INFO) << "Vertices " << (i - 1) << " and " << i
                 << " are identical or antipodal";
       if (err) {
-        *err = stream() << "Vertices " << (i - 1) << " and " << i
+        *err = s2_env::StringStream() << "Vertices " << (i - 1) << " and " << i
                         << " are identical or antipodal";
       }
       return false;
@@ -103,7 +102,9 @@ bool S2Polyline::IsValid(vector<S2Point> const& v, string* err) {
 S2Polyline::S2Polyline(S2Polyline const* src)
   : num_vertices_(src->num_vertices_),
     vertices_(new S2Point[num_vertices_]) {
-  memcpy(vertices_, src->vertices_, num_vertices_ * sizeof(vertices_[0]));
+  // mongodb: void* casts to silence a -Wclass-memaccess warning.
+  memcpy(static_cast<void*>(vertices_), static_cast<const void*>(src->vertices_),
+         num_vertices_ * sizeof(vertices_[0]));
 }
 
 S2Polyline* S2Polyline::Clone() const {

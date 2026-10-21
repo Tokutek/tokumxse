@@ -1,0 +1,165 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/util/spilling.h"
+
+#include "mongo/base/status.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace sbe {
+
+namespace {
+
+[[nodiscard]] Lock::GlobalLock acquireLock(OperationContext* opCtx) {
+    return Lock::GlobalLock(
+        opCtx,
+        LockMode::MODE_IS,
+        Date_t::max(),
+        Lock::InterruptBehavior::kThrow,
+        Lock::GlobalLockOptions{.skipFlowControlTicket = true, .skipRSTLLock = true});
+}
+
+}  // namespace
+
+void assertIgnorePrepareConflictsBehavior(OperationContext* opCtx) {
+    tassert(5907502,
+            "The operation must be ignoring conflicts and allowing writes or enforcing prepare "
+            "conflicts entirely",
+            shard_role_details::getRecoveryUnit(opCtx)->getPrepareConflictBehavior() !=
+                PrepareConflictBehavior::kIgnoreConflicts);
+}
+
+std::pair<RecordId, key_string::TypeBits> encodeKeyString(
+    key_string::Builder& kb, const value::FixedSizeRow<1 /* N */>& value) {
+    value.serializeIntoKeyString(kb);
+    auto typeBits = kb.getTypeBits();
+    auto rid = RecordId(kb.getView());
+    return {rid, typeBits};
+}
+
+key_string::Value decodeKeyString(const RecordId& rid, key_string::TypeBits typeBits) {
+    key_string::Builder kb{key_string::Version::kLatestVersion};
+    kb.resetFromBuffer(rid.getStr());
+    kb.setTypeBits(typeBits);
+    return kb.getValueCopy();
+}
+
+SpillingStore::SpillingStore(OperationContext* opCtx, KeyFormat format) {
+    auto lk = acquireLock(opCtx);
+    _spillTable = opCtx->getServiceContext()->getStorageEngine()->makeSpillTable(
+        opCtx,
+        format,
+        static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load()));
+}
+
+SpillingStore::~SpillingStore() {}
+
+int SpillingStore::upsertToRecordStore(OperationContext* opCtx,
+                                       const RecordId& recordKey,
+                                       const value::MaterializedRow& key,
+                                       const value::MaterializedRow& val,
+                                       bool update) {
+    BufBuilder buf;
+    key.serializeForSorter(buf);
+    val.serializeForSorter(buf);
+    return upsertToRecordStore(opCtx, recordKey, buf, update);
+}
+
+int SpillingStore::upsertToRecordStore(
+    OperationContext* opCtx,
+    const RecordId& key,
+    const value::MaterializedRow& val,
+    const key_string::TypeBits& typeBits,  // recover type of value.
+    bool update) {
+    BufBuilder bufValue;
+    val.serializeForSorter(bufValue);
+    // Append the 'typeBits' to the end of the val's buffer so the 'key' can be reconstructed when
+    // draining HashAgg.
+    bufValue.appendBuf(typeBits.getBuffer(), typeBits.getSize());
+
+    return upsertToRecordStore(opCtx, key, bufValue, update);
+}
+
+int SpillingStore::upsertToRecordStore(
+    OperationContext* opCtx,
+    const RecordId& key,
+    BufBuilder& buf,
+    const key_string::TypeBits& typeBits,  // recover type of value.
+    bool update) {
+    // Append the 'typeBits' to the end of the val's buffer so the 'key' can be reconstructed when
+    // draining HashAgg.
+    buf.appendBuf(typeBits.getBuffer(), typeBits.getSize());
+
+    return upsertToRecordStore(opCtx, key, buf, update);
+}
+
+int SpillingStore::upsertToRecordStore(OperationContext* opCtx,
+                                       const RecordId& key,
+                                       BufBuilder& buf,
+                                       bool update) {
+    assertIgnorePrepareConflictsBehavior(opCtx);
+
+    auto result = [&] {
+        auto lk = acquireLock(opCtx);
+        if (update) {
+            return _spillTable->updateRecord(opCtx, key, buf.buf(), buf.len());
+        }
+        std::vector<Record> records = {{key, {buf.buf(), buf.len()}}};
+        return _spillTable->insertRecords(opCtx, &records);
+    }();
+
+    uassertStatusOK(result);
+    return buf.len();
+}
+
+Status SpillingStore::insertRecords(OperationContext* opCtx, std::vector<Record>* inOutRecords) {
+    assertIgnorePrepareConflictsBehavior(opCtx);
+
+    auto lk = acquireLock(opCtx);
+    return _spillTable->insertRecords(opCtx, inOutRecords);
+}
+
+boost::optional<value::FixedSizeRow<1 /* N */>> SpillingStore::readFromRecordStore(
+    OperationContext* opCtx, const RecordId& rid) {
+    RecordData record;
+    auto found = [&] {
+        auto lk = acquireLock(opCtx);
+        return _spillTable->findRecord(opCtx, rid, &record);
+    }();
+
+    if (found) {
+        auto valueReader = BufReader(record.data(), record.size());
+        return value::FixedSizeRow<1 /* N */>::deserializeForSorter(valueReader, {});
+    }
+    return boost::none;
+}
+
+bool SpillingStore::findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* out) {
+    auto lk = acquireLock(opCtx);
+    return _spillTable->findRecord(opCtx, loc, out);
+}
+
+int64_t SpillingStore::storageSize(OperationContext* opCtx) {
+    auto lk = acquireLock(opCtx);
+    return _spillTable->storageSize();
+}
+
+void SpillingStore::updateSpillStorageStatsForOperation(OperationContext* opCtx) {
+    CurOp::get(opCtx)->updateSpillStorageStats(
+        _spillTable->computeOperationStatisticsSinceLastCall());
+}
+}  // namespace sbe
+}  // namespace mongo

@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::admission"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    ApplicationExemptionListParameters:
+        description: "A parameter value containing a list of exempted application names"
+        strict: true
+        fields:
+            appNames:
+                description: "An array of exempted application names"
+                type: array<string>

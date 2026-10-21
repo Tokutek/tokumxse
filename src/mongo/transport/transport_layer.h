@@ -1,0 +1,366 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/baton.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/connection_metrics.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/ssl_connection_context.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/time_support.h"
+
+#include <chrono>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <string_view>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_manager.h"
+#endif
+
+namespace mongo {
+
+class OperationContext;
+
+namespace [[MONGO_MOD_PUBLIC]] transport {
+using namespace std::literals::string_view_literals;
+
+enum ConnectSSLMode { kGlobalSSLMode, kEnableSSL, kDisableSSL };
+enum class TransportProtocol { MongoRPC, GRPC };
+
+struct SessionStats {
+    bool isIngress{false};
+    boost::optional<int64_t> peerId{};
+    int64_t congestionWindowSizeBytes{0};
+    // size of the receive/send network buffers, in bytes.
+    int64_t receiveBufferSizeBytes{0};
+    int64_t sendBufferSizeBytes{0};
+    // number of bytes currently in the receive/send network buffers.
+    int64_t receiveBufferBytes{0};
+    int64_t sendBufferBytes{0};
+};
+
+struct SessionStatsResult {
+    std::vector<SessionStats> stats;
+    int64_t errorCount{0};
+};
+
+inline std::string_view connectSSLModeToString(ConnectSSLMode mode) {
+    switch (mode) {
+        case kGlobalSSLMode:
+            return "global"sv;
+        case kEnableSSL:
+            return "enabled"sv;
+        case kDisableSSL:
+            return "disabled"sv;
+    }
+    MONGO_UNREACHABLE;
+}
+
+class Reactor;
+using ReactorHandle = std::shared_ptr<Reactor>;
+class SessionManager;
+
+/**
+ * The TransportLayer moves Messages between transport::Endpoints and the database.
+ * This class owns an Acceptor that generates new endpoints from which it can
+ * source Messages.
+ *
+ * The TransportLayer creates Session objects and maps them internally to
+ * endpoints. New Sessions are passed to the database (via a ServiceEntryPoint)
+ * to be run. The database must then call additional methods on the TransportLayer
+ * to manage the Session in a get-Message, handle-Message, return-Message cycle.
+ * It must do this on its own thread(s).
+ *
+ * References to the TransportLayer should be stored on service context objects.
+ */
+class TransportLayer {
+    TransportLayer(const TransportLayer&) = delete;
+    TransportLayer& operator=(const TransportLayer&) = delete;
+
+public:
+    static const Status SessionUnknownStatus;
+    static const Status ShutdownStatus;
+    static const Status TicketSessionUnknownStatus;
+    static const Status TicketSessionClosedStatus;
+
+    friend class Session;
+
+    TransportLayer() = default;
+    virtual ~TransportLayer() = default;
+
+    virtual StatusWith<std::shared_ptr<Session>> connect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        Milliseconds timeout,
+        const boost::optional<TransientSSLParams>& transientSSLParams = boost::none) = 0;
+
+    virtual Future<std::shared_ptr<Session>> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<ConnectionMetrics> connectionMetrics,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext) = 0;
+
+    /**
+     * Start the TransportLayer. After this point, the TransportLayer will begin accepting active
+     * sessions from new transport::Endpoints.
+     */
+    virtual Status start() = 0;
+
+    /**
+     * Shut the TransportLayer down. After this point, the TransportLayer will
+     * end all active sessions and won't accept new transport::Endpoints. Any
+     * future calls to wait() or asyncWait() will fail. This method is synchronous and
+     * will not return until all sessions have ended and any network connections have been
+     * closed.
+     */
+    virtual void shutdown() = 0;
+
+    /**
+     * Stop accepting new sessions.
+     */
+    virtual void stopAcceptingSessions() = 0;
+
+    /**
+     * Optional method for subclasses to setup their state before being ready to accept
+     * connections.
+     */
+    virtual Status setup() = 0;
+
+    /** Allows a `TransportLayer` to contribute to a serverStatus readout. */
+    virtual void appendStatsForServerStatus(BSONObjBuilder* bob) const {}
+
+    /** Allows a `TransportLayer` to contribute to a FTDC readout. */
+    virtual void appendStatsForFTDC(BSONObjBuilder& bob) const {}
+
+    virtual std::string_view getNameForLogging() const = 0;
+
+    enum WhichReactor { kIngress, kEgress, kNewReactor };
+    virtual ReactorHandle getReactor(WhichReactor which) = 0;
+
+    virtual BatonHandle makeBaton(OperationContext* opCtx) const {
+        return {};
+    }
+
+    /**
+     * Returns the TransportProtocol associated with this TransportLayer.
+     */
+    virtual TransportProtocol getTransportProtocol() const = 0;
+
+    /**
+     * Return the session manager, if any, associated with this TransportLayer.
+     */
+    virtual SessionManager* getSessionManager() const = 0;
+
+    /**
+     * Returns whether or not the TransporLayer is configured to use ingress networking.
+     */
+    virtual bool isIngress() const = 0;
+
+    /**
+     * Returns whether or not the TransporLayer is configured to use egress networking.
+     */
+    virtual bool isEgress() const = 0;
+
+    /**
+     * Returns a shared_ptr reference to the owned SessionManager.
+     * Callers are strongly discouraged from retaining a full shared_ptr
+     * reference which may cause the SessionManager to outlive its TransportLayer.
+     * Please convert to `std::weak_ptr` if a long term, non-owning reference is needed.
+     */
+    virtual std::shared_ptr<SessionManager> getSharedSessionManager() const = 0;
+    /**
+     * Returns the collected stats of current replication sessions.
+     */
+    virtual SessionStatsResult collectReplicationSessionStats() = 0;
+    /**
+     * Should be called whenever a new replication session gets created. This ensures
+     * that replication metrics are accurate.
+     */
+    virtual void registerReplicationSession(std::shared_ptr<Session>) = 0;
+#ifdef MONGO_CONFIG_SSL
+    /** Rotate the in-use certificates for new connections. */
+    virtual Status rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
+                                      bool asyncOCSPStaple) = 0;
+
+    /**
+     * Creates a transient SSL context using targeted (non default) SSL params.
+     * @param transientSSLParams overrides any value in stored SSLConnectionContext.
+     * @param optionalManager provides an optional SSL manager, otherwise the default one will be
+     * used.
+     */
+    virtual StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
+    createTransientSSLContext(const TransientSSLParams& transientSSLParams) = 0;
+#endif
+};
+
+class ReactorTimer {
+public:
+    ReactorTimer();
+
+    ReactorTimer(const ReactorTimer&) = delete;
+    ReactorTimer& operator=(const ReactorTimer&) = delete;
+
+    /*
+     * The destructor calls cancel() to ensure the outstanding Future is filled.
+     */
+    virtual ~ReactorTimer() = default;
+
+    size_t id() const {
+        return _id;
+    }
+
+    /*
+     * Cancel any outstanding future from waitFor/waitUntil. The future will be filled with an
+     * ErrorCodes::CallbackCancelled status.
+     *
+     * If no future is outstanding, then this is a noop.
+     */
+    virtual void cancel(const BatonHandle& baton = nullptr) = 0;
+
+    /*
+     * Returns a future that will be filled with Status::OK after the deadline has passed.
+     *
+     * Calling this implicitly calls cancel(), as there can be at most one outstanding Future per
+     * ReactorTimer at a time.
+     */
+    virtual Future<void> waitUntil(Date_t deadline, const BatonHandle& baton = nullptr) = 0;
+
+private:
+    const size_t _id;
+};
+
+/**
+ * The Reactor is an OutOfLineExecutor that uses the event engine of the underlying transport layer
+ * to schedule and execute work. Work is scheduled on the reactor through calls to
+ * schedule and through performing async networking work on the relevant event engine primitive for
+ * each transport layer. The reactor is typically used by starting a separate thread that calls
+ * run() and drain().
+ *
+ * All Session objects associated with a reactor MUST be ended before the reactor is stopped.
+ */
+class Reactor : public OutOfLineExecutor, public std::enable_shared_from_this<Reactor> {
+public:
+    Reactor(const Reactor&) = delete;
+    Reactor& operator=(const Reactor&) = delete;
+
+    ~Reactor() override = default;
+
+    /*
+     * Run the event loop of the reactor until stop() is called.
+     */
+    virtual void run() = 0;
+
+    /**
+     * Stop the polling loop in run(). drain() must be called after stop() to ensure no outstanding
+     * tasks are leaked.
+     */
+    virtual void stop() = 0;
+
+    /**
+     * This function will block until all outstanding work scheduled on the reactor has been
+     * completed or canceled.
+     */
+    virtual void drain() = 0;
+
+    /**
+     * Schedule a task to run on the reactor thread. See OutOfLineExecutor::schedule for more
+     * detailed documentation.
+     */
+    void schedule(Task task) override = 0;
+
+    bool onReactorThread() const {
+        return this == _reactorForThread;
+    }
+
+    /*
+     * Makes a timer tied to this reactor's event loop. Timeout callbacks will be
+     * executed in a thread calling run().
+     */
+    virtual std::unique_ptr<ReactorTimer> makeTimer() = 0;
+
+    // sleepFor is implemented so that the reactor is compatible with the AsyncTry exponential
+    // backoff API.
+    ExecutorFuture<void> sleepFor(Milliseconds duration, const CancellationToken& token);
+
+    /**
+     * Get the time according to the clock driving the event engine of the reactor.
+     */
+    virtual std::chrono::system_clock::time_point systemTime() = 0;
+
+    Date_t now() {
+        return Date_t(systemTime());
+    }
+
+    /**
+     * Appends stats for the reactor, typically recorded with the ExecutorStats class.
+     */
+    virtual void appendStats(BSONObjBuilder& bob, bool forServerStatus = false) const = 0;
+
+protected:
+    Reactor() = default;
+
+    /**
+     * Helper class for the onReactorThread function. Implementations of the Reactor should use the
+     * ThreadIdGuard in the run() and drain() functions.
+     */
+    class ThreadIdGuard {
+    public:
+        ThreadIdGuard(Reactor* reactor) {
+            invariant(!_reactorForThread);
+            _reactorForThread = reactor;
+        }
+
+        ~ThreadIdGuard() {
+            invariant(_reactorForThread);
+            _reactorForThread = nullptr;
+        }
+    };
+
+    /**
+     * Provides `TickSource` API implemented in terms of the reactor's system
+     * clock. This is used to record `ExecutorStats`.
+     */
+    class ReactorTickSource final : public TickSource {
+    public:
+        explicit ReactorTickSource(Reactor* reactor) : _reactor(reactor) {}
+        ~ReactorTickSource() override = default;
+
+        Tick getTicks() override {
+            return _reactor->systemTime().time_since_epoch().count();
+        }
+
+        Tick getTicksPerSecond() override {
+            using SystemDuration = decltype(_reactor->systemTime())::duration;
+            return std::chrono::seconds(1) / SystemDuration(1);
+        }
+
+    private:
+        Reactor* _reactor;
+    };
+
+    static thread_local Reactor* _reactorForThread;
+};
+
+
+}  // namespace transport
+}  // namespace mongo

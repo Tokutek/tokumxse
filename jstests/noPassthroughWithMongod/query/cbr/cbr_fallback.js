@@ -1,0 +1,448 @@
+/**
+ * Verify that collection, index and query types unsupported by CBR fallback to multiplanning.
+ *
+ * @tags: [
+ *   requires_fcv_90,
+ * ]
+ */
+import {
+    getAllPlans,
+    getPlanStages,
+    getWinningPlanFromExplain,
+    isExpress,
+    isSubplannerCompositePlan,
+    planHasStage,
+    assertChosenRanker,
+    ChosenRanker,
+    PlanRankerReason,
+} from "jstests/libs/query/analyze_plan.js";
+import {assertPlanCosted, assertPlanNotCosted} from "jstests/libs/query/cbr_utils.js";
+import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
+import {Stage} from "jstests/noPassthroughWithMongod/query/cbr/cbr_expect_helpers.js";
+
+// TODO SERVER-92589: Remove this exemption
+if (checkSbeFullyEnabled(db)) {
+    jsTestLog(`Skipping ${jsTestName()} as SBE executor is not supported yet`);
+    quit();
+}
+
+const collName = jsTestName();
+const coll = db[collName];
+coll.drop();
+// Ensure the collection is non-empty
+assert.commandWorked(coll.insert({a: 1}));
+assert.commandWorked(coll.insert({"2dsphere_loc": {type: "Point", coordinates: [-73, 40]}}));
+
+/**
+ * Return a boolean predicate function which takes a plan as a parameter and returns true if the
+ * plan contains an IXSCAN stage over the given 'keyPattern'.
+ */
+function isPlanWithIndexScan(keyPattern) {
+    return function (plan) {
+        const stages = getPlanStages(plan, "IXSCAN");
+        return stages.some((stage) => {
+            // bsonWoCompare returns 0 when the objects are equal
+            return bsonWoCompare(stage.keyPattern, keyPattern) === 0;
+        });
+    };
+}
+
+function testHashedIndex() {
+    // Create hashed and non-hashed indexes on 'a'. Run a query on 'a' and check there are two
+    // plans, one using either index.
+    assert.commandWorked(coll.createIndexes([{a: 1}, {a: "hashed"}]));
+    const explain = coll.find({a: 1}).explain();
+    const plans = getAllPlans(explain);
+    assert.eq(plans.length, 2);
+
+    // Assert the plan not costed used the hashed index.
+    plans.filter(isPlanWithIndexScan({a: "hashed"})).forEach(assertPlanNotCosted);
+
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testPartialIndex() {
+    // Create partial index on 'a' and regular index on 'b'. Query using a predicate containing 'a'
+    // and 'b', resulting in three plans:
+    // 1. Fetch(a) -> Ixscan(b)
+    // 2. Fetch(b) -> Ixscan(a)
+    // 3. Fetch -> IxIntersect [IxScan(a), Ixscan(b)]
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableSortIndexIntersection: true}),
+    );
+    assert.commandWorked(coll.createIndex({a: 1}, {partialFilterExpression: {a: {$gt: 10}}}));
+    assert.commandWorked(coll.createIndex({b: 1}));
+    const explain = coll.find({a: 20, b: 20}).explain();
+    const plans = getAllPlans(explain);
+    assert.eq(plans.length, 3);
+
+    // Assert plans using partial 'a' index are not costed
+    plans.filter(isPlanWithIndexScan({a: 1})).forEach(assertPlanNotCosted);
+
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testSparseIndex() {
+    assert.commandWorked(coll.createIndex({a: 1}, {sparse: true}));
+    assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+    const explain = coll.find({a: 20}).explain();
+    const plans = getAllPlans(explain);
+    // Verify sparse index was not costed
+    plans.filter(isPlanWithIndexScan({a: 1})).forEach(assertPlanNotCosted);
+
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testWildcardIndex() {
+    assert.commandWorked(coll.createIndex({a: 1}));
+    assert.commandWorked(coll.createIndex({"$**": 1}));
+    const explain = coll.find({a: 20}).explain();
+    const plans = getAllPlans(explain);
+    // Verify wildcard index was not costed
+    plans.filter(isPlanWithIndexScan({$_path: 1, a: 1})).forEach(assertPlanNotCosted);
+
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testV1Index() {
+    assert.commandWorked(
+        coll.runCommand("createIndexes", {
+            indexes: [
+                {key: {a: 1}, name: "a_1", v: 1},
+                {key: {b: 1, a: 1}, name: "a1_b1"}, // v2 is the default
+            ],
+        }),
+    );
+    const explain = coll.find({a: 1, b: 1}).explain();
+    const plans = getAllPlans(explain);
+    // Verify v1 index was not costed
+    plans.filter(isPlanWithIndexScan({a: 1})).forEach(assertPlanNotCosted);
+
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testTextIndex() {
+    // It seems that we never multi-plan with $text predicates which only ever enumerate a single
+    // plan using the text index (of which there can only be one per collection). As a result, this
+    // testcase just verifies that we don't cost the plan.
+    assert.commandWorked(coll.createIndex({a: "text"}));
+    {
+        // Test fallback on TEXT_MATCH
+        const explain = coll.find({$text: {$search: "abc"}}).explain();
+        const plans = getAllPlans(explain);
+        plans.forEach(assertPlanNotCosted);
+    }
+    {
+        // Test fallback on TEXT_OR
+        const explain = coll
+            .find({$text: {$search: "a b c"}}, {score: {$meta: "textScore"}})
+            .explain();
+        const plans = getAllPlans(explain);
+        plans.forEach(assertPlanNotCosted);
+    }
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function test2dGeoIndex() {
+    assert.commandWorked(coll.createIndex({a: "2d"}));
+    assert.commandWorked(coll.createIndex({a: "2d", b: 1}));
+    const explain = coll.find({a: {$near: [-73, 40], $maxDistance: 2}, b: 1}).explain();
+    const plans = getAllPlans(explain);
+    // Every plan must use the geo index, so assert that every plan is not costed
+    plans.forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function test2dSphereGeoIndex() {
+    assert.commandWorked(coll.createIndex({"2dsphere_loc": "2dsphere"}));
+    assert.commandWorked(coll.createIndex({"2dsphere_loc": "2dsphere", b: 1}));
+    const explain = coll
+        .find({
+            "2dsphere_loc": {
+                $near: {$geometry: {type: "Point", coordinates: [-73, 40]}, $maxDistance: 2},
+            },
+            b: 1,
+        })
+        .explain();
+    const plans = getAllPlans(explain);
+    // Every plan must use the geo index, so assert that every plan is not costed
+    plans.forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testIndexCollation() {
+    const collation = {locale: "en", strength: 2};
+    assert.commandWorked(coll.createIndex({a: 1}, {collation: collation}));
+    const explain = coll.find({a: "abc"}).collation(collation).explain();
+    const plans = getAllPlans(explain);
+    plans.forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testClusteredIndex() {
+    assert.commandWorked(
+        db.createCollection("clusteredColl", {
+            clusteredIndex: {"key": {_id: 1}, unique: true, name: "clustered_index"},
+        }),
+    );
+    const clusteredColl = db.clusteredColl;
+    clusteredColl.insert({_id: 1});
+    {
+        // This query ends up running through the express path and should not be costed
+        const explain = clusteredColl.find({_id: 1}, {a: 1}).explain();
+        getAllPlans(explain).forEach(assertPlanNotCosted);
+    }
+    {
+        // This query is not eligible for express and runs through the query planner, verify that we
+        // do not cost it. This is a regression test for SERVER-99690.
+        const explain = clusteredColl.find({_id: 1}, {"a.b": 1}).explain();
+        const plans = getAllPlans(explain);
+        plans
+            .filter((plan) => {
+                assert(!isExpress(db, plan), plan);
+                return getPlanStages(plan, "CLUSTERED_IXSCAN").length > 0;
+            })
+            .forEach(assertPlanNotCosted);
+    }
+    clusteredColl.drop();
+}
+
+function testMinMaxIndexScan() {
+    // Min/max require a hint, so we'll only end up with one plan to verify is not costed.
+    assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+    const explain = coll.find().hint({a: 1, b: 1}).min({a: 0, b: 0}).max({a: 10, b: 0}).explain();
+    const plans = getAllPlans(explain);
+    plans.forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testReturnKey() {
+    assert.commandWorked(coll.createIndexes([{a: 1}, {b: 1}]));
+    const explain = coll.find().returnKey(true).explain();
+    getAllPlans(explain).forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testSortKeyGenerator() {
+    assert.commandWorked(coll.createIndex({a: 1}));
+    const explain = coll
+        .find({}, {a: {$meta: "sortKey"}})
+        .sort({a: 1})
+        .explain();
+    getAllPlans(explain).forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testUnionBelowIntersection() {
+    // With hash intersection enabled, the planner can enumerate plans that contain an
+    // intersection of unions. Such plans are unsupported by CBR, so they
+    // must fallback to multiplanning.
+    // TODO SERVER-99091: Support intersections of unions.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableHashIntersection: true}),
+    );
+
+    const unionColl = db.unionBelowIntersection;
+    unionColl.drop();
+    assert.commandWorked(
+        unionColl.insertMany([
+            {_id: 1, a: 1},
+            {_id: -1, a: 2},
+            {_id: 2, a: -5},
+        ]),
+    );
+    assert.commandWorked(unionColl.createIndex({a: 1}));
+
+    const query = {$or: [{_id: {$lt: 0}}, {a: 1}], a: {$gte: 0}};
+    const sort = {a: 1};
+
+    const explain = assert.commandWorked(
+        db.runCommand({
+            explain: {find: unionColl.getName(), filter: query, sort},
+            verbosity: "plannerStats",
+        }),
+    );
+    assertChosenRanker(explain, ChosenRanker.kMultiPlanning, PlanRankerReason.kCBRInestimableNode);
+
+    const unionBelowIntersection = getAllPlans(explain)
+        .map((plan) => new Stage(plan))
+        .filter((plan) => plan.hasStage("AND_HASH") && plan.getStage("AND_HASH").hasStage("OR"));
+    assert.gt(unionBelowIntersection.length, 0, "no union below the intersection", {explain});
+    unionBelowIntersection.forEach((plan) => assertPlanNotCosted(plan.explain));
+
+    // The query must still plan and execute correctly via multiplanning.
+    assert.eq(unionColl.find(query).sort(sort).itcount(), 2);
+
+    unionColl.drop();
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableHashIntersection: false}),
+    );
+}
+
+function testMergeSortBelowIntersection() {
+    // An indexed $or whose branches all provide the query sort is planned as a SORT_MERGE node.
+    // Like OR nodes, SORT_MERGE nodes below an intersection are unsupported by CBR and must
+    // fallback to multiplanning.
+    // TODO SERVER-99091: Support intersections of unions.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableHashIntersection: true}),
+    );
+
+    const mergeSortColl = db.mergeSortBelowIntersection;
+    mergeSortColl.drop();
+    assert.commandWorked(
+        mergeSortColl.createIndexes([{sortFieldA: 1, sortFieldB: 1}, {extraField: 1}]),
+    );
+    assert.commandWorked(
+        mergeSortColl.insertMany([
+            {_id: 0, sortFieldA: 2, sortFieldB: 2, extraField: 1},
+            {_id: 1, sortFieldA: 1, sortFieldB: 3, extraField: 0},
+            {_id: 2, sortFieldA: 1, sortFieldB: 3, extraField: 1},
+            {_id: 3, sortFieldA: 3, sortFieldB: 0, extraField: 1},
+        ]),
+    );
+
+    const query = {
+        $or: [
+            {sortFieldA: 1, sortFieldB: 3},
+            {sortFieldA: 2, sortFieldB: 2},
+        ],
+        extraField: 1,
+    };
+    const sort = {sortFieldA: 1, sortFieldB: 1};
+    const explain = assert.commandWorked(
+        db.runCommand({
+            explain: {find: mergeSortColl.getName(), filter: query, sort},
+            verbosity: "plannerStats",
+        }),
+    );
+    assertChosenRanker(explain, ChosenRanker.kMultiPlanning, PlanRankerReason.kCBRInestimableNode);
+
+    const mergeSortBelowIntersection = getAllPlans(explain)
+        .map((plan) => new Stage(plan))
+        .filter((plan) => {
+            const andHash = plan.getStage("AND_HASH");
+            return andHash && andHash.children.some((child) => child.is("SORT_MERGE"));
+        });
+    assert.gt(mergeSortBelowIntersection.length, 0, "no sort-merge below an intersection", {
+        explain,
+    });
+    mergeSortBelowIntersection.forEach((plan) => assertPlanNotCosted(plan.explain));
+
+    // The query must still plan and execute correctly via multiplanning.
+    assert.eq(mergeSortColl.find(query).sort(sort).itcount(), 2);
+
+    mergeSortColl.drop();
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableHashIntersection: false}),
+    );
+}
+
+function testLargeInList() {
+    const bulk = coll.initializeUnorderedBulkOp();
+    // Insert enough documents to have two non-trivial indexes worth ranking.
+    for (let i = 0; i < 4000; i++) {
+        bulk.insert({a: i, b: i % 100});
+    }
+    assert.commandWorked(bulk.execute());
+
+    assert.commandWorked(coll.createIndexes([{a: 1}, {b: 1}]));
+
+    // Use samplingCE so the test does not depend on histograms.
+    const prevCEMode = assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryCBRCEMode: "samplingCE"}),
+    );
+
+    // Sample by strides rather than by chunk. The documents above are inserted in 'a' order, so a
+    // chunk sample is a handful of contiguous 'a' ranges: when none of them falls in the queried
+    // range the sample observes no matching document, the scan is estimated at zero, and CBR
+    // abandons ranking and leaves the plans uncosted. A stride sample is spread over the whole
+    // collection, so it observes matches for any predicate that matches a reasonable fraction of
+    // it, whichever part of the 'a' range that predicate selects.
+    const prevStrideSampling = assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQuerySamplingByStrides: true}),
+    );
+
+    // CBR uses a CE cache for $in-lists with <= 1000 intervals; larger lists bypass the cache.
+    // In both cases, CBR should cost and rank the plans.
+    const cacheableIn = Array.from({length: 1000}, (_, i) => i);
+    const nonCacheableIn = Array.from({length: 1001}, (_, i) => i);
+
+    function testQuery(query) {
+        const explain = coll.find(query).explain();
+        const plans = getAllPlans(explain);
+        assert.gte(plans.length, 2, "Expected at least two plans");
+        plans.forEach(assertPlanCosted);
+    }
+
+    // $in-list with <= 1000 elements: CBR estimates it using the CE cache.
+    testQuery({a: {$in: cacheableIn}, b: {$lt: 50}});
+
+    // $in-list with > 1000 elements: CBR estimates it without the CE cache.
+    testQuery({a: {$in: nonCacheableIn}, b: {$lt: 50}});
+
+    // Restore CE mode and sampling technique for the remaining tests.
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryCBRCEMode: prevCEMode.was}),
+    );
+    assert.commandWorked(
+        db.adminCommand({
+            setParameter: 1,
+            internalQuerySamplingByStrides: prevStrideSampling.was,
+        }),
+    );
+    assert.commandWorked(coll.dropIndexes());
+}
+
+function testDistictScan() {
+    assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+    const explain = coll
+        .explain()
+        .aggregate([{$sort: {a: 1, b: 1}}, {$group: {_id: "$a", f: {$first: "$b"}}}]);
+    const plans = getAllPlans(explain);
+    assert.gt(plans.length, 0);
+    plans.forEach((plan) => {
+        const distinctScanStages = getPlanStages(plan, "DISTINCT_SCAN");
+        assert.neq(0, distinctScanStages.length, plan);
+    });
+    plans.forEach(assertPlanNotCosted);
+    assert.commandWorked(coll.dropIndexes());
+}
+
+try {
+    assert.commandWorked(
+        db.adminCommand({
+            setParameter: 1,
+            featureFlagCostBasedRanker: true,
+            internalQueryPlanRanker: "costBased",
+            internalQueryCBRCEMode: "heuristicCE",
+        }),
+    );
+
+    testHashedIndex();
+    testPartialIndex();
+    testSparseIndex();
+    testWildcardIndex();
+    testV1Index();
+    testTextIndex();
+    test2dGeoIndex();
+    test2dSphereGeoIndex();
+    testIndexCollation();
+    testClusteredIndex();
+    testMinMaxIndexScan();
+    testReturnKey();
+    testSortKeyGenerator();
+    testUnionBelowIntersection();
+    testMergeSortBelowIntersection();
+    testDistictScan();
+    testLargeInList();
+} finally {
+    // Ensure that query knob doesn't leak into other testcases in the suite.
+    assert.commandWorked(db.adminCommand({setParameter: 1, featureFlagCostBasedRanker: false}));
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableSortIndexIntersection: false}),
+    );
+    assert.commandWorked(
+        db.adminCommand({setParameter: 1, internalQueryPlannerEnableHashIntersection: false}),
+    );
+}

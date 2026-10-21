@@ -1,0 +1,141 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/replica_set_change_notifier.h"
+#include "mongo/db/global_catalog/type_shard_identity.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/sharding_initialization.h"
+#include "mongo/util/modules.h"
+
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/**
+ * This class serves as a bootstrap and shutdown for the sharding subsystem and also controls the
+ * persisted cluster identity. The default ShardingEnvironmentInitFunc instantiates all the sharding
+ * services, attaches them to the same service context to which it itself is attached and puts the
+ * ShardingState in the initialized state.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ShardingInitializationMongoD
+    : public ReplicaSetAwareService<ShardingInitializationMongoD> {
+    ShardingInitializationMongoD(const ShardingInitializationMongoD&) = delete;
+    ShardingInitializationMongoD& operator=(const ShardingInitializationMongoD&) = delete;
+
+public:
+    using ShardingEnvironmentInitFunc =
+        std::function<void(OperationContext* opCtx, const ShardIdentity& shardIdentity)>;
+
+    ShardingInitializationMongoD();
+    ~ShardingInitializationMongoD() override;
+
+    static ShardingInitializationMongoD* get(OperationContext* opCtx);
+    static ShardingInitializationMongoD* get(ServiceContext* service);
+
+    /**
+     * Returns the shard identity document for this shard if it exists. This method
+     * will also take into account the --overrideShardIdentity startup parameter
+     */
+    static boost::optional<ShardIdentity> getShardIdentityDoc(OperationContext* opCtx);
+
+    /**
+     * Initializes the sharding state of this server from the shard identity document argument and
+     * sets secondary or primary state information on the catalog cache loader.
+     *
+     * NOTE: This must be called under at least Global IX lock in order for the replica set member
+     * state to be stable (primary/secondary).
+     */
+    void initializeFromShardIdentity(OperationContext* opCtx,
+                                     const ShardIdentityType& shardIdentity);
+
+    void shutDown(OperationContext* service);
+
+    /**
+     * Updates the config server field of the shardIdentity document with the given connection
+     * string.
+     */
+    static void updateShardIdentityConfigString(OperationContext* opCtx,
+                                                const ConnectionString& newConnectionString);
+
+    /**
+     * For testing only. Mock the initialization method used by initializeFromConfigConnString and
+     * initializeFromShardIdentity after all checks are performed.
+     */
+    void setGlobalInitMethodForTest(ShardingEnvironmentInitFunc func) {
+        _initFunc = std::move(func);
+    }
+
+    /**
+     * Installs a listener for RSM change notifications.
+     */
+    void installReplicaSetChangeListener(ServiceContext* service);
+
+private:
+    void _initializeShardingEnvironmentOnShardServer(OperationContext* opCtx,
+                                                     const ShardIdentity& shardIdentity);
+
+    // Virtual methods coming from the ReplicaSetAwareService
+    void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final;
+    void onConsistentDataAvailable(OperationContext* opCtx, bool isMajority, bool isRollback) final;
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final;
+    void onStepDown() final;
+    void onRollbackBegin() final {}
+    void onBecomeArbiter() final {}
+    inline std::string getServiceName() const final {
+        return "ShardingInitializationMongoD";
+    }
+
+    Atomic<bool> _isPrimary;
+
+    // This mutex ensures that only one thread at a time executes the sharding
+    // initialization/teardown sequence
+    std::mutex _initSynchronizationMutex;
+
+    // Function for initializing the sharding environment components (i.e. everything on the Grid)
+    ShardingEnvironmentInitFunc _initFunc;
+
+    std::shared_ptr<ReplicaSetChangeNotifier::Listener> _replicaSetChangeListener;
+};
+
+/**
+ * Initialize the sharding components for a mongod running as a config server (if they haven't
+ * already been set up).
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] void initializeGlobalShardingStateForConfigServer(
+    OperationContext* opCtx);
+
+/**
+ * Helper method to initialize sharding awareness from the shard identity document if it can be
+ * found and load global sharding settings awareness was initialized. See
+ * ShardingInitializationMongoD::initializeShardingAwarenessIfNeeded() above for more details.
+ * The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+ * this function into one single builder that records the time elapsed during startup. Its default
+ * value is nullptr because we only want to time this function when it is called during startup.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] void initializeShardingAwarenessAndLoadGlobalSettings(
+    OperationContext* opCtx,
+    const ShardIdentity& shardIdentity,
+    BSONObjBuilder* startupTimeElapsedBuilder = nullptr);
+
+/**
+ * Ensures that the shard server indexes exist. Creates the collections and the indexes if they do
+ * not already exist.
+ */
+[[MONGO_MOD_PRIVATE]] Status ensureShardServerIndexes(OperationContext* opCtx);
+
+}  // namespace mongo

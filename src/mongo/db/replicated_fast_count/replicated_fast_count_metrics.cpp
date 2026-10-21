@@ -1,0 +1,289 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/replicated_fast_count/replicated_fast_count_metrics.h"
+
+#include "mongo/db/repl/optime_observer.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/otel/metrics/metric_names.h"
+#include "mongo/otel/metrics/metric_unit.h"
+#include "mongo/otel/metrics/metrics_service.h"
+#include "mongo/otel/metrics/server_status_options.h"
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+
+namespace mongo {
+namespace {
+
+using otel::metrics::MetricNames;
+using otel::metrics::MetricsService;
+using otel::metrics::MetricUnit;
+using otel::metrics::ServerStatusOptions;
+
+// Per-thread isRunning gauges. Useful for identifying if a thread has independently died.
+auto& tailerIsRunningGauge = MetricsService::instance().createInt64Gauge(
+    MetricNames::kReplicatedFastCountTailerIsRunning,
+    "1 if the oplog tailer thread is running, 0 otherwise",
+    MetricUnit::kBoolean,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.tailer.isRunning", .role = ClusterRole::None}});
+
+auto& flusherIsRunningGauge = MetricsService::instance().createInt64Gauge(
+    MetricNames::kReplicatedFastCountFlusherIsRunning,
+    "1 if the flusher thread is running, 0 otherwise",
+    MetricUnit::kBoolean,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.flusher.isRunning", .role = ClusterRole::None}});
+
+// Flushes persist fast count information to the oplog and occur during checkpointing,
+// shutdown, etc. The total number of flush attempts = flushSuccessCounter + flushFailureCounter.
+auto& flushSuccessCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountFlushSuccessCount,
+    "Total number of successful replicated fast count flushes",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.flush.successCount", .role = ClusterRole::None}});
+
+auto& flushFailureCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountFlushFailureCount,
+    "Total number of failed replicated fast count flushes",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.flush.failureCount", .role = ClusterRole::None}});
+
+auto& flushRetriedCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountFlushRetriedCount,
+    "Total write-conflict retries during flushes",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.flush.retriedCount", .role = ClusterRole::None}});
+
+auto& flushTimeMsTotalCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountFlushTimeMsTotal,
+    "Total flush duration in milliseconds across all replicated fast count flushes",
+    MetricUnit::kMilliseconds,
+    {.serverStatusOptions = ServerStatusOptions{.dottedPath = "replicatedFastCount.flushTime.total",
+                                                .role = ClusterRole::None}});
+auto& tailerFailureCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountTailerFailureCount,
+    "Total unexpected exceptions handled in the oplog tailer thread",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.tailer.failureCount", .role = ClusterRole::None}});
+
+auto& tailerRetriedScanCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountTailerRetriedScanCount,
+    "Total write-conflict retries during oplog tailer scans",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.tailer.retriedScanCount", .role = ClusterRole::None}});
+
+// The total number of documents written during flushes.
+auto& flushedDocsTotalCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountFlushedDocsTotal,
+    "Total number of documents written across all replicated fast count flushes",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.flushedDocs.total", .role = ClusterRole::None}});
+
+// The number of inserts/updates to the replicated fast count collection.
+auto& insertCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountInsertCount,
+    "Number of inserts into a new record for storing size and count data in the replicated "
+    "fast count collection",
+    MetricUnit::kOperations,
+    {.serverStatusOptions = ServerStatusOptions{.dottedPath = "replicatedFastCount.insertCount",
+                                                .role = ClusterRole::None}});
+
+auto& updateCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountUpdateCount,
+    "Number of updates to an existing record storing size and count data in the replicated "
+    "fast count collection",
+    MetricUnit::kOperations,
+    {.serverStatusOptions = ServerStatusOptions{.dottedPath = "replicatedFastCount.updateCount",
+                                                .role = ClusterRole::None}});
+
+// The number of watermark entries written to the oplog.
+auto& watermarksWrittenCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountWatermarksWritten,
+    "Total number of replicated fast count watermark entries written to the oplog",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.watermarksWritten", .role = ClusterRole::None}});
+
+// The number of watermark entries observed by the oplog tailer during checkpoint scans.
+auto& tailerWatermarksSeenCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountTailerWatermarksSeen,
+    "Total number of replicated fast count watermark entries observed by the oplog tailer",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.tailer.watermarksSeen", .role = ClusterRole::None}});
+
+// Total time the flusher spent blocked waiting for the oplog tailer to cut a batch at a
+// watermark.
+auto& watermarkAwaitTimeMsTotalCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountWatermarkAwaitTimeMsTotal,
+    "Total time in milliseconds the flusher spent waiting for the oplog tailer to cut a batch at "
+    "a replicated fast count watermark",
+    MetricUnit::kMilliseconds,
+    {.serverStatusOptions =
+         ServerStatusOptions{.dottedPath = "replicatedFastCount.flush.watermarkAwaitTime.total",
+                             .role = ClusterRole::None}});
+
+// Gauge for the number of seconds between the most recently applied oplog entry and the most
+// recently persisted fastcount checkpoint. A large value indicates the fastcount checkpoint is
+// falling behind replication.
+auto& oplogLagSecsGauge = MetricsService::instance().createInt64Gauge(
+    MetricNames::kReplicatedFastCountOplogLagSecs,
+    "Seconds between the last applied oplog entry and the last persisted fastcount checkpoint",
+    MetricUnit::kSeconds,
+    {.serverStatusOptions = ServerStatusOptions{.dottedPath = "replicatedFastCount.oplogLagSecs",
+                                                .role = ClusterRole::None}});
+
+// Hold the seconds field of the last observed applied and persisted checkpoint Timestamps. Zero
+// means "not yet observed"; the gauge stays at 0 until both are populated at least once.
+Atomic<uint32_t> lastAppliedSecs{0};
+Atomic<uint32_t> checkpointSecs{0};
+
+void refreshOplogLagGauge() {
+    const auto applied = lastAppliedSecs.loadRelaxed();
+    const auto checkpoint = checkpointSecs.loadRelaxed();
+    if (applied == 0 || checkpoint == 0) {
+        return;
+    }
+    oplogLagSecsGauge.set(static_cast<int64_t>(applied) - static_cast<int64_t>(checkpoint));
+}
+
+}  // namespace
+
+void setTailerIsRunning(bool running) {
+    tailerIsRunningGauge.set(running ? 1 : 0);
+}
+
+void setFlusherIsRunning(bool running) {
+    flusherIsRunningGauge.set(running ? 1 : 0);
+}
+
+void incrementFlushFailureCount() {
+    flushFailureCounter.add(1);
+}
+
+void incrementTailerFailureCount() {
+    tailerFailureCounter.add(1);
+}
+
+void incrementRetriedFlushCount() {
+    flushRetriedCounter.add(1);
+}
+
+void incrementRetriedTailerScanCount() {
+    tailerRetriedScanCounter.add(1);
+}
+
+void incrementInsertCount() {
+    insertCounter.add(1);
+}
+
+void incrementUpdateCount() {
+    updateCounter.add(1);
+}
+
+void incrementWatermarksWrittenCount() {
+    watermarksWrittenCounter.add(1);
+}
+
+void incrementTailerWatermarksSeenCount() {
+    tailerWatermarksSeenCounter.add(1);
+}
+
+void recordWatermarkAwaitTime(Milliseconds waitTime) {
+    watermarkAwaitTimeMsTotalCounter.add(waitTime.count());
+}
+
+void recordFlush(Date_t startTime, replicated_fast_count::CheckpointWriteCounts writeCounts) {
+    const int64_t elapsedMs = (Date_t::now() - startTime).count();
+
+    flushSuccessCounter.add(1);
+    flushTimeMsTotalCounter.add(elapsedMs);
+    flushedDocsTotalCounter.add(static_cast<int64_t>(writeCounts.entryWriteCount));
+    insertCounter.add(static_cast<int64_t>(writeCounts.insertCount));
+    updateCounter.add(static_cast<int64_t>(writeCounts.updateCount));
+}
+
+void recordAppliedOpTime(const Timestamp& ts) {
+    tassert(12397401, "applied opTime fed into oplog_lag_secs must be non-null", !ts.isNull());
+    lastAppliedSecs.storeRelaxed(ts.getSecs());
+    refreshOplogLagGauge();
+}
+
+void recordCheckpointAdvanced(const Timestamp& ts) {
+    tassert(
+        12397402, "checkpoint timestamp fed into oplog_lag_secs must be non-null", !ts.isNull());
+    checkpointSecs.storeRelaxed(ts.getSecs());
+    refreshOplogLagGauge();
+}
+
+namespace {
+class FastCountAppliedOpTimeObserver : public repl::OpTimeObserver {
+public:
+    void onOpTime(const Timestamp& ts) override {
+        recordAppliedOpTime(ts);
+    }
+};
+}  // namespace
+
+void registerAppliedOpTimeObserver(ServiceContext* svcCtx) {
+    repl::ReplicationCoordinator::get(svcCtx)->addAppliedOpTimeObserver(
+        std::make_unique<FastCountAppliedOpTimeObserver>());
+}
+
+void resetOplogLagState_ForTest() {
+    lastAppliedSecs.storeRelaxed(0);
+    checkpointSecs.storeRelaxed(0);
+    oplogLagSecsGauge.set(0);
+}
+
+namespace {
+
+using otel::metrics::MetricNames;
+using otel::metrics::MetricsService;
+using otel::metrics::MetricUnit;
+using otel::metrics::ServerStatusOptions;
+
+auto& checkpointOplogEntriesProcessedCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountCheckpointOplogEntriesProcessed,
+    "Total oplog entries forwarded to delta processing during checkpoint scans",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.checkpoint.oplogEntriesProcessed"}});
+
+auto& checkpointOplogEntriesSkippedCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountCheckpointOplogEntriesSkipped,
+    "Total oplog entries discarded as fastcount-internal writes during checkpoint scans",
+    MetricUnit::kEvents,
+    {.serverStatusOptions =
+         ServerStatusOptions{.dottedPath = "replicatedFastCount.checkpoint.oplogEntriesSkipped"}});
+
+auto& checkpointSizeCountEntriesProcessedCounter = MetricsService::instance().createInt64Counter(
+    MetricNames::kReplicatedFastCountCheckpointSizeCountEntriesProcessed,
+    "Total individual size/count deltas accumulated during checkpoint scans",
+    MetricUnit::kEvents,
+    {.serverStatusOptions = ServerStatusOptions{
+         .dottedPath = "replicatedFastCount.checkpoint.sizeCountEntriesProcessed"}});
+
+}  // namespace
+
+void recordCheckpointOplogEntryProcessed() {
+    checkpointOplogEntriesProcessedCounter.add(1);
+}
+
+void recordCheckpointOplogEntrySkipped() {
+    checkpointOplogEntriesSkippedCounter.add(1);
+}
+
+void recordCheckpointSizeCountEntryProcessed(int count) {
+    checkpointSizeCountEntriesProcessedCounter.add(count);
+}
+
+}  // namespace mongo

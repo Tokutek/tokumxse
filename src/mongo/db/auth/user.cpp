@@ -1,163 +1,237 @@
-/*    Copyright 2013 10gen Inc.
-
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/auth/user.h"
 
-#include <vector>
-
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/base/data_range.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
+#include "mongo/db/auth/auth_name.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/sequence_util.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
 
 namespace mongo {
 
-    User::User(const UserName& name) :
-        _name(name),
-        _refCount(0),
-        _isValid(1) {}
+namespace {
+using namespace std::literals::string_view_literals;
+// Field names used when serializing User objects to BSON for usersInfo.
+constexpr auto kIdFieldName = "_id"sv;
+constexpr auto kUserIdFieldName = "userId"sv;
+constexpr auto kUserFieldName = "user"sv;
+constexpr auto kDbFieldName = "db"sv;
+constexpr auto kMechanismsFieldName = "mechanisms"sv;
+constexpr auto kCredentialsFieldName = "credentials"sv;
+constexpr auto kRolesFieldName = "roles"sv;
+constexpr auto kInheritedRolesFieldName = "inheritedRoles"sv;
+constexpr auto kInheritedPrivilegesFieldName = "inheritedPrivileges"sv;
+constexpr auto kInheritedAuthenticationRestrictionsFieldName =
+    "inheritedAuthenticationRestrictions"sv;
+constexpr auto kAuthenticationRestrictionsFieldName = "authenticationRestrictions"sv;
 
-    User::~User() {
-        dassert(_refCount == 0);
-    }
+SHA256Block computeDigest(const UserName& name) {
+    auto fn = name.getDisplayName();
+    return SHA256Block::computeHash({ConstDataRange(fn.c_str(), fn.size())});
+};
 
-    const UserName& User::getName() const {
-        return _name;
-    }
+}  // namespace
 
-    RoleNameIterator User::getRoles() const {
-        return makeRoleNameIteratorForContainer(_roles);
-    }
+std::vector<std::string> UserRequest::getUserNameAndRolesVector(
+    const UserName& userName, const boost::optional<std::set<RoleName>>& roles) {
+    std::vector<std::string> hashElements;
+    hashElements.push_back(userName.getUnambiguousName());
 
-    RoleNameIterator User::getIndirectRoles() const {
-         return makeRoleNameIteratorForContainer(_indirectRoles);
-    }
-
-    bool User::hasRole(const RoleName& roleName) const {
-        return _roles.count(roleName);
-    }
-
-    const User::CredentialData& User::getCredentials() const {
-        return _credentials;
-    }
-
-    bool User::isValid() const {
-        return _isValid.loadRelaxed() == 1;
-    }
-
-    uint32_t User::getRefCount() const {
-        return _refCount;
-    }
-
-    const ActionSet User::getActionsForResource(const ResourcePattern& resource) const {
-        unordered_map<ResourcePattern, Privilege>::const_iterator it = _privileges.find(resource);
-        if (it == _privileges.end()) {
-            return ActionSet();
+    if (roles) {
+        for (auto& role : *roles) {
+            hashElements.push_back(role.getRole());
         }
+    }
+
+    return hashElements;
+}
+
+UserRequest::UserRequestCacheKey UserRequestGeneral::generateUserRequestCacheKey() const {
+    return UserRequestCacheKey(getUserName(), getUserNameAndRolesVector(getUserName(), getRoles()));
+}
+
+User::User(std::unique_ptr<UserRequest> request)
+    : _request(std::move(request)),
+      _isInvalidated(false),
+      _digest(computeDigest(_request->getUserName())) {}
+
+template <>
+User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() {
+    return scram_sha1;
+}
+template <>
+const User::SCRAMCredentials<SHA1Block>& User::CredentialData::scram<SHA1Block>() const {
+    return scram_sha1;
+}
+
+template <>
+User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Block>() {
+    return scram_sha256;
+}
+template <>
+const User::SCRAMCredentials<SHA256Block>& User::CredentialData::scram<SHA256Block>() const {
+    return scram_sha256;
+}
+
+RoleNameIterator User::getRoles() const {
+    return makeRoleNameIteratorForContainer(_roles);
+}
+
+RoleNameIterator User::getIndirectRoles() const {
+    return makeRoleNameIteratorForContainer(_indirectRoles);
+}
+
+bool User::hasRole(const RoleName& roleName) const {
+    return _roles.count(roleName);
+}
+
+const User::CredentialData& User::getCredentials() const {
+    return _credentials;
+}
+
+ActionSet User::getActionsForResource(const ResourcePattern& resource) const {
+    if (auto it = _privileges.find(resource); it != _privileges.end()) {
         return it->second.getActions();
     }
 
-    User* User::clone() const {
-        std::auto_ptr<User> result(new User(_name));
-        result->_privileges = _privileges;
-        result->_roles = _roles;
-        result->_credentials = _credentials;
-        return result.release();
+    return ActionSet();
+}
+
+bool User::hasActionsForResource(const ResourcePattern& resource) const {
+    return !getActionsForResource(resource).empty();
+}
+
+void User::setCredentials(const CredentialData& credentials) {
+    _credentials = credentials;
+}
+
+void User::setRoles(RoleNameIterator roles) {
+    _roles.clear();
+    while (roles.more()) {
+        _roles.insert(roles.next());
+    }
+}
+
+void User::setIndirectRoles(RoleNameIterator indirectRoles) {
+    _indirectRoles.clear();
+    while (indirectRoles.more()) {
+        _indirectRoles.push_back(indirectRoles.next());
+    }
+    // Keep indirectRoles sorted for more efficient comparison against other users.
+    std::sort(_indirectRoles.begin(), _indirectRoles.end());
+}
+
+void User::setPrivileges(const PrivilegeVector& privileges) {
+    _privileges.clear();
+    for (size_t i = 0; i < privileges.size(); ++i) {
+        const Privilege& privilege = privileges[i];
+        _privileges[privilege.getResourcePattern()] = privilege;
+    }
+}
+
+void User::addRole(const RoleName& roleName) {
+    _roles.insert(roleName);
+}
+
+void User::addRoles(const std::vector<RoleName>& roles) {
+    for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
+        addRole(*it);
+    }
+}
+
+void User::addPrivilege(const Privilege& privilegeToAdd) {
+    ResourcePrivilegeMap::iterator it = _privileges.find(privilegeToAdd.getResourcePattern());
+    if (it == _privileges.end()) {
+        // No privilege exists yet for this resource
+        _privileges.insert(std::make_pair(privilegeToAdd.getResourcePattern(), privilegeToAdd));
+    } else {
+        dassert(it->first == privilegeToAdd.getResourcePattern());
+        it->second.addActions(privilegeToAdd.getActions());
+    }
+}
+
+void User::addPrivileges(const PrivilegeVector& privileges) {
+    for (PrivilegeVector::const_iterator it = privileges.begin(); it != privileges.end(); ++it) {
+        addPrivilege(*it);
+    }
+}
+
+void User::setRestrictions(RestrictionDocuments restrictions) & {
+    _restrictions = std::move(restrictions);
+}
+
+void User::setIndirectRestrictions(RestrictionDocuments restrictions) & {
+    _indirectRestrictions = std::move(restrictions);
+}
+
+Status User::validateRestrictions(OperationContext* opCtx) const {
+    auto& transportSession = opCtx->getClient()->session();
+    if (!transportSession) {
+        // If Client has no transport session, it must be internal system connection
+        invariant(opCtx->getClient()->isFromSystemConnection());
+        return Status::OK();
     }
 
-    void User::setCredentials(const CredentialData& credentials) {
-        _credentials = credentials;
+    auto& env = transportSession->getAuthEnvironment();
+    auto status = _restrictions.validate(env);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Evaluation of direct authentication restrictions failed: "
+                              << status.reason()};
     }
 
-    void User::setRoles(RoleNameIterator roles) {
-        _roles.clear();
-        while (roles.more()) {
-            _roles.insert(roles.next());
+    status = _indirectRestrictions.validate(env);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Evaluation of indirect authentication restrictions failed: "
+                              << status.reason()};
+    }
+
+    return Status::OK();
+}
+
+bool User::hasDifferentRoles(const User& otherUser) const {
+    // If the number of direct or indirect roles in the users' are not the same, they have
+    // different roles.
+    if (_roles.size() != otherUser._roles.size() ||
+        _indirectRoles.size() != otherUser._indirectRoles.size()) {
+        return true;
+    }
+
+    // At this point, it is known that the users have the same number of direct roles. The
+    // direct roles sets are equivalent if all of the roles in the first user's directRoles are
+    // also in the other user's directRoles.
+    for (const auto& role : _roles) {
+        if (otherUser._roles.find(role) == otherUser._roles.end()) {
+            return true;
         }
     }
 
-    void User::setIndirectRoles(RoleNameIterator indirectRoles) {
-        _indirectRoles.clear();
-        while (indirectRoles.more()) {
-            _indirectRoles.push_back(indirectRoles.next());
-        }
-    }
+    // Indirect roles should always be sorted.
+    dassert(std::is_sorted(_indirectRoles.begin(), _indirectRoles.end()));
+    dassert(std::is_sorted(otherUser._indirectRoles.begin(), otherUser._indirectRoles.end()));
 
-    void User::setPrivileges(const PrivilegeVector& privileges) {
-        _privileges.clear();
-        for (size_t i = 0; i < privileges.size(); ++i) {
-            const Privilege& privilege = privileges[i];
-            _privileges[privilege.getResourcePattern()] = privilege;
-        }
-    }
+    return !std::equal(
+        _indirectRoles.begin(), _indirectRoles.end(), otherUser._indirectRoles.begin());
+}
 
-    void User::addRole(const RoleName& roleName) {
-        _roles.insert(roleName);
-    }
-
-    void User::addRoles(const std::vector<RoleName>& roles) {
-        for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
-            addRole(*it);
-        }
-    }
-
-    void User::addPrivilege(const Privilege& privilegeToAdd) {
-        ResourcePrivilegeMap::iterator it = _privileges.find(privilegeToAdd.getResourcePattern());
-        if (it == _privileges.end()) {
-            // No privilege exists yet for this resource
-            _privileges.insert(std::make_pair(privilegeToAdd.getResourcePattern(), privilegeToAdd));
-        } else {
-            dassert(it->first == privilegeToAdd.getResourcePattern());
-            it->second.addActions(privilegeToAdd.getActions());
-        }
-    }
-
-    void User::addPrivileges(const PrivilegeVector& privileges) {
-        for (PrivilegeVector::const_iterator it = privileges.begin();
-                it != privileges.end(); ++it) {
-            addPrivilege(*it);
-        }
-    }
-
-    void User::invalidate() {
-        _isValid.store(0);
-    }
-
-    void User::incrementRefCount() {
-        ++_refCount;
-    }
-
-    void User::decrementRefCount() {
-        dassert(_refCount > 0);
-        --_refCount;
-    }
-} // namespace mongo
+}  // namespace mongo

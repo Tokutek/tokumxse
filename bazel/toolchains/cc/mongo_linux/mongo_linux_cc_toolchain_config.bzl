@@ -1,0 +1,2483 @@
+"""This module provides the cc_toolchain_config rule."""
+
+load(
+    "@rules_cc//cc:cc_toolchain_config_lib.bzl",
+    "action_config",
+    "env_entry",
+    "env_set",
+    "feature",
+    "flag_group",
+    "flag_set",
+    "tool",
+    "tool_path",
+    "with_feature_set",
+)
+load("@rules_cc//cc:action_names.bzl", "ACTION_NAMES")
+load(
+    "//bazel/toolchains/cc:mongo_custom_features.bzl",
+    "COMPILERS",
+    "LINKERS",
+    "all_c_compile_actions",
+    "all_compile_actions",
+    "all_cpp_compile_actions",
+    "get_common_features",
+)
+load("//bazel/toolchains/cc/mongo_linux:mongo_defines.bzl", "DEFINES")
+load("//bazel/toolchains/cc/mongo_linux:mongo_toolchain_flags_v5.bzl", "clang_resource_dir")
+load("@rules_cc//cc/toolchains:cc_toolchain_config_info.bzl", "CcToolchainConfigInfo")
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+
+all_non_assembly_compile_actions = [
+    ACTION_NAMES.c_compile,
+    ACTION_NAMES.cpp_compile,
+    ACTION_NAMES.linkstamp_compile,
+    ACTION_NAMES.cpp_header_parsing,
+    ACTION_NAMES.cpp_module_compile,
+    ACTION_NAMES.cpp_module_codegen,
+    ACTION_NAMES.clif_match,
+    ACTION_NAMES.lto_backend,
+]
+
+preprocessor_compile_actions = [
+    ACTION_NAMES.c_compile,
+    ACTION_NAMES.cpp_compile,
+    ACTION_NAMES.linkstamp_compile,
+    ACTION_NAMES.preprocess_assemble,
+    ACTION_NAMES.cpp_header_parsing,
+    ACTION_NAMES.cpp_module_compile,
+    ACTION_NAMES.clif_match,
+]
+
+all_link_actions = [
+    ACTION_NAMES.cpp_link_executable,
+    ACTION_NAMES.cpp_link_dynamic_library,
+    ACTION_NAMES.cpp_link_nodeps_dynamic_library,
+]
+
+lto_index_actions = [
+    ACTION_NAMES.lto_index_for_executable,
+    ACTION_NAMES.lto_index_for_dynamic_library,
+    ACTION_NAMES.lto_index_for_nodeps_dynamic_library,
+]
+
+def _impl(ctx):
+    # Cross-RBE builds may compile with an execution-architecture compiler (for
+    # example x86_64) and then link on the native IBM host. Keep the regular
+    # tool paths as the default, but allow link actions to use a separate
+    # host-executable driver and its accompanying search paths.
+    # The same split is needed for output tools: local archive/debug actions
+    # must use the native host's ar/dwp/objcopy/strip, while remote compilation
+    # keeps the execution-architecture tools from the cross archive.
+    #
+    # A C++ toolchain is analyzed in its execution configuration.  For a
+    # cross-toolchain that means the select()-based linux_* settings below can
+    # describe the x86/aarch64 RBE worker even though the compiler is targeting
+    # IBM.  The cross repository supplies target_triple explicitly; use it for
+    # architecture-sensitive flags and features so the target never inherits
+    # host-only options such as -march=sandybridge.
+    target_is_aarch64 = ctx.attr.is_aarch64
+    target_is_ppc64le = ctx.attr.is_ppc64le
+    target_is_s390x = ctx.attr.is_s390x
+    target_is_x86_64 = ctx.attr.is_x86_64
+    if ctx.attr.target_triple:
+        target_is_aarch64 = ctx.attr.target_triple == "aarch64-mongodb-linux"
+        target_is_ppc64le = ctx.attr.target_triple == "ppc64le-mongodb-linux"
+        target_is_s390x = ctx.attr.target_triple == "s390x-mongodb-linux"
+        target_is_x86_64 = ctx.attr.target_triple == "x86_64-mongodb-linux"
+
+    tool_paths = dict(ctx.attr.tool_paths)
+    for tool_name, host_tool_path in (
+        ("ar", ctx.attr.host_ar_tool_path),
+        ("dwp", ctx.attr.host_dwp_tool_path),
+        ("objcopy", ctx.attr.host_objcopy_tool_path),
+        ("strip", ctx.attr.host_strip_tool_path),
+    ):
+        if host_tool_path:
+            tool_paths[tool_name] = host_tool_path
+
+    linker_tool = ctx.attr.linker_tool_path or tool_paths["g++"]
+    linker_bin_dirs = (
+        ctx.attr.linker_bin_dirs if ctx.attr.linker_bin_dirs != None and len(ctx.attr.linker_bin_dirs) > 0 else ctx.attr.bin_dirs
+    )
+    linker_resource_dir = ctx.attr.linker_resource_dir or ctx.attr.clang_resource_dir
+    linker_toolchain_repo_dir = (
+        ctx.attr.linker_toolchain_repo_dir or ctx.attr.toolchain_repo_dir
+    )
+
+    action_configs = [
+        action_config(action_name = "objcopy_embed_data", tools = [tool(path = tool_paths["objcopy"])]),
+    ] + [
+        action_config(action_name = ACTION_NAMES.llvm_cov, tools = [tool(path = tool_paths["llvm-cov"])]),
+    ] + [
+        action_config(action_name = name, enabled = True, tools = [tool(path = tool_paths["gcc"])])
+        for name in all_c_compile_actions
+    ] + [
+        action_config(action_name = name, enabled = True, tools = [tool(path = tool_paths["g++"])])
+        for name in all_cpp_compile_actions
+    ] + [
+        action_config(action_name = name, enabled = True, tools = [tool(path = linker_tool)])
+        for name in all_link_actions
+    ] + [
+        # DTLTO's lto-backend actions are distributed to the RBE executor, so
+        # they must run the execution-architecture compiler from the cross
+        # archive even when link actions use the host-native linker. LTO
+        # indexing, by contrast, reuses the link action's tool (Bazel binds
+        # both to the cpp-link-* action configs), so it runs wherever the link
+        # runs and must not be pinned here.
+        action_config(
+            action_name = ACTION_NAMES.lto_backend,
+            enabled = True,
+            tools = [tool(path = tool_paths["gcc"])],
+        ),
+    ]
+
+    opt_feature = feature(name = "opt")
+    dbg_feature = feature(name = "dbg")
+
+    unfiltered_compile_flags_feature = feature(
+        name = "unfiltered_compile_flags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            # Do not resolve our symlinked resource prefixes to real paths. This is required to
+                            # make includes resolve correctly.
+                            "-no-canonical-prefixes",
+                        ] if ctx.attr.compiler == COMPILERS.CLANG else [
+                            "-no-canonical-prefixes",
+                            "-fno-canonical-system-headers",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    omitted_timestamps_feature = feature(
+        name = "redacted_dates",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-D__DATE__=\"OMITTED_FOR_HASH_CONSISTENCY\"",
+                            "-D__TIMESTAMP__=\"OMITTED_FOR_HASH_CONSISTENCY\"",
+                            "-D__TIME__=\"OMITTED_FOR_HASH_CONSISTENCY\"",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    thin_archive_feature = feature(
+        name = "thin_archive",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = [ACTION_NAMES.cpp_link_static_library],
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-T",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    default_compile_flags_feature = feature(
+        name = "default_compile_flags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        # Security hardening requires optimization.
+                        # We need to undef it as some distributions now have it enabled by default.
+                        flags = ["-U_FORTIFY_SOURCE"],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        not_features = ["thin_lto"],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_c_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-std=c11",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-std=c++20",
+                            "-nostdinc++",
+                        ] if ctx.attr.hermetic else [
+                            "-std=c++20",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    include_paths_feature = feature(
+        name = "include_paths",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_header_parsing,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.clif_match,
+                    ACTION_NAMES.objc_compile,
+                    ACTION_NAMES.objcpp_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = ["-iquote", "%{quote_include_paths}"],
+                        iterate_over = "quote_include_paths",
+                    ),
+                    flag_group(
+                        flags = ["-I%{include_paths}"],
+                        iterate_over = "include_paths",
+                    ),
+                    flag_group(
+                        flags = ["-isystem", "%{system_include_paths}"],
+                        iterate_over = "system_include_paths",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    external_include_paths_feature = feature(
+        name = "external_include_paths",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_header_parsing,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.clif_match,
+                    ACTION_NAMES.objc_compile,
+                    ACTION_NAMES.objcpp_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = ["-isystem", "%{external_include_paths}"],
+                        iterate_over = "external_include_paths",
+                        expand_if_available = "external_include_paths",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    library_search_directories_feature = feature(
+        name = "library_search_directories",
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["-L%{library_search_directories}"],
+                        iterate_over = "library_search_directories",
+                        expand_if_available = "library_search_directories",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    supports_dynamic_linker_feature = feature(
+        name = "supports_dynamic_linker",
+        enabled = (not ctx.attr.linkstatic) or ctx.attr.shared_archive,
+    )
+
+    supports_start_end_lib_feature = feature(
+        name = "supports_start_end_lib",
+        enabled = True,
+    )
+
+    objcopy_embed_flags_feature = feature(
+        name = "objcopy_embed_flags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = ["objcopy_embed_data"],
+                flag_groups = [flag_group(flags = ["-I", "binary"])],
+            ),
+        ],
+    )
+
+    user_compile_flags_feature = feature(
+        name = "user_compile_flags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["%{user_compile_flags}"],
+                        iterate_over = "user_compile_flags",
+                        expand_if_available = "user_compile_flags",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    extra_cflags_feature = feature(
+        name = "extra_cflags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [ACTION_NAMES.c_compile, ACTION_NAMES.lto_backend],
+                flag_groups = [flag_group(flags = ctx.attr.extra_cflags)],
+            ),
+        ] if len(ctx.attr.extra_cflags) > 0 else [],
+    )
+
+    extra_cxxflags_feature = feature(
+        name = "extra_cxxflags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [ACTION_NAMES.cpp_compile, ACTION_NAMES.lto_backend],
+                flag_groups = [flag_group(flags = ctx.attr.extra_cxxflags)],
+            ),
+        ] if len(ctx.attr.extra_cxxflags) > 0 else [],
+    )
+
+    includes_feature = feature(
+        name = "includes",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # -isystem and the include path need to be separate strings in the array
+                    # as things like rules_rust parse each flag individually
+                    final_include
+                    for include in ctx.attr.includes
+                    for final_include in ["-isystem", include]
+                ])],
+            ),
+        ] if ctx.attr.includes != None and len(ctx.attr.includes) > 0 else [],
+    )
+
+    # C++-only system include dirs. These must not be added to C compiles: some
+    # standard libraries (e.g. libstdc++ >= 13) ship a C++ <stdatomic.h> under
+    # their C++ include dir that would otherwise shadow the C library's
+    # <stdatomic.h> and break C sources (e.g. libunwind's atomic_bool).
+    cpp_includes_feature = feature(
+        name = "cpp_includes",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    final_include
+                    for include in ctx.attr.cpp_includes
+                    for final_include in ["-isystem", include]
+                ])],
+            ),
+        ] if ctx.attr.cpp_includes != None and len(ctx.attr.cpp_includes) > 0 else [],
+    )
+
+    bin_dirs_feature = feature(
+        name = "bin_dirs",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # -B and the bin dirs need to be separate strings in the array
+                    # as things like rules_rust parse each flag individually
+                    final_bin_dir
+                    for bin_dir in ctx.attr.bin_dirs
+                    for final_bin_dir in ["-B", bin_dir]
+                ])],
+            ),
+        ] if ctx.attr.bin_dirs != None and len(ctx.attr.bin_dirs) > 0 else [],
+    )
+
+    linker_bin_dirs_feature = feature(
+        name = "linker_bin_dirs",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = [
+                    final_bin_dir
+                    for bin_dir in linker_bin_dirs
+                    for final_bin_dir in ["-B", bin_dir]
+                ])],
+            ),
+        ] if linker_bin_dirs != None and len(linker_bin_dirs) > 0 else [],
+    )
+
+    extra_ldflags_feature = feature(
+        name = "extra_ldflags",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = ctx.attr.extra_ldflags)],
+            ),
+        ] if len(ctx.attr.extra_ldflags) > 0 else [],
+    )
+
+    verbose_feature = feature(
+        name = "verbose",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = ["--verbose"])],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-Wl,--verbose"])],
+            ),
+        ] if ctx.attr.verbose else [],
+    )
+
+    sysroot_feature = feature(
+        name = "sysroot",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_header_parsing,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.cpp_module_codegen,
+                    ACTION_NAMES.lto_backend,
+                    ACTION_NAMES.clif_match,
+                ] + all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["--sysroot", "%{sysroot}"],
+                        expand_if_available = "sysroot",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    target_triple_feature = feature(
+        name = "target_triple",
+        enabled = bool(ctx.attr.target_triple),
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions + all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(flags = ["--target=" + ctx.attr.target_triple]),
+                ],
+            ),
+        ],
+    )
+
+    dependency_file_feature = feature(
+        name = "dependency_file",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.assemble,
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.objc_compile,
+                    ACTION_NAMES.objcpp_compile,
+                    ACTION_NAMES.cpp_header_parsing,
+                    ACTION_NAMES.clif_match,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = ["-MD", "-MF", "%{dependency_file}"],
+                        expand_if_available = "dependency_file",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    supports_pic_feature = feature(
+        name = "supports_pic",
+        enabled = True,
+    )
+
+    default_pic = (not ctx.attr.linkstatic) or ctx.attr.shared_archive
+
+    pic_feature = feature(
+        name = "pic",
+        enabled = default_pic,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.assemble,
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_codegen,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.lto_backend,
+                ],
+                flag_groups = [
+                    flag_group(flags = ["-fPIC"], expand_if_available = "pic"),
+                ],
+            ),
+        ],
+    )
+
+    pie_feature = feature(
+        name = "pie",
+        enabled = not default_pic,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.assemble,
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_codegen,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.lto_backend,
+                ],
+                flag_groups = [flag_group(flags = ["-fPIE"])],
+            ),
+            flag_set(
+                actions = [
+                    ACTION_NAMES.cpp_link_executable,
+                    ACTION_NAMES.lto_index_for_executable,
+                ],
+                flag_groups = [flag_group(flags = ["-pie"])],
+            ),
+        ],
+    )
+
+    per_object_debug_info_feature = feature(
+        name = "per_object_debug_info",
+        enabled = not ctx.attr.disable_debug_symbols,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.assemble,
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_codegen,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = ["-gsplit-dwarf", "-g"],
+                        expand_if_available = "per_object_debug_info_file",
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        not_features = ["disable_debug_symbols"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # Bazel's built-in fission_support feature adds a linker-generated GDB
+    # index. Keep split DWARF, but generate the index explicitly with
+    # gdb-add-index so it is consistent across linkers.
+    fission_support_feature = feature(name = "fission_support")
+
+    preprocessor_defines_feature = feature(
+        name = "preprocessor_defines",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.preprocess_assemble,
+                    ACTION_NAMES.linkstamp_compile,
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_header_parsing,
+                    ACTION_NAMES.cpp_module_compile,
+                    ACTION_NAMES.clif_match,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = ["-D%{preprocessor_defines}"],
+                        iterate_over = "preprocessor_defines",
+                    ),
+                    flag_group(
+                        flags = [
+                            "-D{}".format(preprocessor_define)
+                            for preprocessor_define in DEFINES
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dbg_level_0_feature = feature(
+        name = "g0",
+        enabled = ctx.attr.debug_level == 0,
+        flag_sets = [
+            flag_set(
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-g0",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dbg_level_1_feature = feature(
+        name = "g1",
+        enabled = ctx.attr.debug_level == 1 and not ctx.attr.disable_debug_symbols,
+        flag_sets = [
+            flag_set(
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-g1",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dbg_level_2_feature = feature(
+        name = "g2",
+        enabled = ctx.attr.debug_level == 2 and not ctx.attr.disable_debug_symbols,
+        flag_sets = [
+            flag_set(
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-g2",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        not_features = ["g0", "g1", "g3", "disable_debug_symbols"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dbg_level_3_feature = feature(
+        name = "g3",
+        enabled = ctx.attr.debug_level == 3 and not ctx.attr.disable_debug_symbols,
+        flag_sets = [
+            flag_set(
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-g3",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    dwarf4_feature = feature(
+        name = "dwarf-4",
+        enabled = ctx.attr.dwarf_version == 4,
+        implies = ["per_object_debug_info"],
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf-4"])],
+                with_features = [with_feature_set(not_features = ["disable_debug_symbols"])],
+            ),
+        ],
+    )
+
+    dwarf5_feature = feature(
+        name = "dwarf-5",
+        enabled = ctx.attr.dwarf_version == 5,
+        implies = ["per_object_debug_info"],
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf-5"])],
+                with_features = [with_feature_set(not_features = ["disable_debug_symbols"])],
+            ),
+        ],
+    )
+
+    dwarf32_feature = feature(
+        name = "dwarf32",
+        # SUSE builds system libraries with dwarf32; keep our debug info consistent.
+        enabled = ctx.attr.fission or ctx.attr.distro in ["suse15", "suse16"],
+        implies = ["per_object_debug_info"],
+        flag_sets = [
+            flag_set(
+                # This needs to only be set in the cpp compile actions to avoid generating debug info when
+                # building assembly files since the assembler doesn't support gdwarf64.
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf32"])],
+                with_features = [with_feature_set(not_features = ["disable_debug_symbols"])],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf32"])],
+                with_features = [with_feature_set(not_features = ["disable_debug_symbols"])],
+            ),
+        ],
+    )
+
+    # gdb crashes with -gsplit-dwarf and -gdwarf64
+    dwarf64_feature = feature(
+        name = "dwarf64",
+        enabled = not ctx.attr.fission and ctx.attr.distro not in ["suse15", "suse16"] and not ctx.attr.compiler == COMPILERS.CLANG,
+        implies = ["per_object_debug_info"],
+        flag_sets = [
+            flag_set(
+                actions = all_non_assembly_compile_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf64"])],
+                with_features = [with_feature_set(not_features = ["disable_debug_symbols"])],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-gdwarf64"])],
+                with_features = [with_feature_set(not_features = ["disable_debug_symbols"])],
+            ),
+        ],
+    )
+
+    disable_debug_symbols_feature = feature(
+        name = "disable_debug_symbols",
+        enabled = ctx.attr.disable_debug_symbols,
+        implies = ["g0"],
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                with_features = [
+                    with_feature_set(
+                        not_features = [
+                            "per_object_debug_info",
+                            "g1",
+                            "g2",
+                            "g3",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions,
+                with_features = [
+                    with_feature_set(
+                        not_features = [
+                            "per_object_debug_info",
+                            "g1",
+                            "g2",
+                            "g3",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # This warning overzealously warns on uses of non-virtual destructors which are benign.
+    no_warn_non_virtual_destructor_feature = feature(
+        name = "no_warn_non_virtual_destructor",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wno-non-virtual-dtor"])],
+            ),
+        ],
+    )
+
+    no_deprecated_enum_enum_conversion_feature = feature(
+        name = "no_deprecated_enum_enum_conversion",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wno-deprecated-enum-enum-conversion"])],
+            ),
+        ],
+    )
+
+    no_volatile_feature = feature(
+        name = "no_volatile",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wno-volatile"])],
+            ),
+        ],
+    )
+
+    fsized_deallocation_feature = feature(
+        name = "fsized_deallocation",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-fsized-deallocation"])],
+            ),
+        ],
+    )
+
+    # Warn when hiding a virtual function.
+    overloaded_virtual_warning_feature = feature(
+        name = "overloaded_virtual_warning",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Woverloaded-virtual"])],
+            ),
+        ],
+    )
+
+    # Warn when hiding a virtual function.
+    no_overloaded_virtual_warning_feature = feature(
+        name = "no_overloaded_virtual_warning",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wno-overloaded-virtual"])],
+            ),
+        ],
+    )
+
+    # Warn about moves of prvalues, which can inhibit copy elision.
+    pessimizing_move_warning_feature = feature(
+        name = "pessimizing_move_warning",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wpessimizing-move"])],
+            ),
+        ],
+    )
+
+    # -Wno-class-memaccess is only valid for C++ but not for C
+    no_class_memaccess_warning_feature = feature(
+        name = "no_class_memaccess_warning",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wno-class-memaccess"])],
+            ),
+        ],
+    )
+
+    # We shouldn't define any external-facing ABIs dependent on hardware interference sizes, so
+    # inconsistent interference sizes between builds should not affect correctness.
+    no_interference_size_warning_feature = feature(
+        name = "no_interference_size_warning",
+        enabled = ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = ["-Wno-interference-size"])],
+            ),
+        ],
+    )
+
+    thread_safety_warnings_feature = feature(
+        name = "thread_safety_warnings",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Warn about thread safety issues
+                    "-Wthread-safety",
+                ])],
+            ),
+        ],
+    )
+
+    # Disable floating-point contractions such as forming of fused multiply-add
+    # operations.
+    disable_floating_point_contractions_feature = feature(
+        name = "disable_floating_point_contractions",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-ffp-contract=off",
+                ])],
+            ),
+        ],
+    )
+
+    enable_all_warnings_feature = feature(
+        name = "enable_all_warnings_cc",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Enable all warnings by default.
+                    "-Wall",
+                ])],
+            ),
+        ],
+    )
+
+    general_clang_or_gcc_warnings_feature = feature(
+        name = "general_clang_or_gcc_warnings",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Warn on comparison between signed and unsigned integer expressions.
+                    "-Wsign-compare",
+
+                    # Warn if a precompiled header (see Precompiled Headers) is found in the
+                    # search path but can't be used.
+                    "-Winvalid-pch",
+
+                    # This has been suppressed in gcc 4.8, due to false positives, but not
+                    # in clang. So we explicitly disable it here.
+                    "-Wno-missing-braces",
+
+                    # SERVER-76472 we don't try to maintain ABI so disable warnings about
+                    # possible ABI issues.
+                    "-Wno-psabi",
+                ])],
+            ),
+        ],
+    )
+
+    general_clang_warnings_feature = feature(
+        name = "general_clang_warnings",
+        enabled = ctx.attr.compiler == COMPILERS.CLANG,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # SERVER-44856: Our windows builds complain about unused
+                    # exception parameters, but GCC and clang don't seem to do
+                    # that for us automatically. In the interest of making it more
+                    # likely to catch these errors early, add the (currently clang
+                    # only) flag that turns it on.
+                    "-Wunused-exception-parameter",
+
+                    # As of clang-3.4, this warning appears in v8, and gets escalated to an
+                    # error.
+                    "-Wno-tautological-constant-out-of-range-compare",
+
+                    # As of clang in Android NDK 17, these warnings appears in boost and/or
+                    # ICU, and get escalated to errors
+                    "-Wno-tautological-constant-compare",
+                    "-Wno-tautological-unsigned-zero-compare",
+                    "-Wno-tautological-unsigned-enum-zero-compare",
+
+                    # Suppress warnings about not consistently using override everywhere in
+                    # a class. It seems very pedantic, and we have a fair number of
+                    # instances.
+                    "-Wno-inconsistent-missing-override",
+
+                    # This warning was added in clang-4.0, but it warns about code that is
+                    # required on some platforms. Since the warning just states that
+                    # 'explicit instantiation of [a template] that occurs after an explicit
+                    # specialization has no effect', it is harmless on platforms where it
+                    # isn't required
+                    "-Wno-instantiation-after-specialization",
+                ])],
+            ),
+        ],
+    )
+
+    general_gcc_warnings_feature = feature(
+        name = "general_gcc_warnings",
+        enabled = ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Disable warning about variables that may not be initialized
+                    # Failures are triggered in the case of boost::optional
+                    "-Wno-maybe-uninitialized",
+
+                    # Prevents warning about unused but set variables found in boost version
+                    # 1.49 in boost/date_time/format_date_parser.hpp which does not work for
+                    # compilers GCC >= 4.6. Error explained in
+                    # https://svn.boost.org/trac/boost/ticket/6136 .
+                    "-Wno-unused-but-set-variable",
+
+                    # Warn about trampolines that require executable stacks.
+                    "-Wtrampolines",
+                ])],
+            ),
+        ],
+    )
+
+    general_gcc_or_clang_options_feature = feature(
+        name = "general_gcc_or_clang_options",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Generate unwind table in DWARF format, if supported by target machine.
+                    # The table is exact at each instruction boundary, so it can be used for
+                    # stack unwinding from asynchronous events (such as debugger or garbage
+                    # collector).
+                    "-fasynchronous-unwind-tables",
+
+                    # For debug builds with tcmalloc, we need the frame pointer so it can
+                    # record the stack of allocations. We also need the stack pointer for
+                    # stack traces unless libunwind is enabled. Enable frame pointers by
+                    # default.
+                    "-fno-omit-frame-pointer",
+
+                    # Enable strong by default, this may need to be softened to
+                    # -fstack-protector-all if we run into compatibility issues.
+                    "-fstack-protector-strong",
+
+                    # Disable TBAA optimization
+                    "-fno-strict-aliasing",
+
+                    # Show colors even though bazel captures stdout/stderr
+                    "-fdiagnostics-color",
+                ])],
+            ),
+        ],
+    )
+
+    clang_fno_limit_debug_info_feature = feature(
+        name = "clang_fno_limit_debug_info",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # We add this flag to make clang emit debug info for c++ stl types so
+                    # that our pretty printers will work with newer clang's which omit this
+                    # debug info. This does increase the overall debug info size.
+                    # This will triple the debug info size.
+                    "-fno-limit-debug-info",
+                ])],
+            ),
+        ],
+    )
+
+    # If possible with the current linker, mark relocations as read-only.
+    relro_link_flags = ["-Wl,-z,relro"]
+
+    # RHEL 8 arm64 and PPC64LE use 64 KiB pages. Align the end of the PT_GNU_RELRO segment to a
+    # page boundary so the dynamic loader can protect the entire segment. The linkstatic attribute
+    # describes the global build configuration, so dynamic library actions need this flag even
+    # when that configuration is static.
+    common_page_size_link_actions = [
+        ACTION_NAMES.cpp_link_dynamic_library,
+        ACTION_NAMES.cpp_link_nodeps_dynamic_library,
+    ] + ([ACTION_NAMES.cpp_link_executable] if not ctx.attr.linkstatic else [])
+
+    general_linkflags_feature = feature(
+        name = "general_linkflags",
+        enabled = ctx.attr.compiler == COMPILERS.CLANG or ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = [
+                    # Explicitly use the new gnu hash section if the linker offers it.
+                    "-Wl,--hash-style=gnu",
+
+                    # Disallow an executable stack. Also, issue a warning if any files are
+                    # found that would cause the stack to become executable if the
+                    # noexecstack flag was not in play, so that we can find them and fix
+                    # them.
+                    "-Wl,-z,noexecstack",
+                    "-Wl,--warn-execstack",
+                ] + relro_link_flags)],
+            ),
+        ] + ([
+            flag_set(
+                actions = common_page_size_link_actions,
+                flag_groups = [flag_group(flags = ["-Wl,-z,common-page-size=0x10000"])],
+            ),
+        ] if target_is_aarch64 or target_is_ppc64le else []),
+    )
+
+    build_id_feature = feature(
+        name = "build_id",
+        enabled = ctx.attr.compiler == COMPILERS.CLANG or ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = [
+                    # Explicitly enable GNU build id's if the linker supports it.
+                    "-Wl,--build-id",
+                ])],
+            ),
+        ],
+    )
+
+    # Link libatomic statically (-l:libatomic.a) rather than -latomic. The
+    # shared archive only participates in the link when a target actually
+    # references __atomic symbols (unlike a shared library, whose soname is
+    # recorded as DT_NEEDED once it resolves any symbol). x86_64 and aarch64
+    # inline their atomics and see no change, but s390x and ppc64le targets
+    # call into libatomic, which would otherwise leave a runtime dependency on
+    # libatomic.so.1 — e.g. extension .so files, which must only depend on
+    # libraries the server already provides (see
+    # evergreen/verify_extension_visibility_test.sh).
+    global_libs_feature = feature(
+        name = "global_libs",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = [
+                    "-lm",
+                    "-lresolv",
+                    "-l:libatomic.a",
+                ])],
+            ),
+        ],
+    )
+
+    libvoidstar_feature = feature(
+        name = "libvoidstar",
+        enabled = ctx.file.libvoidstar != None,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = [
+                    "-L{}".format(ctx.file.libvoidstar.dirname),
+                    "-lvoidstar",
+                ])],
+            ),
+        ] if ctx.file.libvoidstar != None else [],
+    )
+
+    pthread_feature = feature(
+        name = "pthread",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = [
+                    # Adds support for multithreading with the pthreads library. This option
+                    # sets flags for both the preprocessor and linker.
+                    "-pthread",
+                ])],
+            ),
+        ],
+    )
+
+    compress_debug_sections_feature = feature(
+        name = "compress_debug_sections",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wl,--compress-debug-sections=none",
+                ])],
+            ),
+        ],
+    )
+
+    # Define rdynamic for backtraces with glibc unless we have libunwind.
+    rdynamic_feature = feature(
+        name = "rdynamic",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = [
+                    # Pass the flag -export-dynamic to the ELF linker, on targets that
+                    # support it. This instructs the linker to add all symbols, not only
+                    # used ones, to the dynamic symbol table. This option is needed for some
+                    # uses of dlopen or to allow obtaining backtraces from within a program.
+                    "-rdynamic",
+                ])],
+            ),
+        ],
+    )
+
+    gcc_no_ignored_attributes_features = feature(
+        name = "gcc_no_ignored_attributes",
+        enabled = ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wno-ignored-attributes",
+                ])],
+            ),
+        ],
+    )
+
+    # The resource dir points at the hermetic toolchain's bundled clang runtime.
+    # A native clang finds its own resource dir, so this is hermetic-only.
+    clang_toolchain_resource_dir_feature = feature(
+        name = "clang_toolchain_resource_dir",
+        enabled = ctx.attr.hermetic and ctx.attr.compiler == COMPILERS.CLANG and bool(linker_resource_dir),
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["-resource-dir=" + linker_resource_dir],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    default_linker_with_features = [
+        with_feature_set(
+            not_features = [
+                "linker_lld",
+                "linker_mold",
+            ],
+        ),
+    ]
+
+    # Some of the linux versions are missing libatomic.so.1. When using mold, prefer the copy in the
+    # mongo toolchain rather than relying on one being installed on the host.
+    mold_linker_env_entries = [
+        env_entry(key = "LD_LIBRARY_PATH", value = linker_toolchain_repo_dir + "/stow/gcc-v5/lib64/"),
+    ] if ctx.attr.hermetic else []
+
+    default_linker_lld_feature = feature(
+        name = "default_linker_lld",
+        enabled = ctx.attr.linker == LINKERS.LLD,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = ["-fuse-ld=lld"])],
+                with_features = default_linker_with_features,
+            ),
+        ],
+    )
+
+    default_linker_mold_feature = feature(
+        name = "default_linker_mold",
+        enabled = ctx.attr.linker == LINKERS.MOLD,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = [
+                    "-fuse-ld=mold",
+                    "-B" + ctx.attr.mold_bin_dir,
+                ])],
+                with_features = default_linker_with_features,
+            ),
+        ],
+        env_sets = [
+            env_set(
+                actions = all_link_actions,
+                env_entries = mold_linker_env_entries,
+                with_features = default_linker_with_features,
+            ),
+        ],
+    )
+
+    linker_lld_feature = feature(
+        name = "linker_lld",
+        enabled = False,
+        provides = ["linker_override"],
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = ["-fuse-ld=lld"])],
+            ),
+        ],
+    )
+
+    linker_mold_feature = feature(
+        name = "linker_mold",
+        enabled = False,
+        provides = ["linker_override"],
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = [
+                    "-fuse-ld=mold",
+                    "-B" + ctx.attr.mold_bin_dir,
+                ])],
+            ),
+        ],
+        env_sets = [
+            env_set(
+                actions = all_link_actions,
+                env_entries = mold_linker_env_entries,
+            ),
+        ],
+    )
+
+    pgo_profile_generate_feature = feature(
+        name = "pgo_profile_generate",
+        enabled = ctx.attr.pgo_profile_generate,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                ] + all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fprofile-generate",
+                            "-fno-data-sections",
+                        ] if ctx.attr.compiler == COMPILERS.CLANG else [
+                            "-fprofile-generate",
+                            "-fno-data-sections",
+                            "-fprofile-dir=mongod_perf",
+                            "-Wl,-S",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = [
+                    ACTION_NAMES.cpp_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = [""] if ctx.attr.compiler == COMPILERS.CLANG else ["-Wno-mismatched-new-delete"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    pgo_profile_use_feature = feature(
+        name = "pgo_profile_use",
+        enabled = ctx.attr.pgo_profile_use != None,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fprofile-use=" + ctx.attr.pgo_profile_use[DefaultInfo].files.to_list()[0].path if ctx.attr.pgo_profile_use != None else "",
+                            "-Wno-profile-instr-unprofiled",
+                            "-Wno-profile-instr-out-of-date",
+                            "-Wno-backend-plugin",
+                            "-mllvm",
+                            "-profile-accurate-for-symsinlist=false",
+                        ] if ctx.attr.compiler == COMPILERS.CLANG else [
+                            "-fprofile-use",
+                            "-Wno-missing-profile",
+                            "-fprofile-correction",
+                            "-Wno-coverage-mismatch",
+                            "-fprofile-dir=" + ctx.attr.pgo_profile_use[DefaultInfo].files.to_list()[0].dirname if ctx.attr.pgo_profile_use != None else "",
+                        ],
+                    ),
+                ],
+                # Suppress pgo_profile_use whenever cspgo_profile_use is also active:
+                # the cspgo profdata already contains the PGO data, so emitting both
+                # -fprofile-use flags is redundant (and noisy in compile commands).
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                        not_features = ["cspgo_profile_use"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # CSPGO generate: runs on top of stage-1 PGO. Requires pgo_profile_use to be set
+    # so clang consumes the existing PGO data while emitting context-sensitive counters.
+    # Clang-only; no GCC equivalent.
+    cspgo_profile_generate_feature = feature(
+        name = "cspgo_profile_generate",
+        enabled = ctx.attr.cspgo_profile_generate and ctx.attr.compiler == COMPILERS.CLANG,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.lto_backend,
+                ] + all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fcs-profile-generate=mongod_perf",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    cspgo_profile_use_files = ctx.attr.cspgo_profile_use[DefaultInfo].files.to_list() if ctx.attr.cspgo_profile_use != None else []
+    cspgo_profile_use_feature = feature(
+        name = "cspgo_profile_use",
+        enabled = len(cspgo_profile_use_files) > 0,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fprofile-use=" + cspgo_profile_use_files[0].path if len(cspgo_profile_use_files) > 0 else "",
+                            "-Wno-profile-instr-unprofiled",
+                            "-Wno-profile-instr-out-of-date",
+                            "-Wno-backend-plugin",
+                            "-mllvm",
+                            "-profile-accurate-for-symsinlist=false",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    propeller_profile_generate_feature = feature(
+        name = "propeller_profile_generate",
+        enabled = ctx.attr.propeller_profile_generate,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                ] + all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-funique-internal-linkage-names",
+                            "-fbasic-block-address-map",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    propeller_profile_use_cc_feature = feature(
+        name = "propeller_profile_use_cc",
+        enabled = ctx.attr.propeller_profile_use != None,
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-funique-internal-linkage-names",
+                            "-fbasic-block-sections=list=CCprofile.txt",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    propeller_profile_use_link_feature = feature(
+        name = "propeller_profile_use_link",
+        enabled = ctx.attr.propeller_profile_use != None,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-Wl,--symbol-ordering-file=LINKERprofile.txt",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # This is from bazels toolchain. Modified to add our own implies/enabled section.
+    thinlto_feature = feature(
+        name = "thin_lto",
+        enabled = ctx.attr.distributed_thin_lto,
+        implies = ["no_debug_types_section", "supports_start_end_lib"],
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                ] + all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(flags = ["-flto=thin"]),
+                    flag_group(
+                        expand_if_available = "lto_indexing_bitcode_file",
+                        flags = [
+                            "-Xclang",
+                            "-fthin-link-bitcode=%{lto_indexing_bitcode_file}",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = [ACTION_NAMES.linkstamp_compile],
+                flag_groups = [flag_group(flags = ["-DBUILD_LTO_TYPE=thin"])],
+            ),
+            flag_set(
+                actions = lto_index_actions,
+                flag_groups = [
+                    flag_group(flags = [
+                        "-flto=thin",
+                        "-Wl,-plugin-opt,thinlto-index-only%{thinlto_optional_params_file}",
+                        "-Wl,-plugin-opt,thinlto-emit-imports-files",
+                        "-Wl,-plugin-opt,thinlto-prefix-replace=%{thinlto_prefix_replace}",
+                    ]),
+                    flag_group(
+                        expand_if_available = "thinlto_object_suffix_replace",
+                        flags = [
+                            "-Wl,-plugin-opt,thinlto-object-suffix-replace=%{thinlto_object_suffix_replace}",
+                        ],
+                    ),
+                    flag_group(
+                        expand_if_available = "thinlto_merged_object_file",
+                        flags = [
+                            "-Wl,-plugin-opt,obj-path=%{thinlto_merged_object_file}",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = [ACTION_NAMES.lto_backend],
+                flag_groups = [
+                    flag_group(flags = [
+                        "-c",
+                        "-fthinlto-index=%{thinlto_index}",
+                        "-o",
+                        "%{thinlto_output_object_file}",
+                        "-x",
+                        "ir",
+                        "%{thinlto_input_bitcode_file}",
+                        "-Wno-unused-command-line-argument",
+                    ]),
+                ],
+            ),
+        ],
+    )
+
+    debug_types_section_feature = feature(
+        name = "debug_types_section",
+        enabled = ctx.attr.compiler == COMPILERS.GCC and ctx.attr.linkstatic and ctx.attr.distro in ["suse15", "suse16"],
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = ["-fdebug-types-section"])],
+            ),
+        ],
+    )
+
+    no_debug_types_section_feature = feature(
+        name = "no_debug_types_section",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = ["-fno-debug-types-section"])],
+            ),
+        ],
+    )
+
+    file_prefix_map = feature(
+        name = "file_prefix_map",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions + all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = ["-ffile-prefix-map=/proc/self/cwd=."])],
+            ),
+        ],
+    )
+
+    # When using an RBE sysroot for local builds, map debug paths from the
+    # extracted sysroot back to their absolute container paths so that debug
+    # info is identical to RBE-produced binaries. Only constructed and
+    # registered when a sysroot is configured, so the no-sysroot toolchain
+    # config is identical to what it was before sysroot support existed.
+    sysroot_debug_prefix_map = [feature(
+        name = "sysroot_debug_prefix_map",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-fdebug-prefix-map={}=/".format(ctx.attr.builtin_sysroot),
+                ])],
+            ),
+        ],
+    )] if ctx.attr.builtin_sysroot else []
+
+    strip_debug_feature = feature(
+        name = "strip_debug",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions,
+                flag_groups = [flag_group(flags = ["-Wl,--strip-debug"])],
+            ),
+        ],
+    )
+
+    shared_archive_default_link_flags = ["-Wl,-Bsymbolic"] if ctx.attr.linker == LINKERS.MOLD else ["-Wl,--no-gnu-unique", "-Wl,-Bsymbolic"]
+    shared_archive_override_link_flags = ["-Wl,--no-gnu-unique", "-Wl,-Bsymbolic"] if ctx.attr.linker == LINKERS.MOLD else ["-Wl,-Bsymbolic"]
+    shared_archive_default_with_features = [with_feature_set(not_features = ["linker_lld"])] if ctx.attr.linker == LINKERS.MOLD else [with_feature_set(not_features = ["linker_mold"])]
+    shared_archive_override_with_features = [with_feature_set(features = ["linker_lld"])] if ctx.attr.linker == LINKERS.MOLD else [with_feature_set(features = ["linker_mold"])]
+
+    shared_archive_gcc_feature = feature(
+        name = "shared_archive_gcc",
+        enabled = ctx.attr.shared_archive and ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = ["-fno-gnu-unique"])],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = shared_archive_default_link_flags)],
+                with_features = shared_archive_default_with_features,
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = shared_archive_override_link_flags)],
+                with_features = shared_archive_override_with_features,
+            ),
+        ],
+    )
+
+    # SERVER-9761: Ensure early detection of missing symbols in dependent libraries
+    # at program startup. For non-release dynamic builds we disable this behavior in
+    # the interest of improved mongod startup times. Xcode15 removed bind_at_load
+    # functionality so we cannot have a selection for macosx here
+    # ld: warning: -bind_at_load is deprecated on macOS
+    # TODO: SERVER-90596 reenable loading at startup
+    bind_at_load_feature = feature(
+        name = "bind_at_load",
+        enabled = ctx.attr.linkstatic,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = ["-Wl,-z,now"])],
+            ),
+        ],
+    )
+
+    implicit_fallthrough_feature = feature(
+        name = "implicit_fallthrough",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["-Wimplicit-fallthrough"] if ctx.attr.compiler == COMPILERS.CLANG else ["-Wimplicit-fallthrough=5"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    any_sanitizer_feature = feature(
+        name = "any_sanitizer",
+        enabled = ctx.attr.any_sanitizer_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = ["-fno-omit-frame-pointer"])],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    # Sanitizer libs may inject undefined refs (for hooks) at link time, but the
+                    # symbols will be available at runtime via the compiler runtime lib.
+                    flag_group(
+                        flags = [
+                            "-Wl,--allow-shlib-undefined",
+                            "-rtlib=compiler-rt",
+                            "-unwindlib=libgcc",
+                        ] if not ctx.attr.tsan_enabled else ["-Wl,--allow-shlib-undefined"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    asan_feature = feature(
+        name = "asan",
+        enabled = ctx.attr.asan_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=address",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize-blacklist=" + ctx.attr.asan_denylist[DefaultInfo].files.to_list()[0].path if ctx.attr.asan_denylist != None else "",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["-fsanitize=address"],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # We can't include the fuzzer flag with the other sanitize flags. The libfuzzer
+    # library already has a main function, which will cause the dependencies check
+    # to fail
+    fsan_feature = feature(
+        name = "fsan",
+        enabled = ctx.attr.fsan_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=fuzzer-no-link",
+                            "-fprofile-instr-generate",
+                            "-fcoverage-mapping",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=fuzzer-no-link",
+                            "-fprofile-instr-generate",
+                            "-fcoverage-mapping",
+                            "-nostdlib++",
+                            "-lstdc++",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # Makes it easier to debug memory failures at the cost of some perf:
+    #   -fsanitize-memory-track-origins
+    msan_feature = feature(
+        name = "msan",
+        enabled = ctx.attr.msan_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=memory",
+                            "-fsanitize-memory-track-origins",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize-blacklist=" + ctx.attr.msan_denylist[DefaultInfo].files.to_list()[0].path if ctx.attr.msan_denylist != None else "",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=memory",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    tsan_feature = feature(
+        name = "tsan",
+        enabled = ctx.attr.tsan_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=thread",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize-blacklist=" + ctx.attr.tsan_denylist[DefaultInfo].files.to_list()[0].path if ctx.attr.tsan_denylist != None else "",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=thread",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # In dynamic builds, the `vptr` sanitizer check can require additional
+    # dependency edges. That is very inconvenient, because such builds can't use
+    # z,defs. The result is a very fragile link graph, where refactoring the link
+    # graph in one place can have surprising effects in others. Instead, we just
+    # disable the `vptr` sanitizer for dynamic builds. We tried some other
+    # approaches in SERVER-49798 of adding a new descriptor type, but that didn't
+    # address the fundamental issue that the correct link graph for a dynamic+ubsan
+    # build isn't the same as the correct link graph for a regular dynamic build.
+    ubsan_compile_flags = ["-fno-sanitize-recover"]
+    if not ctx.attr.linkstatic:
+        ubsan_compile_flags += ["-fno-sanitize=vptr"]
+    ubsan_feature = feature(
+        name = "ubsan",
+        enabled = ctx.attr.ubsan_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=undefined",
+                        ] + ubsan_compile_flags,
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize-blacklist=" + ctx.attr.ubsan_denylist[DefaultInfo].files.to_list()[0].path if ctx.attr.ubsan_denylist != None else "",
+                        ],
+                    ),
+                ],
+                with_features = [
+                    with_feature_set(
+                        features = ["rules_rust_unsupported_feature"],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fsanitize=undefined",
+                        ] + ([] if ctx.attr.linkstatic else ["-fno-sanitize=vptr"]),
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # Suppress the function sanitizer check for third party libraries, because:
+    #
+    # - mongod (a C++ binary) links in WiredTiger (a C library)
+    # - If/when mongod--built under ubsan--fails, the sanitizer will by
+    #   default analyze the failed execution for undefined behavior related to
+    #   function pointer usage. See:
+    #   https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#available-checks
+    # - When this happens, the sanitizer will attempt to dynamically load to perform
+    #   the analysis.
+    # - However, since WT was built as a C library, is not linked with the function
+    #   sanitizer library symbols despite its C++ dependencies referencing them.
+    # - This will cause the sanitizer itself to fail, resulting in debug information
+    #   being unavailable.
+    # - So by suppressing the function ubsan check, we won't reference symbols
+    #   defined in the unavailable ubsan function sanitier library and will get
+    #   useful debugging information.
+    ubsan_third_party_feature = feature(
+        name = "ubsan_third_party",
+        enabled = ctx.attr.ubsan_enabled and not ctx.attr.linkstatic,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fno-sanitize=function",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fno-sanitize=function",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    mtune_flags = []
+    if target_is_aarch64:
+        mtune_flags += ["-march=armv8.2-a", "-mtune=generic"]
+    if target_is_ppc64le:
+        mtune_flags += ["-mcpu=power8", "-mtune=power8", "-mcmodel=medium"]
+    if target_is_s390x:
+        mtune_flags += ["-march=z196", "-mtune=zEC12"]
+    if target_is_x86_64:
+        mtune_flags += ["-march=sandybridge", "-mtune=generic", "-mprefer-vector-width=128"]
+
+    mtune_march_feature = feature(
+        name = "mtune_march",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = mtune_flags,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # LLVM's PPC compare optimization has produced incorrect code for the
+    # PowerPC target (SERVER-111421). Keep this scoped to Clang C/C++ actions
+    # that target PPC64LE: cross-RBE actions execute the compiler on x86/arm,
+    # but still need the target-side workaround. DTLTO also moves LTO code
+    # generation into lto-backend actions, so they need it too.
+    ppc_disable_cmp_opt_feature = feature(
+        name = "ppc_disable_cmp_opt",
+        enabled = target_is_ppc64le and ctx.attr.compiler == COMPILERS.CLANG,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions + [ACTION_NAMES.lto_backend],
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-mllvm",
+                            "-disable-ppc-cmp-opt",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    compress_debug_disable_feature = feature(
+        name = "compress_debug_disable",
+        enabled = not ctx.attr.compress_debug_enabled and ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wa,--nocompress-debug-sections",
+                ])],
+            ),
+        ],
+    )
+
+    rpath_override_feature = feature(
+        name = "rpath_override",
+        enabled = not ctx.attr.linkstatic,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-Wl,-z,origin",
+                            "-Wl,--enable-new-dtags",
+                            "-Wl,-rpath,\\$ORIGIN/../lib",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    warnings_as_errors_link_feature = feature(
+        name = "warnings_as_errors_link",
+        enabled = ctx.attr.warnings_as_errors_enabled,
+        flag_sets = [
+            flag_set(
+                actions = all_link_actions + lto_index_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wl,--fatal-warnings",
+                ])],
+            ),
+        ],
+    )
+
+    first_party_gcc_or_clang_warnings_feature = feature(
+        name = "first_party_gcc_or_clang_warnings",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Warn about issues with format strings. Using both -Wformat and -Wformat=2
+                    # is necessary to get all the format string warnings in both gcc and clang.
+                    # Specifically, in clang -Wformat=2 does not imply -Wformat.
+                    "-Wformat",
+                    "-Wformat=2",
+                ])],
+            ),
+        ],
+    )
+
+    first_party_gcc_warnings_feature = feature(
+        name = "first_party_gcc_warnings",
+        enabled = False,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    # Warn about bidirectional control characters that could be used for
+                    # underhanded code.
+                    "-Wbidi-chars=any",
+                ])],
+            ),
+        ],
+    )
+
+    trivial_auto_var_init_pattern_feature = feature(
+        name = "trivial_auto_var_init_pattern",
+        # Only enabled for clang as it produces some bogus warnings in the v5 toolchain's gcc.
+        enabled = ctx.attr.dbg and ctx.attr.compiler == COMPILERS.CLANG,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-ftrivial-auto-var-init=pattern",
+                ])],
+            ),
+        ],
+    )
+
+    glibcxx_assertions_feature = feature(
+        name = "glibcxx_assertions",
+        # The v5 toolchain gcc reports several spurious array-bounds and
+        # stringop-overflow errors, particularly with _GLIBCXX_ASSERTIONS enabled, so this
+        # is only enabled for clang.
+        enabled = ctx.attr.dbg and ctx.attr.compiler == COMPILERS.CLANG,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-D_GLIBCXX_ASSERTIONS",
+                ])],
+            ),
+        ],
+    )
+
+    disable_warnings_for_third_party_libraries_clang_feature = feature(
+        name = "disable_warnings_for_third_party_libraries_clang",
+        enabled = ctx.attr.compiler == COMPILERS.CLANG,
+        flag_sets = [
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wno-deprecated-declarations",
+                    "-Wno-deprecated-non-prototype",
+                    "-Wno-missing-template-arg-list-after-template-kw",
+                    "-Wno-sign-compare",
+                    "-Wno-implicit-fallthrough",
+                    "-Wno-shorten-64-to-32",
+                    "-Wno-unused-but-set-variable",
+                    "-Wno-nullability-completeness",
+                    "-Wno-sign-conversion",
+                    "-Wno-deprecate-lax-vec-conv-all",
+                ])],
+            ),
+        ],
+    )
+
+    disable_warnings_for_third_party_libraries_gcc_feature = feature(
+        name = "disable_warnings_for_third_party_libraries_gcc",
+        enabled = ctx.attr.compiler == COMPILERS.GCC,
+        flag_sets = [
+            flag_set(
+                actions = all_cpp_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wno-overloaded-virtual",
+                    "-Wno-dangling-reference",
+                    "-Wno-deprecated",
+                    "-Wno-deprecated-declarations",
+                    "-Wno-class-memaccess",
+                    "-Wno-uninitialized",
+                    "-Wno-array-bounds",
+                    "-Wno-sign-compare",
+                    "-Wno-stringop-overflow",
+                    "-Wno-stringop-overread",
+                    "-Wno-restrict",
+                    "-Wno-dangling-pointer",
+                    "-Wno-implicit-fallthrough",
+                    "-Wno-template-id-cdtor",
+                ])],
+            ),
+            flag_set(
+                actions = all_compile_actions,
+                flag_groups = [flag_group(flags = [
+                    "-Wno-attributes",
+                    "-Wno-implicit-fallthrough",
+                    "-Wno-uninitialized",
+                    "-Wno-sign-compare",
+                    "-Wno-unused-result",
+                    "-Wno-missing-include-dirs",
+                ])],
+            ),
+        ],
+    )
+
+    # This feature is disabled during rust crate execution
+    # This means that any feature that depends on this feature being
+    # enabled will be disabled during crate compilation/linking.
+    rules_rust_unsupported_feature = feature(
+        name = "rules_rust_unsupported_feature",
+        enabled = True,
+    )
+
+    # Marker feature for Mongo's Linux toolchain. The compiledb aspect uses
+    # this to fail loudly if future toolchain upgrades start enabling
+    # module-map-driven features that require extra compile variables.
+    mongo_linux_toolchain_marker_feature = feature(
+        name = "mongo_linux_toolchain_marker",
+        enabled = True,
+    )
+
+    features = [
+        enable_all_warnings_feature,
+        general_clang_or_gcc_warnings_feature,
+        bin_dirs_feature,
+        linker_bin_dirs_feature,
+        default_compile_flags_feature,
+        include_paths_feature,
+        external_include_paths_feature,
+        library_search_directories_feature,
+        supports_dynamic_linker_feature,
+        supports_start_end_lib_feature,
+        supports_pic_feature,
+        pic_feature,
+        pie_feature,
+        per_object_debug_info_feature,
+        fission_support_feature,
+        preprocessor_defines_feature,
+        objcopy_embed_flags_feature,
+        opt_feature,
+        dbg_feature,
+        sysroot_feature,
+        target_triple_feature,
+        unfiltered_compile_flags_feature,
+        omitted_timestamps_feature,
+        thin_archive_feature,
+        # cpp_includes must come before includes so that on C++ compiles the
+        # C++ standard-library dirs are searched before the C dirs (libstdc++
+        # headers use #include_next to reach the C library headers).
+        cpp_includes_feature,
+        includes_feature,
+        dependency_file_feature,
+        verbose_feature,
+        dwarf4_feature,
+        dwarf5_feature,
+        dwarf32_feature,
+        dwarf64_feature,
+        # Debug level should be passed after dwarf
+        # as many dwarf flags will just set g2
+        dbg_level_0_feature,
+        dbg_level_1_feature,
+        dbg_level_2_feature,
+        dbg_level_3_feature,
+        disable_debug_symbols_feature,
+        no_warn_non_virtual_destructor_feature,
+        no_deprecated_enum_enum_conversion_feature,
+        no_volatile_feature,
+        fsized_deallocation_feature,
+        overloaded_virtual_warning_feature,
+        no_overloaded_virtual_warning_feature,
+        pessimizing_move_warning_feature,
+        no_class_memaccess_warning_feature,
+        no_interference_size_warning_feature,
+        thread_safety_warnings_feature,
+        disable_floating_point_contractions_feature,
+        general_clang_warnings_feature,
+        general_gcc_warnings_feature,
+        general_gcc_or_clang_options_feature,
+        clang_fno_limit_debug_info_feature,
+        general_linkflags_feature,
+        pthread_feature,
+        compress_debug_sections_feature,
+        rdynamic_feature,
+        global_libs_feature,
+        build_id_feature,
+        gcc_no_ignored_attributes_features,
+        pgo_profile_generate_feature,
+        pgo_profile_use_feature,
+        cspgo_profile_generate_feature,
+        cspgo_profile_use_feature,
+        propeller_profile_generate_feature,
+        propeller_profile_use_cc_feature,
+        propeller_profile_use_link_feature,
+        thinlto_feature,
+        debug_types_section_feature,
+        no_debug_types_section_feature,
+        file_prefix_map,
+    ] + sysroot_debug_prefix_map + [
+        strip_debug_feature,
+        clang_toolchain_resource_dir_feature,
+        shared_archive_gcc_feature,
+        bind_at_load_feature,
+        implicit_fallthrough_feature,
+        any_sanitizer_feature,
+        asan_feature,
+        fsan_feature,
+        msan_feature,
+        tsan_feature,
+        ubsan_feature,
+        ubsan_third_party_feature,
+        mtune_march_feature,
+        ppc_disable_cmp_opt_feature,
+        compress_debug_disable_feature,
+        rpath_override_feature,
+        warnings_as_errors_link_feature,
+        first_party_gcc_or_clang_warnings_feature,
+        first_party_gcc_warnings_feature,
+        trivial_auto_var_init_pattern_feature,
+        glibcxx_assertions_feature,
+        rules_rust_unsupported_feature,
+        mongo_linux_toolchain_marker_feature,
+    ] + get_common_features(ctx) + [
+        # These flags are at the bottom so they get applied after anything else.
+        # These are things like the flags people apply directly on cc_library through copts/linkopts
+        user_compile_flags_feature,
+        extra_cflags_feature,
+        extra_cxxflags_feature,
+        default_linker_lld_feature,
+        default_linker_mold_feature,
+        linker_lld_feature,
+        linker_mold_feature,
+        extra_ldflags_feature,
+        libvoidstar_feature,
+        disable_warnings_for_third_party_libraries_clang_feature,
+        disable_warnings_for_third_party_libraries_gcc_feature,
+    ]
+
+    return [
+        cc_common.create_cc_toolchain_config_info(
+            abi_libc_version = "local",
+            abi_version = "local",
+            action_configs = action_configs,
+            artifact_name_patterns = [],
+            builtin_sysroot = ctx.attr.builtin_sysroot,
+            cc_target_os = None,
+            compiler = ctx.attr.compiler,
+            ctx = ctx,
+            cxx_builtin_include_directories = ctx.attr.cxx_builtin_include_directories,
+            features = features,
+            host_system_name = "local",
+            make_variables = [],
+            target_cpu = ctx.attr.cpu,
+            target_libc = "local",
+            target_system_name = ctx.attr.target_triple or "local",
+            toolchain_identifier = ctx.attr.toolchain_identifier,
+            tool_paths = [
+                tool_path(name = name, path = path)
+                for name, path in tool_paths.items()
+            ],
+        ),
+    ]
+
+mongo_linux_cc_toolchain_config = rule(
+    implementation = _impl,
+    attrs = {
+        "builtin_sysroot": attr.string(),
+        "clang_resource_dir": attr.string(mandatory = False),
+        "hermetic": attr.bool(default = True, mandatory = False),
+        "cxx_builtin_include_directories": attr.string_list(mandatory = True),
+        "cpu": attr.string(mandatory = True),
+        "compiler": attr.string(mandatory = True),
+        "dbg": attr.bool(mandatory = True),
+        "linker": attr.string(mandatory = True),
+        "libvoidstar": attr.label(allow_single_file = True),
+        "mold_bin_dir": attr.string(mandatory = False),
+        # Execroot-relative directory of the toolchain repo, e.g.
+        # "external/_main~setup_mongo_toolchains~mongo_toolchain_v5".
+        "toolchain_repo_dir": attr.string(mandatory = False),
+        "distro": attr.string(mandatory = False),
+        "extra_cflags": attr.string_list(mandatory = False),
+        "extra_cxxflags": attr.string_list(mandatory = False),
+        "extra_ldflags": attr.string_list(mandatory = False),
+        "includes": attr.string_list(mandatory = False),
+        "cpp_includes": attr.string_list(mandatory = False),
+        "bin_dirs": attr.string_list(mandatory = False),
+        # Optional host-native link settings used by Linux cross-RBE builds.
+        # Compile actions continue to use tool_paths/bin_dirs while link-family
+        # actions can execute a linker from the native host archive.
+        "linker_bin_dirs": attr.string_list(mandatory = False),
+        "linker_resource_dir": attr.string(mandatory = False),
+        "linker_tool_path": attr.string(mandatory = False),
+        "linker_toolchain_repo_dir": attr.string(mandatory = False),
+        # Optional host-native output tools used by Linux cross-RBE builds.
+        # These are configurable strings so the generated cross toolchain can
+        # select them only for the local-link/output branch while leaving the
+        # execution-architecture compiler branch untouched.
+        "host_ar_tool_path": attr.string(mandatory = False),
+        "host_dwp_tool_path": attr.string(mandatory = False),
+        "host_objcopy_tool_path": attr.string(mandatory = False),
+        "host_strip_tool_path": attr.string(mandatory = False),
+        "tool_paths": attr.string_dict(mandatory = True),
+        "toolchain_repo_name": attr.string(mandatory = True),
+        "toolchain_identifier": attr.string(mandatory = True),
+        "target_triple": attr.string(mandatory = False),
+        "verbose": attr.bool(mandatory = False),
+        "linkstatic": attr.bool(mandatory = True),
+        "shared_archive": attr.bool(mandatory = True),
+        "dwarf_version": attr.int(mandatory = False),
+        "fission": attr.bool(mandatory = False),
+        "debug_level": attr.int(mandatory = False),
+        "disable_debug_symbols": attr.bool(mandatory = False),
+        "optimization_level": attr.string(mandatory = False),
+        "pgo_profile_generate": attr.bool(default = False, mandatory = False),
+        "pgo_profile_use": attr.label(default = None, mandatory = False),
+        "cspgo_profile_generate": attr.bool(default = False, mandatory = False),
+        "cspgo_profile_use": attr.label(default = None, mandatory = False),
+        "bolt_enabled": attr.bool(default = False, mandatory = False),
+        "propeller_profile_generate": attr.bool(default = False, mandatory = False),
+        "propeller_profile_use": attr.label(default = None, allow_single_file = True, mandatory = False),
+        "distributed_thin_lto": attr.bool(default = False, mandatory = False),
+        "any_sanitizer_enabled": attr.bool(default = False, mandatory = False),
+        "asan_enabled": attr.bool(default = False, mandatory = False),
+        "asan_denylist": attr.label(default = None, mandatory = False),
+        "fsan_enabled": attr.bool(default = False, mandatory = False),
+        "msan_enabled": attr.bool(default = False, mandatory = False),
+        "msan_denylist": attr.label(default = None, mandatory = False),
+        "tsan_enabled": attr.bool(default = False, mandatory = False),
+        "tsan_denylist": attr.label(default = None, mandatory = False),
+        "ubsan_enabled": attr.bool(default = False, mandatory = False),
+        "ubsan_denylist": attr.label(default = None, mandatory = False),
+        "is_aarch64": attr.bool(default = False, mandatory = False),
+        "is_ppc64le": attr.bool(default = False, mandatory = False),
+        "is_s390x": attr.bool(default = False, mandatory = False),
+        "is_x86_64": attr.bool(default = False, mandatory = False),
+        "internal_thin_lto_enabled": attr.bool(default = False, mandatory = False),
+        "coverage_enabled": attr.bool(default = False, mandatory = False),
+        "compress_debug_enabled": attr.bool(default = False, mandatory = False),
+        "warnings_as_errors_enabled": attr.bool(default = False, mandatory = False),
+        "global_defines": attr.string_list(mandatory = False),
+    },
+    provides = [CcToolchainConfigInfo],
+)

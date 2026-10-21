@@ -1,0 +1,317 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_benchmark", "mongo_cc_fuzzer_test_deprecated", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "sort_executor",
+    srcs = [
+        "sort_executor.cpp",
+        "sort_key_comparator.cpp",
+    ],
+    deps = [
+        ":working_set",
+        "//src/mongo/db/pipeline/spilling:spilling_stats",
+        "//src/mongo/db/query/compiler/logical_model/sort_pattern",
+        "//src/mongo/db/sorter:sorter_base",
+        "//src/mongo/db/sorter:sorter_stats",
+        "//src/mongo/db/storage:encryption_hooks",
+        "//src/mongo/db/storage:spill_util",
+        "//src/mongo/db/storage:storage_options",
+        "//src/third_party/snappy",
+    ],
+)
+
+mongo_cc_library(
+    name = "js_function",
+    srcs = [
+        "js_function.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/auth",
+        "//src/mongo/db/query:query_knobs",
+        "//src/mongo/scripting:scripting_common",
+    ],
+)
+
+# WorkingSet target and associated test
+mongo_cc_library(
+    name = "working_set",
+    srcs = [
+        "//src/mongo/db/exec/classic:working_set.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/bson/dotted_path:dotted_path_support",
+        "//src/mongo/db:service_context",
+        "//src/mongo/db/exec/document_value",
+    ],
+)
+
+idl_generator(
+    name = "disk_use_options_gen",
+    src = "disk_use_options.idl",
+)
+
+mongo_cc_library(
+    name = "scoped_timer",
+    srcs = [
+        "scoped_timer.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:service_context",
+        "//src/mongo/util/net:network",
+    ],
+)
+
+mongo_cc_library(
+    name = "bucket_unpacker",
+    srcs = [
+        "//src/mongo/db/exec/timeseries:bucket_unpacker.cpp",
+    ],
+    deps = [
+        "//src/mongo/bson/column",
+        "//src/mongo/db:query_expressions",
+        "//src/mongo/db/exec/document_value",
+        "//src/mongo/db/query:bucket_predicate_generator",
+    ],
+)
+
+mongo_cc_library(
+    name = "projection_executor",
+    srcs = [
+        "add_fields_projection_executor.cpp",
+        "exclusion_projection_executor.cpp",
+        "inclusion_projection_executor.cpp",
+        "projection_executor_builder.cpp",
+        "projection_node.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:query_expressions",
+        "//src/mongo/db/matcher:expression_algo",
+        "//src/mongo/db/query/compiler/dependency_analysis",
+    ],
+)
+
+mongo_cc_library(
+    name = "str_trim_utils",
+    srcs = [
+        "str_trim_utils.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "substr_utils",
+    srcs = [
+        "substr_utils.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "db_exec_test",
+    srcs = [
+        "add_fields_projection_executor_test.cpp",
+        "container_size_helper_test.cpp",
+        "exclusion_projection_executor_test.cpp",
+        "find_projection_executor_test.cpp",
+        "inclusion_projection_executor_test.cpp",
+        "projection_executor_builder_test.cpp",
+        "projection_executor_redaction_test.cpp",
+        "projection_executor_test.cpp",
+        "projection_executor_utils_test.cpp",
+        "projection_executor_wildcard_access_test.cpp",
+        "projection_node_optimizations_test.cpp",
+        "serialize_ejson_utils_test.cpp",
+        "//src/mongo/db/exec/agg:batched_enrichment_stage_test.cpp",
+        "//src/mongo/db/exec/agg:bucket_auto_stage_test.cpp",
+        "//src/mongo/db/exec/agg:exec_pipeline_test.cpp",
+        "//src/mongo/db/exec/agg:graph_lookup_test.cpp",
+        "//src/mongo/db/exec/agg:internal_assert_data_assumptions_stage_test.cpp",
+        "//src/mongo/db/exec/agg:lookup_stage_test.cpp",
+        "//src/mongo/db/exec/agg:match_stage_test.cpp",
+        "//src/mongo/db/exec/agg:pipeline_builder_test.cpp",
+        "//src/mongo/db/exec/agg:single_document_transformation_stage_test.cpp",
+        "//src/mongo/db/exec/agg:writer_stage_test.cpp",
+        "//src/mongo/db/exec/classic:distinct_scan_test.cpp",
+        "//src/mongo/db/exec/classic:geo_near_test.cpp",
+        "//src/mongo/db/exec/classic:index_scan_test.cpp",
+        "//src/mongo/db/exec/classic:multi_plan_test.cpp",
+        "//src/mongo/db/exec/classic:or_test.cpp",
+        "//src/mongo/db/exec/classic:orphan_chunk_skipper_test.cpp",
+        "//src/mongo/db/exec/classic:projection_test.cpp",
+        "//src/mongo/db/exec/classic:queued_data_stage_test.cpp",
+        "//src/mongo/db/exec/classic:recordid_deduplicator_test.cpp",
+        "//src/mongo/db/exec/classic:sort_test.cpp",
+        "//src/mongo/db/exec/classic:spool_test.cpp",
+        "//src/mongo/db/exec/classic:text_or_test.cpp",
+        "//src/mongo/db/exec/classic:working_set_test.cpp",
+        "//src/mongo/db/exec/document_value:document_comparator_test.cpp",
+        "//src/mongo/db/exec/document_value:document_metadata_fields_test.cpp",
+        "//src/mongo/db/exec/document_value:document_value_test.cpp",
+        "//src/mongo/db/exec/document_value:document_value_test_util_self_test.cpp",
+        "//src/mongo/db/exec/document_value:value_comparator_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_and_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_array_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_bson_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_compare_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_convert_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_date_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_field_path_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_find_internal_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_fle_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_index_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_logical_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_math_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_meta_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_nary_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_object_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_or_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_regex_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_replace_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_split_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_string_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_test.cpp",
+        "//src/mongo/db/exec/expression:evaluate_test_helpers.cpp",
+        "//src/mongo/db/exec/expression:evaluate_trigonometric_test.cpp",
+        "//src/mongo/db/exec/matcher:matcher_expr_test.cpp",
+        "//src/mongo/db/exec/matcher:matcher_geo_test.cpp",
+        "//src/mongo/db/exec/matcher:matcher_internal_schema_test.cpp",
+        "//src/mongo/db/exec/matcher:matcher_parser_test.cpp",
+        "//src/mongo/db/exec/matcher:matcher_serialization_test.cpp",
+        "//src/mongo/db/exec/matcher:matcher_test.cpp",
+        "//src/mongo/db/exec/timeseries:bucket_unpacker_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        ":projection_executor",
+        ":serialize_ejson_utils",
+        ":working_set",
+        "//src/mongo:base",
+        "//src/mongo/bson/column",
+        "//src/mongo/db:query_exec",
+        "//src/mongo/db:record_id_helpers",
+        "//src/mongo/db:service_context_d_test_fixture",
+        "//src/mongo/db/auth:authmocks",
+        "//src/mongo/db/exec/classic:query_shard_server_test_fixture",
+        "//src/mongo/db/exec/document_value",
+        "//src/mongo/db/exec/document_value:document_value_test_util",
+        "//src/mongo/db/index_builds:index_build_test_helpers",
+        "//src/mongo/db/memory_tracking",
+        "//src/mongo/db/pipeline:aggregation_context_fixture",
+        "//src/mongo/db/pipeline:document_source_lookup_test_util",
+        "//src/mongo/db/pipeline:document_source_mock",
+        "//src/mongo/db/pipeline:graph_lookup_mock_mongo_interface",
+        "//src/mongo/db/pipeline/process_interface:mongod_process_interfaces",
+        "//src/mongo/db/pipeline/spilling:spilling_test_utils",
+        "//src/mongo/db/query:await_data_state",
+        "//src/mongo/db/query:query_planner_test_lib",
+        "//src/mongo/db/query:query_test_service_context",
+        "//src/mongo/db/query/collation:collator_factory_mock",
+        "//src/mongo/db/query/collation:collator_interface_mock",
+        "//src/mongo/db/query/query_knobs:query_knob_configuration",
+        "//src/mongo/db/query/query_knobs:query_knob_configuration_test_util",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/timeseries:bucket_compression",
+        "//src/mongo/dbtests:mocklib",
+        "//src/mongo/util:clock_source_mock",
+    ],
+)
+
+mongo_cc_library(
+    name = "expression_bm_fixture",
+    srcs = [
+        "expression_bm_fixture.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:query_expressions",
+        "//src/mongo/db/exec/document_value",
+        "//src/mongo/db/query:query_fcv_environment_for_test",
+        "//src/mongo/db/query:query_test_service_context",
+        "//src/mongo/scripting:scripting_server",
+        "//src/third_party/benchmark",
+    ],
+)
+
+mongo_cc_benchmark(
+    name = "expression_bm",
+    srcs = [
+        "//src/mongo/db/exec/expression:expression_bm.cpp",
+    ],
+    deps = [
+        ":expression_bm_fixture",
+        "//src/mongo/db:query_expressions",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db/pipeline:expression_context_for_test",
+        "//src/mongo/db/shard_role:service_context_non_d",
+    ],
+)
+
+mongo_cc_benchmark(
+    name = "sbe_get_field_bm",
+    srcs = [
+        "//src/mongo/db/exec/sbe:sbe_get_field_bm.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/exec/sbe:query_sbe",
+        "//src/mongo/db/query/stage_builder/sbe:stage_builder",
+        "//src/third_party/benchmark",
+    ],
+)
+
+mongo_cc_library(
+    name = "docval_to_sbeval",
+    deps = [
+        "//src/mongo/db:sbe_values",
+    ],
+)
+
+mongo_cc_library(
+    name = "convert_utils",
+    srcs = [
+        "convert_utils.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/exec/document_value",
+        "//src/third_party/nlohmann-json:json",
+    ],
+)
+
+mongo_cc_fuzzer_test_deprecated(
+    name = "convert_string_to_object_fuzzer",
+    srcs = [
+        "//src/mongo/db/exec:convert_string_to_object_fuzzer.cpp",
+    ],
+    deps = [
+        ":convert_utils",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/transport:transport_layer_common",
+    ],
+)
+
+mongo_cc_library(
+    name = "serialize_ejson_utils",
+    srcs = [
+        "serialize_ejson_utils.cpp",
+    ],
+    deps = [
+        ":convert_utils",
+        "//src/mongo:base",
+        "//src/mongo/db/exec/document_value",
+    ],
+)

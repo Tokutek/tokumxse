@@ -1,0 +1,235 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/topology/cluster_parameters/set_cluster_parameter_invocation.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/crypto/fle_options_gen.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/search/internal_search_cluster_parameters_gen.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/topology/cluster_role.h"
+#include "mongo/db/topology/vector_clock/vector_clock.h"
+#include "mongo/db/update/storage_validation.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+
+// TODO (SERVER-118757): Consider removing this function after resolving this ticket.
+template <typename T>
+Status checkUnknownFieldsOnParameter(BSONObj obj) {
+    for (auto&& elem : obj) {
+        auto fieldName = elem.fieldNameStringData();
+        bool fieldIsValid = std::any_of(T::fieldNames.begin(),
+                                        T::fieldNames.end(),
+                                        [fieldName](const auto& fn) { return fn == fieldName; });
+        if (!fieldIsValid) {
+            return Status{ErrorCodes::IDLUnknownField,
+                          str::stream() << "Unknown field name: '" << fieldName << "'"};
+        }
+    }
+    return Status::OK();
+}
+
+// Ensure there are no unknown fields in cluster parameters that:
+//   - Use a non-strict IDL parser.
+//   - Have an object type.
+// This temporary check is needed while we migrate the remaining non-strict cluster parameters
+// to strict parsing; we cannot flip them all at once for backward compatibility reasons.
+// TODO (SERVER-118757): Consider removing this function after resolving this ticket.
+void checkUnknownFields(const BSONObj& command) {
+    std::string_view name = command.firstElement().fieldName();
+
+    if (name == kFleCompactionOptionsName) {
+        uassertStatusOK(
+            checkUnknownFieldsOnParameter<FLECompactionOptions>(command.firstElement().Obj()));
+    } else if (name == kFleAllowTotalTagOverheadToExceedBSONLimitName) {
+        uassertStatusOK(checkUnknownFieldsOnParameter<FLEOverrideTagOverheadData>(
+            command.firstElement().Obj()));
+    } else if (name == kFleDisableSubstringPreviewParameterLimitsName) {
+        uassertStatusOK(checkUnknownFieldsOnParameter<FLEOverrideSubstringPreviewLimits>(
+            command.firstElement().Obj()));
+    } else if (name == kInternalSearchOptionsName) {
+        uassertStatusOK(
+            checkUnknownFieldsOnParameter<InternalSearchOptions>(command.firstElement().Obj()));
+    }
+}
+
+bool SetClusterParameterInvocation::invoke(OperationContext* opCtx,
+                                           const SetClusterParameter& cmd,
+                                           boost::optional<Timestamp> clusterParameterTime,
+                                           boost::optional<LogicalTime> previousTime,
+                                           const WriteConcernOptions& writeConcern,
+                                           bool skipValidation) {
+
+    BSONObj cmdParamObj = cmd.getCommandParameter();
+    std::string_view parameterName = cmdParamObj.firstElement().fieldName();
+    ServerParameter* serverParameter = _sps->get(parameterName);
+    auto tenantId = cmd.getDbName().tenantId();
+
+    auto [query, update] =
+        normalizeParameter(opCtx,
+                           cmdParamObj,
+                           clusterParameterTime,
+                           previousTime,
+                           serverParameter,
+                           tenantId,
+                           skipValidation || serverGlobalParams.clusterRole.isShardOnly());
+
+    serverParameter->warnIfDeprecated("setClusterParameter");
+
+    BSONObjBuilder oldValueBob;
+    serverParameter->append(opCtx, &oldValueBob, std::string{parameterName}, tenantId);
+    audit::logSetClusterParameter(opCtx->getClient(), oldValueBob.obj(), update, tenantId);
+
+    LOGV2_DEBUG(
+        6432603, 2, "Updating cluster parameter on-disk", "clusterParameter"_attr = parameterName);
+
+    auto result = _dbService.updateParameterOnDisk(
+        query, update, writeConcern, auth::ValidatedTenancyScope::get(opCtx));
+    auto resultStatus = result.toStatus();
+
+    // When 'previousTime' is provided, it is added to the 'query' part of the upsert command to
+    // match the persisted 'clusterParameterTime' field. If in this case the upsert returns the
+    // 'DuplicateKey' error, this means a concurrent operation has modified 'clusterParameterTime'.
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "encountered concurrent cluster parameter update operations, please try again",
+            !previousTime || resultStatus.code() != ErrorCodes::DuplicateKey);
+
+    // Throw if the upsert command returned any errors (e.g., 'PrimarySteppedDown').
+    uassertStatusOK(resultStatus);
+
+    size_t nUpserted = result.isUpsertDetailsSet() ? result.sizeUpsertDetails() : 0;
+    tassert(8454100,
+            "when 'previousTime' is 'kUninitialized' a new document must be inserted",
+            !(previousTime && *previousTime == LogicalTime::kUninitialized) || nUpserted == 1);
+
+    // Return true if an oplog entry was created.
+    return result.getNModified() == 1 || nUpserted == 1;
+}
+
+std::pair<BSONObj, BSONObj> SetClusterParameterInvocation::normalizeParameter(
+    OperationContext* opCtx,
+    BSONObj cmdParamObj,
+    boost::optional<Timestamp> clusterParameterTime,
+    boost::optional<LogicalTime> previousTime,
+    ServerParameter* sp,
+    const boost::optional<TenantId>& tenantId,
+    bool skipValidation) {
+    BSONElement commandElement = cmdParamObj.firstElement();
+    uassert(ErrorCodes::BadValue,
+            "Cluster parameter value must be an object",
+            BSONType::object == commandElement.type());
+
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "Server parameter: '" << sp->name() << "' is disabled",
+            skipValidation || sp->isEnabled(VersionContext::getDecoration(opCtx)));
+
+    // TODO (SERVER-118757): Consider removing this call after resolving this ticket.
+    checkUnknownFields(cmdParamObj);
+
+    Timestamp clusterTime =
+        clusterParameterTime ? *clusterParameterTime : _dbService.getUpdateClusterTime(opCtx);
+    BSONObjBuilder updateBuilder;
+    updateBuilder << "_id" << sp->name() << "clusterParameterTime" << clusterTime;
+    updateBuilder.appendElements(commandElement.Obj());
+
+    BSONObjBuilder queryBuilder;
+    queryBuilder << "_id" << sp->name();
+    if (previousTime) {
+        // When the 'previousTime' is set, we must check that the parameter being updated has
+        // 'clusterParameterTime' equal to 'previousTime'. This way we ensure there are no
+        // concurrent updates. When 'previousTime' is set to 'kUninitialized', there should be no
+        // cluster parameter with the given name persisted. Therefore, 'kUninitialized' should not
+        // collide with any valid timestamp.
+        tassert(8454101,
+                "'previousTime' was set to 'kUninitialized' with a different timestamp than "
+                "Timestamp(0, 0)",
+                *previousTime != LogicalTime::kUninitialized ||
+                    previousTime->asTimestamp() == Timestamp(0, 0));
+        queryBuilder << "clusterParameterTime" << previousTime->asTimestamp();
+    }
+
+    BSONObj update = updateBuilder.obj();
+
+    // Validate that serialized update is validate replacement update document by calling the same
+    // document validation function as the update stage.
+    {
+        bool ignore;
+        mutablebson::Document mutableUpdate(update);
+        storage_validation::scanDocument(mutableUpdate, false, true, &ignore, false);
+    }
+
+    BSONObj query = queryBuilder.obj();
+
+    if (!skipValidation) {
+        uassertStatusOK(sp->validate(update, tenantId));
+    }
+
+    return {query, update};
+}
+
+Timestamp ClusterParameterDBClientService::getUpdateClusterTime(OperationContext* opCtx) {
+    VectorClock::VectorTime vt = VectorClock::get(opCtx)->getTime();
+    return vt.clusterTime().asTimestamp();
+}
+
+BatchedCommandResponse ClusterParameterDBClientService::updateParameterOnDisk(
+    BSONObj query,
+    BSONObj update,
+    const WriteConcernOptions& writeConcern,
+    const boost::optional<auth::ValidatedTenancyScope>& validatedTenancyScope) {
+    const auto tenantId = (validatedTenancyScope && validatedTenancyScope->hasTenantId())
+        ? boost::make_optional(validatedTenancyScope->tenantId())
+        : boost::none;
+    const auto nss = NamespaceString::makeClusterParametersNSS(tenantId);
+    auto request = OpMsgRequestBuilder::create(validatedTenancyScope, nss.dbName(), [&] {
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setUpdates({[&] {
+            write_ops::UpdateOpEntry entry;
+            entry.setQ(query);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+            entry.setMulti(false);
+            entry.setUpsert(true);
+            return entry;
+        }()});
+        updateOp.setWriteConcern(writeConcern);
+        return updateOp.toBSON();
+    }());
+
+    BSONObj res = _dbClient.runCommand(request)->getCommandReply();
+    BatchedCommandResponse response;
+    std::string errmsg;
+    auto parseResult = response.parseBSON(res, &errmsg);
+    uassert(ErrorCodes::FailedToParse, errmsg, parseResult);
+    return response;
+}
+
+ServerParameter* ClusterParameterService::get(std::string_view name) {
+    return ServerParameterSet::getClusterParameterSet()->get(name);
+}
+}  // namespace mongo

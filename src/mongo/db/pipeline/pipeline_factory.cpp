@@ -1,0 +1,303 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/pipeline_factory.h"
+
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/document_source_hybrid_scoring_util.h"
+#include "mongo/db/pipeline/lite_parsed_desugarer.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/optimization/optimize.h"
+#include "mongo/db/pipeline/search/search_helper_bson_obj.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/db/views/pipeline_resolver.h"
+
+#include <algorithm>
+#include <iterator>
+
+namespace mongo::pipeline_factory {
+
+namespace {
+
+LiteParsedPipeline makeLiteParsedPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                          const std::vector<BSONObj>& rawPipeline) {
+    return LiteParsedPipeline(
+        expCtx->getNamespaceString(),
+        rawPipeline,
+        false,
+        // TODO SERVER-129127 These options should be passed via a ParseContext struct rather than
+        // through LiteParserOptions.
+        LiteParserOptions{.allowGenericForeignDbLookup = expCtx->getAllowGenericForeignDbLookup(),
+                          .ifrContext = expCtx->getIfrContext()});
+}
+
+void addViewInvolvedNamespaces(const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
+                               const std::vector<BSONObj>& viewPipeline) {
+    LiteParsedPipeline viewLiteParsedPipeline(
+        makeLiteParsedPipeline(subPipelineExpCtx, viewPipeline));
+    subPipelineExpCtx->addResolvedNamespaces(viewLiteParsedPipeline.getInvolvedNamespaces());
+}
+
+void desugarIfNecessary(LiteParsedPipeline& liteParsedPipeline,
+                        const MakePipelineOptions& opts,
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (opts.desugar) {
+        LiteParsedDesugarer::desugar(&liteParsedPipeline, expCtx->getIfrContext());
+    }
+}
+
+std::unique_ptr<Pipeline> parseAndDesugarPipeline(
+    const std::vector<BSONObj>& rawPipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MakePipelineOptions& opts) {
+
+    LiteParsedPipeline liteParsedPipeline = makeLiteParsedPipeline(expCtx, rawPipeline);
+
+    desugarIfNecessary(liteParsedPipeline, opts, expCtx);
+
+    if (expCtx->getView()) {
+        // TODO SERVER-121094 When featureFlagExtensionsInsideHybridSearch is removed, all
+        // pipelines will use resolveInvolvedNamespacesFn and this legacy branch can be deleted.
+        // Handle legacy mongot pipelines separately.
+        liteParsedPipeline.bindResolvedNamespaceToStages(*expCtx->getView(),
+                                                         expCtx->getResolvedNamespaces(),
+                                                         0,
+                                                         liteParsedPipeline.getStages().size());
+    } else if (opts.resolveInvolvedNamespacesFn) {
+        opts.resolveInvolvedNamespacesFn(liteParsedPipeline);
+    }
+
+    return Pipeline::parseFromLiteParsed(liteParsedPipeline, expCtx, opts.validator);
+}
+
+std::unique_ptr<Pipeline> finalizePipeline(
+    std::unique_ptr<Pipeline> pipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MakePipelineOptions& opts,
+    AggregateCommandRequest& aggRequest,
+    boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+    boost::optional<BSONObj> readConcernOverride = boost::none) {
+    expCtx->initializeReferencedSystemVariables();
+
+    bool alreadyOptimized = opts.alreadyOptimized;
+
+    if (opts.optimize) {
+        pipeline_optimization::optimizePipeline(*pipeline);
+        alreadyOptimized = true;
+    }
+
+    pipeline->validateCommon(alreadyOptimized);
+
+    if (opts.attachCursorSource) {
+        tassert(11779300,
+                "If preparing pipeline for execution, opts.desugar should be set so that the "
+                "AggregateCommandRequest contains the correct serialization of the pipeline.",
+                opts.desugar);
+
+        query_shape::SerializationOptions wireOptsForAggReq{.isSerializingForRemoteDispatch = true};
+        aggRequest.setPipeline(pipeline->serializeToBson(wireOptsForAggReq));
+
+        pipeline = expCtx->getMongoProcessInterface()->preparePipelineForExecution(
+            expCtx,
+            aggRequest,
+            std::move(pipeline),
+            shardCursorsSortSpec,
+            opts.shardTargetingPolicy,
+            readConcernOverride ? std::move(readConcernOverride) : std::move(opts.readConcern),
+            opts.useCollectionDefaultCollator);
+    }
+
+    return pipeline;
+}
+
+}  // namespace
+
+std::unique_ptr<Pipeline> makePipeline(BSONElement rawPipelineElement,
+                                       const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       MakePipelineOptions opts) {
+    tassert(11524600,
+            "Expected array for makePipeline() with BSONElement input",
+            rawPipelineElement.type() == BSONType::array);
+    auto rawStages = rawPipelineElement.Array();
+
+    std::vector<BSONObj> rawPipeline;
+    rawPipeline.reserve(rawStages.size());
+    std::transform(rawStages.cbegin(),
+                   rawStages.cend(),
+                   std::back_inserter(rawPipeline),
+                   [](const BSONElement& el) {
+                       uassert(11524601,
+                               "Pipeline array element must be an object",
+                               el.type() == BSONType::object);
+                       return el.embeddedObject();
+                   });
+
+    return makePipeline(rawPipeline, expCtx, opts);
+}
+
+std::unique_ptr<Pipeline> makePipeline(const std::vector<BSONObj>& rawPipeline,
+                                       const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       MakePipelineOptions opts) {
+    auto aggRequest = AggregateCommandRequest(expCtx->getNamespaceString(), std::vector<BSONObj>{});
+    return finalizePipeline(
+        parseAndDesugarPipeline(rawPipeline, expCtx, opts), expCtx, opts, aggRequest);
+}
+
+std::unique_ptr<Pipeline> makePipeline(AggregateCommandRequest& aggRequest,
+                                       const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       boost::optional<BSONObj> shardCursorsSortSpec,
+                                       const MakePipelineOptions& opts) {
+    tassert(10892201,
+            "shardCursorsSortSpec must not be set if attachCursorSource is false.",
+            opts.attachCursorSource || shardCursorsSortSpec == boost::none);
+
+    boost::optional<BSONObj> readConcern;
+    // If readConcern is set on opts and aggRequest, assert they are equal.
+    if (opts.readConcern && aggRequest.getReadConcern()) {
+        readConcern = aggRequest.getReadConcern()->toBSONInner();
+        tassert(7393501,
+                "Read concern on aggRequest and makePipelineOpts must match.",
+                opts.readConcern->binaryEqual(*readConcern));
+    } else {
+        readConcern = aggRequest.getReadConcern() ? aggRequest.getReadConcern()->toBSONInner()
+                                                  : opts.readConcern;
+    }
+
+    auto pipeline = parseAndDesugarPipeline(aggRequest.getPipeline(), expCtx, opts);
+    auto copiedOpts = opts;
+    copiedOpts.alreadyOptimized = true;
+    return finalizePipeline(
+        std::move(pipeline), expCtx, copiedOpts, aggRequest, shardCursorsSortSpec, readConcern);
+}
+
+std::unique_ptr<Pipeline> makePipelineFromViewDefinition(
+    const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
+    ResolvedNamespace resolvedNs,
+    std::vector<BSONObj> currentPipeline,
+    const MakePipelineOptions& opts,
+    const NamespaceString& originalNs) {
+
+    // Update subpipeline's ExpressionContext with the resolved namespace.
+    subPipelineExpCtx->setNamespaceString(resolvedNs.getResolvedNamespace());
+
+    // When the sub-pipeline targets a view, stages inside the view's definition must run under the
+    // view's default collation, not the outer collection's.
+    applyViewDefaultCollation(subPipelineExpCtx, resolvedNs);
+
+    if (resolvedNs.getBsonPipeline().empty()) {
+        return makePipeline(currentPipeline, subPipelineExpCtx, opts);
+    }
+
+    const bool pipelineIsMongot = search_helper_bson_obj::isMongotPipeline(
+        subPipelineExpCtx->getIfrContext(), currentPipeline);
+    const bool viewDefinitionIsMongot = search_helper_bson_obj::isMongotPipeline(
+        subPipelineExpCtx->getIfrContext(), resolvedNs.getBsonPipeline());
+
+    if (pipelineIsMongot) {
+        subPipelineExpCtx->setView(ResolvedNamespace::makeForView(
+            originalNs,
+            resolvedNs.getResolvedNamespace(),
+            resolvedNs.getBsonPipeline(),
+            LiteParserOptions{.ifrContext = subPipelineExpCtx->getIfrContext()}));
+    }
+
+    // Register the view's own involved namespaces before the std::move(resolvedNs) below;
+    // the helper keeps its transient LiteParsedPipeline local so it cannot outlive that move.
+    addViewInvolvedNamespaces(subPipelineExpCtx, resolvedNs.getBsonPipeline());
+
+    const bool isHybrid = hybrid_scoring_util::isHybridSearchPipeline(currentPipeline);
+    const NamespaceString liteParseNss = ((pipelineIsMongot && !viewDefinitionIsMongot) || isHybrid)
+        ? originalNs
+        : subPipelineExpCtx->getNamespaceString();
+    LiteParsedPipeline userLiteParsedPipeline(
+        liteParseNss,
+        currentPipeline,
+        false,
+        LiteParserOptions{.allowGenericForeignDbLookup =
+                              subPipelineExpCtx->getAllowGenericForeignDbLookup(),
+                          .ifrContext = subPipelineExpCtx->getIfrContext()});
+    desugarIfNecessary(userLiteParsedPipeline, opts, subPipelineExpCtx);
+
+    // Register the view in the namespace map and run the recursive resolver.
+    {
+        auto resolvedNamespaces = subPipelineExpCtx->getResolvedNamespaces();
+        PipelineResolver::insertTopLevelViewEntry(resolvedNamespaces,
+                                                  originalNs,
+                                                  std::move(resolvedNs),
+                                                  subPipelineExpCtx->getIfrContext());
+        PipelineResolver::resolveInvolvedNamespacesOnLiteParsedPipeline(
+            &userLiteParsedPipeline, originalNs, resolvedNamespaces);
+        subPipelineExpCtx->setResolvedNamespaces(std::move(resolvedNamespaces));
+    }
+
+    // Parse from the modified LiteParsedPipeline. Skip desugar since we already did it above.
+    auto optsWithoutDesugar = opts;
+    optsWithoutDesugar.desugar = false;
+    auto pipeline =
+        Pipeline::parseFromLiteParsed(userLiteParsedPipeline, subPipelineExpCtx, opts.validator);
+    auto aggRequest =
+        AggregateCommandRequest(subPipelineExpCtx->getNamespaceString(), std::vector<BSONObj>{});
+    return finalizePipeline(std::move(pipeline), subPipelineExpCtx, opts, aggRequest);
+}
+
+void applyViewDefaultCollation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                               const ResolvedNamespace& resolvedNs) {
+    const BSONObj& viewCollation = resolvedNs.getDefaultCollation();
+    if (viewCollation.isEmpty()) {
+        // No explicit view collation: leave the inherited collator in place.
+        return;
+    }
+    auto viewCollator = uassertStatusOK(
+        CollatorFactoryInterface::get(expCtx->getOperationContext()->getServiceContext())
+            ->makeFromBSON(viewCollation));
+    expCtx->setCollator(std::move(viewCollator));
+}
+
+
+std::unique_ptr<Pipeline> makePipelineFromViewDefinitionStageParams(
+    const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
+    const ResolvedNamespace& resolvedNs,
+    StageParamsPipeline stageParams,
+    const std::vector<BSONObj>& rawPipeline,
+    const NamespaceString& userNss,
+    const MakePipelineOptions& opts) {
+
+    if (resolvedNs.getResolvedNamespace().isTimeseriesBucketsCollection() &&
+        isRawDataOperation(subPipelineExpCtx->getOperationContext())) {
+        return Pipeline::parseFromStageParams(
+            std::move(stageParams), subPipelineExpCtx, opts.validator);
+    }
+
+    subPipelineExpCtx->setNamespaceString(resolvedNs.getResolvedNamespace());
+
+    if (resolvedNs.getBsonPipeline().empty()) {
+        return Pipeline::parseFromStageParams(
+            std::move(stageParams), subPipelineExpCtx, opts.validator);
+    }
+
+    // For search views, fall back to the BSON-based path since search view handling requires raw
+    // BSON pipeline inspection.
+    if (search_helper_bson_obj::isMongotPipeline(subPipelineExpCtx->getIfrContext(), rawPipeline)) {
+        return makePipelineFromViewDefinition(
+            subPipelineExpCtx, resolvedNs, std::vector<BSONObj>(rawPipeline), opts, userNss);
+    }
+
+    // Stage params already have the view pipeline stitched in (resolved during the LiteParsed
+    // phase), so there is no need to re-apply the view. Add involved namespaces so inner stage
+    // constructors can resolve them via getResolvedNamespace().
+    addViewInvolvedNamespaces(subPipelineExpCtx, resolvedNs.getBsonPipeline());
+
+    return Pipeline::parseFromStageParams(
+        std::move(stageParams), subPipelineExpCtx, opts.validator);
+}
+
+std::unique_ptr<Pipeline> makeFacetPipeline(const std::vector<BSONObj>& rawPipeline,
+                                            const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                            PipelineValidatorCallback validator) {
+    LiteParsedPipeline liteParsedPipeline(makeLiteParsedPipeline(expCtx, rawPipeline));
+    return Pipeline::parseFromLiteParsed(
+        liteParsedPipeline, expCtx, validator, true /*isFacetPipeline*/);
+}
+}  // namespace mongo::pipeline_factory

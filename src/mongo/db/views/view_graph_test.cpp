@@ -1,0 +1,260 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/views/view_graph.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/views/view.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+#include <string_view>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+constexpr auto kEmptyPipelineSize = 0;
+const auto kTestDb = DatabaseName::createDatabaseName_forTest(boost::none, "test");
+constexpr auto kFooName = "foo"sv;
+constexpr auto kBarName = "bar"sv;
+constexpr auto kQuxName = "qux"sv;
+const auto kFooNamespace = NamespaceString::createNamespaceString_forTest(kTestDb, kFooName);
+const auto kBarNamespace = NamespaceString::createNamespaceString_forTest(kTestDb, kBarName);
+const auto kQuxNamespace = NamespaceString::createNamespaceString_forTest(kTestDb, kQuxName);
+const auto kEmptyPipeline = BSONArray();
+const auto kBinaryCollation = BSONObj();
+const auto kFilipinoCollation = BSON("locale" << "fil");
+
+class ViewGraphFixture : public unittest::Test {
+public:
+    ViewGraphFixture()
+        : _queryServiceContext(), _opCtx(_queryServiceContext.makeOperationContext()) {}
+
+    const OperationContext* opCtx() const {
+        return _opCtx.get();
+    }
+
+    ViewGraph* viewGraph() {
+        return &_viewGraph;
+    }
+
+    ViewDefinition makeViewDefinition(const DatabaseName& dbName,
+                                      std::string_view view,
+                                      std::string_view viewOn,
+                                      BSONArray pipeline,
+                                      BSONObj collatorSpec) const {
+        auto collator = std::unique_ptr<CollatorInterface>(nullptr);
+        if (!collatorSpec.isEmpty()) {
+            auto factoryCollator = CollatorFactoryInterface::get(_opCtx->getServiceContext())
+                                       ->makeFromBSON(collatorSpec);
+            ASSERT_OK(factoryCollator.getStatus());
+            collator = std::move(factoryCollator.getValue());
+        }
+
+        return {dbName, view, viewOn, pipeline, std::move(collator)};
+    }
+
+private:
+    QueryTestServiceContext _queryServiceContext;
+    ServiceContext::UniqueOperationContext _opCtx;
+    ViewGraph _viewGraph;
+};
+
+TEST_F(ViewGraphFixture, CanInsertViewsWithMatchingBinaryCollations) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+}
+
+TEST_F(ViewGraphFixture, CanInsertViewsWithMatchingNonTrivialCollations) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+}
+
+TEST_F(ViewGraphFixture, CannotInsertViewsWithNonMatchingCollations) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_EQ(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize),
+              ErrorCodes::OptionNotSupportedOnView);
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+}
+
+TEST_F(ViewGraphFixture, CannotRecreateViewWithDifferentCollationIfDependedOnByOtherViews) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+
+    viewGraph()->remove(kBarNamespace);
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barViewBinaryCollation =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_EQ(
+        viewGraph()->insertAndValidate(barViewBinaryCollation, {kQuxNamespace}, kEmptyPipelineSize),
+        ErrorCodes::OptionNotSupportedOnView);
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+}
+
+// Tests that an insertion that would create a view cycle is rejected, but will later be accepted if
+// the cycle is broken by removing another existing view.
+TEST_F(ViewGraphFixture, CanCreateViewThatReferencesDroppedView) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+
+    const auto quxView =
+        makeViewDefinition(kTestDb, kQuxName, kBarName, kEmptyPipeline, kBinaryCollation);
+
+    // Inserting qux should fail, as it cycles with bar.
+    ASSERT_EQ(viewGraph()->insertAndValidate(quxView, {kBarNamespace}, kEmptyPipelineSize),
+              ErrorCodes::GraphContainsCycle);
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+
+    viewGraph()->remove(kBarNamespace);
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    // With bar removed, we expect qux to be inserted successfully.
+    ASSERT_OK(viewGraph()->insertAndValidate(quxView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+}
+
+// Tests that an insertion that would create mismatching collators is rejected, but will later be
+// accepted if the existing view with the conflicting collator is removed.
+TEST_F(ViewGraphFixture, CanCreateViewWithDifferentCollationThanDroppedView) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kBinaryCollation);
+
+    // Inserting bar should fail, as foo depends on bar and has a different collation.
+    ASSERT_EQ(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize),
+              ErrorCodes::OptionNotSupportedOnView);
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    viewGraph()->remove(kFooNamespace);
+    ASSERT_EQ(viewGraph()->size(), 0UL);
+
+    // Now bar should be inserted successfully, as there are no existing views in the graph that
+    // depend on it.
+    ASSERT_OK(viewGraph()->insertAndValidate(barView, {kFooNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+}
+
+// Tests that a node in the graph is properly converted from a "view" node to a "non-view" node when
+// a view with that namespace is removed.
+TEST_F(ViewGraphFixture, DroppingViewPreservesNodeInGraphIfDependedOnByOtherViews) {
+    const auto fooView =
+        makeViewDefinition(kTestDb, kFooName, kBarName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    const auto barView =
+        makeViewDefinition(kTestDb, kBarName, kQuxName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(barView, {kQuxNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 3UL);
+
+    // Inserts baz into the graph so that qux has another namespace that depends on it. This way,
+    // the node for qux won't be destroyed when baz is removed.
+    const auto bazView =
+        makeViewDefinition(kTestDb, "baz"sv, kQuxName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(bazView, {kQuxNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 4UL);
+
+    // Inserting a view that depends on bar but has a different collation should fail.
+    const auto viewWithDifferentCollation =
+        makeViewDefinition(kTestDb, "badCollation"sv, kBarName, kEmptyPipeline, kFilipinoCollation);
+    ASSERT_EQ(viewGraph()->insertAndValidate(
+                  viewWithDifferentCollation, {kBarNamespace}, kEmptyPipelineSize),
+              ErrorCodes::OptionNotSupportedOnView);
+    ASSERT_EQ(viewGraph()->size(), 4UL);
+
+    // Removes bar from the graph. The graph's size should remain at 4, since bar is still depended
+    // on by qux.
+    viewGraph()->remove(kBarNamespace);
+    ASSERT_EQ(viewGraph()->size(), 4UL);
+
+    // Inserting the viewWithDifferentCollation from above should now succeed, since bar is no
+    // longer a view.
+    ASSERT_OK(viewGraph()->insertAndValidate(
+        viewWithDifferentCollation, {kBarNamespace}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 5UL);
+}
+
+TEST_F(ViewGraphFixture, DifferentTenantsCanCreateViewWithConflictingNamespaces) {
+    unittest::ServerParameterGuard multitenancyController("multitenancySupport", true);
+
+    DatabaseName db1 = DatabaseName::createDatabaseName_forTest(TenantId(OID::gen()), "test");
+    DatabaseName db2 = DatabaseName::createDatabaseName_forTest(TenantId(OID::gen()), "test");
+
+    NamespaceString viewOn1 = NamespaceString::createNamespaceString_forTest(db1, kBarName);
+    NamespaceString viewOn2 = NamespaceString::createNamespaceString_forTest(db2, kBarName);
+
+    // Create a view "foo" on tenant1's collection "test.bar".
+    const auto fooView1 =
+        makeViewDefinition(db1, kFooName, kBarName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView1, {viewOn1}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+
+    // Create a view "foo" on tenant2's collection "test.bar".
+    const auto fooView2 =
+        makeViewDefinition(db2, kFooName, kBarName, kEmptyPipeline, kBinaryCollation);
+    ASSERT_OK(viewGraph()->insertAndValidate(fooView2, {viewOn2}, kEmptyPipelineSize));
+    ASSERT_EQ(viewGraph()->size(), 4UL);
+
+    // Remove tenant1's view "foo".
+    NamespaceString viewToRemove = NamespaceString::createNamespaceString_forTest(db1, kFooName);
+    viewGraph()->remove(viewToRemove);
+    ASSERT_EQ(viewGraph()->size(), 2UL);
+}
+}  // namespace
+}  // namespace mongo

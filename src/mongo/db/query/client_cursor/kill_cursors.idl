@@ -1,0 +1,74 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/query/client_cursor/cursor_id.h"
+
+imports:
+    - "mongo/db/auth/access_checks.idl"
+    - "mongo/db/auth/action_type.idl"
+    - "mongo/db/basic_types.idl"
+
+types:
+    cursorId:
+        bson_serialization_type: long
+        description: "Uniquely identifies a single cursor on a particular mongoS or mongoD."
+        cpp_type: mongo::CursorId
+        deserializer: "mongo::BSONElement::_numberLong"
+        is_view: false
+
+structs:
+    KillCursorsCommandReply:
+        description: "Response from killCursors command"
+        strict: false
+        is_command_reply: true
+        fields:
+            cursorsKilled:
+                description: "Cursors successfully killed"
+                type: array<cursorId>
+                stability: stable
+            cursorsNotFound:
+                description: "Cursors not found"
+                type: array<cursorId>
+                stability: stable
+            cursorsAlive:
+                description: "Cursors still alive"
+                type: array<cursorId>
+                stability: stable
+            cursorsUnknown:
+                # This is a legacy field and always returns an empty array.
+                description: "Unknown cursors"
+                type: array<cursorId>
+                stability: stable
+
+commands:
+    killCursors:
+        description: "Kills a specified set of cursors by ID."
+        command_name: killCursors
+        cpp_name: KillCursorsCommandRequest
+        reply_type: KillCursorsCommandReply
+        api_version: "1"
+        access_check:
+            complex:
+                - check: is_coauthorized_with
+                - privilege:
+                      resource_pattern: cluster
+                      action_type: killAnyCursor
+                - privilege:
+                      resource_pattern: database
+                      action_type: killAnyCursor
+                - privilege:
+                      resource_pattern: exact_namespace
+                      action_type: killAnyCursor
+        strict: true
+        namespace: concatenate_with_db
+        fields:
+            cursors:
+                description: "An array of cursor IDs to be killed."
+                type: array<cursorId>
+                cpp_name: cursorIds
+                optional: false
+                stability: stable

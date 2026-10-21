@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# getDatabaseVersion IDL File
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    getDatabaseVersion:
+        description: "An internal command to get a shard server's cached database version"
+        command_name: getDatabaseVersion
+        namespace: type
+        api_version: ""
+        type: string
+        fields:
+            latestCached:
+                type: bool
+                default: false

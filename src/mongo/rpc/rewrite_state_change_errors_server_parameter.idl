@@ -1,0 +1,16 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::rpc"
+
+server_parameters:
+    # Kill switch just in case this behavior is slow or breaks something.
+    rewriteStateChangeErrors:
+        description: >-
+            A failsafe to disable mongos state change error rewriting.
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: rewriteStateChangeErrors
+        default: true
+        redact: false

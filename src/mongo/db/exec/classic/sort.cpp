@@ -1,0 +1,186 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/classic/sort.h"
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/util/assert_util.h"
+
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+
+SortStage::SortStage(boost::intrusive_ptr<ExpressionContext> expCtx,
+                     WorkingSet* ws,
+                     SortPattern sortPattern,
+                     bool addSortKeyMetadata,
+                     std::unique_ptr<PlanStage> child)
+    : PlanStage(kStageType, expCtx.get()),
+      _ws(ws),
+      _sortKeyGen(sortPattern, expCtx->getCollator()),
+      _addSortKeyMetadata(addSortKeyMetadata),
+      _memoryTracker{OperationMemoryUsageTracker::createChunkedSimpleMemoryUsageTrackerForStage(
+          *expCtx, MemoryUsageLimit{std::numeric_limits<int64_t>::max()})} {
+    _children.emplace_back(std::move(child));
+}
+
+PlanStage::StageState SortStage::doWork(WorkingSetID* out) {
+    if (isEOF()) {
+        return PlanStage::IS_EOF;
+    }
+
+    if (!_populated) {
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        const StageState code = child()->work(&id);
+
+        if (code == PlanStage::ADVANCED) {
+            // The plan must be structured such that a previous stage has attached the sort key
+            // metadata.
+            spool(id);
+            return PlanStage::NEED_TIME;
+        } else if (code == PlanStage::IS_EOF) {
+            // The child has returned all of its results. Record this fact so that subsequent calls
+            // to 'doWork()' will perform sorting and unspool the sorted results.
+            _populated = true;
+            loadingDone();
+            return PlanStage::NEED_TIME;
+        } else {
+            *out = id;
+        }
+
+        return code;
+    }
+
+    return unspool(out);
+}
+
+void SortStageDefault::loadingDone() {
+    _sortExecutor.loadingDone();
+}
+
+void SortStageSimple::loadingDone() {
+    _sortExecutor.loadingDone();
+}
+
+std::unique_ptr<PlanStageStats> SortStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    std::unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, stageType());
+    ret->specific = std::unique_ptr<SpecificStats>{getSpecificStats()->clone()};
+    ret->children.emplace_back(child()->getStats());
+    return ret;
+}
+
+SortStageDefault::SortStageDefault(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                   WorkingSet* ws,
+                                   SortPattern sortPattern,
+                                   uint64_t limit,
+                                   uint64_t maxMemoryUsageBytes,
+                                   bool addSortKeyMetadata,
+                                   std::unique_ptr<PlanStage> child)
+    : SortStage(expCtx, ws, sortPattern, addSortKeyMetadata, std::move(child)),
+      _sortExecutor(expCtx->getOperationContext(),
+                    std::move(sortPattern),
+                    limit,
+                    MemoryUsageLimit{static_cast<int64_t>(maxMemoryUsageBytes)},
+                    expCtx->getTempDir().string(),
+                    expCtx->getAllowDiskUse()) {}
+
+void SortStageDefault::spool(WorkingSetID wsid) {
+    SortableWorkingSetMember extractedMember{_ws->extract(wsid)};
+    auto sortKey = _sortKeyGen.computeSortKey(*extractedMember);
+    uint64_t prevMemBytes = _sortExecutor.stats().memoryUsageBytes;
+    _sortExecutor.add(sortKey, extractedMember);
+    _memoryTracker.add(_sortExecutor.stats().memoryUsageBytes - prevMemBytes);
+}
+
+PlanStage::StageState SortStageDefault::unspool(WorkingSetID* out) {
+    if (!_sortExecutor.hasNext()) {
+        // Storage is freed once all the documents have been returned.
+        _memoryTracker.set(0);
+        return PlanStage::IS_EOF;
+    }
+
+    auto&& [key, nextWsm] = _sortExecutor.getNext();
+    *out = _ws->emplace(nextWsm.extract());
+
+    if (_addSortKeyMetadata) {
+        auto member = _ws->get(*out);
+        member->metadata().setSortKey(std::move(key), _sortKeyGen.isSingleElementKey());
+    }
+
+    // Ensure isEOF flag is up-to-date if the query has a limit.
+    if (_sortExecutor.hasLimit() && !_sortExecutor.hasNext()) {
+        _memoryTracker.set(0);
+    }
+
+    return PlanStage::ADVANCED;
+}
+
+SortStageSimple::SortStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                 WorkingSet* ws,
+                                 SortPattern sortPattern,
+                                 uint64_t limit,
+                                 uint64_t maxMemoryUsageBytes,
+                                 bool addSortKeyMetadata,
+                                 std::unique_ptr<PlanStage> child)
+    : SortStage(expCtx, ws, sortPattern, addSortKeyMetadata, std::move(child)),
+      _sortExecutor(expCtx->getOperationContext(),
+                    std::move(sortPattern),
+                    limit,
+                    MemoryUsageLimit{static_cast<int64_t>(maxMemoryUsageBytes)},
+                    expCtx->getTempDir(),
+                    expCtx->getAllowDiskUse()) {}
+
+void SortStageSimple::spool(WorkingSetID wsid) {
+    auto member = _ws->get(wsid);
+    tassert(
+        11051630, "Expecting working set member to not store metadata fields", !member->metadata());
+    tassert(11051629,
+            "Expecting underlying document to store no metadata",
+            !member->doc.value().metadata());
+    tassert(11051628, "Expecting working set member to have an object", member->hasObj());
+
+    auto sortKey = _sortKeyGen.computeSortKeyFromDocument(member->doc.value());
+
+    uint64_t prevMemBytes = _sortExecutor.stats().memoryUsageBytes;
+    _sortExecutor.add(sortKey, member->doc.value().toBson());
+    _memoryTracker.add(_sortExecutor.stats().memoryUsageBytes - prevMemBytes);
+    _ws->free(wsid);
+}
+
+PlanStage::StageState SortStageSimple::unspool(WorkingSetID* out) {
+    if (!_sortExecutor.hasNext()) {
+        // Storage is freed once all the documents have been returned.
+        _memoryTracker.set(0);
+        return PlanStage::IS_EOF;
+    }
+
+    uint64_t prevMemBytes = _sortExecutor.stats().memoryUsageBytes;
+    auto&& [key, nextObj] = _sortExecutor.getNext();
+    _memoryTracker.add(_sortExecutor.stats().memoryUsageBytes - prevMemBytes);
+
+    *out = _ws->allocate();
+    auto member = _ws->get(*out);
+    member->resetDocument(SnapshotId{}, nextObj.getOwned());
+    member->transitionToOwnedObj();
+
+    if (_addSortKeyMetadata) {
+        member->metadata().setSortKey(std::move(key), _sortKeyGen.isSingleElementKey());
+    }
+
+    // Ensure isEOF flag is up-to-date if the query has a limit.
+    if (_sortExecutor.hasLimit() && !_sortExecutor.hasNext()) {
+        _memoryTracker.set(0);
+    }
+
+    return PlanStage::ADVANCED;
+}
+
+}  // namespace mongo

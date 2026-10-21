@@ -1,0 +1,461 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/temp_dir.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/system_clock_source.h"
+#include "mongo/util/tick_source_mock.h"
+
+#include <sstream>
+#include <string>
+#include <string_view>
+
+#include <wiredtiger.h>
+
+namespace mongo {
+
+using std::string;
+using std::stringstream;
+
+class WiredTigerConnectionTest {
+public:
+    WiredTigerConnectionTest(std::string_view dbpath, std::string_view extraStrings)
+        : _conn(nullptr) {
+        std::stringstream ss;
+        ss << "create,";
+        ss << extraStrings;
+        string config = ss.str();
+        _fastClockSource = std::make_unique<SystemClockSource>();
+        int ret = wiredtiger_open(std::string{dbpath}.c_str(), nullptr, config.c_str(), &_conn);
+        ASSERT_OK(wtRCToStatus(ret, nullptr));
+        ASSERT(_conn);
+    }
+    ~WiredTigerConnectionTest() {
+        _conn->close(_conn, nullptr);
+    }
+    WT_CONNECTION* getConnection() const {
+        return _conn;
+    }
+    ClockSource* getClockSource() {
+        return _fastClockSource.get();
+    }
+
+private:
+    WT_CONNECTION* _conn;
+    std::unique_ptr<ClockSource> _fastClockSource;
+};
+
+class WiredTigerConnectionHarnessHelper {
+public:
+    WiredTigerConnectionHarnessHelper(std::string_view extraStrings)
+        : _dbpath("wt_test"),
+          _connectionTest(_dbpath.path(), extraStrings),
+          _connection(_connectionTest.getConnection(),
+                      _connectionTest.getClockSource(),
+                      /*sessionCacheMax=*/33000) {}
+
+    WiredTigerConnectionHarnessHelper(std::string_view extraStrings, unsigned long sessionCacheMax)
+        : _dbpath("wt_test"),
+          _connectionTest(_dbpath.path(), extraStrings),
+          _connection(
+              _connectionTest.getConnection(), _connectionTest.getClockSource(), sessionCacheMax) {}
+
+
+    WiredTigerConnection* getConnection() {
+        return &_connection;
+    }
+
+private:
+    unittest::TempDir _dbpath;
+    WiredTigerConnectionTest _connectionTest;
+    WiredTigerConnection _connection;
+};
+
+TEST(WiredTigerConnectionTest, CheckSessionCacheCleanup) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+    {
+        WiredTigerManagedSession _session = connection->getUninterruptibleSession();
+        ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+    }
+    // Destroying of a session puts it in the session cache
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 1U);
+
+    // An idle timeout of 0 means we never expire idle sessions
+    connection->closeExpiredIdleSessions(0);
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 1U);
+    sleepmillis(10);
+
+    // Expire sessions that have been idle for 10 secs
+    connection->closeExpiredIdleSessions(10000);
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 1U);
+    // Expire sessions that have been idle for 2 millisecs
+    connection->closeExpiredIdleSessions(2);
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+}
+
+TEST(WiredTigerConnectionTest, ReleaseCursorDuringShutdown) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+    WiredTigerManagedSession session = connection->getUninterruptibleSession();
+    // Simulates the cursor already being deleted during shutdown.
+    WT_CURSOR* cursor = nullptr;
+
+    connection->shuttingDown(WiredTigerConnection::ShutdownReason::kCleanShutdown);
+    ASSERT(connection->isShuttingDown());
+
+    auto tableIdWeDontCareAbout = WiredTigerUtil::genTableId();
+    // Skips actually trying to release the cursor to avoid the segmentation fault.
+    session->releaseCursor(tableIdWeDontCareAbout, cursor, "");
+}
+
+// Test that, in the event that we tried to release a session back into the session cache after
+// the storage engine had shut down, we do not invariant and did not actually release the session
+// back into the cache.
+TEST(WiredTigerConnectionTest, ReleaseSessionAfterShutdown) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+    // Assert that there are no idle sessions in the cache to start off with.
+    ASSERT_EQ(connection->getIdleSessionsCount(), 0);
+    {
+        WiredTigerManagedSession session = connection->getUninterruptibleSession();
+        WT_CURSOR* cursor = nullptr;
+
+        connection->shuttingDown(WiredTigerConnection::ShutdownReason::kCleanShutdown);
+        ASSERT(connection->isShuttingDown());
+        connection->restart();
+
+        // After the connection shut down, the outstanding session's epoch should be older than
+        // the cache's current epoch. So, when we go to release it, we should see this and not
+        // release it back into the cache. We should also not release its cursor.
+        auto tableIdWeDontCareAbout = WiredTigerUtil::genTableId();
+        session->releaseCursor(tableIdWeDontCareAbout, cursor, "");
+    }
+    // Check that the session was not added back into the cache.
+    ASSERT_EQ(connection->getIdleSessionsCount(), 0);
+}
+
+// Test that a session made stale by a rollback to stable is closed when it is released, rather than
+// abandoned as it is during a clean shutdown. A rollback to stable leaves the WT_CONNECTION intact,
+// so an abandoned session keeps its cached cursors, and therefore the data handles of their tables,
+// open for the lifetime of the process.
+TEST(WiredTigerConnectionTest, ReleaseSessionAfterRollbackToStableClosesItsCursors) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+    const std::string uri = "table:rollback_to_stable";
+
+    {
+        WiredTigerManagedSession session = connection->getUninterruptibleSession();
+        ASSERT_OK(
+            wtRCToStatus(session->create(uri.c_str(), "key_format=q,value_format=u"), *session));
+    }
+
+    {
+        WiredTigerManagedSession session = connection->getUninterruptibleSession();
+
+        // Leave a cursor on the table in the session's cursor cache. It stays open, so WiredTiger
+        // holds the table's data handle until the session itself is closed.
+        session->releaseCursor(WiredTigerUtil::genTableId(), session->getNewCursor(uri), "");
+        ASSERT_EQ(session->cachedCursors(), 1);
+
+        connection->shuttingDown(WiredTigerConnection::ShutdownReason::kRollbackToStable);
+        connection->restart();
+    }
+
+    // The session's rollback to stable epoch was stale, so it was not returned to the cache.
+    ASSERT_EQ(connection->getIdleSessionsCount(), 0);
+
+    // Nothing holds the table's data handle any more, so the table can be dropped. Do not wait for
+    // locks, so that a leaked cursor fails the drop with EBUSY instead of hanging the test.
+    WiredTigerManagedSession session = connection->getUninterruptibleSession();
+    ASSERT_OK(wtRCToStatus(session->drop(uri.c_str(), "checkpoint_wait=false,lock_wait=false"),
+                           *session));
+}
+
+// Test that, if a recovery unit reconfigures its session, the session will have its configuration
+// reset to default values before it is released to the session cache where it can be used by
+// another recovery unit.
+TEST(WiredTigerConnectionTest, resetConfigurationBeforeReleasingSessionToCache) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    // Assert that we start off with no sessions in the session cache.
+    ASSERT_EQ(connection->getIdleSessionsCount(), 0U);
+    {
+        WiredTigerRecoveryUnit recoveryUnit(connection, nullptr);
+        // Set ignore_cache_size to be true
+        recoveryUnit.optOutOfCacheEviction();
+
+        WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+        // Set cache max wait time to be a non-default value.
+        session->modifyConfiguration("cache_max_wait_ms=100", "cache_max_wait_ms=0");
+        // Set isolation level to be read-uncommitted (by default it is snapshot)
+        session->modifyConfiguration("isolation=read-uncommitted", "isolation=snapshot");
+        // Set cache_cursors to be false
+        session->modifyConfiguration("cache_cursors=false", "cache_cursors=true");
+        auto undoConfigStringsSet = session->getUndoConfigStrings();
+
+        // Check that all the expected undo config strings are present.
+        ASSERT_EQ(undoConfigStringsSet.size(), 4);
+        ASSERT(undoConfigStringsSet.find("cache_max_wait_ms=0") != undoConfigStringsSet.end());
+        ASSERT(undoConfigStringsSet.find("ignore_cache_size=false") != undoConfigStringsSet.end());
+        ASSERT(undoConfigStringsSet.find("isolation=snapshot") != undoConfigStringsSet.end());
+        ASSERT(undoConfigStringsSet.find("cache_cursors=true") != undoConfigStringsSet.end());
+    };
+    // Destructing the recovery unit should put the session used by the recovery unit back into the
+    // session cache.
+    ASSERT_EQ(connection->getIdleSessionsCount(), 1U);
+    {
+        WiredTigerRecoveryUnit recoveryUnit(connection, nullptr);
+        WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+        // Assert that before it was released back into the session cache, the set of undo config
+        // strings was cleared, which should indicate that the changes to the default settings of
+        // the session were undone.
+        ASSERT_EQ(session->getUndoConfigStrings().size(), 0);
+    }
+}
+
+// Test that, if a recovery unit sets a non-default configuration value for its session and then
+// reconfigures it back to the default value, that we do not store the undo config string (because
+// we do not need to take any action to restore the session to its default configuration).
+TEST(WiredTigerConnectionTest, resetConfigurationToDefault) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    WiredTigerRecoveryUnit recoveryUnit(connection, nullptr);
+    WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+    // Set cache max wait time to be a non-default value.
+    session->modifyConfiguration("cache_max_wait_ms=100", "cache_max_wait_ms=0");
+    // Set ignore_cache_size to be true
+    session->modifyConfiguration("ignore_cache_size=true", "ignore_cache_size=false");
+    // Set isolation level to be read-uncommitted (by default it is snapshot)
+    session->modifyConfiguration("isolation=read-uncommitted", "isolation=snapshot");
+    // Set cache_cursors to be false
+    session->modifyConfiguration("cache_cursors=false", "cache_cursors=true");
+    auto undoConfigStringsSet = session->getUndoConfigStrings();
+
+    // Check that all the expected undo config strings are present.
+    ASSERT_EQ(undoConfigStringsSet.size(), 4);
+    ASSERT(undoConfigStringsSet.find("cache_max_wait_ms=0") != undoConfigStringsSet.end());
+    ASSERT(undoConfigStringsSet.find("ignore_cache_size=false") != undoConfigStringsSet.end());
+    ASSERT(undoConfigStringsSet.find("isolation=snapshot") != undoConfigStringsSet.end());
+    ASSERT(undoConfigStringsSet.find("cache_cursors=true") != undoConfigStringsSet.end());
+
+    // Set all values back to their defaults.
+    session->modifyConfiguration("cache_max_wait_ms=0", "cache_max_wait_ms=0");
+    session->modifyConfiguration("ignore_cache_size=false", "ignore_cache_size=false");
+    session->modifyConfiguration("isolation=snapshot", "isolation=snapshot");
+    session->modifyConfiguration("cache_cursors=true", "cache_cursors=true");
+
+    // Check that we do not store any undo config strings.
+    ASSERT_EQ(session->getUndoConfigStrings().size(), 0);
+}
+
+// Test that opting out of cache eviction sets ignore_cache_size on the recovery unit's session.
+TEST(WiredTigerConnectionTest, optOutOfCacheEvictionIgnoresCacheSize) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    WiredTigerRecoveryUnit recoveryUnit(connection, nullptr);
+    WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+    recoveryUnit.optOutOfCacheEviction();
+
+    auto undoConfigStringsSet = session->getUndoConfigStrings();
+
+    ASSERT_EQ(undoConfigStringsSet.size(), 1);
+    ASSERT(undoConfigStringsSet.find("ignore_cache_size=false") != undoConfigStringsSet.end());
+}
+
+// Test that opting out of cache eviction applies to a session opened after the opt-out.
+TEST(WiredTigerConnectionTest, optOutOfCacheEvictionAppliesToLaterSession) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    WiredTigerRecoveryUnit recoveryUnit(connection, nullptr);
+    // No session exists yet, so the opt-out must be recorded and replayed when one is opened.
+    recoveryUnit.optOutOfCacheEviction();
+
+    WiredTigerSession* session = recoveryUnit.getSessionNoTxn();
+    auto undoConfigStringsSet = session->getUndoConfigStrings();
+
+    ASSERT_EQ(undoConfigStringsSet.size(), 1);
+    ASSERT(undoConfigStringsSet.find("ignore_cache_size=false") != undoConfigStringsSet.end());
+}
+
+TEST(WiredTigerConnectionTest, CheckSessionCacheMax) {
+    auto maxSessionCacheSize = 6;
+    WiredTigerConnectionHarnessHelper harnessHelper("", maxSessionCacheSize);
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+
+    // An idle timeout of 0 means never expire idle sessions.
+    connection->closeExpiredIdleSessions(0);
+    {
+        std::array<WiredTigerManagedSession, 10> sessions;
+
+        for (auto& session : sessions) {
+            session = connection->getUninterruptibleSession();
+        }
+        // Check that the cache is empty here.
+        ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+    }
+    // Destroying a session puts it in the session cache
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 6U);
+}
+
+TEST(WiredTigerConnectionTest, SettingSessionCacheMaxToZeroDisablesSessionCaching) {
+    auto maxSessionCacheSize = 0;
+    WiredTigerConnectionHarnessHelper harnessHelper("", maxSessionCacheSize);
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+
+    // An idle timeout of 0 means never expire idle sessions.
+    connection->closeExpiredIdleSessions(0);
+    {
+        std::array<WiredTigerManagedSession, 10> sessions;
+
+        for (auto& session : sessions) {
+            session = connection->getUninterruptibleSession();
+        }
+        // Check that the cache is empty here.
+        ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+    }
+    // Destroying a session puts it in the session cache. Here, since we disabled session caching,
+    // the session cache should still be empty.
+    ASSERT_EQUALS(connection->getIdleSessionsCount(), 0U);
+}
+
+
+TEST(WiredTigerConnectionTest, RecordsEngineTime) {
+    WiredTigerConnectionHarnessHelper harnessHelper("");
+    WiredTigerConnection* connection = harnessHelper.getConnection();
+
+    TickSourceMock<Microseconds> tickSourceMock;
+    tickSourceMock.setAdvanceOnRead(Microseconds{1});
+    {
+        auto session1 = connection->getUninterruptibleSession();
+        session1->setTickSource_forTest(&tickSourceMock);
+        session1->checkpoint(nullptr);
+
+        auto session2 = connection->getUninterruptibleSession();
+        session2->setTickSource_forTest(&tickSourceMock);
+        session2->checkpoint(nullptr);
+
+        WiredTigerSession sessionUncached(connection);
+        sessionUncached.setTickSource_forTest(&tickSourceMock);
+        sessionUncached.checkpoint(nullptr);
+
+        // Before returning anything to the cache, we have 0 total time.
+        ASSERT_EQ(connection->getTotalEngineTime(), Microseconds::zero());
+    }
+
+    // Once returned, we have the times from the 2 cached sessions, and not the uncached one.
+    ASSERT_EQ(connection->getTotalEngineTime(), Microseconds{2});
+}
+
+TEST(WiredTigerConnectionTest, ThrowsWhenCreatingMoreThanSessionMax) {
+    constexpr auto maxSessionCount = 50;
+    unittest::ServerParameterGuard sessionMax{"wiredTigerSessionMax", maxSessionCount};
+    unittest::ServerParameterGuard reservedSession{"wiredTigerReservedSessionMax", 10};
+
+    WiredTigerConnectionHarnessHelper helper("", 10);
+    WiredTigerConnection* const connection = helper.getConnection();
+
+    std::vector<std::unique_ptr<WiredTigerSession>> sessions;
+    sessions.reserve(maxSessionCount);
+
+    for (int i = 0; i < maxSessionCount; ++i) {
+        sessions.emplace_back(std::make_unique<WiredTigerSession>(connection));
+    }
+
+    ASSERT_THROWS_CODE(WiredTigerSession(connection), AssertionException, 10828100);
+}
+
+TEST(WiredTigerConnectionTest, ThrowsWhenCreatingMoreThanAllowedUserSessions) {
+    constexpr auto maxSessionCount = 50;
+    constexpr auto reservedSessionCount = 10;
+    unittest::ServerParameterGuard sessionMax{"wiredTigerSessionMax", maxSessionCount};
+    unittest::ServerParameterGuard reservedSession{"wiredTigerReservedSessionMax",
+                                                   reservedSessionCount};
+
+    WiredTigerConnectionHarnessHelper helper("", 10);
+    WiredTigerConnection* const connection = helper.getConnection();
+
+    std::vector<std::unique_ptr<WiredTigerSession>> sessions;
+    sessions.reserve(maxSessionCount);
+
+    constexpr auto maxAllowedUserSessions = maxSessionCount - reservedSessionCount;
+    for (int i = 0; i < maxAllowedUserSessions; ++i) {
+        // Create user sessions.
+        sessions.emplace_back(
+            std::make_unique<WiredTigerSession>(connection, 0, 0, nullptr, false));
+    }
+
+    ASSERT_THROWS_CODE(
+        WiredTigerSession(connection, 0, 0, nullptr, false), AssertionException, 10828101);
+}
+
+TEST(WiredTigerConnectionTest, DecrementsSessionCountWhenSessionIsDestroyed) {
+    constexpr auto maxSessionCount = 50;
+    unittest::ServerParameterGuard sessionMax{"wiredTigerSessionMax", maxSessionCount};
+    unittest::ServerParameterGuard reservedSession{"wiredTigerReservedSessionMax", 10};
+
+    WiredTigerConnectionHarnessHelper helper("", 10);
+    WiredTigerConnection* const connection = helper.getConnection();
+
+    std::vector<std::unique_ptr<WiredTigerSession>> sessions;
+    sessions.reserve(maxSessionCount);
+
+    for (int i = 0; i < maxSessionCount; ++i) {
+        sessions.emplace_back(std::make_unique<WiredTigerSession>(connection));
+    }
+
+    sessions.pop_back();
+
+    // Should not throw.
+    sessions.emplace_back(std::make_unique<WiredTigerSession>(connection));
+}
+
+TEST(WiredTigerConnectionTest, RollsBackWhenAssertionTriggers) {
+    constexpr auto maxSessionCount = 50;
+    constexpr auto reservedSessionCount = 10;
+    unittest::ServerParameterGuard sessionMax{"wiredTigerSessionMax", maxSessionCount};
+    unittest::ServerParameterGuard reservedSession{"wiredTigerReservedSessionMax",
+                                                   reservedSessionCount};
+
+    WiredTigerConnectionHarnessHelper helper("", 10);
+    WiredTigerConnection* const connection = helper.getConnection();
+
+    std::vector<std::unique_ptr<WiredTigerSession>> sessions;
+    sessions.reserve(maxSessionCount);
+
+    constexpr auto maxAllowedUserSessions = maxSessionCount - reservedSessionCount;
+    for (int i = 0; i < maxAllowedUserSessions; ++i) {
+        // Create user sessions.
+        sessions.emplace_back(
+            std::make_unique<WiredTigerSession>(connection, 0, 0, nullptr, false));
+    }
+
+    // Should decrement the counter upon unsuccessful session creation.
+    ASSERT_THROWS_CODE(
+        WiredTigerSession(connection, 0, 0, nullptr, false), AssertionException, 10828101);
+
+    // Lower the counter further to allow an additional session to be opened.
+    sessions.pop_back();
+
+    // Should not throw as the counter is now below threshold.
+    sessions.emplace_back(std::make_unique<WiredTigerSession>(connection, 0, 0, nullptr, false));
+}
+
+}  // namespace mongo

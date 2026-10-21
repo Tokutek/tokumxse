@@ -1,0 +1,13 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes: "mongo/db/server_options.h"
+
+server_parameters:
+    disabledSecureAllocatorDomains:
+        description: "Disable use of secure allocator domains"
+        set_at: startup
+        cpp_varname: "serverGlobalParams.disabledSecureAllocatorDomains"
+        redact: false

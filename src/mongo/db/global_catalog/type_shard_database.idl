@@ -1,0 +1,44 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/global_catalog/types_validators.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+
+structs:
+    ShardDatabaseTypeBase:
+        description:
+            "Represents the layout and contents of documents contained in the shard
+            server's config.cache.databases collection."
+        strict: false
+        fields:
+            _id:
+                description: "Database name."
+                cpp_name: dbName
+                type: database_name
+                validator:
+                    callback: "validateDatabaseName"
+                optional: false
+            primary:
+                description: "Primary shard for this database."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+                optional: false
+
+            # What follows below are fields which control DDL operations on the database object
+
+            enterCriticalSectionCounter:
+                type: int
+                description: "Currently just an OpObserver signal, thus otherwise ignored."
+                optional: true
+            version:
+                description: "Version of the database."
+                type: database_version
+                optional: false

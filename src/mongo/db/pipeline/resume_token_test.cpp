@@ -1,0 +1,622 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/pipeline/resume_token.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
+
+#include <limits>
+
+#include <boost/none.hpp>
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+namespace mongo {
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+TEST(ResumeToken, EncodesFullTokenFromData) {
+    Timestamp ts(1000, 2);
+    UUID testUuid = UUID::gen();
+    Document eventIdentifier{{"_id"sv, "stuff"sv}, {"otherkey"sv, Document{{"otherstuff"sv, 2}}}};
+
+    ResumeTokenData resumeTokenDataIn(ts, 0, 0, testUuid, Value(eventIdentifier));
+    ResumeToken token(resumeTokenDataIn);
+    ResumeTokenData tokenData = token.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, EncodesTimestampOnlyTokenFromData) {
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp{1001, 3},
+        ResumeTokenData::kDefaultTokenVersion,
+        /* txnOpindex */ 0,
+        /* uuid */ boost::none,
+        /* eventIdentifier */ Value(Document{{"operationType", "drop"sv}})};
+    ResumeToken token(resumeTokenDataIn);
+    ResumeTokenData tokenData = token.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, ShouldRoundTripThroughHexEncoding) {
+    Timestamp ts(1000, 2);
+    UUID testUuid = UUID::gen();
+    Document eventIdentifier{{"_id"sv, "stuff"sv}, {"otherkey"sv, Document{{"otherstuff"sv, 2}}}};
+
+    ResumeTokenData resumeTokenDataIn(ts, 0, 0, testUuid, Value(eventIdentifier));
+
+    // Test serialization/parsing through Document.
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument());
+    ResumeTokenData tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Test serialization/parsing through BSON.
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, TimestampOnlyTokenShouldRoundTripThroughHexEncoding) {
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp{1001, 3},
+        ResumeTokenData::kDefaultTokenVersion,
+        /* txnOpIndex */ 0,
+        /* uuid */ boost::none,
+        /* eventIdentifier */ Value(Document{{"operationType", "drop"sv}})};
+
+    // Test serialization/parsing through Document.
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ResumeTokenData tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Test serialization/parsing through BSON.
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, NonDocumentKeyResumeTokenRoundTripsThroughHexEncoding) {
+    auto eventIdentifier = Value(BSON("operationType" << "create"
+                                                      << "operationDescription" << BSONObj()));
+    ResumeTokenData resumeTokenDataIn{Timestamp{1001, 3},
+                                      ResumeTokenData::kDefaultTokenVersion,
+                                      /* txnOpIndex */ 0,
+                                      UUID::gen(),
+                                      eventIdentifier};
+
+    // Test serialization/parsing through Document.
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ResumeTokenData tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Test serialization/parsing through BSON.
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, HighWaterMarkTokenCanRoundTripForV1AndV2) {
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp(1001, 3), 1 /* version */, 0 /* txnOpIndex */, boost::none, Value()};
+    resumeTokenDataIn.tokenType = ResumeTokenData::TokenType::kHighWaterMarkToken;
+
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ResumeTokenData tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    resumeTokenDataIn = ResumeTokenData{
+        Timestamp(1001, 3), 2 /* version */, 0 /* txnOpIndex */, boost::none, Value()};
+    resumeTokenDataIn.tokenType = ResumeTokenData::TokenType::kHighWaterMarkToken;
+
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, ParseResumeTokenDataWithNoUUIDButEventIdentifierForV1AndV2) {
+    ResumeTokenData resumeTokenDataIn{Timestamp(1001, 3),
+                                      1 /* version */,
+                                      0 /* txnOpIndex */,
+                                      boost::none,
+                                      Value(Document{{"_id", 1}})};
+    ASSERT_THROWS_CODE(ResumeToken(resumeTokenDataIn), AssertionException, 50788);
+
+    // Can parse a v2 token without a UUID but with an eventIdentifier.
+    resumeTokenDataIn.version = 2;
+    const auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    const auto tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+}
+
+TEST(ResumeToken, CannotParseInvalidHigWaterMarkTokenForV1AndV2) {
+    ResumeTokenData resumeTokenData{
+        Timestamp(1001, 3), 1 /* version */, 0 /* txnOpIndex */, boost::none, Value()};
+    resumeTokenData.tokenType = ResumeTokenData::TokenType::kHighWaterMarkToken;
+
+    auto assertForV1AndV2 = [](auto resumeTokenData) {
+        resumeTokenData.version = 1;
+        ASSERT_THROWS_CODE(ResumeToken(resumeTokenData), AssertionException, 6189505);
+
+        resumeTokenData.version = 2;
+        ASSERT_THROWS_CODE(ResumeToken(resumeTokenData), AssertionException, 6189505);
+    };
+
+    // High water mark token cannot have an eventIdentifier, uuid or txnOpIndex.
+    resumeTokenData.eventIdentifier = Value(Document{{"_id", 1}});
+    assertForV1AndV2(resumeTokenData);
+    resumeTokenData.eventIdentifier = Value();
+
+    resumeTokenData.uuid = UUID::gen();
+    assertForV1AndV2(resumeTokenData);
+    resumeTokenData.uuid = boost::none;
+
+    resumeTokenData.txnOpIndex = 1;
+    assertForV1AndV2(resumeTokenData);
+    resumeTokenData.txnOpIndex = 0;
+
+    resumeTokenData.fromInvalidate = ResumeTokenData::FromInvalidate::kFromInvalidate;
+    assertForV1AndV2(resumeTokenData);
+}
+
+TEST(ResumeToken, CannotParseInvalidEventIdentifierForV1AndV2) {
+    // Version 2 or after resume tokens should always have eventIdentifier.
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp(1001, 3), 2 /* version */, 0 /* txnOpIndex */, UUID::gen(), Value()};
+    ASSERT_THROWS_CODE(ResumeToken(resumeTokenDataIn), AssertionException, 6189502);
+
+    // If eventIdentifier is present, it has to be an object.
+    resumeTokenDataIn.eventIdentifier = Value(1);
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS_CODE(rtToken.getData(), AssertionException, 6189503);
+
+    resumeTokenDataIn.version = 1;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS_CODE(rtToken.getData(), AssertionException, 6189503);
+}
+
+TEST(ResumeToken, TestMissingTypebitsOptimization) {
+    Timestamp ts(1000, 1);
+    UUID testUuid = UUID::gen();
+
+    ResumeTokenData hasTypeBitsData(ts, 0, 0, testUuid, Value(Document{{"_id", 1.0}}));
+    ResumeTokenData noTypeBitsData(
+        ResumeTokenData(ts, 0, 0, testUuid, Value(Document{{"_id", 1}})));
+    ResumeToken hasTypeBitsToken(hasTypeBitsData);
+    ResumeToken noTypeBitsToken(noTypeBitsData);
+    ASSERT_EQ(noTypeBitsToken, hasTypeBitsToken);
+    auto hasTypeBitsDoc = hasTypeBitsToken.toDocument();
+    auto noTypeBitsDoc = noTypeBitsToken.toDocument();
+    ASSERT_FALSE(hasTypeBitsDoc["_typeBits"].missing());
+    ASSERT_TRUE(noTypeBitsDoc["_typeBits"].missing()) << noTypeBitsDoc["_typeBits"];
+    auto rtHasTypeBitsData = ResumeToken::parse(hasTypeBitsDoc).getData();
+    auto rtNoTypeBitsData = ResumeToken::parse(noTypeBitsDoc).getData();
+    ASSERT_EQ(hasTypeBitsData, rtHasTypeBitsData);
+    ASSERT_EQ(noTypeBitsData, rtNoTypeBitsData);
+    ASSERT_EQ(BSONType::numberDouble, rtHasTypeBitsData.eventIdentifier["_id"].getType());
+    ASSERT_EQ(BSONType::numberInt, rtNoTypeBitsData.eventIdentifier["_id"].getType());
+}
+
+TEST(ResumeToken, FailsToParseForInvalidTokenFormats) {
+    // Missing document.
+    ASSERT_THROWS(ResumeToken::parse(Document()), AssertionException);
+    // Missing data field.
+    ASSERT_THROWS(ResumeToken::parse(Document{{"somefield"sv, "stuff"sv}}), AssertionException);
+    // Wrong type data field
+    ASSERT_THROWS(ResumeToken::parse(Document{{"_data"sv, BSONNULL}}), AssertionException);
+    ASSERT_THROWS(ResumeToken::parse(Document{{"_data"sv, 0}}), AssertionException);
+
+    ASSERT_THROWS(
+        ResumeToken::parse(Document{{"_data"sv, BSONBinData("\xde\xad", 2, BinDataGeneral)}}),
+        AssertionException);
+
+    // Valid data field, but wrong type typeBits.
+    ResumeTokenData tokenData{Timestamp{1010, 4},
+                              ResumeTokenData::kDefaultTokenVersion,
+                              /* version */ 0,
+                              /* uuid */ boost::none,
+                              /* eventIdentifier */ Value(Document{{"operationType", "drop"sv}})};
+    auto goodTokenDocBinData = ResumeToken(tokenData).toDocument();
+    auto goodData = goodTokenDocBinData["_data"].getStringData();
+    ASSERT_THROWS(ResumeToken::parse(Document{{"_data"sv, goodData}, {"_typeBits", "string"sv}}),
+                  AssertionException);
+
+    // Valid data, wrong typeBits bindata type.
+    ASSERT_THROWS(ResumeToken::parse(Document{{"_data"sv, goodData},
+                                              {"_typeBits", BSONBinData("\0", 0, newUUID)}}),
+                  AssertionException);
+}
+
+TEST(ResumeToken, FailsToDecodeInvalidKeyString) {
+    ResumeTokenData tokenData{Timestamp{1010, 4},
+                              ResumeTokenData::kDefaultTokenVersion,
+                              /* txnOpIndex */ 0,
+                              /* uuid */ boost::none,
+                              /* eventIdentifier */ Value(Document{{"operationType", "drop"sv}})};
+
+    auto goodTokenDocBinData = ResumeToken(tokenData).toDocument();
+    auto goodData = goodTokenDocBinData["_data"].getStringData();
+    const unsigned char zeroes[] = {0, 0, 0, 0, 0};
+    const unsigned char nonsense[] = {165, 85, 77, 86, 255};
+
+    // Data of correct type, but empty.
+    const auto emptyToken = ResumeToken::parse(Document{{"_data"sv, hexblob::encode(zeroes, 0)}});
+    ASSERT_THROWS_CODE(emptyToken.getData(), AssertionException, 40649);
+
+    // Data of correct type with a bunch of zeros.
+    const auto zeroesToken =
+        ResumeToken::parse(Document{{"_data"sv, hexblob::encode(zeroes, sizeof(zeroes))}});
+    ASSERT_THROWS_CODE(zeroesToken.getData(), AssertionException, 50811);
+
+    // Data of correct type with a bunch of nonsense.
+    const auto nonsenseToken =
+        ResumeToken::parse(Document{{"_data"sv, hexblob::encode(nonsense, sizeof(nonsense))}});
+    ASSERT_THROWS_CODE(nonsenseToken.getData(), AssertionException, 50811);
+
+    // Valid data, bad typeBits; note that an all-zeros typebits is valid so it is not tested here.
+    auto badTypeBitsToken = ResumeToken::parse(
+        Document{{"_data"sv, goodData},
+                 {"_typeBits", BSONBinData(nonsense, sizeof(nonsense), BinDataGeneral)}});
+    ASSERT_THROWS_CODE(badTypeBitsToken.getData(), AssertionException, ErrorCodes::Overflow);
+
+    const unsigned char invalidString[] = {
+        60,  // CType::kStringLike
+        55,  // Non-null terminated
+    };
+    auto invalidStringToken = ResumeToken::parse(
+        Document{{"_data"sv, hexblob::encode(invalidString, sizeof(invalidString))}});
+    // invalidStringToken.getData();
+    ASSERT_THROWS_WITH_CHECK(
+        invalidStringToken.getData(), AssertionException, [](const AssertionException& exception) {
+            ASSERT_EQ(exception.code(), 50816);
+            ASSERT_STRING_CONTAINS(exception.reason(), "Failed to find null terminator in string");
+        });
+
+    auto invalidHexString = ResumeToken::parse(Document{{"_data"sv, "nonsense"sv}});
+    ASSERT_THROWS_WITH_CHECK(
+        invalidHexString.getData(), AssertionException, [](const AssertionException& exception) {
+            ASSERT_EQ(exception.code(), ErrorCodes::FailedToParse);
+            ASSERT_STRING_CONTAINS(exception.reason(), "not a valid hex string");
+        });
+}
+
+TEST(ResumeToken, WrongVersionToken) {
+    Timestamp ts(1001, 3);
+    auto eventIdentifier =
+        Value(Document{{"operationType", "insert"sv}, {"documentKey", Document{{"_id", 1}}}});
+    ResumeTokenData resumeTokenDataIn{ts,
+                                      /* version */ 0,
+                                      /* txnOpIndex */ 0,
+                                      UUID::gen(),
+                                      eventIdentifier,
+                                      ResumeTokenData::FromInvalidate::kFromInvalidate};
+
+    // This one with version 0 should succeed. Version 0 cannot encode the fromInvalidate bool, so
+    // we expect it to be set to the default 'kNotFromInvalidate' after serialization.
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ResumeTokenData tokenData = rtToken.getData();
+    ASSERT_NE(resumeTokenDataIn, tokenData);
+    tokenData.fromInvalidate = ResumeTokenData::FromInvalidate::kFromInvalidate;
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Version 1 or newer should include the 'fromInvalidate' bool through serialization.
+    resumeTokenDataIn.version = 1;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    resumeTokenDataIn.version = 2;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // With version 3 it should fail - the maximum supported version is 2.
+    resumeTokenDataIn.version = 3;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS_CODE(rtToken.getData(), AssertionException, 50795);
+
+    // For version 0, the 'tokenType' field is not encoded. We expect it to default from the value
+    // 'kHighWaterMarkToken' back to 'kEventToken' after serialization.
+    resumeTokenDataIn = ResumeTokenData{ts,
+                                        /* version */ 0,
+                                        /* txnOpIndex */ 0,
+                                        /* uuid */ boost::none,
+                                        /* eventIdentifier */ Value{},
+                                        ResumeTokenData::kNotFromInvalidate,
+                                        ResumeTokenData::TokenType::kHighWaterMarkToken};
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_NE(resumeTokenDataIn, tokenData);
+    tokenData.tokenType = ResumeTokenData::kHighWaterMarkToken;
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Version 1 should include the 'tokenType' field through serialization.
+    resumeTokenDataIn.version = 1;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    resumeTokenDataIn.eventIdentifier = Value();
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // A non-TokenType value in the 'tokenType' field should fail to decode.
+    resumeTokenDataIn.tokenType = static_cast<ResumeTokenData::TokenType>(5);
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS_CODE(rtToken.getData(), AssertionException, 51057);
+
+    // With version 3 it should fail - the maximum supported version is 2.
+    resumeTokenDataIn.version = 3;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS_CODE(rtToken.getData(), AssertionException, 50795);
+}
+
+TEST(ResumeToken, InvalidTxnOpIndex) {
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp{1001, 3},
+        ResumeTokenData::kDefaultTokenVersion,
+        /* txnOpIndex */ 1234,
+        /* uuid */ boost::none,
+        /* eventIdentifier */ Value(Document{{"operationType", "drop"sv}})};
+
+    // Should round trip with a non-negative txnOpIndex.
+    auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ResumeTokenData tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Should fail with a negative txnOpIndex.
+    resumeTokenDataIn.txnOpIndex = std::numeric_limits<size_t>::max();
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+
+    ASSERT_THROWS(rtToken.getData(), AssertionException);
+}
+
+TEST(ResumeToken, StringEncodingSortsCorrectly) {
+    // Make sure that the string encoding of the resume tokens will compare in the correct order,
+    // namely timestamp, version, txnOpIndex, uuid, then eventIdentifier.
+    Timestamp ts2_2(2, 2);
+    Timestamp ts10_4(10, 4);
+    Timestamp ts10_5(10, 5);
+    Timestamp ts11_3(11, 3);
+
+    // Generate two different UUIDs, and figure out which one is smaller. Store the smaller one in
+    // 'lower_uuid'.
+    UUID lower_uuid = UUID::gen();
+    UUID higher_uuid = UUID::gen();
+    if (lower_uuid > higher_uuid) {
+        std::swap(lower_uuid, higher_uuid);
+    }
+
+    const auto lowerEventIdentifer =
+        Value(Document{{"operationType", "insert"sv}, {"documentKey", Document{{"_id", 0}}}});
+    const auto higherEventIdentifer =
+        Value(Document{{"operationType", "insert"sv}, {"documentKey", Document{{"_id", 1}}}});
+
+    auto assertLt = [](const ResumeTokenData& lower, const ResumeTokenData& higher) {
+        auto lowerString = ResumeToken(lower).toDocument()["_data"].getString();
+        auto higherString = ResumeToken(higher).toDocument()["_data"].getString();
+        ASSERT_LT(lowerString, higherString);
+    };
+
+    // Test using only Timestamps.
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts10_4, 0, 0, boost::none, Value()});
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts10_5, 0, 0, boost::none, Value()});
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts11_3, 0, 0, boost::none, Value()});
+    assertLt({ts10_4, 0, 0, boost::none, Value()}, {ts10_5, 0, 0, boost::none, Value()});
+    assertLt({ts10_4, 0, 0, boost::none, Value()}, {ts11_3, 0, 0, boost::none, Value()});
+    assertLt({ts10_5, 0, 0, boost::none, Value()}, {ts11_3, 0, 0, boost::none, Value()});
+
+    // Test using Timestamps and version.
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts2_2, 1, 0, boost::none, Value()});
+    // V2 and newer tokens require an eventIdentifier.
+    assertLt({ts10_4, 5, 0, lower_uuid, lowerEventIdentifer},
+             {ts10_4, 10, 0, lower_uuid, lowerEventIdentifer});
+
+    // Test that the Timestamp is more important than the version, txnOpIndex, UUID and
+    // eventIdentifier.
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+
+    // Test that when the Timestamp is the same, the version breaks the tie.
+    assertLt({ts10_4, 1, 50, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 5, 1, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts2_2, 1, 0, higher_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 2, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 1, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 2, 0, lower_uuid, Value(Document{{"_id", 0}})});
+
+    // Test that when the Timestamp and version are the same, the txnOpIndex breaks the tie.
+    assertLt({ts10_4, 1, 6, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 1, 50, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts2_2, 0, 0, higher_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 0, 4, lower_uuid, Value(Document{{"_id", 0}})});
+
+    // Test that when the Timestamp, version, and txnOpIndex are the same, the UUID breaks the tie.
+    assertLt({ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 1, 2, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 1, 2, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 2}})});
+
+    // Test that when the Timestamp, version, txnOpIndex, and UUID are the same, the eventIdentifier
+    // breaks the tie.
+    assertLt({ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 1}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", "string"sv}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", BSONNULL}})},
+             {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+
+    // Test that v2 eventIdentifiers break the tie and sort correctly.
+    assertLt({ts10_4, 2, 0, lower_uuid, lowerEventIdentifer},
+             {ts10_4, 2, 0, lower_uuid, higherEventIdentifer});
+}
+
+TEST(ResumeToken, FragmentNumRoundTripsThroughEncodingAndDecoding) {
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp(1000, 1), 2, 0, UUID::gen(), Value(Document{{"_id", 1}})};
+
+    auto resumeTokenDataFragmentNone =
+        ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument()).getData();
+
+    ASSERT_EQ(resumeTokenDataIn, resumeTokenDataFragmentNone);
+    ASSERT_EQ(ResumeToken(resumeTokenDataIn).toBSON().objsize(),
+              ResumeToken(resumeTokenDataFragmentNone).toBSON().objsize());
+
+    resumeTokenDataIn.fragmentNum = 0ULL;
+    auto resumeTokenDataFragment0 =
+        ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument()).getData();
+
+    ASSERT_EQ(resumeTokenDataIn, resumeTokenDataFragment0);
+    ASSERT_EQ(ResumeToken(resumeTokenDataIn).toBSON().objsize(),
+              ResumeToken(resumeTokenDataFragment0).toBSON().objsize());
+
+    resumeTokenDataIn.fragmentNum = 1ULL;
+    auto resumeTokenDataFragment1 =
+        ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument()).getData();
+
+    ASSERT_EQ(resumeTokenDataIn, resumeTokenDataFragment1);
+    ASSERT_EQ(ResumeToken(resumeTokenDataIn).toBSON().objsize(),
+              ResumeToken(resumeTokenDataFragment1).toBSON().objsize());
+}
+
+TEST(ResumeToken, NegativeFragmentNumThrows) {
+    ResumeTokenData resumeTokenDataIn{
+        Timestamp(1000, 1), 2, 0, UUID::gen(), Value(Document{{"_id", 1}})};
+
+    // Large 'ResumeTokenData::fragmentNum' value will be serialized as a negative integer.
+    resumeTokenDataIn.fragmentNum = std::numeric_limits<size_t>::max();
+    auto resumeToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument());
+
+    ASSERT_THROWS_CODE(resumeToken.getData(), DBException, 7182501);
+}
+
+TEST(ResumeToken, FragmentNumInV1Throws) {
+    ResumeTokenData resumeTokenDataV1{
+        Timestamp(1000, 1), 1, 0, UUID::gen(), Value(Document{{"_id", 1}})};
+
+    resumeTokenDataV1.fragmentNum = 0ULL;
+    ASSERT_THROWS_CODE(ResumeToken(resumeTokenDataV1), DBException, 7182504);
+}
+
+TEST(ResumeToken, ExtractClusterTimeFromHexDataThrowsOnInvalidInputs) {
+    const auto strings = {"",
+                          " ",
+                          "f",
+                          "ff",
+                          "0",
+                          "00",
+                          "fff",
+                          "ffff",
+                          "z",
+                          "82",
+                          "820000000000000",
+                          "82abababababababaz",
+                          " 820000000000000000",
+                          "ff0000000000000000",
+                          "830000000000000000"};
+
+    for (const auto& hex : strings) {
+        ASSERT_THROWS_CODE(ResumeToken::extractClusterTimeFromHexData(hex),
+                           DBException,
+                           ErrorCodes::FailedToParse);
+    }
+}
+
+TEST(ResumeToken, ExtractClusterTimeFromHexDataWorksWithValidInputs) {
+    const auto values = {
+        std::make_pair("820000000000000000", Timestamp(0, 0)),
+        std::make_pair("820000000000000001", Timestamp(0, 1)),
+        std::make_pair("820000000100000000", Timestamp(1, 0)),
+        std::make_pair("82000000ff00000000", Timestamp(255, 0)),
+        std::make_pair("82000000FF00000000", Timestamp(255, 0)),
+        std::make_pair(
+            "82ffffffffffffffff",
+            Timestamp(std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max())),
+        std::make_pair("82ffffffff00000000", Timestamp(std::numeric_limits<uint32_t>::max(), 0)),
+        std::make_pair("8200000000FFFFFFFF", Timestamp(0, std::numeric_limits<uint32_t>::max())),
+        std::make_pair("8269B03187000000022B0429296E1404", Timestamp(1773154695, 2)),
+        std::make_pair("820123456789AbCdeF", Timestamp(19088743, 2309737967)),
+        std::make_pair("82abCDEf0123456789", Timestamp(2882400001, 591751049)),
+        // Technically invalid resume token, but extra bytes after the timestamp are
+        // deliberately ignored by the fast path
+        std::make_pair("82abCDEf0123456789zzzzz", Timestamp(2882400001, 591751049)),
+    };
+
+    for (const auto& value : values) {
+        ASSERT_EQ(ResumeToken::extractClusterTimeFromHexData(value.first), value.second);
+    }
+}
+
+TEST(ResumeToken, ExtractClusterTimeFromResumeTokenThrowsOnInvalidInputs) {
+    const auto values = {BSONObj(),
+                         BSON("data" << "820000000000000000"),
+                         BSON("_data" << 1234),
+                         BSON("_data" << false),
+                         BSON("_data" << BSONArray()),
+                         BSON("_data" << BSONObj())};
+
+    for (const auto& token : values) {
+        ASSERT_THROWS_CODE(
+            ResumeToken::extractClusterTime(token), DBException, ErrorCodes::FailedToParse);
+        ASSERT_THROWS_CODE(ResumeToken::extractClusterTime(Document{token}),
+                           DBException,
+                           ErrorCodes::FailedToParse);
+    }
+}
+
+TEST(ResumeToken, ExtractClusterTimeFromResumeTokenWorksWithValidInputs) {
+    const auto values = {
+        std::make_pair("820000000000000000", Timestamp(0, 0)),
+        std::make_pair("820000000000000001", Timestamp(0, 1)),
+        std::make_pair("820000000100000000", Timestamp(1, 0)),
+        std::make_pair("82000000ff00000000", Timestamp(255, 0)),
+        std::make_pair("82000000FF00000000", Timestamp(255, 0)),
+        std::make_pair(
+            "82ffffffffffffffff",
+            Timestamp(std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max())),
+        std::make_pair("82ffffffff00000000", Timestamp(std::numeric_limits<uint32_t>::max(), 0)),
+        std::make_pair("8200000000FFFFFFFF", Timestamp(0, std::numeric_limits<uint32_t>::max())),
+        std::make_pair("8269B03187000000022B0429296E1404", Timestamp(1773154695, 2)),
+        std::make_pair("820123456789AbCdeF", Timestamp(19088743, 2309737967)),
+        std::make_pair("82abCDEf0123456789", Timestamp(2882400001, 591751049)),
+        // Technically invalid resume token, but extra bytes after the timestamp are
+        // deliberately ignored by the fast path
+        std::make_pair("82abCDEf0123456789zzzzz", Timestamp(2882400001, 591751049)),
+    };
+
+    for (const auto& value : values) {
+        ASSERT_EQ(ResumeToken::extractClusterTime(BSON("_data" << value.first)), value.second);
+        ASSERT_EQ(ResumeToken::extractClusterTime(Document{BSON("_data" << value.first)}),
+                  value.second);
+    }
+}
+
+}  // namespace
+}  // namespace mongo

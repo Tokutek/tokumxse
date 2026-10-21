@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo::procparser"
+    cpp_includes:
+        - "mongo/util/procparser_parameters.h"
+
+server_parameters:
+    procFileSizeLimit:
+        description: "Server will not read procfs files larger than this limit"
+        set_at: ["startup"]
+        cpp_varname: "procFileSizeLimit"
+        cpp_vartype: long long
+        default: 1048576 # 1MiB
+        redact: false
+        on_update: onUpdateProcFileSizeLimit

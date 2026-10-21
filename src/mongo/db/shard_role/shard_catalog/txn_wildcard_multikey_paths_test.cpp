@@ -1,0 +1,188 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/shard_role/shard_catalog/txn_wildcard_multikey_paths.h"
+
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/unittest/unittest.h"
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+class TxnWildcardMultikeyPathsTest : public ServiceContextTest {
+protected:
+    void setUp() override {
+        ServiceContextTest::setUp();
+        _opCtx = makeOperationContext();
+        shard_role_details::setRecoveryUnit(_opCtx.get(),
+                                            std::make_unique<RecoveryUnitNoop>(),
+                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    }
+
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+    const UUID testUuid = UUID::gen();
+
+private:
+    ServiceContext::UniqueOperationContext _opCtx;
+};
+
+TEST_F(TxnWildcardMultikeyPathsTest, EmptyByDefault) {
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    ASSERT_TRUE(cache.empty());
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendAndReadBack) {
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "wc_idx", {FieldRef("a.b"sv), FieldRef("c"sv)});
+    ASSERT_FALSE(cache.empty());
+
+    std::set<FieldRef> out;
+    cache.appendMatchingPaths(testUuid, "wc_idx", &out);
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_TRUE(out.contains(FieldRef("a.b"sv)));
+    ASSERT_TRUE(out.contains(FieldRef("c"sv)));
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, IndexSegregationByName) {
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "idx1", {FieldRef("a"sv)});
+    cache.append(testUuid, "idx2", {FieldRef("b"sv)});
+
+    std::set<FieldRef> out1;
+    cache.appendMatchingPaths(testUuid, "idx1", &out1);
+    ASSERT_EQ(out1.size(), 1u);
+    ASSERT_TRUE(out1.contains(FieldRef("a"sv)));
+
+    std::set<FieldRef> out2;
+    cache.appendMatchingPaths(testUuid, "idx2", &out2);
+    ASSERT_EQ(out2.size(), 1u);
+    ASSERT_TRUE(out2.contains(FieldRef("b"sv)));
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendIsAdditiveAndDeduplicates) {
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "wc", {FieldRef("a"sv)});
+    cache.append(testUuid, "wc", {FieldRef("a"sv), FieldRef("b"sv)});
+
+    std::set<FieldRef> out;
+    cache.appendMatchingPaths(testUuid, "wc", &out);
+    ASSERT_EQ(out.size(), 2u);
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendMatchingPathsOnEmptyIsNoOp) {
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    std::set<FieldRef> out;
+    cache.appendMatchingPaths(testUuid, "any", &out);
+    ASSERT_TRUE(out.empty());
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendMatchingPathsForUnknownIndexIsNoOp) {
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "exists", {FieldRef("a"sv)});
+
+    std::set<FieldRef> out;
+    cache.appendMatchingPaths(testUuid, "absent", &out);
+    ASSERT_TRUE(out.empty());
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendMatchingPathsReturnsAllCachedForIndex) {
+    // appendMatchingPaths returns every cached path for the index. Over-reporting is safe
+    // because multikey is monotonic — extra paths only force more conservative bounds.
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid,
+                 "wc",
+                 {FieldRef("a"sv),
+                  FieldRef("a.b"sv),
+                  FieldRef("a.b.x"sv),
+                  FieldRef("a.c"sv),
+                  FieldRef("unrelated"sv)});
+
+    std::set<FieldRef> out;
+    cache.appendMatchingPaths(testUuid, "wc", &out);
+    ASSERT_EQ(out.size(), 5u);
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendMatchingPathsPreservesPriorOutEntries) {
+    // appendMatchingPaths must merge into `out`, not clear/replace it.
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "wc", {FieldRef("a"sv)});
+
+    std::set<FieldRef> out;
+    out.insert(FieldRef("preexisting.entry"sv));
+    cache.appendMatchingPaths(testUuid, "wc", &out);
+
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_TRUE(out.count(FieldRef("preexisting.entry"sv)));
+    ASSERT_TRUE(out.count(FieldRef("a"sv)));
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, DeepPathsRoundtripThroughCache) {
+    // Deep FieldRefs should be stored and returned without loss.
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "wc", {FieldRef("a"sv), FieldRef("a.b.c.d.e.f.g"sv)});
+
+    std::set<FieldRef> out;
+    cache.appendMatchingPaths(testUuid, "wc", &out);
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_TRUE(out.count(FieldRef("a.b.c.d.e.f.g"sv)));
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, AppendAfterAppendMatchingPathsIsVisible) {
+    // Cache stays mutable across lookups; subsequent appends show up immediately.
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "wc", {FieldRef("a"sv)});
+
+    std::set<FieldRef> firstOut;
+    cache.appendMatchingPaths(testUuid, "wc", &firstOut);
+    ASSERT_EQ(firstOut.size(), 1u);
+
+    cache.append(testUuid, "wc", {FieldRef("a.late"sv)});
+
+    std::set<FieldRef> secondOut;
+    cache.appendMatchingPaths(testUuid, "wc", &secondOut);
+    ASSERT_EQ(secondOut.size(), 2u);
+    ASSERT_TRUE(secondOut.count(FieldRef("a.late"sv)));
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, DiesWithSnapshotOnAbandon) {
+    {
+        auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+        cache.append(testUuid, "wc", {FieldRef("a"sv)});
+        ASSERT_FALSE(cache.empty());
+    }
+
+    shard_role_details::getRecoveryUnit(opCtx())->abandonSnapshot();
+
+    auto& cacheAfter = TxnWildcardMultikeyPaths::get(opCtx());
+    ASSERT_TRUE(cacheAfter.empty());
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, TryGetReturnsNullptrUntilGetIsCalled) {
+    ASSERT_EQ(TxnWildcardMultikeyPaths::tryGet(opCtx()), nullptr);
+
+    auto& cache = TxnWildcardMultikeyPaths::get(opCtx());
+    cache.append(testUuid, "wc", {FieldRef("a"sv)});
+
+    const auto* tried = TxnWildcardMultikeyPaths::tryGet(opCtx());
+    ASSERT_NE(tried, nullptr);
+    ASSERT_FALSE(tried->empty());
+}
+
+TEST_F(TxnWildcardMultikeyPathsTest, TryGetIsNullptrAgainAfterAbandon) {
+    TxnWildcardMultikeyPaths::get(opCtx()).append(testUuid, "wc", {FieldRef("a"sv)});
+    ASSERT_NE(TxnWildcardMultikeyPaths::tryGet(opCtx()), nullptr);
+
+    shard_role_details::getRecoveryUnit(opCtx())->abandonSnapshot();
+
+    ASSERT_EQ(TxnWildcardMultikeyPaths::tryGet(opCtx()), nullptr);
+}
+
+}  // namespace
+}  // namespace mongo

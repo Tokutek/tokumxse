@@ -1,0 +1,507 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::feature_flags"
+    mod_visibility: public
+
+feature_flags:
+    featureFlagChangeStreamPreciseShardTargeting:
+        description: "Feature flag to enable improved handling of cluster topology changes in change streams"
+        cpp_varname: gFeatureFlagChangeStreamPreciseShardTargeting
+        default: true
+        version: 9.0
+        fcv_gated: true
+
+    featureFlagChangeStreamReaderV2:
+        description:
+            "IFR kill switch gating the change stream v2 (precise shard targeting) reader. Disabling
+            at runtime retires open v2 cursors with a resumable RetryChangeStream error so they
+            resume on the v1 path."
+        cpp_varname: gFeatureFlagChangeStreamReaderV2
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagSbeAccumulators:
+        description: "Feature flag to enable single-purpose SBE $group accumulators."
+        cpp_varname: gFeatureFlagSbeAccumulators
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagSbeAccumulatorExpressions:
+        description:
+            "Feature flag to enable SBE lowering of accumulators used as expressions, i.e. $sum,
+            $min, $max, $avg, $stdDevPop, $stdDevSamp and $mergeObjects outside of $group."
+        cpp_varname: gFeatureFlagSbeAccumulatorExpressions
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeFull:
+        description:
+            "Feature flag for SBE behaviors, features, or extensions that are not yet enabled
+            by default"
+        cpp_varname: gFeatureFlagSbeFull
+        default: false
+        fcv_gated: false
+
+    featureFlagTimeSeriesInSbe:
+        description: "Feature flag to enable queries against time-series collections to execute in SBE"
+        cpp_varname: gFeatureFlagTimeSeriesInSbe
+        default: true
+        fcv_gated: false
+
+    featureFlagSbeBlockHashAgg:
+        description: "Feature flag to enable Block Hash Aggregation for TS queries SBE"
+        cpp_varname: gFeatureFlagSbeBlockHashAgg
+        default: true
+        fcv_gated: false
+
+    featureFlagBinDataConvert:
+        description: "Feature flag to enable BinData support in $convert."
+        cpp_varname: gFeatureFlagBinDataConvert
+        default: true
+        version: 8.0
+        fcv_gated: true
+        check_against_fcv: legacy_fcv_snapshot_only
+
+    featureFlagAllowMergeOnNullishValues:
+        description: "Feature flag to support null and missing values for 'on' fields in $merge."
+        cpp_varname: gFeatureFlagAllowMergeOnNullishValues
+        default: true
+        version: 8.1
+        fcv_gated: true
+
+    featureFlagExposeArrayIndexInMapFilterReduce:
+        description:
+            "Feature flag to enable referencing array indices in $map, $filter, and $reduce
+            expressions."
+        cpp_varname: gFeatureFlagExposeArrayIndexInMapFilterReduce
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagBinDataConvertNumeric:
+        description: "Feature flag to enable extended BinData support for int, double and long in $convert."
+        cpp_varname: gFeatureFlagBinDataConvertNumeric
+        default: true
+        version: 8.1
+        fcv_gated: true
+
+    featureFlagAccuratePercentiles:
+        description: "Feature flag to enable accurate continuous and discrete $percentile accumulator/expression."
+        cpp_varname: gFeatureFlagAccuratePercentiles
+        default: false
+        fcv_gated: true
+
+    featureFlagCursorBasedTop:
+        description: "Feature flag to enable cursor-based top command."
+        cpp_varname: gFeatureFlagCursorBasedTop
+        default: false
+        fcv_gated: true
+
+    featureFlagSearchExplainExecutionStats:
+        description: "Feature flag to enable executing search queries for explain."
+        cpp_varname: gFeatureFlagSearchExplainExecutionStats
+        default: true
+        fcv_gated: false
+
+    featureFlagShardFilteringDistinctScan:
+        description: "Feature flag to support shard filtering in distinct scan optimization"
+        cpp_varname: gFeatureFlagShardFilteringDistinctScan
+        default: true
+        version: 8.2
+        fcv_gated: true
+
+    # TODO SERVER-95358 remove once 9.0 becomes last LTS
+    featureFlagAggMongosToRouter:
+        description: "Feature flag to switch from 'fromMongos' to 'fromRouter' field on aggregate commands."
+        cpp_varname: gFeatureFlagAggMongosToRouter
+        default: true
+        version: 8.1
+        fcv_gated: true
+
+    featureFlagLookupEncryptionSchemasFLE:
+        description: "Feature flag to support multiple FLE schemas with $lookup"
+        cpp_varname: gFeatureFlagLookupEncryptionSchemasFLE
+        default: true
+        fcv_gated: false
+
+    featureFlagQueryMemoryTracking:
+        description:
+            "Feature flag to enable current and high watermark memory usage tracking for
+            queries' blocking stages."
+        cpp_varname: gFeatureFlagQueryMemoryTracking
+        default: true
+        fcv_gated: false
+
+    featureFlagExpressionMemoryTracking:
+        description:
+            "Feature flag to enable expression-level memory usage tracking during query
+            execution. Only takes effect when featureFlagQueryMemoryTracking is also enabled."
+        cpp_varname: gFeatureFlagExpressionMemoryTracking
+        default: true
+        fcv_gated: false
+
+    featureFlagCurrentDate:
+        description: "Feature flag to enable $currentDate expression"
+        cpp_varname: gFeatureFlagCurrentDate
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagMultiPlanLimiter:
+        description: "Feature flag to enable MultiPlan rate limiter."
+        cpp_varname: gfeatureFlagMultiPlanLimiter
+        default: true
+        version: 8.3
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagSbeUpgradeBinaryTrees:
+        description: "Feature flag to enable N-ary ABT nodes"
+        cpp_varname: gFeatureFlagSbeUpgradeBinaryTrees
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagUUIDExpression:
+        description: "Feature flag to enable $createUUID expression"
+        cpp_varname: gFeatureFlagUUIDExpression
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagTopNBottomNExpressions:
+        description: "Feature flag to enable $topN, $top, $bottomN and $bottom expressions"
+        cpp_varname: gFeatureFlagTopNBottomNExpressions
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagConvertObjectToBinData:
+        description: "Feature flag to enable converting from Object to BinData"
+        cpp_varname: gFeatureFlagConvertObjectToBinData
+        default: true
+        version: 9.0
+        fcv_gated: true
+
+    featureFlagExtensionsAPI:
+        description: "Feature flag to enable loading extensions via the Extensions API."
+        cpp_varname: gFeatureFlagExtensionsAPI
+        default: true
+        fcv_gated: false
+
+    featureFlagExtensionsApiSignatureValidation:
+        description: "Feature flag to enable validating extension signatures at load time."
+        cpp_varname: gFeatureFlagExtensionsApiSignatureValidation
+        default: true
+        fcv_gated: false
+
+    featureFlagExtensionStubParsers:
+        description: "Test feature flag for extension stub parser fallback registration. Used to test incremental rollout of extension stage parsers."
+        cpp_varname: gFeatureFlagExtensionStubParsers
+        incremental_rollout_phase: in_development
+        fcv_gated: false
+
+    featureFlagMqlJsEngineGap:
+        description: "Feature flag to enable MQL features that cover common use cases for server side Javascript"
+        cpp_varname: gFeatureFlagMqlJsEngineGap
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagExtendedAutoSpilling:
+        description: "Feature flag to enable auto spilling to additional stages"
+        cpp_varname: gFeatureFlagExtendedAutoSpilling
+        default: true
+        fcv_gated: false
+
+    featureFlagQueryStatsUpdateCommand:
+        description: "Feature flag to enable query stats for the write commands."
+        cpp_varname: gFeatureFlagQueryStatsUpdateCommand
+        default: true
+        version: 9.0
+        fcv_gated: true
+
+    featureFlagQueryStatsInsert:
+        description: "Feature flag to enable query stats for the insert command."
+        cpp_varname: gFeatureFlagQueryStatsInsert
+        default: true
+        version: 9.0
+        fcv_gated: true
+
+    featureFlagQueryStatsDelete:
+        description: "Feature flag to enable query stats for the delete command."
+        cpp_varname: gFeatureFlagQueryStatsDelete
+        default: true
+        version: 9.0
+        fcv_gated: true
+
+    featureFlagQueryStatsCBRMetrics:
+        description: "Feature flag to enable cost-based ranker metrics in query stats."
+        cpp_varname: gFeatureFlagQueryStatsCBRMetrics
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagQueryStatsMetricsSubsections:
+        description: "Feature flag to enable query stats metrics being reorganized into subsections, rather than a flat structure."
+        cpp_varname: gFeatureFlagQueryStatsMetricsSubsections
+        default: true
+        fcv_gated: false
+
+    featureFlagQueryStatsErrors:
+        description: >-
+            Feature flag to enable collecting query stats for commands that error.
+        cpp_varname: gFeatureFlagQueryStatsErrors
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagExtractFieldPathsSbeStage:
+        description: "Feature flag to enable extract_field_paths SBE stage."
+        cpp_varname: gFeatureFlagExtractFieldPathsSbeStage
+        fcv_gated: false
+        default: true
+        incremental_rollout_phase: release
+
+    featureFlagPathArrayness:
+        description: "Feature flag to enable tracking of path arrayness."
+        cpp_varname: gFeatureFlagPathArrayness
+        fcv_gated: false
+        default: true
+
+    featureFlagUnifiedWriteExecutor:
+        description: "Feature flag to use the unified write executor."
+        cpp_varname: "gFeatureFlagUnifiedWriteExecutor"
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagOriginalQueryShapeHash:
+        description: "Feature flag to to pass 'originalQueryShapeHash' field in commands from router to shards."
+        cpp_varname: gFeatureFlagOriginalQueryShapeHash
+        default: true
+        version: 8.3
+        fcv_gated: true
+
+    featureFlagAllowUserFacingQuerySettings:
+        description: "Allow users to pass querySettings directly in commands as runtime hints without persistence."
+        cpp_varname: gFeatureFlagAllowUserFacingQuerySettings
+        default: true
+        fcv_gated: false
+
+    featureFlagEnableTestingAggregateRewriteRules:
+        description: "Feature flag to enable testing of specific aggregation re-write rules."
+        cpp_varname: gFeatureFlagEnableTestingAggregateRewriteRules
+        default: false
+        fcv_gated: false
+
+    featureFlagVectorSearchExtension:
+        description: "Feature flag to enable vector search extension functionality."
+        cpp_varname: gFeatureFlagVectorSearchExtension
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+        serialize_on_outgoing_requests: true
+        version: 8.3
+
+    featureFlagSearchExtension:
+        description: "Feature flag to enable search and searchMeta extension functionality."
+        cpp_varname: gFeatureFlagSearchExtension
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+        serialize_on_outgoing_requests: true
+        version: 9.0
+
+    featureFlagMergeStageInsertWithUpdateBackup:
+        description: "Feature flag to enable $merge stage strategy that tries to insert documents and falls back to update in case of errors"
+        cpp_varname: gFeatureFlagMergeStageInsertWithUpdateBackup
+        default: true
+        fcv_gated: false
+
+    featureFlagQueryStatsForInternalClients:
+        description: "Feature flag to enable collecting query stats for queries from internal clients."
+        cpp_varname: gFeatureFlagQueryStatsForInternalClients
+        default: true
+        fcv_gated: false
+
+    featureFlagSbeNonLeadingMatch:
+        description: "Feature flag to enable non-leading $match in SBE."
+        cpp_varname: gFeatureFlagSbeNonLeadingMatch
+        fcv_gated: false
+        default: true
+        incremental_rollout_phase: release
+
+    featureFlag2dsphereIndexVersion4:
+        description: "Feature flag to enable v4 of 2dsphereIndexVersion."
+        cpp_varname: gFeatureFlag2dsphereIndexVersion4
+        default: true
+        fcv_gated: true
+        version: 8.3
+
+    featureFlagCostBasedRanker:
+        description: "Feature flag to enable the cost-based ranker for query plans."
+        cpp_varname: gFeatureFlagCostBasedRanker
+        default: true
+        version: 8.3
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagSbeEqLookupUnwindHashJoin:
+        description: "Enables executing $lookup-$unwind in SBE using the hash join strategy."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindHashJoin
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeEqLookupUnwindIndexedLoopJoin:
+        description: "Enables executing $lookup-$unwind in SBE using the indexed loop join strategy."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindIndexedLoopJoin
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeEqLookupUnwindNestedLoopJoin:
+        description: "Enables executing $lookup-$unwind in SBE using the nested loop join strategy."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindNestedLoopJoin
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeEqLookupUnwindDynamicIndexedLoopJoin:
+        description: "Enables executing $lookup-$unwind in SBE using the dynamic indexed loop join strategy."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindDynamicIndexedLoopJoin
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeEqLookupUnwindLocalCollscan:
+        description: "Enables executing $lookup-$unwind in SBE with a collection scan local-side access plan."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindLocalCollscan
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeEqLookupUnwindLocalIxscanFetch:
+        description: "Enables executing $lookup-$unwind in SBE with an index scan + fetch local-side access plan."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindLocalIxscanFetch
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeEqLookupUnwindLocalComplexDataAccessPlans:
+        description: "Enables executing $lookup-$unwind in SBE with complex local-side access plans (sort, OR, and sorted merge variants)."
+        cpp_varname: gFeatureFlagSbeEqLookupUnwindLocalComplexDataAccessPlans
+        default: false
+        fcv_gated: false
+        incremental_rollout_phase: in_development
+
+    featureFlagGetExecutorDeferredEngineChoice:
+        description: "Feature flag to enable engine selection based on query plan, rather than query text."
+        cpp_varname: gFeatureFlagGetExecutorDeferredEngineChoice
+        fcv_gated: false
+        default: true
+        incremental_rollout_phase: release
+
+    featureFlagImprovedDepsAnalysis:
+        description: "Feature flag to enable pipeline rewrites that require a dependency graph"
+        cpp_varname: gFeatureFlagImprovedDepsAnalysis
+        fcv_gated: false
+        default: true
+        incremental_rollout_phase: release
+
+    featureFlagQueryTypeInference:
+        description: "Feature flag to enable query type inference"
+        cpp_varname: gFeatureFlagQueryTypeInference
+        fcv_gated: false
+        default: false
+        incremental_rollout_phase: in_development
+
+    featureFlagSbeTransformStages:
+        description: "Feature flag to enable transform stages in SBE, including $addFields, $replaceRoot, $replaceWith, $project."
+        cpp_varname: gFeatureFlagSbeTransformStages
+        fcv_gated: false
+        default: true
+        incremental_rollout_phase: release
+
+    featureFlagSbeUnwind:
+        description: "Feature flag to enable pushing down $unwind stages to SBE."
+        cpp_varname: gFeatureFlagSbeUnwind
+        fcv_gated: false
+        default: false
+        incremental_rollout_phase: in_development
+
+    featureFlagLookupWithPipelinesInSbe:
+        description: "Feature flag to enable SBE to execute eligible $lookup stages containing subpipelines."
+        cpp_varname: gFeatureFlagLookupWithPipelinesInSbe
+        fcv_gated: false
+        default: false
+        incremental_rollout_phase: in_development
+
+    featureFlagExtensionsInsideHybridSearch:
+        description: "Feature flag to enable extension stages inside of hybrid search."
+        cpp_varname: gFeatureFlagExtensionsInsideHybridSearch
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+        serialize_on_outgoing_requests: true
+        version: 9.0
+
+    featureFlagExtensionsOptimizations:
+        description: "Feature flag to enable new extension stage optimizations."
+        cpp_varname: gFeatureFlagExtensionsOptimizations
+        default: true
+        fcv_gated: false
+
+    featureFlagPersistentStats:
+        description: "Feature flag to enable persistent statistics for cost estimation."
+        cpp_varname: gFeatureFlagPersistentStats
+        default: false
+        fcv_gated: true
+
+    featureFlagFixedBucketingOptimizations:
+        description: "Enable query optimizations relying on the fixed bucketing property of time-series collections."
+        cpp_varname: gFixedBucketingOptimizations
+        default: true
+        fcv_gated: false
+
+    featureFlagChangeStreamOptimizedUpdateLookup:
+        description:
+            "Feature flag to enable optimized change stream updateLookup and pre-image lookups via
+            specialized local execution (Express/SBE) with an aggregation-pipeline fallback."
+        cpp_varname: gFeatureFlagChangeStreamOptimizedUpdateLookup
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagSearchOptimizedIdLookup:
+        description:
+            "Feature flag to enable the Express fast path for $search / $vectorSearch
+            $_internalSearchIdLookup local _id point lookups, falling back to the existing
+            local-read aggregation path when Express declines."
+        cpp_varname: gFeatureFlagSearchOptimizedIdLookup
+        default: true
+        fcv_gated: false
+        incremental_rollout_phase: release
+
+    featureFlagIncludeMetricsObjectOption:
+        description: "Use includeMetrics.queryStats field instead of deprecated includeQueryStatsMetrics when forwarding to shards."
+        cpp_varname: gFeatureFlagIncludeMetricsObjectOption
+        default: true
+        version: 9.0
+        fcv_gated: true
+
+    featureFlagClusteredCollScanMultiRange:
+        description:
+            "Feature flag to enable non-contiguous (multi-range) clustered collection scans.
+            When enabled, the planner produces multiple disjoint RecordId ranges from $in and
+            disjoint $or predicates on the cluster key, allowing the scan to seek between
+            ranges rather than scanning the entire min-max span."
+        cpp_varname: gFeatureFlagClusteredCollScanMultiRange
+        fcv_gated: false
+        incremental_rollout_phase: release

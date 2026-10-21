@@ -1,0 +1,73 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/repl/container_oplog_entry_serialization.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+types:
+    containerKey:
+        bson_serialization_type: any
+        description:
+            "A container key that is either a NumberLong, BinData(Generic), or an array of BinData.
+            This is a non-owning view; the source BSONObj must outlive it."
+        cpp_type: "mongo::repl::ContainerKey"
+        serializer: "mongo::repl::ContainerKey::serialize"
+        deserializer: "mongo::repl::ContainerKey::parse"
+        is_view: true
+
+    containerVal:
+        bson_serialization_type: any
+        description:
+            "A non-owning view of a container value (BinData, or an array of BinData). The source
+            BSONObj must outlive it."
+        cpp_type: "mongo::repl::ContainerVal"
+        serializer: "mongo::repl::ContainerVal::serialize"
+        deserializer: "mongo::repl::ContainerVal::parse"
+        is_view: true
+
+structs:
+    ContainerInsertOplogEntryO:
+        description: "The 'o' field of a container insert (ci) oplog entry."
+        strict: false
+        fields:
+            k:
+                cpp_name: key
+                type: containerKey
+                description: "The container key (NumberLong, BinData, or an array of BinData)"
+            v:
+                cpp_name: value
+                type: containerVal
+                description: "The value to insert (BinData, or an array of BinData)"
+                optional: true
+
+    ContainerUpdateOplogEntryO:
+        description: "The 'o' field of a container update (cu) oplog entry."
+        strict: false
+        fields:
+            k:
+                cpp_name: key
+                type: containerKey
+                description: "The container key (NumberLong or BinData)"
+            v:
+                cpp_name: value
+                type: containerVal
+                description: "The new value"
+            "$v":
+                cpp_name: version
+                type: safeInt64
+                description: "The update oplog entry version"
+
+    ContainerDeleteOplogEntryO:
+        description: "The 'o' field of a container delete (cd) oplog entry."
+        strict: false
+        fields:
+            k:
+                cpp_name: key
+                type: containerKey
+                description: "The container key (NumberLong, BinData, or an array of BinData)"

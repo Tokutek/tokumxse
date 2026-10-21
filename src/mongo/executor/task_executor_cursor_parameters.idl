@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo"
+
+server_parameters:
+    pinTaskExecCursorConns:
+        description: >-
+            TaskExecutorCursor will `pin` the transport connection it uses to establish
+            cursors and re-use that same connection for all subsequent operations on those cursors.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: "gPinTaskExecCursorConns"
+        default: true
+        redact: false

@@ -1,0 +1,298 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/shard_role/shard_catalog/db_raii.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/direct_connection_util.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_uuid_mismatch.h"
+#include "mongo/db/shard_role/shard_catalog/database_sharding_state.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <tuple>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+namespace mongo {
+namespace {
+
+/**
+ * Performs some checks to determine whether the operation is compatible with a lock-free read.
+ * Multi-doc transactions are not supported, nor are operations holding an exclusive lock.
+ */
+bool supportsLockFreeRead(OperationContext* opCtx) {
+    // Lock-free reads are not supported in multi-document transactions.
+    // Lock-free reads are not supported when performing a write.
+    // Lock-free reads are not supported if a storage txn is already open w/o the lock-free reads
+    // operation flag set.
+    return !opCtx->inMultiDocumentTransaction() &&
+        !shard_role_details::getLocker(opCtx)->isWriteLocked() &&
+        !(shard_role_details::getRecoveryUnit(opCtx)->isActive() && !opCtx->isLockFreeReadsOp());
+}
+
+bool isAnySecondaryNamespaceAView(OperationContext* opCtx,
+                                  const CollectionCatalog* catalog,
+                                  const std::vector<NamespaceString>& secondaryNamespaces) {
+    return std::any_of(secondaryNamespaces.begin(), secondaryNamespaces.end(), [&](auto&& nss) {
+        auto collection = catalog->lookupCollectionByNamespace(opCtx, nss);
+        return !collection && catalog->lookupView(opCtx, nss).get();
+    });
+}
+
+bool haveAcquiredConsistentCatalogAndSnapshot(
+    OperationContext* opCtx,
+    const CollectionCatalog* catalogBeforeSnapshot,
+    const CollectionCatalog* catalogAfterSnapshot,
+    long long replTermBeforeSnapshot,
+    long long replTermAfterSnapshot,
+    boost::optional<rss::consensus::IntentRegistry::ActiveStateTransition>
+        activeStateTransitionBeforeSnapshot,
+    boost::optional<rss::consensus::IntentRegistry::ActiveStateTransition>
+        activeStateTransitionAfterSnapshot) {
+    // The catalog and replication term are equal before and after opening the snapshot.
+    bool catalogEqual = catalogBeforeSnapshot == catalogAfterSnapshot;
+    bool replTermEqual = replTermBeforeSnapshot == replTermAfterSnapshot;
+
+    // There was no active state transition while opening the snapshot.
+    bool noStateTransition =
+        !activeStateTransitionBeforeSnapshot && !activeStateTransitionAfterSnapshot;
+
+    // If there is an active transition, if our opCtx is the interruption's opCtx, we permit the
+    // read so the transition can complete.
+    bool isStateTransitionThread = activeStateTransitionBeforeSnapshot
+        ? (opCtx == activeStateTransitionBeforeSnapshot->opCtx)
+        : false;
+
+    // If this operation should not be killed during an interruption (it's allowed to see an
+    // inconsistent state), permit the read (ex: FTDC thread).
+    bool canKillOperationInStepdown = opCtx->getClient()->canKillOperationInStepdown();
+
+    // The active transition is a step up that takes the global lock in MODE_X, a read holding
+    // MODE_IS blocks the step up, so we must succeed so step up can proceed. This is safe because
+    // step up acquires the global lock in MODE_X, so the snapshot is guaranteed to be consistent
+    // until the read finishes.
+    //
+    // TODO(SERVER-122542): Remove once step up no longer takes the global lock in MODE_X.
+    bool isStepUpOrderedByGlobalLock = activeStateTransitionBeforeSnapshot &&
+        activeStateTransitionBeforeSnapshot == activeStateTransitionAfterSnapshot &&
+        activeStateTransitionBeforeSnapshot->type ==
+            rss::consensus::IntentRegistry::InterruptionType::StepUp &&
+        activeStateTransitionBeforeSnapshot->orderedByGlobalLock;
+
+    return catalogEqual && replTermEqual &&
+        (noStateTransition || isStateTransitionThread || !canKillOperationInStepdown ||
+         isStepUpOrderedByGlobalLock);
+}
+
+}  // namespace
+
+AutoStatsTracker::AutoStatsTracker(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    Top::LockType lockType,
+    LogMode logMode,
+    int dbProfilingLevel,
+    Date_t deadline,
+    boost::optional<std::vector<NamespaceStringOrUUID>::const_iterator> secondaryNssVectorBegin,
+    boost::optional<std::vector<NamespaceStringOrUUID>::const_iterator> secondaryNssVectorEnd)
+    : _opCtx(opCtx), _lockType(lockType), _logMode(logMode) {
+    // Deduplicate all namespaces for Top reporting on destruct.
+    _nssSet.insert(nss);
+
+    if (secondaryNssVectorBegin && secondaryNssVectorEnd) {
+        auto catalog = CollectionCatalog::get(opCtx);
+        for (auto iter = *secondaryNssVectorBegin; iter != *secondaryNssVectorEnd; ++iter) {
+            const auto& secondaryNssOrUUID = *iter;
+            _nssSet.insert(catalog->resolveNamespaceStringOrUUID(opCtx, secondaryNssOrUUID));
+        }
+    }
+
+    if (_logMode == LogMode::kUpdateTop) {
+        return;
+    }
+
+    std::lock_guard<Client> clientLock(*_opCtx->getClient());
+    CurOp::get(_opCtx)->enter(clientLock, nss, dbProfilingLevel);
+}
+
+AutoStatsTracker::~AutoStatsTracker() {
+    if (_logMode == LogMode::kUpdateCurOp) {
+        return;
+    }
+
+    // Update stats for each namespace.
+    auto curOp = CurOp::get(_opCtx);
+    Top::getDecoration(_opCtx).record(
+        _opCtx,
+        std::span<const NamespaceString>{_nssSet.begin(), _nssSet.end()},
+        curOp->getLogicalOp(),
+        _lockType,
+        curOp->elapsedTimeExcludingPauses(),
+        curOp->isCommand(),
+        curOp->getReadWriteType());
+}
+
+namespace {
+
+/**
+ * Helper function to acquire a consistent catalog and storage snapshot without holding the RSTL or
+ * collection locks.
+ *
+ * Should only be used to setup lock-free reads in a global/db context. Not safe to use for reading
+ * on collections.
+ *
+ * Pass in boost::none as dbName to setup for a global context
+ */
+void acquireConsistentCatalogAndSnapshotUnsafe(OperationContext* opCtx,
+                                               boost::optional<const DatabaseName&> dbName) {
+
+    while (true) {
+        // AutoGetCollectionForReadBase can choose a read source based on the current replication
+        // state. Therefore we must fetch the repl state beforehand, to compare with afterwards.
+        const long long replTermBeforeSnapshot =
+            repl::ReplicationCoordinator::get(opCtx)->getTerm();
+
+        boost::optional<rss::consensus::IntentRegistry::ActiveStateTransition>
+            activeStateTransitionBeforeSnapshot = boost::none;
+        if (gFeatureFlagIntentRegistration.isEnabled()) {
+            activeStateTransitionBeforeSnapshot =
+                rss::consensus::IntentRegistry::get(opCtx->getServiceContext())
+                    .activeStateTransitionInfo();
+        }
+        auto catalog = CollectionCatalog::get(opCtx);
+
+        // Check that the sharding database version matches our read.
+        if (dbName) {
+            // Check that the sharding database version matches our read.
+            DatabaseShardingState::acquire(opCtx, *dbName)->checkDbVersionOrThrow(opCtx);
+        }
+
+        // We must open a storage snapshot consistent with the fetched in-memory Catalog instance.
+        // The Catalog instance and replication state after opening a snapshot will be compared with
+        // the previously acquired state. If either does not match, then this loop will retry lock
+        // acquisition and read source selection until there is a match.
+        shard_role_details::getRecoveryUnit(opCtx)->preallocateSnapshot();
+
+        // Verify that the catalog has not changed while we opened the storage snapshot. If the
+        // catalog is unchanged, then the requested Collection is also guaranteed to be the same.
+        auto newCatalog = CollectionCatalog::get(opCtx);
+
+        // Verify that that the replication state stayed the same while we opened the storage
+        // snapshot.
+        const auto replTermAfterSnapshot = repl::ReplicationCoordinator::get(opCtx)->getTerm();
+        boost::optional<rss::consensus::IntentRegistry::ActiveStateTransition>
+            activeStateTransitionAfterSnapshot = boost::none;
+        if (gFeatureFlagIntentRegistration.isEnabled()) {
+            activeStateTransitionAfterSnapshot =
+                rss::consensus::IntentRegistry::get(opCtx->getServiceContext())
+                    .activeStateTransitionInfo();
+        }
+
+        if (haveAcquiredConsistentCatalogAndSnapshot(opCtx,
+                                                     catalog.get(),
+                                                     newCatalog.get(),
+                                                     replTermBeforeSnapshot,
+                                                     replTermAfterSnapshot,
+                                                     activeStateTransitionBeforeSnapshot,
+                                                     activeStateTransitionAfterSnapshot)) {
+            CollectionCatalog::stash(opCtx, std::move(catalog));
+            return;
+        }
+
+        LOGV2_DEBUG(5067701,
+                    3,
+                    "Retrying acquiring state for lock-free read because collection, catalog or "
+                    "replication state changed.");
+        shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+
+        // If the active state transition is draining an intent this opCtx holds, respond to the
+        // kill so the drain can complete. StepDown only drain Write intents, so they interrupt only
+        // if the opCtx has a Write intent declared; an unrelated kill must not cut short work that
+        // is legitimately allowed to continue.
+        if (gFeatureFlagIntentRegistration.isEnabled() &&
+            rss::consensus::IntentRegistry::get(opCtx->getServiceContext())
+                .isOpBlockedByActiveTransitionDrain(opCtx)) {
+            opCtx->checkForInterrupt();
+        }
+    }
+}
+
+std::shared_ptr<const ViewDefinition> lookupView(
+    OperationContext* opCtx,
+    const std::shared_ptr<const CollectionCatalog>& catalog,
+    const NamespaceString& nss,
+    auto_get_collection::ViewMode viewMode) {
+    auto view = catalog->lookupView(opCtx, nss);
+    uassert(ErrorCodes::CommandNotSupportedOnView,
+            str::stream() << "Taking " << nss.toStringForErrorMsg()
+                          << " lock for timeseries is not allowed",
+            !view || viewMode == auto_get_collection::ViewMode::kViewsPermitted ||
+                !view->timeseries());
+    uassert(ErrorCodes::CommandNotSupportedOnView,
+            str::stream() << "Namespace " << nss.toStringForErrorMsg()
+                          << " is a view, not a collection",
+            !view || viewMode == auto_get_collection::ViewMode::kViewsPermitted);
+    return view;
+}
+
+}  // namespace
+
+AutoReadLockFree::AutoReadLockFree(OperationContext* opCtx, Date_t deadline)
+    : _lockFreeReadsBlock(opCtx),
+      _globalLock(opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, [] {
+          Lock::GlobalLockOptions options;
+          options.skipRSTLLock = true;
+          return options;
+      }()) {
+
+    acquireConsistentCatalogAndSnapshotUnsafe(opCtx, /*dbName*/ boost::none);
+}
+
+AutoGetDbForReadLockFree::AutoGetDbForReadLockFree(OperationContext* opCtx,
+                                                   const DatabaseName& dbName,
+                                                   Date_t deadline)
+    : _lockFreeReadsBlock(opCtx),
+      _globalLock(opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, [] {
+          Lock::GlobalLockOptions options;
+          options.skipRSTLLock = true;
+          return options;
+      }()) {
+
+    acquireConsistentCatalogAndSnapshotUnsafe(opCtx, dbName);
+
+    // Check if this operation is a direct connection and if it is authorized to be one after
+    // acquiring the snapshot.
+    direct_connection_util::checkDirectShardOperationAllowed(opCtx, NamespaceString(dbName));
+}
+
+AutoGetDbForReadMaybeLockFree::AutoGetDbForReadMaybeLockFree(OperationContext* opCtx,
+                                                             const DatabaseName& dbName,
+                                                             Date_t deadline) {
+    if (supportsLockFreeRead(opCtx)) {
+        _autoGetLockFree.emplace(opCtx, dbName, deadline);
+    } else {
+        _autoGet.emplace(opCtx, dbName, MODE_IS, deadline);
+    }
+}
+
+}  // namespace mongo

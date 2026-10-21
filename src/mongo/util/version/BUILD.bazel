@@ -1,0 +1,37 @@
+load("//bazel/config:render_template.bzl", "render_template")
+load("//bazel/uv:defs.bzl", "dependency")
+
+package(default_visibility = ["//visibility:public"])
+
+render_template(
+    name = "releases_header",
+    srcs = [
+        "releases.tpl.h",
+        "releases.yml",
+    ],
+    cmd = [
+        "-o",
+        "$(location releases.h)",
+        "$(location releases.tpl.h)",
+        "$(location releases.yml)",
+        "$(MONGO_VERSION)",
+    ],
+    output = "releases.h",
+    python_file = "//buildscripts:cheetah_source_generator.py",
+    python_libs = [
+        dependency(
+            "ct3",
+            group = "compile",
+        ),
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+        dependency(
+            "packaging",
+            group = "compile",
+        ),
+    ],
+)
+
+exports_files(["releases.yml"])

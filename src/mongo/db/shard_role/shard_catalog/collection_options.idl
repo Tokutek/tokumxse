@@ -1,0 +1,70 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/shard_role/shard_catalog/collection_options_validation.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/storage/storage_tier.idl"
+
+enums:
+    ValidationLevel:
+        description: "Determines how strictly MongoDB applies the validation rules to existing documents during an update."
+        type: string
+        values:
+            "off": "off"
+            strict: strict
+            moderate: moderate
+            constraint: constraint
+
+    ValidationAction:
+        description: "Determines an action on invalid documents being written:
+            error - return an error to the client
+            warn - write a message to mongod logs
+            errorAndLog - perform both actions"
+        type: string
+        values:
+            error: error
+            warn: warn
+            errorAndLog: errorAndLog
+
+structs:
+    IndexOptionDefaults:
+        description: "The default configuration for indexes per storage engine."
+        strict: true
+        fields:
+            storageEngine:
+                description: "The index options for the specified storage engines."
+                type: object_owned
+                optional: true
+                stability: stable
+                validator:
+                    callback: collection_options_validation::validateStorageEngineOptions
+
+    DefaultIndexesTier:
+        description: "When using a disaggregated storage engine, default 'hotness' level for indexes belonging to a collection"
+        strict: true
+        fields:
+            defaultTier:
+                description: "Default storage tier for indexes"
+                type: StorageTierLevel
+                stability: unstable
+
+    CollectionStorageTier:
+        description: "Configuration for hot/cold collections when using a disaggregated storage engine"
+        strict: true
+        fields:
+            collection:
+                description: "Specifies the collection storage tier"
+                type: StorageTierLevel
+                stability: unstable
+                default: "hot"
+            indexes:
+                description: "Specifies the indexes storage tier"
+                type: DefaultIndexesTier
+                optional: true
+                stability: unstable

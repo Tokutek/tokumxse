@@ -1,204 +1,408 @@
-// sorted_data_interface_test_cursor.cpp
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
-#include <boost/scoped_ptr.hpp>
-
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/sorted_data_interface_test_assert.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/unittest/unittest.h"
 
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
 namespace mongo {
+namespace {
 
-    using boost::scoped_ptr;
+// Verify that a forward cursor is positioned at EOF when the index is empty.
+TEST_F(SortedDataInterfaceTest, CursorIsEOFWhenEmpty) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-    // Call getDirection() on a forward cursor and verify the result equals +1.
-    TEST( SortedDataInterface, GetCursorDirection ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-            ASSERT_EQUALS( 1, cursor->getDirection() );
-        }
+    const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+    ASSERT(!cursor->seek(
+        recoveryUnit(),
+        makeKeyStringForSeek(sorted.get(), BSONObj(), true, true).finishAndGetBuffer()));
+    // Cursor at EOF should remain at EOF when advanced
+    ASSERT(!cursor->next(recoveryUnit()));
+}
+
+// Verify that a reverse cursor is positioned at EOF when the index is empty.
+TEST_F(SortedDataInterfaceTest, CursorIsEOFWhenEmptyReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), false));
+
+    ASSERT(!cursor->seek(
+        recoveryUnit(),
+        makeKeyStringForSeek(sorted.get(), kMaxBSONKey, false, true).finishAndGetBuffer()));
+
+    // Cursor at EOF should remain at EOF when advanced
+    ASSERT(!cursor->next(recoveryUnit()));
+}
+
+// Call advance() on a forward cursor until it is exhausted.
+// When a cursor positioned at EOF is advanced, it stays at EOF.
+TEST_F(SortedDataInterfaceTest, ExhaustCursor) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        BSONObj key = BSON("" << i);
+        RecordId loc(42, i * 2);
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key, loc), true));
+        txn.commit();
     }
 
-    // Call getDirection() on a reverse cursor and verify the result equals -1.
-    TEST( SortedDataInterface, GetCursorDirectionReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-            ASSERT_EQUALS( -1, cursor->getDirection() );
-        }
+    const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+    for (int i = 0; i < nToInsert; i++) {
+        auto entry = cursor->next(recoveryUnit());
+        ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
+    }
+    ASSERT(!cursor->next(recoveryUnit()));
+
+    // Cursor at EOF should remain at EOF when advanced
+    ASSERT(!cursor->next(recoveryUnit()));
+}
+
+TEST_F(SortedDataInterfaceTest, ExhaustKeyStringCursor) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    std::vector<key_string::Value> keyStrings;
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        BSONObj key = BSON("" << i);
+        RecordId loc(42, i * 2);
+        key_string::Value ks = makeKeyString(sorted.get(), key, loc);
+        keyStrings.push_back(ks);
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(), recoveryUnit(), ks, true));
+        txn.commit();
     }
 
-    // Verify that a forward cursor is positioned at EOF when the index is empty.
-    TEST( SortedDataInterface, CursorIsEOFWhenEmpty ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+        for (int i = 0; i < nToInsert; i++) {
+            auto entry = cursor->nextKeyString(recoveryUnit());
+            ASSERT(entry);
+            ASSERT_EQ(entry->keyString, keyStrings.at(i));
         }
+        ASSERT(!cursor->nextKeyString(recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-
-            ASSERT( !cursor->locate( minKey, RecordId::min() ) );
-            ASSERT( cursor->isEOF() );
-
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->nextKeyString(recoveryUnit()));
     }
 
-    // Verify that a reverse cursor is positioned at EOF when the index is empty.
-    TEST( SortedDataInterface, CursorIsEOFWhenEmptyReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+        for (int i = 0; i < nToInsert; i++) {
+            auto entry = cursor->nextKeyValueView(recoveryUnit());
+            ASSERT(!entry.isEmpty());
+            ASSERT_EQ(entry.getValueCopy(), keyStrings.at(i));
         }
+        ASSERT(cursor->nextKeyValueView(recoveryUnit()).isEmpty());
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(cursor->nextKeyValueView(recoveryUnit()).isEmpty());
+    }
+}
 
-            ASSERT( !cursor->locate( maxKey, RecordId::max() ) );
-            ASSERT( cursor->isEOF() );
+// Call advance() on a reverse cursor until it is exhausted.
+// When a cursor positioned at EOF is advanced, it stays at EOF.
+TEST_F(SortedDataInterfaceTest, ExhaustCursorReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        BSONObj key = BSON("" << i);
+        RecordId loc(42, i * 2);
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(), recoveryUnit(), makeKeyString(sorted.get(), key, loc), true));
+        txn.commit();
     }
 
-    // Call advance() on a forward cursor until it is exhausted.
-    // When a cursor positioned at EOF is advanced, it stays at EOF.
-    TEST( SortedDataInterface, ExhaustCursor ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), false));
+        for (int i = nToInsert - 1; i >= 0; i--) {
+            auto entry = cursor->next(recoveryUnit());
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42, i * 2)));
         }
+        ASSERT(!cursor->next(recoveryUnit()));
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->next(recoveryUnit()));
+    }
+}
+
+TEST_F(SortedDataInterfaceTest, ExhaustKeyStringCursorReversed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    std::vector<key_string::Value> keyStrings;
+    int nToInsert = 10;
+    for (int i = 0; i < nToInsert; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        BSONObj key = BSON("" << i);
+        RecordId loc(42, i * 2);
+        key_string::Value ks = makeKeyString(sorted.get(), key, loc);
+        keyStrings.push_back(ks);
+        ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(), recoveryUnit(), ks, true));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(nToInsert, sorted->numEntries(opCtx(), recoveryUnit()));
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), false));
+        for (int i = nToInsert - 1; i >= 0; i--) {
+            auto entry = cursor->nextKeyString(recoveryUnit());
+            ASSERT(entry);
+            ASSERT_EQ(entry->keyString, keyStrings.at(i));
+        }
+        ASSERT(!cursor->nextKeyString(recoveryUnit()));
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(!cursor->nextKeyString(recoveryUnit()));
+    }
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), false));
+        for (int i = nToInsert - 1; i >= 0; i--) {
+            auto entry = cursor->nextKeyValueView(recoveryUnit());
+            ASSERT(!entry.isEmpty());
+            ASSERT_EQ(entry.getValueCopy(), keyStrings.at(i));
+        }
+        ASSERT(cursor->nextKeyValueView(recoveryUnit()).isEmpty());
+
+        // Cursor at EOF should remain at EOF when advanced
+        ASSERT(cursor->nextKeyValueView(recoveryUnit()).isEmpty());
+    }
+}
+
+
+TEST_F(SortedDataInterfaceTest, CursorIterate1) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    int N = 5;
+    for (int i = 0; i < N; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(),
+                           recoveryUnit(),
+                           makeKeyString(sorted.get(), BSON("" << i), RecordId(5, i * 2)),
+                           true));
+        txn.commit();
+    }
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+        int n = 0;
+        for (auto entry = cursor->next(recoveryUnit()); entry;
+             entry = cursor->next(recoveryUnit())) {
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << n), RecordId(5, n * 2)));
+            n++;
+        }
+        ASSERT_EQUALS(N, n);
+    }
+}
+
+TEST_F(SortedDataInterfaceTest, CursorIterate1WithSaveRestore) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    int N = 5;
+    for (int i = 0; i < N; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(),
+                           recoveryUnit(),
+                           makeKeyString(sorted.get(), BSON("" << i), RecordId(5, i * 2)),
+                           true));
+        txn.commit();
+    }
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+        int n = 0;
+        for (auto entry = cursor->next(recoveryUnit()); entry;
+             entry = cursor->next(recoveryUnit())) {
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << n), RecordId(5, n * 2)));
+            n++;
+            cursor->save();
+            cursor->restore(recoveryUnit());
+        }
+        ASSERT_EQUALS(N, n);
+    }
+}
+
+
+TEST_F(SortedDataInterfaceTest, CursorIterateAllDupKeysWithSaveRestore) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    int N = 5;
+    for (int i = 0; i < N; i++) {
+        StorageWriteTransaction txn(recoveryUnit());
+        ASSERT_SDI_INSERT_OK(
+            sorted->insert(opCtx(),
+                           recoveryUnit(),
+                           makeKeyString(sorted.get(), BSON("" << 5), RecordId(5, i * 2)),
+                           true));
+        txn.commit();
+    }
+
+    {
+        const auto cursor(sorted->newCursor(opCtx(), recoveryUnit()));
+        int n = 0;
+        for (auto entry = cursor->next(recoveryUnit()); entry;
+             entry = cursor->next(recoveryUnit())) {
+            ASSERT_EQ(entry, IndexKeyEntry(BSON("" << 5), RecordId(5, n * 2)));
+            n++;
+            cursor->save();
+            cursor->restore(recoveryUnit());
+        }
+        ASSERT_EQUALS(N, n);
+    }
+}
+
+class SortedDataInterfaceTestBoundaryTest : public SortedDataInterfaceTest {
+public:
+    enum class IndexType { kId, kUnique, kNonUnique };
+    void testBoundaries(IndexType type, bool forward, bool inclusive) {
+        std::unique_ptr<SortedDataInterface> sorted;
+        if (IndexType::kId == type) {
+            sorted = harnessHelper()->newIdIndexSortedDataInterface(opCtx());
+        } else {
+            sorted = harnessHelper()->newSortedDataInterface(opCtx(),
+                                                             IndexType::kUnique == type,
+                                                             /*partial=*/false);
+        }
+
+        ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
         int nToInsert = 10;
-        for ( int i = 0; i < nToInsert; i++ ) {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                BSONObj key = BSON( "" << i );
-                RecordId loc( 42, i * 2 );
-                ASSERT_OK( sorted->insert( opCtx.get(), key, loc, true ) );
-                uow.commit();
-            }
+        for (int i = 0; i < nToInsert; i++) {
+            StorageWriteTransaction txn(recoveryUnit());
+            BSONObj key = BSON("" << i);
+            RecordId loc(42 + i * 2);
+            ASSERT_SDI_INSERT_OK(sorted->insert(opCtx(),
+                                                recoveryUnit(),
+                                                makeKeyString(sorted.get(), key, loc),
+                                                false /* dupsAllowed*/));
+            txn.commit();
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( nToInsert, sorted->numEntries( opCtx.get() ) );
-        }
+            const auto cursor(sorted->newCursor(opCtx(), recoveryUnit(), forward));
+            int startVal = 2;
+            int endVal = 6;
+            if (!forward)
+                std::swap(startVal, endVal);
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), 1 ) );
-            ASSERT( !cursor->locate( minKey, RecordId::min() ) );
-            for ( int i = 0; i < nToInsert; i++ ) {
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( BSON( "" << i ), cursor->getKey() );
-                ASSERT_EQUALS( RecordId( 42, i * 2 ), cursor->getRecordId() );
-                cursor->advance();
+            auto startKey = BSON("" << startVal);
+            auto endKey = BSON("" << endVal);
+            cursor->setEndPosition(endKey, inclusive);
+
+            auto entry =
+                cursor->seek(recoveryUnit(),
+                             makeKeyStringForSeek(sorted.get(), startKey, forward, inclusive)
+                                 .finishAndGetBuffer());
+
+            // Check that the cursor returns the expected values in range.
+            int step = forward ? 1 : -1;
+            for (int i = startVal + (inclusive ? 0 : step); i != endVal + (inclusive ? step : 0);
+                 i += step) {
+                ASSERT_EQ(entry, IndexKeyEntry(BSON("" << i), RecordId(42 + i * 2)));
+                entry = cursor->next(recoveryUnit());
             }
-            ASSERT( cursor->isEOF() );
+            ASSERT(!entry);
 
             // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
+            ASSERT(!cursor->next(recoveryUnit()));
         }
     }
+};
 
-    // Call advance() on a reverse cursor until it is exhausted.
-    // When a cursor positioned at EOF is advanced, it stays at EOF.
-    TEST( SortedDataInterface, ExhaustCursorReversed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+TEST_F(SortedDataInterfaceTestBoundaryTest, UniqueForwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kUnique, /*forward*/ true, /*inclusive*/ false);
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+TEST_F(SortedDataInterfaceTestBoundaryTest, NonUniqueForwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kNonUnique, /*forward*/ true, /*inclusive*/ false);
+}
 
-        int nToInsert = 10;
-        for ( int i = 0; i < nToInsert; i++ ) {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                BSONObj key = BSON( "" << i );
-                RecordId loc( 42, i * 2 );
-                ASSERT_OK( sorted->insert( opCtx.get(), key, loc, true ) );
-                uow.commit();
-            }
-        }
+TEST_F(SortedDataInterfaceTestBoundaryTest, IdForwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ true, /*inclusive*/ false);
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( nToInsert, sorted->numEntries( opCtx.get() ) );
-        }
+TEST_F(SortedDataInterfaceTestBoundaryTest, UniqueForwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kUnique, /*forward*/ true, /*inclusive*/ true);
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataInterface::Cursor> cursor( sorted->newCursor( opCtx.get(), -1 ) );
-            ASSERT( !cursor->locate( maxKey, RecordId::max() ) );
-            for ( int i = nToInsert - 1; i >= 0; i-- ) {
-                ASSERT( !cursor->isEOF() );
-                ASSERT_EQUALS( BSON( "" << i ), cursor->getKey() );
-                ASSERT_EQUALS( RecordId( 42, i * 2 ), cursor->getRecordId() );
-                cursor->advance();
-            }
-            ASSERT( cursor->isEOF() );
+TEST_F(SortedDataInterfaceTestBoundaryTest, NonUniqueForwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kNonUnique, /*forward*/ true, /*inclusive*/ true);
+}
 
-            // Cursor at EOF should remain at EOF when advanced
-            cursor->advance();
-            ASSERT( cursor->isEOF() );
-        }
-    }
+TEST_F(SortedDataInterfaceTestBoundaryTest, IdForwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ true, /*inclusive*/ true);
+}
 
-} // namespace mongo
+TEST_F(SortedDataInterfaceTestBoundaryTest, UniqueBackwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kUnique, /*forward*/ false, /*inclusive*/ false);
+}
+
+TEST_F(SortedDataInterfaceTestBoundaryTest, NonUniqueBackwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kNonUnique, /*forward*/ false, /*inclusive*/ false);
+}
+
+TEST_F(SortedDataInterfaceTestBoundaryTest, IdBackwardWithNonInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ false, /*inclusive*/ false);
+}
+
+TEST_F(SortedDataInterfaceTestBoundaryTest, UniqueBackwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kUnique, /*forward*/ false, /*inclusive*/ true);
+}
+
+TEST_F(SortedDataInterfaceTestBoundaryTest, NonUniqueBackwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kNonUnique, /*forward*/ false, /*inclusive*/ true);
+}
+
+TEST_F(SortedDataInterfaceTestBoundaryTest, IdBackwardWithInclusiveBoundaries) {
+    testBoundaries(IndexType::kId, /*forward*/ false, /*inclusive*/ true);
+}
+
+}  // namespace
+}  // namespace mongo

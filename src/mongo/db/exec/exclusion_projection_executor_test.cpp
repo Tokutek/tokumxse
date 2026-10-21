@@ -1,0 +1,674 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/compiler/dependency_analysis/document_transformation_helpers.h"
+#include "mongo/db/query/compiler/logical_model/projection/projection_parser.h"
+#include "mongo/db/record_id.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo::projection_executor {
+namespace {
+using namespace std::literals::string_view_literals;
+using std::vector;
+
+auto createProjectionExecutor(const BSONObj& spec, const ProjectionPolicies& policies) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto projection = projection_ast::parseAndAnalyze(expCtx, spec, policies);
+    auto builderParams = BuilderParamsBitSet{kDefaultBuilderParams};
+    auto executor = buildProjectionExecutor(expCtx, &projection, policies, builderParams);
+    tassert(7241742,
+            "projection executor must be exclusion projections",
+            executor->getType() == TransformerInterface::TransformerType::kExclusionProjection);
+    return executor;
+}
+
+// Helper to simplify the creation of a ExclusionProjectionExecutor with default policies.
+auto makeExclusionProjectionWithDefaultPolicies(const BSONObj& spec) {
+    return createProjectionExecutor(spec, {});
+}
+
+// Helper to simplify the creation of a ExclusionProjectionExecutor which excludes _id by default.
+auto makeExclusionProjectionWithDefaultIdExclusion(const BSONObj& spec) {
+    ProjectionPolicies defaultExcludeId{ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+                                        ProjectionPolicies::kArrayRecursionPolicyDefault,
+                                        ProjectionPolicies::kComputedFieldsPolicyDefault};
+    return createProjectionExecutor(spec, defaultExcludeId);
+}
+
+// Helper to simplify the creation of a ExclusionProjectionExecutor which does not recurse arrays.
+auto makeExclusionProjectionWithNoArrayRecursion(const BSONObj& spec) {
+    ProjectionPolicies noArrayRecursion{
+        ProjectionPolicies::kDefaultIdPolicyDefault,
+        ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays,
+        ProjectionPolicies::kComputedFieldsPolicyDefault};
+    return createProjectionExecutor(spec, noArrayRecursion);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldSerializeToEquivalentProjection) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(
+        fromjson("{a: 0, b: {c: NumberLong(0), d: 0.0}, 'x.y': false, _id: NumberInt(0)}"));
+
+    // Converts numbers to bools, converts dotted paths to nested documents. Note order of excluded
+    // fields is subject to change.
+    auto serialization = exclusion->serializeTransformation();
+    ASSERT_EQ(serialization.computeSize(), 4ULL);
+    ASSERT_VALUE_EQ(serialization["a"], Value(false));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(false));
+
+    ASSERT_EQ(serialization["b"].getType(), BSONType::object);
+    ASSERT_EQ(serialization["b"].getDocument().computeSize(), 2ULL);
+    ASSERT_VALUE_EQ(serialization["b"].getDocument()["c"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"].getDocument()["d"], Value(false));
+
+    ASSERT_EQ(serialization["x"].getType(), BSONType::object);
+    ASSERT_EQ(serialization["x"].getDocument().computeSize(), 1ULL);
+    ASSERT_VALUE_EQ(serialization["x"].getDocument()["y"], Value(false));
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldSerializeWithTopLevelID) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a" << 0 << "b" << 0));
+    auto serialization = exclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"], Value(false));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(true));
+
+    exclusion = makeExclusionProjectionWithDefaultPolicies(
+        BSON("a" << 0 << "b" << BSON("c" << 0 << "d" << 0)));
+    serialization = exclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"]["c"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"]["d"], Value(false));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"]["_id"], Value());
+
+    exclusion = makeExclusionProjectionWithDefaultIdExclusion(BSON("a" << false << "b" << false));
+    serialization = exclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"], Value(false));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(false));
+
+    exclusion = makeExclusionProjectionWithDefaultIdExclusion(
+        BSON("a" << false << "b" << false << "_id" << false));
+    serialization = exclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"], Value(false));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(false));
+
+    exclusion = makeExclusionProjectionWithDefaultIdExclusion(
+        BSON("a" << false << "b" << false << "_id" << true));
+    serialization = exclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(false));
+    ASSERT_VALUE_EQ(serialization["b"], Value(false));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(true));
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldNotAddAnyDependencies) {
+    // An exclusion projection will cause the stage to return DepsTracker::State::SEE_NEXT, meaning
+    // it doesn't strictly require any fields.
+    //
+    // For example, if our projection was {a: 0}, and a later stage requires the field "a", then "a"
+    // will be added to the dependencies correctly. If a later stage doesn't need "a", then we don't
+    // need to include the "a" in the dependencies of this projection, since it will just be ignored
+    // later. If there are no later stages, then we will finish the dependency computation
+    // cycle without full knowledge of which fields are needed, and thus include all the fields.
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(
+        BSON("_id" << false << "a" << false << "b.c" << false << "x.y.z" << false));
+
+    DepsTracker deps;
+    exclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 0UL);
+    ASSERT_FALSE(deps.needWholeDocument);
+    ASSERT_FALSE(deps.getNeedsMetadata(DocumentMetadataFields::kTextScore));
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldReportExcludedFieldsAsModified) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(
+        BSON("_id" << false << "a" << false << "b.c" << false));
+
+    auto modifiedPaths = exclusion->getModifiedPaths();
+    ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet);
+    ASSERT_EQ(modifiedPaths.paths.count("_id"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.count("a"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.count("b.c"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.size(), 3UL);
+}
+
+TEST(ExclusionProjectionExecutionTest,
+     ShouldReportExcludedFieldsAsModifiedWhenSpecifiedAsNestedObj) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(
+        BSON("a" << BSON("b" << false << "c" << BSON("d" << false))));
+
+    auto modifiedPaths = exclusion->getModifiedPaths();
+    ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet);
+    ASSERT_EQ(modifiedPaths.paths.count("a.b"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.count("a.c.d"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.size(), 2UL);
+}
+
+//
+// Tests of execution of exclusions at the top level.
+//
+
+TEST(ExclusionProjectionExecutionTest, ShouldExcludeTopLevelField) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a" << false));
+
+    // More than one field in document.
+    auto result = exclusion->applyTransformation(Document{{"a", 1}, {"b", 2}}, {});
+    auto expectedResult = Document{{"b", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is the only field in the document.
+    result = exclusion->applyTransformation(Document{{"a", 1}}, {});
+    expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is not present in the document.
+    result = exclusion->applyTransformation(Document{{"c", 1}}, {});
+    expectedResult = Document{{"c", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // There are no fields in the document.
+    result = exclusion->applyTransformation(Document{}, {});
+    expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldCoerceNumericsToBools) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON(
+        "a" << Value(0) << "b" << Value(0LL) << "c" << Value(0.0) << "d" << Value(Decimal128(0))));
+
+    auto result =
+        exclusion->applyTransformation(Document{{"_id", "ID"sv}, {"a", 1}, {"b", 2}, {"c", 3}}, {});
+    auto expectedResult = Document{{"_id", "ID"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldPreserveOrderOfExistingFields) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("second" << false));
+    auto result =
+        exclusion->applyTransformation(Document{{"first", 0}, {"second", 1}, {"third", 2}}, {});
+    auto expectedResult = Document{{"first", 0}, {"third", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldImplicitlyIncludeId) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a" << false));
+    auto result = exclusion->applyTransformation(Document{{"a", 1}, {"b", 2}, {"_id", "ID"sv}}, {});
+    auto expectedResult = Document{{"b", 2}, {"_id", "ID"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExcludeIdIfExplicitlyExcluded) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(BSON("a" << false << "_id" << false));
+    auto result = exclusion->applyTransformation(Document{{"a", 1}, {"b", 2}, {"_id", "ID"sv}}, {});
+    auto expectedResult = Document{{"b", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExcludeIdAndKeepAllOtherFields) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("_id" << false));
+    auto result = exclusion->applyTransformation(Document{{"a", 1}, {"b", 2}, {"_id", "ID"sv}}, {});
+    auto expectedResult = Document{{"a", 1}, {"b", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+//
+// Tests of execution of nested exclusions.
+//
+
+TEST(ExclusionProjectionExecutionTest, ShouldExcludeSubFieldsOfId) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(
+        BSON("_id.x" << false << "_id" << BSON("y" << false)));
+    auto result = exclusion->applyTransformation(
+        Document{{"_id", Document{{"x", 1}, {"y", 2}, {"z", 3}}}, {"a", 1}}, {});
+    auto expectedResult = Document{{"_id", Document{{"z", 3}}}, {"a", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExcludeSimpleDottedFieldFromSubDoc) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a.b" << false));
+
+    // More than one field in sub document.
+    auto result = exclusion->applyTransformation(Document{{"a", Document{{"b", 1}, {"c", 2}}}}, {});
+    auto expectedResult = Document{{"a", Document{{"c", 2}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is the only field in the sub document.
+    result = exclusion->applyTransformation(Document{{"a", Document{{"b", 1}}}}, {});
+    expectedResult = Document{{"a", Document{}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is not present in the sub document.
+    result = exclusion->applyTransformation(Document{{"a", Document{{"c", 1}}}}, {});
+    expectedResult = Document{{"a", Document{{"c", 1}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // There are no fields in sub document.
+    result = exclusion->applyTransformation(Document{{"a", Document{}}}, {});
+    expectedResult = Document{{"a", Document{}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldNotCreateSubDocIfDottedExcludedFieldDoesNotExist) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("sub.target" << false));
+
+    // Should not add the path if it doesn't exist.
+    auto result = exclusion->applyTransformation(Document{}, {});
+    auto expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Should not replace non-documents with documents.
+    result = exclusion->applyTransformation(Document{{"sub", "notADocument"sv}}, {});
+    expectedResult = Document{{"sub", "notADocument"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldApplyDottedExclusionToEachElementInArray) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a.b" << false));
+
+    auto result = exclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}, {"b", 1}}}}}},
+                                                 {});
+    auto expectedResult = Document{{"a",
+                                    {1,
+                                     Document{},
+                                     Document{},
+                                     Document{{"c", 2}},
+                                     vector<Value>{},
+                                     {1, Document{{"c", 1}}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAllowMixedNestedAndDottedFields) {
+    // Exclude all of "a.b", "a.c", "a.d", and "a.e".
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(
+        BSON("a.b" << false << "a.c" << false << "a" << BSON("d" << false << "e" << false)));
+    auto result = exclusion->applyTransformation(
+        Document{{"a", Document{{"b", 1}, {"c", 2}, {"d", 3}, {"e", 4}, {"f", 5}}}}, {});
+    auto expectedResult = Document{{"a", Document{{"f", 5}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAlwaysKeepMetadataFromOriginalDoc) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a" << false));
+
+    MutableDocument inputDocBuilder(Document{{"_id", "ID"sv}, {"a", 1}});
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setTextScore(10.0);
+    Document inputDoc = inputDocBuilder.freeze();
+
+    auto result = exclusion->applyTransformation(inputDoc, {});
+
+    MutableDocument expectedDoc(Document{{"_id", "ID"sv}});
+    expectedDoc.copyMetaDataFrom(inputDoc);
+    ASSERT_DOCUMENT_EQ(result, expectedDoc.freeze());
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldEvaluateMetaExpressions) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0, c: {$meta: 'textScore'}, "
+                                                            "d: {$meta: 'randVal'}, "
+                                                            "e: {$meta: 'searchScore'}, "
+                                                            "f: {$meta: 'searchHighlights'}, "
+                                                            "g: {$meta: 'geoNearDistance'}, "
+                                                            "h: {$meta: 'geoNearPoint'}, "
+                                                            "i: {$meta: 'recordId'}, "
+                                                            "j: {$meta: 'indexKey'}, "
+                                                            "k: {$meta: 'sortKey'}, "
+                                                            "l: {$meta: 'searchScoreDetails'}, "
+                                                            "m: {$meta: 'vectorSearchScore'}, "
+                                                            "n: {$meta: 'score'}, "
+                                                            "o: {$meta: 'searchRootDocumentId'}}"));
+
+    MutableDocument inputDocBuilder(Document{{"a", 1}, {"b", 2}});
+    inputDocBuilder.metadata().setTextScore(0.0);
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setSearchScore(2.0);
+    inputDocBuilder.metadata().setSearchHighlights(Value{"foo"sv});
+    inputDocBuilder.metadata().setGeoNearDistance(3.0);
+    inputDocBuilder.metadata().setGeoNearPoint(Value{BSON_ARRAY(4 << 5)});
+    inputDocBuilder.metadata().setRecordId(RecordId{6});
+    inputDocBuilder.metadata().setIndexKey(BSON("foo" << 7));
+    inputDocBuilder.metadata().setSortKey(Value{Document{{"bar", 8}}}, true);
+    inputDocBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails" << "foo"));
+    inputDocBuilder.metadata().setVectorSearchScore(9.0);
+    inputDocBuilder.metadata().setScore(10.0);
+    inputDocBuilder.metadata().setSearchRootDocumentId(Value{10.0});
+    Document inputDoc = inputDocBuilder.freeze();
+
+    auto result = exclusion->applyTransformation(inputDoc, {});
+
+    ASSERT_DOCUMENT_EQ(result,
+                       Document{fromjson("{b: 2, c: 0.0, d: 1.0, e: 2.0, f: 'foo', g: 3.0, "
+                                         "h: [4, 5], i: 6, j: {foo: 7}, k: [{bar: 8}],"
+                                         "l: {scoreDetails: 'foo'}, m: 9.0, n: 10.0, o: 10.0}")});
+}
+
+TEST(ExclusionProjectionExecutionTest, MetaDependenciesFalseWhenNotIncluded) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0}"));
+
+    DepsTracker deps;
+    exclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 0UL);
+
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRecordId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kIndexKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchRootDocumentId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAddSingleMetaExpressionDependency) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0, b: {$meta: 'geoNearPoint'}}"));
+
+    DepsTracker deps;
+    exclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 0UL);
+
+    // Only geo near point should be included as a dependency.
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRecordId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kIndexKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchRootDocumentId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAddMetaExpressionsToDependencies) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0, c: {$meta: 'textScore'}, "
+                                                            "d: {$meta: 'randVal'}, "
+                                                            "e: {$meta: 'searchScore'}, "
+                                                            "f: {$meta: 'searchHighlights'}, "
+                                                            "g: {$meta: 'geoNearDistance'}, "
+                                                            "h: {$meta: 'geoNearPoint'}, "
+                                                            "i: {$meta: 'recordId'}, "
+                                                            "j: {$meta: 'indexKey'}, "
+                                                            "k: {$meta: 'sortKey'}, "
+                                                            "l: {$meta: 'searchScoreDetails'}, "
+                                                            "m: {$meta: 'vectorSearchScore'}, "
+                                                            "n: {$meta: 'score'}, "
+                                                            "o: {$meta: 'searchRootDocumentId'}}"));
+
+    DepsTracker deps;
+    exclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 0UL);
+
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kRecordId]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kIndexKey]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchRootDocumentId]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
+}
+
+//
+// _id exclusion policy.
+//
+
+TEST(ExclusionProjectionExecutionTest, ShouldIncludeIdByDefault) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a" << false));
+
+    auto result = exclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{{"_id", 2}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExcludeIdWithExplicitPolicy) {
+    auto exclusion = makeExclusionProjectionWithDefaultIdExclusion(BSON("a" << false));
+
+    auto result = exclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldOverrideIncludePolicyWithExplicitExcludeIdSpec) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(BSON("_id" << false << "a" << false));
+
+    auto result = exclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldOverrideExcludePolicyWithExplicitIncludeIdSpec) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultIdExclusion(BSON("_id" << true << "a" << false));
+
+    auto result = exclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}, {"b", 4}}, {});
+    auto expectedResult = Document{{"_id", 2}, {"b", 4}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAllowExclusionOfIdSubfieldWithDefaultIncludePolicy) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(BSON("_id.id1" << false << "a" << false));
+
+    auto result = exclusion->applyTransformation(
+        Document{{"_id", Document{{"id1", 1}, {"id2", 2}}}, {"a", 3}, {"b", 4}}, {});
+    auto expectedResult = Document{{"_id", Document{{"id2", 2}}}, {"b", 4}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAllowExclusionOfIdSubfieldWithDefaultExcludePolicy) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultIdExclusion(BSON("_id.id1" << false << "a" << false));
+
+    auto result = exclusion->applyTransformation(
+        Document{{"_id", Document{{"id1", 1}, {"id2", 2}}}, {"a", 3}, {"b", 4}}, {});
+    auto expectedResult = Document{{"_id", Document{{"id2", 2}}}, {"b", 4}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldAllowLimitedDollarPrefixedFields) {
+    auto exclusion = makeExclusionProjectionWithDefaultIdExclusion(
+        BSON("$id" << false << "$db" << false << "$ref" << false << "$sortKey" << false));
+
+    auto result = exclusion->applyTransformation(
+        Document{{"$id", 5}, {"$db", 3}, {"$ref", 4}, {"$sortKey", 5}, {"someField", 6}}, {});
+    auto expectedResult = Document{{"someField", 6}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+//
+// Nested array recursion.
+//
+
+TEST(ExclusionProjectionExecutionTest, ShouldRecurseNestedArraysByDefault) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(BSON("a.b" << false));
+
+    // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {a: [1, {c: 3}, [{c: 5}], {d: 6}]}
+    auto result = exclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{{"b", 2}, {"c", 3}},
+                                                            vector{Document{{"b", 4}, {"c", 5}}},
+                                                            Document{{"d", 6}}}}},
+                                                 {});
+
+    auto expectedResult =
+        Document{{"a", {1, Document{{"c", 3}}, vector{Document{{"c", 5}}}, Document{{"d", 6}}}}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldNotRecurseNestedArraysForNoRecursePolicy) {
+    auto exclusion = makeExclusionProjectionWithNoArrayRecursion(BSON("a.b" << false));
+
+    // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {a: [1, {c: 3}, [{b: 4, c: 5}], {d:
+    // 6}]}
+    auto result = exclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{{"b", 2}, {"c", 3}},
+                                                            vector{Document{{"b", 4}, {"c", 5}}},
+                                                            Document{{"d", 6}}}}},
+                                                 {});
+
+    auto expectedResult = Document{
+        {"a", {1, Document{{"c", 3}}, vector{Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldNotRetainNestedArraysIfNoRecursionNeeded) {
+    auto exclusion = makeExclusionProjectionWithNoArrayRecursion(BSON("a" << false));
+
+    // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {}
+    const auto inputDoc = Document{{"a",
+                                    {1,
+                                     Document{{"b", 2}, {"c", 3}},
+                                     vector{Document{{"b", 4}, {"c", 5}}},
+                                     Document{{"d", 6}}}}};
+
+    auto result = exclusion->applyTransformation(inputDoc, {});
+    const auto expectedResult = Document{};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+//
+// extractProjectOnFieldAndRename() tests.
+//
+TEST(ExclusionProjectionExecutionTest, ShouldExtractEntireProjectOnRootField) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0}"));
+
+    auto [extractedProj, allExtracted] = exclusion->extractProjectOnFieldAndRename("a", "b");
+
+    ASSERT_TRUE(allExtracted);
+    ASSERT_BSONOBJ_EQ(fromjson("{b: false}"), extractedProj);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExtractEntireProjectOnMultipleSubfields) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(fromjson("{'a.c': 0, 'a.d': 0}"));
+
+    auto [extractedProj, allExtracted] = exclusion->extractProjectOnFieldAndRename("a", "b");
+
+    ASSERT_TRUE(allExtracted);
+    const UnorderedFieldsBSONObjComparator kComparator;
+    ASSERT_EQ(kComparator.compare(fromjson("{b: {c: false, d: false}}"), extractedProj), 0);
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExtractPartOfProjectOnRootField) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0, c: 0}"));
+
+    auto [extractedProj, allExtracted] = exclusion->extractProjectOnFieldAndRename("a", "b");
+
+    ASSERT_FALSE(allExtracted);
+    ASSERT_BSONOBJ_EQ(fromjson("{b: false}"), extractedProj);
+    ASSERT_BSONOBJ_EQ(fromjson("{c: false, _id: true}"),
+                      exclusion->serializeTransformation().toBson());
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldExtractPartOfProjectOnSubfields) {
+    auto exclusion =
+        makeExclusionProjectionWithDefaultPolicies(fromjson("{'x.y': 0, 'x.z': 0, 'c.d': 0}"));
+
+    auto [extractedProj, allExtracted] = exclusion->extractProjectOnFieldAndRename("x", "w");
+
+    ASSERT_FALSE(allExtracted);
+    const UnorderedFieldsBSONObjComparator kComparator;
+    ASSERT_EQ(kComparator.compare(fromjson("{w: {y: false, z: false}}"), extractedProj), 0);
+    ASSERT_BSONOBJ_EQ(fromjson("{c: {d: false}, _id: true}"),
+                      exclusion->serializeTransformation().toBson());
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldCorrectlyLeaveRemainderWithExcludedId) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(fromjson("{a: 0, _id: 0}"));
+
+    auto [extractedProj, allExtracted] = exclusion->extractProjectOnFieldAndRename("a", "b");
+
+    ASSERT_FALSE(allExtracted);
+    ASSERT_BSONOBJ_EQ(fromjson("{b: false}"), extractedProj);
+    ASSERT_BSONOBJ_EQ(fromjson("{_id: false}"), exclusion->serializeTransformation().toBson());
+}
+
+TEST(ExclusionProjectionExecutionTest, ShouldNotExtractWhenFieldIsNotPresent) {
+    auto exclusion = makeExclusionProjectionWithDefaultPolicies(fromjson("{a: {b: 0}}"));
+
+    auto [extractedProj, allExtracted] = exclusion->extractProjectOnFieldAndRename("b", "c");
+
+    ASSERT_FALSE(allExtracted);
+    ASSERT_BSONOBJ_EQ(fromjson("{}"), extractedProj);
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {b: false}, _id: true}"),
+                      exclusion->serializeTransformation().toBson());
+}
+
+TEST(ExclusionProjectionExecutionTest, DescribeTransformation) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    for (auto includeId : {true, false}) {
+        auto exclusion =
+            makeExclusionProjectionWithDefaultPolicies(BSON("_id" << includeId << "a" << false));
+
+        auto converted = document_transformation::toGetModPathsReturn(*exclusion);
+        // Check that the describeTransformation provides at least the same information.
+        auto original = exclusion->getModifiedPaths();
+
+        EXPECT_EQ(original.type, converted.type);
+        EXPECT_EQ(original.paths, converted.paths);
+        EXPECT_EQ(original.renames, converted.renames);
+        EXPECT_EQ(original.complexRenames, converted.complexRenames);
+    }
+}
+
+}  // namespace
+}  // namespace mongo::projection_executor

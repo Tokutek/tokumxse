@@ -1,0 +1,165 @@
+#!/usr/bin/env python
+#
+# Public Domain 2014-present MongoDB, Inc.
+# Public Domain 2008-2014 WiredTiger, Inc.
+#
+# This is free and unencumbered software released into the public domain.
+#
+# Anyone is free to copy, modify, publish, use, compile, sell, or
+# distribute this software, either in source code form or as a compiled
+# binary, for any purpose, commercial or non-commercial, and by any
+# means.
+#
+# In jurisdictions that recognize copyright laws, the author or authors
+# of this software dedicate any and all copyright interest in the
+# software to the public domain. We make this dedication for the benefit
+# of the public at large and to the detriment of our heirs and
+# successors. We intend this dedication to be an overt act of
+# relinquishment in perpetuity of all present and future rights to this
+# software under copyright law.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+
+import wiredtiger, wttest
+from wtscenario import make_scenarios
+
+# Transactions and eviction: Test if using snapshot isolation for eviction threads helps with
+# cache stuck issue.
+class test_txn24(wttest.WiredTigerTestCase):
+    test_name = __qualname__
+    table_params_values = [
+        ('integer-row', dict(key_format='i', extraconfig='')),
+        ('column', dict(key_format='r', extraconfig='')),
+    ]
+    scenarios = make_scenarios(table_params_values)
+
+    # The default (non-zero) value of rollbacks_allowed will retry up to that number of rollbacks before failing.
+    # However, for this test it is better to generate an error immediately for any rollback, so we disallow them
+    # by setting rollbacks_allowed to 0 here.
+    rollbacks_allowed = 0
+
+    def conn_config(self):
+        return 'cache_size=100MB,eviction=(threads_min=4,threads_max=4),verbose=[transaction]'
+
+    def test_snapshot_isolation_and_eviction(self):
+        # Verbose transaction logging is enabled; suppress the "oldest id pinned" messages that
+        # may appear from background eviction threads during the long-running transaction below.
+        self.ignoreStdoutPattern(r"oldest id .* pinned in session")
+
+        # Create and populate a table.
+        uri = f"table:{self.test_name}"
+        table_params = 'key_format={},value_format={}'.format(self.key_format, 'S')
+
+        default_val = 'ABCD' * 60
+        new_val = 'YYYY' * 60
+        n_rows = 480000
+
+        # Populate
+        self.session.create(uri, table_params + self.extraconfig)
+        cursor = self.session.open_cursor(uri, None)
+        for i in range(1, n_rows + 1):
+            cursor[i] = default_val
+        cursor.close()
+
+        # Perform a checkpoint. There should be no dirty content in the cache after this.
+        self.session.checkpoint()
+
+        # Start a long-running transaction, make an update and keep it running.
+        cursor = self.session.open_cursor(uri, None)
+        self.session.begin_transaction()
+        cursor[1] = new_val
+
+        '''
+        At this point, the system has a long-running transaction.
+        Now, perform updates using different implicit transactions.
+        Regarding eviction, application threads won't be able to make progress since these
+        implicit transactions could only evict pages before the last long-running transaction.
+        This is effective for testing the performance of eviction threads to determine if they utilize their
+        capability to take snapshots and evict pages after the last long-running transaction.
+
+        At the end of this test, check if any bytes were written by eviction.
+        '''
+        bytes_evicted = self.get_stat(wiredtiger.stat.conn.capacity_bytes_evict)
+
+        session2 = self.setUpSessionOpen(self.conn)
+        cursor2 = session2.open_cursor(uri)
+        start_row = n_rows // 4
+        for i in range(0, n_rows // 4):
+            cursor2[start_row] = new_val
+            start_row += 1
+
+        session3 = self.setUpSessionOpen(self.conn)
+        cursor3 = session3.open_cursor(uri)
+        start_row = n_rows // 2
+        for i in range(0, n_rows // 4):
+            cursor3[start_row] = new_val
+            start_row += 1
+
+        session4 = self.setUpSessionOpen(self.conn)
+        cursor4 = session4.open_cursor(uri)
+        start_row = 2
+        for i in range(0, n_rows // 4):
+            cursor4[start_row] = new_val
+            start_row += 1
+
+        bytes_evicted_new = self.get_stat(wiredtiger.stat.conn.capacity_bytes_evict)
+
+        # Before committing the long running transaction check whether any bytes were written to disk s part of eviction.
+        self.assertGreater((bytes_evicted_new - bytes_evicted), 0)
+        self.session.commit_transaction()
+
+    def test_oldest_id_log(self):
+        # Create and populate a table.
+        uri = f"table:{self.test_name}"
+        table_params = 'key_format={},value_format=S'.format(self.key_format)
+
+        default_val = 'ABCD' * 60
+        new_val = 'YYYY' * 60
+        # Needs > 10,000 transactions from session3 to exceed the verbose-message threshold
+        # (current_id - oldest_id > 10 * WT_THOUSAND). Keep small enough to avoid cache pressure.
+        n_rows = 12000
+
+        # Populate
+        self.session.create(uri, table_params + self.extraconfig)
+        cursor = self.session.open_cursor(uri, None)
+        for i in range(1, n_rows + 1):
+            cursor[i] = default_val
+        cursor.close()
+
+        # Perform a checkpoint. There should be no dirty content in the cache after this.
+        self.session.checkpoint()
+
+        # Start a long-running transaction, make an update and keep it running.
+        cursor = self.session.open_cursor(uri, None)
+        self.session.begin_transaction()
+        cursor[1] = new_val
+
+        # Start another long-running transaction, make an update and keep it running.
+        session2 = self.setUpSessionOpen(self.conn)
+        cursor2 = session2.open_cursor(uri)
+        session2.begin_transaction()
+        cursor2[2] = new_val
+
+        session3 = self.setUpSessionOpen(self.conn)
+        cursor3 = session3.open_cursor(uri)
+        for i in range(3, n_rows):
+            session3.begin_transaction()
+            cursor3[i] = new_val
+            session3.commit_transaction()
+
+        # Committing the oldest transaction should cause a verbose message to appear when
+        # __wt_txn_update_oldest next runs, because the pinning session has changed.
+        self.session.commit_transaction()
+        session3.checkpoint()
+        self.captureout.checkAdditionalPattern(self, r"oldest id .* pinned in session")
+        # Background eviction threads may continue emitting these messages; ignore trailing
+        # occurrences so tearDown does not flag them as unexpected output.
+        self.ignoreStdoutPattern(r"oldest id .* pinned in session")
+        session2.commit_transaction()

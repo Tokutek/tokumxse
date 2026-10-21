@@ -1,0 +1,594 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/timeseries/upgrade_downgrade_viewless_timeseries.h"
+
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/version_context.h"
+#include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::timeseries {
+namespace {
+
+class UpgradeDowngradeViewlessTimeseriesTest : public CatalogTestFixture {
+protected:
+    void setUp() override {
+        CatalogTestFixture::setUp();
+    }
+
+    void createTimeseriesCollection(const NamespaceString& nss) {
+        CreateCommand cmd = CreateCommand(nss);
+        TimeseriesOptions tsOpts("timestamp");
+        cmd.getCreateCollectionRequest().setTimeseries(tsOpts);
+        ASSERT_OK(createCollection(operationContext(), cmd));
+    }
+
+    UUID createViewfulTimeseriesCollection(const NamespaceString& nss) {
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", false);
+        createTimeseriesCollection(nss);
+        auto collPtr =
+            CollectionCatalog::get(operationContext())
+                ->lookupCollectionByNamespace(operationContext(),
+                                              nss.isTimeseriesBucketsCollection()
+                                                  ? nss
+                                                  : nss.makeTimeseriesBucketsNamespace());
+        ASSERT(collPtr);
+        return collPtr->uuid();
+    }
+
+    UUID createViewlessTimeseriesCollection(const NamespaceString& nss) {
+        unittest::ServerParameterGuard featureFlagController(
+            "featureFlagCreateViewlessTimeseriesCollections", true);
+        createTimeseriesCollection(nss);
+        auto collPtr = CollectionCatalog::get(operationContext())
+                           ->lookupCollectionByNamespace(operationContext(), nss);
+        ASSERT(collPtr);
+        return collPtr->uuid();
+    }
+
+    void assertIsTimeseriesCollection(const NamespaceString& nss, const UUID& uuid) {
+        auto opCtx = operationContext();
+
+        auto coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+        ASSERT(coll && coll->isTimeseriesCollection() && coll->uuid() == uuid);
+    }
+
+    void assertIsViewfulTimeseries(const NamespaceString& nss, const UUID& uuid) {
+        auto opCtx = operationContext();
+
+        ASSERT(!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
+        auto view = CollectionCatalog::get(opCtx)->lookupView(opCtx, nss);
+        ASSERT(view && view->timeseries() &&
+               view->viewOn() == nss.makeTimeseriesBucketsNamespace());
+
+        assertIsTimeseriesCollection(nss.makeTimeseriesBucketsNamespace(), uuid);
+    }
+
+    void assertIsViewlessTimeseries(const NamespaceString& nss, const UUID& uuid) {
+        auto opCtx = operationContext();
+
+        assertIsTimeseriesCollection(nss, uuid);
+
+        ASSERT(!CollectionCatalog::get(opCtx)->lookupView(opCtx, nss));
+        ASSERT(!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+            opCtx, nss.makeTimeseriesBucketsNamespace()));
+    }
+
+    const NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("test", "foo");
+    const NamespaceString nss2 = NamespaceString::createNamespaceString_forTest("test", "bar");
+};
+
+/**
+ * Basic upgrade/downgrade.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeOne) {
+    auto uuid1 = createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+    assertIsViewlessTimeseries(nss1, uuid1);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeOne) {
+    auto uuid1 = createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeFromViewlessTimeseries(operationContext(), nss1);
+    assertIsViewfulTimeseries(nss1, uuid1);
+}
+
+/**
+ * Idempotency.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeOneWithExpectedUUID) {
+    auto uuid1 = createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1, uuid1 /* expectedUUID */);
+    assertIsViewlessTimeseries(nss1, uuid1);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeIdempotency) {
+    auto uuid1 = createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+    assertIsViewlessTimeseries(nss1, uuid1);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeOneWithExpectedUUID) {
+    auto uuid1 = createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeFromViewlessTimeseries(operationContext(), nss1, uuid1 /* expectedUUID */);
+    assertIsViewfulTimeseries(nss1, uuid1);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeIdempotency) {
+    auto uuid = createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeFromViewlessTimeseries(operationContext(), nss1);
+    assertIsViewfulTimeseries(nss1, uuid);
+}
+
+/**
+ * Check that the collection options resulting from an upgrade/downgrade are consistent with those
+ * of a brand new collection.
+ *
+ * This exercises the metadata changes, e.g. adding/removing the buckets validator.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradedOptionsConsistentWithNewViewless) {
+    createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+
+    createViewlessTimeseriesCollection(nss2);
+
+    auto catalog = CollectionCatalog::get(operationContext());
+    auto collPtr1 = catalog->lookupCollectionByNamespace(operationContext(), nss1);
+    auto collPtr2 = catalog->lookupCollectionByNamespace(operationContext(), nss2);
+
+    // Strip 'fixedBucketing' before comparing: upgraded collections and newly-created collections
+    // are expected to have different values; 'fixedBucketing' behavior is tested separately in
+    // DowngradeStripsFixedBucketing.
+    auto opts1 = collPtr1->getCollectionOptions();
+    auto opts2 = collPtr2->getCollectionOptions();
+    if (opts1.timeseries)
+        opts1.timeseries->setFixedBucketing(OptionalBool{});
+    if (opts2.timeseries)
+        opts2.timeseries->setFixedBucketing(OptionalBool{});
+    ASSERT_BSONOBJ_EQ(opts1.toBSON(false /* includeUUID */), opts2.toBSON(false /* includeUUID */));
+
+    ASSERT_BSONOBJ_EQ(collPtr1->getValidatorDoc(), collPtr2->getValidatorDoc());
+    ASSERT(!collPtr2->getValidatorDoc().isEmpty());
+    ASSERT(collPtr2->getCollectionOptions().validator.isEmpty());
+    ASSERT(!collPtr2->getCollectionOptions().validationAction.has_value());
+    ASSERT(!collPtr2->getCollectionOptions().validationLevel.has_value());
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradedOptionsConsistentWithNewViewful) {
+    createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeFromViewlessTimeseries(operationContext(), nss1);
+
+    createViewfulTimeseriesCollection(nss2);
+
+    auto catalog = CollectionCatalog::get(operationContext());
+    auto collPtr1 = catalog->lookupCollectionByNamespace(operationContext(),
+                                                         nss1.makeTimeseriesBucketsNamespace());
+    auto collPtr2 = catalog->lookupCollectionByNamespace(operationContext(),
+                                                         nss2.makeTimeseriesBucketsNamespace());
+
+    ASSERT_BSONOBJ_EQ(collPtr1->getCollectionOptions().toBSON(false /* includeUUID */),
+                      collPtr2->getCollectionOptions().toBSON(false /* includeUUID */));
+
+    ASSERT_BSONOBJ_EQ(collPtr1->getValidatorDoc(), collPtr2->getValidatorDoc());
+    ASSERT(!collPtr2->getValidatorDoc().isEmpty());
+    ASSERT(!collPtr2->getCollectionOptions().validator.isEmpty());
+    ASSERT(!collPtr2->getCollectionOptions().validationAction.has_value());
+    ASSERT(!collPtr2->getCollectionOptions().validationLevel.has_value());
+
+    auto viewPipeline1 = catalog->lookupView(operationContext(), nss1)->pipeline();
+    auto viewPipeline2 = catalog->lookupView(operationContext(), nss2)->pipeline();
+    ASSERT_EQ(viewPipeline1.size(), viewPipeline2.size());
+    for (size_t i = 0; i < viewPipeline1.size(); i++) {
+        ASSERT_BSONOBJ_EQ(viewPipeline1[i], viewPipeline2[i]);
+    }
+}
+
+/**
+ * Upgrade/downgrade all collections in the catalog.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeMany) {
+    auto uuid1 = createViewfulTimeseriesCollection(nss1);
+    auto uuid2 = createViewfulTimeseriesCollection(nss2);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeAllTimeseriesToViewless(operationContext());
+    assertIsViewlessTimeseries(nss1, uuid1);
+    assertIsViewlessTimeseries(nss2, uuid2);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeMany) {
+    auto uuid1 = createViewlessTimeseriesCollection(nss1);
+    auto uuid2 = createViewlessTimeseriesCollection(nss2);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeAllTimeseriesFromViewless(operationContext());
+    assertIsViewfulTimeseries(nss1, uuid1);
+    assertIsViewfulTimeseries(nss2, uuid2);
+}
+
+/**
+ * Handling of inconsistent collections on upgrade.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeWithoutView) {
+    auto uuid1 = createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+    assertIsViewlessTimeseries(nss1, uuid1);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeSkippedOnConflictingCollection) {
+    auto uuid1 = createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+    operationContext()->setEnforceConstraints(false);
+    ASSERT_OK(createCollection(operationContext(), CreateCommand(nss1)));
+    operationContext()->setEnforceConstraints(true);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+    assertIsTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace(), uuid1);
+    ASSERT(CollectionCatalog::get(operationContext())
+               ->lookupCollectionByNamespace(operationContext(), nss1));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeSkippedOnConflictingView) {
+    auto uuid1 = createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+
+    operationContext()->setEnforceConstraints(false);
+    CreateCommand createViewCmd(nss1);
+    createViewCmd.setViewOn(nss2.coll());
+    createViewCmd.setPipeline({{}});
+    ASSERT_OK(createCollection(operationContext(), createViewCmd));
+    operationContext()->setEnforceConstraints(true);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+    assertIsTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace(), uuid1);
+    ASSERT(CollectionCatalog::get(operationContext())->lookupView(operationContext(), nss1));
+}
+
+/*SkipViewCreation*/
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeWithSkipViewCreation) {
+    auto uuid = createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeFromViewlessTimeseries(
+        operationContext(), nss1, boost::none /* expectedUUID */, true /* skipViewCreation */);
+
+    auto opCtx = operationContext();
+    auto catalog = CollectionCatalog::get(opCtx);
+
+    auto bucketsColl =
+        catalog->lookupCollectionByNamespace(opCtx, nss1.makeTimeseriesBucketsNamespace());
+    ASSERT(bucketsColl);
+    ASSERT(bucketsColl->isTimeseriesCollection());
+    ASSERT(!bucketsColl->isNewTimeseriesWithoutView());
+    ASSERT_EQ(bucketsColl->uuid(), uuid);
+
+    ASSERT(!catalog->lookupView(opCtx, nss1));
+    ASSERT(!catalog->lookupCollectionByNamespace(opCtx, nss1));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeWithSkipViewCreationIdempotency) {
+    auto uuid = createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    downgradeFromViewlessTimeseries(
+        operationContext(), nss1, boost::none /* expectedUUID */, true /* skipViewCreation */);
+
+    downgradeFromViewlessTimeseries(
+        operationContext(), nss1, boost::none /* expectedUUID */, true /* skipViewCreation */);
+
+    auto opCtx = operationContext();
+    auto catalog = CollectionCatalog::get(opCtx);
+
+    assertIsTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace(), uuid);
+
+    ASSERT(!catalog->lookupView(opCtx, nss1));
+}
+
+/**
+ * Tests for canUpgradeToViewlessTimeseries validation function.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeReturnsOk) {
+    createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_OK(canUpgradeToViewlessTimeseries(operationContext(), nss1));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeReturnsOkWhenAlreadyConverted) {
+    createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_OK(canUpgradeToViewlessTimeseries(operationContext(), nss1));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeFailsWithoutFeatureFlag) {
+    createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canUpgradeToViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::IllegalOperation);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeFailsWhenBucketsNotFound) {
+    // Create a regular collection (not timeseries) at the main namespace
+    ASSERT_OK(createCollection(operationContext(), CreateCommand(nss1)));
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canUpgradeToViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::NamespaceNotFound);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeFailsOnConflictingCollection) {
+    // Conflicting collection at main namespace
+    createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+    operationContext()->setEnforceConstraints(false);
+    ASSERT_OK(createCollection(operationContext(), CreateCommand(nss1)));
+    operationContext()->setEnforceConstraints(true);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canUpgradeToViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::TimeseriesBucketMetadataInconsistent);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeFailsOnConflictingView) {
+    // Conflicting view at main namespace
+    createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+
+    operationContext()->setEnforceConstraints(false);
+    CreateCommand createViewCmd(nss1);
+    createViewCmd.setViewOn(nss2.coll());
+    createViewCmd.setPipeline({{}});
+    ASSERT_OK(createCollection(operationContext(), createViewCmd));
+    operationContext()->setEnforceConstraints(true);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canUpgradeToViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::TimeseriesBucketMetadataInconsistent);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanUpgradeSucceedsWithoutView) {
+    // Buckets collection without a view (buckets-only)
+    createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_OK(canUpgradeToViewlessTimeseries(operationContext(), nss1));
+}
+
+/**
+ * Tests for canDowngradeFromViewlessTimeseries validation function.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanDowngradeReturnsOk) {
+    createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_OK(canDowngradeFromViewlessTimeseries(operationContext(), nss1));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanDowngradeReturnsOkWhenAlreadyConverted) {
+    createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_OK(canDowngradeFromViewlessTimeseries(operationContext(), nss1));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest,
+       CanDowngradeReturnsOkWhenAlreadyConvertedWithoutView) {
+    // Simulate non-primary shard: buckets collection exists but no view.
+    // This happens after downgrade with skipViewCreation=true.
+    createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    // Must pass skipViewCreation=true to match the non-primary shard scenario
+    ASSERT_OK(
+        canDowngradeFromViewlessTimeseries(operationContext(), nss1, true /* skipViewCreation */));
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest,
+       CanDowngradeFailsWhenAlreadyConvertedButMissingView) {
+    // Buckets collection exists but no view - with skipViewCreation=false this should fail
+    createViewfulTimeseriesCollection(nss1.makeTimeseriesBucketsNamespace());
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    // Without skipViewCreation, we expect an error because the view is missing
+    ASSERT_EQ(canDowngradeFromViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::NamespaceNotFound);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanDowngradeFailsWithFeatureFlag) {
+    createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canDowngradeFromViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::IllegalOperation);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanDowngradeFailsWhenCollectionNotFound) {
+    // No collection at the namespace
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canDowngradeFromViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::NamespaceNotFound);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanDowngradeFailsWhenNotViewlessTimeseries) {
+    // Create a regular collection (not timeseries)
+    ASSERT_OK(createCollection(operationContext(), CreateCommand(nss1)));
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canDowngradeFromViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::IllegalOperation);
+}
+
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, CanDowngradeFailsWithConflictingBuckets) {
+    // Create viewless timeseries at main namespace
+    createViewlessTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+
+    {
+        // Create a conflicting viewless timeseries at the buckets namespace.
+        // This simulates an inconsistent state where both foo and system.buckets.foo have
+        // collections.
+        const auto& bucketsNss = nss1.makeTimeseriesBucketsNamespace();
+        AutoGetDb autoDb(operationContext(), bucketsNss.dbName(), MODE_IX);
+        Lock::CollectionLock collLock(operationContext(), bucketsNss, MODE_IX);
+        CreateCommand cmd = CreateCommand(bucketsNss);
+        cmd.getCreateCollectionRequest().setTimeseries(TimeseriesOptions("timestamp"));
+        ASSERT_OK(createCollectionForApplyOps(
+            operationContext(), bucketsNss.dbName(), boost::none /*UUID*/, cmd.toBSON(), false));
+    }
+
+    VersionContext::FixedOperationFCVRegion fixedOfcvRegion(operationContext());
+    ASSERT_EQ(canDowngradeFromViewlessTimeseries(operationContext(), nss1).code(),
+              ErrorCodes::NamespaceExists);
+}
+
+/**
+ * A viewless collection with fixedBucketing=true must have that field stripped after downgrade.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, DowngradeStripsFixedBucketing) {
+    unittest::ServerParameterGuard fixedBucketingFlag("featureFlagFixedBucketingCatalog", true);
+    auto uuid = createViewlessTimeseriesCollection(nss1);
+
+    auto* opCtx = operationContext();
+    // Check that the created collection has the `fixedBucketing` field set
+    // NOTE: The exact value doesn't matter; we only need the field present to confirm that the
+    // downgrade strip is exercised.
+    ASSERT(CollectionCatalog::get(opCtx)
+               ->lookupCollectionByNamespace(opCtx, nss1)
+               ->getTimeseriesOptions()
+               ->getFixedBucketing()
+               .has_value());
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", false);
+    downgradeFromViewlessTimeseries(opCtx, nss1);
+
+    // assertIsViewfulTimeseries also checks the buckets collection exists with timeseries options.
+    assertIsViewfulTimeseries(nss1, uuid);
+
+    const auto bucketsNss = nss1.makeTimeseriesBucketsNamespace();
+    auto bucketsColl =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, bucketsNss);
+    ASSERT_FALSE(bucketsColl->getTimeseriesOptions()->getFixedBucketing().has_value())
+        << "fixedBucketing must be stripped on downgrade";
+}
+
+/**
+ * A legacy (viewful) collection upgraded to viewless must have fixedBucketing set to false
+ * when featureFlagFixedBucketingCatalog is enabled.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeSetsFixedBucketingToFalse) {
+    unittest::ServerParameterGuard fixedBucketingFlag("featureFlagFixedBucketingCatalog", true);
+    auto uuid = createViewfulTimeseriesCollection(nss1);
+
+    auto* opCtx = operationContext();
+    // A legacy collection has no 'fixedBucketing' field.
+    const auto bucketsNssBefore = nss1.makeTimeseriesBucketsNamespace();
+    ASSERT_FALSE(CollectionCatalog::get(opCtx)
+                     ->lookupCollectionByNamespace(opCtx, bucketsNssBefore)
+                     ->getTimeseriesOptions()
+                     ->getFixedBucketing()
+                     .has_value())
+        << "fixedBucketing must be absent on a legacy collection before upgrade";
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(opCtx, nss1);
+
+    assertIsViewlessTimeseries(nss1, uuid);
+
+    auto coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss1);
+    const auto fixedBucketing = coll->getTimeseriesOptions()->getFixedBucketing();
+    ASSERT_TRUE(fixedBucketing.has_value()) << "fixedBucketing must be set after upgrade";
+    ASSERT_FALSE(fixedBucketing) << "fixedBucketing must be false after upgrade";
+}
+
+/**
+ * When featureFlagFixedBucketingCatalog is disabled, upgrade must leave fixedBucketing unset.
+ */
+TEST_F(UpgradeDowngradeViewlessTimeseriesTest, UpgradeDoesNotSetFixedBucketingWhenFlagOff) {
+    unittest::ServerParameterGuard fixedBucketingFlag("featureFlagFixedBucketingCatalog", false);
+    auto uuid = createViewfulTimeseriesCollection(nss1);
+
+    unittest::ServerParameterGuard featureFlagController(
+        "featureFlagCreateViewlessTimeseriesCollections", true);
+    upgradeToViewlessTimeseries(operationContext(), nss1);
+
+    assertIsViewlessTimeseries(nss1, uuid);
+
+    auto* opCtx = operationContext();
+    auto coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss1);
+    ASSERT_FALSE(coll->getTimeseriesOptions()->getFixedBucketing().has_value())
+        << "fixedBucketing must remain unset when featureFlagFixedBucketingCatalog is off";
+}
+
+}  // namespace
+}  // namespace mongo::timeseries

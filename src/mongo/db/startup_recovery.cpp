@@ -1,0 +1,1236 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/startup_recovery.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/change_stream_pre_image_util.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/index_builds/index_builds_common.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/index_builds/multi_index_block.h"
+#include "mongo/db/index_builds/primary_driven/enabled.h"
+#include "mongo/db/index_builds/primary_driven/registry.h"
+#include "mongo/db/index_builds/primary_driven/util.h"
+#include "mongo/db/index_builds/rebuild_indexes.h"
+#include "mongo/db/index_builds/resumable_index_builds_gen.h"
+#include "mongo/db/mongod_options_storage_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repair.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/repl_set_member_in_standalone_mode.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_enabled.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/lock_manager/d_concurrency.h"
+#include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_repair.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/create_collection.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_catalog/drop_collection.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/control/journal_flusher.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
+#include "mongo/db/validate/collection_validation.h"
+#include "mongo/db/validate/validate_results.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/producer_consumer_queue.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/synchronized_value.h"
+#include "mongo/util/version/releases.h"
+
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+namespace mongo {
+
+using namespace std::literals::string_view_literals;
+
+namespace {
+
+// Exit after repair has started, but before data is repaired.
+MONGO_FAIL_POINT_DEFINE(exitBeforeDataRepair);
+// Exit after repairing data, but before the replica set configuration is invalidated.
+MONGO_FAIL_POINT_DEFINE(exitBeforeRepairInvalidatesConfig);
+
+struct OfflineValidateResults {
+    bool allValidationComplete = true;
+    bool allResultsValid = true;
+};
+
+// Returns true if storage engine is writable.
+bool isWriteableStorageEngine() {
+    return storageGlobalParams.engine != "devnull";
+}
+
+// Attempt to restore the featureCompatibilityVersion document if it is missing.
+// The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+// this function into one single builder that records the time elapsed during startup. Its default
+// value is nullptr because we only want to time this function when it is called during startup.
+Status restoreMissingFeatureCompatibilityVersionDocument(
+    OperationContext* opCtx, BSONObjBuilder* startupTimeElapsedBuilder = nullptr) {
+    const NamespaceString fcvNss(NamespaceString::kServerConfigurationNamespace);
+
+    // If the admin database, which contains the server configuration collection with the
+    // featureCompatibilityVersion document, does not exist, create it.
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->getDb(opCtx, fcvNss.dbName());
+    if (!db) {
+        LOGV2(20998, "Re-creating admin database that was dropped.");
+    }
+    db = databaseHolder->openDb(opCtx, fcvNss.dbName());
+    invariant(db);
+
+    // If the server configuration collection, which contains the FCV document, does not exist, then
+    // create it.
+    auto catalog = CollectionCatalog::get(opCtx);
+    if (!catalog->lookupCollectionByNamespace(opCtx, fcvNss)) {
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+        LOGV2(4926905,
+              "Re-creating featureCompatibilityVersion document that was deleted. Creating new "
+              "document with last LTS version.",
+              "version"_attr = multiversion::toString(multiversion::GenericFCV::kLastLTS));
+        SectionScopedTimer scopedTimer(&opCtx->fastClockSource(),
+                                       TimedSectionId::createFCVDocument,
+                                       startupTimeElapsedBuilder);
+        uassertStatusOK(createCollection(opCtx, fcvNss.dbName(), BSON("create" << fcvNss.coll())));
+    }
+
+    const auto fcvColl = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(fcvNss,
+                                     PlacementConcern{boost::none, ShardVersion::UNTRACKED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    invariant(fcvColl.exists());
+
+    // Restore the featureCompatibilityVersion document if it is missing.
+    BSONObj featureCompatibilityVersion;
+    if (!Helpers::findOne(opCtx,
+                          fcvColl,
+                          BSON("_id" << multiversion::kParameterName),
+                          featureCompatibilityVersion)) {
+        SectionScopedTimer scopedTimer(&opCtx->fastClockSource(),
+                                       TimedSectionId::restoreFCVDocument,
+                                       startupTimeElapsedBuilder);
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+        LOGV2(21000,
+              "Re-creating featureCompatibilityVersion document that was deleted. Creating new "
+              "document with version ",
+              "version"_attr = multiversion::toString(multiversion::GenericFCV::kLastLTS));
+
+        FeatureCompatibilityVersionDocument fcvDoc;
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+        fcvDoc.setVersion(multiversion::GenericFCV::kLastLTS);
+
+        writeConflictRetry(opCtx, "insertFCVDocument", fcvNss, [&] {
+            WriteUnitOfWork wunit(opCtx);
+            uassertStatusOK(Helpers::insert(opCtx, fcvColl.getCollectionPtr(), fcvDoc.toBSON()));
+            wunit.commit();
+        });
+    }
+
+    invariant(Helpers::findOne(
+        opCtx, fcvColl, BSON("_id" << multiversion::kParameterName), featureCompatibilityVersion));
+
+    return Status::OK();
+}
+
+/**
+ * Returns true if the collection associated with the given CollectionCatalogEntry has an index on
+ * the _id field
+ */
+bool checkIdIndexExists(OperationContext* opCtx, const Collection* coll) {
+    auto indexNames = std::vector<std::string>();
+    coll->getAllIndexes(&indexNames);
+
+    for (const auto& name : indexNames) {
+        if (name == IndexConstants::kIdIndexName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Status buildMissingIdIndex(OperationContext* opCtx, const NamespaceString nss) {
+    MultiIndexBlock indexer;
+    // This method is called in startup recovery so we can safely build the id index in foreground
+    // mode. This prevents us from yielding a MODE_X lock (which is disallowed).
+    indexer.setIndexBuildMethod(IndexBuildMethodEnum::kForeground);
+    CollectionWriter collWriter(opCtx, nss);
+    LOGV2(4805002, "Building missing _id index", logAttrs(*collWriter));
+
+    ScopeGuard abortOnExit(
+        [&] { indexer.abortIndexBuild(opCtx, collWriter, MultiIndexBlock::kNoopOnCleanUpFn); });
+
+    const auto indexCatalog = collWriter->getIndexCatalog();
+    IndexBuildInfo idIndexBuildInfo(indexCatalog->getDefaultIdIndexSpec(collWriter.get()),
+                                    *opCtx->getServiceContext()->getStorageEngine(),
+                                    nss.dbName());
+    auto swSpecs = indexer.init(opCtx,
+                                collWriter,
+                                {std::move(idIndexBuildInfo)},
+                                MultiIndexBlock::kNoopOnInitFn,
+                                MultiIndexBlock::InitMode::SteadyState,
+                                /*resumeInfo=*/boost::none);
+    if (!swSpecs.isOK()) {
+        return swSpecs.getStatus();
+    }
+
+    auto status = indexer.insertAllDocumentsInCollection(opCtx, nss);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = indexer.checkConstraints(opCtx, collWriter.get());
+    if (!status.isOK()) {
+        return status;
+    }
+
+    WriteUnitOfWork wuow(opCtx);
+    status = indexer.commit(opCtx,
+                            collWriter.getWritableCollection(opCtx),
+                            MultiIndexBlock::kNoopOnCreateEachFn,
+                            MultiIndexBlock::kNoopOnCommitFn);
+    wuow.commit();
+    abortOnExit.dismiss();
+    return status;
+}
+
+auto downgradeError =
+    Status{ErrorCodes::MustDowngrade,
+           str::stream() << "UPGRADE PROBLEM: The data files need to be fully upgraded to version "
+                            "4.4 before attempting a binary upgrade; see "
+                         << feature_compatibility_version_documentation::upgradeLink()
+                         << " for more details."};
+
+/**
+ * Checks that all collections on a database have valid properties for this version of MongoDB.
+ *
+ * This validates that required collections have an _id index. If a collection is missing an _id
+ * index, this function will build it if EnsureIndexPolicy is kBuildMissing.
+ *
+ * kSkipMissingForInitialSync leaves the collection without an _id index. It is only used when
+ * the data is about to be discarded by a (repeated) initial sync, where building the index would
+ * be wasted work.
+ *
+ * Returns a MustDowngrade error if any index builds on the required _id field fail.
+ */
+enum class EnsureIndexPolicy { kBuildMissing, kError, kSkipMissingForInitialSync };
+Status ensureCollectionProperties(OperationContext* opCtx,
+                                  const DatabaseName& dbName,
+                                  EnsureIndexPolicy ensureIndexPolicy) {
+    auto catalog = CollectionCatalog::get(opCtx);
+    for (auto&& coll : catalog->range(dbName)) {
+        if (!coll) {
+            break;
+        }
+
+        // All user-created replicated collections created since MongoDB 4.0 have _id indexes.
+        auto requiresIndex = coll->requiresIdIndex() && coll->ns().isReplicated();
+        const auto& collOptions = coll->getCollectionOptions();
+        auto hasAutoIndexIdField = collOptions.autoIndexId == CollectionOptions::YES;
+
+        // Even if the autoIndexId field is not YES, the collection may still have an _id index
+        // that was created manually by the user. Check the list of indexes to confirm index
+        // does not exist before attempting to build it or returning an error.
+        if (requiresIndex && !hasAutoIndexIdField && !checkIdIndexExists(opCtx, coll)) {
+            LOGV2(21001, "Collection is missing an _id index", logAttrs(*coll));
+            if (EnsureIndexPolicy::kSkipMissingForInitialSync == ensureIndexPolicy) {
+                LOGV2(13350100,
+                      "Not building the missing _id index because this node is about to perform an "
+                      "initial sync, which will drop this collection",
+                      logAttrs(*coll));
+            } else if (EnsureIndexPolicy::kBuildMissing == ensureIndexPolicy) {
+                auto status = buildMissingIdIndex(opCtx, coll->ns());
+                if (!status.isOK()) {
+                    LOGV2_ERROR(21021,
+                                "Could not build an _id index on collection",
+                                logAttrs(*coll),
+                                "error"_attr = status);
+                    return downgradeError;
+                }
+            } else {
+                return downgradeError;
+            }
+        }
+
+        if (coll->getTimeseriesOptions() &&
+            timeseries::collectionMayRequireExtendedRangeSupport(opCtx, *coll)) {
+            coll->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+        }
+    }
+    return Status::OK();
+}
+
+/**
+ * Opens each database and provides a callback on each one.
+ */
+template <typename Func>
+void openDatabases(OperationContext* opCtx, Func&& onDatabase) {
+    invariant(shard_role_details::getLocker(opCtx)->isW());
+
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto dbNames = catalog::listDatabases();
+    for (const auto& dbName : dbNames) {
+        LOGV2_DEBUG(21010, 1, "    Opening database: {dbName}", "dbName"_attr = dbName);
+        auto db = databaseHolder->openDb(opCtx, dbName);
+        invariant(db);
+        onDatabase(db->name());
+    }
+}
+
+/**
+ * Returns 'true' if this server has a configuration document in local.system.replset.
+ */
+bool hasReplSetConfigDoc(OperationContext* opCtx) {
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+
+    // We open the "local" database before reading to ensure the in-memory catalog entries for the
+    // 'kSystemReplSetNamespace' collection have been populated if the collection exists. If the
+    // "local" database doesn't exist at this point yet, then it will be created.
+    const auto nss = NamespaceString::kSystemReplSetNamespace;
+
+    databaseHolder->openDb(opCtx, nss.dbName());
+    BSONObj config;
+    return Helpers::getSingleton(opCtx, nss, config);
+}
+
+/**
+ * Check that the oplog is capped, and abort the process if it is not.
+ * Caller must lock DB before calling this function.
+ */
+void assertCappedOplog(OperationContext* opCtx) {
+    const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(oplogNss.dbName(), MODE_IS));
+    const Collection* oplogCollection =
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogNss);
+    if (oplogCollection && !oplogCollection->isCapped()) {
+        LOGV2_FATAL_NOTRACE(40115,
+                            "The oplog collection is not capped; a capped oplog is a "
+                            "requirement for replication to function.",
+                            "oplogNamespace"_attr = oplogNss);
+    }
+}
+
+void clearTempFilesExceptForResumableBuilds(const std::vector<ResumeIndexInfo>& indexBuildsToResume,
+                                            const boost::filesystem::path& tempDir) {
+    StringSet resumableIndexFiles;
+    for (const auto& resumeInfo : indexBuildsToResume) {
+        const auto& indexes = resumeInfo.getIndexes();
+        for (const auto& index : indexes) {
+            boost::optional<std::string_view> indexFilename = index.getStorageIdentifier();
+            if (indexFilename) {
+                resumableIndexFiles.insert(std::string{*indexFilename});
+            }
+        }
+    }
+
+    size_t numFilesRemaining{0};
+    auto dirItr = boost::filesystem::directory_iterator(tempDir);
+    auto dirEnd = boost::filesystem::directory_iterator();
+    for (; dirItr != dirEnd; ++dirItr) {
+        auto curFilename = dirItr->path().filename().string();
+        // Skip deleting files specified by 'resumableIndexFiles' and any directories. Specifically,
+        // ensure that the StorageGlobalParams::getSpillDbPath() directory is not deleted.
+        if (!resumableIndexFiles.contains(curFilename) &&
+            !boost::filesystem::is_directory(dirItr->path())) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(dirItr->path(), ec);
+            if (ec) {
+                LOGV2(5676601,
+                      "Failed to clear temp directory file",
+                      "filename"_attr = curFilename,
+                      "error"_attr = ec.message());
+            }
+        } else {
+            ++numFilesRemaining;
+        }
+    }
+
+    if (numFilesRemaining == 0) {
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(tempDir, ec);
+        if (ec) {
+            LOGV2(5071101, "Failed to clear temp directory", "error"_attr = ec.message());
+        }
+    }
+}
+
+// Returns the timestamp at which pre-images should be truncated for recovery.
+Timestamp getPreImageTruncateTimestampForRecovery(OperationContext* opCtx) {
+    const auto currentTime = change_stream_pre_image_util::getCurrentTimeForPreImageRemoval(opCtx);
+    auto originalExpirationDate =
+        change_stream_pre_image_util::getPreImageOpTimeExpirationDate(opCtx, currentTime);
+    boost::optional<Date_t> operationTimeExpirationDate = boost::none;
+    if (originalExpirationDate) {
+        // Pre-image expiration is based on either 'operationTime', or '_id.ts'. However, after
+        // unclean shutdown, initial truncation must be based on RecordId (which only encodes
+        // '_id.ts') since truncate markers haven't been created yet. A pre-image's
+        // 'operationTime' is based off it's corresponding oplog entry's reserved 'opTime'.
+        // Because writes can commit out of order with respect to their reserved 'opTime' (e.g.
+        // oplog holes), the pre-images collection may not be strictly monotonically increasing
+        // with respect to 'operationTime'.
+        //
+        // To account for oplog holes, and a loss of precision converting Date_t to Timestamp,
+        // truncate up to a few seconds past the expiration date to guarantee only consistent
+        // data survives post crash.
+        operationTimeExpirationDate = *originalExpirationDate +
+            Seconds(startup_recovery::kChangeStreamPostUncleanShutdownExpiryExtensionSeconds);
+    }
+
+    auto operationTimeExpirationTSEstimate = operationTimeExpirationDate
+        ? Timestamp{Timestamp(operationTimeExpirationDate->toMillisSinceEpoch() / 1000,
+                              std::numeric_limits<unsigned>::max())}
+        : Timestamp();
+
+    // Pre-images expired when "_id.ts" < oldest oplog timestamp OR "_id.ts" <= the
+    // estimated timestamp for the 'operationTime' expiration date.
+    const auto oldestOplogTimestamp =
+        repl::StorageInterface::get(opCtx->getServiceContext())->getEarliestOplogTimestamp(opCtx);
+    const auto expirationTimestamp =
+        std::max(oldestOplogTimestamp, operationTimeExpirationTSEstimate);
+    LOGV2_DEBUG(7803703,
+                0,
+                "Computed timestamp to truncate pre-images at after unclean shutdown",
+                "truncateAtTimestamp"_attr = expirationTimestamp,
+                "oldestOplogEntryTimestamp"_attr = oldestOplogTimestamp);
+    return expirationTimestamp;
+}
+
+void cleanupPreImagesCollectionAfterUncleanShutdown(OperationContext* opCtx) {
+    // If pre-images truncation is replicated, replication recovery will replay the truncate
+    // operations after an unclean shutdown, so no additional local truncation is required here.
+    if (change_stream_pre_image_util::shouldUseReplicatedTruncatesForPreImages(opCtx)) {
+        return;
+    }
+
+    // It is possible to be in a situation in which the recovery runs but the FCV snapshot is not
+    // present. This can happen with the in-memory engine. In this case it is not safe to use the
+    // feature flag value from last LTS or last continuous FCV, because other servers in the replica
+    // set may already be running latest FCV. In this case, we do not want local truncations to
+    // happen either.
+    if (const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+        !fcvSnapshot.isVersionInitialized()) {
+        return;
+    }
+
+    writeConflictRetry(
+        opCtx,
+        "cleanupPreImagesCollectionAfterUncleanShutdown",
+        NamespaceString::kChangeStreamPreImagesNamespace,
+        [&] {
+            shard_role_details::getRecoveryUnit(opCtx)->allowAllUntimestampedWrites();
+            const auto preImagesColl =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest(
+                                      NamespaceString::kChangeStreamPreImagesNamespace,
+                                      PlacementConcern{boost::none, ShardVersion::UNTRACKED()},
+                                      repl::ReadConcernArgs::get(opCtx),
+                                      AcquisitionPrerequisites::kUnreplicatedWrite),
+                                  MODE_IX);
+
+            if (!preImagesColl.exists()) {
+                LOGV2_DEBUG(7803702,
+                            3,
+                            "Bypassing truncation of pre-images collection on startup recovery "
+                            "because it does not exist");
+                return;
+            }
+
+            const auto approximateExpirationTimestamp =
+                getPreImageTruncateTimestampForRecovery(opCtx);
+            change_stream_pre_image_util::truncatePreImagesByTimestampExpirationApproximation(
+                opCtx, preImagesColl, approximateExpirationTimestamp);
+        });
+}
+
+// The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+// this function into one single builder that records the time elapsed during startup. Its default
+// value is nullptr because we only want to time this function when it is called during startup.
+void reconcileCatalogAndRestartUnfinishedIndexBuilds(
+    OperationContext* opCtx,
+    StorageEngine* storageEngine,
+    StorageEngine::LastShutdownState lastShutdownState,
+    BSONObjBuilder* startupTimeElapsedBuilder = nullptr) {
+
+    StorageEngine::ReconcileResult reconcileResult;
+    {
+        SectionScopedTimer scopedTimer(&opCtx->fastClockSource(),
+                                       TimedSectionId::dropAbandonedIdents,
+                                       startupTimeElapsedBuilder);
+        reconcileResult =
+            fassert(40593,
+                    catalog_repair::reconcileCatalogAndIdents(opCtx,
+                                                              storageEngine,
+                                                              storageEngine->getStableTimestamp(),
+                                                              lastShutdownState,
+                                                              storageGlobalParams.repair));
+    }
+
+    auto tempDir = boost::filesystem::path(storageGlobalParams.dbpath).append("_tmp");
+    if (reconcileResult.indexBuildsToResume.empty() ||
+        lastShutdownState == StorageEngine::LastShutdownState::kUnclean) {
+        // If we did not find any index builds to resume or we are starting up after an unclean
+        // shutdown, nothing in the temp directory will be used. Thus, we can clear it
+        // completely.
+        LOGV2(5071100, "Clearing temp directory");
+
+        if (boost::filesystem::exists(tempDir)) {
+            clearTempFilesExceptForResumableBuilds({}, tempDir);
+        }
+    } else if (boost::filesystem::exists(tempDir)) {
+        // Clears the contents of the temp directory except for files for resumable builds.
+        LOGV2(5676600, "Clearing temp directory except for files for resumable builds");
+
+        clearTempFilesExceptForResumableBuilds(reconcileResult.indexBuildsToResume, tempDir);
+    }
+
+    if (auto* spillEngine = storageEngine->getSpillEngine()) {
+        auto ru = spillEngine->newRecoveryUnit();
+        auto idents = spillEngine->getAllIdents(*ru);
+        LOGV2(10682200, "Dropping spill idents", "numIdents"_attr = idents.size());
+        for (auto&& ident : idents) {
+            auto result = spillEngine->dropIdent(*ru, ident, false);
+            if (!result.isOK()) {
+                LOGV2(10682201,
+                      "Failed to drop spill table ident during startup recovery",
+                      "ident"_attr = ident,
+                      "error"_attr = result);
+            }
+        }
+    }
+
+    // Two-phase index builds depend on an eventually-replicated 'commitIndexBuild' oplog entry to
+    // complete. Therefore, when a replica set member is started in standalone mode, we cannot
+    // restart the index build because it will never complete.
+    if (getReplSetMemberInStandaloneMode(opCtx->getServiceContext())) {
+        LOGV2(
+            9871800,
+            "Any unfinished index builds will not be resumed nor restarted due to standalone mode",
+            "numIndexBuildsToRestart"_attr = reconcileResult.indexBuildsToRestart.size(),
+            "numIndexBuildsToResume"_attr = reconcileResult.indexBuildsToResume.size());
+        return;
+    }
+
+    if (index_builds::primary_driven::enabled(
+            opCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        for (auto&& [buildUUID, entry] : reconcileResult.indexBuildsToRestart) {
+            std::vector<IndexBuildInfo> builds;
+            builds.reserve(entry.indexSpecsAndIdents.size());
+            for (auto&& [spec, ident] : entry.indexSpecsAndIdents) {
+                builds.emplace_back(spec, ident, *opCtx->getServiceContext()->getStorageEngine());
+            }
+            index_builds::primary_driven::registry(opCtx->getServiceContext())
+                .add(buildUUID,
+                     entry.dbName,
+                     entry.collUUID,
+                     std::move(builds),
+                     ident::generateNewIndexBuildIdent(buildUUID));
+        }
+        return;
+    }
+
+    // Restart any unfinished index builds. This will not build any indexes to completion, but
+    // rather start the background thread to build the index, and wait for a replicated commit or
+    // abort oplog entry.
+    IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
+        opCtx, reconcileResult.indexBuildsToRestart, reconcileResult.indexBuildsToResume);
+}
+
+/**
+ * Sets the appropriate flag on the service context decorable 'replSetMemberInStandaloneMode' to
+ * 'true' if this is a replica set node running in standalone mode.
+ */
+void setReplSetMemberInStandaloneMode(OperationContext* opCtx, StorageEngine* engine) {
+    if (repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet()) {
+        return;
+    }
+
+    invariant(shard_role_details::getLocker(opCtx)->isW());
+    const Collection* collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, NamespaceString::kSystemReplSetNamespace);
+    if (collection && !collection->isEmpty(opCtx)) {
+        setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);
+        engine->setInStandaloneMode();
+    }
+}
+
+// Perform startup procedures for --repair mode.
+// The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+// this function into one single builder that records the time elapsed during startup. Its default
+// value is nullptr because we only want to time this function when it is called during startup.
+void startupRepair(OperationContext* opCtx,
+                   StorageEngine* storageEngine,
+                   BSONObjBuilder* startupTimeElapsedBuilder = nullptr) {
+    invariant(!storageGlobalParams.queryableBackupMode);
+    ServiceContext* svcCtx = opCtx->getServiceContext();
+
+    if (MONGO_unlikely(exitBeforeDataRepair.shouldFail())) {
+        LOGV2(21006, "Exiting because 'exitBeforeDataRepair' fail point was set.");
+        quickExit(ExitCode::abrupt);
+    }
+
+    auto invalidateReplConfigIfNeeded = [opCtx]() {
+        // If the config doesn't exist, don't invalidate anything. If this node were originally
+        // part of a replica set but lost its config due to a repair, it would automatically
+        // perform a resync. If this node is a standalone, this would lead to a confusing error
+        // message if it were added to a replica set later on.
+        auto storage = repl::StorageInterface::get(opCtx);
+        auto swConfig = storage->findSingleton(opCtx, NamespaceString::kSystemReplSetNamespace);
+        if (!swConfig.isOK()) {
+            return;
+        }
+        auto config = swConfig.getValue();
+        if (config.hasField(repl::ReplSetConfig::kRepairedFieldName)) {
+            return;
+        }
+        BSONObjBuilder configBuilder(config);
+        configBuilder.append(repl::ReplSetConfig::kRepairedFieldName, true);
+        fassert(7101800,
+                storage->putSingleton(opCtx,
+                                      NamespaceString::kSystemReplSetNamespace,
+                                      {configBuilder.obj(), Timestamp{}}));
+
+        JournalFlusher::get(opCtx)->waitForJournalFlush();
+    };
+
+    // Repair, restore, and initialize the featureCompatibilityVersion document before allowing
+    // repair to potentially rebuild indexes on the remaining collections. This ensures any
+    // FCV-dependent features are rebuilt properly. Note that we don't try to prevent
+    // repairDatabase from repairing this collection again, because it only consists of one
+    // document.
+    // If we fail to load the FCV document due to upgrade problems, we need to abort the repair in
+    // order to allow downgrading to older binary versions.
+    ScopeGuard abortRepairOnFCVErrors([&] {
+        StorageRepairObserver::get(opCtx->getServiceContext())
+            ->onRepairDone(opCtx, invalidateReplConfigIfNeeded);
+    });
+
+    auto catalog = CollectionCatalog::get(opCtx);
+    if (auto fcvColl = catalog->lookupCollectionByNamespace(
+            opCtx, NamespaceString::kServerConfigurationNamespace)) {
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+
+        SectionScopedTimer scopedTimer(svcCtx->getFastClockSource(),
+                                       TimedSectionId::repairServerConfigNamespace,
+                                       startupTimeElapsedBuilder);
+        databaseHolder->openDb(opCtx, fcvColl->ns().dbName());
+        fassertNoTrace(4805000,
+                       repair::repairCollection(
+                           opCtx, storageEngine, NamespaceString::kServerConfigurationNamespace));
+    }
+    uassertStatusOK(
+        restoreMissingFeatureCompatibilityVersionDocument(opCtx, startupTimeElapsedBuilder));
+
+    {
+        SectionScopedTimer scopedTimer(
+            svcCtx->getFastClockSource(), TimedSectionId::initializeFCV, startupTimeElapsedBuilder);
+        FeatureCompatibilityVersion::initializeForStartup(opCtx);
+        abortRepairOnFCVErrors.dismiss();
+    }
+
+    // The local database should be repaired before any other replicated collections so we know
+    // whether not to rebuild unfinished two-phase index builds if this is a replica set node
+    // running in standalone mode.
+    auto dbNames = catalog::listDatabases();
+    if (auto it = std::find(dbNames.begin(), dbNames.end(), DatabaseName::kLocal);
+        it != dbNames.end()) {
+        SectionScopedTimer scopedTimer(
+            svcCtx->getFastClockSource(), TimedSectionId::repairLocalDB, startupTimeElapsedBuilder);
+        fassertNoTrace(4805001, repair::repairDatabase(opCtx, storageEngine, *it));
+
+        // This must be set before rebuilding index builds on replicated collections.
+        setReplSetMemberInStandaloneMode(opCtx, storageEngine);
+        dbNames.erase(it);
+    }
+
+    {
+        // Repair the remaining databases.
+        SectionScopedTimer scopedTimer(svcCtx->getFastClockSource(),
+                                       TimedSectionId::repairRemainingDB,
+                                       startupTimeElapsedBuilder);
+        for (const auto& dbName : dbNames) {
+            fassertNoTrace(18506, repair::repairDatabase(opCtx, storageEngine, dbName));
+        }
+    }
+
+    openDatabases(opCtx, [&](auto dbName) {
+        // Ensures all collections meet requirements such as having _id indexes, and corrects them
+        // if needed.
+        uassertStatusOK(
+            ensureCollectionProperties(opCtx, dbName, EnsureIndexPolicy::kBuildMissing));
+    });
+
+    if (MONGO_unlikely(exitBeforeRepairInvalidatesConfig.shouldFail())) {
+        LOGV2(21008, "Exiting because 'exitBeforeRepairInvalidatesConfig' fail point was set.");
+        quickExit(ExitCode::abrupt);
+    }
+
+    auto repairObserver = StorageRepairObserver::get(opCtx->getServiceContext());
+    repairObserver->onRepairDone(opCtx, invalidateReplConfigIfNeeded);
+    if (repairObserver->getModifications().size() > 0) {
+        const auto& mods = repairObserver->getModifications();
+        for (const auto& mod : mods) {
+            LOGV2_WARNING(21019, "repairModification", "description"_attr = mod.getDescription());
+        }
+    }
+    if (repairObserver->isDataInvalidated()) {
+        if (hasReplSetConfigDoc(opCtx)) {
+            LOGV2_WARNING(21020,
+                          "WARNING: Repair may have modified replicated data. This node will no "
+                          "longer be able to join a replica set without a full re-sync");
+        }
+    }
+
+    // There were modifications, but only benign ones.
+    if (repairObserver->getModifications().size() > 0 && !repairObserver->isDataInvalidated()) {
+        LOGV2(21009,
+              "Repair has made modifications to unreplicated data. The data is healthy and "
+              "the node is eligible to be returned to the replica set.");
+    }
+}
+
+// Performs collection validation for a singular collection.
+// Returns if the collection is valid, or the validation didn't complete correctly.
+StatusWith<bool> offlineValidateCollection(OperationContext* opCtx,
+                                           NamespaceString nss,
+                                           bool skipAtClusterTime = false) {
+    const auto collectionValidateOptionsParam =
+        ServerParameterSet::getNodeParameterSet()->get<CollectionValidateOptionsServerParameter>(
+            "collectionValidateOptions");
+    const auto validateOptions = collectionValidateOptionsParam->_data.getOptions();
+
+    // Enabling parallel record store traversal disables sizeStats.
+    const bool slicingDisabled = !collection_validation::getTargetRecordsPerRecordStoreSlice() ||
+        *collection_validation::getTargetRecordsPerRecordStoreSlice() == 0;
+    const bool onlyOneSlice = collection_validation::getMaxRecordStoreSlices() == 1;
+    const bool enableSizeStats = slicingDisabled || onlyOneSlice;
+
+    const auto parsedOptions = !validateOptions.isEmpty()
+        ? collection_validation::parseValidateOptions(
+              opCtx, nss, validateOptions, skipAtClusterTime, enableSizeStats)
+        : collection_validation::ValidationOptions(
+              collection_validation::ValidateMode::kForegroundFull,
+              collection_validation::RepairMode::kNone,
+              /*logDiagnostics=*/false,
+              currentValidationVersion,
+              /*verifyConfigurationOverride=*/boost::none,
+              /*readTimestamp=*/boost::none,
+              /*hashPrefixes=*/boost::none,
+              /*revealHashedIds=*/boost::none,
+              collection_validation::getTargetRecordsPerRecordStoreSlice());
+    if (parsedOptions.getRepairMode() != collection_validation::RepairMode::kNone) {
+        return Status{ErrorCodes::InvalidOptions,
+                      "Repair is not allowed in offline validation mode"};
+    }
+    ValidateResults validateResults;
+    try {
+        Status status = collection_validation::validate(opCtx, nss, parsedOptions, validateResults);
+
+        if (!status.isOK()) {
+            LOGV2_ERROR(11790200,
+                        "Collection validation failed to complete, see logs for more details",
+                        "nss"_attr = nss.toStringForErrorMsg(),
+                        "error"_attr = status.toString());
+            return status;
+        }
+    } catch (const DBException& e) {
+        // When validating at 'atClusterTime', a collection present in the latest catalog may not
+        // have existed at that timestamp because it was created or renamed into place afterwards;
+        // validate() throws NamespaceNotFound. That is a valid catalog state rather than
+        // corruption, so skip the collection and continue validating the rest.
+        if (e.code() == ErrorCodes::NamespaceNotFound && parsedOptions.getReadTimestamp()) {
+            if (!gValidateCollectionName.empty()) {
+                // If validating a single collection, return non-OK status to indicate that the
+                // collection was not validated and return early.
+                LOGV2_ERROR(
+                    11790202,
+                    "Single collection validation failed to complete, see logs for more details",
+                    "nss"_attr = nss.toStringForErrorMsg(),
+                    "error"_attr = e.toString());
+                return e.toStatus();
+            }
+            LOGV2(11790100,
+                  "Skipping validation of collection because it did not exist at atClusterTime",
+                  "nss"_attr = nss.toStringForErrorMsg(),
+                  "atClusterTime"_attr = *parsedOptions.getReadTimestamp());
+            return true;
+        }
+        LOGV2_ERROR(11790201,
+                    "Collection validation failed to complete, see logs for more details",
+                    "nss"_attr = nss.toStringForErrorMsg(),
+                    "error"_attr = e.toString());
+        return e.toStatus();
+    }
+
+    BSONObjBuilder results;
+    validateResults.appendToResultObj(&results, /*debug=*/false);
+    LOGV2_OPTIONS(9437301,
+                  {logv2::LogTruncation::Disabled},
+                  "Offline validation result",
+                  "results"_attr = results.done());
+    return validateResults.isValid();
+}
+
+OfflineValidateResults offlineValidateParallel(OperationContext* opCtx,
+                                               boost::optional<Lock::GlobalWrite> globalWriteLock,
+                                               size_t maxThreadCount) {
+    invariant(!storageGlobalParams.queryableBackupMode);
+    // Must have global write lock before beginning offlineValidateParallel
+    invariant(globalWriteLock && globalWriteLock->isLocked());
+
+    // Must only be called before the server accepts network connections. The lighter per-worker
+    // lock mode (IX at global, X at collection) relies on there being no concurrent writers or
+    // DDL operations — a guarantee that only holds at startup.
+    {
+        auto* tlm = opCtx->getServiceContext()->getTransportLayerManager();
+        fassert(12759001, !tlm || !tlm->hasActiveSessions());
+    }
+
+    auto& serviceLifecycle = rss::ReplicatedStorageService::get(opCtx).getServiceLifecycle();
+    serviceLifecycle.initializeStateRequiredForOfflineValidation(opCtx);
+    const auto dbNames = std::invoke([opCtx]() -> std::vector<DatabaseName> {
+        if (gValidateDbName.empty()) {
+            return CollectionCatalog::get(opCtx)->getAllDbNames();
+        }
+        return std::vector{DatabaseNameUtil::deserialize(
+            /*tenantId=*/boost::none,
+            gValidateDbName.data(),
+            SerializationContext(SerializationContext::Source::Catalog))};
+    });
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    for (const auto& dbName : dbNames) {
+        databaseHolder->openDb(opCtx, dbName);
+    }
+
+    globalWriteLock.reset();
+    Lock::GlobalLock catalogLock(opCtx, MODE_IS);
+    const auto catalog = CollectionCatalog::get(opCtx);
+
+    // Collect every namespace to validate along with its data size, so that the largest
+    // collections can be dispatched first. Scheduling longest-processing-time-first keeps a
+    // large collection from being picked up late and running as a long tail.
+    std::vector<std::pair<long long, NamespaceString>> collectionsBySize;
+    for (const auto& dbName : dbNames) {
+        for (const auto& coll : catalog->range(dbName)) {
+            collectionsBySize.emplace_back(coll->dataSize(opCtx), NamespaceString{coll->ns()});
+        }
+    }
+
+    // Sort descending by data size, breaking ties by namespace to keep dispatch order
+    // deterministic.
+    std::sort(collectionsBySize.begin(), collectionsBySize.end(), std::greater<>());
+
+    synchronized_value<OfflineValidateResults> results{OfflineValidateResults{
+        .allValidationComplete = true,
+        .allResultsValid = true,
+    }};
+
+    if (collectionsBySize.empty()) {
+        return results.get();
+    }
+
+    const size_t numCores = ProcessInfo::getNumAvailableCores();
+    maxThreadCount = maxThreadCount == 0 ? numCores : std::min(maxThreadCount, numCores);
+    // Do not exceed the number of collections
+    maxThreadCount = std::min(maxThreadCount, collectionsBySize.size());
+    SingleProducerMultiConsumerQueue<NamespaceString> queue{
+        {.maxQueueDepth = maxThreadCount * 4ULL}};
+
+    auto threadPool = ThreadPool::make({
+        .poolName = "ParallelOfflineValidate",
+        .threadNamePrefix = "NamespaceValidationWorker",
+        .maxThreads = maxThreadCount,
+        .onCreateThread =
+            [](const auto& threadName) {
+                Client::initThread(threadName, getGlobalServiceContext()->getService());
+            },
+    });
+    threadPool->startup();
+
+    // Create worker threads
+    for (size_t i = 0; i < maxThreadCount; ++i) {
+        threadPool->schedule([&queue, &results](Status status) {
+            if (!status.isOK()) {
+                results->allValidationComplete = false;
+                return;
+            }
+            auto opCtx = cc().makeOperationContext();
+
+            while (true) {
+                try {
+                    // Pull namespaces off the queue to run validation against.
+                    const auto nss = queue.pop(opCtx.get());
+                    auto swValidateResult =
+                        offlineValidateCollection(opCtx.get(), nss, !nss.isReplicated());
+
+                    // Once complete, synchronize the results.  This could be an atomic, but the
+                    // contention window for the lock should be quite small so it will be
+                    // synchronized value using a mutex.
+                    auto resultsGuard = results.synchronize();
+                    if (swValidateResult.isOK()) {
+                        resultsGuard->allResultsValid =
+                            resultsGuard->allResultsValid && swValidateResult.getValue();
+                    } else {
+                        resultsGuard->allValidationComplete = false;
+                    }
+                } catch (const ExceptionFor<ErrorCodes::ProducerConsumerQueueConsumed>&) {
+                    // queue exhausted, end worker thread
+                    break;
+                } catch (const DBException& e) {
+                    LOGV2_ERROR(12759002,
+                                "An error occurred running validation",
+                                "error"_attr = e.toString());
+                    results->allValidationComplete = false;
+                }
+            }
+        });
+    }
+
+    // The queue is FIFO and bounded, so pushing in sorted order is enough to control the order
+    // work is picked up in; `maxQueueDepth` only throttles how far ahead this producer may run.
+    for (auto&& [_, nss] : collectionsBySize) {
+        queue.push(std::move(nss));
+    }
+    queue.closeProducerEnd();
+
+    // Synchronize the thread pool and wait for all workers to finish.
+    threadPool->waitForIdle();
+    threadPool->shutdown();
+    threadPool->join();
+    return results.get();
+}
+
+// Performs collection validation for all collections or one collection in a database.
+// Returns if all collections complete validation and if all collections are valid.
+OfflineValidateResults offlineValidateDb(OperationContext* opCtx, DatabaseName dbName) {
+    OfflineValidateResults offlineValidateResults;
+    if (!gValidateCollectionName.empty()) {
+        NamespaceString userNss = NamespaceStringUtil::deserialize(dbName, gValidateCollectionName);
+        if (auto swValidateResult = offlineValidateCollection(opCtx, userNss);
+            swValidateResult.isOK()) {
+            offlineValidateResults.allResultsValid = swValidateResult.getValue();
+        } else {
+            offlineValidateResults.allValidationComplete = false;
+        }
+    } else {
+        for (const auto& nss :
+             CollectionCatalog::get(opCtx)->getAllCollectionNamesFromDb(opCtx, dbName)) {
+            opCtx->checkForInterrupt();
+
+            if (auto swValidateResult = offlineValidateCollection(opCtx, nss, !nss.isReplicated());
+                swValidateResult.isOK()) {
+                offlineValidateResults.allResultsValid =
+                    offlineValidateResults.allResultsValid && swValidateResult.getValue();
+            } else {
+                offlineValidateResults.allValidationComplete = false;
+            }
+        }
+    }
+    return offlineValidateResults;
+}
+
+// Performs collection validation for all collections in one or all databases.
+// Returns if all databases complete validation and if all databases are valid.
+OfflineValidateResults offlineValidate(OperationContext* opCtx) {
+    invariant(!storageGlobalParams.queryableBackupMode);
+
+    auto& serviceLifecycle = rss::ReplicatedStorageService::get(opCtx).getServiceLifecycle();
+    serviceLifecycle.initializeStateRequiredForOfflineValidation(opCtx);
+
+    OfflineValidateResults offlineValidateResults;
+
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    const auto dbNames = std::invoke([opCtx]() -> std::vector<DatabaseName> {
+        if (gValidateDbName.empty()) {
+            return CollectionCatalog::get(opCtx)->getAllDbNames();
+        }
+        const boost::optional<TenantId>& tenantId = boost::none;
+        return std::vector{DatabaseNameUtil::deserialize(
+            tenantId,
+            gValidateDbName.data(),
+            SerializationContext(SerializationContext::Source::Catalog))};
+    });
+    for (const auto& dbName : dbNames) {
+        databaseHolder->openDb(opCtx, dbName);
+    }
+    for (const auto& dbName : dbNames) {
+        const auto [isComplete, isValid] = offlineValidateDb(opCtx, dbName);
+        offlineValidateResults.allValidationComplete =
+            offlineValidateResults.allValidationComplete && isComplete;
+        offlineValidateResults.allResultsValid = offlineValidateResults.allResultsValid && isValid;
+    }
+    return offlineValidateResults;
+}
+
+// Perform routine startup recovery procedure.
+// The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+// this function into one single builder that records the time elapsed during startup. Its default
+// value is nullptr because we only want to time this function when it is called during startup.
+void startupRecovery(OperationContext* opCtx,
+                     StorageEngine* storageEngine,
+                     StorageEngine::LastShutdownState lastShutdownState,
+                     BSONObjBuilder* startupTimeElapsedBuilder = nullptr,
+                     bool afterDataReady = false) {
+    auto& rss = rss::ReplicatedStorageService::get(opCtx);
+    if (rss.getPersistenceProvider().shouldDelayDataAccessDuringStartup() && !afterDataReady) {
+        LOGV2(10985327,
+              "Skip startupRecovery; it will be handled later when WT loads the "
+              "checkpoint");
+        return;
+    }
+
+    invariant(!storageGlobalParams.repair);
+
+    ServiceContext* svcCtx = opCtx->getServiceContext();
+
+    // Determine whether this is a replica set node running in standalone mode. This must be set
+    // before determining whether to restart index builds.
+    setReplSetMemberInStandaloneMode(opCtx, storageEngine);
+
+    // Initialize FCV before rebuilding indexes that may have features dependent on FCV.
+    {
+        SectionScopedTimer scopedTimer(svcCtx->getFastClockSource(),
+                                       TimedSectionId::initializeFCVForIndex,
+                                       startupTimeElapsedBuilder);
+        FeatureCompatibilityVersion::initializeForStartup(opCtx);
+    }
+
+    // Drops abandoned idents. Restarts incomplete two-phase index builds.
+    reconcileCatalogAndRestartUnfinishedIndexBuilds(
+        opCtx, storageEngine, lastShutdownState, startupTimeElapsedBuilder);
+
+    // Clean up orphaned encryption keys.
+    //
+    // This MUST run after reconcileCatalogAndRestartUnfinishedIndexBuilds.
+    // That call drops WT idents that the catalog no longer references (the
+    // typical case: a database was dropped but its WT files survived because
+    // the drop-pending reaper had not yet unlinked them when mongod stopped).
+    // The orphan-key scan compares keys in the keystore against the keyIds
+    // still referenced by WT idents - so it must see the post-reconcile ident
+    // set. If we ran it before reconcile, the about-to-be-dropped idents
+    // would still be visible in WT and their keys would be misclassified as
+    // in-use, deferring their cleanup to the *next* startup.
+    storageEngine->cleanupOrphanedEncryptionKeys(opCtx, "startup"sv);
+
+    const bool usingReplication =
+        repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet();
+
+    // On replica set members we only clear temp collections on DBs other than "local" during
+    // promotion to primary. On secondaries, they are only cleared when the oplog tells them to. The
+    // local DB is special because it is not replicated.  See SERVER-10927 for more details.
+    const bool shouldClearNonLocalTmpCollections =
+        !(hasReplSetConfigDoc(opCtx) || usingReplication);
+
+    // If the initial sync flag is set, an initial sync from a prior boot did not complete and this
+    // node will restart initial sync after startup recovery completes. Rebuilding the _id index
+    // before the retried initial sync will be wasted work.
+    const auto ensureIndexPolicy = [&] {
+        if (usingReplication &&
+            repl::ReplicationProcess::get(opCtx)->getConsistencyMarkers()->getInitialSyncFlag(
+                opCtx)) {
+            LOGV2(13350101,
+                  "Initial sync flag is set; skipping the build of any missing _id indexes because "
+                  "initial sync will drop all replicated data");
+            return EnsureIndexPolicy::kSkipMissingForInitialSync;
+        }
+        return EnsureIndexPolicy::kBuildMissing;
+    }();
+
+    openDatabases(opCtx, [&](const DatabaseName& dbName) {
+        // Ensures all collections meet requirements such as having _id indexes, and corrects them
+        // if needed.
+        uassertStatusOK(ensureCollectionProperties(opCtx, dbName, ensureIndexPolicy));
+
+        if (usingReplication) {
+            // Ensure oplog is capped (mongodb does not guarantee order of inserts on noncapped
+            // collections)
+            if (dbName == DatabaseName::kLocal) {
+                assertCappedOplog(opCtx);
+            }
+        }
+
+        if (shouldClearNonLocalTmpCollections || dbName == DatabaseName::kLocal) {
+            clearTempCollections(opCtx, dbName);
+        }
+    });
+}
+
+// Returns true if the oplog collection exists. Will always return false if the cached pointer to
+// the collection has not yet been initialized.
+bool oplogExists(OperationContext* opCtx) {
+    return static_cast<bool>(LocalOplogInfo::get(opCtx)->getRecordStore());
+}
+}  // namespace
+
+namespace startup_recovery {
+
+/**
+ * Recovers or repairs all databases from a previous shutdown. May throw a MustDowngrade error
+ * if data files are incompatible with the current binary version.
+ * The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+ * this function into one single builder that records the time elapsed during startup. Its default
+ * value is nullptr because we only want to time this function when it is called during startup.
+ */
+void repairAndRecoverDatabases(OperationContext* opCtx,
+                               StorageEngine::LastShutdownState lastShutdownState,
+                               BSONObjBuilder* startupTimeElapsedBuilder) {
+    auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
+    boost::optional<Lock::GlobalWrite> lk(opCtx);
+
+    // Create the FCV document for the first time, if necessary.
+    // - Replica set nodes only initialize the FCV when the replica set is first initiated or by
+    // data replication.
+    // - We should also not create the FCV document when the storage engine is not ready to accept
+    // writes according to PersistenceProvider::shouldDelayDataAccessDuringStartup(). In this
+    // persistence mode, the MDB catalog will not be available to include new entry for the FCV
+    // collection. The FCV collection will be included in the WT checkpoint that will be loaded
+    // eventually.
+    const bool usingReplication =
+        repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet();
+    auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+    if (isWriteableStorageEngine() && !usingReplication &&
+        !provider.shouldDelayDataAccessDuringStartup()) {
+        const auto minumumRequiredFCV = provider.getMinimumRequiredFCV();
+        FeatureCompatibilityVersion::setIfCleanStartup(
+            opCtx, repl::StorageInterface::get(opCtx), minumumRequiredFCV);
+    }
+
+    if (storageGlobalParams.repair) {
+        startupRepair(opCtx, storageEngine, startupTimeElapsedBuilder);
+    } else if (storageGlobalParams.validate) {
+        // If the feature flag is enabled and a collection is not specified, run concurrent
+        // validations across the database instance.
+        const bool runParallel =
+            gFeatureFlagParallelCollectionValidation.isEnabled() && gValidateCollectionName.empty();
+
+        const auto offlineValidateResults = runParallel
+            ? offlineValidateParallel(
+                  opCtx, std::move(lk), gValidateParallelMaxConcurrentNamespaces.load())
+            : offlineValidate(opCtx);
+
+        if (offlineValidateResults.allResultsValid) {
+            LOGV2(9437303, "Offline validation detected no issues");
+        } else {
+            LOGV2(9437304,
+                  "Offline validation found issues in some collections, see logs for details");
+        }
+
+        if (!offlineValidateResults.allValidationComplete) {
+            uassertStatusOK({ErrorCodes::OfflineValidationFailedToComplete,
+                             "Offline validation didn't complete for some collections"});
+        }
+    } else {
+        startupRecovery(opCtx, storageEngine, lastShutdownState, startupTimeElapsedBuilder);
+    }
+}
+
+/**
+ * Runs startup recovery after system startup.
+ * If we are in replSet mode, index builds will be restarted.
+ * If we deferred storage engine initialization because we had to load a WT checkpoint, we
+ * will also need this function to complete server startup. The PersistenceProvider can
+ * be used to detect this scenario.
+ * In no case will it create an FCV document nor run repair or read-only recovery.
+ */
+void runStartupRecovery(OperationContext* opCtx,
+                        StorageEngine::LastShutdownState lastShutdownState,
+                        bool afterDataReady) {
+    auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    Lock::GlobalWrite lk(opCtx);
+
+    invariant(isWriteableStorageEngine());
+    invariant(!storageGlobalParams.repair);
+    const bool usingReplication =
+        repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet();
+    auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+    invariant(usingReplication || provider.shouldDelayDataAccessDuringStartup());
+    startupRecovery(opCtx, storageEngine, lastShutdownState, nullptr, afterDataReady);
+}
+
+void recoverChangeStreamCollections(OperationContext* opCtx,
+                                    bool isStandalone,
+                                    StorageEngine::LastShutdownState lastShutdownState) {
+    if (lastShutdownState != StorageEngine::LastShutdownState::kUnclean) {
+        // The storage engine guarantees consistent data ranges after truncate on clean
+        // shutdown.
+        return;
+    }
+
+    if (isStandalone && !oplogExists(opCtx)) {
+        // If the node is started up as a standalone, it could have either (1) previously been a
+        // standalone (the oplog doesn't exist), or (2) previously been a replica set node (the
+        // oplog collection exists and the cached pointer to the oplog is initialized, or the oplog
+        // collection exists but the cached pointer to the oplog hasn't been initialized yet).
+        // If the oplog exists, the pointer has already been cached, even in standalone mode.
+
+        // There is no underlying oplog collection. Nothing to do since change stream collections
+        // implicitly replicate from the oplog, and can't exist without it.
+        LOGV2_DEBUG(7803704,
+                    3,
+                    "Skipping truncation of change stream collections on startup recovery "
+                    "because there is no oplog");
+
+        return;
+    }
+
+    // Clean up change stream pre-images collection.
+    cleanupPreImagesCollectionAfterUncleanShutdown(opCtx);
+}
+}  // namespace startup_recovery
+}  // namespace mongo

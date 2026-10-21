@@ -1,0 +1,261 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/query/compiler/optimizer/join/cardinality_estimator.h"
+
+#include "mongo/db/query/compiler/optimizer/join/catalog_stats.h"
+#include "mongo/db/query/compiler/optimizer/join/join_reordering_context.h"
+#include "mongo/db/query/util/bitset_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
+
+#include <algorithm>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQueryJoin
+
+namespace mongo::join_ordering {
+
+using namespace cost_based_ranker;
+
+// Sleeps for {ms: <millis>} while computing a cardinality estimate, so that tests can verify that
+// 'ceTimeMicros' measures this phase. Note this fires once per computed estimate, not once per
+// query, since only estimates that are not served from the memo are charged to 'ceTimeMicros'.
+MONGO_FAIL_POINT_DEFINE(sleepWhileEstimatingJoinCardinality);
+
+JoinCardinalityEstimator::JoinCardinalityEstimator(const JoinReorderingContext& ctx,
+                                                   EdgeSelectivities edgeSelectivities)
+    : _ctx(ctx),
+      _edgeSelectivities(std::move(edgeSelectivities)),
+      _cycleBreaker(
+          GraphCycleBreaker(_ctx.joinGraph, _edgeSelectivities, _ctx.resolvedPaths.size())) {
+    tassert(11514700,
+            "Missing edge selectivities",
+            _edgeSelectivities.size() == _ctx.joinGraph.numEdges());
+    tassert(11514701,
+            "Missing node cardinalities",
+            _ctx.singleTableAccess.nodeCardinalitiesOriginalFilter.size() ==
+                _ctx.joinGraph.numNodes());
+}
+
+JoinCardinalityEstimator JoinCardinalityEstimator::make(
+    const JoinReorderingContext& ctx,
+    const SamplingEstimatorMap& samplingEstimators,
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics& metrics) {
+    Timer timer;
+    auto edgeSelectivities =
+        JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators, metrics);
+    auto estimator = JoinCardinalityEstimator(ctx, std::move(edgeSelectivities));
+    // Time the up-front edge selectivity estimation.
+    estimator._estimationTimeMicros = timer.micros();
+    return estimator;
+}
+
+EdgeSelectivities JoinCardinalityEstimator::estimateEdgeSelectivities(
+    const JoinReorderingContext& ctx,
+    const SamplingEstimatorMap& samplingEstimators,
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics& metrics) {
+    EdgeSelectivities edgeSelectivities;
+    edgeSelectivities.reserve(ctx.joinGraph.numEdges());
+    for (size_t edgeId = 0; edgeId < ctx.joinGraph.numEdges(); edgeId++) {
+        const auto& edge = ctx.joinGraph.getEdge(edgeId);
+        edgeSelectivities.push_back(
+            JoinCardinalityEstimator::joinPredicateSel(ctx, samplingEstimators, edge, metrics));
+    }
+    return edgeSelectivities;
+}
+
+// This function makes a number of assumptions:
+// * Join predicate are independent from single table predicates. This allows us to estimate them
+// separately, which can be seen by our use of NDV(join key) over the entire collection, as opposed
+// to considering values after selections.
+// * While MongoDB does not implement referential data integrity constraints like typical relational
+// systems, we assume that joins are logically either primary key - foreign key (PK-FK) joins or
+// foreign key - foreign key (FK-FK) joins. These types of joins satisfy the "Principle of
+// Inclusion" which states that every foreign key value must exist as a primary key value in the
+// primary table. We also assume that there is a uniform distribution of foreign key values within
+// foreign tables over the set of primary key values in the primary table.
+//
+// The algorithm this function performs is rather simple, we look at the node which has a smaller
+// CE (before single-table selections), calculate the NDV of the join key of that node and return
+// 1/NDV(PK). To explain why this works, we should examine the two possible cases we assumed we are
+// in.
+//
+// Case 1: This join represents a PK-FK join. Recall that a primary key must be unique and due to
+// the principle of inclusion, we know that the cardinality of the join is card(F). The selectivity
+// of the join is defined as the cardinality of the join over the cardinality of the cross product.
+// Join sel = Card(F) / (Card(F) * Card(P)). Therefore, the selectivity is 1 / Card(P).
+
+// Case 2: This join represents a FK-FK join. Here, we make an additional assumption that the two
+// join keys are foreign keys to the same underlying primary table, P. In this case, the join
+// cardinality is a little more complex. We can estimate it as:
+// (Card(F1) / Card(P)) * (Card(F2) / Card(P)) * Card(P) = (Card(F1) * Card(F2)) / Card(P)
+// Here we make use of the uniform distribution of foreign keys assumption: Every row in F1 has a
+// foreign key value chosen uniformly from the (|P|) possible PK values. So for any particular row
+// in P, the number of rows in F1 that reference it is Card(F1) / Card(P). The same logic applies to
+// F2. We multiply by Card(P) at the end since that is the number of distinct PK values that can be
+// referenced. Simplifying the above equation, we get:
+// Join card = (Card(F1) * Card(F2)) / Card(P)
+// We divide this by the cross product cardinality to get the selectivity:
+// Join sel = (Card(F1) * Card(F2)) / (Card(F1) * Card(F2) * Card(P)) = 1 / Card(P)
+//
+// Regardless of whether we are in case (1) or (2), our estimate of join selectivity is 1 / Card(P).
+// If we are in case (1), for simplicity we assume that the node with the smaller CE is the primary
+// key side. We estimate Card(P) by estimating NDV(PK), though we easily could have done NDV(FK) as
+// based on our assumptions, we'd get a similar result.
+//
+// If we are in case (2), we again can estimate Card(P) via NDV(FK) on either side, since we assume
+// both sides reference the primary key. Again, we use the side with the smaller CE for simplicity.
+JoinEdgeSelectivityEstimate JoinCardinalityEstimator::joinPredicateSel(
+    const JoinReorderingContext& ctx,
+    const SamplingEstimatorMap& samplingEstimators,
+    const JoinEdge& edge,
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics& metrics) {
+
+    auto& leftNode = ctx.joinGraph.getNode(edge.left);
+    auto& rightNode = ctx.joinGraph.getNode(edge.right);
+
+    // Extract the cardinality estimates for left and right nodes before single table predicates are
+    // applied.
+    auto leftCard = samplingEstimators.at(leftNode.collectionName)->getCollCard();
+    auto rightCard = samplingEstimators.at(rightNode.collectionName)->getCollCard();
+
+    // For the purposes of estimation, we assume that this edge represents a "primary key" to
+    // "foreign key" join, despite these concepts not existing in MongoDB. We also assume that the
+    // node with the small CE is the primary key side.
+    bool smallerCardIsLeft = cost_based_ranker::exactLtEq(leftCard, rightCard);
+    auto& primaryKeyNode = smallerCardIsLeft ? leftNode : rightNode;
+
+    // Accumulate the field names of the "primary key" of the join edge. Note that we track $expr
+    // predicates as their NDV computation is slightly different due to $expr equality semantics.
+    std::vector<ce::FieldPathAndEqSemantics> fields;
+    std::set<FieldPath> fieldNames;
+    for (auto&& joinPred : edge.predicates) {
+        tassert(11352502,
+                "join predicate selectivity estimation only supported for equality",
+                joinPred.isEquality());
+        auto pathId = smallerCardIsLeft ? joinPred.left : joinPred.right;
+        fields.push_back({.path = ctx.resolvedPaths[pathId].underlyingFieldPath,
+                          .isExprEq = joinPred.op == JoinPredicate::Operator::ExprEq});
+        fieldNames.emplace(ctx.resolvedPaths[pathId].underlyingFieldPath);
+    }
+
+    // Get sampling estimator for the "primary key" collection
+    auto& samplingEstimator = samplingEstimators.at(primaryKeyNode.collectionName);
+
+    // We are able to optimize NDV estimation if we know that the join key fields represent unique
+    // data. In that case, the NDV is simply the collection cardinality. Otherwise, we invoke NDV
+    // estimation for the "primary key".
+    bool ndvFieldsAreUnique = ctx.uniqueFieldInfo.contains(primaryKeyNode.collectionName) &&
+        fieldsAreUnique(fieldNames, ctx.uniqueFieldInfo.at(primaryKeyNode.collectionName));
+
+    JoinNdvEstimateSource source = JoinNdvEstimateSource::kSampling;
+    CardinalityEstimate ndv =
+        [&samplingEstimator, &fields, &ndvFieldsAreUnique, &metrics, &source]() {
+            if (ndvFieldsAreUnique) {
+                source = JoinNdvEstimateSource::kUniqueIndex;
+                ++metrics.numUniqueIndexesUsedForNDV;
+                return CardinalityEstimate(samplingEstimator->getCollCard().cardinality(),
+                                           EstimationSource::Metadata);
+            }
+
+            // TODO SERVER-135494: report HLL when used/available.
+            return samplingEstimator->estimateNDV(fields);
+        }();
+
+    cost_based_ranker::SelectivityEstimate sel{cost_based_ranker::oneSel};
+    // Ensure we don't accidentally produce a selectivity > 1
+    if (cost_based_ranker::exactGt(ndv, cost_based_ranker::oneCE)) {
+        sel = cost_based_ranker::oneCE / ndv;
+    }
+
+    LOGV2_DEBUG(11352504,
+                5,
+                "Performed estimation of selectivity of join edge",
+                "leftNss"_attr = leftNode.collectionName,
+                "rightNs"_attr = rightNode.collectionName,
+                "smallerColl"_attr =
+                    smallerCardIsLeft ? leftNode.collectionName : rightNode.collectionName,
+                "fields"_attr = fields,
+                "ndvEstimate"_attr = ndv,
+                "ndvFieldsAreUnique"_attr = ndvFieldsAreUnique,
+                "selectivityEstimate"_attr = sel,
+                "source"_attr = toStringData(source));
+
+    return {.assumedPkSide = primaryKeyNode.collectionName,
+            .ndv = ndv,
+            .selectivity = sel,
+            .source = source};
+}
+
+cost_based_ranker::CardinalityEstimate JoinCardinalityEstimator::getOrEstimateSubsetCardinality(
+    const NodeSet& nodes) {
+    if (auto it = _subsetCardinalities.find(nodes); it != _subsetCardinalities.end()) {
+        return it->second;
+    }
+
+    // Only charge 'ceTimeMicros' for estimates we actually compute, not for memo hits.
+    Timer timer;
+    ON_BLOCK_EXIT([&]() { _estimationTimeMicros += timer.micros(); });
+    sleepWhileEstimatingJoinCardinality.execute(
+        [](const BSONObj& data) { sleepmillis(data["ms"].numberInt()); });
+
+    // This method assumes that all predicates (join and and single-table) are independent from each
+    // other, allowing us to combine them with simple multiplication below.
+    //
+    // '_edgeSels' contains edge selectivities: for a given edge connecting tables U and V, it is
+    // the fraction of rows that are output by the U-V join over the total number of row
+    // combinations between U and V (|U| * |V|). The number of rows in the U-V output is by
+    // definition this selectivity multiplied by |U| and |V|.
+    //
+    // We extend this logic to more tables using the independence assumption. For example, given the
+    // result of the U-V join, assume we are further joining with W through a V-W edge. We treat the
+    // intermediate result as a single "table" with its own cardinality. We apply the selectivity of
+    // the V-W edge to estimate how many rows from the intermediate result match rows in W, and
+    // finally multiply by |W| to account for the number of rows in W that participate in the join.
+    //
+    // So far, we have the product of all base table cardinalities with the selectivities of the
+    // edges in the graph induced by 'nodes'. We must also include the selectivities of single-table
+    // predicates. By the independence assumption, these can simply be multiplied with the product.
+    //
+    // One final complication involves cycles. If all selectivities from edges in a cycle are
+    // included in the estimate, we will double-count some join predicates. We remove cycles below
+    // by building a spanning tree (or forest) from the edges considered.
+    //
+    // Therefore, this method takes the following steps: Induce a subgraph involving only the nodes
+    // in 'nodes', and reduce the edges in that subgraph to remove cycles. Then, multiply:
+    // (1) The selectivities from the reduced edge list.
+    // (2) The base table cardinalities.
+    // (3) The single-table predicate selectivities.
+    // Finally, note that we have the pre-computed combination of (2) and (3) in '_nodeCEs'.
+    cost_based_ranker::CardinalityEstimate ce = cost_based_ranker::oneCE;
+    for (auto nodeIdx : iterable(nodes, _ctx.joinGraph.numNodes())) {
+        ce = cost_based_ranker::product(
+            ce, _ctx.singleTableAccess.nodeCardinalitiesOriginalFilter[nodeIdx]);
+    }
+
+    auto edges = _cycleBreaker.breakCycles(_ctx.joinGraph.getEdgesForSubgraph(nodes));
+    for (const auto& edgeId : edges) {
+        ce = ce * _edgeSelectivities.at(edgeId).selectivity;
+    }
+
+    LOGV2_DEBUG(11514603,
+                5,
+                "Estimating cardinality for subset",
+                "subset"_attr = nodeSetToString(nodes, _ctx.joinGraph.numNodes()),
+                "subsetCollectionNames"_attr = subsetCollectionNames(nodes, _ctx.joinGraph),
+                "cardinalityEstimate"_attr = ce);
+
+    _subsetCardinalities.emplace(nodes, ce);
+    return ce;
+}
+
+SelectivityEstimate JoinCardinalityEstimator::getEdgeSelectivity(EdgeId edge) const {
+    return _edgeSelectivities[edge].selectivity;
+}
+
+
+}  // namespace mongo::join_ordering

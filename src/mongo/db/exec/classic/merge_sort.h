@@ -1,0 +1,144 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/recordid_deduplicator.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/util/modules.h"
+
+#include <list>
+#include <memory>
+#include <queue>
+#include <string_view>
+#include <vector>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+class CollatorInterface;
+
+// External params for the merge sort stage.  Declared below.
+class MergeSortStageParams;
+
+/**
+ * Merges the outputs of N children, each of which is sorted in the order specified by
+ * 'pattern'.  The output is sorted by 'pattern'.  Practically speaking, all of this stage's
+ * children are indices.
+ *
+ * AKA the SERVER-1205 stage.  Allows very efficient handling of the following query:
+ * find($or[{a:1}, {b:1}]).sort({c:1}) with indices {a:1, c:1} and {b:1, c:1}.
+ *
+ * This stage is part of the "find" subsystem, which only handles local execution and is not related
+ * to merging results from shards.
+ *
+ * Preconditions: For each field in 'pattern' all inputs in the child must handle a
+ * getFieldDotted for that field.
+ */
+class MergeSortStage final : public PlanStage {
+public:
+    MergeSortStage(ExpressionContext* expCtx, const MergeSortStageParams& params, WorkingSet* ws);
+
+    void addChild(std::unique_ptr<PlanStage> child);
+
+    bool isEOF() const final;
+    StageState doWork(WorkingSetID* out) final;
+
+    StageType stageType() const final {
+        return STAGE_SORT_MERGE;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() override;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    [[MONGO_MOD_PRIVATE]] const SimpleMemoryUsageTracker& getMemoryTracker_forTest() const {
+        return _memoryTracker;
+    }
+
+    static constexpr std::string_view kStageType = "SORT_MERGE"sv;
+
+private:
+    struct StageWithValue {
+        StageWithValue() : id(WorkingSet::INVALID_ID), stage(nullptr) {}
+        WorkingSetID id;
+        PlanStage* stage;
+    };
+
+    // This stage maintains a priority queue of results from each child stage so that it can quickly
+    // return the next result according to the sort order. A value in the priority queue is a
+    // MergingRef, an iterator which refers to a buffered (WorkingSetMember, child stage) pair.
+    typedef std::list<StageWithValue>::iterator MergingRef;
+
+    // The comparison function used in our priority queue.
+    class StageWithValueComparison {
+    public:
+        StageWithValueComparison(WorkingSet* ws, BSONObj pattern, const CollatorInterface* collator)
+            : _ws(ws), _pattern(pattern), _collator(collator) {}
+
+        // Is lhs less than rhs?  Note that priority_queue is a max heap by default so we invert
+        // the return from the expected value.
+        bool operator()(const MergingRef& lhs, const MergingRef& rhs);
+
+    private:
+        // Encodes sort key part 'keyPart' according to the collation of the query.
+        BSONObj encodeKeyPartWithCollation(const BSONElement& keyPart);
+
+        WorkingSet* _ws;
+        BSONObj _pattern;
+        const CollatorInterface* _collator;
+    };
+
+    // Not owned by us.
+    WorkingSet* _ws;
+
+    // The pattern that we're sorting by.
+    BSONObj _pattern;
+
+    // Are we deduplicating on RecordId?
+    const bool _dedup;
+
+    // Which RecordIds have we seen?
+    RecordIdDeduplicator _recordIdDeduplicator;
+
+    // In order to pick the next smallest value, we need each child work(...) until it produces
+    // a result.  This is the queue of children that haven't given us a result yet.
+    std::queue<PlanStage*> _noResultToMerge;
+
+    // The min heap of the results we're returning.
+    std::priority_queue<MergingRef, std::vector<MergingRef>, StageWithValueComparison> _merging;
+
+    // The data referred to by the _merging queue above.
+    std::list<StageWithValue> _mergingData;
+
+    // Stats
+    MergeSortStats _specificStats;
+
+    SimpleMemoryUsageTracker _memoryTracker;
+
+    DeduplicatorReporter _dedupReporter;
+};
+
+// Parameters that must be provided to a MergeSortStage
+class MergeSortStageParams {
+public:
+    MergeSortStageParams() : collator(nullptr), dedup(true) {}
+
+    // How we're sorting.
+    BSONObj pattern;
+
+    // Null if this merge sort stage orders strings according to simple binary compare. If non-null,
+    // represents the collator used to compare strings.
+    const CollatorInterface* collator;
+
+    // Do we deduplicate on RecordId?
+    bool dedup;
+};
+
+}  // namespace mongo

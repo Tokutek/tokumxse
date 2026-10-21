@@ -1,0 +1,745 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/util/deferred.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/scripting/mozjs/common/error.h"
+#include "mongo/scripting/mozjs/common/freeOpToJSContext.h"
+#include "mongo/scripting/mozjs/common/global.h"
+#include "mongo/scripting/mozjs/common/internedstring.h"
+#include "mongo/scripting/mozjs/common/types/bindata.h"
+#include "mongo/scripting/mozjs/common/types/bson.h"
+#include "mongo/scripting/mozjs/common/types/code.h"
+#include "mongo/scripting/mozjs/common/types/dbpointer.h"
+#include "mongo/scripting/mozjs/common/types/dbref.h"
+#include "mongo/scripting/mozjs/common/types/maxkey.h"
+#include "mongo/scripting/mozjs/common/types/minkey.h"
+#include "mongo/scripting/mozjs/common/types/nativefunction.h"
+#include "mongo/scripting/mozjs/common/types/numberdecimal.h"
+#include "mongo/scripting/mozjs/common/types/numberint.h"
+#include "mongo/scripting/mozjs/common/types/numberlong.h"
+#include "mongo/scripting/mozjs/common/types/object.h"
+#include "mongo/scripting/mozjs/common/types/oid.h"
+#include "mongo/scripting/mozjs/common/types/regexp.h"
+#include "mongo/scripting/mozjs/common/types/status.h"
+#include "mongo/scripting/mozjs/common/types/timestamp.h"
+#include "mongo/scripting/mozjs/common/wraptype.h"
+#include "mongo/scripting/mozjs/shell/countdownlatch.h"
+#include "mongo/scripting/mozjs/shell/cursor.h"
+#include "mongo/scripting/mozjs/shell/cursor_handle.h"
+#include "mongo/scripting/mozjs/shell/db.h"
+#include "mongo/scripting/mozjs/shell/dbcollection.h"
+#include "mongo/scripting/mozjs/shell/dbquery.h"
+#include "mongo/scripting/mozjs/shell/engine.h"
+#include "mongo/scripting/mozjs/shell/jsthread.h"
+#include "mongo/scripting/mozjs/shell/module_loader.h"
+#include "mongo/scripting/mozjs/shell/mongo.h"
+#include "mongo/scripting/mozjs/shell/mongohelpers.h"
+#include "mongo/scripting/mozjs/shell/resumetoken.h"
+#include "mongo/scripting/mozjs/shell/runtime.h"
+#include "mongo/scripting/mozjs/shell/session.h"
+#include "mongo/scripting/mozjs/shell/uri.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/static_immortal.h"
+#include "mongo/util/string_map.h"
+
+#include <atomic>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <jsapi.h>
+#include <jsfriendapi.h>
+
+#include <boost/optional/optional.hpp>
+#include <js/CompileOptions.h>
+#include <js/Context.h>
+#include <js/GCAPI.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <js/Value.h>
+#include <vm/PosixNSPR.h>
+
+namespace mongo {
+namespace mozjs {
+
+/**
+ * Error messages or error message prefixes.
+ */
+namespace ErrorMessage {
+const std::string_view kUncaughtException = "uncaught exception";
+const std::string_view kOutOfMemory = "Out of memory";
+const std::string_view kUnknownError = "Unknown Failure from JSInterpreter";
+}  // namespace ErrorMessage
+
+/**
+ * Implementation Scope for MozJS
+ *
+ * The Implementation scope holds the actual mozjs runtime and context objects,
+ * along with a number of global prototypes for mongoDB specific types. Each
+ * ImplScope requires it's own thread and cannot be accessed from any thread
+ * other than the one it was created on (this is a detail inherited from the
+ * JSRuntime). If you need a scope that can be accessed by different threads
+ * over the course of it's lifetime, see MozJSProxyScope
+ *
+ * For more information about overriden fields, see mongo::Scope
+ */
+class [[MONGO_MOD_PUBLIC]] MozJSImplScope final : public Scope,
+                                                  public MozJSShellRuntimeInterface,
+                                                  public MozJSCommonRuntimeInterface {
+    MozJSImplScope(const MozJSImplScope&) = delete;
+    MozJSImplScope& operator=(const MozJSImplScope&) = delete;
+
+    template <typename T>
+    friend WrapType<T>& getProto(MozJSCommonRuntimeInterface*);
+
+public:
+    explicit MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
+    ~MozJSImplScope() override;
+
+    // ---- Proto accessors ----
+    WrapType<BinDataInfo>& binDataProto() override {
+        return _binDataProto;
+    }
+    WrapType<BSONInfo>& bsonProto() override {
+        return _bsonProto;
+    }
+    WrapType<CodeInfo>& codeProto() override {
+        return _codeProto;
+    }
+    WrapType<CursorHandleInfo>& cursorHandleProto() override {
+        return _cursorHandleProto;
+    }
+    WrapType<CursorInfo>& cursorProto() override {
+        return _cursorProto;
+    }
+    WrapType<DBPointerInfo>& dbPointerProto() override {
+        return _dbPointerProto;
+    }
+    WrapType<DBRefInfo>& dbRefProto() override {
+        return _dbRefProto;
+    }
+    WrapType<ErrorInfo>& errorProto() override {
+        return _errorProto;
+    }
+    WrapType<MaxKeyInfo>& maxKeyProto() override {
+        return _maxKeyProto;
+    }
+    WrapType<MinKeyInfo>& minKeyProto() override {
+        return _minKeyProto;
+    }
+    WrapType<NativeFunctionInfo>& nativeFunctionProto() override {
+        return _nativeFunctionProto;
+    }
+    WrapType<MongoExternalInfo>& mongoExternalProto() override {
+        return _mongoExternalProto;
+    }
+    WrapType<MongoStatusInfo>& mongoStatusProto() override {
+        return _statusProto;
+    }
+    WrapType<NumberDecimalInfo>& numberDecimalProto() override {
+        return _numberDecimalProto;
+    }
+    WrapType<NumberIntInfo>& numberIntProto() override {
+        return _numberIntProto;
+    }
+    WrapType<NumberLongInfo>& numberLongProto() override {
+        return _numberLongProto;
+    }
+    WrapType<OIDInfo>& oidProto() override {
+        return _oidProto;
+    }
+    WrapType<RegExpInfo>& regExpProto() override {
+        return _regExpProto;
+    }
+    WrapType<SessionInfo>& sessionProto() override {
+        return _sessionProto;
+    }
+    WrapType<TimestampInfo>& timestampProto() override {
+        return _timestampProto;
+    }
+    WrapType<URIInfo>& uriProto() override {
+        return _uriProto;
+    }
+    std::int64_t* trackedNewInt64(std::int64_t value) override {
+        return trackedNew<std::int64_t>(value);
+    }
+
+    void init(const BSONObj* data) override;
+
+    void reset() override;
+
+    void kill() override;
+
+    void interrupt();
+
+    bool isKillPending() const override;
+
+    OperationContext* getOpContext() const;
+
+    void registerOperation(OperationContext* opCtx) override;
+
+    void unregisterOperation() override;
+
+    void externalSetup() override;
+
+    std::string getError() override;
+
+    std::string getBaseURL() const override;
+
+    bool hasOutOfMemoryException() override;
+
+    void gc() override;
+
+    void sleep(Milliseconds ms) override;
+
+    bool isJavaScriptProtectionEnabled() const override;
+
+    double getNumber(const char* field) override;
+    int getNumberInt(const char* field) override;
+    long long getNumberLongLong(const char* field) override;
+    Decimal128 getNumberDecimal(const char* field) override;
+    std::string getString(const char* field) override;
+    bool getBoolean(const char* field) override;
+    BSONObj getObject(const char* field) override;
+    OID getOID(const char* field) override;
+    // Note: The resulting BSONBinData is only valid within the scope of the 'withBinData' callback.
+    void getBinData(const char* field,
+                    std::function<void(const BSONBinData&)> withBinData) override;
+    Timestamp getTimestamp(const char* field) override;
+    JSRegEx getRegEx(const char* field) override;
+
+    void setNumber(const char* field, double val) override;
+    void setString(const char* field, std::string_view val) override;
+    void setBoolean(const char* field, bool val) override;
+    void setElement(const char* field, const BSONElement& e, const BSONObj& parent) override;
+    void setObject(const char* field, const BSONObj& obj, bool readOnly) override;
+    void setFunction(const char* field, const char* code) override;
+    void deleteGlobal(std::string_view name) override;
+
+    int type(const char* field) override;
+
+    void rename(const char* from, const char* to) override;
+
+    int invoke(ScriptingFunction func,
+               const BSONObj* args,
+               const BSONObj* recv,
+               int timeoutMs = 0,
+               bool ignoreReturn = false,
+               bool readOnlyArgs = false,
+               bool readOnlyRecv = false) override;
+
+    bool exec(std::string_view code,
+              const std::string& name,
+              bool printResult,
+              bool reportError,
+              bool assertOnError,
+              int timeoutMs) override;
+
+    void injectNative(const char* field, NativeFunction func, void* data = nullptr) override;
+
+    ScriptingFunction _createFunction(const char* code) override;
+
+    void newFunction(std::string_view code, JS::MutableHandleValue out) override;
+
+    BSONObj callThreadArgs(const BSONObj& obj);
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, BinDataInfo>::value, WrapType<T>&>::type getProto() {
+        return _binDataProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, BSONInfo>::value, WrapType<T>&>::type getProto() {
+        return _bsonProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, CountDownLatchInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _countDownLatchProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, CursorInfo>::value, WrapType<T>&>::type getProto() {
+        return _cursorProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, CursorHandleInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _cursorHandleProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, DBCollectionInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _dbCollectionProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, DBPointerInfo>::value, WrapType<T>&>::type getProto() {
+        return _dbPointerProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, DBQueryInfo>::value, WrapType<T>&>::type getProto() {
+        return _dbQueryProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, DBInfo>::value, WrapType<T>&>::type getProto() {
+        return _dbProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, DBRefInfo>::value, WrapType<T>&>::type getProto() {
+        return _dbRefProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, ErrorInfo>::value, WrapType<T>&>::type getProto() {
+        return _errorProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, JSThreadInfo>::value, WrapType<T>&>::type getProto() {
+        return _jsThreadProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, MaxKeyInfo>::value, WrapType<T>&>::type getProto() {
+        return _maxKeyProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, MinKeyInfo>::value, WrapType<T>&>::type getProto() {
+        return _minKeyProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, MongoExternalInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _mongoExternalProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, MongoHelpersInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _mongoHelpersProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, NativeFunctionInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _nativeFunctionProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, NumberIntInfo>::value, WrapType<T>&>::type getProto() {
+        return _numberIntProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, NumberLongInfo>::value, WrapType<T>&>::type getProto() {
+        return _numberLongProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, NumberDecimalInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _numberDecimalProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, CodeInfo>::value, WrapType<T>&>::type getProto() {
+        return _codeProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, ObjectInfo>::value, WrapType<T>&>::type getProto() {
+        return _objectProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, OIDInfo>::value, WrapType<T>&>::type getProto() {
+        return _oidProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, RegExpInfo>::value, WrapType<T>&>::type getProto() {
+        return _regExpProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, ResumeTokenDataUtility>::value, WrapType<T>&>::type
+    getProto() {
+        return _resumeTokenDataProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, SessionInfo>::value, WrapType<T>&>::type getProto() {
+        return _sessionProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, MongoStatusInfo>::value, WrapType<T>&>::type
+    getProto() {
+        return _statusProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, TimestampInfo>::value, WrapType<T>&>::type getProto() {
+        return _timestampProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, URIInfo>::value, WrapType<T>&>::type getProto() {
+        return _uriProto;
+    }
+
+    template <typename T>
+    typename std::enable_if<std::is_same<T, GlobalInfo>::value, WrapType<T>&>::type getProto() {
+        return _globalProto;
+    }
+
+    static const char* const kInteractiveShellName;
+    static const char* const kExecResult;
+    static const char* const kInvokeResult;
+
+    static MozJSImplScope* getThreadScope();
+
+    /**
+     * Handles an out-of-memory condition this scope cannot come back from: marks the scope
+     * poisoned and interrupts execution.
+     */
+    void setOOM();
+
+    void setParentStack(std::string);
+    const std::string& getParentStack() const;
+
+    std::size_t getGeneration() const override;
+
+    void advanceGeneration() override;
+
+    void requireOwnedObjects() override;
+
+    bool requiresOwnedObjects() const override;
+
+    JS::HandleId getInternedStringId(InternedString name) override {
+        return _internedStrings.getInternedString(name);
+    }
+
+    void trackNewPointer(void* ptr) override {
+#if __has_feature(address_sanitizer)
+        ASANHandles::getInstance().addPointer(ptr);
+#else
+        (void)ptr;
+#endif
+    }
+
+    void trackDeletePointer(void* ptr) override {
+#if __has_feature(address_sanitizer)
+        ASANHandles::getInstance().removePointer(ptr);
+#else
+        (void)ptr;
+#endif
+    }
+
+    std::string buildStackString();
+
+    template <typename T, typename... Args>
+    T* trackedNew(Args&&... args) {
+        T* t = new T(std::forward<Args>(args)...);
+        ASANHandles::getInstance().addPointer(t);
+        return t;
+    }
+
+    template <typename T>
+    void trackedDelete(T* t) {
+        ASANHandles::getInstance().removePointer(t);
+        delete (t);
+    }
+
+#if __has_feature(address_sanitizer)
+    class ASANHandlesNoLock {
+    public:
+        ~ASANHandlesNoLock() = default;
+        void addPointer(void* ptr);
+        void removePointer(void* ptr);
+
+    protected:
+        stdx::unordered_map<void*, size_t> _handles;
+    };
+#endif
+
+    class ASANHandles {
+    public:
+        ~ASANHandles() = default;
+
+        void addPointer(void* ptr);
+        void removePointer(void* ptr);
+
+        static ASANHandles& getInstance() {
+            // We can't guarantee static de-initialization order across different compilation units,
+            // so we run into problems with the destruction of the ASANHandles singleton taking
+            // place before the WellKnownParserAtoms singleton in libmozjs.so. To get around this
+            // problem, we make the singleton here a StaticImmortal, which prevents the destructor
+            // from being called, allowing WellKnownParserAtoms to finish its cleanup when the
+            // program exits.
+            static StaticImmortal<ASANHandles> singleton;
+            return *singleton;
+        }
+
+        ASANHandles() = default;
+        ASANHandles(const ASANHandles&) = delete;
+        ASANHandles& operator=(const ASANHandles&) = delete;
+#if __has_feature(address_sanitizer)
+    private:
+        std::mutex _mutex;
+        ASANHandlesNoLock _handles;
+#endif
+    };
+
+    void setStatus(Status status) override;
+
+    ModuleLoader& getModuleLoader() const;
+
+    /**
+     * JavaScript module loading is a shell-only feature. It is not supported in the server
+     * execution environment, where it would let server-side JavaScript (e.g. $function) read
+     * arbitrary host files via import().
+     */
+    bool supportsModules() const;
+
+    // Register a process-global hook that runs in ~MozJSImplScope() before _context is
+    // destroyed (i.e., before JS_DestroyContext). This is last-writer-wins: a second
+    // registration overwrites the first. The hook is cleared after it fires, so it runs at
+    // most once. Used by shell_utils to release the JS debugger's PersistentRootedObject
+    // while the owning JSContext is still alive.
+    static void registerPreDestroyHook(std::function<void()> hook);
+
+    /**
+     * getJSContextForTest and getGlobalForTest should only be used from implscope_test.cpp, as we
+     * need a way to expose these members for some JS API calls.
+     */
+    JSContext* getJSContextForTest() {
+        return _context;
+    }
+
+    JS::HandleObject getGlobalForTest() {
+        return _global;
+    }
+
+private:
+    template <typename ImplScopeFunction>
+    auto _runSafely(ImplScopeFunction&& functionToRun) -> decltype(functionToRun());
+
+    void _MozJSCreateFunction(std::string_view raw, JS::MutableHandleValue fun);
+
+    /**
+     * This structure exists exclusively to construct the runtime and context
+     * ahead of the various global prototypes in the ImplScope construction.
+     * Basically, we have to call some c apis on the way up and down and this
+     * takes care of that
+     */
+    struct MozRuntime {
+    public:
+        MozRuntime(const MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
+        ~MozRuntime();
+        std::unique_ptr<JSContext, std::function<void(JSContext*)>> _context;
+    };
+
+    /**
+     * The connection state of the scope.
+     */
+    enum class ConnectState : char {
+        Not,
+        External,
+    };
+
+    struct MozJSEntry;
+    friend struct MozJSEntry;
+
+    static bool _interruptCallback(JSContext* cx);
+    static void _gcCallback(JSContext* rt, JSGCStatus status, JS::GCReason reason, void* data);
+
+    /**
+     * Invoked when SpiderMonkey reports an out-of-memory condition it cannot recover from.
+     */
+    static void _outOfMemoryCallback(JSContext* cx, void* data);
+
+    bool _checkErrorState(bool success, bool reportError = true, bool assertOnError = true);
+    Status _checkForPendingException();
+
+    /**
+     * Returns true if a failed script compilation/execution should be retried as an ES module,
+     * based on the pending exception (a SyntaxError, or a top-level-await ReferenceError). Always
+     * false for the interactive shell. Note, returns false if modules are not supported (i.e in the
+     * server).
+     */
+    bool _shouldTryExecAsModule(const std::string& name, bool success) const;
+
+    void installDBAccess();
+    void installBSONTypes();
+    void installFork();
+    void _setupScripts();
+
+    void setCompileOptions(JS::CompileOptions* co);
+
+    static bool onSyncPromiseResolved(JSContext* cx, unsigned argc, JS::Value* vp);
+    static bool onSyncPromiseRejected(JSContext* cx, unsigned argc, JS::Value* vp);
+    static bool awaitPromise(JSContext* cx, JS::HandleObject promise, JS::MutableHandleValue out);
+
+    // SpiderMonkey requires that an environment preparer is installed in order to dynamically load
+    // modules.
+    struct EnvironmentPreparer final : public js::ScriptEnvironmentPreparer {
+        JSContext* _context;
+        explicit EnvironmentPreparer(JSContext* cx) : _context(cx) {
+            js::SetScriptEnvironmentPreparer(cx, this);
+        }
+        void invoke(JS::HandleObject global, Closure& closure) override;
+    };
+
+    MozJSScriptEngine* _engine;
+    MozRuntime _mr;
+    JSContext* _context;
+    WrapType<GlobalInfo> _globalProto;
+    JS::HandleObject _global;
+    std::vector<JS::PersistentRootedValue> _funcs;
+    StringMap<ScriptingFunction> _funcCodeToHandleMap;
+    InternedStringTable _internedStrings;
+    Status _killStatus;
+    mutable std::mutex _mutex;
+    stdx::condition_variable _sleepCondition;
+    OperationContext* _opCtx;         // Op context for DbEval
+    stdx::thread::id _opCtxThreadId;  // Id of the thread that owns '_opCtx'
+    std::size_t _inOp;
+    std::atomic<bool> _pendingGC;  // NOLINT
+    ConnectState _connectState;
+    Status _status;
+    std::string _parentStack;
+    std::size_t _generation;
+    bool _requireOwnedObjects;
+    Deferred<std::string (*)(const MozJSImplScope&)> _baseURL;
+    bool _hasOutOfMemoryException;
+
+    // Host-supplied BSON bytes pinned by live BSONHolder proxies since the last GC.
+    // ValueReader wraps the argument/global BSON in lazy proxies whose holders keep the
+    // owned buffer alive until the proxy is finalized -- which only happens at GC.
+    // SpiderMonkey never sees those malloc bytes (no JS::AddAssociatedMemory accounting)
+    // so without help the GC feels no pressure and dead proxies pin their buffers
+    // indefinitely. So we count the bytes ourselves and force a GC at the threshold below.
+    // See _notePinnedHostBytes().
+    int64_t _pinnedHostBytesSinceGc = 0;
+
+    // Force a GC once this many bytes have been pinned.
+    // 32 MB keeps the worst-case backlog under 3% of the 1100 MB jsHeapLimitMB cap while amortising
+    // the cost of a full GC over many invocations (depending on document size).
+    static constexpr int64_t kPinnedBytesGcThreshold = 32 * 1024 * 1024;
+
+    // Force a GC in reset() if this much pinned garbage exists, so reused pooled scopes
+    // return to a clean floor between requests.
+    static constexpr int64_t kPinnedBytesResetGcThreshold = 1024 * 1024;
+
+    // Adds nbytes to the pinned counter and runs a full GC at kPinnedBytesGcThreshold.
+    void _notePinnedHostBytes(int64_t nbytes);
+
+    // Checks whether _pinnedHostBytesSinceGc exceeds the threshold and performs a GC if so.
+    void _checkPinnedHostBytesAndGc(int64_t threshold);
+
+    const std::unique_ptr<ModuleLoader> _moduleLoader;
+    std::unique_ptr<EnvironmentPreparer> _environmentPreparer;
+    // _promiseResult must be a persistentRootedValue (instead of a simple RootedValue). Using a
+    // simple RootedValue here affects the stack cleanup conditions in the promise's execution
+    // context.
+    JS::PersistentRootedValue _promiseResult;
+
+    WrapType<BinDataInfo> _binDataProto;
+    WrapType<BSONInfo> _bsonProto;
+    WrapType<CodeInfo> _codeProto;
+    WrapType<CountDownLatchInfo> _countDownLatchProto;
+    WrapType<CursorHandleInfo> _cursorHandleProto;
+    WrapType<CursorInfo> _cursorProto;
+    WrapType<DBCollectionInfo> _dbCollectionProto;
+    WrapType<DBInfo> _dbProto;
+    WrapType<DBPointerInfo> _dbPointerProto;
+    WrapType<DBQueryInfo> _dbQueryProto;
+    WrapType<DBRefInfo> _dbRefProto;
+    WrapType<ErrorInfo> _errorProto;
+    WrapType<JSThreadInfo> _jsThreadProto;
+    WrapType<MaxKeyInfo> _maxKeyProto;
+    WrapType<MinKeyInfo> _minKeyProto;
+    WrapType<MongoExternalInfo> _mongoExternalProto;
+    WrapType<MongoHelpersInfo> _mongoHelpersProto;
+    WrapType<NativeFunctionInfo> _nativeFunctionProto;
+    WrapType<NumberDecimalInfo> _numberDecimalProto;
+    WrapType<NumberIntInfo> _numberIntProto;
+    WrapType<NumberLongInfo> _numberLongProto;
+    WrapType<ObjectInfo> _objectProto;
+    WrapType<OIDInfo> _oidProto;
+    WrapType<RegExpInfo> _regExpProto;
+    WrapType<ResumeTokenDataUtility> _resumeTokenDataProto;
+    WrapType<SessionInfo> _sessionProto;
+    WrapType<MongoStatusInfo> _statusProto;
+    WrapType<TimestampInfo> _timestampProto;
+    WrapType<URIInfo> _uriProto;
+};
+
+[[MONGO_MOD_PUBLIC]] inline MozJSImplScope* getScope(JSContext* cx) {
+    return static_cast<MozJSImplScope*>(getCommonRuntime(cx));
+}
+
+inline MozJSImplScope* getScope(class JS::GCContext* gcCtx) {
+    return getScope(freeOpToJSContext(gcCtx));
+}
+
+template <>
+inline WrapType<CursorHandleInfo>& getProto(MozJSCommonRuntimeInterface* runtime) {
+    return static_cast<MozJSImplScope*>(runtime)->cursorHandleProto();
+}
+
+template <>
+inline WrapType<CursorInfo>& getProto(MozJSCommonRuntimeInterface* runtime) {
+    return static_cast<MozJSImplScope*>(runtime)->cursorProto();
+}
+
+template <>
+inline WrapType<MongoExternalInfo>& getProto(MozJSCommonRuntimeInterface* runtime) {
+    return static_cast<MozJSImplScope*>(runtime)->mongoExternalProto();
+}
+
+template <>
+inline WrapType<SessionInfo>& getProto(MozJSCommonRuntimeInterface* runtime) {
+    return static_cast<MozJSImplScope*>(runtime)->sessionProto();
+}
+
+template <>
+inline WrapType<URIInfo>& getProto(MozJSCommonRuntimeInterface* runtime) {
+    return static_cast<MozJSImplScope*>(runtime)->uriProto();
+}
+
+}  // namespace mozjs
+}  // namespace mongo

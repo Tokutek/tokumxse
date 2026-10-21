@@ -1,0 +1,36 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "setup_multiversion",
+    srcs = [
+        "__init__.py",
+        "config.py",
+        "download.py",
+        "github_conn.py",
+        "setup_multiversion.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "pyyaml",
+            group = "core",
+        ),
+        dependency(
+            "structlog",
+            group = "evergreen",
+        ),
+        dependency(
+            "pygithub",
+            group = "testing",
+        ),
+        dependency(
+            "distro",
+            group = "testing",
+        ),
+        dependency(
+            "requests",
+            group = "core",
+        ),
+    ],
+)

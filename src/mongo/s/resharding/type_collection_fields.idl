@@ -1,0 +1,116 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of resharding-related fields stored in a config.collections entry.
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/keypattern.idl"
+    - "mongo/s/resharding/common_types.idl"
+
+structs:
+    TypeCollectionDonorFields:
+        description: "Resharding-related fields specific to donor shards."
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        mod_visibility: public
+        fields:
+            tempNs:
+                cpp_name: tempReshardingNss
+                type: namespacestring
+                description:
+                    "The namespace of the temporary resharding collection that exists on
+                    recipient shards."
+            reshardingKey:
+                type: KeyPattern
+            recipientShardIds:
+                type: array<shard_id>
+
+    TypeCollectionRecipientFields:
+        description: "Resharding-related fields specific to recipient shards."
+        inline_chained_structs: true
+        chained_structs:
+            ReshardingApproxCopySize: ReshardingApproxCopySizeStruct
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        mod_visibility: public
+        fields:
+            cloneTimestamp:
+                type: timestamp
+                optional: true
+                description: "The timestamp for the snapshot read while cloning from the donors."
+            donorShards:
+                type: array<DonorShardFetchTimestamp>
+                description: "The list of donors to clone from."
+            sourceUUID:
+                cpp_name: sourceUUID
+                type: uuid
+                description: "The UUID of the original collection being resharded."
+            sourceNs:
+                cpp_name: sourceNss
+                type: namespacestring
+                description: "The namespace of the collection being resharded."
+            minimumOperationDurationMillis:
+                type: long
+            oplogBatchTaskCount:
+                type: long
+                description: >-
+                    "The number of subtasks to divide a single oplog batch into,
+                    so that it may be applied concurrently by multiple threads."
+                optional: true
+            relaxed:
+                type: optionalBool
+                description: >-
+                    "Runs the cloner aggregation without specifying a collection
+                    uuid to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards."
+
+    TypeCollectionReshardingFields:
+        description:
+            "Resharding-related fields meant to be stored in a config.collections
+            document."
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        mod_visibility: public
+        fields:
+            uuid:
+                cpp_name: reshardingUUID
+                type: uuid
+                description: "A unique identifier for the resharding operation."
+            state:
+                type: CoordinatorState
+                default: kUnused
+            userCanceled:
+                type: bool
+                optional: true
+                description: >-
+                    If emplaced, indicates whether an abort originated from a user cancellation.
+            donorFields:
+                type: TypeCollectionDonorFields
+                optional: true
+            recipientFields:
+                type: TypeCollectionRecipientFields
+                optional: true
+            startTime:
+                type: date
+                description: "Start time of the operation."
+                optional: true
+            provenance:
+                type: ReshardingProvenance
+                description: "The source operation that called this resharding operation."
+                optional: true
+            performVerification:
+                type: optionalBool
+                description: "Whether to perform data comparison verification."
+            telemetryContext:
+                type: object_owned
+                optional: true
+                description: "Tracing context for this resharding operation."

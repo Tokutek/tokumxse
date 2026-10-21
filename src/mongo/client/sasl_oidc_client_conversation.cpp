@@ -1,0 +1,345 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/client/sasl_oidc_client_conversation.h"
+
+#include "mongo/base/data_builder.h"
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/client/mongo_uri.h"
+#include "mongo/client/sasl_oidc_client_types_gen.h"
+#include "mongo/db/auth/authentication_metrics.h"
+#include "mongo/db/auth/oauth_authorization_server_metadata_gen.h"
+#include "mongo/db/auth/oauth_discovery_factory.h"
+#include "mongo/db/auth/oidc_protocol_gen.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/object_check.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/http_client.h"
+#include "mongo/util/str.h"
+
+#include <cstddef>
+#include <memory>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+namespace {
+constexpr auto kClientIdParameterName = "client_id"sv;
+constexpr auto kRequestScopesParameterName = "scope"sv;
+constexpr auto kGrantTypeParameterName = "grant_type"sv;
+constexpr auto kGrantTypeParameterDeviceCodeValue =
+    "urn:ietf:params:oauth:grant-type:device_code"sv;
+constexpr auto kGrantTypeParameterRefreshTokenValue = "refresh_token"sv;
+constexpr auto kDeviceCodeParameterName = "device_code"sv;
+constexpr auto kCodeParameterName = "code"sv;
+constexpr auto kRefreshTokenParameterName = kGrantTypeParameterRefreshTokenValue;
+
+std::unique_ptr<HttpClient> createHttpClient(bool withConnectionPool = false) {
+    std::unique_ptr<HttpClient> httpClient =
+        withConnectionPool ? HttpClient::create() : HttpClient::createWithoutConnectionPool();
+    // If we consider plain HTTP localhost endpoints secure, then don't prevent the HTTP client
+    // from sending requests there.
+    httpClient->allowInsecureHTTP(HttpClient::localhostExceptionEnabled());
+    return httpClient;
+}
+
+inline void appendPostBodyRequiredParams(StringBuilder* sb, std::string_view clientId) {
+    *sb << kClientIdParameterName << "=" << uriEncode(clientId);
+}
+
+inline void appendPostBodyDeviceCodeRequestParams(
+    StringBuilder* sb, const boost::optional<std::vector<std::string_view>>& requestScopes) {
+    if (requestScopes) {
+        *sb << "&" << kRequestScopesParameterName << "=";
+        for (std::size_t i = 0; i < requestScopes->size(); i++) {
+            *sb << uriEncode(requestScopes.get()[i]);
+            if (i < requestScopes->size() - 1) {
+                *sb << "%20";
+            }
+        }
+    }
+}
+
+inline void appendPostBodyTokenRequestParams(StringBuilder* sb, std::string_view deviceCode) {
+    // kDeviceCodeParameterName and kCodeParameterName are the same, IDP's use different names.
+    *sb << "&" << kGrantTypeParameterName << "=" << kGrantTypeParameterDeviceCodeValue << "&"
+        << kDeviceCodeParameterName << "=" << uriEncode(deviceCode) << "&" << kCodeParameterName
+        << "=" << uriEncode(deviceCode);
+}
+
+inline void appendPostBodyRefreshFlowParams(StringBuilder* sb, std::string_view refreshToken) {
+    *sb << "&" << kGrantTypeParameterName << "=" << kGrantTypeParameterRefreshTokenValue << "&"
+        << kRefreshTokenParameterName << "=" << uriEncode(refreshToken);
+}
+
+BSONObj doPostRequest(HttpClient* httpClient,
+                      std::string_view endPoint,
+                      const std::string& requestBody) {
+    auto response = httpClient->post(endPoint, requestBody);
+    ConstDataRange responseCdr = response.getCursor();
+    std::string_view responseStr;
+    responseCdr.readInto<std::string_view>(&responseStr);
+    return fromjson(responseStr);
+}
+
+// @returns {accessToken, refreshToken}
+std::pair<std::string, std::string> doDeviceAuthorizationGrantFlow(
+    const OAuthAuthorizationServerMetadata& discoveryReply,
+    const auth::OIDCMechanismServerStep1& serverReply,
+    std::string_view principalName) {
+    boost::optional<std::string_view> deviceAuthorizationEndpoint =
+        discoveryReply.getDeviceAuthorizationEndpoint().get();
+    uassert(ErrorCodes::BadValue,
+            "Missing or invalid device authorization endpoint in server reply",
+            deviceAuthorizationEndpoint && !deviceAuthorizationEndpoint->empty());
+    uassertStatusOK(HttpClient::endpointIsSecure(*deviceAuthorizationEndpoint)
+                        .withContext("device authorization endpoint in discovery document"));
+
+    auto clientId = serverReply.getClientId();
+    uassert(ErrorCodes::BadValue,
+            "Encountered empty client ID in server reply",
+            clientId && !clientId->empty());
+
+    // Cache clientId for potential refresh flow uses in the future.
+    oidcClientGlobalParams.oidcClientId = std::string{*clientId};
+
+    // Construct body of POST request to device authorization endpoint based on provided
+    // parameters.
+    StringBuilder deviceCodeRequestSb;
+    appendPostBodyRequiredParams(&deviceCodeRequestSb, clientId.value());
+    appendPostBodyDeviceCodeRequestParams(&deviceCodeRequestSb, serverReply.getRequestScopes());
+    auto deviceCodeRequest = deviceCodeRequestSb.str();
+
+    // Retrieve device code and user verification URI from IdP.
+    auto httpClient = createHttpClient();
+    httpClient->setHeaders(
+        {"Accept: application/json", "Content-Type: application/x-www-form-urlencoded"});
+    BSONObj deviceAuthorizationResponseObj =
+        doPostRequest(httpClient.get(), *deviceAuthorizationEndpoint, deviceCodeRequest);
+
+    // Simulate end user login via user verification URI.
+    auto deviceAuthorizationResponse = OIDCDeviceAuthorizationResponse::parse(
+        deviceAuthorizationResponseObj, IDLParserContext{"oidcDeviceAuthorizationResponse"});
+
+    // IDP's use different names to refer to the verification url.
+    const auto& optURI = deviceAuthorizationResponse.getVerificationUri();
+    const auto& optURL = deviceAuthorizationResponse.getVerificationUrl();
+    uassert(ErrorCodes::BadValue, "Encountered empty device authorization url", optURI || optURL);
+    uassert(ErrorCodes::BadValue,
+            "Encounterd both verification_uri and verification_url",
+            !(optURI && optURL));
+    auto deviceAuthURL = optURI ? optURI.get() : optURL.get();
+
+    oidcClientGlobalParams.oidcIdPAuthCallback(
+        principalName, deviceAuthURL, deviceAuthorizationResponse.getUserCode());
+
+    // Poll token endpoint for access and refresh tokens. It should return immediately since
+    // the shell blocks on the authenticationSimulator until it completes, but poll anyway.
+    StringBuilder tokenRequestSb;
+    appendPostBodyRequiredParams(&tokenRequestSb, clientId.value());
+    appendPostBodyTokenRequestParams(&tokenRequestSb, deviceAuthorizationResponse.getDeviceCode());
+    auto tokenRequest = tokenRequestSb.str();
+
+    while (true) {
+        // SASLOIDCClientConversation::_step2() already checked that tokenEndpoint exists in
+        // discoveryReply and points to http://localhost or a https:// URL.
+        BSONObj tokenResponseObj =
+            doPostRequest(httpClient.get(), discoveryReply.getTokenEndpoint().get(), tokenRequest);
+        auto tokenResponse =
+            OIDCTokenResponse::parse(tokenResponseObj, IDLParserContext{"oidcTokenResponse"});
+
+        // The token endpoint will either respond with the tokens or {"error":
+        // "authorization pending"}.
+        bool hasAccessToken = tokenResponse.getAccessToken().has_value();
+        bool hasError = tokenResponse.getError().has_value();
+        uassert(ErrorCodes::UnknownError,
+                fmt::format("Received unrecognized reply from token endpoint: {}",
+                            tokenResponseObj.toString()),
+                hasAccessToken || hasError);
+
+        if (hasAccessToken) {
+            auto accessToken = std::string{*tokenResponse.getAccessToken()};
+
+            // If a refresh token was also provided, cache that as well.
+            if (tokenResponse.getRefreshToken()) {
+                return {accessToken, std::string{*tokenResponse.getRefreshToken()}};
+            }
+
+            return {accessToken, ""};
+        }
+
+        // Assert that the error returned with "authorization pending", which indicates that
+        // the token endpoint has not perceived end-user authentication yet and we should
+        // poll again.
+        auto error = std::string{*tokenResponse.getError()};
+        uassert(ErrorCodes::UnknownError,
+                fmt::format("Received unexpected error from token endpoint: {}", error),
+                error == "authorization pending");
+    }
+
+    MONGO_UNREACHABLE
+}
+
+std::pair<std::string, std::string> doAuthorizationCodeFlow(
+    const auth::OIDCMechanismServerStep1& serverReply) {
+    // TODO SERVER-73969 Add authorization code flow support.
+    uasserted(ErrorCodes::NotImplemented, "Authorization code flow is not yet supported");
+}
+
+}  // namespace
+OIDCClientGlobalParams oidcClientGlobalParams;
+
+StatusWith<bool> SaslOIDCClientConversation::step(std::string_view inputData,
+                                                  std::string* outputData) {
+    switch (++_step) {
+        case 1:
+            return _firstStep(outputData);
+        case 2:
+            return _secondStep(inputData, outputData);
+        default:
+            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
+                                    str::stream()
+                                        << "Invalid client OIDC authentication step: " << _step);
+    }
+}
+
+StatusWith<std::string> SaslOIDCClientConversation::doRefreshFlow() try {
+    // The refresh flow can only be performed if a successful auth attempt has already occurred.
+    uassert(ErrorCodes::IllegalOperation,
+            "Cannot perform refresh flow without previously-successful auth attempt",
+            !oidcClientGlobalParams.oidcRefreshToken.empty() &&
+                !oidcClientGlobalParams.oidcClientId.empty() &&
+                !oidcClientGlobalParams.oidcTokenEndpoint.empty());
+
+    StringBuilder refreshFlowRequestBuilder;
+    appendPostBodyRequiredParams(&refreshFlowRequestBuilder, oidcClientGlobalParams.oidcClientId);
+    appendPostBodyRefreshFlowParams(&refreshFlowRequestBuilder,
+                                    oidcClientGlobalParams.oidcRefreshToken);
+
+    auto refreshFlowRequestBody = refreshFlowRequestBuilder.str();
+
+    auto httpClient = createHttpClient();
+    httpClient->setHeaders(
+        {"Accept: application/json", "Content-Type: application/x-www-form-urlencoded"});
+    BSONObj refreshFlowResponseObj = doPostRequest(
+        httpClient.get(), oidcClientGlobalParams.oidcTokenEndpoint, refreshFlowRequestBody);
+    auto refreshResponse =
+        OIDCTokenResponse::parse(refreshFlowResponseObj, IDLParserContext{"oidcRefreshResponse"});
+
+    // New tokens should be supplied immediately.
+    uassert(ErrorCodes::UnknownError,
+            "Failed to retrieve refreshed access token",
+            refreshResponse.getAccessToken());
+    if (refreshResponse.getRefreshToken()) {
+        oidcClientGlobalParams.oidcRefreshToken = std::string{*refreshResponse.getRefreshToken()};
+    }
+
+    return std::string{*refreshResponse.getAccessToken()};
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
+
+StatusWith<bool> SaslOIDCClientConversation::_firstStep(std::string* outputData) {
+    // If an access token was provided without a username, proceed to the second step and send it
+    // directly to the server.
+    if (_principalName.empty()) {
+        if (_accessToken.empty()) {
+            return Status(ErrorCodes::AuthenticationFailed,
+                          "Either a username or an access token must be provided for the "
+                          "MONGODB-OIDC mechanism");
+        }
+        try {
+            auto ret = _secondStep("", outputData);
+            ++_step;
+            return ret;
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+    }
+
+    // If the username is provided, then request information needed to contact the identity provider
+    // from the server.
+    auth::OIDCMechanismClientStep1 firstClientRequest;
+    firstClientRequest.setPrincipalName(_principalName);
+    auto firstClientRequestBSON = firstClientRequest.toBSON();
+    *outputData = std::string(firstClientRequestBSON.objdata(), firstClientRequestBSON.objsize());
+    return false;
+}
+
+StatusWith<bool> SaslOIDCClientConversation::_secondStep(std::string_view input,
+                                                         std::string* outputData) try {
+    // If the client already has a non-empty access token, then token acquisition can be skipped.
+    if (_accessToken.empty()) {
+        // Currently, only device authorization flow is supported for token acquisition.
+        // Parse device authorization endpoint from input.
+        ConstDataRange inputCdr(input.data(), input.size());
+        BSONObj payload{inputCdr.read<rpc::ValidatedBSONObj>()};
+        auto serverReply = auth::OIDCMechanismServerStep1::parse(
+            payload, IDLParserContext{"oidcServerStep1Reply"});
+
+        auto issuer = serverReply.getIssuer();
+
+        OAuthDiscoveryFactory discoveryFactory(createHttpClient(/* withConnectionPool = */ true));
+        OAuthAuthorizationServerMetadata discoveryReply = discoveryFactory.acquire(issuer);
+
+        // The token endpoint must be provided for both device auth and authz code flows.
+        // If exists, the token endpoint has been already validated during parsing of
+        // `OAuthAuthorizationServerMetadata` class.
+        // (@see `src/mongo/db/auth/oauth_authorization_server_metadata.idl`).
+        boost::optional<std::string_view> tokenEndpoint = discoveryReply.getTokenEndpoint();
+        uassert(ErrorCodes::BadValue,
+                "Missing or invalid token endpoint in server reply",
+                tokenEndpoint && !tokenEndpoint->empty());
+        uassertStatusOK(HttpClient::endpointIsSecure(*tokenEndpoint)
+                            .withContext("token endpoint in discovery document"));
+
+        // Cache the token endpoint for potential reuse during the refresh flow.
+        oidcClientGlobalParams.oidcTokenEndpoint = std::string{*tokenEndpoint};
+
+        // Try device authorization grant flow first if provided, falling back to authorization code
+        // flow.
+        if (discoveryReply.getDeviceAuthorizationEndpoint()) {
+            auto tokens =
+                doDeviceAuthorizationGrantFlow(discoveryReply, serverReply, _principalName);
+            _accessToken = tokens.first;
+            oidcClientGlobalParams.oidcAccessToken = tokens.first;
+            oidcClientGlobalParams.oidcRefreshToken = tokens.second;
+        } else if (discoveryReply.getAuthorizationEndpoint()) {
+            auto tokens = doAuthorizationCodeFlow(serverReply);
+            _accessToken = tokens.first;
+            oidcClientGlobalParams.oidcAccessToken = tokens.first;
+            oidcClientGlobalParams.oidcRefreshToken = tokens.second;
+        } else {
+            uasserted(ErrorCodes::BadValue,
+                      "Missing device authorization and authorization endpoint in server reply");
+        }
+    }
+
+    auth::OIDCMechanismClientStep2 secondClientRequest;
+    secondClientRequest.setJWT(_accessToken);
+    auto bson = secondClientRequest.toBSON();
+    *outputData = std::string(bson.objdata(), bson.objsize());
+
+    return true;
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
+
+}  // namespace mongo

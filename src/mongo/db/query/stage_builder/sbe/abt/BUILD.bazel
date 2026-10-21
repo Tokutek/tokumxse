@@ -1,0 +1,38 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+        "*.py",
+    ]),
+)
+
+# Core definitions: ABT, Logical and physical properties, Metadata, and core
+# utilities.
+mongo_cc_library(
+    name = "abt_base",
+    srcs = [
+        "explain.cpp",
+        "reference_tracker.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db/query/stage_builder/sbe/abt/syntax:syntax_expr",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "reference_tracker_test",
+    srcs = [
+        "reference_tracker_test.cpp",
+    ],
+    tags = ["mongo_unittest_seventh_group"],
+    deps = [
+        ":abt_base",
+        "//src/mongo/db:sbe_values",
+        "//src/mongo/db/query/stage_builder/sbe:abt_unit_test_utils",
+    ],
+)

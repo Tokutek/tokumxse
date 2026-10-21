@@ -1,0 +1,506 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/change_stream_pre_images_truncate_manager.h"
+
+#include "mongo/db/change_stream_options_manager.h"
+#include "mongo/db/change_stream_pre_images_collection_manager.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
+#include "mongo/db/pipeline/change_stream_preimage_gen.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/storage/collection_truncate_markers.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/server_parameter_guard.h"
+
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo {
+
+class PreImagesTruncateManagerTest : public CatalogTestFixture {
+protected:
+    const UUID kNsUUID0 = UUID::gen();
+    const UUID kNsUUID1 = UUID::gen();
+    const UUID kNsUUID2 = UUID::gen();
+
+    void setUp() override {
+        CatalogTestFixture::setUp();
+        ChangeStreamOptionsManager::create(getServiceContext());
+
+        // Set up OpObserver so that the test will append actual oplog entries to the oplog
+        // using repl::logOp().
+        auto opObserverRegistry =
+            dynamic_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
+        opObserverRegistry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
+    }
+
+    PreImagesTruncateManager& getTruncateManager() {
+        return _truncateManager;
+    }
+
+    auto acquirePreImagesCollectionForRead(NamespaceStringOrUUID nssOrUUID) {
+        const auto opCtx = operationContext();
+        return acquireCollection(
+            opCtx,
+            CollectionAcquisitionRequest(std::move(nssOrUUID),
+                                         PlacementConcern{boost::none, ShardVersion::UNTRACKED()},
+                                         repl::ReadConcernArgs::get(opCtx),
+                                         AcquisitionPrerequisites::kRead),
+            MODE_IS);
+    }
+
+    void createPreImagesCollection() {
+        const auto preImagesCollectionNss = NamespaceString::kChangeStreamPreImagesNamespace;
+        const auto opCtx = operationContext();
+        ChangeStreamPreImagesCollectionManager::get(opCtx).createPreImagesCollection(opCtx);
+    }
+
+    void insertPreImages(const UUID& nsUUID, int64_t numPreImages, int64_t docPaddingBytes) {
+        const auto opCtx = operationContext();
+        const auto preImagesNss = NamespaceString::kChangeStreamPreImagesNamespace;
+        AutoGetCollection preImagesCollectionRaii(opCtx, preImagesNss, MODE_IX);
+        ASSERT(preImagesCollectionRaii);
+
+        // 'getNextOpTimes' requires us to be inside a WUOW.
+        WriteUnitOfWork wuow(opCtx);
+        auto opTimes = repl::getNextOpTimes(opCtx, numPreImages);
+
+        std::vector<BSONObj> preImageDocs;
+        for (const auto& opTime : opTimes) {
+            ChangeStreamPreImageId preImageId(nsUUID, opTime.getTimestamp(), 0);
+            const auto operationTime = Date_t() + Seconds(opTime.getSecs());
+            ChangeStreamPreImage preImage(std::move(preImageId),
+                                          operationTime,
+                                          BSON("padding" << std::string(docPaddingBytes, 'a')));
+            preImageDocs.push_back(preImage.toBSON());
+        };
+
+        auto& changeStreamPreImagesCollection = *preImagesCollectionRaii;
+        ASSERT_OK(Helpers::insert(opCtx, changeStreamPreImagesCollection, preImageDocs));
+        wuow.commit();
+    }
+
+    void flushTruncateMarkers() {
+        _truncateManager.flushTruncateMarkers();
+    }
+
+    std::shared_ptr<PreImagesTruncateMarkers> getInitializedTruncateMarkers() {
+        return _truncateManager.getInitializedMarkersForPreImagesCollection_forTest(
+            operationContext());
+    }
+
+    int64_t getNumRecordsInMarkers(std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers) {
+        const auto markersSnapshot =
+            truncateMarkers->getMarkersMap_forTest().getUnderlyingSnapshot();
+        int64_t numRecords{0};
+        for (const auto& [nsUUID, truncateMarkersForNsUUID] : *markersSnapshot) {
+            auto markers = truncateMarkersForNsUUID->getMarkers_forTest();
+            for (const auto& marker : markers) {
+                numRecords = numRecords + marker.records;
+            }
+            numRecords = numRecords + truncateMarkersForNsUUID->currentRecords_forTest();
+        }
+        return numRecords;
+    }
+
+    int64_t getBytesInMarkers(std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers) {
+        const auto markersSnapshot =
+            truncateMarkers->getMarkersMap_forTest().getUnderlyingSnapshot();
+        int64_t bytes{0};
+        for (const auto& [nsUUID, truncateMarkersForNsUUID] : *markersSnapshot) {
+            auto markers = truncateMarkersForNsUUID->getMarkers_forTest();
+            for (const auto& marker : markers) {
+                bytes = bytes + marker.bytes;
+            }
+            bytes = bytes + truncateMarkersForNsUUID->currentBytes_forTest();
+        }
+        return bytes;
+    }
+
+    // Validates that the truncate markers capture the metadata for the pre-images collection
+    // accurately.
+    void validateMarkerMetadataMatchesCollection(
+        const CollectionAcquisition& preImagesCollection,
+        std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers) {
+        ASSERT(preImagesCollection.exists());
+
+        // Also validate that the _truncateManager contains the markers we are validated.
+        ASSERT(_truncateManager.areTruncateMarkersPopulated_forTest());
+
+        ASSERT_EQ(truncateMarkers->getPreImagesCollectionUUID(), preImagesCollection.uuid());
+
+        const auto& preImagesCollPtr = preImagesCollection.getCollectionPtr();
+        const auto opCtx = operationContext();
+
+        const auto numRecordsInMarkers = getNumRecordsInMarkers(truncateMarkers);
+        ASSERT_EQ(numRecordsInMarkers, preImagesCollPtr->numRecords(opCtx));
+
+        const auto bytesInMarkers = getBytesInMarkers(truncateMarkers);
+        ASSERT_EQ(bytesInMarkers, preImagesCollPtr->dataSize(opCtx));
+    }
+
+    void validateMarkersExistForNsUUID(std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers,
+                                       const UUID& nsUUID) {
+        ASSERT(truncateMarkers->getMarkersMap_forTest().find(nsUUID));
+    }
+
+    void validateCreationMethod(
+        std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers,
+        const UUID& nsUUID,
+        CollectionTruncateMarkers::MarkersCreationMethod expectedCreationMethod) {
+        auto nsUUIDTruncateMarkers = truncateMarkers->getMarkersMap_forTest().find(nsUUID);
+        ASSERT(nsUUIDTruncateMarkers);
+        ASSERT_EQ(nsUUIDTruncateMarkers->getMarkersCreationMethod(), expectedCreationMethod);
+    }
+
+    void validateMarkersDontExistForNsUUID(
+        std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers, const UUID& nsUUID) {
+        ASSERT(!truncateMarkers->getMarkersMap_forTest().find(nsUUID));
+    }
+
+    void validateIncreasingRidAndWallTimesInMarkers(
+        std::shared_ptr<PreImagesTruncateMarkers> truncateMarkers) {
+        auto markersSnapshot = truncateMarkers->getMarkersMap_forTest().getUnderlyingSnapshot();
+        for (auto& [nsUUID, truncateMarkersForNsUUID] : *markersSnapshot) {
+            auto markers = truncateMarkersForNsUUID->getMarkers_forTest();
+
+            RecordId highestSeenRecordId{};
+            Date_t highestSeenWallTime{};
+            for (const auto& marker : markers) {
+                auto currentRid = marker.lastRecord;
+                auto currentWallTime = marker.wallTime;
+                if (currentRid < highestSeenRecordId || currentWallTime < highestSeenWallTime) {
+                    // Something went wrong during marker initialisation. Log the details of which
+                    // 'nsUUID' failed for debugging before failing the test.
+                    LOGV2_ERROR(7658610,
+                                "Truncate markers created for pre-images with nsUUID were not "
+                                "initialised in increasing order of highest wall time and RecordId",
+                                "nsUUID"_attr = nsUUID,
+                                "highestSeenWallTime"_attr = highestSeenWallTime,
+                                "highestSeenRecordId"_attr = highestSeenRecordId,
+                                "markerRecordId"_attr = currentRid,
+                                "markerWallTime"_attr = currentWallTime);
+                }
+                ASSERT_GTE(currentRid, highestSeenRecordId);
+                ASSERT_GTE(currentWallTime, highestSeenWallTime);
+                highestSeenRecordId = currentRid;
+                highestSeenWallTime = currentWallTime;
+            }
+
+            const auto& [partialMarkerHighestRid, partialMarkerHighestWallTime] =
+                truncateMarkersForNsUUID->getHighestRecordMetrics_forTest();
+            ASSERT_GTE(partialMarkerHighestRid, highestSeenRecordId);
+            ASSERT_GTE(partialMarkerHighestWallTime, highestSeenWallTime);
+        }
+    }
+
+private:
+    PreImagesTruncateManager _truncateManager;
+};
+
+TEST_F(PreImagesTruncateManagerTest, ScanningSingleNsUUID) {
+    auto minBytesPerMarker = 1;
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    insertPreImages(kNsUUID0, /*numPreImages*/ 3000, /*docPaddingBytes*/ 1);
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 1);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    validateMarkersExistForNsUUID(truncateMarkers, kNsUUID0);
+
+    validateCreationMethod(
+        truncateMarkers, kNsUUID0, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+}
+
+TEST_F(PreImagesTruncateManagerTest, ScanningSingleNsUUID1Doc) {
+    auto minBytesPerMarker = 1;
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    insertPreImages(kNsUUID0, /*numPreImages*/ 1, /*docPaddingBytes*/ 1);
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 1);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    validateMarkersExistForNsUUID(truncateMarkers, kNsUUID0);
+
+    validateCreationMethod(
+        truncateMarkers, kNsUUID0, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+}
+
+TEST_F(PreImagesTruncateManagerTest, EmptyCollection) {
+    auto minBytesPerMarker = 1;
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 0);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+}
+
+TEST_F(PreImagesTruncateManagerTest, ScanningTwoNsUUIDs) {
+    auto minBytesPerMarker = 1;
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    insertPreImages(kNsUUID0, /*numPreImages*/ 10, /*docPaddingSize*/ 100);
+    insertPreImages(kNsUUID1, /*numPreImages*/ 1990, /*docPaddingSize*/ 1);
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 2);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    std::vector<UUID> nsUUIDs{kNsUUID0, kNsUUID1};
+    for (const auto& nsUUID : nsUUIDs) {
+        validateMarkersExistForNsUUID(truncateMarkers, nsUUID);
+        validateCreationMethod(
+            truncateMarkers, nsUUID, CollectionTruncateMarkers::MarkersCreationMethod::Scanning);
+    }
+}
+
+TEST_F(PreImagesTruncateManagerTest, SamplingSingleNsUUID) {
+    auto minBytesPerMarker = 1024 * 25;  // 25KB to downsize for testing.
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    insertPreImages(kNsUUID0, /*numPreImages*/ 4000, /*docPaddingBytes*/ 1);
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 1);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    validateMarkersExistForNsUUID(truncateMarkers, kNsUUID0);
+
+    validateCreationMethod(
+        truncateMarkers, kNsUUID0, CollectionTruncateMarkers::MarkersCreationMethod::Sampling);
+}
+
+// Tests that markers initialized from a pre-populated pre-images collection guarantee that the
+// total size and number of records across the pre-images collection are captured in the generated
+// truncate markers. No other guarantees can be made aside from that the cumulative size and number
+// of records across the nsUUIDs will be consistent.
+TEST_F(PreImagesTruncateManagerTest, SamplingTwoNsUUIDs) {
+    auto minBytesPerMarker = 1024 * 100;  // 100KB.
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    insertPreImages(kNsUUID0, /*numPreImages*/ 1000, /*docPaddingSize*/ 100);
+    insertPreImages(kNsUUID1, /*numPreImages*/ 1000, /*docPaddingSize*/ 1);
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 2);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    std::vector<UUID> nsUUIDs{kNsUUID0, kNsUUID1};
+    for (const auto& nsUUID : nsUUIDs) {
+        validateMarkersExistForNsUUID(truncateMarkers, nsUUID);
+        validateCreationMethod(
+            truncateMarkers, nsUUID, CollectionTruncateMarkers::MarkersCreationMethod::Sampling);
+    }
+}
+
+TEST_F(PreImagesTruncateManagerTest, SamplingTwoNsUUIDsManyRecordsToFew) {
+    auto minBytesPerMarker = 1024 * 100;  // 100KB.
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    insertPreImages(kNsUUID0, /*numPreImages*/ 1999, /*docPaddingSize*/ 100);
+    insertPreImages(kNsUUID1, /*numPreImages*/ 1, /*docPaddingSize*/ 1);
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), 2);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    std::vector<UUID> nsUUIDs{kNsUUID0, kNsUUID1};
+    for (const auto& nsUUID : nsUUIDs) {
+        validateMarkersExistForNsUUID(truncateMarkers, nsUUID);
+        validateCreationMethod(
+            truncateMarkers, nsUUID, CollectionTruncateMarkers::MarkersCreationMethod::Sampling);
+    }
+}
+
+TEST_F(PreImagesTruncateManagerTest, SamplingManyNsUUIDs) {
+    auto minBytesPerMarker = 1024 * 100;  // 100KB.
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    std::vector<UUID> nsUUIDs{};
+    auto numNssUUIDs = 11;
+    for (int i = 0; i < numNssUUIDs; i++) {
+        nsUUIDs.push_back(UUID::gen());
+    }
+
+    for (const auto& nsUUID : nsUUIDs) {
+        insertPreImages(nsUUID, /*numPreImages*/ 555, /*docPaddingSize*/ 100);
+    }
+
+    auto truncateMarkers = getInitializedTruncateMarkers();
+    ASSERT(truncateMarkers);
+
+    BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+    ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), 1);
+    ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), numNssUUIDs);
+    ASSERT_GTE(markerCreationStats["timeElapsedMillis"].numberLong(), 0);
+
+    const auto preImagesCollection =
+        acquirePreImagesCollectionForRead(NamespaceString::kChangeStreamPreImagesNamespace);
+
+    validateMarkerMetadataMatchesCollection(preImagesCollection, truncateMarkers);
+
+    validateIncreasingRidAndWallTimesInMarkers(truncateMarkers);
+
+    for (const auto& nsUUID : nsUUIDs) {
+        validateMarkersExistForNsUUID(truncateMarkers, nsUUID);
+        validateCreationMethod(
+            truncateMarkers, nsUUID, CollectionTruncateMarkers::MarkersCreationMethod::Sampling);
+    }
+}
+
+TEST_F(PreImagesTruncateManagerTest, SamplingMultiplePassesStatsAreCumulative) {
+    auto minBytesPerMarker = 1024 * 100;  // 100KB.
+    unittest::ServerParameterGuard minBytesPerMarkerController{
+        "preImagesCollectionTruncateMarkersMinBytes", minBytesPerMarker};
+
+    createPreImagesCollection();
+
+    std::vector<UUID> nsUUIDs{};
+    auto numNssUUIDs = 11;
+    for (int i = 0; i < numNssUUIDs; i++) {
+        nsUUIDs.push_back(UUID::gen());
+    }
+
+    for (const auto& nsUUID : nsUUIDs) {
+        insertPreImages(nsUUID, /*numPreImages*/ 555, /*docPaddingSize*/ 100);
+    }
+
+    boost::optional<long long> prevMillis;
+
+    for (int i = 1; i <= 5; ++i) {
+        // Clear previous state.
+        flushTruncateMarkers();
+
+        auto truncateMarkers = getInitializedTruncateMarkers();
+        ASSERT(truncateMarkers);
+
+        BSONObj markerCreationStats = getTruncateManager().getMarkerCreationStats().toBSON();
+        ASSERT_EQ(markerCreationStats["totalPass"].numberLong(), i);
+        ASSERT_EQ(markerCreationStats["scannedInternalCollections"].numberLong(), i * numNssUUIDs);
+
+        auto millis = markerCreationStats["timeElapsedMillis"].numberLong();
+        if (prevMillis.has_value()) {
+            ASSERT_GTE(millis, prevMillis.value());
+        } else {
+            ASSERT_GTE(millis, 0);
+        }
+        prevMillis = millis;
+    }
+}
+
+}  // namespace mongo

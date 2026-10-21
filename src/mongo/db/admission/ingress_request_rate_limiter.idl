@@ -1,0 +1,88 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo::admission"
+    cpp_includes:
+        - "mongo/db/admission/ingress_request_rate_limiter.h"
+        - "mongo/db/server_options.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+server_parameters:
+    ingressRequestRateLimiterEnabled:
+        description: Controls whether ingress request rate limiter mechanism is enabled.
+        set_at: [startup, runtime]
+        cpp_varname: gIngressRequestRateLimiterEnabled
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+    ingressRequestAdmissionRatePerSec:
+        description: "The number of new requests that will be admitted per second"
+        set_at: [startup, runtime]
+        cpp_varname: gIngressRequestRateLimiterRatePerSec
+        cpp_vartype: Atomic<int32_t>
+        on_update: IngressRequestRateLimiter::onUpdateAdmissionRatePerSec
+        default:
+            expr: std::numeric_limits<int32_t>::max()
+        validator: {gte: 1}
+        redact: false
+
+    ingressRequestAdmissionBurstCapacitySecs:
+        description: >-
+            Describes how many seconds worth of unutilized rate limit can be stored away to admit
+            additional ingress requests during periods where the rate limit is temporarily
+            exceeded.
+        set_at: [startup, runtime]
+        cpp_varname: gIngressRequestRateLimiterBurstCapacitySecs
+        cpp_vartype: Atomic<double>
+        on_update: IngressRequestRateLimiter::onUpdateAdmissionBurstCapacitySecs
+        default:
+            expr: std::numeric_limits<double>::max()
+        validator: {gt: 0}
+        redact: false
+
+    ingressRequestRateLimiterExemptions:
+        description: "A document containing a list of CIDR ranges to be exempted from ingress request rate limiting."
+        set_at: [startup, runtime]
+        cpp_class:
+            name: "IngressRequestRateLimiterIPExemptions"
+            # Expects the payload to be an instance of `CIDRRangeListParameters`.
+            override_set: true
+        redact: false
+
+    ingressRequestRateLimiterApplicationExemptions:
+        description: "A document containing a list of application names to be exempted from ingress request rate limiting."
+        set_at: [startup, runtime]
+        cpp_class:
+            name: "IngressRequestRateLimiterAppExemptions"
+            # Expects the payload to be an instance of `ApplicationExemptionListParameters`
+            override_set: true
+        redact: false
+
+    ingressRequestRateLimiterAllowRetries:
+        description: >-
+            Whether or not rejections from the rate limiter should indicate to clients that the error is
+            retryable.
+        set_at: [startup, runtime]
+        cpp_varname: gIngressRequestRateLimiterAllowRetries
+        cpp_vartype: Atomic<bool>
+        default: true
+        redact: false
+
+    ingressRequestAdmissionMaxQueueDepth:
+        description: >-
+            The maximum number of requests that may be queued waiting for an admission token when
+            the ingress request rate limit is exceeded. Requests that arrive when the queue is at
+            capacity are rejected immediately. A value of 0 disables queueing (requests are always
+            rejected immediately when the rate limit is exceeded).
+        set_at: [startup, runtime]
+        cpp_varname: gIngressRequestAdmissionMaxQueueDepth
+        cpp_vartype: Atomic<long long>
+        on_update: IngressRequestRateLimiter::onUpdateAdmissionMaxQueueDepth
+        default: 0
+        validator: {gte: 0}
+        redact: false

@@ -1,0 +1,96 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/sbe/values/block_interface.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+
+namespace mongo::sbe::value {
+/**
+ * CellBlock corresponds to a path for a given document and is a container of values at a "path"
+ * according to the chosen definition of "path".
+ *
+ * For example, a TS bucket has the "data" field that stores the actual data in a columnar format.
+ * Each top-level field in the "data" field could be a CellBlock, in which case the "path"
+ * definition is the top-level field name.
+ */
+struct CellBlock {
+    virtual ~CellBlock() = default;
+
+    /**
+     * Returns the value block for this cell block. The value block is the block of values that
+     * corresponds to the path of this cell block.
+     */
+    virtual ValueBlock& getValueBlock() = 0;
+
+    /**
+     * Makes a fully independent clone of this CellBlock.
+     */
+    virtual std::unique_ptr<CellBlock> clone() const = 0;
+
+    /**
+     * Returns an vector of integers indicating the position of values within documents. The ith
+     * integer represents number of values for the ith row.
+     * {a: [1,2,3,4]}
+     * {a: 5}
+     * {XYZ: 999}
+     * {a: [6,7]}
+     *
+     * Values for the 'a' CellBlock:
+     * [1, 2, 3, 4, 5, Nothing, 6, 7]
+     *
+     * Filter position info (the return value of this function):
+     * [4            1  1        2]
+     *
+     * Or (without spaces): [4,1,1,2]
+     *
+     * The case where a document has an empty array is special, because we need to distinguish it
+     * from the case where the document has no values at the path for MQL's sake. (For example, if
+     * we search for documents that have a missing 'a' field, we need to know whether 'a' is really
+     * missing or whether it's an empty array)
+     *
+     * A document with an empty array has a 0 in its position info.
+     * {a: 1}
+     * {a: []}
+     * {a: [2,3]}
+     *
+     * values:    [1,2,3]
+     * pos info:  [1,0,2]
+     *
+     * An empty vector represents a trivial position info, ie, there are no arrays at all, and
+     * there is exactly one value per document (including Nothings, for documents where the field
+     * is missing). This could also be represented with a vector of all 1s.
+     */
+    virtual const std::vector<int32_t>& filterPositionInfo() = 0;
+
+    virtual int getApproximateSize() const = 0;
+};
+
+/*
+ * Represents a single path through a block of objects. Stores all of the values found at
+ * the given path with eagerly materialized projection and filter position info.
+ */
+struct MaterializedCellBlock : public CellBlock {
+    ValueBlock& getValueBlock() override;
+    std::unique_ptr<CellBlock> clone() const override;
+
+    const std::vector<int32_t>& filterPositionInfo() override {
+        return _filterPosInfo;
+    }
+
+    int getApproximateSize() const override {
+        int result = sizeof(*this);
+        result += static_cast<int>(_filterPosInfo.capacity() * sizeof(int32_t));
+        if (_deblocked) {
+            result += _deblocked->getApproximateSize();
+        }
+        return result;
+    }
+
+    std::unique_ptr<ValueBlock> _deblocked;
+    std::vector<int32_t> _filterPosInfo;
+};
+}  // namespace mongo::sbe::value

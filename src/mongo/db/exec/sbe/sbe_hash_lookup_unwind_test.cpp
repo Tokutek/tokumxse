@@ -1,0 +1,641 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/**
+ * This file contains tests for sbe::HashLookupUnwindStage.
+ */
+
+#include "mongo/db/exec/sbe/sbe_hash_lookup_shared_test.h"
+#include "mongo/db/exec/sbe/sbe_unittest_assert.h"
+#include "mongo/db/exec/sbe/stages/hash_lookup_unwind.h"
+
+namespace mongo::sbe {
+
+class HashLookupUnwindStageTest : public HashLookupSharedTest {
+public:
+    void runVariation(const RunVariationParams& params) override {
+        auto& stream = params.gctx.outStream();
+
+        // Avoid using 'std::endl' here because it unnecessarily flushes the stream, which can lead
+        // to poor performance.
+        if (stream.tellp()) {
+            stream << '\n';
+        }
+
+        stream << "==== VARIATION: " << params.name << " ====\n";
+        if (params.collator) {
+            stream << "COLLATOR: ";
+            value::ValuePrinters::make(stream, printOptions).writeCollatorToStream(params.collator);
+            stream << '\n';
+        }
+        stream << "-- INPUTS:\n";
+
+        // Build a scan for the outer loop.
+        auto [outerScanSlots, outerScanStage] = generateVirtualScanMulti(2, params.outer);
+        stream << "OUTER ";
+        cloneAndEvalStage(stream,
+                          {{outerScanSlots[0], "value"}, {outerScanSlots[1], "key"}},
+                          outerScanStage.get());
+        stream << '\n';
+
+        // Build a scan for the inner loop.
+        auto [innerScanSlots, innerScanStage] = generateVirtualScanMulti(2, params.inner);
+        stream << "INNER ";
+        cloneAndEvalStage(stream,
+                          {{innerScanSlots[0], "value"}, {innerScanSlots[1], "key"}},
+                          innerScanStage.get());
+        stream << '\n';
+
+        // Prepare and eval stage
+        auto ctx = makeCompileCtx();
+
+        value::ViewOfValueAccessor collatorAccessor;
+        boost::optional<value::SlotId> collatorSlot;
+
+        if (params.collator) {
+            // Setup collator and insert it into the ctx.
+            collatorSlot = generateSlotId();
+            ctx->pushCorrelated(collatorSlot.value(), &collatorAccessor);
+            collatorAccessor.reset(value::TypeTags::collator,
+                                   value::bitcastFrom<CollatorInterface*>(params.collator));
+        }
+
+        // Build and prepare for execution loop join of the two scan stages.
+        value::SlotId lookupStageOutputSlot = generateSlotId();
+        auto lookupStage = makeS<HashLookupUnwindStage>(std::move(outerScanStage),
+                                                        std::move(innerScanStage),
+                                                        outerScanSlots[1],
+                                                        innerScanSlots[1],
+                                                        innerScanSlots[0],
+                                                        lookupStageOutputSlot,
+                                                        collatorSlot,
+                                                        sbe::JoinType::Inner,
+                                                        boost::none /*indexSlot*/,
+                                                        kEmptyPlanNodeId);
+
+        StageResultsPrinters::SlotNames slotNames;
+        slotNames.reserve(2);
+        if (params.outerKeyOnly) {
+            slotNames.emplace_back(outerScanSlots[1], "outer_key");
+        } else {
+            slotNames.emplace_back(outerScanSlots[0], "outer");
+        }
+        slotNames.emplace_back(lookupStageOutputSlot, "inner_agg");
+
+        prepareAndEvalStageWithReopen(
+            ctx.get(), stream, slotNames, lookupStage.get(), params.expectMemUse);
+    }  // runVariation
+};  // HashLookupUnwindStageTest
+
+TEST_F(HashLookupUnwindStageTest, BasicTests) {
+    unittest::GoldenTestContext gctx(&goldenTestConfigSbe);
+
+    runVariation({.gctx = gctx,
+                  .name = "simple scalar key",
+                  .outer = BSONArray(fromjson(R"""([
+                    [{_id: 1}, 1],
+                    [{_id: 2}, 2],
+                    [{_id: 3}, 2],
+                    [{_id: 4}, 7]
+                 ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+                    [{_id: 11}, 1],
+                    [{_id: 12}, 2],
+                    [{_id: 13}, 2],
+                    [{_id: 14}, 7]
+                 ])"""))});
+
+    runVariation({.gctx = gctx,
+                  .name = "no matches",
+                  .outer = BSONArray(fromjson(R"""([
+                  [{_id: 1}, 1],
+                  [{_id: 2}, 4]
+               ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+                  [{_id: 11}, 2],
+                  [{_id: 12}, 3]
+               ])"""))});
+
+    runVariation({.gctx = gctx,
+                  .name = "simple array key",
+                  .outer = BSONArray(fromjson(R"""([
+                  [{_id: 1}, 1],
+                  [{_id: 2}, [2, 3]],
+                  [{_id: 3}, [2, 4]],
+                  [{_id: 4}, []]
+               ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+                  [{_id: 11}, 2],
+                  [{_id: 12}, 4],
+                  [{_id: 13}, [1, 2, 3]],
+                  [{_id: 14}, []]
+               ])"""))});
+
+    runVariation({.gctx = gctx,
+                  .name = "nested array key",
+                  .outer = BSONArray(fromjson(R"""([
+                [{_id: 1}, 1],
+                [{_id: 2}, 2],
+                [{_id: 3}, 3],
+                [{_id: 4}, [1]],
+                [{_id: 5}, [3]],
+                [{_id: 6}, [[3]]],
+                [{_id: 7}, [2, [3]]]
+             ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+                [{_id: 11}, 1],
+                [{_id: 12}, 2],
+                [{_id: 13}, 3],
+                [{_id: 14}, [1]],
+                [{_id: 15}, [3]],
+                [{_id: 16}, [[3]]],
+                [{_id: 17}, [2, [3]]]
+             ])"""))});
+
+    runVariation({.gctx = gctx,
+                  .name = "nested object key",
+                  .outer = BSONArray(fromjson(R"""([
+                [{_id: 1}, {a: 1}],
+                [{_id: 2}, {b: 1}],
+                [{_id: 3}, {a: 1, b: 1}],
+                [{_id: 4}, {b: 1, a: 1}],
+                [{_id: 5}, [{a: 1}]],
+                [{_id: 6}, [{a: 1}, {b: 1}]],
+                [{_id: 7}, [{a: 1, b: 1}]],
+                [{_id: 8}, [{b: 1, a: 1}]]
+             ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+                [{_id: 11}, {a: 1}],
+                [{_id: 12}, {b: 1}],
+                [{_id: 13}, {a: 1, b: 1}],
+                [{_id: 14}, {b: 1, a: 1}],
+                [{_id: 15}, [{a: 1}]],
+                [{_id: 16}, [{a: 1}, {b: 1}]],
+                [{_id: 17}, [{a: 1, b: 1}]],
+                [{_id: 18}, [{b: 1, a: 1}]]
+             ])"""))});
+
+    runVariation({.gctx = gctx,
+                  .name = "mixed key",
+                  .outer = BSONArray(fromjson(R"""([
+              [{_id: 1}, null],
+              [{_id: 2}, 1],
+              [{_id: 3}, "abc"],
+              [{_id: 4}, NumberDecimal("1")],
+              [{_id: 5}, [1]],
+              [{_id: 6}, ["abc"]],
+              [{_id: 7}, [null]],
+              [{_id: 8}, [null, "1", "abc", NumberDecimal("1")]],
+              [{_id: 9}, [{x:1, y: "abc"}]]
+           ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+              [{_id: 11}, null],
+              [{_id: 12}, 1],
+              [{_id: 13}, "abc"],
+              [{_id: 14}, NumberDecimal("1")],
+              [{_id: 15}, [1]],
+              [{_id: 16}, ["abc"]],
+              [{_id: 17}, [null]],
+              [{_id: 18}, [null, "1", "abc", NumberDecimal("1")]],
+              [{_id: 19}, [{x:1, y: "abc"}]]
+           ])"""))});
+
+    auto toLowerCollator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
+    runVariation({.gctx = gctx,
+                  .name = "with toLower collator",
+                  .outer = BSONArray(fromjson(R"""([
+              [{_id: 1}, null],
+              [{_id: 2}, "abc"],
+              [{_id: 3}, "ABC"],
+              [{_id: 4}, "Abc"],
+              [{_id: 5}, "def"]
+           ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+              [{_id: 11}, null],
+              [{_id: 12}, "abc"],
+              [{_id: 13}, "ABC"],
+              [{_id: 14}, "Abc"],
+              [{_id: 15}, "def"]
+           ])""")),
+                  .collator = toLowerCollator.get()});
+
+    runVariation({.gctx = gctx,
+                  .name = "empty",
+                  .outer = BSONArray(fromjson(R"""([
+           ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+           ])""")),
+                  .expectMemUse = false});
+
+    runVariation({.gctx = gctx,
+                  .name = "empty outer",
+                  .outer = BSONArray(fromjson(R"""([
+           ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+                [{_id: 11}, 2],
+                [{_id: 12}, 3]
+           ])"""))});
+
+    // We don't expect a memory footprint to be recorded because the hash table never needs to be
+    // constructed-- there are no "inner" side documents.
+    runVariation({.gctx = gctx,
+                  .name = "empty inner",
+                  .outer = BSONArray(fromjson(R"""([
+              [{_id: 1}, 1],
+              [{_id: 2}, 2]
+         ])""")),
+                  .inner = BSONArray(fromjson(R"""([
+         ])""")),
+                  .expectMemUse = false});
+}
+
+TEST_F(HashLookupUnwindStageTest, ForceSpillTest) {
+
+    const BSONArray outer{fromjson(R"""([
+     [{_id: 1}, 1],
+     [{_id: 2}, 2],
+     [{_id: 3}, 2],
+     [{_id: 4}, 7]
+  ])""")};
+    const BSONArray inner{fromjson(R"""([
+     [{_id: 11}, 1],
+     [{_id: 12}, 2],
+     [{_id: 13}, 7],
+     [{_id: 14}, 2]
+  ])""")};
+
+    // Build a scan for the outer loop.
+    auto [outerScanSlots, outerScanStage] = generateVirtualScanMulti(2, outer);
+    // Build a scan for the inner loop.
+    auto [innerScanSlots, innerScanStage] = generateVirtualScanMulti(2, inner);
+
+    auto ctx = makeCompileCtx();
+
+    boost::optional<value::SlotId> collatorSlot;
+
+    // Build and prepare for execution loop join of the two scan stages.
+    value::SlotId lookupStageOutputSlot = generateSlotId();
+    auto lookupStage = makeS<HashLookupUnwindStage>(std::move(outerScanStage),
+                                                    std::move(innerScanStage),
+                                                    outerScanSlots[1],
+                                                    innerScanSlots[1],
+                                                    innerScanSlots[0],
+                                                    lookupStageOutputSlot,
+                                                    collatorSlot,
+                                                    sbe::JoinType::Inner,
+                                                    boost::none /*indexSlot*/,
+                                                    kEmptyPlanNodeId);
+
+    value::SlotVector lookupSlots;
+    lookupSlots.reserve(2);
+    lookupSlots.push_back(outerScanSlots[0]);
+    lookupSlots.push_back(lookupStageOutputSlot);
+    auto resultAccessors = prepareTree(ctx.get(), lookupStage.get(), lookupSlots);
+
+    // The expected results are the results without forceSpill.
+    std::vector<std::vector<std::pair<value::TypeTags, value::Value>>> expectedResults;
+    std::vector<value::TagValueOwned> flatValues;
+    while (lookupStage->getNext() == PlanState::ADVANCED) {
+        std::vector<std::pair<value::TypeTags, value::Value>> results{};
+        results.reserve(resultAccessors.size());
+        for (size_t i = 0; i < resultAccessors.size(); ++i) {
+            flatValues.emplace_back(resultAccessors[i]->getCopyOfValue());
+            results.emplace_back(flatValues.back().view());
+        }
+        expectedResults.emplace_back(std::move(results));
+    }
+
+    // Close the stage and execute again with spilling.
+    lookupStage->close();
+
+    lookupStage->open(false);
+    int idx = 0;
+    while (lookupStage->getNext() == PlanState::ADVANCED) {
+        for (size_t i = 0; i < resultAccessors.size(); ++i) {
+            const auto [resTag, resValue] = resultAccessors[i]->getViewOfValue();
+            const auto [expectedTag, expectedValue] = expectedResults[idx][i];
+
+            ASSERT_SBE_VALUE_EQ(expectedTag, expectedValue, resTag, resValue);
+        }
+
+        if (idx == 1) {
+            // Make sure it has not spilled already.
+            auto* stats = static_cast<const HashLookupStats*>(lookupStage->getSpecificStats());
+            auto totalSpillingStats = stats->getTotalSpillingStats();
+            ASSERT_FALSE(stats->usedDisk);
+            ASSERT_EQ(0, totalSpillingStats.getSpills());
+            ASSERT_EQ(0, totalSpillingStats.getSpilledRecords());
+            ASSERT_GT(lookupStage->getMemoryTracker()->inUseTrackedMemoryBytes(), 0);
+            ASSERT_GT(stats->peakTrackedMemBytes, 0);
+
+            // Get ready to yield.
+            lookupStage->saveState();
+
+            // Force spill.
+            lookupStage->forceSpill(nullptr /*yieldPolicy*/);
+
+            // Check stats to make sure it spilled
+            stats = static_cast<const HashLookupStats*>(lookupStage->getSpecificStats());
+            totalSpillingStats = stats->getTotalSpillingStats();
+            ASSERT_TRUE(stats->usedDisk);
+            ASSERT_EQ(7, totalSpillingStats.getSpills());
+            ASSERT_EQ(7, totalSpillingStats.getSpilledRecords());
+            ASSERT_EQ(0, lookupStage->getMemoryTracker()->inUseTrackedMemoryBytes());
+            ASSERT_GT(stats->peakTrackedMemBytes, 0);
+
+            // Get ready to retrieve more records.
+            lookupStage->restoreState();
+        }
+        ++idx;
+    }
+
+    lookupStage->close();
+}
+
+TEST_F(HashLookupUnwindStageTest, InnerJoinIncludeIndex) {
+
+    const BSONArray outer{fromjson(R"""([
+     [{_id: 1}, 1],
+     [{_id: 2}, 2],
+     [{_id: 3}, 2],
+     [{_id: 4}, 7]
+  ])""")};
+    const BSONArray inner{fromjson(R"""([
+     [{_id: 11}, 1],
+     [{_id: 12}, 2],
+     [{_id: 13}, 7],
+     [{_id: 14}, 2]
+  ])""")};
+
+    // Build a scan for the outer loop.
+    auto [outerScanSlots, outerScanStage] = generateVirtualScanMulti(2, outer);
+    // Build a scan for the inner loop.
+    auto [innerScanSlots, innerScanStage] = generateVirtualScanMulti(2, inner);
+
+    auto ctx = makeCompileCtx();
+
+    boost::optional<value::SlotId> collatorSlot;
+
+    // Build and prepare for execution loop join of the two scan stages.
+    value::SlotId lookupStageOutputSlot = generateSlotId();
+    boost::optional<value::SlotId> indexSlot = generateSlotId();
+    auto lookupStage = makeS<HashLookupUnwindStage>(std::move(outerScanStage),
+                                                    std::move(innerScanStage),
+                                                    outerScanSlots[1],
+                                                    innerScanSlots[1],
+                                                    innerScanSlots[0],
+                                                    lookupStageOutputSlot,
+                                                    collatorSlot,
+                                                    sbe::JoinType::Inner,
+                                                    indexSlot,
+                                                    kEmptyPlanNodeId);
+
+    value::SlotVector lookupSlots;
+    lookupSlots.reserve(3);
+    lookupSlots.push_back(outerScanSlots[0]);
+    lookupSlots.push_back(lookupStageOutputSlot);
+    lookupSlots.push_back(*indexSlot);
+    auto resultAccessors = prepareTree(ctx.get(), lookupStage.get(), lookupSlots);
+
+    auto outerDocs = makeOwnedVector({stage_builder::makeValue(BSON("_id" << 1)),
+                                      stage_builder::makeValue(BSON("_id" << 2)),
+                                      stage_builder::makeValue(BSON("_id" << 3)),
+                                      stage_builder::makeValue(BSON("_id" << 4)),
+                                      stage_builder::makeValue(BSON("_id" << 5))});
+    auto innerDocs = makeOwnedVector({stage_builder::makeValue(BSON("_id" << 11)),
+                                      stage_builder::makeValue(BSON("_id" << 12)),
+                                      stage_builder::makeValue(BSON("_id" << 13)),
+                                      stage_builder::makeValue(BSON("_id" << 14))});
+    // Expected output: each outer doc has one or more inner doc matches.
+    std::vector<std::vector<sbe::value::Value>> expected{
+        {outerDocs[0].value(), innerDocs[0].value(), 0},
+        {outerDocs[1].value(), innerDocs[1].value(), 0},
+        {outerDocs[1].value(), innerDocs[3].value(), 1},
+        {outerDocs[2].value(), innerDocs[1].value(), 0},
+        {outerDocs[2].value(), innerDocs[3].value(), 1},
+        {outerDocs[3].value(), innerDocs[2].value(), 0}};
+    int i = 0;
+    for (auto st = lookupStage->getNext(); st == PlanState::ADVANCED;
+         st = lookupStage->getNext(), i++) {
+        ASSERT_LT(i, expected.size());
+
+        auto [outerTag, outerVal] = resultAccessors[0]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(outerTag, outerVal, value::TypeTags::bsonObject, expected[i][0]);
+
+        auto [innerTag, innerVal] = resultAccessors[1]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(innerTag, innerVal, value::TypeTags::bsonObject, expected[i][1]);
+
+        auto [indexTag, indexVal] = resultAccessors[2]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(indexTag, indexVal, value::TypeTags::NumberInt32, expected[i][2]);
+    }
+    ASSERT_EQ(i, expected.size());
+
+    lookupStage->close();
+}
+
+TEST_F(HashLookupUnwindStageTest, LeftJoinIncludeIndex) {
+
+    const BSONArray outer{fromjson(R"""([
+     [{_id: 1}, 1]
+  ])""")};
+    const BSONArray inner{fromjson(R"""([
+     [{_id: 2}, 2]
+  ])""")};
+
+    // Build a scan for the outer loop.
+    auto [outerScanSlots, outerScanStage] = generateVirtualScanMulti(2, outer);
+    // Build a scan for the inner loop.
+    auto [innerScanSlots, innerScanStage] = generateVirtualScanMulti(2, inner);
+
+    auto ctx = makeCompileCtx();
+
+    boost::optional<value::SlotId> collatorSlot;
+
+    // Build and prepare for execution loop join of the two scan stages.
+    value::SlotId lookupStageOutputSlot = generateSlotId();
+    boost::optional<value::SlotId> indexSlot = generateSlotId();
+    auto lookupStage = makeS<HashLookupUnwindStage>(std::move(outerScanStage),
+                                                    std::move(innerScanStage),
+                                                    outerScanSlots[1],
+                                                    innerScanSlots[1],
+                                                    innerScanSlots[0],
+                                                    lookupStageOutputSlot,
+                                                    collatorSlot,
+                                                    sbe::JoinType::Left,
+                                                    indexSlot,
+                                                    kEmptyPlanNodeId);
+
+    value::SlotVector lookupSlots;
+    lookupSlots.reserve(3);
+    lookupSlots.push_back(outerScanSlots[0]);
+    lookupSlots.push_back(lookupStageOutputSlot);
+    lookupSlots.push_back(*indexSlot);
+    auto resultAccessors = prepareTree(ctx.get(), lookupStage.get(), lookupSlots);
+
+    // Expected output: each outer doc has no match, but it's part of the results due to left join
+    // being used.
+    auto expected = makeOwnedVector({stage_builder::makeValue(BSON("_id" << 1))});
+    int i = 0;
+    for (auto st = lookupStage->getNext(); st == PlanState::ADVANCED;
+         st = lookupStage->getNext(), i++) {
+        ASSERT_LT(i, expected.size());
+
+        auto [outerTag, outerVal] = resultAccessors[0]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(outerTag, outerVal, value::TypeTags::bsonObject, expected[i].value());
+
+        auto [innerTag, innerVal] = resultAccessors[1]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(innerTag, innerVal, value::TypeTags::Nothing, 0);
+
+        auto [indexTag, indexVal] = resultAccessors[2]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(indexTag, indexVal, value::TypeTags::Null, 0);
+    }
+    ASSERT_EQ(i, expected.size());
+
+    lookupStage->close();
+}
+
+// Verifies that when the outer key is an array, the matching inner-document buffer indices are
+// iterated in sorted order, even when the array elements are enumerated in an order that produces
+// unsorted buffer indices. This exercises the array-key path of LookupHashTableIter, which sorts
+// the reused match vector after collecting matches.
+TEST_F(HashLookupUnwindStageTest, ArrayKeySortedMatchIndices) {
+    // The inner docs are buffered in scan order, so their buffer indices are 0, 1, 2 for keys
+    // 5, 3, 1 respectively.
+    const BSONArray outer{fromjson(R"""([
+     [{_id: 1}, [1, 3, 5]]
+  ])""")};
+    const BSONArray inner{fromjson(R"""([
+     [{_id: 11}, 5],
+     [{_id: 12}, 3],
+     [{_id: 13}, 1]
+  ])""")};
+
+    // Build a scan for the outer loop.
+    auto [outerScanSlots, outerScanStage] = generateVirtualScanMulti(2, outer);
+    // Build a scan for the inner loop.
+    auto [innerScanSlots, innerScanStage] = generateVirtualScanMulti(2, inner);
+
+    auto ctx = makeCompileCtx();
+
+    boost::optional<value::SlotId> collatorSlot;
+
+    value::SlotId lookupStageOutputSlot = generateSlotId();
+    boost::optional<value::SlotId> indexSlot = generateSlotId();
+    auto lookupStage = makeS<HashLookupUnwindStage>(std::move(outerScanStage),
+                                                    std::move(innerScanStage),
+                                                    outerScanSlots[1],
+                                                    innerScanSlots[1],
+                                                    innerScanSlots[0],
+                                                    lookupStageOutputSlot,
+                                                    collatorSlot,
+                                                    sbe::JoinType::Inner,
+                                                    indexSlot,
+                                                    kEmptyPlanNodeId);
+
+    value::SlotVector lookupSlots;
+    lookupSlots.reserve(3);
+    lookupSlots.push_back(outerScanSlots[0]);
+    lookupSlots.push_back(lookupStageOutputSlot);
+    lookupSlots.push_back(*indexSlot);
+    auto resultAccessors = prepareTree(ctx.get(), lookupStage.get(), lookupSlots);
+
+    auto outerDocs = makeOwnedVector({stage_builder::makeValue(BSON("_id" << 1))});
+    auto innerDocs = makeOwnedVector({stage_builder::makeValue(BSON("_id" << 11)),
+                                      stage_builder::makeValue(BSON("_id" << 12)),
+                                      stage_builder::makeValue(BSON("_id" << 13))});
+    // Expected output: inner docs are visited in ascending buffer-index order (0, 1, 2), i.e. the
+    // docs with keys 5, 3, 1 in that order, regardless of the outer array's [1, 3, 5] ordering.
+    std::vector<std::vector<sbe::value::Value>> expected{
+        {outerDocs[0].value(), innerDocs[0].value(), 0},
+        {outerDocs[0].value(), innerDocs[1].value(), 1},
+        {outerDocs[0].value(), innerDocs[2].value(), 2}};
+    int i = 0;
+    for (auto st = lookupStage->getNext(); st == PlanState::ADVANCED;
+         st = lookupStage->getNext(), i++) {
+        ASSERT_LT(i, expected.size());
+
+        auto [outerTag, outerVal] = resultAccessors[0]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(outerTag, outerVal, value::TypeTags::bsonObject, expected[i][0]);
+
+        auto [innerTag, innerVal] = resultAccessors[1]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(innerTag, innerVal, value::TypeTags::bsonObject, expected[i][1]);
+
+        auto [indexTag, indexVal] = resultAccessors[2]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(indexTag, indexVal, value::TypeTags::NumberInt32, expected[i][2]);
+    }
+    ASSERT_EQ(i, expected.size());
+
+    lookupStage->close();
+}
+
+// Verifies that when the outer key is an array, an inner document reachable via more than one outer
+// array element (because the inner document itself has an array key) is returned exactly once. This
+// exercises the de-duplication (std::unique) of the array-key path in LookupHashTableIter.
+TEST_F(HashLookupUnwindStageTest, ArrayKeyDeduplicatedMatchIndices) {
+    // Inner doc {_id: 11} has array key [2, 3], so its buffer index 0 is registered under both keys
+    // 2 and 3. Inner doc {_id: 12} has key 4 at buffer index 1.
+    const BSONArray outer{fromjson(R"""([
+     [{_id: 1}, [2, 3, 4]]
+  ])""")};
+    const BSONArray inner{fromjson(R"""([
+     [{_id: 11}, [2, 3]],
+     [{_id: 12}, 4]
+  ])""")};
+
+    // Build a scan for the outer loop.
+    auto [outerScanSlots, outerScanStage] = generateVirtualScanMulti(2, outer);
+    // Build a scan for the inner loop.
+    auto [innerScanSlots, innerScanStage] = generateVirtualScanMulti(2, inner);
+
+    auto ctx = makeCompileCtx();
+
+    boost::optional<value::SlotId> collatorSlot;
+
+    value::SlotId lookupStageOutputSlot = generateSlotId();
+    boost::optional<value::SlotId> indexSlot = generateSlotId();
+    auto lookupStage = makeS<HashLookupUnwindStage>(std::move(outerScanStage),
+                                                    std::move(innerScanStage),
+                                                    outerScanSlots[1],
+                                                    innerScanSlots[1],
+                                                    innerScanSlots[0],
+                                                    lookupStageOutputSlot,
+                                                    collatorSlot,
+                                                    sbe::JoinType::Inner,
+                                                    indexSlot,
+                                                    kEmptyPlanNodeId);
+
+    value::SlotVector lookupSlots;
+    lookupSlots.reserve(3);
+    lookupSlots.push_back(outerScanSlots[0]);
+    lookupSlots.push_back(lookupStageOutputSlot);
+    lookupSlots.push_back(*indexSlot);
+    auto resultAccessors = prepareTree(ctx.get(), lookupStage.get(), lookupSlots);
+
+    auto outerDocs = makeOwnedVector({stage_builder::makeValue(BSON("_id" << 1))});
+    auto innerDocs = makeOwnedVector(
+        {stage_builder::makeValue(BSON("_id" << 11)), stage_builder::makeValue(BSON("_id" << 12))});
+    // Expected output: {_id: 11} appears once even though outer keys 2 and 3 both match it, then
+    // {_id: 12} for key 4.
+    std::vector<std::vector<sbe::value::Value>> expected{
+        {outerDocs[0].value(), innerDocs[0].value(), 0},
+        {outerDocs[0].value(), innerDocs[1].value(), 1}};
+    int i = 0;
+    for (auto st = lookupStage->getNext(); st == PlanState::ADVANCED;
+         st = lookupStage->getNext(), i++) {
+        ASSERT_LT(i, expected.size());
+
+        auto [outerTag, outerVal] = resultAccessors[0]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(outerTag, outerVal, value::TypeTags::bsonObject, expected[i][0]);
+
+        auto [innerTag, innerVal] = resultAccessors[1]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(innerTag, innerVal, value::TypeTags::bsonObject, expected[i][1]);
+
+        auto [indexTag, indexVal] = resultAccessors[2]->getViewOfValue();
+        ASSERT_SBE_VALUE_EQ(indexTag, indexVal, value::TypeTags::NumberInt32, expected[i][2]);
+    }
+    ASSERT_EQ(i, expected.size());
+
+    lookupStage->close();
+}
+}  // namespace mongo::sbe

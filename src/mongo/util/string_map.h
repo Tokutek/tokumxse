@@ -1,67 +1,112 @@
-// string_map.h
-
-/*    Copyright 2012 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include "mongo/base/string_data.h"
-#include "mongo/util/unordered_fast_key_table.h"
+#include "mongo/stdx/trusted_hasher.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cstddef>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
+#include <absl/hash/hash.h>
+#include <absl/strings/string_view.h>
+
+[[MONGO_MOD_PUBLIC]];
 
 namespace mongo {
 
-    typedef StringData::Hasher StringMapDefaultHash;
+// Type that bundles a hashed key with the actual string so hashing can be performed outside of
+// insert call by using heterogeneous lookup.
+struct StringMapHashedKey {
+public:
+    explicit StringMapHashedKey(std::string_view sd, std::size_t hash) : _sd(sd), _hash(hash) {}
 
-    struct StringMapDefaultEqual {
-        bool operator()( StringData a, StringData b ) const {
-            return a == b;
-        }
-    };
+    explicit operator std::string() const {
+        return std::string{_sd};
+    }
 
-    struct StringMapDefaultConvertor {
-        StringData operator()( const std::string& s ) const {
-            return StringData( s );
-        }
-    };
+    std::string_view key() const {
+        return _sd;
+    }
 
-    struct StringMapDefaultConvertorOther {
-        std::string operator()( StringData s ) const {
-            return s.toString();
-        }
-    };
+    std::size_t hash() const {
+        return _hash;
+    }
 
-    template< typename V >
-    class StringMap : public UnorderedFastKeyTable< StringData, // K_L
-                                                    std::string, // K_S
-                                                    V,           // V
-                                                    StringMapDefaultHash,
-                                                    StringMapDefaultEqual,
-                                                    StringMapDefaultConvertor,
-                                                    StringMapDefaultConvertorOther > {
-    };
-}
+private:
+    std::string_view _sd;
+    std::size_t _hash;
+};
 
+// Hasher to support heterogeneous lookup for std::string_view and string-like elements.
+struct StringMapHasher {
+    // This using directive activates heterogeneous lookup in the hash table
+    using is_transparent = void;
+
+    std::size_t operator()(std::string_view sd) const {
+        // Use the default absl string hasher.
+        return absl::Hash<absl::string_view>{}(absl::string_view(sd.data(), sd.size()));
+    }
+
+    std::size_t operator()(const std::string& s) const {
+        return operator()(std::string_view(s));
+    }
+
+    std::size_t operator()(const char* s) const {
+        return operator()(std::string_view(s));
+    }
+
+    std::size_t operator()(StringMapHashedKey key) const {
+        return key.hash();
+    }
+
+    StringMapHashedKey hashed_key(std::string_view sd) {
+        return StringMapHashedKey(sd, operator()(sd));
+    }
+};
+
+struct StringMapEq {
+    // This using directive activates heterogeneous lookup in the hash table
+    using is_transparent = void;
+
+    bool operator()(std::string_view lhs, std::string_view rhs) const {
+        return lhs == rhs;
+    }
+
+    bool operator()(StringMapHashedKey lhs, std::string_view rhs) const {
+        return lhs.key() == rhs;
+    }
+
+    bool operator()(std::string_view lhs, StringMapHashedKey rhs) const {
+        return lhs == rhs.key();
+    }
+
+    bool operator()(StringMapHashedKey lhs, StringMapHashedKey rhs) const {
+        return lhs.key() == rhs.key();
+    }
+};
+
+template <typename V>
+using StringMap = absl::flat_hash_map<std::string, V, StringMapHasher, StringMapEq>;
+
+using StringSet = absl::flat_hash_set<std::string, StringMapHasher, StringMapEq>;
+
+template <typename V>
+using StringDataMap = absl::flat_hash_map<std::string_view, V, StringMapHasher, StringMapEq>;
+
+using StringDataSet = absl::flat_hash_set<std::string_view, StringMapHasher, StringMapEq>;
+
+// StringMapHasher is a trusted hasher, no need to wrap in a secondary layer of hashing when used in
+// stdx unordered containers.
+template <>
+struct IsTrustedHasher<StringMapHasher, std::string> : std::true_type {};
+template <>
+struct IsTrustedHasher<StringMapHasher, std::string_view> : std::true_type {};
+
+}  // namespace mongo

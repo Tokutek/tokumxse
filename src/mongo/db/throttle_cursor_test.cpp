@@ -1,0 +1,541 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/throttle_cursor.h"
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/validate/validate_gen.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+
+#include <limits>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+namespace {
+
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.throttleCursor");
+const uint8_t kTickDelay = 200;
+// Margin of error to be subtracted from test times to account for clock inconsistencies
+const Milliseconds kErrorMargin = Milliseconds(100);
+
+class ThrottleCursorTest : public CatalogTestFixture {
+private:
+    void setUp() override;
+    void tearDown() override;
+
+protected:
+    const key_string::Value kMinKeyString = key_string::Builder{key_string::Version::kLatestVersion,
+                                                                kMinBSONKey,
+                                                                key_string::ALL_ASCENDING}
+                                                .getValueCopy();
+
+    explicit ThrottleCursorTest(Milliseconds clockIncrement = Milliseconds{kTickDelay})
+        : CatalogTestFixture() {}
+
+public:
+    void setDataThrottle(Date_t time);
+
+    /**
+     * Builds a throttle with rate 'maxMBPerSec'.
+     */
+    void setDataThrottle(Date_t time, int maxMBPerSec);
+
+    void setMaxMbPerSec(int maxMbPerSec);
+
+    Date_t getTime();
+    SortedDataInterfaceThrottleCursor getIdIndex(const CollectionPtr& coll);
+
+    std::unique_ptr<DataThrottle> _dataThrottle;
+};
+
+class ThrottleCursorTestFastClock : public ThrottleCursorTest {
+protected:
+    // Move the clock faster to speed up the test.
+    ThrottleCursorTestFastClock() : ThrottleCursorTest(Milliseconds{1000}) {}
+};
+
+void ThrottleCursorTest::setUp() {
+    CatalogTestFixture::setUp();
+    CollectionOptions defaultCollectionOptions;
+    ASSERT_OK(
+        storageInterface()->createCollection(operationContext(), kNss, defaultCollectionOptions));
+
+    // Insert random data into the collection. We don't need to create an index as the _id index is
+    // created by default.
+    AutoGetCollection collection(operationContext(), kNss, MODE_X);
+    invariant(collection);
+
+    for (int i = 0; i < 10; i++) {
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(Helpers::insert(operationContext(), *collection, BSON("_id" << i)));
+        wuow.commit();
+    }
+}
+
+void ThrottleCursorTest::tearDown() {
+    CatalogTestFixture::tearDown();
+}
+
+void ThrottleCursorTest::setDataThrottle(Date_t time) {
+    _dataThrottle = std::make_unique<DataThrottle>(time.toMillisSinceEpoch(),
+                                                   [&]() { return gMaxValidateMBperSec.load(); });
+}
+
+void ThrottleCursorTest::setDataThrottle(Date_t time, int maxMBPerSec) {
+    _dataThrottle = std::make_unique<DataThrottle>(time.toMillisSinceEpoch(),
+                                                   [maxMBPerSec]() { return maxMBPerSec; });
+}
+
+void ThrottleCursorTest::setMaxMbPerSec(int maxMbPerSec) {
+    gMaxValidateMBperSec.store(maxMbPerSec);
+}
+
+Date_t ThrottleCursorTest::getTime() {
+    return operationContext()->getServiceContext()->getFastClockSource()->now();
+}
+
+SortedDataInterfaceThrottleCursor ThrottleCursorTest::getIdIndex(const CollectionPtr& coll) {
+    const auto idEntry = coll->getIndexCatalog()->findIdIndex(operationContext());
+    auto iam = idEntry->accessMethod()->asSortedData();
+
+    return SortedDataInterfaceThrottleCursor(operationContext(), iam, _dataThrottle.get());
+}
+
+TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOff) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+
+    Date_t start = getTime();
+    setDataThrottle(start);
+    SeekableRecordThrottleCursor cursor =
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+
+    // With the data throttle off, all operations should finish within a second.
+    setMaxMbPerSec(0);
+
+    int numRecords = 0;
+
+    while (cursor.next(opCtx)) {
+        numRecords++;
+    }
+
+    int64_t recordId = 1;
+    while (cursor.seekExact(opCtx, RecordId(recordId))) {
+        recordId++;
+        numRecords++;
+    }
+
+    Date_t end = getTime();
+
+    ASSERT_EQ(numRecords, 20);
+    ASSERT_LTE(end - start, Milliseconds(1000));
+}
+
+TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorReverse) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Direction is independent of throttling; leave the throttle off so the test stays fast.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+    Date_t start = getTime();
+    setDataThrottle(start);
+    setMaxMbPerSec(0);
+
+    SeekableRecordThrottleCursor cursor = SeekableRecordThrottleCursor(
+        opCtx, coll->getRecordStore(), _dataThrottle.get(), /*forward=*/false);
+
+    // The fixture inserts _id 0..9, which occupy RecordIds 1..10. A reverse cursor's first next()
+    // returns the last record, then walks backwards to the first.
+    std::vector<int64_t> seen;
+    while (auto record = cursor.next(opCtx)) {
+        seen.push_back(record->id.getLong());
+    }
+
+    const std::vector<int64_t> expected = {10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+    ASSERT_EQ(seen.size(), expected.size());  // Fatal: the comparison below indexes both vectors.
+    for (size_t i = 0; i < expected.size(); i++) {
+        EXPECT_EQ(seen[i], expected[i]);
+    }
+
+    // seekToStart() returns the cursor to its starting position so the reverse iteration can be
+    // repeated.
+    cursor.seekToStart(opCtx);
+    auto first = cursor.next(opCtx);
+    ASSERT_TRUE(first);  // Fatal: dereferenced below.
+    EXPECT_EQ(first->id.getLong(), 10);
+}
+
+TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+
+    // We have 10 records, each of which is 0.5MB courtesy of the fail point. Using a throttle with
+    // a limit of 1MB per second, this will mean the data is processed as follows:
+    // 0s                    1s                    2s    5s
+    // | 0.5MB 0.5MB (sleep) | 0.5MB 0.5MB (sleep) | ... | 0.5MB 0.5MB (sleep)
+    // All operations should take very close to 5 seconds to finish.
+    {
+        Date_t start = getTime();
+        setDataThrottle(start);
+        SeekableRecordThrottleCursor cursor =
+            SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+        setMaxMbPerSec(1);
+
+        ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+        int numRecords = 1;
+
+        while (cursor.next(opCtx)) {
+            numRecords++;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(numRecords, 10);
+        ASSERT_GTE(end - start, Milliseconds(5000) - kErrorMargin);
+    }
+
+    // Using a throttle with a limit of 5MB per second, all operations should take very close to 1
+    // second (or more) to finish. We have 10 records, each of which is 0.5MB courtesy of the fail
+    // point, so 10 records per second.
+    {
+        Date_t start = getTime();
+        setDataThrottle(start);
+        SeekableRecordThrottleCursor cursor =
+            SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+        setMaxMbPerSec(5);
+
+        ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+        int numRecords = 1;
+
+        while (cursor.next(opCtx)) {
+            numRecords++;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(numRecords, 10);
+        ASSERT_GTE(end - start, Milliseconds(1000) - kErrorMargin);
+    }
+}
+
+TEST_F(ThrottleCursorTestFastClock, TestSeekableRecordThrottleCursorOnLargeDocs1MBps) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf2MBForDataThrottle");
+
+    // Using a throttle with a limit of 1MB per second, all operations should take very close to 10
+    // seconds (or more) to finish. We scan 5 records, each of which is 2MB courtesy of the fail
+    // point, so 1 record every 2 seconds.
+    Date_t start = getTime();
+    setDataThrottle(start);
+    SeekableRecordThrottleCursor cursor =
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+    setMaxMbPerSec(1);
+
+
+    // Seek to the first record, then iterate through 4 more.
+    ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+    int scanRecords = 4;
+
+    while (scanRecords > 0 && cursor.next(opCtx)) {
+        scanRecords--;
+    }
+
+    Date_t end = getTime();
+
+    ASSERT_EQ(scanRecords, 0);
+    ASSERT_GTE(end - start, Milliseconds(10 * 1000) - kErrorMargin);
+}
+
+TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOnLargeDocs5MBps) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf2MBForDataThrottle");
+
+    // We have 6 records, each of which is 2MB courtesy of the fail point. Using a throttle with a
+    // limit of 5MB per second, this will mean the data is processed as follows:
+    // 0s                   1.2s                  2.4s
+    // | 2MB 2MB 2MB (sleep) | 2MB 2MB 2MB (sleep) |
+    // All operations should take at very close to 2.4 seconds (or more) to finish.
+    Date_t start = getTime();
+    setDataThrottle(start);
+    SeekableRecordThrottleCursor cursor =
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+
+    setMaxMbPerSec(5);
+
+    // Seek to the first record, then iterate through 5 more.
+    ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+    int scanRecords = 5;
+
+    while (scanRecords > 0 && cursor.next(opCtx)) {
+        scanRecords--;
+    }
+
+    Date_t end = getTime();
+
+    ASSERT_EQ(scanRecords, 0);
+    ASSERT_GTE(end - start, Milliseconds(2400) - kErrorMargin);
+}
+
+TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+
+    Date_t start = getTime();
+    setDataThrottle(start);
+    SortedDataInterfaceThrottleCursor cursor = getIdIndex(coll);
+
+    // With the data throttle off, all operations should finish within a second.
+    setMaxMbPerSec(0);
+
+    int numRecords = 0;
+
+    while (cursor.next(opCtx)) {
+        numRecords++;
+    }
+
+    Date_t end = getTime();
+
+    ASSERT_EQ(numRecords, 10);
+    ASSERT_LTE(end - start, Milliseconds(1000));
+}
+
+TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+
+    // We have 10 records, each of which is 0.5MB courtesy of the fail point. Using a throttle with
+    // a limit of 1MB per second, this will mean the data is processed as follows:
+    // 0s                    1s                    2s    5s
+    // | 0.5MB 0.5MB (sleep) | 0.5MB 0.5MB (sleep) | ... | 0.5MB 0.5MB (sleep)
+    // All operations should take very close to 5 seconds to finish.
+    {
+        Date_t start = getTime();
+        setDataThrottle(start);
+        SortedDataInterfaceThrottleCursor cursor = getIdIndex(coll);
+        setMaxMbPerSec(1);
+
+        int numRecords = 0;
+
+        while (cursor.next(opCtx)) {
+            numRecords++;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(numRecords, 10);
+        ASSERT_GTE(end - start, Milliseconds(5000) - kErrorMargin);
+    }
+
+    // Using a throttle with a limit of 5MB per second, all operations should take very close to 1
+    // second (or more) to finish. We have 10 records, each of which is 0.5MB courtesy of the fail
+    // point, so 10 records per second.
+    {
+        Date_t start = getTime();
+        setDataThrottle(start);
+        SortedDataInterfaceThrottleCursor cursor = getIdIndex(coll);
+        setMaxMbPerSec(5);
+
+        ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString.getView()));
+        int numRecords = 1;
+
+        while (cursor.next(opCtx)) {
+            numRecords++;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(numRecords, 10);
+        ASSERT_GTE(end - start, Milliseconds(1000) - kErrorMargin);
+    }
+}
+
+TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOff) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+
+    Date_t start = getTime();
+    setDataThrottle(start);
+    SeekableRecordThrottleCursor recordCursor =
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+
+    SortedDataInterfaceThrottleCursor indexCursor = getIdIndex(coll);
+
+    // With the data throttle off, all operations should finish within a second, regardless if
+    // the 'maxValidateMBperSec' server parameter is set.
+    _dataThrottle->turnThrottlingOff();
+    setMaxMbPerSec(10);
+
+    int numRecords = 0;
+
+    while (indexCursor.next(opCtx)) {
+        numRecords++;
+    }
+
+    while (recordCursor.next(opCtx)) {
+        numRecords++;
+    }
+
+    int64_t recordId = 1;
+    while (recordCursor.seekExact(opCtx, RecordId(recordId))) {
+        recordId++;
+        numRecords++;
+    }
+
+    Date_t end = getTime();
+
+    ASSERT_EQ(numRecords, 30);
+    ASSERT_LTE(end - start, Milliseconds(1000));
+}
+
+TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = *autoColl;
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf512KBForDataThrottle");
+
+    // Using a throttle with a limit of 2MB per second, all operations should take very close to 5
+    // seconds (or more) to finish. We have 20 records, each of which is 0.5MB courtesy of the fail
+    // point, so 4 records per second.
+    {
+        Date_t start = getTime();
+        setDataThrottle(start);
+        SeekableRecordThrottleCursor recordCursor =
+            SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+
+        SortedDataInterfaceThrottleCursor indexCursor = getIdIndex(coll);
+        setMaxMbPerSec(2);
+
+        int numRecords = 0;
+
+        while (indexCursor.next(opCtx)) {
+            if (numRecords == 0) {
+                ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
+            } else {
+                ASSERT_TRUE(recordCursor.next(opCtx));
+            }
+            numRecords += 2;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(numRecords, 20);
+        ASSERT_GTE(end - start, Milliseconds(5000) - kErrorMargin);
+    }
+
+    // Using a throttle with a limit of 5MB per second, all operations should take very close to 2
+    // seconds (or more) to finish. We have 20 records, each of which is 0.5MB courtesy of the fail
+    // point, so 10 records per second.
+    {
+        Date_t start = getTime();
+        setDataThrottle(start);
+        SeekableRecordThrottleCursor recordCursor =
+            SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
+
+        SortedDataInterfaceThrottleCursor indexCursor = getIdIndex(coll);
+        setMaxMbPerSec(5);
+
+        ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString.getView()));
+        ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
+        int numRecords = 2;
+
+        while (indexCursor.next(opCtx)) {
+            ASSERT_TRUE(recordCursor.next(opCtx));
+            numRecords += 2;
+        }
+
+        Date_t end = getTime();
+
+        ASSERT_EQ(numRecords, 20);
+        ASSERT_GTE(end - start, Milliseconds(2000) - kErrorMargin);
+    }
+}
+
+TEST_F(ThrottleCursorTest, SettingNegativeMaxMBPerSecDoesNotThrottle) {
+    auto opCtx = operationContext();
+
+    const int64_t kOneGB = 1LL * 1024 * 1024 * 1024;
+
+    Date_t start = getTime();
+    setDataThrottle(start, -1);
+    _dataThrottle->awaitIfNeeded(opCtx, kOneGB);
+
+    // If the throttle had engaged, at least a full second would have elapsed.
+    ASSERT_LT(getTime() - start, Milliseconds(1000));
+}
+
+TEST_F(ThrottleCursorTest, SettingLargeMaxMBPerSecDoesNotOverflow) {
+    auto opCtx = operationContext();
+
+    // Without overflow protection, setting the throttle to 2048 MB or higher (2048 * 1024 * 1024
+    // bytes) would overflow, effectively disabling the throttle.
+    // Set large values as the max rate and then pass in that same value for the number of bytes
+    // processed. If the rates didn't overflow, the throttle should be engaged.
+    for (int maxMBPerSec : {2048, std::numeric_limits<int>::max()}) {
+        Date_t start = getTime();
+        setDataThrottle(start, maxMBPerSec);
+
+        _dataThrottle->awaitIfNeeded(opCtx, int64_t{maxMBPerSec} * 1024 * 1024);
+
+        // Assert that the throttle was engaged (at least one second elapsed).
+        ASSERT_GTE(getTime() - start, Milliseconds(1000) - kErrorMargin);
+    }
+}
+
+}  // namespace
+
+}  // namespace mongo

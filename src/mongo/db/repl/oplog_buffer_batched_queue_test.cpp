@@ -1,0 +1,422 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/oplog_buffer_batched_queue.h"
+
+#include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+
+namespace mongo {
+namespace repl {
+
+namespace {
+
+BSONObj makeNoopOplogEntry(int t) {
+    auto oplogEntry = repl::DurableOplogEntry(
+        OpTime(Timestamp(t, 1), 1),                                // optime
+        OpTypeEnum::kNoop,                                         // opType
+        NamespaceString::createNamespaceString_forTest("test.t"),  // namespace
+        boost::none,                                               // uuid
+        boost::none,                                               // fromMigrate
+        boost::none,                                               // checkExistenceForDiffInsert
+        boost::none,                                               // versionContext
+        repl::OplogEntry::kOplogVersion,                           // version
+        BSON("count" << t),                                        // o
+        boost::none,                                               // o2
+        {},                                                        // sessionInfo
+        boost::none,                                               // upsert
+        Date_t(),                                                  // wall clock time
+        {},                                                        // statement ids
+        boost::none,   // optime of previous write within same transaction
+        boost::none,   // pre-image optime
+        boost::none,   // post-image optime
+        boost::none,   // ShardId of resharding recipient
+        boost::none,   // _id
+        boost::none);  // needsRetryImage
+    return oplogEntry.toBSON();
+}
+
+}  // namespace
+
+class OplogBufferBatchedQueueTest : public ServiceContextMongoDTest {
+public:
+    explicit OplogBufferBatchedQueueTest(Options options = {})
+        : ServiceContextMongoDTest(options.useReplSettings(true)) {}
+
+    void setUp() override;
+    void tearDown() override;
+
+    OperationContext* opCtx() const;
+
+protected:
+    ServiceContext* _serviceContext;
+    ServiceContext::UniqueOperationContext _opCtxHolder;
+};
+
+void OplogBufferBatchedQueueTest::setUp() {
+    ServiceContextMongoDTest::setUp();
+    _serviceContext = getServiceContext();
+    _opCtxHolder = makeOperationContext();
+}
+
+void OplogBufferBatchedQueueTest::tearDown() {
+    _opCtxHolder = {};
+    ServiceContextMongoDTest::tearDown();
+}
+
+OperationContext* OplogBufferBatchedQueueTest::opCtx() const {
+    return _opCtxHolder.get();
+}
+
+TEST_F(OplogBufferBatchedQueueTest, PushEmptyBatch) {
+    OplogBufferBatchedQueue buffer(1024);
+    buffer.startup(opCtx());
+
+    std::vector<BSONObj> ops;
+    OplogBuffer::Cost cost{0, ops.size()};
+    buffer.push(opCtx(), ops.begin(), ops.end(), cost);
+
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT_FALSE(buffer.tryPopBatch(opCtx(), &firstBatch));
+}
+
+TEST_F(OplogBufferBatchedQueueTest, BasicBatchedQueueOperations) {
+    OplogBufferBatchedQueue buffer(1024);
+    buffer.startup(opCtx());
+
+    // Push two batches.
+    std::vector<BSONObj> ops1;
+    ops1.push_back(makeNoopOplogEntry(1));
+    ops1.push_back(makeNoopOplogEntry(2));
+
+    OplogBuffer::Cost cost1{16, ops1.size()};
+    buffer.push(opCtx(), ops1.begin(), ops1.end(), cost1);
+
+    std::vector<BSONObj> ops2;
+    ops2.push_back(makeNoopOplogEntry(3));
+
+    OplogBuffer::Cost cost2{32, ops2.size()};
+    buffer.push(opCtx(), ops2.begin(), ops2.end(), cost2);
+
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost1.size + cost2.size, buffer.getSize());
+    ASSERT_EQ(cost1.count + cost2.count, buffer.getCount());
+
+    // Pop both batches.
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT(buffer.tryPopBatch(opCtx(), &firstBatch));
+    ASSERT_EQ(cost1.size, firstBatch.byteSize());
+    ASSERT_EQ(ops1.size(), firstBatch.count());
+    ASSERT_BSONOBJ_EQ(ops1[0], firstBatch.getBatch()[0]);
+    ASSERT_BSONOBJ_EQ(ops1[1], firstBatch.getBatch()[1]);
+
+    OplogBatch<BSONObj> secondBatch;
+    ASSERT(buffer.tryPopBatch(opCtx(), &secondBatch));
+    ASSERT_EQ(cost2.size, secondBatch.byteSize());
+    ASSERT_EQ(cost2.count, secondBatch.count());
+    ASSERT_BSONOBJ_EQ(ops2[0], secondBatch.getBatch()[0]);
+
+    // Popped both batches, now the buffer should be empty.
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+
+    OplogBatch<BSONObj> thirdBatch;
+    ASSERT_FALSE(buffer.tryPopBatch(opCtx(), &thirdBatch));
+}
+
+TEST_F(OplogBufferBatchedQueueTest, ClearAndShutdownBuffer) {
+    OplogBufferBatchedQueue buffer(1024);
+    buffer.startup(opCtx());
+
+    std::vector<BSONObj> ops;
+    ops.push_back(makeNoopOplogEntry(1));
+    ops.push_back(makeNoopOplogEntry(2));
+
+    OplogBuffer::Cost cost{16, ops.size()};
+    buffer.push(opCtx(), ops.begin(), ops.end(), cost);
+
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost.size, buffer.getSize());
+    ASSERT_EQ(cost.count, buffer.getCount());
+
+    // Clear the buffer.
+    buffer.clear(opCtx());
+
+    // Clear should empty the buffer.
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+
+    // Clear should not prevent new data from being pushed.
+    buffer.push(opCtx(), ops.begin(), ops.end(), cost);
+
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost.size, buffer.getSize());
+    ASSERT_EQ(cost.count, buffer.getCount());
+
+    // Shutdown the buffer.
+    buffer.shutdown(opCtx());
+
+    // Shutdown should empty the buffer.
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+
+    // Shutdown should prevent new data from being pushed.
+    buffer.push(opCtx(), ops.begin(), ops.end(), cost);
+
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+}
+
+TEST_F(OplogBufferBatchedQueueTest, PushWaitForSpace) {
+    OplogBufferBatchedQueue buffer(36);
+    buffer.startup(opCtx());
+
+    // Push first batch with 8 bytes.
+    std::vector<BSONObj> ops1;
+    ops1.push_back(makeNoopOplogEntry(1));
+    ops1.push_back(makeNoopOplogEntry(2));
+
+    OplogBuffer::Cost cost1{8, ops1.size()};
+    buffer.push(opCtx(), ops1.begin(), ops1.end(), cost1);
+
+    // Push second batch with 16 bytes.
+    std::vector<BSONObj> ops2;
+    ops2.push_back(makeNoopOplogEntry(3));
+    ops2.push_back(makeNoopOplogEntry(4));
+
+    OplogBuffer::Cost cost2{24, ops2.size()};
+    buffer.push(opCtx(), ops2.begin(), ops2.end(), cost2);
+
+    // Push third batch with 12 bytes, this should block.
+    std::vector<BSONObj> ops3;
+    ops3.push_back(makeNoopOplogEntry(5));
+    ops3.push_back(makeNoopOplogEntry(6));
+
+    OplogBuffer::Cost cost3{16, ops3.size()};
+    stdx::thread pushThread([&, this] {
+        // Will block until there is 12 bytes space in buffer.
+        buffer.push(opCtx(), ops3.begin(), ops3.end(), cost3);
+    });
+
+    // Wait for some time and check that the third batch has
+    // not been pushed in.
+    sleepsecs(3);
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost1.size + cost2.size, buffer.getSize());
+    ASSERT_EQ(cost1.count + cost2.count, buffer.getCount());
+
+    // Pop the first batch, wait for some time and check that
+    // the third batch has still not been pushed in.
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT_TRUE(buffer.tryPopBatch(opCtx(), &firstBatch));
+
+    sleepsecs(3);
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost2.size, buffer.getSize());
+    ASSERT_EQ(cost2.count, buffer.getCount());
+
+    // Pop the second batch, now there should be enough space
+    // to push the third batch and unblock the pushThread.
+    OplogBatch<BSONObj> secondBatch;
+    ASSERT_TRUE(buffer.tryPopBatch(opCtx(), &secondBatch));
+
+    pushThread.join();
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost3.size, buffer.getSize());
+    ASSERT_EQ(cost3.count, buffer.getCount());
+}
+
+TEST_F(OplogBufferBatchedQueueTest, shutdownUnblocksWaitForSpace) {
+    OplogBufferBatchedQueue buffer(32);
+    buffer.startup(opCtx());
+
+    // Push first batch with 16 bytes.
+    std::vector<BSONObj> ops1;
+    ops1.push_back(makeNoopOplogEntry(1));
+    ops1.push_back(makeNoopOplogEntry(2));
+
+    OplogBuffer::Cost cost1{16, ops1.size()};
+    buffer.push(opCtx(), ops1.begin(), ops1.end(), cost1);
+
+    // Push second batch with 24 bytes, this should block.
+    std::vector<BSONObj> ops2;
+    ops2.push_back(makeNoopOplogEntry(5));
+    ops2.push_back(makeNoopOplogEntry(6));
+
+    OplogBuffer::Cost cost2{16, ops2.size()};
+    stdx::thread pushThread([&, this] {
+        // Will block until there is 16 bytes space in buffer.
+        buffer.push(opCtx(), ops2.begin(), ops2.end(), cost2);
+    });
+
+    // Shutdown will clear the buffer and unblock the pushThread,
+    // however it prevents the second batch from being pushed in.
+    buffer.shutdown(opCtx());
+
+    pushThread.join();
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+}
+
+TEST_F(OplogBufferBatchedQueueTest, pushUnblocksWaitForData) {
+    OplogBufferBatchedQueue buffer(32);
+    buffer.startup(opCtx());
+
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT_FALSE(buffer.tryPopBatch(opCtx(), &firstBatch));
+
+    // The first waitForData should return false after waiting
+    // since the buffer is still empty.
+    ASSERT_FALSE(buffer.waitForData(Seconds(3)));
+
+    // Call waitForData with a long duration, push should
+    // unblock it and return true.
+    stdx::thread waitForDataThread([&, this] {
+        // Will block until there is data in buffer.
+        ASSERT(buffer.waitForData(Days(1)));
+    });
+
+    std::vector<BSONObj> ops;
+    ops.push_back(makeNoopOplogEntry(1));
+    ops.push_back(makeNoopOplogEntry(2));
+
+    OplogBuffer::Cost cost{16, ops.size()};
+    buffer.push(opCtx(), ops.begin(), ops.end(), cost);
+
+    waitForDataThread.join();
+
+    ASSERT(!buffer.isEmpty());
+    ASSERT_EQ(cost.size, buffer.getSize());
+    ASSERT_EQ(cost.count, buffer.getCount());
+}
+
+TEST_F(OplogBufferBatchedQueueTest, shutdownUnblocksWaitForData) {
+    OplogBufferBatchedQueue buffer(32);
+    buffer.startup(opCtx());
+
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT_FALSE(buffer.tryPopBatch(opCtx(), &firstBatch));
+
+    // The first waitForData should return false after waiting
+    // since the buffer is still empty.
+    ASSERT_FALSE(buffer.waitForData(Seconds(3)));
+
+    // Call waitForData with a long duration, shutdown should
+    // unblock it and return false.
+    stdx::thread waitForDataThread([&, this] {
+        // Will block until there is data in buffer.
+        ASSERT_FALSE(buffer.waitForData(Days(1)));
+    });
+
+    buffer.shutdown(opCtx());
+    waitForDataThread.join();
+
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+}
+
+TEST_F(OplogBufferBatchedQueueTest, drainModeUnblocksWaitForData) {
+    OplogBufferBatchedQueue buffer(32);
+    buffer.startup(opCtx());
+
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT_FALSE(buffer.tryPopBatch(opCtx(), &firstBatch));
+
+    // The first waitForData should return false after waiting
+    // since the buffer is still empty.
+    ASSERT_FALSE(buffer.waitForData(Seconds(3)));
+
+    // Call waitForData with a long duration, entering drain
+    // mode should unblock it and return false.
+    stdx::thread waitForDataThread1([&, this] {
+        // Will block until there is data in buffer.
+        ASSERT_FALSE(buffer.waitForData(Days(1)));
+    });
+
+    buffer.enterDrainMode();
+    waitForDataThread1.join();
+
+    ASSERT(buffer.isEmpty());
+    ASSERT_EQ(0, buffer.getSize());
+    ASSERT_EQ(0, buffer.getCount());
+
+    // Exit drain mode and check that waitForDataFor will block
+    // indefinitely unless being interrupted.
+    buffer.exitDrainMode();
+
+    bool doneWait = false;
+    stdx::thread waitForDataThread2([&, this] {
+        // Will block until there data in buffer.
+        ASSERT_THROWS_CODE(buffer.waitForDataFor(Days(1), opCtx()),
+                           DBException,
+                           ErrorCodes::InterruptedAtShutdown);
+        doneWait = true;
+    });
+
+    sleepsecs(3);
+    ASSERT_FALSE(doneWait);
+
+    opCtx()->markKilled(ErrorCodes::InterruptedAtShutdown);
+    waitForDataThread2.join();
+
+    ASSERT(doneWait);
+}
+
+TEST_F(OplogBufferBatchedQueueTest, pushOversizedBatchOnEmptyQueue) {
+    // maxSize=100, but the batch declares size=200. With an empty queue the producer must not block
+    // forever — the _waitForSpace guard allows the push through immediately.
+    OplogBufferBatchedQueue buffer(100);
+    buffer.startup(opCtx());
+
+    std::vector<BSONObj> ops;
+    ops.push_back(makeNoopOplogEntry(1));
+    OplogBuffer::Cost cost{200, ops.size()};
+    buffer.push(opCtx(), ops.begin(), ops.end(), cost);
+
+    OplogBatch<BSONObj> batch;
+    ASSERT(buffer.tryPopBatch(opCtx(), &batch));
+    ASSERT_EQ(1u, batch.count());
+    ASSERT(buffer.isEmpty());
+}
+
+TEST_F(OplogBufferBatchedQueueTest, oversizedBatchUnblockedWhenQueueDrains) {
+    // maxSize=100. Push 60 bytes so the buffer is non-empty, then try to push 200 bytes
+    // (oversized). The pushThread blocks because the queue is non-empty and 60+200 > 100. Popping
+    // the first batch empties the queue; tryPopBatch will then notify the pushThread
+    OplogBufferBatchedQueue buffer(100);
+    buffer.startup(opCtx());
+
+    std::vector<BSONObj> ops1;
+    ops1.push_back(makeNoopOplogEntry(1));
+    OplogBuffer::Cost cost1{60, ops1.size()};
+    buffer.push(opCtx(), ops1.begin(), ops1.end(), cost1);
+
+    std::vector<BSONObj> ops2;
+    ops2.push_back(makeNoopOplogEntry(2));
+    OplogBuffer::Cost cost2{200, ops2.size()};
+    stdx::thread pushThread([&, this] { buffer.push(opCtx(), ops2.begin(), ops2.end(), cost2); });
+
+    // Pop the first batch — queue becomes empty → tryPopBatch notifies → pushThread unblocks.
+    OplogBatch<BSONObj> firstBatch;
+    ASSERT(buffer.tryPopBatch(opCtx(), &firstBatch));
+    pushThread.join();
+
+    OplogBatch<BSONObj> secondBatch;
+    ASSERT(buffer.tryPopBatch(opCtx(), &secondBatch));
+    ASSERT_EQ(1u, secondBatch.count());
+    ASSERT(buffer.isEmpty());
+}
+
+}  // namespace repl
+}  // namespace mongo

@@ -1,0 +1,210 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/router_role/cluster_commands_helpers.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/none.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+namespace {
+
+class FileMD5Cmd : public BasicCommand {
+public:
+    FileMD5Cmd() : BasicCommand("filemd5") {}
+
+    std::string help() const override {
+        return " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool adminOnly() const override {
+        return false;
+    }
+
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        std::string collectionName;
+        if (const auto rootElt = cmdObj["root"]) {
+            uassert(ErrorCodes::InvalidNamespace,
+                    "'root' must be of type String",
+                    rootElt.type() == BSONType::string);
+            collectionName = rootElt.str();
+        }
+        if (collectionName.empty())
+            collectionName = "fs";
+        collectionName += ".chunks";
+        return NamespaceStringUtil::deserialize(dbName, collectionName);
+    }
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::find)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbName, cmdObj));
+
+        sharding::router::CollectionRouter router(opCtx, nss);
+        return router.routeWithRoutingContext(
+            getName(), [&](OperationContext* opCtx, RoutingContext& routingCtx) {
+                const auto callShardFn = [&](const BSONObj& cmdObj, const BSONObj& routingQuery) {
+                    auto shardResults = scatterGatherVersionedTargetByRoutingTable(
+                        opCtx,
+                        routingCtx,
+                        nss,
+                        cmdObj,
+                        ReadPreferenceSetting::get(opCtx),
+                        Shard::RetryPolicy::kIdempotent,
+                        routingQuery,
+                        CollationSpec::kSimpleSpec,
+                        boost::none /*letParameters*/,
+                        boost::none /*runtimeConstants*/);
+                    invariant(shardResults.size() == 1);
+                    const auto shardResponse =
+                        uassertStatusOK(std::move(shardResults[0].swResponse));
+                    uassertStatusOK(shardResponse.status);
+
+                    const auto& res = shardResponse.data;
+                    uassertStatusOK(getStatusFromCommandResult(res));
+
+                    return res;
+                };
+
+                // If the collection is not sharded, or is sharded only on the 'files_id' field, we
+                // only need to target a single shard, because the files' chunks can only be
+                // contained in a single sharded chunk
+                const auto& cm = routingCtx.getCollectionRoutingInfo(nss).getChunkManager();
+                if (!cm.isSharded() ||
+                    SimpleBSONObjComparator::kInstance.evaluate(cm.getShardKeyPattern().toBSON() ==
+                                                                BSON("files_id" << 1))) {
+                    CommandHelpers::filterCommandReplyForPassthrough(
+                        callShardFn(applyReadWriteConcern(
+                                        opCtx,
+                                        this,
+                                        CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
+                                    BSON("files_id" << cmdObj.firstElement())),
+                        &result);
+                    return true;
+                }
+
+                // Since the filemd5 command is tailored specifically for GridFS, there is no need
+                // to support arbitrary shard keys
+                uassert(ErrorCodes::IllegalOperation,
+                        "The GridFS fs.chunks collection must be sharded on either {files_id:1} or "
+                        "{files_id:1, n:1}",
+                        SimpleBSONObjComparator::kInstance.evaluate(
+                            cm.getShardKeyPattern().toBSON() == BSON("files_id" << 1 << "n" << 1)));
+
+                // Theory of operation:
+                //
+                // Starting with n=0, send filemd5 command to shard with that chunk (gridfs chunk
+                // not sharding chunk). That shard will then compute a partial md5 state (passed in
+                // the "md5state" field) for all contiguous chunks that it contains. When it runs
+                // out or hits a discontinuity (eg [1,2,7]) it returns what it has done so far. This
+                // is repeated as long as we keep getting more chunks. The end condition is when we
+                // go to look for chunk n and it doesn't exist. This means that the file's last
+                // chunk is n-1, so we return the computed md5 results.
+
+                int numGridFSChunksProcessed = 0;
+                BSONObj lastResult;
+
+                while (true) {
+                    const auto res = callShardFn(
+                        [&] {
+                            BSONObjBuilder bb(applyReadWriteConcern(
+                                opCtx,
+                                this,
+                                CommandHelpers::filterCommandRequestForPassthrough(cmdObj)));
+                            bb.append("partialOk", true);
+                            bb.append("startAt", numGridFSChunksProcessed);
+                            if (!lastResult.isEmpty()) {
+                                bb.append(lastResult["md5state"]);
+                            }
+                            return bb.obj();
+                        }(),
+                        BSON("files_id" << cmdObj.firstElement() << "n"
+                                        << numGridFSChunksProcessed));
+
+                    uassert(16246,
+                            str::stream()
+                                << "Shard for database " << nss.dbName().toStringForErrorMsg()
+                                << " is too old to support GridFS sharded by {files_id:1, n:1}",
+                            res.hasField("md5state"));
+
+                    lastResult = res;
+
+                    const int numChunks = res["numChunks"].numberInt();
+
+                    if (numGridFSChunksProcessed == numChunks) {
+                        // No new data means we've reached the end of the file
+                        CommandHelpers::filterCommandReplyForPassthrough(res, &result);
+                        return true;
+                    }
+
+                    uassert(ErrorCodes::InternalError,
+                            str::stream()
+                                << "Command returned numChunks of " << numChunks
+                                << " which is less than the number of chunks processes so far "
+                                << numGridFSChunksProcessed,
+                            numChunks > numGridFSChunksProcessed);
+                    numGridFSChunksProcessed = numChunks;
+                }
+
+                MONGO_UNREACHABLE;
+            });
+    }
+};
+MONGO_REGISTER_COMMAND(FileMD5Cmd).forRouter();
+
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,37 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+imports:
+    - "mongo/db/basic_types.idl"
+structs:
+    MinMaxScalerFunctionSpec:
+        description: Specification for the $minMaxScaler expression.
+        strict: true
+        fields:
+            input:
+                description: Numerical expression to evaluate.
+                type: IDLAnyType
+                optional: false
+            min:
+                description: Constant numerical expression representing the minimum, defaults to 0 if unspecified.
+                type: IDLAnyType
+                optional: true
+            max:
+                description: Constant numerical expression representing the maximum, defaults to 1 if unspecified.
+                type: IDLAnyType
+                optional: true
+    MinMaxScalerSpec:
+        description: Specification for the $minMaxScaler window function stage.
+        strict: true
+        fields:
+            $minMaxScaler:
+                description: The $minMaxScaler function definition.
+                type: MinMaxScalerFunctionSpec
+                optional: false
+                cpp_name: minMaxScaler
+            window:
+                description: The window specification used to calculate the minMaxScaler function over.
+                type: object
+                optional: true

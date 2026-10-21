@@ -1,0 +1,58 @@
+// Ensure that the shell may connect to servers running supporting restricted subsets of TLS
+// protocols.
+
+import {
+    clientSupportsTLS1_2,
+    clientSupportsTLS1_3,
+    determineSSLProvider,
+} from "jstests/ssl/libs/ssl_helpers.js";
+
+let SERVER_CERT = getX509Path("server.pem");
+let CLIENT_CERT = getX509Path("client.pem");
+let CA_CERT = getX509Path("ca.pem");
+
+const supportsTLS1_2 = clientSupportsTLS1_2();
+const supportsTLS1_3 = clientSupportsTLS1_3();
+
+function runTestWithoutSubset(subset) {
+    const disabledProtocols = subset.join(",");
+    const conn = MongoRunner.runMongod({
+        tlsMode: "allowTLS",
+        tlsCertificateKeyFile: SERVER_CERT,
+        tlsDisabledProtocols: disabledProtocols,
+        tlsCAFile: CA_CERT,
+    });
+
+    const exitStatus = runMongoProgram(
+        "mongo",
+        "--tls",
+        "--tlsAllowInvalidHostnames",
+        "--tlsCertificateKeyFile",
+        CLIENT_CERT,
+        "--tlsCAFile",
+        CA_CERT,
+        "--port",
+        conn.port,
+        "--eval",
+        "quit()",
+    );
+
+    assert.eq(0, exitStatus, "");
+
+    MongoRunner.stopMongod(conn);
+}
+
+runTestWithoutSubset(["TLS1_0"]);
+runTestWithoutSubset(["TLS1_0", "TLS1_1"]);
+
+const sslProvider = determineSSLProvider();
+
+if (sslProvider === "openssl" && (!supportsTLS1_2 || supportsTLS1_3)) {
+    runTestWithoutSubset(["TLS1_2"]);
+}
+
+// TLS 1.3 tests - run for OpenSSL and Windows (SChannel) when TLS 1.3 is supported
+if ((sslProvider === "openssl" || sslProvider === "windows") && supportsTLS1_3) {
+    runTestWithoutSubset(["TLS1_3"]);
+    runTestWithoutSubset(["TLS1_0", "TLS1_1", "TLS1_2"]);
+}

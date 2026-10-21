@@ -1,0 +1,35 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/crypto/fle_stats.idl"
+
+structs:
+    CleanupStructuredEncryptionDataCommandReply:
+        description: "Reply from the {cleanupStructuredEncryptionData: ...} command"
+        strict: true
+        mod_visibility: private
+        is_command_reply: true
+        fields:
+            stats: CleanupStats
+
+commands:
+    cleanupStructuredEncryptionData:
+        description: "Parser for the 'cleanupStructuredEncryptionData' command"
+        command_name: cleanupStructuredEncryptionData
+        api_version: ""
+        namespace: concatenate_with_db
+        strict: true
+        mod_visibility: public
+        reply_type: CleanupStructuredEncryptionDataCommandReply
+        fields:
+            cleanupTokens:
+                description: |-
+                    Map of field path to ECOCToken.
+                    Dictionary key/value pairs in the form: { fieldName: "ecocToken" }
+                    or { fieldName: { ecoc: "ecocToken", anchorPaddingToken: "anchorPaddingToken" } }
+                type: object

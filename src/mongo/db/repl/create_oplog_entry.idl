@@ -1,0 +1,74 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/record_id.idl"
+
+structs:
+    CreateOplogEntryO2:
+        description: "In a 'create' collection oplog entry, defines the fields expected in the 'o2' subobject."
+        strict: false
+        fields:
+            catalogId:
+                description: "The recordId mapping to the _mdb_catalog for the collection"
+                type: RecordId
+            ident:
+                description: "The unique tag of the ident where the collection's main data table is stored."
+                type: string
+            idIndexIdent:
+                description: "The unique tag of the ident where the collection's _id index is stored. Present if the _id index is generated as a part of collection creation"
+                type: string
+                optional: true
+    CreateIndexesOplogEntryO2:
+        description: "In a 'createIndexes' oplog entry, defines the fields expected in the 'o2' subobject."
+        strict: false
+        fields:
+            indexIdent:
+                description: "The unique tag of the ident where the index's table is stored."
+                type: string
+    InternalIdents:
+        description: "The internal idents assigned for an index build."
+        strict: false
+        fields:
+            sorterIdent:
+                description: "The ident used for the sorter temp table."
+                type: string
+            sideWritesIdent:
+                description: "The ident used for the side writes temp table."
+                type: string
+            skippedRecordsIdent:
+                description: "The ident used for the skipped records tracker temp table."
+                type: string
+            constraintViolationsIdent:
+                description: "The ident used for the duplicate key tracker temp table, when one is created."
+                type: string
+                optional: true
+    IndexIdents:
+        description: "The idents used for an index build."
+        strict: false
+        fields:
+            indexIdent:
+                description: "The unique tag of the ident where the table of the index being built is stored."
+                type: string
+            internalIdents:
+                description: "The internal idents assigned for this index build."
+                type: InternalIdents
+                optional: true
+    IndexBuildOplogEntryO2:
+        description:
+            "In a 'startIndexBuild' or 'commitIndexBuild' oplog entry, defines the fields
+            expected in the 'o2' subobject."
+        strict: false
+        fields:
+            indexes:
+                description: "The array of index build idents."
+                type: array<IndexIdents>
+            indexBuildIdent:
+                description: "The ident of the table containing metadata about the index build."
+                type: string
+                optional: true

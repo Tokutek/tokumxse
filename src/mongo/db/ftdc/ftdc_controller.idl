@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+server_parameters:
+    diagnosticDataCollectionDiscardLargeSamples:
+        description:
+            "Enable FTDC to discard excessively large samples instead of terminating the server. This
+            parameter should only be used as a short-term mitigation and an issue should be raised if
+            BSONObjectTooLarge exceptions are consistently encountered."
+        default: false
+        set_at: [startup, runtime]
+        cpp_vartype: "Atomic<bool>"
+        cpp_varname: gDiagnosticDataCollectionDiscardLargeSamples
+        redact: false

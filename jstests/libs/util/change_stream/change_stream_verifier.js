@@ -1,0 +1,660 @@
+/**
+ * Verifier module for black-box testing of change streams.
+ *
+ * This module orchestrates verification tests for change streams by:
+ * - Running one or more VerifierTestCase strategies for a given configuration
+ * - Hiding external dependencies behind a VerifierContext facade
+ * - Providing composable, reusable test case implementations
+ *
+ * Main Concepts:
+ * - VerifierContext: Facade for reading events, matchers, and clusterTime helpers
+ * - VerifierTestCase: Strategy object implementing a particular test
+ * - Verifier: Driver that runs one or more test cases with a given context
+ *
+ * Test Cases:
+ * - SingleReaderVerificationTestCase: Validates a single reader's events; supports
+ *   allowSkips for ignoreRemovedShards mode
+ * - SequentialPairwiseFetchingTestCase: Compares two fetching strategies (e.g., v1 vs v2,
+ *   or continuous vs fetch-one-and-resume)
+ * - PrefixReadTestCase: Verifies resume-from-clusterTime and prefix correctness
+ *
+ * Usage:
+ * The verifier expects readers to have already been started (potentially in parallel).
+ * It reads events from the Connector storage and validates them against matchers.
+ */
+import {Connector} from "jstests/libs/util/change_stream/change_stream_connector.js";
+import {formatEventTypeAndNs} from "jstests/libs/util/change_stream/change_stream_matcher.js";
+import {
+    ChangeStreamReader,
+    ChangeStreamReadingMode,
+} from "jstests/libs/util/change_stream/change_stream_reader.js";
+
+/**
+ * Format a change event record for debugging output.
+ * @param {Object} rec - Event record containing changeEvent
+ * @param {number} i - Index in the event list
+ * @returns {string} Formatted string like "[0] insert(test_cs.test_coll_fsm) @ 123,1"
+ */
+function formatEventSummary(rec, i) {
+    const e = rec.changeEvent;
+    return `[${i}] ${formatEventTypeAndNs(e.operationType, e.ns)} @ ${e.clusterTime.t},${e.clusterTime.i}`;
+}
+
+/**
+ * Context facade for Verifier test cases.
+ *
+ * Provides a clean interface for:
+ * - Reading change events via Connector (after readers have finished)
+ * - Retrieving matchers for event comparison
+ * - Reading events from specific cluster times for resume testing
+ *
+ * This abstraction allows test cases to be independent of the underlying
+ * infrastructure, making them easier to test and maintain.
+ */
+class VerifierContext {
+    /**
+     * Create a VerifierContext.
+     * @param {Object} changeStreamReaderConfigs - Map of instanceName -> reader config
+     * @param {Object} matchersPerInstance - Map of instanceName -> ChangeStreamMatcher
+     * @param {Array} [shardConnections] - Optional array of direct connections to shard primaries.
+     *   Required for PrefixReadTestCase to query oplog cluster times for resume testing.
+     *   Mongos doesn't expose the oplog, so direct shard connections are needed.
+     */
+    constructor(changeStreamReaderConfigs, matchersPerInstance, shardConnections = []) {
+        this.changeStreamReaderConfigs = changeStreamReaderConfigs;
+        this.matchersPerInstance = matchersPerInstance;
+        this.shardConnections = shardConnections;
+    }
+
+    /**
+     * Wait for a reader to finish, then return its recorded events.
+     * @param {Mongo} conn - MongoDB connection
+     * @param {string} instanceName - Name of the reader instance
+     * @returns {Array} Array of change event records {changeEvent, cursorClosed}
+     */
+    getChangeEvents(conn, instanceName) {
+        try {
+            Connector.waitForDone(conn, instanceName);
+        } catch (e) {
+            // On a stall (no heartbeat progress), the bare timeout isn't actionable. Log the
+            // commands that should have produced this reader's events and the events it actually
+            // read so far, then rethrow the original error unchanged.
+            const commandTrace = this.getCommandTrace(instanceName);
+            jsTest.log.info("Stalled reader: commands issued", {
+                instanceName,
+                count: commandTrace.length,
+                commands: commandTrace.map(
+                    (c) => `#${c.cmdIndex} ${c.cmdName} -> [${(c.events || []).join(", ")}]`,
+                ),
+                commandsDetailed: commandTrace,
+            });
+
+            let eventsRead = [];
+            try {
+                eventsRead = Connector.readAllChangeEvents(conn, instanceName);
+            } catch (readErr) {
+                jsTest.log.info("Stalled reader: failed to read recorded events", {
+                    instanceName,
+                    error: readErr.message,
+                });
+            }
+            jsTest.log.info("Stalled reader: events read so far", {
+                instanceName,
+                count: eventsRead.length,
+                events: eventsRead.map((rec, i) => formatEventSummary(rec, i)),
+            });
+            throw e;
+        }
+        return Connector.readAllChangeEvents(conn, instanceName);
+    }
+
+    /**
+     * Read change events starting from a specific cluster time.
+     * Creates an inline reader with modified configuration for resume testing.
+     * @param {Mongo} conn - MongoDB connection
+     * @param {string} instanceName - Base instance name (used to find reader config)
+     * @param {Timestamp} clusterTime - Cluster time to resume from
+     * @param {number} limit - Maximum number of events to read
+     * @returns {Array} Array of change event records
+     */
+    readChangeEventsFromClusterTime(conn, instanceName, clusterTime, limit) {
+        const readerInstanceName = this.launchReaderFromClusterTime(
+            conn,
+            instanceName,
+            clusterTime,
+            limit,
+        );
+        return this.getChangeEvents(conn, readerInstanceName);
+    }
+
+    /**
+     * Launch a reader from a specific cluster time without waiting for completion.
+     * @returns {string} The instance name of the launched reader (use with getChangeEvents to collect).
+     */
+    launchReaderFromClusterTime(conn, instanceName, clusterTime, limit) {
+        const baseCfg = this.changeStreamReaderConfigs[instanceName];
+        assert(baseCfg, `No reader config for instanceName=${instanceName}`);
+        assert(limit > 0, `limit must be a positive number, got ${limit}`);
+
+        const cfg = Object.assign({}, baseCfg, {
+            instanceName: `${instanceName}.resumeFromClusterTime.${clusterTime.t}_${clusterTime.i}`,
+            numberOfEventsToRead: limit,
+            readingMode: ChangeStreamReadingMode.kContinuous,
+            startAtClusterTime: clusterTime,
+        });
+
+        ChangeStreamReader.run(conn, cfg);
+        return cfg.instanceName;
+    }
+
+    /**
+     * Get the matcher for a specific reader instance.
+     * NOTE: This returns a reference to the matcher, not a copy. If multiple test
+     * cases access the same matcher, the state will need to be reset between uses.
+     * @param {string} instanceName - Name of the reader instance
+     * @returns {ChangeStreamMatcher} Matcher for the instance
+     */
+    getChangeStreamMatcher(instanceName) {
+        const matcher = this.matchersPerInstance[instanceName];
+        assert(matcher, `No matcher for instanceName=${instanceName}`);
+        return matcher;
+    }
+
+    getCommandTrace(instanceName) {
+        const cfg = this.changeStreamReaderConfigs[instanceName];
+        return cfg ? cfg.debugCommandTrace || [] : [];
+    }
+
+    /**
+     * Get unique cluster times from the oplog across all shards.
+     * Excludes config/admin/control namespaces and empty-namespace entries
+     * to avoid resuming from cluster-internal operations that don't produce
+     * user-visible change events.
+     * @private
+     * @param {Timestamp} startTime - Only include cluster times >= this timestamp
+     * @param {Timestamp} endTime - Only include cluster times <= this timestamp
+     * @returns {Array<Timestamp>} Array of unique cluster times from oplog, sorted
+     */
+    _getClusterTimesFromOplog(startTime, endTime) {
+        assert(
+            this.shardConnections.length > 0,
+            "No shard connections provided. Pass shardConnections in verifier config.",
+        );
+
+        const clusterTimesMap = new Map();
+
+        for (const shardConn of this.shardConnections) {
+            const filter = {
+                ts: {$gte: startTime},
+                ns: {$not: /^(config|admin|change_stream_test_control)\./, $ne: ""},
+            };
+            if (endTime) {
+                filter.ts.$lte = endTime;
+            }
+
+            const oplogCursor = shardConn
+                .getDB("local")
+                .oplog.rs.find(filter, {ts: 1})
+                .sort({ts: 1});
+
+            while (oplogCursor.hasNext()) {
+                const entry = oplogCursor.next();
+                if (entry.ts) {
+                    const key = `${entry.ts.t},${entry.ts.i}`;
+                    if (!clusterTimesMap.has(key)) {
+                        clusterTimesMap.set(key, entry.ts);
+                    }
+                }
+            }
+        }
+
+        // Convert to array and sort by timestamp value.
+        const clusterTimes = Array.from(clusterTimesMap.values());
+        clusterTimes.sort((a, b) => {
+            if (a.t !== b.t) {
+                return a.t - b.t;
+            }
+            return a.i - b.i;
+        });
+
+        return clusterTimes;
+    }
+
+    /**
+     * Get cluster times for resume testing by reading from the oplog across all shards.
+     * This provides comprehensive testing by including timestamps for operations that
+     * may not produce change events.
+     *
+     * Requires shardConnections to be provided in the verifier config.
+     *
+     * @param {Timestamp} startTime - Start time for oplog query (first event's clusterTime)
+     * @param {Timestamp} endTime - End time for oplog query (last event's or invalidate's clusterTime)
+     * @returns {Array<Timestamp>} Array of unique cluster times, sorted
+     */
+    getClusterTimesForResumeTesting(startTime, endTime) {
+        assert(this.shardConnections.length > 0, "shardConnections required for resume testing");
+        assert(startTime, "startTime is required");
+        assert(endTime, "endTime is required");
+        return this._getClusterTimesFromOplog(startTime, endTime);
+    }
+}
+
+/**
+ * Query config.placementHistory since this reader's startAtClusterTime, to check on failure
+ * whether the shard-targeting mismatch traces back to wrong/missing placement data rather than a
+ * downstream cursor-management defect. Bounded by time rather than namespace: a namespace filter
+ * would have to be reconstructed from the command trace, which for cluster-wide watch mode means
+ * every writer's database (including db-level-only entries like movePrimary/dropDatabase, which
+ * key on the bare db name, not a writer's 'db.coll' trace entry) -- easy to under-cover. Time
+ * bounding also naturally excludes stale entries from an earlier test case in the same suite run.
+ */
+function dumpPlacementHistory(conn, startAtClusterTime, readerInstanceName) {
+    const history = conn
+        .getDB("config")
+        .placementHistory.find({timestamp: {$gte: startAtClusterTime}})
+        .sort({timestamp: 1})
+        .toArray();
+    jsTest.log.info("Placement history at failure time", {
+        instanceName: readerInstanceName,
+        since: startAtClusterTime,
+        count: history.length,
+        history,
+    });
+}
+
+/**
+ * Query every shard's own oplog directly for noop notification entries (reshardCollection,
+ * namespacePlacementChanged, shardCollection, movePrimary, etc.) since this reader's
+ * startAtClusterTime. This is ground truth from the source, independent of anything the
+ * change-stream pipeline or ARM/merge layer did with it -- settles whether a "missing" event was
+ * ever written at all, versus written but never surfaced to the client. Bounded by time for the
+ * same reason as dumpPlacementHistory(). No-ops if shardConnections wasn't provided.
+ */
+function dumpRawOplogSinceStart(ctx, startAtClusterTime, readerInstanceName) {
+    if (!ctx.shardConnections || ctx.shardConnections.length === 0) {
+        return;
+    }
+    const entriesByShard = ctx.shardConnections.map((shardConn) => {
+        const shardId = assert.commandWorked(
+            shardConn.getDB("admin").adminCommand({replSetGetStatus: 1}),
+        ).set;
+        const entries = shardConn
+            .getDB("local")
+            .oplog.rs.find({op: "n", ts: {$gte: startAtClusterTime}})
+            .sort({ts: 1})
+            .toArray();
+        return {shardId, count: entries.length, entries};
+    });
+
+    jsTest.log.info("Raw oplog noop entries at failure time", {
+        instanceName: readerInstanceName,
+        since: startAtClusterTime,
+        entriesByShard,
+    });
+}
+
+/**
+ * Run both on-failure diagnostic dumps for a reader. Each dump is independently guarded: a dump
+ * failing (e.g. a connection already torn down late in a failing FSM run) must never replace the
+ * real assertion failure it was meant to help explain, and one dump failing must not prevent the
+ * other from running.
+ */
+function dumpOplogAndPlacementHistory(conn, ctx, readerInstanceName) {
+    const cfg = ctx.changeStreamReaderConfigs[readerInstanceName];
+    if (!cfg || !cfg.startAtClusterTime) {
+        return;
+    }
+    for (const dump of [
+        () => dumpPlacementHistory(conn, cfg.startAtClusterTime, readerInstanceName),
+        () => dumpRawOplogSinceStart(ctx, cfg.startAtClusterTime, readerInstanceName),
+    ]) {
+        try {
+            dump();
+        } catch (e) {
+            jsTest.log.info("On-failure diagnostic dump itself failed", {
+                instanceName: readerInstanceName,
+                error: e.toString(),
+            });
+        }
+    }
+}
+
+/**
+ * Assert that the matcher consumed all expected events, with detailed diagnostics on failure.
+ * Logs the FSM command trace and reports a per-stream matched/stuck breakdown.
+ */
+function assertMatcherDone(conn, matcher, events, ctx, readerInstanceName) {
+    // isDone() alone isn't sufficient: matches() always returns false once a stream is done, so
+    // a trailing unexpected event makes the calling events.every() loop stop early without ever
+    // advancing past it. Require every actual event to have been consumed too, or a stray/extra
+    // event after the expected sequence completes would silently pass.
+    if (matcher.isDone() && matcher.getMatchedCount() === events.length) {
+        return;
+    }
+
+    // getMatchedCount() sums across all sub-streams, which hides *which* stream is actually
+    // short. Break it down per sub-stream instead -- a stream that's done isn't the problem.
+    const perStreamBreakdown = matcher.getPerStreamBreakdown();
+    const perStreamLines = perStreamBreakdown
+        .map(
+            (s, i) =>
+                `stream ${i}: ${s.matched}/${s.total} matched${s.done ? "" : ` (stuck, waiting for ${s.nextExpected})`}`,
+        )
+        .join("\n");
+
+    const expectedEventSummariesPerStream = matcher.getExpectedEventSummaries();
+    const expectedTotal = expectedEventSummariesPerStream.reduce(
+        (acc, expectedEvents) => acc + expectedEvents.length,
+        0,
+    );
+    const expectedEventsPerStream = expectedEventSummariesPerStream
+        .map((summary, i) => `stream ${i}(${summary.length}): [${summary.join(", ")}]`)
+        .join("\n");
+
+    const actualEvents = events.map((rec) =>
+        formatEventTypeAndNs(rec.changeEvent.operationType, rec.changeEvent.ns),
+    );
+    const actualMismatchedEvent = actualEvents[matcher.getMatchedCount()];
+
+    const commandTrace = ctx.getCommandTrace(readerInstanceName);
+    jsTest.log.info("FSM command trace (on mismatch)", {
+        instanceName: readerInstanceName,
+        commandsCount: commandTrace.length,
+        commands: commandTrace,
+    });
+
+    dumpOplogAndPlacementHistory(conn, ctx, readerInstanceName);
+
+    const headline = matcher.isDone()
+        ? `All ${expectedTotal} expected events matched, but ${events.length - matcher.getMatchedCount()} extra unexpected event(s) arrived afterward`
+        : `Matched ${matcher.getMatchedCount()} of ${expectedTotal} across ${perStreamBreakdown.length} stream(s)`;
+
+    assert(
+        false,
+        headline +
+            `\nper-stream breakdown:\n${perStreamLines}` +
+            `\nexpected(${expectedTotal}):\n${expectedEventsPerStream}` +
+            `\nactual(${actualEvents.length}): [${actualEvents.join(", ")}]` +
+            `\nGrep logs for "FSM command trace (on mismatch)" to see the full command sequence.`,
+        {
+            perStreamBreakdown,
+            expectedEventsPerStream: expectedEventSummariesPerStream,
+            actualEvents,
+            actualMismatchedEvent,
+        },
+    );
+}
+
+/**
+ * Test case that compares two sequential fetching strategies.
+ *
+ * This test case is reusable for:
+ * - v1 vs v2 change stream comparison
+ * - Continuous vs fetch-one-and-resume mode comparison
+ * - Any pairwise comparison of change stream reading strategies
+ *
+ * The test reads events from both instances (which should have been run with
+ * different strategies) and verifies they produce identical event sequences.
+ */
+class SequentialPairwiseFetchingTestCase {
+    /**
+     * Create a pairwise fetching test case.
+     * @param {string} controlInstanceName - Instance name for control reader
+     * @param {string} experimentInstanceName - Instance name for experiment reader
+     */
+    constructor(controlInstanceName, experimentInstanceName) {
+        this._controlInstanceName = controlInstanceName;
+        this._experimentInstanceName = experimentInstanceName;
+    }
+
+    /**
+     * Run the pairwise comparison test.
+     * @param {Mongo} conn - MongoDB connection
+     * @param {VerifierContext} ctx - Verifier context
+     */
+    run(conn, ctx) {
+        // Check both instances independently, even if one stalls/throws, so a hang on one side
+        // (e.g. a lost event) doesn't prevent us from seeing whether the other side succeeded.
+        const errors = [];
+        for (const instanceName of [this._controlInstanceName, this._experimentInstanceName]) {
+            try {
+                const events = ctx.getChangeEvents(conn, instanceName);
+                const matcher = ctx.getChangeStreamMatcher(instanceName);
+                events.every((rec) => matcher.matches(rec.changeEvent, rec.cursorClosed));
+                assertMatcherDone(conn, matcher, events, ctx, instanceName);
+            } catch (e) {
+                errors.push(e);
+            }
+        }
+        if (errors.length > 0) {
+            throw new Error(
+                `SequentialPairwiseFetchingTestCase encountered ${errors.length} error(s):\n` +
+                    errors.map((e) => e.toString()).join("\n"),
+            );
+        }
+    }
+}
+
+/**
+ * Test case that verifies a single reader's events against expected patterns.
+ *
+ * In strict mode (default), all expected events must be matched in order.
+ * With allowSkips, uses matchesOrSkip() to tolerate missing events (e.g.
+ * from a removed shard with ignoreRemovedShards). In that mode only the
+ * relative ordering and presence of at least some events are checked.
+ */
+class SingleReaderVerificationTestCase {
+    /**
+     * @param {string} readerInstanceName - Instance name for the reader
+     * @param {Object} [opts]
+     * @param {boolean} [opts.allowSkips=false] - Use matchesOrSkip() instead of matches()
+     */
+    constructor(readerInstanceName, {allowSkips = false} = {}) {
+        this._readerInstanceName = readerInstanceName;
+        this._allowSkips = allowSkips;
+    }
+
+    run(conn, ctx) {
+        const events = ctx.getChangeEvents(conn, this._readerInstanceName);
+        const matcher = ctx.getChangeStreamMatcher(this._readerInstanceName);
+
+        if (this._allowSkips) {
+            // No assertMatcherDone: with IRS, the removed shard may have held
+            // some expected events, so not all matchers will be exhausted.
+            events.forEach((rec, i) => {
+                assert(
+                    matcher.matchesOrSkip(rec.changeEvent, rec.cursorClosed),
+                    `${this._readerInstanceName}[${i}]: unexpected '${rec.changeEvent.operationType}' ` +
+                        `(ns: ${tojson(rec.changeEvent.ns)}) not in remaining expected events`,
+                );
+            });
+        } else {
+            // every() short-circuits on the first mismatch (matches() returns false), so
+            // the matcher stops advancing and records the failure point.
+            events.every((rec) => matcher.matches(rec.changeEvent, rec.cursorClosed));
+            assertMatcherDone(conn, matcher, events, ctx, this._readerInstanceName);
+        }
+    }
+}
+
+/**
+ * Test case that verifies prefix/resume correctness.
+ *
+ * Per spec: "Starting of a change stream from any cluster time test case"
+ * 1. Compute cluster times from oplog entries (excluding config/admin/control namespaces)
+ * 2. Fetch change events continuously with the default reader
+ * 3. Start a change stream from each cluster time and verify that `limit`
+ *    fetched events match corresponding events from step 2
+ * 4. Verify the full event sequence matches expectations
+ *
+ * Uses a sliding window of kParallelReadersCount readers to keep throughput
+ * high without overwhelming mongos with connections.
+ */
+class PrefixReadTestCase {
+    static kParallelReadersCount = 8;
+
+    constructor(readerInstanceName, limit, {allowSkips = false} = {}) {
+        assert(limit > 0, `limit must be a positive number, got ${limit}`);
+        this._readerInstanceName = readerInstanceName;
+        this._limit = limit;
+        this._allowSkips = allowSkips;
+    }
+
+    static _extractComparable(rec) {
+        return {changeEvent: rec.changeEvent, cursorClosed: rec.cursorClosed};
+    }
+
+    _buildWorkItems(events, clusterTimes) {
+        const items = [];
+        let lastStartIdx = -1;
+        for (const ts of clusterTimes) {
+            const startIdx = events.findIndex(
+                (rec) => bsonWoCompare(rec.changeEvent.clusterTime, ts) >= 0,
+            );
+            assert(
+                startIdx >= 0,
+                `No event found with clusterTime >= ${tojson(ts)}, but ts is within event range`,
+            );
+
+            // Skip cluster times that map to the same event window as the previous item.
+            // Many consecutive oplog entries can fall between the same two change events
+            // (e.g. noop/metadata operations), producing identical resume windows. Testing
+            // one representative per unique startIdx is sufficient.
+            if (startIdx === lastStartIdx) {
+                continue;
+            }
+            lastStartIdx = startIdx;
+
+            const expected = events
+                .slice(startIdx, startIdx + this._limit)
+                .map(PrefixReadTestCase._extractComparable);
+            if (expected.length > 0) {
+                items.push({ts, expected});
+            }
+        }
+        return items;
+    }
+
+    _launchReader(conn, ctx, item) {
+        return {
+            ...item,
+            readerInstanceName: ctx.launchReaderFromClusterTime(
+                conn,
+                this._readerInstanceName,
+                item.ts,
+                item.expected.length,
+            ),
+        };
+    }
+
+    _verifyReader(conn, ctx, item) {
+        const actual = ctx
+            .getChangeEvents(conn, item.readerInstanceName)
+            .map(PrefixReadTestCase._extractComparable);
+        const expected = item.expected.slice(0, actual.length);
+        assert(
+            bsonUnorderedFieldsCompare(expected, actual) === 0,
+            `mismatch when resuming from clusterTime ${tojson(item.ts)}`,
+            {clusterTime: item.ts, expected, actual},
+        );
+    }
+
+    run(conn, ctx) {
+        const events = ctx.getChangeEvents(conn, this._readerInstanceName);
+        if (events.length === 0) {
+            // IRS (ignoreRemovedShards) drain readers can legitimately see zero
+            // events when the removed shard held all data for this collection.
+            assert(
+                this._allowSkips,
+                "No events captured but allowSkips is false — this indicates a real bug",
+            );
+            return;
+        }
+
+        const startTime = events[0].changeEvent.clusterTime;
+        const endTime = events[events.length - 1].changeEvent.clusterTime;
+
+        const clusterTimes = ctx.getClusterTimesForResumeTesting(startTime, endTime);
+        const workItems = this._buildWorkItems(events, clusterTimes);
+
+        jsTest.log.info("PrefixReadTestCase: starting resume verification", {
+            clusterTimes: clusterTimes.length,
+            workItems: workItems.length,
+            parallelReaders: PrefixReadTestCase.kParallelReadersCount,
+        });
+
+        // Sliding window: always keep kParallelReadersCount readers in flight.
+        // As each reader completes verification, the next one is launched.
+        const inflight = [];
+        let next = 0;
+        while (
+            next < workItems.length &&
+            inflight.length < PrefixReadTestCase.kParallelReadersCount
+        ) {
+            inflight.push(this._launchReader(conn, ctx, workItems[next++]));
+        }
+        while (inflight.length > 0) {
+            this._verifyReader(conn, ctx, inflight.shift());
+            if (next < workItems.length) {
+                inflight.push(this._launchReader(conn, ctx, workItems[next++]));
+            }
+        }
+
+        const matcher = ctx.getChangeStreamMatcher(this._readerInstanceName);
+        if (this._allowSkips) {
+            // No assertMatcherDone: with IRS, the removed shard may have held
+            // some expected events, so not all matchers will be exhausted.
+            events.forEach((rec, i) => {
+                assert(
+                    matcher.matchesOrSkip(rec.changeEvent, rec.cursorClosed),
+                    `${this._readerInstanceName}[${i}]: unexpected '${rec.changeEvent.operationType}' ` +
+                        `(ns: ${tojson(rec.changeEvent.ns)}) not in remaining expected events`,
+                );
+            });
+        } else {
+            events.every((rec) => matcher.matches(rec.changeEvent, rec.cursorClosed));
+            assertMatcherDone(conn, matcher, events, ctx, this._readerInstanceName);
+        }
+    }
+}
+
+/**
+ * Verifier driver class.
+ *
+ * Orchestrates running one or more test cases with a given configuration.
+ * Expects readers to have already been started (potentially in parallel).
+ */
+class Verifier {
+    /**
+     * Run verification tests with the given configuration and test cases.
+     * @param {Mongo} conn - MongoDB connection
+     * @param {Object} config - Verifier configuration containing:
+     *   - changeStreamReaderConfigs: Map of instanceName -> reader config
+     *   - matcherSpecsByInstance: Map of instanceName -> matcher
+     *   - instanceName: Name for this verifier instance (for notifyDone)
+     *   - shardConnections: (optional) Direct connections to shard primaries for oplog access.
+     *       Required by PrefixReadTestCase to query cluster times for resume testing.
+     * @param {Array} testCases - Array of test cases to run
+     */
+    run(conn, config, testCases) {
+        const ctx = new VerifierContext(
+            config.changeStreamReaderConfigs,
+            config.matcherSpecsByInstance,
+            config.shardConnections || [],
+        );
+
+        for (const testCase of testCases) {
+            testCase.run(conn, ctx);
+        }
+
+        Connector.notifyDone(conn, config.instanceName);
+    }
+}
+
+export {
+    VerifierContext,
+    SequentialPairwiseFetchingTestCase,
+    SingleReaderVerificationTestCase,
+    PrefixReadTestCase,
+    Verifier,
+};

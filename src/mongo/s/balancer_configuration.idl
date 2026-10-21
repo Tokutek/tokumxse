@@ -1,0 +1,104 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/s/request_types/migration_secondary_throttle_options.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    BalancerMode:
+        description: "Balancer mode enum"
+        type: string
+        values:
+            kFull: "full"
+            kOff: "off"
+
+    DayOfWeek:
+        description: "Valid days of the week for balancer windows"
+        type: string
+        values:
+            Sunday: "Sunday"
+            Monday: "Monday"
+            Tuesday: "Tuesday"
+            Wednesday: "Wednesday"
+            Thursday: "Thursday"
+            Friday: "Friday"
+            Saturday: "Saturday"
+
+types:
+    MigrationSecondaryThrottle:
+        bson_serialization_type: any
+        description: "Secondary throttle policy to adopt during the migration"
+        cpp_type: "mongo::MigrationSecondaryThrottleOptions"
+        serializer: mongo::MigrationSecondaryThrottleOptions::serializeToBalancerConfigElement
+        deserializer: mongo::MigrationSecondaryThrottleOptions::parseFromBalancerConfigElement
+        is_view: false
+
+structs:
+    ActiveWindow:
+        description: "Active window configuration for balancer"
+        strict: false
+        fields:
+            start:
+                type: string
+                description: "Start time in HH:MM format"
+                optional: false
+            stop:
+                type: string
+                description: "Stop time in HH:MM format"
+                optional: false
+
+    DayOfWeekWindow:
+        description: "Day of week specific active window configuration"
+        strict: false
+        fields:
+            day:
+                type: DayOfWeek
+                description: "Day of the week (must be a valid, capitalized day name)"
+                optional: false
+            start:
+                type: string
+                description: "Start time in HH:MM format"
+                optional: false
+            stop:
+                type: string
+                description: "Stop time in HH:MM format"
+                optional: false
+
+    BalancerSettings:
+        description: "Balancer configuration settings"
+        strict: false
+        fields:
+            mode:
+                type: BalancerMode
+                description: "Balancer mode (full or off)"
+                default: kFull
+            stopped:
+                type: bool
+                description: "Whether the balancer is stopped"
+                default: false
+            activeWindow:
+                type: ActiveWindow
+                description: "Time window when balancer is active"
+                optional: true
+            activeWindowDOW:
+                type: array<DayOfWeekWindow>
+                description: "Day-of-week specific active windows"
+                optional: true
+            _secondaryThrottle:
+                type: MigrationSecondaryThrottle
+                description: "Secondary throttle configuration"
+                optional: true
+            _waitForDelete:
+                type: bool
+                description: "Whether to wait for deletes to complete"
+                default: false
+            attemptToBalanceJumboChunks:
+                type: bool
+                description: "Whether to attempt balancing jumbo chunks"
+                default: false

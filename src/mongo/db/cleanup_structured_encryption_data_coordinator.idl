@@ -1,0 +1,69 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/commands/fle2_cleanup.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+
+enums:
+    CleanupStructuredEncryptionDataPhase:
+        description: "The current phase of the cleanupStructuredEncryptionData pipeline"
+        type: string
+        mod_visibility: private
+        values:
+            kUnset: "unset"
+            kRenameEcocForCleanup: "rename-collections-for-cleanup"
+            kCleanupStructuredEncryptionData: "cleanup-structured-encryption-data"
+            kDeleteAnchors: "delete-anchors"
+            kDropTempCollection: "drop-temp-collection"
+
+structs:
+    CleanupStructuredEncryptionDataState:
+        description:
+            "Represents the state of the cleanupStructuredEncryptionData pipeline
+            for protocol version 2"
+        strict: false
+        mod_visibility: public
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                description: "Current phase"
+                type: CleanupStructuredEncryptionDataPhase
+                default: kUnset
+            skipCleanup:
+                description: "Whether to skip the cleanup operation"
+                type: bool
+                default: false
+            escNss:
+                description: "Collection containing insertions metadata"
+                type: namespacestring
+            ecocNss:
+                description: "Collection containing cleanup metadata to perform cleanup with"
+                type: namespacestring
+            ecocUuid:
+                description: "UUID of the collection identified by ecocNss"
+                type: uuid
+                optional: true
+            ecocRenameNss:
+                description: "Temporary name to use while performing cleanup"
+                type: namespacestring
+            ecocRenameUuid:
+                description: "UUID of the collection identified by ecocRenameNss"
+                type: uuid
+                optional: true
+            cleanupTokens:
+                description: "Cleanup tokens for the cleanup operation"
+                type: object_owned
+            escStats:
+                description: "Statistics for the ESC collection"
+                type: ECStats
+                optional: true
+            ecocStats:
+                description: "Statistics for the temporary ECOC collection"
+                type: ECOCStats
+                optional: true

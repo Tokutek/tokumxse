@@ -1,0 +1,301 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/lite_parsed_lookup.h"
+
+#include "mongo/db/extension/host/extension_search_server_status.h"
+#include "mongo/db/extension/host/extension_vector_search_server_status.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/document_source_documents.h"
+#include "mongo/db/pipeline/document_source_lookup.h"      // parseLookupFromAndResolveNamespace
+#include "mongo/db/pipeline/document_source_lookup_gen.h"  // DocumentSourceLookupSpec IDL
+#include "mongo/db/pipeline/document_source_queue.h"
+#include "mongo/db/pipeline/owned_lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/search/search_helper.h"
+#include "mongo/db/pipeline/stage_params_to_document_source_registry.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE(lookup,
+                                     LiteParsedLookUp::parse,
+                                     AllowedWithApiStrict::kConditionally);
+
+LiteParsedLookUp::LiteParsedLookUp(const BSONElement& spec,
+                                   const LiteParserOptions& options,
+                                   NamespaceString foreignNss,
+                                   boost::optional<OwnedLiteParsedPipeline> pipeline,
+                                   std::vector<BSONObj> rawPipeline,
+                                   std::string as,
+                                   BSONObj letVariables,
+                                   boost::optional<std::string> localField,
+                                   boost::optional<std::string> foreignField,
+                                   boost::optional<BSONObj> unwindSpec,
+                                   bool hasForeignDB,
+                                   bool isHybridSearch,
+                                   boost::optional<int64_t> internalFieldMatchPipelineIdx,
+                                   bool internalFromIsAView,
+                                   bool noUserPipeline,
+                                   bool allowGenericForeignDbLookup)
+    : LiteParsedDocumentSourceNestedPipelines(
+          spec, options, std::move(foreignNss), std::move(pipeline)),
+      _rawPipeline(std::move(rawPipeline)),
+      _as(std::move(as)),
+      _letVariables(std::move(letVariables)),
+      _localField(std::move(localField)),
+      _foreignField(std::move(foreignField)),
+      _unwindSpec(std::move(unwindSpec)),
+      _hasForeignDB(hasForeignDB),
+      _isHybridSearch(isHybridSearch),
+      _allowGenericForeignDbLookup(allowGenericForeignDbLookup),
+      _internalFieldMatchPipelineIdx(internalFieldMatchPipelineIdx),
+      _internalFromIsAView(internalFromIsAView),
+      _noUserPipeline(noUserPipeline) {}
+
+std::unique_ptr<LiteParsedLookUp> LiteParsedLookUp::parse(const NamespaceString& nss,
+                                                          const BSONElement& spec,
+                                                          const LiteParserOptions& options) {
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "the $lookup stage specification must be an object, but found "
+                          << typeName(spec.type()),
+            spec.type() == BSONType::object);
+
+    auto specObj = spec.Obj();
+    auto lookupSpec = DocumentSourceLookupSpec::parse(specObj, IDLParserContext(kStageName));
+
+    NamespaceString fromNss;
+    bool hasForeignDB = false;
+    if (lookupSpec.getFrom().has_value()) {
+        auto fromElem = lookupSpec.getFrom().value().getElement();
+        fromNss = parseLookupFromAndResolveNamespace(
+            fromElem, nss.dbName(), options.allowGenericForeignDbLookup);
+        if (fromElem.type() == BSONType::object) {
+            auto specAsNs = NamespaceSpec::parse(fromElem.embeddedObject(),
+                                                 IDLParserContext{fromElem.fieldNameStringData()});
+            hasForeignDB = specAsNs.getDb().has_value();
+        }
+    } else {
+        uassert(ErrorCodes::FailedToParse,
+                "must specify 'pipeline' when 'from' is empty",
+                lookupSpec.getPipeline().has_value());
+        validateLookupCollectionlessPipeline(lookupSpec.getPipeline().value());
+        fromNss = NamespaceString::makeCollectionlessAggregateNSS(nss.dbName());
+    }
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "invalid $lookup namespace: " << fromNss.toStringForErrorMsg(),
+            fromNss.isValid());
+
+    if (!lookupSpec.getPipeline().has_value()) {
+        uassert(ErrorCodes::FailedToParse,
+                "$lookup requires either 'pipeline' or both 'localField' and 'foreignField' to be "
+                "specified",
+                lookupSpec.getLocalField() && lookupSpec.getForeignField());
+        uassert(ErrorCodes::FailedToParse,
+                "$lookup with a 'let' argument must also specify 'pipeline'",
+                !lookupSpec.getLetVars().has_value());
+    }
+
+    boost::optional<OwnedLiteParsedPipeline> ownedPipeline;
+    std::vector<BSONObj> rawPipeline;
+    bool noUserPipeline = false;
+    if (lookupSpec.getPipeline().has_value()) {
+        rawPipeline = lookupSpec.getPipeline().value();
+        ownedPipeline = OwnedLiteParsedPipeline(fromNss, rawPipeline, options);
+    } else if (options.ifrContext &&
+               options.ifrContext->getSavedFlagValue(
+                   feature_flags::gFeatureFlagExtensionsInsideHybridSearch)) {
+        // The user did not provide a pipeline object, but the foreign namespace might still be a
+        // view. Defer to the bindResolvedNamespace() call to potentially materialize the view
+        // pipeline.
+        noUserPipeline = true;
+    }
+
+    std::string as = std::string{lookupSpec.getAs()};
+    BSONObj letVariables =
+        lookupSpec.getLetVars().has_value() ? lookupSpec.getLetVars()->getOwned() : BSONObj();
+
+    boost::optional<std::string> localField;
+    boost::optional<std::string> foreignField;
+    if (lookupSpec.getLocalField().has_value()) {
+        localField = std::string{*lookupSpec.getLocalField()};
+    }
+    if (lookupSpec.getForeignField().has_value()) {
+        foreignField = std::string{*lookupSpec.getForeignField()};
+    }
+
+    boost::optional<BSONObj> unwindSpec;
+    if (lookupSpec.getUnwindSpec().has_value()) {
+        unwindSpec = lookupSpec.getUnwindSpec()->getOwned();
+    }
+
+    const bool isHybridSearch = lookupSpec.getIsHybridSearch().value_or(false);
+
+    boost::optional<int64_t> internalFieldMatchPipelineIdx =
+        lookupSpec.getInternalFieldMatchPipelineIdx();
+
+    const bool internalFromIsAView = lookupSpec.getInternalFromIsAView().value_or(false);
+
+    return std::make_unique<LiteParsedLookUp>(spec,
+                                              options,
+                                              std::move(fromNss),
+                                              std::move(ownedPipeline),
+                                              std::move(rawPipeline),
+                                              std::move(as),
+                                              std::move(letVariables),
+                                              std::move(localField),
+                                              std::move(foreignField),
+                                              std::move(unwindSpec),
+                                              hasForeignDB,
+                                              isHybridSearch,
+                                              internalFieldMatchPipelineIdx,
+                                              internalFromIsAView,
+                                              noUserPipeline,
+                                              options.allowGenericForeignDbLookup);
+}
+
+PrivilegeVector LiteParsedLookUp::requiredPrivileges(bool isMongos,
+                                                     bool bypassDocumentValidation) const {
+    PrivilegeVector requiredPrivileges;
+    tassert(11282983,
+            str::stream() << "$lookup only supports 1 subpipeline, got " << _pipelines.size(),
+            _pipelines.size() <= 1);
+    tassert(11282982, "Missing foreignNss", _foreignNss);
+
+    if (_pipelines.empty() || !_pipelines[0]->startsWithInitialSource()) {
+        Privilege::addPrivilegeToPrivilegeVector(
+            &requiredPrivileges,
+            Privilege(ResourcePattern::forExactNamespace(*_foreignNss), ActionType::find));
+    }
+
+    if (!_pipelines.empty()) {
+        const LiteParsedPipeline& pipeline = *_pipelines[0];
+        Privilege::addPrivilegesToPrivilegeVector(
+            &requiredPrivileges, pipeline.requiredPrivileges(isMongos, bypassDocumentValidation));
+    }
+
+    return requiredPrivileges;
+}
+
+Status LiteParsedLookUp::checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                                        bool inMultiDocumentTransaction) const {
+    const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+    if (!inMultiDocumentTransaction ||
+        gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot)) {
+        return Status::OK();
+    }
+    auto involvedNss = getInvolvedNamespaces();
+    if (involvedNss.find(nss) == involvedNss.end()) {
+        return Status::OK();
+    }
+    return Status(ErrorCodes::NamespaceCannotBeSharded,
+                  "Sharded $lookup is not allowed within a multi-document transaction");
+}
+
+void LiteParsedLookUp::getForeignExecutionNamespaces(
+    stdx::unordered_set<NamespaceString>& nssSet) const {
+    tassert(6235100, "Expected foreignNss to be initialized for $lookup", _foreignNss);
+    nssSet.emplace(*_foreignNss);
+}
+
+bool LiteParsedLookUp::hasExtensionSearchStage() const {
+    return !_pipelines.empty() && _pipelines[0]->hasExtensionSearchStage();
+}
+
+std::unique_ptr<StageParams> LiteParsedLookUp::getStageParams() const {
+    boost::optional<StageParamsPipeline> subParams;
+    auto subpipelineViewPolicy = FirstStageViewApplicationPolicy::kDefaultPrepend;
+    size_t subpipelineViewPrefixLen = 0;
+    if (!_pipelines.empty()) {
+        subParams = _pipelines[0]->getStageParams();
+        // handleView() may already have prepended the foreign view's definition here, so ask for
+        // the user's first stage rather than the front stage.
+        subpipelineViewPolicy = _pipelines[0]->getUserFirstStageViewApplicationPolicy();
+        // With no user `pipeline:` field the subpipeline *is* the materialized view definition, so
+        // every stage is a view stage; otherwise the view was prepended ahead of the user's stages.
+        subpipelineViewPrefixLen = _noUserPipeline ? _pipelines[0]->getStages().size()
+                                                   : _pipelines[0]->getNumPrependedViewStages();
+    }
+    return std::make_unique<LookUpStageParams>(*_foreignNss,
+                                               _as,
+                                               _rawPipeline,
+                                               _letVariables,
+                                               _localField,
+                                               _foreignField,
+                                               _unwindSpec,
+                                               _hasForeignDB,
+                                               _isHybridSearch,
+                                               getOriginalBson().wrap(),
+                                               std::move(subParams),
+                                               _internalFieldMatchPipelineIdx,
+                                               _internalFromIsAView,
+                                               _noUserPipeline,
+                                               subpipelineViewPolicy,
+                                               subpipelineViewPrefixLen);
+}
+
+void LiteParsedLookUp::validate(const OperationContext* opCtx) const {
+    if (_hasForeignDB) {
+        // Enforce the cross-db $lookup restriction. This mirrors the check on the legacy
+        // createFromBson path via expCtx and ensures validation fires before the stage is
+        // constructed from stage params.
+        parseLookupFromAndResolveNamespace(getOriginalBson().Obj().getField("from"),
+                                           _foreignNss->dbName(),
+                                           _allowGenericForeignDbLookup);
+    }
+    if (_pipelines.empty()) {
+        return;
+    }
+    for (const auto& stage : _pipelines[0]->getStages()) {
+        uassert(11725900,
+                str::stream() << stage->getParseTimeName()
+                              << " is not allowed to be used within a $lookup pipeline",
+                stage->isAllowedInLookupPipeline());
+    }
+
+    // The extension implementations of $search/$searchMeta/$vectorSearch are not supported inside a
+    // $lookup sub-pipeline while featureFlagExtensionsInsideHybridSearch is disabled.
+    // DocumentSourceExtensionOptimizable::create() raises that kickback when the stage is
+    // constructed, but unlike $unionWith, $lookup does not desugar its sub-pipeline during parsing:
+    // it waits until the first input document reaches LookUpStage::buildPipeline. That document may
+    // not arrive until a getMore, which has no retry handler to catch the kickback. Raise it here
+    // instead, during lite-parse, which every caller wraps in an IFRFlagRetry handler.
+    if (const auto& ifrContext = getIfrContext(); ifrContext &&
+        !ifrContext->getSavedFlagValue(feature_flags::gFeatureFlagExtensionsInsideHybridSearch)) {
+        search_helpers::throwIfrKickbackIfNecessary(
+            _pipelines[0]->hasExtensionVectorSearchStage(),
+            feature_flags::gFeatureFlagVectorSearchExtension,
+            vector_search_metrics::inLookupKickbackRetryCount,
+            "The $vectorSearch extension stage is not supported in a $lookup");
+        search_helpers::throwIfrKickbackIfNecessary(
+            _pipelines[0]->hasExtensionSearchStage(),
+            feature_flags::gFeatureFlagSearchExtension,
+            search_metrics::inLookupKickbackRetryCount,
+            "The $search/$searchMeta extension stage is not supported in a $lookup");
+    }
+}
+
+void LiteParsedLookUp::validateLookupCollectionlessPipeline(const std::vector<BSONObj>& pipeline) {
+    uassert(ErrorCodes::FailedToParse,
+            "$lookup stage without explicit collection must have a pipeline with $documents as "
+            "first stage",
+            pipeline.size() > 0 &&
+                !pipeline[0].getField(DocumentSourceDocuments::kStageName).eoo());
+}
+
+void LiteParsedLookUp::validateLookupCollectionlessPipeline(const BSONElement& pipeline) {
+    uassert(ErrorCodes::FailedToParse, "must specify 'pipeline' when 'from' is empty", pipeline);
+    auto parsedPipeline = parsePipelineFromBSON(pipeline);
+    validateLookupCollectionlessPipeline(parsedPipeline);
+}
+
+}  // namespace mongo

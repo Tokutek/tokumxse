@@ -1,0 +1,83 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    KMSProvider:
+        description: "Enumeration of supported KMS Providers"
+        type: string
+        values:
+            local: "local"
+
+structs:
+    # Options passed to Mongo() javascript constructor
+    localKMS:
+        description: "Local KMS config"
+        mod_visibility: private
+        fields:
+            key: bindata_generic
+
+    kmsProviders:
+        description: "Supported KMS Providers"
+        mod_visibility: private
+        strict: true
+        fields:
+            local:
+                type: localKMS
+                optional: true
+
+    clientSideFLEOptions:
+        description: "FLE Options inputted through the Mongo constructor in the shell"
+        mod_visibility: private
+        fields:
+            keyVaultClient: #Parsed as a JSHandleValue, not through IDL
+                type: void
+                ignore: true
+            keyVaultNamespace:
+                type: string
+            kmsProviders: kmsProviders
+            schemaMap:
+                type: object
+                optional: true
+            bypassAutoEncryption:
+                type: bool
+                optional: true
+
+    localMasterKey:
+        description: "Local KMS Key Store Description"
+        mod_visibility: private
+        fields:
+            provider:
+                type: string
+                default: '"local"'
+
+    localMasterKeyAndMaterial:
+        description: "Local KMS Key Material Description"
+        mod_visibility: private
+        fields:
+            keyMaterial:
+                type: bindata_generic
+            masterKey:
+                type: localMasterKey
+
+    keyStoreRecord:
+        description: "A V0 Key Store Record"
+        mod_visibility: private
+        fields:
+            _id: uuid
+            keyMaterial: bindata_generic
+            creationDate: date
+            updateDate: date
+            status: int
+            version:
+                type: long
+                default: 0
+            masterKey: object
+            keyAltNames:
+                type: array<string>
+                ignore: true

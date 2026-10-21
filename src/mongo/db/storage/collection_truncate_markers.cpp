@@ -1,0 +1,817 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/collection_truncate_markers.h"
+
+#include "mongo/db/operation_context.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/collection_truncate_markers_parameters_gen.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/timer.h"
+
+#include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+namespace mongo {
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+// Strings for MarkerCreationMethods.
+static constexpr std::string_view kEmptyCollectionString = "emptyCollection"sv;
+static constexpr std::string_view kScanningString = "scanning"sv;
+static constexpr std::string_view kSamplingString = "sampling"sv;
+static constexpr std::string_view kInProgressString = "inProgress"sv;
+}  // namespace
+
+std::string_view CollectionTruncateMarkers::toString(
+    CollectionTruncateMarkers::MarkersCreationMethod creationMethod) {
+    switch (creationMethod) {
+        case CollectionTruncateMarkers::MarkersCreationMethod::EmptyCollection:
+            return kEmptyCollectionString;
+        case CollectionTruncateMarkers::MarkersCreationMethod::Scanning:
+            return kScanningString;
+        case CollectionTruncateMarkers::MarkersCreationMethod::Sampling:
+            return kSamplingString;
+        case CollectionTruncateMarkers::MarkersCreationMethod::InProgress:
+            return kInProgressString;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+boost::optional<CollectionTruncateMarkers::Marker>
+CollectionTruncateMarkers::peekOldestMarkerIfNeeded(OperationContext* opCtx) const {
+    std::lock_guard<std::mutex> lk(_markersMutex);
+
+    if (!_hasExcessMarkers(opCtx)) {
+        return {};
+    }
+
+    return _markers.front();
+}
+
+boost::optional<CollectionTruncateMarkers::Marker> CollectionTruncateMarkers::newestExpiredRecord(
+    OperationContext* opCtx,
+    RecordStore& recordStore,
+    const RecordId& mayTruncateUpTo,
+    Date_t expiryTime) {
+    if (mayTruncateUpTo.isNull()) {
+        return boost::none;
+    }
+    // reverse cursor so that non-exact matches will give the next older entry, not the next newer
+    auto recoveryUnit = shard_role_details::getRecoveryUnit(opCtx);
+    auto cursor = recordStore.getCursor(opCtx, *recoveryUnit, /* forward */ false);
+    auto record = cursor->next();
+    RecordId newestId = record ? record->id : RecordId();
+    RecordId newestUnpinnedId;
+    record = cursor->seek(mayTruncateUpTo, SeekableRecordCursor::BoundInclusion::kInclude);
+    newestUnpinnedId = record ? record->id : RecordId();
+    // it's OK to round off expiry time to the nearest second.
+    RecordId seekTo(durationCount<Seconds>(expiryTime.toDurationSinceEpoch()), /* low */ 0);
+    seekTo = std::min(seekTo, mayTruncateUpTo);
+    record = cursor->seek(seekTo, SeekableRecordCursor::BoundInclusion::kInclude);
+    if (!record) {
+        return {};
+    }
+    // for behavioral compatibility with ASC, don't entirely empty the oplog
+    // or remove the last unpinned entry (defined there to *include* the mayTruncateUpTo point)
+    if (record->id == newestId || record->id == newestUnpinnedId) {
+        // reverse cursor, so one older
+        record = cursor->next();
+        if (!record) {
+            return {};
+        }
+    }
+    // byte and record increments are only advisory even when there's a size storer to look at them.
+    return Marker(/*.records =*/0, /*.bytes =*/0, record->id, expiryTime);
+}
+
+void CollectionTruncateMarkers::popOldestMarker() {
+    std::lock_guard<std::mutex> lk(_markersMutex);
+    _markers.pop_front();
+}
+
+CollectionTruncateMarkers::Marker& CollectionTruncateMarkers::createNewMarker(
+    const RecordId& lastRecord, Date_t wallTime) {
+    return _markers.emplace_back(
+        _currentRecords.swap(0), _currentBytes.swap(0), lastRecord, wallTime);
+}
+
+void CollectionTruncateMarkers::createNewMarkerIfNeeded(const RecordId& lastRecord,
+                                                        Date_t wallTime,
+                                                        bool oplogSamplingAsyncEnabled) {
+    auto logFailedLockAcquisition = [&](const std::string& lock) {
+        LOGV2_DEBUG(7393214,
+                    2,
+                    "Failed to acquire lock to check if a new collection marker is needed",
+                    "lock"_attr = lock);
+    };
+
+    // Try to lock the mutex, if we fail to lock then someone else is either already creating a new
+    // marker or popping the oldest one. In the latter case, we let the next insert trigger the new
+    // marker's creation.
+    std::unique_lock<std::mutex> lk(_markersMutex, std::try_to_lock);
+    if (!lk) {
+        logFailedLockAcquisition("_markersMutex");
+        return;
+    }
+
+    if (oplogSamplingAsyncEnabled && !_initialSamplingFinished) {
+        // Must have finished creating initial markers first.
+        return;
+    }
+
+    if (_currentBytes.load() < _minBytesPerMarker.load()) {
+        // Must have raced to create a new marker, someone else already triggered it.
+        return;
+    }
+
+    if (!_markers.empty() && lastRecord < _markers.back().lastRecord) {
+        // Skip creating a new marker when the record's position comes before the most recently
+        // created marker. We likely raced with another batch of inserts that caused us to try and
+        // make multiples markers.
+        return;
+    }
+
+    auto& marker = createNewMarker(lastRecord, wallTime);
+
+    LOGV2_DEBUG(7393213,
+                2,
+                "Created a new collection marker",
+                "lastRecord"_attr = marker.lastRecord,
+                "wallTime"_attr = marker.wallTime,
+                "numMarkers"_attr = _markers.size());
+
+    _notifyNewMarkerCreation();
+}
+
+void CollectionTruncateMarkers::updateCurrentMarkerAfterInsertOnCommit(
+    OperationContext* opCtx,
+    int64_t bytesInserted,
+    const RecordId& highestInsertedRecordId,
+    Date_t wallTime,
+    int64_t countInserted,
+    bool oplogSamplingAsyncEnabled) {
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [collectionMarkers = shared_from_this(),
+         bytesInserted,
+         recordId = highestInsertedRecordId,
+         wallTime,
+         countInserted,
+         oplogSamplingAsyncEnabled](OperationContext* opCtx, auto) {
+            invariant(bytesInserted >= 0);
+            invariant(recordId.isValid());
+
+            collectionMarkers->_currentRecords.addAndFetch(countInserted);
+            int64_t newCurrentBytes = collectionMarkers->_currentBytes.addAndFetch(bytesInserted);
+
+            if (wallTime != Date_t() &&
+                newCurrentBytes >= collectionMarkers->_minBytesPerMarker.load()) {
+                // When other transactions commit concurrently, an uninitialized wallTime may delay
+                // the creation of a new marker. This delay is limited to the number of concurrently
+                // running transactions, so the size difference should be inconsequential.
+                collectionMarkers->createNewMarkerIfNeeded(
+                    recordId, wallTime, oplogSamplingAsyncEnabled);
+            }
+        });
+}
+
+void CollectionTruncateMarkers::setMinBytesPerMarker(int64_t size) {
+    invariant(size > 0);
+    _minBytesPerMarker.store(size);
+}
+
+void CollectionTruncateMarkers::initialSamplingFinished() {
+    std::lock_guard<std::mutex> lk(_markersMutex);
+    LOGV2_DEBUG(10167200, 2, "Initial sampling finished marked true.");
+    _initialSamplingFinished = true;
+}
+
+CollectionTruncateMarkers::InitialSetOfMarkers CollectionTruncateMarkers::createMarkersByScanning(
+    OperationContext* opCtx,
+    CollectionIterator& collectionIterator,
+    int64_t minBytesPerMarker,
+    std::function<RecordIdAndWallTime(const Record&)> getRecordIdAndWallTime,
+    int64_t startTime,
+    TickSource* tickSource) {
+    const int64_t numRecordsTotal = collectionIterator.numRecords();
+    LOGV2_INFO(7393212,
+               "Scanning collection to determine where to place markers for truncation",
+               "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+               "numRecords"_attr = numRecordsTotal);
+
+    int64_t numRecords = 0;
+    int64_t dataSize = 0;
+    int64_t currentRecords = 0;
+    int64_t currentBytes = 0;
+
+    std::deque<Marker> markers;
+    Timer lastProgressTimer(tickSource);
+
+    while (auto nextRecord = collectionIterator.getNext()) {
+        const auto& [rId, doc] = *nextRecord;
+        currentRecords++;
+        currentBytes += doc.objsize();
+        if (currentBytes >= minBytesPerMarker) {
+            auto [_, wallTime] =
+                getRecordIdAndWallTime(Record{rId, RecordData{doc.objdata(), doc.objsize()}});
+
+            LOGV2_DEBUG(7393211,
+                        1,
+                        "Marking entry as a potential future truncation point",
+                        "wall"_attr = wallTime);
+
+            markers.emplace_back(
+                std::exchange(currentRecords, 0), std::exchange(currentBytes, 0), rId, wallTime);
+        }
+
+        numRecords++;
+        dataSize += doc.objsize();
+
+        const int samplingLogIntervalSeconds = gCollectionSamplingLogIntervalSeconds.load();
+        if (samplingLogIntervalSeconds > 0 &&
+            lastProgressTimer.elapsed() >= Seconds(samplingLogIntervalSeconds)) {
+            LOGV2(11212203,
+                  "Collection scanning progress",
+                  "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+                  "completed"_attr = numRecords,
+                  "scanned kb"_attr = dataSize / 1024,
+                  "markers"_attr = markers.size(),
+                  "total"_attr = numRecordsTotal);
+            lastProgressTimer.reset();
+        }
+
+        // Force a call to next() only every ~ 1 second to simulate slowness.
+        if (MONGO_unlikely(gUseSlowCollectionTruncateMarkerScanning)) {
+            sleepFor(Seconds(1));
+        }
+    }
+
+    collectionIterator.getRecordStore()->updateStatsAfterRepair(numRecords, dataSize);
+    auto endTime = curTimeMicros64();
+    return CollectionTruncateMarkers::InitialSetOfMarkers{
+        std::move(markers),
+        currentRecords,
+        currentBytes,
+        Microseconds{static_cast<int64_t>(endTime - startTime)},
+        MarkersCreationMethod::Scanning};
+}
+
+CollectionTruncateMarkers::InitialSetOfMarkers CollectionTruncateMarkers::createMarkersBySampling(
+    OperationContext* opCtx,
+    CollectionIterator& collectionIterator,
+    int64_t minBytesPerMarker,
+    std::function<RecordIdAndWallTime(const Record&)> getRecordIdAndWallTime,
+    bool allowFallbackScanning,
+    int64_t startTime,
+    TickSource* tickSource) {
+    invariant(minBytesPerMarker > 0);
+
+    // Use the collection's average record size to estimate the number of records in each marker,
+    // and thus estimate the combined size of the records.
+    int64_t numRecords = collectionIterator.numRecords();
+    int64_t dataSize = collectionIterator.dataSize();
+
+    auto fallbackOnFailure = [&](std::string_view reason) -> InitialSetOfMarkers {
+        int64_t numRecords = collectionIterator.numRecords();
+        int64_t dataSize = collectionIterator.dataSize();
+        LOGV2_WARNING(13283605,
+                      "Failed to sample collection for initial truncation markers",
+                      "reason"_attr = reason,
+                      "fallbackMethod"_attr = allowFallbackScanning
+                          ? toString(MarkersCreationMethod::Scanning)
+                          : toString(MarkersCreationMethod::EmptyCollection),
+                      "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+                      "numRecords"_attr = numRecords,
+                      "dataSize"_attr = dataSize);
+        collectionIterator.reset(opCtx);
+        if (allowFallbackScanning) {
+            return CollectionTruncateMarkers::createMarkersByScanning(
+                opCtx,
+                collectionIterator,
+                minBytesPerMarker,
+                std::move(getRecordIdAndWallTime),
+                startTime,
+                tickSource);
+        } else {
+            // If scanning is disabled, start with a single partial marker that contains the initial
+            // size/count of records. These values will be accumulated into a real marker once new
+            // records are written. These initial values may be incorrect (since we usually hit this
+            // path on an incorrect size storer), but will be corrected once the first marker is
+            // truncated off. Call numRecords() and dataSize() to get the most recent values in case
+            // this failure happens some time after the initial values are captured.
+            auto duration = Microseconds{static_cast<int64_t>(curTimeMicros64() - startTime)};
+            return CollectionTruncateMarkers::InitialSetOfMarkers{
+                {}, numRecords, dataSize, duration, MarkersCreationMethod::EmptyCollection};
+        }
+    };
+
+    if (numRecords <= 0 || dataSize <= 0) {
+        // A mismatch on these indicates that the collection is likely empty or something is wrong
+        // with the size/count. Fall back to another method.
+        return fallbackOnFailure("Collection size or count returned 0");
+    }
+
+
+    LOGV2_INFO(7393210,
+               "Sampling the collection to determine where to place markers for truncation",
+               "uuid"_attr = collectionIterator.getRecordStore()->uuid());
+    RecordId earliestRecordId, latestRecordId;
+
+    auto getRecord = [&](bool forward) {
+        auto rs = collectionIterator.getRecordStore();
+        return rs->getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx), forward)->next();
+    };
+
+    {
+        auto record = getRecord(true);
+        if (!record) {
+            // This shouldn't really happen unless the size storer values are far off from reality.
+            // The collection is probably empty, so fall back to another method just in case.
+            return fallbackOnFailure("Failed to determine the earliest recordId");
+        }
+        earliestRecordId = record->id;
+    }
+
+    {
+        auto record = getRecord(false);
+        if (!record) {
+            // This shouldn't really happen unless the size storer values are far off from reality.
+            // The collection is probably empty, so fall back to another method just in case.
+            return fallbackOnFailure("Failed to determine the latest recordId");
+        }
+        latestRecordId = record->id;
+    }
+
+    LOGV2(7393207,
+          "Sampling from the collection to determine where to place markers for truncation",
+          "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+          "from"_attr = earliestRecordId,
+          "to"_attr = latestRecordId);
+
+    double avgRecordSize = double(dataSize) / double(numRecords);
+
+    // These values will be stored as the size/count of each marker
+    const int64_t estimatedRecordsPerMarker = std::ceil(minBytesPerMarker / avgRecordSize);
+    const int64_t estimatedBytesPerMarker = estimatedRecordsPerMarker * avgRecordSize;
+
+    int64_t wholeMarkers = numRecords / estimatedRecordsPerMarker;
+    // We don't use the wholeMarkers variable here due to integer division not being associative.
+    // For example, 10 * (47500 / 28700) = 10, but (10 * 47500) / 28700 = 16.
+    int64_t numSamples = (kRandomSamplesPerMarker * numRecords) / estimatedRecordsPerMarker;
+
+    LOGV2(7393216,
+          "Taking samples and assuming each collection section contains equal amounts",
+          "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+          "numSamples"_attr = numSamples,
+          "estimatedRecordsPerMarker"_attr = estimatedRecordsPerMarker,
+          "estimatedBytesPerMarker"_attr = estimatedBytesPerMarker);
+
+    // Divide the collection into 'wholeMarkers' logical sections, with each section containing
+    // approximately 'estimatedRecordsPerMarker'. Do so by oversampling the collection, sorting the
+    // samples in order of their RecordId, and then choosing the samples expected to be near the
+    // right edge of each logical section.
+
+    std::vector<RecordIdAndWallTime> collectionEstimates;
+    Timer lastProgressTimer(tickSource);
+
+    for (int i = 0; i < numSamples; ++i) {
+        auto nextRandom = collectionIterator.getNextRandom();
+        if (!nextRandom) {
+            // getNextRandom() returns nullopt on an empty collection, so either the size storer was
+            // wrong or something modified the collection concurrently (which we do in tests).
+            return fallbackOnFailure("Failed to get enough random samples");
+        }
+        const auto [rId, doc] = *nextRandom;
+        auto samplingLogIntervalSeconds = gCollectionSamplingLogIntervalSeconds.load();
+
+        collectionEstimates.emplace_back(
+            getRecordIdAndWallTime(Record{rId, RecordData{doc.objdata(), doc.objsize()}}));
+
+        if (samplingLogIntervalSeconds > 0 &&
+            lastProgressTimer.elapsed() >= Seconds(samplingLogIntervalSeconds)) {
+            LOGV2(7393217,
+                  "Collection sampling progress",
+                  "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+                  "completed"_attr = (i + 1),
+                  "total"_attr = numSamples);
+            lastProgressTimer.reset();
+        }
+    }
+
+    std::sort(collectionEstimates.begin(),
+              collectionEstimates.end(),
+              [](const auto& a, const auto& b) { return a.id < b.id; });
+    LOGV2(7393205,
+          "Collection sampling complete",
+          "uuid"_attr = collectionIterator.getRecordStore()->uuid());
+
+    std::deque<Marker> markers;
+
+    for (int i = 1; i <= wholeMarkers; ++i) {
+        // Use every (kRandomSamplesPerMarker)th sample, starting with the
+        // (kRandomSamplesPerMarker - 1)th, as the last record for each marker.
+        // If parsing "wall" fails, we crash to allow user to fix their collection.
+        const auto& [id, wallTime] = collectionEstimates[kRandomSamplesPerMarker * i - 1];
+
+        LOGV2_DEBUG(7393204,
+                    1,
+                    "Marking entry as a potential future truncation point",
+                    "uuid"_attr = collectionIterator.getRecordStore()->uuid(),
+                    "wall"_attr = wallTime,
+                    "ts"_attr = id);
+
+        markers.emplace_back(estimatedRecordsPerMarker, estimatedBytesPerMarker, id, wallTime);
+    }
+
+    // Account for the partially filled chunk. Reading numRecords() and dataSize() here results in
+    // the size and count of any records that were written during the traversal being included in
+    // the partial marker.
+    auto currentRecords =
+        collectionIterator.numRecords() - estimatedRecordsPerMarker * wholeMarkers;
+    auto currentBytes = collectionIterator.dataSize() - estimatedBytesPerMarker * wholeMarkers;
+    auto duration = static_cast<int64_t>(curTimeMicros64() - startTime);
+    LOGV2_DEBUG(10621100, 1, "createMarkersBySampling finished", "durationMicros"_attr = duration);
+    return CollectionTruncateMarkers::InitialSetOfMarkers{std::move(markers),
+                                                          currentRecords,
+                                                          currentBytes,
+                                                          Microseconds{duration},
+                                                          MarkersCreationMethod::Sampling};
+}
+
+CollectionTruncateMarkers::MarkersCreationMethod
+CollectionTruncateMarkers::computeInitialCreationMethod(
+    int64_t numRecords,
+    int64_t dataSize,
+    int64_t minBytesPerMarker,
+    MarkersCreationPolicy policy,
+    boost::optional<int64_t> numberOfMarkersToKeepForOplog) {
+
+    // Don't calculate markers if this is a new collection. This is to prevent standalones from
+    // attempting to get a forward scanning cursor on an explicit create of the collection. These
+    // values can be wrong. The assumption is that if they are both observed to be zero, there must
+    // be very little data in the collection; the cost of being wrong is imperceptible.
+    if (numRecords == 0 && dataSize == 0) {
+        return MarkersCreationMethod::EmptyCollection;
+    }
+
+    // Force scanning if the slow collection scanning flag is set, overriding the policy.
+    if (gUseSlowCollectionTruncateMarkerScanning) {
+        LOGV2_WARNING(13283606,
+                      "Running intentionally slow collection scan to generate initial truncate "
+                      "markers. Any other configuration that may disable scanning is ignored.",
+                      "policy"_attr = policy == MarkersCreationPolicy::kSampleOnly
+                          ? "SampleOnly"
+                          : (policy == MarkersCreationPolicy::kScanOnly ? "ScanOnly" : "Auto"),
+                      "numRecords"_attr = numRecords,
+                      "dataSize"_attr = dataSize);
+        return MarkersCreationMethod::Scanning;
+    }
+
+    // If a specific method is required by the caller, use it.
+    if (policy == MarkersCreationPolicy::kScanOnly) {
+        return MarkersCreationMethod::Scanning;
+    } else if (policy == MarkersCreationPolicy::kSampleOnly) {
+        return MarkersCreationMethod::Sampling;
+    }
+
+    // Only use sampling to estimate where to place the collection markers if the number of samples
+    // drawn is less than 5% of the collection.
+    const uint64_t kMinSampleRatioForRandCursor = 20;
+
+    // If the collection doesn't contain enough records to make sampling more efficient, then scan
+    // the collection to determine where to put down markers.
+    //
+    // Unless preserving legacy behavior of 'OplogTruncateMarkers', compute the number of markers
+    // which would be generated based on the estimated data size.
+    auto numMarkers = numberOfMarkersToKeepForOplog ? numberOfMarkersToKeepForOplog.get()
+                                                    : dataSize / minBytesPerMarker;
+    if (numRecords <= 0 || dataSize <= 0 ||
+        uint64_t(numRecords) <
+            kMinSampleRatioForRandCursor * kRandomSamplesPerMarker * numMarkers) {
+        return MarkersCreationMethod::Scanning;
+    }
+
+    return MarkersCreationMethod::Sampling;
+}
+
+CollectionTruncateMarkers::InitialSetOfMarkers
+CollectionTruncateMarkers::createFromCollectionIterator(
+    OperationContext* opCtx,
+    CollectionIterator& collectionIterator,
+    int64_t minBytesPerMarker,
+    std::function<RecordIdAndWallTime(const Record&)> getRecordIdAndWallTime,
+    MarkersCreationPolicy policy,
+    boost::optional<int64_t> numberOfMarkersToKeepForOplog) {
+
+    long long numRecords = collectionIterator.numRecords();
+    long long dataSize = collectionIterator.dataSize();
+
+    LOGV2(7393203,
+          "The size storer reports that the collection contains",
+          "numRecords"_attr = numRecords,
+          "dataSize"_attr = dataSize);
+
+    auto creationMethod = CollectionTruncateMarkers::computeInitialCreationMethod(
+        numRecords, dataSize, minBytesPerMarker, policy, numberOfMarkersToKeepForOplog);
+
+    auto startTime = curTimeMicros64();
+    switch (creationMethod) {
+        case MarkersCreationMethod::EmptyCollection:
+            // Don't calculate markers if this is a new collection. This is to prevent standalones
+            // from attempting to get a forward scanning cursor on an explicit create of the
+            // collection. These values can be wrong. The assumption is that if they are both
+            // observed to be zero, there must be very little data in the collection; the cost of
+            // being wrong is imperceptible.
+            return CollectionTruncateMarkers::InitialSetOfMarkers{
+                {}, 0, 0, Microseconds{0}, MarkersCreationMethod::EmptyCollection};
+        case MarkersCreationMethod::Scanning:
+            return CollectionTruncateMarkers::createMarkersByScanning(
+                opCtx,
+                collectionIterator,
+                minBytesPerMarker,
+                std::move(getRecordIdAndWallTime),
+                startTime);
+        default: {
+            bool allowScanning = policy != MarkersCreationPolicy::kSampleOnly;
+            return CollectionTruncateMarkers::createMarkersBySampling(
+                opCtx,
+                collectionIterator,
+                minBytesPerMarker,
+                std::move(getRecordIdAndWallTime),
+                allowScanning,
+                startTime);
+        }
+    }
+}
+
+void CollectionTruncateMarkersWithPartialExpiration::updateCurrentMarkerAfterInsertOnCommit(
+    OperationContext* opCtx,
+    int64_t bytesInserted,
+    const RecordId& highestInsertedRecordId,
+    Date_t wallTime,
+    int64_t countInserted,
+    bool oplogSamplingAsyncEnabled) {
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [collectionMarkers =
+             std::static_pointer_cast<CollectionTruncateMarkersWithPartialExpiration>(
+                 shared_from_this()),
+         bytesInserted,
+         recordId = highestInsertedRecordId,
+         wallTime,
+         countInserted,
+         oplogSamplingAsyncEnabled](OperationContext* opCtx, auto) {
+            invariant(bytesInserted >= 0);
+            invariant(recordId.isValid());
+            collectionMarkers->updateCurrentMarker(
+                bytesInserted, recordId, wallTime, countInserted, oplogSamplingAsyncEnabled);
+        });
+}
+
+void CollectionTruncateMarkersWithPartialExpiration::createPartialMarkerIfNecessary(
+    OperationContext* opCtx) {
+    auto logFailedLockAcquisition = [&](const std::string& lock) {
+        LOGV2_DEBUG(7393202,
+                    2,
+                    "Failed to acquire lock to check if a new partial collection marker is needed",
+                    "lock"_attr = lock);
+    };
+
+    // Try to lock all mutexes, if we fail to lock a mutex then someone else is either already
+    // creating a new marker or popping the oldest one. In the latter case, we let the next check
+    // trigger the new partial marker's creation.
+
+    std::unique_lock<std::mutex> lk(_markersMutex, std::try_to_lock);
+    if (!lk) {
+        logFailedLockAcquisition("_markersMutex");
+        return;
+    }
+
+    std::unique_lock<std::mutex> highestRecordLock(_highestRecordMutex, std::try_to_lock);
+    if (!highestRecordLock) {
+        logFailedLockAcquisition("_highestRecordMutex");
+        return;
+    }
+
+    if (_currentBytes.load() == 0 && _currentRecords.load() == 0 &&
+        (_markers.empty() || _highestRecordId <= _markers.back().lastRecord)) {
+        // If _highestRecordId is not already covered by an existing marker, even if the counters
+        // are zero we can still proceed to create a partial marker.
+        return;
+    }
+
+    // This block can result in a marker creation even if the current bytes and records are 0. If
+    // the highest record seen so far is not covered by the last marker, then we need to create a
+    // partial marker to cover it to ensure that we have a marker that can be expired when
+    // the highest record seen so far expires.
+    if (_hasPartialMarkerExpired(opCtx, _highestRecordId, _highestWallTime)) {
+        auto& marker = createNewMarker(_highestRecordId, _highestWallTime);
+
+        LOGV2_DEBUG(7393201,
+                    2,
+                    "Created a new partial collection marker",
+                    "lastRecord"_attr = marker.lastRecord,
+                    "wallTime"_attr = marker.wallTime,
+                    "numMarkers"_attr = _markers.size());
+        _notifyNewMarkerCreation();
+    }
+}
+
+void CollectionTruncateMarkersWithPartialExpiration::_updateHighestSeenRecordIdAndWallTime(
+    const RecordId& rId, Date_t wallTime) {
+    std::unique_lock lk(_highestRecordMutex);
+    if (_highestRecordId < rId) {
+        _highestRecordId = rId;
+    }
+    if (_highestWallTime < wallTime) {
+        _highestWallTime = wallTime;
+    }
+}
+
+void CollectionTruncateMarkersWithPartialExpiration::updateCurrentMarker(
+    int64_t bytesAdded,
+    const RecordId& highestRecordId,
+    Date_t highestWallTime,
+    int64_t numRecordsAdded,
+    bool oplogSamplingAsyncEnabled) {
+    // By putting the highest marker modification first we can guarantee than in the
+    // event of a race condition between expiring a partial marker the metrics increase
+    // will happen after the marker has been created. This guarantees that the metrics
+    // will eventually be correct as long as the expiration criteria checks for the
+    // metrics and the highest marker expiration.
+    _updateHighestSeenRecordIdAndWallTime(highestRecordId, highestWallTime);
+    _currentRecords.addAndFetch(numRecordsAdded);
+    int64_t newCurrentBytes = _currentBytes.addAndFetch(bytesAdded);
+    if (highestWallTime != Date_t() && highestRecordId.isValid() &&
+        newCurrentBytes >= _minBytesPerMarker.load()) {
+        createNewMarkerIfNeeded(highestRecordId, highestWallTime, oplogSamplingAsyncEnabled);
+    }
+}
+
+namespace {
+/**
+ * A Collection iterator meant to work with raw RecordStores. Whether this iterator yields between
+ * calls to getNext()/getNextRandom(), or not, is decided by the child class.
+ *
+ * It is only safe to use when the user is not accepting any user operation. Some examples of when
+ * this class can be used are during oplog initialisation, repair, recovery, etc.
+ */
+class UnyieldableCollectionIterator : public CollectionTruncateMarkers::CollectionIterator {
+public:
+    UnyieldableCollectionIterator(OperationContext* opCtx, RecordStore* rs) : _rs(rs) {
+        reset(opCtx);
+    }
+
+    ~UnyieldableCollectionIterator() override = default;
+
+    boost::optional<std::pair<RecordId, BSONObj>> getNext() override {
+        auto record = _directionalCursor->next();
+        if (!record) {
+            return boost::none;
+        }
+        return std::make_pair(std::move(record->id), record->data.releaseToBson());
+    }
+
+    boost::optional<std::pair<RecordId, BSONObj>> getNextRandom() override {
+        auto record = _randomCursor->next();
+        if (!record) {
+            return boost::none;
+        }
+        return std::make_pair(std::move(record->id), record->data.releaseToBson());
+    }
+
+    RecordStore* getRecordStore() const final {
+        return _rs;
+    }
+
+    void reset(OperationContext* opCtx) final {
+        _directionalCursor = _rs->getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx));
+        _randomCursor = _rs->getRandomCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx));
+    }
+
+protected:
+    RecordStore* _rs;
+    std::unique_ptr<RecordCursor> _directionalCursor;
+    std::unique_ptr<RecordCursor> _randomCursor;
+};
+
+class YieldableCollectionIterator : public UnyieldableCollectionIterator {
+public:
+    YieldableCollectionIterator(OperationContext* opCtx,
+                                RecordStore* rs,
+                                TickSource* ticks,
+                                Milliseconds yieldInterval);
+
+    boost::optional<std::pair<RecordId, BSONObj>> getNext() final;
+
+    boost::optional<std::pair<RecordId, BSONObj>> getNextRandom() final;
+
+private:
+    // Release resources held by the iterator, allowing other concurrent operations to proceed.
+    void _maybeYield();
+
+    OperationContext* _opCtx;
+    Timer _yieldTimer;
+    Milliseconds _yieldInterval;
+    RecordId _lastRecordId;
+};
+
+YieldableCollectionIterator::YieldableCollectionIterator(OperationContext* opCtx,
+                                                         RecordStore* rs,
+                                                         TickSource* ticks,
+                                                         Milliseconds yieldInterval)
+    : UnyieldableCollectionIterator(opCtx, rs),
+      _opCtx(opCtx),
+      _yieldTimer(ticks),
+      _yieldInterval(yieldInterval),
+      _lastRecordId([&] {
+          auto record =
+              rs->getCursor(opCtx, *shard_role_details::getRecoveryUnit(opCtx), /*forward=*/false)
+                  ->next();
+          if (!record) {
+              // This shouldn't really happen unless the size storer values are far off from
+              // reality. The collection is definitely empty.
+              LOGV2(11211701,
+                    "Collection was empty when creating initial markers",
+                    "uuid"_attr = rs->uuid());
+              // Null recordid is less than all record IDs, so this makes the collection seem empty.
+              return RecordId{};
+          }
+          return record->id;
+      }()) {}
+
+// Note: Since oplog sampling explicitly reads the entire oplog, the effect of yielding will be that
+// the sampling cursor sees the end of the collection moving away from it. To prevent Zeno's paradox
+// from impacting our customers, we explicitly bound the end for the purpose of sampling.
+boost::optional<std::pair<RecordId, BSONObj>> YieldableCollectionIterator::getNext() {
+    _maybeYield();
+    auto ret = UnyieldableCollectionIterator::getNext();
+    if (!ret || ret.value().first > _lastRecordId) {
+        return boost::none;
+    }
+    return ret;
+}
+
+// Note: Random cursors do not support timestamped reads. So the result of yielding will be a
+// reduced probability of sampling in the region between the end of the oplog when sampling starts
+// and the end when sampling stops. This is fine for initial marker generation.
+boost::optional<std::pair<RecordId, BSONObj>> YieldableCollectionIterator::getNextRandom() {
+    _maybeYield();
+    return UnyieldableCollectionIterator::getNextRandom();
+}
+
+void YieldableCollectionIterator::_maybeYield() {
+    if (_yieldTimer.elapsed() < _yieldInterval) {
+        return;
+    }
+
+    auto& ru = *shard_role_details::getRecoveryUnit(_opCtx);
+
+    _directionalCursor->save();
+    _randomCursor->save();
+
+    ru.abandonSnapshot();
+
+    Locker::LockSnapshot lockState;
+    invariant(shard_role_details::getLocker(_opCtx)->canSaveLockState());
+    shard_role_details::getLocker(_opCtx)->saveLockStateAndUnlock(&lockState);
+
+    LOGV2_DEBUG(11211700, 2, "Yielding truncate markers iterator", "rs"_attr = _rs->getIdent());
+
+    _opCtx->checkForInterrupt();
+    shard_role_details::getLocker(_opCtx)->restoreLockState(_opCtx, lockState);
+
+    // Invariant here. Collections using this iterator are being maintained by it, so we should not
+    // be able to get into a situation where a previously saved cursor is not restoreable.
+    invariant(_randomCursor->restore(ru));
+    invariant(_directionalCursor->restore(ru));
+
+    _yieldTimer.reset();
+}
+}  // namespace
+
+std::unique_ptr<CollectionTruncateMarkers::CollectionIterator>
+CollectionTruncateMarkers::makeIterator(OperationContext* opCtx,
+                                        RecordStore* rs,
+                                        TickSource* ticks,
+                                        boost::optional<Milliseconds> yieldInterval) {
+    if (yieldInterval) {
+        return std::make_unique<YieldableCollectionIterator>(opCtx, rs, ticks, *yieldInterval);
+    }
+    return std::make_unique<UnyieldableCollectionIterator>(opCtx, rs);
+}
+
+}  // namespace mongo

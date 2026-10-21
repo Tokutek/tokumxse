@@ -1,0 +1,363 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/*
+ * ASSERTion macros for the C++ unit testing framework.
+ */
+
+#pragma once
+
+// IWYU pragma: private, include "mongo/unittest/unittest.h"
+// IWYU pragma: friend "mongo/unittest/.*"
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_matcher.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/mutable_bson/mutable_bson_test_utils.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/matcher.h"
+#include "mongo/util/active_exception_witness.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+
+#include <cmath>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <fmt/format.h>
+
+[[MONGO_MOD_PUBLIC]];
+
+/**
+ * Fail unconditionally, reporting the given message.
+ */
+#define FAIL(msg) GTEST_FAIL() << (msg)
+
+/**
+ * Fails unless "EXPRESSION" is true.
+ */
+#define ASSERT(EXPRESSION) ASSERT_TRUE(EXPRESSION)
+
+/**
+ * Asserts that a Status code is OK.
+ * TODO(gtest): Try expressing as `ASSERT_THAT(EXRESSION, IsOk())` which should accept Status and
+ * StatusWith (and maybe ErrorCode).
+ */
+#define ASSERT_OK(EXPRESSION) ASSERT_EQUALS(::mongo::Status::OK(), (EXPRESSION))
+
+#define EXPECT_OK(EXPRESSION) EXPECT_EQ(::mongo::Status::OK(), (EXPRESSION))
+
+/**
+ * Asserts that a status code is anything but OK.
+ * TODO(gtest) Try expressing as `ASSERT_THAT(EXRESSION, Not(IsOk()))` which should accept Status
+ * and StatusWith (and maybe ErrorCode).
+ */
+#define ASSERT_NOT_OK(EXPRESSION) ASSERT_NOT_EQUALS(::mongo::Status::OK(), (EXPRESSION))
+
+#define EXPECT_NOT_OK(EXPRESSION) EXPECT_NE(::mongo::Status::OK(), (EXPRESSION))
+
+/*
+ * Binary comparison assertions.
+ */
+#define ASSERT_EQUALS(a, b) ASSERT_EQ(a, b)
+#define ASSERT_NOT_EQUALS(a, b) ASSERT_NE(a, b)
+#define ASSERT_LESS_THAN(a, b) ASSERT_LT(a, b)
+#define ASSERT_NOT_LESS_THAN(a, b) ASSERT_GTE(a, b)
+#define ASSERT_GREATER_THAN(a, b) ASSERT_GT(a, b)
+#define ASSERT_NOT_GREATER_THAN(a, b) ASSERT_LTE(a, b)
+#define ASSERT_LESS_THAN_OR_EQUALS(a, b) ASSERT_LTE(a, b)
+#define ASSERT_GREATER_THAN_OR_EQUALS(a, b) ASSERT_GTE(a, b)
+
+#define ASSERT_LTE(a, b) ASSERT_LE(a, b)
+#define ASSERT_GTE(a, b) ASSERT_GE(a, b)
+
+/**
+ * Approximate equality assertion. Useful for comparisons on limited precision floating point
+ * values.
+ */
+#define ASSERT_APPROX_EQUAL(a, b, absoluteErr) ASSERT_NEAR(a, b, absoluteErr)
+
+/**
+ * Verify that the evaluation of `expression` throws an exception of type `exceptionType` and
+ * is matched by `matcher`.
+ */
+#define ASSERT_THROWS_EXCEPTION_MATCHING(expression, exceptionType, matcher)            \
+    if (auto failureMessage_macro_ =                                                    \
+            ::mongo::unittest::assert_details::evaluateExceptionMatcher<exceptionType>( \
+                [&] { (void)(expression); }, #expression, matcher);                     \
+        !failureMessage_macro_) {                                                       \
+    } else                                                                              \
+        FAIL(*failureMessage_macro_)
+
+/**
+ * Verify that the evaluation of `expression` throws an exception of type `exceptionType`.
+ *
+ * If `expression` throws no exception, or one that is neither of type `exceptionType` nor
+ * of a subtype of `exceptionType`, the test is considered a failure and further evaluation
+ * halts.
+ */
+#define ASSERT_THROWS(expression, exceptionType) \
+    ASSERT_THROWS_EXCEPTION_MATCHING(expression, exceptionType, ::testing::A<exceptionType>())
+
+/**
+ * Verify that the evaluation of `expression` does not throw any exceptions.
+ *
+ * If `expression` throws an exception the test is considered a failure and further evaluation
+ * halts.
+ */
+#define ASSERT_DOES_NOT_THROW(expression) ASSERT_NO_THROW(expression)
+
+/**
+ * Behaves like ASSERT_THROWS, above, but also fails if calling what() on the thrown exception
+ * does not return a string equal to expectedWhat.
+ * TODO(gtest) Consider using ASSERT_THROWS_WITH_CHECK(...) but with gtest output formatting.
+ */
+#define ASSERT_THROWS_WHAT(expression, exceptionType, expectedWhat) \
+    ASSERT_THROWS_EXCEPTION_MATCHING(                               \
+        expression,                                                 \
+        exceptionType,                                              \
+        ::mongo::unittest::match::WhatIs(::mongo::unittest::match::AsStringView(expectedWhat)))
+
+/**
+ * Behaves like ASSERT_THROWS, above, but also fails if calling getCode() on the thrown exception
+ * does not return an error code equal to expectedCode.
+ */
+#define ASSERT_THROWS_CODE(expression, exceptionType, expectedCode) \
+    ASSERT_THROWS_EXCEPTION_MATCHING(                               \
+        expression, exceptionType, ::mongo::unittest::match::CodeIs(expectedCode))
+
+/**
+ * Behaves like ASSERT_THROWS, above, but also fails if calling getCode() on the thrown exception
+ * does not return an error code equal to expectedCode or if calling what() on the thrown exception
+ * does not return a string equal to expectedWhat.
+ */
+#define ASSERT_THROWS_CODE_AND_WHAT(expression, exceptionType, expectedCode, expectedWhat) \
+    ASSERT_THROWS_EXCEPTION_MATCHING(                                                      \
+        expression,                                                                        \
+        exceptionType,                                                                     \
+        ::testing::AllOf(::mongo::unittest::match::CodeIs(expectedCode),                   \
+                         ::mongo::unittest::match::WhatIs(                                 \
+                             ::mongo::unittest::match::AsStringView(expectedWhat))))
+
+/**
+ * Compiles if expr doesn't compile.
+ *
+ * This only works for compile errors in the "immediate context" of the expression, which matches
+ * the rules for SFINAE. The first argument is a defaulted template parameter that is used in the
+ * expression to make it dependent. This only works with expressions, not statements, although you
+ * can separate multiple expressions with a comma.
+ *
+ * This should be used at namespace scope, not inside a TEST function.
+ *
+ * Examples that pass:
+ *     ASSERT_DOES_NOT_COMPILE(MyTest1, typename Char = char, *std::declval<Char>());
+ *     ASSERT_DOES_NOT_COMPILE(MyTest2, bool B = false, std::enable_if_t<B, int>{});
+ *
+ * Examples that fail:
+ *     ASSERT_DOES_NOT_COMPILE(MyTest3, typename Char = char, *std::declval<Char*>());
+ *     ASSERT_DOES_NOT_COMPILE(MyTest4, bool B = true, std::enable_if_t<B, int>{});
+ *
+ */
+#define ASSERT_DOES_NOT_COMPILE(Id, Alias, ...) \
+    ASSERT_DOES_NOT_COMPILE_1_(Id, Alias, #Alias, (__VA_ARGS__), #__VA_ARGS__)
+
+#define ASSERT_DOES_NOT_COMPILE_1_(Id, Alias, AliasString, Expr, ExprString)  \
+                                                                              \
+    static std::true_type Id(...);                                            \
+                                                                              \
+    template <Alias>                                                          \
+    static std::conditional_t<true, std::false_type, decltype(Expr)> Id(int); \
+                                                                              \
+    static_assert(decltype(Id(0))::value,                                     \
+                  "Expression '" ExprString "' [with " AliasString "] shouldn't compile.");
+
+/**
+ * Behaves like ASSERT_THROWS, above, but also calls CHECK(caughtException) which may contain
+ * additional assertions.
+ */
+#define ASSERT_THROWS_WITH_CHECK(EXPRESSION, EXCEPTION_TYPE, CHECK)                \
+    if ([&] {                                                                      \
+            try {                                                                  \
+                (void)(EXPRESSION);                                                \
+                return false;                                                      \
+            } catch (const EXCEPTION_TYPE& ex) {                                   \
+                SCOPED_TRACE(                                                      \
+                    fmt::format("\n  expression: {}"                               \
+                                "\n  exception: {}",                               \
+                                #EXPRESSION,                                       \
+                                ::mongo::describeActiveException()));              \
+                CHECK(ex);                                                         \
+                return true;                                                       \
+            }                                                                      \
+        }()) {                                                                     \
+    } else                                                                         \
+        /* Fail outside of the try/catch, this way the code in the `FAIL` macro */ \
+        /* doesn't have the potential to throw an exception which we might also */ \
+        /* be checking for. */                                                     \
+        FAIL("Expected expression " #EXPRESSION " to throw " #EXCEPTION_TYPE       \
+             " but it threw nothing.")
+
+#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS) \
+    ASSERT_THAT(BIG_STRING, ::testing::HasSubstr(CONTAINS))
+
+#define EXPECT_STRING_CONTAINS(BIG_STRING, CONTAINS) \
+    EXPECT_THAT(BIG_STRING, ::testing::HasSubstr(CONTAINS))
+
+#define ASSERT_STRING_OMITS(BIG_STRING, CONTAINS) \
+    ASSERT_THAT(BIG_STRING, ::testing::Not(::testing::HasSubstr(CONTAINS)))
+
+#define EXPECT_STRING_OMITS(BIG_STRING, CONTAINS) \
+    EXPECT_THAT(BIG_STRING, ::testing::Not(::testing::HasSubstr(CONTAINS)))
+
+/** TODO(gtest) Consider using a PCRE2 matcher to better match existing behavior. */
+#define ASSERT_STRING_SEARCH_REGEX(BIG_STRING, REGEX) \
+    ASSERT_THAT(BIG_STRING, ::testing::ContainsRegex(REGEX))
+
+#define EXPECT_STRING_SEARCH_REGEX(BIG_STRING, REGEX) \
+    EXPECT_THAT(BIG_STRING, ::testing::ContainsRegex(REGEX))
+
+namespace mongo::unittest {
+namespace assert_details {
+template <typename Exception>
+[[MONGO_MOD_PUBLIC_FOR_TECHNICAL_REASONS]] inline boost::optional<std::string>
+evaluateExceptionMatcher(std::invocable auto expression,
+                         std::string_view expressionText,
+                         testing::Matcher<Exception> matcher) {
+    if (testing::StringMatchResultListener listener;
+        !testing::ExplainMatchResult(match::Throws<Exception>(matcher), expression, &listener)) {
+        return fmt::format(
+            "Expected: {} throws an exception of type {} which {}\n"
+            "  Actual: {}",
+            expressionText,
+            demangleName(typeid(Exception)),
+            testing::DescribeMatcher<Exception>(matcher),
+            listener.str());
+    }
+
+    return boost::none;
+}
+}  // namespace assert_details
+
+/**
+ * Get the value out of a StatusWith<T>, or throw an exception if it is not OK.
+ */
+template <typename T>
+const T& assertGet(const StatusWith<T>& swt) {
+    ASSERT_OK(swt.getStatus());
+    return swt.getValue();
+}
+
+template <typename T>
+T assertGet(StatusWith<T>&& swt) {
+    ASSERT_OK(swt.getStatus());
+    return std::move(swt.getValue());
+}
+
+
+/**
+ * Use to compare two instances of type BSONObj under the default comparator in unit tests.
+ */
+#define ASSERT_BSONOBJ_EQ(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjEQ(b))
+#define ASSERT_BSONOBJ_LT(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjLT(b))
+#define ASSERT_BSONOBJ_LTE(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjLE(b))
+#define ASSERT_BSONOBJ_GT(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjGT(b))
+#define ASSERT_BSONOBJ_GTE(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjGE(b))
+#define ASSERT_BSONOBJ_NE(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjNE(b))
+
+/**
+ * Use to compare two instances of type BSONObj with unordered fields in unit tests.
+ */
+#define ASSERT_BSONOBJ_EQ_UNORDERED(a, b) \
+    ASSERT_THAT(a, ::mongo::unittest::match::BSONObjUnorderedEQ(b))
+#define ASSERT_BSONOBJ_LT_UNORDERED(a, b) \
+    ASSERT_THAT(a, ::mongo::unittest::match::BSONObjUnorderedLT(b))
+#define ASSERT_BSONOBJ_LTE_UNORDERED(a, b) \
+    ASSERT_THAT(a, ::mongo::unittest::match::BSONObjUnorderedLE(b))
+#define ASSERT_BSONOBJ_GT_UNORDERED(a, b) \
+    ASSERT_THAT(a, ::mongo::unittest::match::BSONObjUnorderedGT(b))
+#define ASSERT_BSONOBJ_GTE_UNORDERED(a, b) \
+    ASSERT_THAT(a, ::mongo::unittest::match::BSONObjUnorderedGE(b))
+#define ASSERT_BSONOBJ_NE_UNORDERED(a, b) \
+    ASSERT_THAT(a, ::mongo::unittest::match::BSONObjUnorderedNE(b))
+
+/**
+ * Use to compare two instances of type BSONElement under the default comparator in unit tests.
+ */
+#define ASSERT_BSONELT_EQ(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONElementEQ(b))
+#define ASSERT_BSONELT_LT(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONElementLT(b))
+#define ASSERT_BSONELT_LTE(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONElementLE(b))
+#define ASSERT_BSONELT_GT(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONElementGT(b))
+#define ASSERT_BSONELT_GTE(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONElementGE(b))
+#define ASSERT_BSONELT_NE(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONElementNE(b))
+
+/**
+ * Like ASSERT_BSONOBJ_EQ but requires wire-identical BSON (`binaryEqual`), not logical equality.
+ */
+#define ASSERT_BSONOBJ_BINARY_EQ(a, b) ASSERT_THAT(a, ::mongo::unittest::match::BSONObjBinaryEQ(b))
+
+/**
+ * Given a BSONObj, return a string that wraps the json form of the BSONObj with
+ * `fromjson(R"(<>)")`.
+ */
+std::string formatJsonStr(const std::string& obj);
+
+#define ASSERT_BSONOBJ_EQ_AUTO(expected, actual)                                     \
+    ASSERT(AUTO_UPDATE_HELPER(::mongo::unittest::formatJsonStr(expected),            \
+                              ::mongo::unittest::formatJsonStr(actual.jsonString()), \
+                              false))
+
+/**
+ * Computes a difference between the expected and actual formatted output and outputs it to the
+ * provide stream instance. Used to display difference between expected and actual format for
+ * auto-update macros. It is exposed in the header here for testability.
+ */
+void outputDiff(std::ostream& os,
+                const std::vector<std::string>& expFormatted,
+                const std::vector<std::string>& actualFormatted,
+                size_t startLineNumber);
+
+bool handleAutoUpdate(const std::string& expected,
+                      const std::string& actual,
+                      const std::string& fileName,
+                      size_t lineNumber,
+                      bool needsEscaping);
+
+bool expandNoPlanMacro(const std::string& fileName, size_t lineNumber);
+
+void updateDelta(const std::string& fileName, size_t lineNumber, int64_t delta);
+
+void expandActualPlan(const SourceLocation& location, const std::string& actual);
+
+// Account for maximum line length after linting. We need to indent, add quotes, etc.
+static constexpr size_t kAutoUpdateMaxLineLength = 88;
+
+/**
+ * Auto update result back in the source file if the assert fails.
+ * The expected result must be a multi-line string in the following form:
+ *
+ * ASSERT_EXPLAIN_V2_AUTO(     // NOLINT
+ *       "BinaryOp [Add]\n"
+ *       "|   Const [2]\n"
+ *       "Const [1]\n",
+ *       tree);
+ *
+ * Limitations:
+ *      1. There should not be any comments or other formatting inside the multi-line string
+ *      constant other than 'NOLINT'. If we have a single-line constant, the auto-updating will
+ *      generate a 'NOLINT' at the end of the line.
+ *      2. The expression which we are explaining ('tree' in the example above) must fit on a single
+ *      line.
+ *      3. The macro should be indented by 4 spaces.
+ */
+#define AUTO_UPDATE_HELPER(expected, actual, needsEscaping) \
+    ::mongo::unittest::handleAutoUpdate(expected, actual, __FILE__, __LINE__, needsEscaping)
+
+#define ASSERT_STR_EQ_AUTO(expected, actual) ASSERT(AUTO_UPDATE_HELPER(expected, actual, true))
+
+#define ASSERT_NUMBER_EQ_AUTO(expected, actual) \
+    ASSERT(AUTO_UPDATE_HELPER(str::stream() << expected, str::stream() << actual, false))
+}  // namespace mongo::unittest

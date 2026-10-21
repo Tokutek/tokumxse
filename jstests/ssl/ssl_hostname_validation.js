@@ -1,58 +1,84 @@
 // Test SSL server certificate hostname validation
-// for client-server and server-server connections 
-var CA_CERT = "jstests/libs/ca.pem" 
-var SERVER_CERT = "jstests/libs/server.pem";
-var CN_CERT = "jstests/libs/localhostnameCN.pem"; 
-var SAN_CERT = "jstests/libs/localhostnameSAN.pem"; 
-var CLIENT_CERT = "jstests/libs/client.pem"
-var BAD_SAN_CERT = "jstests/libs/badSAN.pem";
+// for client-server and server-server connections
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-// We want to be able to control all SSL parameters
-// but still need an SSL shell hence the test is placed
-// in the /ssl directory
-TestData.useX509 = false;
-TestData.useSSL = false;
-
-port = allocatePorts(1)[0];
+let CA_CERT = getX509Path("ca.pem");
+let SERVER_CERT = getX509Path("server.pem");
+let CN_CERT = getX509Path("localhostnameCN.pem");
+let SAN_CERT = getX509Path("localhostnameSAN.pem");
+let CLIENT_CERT = getX509Path("client.pem");
+let BAD_SAN_CERT = getX509Path("badSAN.pem");
+let NOSUBJ_CERT = getX509Path("server_no_subject.pem");
+let NOSUBJ_NOSAN_CERT = getX509Path("server_no_subject_no_SAN.pem");
 
 function testCombination(certPath, allowInvalidHost, allowInvalidCert, shouldSucceed) {
-    MongoRunner.runMongod({port: port,
-                           sslMode: "requireSSL", 
-                           sslPEMKeyFile: certPath,
-                           sslCAFile: CA_CERT});
+    jsTestLog("Testing certificate: " + JSON.stringify(arguments));
+    let mongod = MongoRunner.runMongod({
+        tlsMode: "requireTLS",
+        tlsCertificateKeyFile: certPath,
+        tlsCAFile: CA_CERT,
+    });
 
-    var mongo;
+    let mongo;
     if (allowInvalidCert) {
-        mongo = runMongoProgram("mongo", "--port", port, "--ssl", 
-                                "--sslCAFile", CA_CERT, 
-                                "--sslPEMKeyFile", CLIENT_CERT,
-                                "--sslAllowInvalidCertificates",
-                                "--eval", ";");
-    }
-    else if (allowInvalidHost) {
-        mongo = runMongoProgram("mongo", "--port", port, "--ssl",
-                                "--sslCAFile", CA_CERT,
-                                "--sslPEMKeyFile", CLIENT_CERT,
-                                "--sslAllowInvalidHostnames",
-                                "--eval", ";");
+        mongo = runMongoProgram(
+            "mongo",
+            "--port",
+            mongod.port,
+            "--tls",
+            "--tlsCAFile",
+            CA_CERT,
+            "--tlsCertificateKeyFile",
+            CLIENT_CERT,
+            "--tlsAllowInvalidCertificates",
+            "--eval",
+            ";",
+        );
+    } else if (allowInvalidHost) {
+        mongo = runMongoProgram(
+            "mongo",
+            "--port",
+            mongod.port,
+            "--tls",
+            "--tlsCAFile",
+            CA_CERT,
+            "--tlsCertificateKeyFile",
+            CLIENT_CERT,
+            "--tlsAllowInvalidHostnames",
+            "--eval",
+            ";",
+        );
     } else {
-        mongo = runMongoProgram("mongo", "--port", port, "--ssl", 
-                                "--sslCAFile", CA_CERT, 
-                                "--sslPEMKeyFile", CLIENT_CERT,
-                                "--eval", ";");
+        mongo = runMongoProgram(
+            "mongo",
+            "--port",
+            mongod.port,
+            "--tls",
+            "--tlsCAFile",
+            CA_CERT,
+            "--tlsCertificateKeyFile",
+            CLIENT_CERT,
+            "--eval",
+            ";",
+        );
     }
 
     if (shouldSucceed) {
         // runMongoProgram returns 0 on success
-        assert.eq(0, mongo, "Connection attempt failed when it should succeed certPath: " + 
-                  certPath);
-    }
-    else {
+        assert.eq(
+            0,
+            mongo,
+            "Connection attempt failed when it should succeed certPath: " + certPath,
+        );
+    } else {
         // runMongoProgram returns 1 on failure
-        assert.eq(1, mongo, "Connection attempt succeeded when it should fail certPath: " + 
-                  certPath);
+        assert.eq(
+            1,
+            mongo,
+            "Connection attempt succeeded when it should fail certPath: " + certPath,
+        );
     }
-    stopMongod(port);
+    MongoRunner.stopMongod(mongod);
 }
 
 // 1. Test client connections with different server certificates
@@ -69,36 +95,63 @@ testCombination(SERVER_CERT, true, true, true);
 // BAD_SAN_CERT has SAN=BadSAN.
 testCombination(BAD_SAN_CERT, false, false, false);
 
-// 2. Initiate ReplSetTest with invalid certs
-ssl_options = {sslMode : "requireSSL",
-               // SERVER_CERT has SAN=localhost. CLIENT_CERT is exact same except no SANS
-               sslPEMKeyFile : CLIENT_CERT,
-               sslCAFile: CA_CERT};
+// NOSUBJ_CERT has SAN=localhost but empty Subject
+testCombination(NOSUBJ_CERT, false, false, true);
 
-replTest = new ReplSetTest({nodes : {node0 : ssl_options, node1 : ssl_options}});
+// NOSUBJ_NOSAN_CERT has neither Subject nor SANs
+testCombination(NOSUBJ_NOSAN_CERT, false, false, false);
+
+// Skip db hash check because replset cannot initiate.
+TestData.skipCheckDBHashes = true;
+
+// 2. Initiate ReplSetTest with invalid certs
+let ssl_options = {
+    tlsMode: "requireTLS",
+    // SERVER_CERT has SAN=localhost. CLIENT_CERT is exact same except no SANS
+    tlsCertificateKeyFile: CLIENT_CERT,
+    tlsCAFile: CA_CERT,
+};
+
+replTest = new ReplSetTest({nodes: {node0: ssl_options, node1: ssl_options}});
+
+// We don't want to invoke the hang analyzer because we
+// expect this test to fail by timing out
+MongoRunner.runHangAnalyzer.disable();
+
 replTest.startSet();
-assert.throws( function() { replTest.initiate() } );
+assert.throws(function () {
+    replTest.initiate();
+});
 replTest.stopSet();
 
-// 3. Initiate ReplSetTest with invalid certs but set allowInvalidHostnames
-ssl_options = {sslMode : "requireSSL",
-               sslPEMKeyFile : SERVER_CERT,
-               sslCAFile: CA_CERT,
-               sslAllowInvalidHostnames: ""};
+// Re-enable the hang analyzer for the test
+MongoRunner.runHangAnalyzer.enable();
 
-var replTest = new ReplSetTest({nodes : {node0 : ssl_options, node1 : ssl_options}});
+TestData.skipCheckDBHashes = false;
+
+// 3. Initiate ReplSetTest with invalid certs but set allowInvalidHostnames
+ssl_options = {
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT,
+    tlsAllowInvalidHostnames: "",
+};
+
+var replTest = new ReplSetTest({nodes: {node0: ssl_options, node1: ssl_options}});
 replTest.startSet();
 replTest.initiate();
 replTest.stopSet();
 
 // 4. Initiate ReplSetTest with invalid certs but set allowInvalidCertificates
-ssl_options = {sslMode : "requireSSL",
-               // SERVER_CERT has SAN=localhost. CLIENT_CERT is exact same except no SANS
-               sslPEMKeyFile : SERVER_CERT,
-               sslCAFile: CA_CERT,
-               sslAllowInvalidCertificates: ""};
+ssl_options = {
+    tlsMode: "requireTLS",
+    // SERVER_CERT has SAN=localhost. CLIENT_CERT is exact same except no SANS
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT,
+    tlsAllowInvalidCertificates: "",
+};
 
-var replTest = new ReplSetTest({nodes : {node0 : ssl_options, node1 : ssl_options}});
+replTest = new ReplSetTest({nodes: {node0: ssl_options, node1: ssl_options}});
 replTest.startSet();
 replTest.initiate();
 replTest.stopSet();

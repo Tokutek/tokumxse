@@ -1,537 +1,176 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/plan_executor.h"
 
-#include <boost/shared_ptr.hpp>
+#include "mongo/base/error_codes.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/exec/cached_plan.h"
-#include "mongo/db/exec/multi_plan.h"
-#include "mongo/db/exec/pipeline_proxy.h"
-#include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/plan_stats.h"
-#include "mongo/db/exec/subplan.h"
-#include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/storage/record_fetcher.h"
+#include <utility>
 
-#include "mongo/util/stacktrace.h"
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
+namespace {
+MONGO_FAIL_POINT_DEFINE(planExecutorAlwaysFails);
+}  // namespace
 
-    using boost::shared_ptr;
-    using std::string;
-    using std::vector;
+const OperationContext::Decoration<PlanExecutorShardingState> planExecutorShardingState =
+    OperationContext::declareDecoration<PlanExecutorShardingState>();
 
-    namespace {
-
-        /**
-         * Retrieves the first stage of a given type from the plan tree, or NULL
-         * if no such stage is found.
-         */
-        PlanStage* getStageByType(PlanStage* root, StageType type) {
-            if (root->stageType() == type) {
-                return root;
-            }
-
-            vector<PlanStage*> children = root->getChildren();
-            for (size_t i = 0; i < children.size(); i++) {
-                PlanStage* result = getStageByType(children[i], type);
-                if (result) {
-                    return result;
-                }
-            }
-
-            return NULL;
-        }
-
+std::string PlanExecutor::stateToStr(ExecState execState) {
+    switch (execState) {
+        case PlanExecutor::ADVANCED:
+            return "ADVANCED";
+        case PlanExecutor::IS_EOF:
+            return "IS_EOF";
     }
+    MONGO_UNREACHABLE;
+}
 
-    // static
-    Status PlanExecutor::make(OperationContext* opCtx,
-                              WorkingSet* ws,
-                              PlanStage* rt,
-                              const Collection* collection,
-                              YieldPolicy yieldPolicy,
-                              PlanExecutor** out) {
-        return PlanExecutor::make(opCtx, ws, rt, NULL, NULL, collection, "", yieldPolicy, out);
+std::string PlanExecutor::writeTypeToStr(PlanExecWriteType writeType) {
+    switch (writeType) {
+        case PlanExecWriteType::kUpdate:
+            return "update";
+        case PlanExecWriteType::kDelete:
+            return "delete";
+        case PlanExecWriteType::kFindAndModify:
+            return "findAndModify";
     }
+    MONGO_UNREACHABLE;
+}
 
-    // static
-    Status PlanExecutor::make(OperationContext* opCtx,
-                              WorkingSet* ws,
-                              PlanStage* rt,
-                              const std::string& ns,
-                              YieldPolicy yieldPolicy,
-                              PlanExecutor** out) {
-        return PlanExecutor::make(opCtx, ws, rt, NULL, NULL, NULL, ns, yieldPolicy, out);
-    }
-
-    // static
-    Status PlanExecutor::make(OperationContext* opCtx,
-                              WorkingSet* ws,
-                              PlanStage* rt,
-                              CanonicalQuery* cq,
-                              const Collection* collection,
-                              YieldPolicy yieldPolicy,
-                              PlanExecutor** out) {
-        return PlanExecutor::make(opCtx, ws, rt, NULL, cq, collection, "", yieldPolicy, out);
-    }
-
-    // static
-    Status PlanExecutor::make(OperationContext* opCtx,
-                              WorkingSet* ws,
-                              PlanStage* rt,
-                              QuerySolution* qs,
-                              CanonicalQuery* cq,
-                              const Collection* collection,
-                              YieldPolicy yieldPolicy,
-                              PlanExecutor** out) {
-        return PlanExecutor::make(opCtx, ws, rt, qs, cq, collection, "", yieldPolicy, out);
-    }
-
-    // static
-    Status PlanExecutor::make(OperationContext* opCtx,
-                              WorkingSet* ws,
-                              PlanStage* rt,
-                              QuerySolution* qs,
-                              CanonicalQuery* cq,
-                              const Collection* collection,
-                              const std::string& ns,
-                              YieldPolicy yieldPolicy,
-                              PlanExecutor** out) {
-        std::auto_ptr<PlanExecutor> exec(new PlanExecutor(opCtx, ws, rt, qs, cq, collection, ns));
-
-        // Perform plan selection, if necessary.
-        Status status = exec->pickBestPlan(yieldPolicy);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        *out = exec.release();
-        return Status::OK();
-    }
-
-    PlanExecutor::PlanExecutor(OperationContext* opCtx,
-                               WorkingSet* ws,
-                               PlanStage* rt,
-                               QuerySolution* qs,
-                               CanonicalQuery* cq,
-                               const Collection* collection,
-                               const std::string& ns)
-        : _opCtx(opCtx),
-          _collection(collection),
-          _cq(cq),
-          _workingSet(ws),
-          _qs(qs),
-          _root(rt),
-          _ns(ns),
-          _killed(false),
-          _yieldPolicy(new PlanYieldPolicy(this, YIELD_MANUAL)) {
-        // We may still need to initialize _ns from either _collection or _cq.
-        if (!_ns.empty()) {
-            // We already have an _ns set, so there's nothing more to do.
+void PlanExecutor::checkFailPointPlanExecAlwaysFails(const NamespaceString& nss) {
+    if (auto scoped = planExecutorAlwaysFails.scoped(); MONGO_unlikely(scoped.isActive())) {
+        if (scoped.getData().hasField("namespace") &&
+            scoped.getData().getStringField("namespace") !=
+                NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())) {
             return;
         }
-
-        if (NULL != _collection) {
-            _ns = _collection->ns().ns();
+        if (scoped.getData().hasField("tassert") && scoped.getData().getBoolField("tassert")) {
+            tasserted(9028201, "PlanExecutor hit planExecutorAlwaysFails fail point");
         }
-        else {
-            invariant(NULL != _cq.get());
-            _ns = _cq->getParsed().ns();
-        }
+        uasserted(4382101, "PlanExecutor hit planExecutorAlwaysFails fail point");
     }
+}
 
-    Status PlanExecutor::pickBestPlan(YieldPolicy policy) {
-        // For YIELD_AUTO, this will both set an auto yield policy on the PlanExecutor and
-        // register it to receive notifications.
-        this->setYieldPolicy(policy);
+size_t PlanExecutor::getNextBatch(size_t batchSize, AppendBSONObjFn append) {
+    // Subclasses may override this in order to provide a more optimized loop.
+    const bool hasAppendFn = static_cast<bool>(append);
+    BSONObj obj;
+    BSONObj* objPtr = hasAppendFn ? &obj : nullptr;
 
-        // First check if we need to do subplanning.
-        PlanStage* foundStage = getStageByType(_root.get(), STAGE_SUBPLAN);
-        if (foundStage) {
-            SubplanStage* subplan = static_cast<SubplanStage*>(foundStage);
-            return subplan->pickBestPlan(_yieldPolicy.get());
+    size_t numResults = 0;
+
+    while (numResults < batchSize) {
+        if (PlanExecutor::IS_EOF == getNext(objPtr, nullptr)) {
+            break;
         }
 
-        // If we didn't have to do subplanning, we might still have to do regular
-        // multi plan selection.
-        foundStage = getStageByType(_root.get(), STAGE_MULTI_PLAN);
-        if (foundStage) {
-            MultiPlanStage* mps = static_cast<MultiPlanStage*>(foundStage);
-            return mps->pickBestPlan(_yieldPolicy.get());
+        if (hasAppendFn && !append(obj, getPostBatchResumeToken(), numResults)) {
+            stashResult(obj);
+            break;
+        }
+        numResults++;
+    }
+
+    return numResults;
+}
+
+boost::optional<BSONObj> PlanExecutor::executeWrite(PlanExecWriteType writeType) {
+    BSONObj value;
+    PlanExecutor::ExecState state;
+    try {
+        // Multi-updates and multi-deletes never return 'ADVANCED'. Therefore, running 'getNext()'
+        // once will either perform a single write for multi:false statements, or will perform an
+        // entire multi:true statement.
+        state = getNext(&value, nullptr);
+    } catch (const StorageUnavailableException&) {
+        throw;
+    } catch (ExceptionFor<ErrorCodes::StaleConfig>& ex) {
+        // A 'StaleConfig' exception needs to be changed to an operation-fatal 'QueryPlanKilled'
+        // exception for multi-updates that have already modified some documents. First, re-throw
+        // the exception if we're not an update.
+        if (writeType != PlanExecWriteType::kUpdate) {
+            throw;
         }
 
-        // Either we chose a plan, or no plan selection was required. In both cases,
-        // our work has been successfully completed.
-        return Status::OK();
-    }
-
-    PlanExecutor::~PlanExecutor() { }
-
-    // static
-    std::string PlanExecutor::statestr(ExecState s) {
-        if (PlanExecutor::ADVANCED == s) {
-            return "ADVANCED";
+        const auto updateResult = getUpdateResult();
+        tassert(
+            9146500,
+            fmt::format(
+                "An update plan should never yield after having performed an upsert; upsertId: {}",
+                redact(updateResult.upsertedId.toString())),
+            updateResult.upsertedId.isEmpty());
+        if (updateResult.numDocsModified > 0 && !getOpCtx()->isRetryableWrite() &&
+            !getOpCtx()->inMultiDocumentTransaction()) {
+            // An update plan can fail with StaleConfig error after having performed some writes but
+            // not completed. This can happen when the collection is moved. Routers consider
+            // StaleConfig as retryable. However, it is unsafe to retry, because if the update is
+            // not idempotent it would cause some documents to be updated twice. To prevent that, we
+            // rewrite the error code to QueryPlanKilled, which routers won't retry on.
+            ex.addContext("Update plan failed after having partially executed");
+            uasserted(ErrorCodes::QueryPlanKilled, ex.reason());
+        } else {
+            throw;
         }
-        else if (PlanExecutor::IS_EOF == s) {
-            return "IS_EOF";
-        }
-        else if (PlanExecutor::DEAD == s) {
-            return "DEAD";
-        }
-        else {
-            verify(PlanExecutor::FAILURE == s);
-            return "FAILURE";
-        }
+    } catch (DBException& exception) {
+        auto&& explainer = getPlanExplainer();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        auto operationName = writeTypeToStr(writeType);
+        LOGV2_WARNING(7267501,
+                      "Plan executor error",
+                      "operation"_attr = operationName,
+                      "error"_attr = exception.toStatus(),
+                      "stats"_attr = redact(stats));
+
+        exception.addContext(str::stream() << "Plan executor error during " << operationName);
+        throw;
     }
 
-    WorkingSet* PlanExecutor::getWorkingSet() const {
-        return _workingSet.get();
+    if (PlanExecutor::ADVANCED == state) {
+        return {std::move(value)};
     }
 
-    PlanStage* PlanExecutor::getRootStage() const {
-        return _root.get();
-    }
+    invariant(state == PlanExecutor::IS_EOF);
+    return boost::none;
+}
 
-    CanonicalQuery* PlanExecutor::getCanonicalQuery() const {
-        return _cq.get();
-    }
+UpdateResult PlanExecutor::executeUpdate() {
+    auto doc = executeWrite(PlanExecWriteType::kUpdate);
+    tassert(9212600, "expected 'boost::none' return value from executeWrite()", !doc);
+    return getUpdateResult();
+}
 
-    PlanStageStats* PlanExecutor::getStats() const {
-        return _root->getStats();
-    }
+long long PlanExecutor::executeDelete() {
+    auto doc = executeWrite(PlanExecWriteType::kDelete);
+    tassert(9212601, "expected 'boost::none' return value from executeWrite()", !doc);
+    return getDeleteResult();
+}
 
-    const Collection* PlanExecutor::collection() const {
-        return _collection;
-    }
+boost::optional<BSONObj> PlanExecutor::executeFindAndModify() {
+    return executeWrite(PlanExecWriteType::kFindAndModify);
+}
 
-    OperationContext* PlanExecutor::getOpCtx() const {
-        return _opCtx;
-    }
+void PlanExecutor::releaseAllAcquiredResources() {
+    auto opCtx = getOpCtx();
+    invariant(opCtx);
 
-    void PlanExecutor::saveState() {
-        if (!_killed) {
-            _root->saveState();
-        }
-
-        // Doc-locking storage engines drop their transactional context after saving state.
-        // The query stages inside this stage tree might buffer record ids (e.g. text, geoNear,
-        // mergeSort, sort) which are no longer protected by the storage engine's transactional
-        // boundaries. Force-fetch the documents for any such record ids so that we have our
-        // own copy in the working set.
-        if (supportsDocLocking()) {
-            WorkingSetCommon::prepareForSnapshotChange(_workingSet.get());
-        }
-
-        _opCtx = NULL;
-    }
-
-    bool PlanExecutor::restoreState(OperationContext* opCtx) {
-        try {
-            return restoreStateWithoutRetrying(opCtx);
-        }
-        catch (const WriteConflictException& wce) {
-            if (!_yieldPolicy->allowedToYield())
-                throw;
-
-            // Handles retries by calling restoreStateWithoutRetrying() in a loop.
-            return _yieldPolicy->yield(NULL);
-        }
-    }
-
-    bool PlanExecutor::restoreStateWithoutRetrying(OperationContext* opCtx) {
-        invariant(NULL == _opCtx);
-        invariant(opCtx);
-
-        _opCtx = opCtx;
-
-        // We're restoring after a yield or getMore now. If we're a yielding plan executor, reset
-        // the yield timer in order to prevent from yielding again right away.
-        _yieldPolicy->resetTimer();
-
-        if (!_killed) {
-            _root->restoreState(opCtx);
-        }
-
-        return !_killed;
-    }
-
-    void PlanExecutor::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-        if (!_killed) { _root->invalidate(txn, dl, type); }
-    }
-
-    PlanExecutor::ExecState PlanExecutor::getNext(BSONObj* objOut, RecordId* dlOut) {
-        Snapshotted<BSONObj> snapshotted;
-        ExecState state = getNextSnapshotted(objOut ? &snapshotted : NULL, dlOut);
-
-        if (objOut) {
-            *objOut = snapshotted.value();
-        }
-
-        return state;
-    }
-
-    PlanExecutor::ExecState PlanExecutor::getNextSnapshotted(Snapshotted<BSONObj>* objOut,
-                                                             RecordId* dlOut) {
-        if (_killed) { return PlanExecutor::DEAD; }
-
-        // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
-        // to use to pull the record into memory. We take ownership of the RecordFetcher here,
-        // deleting it after we've had a chance to do the fetch. For timing-based yields, we
-        // just pass a NULL fetcher.
-        boost::scoped_ptr<RecordFetcher> fetcher;
-
-        // Incremented on every writeConflict, reset to 0 on any successful call to _root->work.
-        size_t writeConflictsInARow = 0;
-
-        for (;;) {
-            // These are the conditions which can cause us to yield:
-            //   1) The yield policy's timer elapsed, or
-            //   2) some stage requested a yield due to a document fetch, or
-            //   3) we need to yield and retry due to a WriteConflictException.
-            // In all cases, the actual yielding happens here.
-            if (_yieldPolicy->shouldYield()) {
-                _yieldPolicy->yield(fetcher.get());
-
-                if (_killed) {
-                    return PlanExecutor::DEAD;
-                }
-            }
-
-            // We're done using the fetcher, so it should be freed. We don't want to
-            // use the same RecordFetcher twice.
-            fetcher.reset();
-
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState code = _root->work(&id);
-
-            if (code != PlanStage::NEED_YIELD)
-                writeConflictsInARow = 0;
-
-            if (PlanStage::ADVANCED == code) {
-                // Fast count.
-                if (WorkingSet::INVALID_ID == id) {
-                    invariant(NULL == objOut);
-                    invariant(NULL == dlOut);
-                    return PlanExecutor::ADVANCED;
-                }
-
-                WorkingSetMember* member = _workingSet->get(id);
-                bool hasRequestedData = true;
-
-                if (NULL != objOut) {
-                    if (WorkingSetMember::LOC_AND_IDX == member->state) {
-                        if (1 != member->keyData.size()) {
-                            _workingSet->free(id);
-                            hasRequestedData = false;
-                        }
-                        else {
-                            // TODO: currently snapshot ids are only associated with documents, and
-                            // not with index keys.
-                            *objOut = Snapshotted<BSONObj>(SnapshotId(),
-                                                           member->keyData[0].keyData);
-                        }
-                    }
-                    else if (member->hasObj()) {
-                        *objOut = member->obj;
-                    }
-                    else {
-                        _workingSet->free(id);
-                        hasRequestedData = false;
-                    }
-                }
-
-                if (NULL != dlOut) {
-                    if (member->hasLoc()) {
-                        *dlOut = member->loc;
-                    }
-                    else {
-                        _workingSet->free(id);
-                        hasRequestedData = false;
-                    }
-                }
-
-                if (hasRequestedData) {
-                    _workingSet->free(id);
-                    return PlanExecutor::ADVANCED;
-                }
-                // This result didn't have the data the caller wanted, try again.
-            }
-            else if (PlanStage::NEED_YIELD == code) {
-                if (id == WorkingSet::INVALID_ID) {
-                    if (!_yieldPolicy->allowedToYield()) throw WriteConflictException();
-                    _opCtx->getCurOp()->debug().writeConflicts++;
-                    writeConflictsInARow++;
-                    WriteConflictException::logAndBackoff(writeConflictsInARow,
-                                                          "plan execution",
-                                                          _collection->ns().ns());
-
-                }
-                else {
-                    WorkingSetMember* member = _workingSet->get(id);
-                    invariant(member->hasFetcher());
-                    // Transfer ownership of the fetcher. Next time around the loop a yield will
-                    // happen.
-                    fetcher.reset(member->releaseFetcher());
-                }
-
-                // If we're allowed to, we will yield next time through the loop.
-                if (_yieldPolicy->allowedToYield()) _yieldPolicy->forceYield();
-            }
-            else if (PlanStage::NEED_TIME == code) {
-                // Fall through to yield check at end of large conditional.
-            }
-            else if (PlanStage::IS_EOF == code) {
-                return PlanExecutor::IS_EOF;
-            }
-            else if (PlanStage::DEAD == code) {
-                return PlanExecutor::DEAD;
-            }
-            else {
-                verify(PlanStage::FAILURE == code);
-                if (NULL != objOut) {
-                    BSONObj statusObj;
-                    WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &statusObj);
-                    *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
-                }
-                return PlanExecutor::FAILURE;
-            }
-        }
-    }
-
-    bool PlanExecutor::isEOF() {
-        return _killed || _root->isEOF();
-    }
-
-    void PlanExecutor::registerExec() {
-        _safety.reset(new ScopedExecutorRegistration(this));
-    }
-
-    void PlanExecutor::deregisterExec() {
-        _safety.reset();
-    }
-
-    void PlanExecutor::kill() {
-        _killed = true;
-        _collection = NULL;
-
-        // XXX: PlanExecutor is designed to wrap a single execution tree. In the case of
-        // aggregation queries, PlanExecutor wraps a proxy stage responsible for pulling results
-        // from an aggregation pipeline. The aggregation pipeline pulls results from yet another
-        // PlanExecutor. Such nested PlanExecutors require us to manually propagate kill() to
-        // the "inner" executor. This is bad, and hopefully can be fixed down the line with the
-        // unification of agg and query.
-        //
-        // The CachedPlanStage is another special case. It needs to update the plan cache from
-        // its destructor. It needs to know whether it has been killed so that it can avoid
-        // touching a potentially invalid plan cache in this case.
-        //
-        // TODO: get rid of this code block.
-        {
-            PlanStage* foundStage = getStageByType(_root.get(), STAGE_PIPELINE_PROXY);
-            if (foundStage) {
-                PipelineProxyStage* proxyStage = static_cast<PipelineProxyStage*>(foundStage);
-                shared_ptr<PlanExecutor> childExec = proxyStage->getChildExecutor();
-                if (childExec) {
-                    childExec->kill();
-                }
-            }
-
-            foundStage = getStageByType(_root.get(), STAGE_CACHED_PLAN);
-            if (foundStage) {
-                CachedPlanStage* cacheStage = static_cast<CachedPlanStage*>(foundStage);
-                cacheStage->kill();
-            }
-        }
-    }
-
-    Status PlanExecutor::executePlan() {
-        BSONObj obj;
-        PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
-        while (PlanExecutor::ADVANCED == state) {
-            state = this->getNext(&obj, NULL);
-        }
-
-        if (PlanExecutor::DEAD == state) {
-            return Status(ErrorCodes::OperationFailed, "Exec error: PlanExecutor killed");
-        }
-        else if (PlanExecutor::FAILURE == state) {
-            return Status(ErrorCodes::OperationFailed,
-                          str::stream() << "Exec error: "
-                                        << WorkingSetCommon::toStatusString(obj));
-        }
-
-        invariant(PlanExecutor::IS_EOF == state);
-        return Status::OK();
-    }
-
-    const string& PlanExecutor::ns() {
-        return _ns;
-    }
-
-    void PlanExecutor::setYieldPolicy(YieldPolicy policy, bool registerExecutor) {
-        _yieldPolicy->setPolicy(policy);
-        if (PlanExecutor::YIELD_AUTO == policy) {
-            // Runners that yield automatically generally need to be registered so that
-            // after yielding, they receive notifications of events like deletions and
-            // index drops. The only exception is that a few PlanExecutors get registered
-            // by ClientCursor instead of being registered here. This is unneeded if we only do
-            // partial "yields" for WriteConflict retrying.
-            if (registerExecutor) {
-                this->registerExec();
-            }
-        }
-    }
-
+    saveState();
+    // Detach + reattach forces us to release all resources back to the storage engine. This is
+    // currently a side-effect of how Storage Engine cursors are implemented in the plans.
     //
-    // ScopedExecutorRegistration
-    //
+    // TODO SERVER-87866: See if we can remove this if saveState/restoreState actually release all
+    // resources.
+    detachFromOperationContext();
+    reattachToOperationContext(opCtx);
+}
 
-    PlanExecutor::ScopedExecutorRegistration::ScopedExecutorRegistration(PlanExecutor* exec)
-        : _exec(exec) {
-        // Collection can be null for an EOFStage plan, or other places where registration
-        // is not needed.
-        if (_exec->collection()) {
-            _exec->collection()->getCursorManager()->registerExecutor(exec);
-        }
-    }
-
-    PlanExecutor::ScopedExecutorRegistration::~ScopedExecutorRegistration() {
-        if (_exec->collection()) {
-            _exec->collection()->getCursorManager()->deregisterExecutor(_exec);
-        }
-    }
-
-} // namespace mongo
+}  // namespace mongo

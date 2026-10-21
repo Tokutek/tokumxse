@@ -1,0 +1,508 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/transaction/transaction_operations.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+namespace {
+
+/**
+ * Returns the operations from the range ['operationsBegin', 'operationsEnd') that fit into a single
+ * "applyOps" entry, serialized to BSON.
+ * - Multi-document transactions follow the following constraints for fitting the operations:
+ *    (1) the resulting "applyOps" entry shouldn't exceed the 16MB limit, unless only one operation
+ *          is allocated to it;
+ *    (2) the number of operations is not larger than the maximum number of transaction statements
+ *          allowed in one entry as defined by
+ *          'gMaxNumberOfTransactionOperationsInSingleOplogEntry'.
+ * - Batched writes (WUOWs that pack writes into a single applyOps outside of a multi-doc
+ *    transaction) are exempt from the constraints above, but instead are subject to one:
+ *    (1) If the operations cannot be packed into a single applyOps that's within the BSON size
+ *         limit (16MB), the batched write will fail with TransactionTooLarge.
+ */
+std::vector<BSONObj> packOperationsIntoApplyOps(
+    std::vector<repl::ReplOperation>::const_iterator operationsBegin,
+    std::vector<repl::ReplOperation>::const_iterator operationsEnd,
+    std::size_t oplogEntryCountLimit,
+    std::size_t oplogEntrySizeLimitBytes,
+    bool respectAtomicGroups,
+    bool* groupIsOversized) {
+    std::vector<BSONObj> operations;
+    std::size_t totalOperationsSize{0};
+    auto groupId = [](const repl::ReplOperation& op) -> boost::optional<RecordId> {
+        if (auto groupRecordId = op.getGroupRecordId()) {
+            return groupRecordId;
+        }
+        return op.getRecordId();
+    };
+
+    // 'lastGroupId' is the id of the last operation packed into the entry, and 'lastGroupStart' is
+    // the index in 'operations' where that group began, so an incomplete trailing group can be
+    // dropped as a whole. Only meaningful while respecting groups.
+    boost::optional<RecordId> lastGroupId;
+    std::size_t lastGroupStart = 0;
+    for (auto operationIter = operationsBegin; operationIter != operationsEnd; ++operationIter) {
+        const auto& operation = *operationIter;
+        const auto opGroupId = groupId(operation);
+
+        // Whether the operation fits the current entry, checked before adding it, so the first
+        // operation of an entry is always added and a lone oversized operation still makes
+        // progress. The size term is only evaluated when the count is not already at its limit.
+        const bool exceedsCount = operations.size() == oplogEntryCountLimit;
+        const bool exceedsSize = !exceedsCount && !operations.empty() &&
+            totalOperationsSize + repl::DurableOplogEntry::getDurableReplOperationSize(operation) >
+                oplogEntrySizeLimitBytes;
+        if (exceedsCount || exceedsSize) {
+            // The operation does not fit in this oplog entry. If it belongs to the same group as
+            // the last operation packed, ending the entry here would split the group across
+            // entries. Under nonAtomicGroup, whose entries apply separately
+            // on secondaries, the group's operations would then not apply atomically.
+            const bool wouldSplitGroup =
+                respectAtomicGroups && lastGroupId && opGroupId == lastGroupId;
+            if (wouldSplitGroup) {
+                if (lastGroupStart == 0) {
+                    // The group fills this entry from the start and still does not fit, so it is
+                    // too large for a single applyOps entry. Flag the oversized group and return an
+                    // empty prefix.
+                    if (groupIsOversized) {
+                        *groupIsOversized = true;
+                    }
+                    return {};
+                }
+                // Complete groups precede this incomplete one; keep only those by dropping the
+                // incomplete group's operations from the entry.
+                operations.resize(lastGroupStart);
+            }
+            break;
+        }
+
+        auto serializedOperation = operation.toBSON();
+        totalOperationsSize += static_cast<std::size_t>(serializedOperation.objsize());
+
+        // Add BSON array element overhead since operations will ultimately be packed into a BSON
+        // array.
+        totalOperationsSize += TransactionOperations::ApplyOpsInfo::kBSONArrayElementOverhead;
+
+        // When the group id changes, record where the new group begins so an incomplete trailing
+        // group can be dropped as a whole above.
+        if (opGroupId != lastGroupId) {
+            lastGroupId = opGroupId;
+            lastGroupStart = operations.size();
+        }
+        operations.emplace_back(std::move(serializedOperation));
+    }
+    return operations;
+}
+
+}  // namespace
+
+MONGO_FAIL_POINT_DEFINE(hangAfterLoggingApplyOpsForTransaction);
+MONGO_FAIL_POINT_DEFINE(skipLoggingLastOpForTransaction);
+
+// static
+void TransactionOperations::packTransactionStatementsForApplyOps(
+    std::vector<TransactionOperation>::const_iterator stmtBegin,
+    std::vector<TransactionOperation>::const_iterator stmtEnd,
+    const std::vector<BSONObj>& operations,
+    BSONObjBuilder* applyOpsBuilder,
+    std::vector<StmtId>* stmtIdsWritten,
+    boost::optional<repl::ReplOperation::ImageBundle>* imageToWrite) {
+    tassert(6278508,
+            "Number of operations does not match the number of transaction statements",
+            operations.size() == static_cast<size_t>(stmtEnd - stmtBegin));
+
+    auto operationsIter = operations.begin();
+    BSONArrayBuilder opsArray(applyOpsBuilder->subarrayStart("applyOps"sv));
+    for (auto stmtIter = stmtBegin; stmtIter != stmtEnd; stmtIter++) {
+        const auto& stmt = *stmtIter;
+        opsArray.append(*operationsIter++);
+        const auto& stmtIds = stmt.getStatementIds();
+        stmtIdsWritten->insert(stmtIdsWritten->end(), stmtIds.begin(), stmtIds.end());
+        if (imageToWrite) {
+            stmt.extractPrePostImageForTransaction(imageToWrite);
+        }
+    }
+    try {
+        // If the BSONArrayBuilder exceeds the max BSON size, throw TransactionTooLarge.
+        uassertStatusOK(opsArray.done().validateBSONObjSize().addContext(
+            "Packing transaction statements failed."));
+    } catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>& e) {
+        // Change BSONObjectTooLarge => TransactionTooLarge.
+        uasserted(ErrorCodes::TransactionTooLarge, e.reason());
+    }
+}
+
+bool TransactionOperations::isEmpty() const {
+    return _transactionOperations.empty();
+}
+
+std::size_t TransactionOperations::numOperations() const {
+    return _transactionOperations.size();
+}
+
+std::size_t TransactionOperations::getTotalOperationBytes() const {
+    return _totalOperationBytes;
+}
+
+std::size_t TransactionOperations::getNumberOfPrePostImagesToWrite() const {
+    return _numberOfPrePostImagesToWrite;
+}
+
+std::size_t TransactionOperations::getNumberOfOperationsWithStatementIds() const {
+    return static_cast<std::size_t>(std::count_if(_transactionOperations.begin(),
+                                                  _transactionOperations.end(),
+                                                  [](const TransactionOperation& operation) {
+                                                      return !operation.getStatementIds().empty();
+                                                  }));
+}
+
+bool TransactionOperations::hasStatementIds() const {
+    return !_transactionStmtIds.empty();
+}
+
+void TransactionOperations::clear() {
+    _transactionOperations.clear();
+    _transactionStmtIds.clear();
+    _totalOperationBytes = 0;
+    _numberOfPrePostImagesToWrite = 0;
+}
+
+void TransactionOperations::groupByRecordId() {
+    // Make each group's operations contiguous, preserving the order in which groups and operations
+    // first appear, so the applyOps packer can keep a group whole. A group is identified by an
+    // operation's group record id if set, else its own record id.
+    auto groupId = [](const TransactionOperation& op) -> boost::optional<RecordId> {
+        if (auto groupRecordId = op.getGroupRecordId()) {
+            return groupRecordId;
+        }
+        return op.getRecordId();
+    };
+
+    // Collect each group's operations into its own bucket, creating buckets in first-appearance
+    // order. A record-less operation forms its own singleton bucket. Operations keep their relative
+    // order within a bucket.
+    std::vector<std::vector<TransactionOperation>> buckets;
+    stdx::unordered_map<RecordId, size_t, RecordId::Hasher> bucketForRecordId;
+    for (auto& operation : _transactionOperations) {
+        if (auto recordId = groupId(operation)) {
+            auto [it, inserted] = bucketForRecordId.try_emplace(*recordId, buckets.size());
+            if (inserted) {
+                buckets.emplace_back();
+            }
+            buckets[it->second].push_back(std::move(operation));
+        } else {
+            buckets.emplace_back().push_back(std::move(operation));
+        }
+    }
+
+    // Concatenate the buckets in first-appearance order.
+    std::vector<TransactionOperation> reordered;
+    reordered.reserve(_transactionOperations.size());
+    for (auto& bucket : buckets) {
+        for (auto& operation : bucket) {
+            reordered.push_back(std::move(operation));
+        }
+    }
+    _transactionOperations = std::move(reordered);
+}
+
+Status TransactionOperations::addOperation(TransactionOperation operation,
+                                           boost::optional<std::size_t> transactionSizeLimitBytes) {
+    const auto& stmtIdsToInsert = operation.getStatementIds();
+    auto nextStmtIdToInsert = stmtIdsToInsert.begin();
+
+    // If the addOperation fails, we need to remove any statement IDs inserted.
+    ScopeGuard stmtIdRemover([&] {
+        for (auto iter = stmtIdsToInsert.begin(); iter != nextStmtIdToInsert; iter++)
+            _transactionStmtIds.erase(*iter);
+    });
+
+    for (; nextStmtIdToInsert != stmtIdsToInsert.end(); ++nextStmtIdToInsert) {
+        auto stmtId = *nextStmtIdToInsert;
+        auto [_, inserted] = _transactionStmtIds.insert(stmtId);
+        if (!inserted) {
+            return Status(ErrorCodes::Error(5875600),
+                          fmt::format("Found two operations using the same stmtId of {}", stmtId));
+        }
+    }
+
+    auto opSize = repl::DurableOplogEntry::getDurableReplOperationSize(operation);
+
+    // The pre-image size is always added to the collection transaction size, but
+    // there are additional conditions for adding the pre-image to
+    // '_numberOfPrePostImagesToWrite'. See SERVER-59694.
+    std::size_t numberOfPrePostImagesToWrite = 0;
+    if (const auto& preImage = operation.getPreImage(); !preImage.isEmpty()) {
+        opSize += static_cast<std::size_t>(preImage.objsize());
+        if (operation.isPreImageRecordedForRetryableInternalTransaction()) {
+            numberOfPrePostImagesToWrite++;
+        }
+    }
+
+    // The post-image, if present, is always included in the size and pre/post image counters.
+    if (const auto& postImage = operation.getPostImage(); !postImage.isEmpty()) {
+        opSize += operation.getPostImage().objsize();
+        numberOfPrePostImagesToWrite++;
+    }
+
+    if (transactionSizeLimitBytes && (_totalOperationBytes + opSize) > *transactionSizeLimitBytes) {
+        return Status(ErrorCodes::TransactionTooLarge,
+                      fmt::format("Total size of all transaction operations must be less than "
+                                  "server parameter 'transactionSizeLimitBytes' = {}",
+                                  *transactionSizeLimitBytes));
+    }
+
+    _transactionOperations.push_back(std::move(operation));
+    _totalOperationBytes += opSize;
+    _numberOfPrePostImagesToWrite += numberOfPrePostImagesToWrite;
+    stmtIdRemover.dismiss();
+
+    return Status::OK();
+}
+
+TransactionOperations::CollectionUUIDs TransactionOperations::getCollectionUUIDs() const {
+    CollectionUUIDs uuids;
+    for (const auto& op : _transactionOperations) {
+        if (op.getOpType() == repl::OpTypeEnum::kNoop) {
+            // No-ops can't modify data, so there's no need to check if they involved a temporary
+            // collection.
+            continue;
+        }
+
+        // Ignore operations without collection UUIDs. No need for invariant.
+        auto uuid = op.getUuid();
+        if (!uuid) {
+            continue;
+        }
+
+        uuids.insert(*uuid);
+    }
+
+    return uuids;
+}
+
+TransactionOperations::ApplyOpsInfo TransactionOperations::getApplyOpsInfo(
+    std::size_t oplogEntryCountLimit,
+    std::size_t oplogEntrySizeLimitBytes,
+    bool prepare,
+    bool respectAtomicGroups) const {
+    const auto& operations = _transactionOperations;
+    if (operations.empty()) {
+        return {/*applyOpsEntries=*/{},
+                /*numberOfOplogSlotsRequired=*/(prepare ? 1U : 0),
+                /*numOperationsWithNeedsRetryImage=*/0,
+                prepare};
+    }
+
+    std::vector<ApplyOpsInfo::ApplyOpsEntry> applyOpsEntries;
+    std::size_t numOperationsWithNeedsRetryImage = 0;
+    std::size_t numOplogSlotsRequired = 0;
+    auto hasNeedsRetryImage = [](const repl::ReplOperation& operation) {
+        return static_cast<bool>(operation.getNeedsRetryImage());
+    };
+
+    // Assign operations to "applyOps" entries.
+    for (auto operationIt = operations.begin(); operationIt != operations.end();) {
+        bool oversizedGroup = false;
+        auto applyOpsOperations = packOperationsIntoApplyOps(operationIt,
+                                                             operations.end(),
+                                                             oplogEntryCountLimit,
+                                                             oplogEntrySizeLimitBytes,
+                                                             respectAtomicGroups,
+                                                             &oversizedGroup);
+        // A single record's operations cannot be represented as independent applyOps entries.
+        uassert(ErrorCodes::TransactionTooLarge,
+                "a single record's operations do not fit in one applyOps entry",
+                !oversizedGroup);
+        const auto opCountWithNeedsRetryImage =
+            std::count_if(operationIt, operationIt + applyOpsOperations.size(), hasNeedsRetryImage);
+        if (opCountWithNeedsRetryImage > 0) {
+            // Reserve a slot for a forged no-op entry.
+            numOplogSlotsRequired++;
+
+            numOperationsWithNeedsRetryImage += opCountWithNeedsRetryImage;
+        }
+        operationIt += applyOpsOperations.size();
+        applyOpsEntries.emplace_back(
+            ApplyOpsInfo::ApplyOpsEntry{std::move(applyOpsOperations), numOplogSlotsRequired++});
+    }
+
+    return {std::move(applyOpsEntries),
+            numOplogSlotsRequired,
+            /*numOperationsWithNeedsRetryImage=*/numOperationsWithNeedsRetryImage,
+            prepare};
+}
+
+std::size_t TransactionOperations::logOplogEntries(
+    const std::vector<OplogSlot>& oplogSlots,
+    const ApplyOpsInfo& applyOpsOperationAssignment,
+    Date_t wallClockTime,
+    WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat,
+    LogApplyOpsFn logApplyOpsFn,
+    boost::optional<TransactionOperation::ImageBundle>* prePostImageToWriteToImageCollection)
+    const {
+    invariant(oplogSlots.size() == applyOpsOperationAssignment.numberOfOplogSlotsRequired,
+              "Wrong number of oplogSlots reserved");
+
+    // Each entry in a chain of applyOps contains a 'prevOpTime' field that serves as a back
+    // pointer to the previous entry.
+    // The first entry will always have a null op time with term -1 and a timestamp containing
+    // 0 seconds and 0 for the increment component.
+    // For the atomic applyOps format used for batched writes, any value in this field will be
+    // rejected during secondary oplog application in the form of an invariant, so it is important
+    // for 'logApplyOpsFn' to remove this field before writing to the actual oplog collection.
+    repl::OpTime prevWriteOpTime;
+
+    // Stores the statement ids of all write statements in the transaction.
+    std::vector<StmtId> stmtIdsWritten;
+
+    // At the beginning of each loop iteration below, 'stmtsIter' will always point to the
+    // first statement of the sequence of remaining, unpacked transaction statements. If all
+    // statements have been packed, it should point to stmts.end(), which is the loop's
+    // termination condition.
+    auto stmtsIter = _transactionOperations.begin();
+    auto applyOpsIter = applyOpsOperationAssignment.applyOpsEntries.begin();
+    const bool prepare = applyOpsOperationAssignment.prepare;
+    const bool applyOpsAppliedSeparately = oplogGroupingFormat == WriteUnitOfWork::nonAtomicGroup;
+    while (stmtsIter != _transactionOperations.end()) {
+        tassert(6278509,
+                "Not enough \"applyOps\" entries",
+                applyOpsIter != applyOpsOperationAssignment.applyOpsEntries.end());
+        const auto& applyOpsEntry = *applyOpsIter++;
+        BSONObjBuilder applyOpsBuilder;
+        boost::optional<repl::ReplOperation::ImageBundle> imageToWrite;
+
+        const auto nextStmt = stmtsIter + applyOpsEntry.operations.size();
+        // Skip extraction when the caller does not persist images by passing a null 'imageToWrite'.
+        TransactionOperations::packTransactionStatementsForApplyOps(
+            stmtsIter,
+            nextStmt,
+            applyOpsEntry.operations,
+            &applyOpsBuilder,
+            &stmtIdsWritten,
+            prePostImageToWriteToImageCollection ? &imageToWrite : nullptr);
+
+        // If we packed the last op, then the next oplog entry we log should be the implicit
+        // commit or implicit prepare, i.e. we omit the 'partialTxn' field.
+        auto firstOp = stmtsIter == _transactionOperations.begin();
+        auto lastOp = nextStmt == _transactionOperations.end();
+
+        // Skip logging the last oplog entry if this failpoint is enabled.
+        if (MONGO_unlikely(skipLoggingLastOpForTransaction.shouldFail()) && lastOp) {
+            // This will cause the loop to exit.
+            stmtsIter = nextStmt;
+            continue;
+        }
+
+        auto implicitPrepare = lastOp && prepare;
+        auto isPartialTxn = !lastOp && !applyOpsAppliedSeparately;
+
+        if (imageToWrite) {
+            tassert(13286500,
+                    "Expected a non-null prePostImageToWriteToImageCollection when a pre/post "
+                    "image was extracted",
+                    prePostImageToWriteToImageCollection);
+            uassert(6054002,
+                    str::stream() << NamespaceString::kConfigImagesNamespace.toStringForErrorMsg()
+                                  << " can only store the pre or post image of one "
+                                     "findAndModify operation for each "
+                                     "transaction",
+                    !(*prePostImageToWriteToImageCollection));
+        }
+
+        // A 'prepare' oplog entry should never include a 'partialTxn' field.
+        invariant(!(isPartialTxn && implicitPrepare),
+                  str::stream() << "isPartialTxn: " << isPartialTxn
+                                << ", implicitPrepare: " << implicitPrepare);
+        if (implicitPrepare) {
+            applyOpsBuilder.append("prepare", true);
+        }
+        if (isPartialTxn) {
+            applyOpsBuilder.append("partialTxn", true);
+        }
+
+        // The 'count' field gives the total number of individual operations in the
+        // transaction, and is included on a non-initial implicit commit or prepare entry.
+        // This field is used by the oplog application logic on secondary nodes to determine
+        // how many operations to apply in the same batch without having to step through
+        // all the oplog entries in an applyOps chain.
+        // The 'count' field is redundant for single entry applyOps operations because
+        // the number of operations can be derived from the length of the array in the
+        // 'applyOps' field.
+        // See SERVER-40676 and SERVER-40678.
+        if (lastOp && !firstOp && !applyOpsAppliedSeparately) {
+            applyOpsBuilder.append("count", static_cast<long long>(_transactionOperations.size()));
+        }
+
+        repl::MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+        oplogEntry.setNss(NamespaceString::kAdminCommandNamespace);
+        oplogEntry.setOpTime(oplogSlots[applyOpsEntry.oplogSlotIndex]);
+        oplogEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTime);
+        oplogEntry.setWallClockTime(wallClockTime);
+        oplogEntry.setObject(applyOpsBuilder.done());
+        oplogEntry.setTid(stmtsIter->getTid());
+
+        // Set fromMigrate on the applyOps entry if all sub-operations in this entry have
+        // fromMigrate set.
+        bool allFromMigrate = std::all_of(stmtsIter, nextStmt, [](const auto& op) {
+            return op.getFromMigrate().value_or(false);
+        });
+        oplogEntry.setFromMigrateIfTrue(allFromMigrate);
+
+        prevWriteOpTime =
+            logApplyOpsFn(&oplogEntry,
+                          firstOp,
+                          lastOp,
+                          (lastOp || applyOpsAppliedSeparately ? std::move(stmtIdsWritten)
+                                                               : std::vector<StmtId>{}),
+                          oplogGroupingFormat);
+
+        hangAfterLoggingApplyOpsForTransaction.pauseWhileSet();
+
+        if (imageToWrite) {
+            invariant(!(*prePostImageToWriteToImageCollection));
+            imageToWrite->timestamp = prevWriteOpTime.getTimestamp();
+            *prePostImageToWriteToImageCollection = *imageToWrite;
+        }
+
+        // Advance the iterator to the beginning of the remaining unpacked statements.
+        stmtsIter = nextStmt;
+    }
+
+    return applyOpsOperationAssignment.numberOfOplogSlotsRequired;
+}
+
+const std::vector<TransactionOperations::TransactionOperation>&
+TransactionOperations::getOperationsForOpObserver() const {
+    return _transactionOperations;
+}
+
+std::vector<TransactionOperations::TransactionOperation>
+TransactionOperations::getOperationsForTest() const {
+    return _transactionOperations;
+}
+
+size_t TransactionOperations::getOperationsCount() const {
+    return _transactionOperations.size();
+}
+
+}  // namespace mongo

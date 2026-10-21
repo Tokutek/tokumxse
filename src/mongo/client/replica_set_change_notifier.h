@@ -1,0 +1,150 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/client/connection_string.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+namespace mongo {
+
+/**
+ * A stateful notifier for events from a set of ReplicaSetMonitors
+ */
+class [[MONGO_MOD_PUBLIC]] ReplicaSetChangeNotifier {
+public:
+    using Key = std::string;
+    class Listener;
+
+    struct State {
+        ConnectionString connStr;
+        HostAndPort primary;
+        std::set<HostAndPort> passives;
+
+        int64_t generation = 0;
+    };
+
+public:
+    ReplicaSetChangeNotifier() = default;
+    ReplicaSetChangeNotifier(const ReplicaSetChangeNotifier&) = delete;
+    ReplicaSetChangeNotifier(ReplicaSetChangeNotifier&&) = delete;
+    ReplicaSetChangeNotifier& operator=(const ReplicaSetChangeNotifier&) = delete;
+    ReplicaSetChangeNotifier& operator=(ReplicaSetChangeNotifier&&) = delete;
+
+    /**
+     *  Notify every listener that there is a new ReplicaSet and initialize the State
+     */
+    void onFoundSet(const std::string& replicaSet);
+
+    /**
+     * Notify every listener that a scan completed without finding a primary and update
+     */
+    void onPossibleSet(ConnectionString connectionString);
+
+    /**
+     * Notify every listener that a scan completed and found a new primary or config
+     */
+    void onConfirmedSet(ConnectionString connectionString,
+                        HostAndPort primary,
+                        std::set<HostAndPort> passives);
+
+    /**
+     * Notify every listener that a ReplicaSet is no longer in use and drop the State
+     */
+    void onDroppedSet(const std::string& replicaSet);
+
+    /**
+     * Create a listener of a given type and bind it to this notifier
+     */
+    template <typename DerivedT,
+              typename... Args,
+              typename = std::enable_if_t<std::is_constructible_v<DerivedT, Args...>>>
+    auto makeListener(Args&&... args) {
+        auto ptr = std::make_shared<DerivedT>(std::forward<Args>(args)...);
+        _addListener(ptr);
+        return ptr;
+    }
+
+private:
+    void _addListener(std::shared_ptr<Listener> listener);
+
+    std::mutex _mutex;
+    std::vector<std::weak_ptr<Listener>> _listeners;
+    stdx::unordered_map<Key, State> _replicaSetStates;
+};
+
+/**
+ * A listener for events from a set of ReplicaSetMonitors
+ *
+ * This class will normally be notified of events for every replica set in use in the system.
+ * The onSet functions are all called syncronously by the notifier,
+ * if your implementation would block or seriously delay execution,
+ * please schedule the majority of the work to complete asynchronously.
+ */
+class [[MONGO_MOD_OPEN]] ReplicaSetChangeNotifier::Listener {
+public:
+    using Notifier = ReplicaSetChangeNotifier;
+    using Key = typename Notifier::Key;
+    using State = typename Notifier::State;
+
+public:
+    Listener(const Listener&) = delete;
+    Listener(Listener&&) = delete;
+    Listener& operator=(const Listener&) = delete;
+    Listener& operator=(Listener&&) = delete;
+
+    Listener() = default;
+    virtual ~Listener() = default;
+
+    /**
+     * Initialize this listener with a notifier
+     */
+    void init(Notifier* notifier) {
+        _notifier = notifier;
+    }
+
+    /**
+     * React to a new ReplicaSet that will soon be scanned
+     */
+    virtual void onFoundSet(const Key& key) = 0;
+
+    /**
+     * React to a finished scan that found no primary
+     */
+    virtual void onPossibleSet(const State& data) = 0;
+
+    /**
+     * React to a finished scan that found a primary
+     */
+    virtual void onConfirmedSet(const State& data) = 0;
+
+    /**
+     * React to a ReplicaSet being dropped from use
+     */
+    virtual void onDroppedSet(const Key& key) = 0;
+
+    /**
+     * Get the State as of the last signal function invoked on the Notifier
+     */
+    State getCurrentState(const Key& key);
+
+private:
+    Notifier* _notifier = nullptr;
+};
+
+}  // namespace mongo

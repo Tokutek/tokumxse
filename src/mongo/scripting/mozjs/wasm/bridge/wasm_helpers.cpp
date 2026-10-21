@@ -1,0 +1,270 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/wasm/bridge/wasm_helpers.h"
+
+#include "mongo/bson/bson_validate.h"
+#include "mongo/util/shared_buffer.h"
+
+#include <cstring>
+#include <string_view>
+
+namespace mongo::mozjs::wasm::wasm_helpers {
+
+std::vector<uint8_t> readWasmFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        return {};
+    }
+    auto pos = f.tellg();
+    if (pos < 0) {
+        return {};
+    }
+    auto size = static_cast<size_t>(pos);
+    f.seekg(0);
+    std::vector<uint8_t> buf(size);
+    if (!f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size))) {
+        return {};
+    }
+    return buf;
+}
+
+const wc::Val* findField(std::string_view name, const wc::Record& record) {
+    for (auto it = record.begin(); it != record.end(); ++it) {
+        if (it->name() == name)
+            return &it->value();
+    }
+    return nullptr;
+}
+
+std::string translateMozJSError(const wc::Val& mozJSError) {
+    if (!mozJSError.is_record()) {
+        return "unknown error (not a record)";
+    }
+
+    const auto& record = mozJSError.get_record();
+
+    auto findField = [&](std::string_view name) -> const wc::Val* {
+        return wasm_helpers::findField(name, record);
+    };
+
+    auto optStr = [](const wc::Val* v) -> std::string {
+        if (!v || !v->is_option())
+            return "none";
+        auto optVal = v->get_option().value();
+        return optVal ? std::string(optVal->get_string()) : "none";
+    };
+
+    std::stringstream ss;
+    // Include the WIT error-code enum (e.g. e-compile, e-runtime, e-oom).
+    auto it = record.begin();
+    if (it != record.end() && it->value().is_enum()) {
+        ss << it->value().get_enum() << " ";
+    }
+    ss << "message : '" << optStr(findField("msg")) << "', ";
+    ss << "file : '" << optStr(findField("filename")) << "', ";
+    if (auto* line = findField("line"); line && line->is_u32()) {
+        ss << "line : " << line->get_u32() << ", ";
+    }
+    if (auto* col = findField("column"); col && col->is_u32()) {
+        ss << "column : " << col->get_u32();
+    }
+    // Append the JS stack trace on its own lines so callers that split on '\n' see
+    // individual frames (e.g. the agg_infinite_recursion.js test requires ≥20 lines).
+    auto* stackField = findField("stack");
+    if (stackField && stackField->is_option()) {
+        auto optVal = stackField->get_option().value();
+        if (optVal) {
+            ss << "\n" << optVal->get_string();
+        }
+    }
+    return ss.str();
+}
+
+ErrorCodes::Error mozJSErrorCode(const wc::Val& mozJSError) {
+    if (!mozJSError.is_record())
+        return ErrorCodes::JSInterpreterFailure;
+
+    const auto* mc = findField("mongo-code", mozJSError.get_record());
+    if (mc && mc->is_u32()) {
+        if (auto code = mc->get_u32(); code != 0)
+            return ErrorCodes::Error(code);
+    }
+    return ErrorCodes::JSInterpreterFailure;
+}
+
+wc::Func getMozjsFunc(wc::Instance& instance,
+                      wt::Store::Context ctx,
+                      std::string_view ifaceName,
+                      std::string_view funcName) {
+    auto ifaceIdx = instance.get_export_index(ctx, nullptr, ifaceName);
+    // We should never request a function that we don't know of.
+    invariant(ifaceIdx);
+    auto funcIdx = instance.get_export_index(ctx, &*ifaceIdx, funcName);
+    invariant(funcIdx);
+    auto func = instance.get_func(ctx, *funcIdx);
+    invariant(func);
+    return *func;
+}
+
+wc::Val makeBytesVal(const uint8_t* data, size_t len) {
+    // Follows the same pattern as makeString: directly set the kind and union
+    // field on the C struct so the Val is initialized without triggering any
+    // destructors on uninitialized memory. wasm_byte_vec_new copies the bytes
+    // and the Val destructor later calls wasm_byte_vec_delete to free them.
+    wasmtime_component_val_t raw;
+    raw.kind = WASMTIME_COMPONENT_RAW_U8_LIST;
+    wasm_byte_vec_new(&raw.of.raw_u8_list, len, reinterpret_cast<const wasm_byte_t*>(data));
+    return wc::Val(std::move(raw));
+}
+
+boost::optional<wc::Func> getMozjsFuncOptional(wc::Instance& instance,
+                                               wt::Store::Context ctx,
+                                               std::string_view ifaceName,
+                                               std::string_view funcName) {
+    auto ifaceIdx = instance.get_export_index(ctx, nullptr, ifaceName);
+    if (!ifaceIdx)
+        return boost::none;
+    auto funcIdx = instance.get_export_index(ctx, &*ifaceIdx, funcName);
+    if (!funcIdx)
+        return boost::none;
+    auto func = instance.get_func(ctx, *funcIdx);
+    if (!func)
+        return boost::none;
+    return *func;
+}
+
+wc::List makeListU8(const uint8_t* data, size_t len) {
+    wasmtime_component_vallist_t raw;
+    wasmtime_component_vallist_new_uninit(&raw, len);
+    for (size_t i = 0; i < len; i++) {
+        raw.data[i].kind = WASMTIME_COMPONENT_U8;
+        raw.data[i].of.u8 = data[i];
+    }
+    return wc::List(std::move(raw));
+}
+
+wc::List makeListU8(std::string_view s) {
+    return makeListU8(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+}
+
+// Create a component Val for WIT `string` type (distinct from list<u8>).
+wc::Val makeString(std::string_view s) {
+    wasmtime_component_val_t raw;
+    raw.kind = WASMTIME_COMPONENT_STRING;
+    wasm_byte_vec_new(&raw.of.string, s.size(), s.data());
+    return wc::Val(std::move(raw));
+}
+
+std::vector<uint8_t> extractListU8(const wc::Val& v) {
+    // Fast path: lift patch turns list<u8> results into RAW_U8_LIST; copy the byte
+    // buffer directly without iterating per-element.
+    const auto* rawV = wc::Val::to_capi(&v);
+    if (rawV->kind == WASMTIME_COMPONENT_RAW_U8_LIST) {
+        const auto& bv = rawV->of.raw_u8_list;
+        return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(bv.data),
+                                    reinterpret_cast<const uint8_t*>(bv.data) + bv.size);
+    }
+    std::vector<uint8_t> out;
+    if (!v.is_list())
+        return out;
+    const wc::List& list = v.get_list();
+    out.reserve(list.size());
+    for (const wc::Val& elem : list) {
+        if (elem.is_u8()) {
+            out.push_back(elem.get_u8());
+        }
+    }
+    return out;
+}
+
+namespace {
+// Bounds guest-produced BSON to the same range BSONObj::isValid() historically enforced: at least
+// the minimum length, and no larger than the 125 MiB buffer cap, so a compromised guest cannot
+// force an oversized allocation/copy. Checked before allocating on the copy path.
+void checkGuestBsonSize(size_t size) {
+    uassert(11543000,
+            "WASM guest returned a BSON buffer shorter than the minimum BSON length",
+            size >= static_cast<size_t>(BSONObj::kMinBSONLength));
+    uassert(11543002,
+            "WASM guest returned a BSON buffer larger than the maximum BSON size",
+            size <= static_cast<size_t>(BufferMaxSize));
+}
+
+// Validates the (owned) buffer against its actual size and, on success, adopts it into a BSONObj.
+// maxLength is the actual buffer size (NOT the embedded BSON size header), so any forged top-level
+// or nested length that would read past the allocation is rejected here rather than trusted by
+// downstream BSON readers.
+BSONObj validateAndAdopt(SharedBuffer buf, size_t size) {
+    uassertStatusOK(validateBSON(buf.get(), size));
+    return BSONObj(std::move(buf));
+}
+}  // namespace
+
+BSONObj validatedBsonFromGuestBytes(const uint8_t* data, size_t size) {
+    checkGuestBsonSize(size);
+    auto buf = SharedBuffer::allocate(size);
+    std::memcpy(buf.get(), data, size);
+    return validateAndAdopt(std::move(buf), size);
+}
+
+BSONObj validatedBsonFromGuestBuffer(SharedBuffer buf, size_t size) {
+    checkGuestBsonSize(size);
+    return validateAndAdopt(std::move(buf), size);
+}
+
+bool isResultOk(const wc::Val& result) {
+    return result.is_result() && result.get_result().is_ok();
+}
+
+bool isFatalWitError(const wc::Val& witError) {
+    if (!witError.is_record())
+        return false;
+    const auto& record = witError.get_record();
+    // The first field of the WIT wasm-mozjs-error record is the err-code enum.
+    auto it = record.begin();
+    if (it == record.end() || !it->value().is_enum())
+        return false;
+    auto code = it->value().get_enum();
+    return code == std::string_view("e-oom") || code == std::string_view("e-internal");
+}
+
+bool isOomWitError(const wc::Val& witError) {
+    if (!witError.is_record())
+        return false;
+    const auto& record = witError.get_record();
+    auto it = record.begin();
+    if (it == record.end() || !it->value().is_enum())
+        return false;
+    auto code = it->value().get_enum();
+    // e-oom is handled by isFatalWitError (sets Trapped). This function only
+    // detects the non-fatal OOM path: SpiderMonkey reports heap allocation
+    // failures as e-runtime with a message that indicates memory exhaustion.
+    //
+    // NOTE: This relies on SpiderMonkey error message strings, which are set in
+    // js/src/js.msg (JSMSG_ALLOC_OVERFLOW -> "allocation size overflow") and
+    // (JSMSG_OUT_OF_MEMORY -> "out of memory"). If SpiderMonkey changes these
+    // messages, this detection will silently stop matching and the error will
+    // be treated as a generic e-runtime failure rather than OOM.
+    if (code == std::string_view("e-runtime")) {
+        for (auto fi = record.begin(); fi != record.end(); ++fi) {
+            if (fi->name() == std::string_view("msg") && fi->value().is_option()) {
+                auto optVal = fi->value().get_option().value();
+                if (optVal) {
+                    auto msg = optVal->get_string();
+                    if (msg.find("allocation size overflow") != std::string_view::npos ||
+                        msg.find("out of memory") != std::string_view::npos ||
+                        msg.find("std::bad_alloc") != std::string_view::npos)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+wc::Val convertBsonToWcVal(const BSONObj& bson) {
+    return makeBytesVal(reinterpret_cast<const uint8_t*>(bson.objdata()),
+                        static_cast<size_t>(bson.objsize()));
+}
+}  // namespace mongo::mozjs::wasm::wasm_helpers

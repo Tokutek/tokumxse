@@ -1,0 +1,77 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/write_concern_idl.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/read_write_concern_provenance_base.idl"
+
+types:
+    writeConcernW:
+        bson_serialization_type: any
+        description: >-
+            A string or integer representing the 'w' option in a document specifying write concern.
+            See https://docs.mongodb.com/manual/reference/write-concern/"
+        cpp_type: "mongo::WriteConcernW"
+        serializer: "::mongo::serializeWriteConcernW"
+        deserializer: "::mongo::deserializeWriteConcernW"
+        is_view: false
+
+    writeConcernWTimeout:
+        bson_serialization_type: any
+        description: >-
+            An integer representing the 'wtimeout' option in a document specifying write concern.
+            See https://docs.mongodb.com/manual/reference/write-concern/"
+        cpp_type: std::int64_t
+        deserializer: "::mongo::parseWTimeoutFromBSON"
+        serializer: "::mongo::serializeWTimeout"
+        is_view: false
+
+structs:
+    WriteConcernIdl:
+        description:
+            "An object representing a write concern document, used only for mapping to
+            and from BSON."
+        strict: true
+        fields:
+            w:
+                type: writeConcernW
+                cpp_name: writeConcernW
+                optional: true
+                stability: stable
+            j:
+                type: safeBool
+                optional: true
+                stability: stable
+            wtimeout:
+                type: writeConcernWTimeout
+                default: 0
+                stability: stable
+            fsync:
+                type: safeBool
+                optional: true
+                stability: stable
+            # Fields with names wElectionId, wOpTime, and getLastError are accepted in the WriteConcern document for
+            # backwards-compatibility reasons, but their values are entirely ignored.
+            wElectionId:
+                type: any
+                ignore: true
+                stability: stable
+            wOpTime:
+                type: any
+                ignore: true
+                stability: stable
+            getLastError:
+                type: any
+                ignore: true
+                stability: stable
+            provenance:
+                description: "The source for this provenance"
+                cpp_name: source
+                type: ReadWriteConcernProvenanceSource
+                optional: true
+                stability: stable

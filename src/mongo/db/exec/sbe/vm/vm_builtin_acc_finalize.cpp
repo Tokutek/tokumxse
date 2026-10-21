@@ -1,0 +1,106 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+// This function is necessary because 'aggDoubleDoubleSum()' result is 'Array' type but we need
+// to produce a scalar value out of it.
+value::TagValueMaybeOwned ByteCode::builtinDoubleDoubleSumFinalize(ArityType arity) {
+    auto fieldView = viewFromStack(0);
+    auto arr = value::getArrayView(fieldView.value);
+    return aggDoubleDoubleSumFinalizeImpl(arr);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinDoubleDoublePartialSumFinalize(ArityType arity) {
+    auto fieldView = viewFromStack(0);
+    return builtinDoubleDoublePartialSumFinalizeImpl(fieldView.tag, fieldView.value);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinDoubleDoublePartialSumFinalizeImpl(
+    value::TypeTags fieldTag, value::Value fieldValue) {
+    // For {$sum: 1}, we use aggSum instruction. In this case, the result type is guaranteed to be
+    // either 'NumberInt32', 'NumberInt64', or 'NumberDouble'. We should transform the scalar result
+    // into an array which is the over-the-wire data format from a shard to a merging side.
+    if (fieldTag == value::TypeTags::NumberInt32 || fieldTag == value::TypeTags::NumberInt64 ||
+        fieldTag == value::TypeTags::NumberDouble) {
+        value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto newArr = value::getArrayView(result.value());
+
+        DoubleDoubleSummation res;
+        BSONType resType = BSONType::numberInt;
+        switch (fieldTag) {
+            case value::TypeTags::NumberInt32:
+                res.addInt(value::bitcastTo<int32_t>(fieldValue));
+                break;
+            case value::TypeTags::NumberInt64:
+                res.addLong(value::bitcastTo<long long>(fieldValue));
+                resType = BSONType::numberLong;
+                break;
+            case value::TypeTags::NumberDouble:
+                res.addDouble(value::bitcastTo<double>(fieldValue));
+                resType = BSONType::numberDouble;
+                break;
+            default:
+                MONGO_UNREACHABLE_TASSERT(6546500);
+        }
+        auto [sum, addend] = res.getDoubleDouble();
+
+        // The merge-side expects that the first element is the BSON type, not internal slot type.
+        newArr->push_back_raw(value::TypeTags::NumberInt32,
+                              value::bitcastFrom<int>(stdx::to_underlying(resType)));
+        newArr->push_back_raw(value::TypeTags::NumberDouble, value::bitcastFrom<double>(sum));
+        newArr->push_back_raw(value::TypeTags::NumberDouble, value::bitcastFrom<double>(addend));
+
+        return std::move(result);
+    }
+
+    tassert(6546501, "The result slot must be an Array", fieldTag == value::TypeTags::Array);
+    auto arr = value::getArrayView(fieldValue);
+    tassert(6294000,
+            str::stream() << "The result slot must have at least "
+                          << AggSumValueElems::kMaxSizeOfArray - 1
+                          << " elements but got: " << arr->size(),
+            arr->size() >= AggSumValueElems::kMaxSizeOfArray - 1);
+
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(makeCopyArray(*arr));
+    auto newArr = value::getArrayView(result.value());
+
+    // Replaces the first element by the corresponding 'BSONType'.
+    auto bsonType = [=]() -> int {
+        switch (arr->getAt(AggSumValueElems::kNonDecimalTotalTag).tag) {
+            case value::TypeTags::NumberInt32:
+                return static_cast<int>(BSONType::numberInt);
+            case value::TypeTags::NumberInt64:
+                return static_cast<int>(BSONType::numberLong);
+            case value::TypeTags::NumberDouble:
+                return static_cast<int>(BSONType::numberDouble);
+            default:
+                MONGO_UNREACHABLE_TASSERT(6294001);
+                return 0;
+        }
+    }();
+    // The merge-side expects that the first element is the BSON type, not internal slot type.
+    newArr->setAt(AggSumValueElems::kNonDecimalTotalTag,
+                  value::TypeTags::NumberInt32,
+                  value::bitcastFrom<int>(bsonType));
+
+    return std::move(result);
+}  // ByteCode::builtinDoubleDoublePartialSumFinalize
+
+value::TagValueMaybeOwned ByteCode::builtinStdDevPopFinalize(ArityType arity) {
+    auto fieldView = viewFromStack(0);
+    return aggStdDevFinalizeImpl(fieldView.value, false /* isSamp */);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinStdDevSampFinalize(ArityType arity) {
+    auto fieldView = viewFromStack(0);
+    return aggStdDevFinalizeImpl(fieldView.value, true /* isSamp */);
+}
+
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

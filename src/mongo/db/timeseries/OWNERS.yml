@@ -1,0 +1,20 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-collection-write-path
+  - "timeseries_2dsphere_index_version_lookup*":
+    approvers:
+      - 10gen/query-execution
+  - "*catalog_helper*":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "upgrade_downgrade_viewless_timeseries*":
+    approvers:
+      - 10gen/server-catalog-and-routing-shard-catalog
+  - "upgrade_downgrade_viewless_timeseries_sharded_cluster*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl
+  - "viewless_timeseries_collection_creation_helpers*":
+    approvers:
+      - 10gen/server-catalog-and-routing-ddl

@@ -1,0 +1,75 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+idl_generator(
+    name = "oidc_server_parameters_gen",
+    src = "oidc_server_parameters.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "oidc",
+    srcs = [
+        "oidc_identity_providers_registry.cpp",
+        "oidc_identity_providers_registry_impl.cpp",
+        "oidc_server_parameters.cpp",
+        "oidc_server_parameters_gen",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/crypto:jwt",
+        "//src/mongo/crypto:jwt_types",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db:service_context",
+        "//src/mongo/util/options_parser",
+    ],
+)
+
+mongo_cc_library(
+    name = "oidc_commands",
+    srcs = [
+        "oidc_commands.cpp",
+    ],
+    deps = [
+        "oidc",
+        "//src/mongo/db:commands",
+        "//src/mongo/db/commands:test_commands_enabled",
+    ],
+)
+
+mongo_cc_library(
+    name = "oidc_test_fixture",
+    deps = [
+        ":oidc",
+        "//src/mongo/crypto:jwt",
+        "//src/mongo/db:audit",
+        "//src/mongo/db/auth:auth_impl_internal",
+        "//src/mongo/db/auth:authmocks",
+        "//src/mongo/db/auth:authorization_session_test_fixture",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "oidc_test",
+    srcs = [
+        "oidc_commands_test.cpp",
+        "oidc_identity_providers_registry_test.cpp",
+        "user_request_oidc_test.cpp",
+    ],
+    tags = ["mongo_unittest_seventh_group"],
+    deps = [
+        ":oidc",
+        ":oidc_commands",
+        ":oidc_test_fixture",
+    ],
+)

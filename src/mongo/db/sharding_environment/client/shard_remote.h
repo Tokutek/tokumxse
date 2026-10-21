@@ -1,0 +1,148 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/net/hostandport.h"
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+/*
+ * Maintains the targeting and command execution logic for a single shard. Performs polling of
+ * the shard (if replica set).
+ */
+class [[MONGO_MOD_PUBLIC]] ShardRemote : public Shard {
+    ShardRemote(const ShardRemote&) = delete;
+    ShardRemote& operator=(const ShardRemote&) = delete;
+
+public:
+    /**
+     * Instantiates a new shard connection management object for the specified shard.
+     */
+    ShardRemote(const ShardId& id,
+                const ConnectionString& connString,
+                std::unique_ptr<RemoteCommandTargeter> targeter,
+                std::shared_ptr<ShardSharedStateCache::State> sharedState);
+
+    ~ShardRemote() override;
+
+    const ConnectionString& getConnString() const override {
+        return _connString;
+    }
+
+    std::shared_ptr<RemoteCommandTargeter> getTargeter() const override {
+        return _targeter;
+    }
+
+    void updateReplSetMonitor(const HostAndPort& remoteHost,
+                              const Status& remoteCommandStatus) override;
+
+    std::string toString() const override;
+
+    bool isRetriableError(const Status& status,
+                          std::span<const std::string> errorLabels,
+                          RetryPolicy options) const final;
+
+    void runFireAndForgetCommand(OperationContext* opCtx,
+                                 const ReadPreferenceSetting& readPref,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) final;
+
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                const WriteConcernOptions& writeConcern,
+                                                RetryPolicy retryPolicy) final;
+
+private:
+    struct AsyncCmdHandle {
+        HostAndPort hostTargetted;
+        executor::TaskExecutor::CallbackHandle handle;
+    };
+
+    /**
+     * Returns the metadata that should be used when running commands against this shard with
+     * the given read preference.
+     */
+    BSONObj _appendMetadataForCommand(OperationContext* opCtx,
+                                      const ReadPreferenceSetting& readPref);
+
+    StatusWith<Shard::CommandResponse> _runCommand(OperationContext* opCtx,
+                                                   const ReadPreferenceSetting& readPref,
+                                                   const TargetingMetadata& targetingMetadata,
+                                                   const DatabaseName& dbName,
+                                                   Milliseconds maxTimeMSOverride,
+                                                   const BSONObj& cmdObj) final;
+
+    RetryStrategy::Result<Shard::QueryResponse> _runExhaustiveCursorCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const DatabaseName& dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj) final;
+
+    RetryStrategy::Result<QueryResponse> _exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const repl::ReadConcernArgs& readConcern,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none,
+        const boost::optional<BSONObj>& projection = boost::none) final;
+
+    RetryStrategy::Result<std::monostate> _runAggregation(
+        OperationContext* opCtx,
+        const TargetingMetadata& targetingMetadata,
+        const AggregateCommandRequest& aggRequest,
+        std::function<bool(const std::vector<BSONObj>& batch,
+                           const boost::optional<BSONObj>& postBatchResumeToken)> callback) final;
+
+
+    StatusWith<AsyncCmdHandle> _scheduleCommand(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const TargetingMetadata& targetingMetadata,
+        const DatabaseName& dbName,
+        Milliseconds maxTimeMSOverride,
+        const BSONObj& cmdObj,
+        const executor::TaskExecutor::RemoteCommandCallbackFn& cb);
+
+    /**
+     * Connection string for the shard at the creation time.
+     */
+    ConnectionString _connString;
+
+    /**
+     * Targeter for obtaining hosts from which to read or to which to write.
+     */
+    std::shared_ptr<RemoteCommandTargeter> _targeter;
+};
+
+}  // namespace mongo

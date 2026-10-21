@@ -1,213 +1,294 @@
-// processinfo.h
-
-/*    Copyright 2009 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <string>
-
-#include "mongo/platform/cstdint.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/static_immortal.h"
+
+#include <cstdint>
+#include <new>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    class ProcessInfo {
+class [[MONGO_MOD_PUBLIC]] ProcessInfo {
+public:
+    static auto constexpr kTranparentHugepageDirectory = "/sys/kernel/mm/transparent_hugepage";
+    static auto constexpr kGlibcTunableEnvVar = "GLIBC_TUNABLES";
+    static auto constexpr kRseqKey = "glibc.pthread.rseq";
+
+    ProcessInfo(ProcessId pid = ProcessId::getCurrent());
+    ~ProcessInfo();
+
+    /**
+     * @return mbytes
+     */
+    int getVirtualMemorySize();
+
+    /**
+     * @return mbytes
+     */
+    int getResidentSize();
+
+    /**
+     * Get the type of os (e.g. Windows, Linux, Mac OS)
+     */
+    static const std::string& getOsType() {
+        return sysInfo().osType;
+    }
+
+    /**
+     * Get the os Name (e.g. Ubuntu, Gentoo, Windows Server 2008)
+     */
+    static const std::string& getOsName() {
+        return sysInfo().osName;
+    }
+
+    /**
+     * Get the os version (e.g. 10.04, 11.3.0, 6.1 (build 7600))
+     */
+    static const std::string& getOsVersion() {
+        return sysInfo().osVersion;
+    }
+
+    /**
+     * Get the cpu address size (e.g. 32, 36, 64)
+     */
+    static unsigned getAddrSize() {
+        return sysInfo().addrSize;
+    }
+
+    /**
+     * Get the size of total memory available to the process in bytes
+     */
+    static unsigned long long getMemSizeBytes() {
+        return sysInfo().memLimit;
+    }
+
+    /**
+     * Get the size of total memory available to the process in MB
+     */
+    static unsigned long long getMemSizeMB() {
+        return sysInfo().memLimit / (1024 * 1024);
+    }
+
+    /**
+     * Get the total memory available on the machine in MB
+     */
+    static unsigned long long getSystemMemSizeMB() {
+        return sysInfo().memSize / (1024 * 1024);
+    }
+
+    /**
+     * Get the number of (logical) CPUs
+     */
+    static unsigned getNumLogicalCores() {
+        return sysInfo().numCores;
+    }
+
+    /**
+     * Get the number of physical CPUs
+     */
+    static unsigned getNumPhysicalCores() {
+        return sysInfo().numPhysicalCores;
+    }
+
+    /**
+     * Get the number of CPU sockets
+     */
+    static unsigned getNumCpuSockets() {
+        return sysInfo().numCpuSockets;
+    }
+
+    /**
+     * Get the number of cores available. Make a best effort to get the cores for this process.
+     * If that information is not available, get the total number of CPUs.
+     */
+    static uint64_t getNumAvailableCores() {
+        return ProcessInfo::getNumCoresForProcess().value_or(ProcessInfo::getNumLogicalCores());
+    }
+
+    /**
+     * Get the number of cores available for process or return the errorValue.
+     */
+    static int64_t getNumCoresAvailableToProcess(int64_t errorValue = -1) {
+        const auto cores = ProcessInfo::getNumCoresForProcess();
+        return cores ? static_cast<int64_t>(cores.value()) : errorValue;
+    }
+
+    /**
+     * Get the system page size in bytes.
+     */
+    static unsigned long long getPageSize() {
+        return sysInfo().pageSize;
+    }
+
+    /**
+     * Get the CPU architecture (e.g. x86, x86_64)
+     */
+    static const std::string& getArch() {
+        return sysInfo().cpuArch;
+    }
+
+    /**
+     * Determine if NUMA is enabled (interleaved) for this process
+     */
+    static bool hasNumaEnabled() {
+        return sysInfo().hasNuma;
+    }
+
+    /**
+     * Get the number of NUMA nodes if NUMA is enabled, or 1 otherwise.
+     */
+    static uint64_t getNumNumaNodes() {
+        if (sysInfo().hasNuma) {
+            return sysInfo().numNumaNodes;
+        }
+        return 1;
+    }
+
+    /**
+     * Determine if we need to workaround slow msync performance on Illumos/Solaris
+     */
+    static bool preferMsyncOverFSync() {
+        return sysInfo().preferMsyncOverFSync;
+    }
+
+    /**
+     * Transparent hugepage files display settings like so, with the selected setting in brackets:
+     *      always defer [defer+madvise] madvise never
+     *
+     * This function parses out the selected setting from this file format.
+     */
+    static StatusWith<std::string> readTransparentHugePagesParameter(
+        std::string_view parameter, std::string_view directory = kTranparentHugepageDirectory);
+
+    /**
+     * Check whether the environment variable GLIBC_TUNABLES=glibc.pthread.rseq=0 is correctly set.
+     */
+    static bool checkGlibcRseqTunable();
+
+    /**
+     * Get extra system stats
+     */
+    void appendSystemDetails(BSONObjBuilder& details) const {
+        details.appendElements(sysInfo()._extraStats);
+    }
+
+    /**
+     * Append platform-specific data to obj
+     */
+    void getExtraInfo(BSONObjBuilder& info);
+
+    bool supported();
+
+    static const std::string& getProcessName() {
+        return appInfo().getProcessName();
+    }
+
+    static int getDefaultListenBacklog() {
+        return sysInfo().defaultListenBacklog;
+    }
+
+private:
+    /**
+     * Host and operating system info.  Does not change over time.
+     */
+    class SystemInfo {
     public:
-        ProcessInfo( ProcessId pid = ProcessId::getCurrent() );
-        ~ProcessInfo();
+        std::string osType;
+        std::string osName;
+        std::string osVersion;
+        unsigned addrSize;
+        unsigned long long memSize;
+        unsigned long long memLimit;
+        unsigned numCores;
+        unsigned numPhysicalCores;
+        unsigned numCpuSockets;
+        unsigned long long pageSize;
+        std::string cpuArch;
+        bool hasNuma;
+        unsigned numNumaNodes;
+        BSONObj _extraStats;
 
-        /**
-         * @return mbytes
-         */
-        int getVirtualMemorySize();
+        // On non-Solaris (ie, Linux, Darwin, *BSD) kernels, prefer msync.
+        // Illumos kernels do O(N) scans in memory of the page table during msync which
+        // causes high CPU, Oracle Solaris 11.2 and later modified ZFS to workaround mongodb
+        // Oracle Solaris Bug:
+        //  18658199 Speed up msync() on ZFS by 90000x with this one weird trick
+        bool preferMsyncOverFSync;
 
-        /**
-         * @return mbytes
-         */
-        int getResidentSize();
+        int defaultListenBacklog;
 
-        /**
-         * Get the type of os (e.g. Windows, Linux, Mac OS)
-         */
-        const std::string& getOsType() const { return sysInfo().osType; }
-
-        /**
-         * Get the os Name (e.g. Ubuntu, Gentoo, Windows Server 2008)
-         */
-        const std::string& getOsName() const { return sysInfo().osName; }
-
-        /**
-         * Get the os version (e.g. 10.04, 11.3.0, 6.1 (build 7600))
-         */
-        const std::string& getOsVersion() const { return sysInfo().osVersion; }
-
-        /**
-         * Get the cpu address size (e.g. 32, 36, 64)
-         */
-        unsigned getAddrSize() const { return sysInfo().addrSize; }
-
-        /**
-         * Get the total amount of system memory in MB
-         */
-        unsigned long long getMemSizeMB() const { return sysInfo().memSize / (1024 * 1024); }
-
-        /**
-         * Get the number of CPUs
-         */
-        unsigned getNumCores() const { return sysInfo().numCores; }
-
-        /**
-         * Get the system page size in bytes.
-         */
-        static unsigned long long getPageSize() { return systemInfo->pageSize; }
-
-        /**
-         * Get the CPU architecture (e.g. x86, x86_64)
-         */
-        const std::string& getArch() const { return sysInfo().cpuArch; }
-
-        /**
-         * Determine if NUMA is enabled (interleaved) for this process
-         */
-        bool hasNumaEnabled() const { return sysInfo().hasNuma; }
-
-        /**
-         * Determine if file zeroing is necessary for newly allocated data files.
-         */
-        static bool isDataFileZeroingNeeded() { return systemInfo->fileZeroNeeded;  }
-
-        /**
-         * Determine if we need to workaround slow msync performance on Illumos/Solaris
-         */
-        static bool preferMsyncOverFSync() { return systemInfo->preferMsyncOverFSync;  }
-
-        /**
-         * Get extra system stats
-         */
-        void appendSystemDetails( BSONObjBuilder& details ) const {
-            details.append( StringData("extra"), sysInfo()._extraStats.copy() );
+        SystemInfo()
+            : addrSize(0),
+              memSize(0),
+              memLimit(0),
+              numCores(0),
+              numPhysicalCores(0),
+              numCpuSockets(0),
+              pageSize(0),
+              hasNuma(false),
+              numNumaNodes(0),
+              preferMsyncOverFSync(true),
+              defaultListenBacklog(0) {
+            // populate SystemInfo during construction
+            collectSystemInfo();
         }
-
-        /**
-         * Append platform-specific data to obj
-         */
-        void getExtraInfo( BSONObjBuilder& info );
-
-        bool supported();
-
-        static bool blockCheckSupported();
-
-        static bool blockInMemory(const void* start);
-
-        /**
-         * @return a pointer aligned to the start of the page the provided pointer belongs to.
-         *
-         * NOTE requires blockCheckSupported() == true
-         */
-        inline static const void* alignToStartOfPage(const void* ptr) {
-            return reinterpret_cast<const void*>(
-                    reinterpret_cast<unsigned long long>(ptr) & ~(getPageSize() - 1));
-        }
-
-        /**
-         * Sets i-th element of 'out' to non-zero if the i-th page starting from the one containing
-         * 'start' is in memory.
-         * The 'out' vector will be resized to fit the requested number of pages.
-         * @return true on success, false otherwise
-         *
-         * NOTE: requires blockCheckSupported() == true
-         */
-        static bool pagesInMemory(const void* start, size_t numPages, std::vector<char>* out);
 
     private:
-        /**
-         * Host and operating system info.  Does not change over time.
-         */
-        class SystemInfo {
-        public:
-            std::string osType;
-            std::string osName;
-            std::string osVersion;
-            unsigned addrSize;
-            unsigned long long memSize;
-            unsigned numCores;
-            unsigned long long pageSize;
-            std::string cpuArch;
-            bool hasNuma;
-            BSONObj _extraStats;
-
-            // This is an OS specific value, which determines whether files should be zero-filled
-            // at allocation time in order to avoid Microsoft KB 2731284.
-            //
-            bool fileZeroNeeded;
-
-            // On non-Solaris (ie, Linux, Darwin, *BSD) kernels, prefer msync.
-            // Illumos kernels do O(N) scans in memory of the page table during msync which
-            // causes high CPU, Oracle Solaris 11.2 and later modified ZFS to workaround mongodb
-            // Oracle Solaris Bug: 
-            //  18658199 Speed up msync() on ZFS by 90000x with this one weird trick
-            bool preferMsyncOverFSync;
-
-            SystemInfo() :
-                    addrSize( 0 ),
-                    memSize( 0 ),
-                    numCores( 0 ),
-                    pageSize( 0 ),
-                    hasNuma( false ),
-                    fileZeroNeeded (false), 
-                    preferMsyncOverFSync (true) { 
-                // populate SystemInfo during construction
-                collectSystemInfo();
-            }
-        private:
-            /** Collect host system info */
-            void collectSystemInfo();
-        };
-
-        ProcessId _pid;
-        static mongo::mutex _sysInfoLock;
-
-        static bool checkNumaEnabled();
-
-        static ProcessInfo::SystemInfo* systemInfo;
-
-        inline const SystemInfo& sysInfo() const {
-            return *systemInfo;
-        }
-
-    public:
-        static void initializeSystemInfo();
-
+        /** Collect host system info */
+        void collectSystemInfo();
     };
 
-    bool writePidFile( const std::string& path );
+    class ApplicationInfo {
+    public:
+        void init(const std::vector<std::string>& argv) {
+            invariant(!_isInitialized);
+            _isInitialized = true;
+            if (!argv.empty()) {
+                _processName = argv[0];
+            }
+        }
+        const std::string& getProcessName() const {
+            return _processName;
+        }
 
-    void printMemInfo( const char * whereContextStr = 0 );
+    private:
+        bool _isInitialized = false;
+        std::string _processName;
+    };
 
-}
+    ProcessId _pid;
+
+    static const SystemInfo& sysInfo() {
+        static ProcessInfo::SystemInfo systemInfo;
+        return systemInfo;
+    }
+
+public:
+    static ApplicationInfo& appInfo() {
+        static StaticImmortal<ApplicationInfo> applicationInfo{};
+        return applicationInfo.value();
+    }
+
+private:
+    /**
+     * Get the number of available CPUs. Depending on the OS, the number can be the
+     * number of available CPUs to the current process or scheduler.
+     */
+    static boost::optional<uint64_t> getNumCoresForProcess();
+};
+
+bool writePidFile(const std::string& path);
+}  // namespace mongo

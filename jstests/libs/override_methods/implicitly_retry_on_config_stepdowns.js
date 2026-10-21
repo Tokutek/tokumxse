@@ -1,0 +1,149 @@
+/**
+ * Overrides runCommand to retry operations that encounter FailedToSatisfyReadPreference or PrimarySteppedDown errors
+ * (or ConflictingOperationInProgress, for chunk operations), which can occur when the config server primary is stepped down.
+ *
+ * This override is intended to be used with the sharding_csrs_continuous_config_stepdown suite.
+ *
+ * NOTE: Tests that deliberately stop shards and expect FailedToSatisfyReadPreference or PrimarySteppedDown errors from
+ * them should be excluded from the suite in the yml file, not handled here. See the exclusion
+ * list in sharding_csrs_continuous_config_stepdown.yml for examples.
+ */
+
+import {getCommandName} from "jstests/libs/cmd_object_utils.js";
+import {OverrideHelpers} from "jstests/libs/override_methods/override_helpers.js";
+
+const kTimeout = 10 * 60 * 1000; // 10 minutes
+const kInterval = 200;
+
+// Make it easier to understand whether or not returns from the assert.soon are being retried.
+const kNoRetry = true;
+const kRetry = false;
+
+// Commands that should not be retried on FailedToSatisfyReadPreference.
+const kNonRetryableCommands = new Set([
+    // getMore errors cannot be retried since a client may not know if previous getMore advanced
+    // the cursor.
+    "getMore",
+    // We do not retry checkMetadataConsistency on FailedToSatisfyReadPreference
+    // from check_metadata_consistency_helpers.js
+    "checkMetadataConsistency",
+]);
+
+// Retried on ConflictingOperationInProgress from a config stepup.
+const kChunkOperationCommands = new Set(["split", "mergeChunks", "mergeAllChunksOnShard"]);
+
+function isChunkOperation(cmdObj) {
+    return (
+        typeof cmdObj === "object" &&
+        cmdObj !== null &&
+        kChunkOperationCommands.has(getCommandName(cmdObj))
+    );
+}
+
+function isRetryableException(e, cmdObj) {
+    // Check if exception or error object has FailedToSatisfyReadPreference or PrimarySteppedDown error.
+    if (
+        e.code === ErrorCodes.FailedToSatisfyReadPreference ||
+        e.code === ErrorCodes.PrimarySteppedDown
+    ) {
+        return true;
+    }
+
+    return e.code === ErrorCodes.ConflictingOperationInProgress && isChunkOperation(cmdObj);
+}
+
+function isRetryableError(res, cmdObj) {
+    if (isRetryableException(res, cmdObj)) {
+        return true;
+    }
+
+    if (res.writeErrors) {
+        for (const writeError of res.writeErrors) {
+            if (isRetryableException(writeError, cmdObj)) {
+                return true;
+            }
+        }
+    }
+
+    if (res.writeConcernError && isRetryableException(res.writeConcernError, cmdObj)) {
+        return true;
+    }
+
+    return false;
+}
+
+function shouldRetry(cmdObj, res) {
+    const cmdName = getCommandName(cmdObj);
+    if (kNonRetryableCommands.has(cmdName)) {
+        return false;
+    }
+    // Don't retry commands in transactions - the transaction logic handles retries
+    if (cmdObj.hasOwnProperty("autocommit")) {
+        return false;
+    }
+
+    return isRetryableError(res, cmdObj);
+}
+
+function runCommandWithRetries(conn, dbName, cmdName, cmdObj, func, makeFuncArgs) {
+    let res;
+    let attempt = 0;
+    let caughtException;
+
+    assert.soon(
+        () => {
+            attempt++;
+            caughtException = null;
+
+            try {
+                res = func.apply(conn, makeFuncArgs(cmdObj));
+            } catch (e) {
+                if (isRetryableException(e, cmdObj)) {
+                    jsTest.log.info(
+                        "Retrying on retryable exception (code " +
+                            e.code +
+                            ") from " +
+                            cmdName +
+                            " during config server stepdown. Attempt: " +
+                            attempt,
+                        {error: e.toString()},
+                    );
+                    caughtException = e;
+                    return kRetry;
+                }
+                throw e;
+            }
+
+            if (shouldRetry(cmdObj, res)) {
+                jsTest.log.info(
+                    "Retrying on config server stepdown error from " +
+                        cmdName +
+                        ". Attempt: " +
+                        attempt,
+                    {
+                        res,
+                    },
+                );
+                return kRetry;
+            }
+
+            return kNoRetry;
+        },
+        () =>
+            "Timed out while retrying command '" +
+            tojson(cmdObj) +
+            "' on config server stepdown error, response: " +
+            tojson(res) +
+            ", last exception: " +
+            (caughtException ? caughtException.toString() : "none"),
+        kTimeout,
+        kInterval,
+    );
+    return res;
+}
+
+OverrideHelpers.prependOverrideInParallelShell(
+    "jstests/libs/override_methods/implicitly_retry_on_config_stepdowns.js",
+);
+
+OverrideHelpers.overrideRunCommand(runCommandWithRetries);

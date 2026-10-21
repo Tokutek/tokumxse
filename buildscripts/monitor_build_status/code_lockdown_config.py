@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Optional
+
+import yaml
+from pydantic import BaseModel
+
+
+class ThresholdConfig(BaseModel):
+    count: int
+    grace_period_days: int
+
+
+class ThresholdOverride(BaseModel):
+    hot: int
+    cold: int
+
+
+class IssueThresholds(BaseModel):
+    hot: ThresholdConfig
+    cold: ThresholdConfig
+
+
+class ThresholdsConfig(BaseModel):
+    overall: IssueThresholds
+    group: IssueThresholds
+    team: IssueThresholds
+
+
+class JiraQueriesConfig(BaseModel):
+    hot: str
+    cold: str
+
+
+class ScopesConfig(BaseModel):
+    name: str
+    jira_queries: JiraQueriesConfig
+
+
+class SlackConfig(BaseModel):
+    overall_scope_tags: list[str]
+    message_footer: str
+    short_issue_data_table: bool = False
+
+
+class NotificationsConfig(BaseModel):
+    scopes: list[ScopesConfig]
+    thresholds: ThresholdsConfig
+    slack: SlackConfig
+
+
+# Note: pydantic 2 dropped the v1 behavior where `Optional[X]` implied a
+# default of None — without an explicit `= None` such fields are REQUIRED
+# and yaml entries that omit them fail validation.
+class TeamConfig(BaseModel):
+    name: str
+    slack_tags: Optional[list[str]] = None
+    thresholds: Optional[ThresholdOverride] = None
+
+
+class GroupConfig(BaseModel):
+    name: str
+    teams: list[str]
+    slack_tags: Optional[list[str]] = None
+    thresholds: Optional[ThresholdOverride] = None
+
+
+class CodeLockdownConfig(BaseModel):
+    notifications: list[NotificationsConfig]
+    teams: list[TeamConfig]
+    groups: list[GroupConfig]
+
+    @classmethod
+    def from_yaml_config(cls, file_path: str) -> CodeLockdownConfig:
+        """
+        Read the configuration from the given file.
+
+        :param file_path: Path to file.
+        :return: Config object.
+        """
+        with open(file_path, encoding="utf8") as file_handler:
+            return cls(**yaml.safe_load(file_handler))
+
+    def get_all_group_names(self) -> list[str]:
+        """Get all group names."""
+        return [group.name for group in self.groups]
+
+    def get_group_teams(self, group_name: str) -> list[str]:
+        """
+        Get group teams.
+
+        :param group_name: The name of the group.
+        :return: List of teams that belongs to the group.
+        """
+        for group in self.groups:
+            if group.name == group_name:
+                return group.teams
+
+        return []
+
+    def get_group_slack_tags(self, group_name: str) -> list[str]:
+        """
+        Get group slack tags.
+
+        :param group_name: The name of the group.
+        :return: Group slack tags.
+        """
+        for group in self.groups:
+            if group.name == group_name:
+                return group.slack_tags or []
+
+        return []
+
+    def get_team_slack_tags(self, team_name: str) -> list[str]:
+        """
+        Get team slack tags.
+
+        :param team_name: The name of the team.
+        :return: Team slack tags.
+        """
+        for team in self.teams:
+            if team.name == team_name:
+                return team.slack_tags or []
+
+        return []
+
+    def get_group_thresholds(self, group_name: str, defaults: IssueThresholds) -> IssueThresholds:
+        """
+        Get group thresholds (or defaults if none set)
+        """
+
+        for group in self.groups:
+            if group.name == group_name and group.thresholds:
+                thresholds = deepcopy(defaults)
+                if group.thresholds.hot is not None:
+                    thresholds.hot.count = group.thresholds.hot
+                if group.thresholds.cold is not None:
+                    thresholds.cold.count = group.thresholds.cold
+                return thresholds
+
+        return defaults
+
+    def get_team_thresholds(self, team_name: str, defaults: IssueThresholds) -> IssueThresholds:
+        """
+        Get team thresholds (or defaults if none set)
+        """
+
+        for team in self.teams:
+            if team.name == team_name and team.thresholds:
+                thresholds = deepcopy(defaults)
+                if team.thresholds.hot is not None:
+                    thresholds.hot.count = team.thresholds.hot
+                if team.thresholds.cold is not None:
+                    thresholds.cold.count = team.thresholds.cold
+                return thresholds
+
+        return defaults

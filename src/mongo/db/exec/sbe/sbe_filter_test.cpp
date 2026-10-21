@@ -1,0 +1,160 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/**
+ * This file contains tests for sbe::FilterStage.
+ */
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
+#include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
+#include "mongo/db/exec/sbe/stages/filter.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+#include <utility>
+
+
+namespace mongo::sbe {
+
+using FilterStageTest = PlanStageTestFixture;
+
+TEST_F(FilterStageTest, ConstantFilterAlwaysTrueTest) {
+    auto input = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(12LL << "yar" << BSON_ARRAY(2.5) << 7.5 << BSON("foo" << 23))));
+
+    auto expected = value::TagValueOwned::fromRaw(value::copyValue(input.tag(), input.value()));
+
+    auto makeStageFn = [](value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
+        // Build a constant FilterStage whose filter expression is always boolean true.
+        auto filter = makeS<FilterStage<true>>(
+            std::move(scanStage),
+            makeE<EConstant>(value::TypeTags::Boolean, value::bitcastFrom<bool>(true)),
+            kEmptyPlanNodeId);
+
+        return std::make_pair(scanSlot, std::move(filter));
+    };
+
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTest(inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(FilterStageTest, ConstantFilterAlwaysFalseTest) {
+    auto input = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(12LL << "yar" << BSON_ARRAY(2.5) << 7.5 << BSON("foo" << 23))));
+
+    auto expected = value::TagValueOwned::fromRaw(value::makeNewArray());
+
+    auto makeStageFn = [](value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
+        // Build a constant FilterStage whose filter expression is always boolean false.
+        auto filter = makeS<FilterStage<true>>(
+            std::move(scanStage),
+            makeE<EConstant>(value::TypeTags::Boolean, value::bitcastFrom<bool>(false)),
+            kEmptyPlanNodeId);
+
+        return std::make_pair(scanSlot, std::move(filter));
+    };
+
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTest(inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(FilterStageTest, FilterAlwaysTrueTest) {
+    auto input = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(12LL << "yar" << BSON_ARRAY(2.5) << 7.5 << BSON("foo" << 23))));
+
+    auto expected = value::TagValueOwned::fromRaw(value::copyValue(input.tag(), input.value()));
+
+    auto makeStageFn = [](value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
+        // Build a non-constant FilterStage whose filter expression is always boolean true.
+        auto filter = makeS<FilterStage<false>>(
+            std::move(scanStage),
+            makeE<EConstant>(value::TypeTags::Boolean, value::bitcastFrom<bool>(true)),
+            kEmptyPlanNodeId);
+
+        return std::make_pair(scanSlot, std::move(filter));
+    };
+
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTest(inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(FilterStageTest, FilterAlwaysFalseTest) {
+    auto input = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(12LL << "yar" << BSON_ARRAY(2.5) << 7.5 << BSON("foo" << 23))));
+
+    auto expected = value::TagValueOwned::fromRaw(value::makeNewArray());
+
+    auto makeStageFn = [](value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
+        // Build a non-constant FilterStage whose filter expression is always boolean false.
+        auto filter = makeS<FilterStage<false>>(
+            std::move(scanStage),
+            makeE<EConstant>(value::TypeTags::Boolean, value::bitcastFrom<bool>(false)),
+            kEmptyPlanNodeId);
+
+        return std::make_pair(scanSlot, std::move(filter));
+    };
+
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTest(inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(FilterStageTest, FilterIsNumberTest) {
+    using namespace std::literals;
+
+    auto input = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(12LL << "42" << BSON_ARRAY(2.5) << 7.5 << BSON("34" << 56))));
+
+    auto expected =
+        value::TagValueOwned::fromRaw(stage_builder::makeValue(BSON_ARRAY(12LL << 7.5)));
+
+    auto makeStageFn = [](value::SlotId scanSlot, std::unique_ptr<PlanStage> scanStage) {
+        // Build a FilterStage whose filter expression is "isNumber(scanSlot)".
+        auto filter = makeS<FilterStage<false>>(
+            std::move(scanStage),
+            makeE<EFunction>(EFn::kIsNumber, makeEs(makeE<EVariable>(scanSlot))),
+            kEmptyPlanNodeId);
+
+        return std::make_pair(scanSlot, std::move(filter));
+    };
+
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTest(inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+TEST_F(FilterStageTest, FilterLessThanTest) {
+    auto input = value::TagValueOwned::fromRaw(stage_builder::makeValue(BSON_ARRAY(
+        BSON_ARRAY(2.8 << 3) << BSON_ARRAY(7LL << 5.0) << BSON_ARRAY(4LL << 4.3)
+                             << BSON_ARRAY(8 << 8) << BSON_ARRAY("1" << 2) << BSON_ARRAY(1 << "2")
+                             << BSON_ARRAY(4.9 << 5) << BSON_ARRAY(6.0 << BSON_ARRAY(11.0)))));
+
+    auto expected = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(BSON_ARRAY(2.8 << 3) << BSON_ARRAY(4LL << 4.3) << BSON_ARRAY(4.9 << 5))));
+
+    auto makeStageFn = [](value::SlotVector scanSlots, std::unique_ptr<PlanStage> scanStage) {
+        // Build a FilterStage whose filter expression is "slot0 < slot1".
+        auto filter = makeS<FilterStage<false>>(std::move(scanStage),
+                                                makeE<EPrimBinary>(EPrimBinary::less,
+                                                                   makeE<EVariable>(scanSlots[0]),
+                                                                   makeE<EVariable>(scanSlots[1])),
+                                                kEmptyPlanNodeId);
+        return std::make_pair(scanSlots, std::move(filter));
+    };
+
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTestMulti(2, inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+}  // namespace mongo::sbe

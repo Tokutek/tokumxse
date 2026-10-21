@@ -1,0 +1,22 @@
+test_kind: js_test
+
+selector:
+  roots:
+    - jstestfuzz/out/*.js
+
+executor:
+  archive:
+    tests: true
+  config:
+    shell_options:
+      nodb: ""
+      # BF-45258: these suites are where the shell runs out of memory, and the heap at that moment
+      # is the evidence we lack. Abort so the kernel writes a core of it.
+      jsAbortOnOutOfMemory: ""
+      global_vars:
+        TestData:
+          clusterType: "standalone"
+          traceExceptions: false
+          internalQueryAppendIdToSetWindowFieldsSort: true
+          # Reduce the number of docs generated from $densify to avoid the 30min timeout.
+          internalQueryMaxAllowedDensifyDocs: 1000

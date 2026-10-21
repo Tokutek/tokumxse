@@ -1,0 +1,946 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/crypto/symmetric_crypto.h"
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_range_cursor.h"
+#include "mongo/base/secure_allocator.h"
+#include "mongo/base/status_with.h"
+#include "mongo/crypto/block_packer.h"
+#include "mongo/crypto/symmetric_key.h"
+#include "mongo/unittest/thread_assertion_monitor.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <iterator>
+#include <memory>
+#include <numeric>
+#include <queue>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+namespace mongo {
+namespace crypto {
+using namespace std::literals::string_view_literals;
+
+std::vector<uint8_t> generateByteSequence(uint8_t start, uint8_t count) {
+    std::vector<uint8_t> result;
+    for (uint8_t i = start; i < count; i++) {
+        result.push_back(i);
+    }
+    return result;
+}
+
+class MockPackerCallback {
+public:
+    ~MockPackerCallback() {
+        ASSERT(_invokations.empty());
+    }
+
+    StatusWith<size_t> operator()(ConstDataRange input) {
+        ASSERT_GT(input.length(), 0);
+        ASSERT(input.length() % 16 == 0);
+        ASSERT(_invokations.size() > 0);
+
+        uint8_t front = _invokations.front();
+        _invokations.pop();
+        ASSERT_EQ(front, input.length());
+        auto expectedBuffer = generateByteSequence(index, input.length());
+        index += input.length();
+        ASSERT(std::equal(expectedBuffer.begin(), expectedBuffer.end(), input.data()));
+
+        return 0;
+    }
+
+    void expects(std::initializer_list<uint8_t> expectations) {
+        _invokations = std::queue<uint8_t>(std::move(expectations));
+        ASSERT(_invokations.size() > 0);
+    }
+
+private:
+    size_t index = 0;
+    std::queue<uint8_t> _invokations;
+};
+
+// Test that a Packer with no input has no leftover bytes
+TEST(BlockPacker, NoInput) {
+    BlockPacker packer;
+    auto leftovers = packer.getBlock();
+    ASSERT(leftovers.empty());
+}
+
+// Test that all writes that fill up to a single block
+// produce no callback invokations
+TEST(BlockPacker, SingleWriteBlock) {
+    for (int i = 0; i <= 16; i++) {
+        MockPackerCallback callback;
+        BlockPacker packer;
+
+        auto buffer = generateByteSequence(0, i);
+        ASSERT_OK(packer.pack(ConstDataRange(buffer), callback));
+        auto leftovers = packer.getBlock();
+        ASSERT_EQ(i, leftovers.length());
+    }
+}
+
+// Test a single write which overflows a block
+TEST(BlockPacker, SingleWriteBiggerThanBlock) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 17);
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(1, leftovers.length());
+}
+
+// Test a single write which perfectly fills multiple blocks
+TEST(BlockPacker, SingleWriteMultiBlock) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 32);
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(16, leftovers.length());
+}
+
+// Test a single write which fills multiple blocks, and then overflows the last
+TEST(BlockPacker, MultiBlockInputPlus) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 33);
+    callback.expects({32});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(1, leftovers.length());
+}
+
+// Given an initial partially filled block...
+// ... Try writing insufficient data to fill the block
+TEST(BlockPacker, PrepackedLessThanBlock) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 2);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 1), callback));
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 1, buffer.data() + 2), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(2, leftovers.length());
+}
+
+// ... Try writing just enough data to fill the block
+TEST(BlockPacker, PrepackedFillBlock) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 16);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 2), callback));
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 2, buffer.data() + 16), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(16, leftovers.length());
+}
+
+// .. Try writing more data than is needed to fill the block
+TEST(BlockPacker, PrepackedMoreThanBlock) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 20);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 10), callback));
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 10, buffer.data() + 20), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(4, leftovers.length());
+}
+
+// ... Try writing enough data to fill the block, and the next block.
+TEST(BlockPacker, BlockAlignPrepackedBuffer) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 32);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 6), callback));
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 6, buffer.data() + 32), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(16, leftovers.length());
+}
+
+// ... Try writing enough data to fill the block, the next block, and then partial fill the next.
+TEST(BlockPacker, OverflowNewBlockWithPrepackedBuffer) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 33);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 6), callback));
+    callback.expects({16, 16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 6, buffer.data() + 33), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(1, leftovers.length());
+}
+
+// ... Try writing enough data to fill the block, then several more.
+TEST(BlockPacker, OverflowMultipleBlocksWithPrepackedBuffer) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 64);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 6), callback));
+    callback.expects({16, 32});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 6, buffer.data() + 64), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(16, leftovers.length());
+}
+
+// Given an initial write which overflows a block...
+
+// ... Try writing insufficient data to align the next block
+TEST(BlockPacker, OverflowedThenUnderfill) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 31);
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 17), callback));
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 17, buffer.data() + 31), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(15, leftovers.length());
+}
+
+// ... Try writing enough data to align the next block
+TEST(BlockPacker, OverflowedThenAlign) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 32);
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 17), callback));
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 17, buffer.data() + 32), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(16, leftovers.length());
+}
+
+// ... Try writing enough data to overflow the next block
+TEST(BlockPacker, OverflowedThenOverflow) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 33);
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 17), callback));
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 17, buffer.data() + 33), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(1, leftovers.length());
+}
+
+// Given an initial write of one block...
+
+// ... Try writing insufficient data to align the next block
+TEST(BlockPacker, AlignedThenUnderfill) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 31);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 16), callback));
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 16, buffer.data() + 31), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(15, leftovers.length());
+}
+
+// ... Try writing enough data to align the next block
+TEST(BlockPacker, AlignedThenAlign) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 32);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 16), callback));
+    callback.expects({16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 16, buffer.data() + 32), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(16, leftovers.length());
+}
+
+// ... Try writing enough data to overfill the next block
+TEST(BlockPacker, AlignedThenOverfill) {
+    MockPackerCallback callback;
+    BlockPacker packer;
+
+    auto buffer = generateByteSequence(0, 33);
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data(), buffer.data() + 16), callback));
+    callback.expects({16, 16});
+    ASSERT_OK(packer.pack(ConstDataRange(buffer.data() + 16, buffer.data() + 33), callback));
+    auto leftovers = packer.getBlock();
+    ASSERT_EQ(1, leftovers.length());
+}
+
+#ifdef __linux__
+// (Only for OpenSSL, i.e. on Linux)
+// ... Try using insufficiently large output buffers for encryption and decryption
+TEST(SymmetricEncryptor, InsufficientOutputBuffer) {
+    SymmetricKey key = crypto::aesGenerate(crypto::sym256KeySize, "InsufficientOutputBufferTest");
+    constexpr auto plaintextMessage = "DOLOREM IPSUM"sv;
+    std::vector<uint8_t> encodedPlaintext(plaintextMessage.begin(), plaintextMessage.end());
+    const std::array<uint8_t, 16> iv = {};
+    std::array<std::uint8_t, 1024> cryptoBuffer;
+    DataRange cryptoRange(cryptoBuffer.data(), cryptoBuffer.size());
+
+    auto swEnc = crypto::SymmetricEncryptor::create(key, crypto::aesMode::cbc, iv);
+    ASSERT_OK(swEnc.getStatus());
+    auto encryptor = std::move(swEnc.getValue());
+    DataRangeCursor cryptoCursor(cryptoRange);
+
+    // Validate that encryption with insufficient output buffer does not succeed
+    DataRange smallOutputBuffer(cryptoBuffer.data(), 1);
+    ASSERT_NOT_OK(encryptor->update(encodedPlaintext, smallOutputBuffer));
+
+    // Validate that encryption with zero output buffer does not succeed
+    DataRange zeroOutputBuffer(cryptoBuffer.data(), 0);
+    ASSERT_NOT_OK(
+        encryptor->update({plaintextMessage.data(), plaintextMessage.size()}, zeroOutputBuffer));
+
+    auto swSize = encryptor->update(encodedPlaintext, cryptoCursor);
+    ASSERT_OK(swSize);
+    cryptoCursor.advance(swSize.getValue());
+
+    swSize = encryptor->finalize(cryptoCursor);
+    ASSERT_OK(swSize);
+
+    // finalize is guaranteed to output at least 16 bytes for the CBC blockmode
+    ASSERT_GTE(swSize.getValue(), 16);
+    cryptoCursor.advance(swSize.getValue());
+
+    // Validate beginning of decryption process
+    auto swDec = crypto::SymmetricDecryptor::create(key, crypto::aesMode::cbc, iv);
+    ASSERT_OK(swDec.getStatus());
+    auto decryptor = std::move(swDec.getValue());
+
+    // Validate that decryption with insufficient output buffer does not succeed
+    std::array<uint8_t, 1> shortOutputBuffer;
+    DataRangeCursor shortOutputCursor(shortOutputBuffer);
+    ASSERT_NOT_OK(decryptor->update(
+        {cryptoRange.data(), cryptoRange.length() - cryptoCursor.length()}, shortOutputCursor));
+
+    // Validate that decryption with zero output buffer does not succeed
+    DataRangeCursor zeroOutputCursor(zeroOutputBuffer);
+    ASSERT_NOT_OK(decryptor->update(
+        {cryptoRange.data(), cryptoRange.length() - cryptoCursor.length()}, zeroOutputCursor));
+
+    // Validate that decryption update/finalize with sufficient output buffer succeeds
+    std::array<uint8_t, 1024> decryptionBuffer;
+    DataRangeCursor decryptionCursor(decryptionBuffer);
+    auto swUpdateSize = decryptor->update(
+        {cryptoRange.data(), cryptoRange.length() - cryptoCursor.length()}, decryptionCursor);
+    ASSERT_OK(swUpdateSize.getStatus());
+    decryptionCursor.advance(swUpdateSize.getValue());
+    auto swFinalizeSize = decryptor->finalize(decryptionCursor);
+    ASSERT_OK(swFinalizeSize.getStatus());
+
+    // Validate that the decrypted ciphertext matches the original plaintext
+    ASSERT(std::equal(plaintextMessage.begin(), plaintextMessage.end(), decryptionBuffer.begin()));
+}
+#endif
+
+// The following tests validate that SymmetricEncryptors function when called with inputs with
+// varying block alignments.
+TEST(SymmetricEncryptor, PaddingLogic) {
+    SymmetricKey key = crypto::aesGenerate(crypto::sym256KeySize, "SymmetricEncryptorTest");
+    const std::array<uint8_t, 16> iv = {};
+    std::array<std::uint8_t, 1024> cryptoBuffer;
+    DataRange cryptoRange(cryptoBuffer.data(), cryptoBuffer.size());
+    // This array defines a series of different test cases. Each sub-array defines a series of calls
+    // to encryptor->update(). Each number represents the number of bytes to pass to update in a
+    // single call
+    const std::vector<std::vector<uint8_t>> testData = {
+        // Pre-condition: blockBuffer is empty
+        {0x01, 0x10},
+        {0x10},
+        {0x20},
+        {0x05, 0x30},
+        {
+            0x02,
+            0x07,
+        },
+        {
+            0x0B,
+        },
+        {
+            0x15,
+            0x26,
+        },
+    };
+
+    // We will loop through all of the test cases, ensuring no fatal errors,
+    // and ensuring correct encryption and decryption.
+    for (auto& testCase : testData) {
+        auto swEnc = crypto::SymmetricEncryptor::create(key, crypto::aesMode::cbc, iv);
+        ASSERT_OK(swEnc.getStatus());
+        auto encryptor = std::move(swEnc.getValue());
+        DataRangeCursor cryptoCursor(cryptoRange);
+        // Make subsequent calls to encryptor->update() as defined by the test data
+        std::vector<uint8_t> accumulatedPlaintext;
+        for (auto& updateBytes : testCase) {
+            std::vector<uint8_t> plainText(updateBytes, updateBytes);
+            std::copy(plainText.begin(), plainText.end(), std::back_inserter(accumulatedPlaintext));
+            auto swSize = encryptor->update(plainText, cryptoCursor);
+            ASSERT_OK(swSize);
+            cryptoCursor.advance(swSize.getValue());
+        }
+        auto swSize = encryptor->finalize(cryptoCursor);
+        ASSERT_OK(swSize);
+
+        // finalize is guaranteed to output at least 16 bytes for the CBC blockmode
+        ASSERT_GTE(swSize.getValue(), 16);
+        cryptoCursor.advance(swSize.getValue());
+
+        // Validate the length of the ciphertext is plausible for the plaintext
+        auto totalSize = std::accumulate(testCase.begin(), testCase.end(), 0);
+        auto totalBlocks = totalSize / 16 + 1;
+        ASSERT_EQ(totalBlocks * 16, cryptoRange.length() - cryptoCursor.length());
+
+        // Validate that the ciphertext can be decrypted
+        auto swDec = crypto::SymmetricDecryptor::create(key, crypto::aesMode::cbc, iv);
+        ASSERT_OK(swDec.getStatus());
+        auto decryptor = std::move(swDec.getValue());
+        std::array<uint8_t, 1024> decryptionBuffer;
+        DataRangeCursor decryptionCursor(decryptionBuffer);
+        auto swUpdateSize = decryptor->update(
+            {cryptoRange.data(), cryptoRange.length() - cryptoCursor.length()}, decryptionCursor);
+        ASSERT_OK(swUpdateSize.getStatus());
+        decryptionCursor.advance(swUpdateSize.getValue());
+        auto swFinalizeSize = decryptor->finalize(decryptionCursor);
+        ASSERT_OK(swUpdateSize.getStatus());
+        decryptionCursor.advance(swUpdateSize.getValue());
+        ASSERT_EQ(totalSize, swUpdateSize.getValue() + swFinalizeSize.getValue());
+
+        // Validate that the decrypted ciphertext matches the original plaintext
+        ASSERT(std::equal(
+            accumulatedPlaintext.begin(), accumulatedPlaintext.end(), decryptionBuffer.begin()));
+    }
+}
+
+SymmetricKey aesGeneratePredictableKey256(std::string_view stringKey, std::string_view keyId) {
+    const size_t keySize = crypto::sym256KeySize;
+    ASSERT_EQ(keySize, stringKey.size());
+
+    SecureVector<uint8_t> key(keySize);
+    std::copy(stringKey.begin(), stringKey.end(), key->begin());
+
+    return SymmetricKey(std::move(key), crypto::aesAlgorithm, std::string{keyId});
+}
+
+// Convenience wrappers to avoid line-wraps later.
+const char* asChar(const std::uint8_t* data) {
+    return reinterpret_cast<const char*>(data);
+};
+
+// Positive/Negative test for additional authenticated data GCM encryption.
+// Setup encryptor/decryptor with fixed key/iv/aad in order to produce predictable results.
+// Check roundtrip and that tag violation triggers failure.
+void GCMAdditionalAuthenticatedDataHelper(bool succeed) {
+    const auto mode = crypto::aesMode::gcm;
+    if (!crypto::getSupportedSymmetricAlgorithms().count(getStringFromCipherMode(mode))) {
+        return;
+    }
+
+    constexpr auto kKey = "abcdefghijklmnopABCDEFGHIJKLMNOP"sv;
+    SymmetricKey key = aesGeneratePredictableKey256(kKey, "testID");
+
+    constexpr auto kIV = "FOOBARbazqux"sv;
+    std::array<std::uint8_t, 12> iv;
+    std::copy(kIV.begin(), kIV.end(), iv.begin());
+
+    auto encryptor = uassertStatusOK(crypto::SymmetricEncryptor::create(key, mode, iv));
+
+    constexpr auto kAAD = "Hello World"sv;
+    ASSERT_OK(encryptor->addAuthenticatedData({kAAD.data(), kAAD.size()}));
+
+    constexpr auto kPlaintextMessage = "01234567012345670123456701234567"sv;
+    constexpr auto kBufferSize = kPlaintextMessage.size() + (2 * crypto::aesBlockSize);
+    std::array<std::uint8_t, kBufferSize> cipherText;
+    std::size_t cipherLen = 0;
+    {
+        DataRangeCursor cipherTextCursor(cipherText);
+        cipherLen = uassertStatusOK(encryptor->update(
+            {kPlaintextMessage.data(), kPlaintextMessage.size()}, cipherTextCursor));
+        cipherTextCursor.advance(cipherLen);
+        cipherLen += uassertStatusOK(encryptor->finalize(cipherTextCursor));
+    }
+
+    constexpr auto kExpectedCipherText =
+        "\xF1\x87\x38\x92\xA3\x0E\x77\x27\x92\xB1\x3B\xA6\x27\xB5\xF5\x2B"
+        "\xA0\x16\xCC\xB8\x88\x54\xC0\x06\x6E\x36\xCF\x3B\xB0\x8B\xF5\x11";
+    ASSERT_EQ(std::string_view(asChar(cipherText.data()), cipherLen), kExpectedCipherText);
+
+    std::array<std::uint8_t, 12> tag;
+    const auto taglen = uassertStatusOK(encryptor->finalizeTag({tag}));
+
+    constexpr auto kExpectedTag = "\xF9\xD6\xF9\x63\x21\x93\xE8\x5C\x42\xAA\x5E\x02"sv;
+    ASSERT_EQ(std::string_view(asChar(tag.data()), taglen), kExpectedTag);
+
+    auto decryptor = uassertStatusOK(crypto::SymmetricDecryptor::create(key, mode, iv));
+    ASSERT_OK(decryptor->addAuthenticatedData({kAAD.data(), kAAD.size()}));
+
+    std::array<std::uint8_t, kBufferSize> plainText;
+    auto plainLen = uassertStatusOK(decryptor->update({cipherText.data(), cipherLen}, plainText));
+
+    if (!succeed) {
+        // Corrupt the authenticated tag, which should cause a failure below.
+        ++tag[0];
+    }
+
+    ASSERT_OK(decryptor->updateTag(tag));
+    auto swFinalize =
+        decryptor->finalize({plainText.data() + plainLen, plainText.size() - plainLen});
+
+    if (!succeed) {
+        ASSERT_NOT_OK(swFinalize.getStatus());
+        return;
+    }
+
+    ASSERT_OK(swFinalize.getStatus());
+    plainLen += swFinalize.getValue();
+
+    ASSERT_EQ(std::string_view(asChar(plainText.data()), plainLen), kPlaintextMessage);
+}
+
+TEST(AES, GCMAdditionalAuthenticatedData) {
+    GCMAdditionalAuthenticatedDataHelper(true);
+    GCMAdditionalAuthenticatedDataHelper(false);
+}
+
+namespace {
+// One-shot CBC helpers shared by the cipher-context-reuse tests below. Each
+// returns the byte count written into `out`.
+size_t cbcEncrypt(const SymmetricKey& key,
+                  ConstDataRange iv,
+                  std::string_view plaintext,
+                  DataRange out) {
+    auto encryptor = uassertStatusOK(SymmetricEncryptor::create(key, aesMode::cbc, iv));
+    DataRangeCursor cursor(out);
+    size_t len = uassertStatusOK(encryptor->update({plaintext.data(), plaintext.size()}, cursor));
+    cursor.advance(len);
+    return len + uassertStatusOK(encryptor->finalize(cursor));
+}
+
+size_t cbcDecrypt(const SymmetricKey& key,
+                  ConstDataRange iv,
+                  ConstDataRange cipher,
+                  DataRange out) {
+    auto decryptor = uassertStatusOK(SymmetricDecryptor::create(key, aesMode::cbc, iv));
+    DataRangeCursor cursor(out);
+    size_t len = uassertStatusOK(decryptor->update(cipher, cursor));
+    cursor.advance(len);
+    return len + uassertStatusOK(decryptor->finalize(cursor));
+}
+}  // namespace
+
+// Covers the thread-local EVP_CIPHER_CTX reuse path: the second decryptor's
+// reset must wipe all state from the first decryption.
+TEST(SymmetricDecryptor, SequentialReuseOnSameThread) {
+    SymmetricKey key = crypto::aesGenerate(crypto::sym256KeySize, "SequentialReuseTest");
+    const std::array<std::uint8_t, 16> iv = {};
+
+    constexpr auto kMessageA = "first plaintext"sv;
+    constexpr auto kMessageB = "second plaintext, slightly longer"sv;
+
+    std::array<std::uint8_t, 64> cipherA, cipherB;
+    auto cipherALen = cbcEncrypt(key, iv, kMessageA, cipherA);
+    auto cipherBLen = cbcEncrypt(key, iv, kMessageB, cipherB);
+
+    std::array<std::uint8_t, 64> plainA, plainB;
+    auto plainALen = cbcDecrypt(key, iv, {cipherA.data(), cipherALen}, plainA);
+    auto plainBLen = cbcDecrypt(key, iv, {cipherB.data(), cipherBLen}, plainB);
+
+    ASSERT_EQ(std::string_view(asChar(plainA.data()), plainALen), kMessageA);
+    ASSERT_EQ(std::string_view(asChar(plainB.data()), plainBLen), kMessageB);
+}
+
+// Verifies the thread-local CTX reset wipes leftover GCM tag/key/IV state from
+// a decryptor whose finalize() failed mid-sequence.
+TEST(SymmetricDecryptor, RecoverAfterFailedDecrypt) {
+    const auto mode = aesMode::gcm;
+    if (!getSupportedSymmetricAlgorithms().count(getStringFromCipherMode(mode))) {
+        return;
+    }
+
+    constexpr auto kKey = "abcdefghijklmnopABCDEFGHIJKLMNOP"sv;
+    SymmetricKey key = aesGeneratePredictableKey256(kKey, "testID");
+
+    constexpr auto kIV = "FOOBARbazqux"sv;
+    std::array<std::uint8_t, 12> iv;
+    std::copy(kIV.begin(), kIV.end(), iv.begin());
+
+    constexpr auto kPlaintext = "the quick brown fox"sv;
+    std::array<std::uint8_t, 64> cipher;
+    size_t cipherLen = 0;
+    std::array<std::uint8_t, 12> tag;
+    {
+        auto encryptor = uassertStatusOK(SymmetricEncryptor::create(key, mode, iv));
+        DataRangeCursor cursor(cipher);
+        cipherLen =
+            uassertStatusOK(encryptor->update({kPlaintext.data(), kPlaintext.size()}, cursor));
+        cursor.advance(cipherLen);
+        cipherLen += uassertStatusOK(encryptor->finalize(cursor));
+        uassertStatusOK(encryptor->finalizeTag(tag));
+    }
+
+    {
+        auto decryptor = uassertStatusOK(SymmetricDecryptor::create(key, mode, iv));
+        auto badTag = tag;
+        badTag[0]++;
+        ASSERT_OK(decryptor->updateTag(badTag));
+        std::array<std::uint8_t, 64> plain;
+        DataRangeCursor cursor(plain);
+        auto size = uassertStatusOK(decryptor->update({cipher.data(), cipherLen}, cursor));
+        cursor.advance(size);
+        ASSERT_NOT_OK(decryptor->finalize(cursor));
+    }
+
+    {
+        auto decryptor = uassertStatusOK(SymmetricDecryptor::create(key, mode, iv));
+        ASSERT_OK(decryptor->updateTag(tag));
+        std::array<std::uint8_t, 64> plain;
+        DataRangeCursor cursor(plain);
+        auto size = uassertStatusOK(decryptor->update({cipher.data(), cipherLen}, cursor));
+        cursor.advance(size);
+        size += uassertStatusOK(decryptor->finalize(cursor));
+        ASSERT_EQ(std::string_view(asChar(plain.data()), size), kPlaintext);
+    }
+}
+
+// Verifies the thread_local CTX is per-thread, not shared.
+TEST(SymmetricDecryptor, ParallelDecryptOnMultipleThreads) {
+    SymmetricKey key = crypto::aesGenerate(crypto::sym256KeySize, "ParallelDecryptTest");
+    const std::array<std::uint8_t, 16> iv = {};
+
+    constexpr auto kPlaintext = "thread-local cipher context smoke test payload"sv;
+
+    std::array<std::uint8_t, 64> cipher;
+    auto cipherLen = cbcEncrypt(key, iv, kPlaintext, cipher);
+
+    constexpr int kNumThreads = 8;
+    constexpr int kIterationsPerThread = 32;
+
+    unittest::threadAssertionMonitoredTest([&](unittest::ThreadAssertionMonitor& monitor) {
+        std::vector<stdx::thread> threads;
+        threads.reserve(kNumThreads);
+        for (int t = 0; t < kNumThreads; ++t) {
+            threads.emplace_back(monitor.spawn([&] {
+                for (int i = 0; i < kIterationsPerThread; ++i) {
+                    std::array<std::uint8_t, 64> plain;
+                    auto plainLen = cbcDecrypt(key, iv, {cipher.data(), cipherLen}, plain);
+                    ASSERT_EQ(std::string_view(asChar(plain.data()), plainLen), kPlaintext);
+                }
+            }));
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    });
+}
+
+class AESTestVectors : public unittest::Test {
+public:
+    class GCMTestVector {
+    public:
+        GCMTestVector(std::string_view key,
+                      std::string_view plaintext,
+                      std::string_view a,
+                      std::string_view iv,
+                      std::string_view ciphertext,
+                      std::string_view tag) {
+            this->key = hexblob::decode(key);
+            this->plaintext = hexblob::decode(plaintext);
+            this->a = hexblob::decode(a);
+            this->iv = hexblob::decode(iv);
+            this->ciphertext = hexblob::decode(ciphertext);
+            this->tag = hexblob::decode(tag);
+        }
+
+        std::string key;
+        std::string plaintext;
+        std::string a;
+        std::string iv;
+        std::string ciphertext;
+        std::string tag;
+    };
+
+    class CTRTestVector {
+    public:
+        CTRTestVector(std::string_view key,
+                      std::string_view plaintext,
+                      std::string_view iv,
+                      std::string_view ciphertext) {
+            this->key = hexblob::decode(key);
+            this->plaintext = hexblob::decode(plaintext);
+            this->iv = hexblob::decode(iv);
+            this->ciphertext = hexblob::decode(ciphertext);
+        }
+
+        std::string key;
+        std::string plaintext;
+        std::string iv;
+        std::string ciphertext;
+    };
+
+    void evaluate(GCMTestVector test) {
+        constexpr auto mode = crypto::aesMode::gcm;
+
+        if (getSupportedSymmetricAlgorithms().count(getStringFromCipherMode(mode)) == 0) {
+            return;
+        }
+
+        SymmetricKey key = aesGeneratePredictableKey256(test.key, "testID");
+
+        // Validate encryption
+        auto encryptor = uassertStatusOK(crypto::SymmetricEncryptor::create(key, mode, test.iv));
+
+        ASSERT_OK(encryptor->addAuthenticatedData(test.a));
+
+        const size_t kBufferSize = test.plaintext.size();
+        {
+            // Validate encryption
+            std::vector<uint8_t> encryptionResult(kBufferSize);
+            auto cipherLen = uassertStatusOK(encryptor->update(test.plaintext, encryptionResult));
+            cipherLen += uassertStatusOK(encryptor->finalize(
+                {encryptionResult.data() + cipherLen, encryptionResult.size() - cipherLen}));
+
+            ASSERT_EQ(test.ciphertext.size(), cipherLen);
+            ASSERT_EQ(hexblob::encode(test.ciphertext),
+                      hexblob::encode(std::string_view(asChar(encryptionResult.data()),
+                                                       encryptionResult.size())));
+
+            // The symmetric crypto framework uses 12 byte GCM tags. The tags used in NIST test
+            // vectors can be larger than 12 bytes, but may be truncated.
+
+            std::array<std::uint8_t, 12> tag;
+            const auto taglen = uassertStatusOK(encryptor->finalizeTag(tag));
+            ASSERT_EQ(tag.size(), taglen);
+            ASSERT_EQ(hexblob::encode(std::string_view(test.tag.data(), test.tag.size()))
+                          .substr(0, aesGCMTagSize * 2),
+                      hexblob::encode(std::string_view(asChar(tag.data()), tag.size())));
+        }
+        {
+            // Validate decryption
+            auto decryptor =
+                uassertStatusOK(crypto::SymmetricDecryptor::create(key, mode, test.iv));
+            uassertStatusOK(decryptor->updateTag({test.tag.data(), aesGCMTagSize}));
+
+            ASSERT_OK(decryptor->addAuthenticatedData(test.a));
+            std::vector<uint8_t> decryptionResult(kBufferSize);
+            auto decipherLen =
+                uassertStatusOK(decryptor->update(test.ciphertext, decryptionResult));
+            decipherLen += uassertStatusOK(decryptor->finalize(
+                {decryptionResult.data() + decipherLen, decryptionResult.size() - decipherLen}));
+
+            ASSERT_EQ(test.plaintext.size(), decipherLen);
+            ASSERT_EQ(
+                hexblob::encode(std::string_view(test.plaintext.data(), test.plaintext.size())),
+                hexblob::encode(
+                    std::string_view(asChar(decryptionResult.data()), decryptionResult.size())));
+        }
+        {
+            // Validate that decryption with incorrect tag does not succeed
+            auto decryptor =
+                uassertStatusOK(crypto::SymmetricDecryptor::create(key, mode, test.iv));
+            auto tag = test.tag;
+            tag[0]++;
+            uassertStatusOK(decryptor->updateTag({tag.data(), aesGCMTagSize}));
+
+            ASSERT_OK(decryptor->addAuthenticatedData(test.a));
+            std::vector<uint8_t> decryptionResult(kBufferSize);
+            DataRangeCursor decryptionResultCursor(decryptionResult);
+            auto decipherLen =
+                uassertStatusOK(decryptor->update(test.ciphertext, decryptionResultCursor));
+            decryptionResultCursor.advance(decipherLen);
+            ASSERT_NOT_OK(decryptor->finalize(decryptionResultCursor));
+        }
+    }
+
+    void evaluate(CTRTestVector test) {
+        constexpr auto mode = crypto::aesMode::ctr;
+
+        if (getSupportedSymmetricAlgorithms().count(getStringFromCipherMode(mode)) == 0) {
+            return;
+        }
+
+        SymmetricKey key = aesGeneratePredictableKey256(test.key, "testID");
+
+        // Validate encryption
+        auto encryptor = uassertStatusOK(crypto::SymmetricEncryptor::create(key, mode, test.iv));
+
+        const size_t kBufferSize = test.plaintext.size();
+        {
+            // Validate encryption
+            std::vector<uint8_t> encryptionResult(kBufferSize);
+            auto cipherLen = uassertStatusOK(encryptor->update(test.plaintext, encryptionResult));
+            cipherLen += uassertStatusOK(encryptor->finalize(
+                {encryptionResult.data() + cipherLen, encryptionResult.size() - cipherLen}));
+
+            ASSERT_EQ(test.ciphertext.size(), cipherLen);
+            ASSERT_EQ(hexblob::encode(test.ciphertext),
+                      hexblob::encode(std::string_view(asChar(encryptionResult.data()),
+                                                       encryptionResult.size())));
+        }
+        {
+            // Validate decryption
+            auto decryptor =
+                uassertStatusOK(crypto::SymmetricDecryptor::create(key, mode, test.iv));
+
+            std::vector<uint8_t> decryptionResult(kBufferSize);
+            auto decipherLen =
+                uassertStatusOK(decryptor->update(test.ciphertext, decryptionResult));
+            decipherLen += uassertStatusOK(decryptor->finalize(
+                {decryptionResult.data() + decipherLen, decryptionResult.size() - decipherLen}));
+
+            ASSERT_EQ(test.plaintext.size(), decipherLen);
+            ASSERT_EQ(
+                hexblob::encode(std::string_view(test.plaintext.data(), test.plaintext.size())),
+                hexblob::encode(
+                    std::string_view(asChar(decryptionResult.data()), decryptionResult.size())));
+        }
+    }
+};
+
+/** Test vectors drawn from
+ *  https://csrc.nist.rip/groups/ST/toolkit/BCM/documents/proposedmodes/gcm/gcm-spec.pdf
+ */
+TEST_F(AESTestVectors, GCMTestCase13) {
+    evaluate(
+        GCMTestVector("00000000000000000000000000000000"
+                      "00000000000000000000000000000000"sv,
+                      ""sv,
+                      ""sv,
+                      "000000000000000000000000"sv,
+                      ""sv,
+                      "530f8afbc74536b9a963b4f1c4cb738b"sv));
+}
+
+TEST_F(AESTestVectors, GCMTestCase14) {
+    evaluate(
+        GCMTestVector("00000000000000000000000000000000"
+                      "00000000000000000000000000000000"sv,
+                      "00000000000000000000000000000000"sv,
+                      ""sv,
+                      "000000000000000000000000"sv,
+                      "cea7403d4d606b6e074ec5d3baf39d18"sv,
+                      "d0d1c8a799996bf0265b98b5d48ab919"sv));
+}
+
+TEST_F(AESTestVectors, GCMTestCase15) {
+    evaluate(
+        GCMTestVector("feffe9928665731c6d6a8f9467308308"
+                      "feffe9928665731c6d6a8f9467308308"sv,
+                      "d9313225f88406e5a55909c5aff5269a"
+                      "86a7a9531534f7da2e4c303d8a318a72"
+                      "1c3c0c95956809532fcf0e2449a6b525"
+                      "b16aedf5aa0de657ba637b391aafd255"sv,
+                      ""sv,
+                      "cafebabefacedbaddecaf888"sv,
+                      "522dc1f099567d07f47f37a32a84427d"
+                      "643a8cdcbfe5c0c97598a2bd2555d1aa"
+                      "8cb08e48590dbb3da7b08b1056828838"
+                      "c5f61e6393ba7a0abcc9f662898015ad"sv,
+                      "b094dac5d93471bdec1a502270e3cc6c"sv));
+}
+
+TEST_F(AESTestVectors, GCMTestCase16) {
+    evaluate(
+        GCMTestVector("feffe9928665731c6d6a8f9467308308"
+                      "feffe9928665731c6d6a8f9467308308"sv,
+                      "d9313225f88406e5a55909c5aff5269a"
+                      "86a7a9531534f7da2e4c303d8a318a72"
+                      "1c3c0c95956809532fcf0e2449a6b525"
+                      "b16aedf5aa0de657ba637b39"sv,
+                      "feedfacedeadbeeffeedfacedeadbeef"
+                      "abaddad2"sv,
+                      "cafebabefacedbaddecaf888"sv,
+                      "522dc1f099567d07f47f37a32a84427d"
+                      "643a8cdcbfe5c0c97598a2bd2555d1aa"
+                      "8cb08e48590dbb3da7b08b1056828838"
+                      "c5f61e6393ba7a0abcc9f662"sv,
+                      "76fc6ece0f4e1768cddf8853bb2d551b"sv));
+}
+
+// AES-CTR test vectors are obtained here:
+// https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38a.pdf
+
+TEST_F(AESTestVectors, CTRTestCase1) {
+    evaluate(
+        CTRTestVector("603deb1015ca71be2b73aef0857d7781"
+                      "1f352c073b6108d72d9810a30914dff4",
+                      "6bc1bee22e409f96e93d7e117393172a",
+                      "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+                      "601ec313775789a5b7a7f504bbf3d228"));
+}
+
+TEST_F(AESTestVectors, CTRTestCase2) {
+    evaluate(
+        CTRTestVector("603deb1015ca71be2b73aef0857d7781"
+                      "1f352c073b6108d72d9810a30914dff4",
+                      "ae2d8a571e03ac9c9eb76fac45af8e51",
+                      "f0f1f2f3f4f5f6f7f8f9fafbfcfdff00",
+                      "f443e3ca4d62b59aca84e990cacaf5c5"));
+}
+
+TEST_F(AESTestVectors, CTRTestCase3) {
+    evaluate(
+        CTRTestVector("603deb1015ca71be2b73aef0857d7781"
+                      "1f352c073b6108d72d9810a30914dff4",
+                      "30c81c46a35ce411e5fbc1191a0a52ef",
+                      "f0f1f2f3f4f5f6f7f8f9fafbfcfdff01",
+                      "2b0930daa23de94ce87017ba2d84988d"));
+}
+
+TEST_F(AESTestVectors, CTRTestCase4) {
+    evaluate(
+        CTRTestVector("603deb1015ca71be2b73aef0857d7781"
+                      "1f352c073b6108d72d9810a30914dff4",
+                      "f69f2445df4f9b17ad2b417be66c3710",
+                      "f0f1f2f3f4f5f6f7f8f9fafbfcfdff02",
+                      "dfc9c58db67aada613c2dd08457941a6"));
+}
+
+TEST_F(AESTestVectors, CTRTestCase1234) {
+    evaluate(
+        CTRTestVector("603deb1015ca71be2b73aef0857d7781"
+                      "1f352c073b6108d72d9810a30914dff4",
+
+                      "6bc1bee22e409f96e93d7e117393172a"
+                      "ae2d8a571e03ac9c9eb76fac45af8e51"
+                      "30c81c46a35ce411e5fbc1191a0a52ef"
+                      "f69f2445df4f9b17ad2b417be66c3710",
+
+                      "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+
+                      "601ec313775789a5b7a7f504bbf3d228"
+                      "f443e3ca4d62b59aca84e990cacaf5c5"
+                      "2b0930daa23de94ce87017ba2d84988d"
+                      "dfc9c58db67aada613c2dd08457941a6"));
+}
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+}  // namespace crypto
+}  // namespace mongo

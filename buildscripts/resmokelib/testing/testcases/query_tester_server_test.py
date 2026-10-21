@@ -1,0 +1,93 @@
+"""The unittest.TestCase for QueryTester server correctness tests."""
+
+import os
+import time
+
+from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib import core, logging
+from buildscripts.resmokelib.testing.testcases import interface
+
+
+def wait_for_file(file_path, sleep_interval=2):
+    """Wait for `file_path` to be present on the filesystem. Sleep for
+    `sleep_interval` between each existence check and fail if we have
+    waited longer than `timeout` seconds."""
+    # Returns time in seconds
+    while True:
+        if os.path.exists(file_path):
+            return
+        time.sleep(sleep_interval)
+
+
+class QueryTesterServerTestCase(interface.ProcessTestCase):
+    """A QueryTester server test to execute."""
+
+    REGISTERED_NAME = "query_tester_server_test"
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        test_dir: list[str],
+        wait_for_files: bool = True,
+        override: str = None,
+        **kwargs,
+    ):
+        """Initialize QueryTesterServerTestCase.
+        test_dir: file path to a dir that contains .test files, their corresponding .results and a .coll file
+            To run multiple test dirs, you would create an instance of QueryTesterServerTestCase for each one.
+        wait_for_files indicates whether we want to wait for test files to be available before running mongotest, e.g.
+            if we are pulling from a remote git repo.
+        """
+        assert len(test_dir) == 1
+        interface.ProcessTestCase.__init__(
+            self, logger, "QueryTesterServerTest", test_dir[0], **kwargs
+        )
+
+        self.test_dir = test_dir[0]
+        self.wait_for_files = wait_for_files
+        self.override = override
+
+    def _make_process(self):
+        # Under Bazel the test corpus is a declared input of the test target, so it
+        # is fully materialized in runfiles before resmoke starts. There is no
+        # sparse checkout racing us and no sentinel will ever be written, so
+        # waiting here would hang forever.
+        if self.wait_for_files and not os.environ.get("TEST_SRCDIR"):
+            # Ensure the test files are all available. See
+            # query_tester_test_sparse_checkout.sh for how this process
+            # works. This must be done outside of the constructor to allow
+            # resmoke to proceed with initializing the complete set of
+            # tests before beginning execution.
+            wait_for_file(os.path.join(self.test_dir, ".sparse-checkout-done"))
+
+        test_files = [
+            os.path.join(self.test_dir, f) for f in os.listdir(self.test_dir) if f.endswith(".test")
+        ]
+
+        command = [
+            _config.DEFAULT_MONGOTEST_EXECUTABLE,
+            "--uri",
+            self.fixture.get_internal_connection_string(),
+            *[cmd for f in test_files for cmd in ("-t", f)],
+            "--drop",
+            "--load",
+            "--mode",
+            "compare",
+            "-v",
+        ]
+        if self.override:
+            command = command + ["--override", self.override]
+
+        # Under Bazel the corpus is a build output, so its directory is read-only and
+        # mongotest cannot write a test's .actual/.fail files next to it. Send them to
+        # the test's undeclared outputs instead, which also gets them archived.
+        undeclared_outputs = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
+        if undeclared_outputs:
+            command = command + ["--outputDir", os.path.join(undeclared_outputs, "query_tester")]
+
+        program_options = {}
+        interface.append_process_tracking_options(program_options, self._id)
+        # Merge test and fixture environment variables into program_options
+        self._merge_environment_variables(program_options)
+
+        return core.programs.generic_program(self.logger, command, program_options)

@@ -1,85 +1,102 @@
-// util/base64.h
-
-/*    Copyright 2009 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/scoped_array.hpp>
+#include "mongo/util/modules.h"
 
-#include "mongo/util/assert_util.h"
+#include <array>
+#include <cstddef>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
 
-namespace mongo {
-    namespace base64 {
+#include <fmt/format.h>
 
-        class Alphabet {
-        public:
-            Alphabet()
-                : encode((unsigned char*)
-                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                         "abcdefghijklmnopqrstuvwxyz"
-                         "0123456789"
-                         "+/")
-                , decode(new unsigned char[257]) {
-                memset( decode.get() , 0 , 256 );
-                for ( int i=0; i<64; i++ ) {
-                    decode[ encode[i] ] = i;
-                }
+namespace [[MONGO_MOD_PUBLIC]] mongo {
+namespace [[MONGO_MOD_FILE_PRIVATE]] base64_detail {
+using namespace std::literals::string_view_literals;
 
-                test();
-            }
-            void test() {
-                verify( strlen( (char*)encode ) == 64 );
-                for ( int i=0; i<26; i++ )
-                    verify( encode[i] == toupper( encode[i+26] ) );
-            }
+/**
+ * Abstract class used to split the translation formats below
+ * into something resembling namespaced implementations.
+ */
+template <typename Mode>
+class [[MONGO_MOD_PUBLIC]] Base64Impl {
+private:
+    Base64Impl() = delete;
 
-            char e( int x ) {
-                return encode[x&0x3f];
-            }
-
-        private:
-            const unsigned char * encode;
-        public:
-            boost::scoped_array<unsigned char> decode;
-        };
-
-        extern Alphabet alphabet;
-
-
-        void encode( std::stringstream& ss , const char * data , int size );
-        std::string encode( const char * data , int size );
-        std::string encode( const std::string& s );
-
-        void decode( std::stringstream& ss , const std::string& s );
-        std::string decode( const std::string& s );
-
-        extern const char* chars;
-
-        void testAlphabet();
+public:
+    /**
+     * Encode a payload to base64.
+     */
+    static std::string encode(std::string_view in);
+    static std::string encode(const void* data, size_t len) {
+        return encode(std::string_view(reinterpret_cast<const char*>(data), len));
     }
+    static void encode(std::stringstream& ss, std::string_view in);
+    static void encode(fmt::memory_buffer& buffer, std::string_view in);
+
+    /**
+     * Decode a base64 string to its original payload.
+     */
+    static std::string decode(std::string_view in);
+    static void decode(std::stringstream& ss, std::string_view in);
+    static void decode(fmt::memory_buffer& buffer, std::string_view in);
+
+    /**
+     * Determines if a given string appears to be valid base64.
+     */
+    static bool validate(std::string_view s);
+
+    /**
+     * Calculate how large a given input would expand to.
+     * Effectively: ceil(inLen * 4 / 3)
+     */
+    static constexpr std::size_t encodedLength(std::size_t inLen) {
+        return (inLen + 2) / 3 * 4;
+    }
+};
+
+constexpr unsigned char kInvalid = ~0;
+
+constexpr std::size_t search(std::string_view table, int c) {
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        if (table[i] == c) {
+            return i;
+        }
+    }
+
+    return kInvalid;
 }
+
+template <std::size_t... Cs>
+constexpr auto invertTable(std::string_view table, std::index_sequence<Cs...>) {
+    return std::array<unsigned char, sizeof...(Cs)>{
+        {static_cast<unsigned char>(search(table, Cs))...}};
+}
+
+struct Standard {
+    static constexpr auto kEncodeTable =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"sv;
+    static constexpr auto kDecodeTable = invertTable(kEncodeTable, std::make_index_sequence<256>{});
+    static constexpr bool kTerminatorRequired = true;
+};
+
+// base64url encoding is a "url safe" variant of base64.
+// '+' is replaced with '-'
+// '/' is replaced with '_'
+// '=' at the end of the string are optional
+struct URL {
+    static constexpr auto kEncodeTable =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"sv;
+    static constexpr auto kDecodeTable = invertTable(kEncodeTable, std::make_index_sequence<256>{});
+    static constexpr bool kTerminatorRequired = false;
+};
+}  // namespace base64_detail
+
+using base64 = typename base64_detail::Base64Impl<base64_detail::Standard>;
+using base64url = typename base64_detail::Base64Impl<base64_detail::URL>;
+
+}  // namespace mongo

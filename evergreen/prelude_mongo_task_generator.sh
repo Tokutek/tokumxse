@@ -1,0 +1,24 @@
+function setup_mongo_task_generator {
+    if [ ! -f mongo-task-generator ]; then
+        curl -fL --retry 5 --retry-delay 10 --retry-max-time 120 https://github.com/mongodb/mongo-task-generator/releases/download/v3.9.0/mongo-task-generator --output mongo-task-generator
+        chmod +x mongo-task-generator
+    fi
+}
+
+## Comment above and uncomment below to test unreleased mongo-task-generator changes that are
+## pushed to the `<branch-name>` of the `https://github.com/mongodb/mongo-task-generator.git`
+## repo
+#function setup_mongo_task_generator {
+#  if [ ! -f mongo-task-generator ]; then
+#
+#    curl https://sh.rustup.rs -sSf | sh -s -- -y
+#    source "$HOME/.cargo/env"
+#    git clone https://github.com/mongodb/mongo-task-generator.git unreleased-mongo-task-generator
+#    pushd unreleased-mongo-task-generator
+#    git checkout <branch-name>
+#    cargo build --release --locked
+#    generator_path="$(pwd)/target/release/mongo-task-generator"
+#    popd
+#    cp "$generator_path" mongo-task-generator
+#  fi
+#}

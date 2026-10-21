@@ -1,0 +1,30 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    replSetResizeOplog:
+        description: "Parser for the 'replSetResizeOplog' command."
+        command_name: replSetResizeOplog
+        cpp_name: ReplSetResizeOplogRequest
+        strict: true
+        namespace: type
+        api_version: ""
+        type: safeInt64
+        mod_visibility: private
+        fields:
+            size:
+                description: "Size of the oplog in MB"
+                type: safeDouble
+                optional: true
+                validator: {gt: 0, lte: 1073741824} # gt 0; lte 1PB (in MB)
+            minRetentionHours:
+                description: "Minimum number of hours to preserve oplog entry."
+                type: safeDouble
+                optional: true
+                validator: {gte: 0}

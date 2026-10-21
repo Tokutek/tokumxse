@@ -1,0 +1,105 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+/**
+ * This file contains minimal tests for sbe::ScanStage.
+ */
+
+#include "mongo/bson/json.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
+#include "mongo/db/exec/sbe/stages/generic_scan.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/shard_role/shard_catalog/collection.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/unittest.h"
+
+#include <memory>
+#include <utility>
+#include <vector>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo::sbe {
+
+class ScanStageTest : public PlanStageTestFixture {
+public:
+    void insertDocuments(const std::vector<BSONObj>& docs) {
+        AutoGetCollection agc(operationContext(), _nss, LockMode::MODE_IX);
+        WriteUnitOfWork wuow{operationContext()};
+        ASSERT_OK(Helpers::insert(operationContext(), *agc, docs));
+        wuow.commit();
+    }
+
+    MultipleCollectionAccessor createCollection(const std::vector<BSONObj>& docs,
+                                                boost::optional<BSONObj> indexKeyPattern) {
+        // Create collection and index
+        ASSERT_OK(
+            storageInterface()->createCollection(operationContext(), _nss, CollectionOptions()));
+        if (indexKeyPattern) {
+            ASSERT_OK(storageInterface()->createIndexesOnEmptyCollection(
+                operationContext(),
+                _nss,
+                {BSON("v" << 2 << "name" << DBClientBase::genIndexName(*indexKeyPattern) << "key"
+                          << *indexKeyPattern)}));
+        }
+        insertDocuments(docs);
+
+        auto localColl =
+            acquireCollection(operationContext(),
+                              CollectionAcquisitionRequest::fromOpCtx(
+                                  operationContext(), _nss, AcquisitionPrerequisites::kRead),
+                              MODE_IS);
+        MultipleCollectionAccessor colls(localColl);
+        return colls;
+    }
+
+protected:
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("testdb.sbe_scan_stage");
+};
+
+TEST_F(ScanStageTest, genericScanStage) {
+    auto colls =
+        createCollection({fromjson("{_id: 0, a: 1}"), fromjson("{_id: 1, a: 2}")}, boost::none);
+    UUID uuid = colls.getMainCollection()->uuid();
+    DatabaseName dbName = _nss.dbName();
+
+    value::TagValueOwned input =
+        value::TagValueOwned::fromRaw(stage_builder::makeValue(BSONArray()));
+    value::TagValueOwned expected = value::TagValueOwned::fromRaw(stage_builder::makeValue(
+        BSON_ARRAY(BSON("_id" << 0 << "a" << 1) << BSON("_id" << 1 << "a" << 2))));
+
+    auto makeStageFn = [uuid, dbName](value::SlotId scanSlot, std::unique_ptr<PlanStage> stage) {
+        sbe::value::SlotVector scanFieldSlots;
+        auto scanStage =
+            sbe::makeS<sbe::GenericScanStage>(uuid,
+                                              dbName,
+                                              scanSlot,
+                                              boost::none /* recordIdSlot */,
+                                              boost::none /* snapshotIdSlot */,
+                                              boost::none /* indexIdentSlot */,
+                                              boost::none /* indexKeySlot */,
+                                              boost::none /* indexKeyPatternSlot */,
+                                              std::vector<std::string>{} /* scanFieldNames */,
+                                              scanFieldSlots,
+                                              true /* forward */,
+                                              nullptr /* yieldPolicy */,
+                                              kEmptyPlanNodeId,
+                                              nullptr /* scanOpenCallback */,
+                                              false /* participateInTrialRunTracking */);
+
+        return std::make_pair(scanSlot, std::move(scanStage));
+    };
+
+    attachCollectionAcquisition(colls);
+    auto [inputTag, inputVal] = input.releaseToRaw();
+    auto [expectedTag, expectedVal] = expected.releaseToRaw();
+    runTest(inputTag, inputVal, expectedTag, expectedVal, makeStageFn);
+}
+
+}  // namespace mongo::sbe

@@ -1,262 +1,181 @@
-// fts_language.cpp
-
-/**
- *    Copyright (C) 2013 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/fts/fts_language.h"
 
-#include <string>
- 
-#include "mongo/base/init.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/fts/fts_basic_tokenizer.h"
+#include "mongo/db/fts/fts_tokenizer.h"
+#include "mongo/db/fts/fts_unicode_ngram_tokenizer.h"
+#include "mongo/db/fts/fts_unicode_tokenizer.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/string_map.h"
-#include "mongo/util/stringutils.h"
+#include "mongo/util/ctype.h"
 
-namespace mongo {
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
 
-    namespace fts {
+#include <fmt/format.h>
 
-        namespace {
+namespace mongo::fts {
 
-            /**
-             * Case-insensitive StringData comparator.
-             */
-            struct LanguageStringCompare {
-                /** Returns true if lhs < rhs. */
-                bool operator()( StringData lhs, StringData rhs ) const {
-                    size_t minSize = std::min( lhs.size(), rhs.size() );
+namespace {
+using namespace std::literals::string_view_literals;
 
-                    for ( size_t x = 0; x < minSize; x++ ) {
-                        char a = tolower( lhs[x] );
-                        char b = tolower( rhs[x] );
-                        if ( a < b ) {
-                            return true;
-                        }
-                        if ( a > b ) {
-                            return false;
-                        }
-                    }
+/**
+ * Case-insensitive std::string_view comparator.
+ * Returns true if a < b.
+ */
+struct LanguageStringCompare {
+    bool operator()(std::string_view a, std::string_view b) const {
+        return std::lexicographical_compare(
+            a.begin(), a.end(), b.begin(), b.end(), [](char a, char b) {
+                return ctype::toLower(a) < ctype::toLower(b);
+            });
+    }
+};
 
-                    return lhs.size() < rhs.size();
-                }
-            };
+// FTS Language map. These languages are available with TEXT_INDEX_VERSION_2 and above.
+//
+// Parameters:
+// - C++ unique identifier suffix
+// - lower case string name
+// - language alias
+//
+struct {
+    std::string_view name;   // - lower case string name
+    std::string_view alias;  // - language alias (if nonempty)
+} static constexpr kLanguagesV2V3[] = {
+    {"none"sv, {}},
+    {"ngram"sv, {}},
+    {"danish"sv, "da"sv},
+    {"dutch"sv, "nl"sv},
+    {"english"sv, "en"sv},
+    {"finnish"sv, "fi"sv},
+    {"french"sv, "fr"sv},
+    {"german"sv, "de"sv},
+    {"hungarian"sv, "hu"sv},
+    {"italian"sv, "it"sv},
+    {"norwegian"sv, "nb"sv},
+    {"portuguese"sv, "pt"sv},
+    {"romanian"sv, "ro"sv},
+    {"russian"sv, "ru"sv},
+    {"spanish"sv, "es"sv},
+    {"swedish"sv, "sv"sv},
+    {"turkish"sv, "tr"sv},
+};
 
-            // Lookup table from user language string (case-insensitive) to FTSLanguage.  Populated
-            // by initializers in group FTSAllLanguagesRegistered and initializer
-            // FTSRegisterLanguageAliases.  For use with TEXT_INDEX_VERSION_2 text indexes only.
-            typedef std::map<StringData, const FTSLanguage*, LanguageStringCompare> LanguageMapV2;
-            LanguageMapV2 languageMapV2;
+//
+// Register all Snowball language modules for TEXT_INDEX_VERSION_1.  Note that only the full
+// names are recognized by the StopWords class (as such, the language string "dan" in
+// TEXT_INDEX_VERSION_1 will generate the Danish stemmer and the empty stopword list).
+//
 
-            // Like languageMapV2, but for use with TEXT_INDEX_VERSION_1 text indexes.
-            // Case-sensitive by lookup key.
-            typedef std::map<StringData, const FTSLanguage*> LanguageMapV1;
-            LanguageMapV1 languageMapV1;
-        }
+struct {
+    std::string_view name;
+} static constexpr kLanguagesV1[] = {
+    {"none"sv},      {"da"sv},      {"dan"sv},       {"danish"sv},  {"de"sv},      {"deu"sv},
+    {"dut"sv},       {"dutch"sv},   {"en"sv},        {"eng"sv},     {"english"sv}, {"es"sv},
+    {"esl"sv},       {"fi"sv},      {"fin"sv},       {"finnish"sv}, {"fr"sv},      {"fra"sv},
+    {"fre"sv},       {"french"sv},  {"ger"sv},       {"german"sv},  {"hu"sv},      {"hun"sv},
+    {"hungarian"sv}, {"it"sv},      {"ita"sv},       {"italian"sv}, {"nl"sv},      {"nld"sv},
+    {"no"sv},        {"nor"sv},     {"norwegian"sv}, {"por"sv},     {"porter"sv},  {"portuguese"sv},
+    {"pt"sv},        {"ro"sv},      {"romanian"sv},  {"ron"sv},     {"ru"sv},      {"rum"sv},
+    {"rus"sv},       {"russian"sv}, {"spa"sv},       {"spanish"sv}, {"sv"sv},      {"swe"sv},
+    {"swedish"sv},   {"tr"sv},      {"tur"sv},       {"turkish"sv},
+};
 
-        MONGO_INITIALIZER_GROUP( FTSAllLanguagesRegistered, MONGO_NO_PREREQUISITES,
-                                 MONGO_NO_DEPENDENTS );
+template <TextIndexVersion ver>
+class LanguageRegistry {
+public:
+    // For V3 and above, use UnicodeFTSLanguage.
+    using LanguageType =
+        std::conditional_t<(ver >= TEXT_INDEX_VERSION_3), UnicodeFTSLanguage, BasicFTSLanguage>;
 
-        //
-        // Register supported languages' canonical names for TEXT_INDEX_VERSION_2.
-        //
+    // For V2 and above, language names are case-insensitive.
+    using KeyCompare =
+        std::conditional_t<(ver >= TEXT_INDEX_VERSION_2), LanguageStringCompare, std::less<>>;
 
-        MONGO_FTS_LANGUAGE_DECLARE( languageNoneV2, "none", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDanishV2, "danish", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDutchV2, "dutch", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageEnglishV2, "english", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFinnishV2, "finnish", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFrenchV2, "french", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageGermanV2, "german", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageHungarianV2, "hungarian", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageItalianV2, "italian", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageNorwegianV2, "norwegian", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languagePortugueseV2, "portuguese", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRomanianV2, "romanian", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRussianV2, "russian", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSpanishV2, "spanish", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSwedishV2, "swedish", TEXT_INDEX_VERSION_2 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageTurkishV2, "turkish", TEXT_INDEX_VERSION_2 );
-
-        //
-        // Register all Snowball language modules for TEXT_INDEX_VERSION_1.  Note that only the full
-        // names are recognized by the StopWords class (as such, the language string "dan" in
-        // TEXT_INDEX_VERSION_1 will generate the Danish stemmer and the empty stopword list).
-        //
-
-        MONGO_FTS_LANGUAGE_DECLARE( languageNoneV1, "none", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDaV1, "da", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDanV1, "dan", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDanishV1, "danish", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDeV1, "de", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDeuV1, "deu", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDutV1, "dut", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageDutchV1, "dutch", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageEnV1, "en", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageEngV1, "eng", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageEnglishV1, "english", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageEsV1, "es", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageEslV1, "esl", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFiV1, "fi", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFinV1, "fin", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFinnishV1, "finnish", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFrV1, "fr", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFraV1, "fra", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFreV1, "fre", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageFrenchV1, "french", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageGerV1, "ger", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageGermanV1, "german", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageHuV1, "hu", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageHunV1, "hun", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageHungarianV1, "hungarian", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageItV1, "it", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageItaV1, "ita", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageItalianV1, "italian", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageNlV1, "nl", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageNldV1, "nld", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageNoV1, "no", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageNorV1, "nor", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageNorwegianV1, "norwegian", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languagePorV1, "por", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languagePorterV1, "porter", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languagePortugueseV1, "portuguese", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languagePtV1, "pt", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRoV1, "ro", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRomanianV1, "romanian", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRonV1, "ron", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRuV1, "ru", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRumV1, "rum", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRusV1, "rus", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageRussianV1, "russian", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSpaV1, "spa", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSpanishV1, "spanish", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSvV1, "sv", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSweV1, "swe", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageSwedishV1, "swedish", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageTrV1, "tr", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageTurV1, "tur", TEXT_INDEX_VERSION_1 );
-        MONGO_FTS_LANGUAGE_DECLARE( languageTurkishV1, "turkish", TEXT_INDEX_VERSION_1 );
-
-        MONGO_INITIALIZER_WITH_PREREQUISITES( FTSRegisterLanguageAliases,
-                                              ( "FTSAllLanguagesRegistered" ) )
-                                            ( InitializerContext* context ) {
-            // Register language aliases for TEXT_INDEX_VERSION_2.
-            FTSLanguage::registerLanguageAlias( &languageDanishV2, "da", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageDutchV2, "nl", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageEnglishV2, "en", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageFinnishV2, "fi", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageFrenchV2, "fr", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageGermanV2, "de", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageHungarianV2, "hu", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageItalianV2, "it", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageNorwegianV2, "nb", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languagePortugueseV2, "pt", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageRomanianV2, "ro", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageRussianV2, "ru", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageSpanishV2, "es", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageSwedishV2, "sv", TEXT_INDEX_VERSION_2 );
-            FTSLanguage::registerLanguageAlias( &languageTurkishV2, "tr", TEXT_INDEX_VERSION_2 );
-            return Status::OK();
-        }
-
-        // static
-        void FTSLanguage::registerLanguage( StringData languageName,
-                                            TextIndexVersion textIndexVersion,
-                                            FTSLanguage* language ) {
-            verify( !languageName.empty() );
-            language->_canonicalName = languageName.toString();
-            switch ( textIndexVersion ) {
-            case TEXT_INDEX_VERSION_2:
-                verify( languageMapV2.find( languageName ) == languageMapV2.end() );
-                languageMapV2[ languageName ] = language;
-                return; 
-            case TEXT_INDEX_VERSION_1:
-                verify( languageMapV1.find( languageName ) == languageMapV1.end() );
-                languageMapV1[ languageName ] = language;
-                return;
-            }
-            verify( false );
-        }
-
-        // static
-        void FTSLanguage::registerLanguageAlias( const FTSLanguage* language,
-                                                 StringData alias,
-                                                 TextIndexVersion textIndexVersion ) {
-            switch ( textIndexVersion ) {
-            case TEXT_INDEX_VERSION_2:
-                verify( languageMapV2.find( alias ) == languageMapV2.end() );
-                languageMapV2[ alias ] = language;
-                return;
-            case TEXT_INDEX_VERSION_1:
-                verify( languageMapV1.find( alias ) == languageMapV1.end() );
-                languageMapV1[ alias ] = language;
-                return;
-            }
-            verify( false );
-        }
-
-        FTSLanguage::FTSLanguage() : _canonicalName() {
-        }
-
-        const std::string& FTSLanguage::str() const {
-            verify( !_canonicalName.empty() );
-            return _canonicalName;
-        }
-
-        // static
-        StatusWithFTSLanguage FTSLanguage::make( StringData langName,
-                                                 TextIndexVersion textIndexVersion ) {
-            switch ( textIndexVersion ) {
-                case TEXT_INDEX_VERSION_2: {
-                    LanguageMapV2::const_iterator it = languageMapV2.find( langName );
-                    if ( it == languageMapV2.end() ) {
-                        // TEXT_INDEX_VERSION_2 rejects unrecognized language strings.
-                        Status status = Status( ErrorCodes::BadValue,
-                                                mongoutils::str::stream() <<
-                                                    "unsupported language: \"" << langName <<
-                                                    "\"" );
-                        return StatusWithFTSLanguage( status );
-                    }
-
-                    return StatusWithFTSLanguage( it->second );
-                }
-                case TEXT_INDEX_VERSION_1: {
-                    LanguageMapV1::const_iterator it = languageMapV1.find( langName );
-                    if ( it == languageMapV1.end() ) {
-                        // TEXT_INDEX_VERSION_1 treats unrecognized language strings as "none".
-                        return StatusWithFTSLanguage( &languageNoneV1 );
-                    }
-                    return StatusWithFTSLanguage( it->second );
-                }
-            }
-
-            verify( false );
-            return StatusWithFTSLanguage( Status::OK() );
+    void add(std::string_view name, std::string_view alias = {}) {
+        auto p = std::make_shared<const LanguageType>(std::string{name});
+        _map[std::string{name}] = p;
+        if (!alias.empty()) {
+            _map[std::string{alias}] = p;
         }
     }
+
+    const LanguageType& make(std::string_view langName) const {
+        std::string nameStr{langName};
+        auto it = _map.find(nameStr);
+        if (it == _map.end()) {
+            if constexpr (ver == TEXT_INDEX_VERSION_1) {
+                // v1 treats unrecognized language strings as "none".
+                return *_map.at("none");
+            } else {
+                // v2 and above reject unrecognized language strings.
+                uasserted(ErrorCodes::BadValue,
+                          fmt::format(R"(unsupported language: "{}" for text index version {})",
+                                      langName,
+                                      fmt::underlying(ver)));
+            }
+        }
+        return *it->second;
+    }
+
+private:
+    std::map<std::string, std::shared_ptr<const LanguageType>, KeyCompare> _map;
+};
+
+// template <TextIndexVersion ver>
+// LanguageRegistry<ver> languageRegistry;
+
+template <TextIndexVersion ver>
+const LanguageRegistry<ver>& getLanguageRegistry() {
+    static const auto instance = [] {
+        auto registry = new LanguageRegistry<ver>;
+        if constexpr (ver == TEXT_INDEX_VERSION_1) {
+            for (auto&& spec : kLanguagesV1) {
+                registry->add(spec.name);
+            }
+        } else if constexpr (ver == TEXT_INDEX_VERSION_2 || ver == TEXT_INDEX_VERSION_3) {
+            for (auto&& spec : kLanguagesV2V3) {
+                registry->add(spec.name, spec.alias);
+            }
+        }
+        return registry;
+    }();
+    return *instance;
 }
+
+}  // namespace
+
+const FTSLanguage& FTSLanguage::make(std::string_view langName, TextIndexVersion textIndexVersion) {
+    switch (textIndexVersion) {
+        case TEXT_INDEX_VERSION_1:
+            return getLanguageRegistry<TEXT_INDEX_VERSION_1>().make(langName);
+        case TEXT_INDEX_VERSION_2:
+            return getLanguageRegistry<TEXT_INDEX_VERSION_2>().make(langName);
+        case TEXT_INDEX_VERSION_3:
+            return getLanguageRegistry<TEXT_INDEX_VERSION_3>().make(langName);
+        case TEXT_INDEX_VERSION_INVALID:
+            break;
+    }
+    uasserted(ErrorCodes::BadValue, "invalid TextIndexVersion");
+}
+
+std::unique_ptr<FTSTokenizer> BasicFTSLanguage::createTokenizer() const {
+    return std::make_unique<BasicFTSTokenizer>(this);
+}
+
+std::unique_ptr<FTSTokenizer> UnicodeFTSLanguage::createTokenizer() const {
+    if ("ngram" == str()) {
+        return std::make_unique<UnicodeNgramFTSTokenizer>(this);
+    }
+    return std::make_unique<UnicodeFTSTokenizer>(this);
+}
+
+}  // namespace mongo::fts

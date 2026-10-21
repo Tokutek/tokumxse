@@ -1,0 +1,174 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/router_role/ns_targeter.h"
+#include "mongo/db/router_role/router_role.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/versioning_protocol/stale_exception.h"
+#include "mongo/util/modules.h"
+
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+/**
+ * NSTargeter based on a CollectionRoutingInfo implementation. Wraps all exception codepaths and
+ * returns NamespaceNotFound status on applicable failures.
+ *
+ * Must be initialized before use, and initialization may fail.
+ *
+ * TODO (SERVER-116151): The NSTargeter(s) hierarchy is a legacy implementation. When it is no
+ * longer needed by BatchWriteExec and bulk_write_exec it should be removed.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] CollectionRoutingInfoTargeter final : public NSTargeter {
+public:
+    enum class LastErrorType {
+        kCouldNotTarget,
+        kStaleRoutingInfo,
+        kCannotImplicitlyCreateCollection
+    };
+
+    /**
+     * Initializes the targeter with the latest routing information for the namespace, which means
+     * it may have to block and load information from the config server.
+     *
+     * If 'nss' is a tracked time-series collection, replaces this value with namespace string of a
+     * time-series buckets collection.
+     *
+     * If 'expectedEpoch' is specified, the targeter will throws 'StaleEpoch' exception if the epoch
+     * for 'nss' ever becomes different from 'expectedEpoch'. Otherwise, the targeter will continue
+     * targeting even if the collection gets dropped and recreated.
+     */
+    CollectionRoutingInfoTargeter(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  boost::optional<OID> expectedEpoch = boost::none);
+
+    /**
+     * Initializes the targeter using the cri in the passed 'routingCtx', in order to support using
+     * a custom (synthetic) routing table.
+     */
+    CollectionRoutingInfoTargeter(const NamespaceString& nss, const RoutingContext& routingCtx);
+
+    const NamespaceString& getNS() const override;
+
+    ShardEndpoint targetInsert(OperationContext* opCtx, const BSONObj& doc) const override;
+
+    /**
+     * Attempts to target an update request by shard key and returns a vector of shards to target.
+     */
+    TargetingResult targetUpdate(OperationContext* opCtx,
+                                 const BatchItemRef& itemRef) const override;
+
+    /**
+     * Attempts to target an delete request by shard key and returns a vector of shards to target.
+     */
+    TargetingResult targetDelete(OperationContext* opCtx,
+                                 const BatchItemRef& itemRef) const override;
+
+    std::vector<ShardEndpoint> targetAllShards(OperationContext* opCtx) const override;
+
+    void noteCouldNotTarget() override;
+
+    void noteStaleCollVersionResponse(OperationContext* opCtx,
+                                      const StaleConfigInfo& staleInfo) override;
+
+    void noteStaleDbVersionResponse(OperationContext* opCtx,
+                                    const StaleDbRoutingVersion& staleInfo) override;
+
+    /**
+     * Returns if _lastError is StaleConfig type.
+     */
+    bool hasStaleShardResponse() override;
+
+    void noteCannotImplicitlyCreateCollectionResponse(
+        OperationContext* opCtx, const CannotImplicitlyCreateCollectionInfo& createInfo) override;
+
+    /**
+     * Replaces the targeting information with the latest information from the cache.  If this
+     * information is stale WRT the noted stale responses or a remote refresh is needed due
+     * to a targeting failure, will contact the config servers to reload the metadata.
+     *
+     * Return true if the metadata was different after this reload.
+     *
+     * Also see NSTargeter::refreshIfNeeded().
+     */
+    bool refreshIfNeeded(OperationContext* opCtx) override;
+
+    /**
+     * Creates a collection if there was a prior CannotImplicitlyCreateCollection error thrown.
+     *
+     * Return true if a collection was created and false if the collection already existed, throwing
+     * on any errors.
+     *
+     * Also see NSTargeter::createCollectionIfNeeded().
+     */
+    bool createCollectionIfNeeded(OperationContext* opCtx) override;
+
+    /**
+     * Returns the number of shards on which the collection has any chunks.
+     *
+     * To be only used for logging/metrics which do not need to be always correct. The returned
+     * value may be incorrect when this targeter is at point-in-time (it will reflect the 'latest'
+     * number of shards, rather than the one at the point-in-time).
+     */
+    int getAproxNShardsOwningChunks() const override;
+
+    bool isTargetedCollectionSharded() const override;
+
+    bool isTrackedTimeSeriesBucketsNamespace() const override;
+
+    bool isTrackedTimeSeriesNamespace() const override;
+
+    bool timeseriesNamespaceNeedsRewrite(const NamespaceString& nss) const;
+
+    RoutingContext& getRoutingCtx() const;
+
+    const CollectionRoutingInfo& getRoutingInfo() const;
+
+private:
+    /**
+     * Initializes and returns the RoutingContext which needs to be used for targeting.
+     * If 'refresh' is true, additionally fetches the latest routing info from the config servers.
+     *
+     * Note: For tracked time-series collections, we use the buckets collection for targeting. If
+     * the user request is on the view namespace, we implicitly transform the request to the buckets
+     * namespace.
+     */
+    std::unique_ptr<RoutingContext> _init(OperationContext* opCtx, bool refresh);
+
+    // Full namespace of the collection for this targeter
+    NamespaceString _nss;
+
+    // Set to true when the request was originally targeting the view of a tracked timeseries
+    // collection and the namespace got converted to the underlying buckets collection. Note: this
+    // will only be true if the timeseries collection is tracked in the global catalog.
+    //
+    // TODO SERVER-106874 remove this parameter once 9.0 becomes last LTS. By then we will only have
+    // viewless timeseries so nss conversion will not be needed anymore
+    bool _nssConvertedToTimeseriesBuckets = false;
+
+    // Stores the type of the last error that occurred (if any).
+    boost::optional<LastErrorType> _lastError;
+
+    // Set to the epoch of the namespace we are targeting. If we ever refresh the catalog cache
+    // and find a new epoch, we immediately throw a StaleEpoch exception.
+    boost::optional<OID> _targetEpoch;
+
+    std::unique_ptr<RoutingContext> _routingCtx;
+
+    // The latest loaded routing cache entry.
+    CollectionRoutingInfo _cri;
+};
+}  // namespace mongo

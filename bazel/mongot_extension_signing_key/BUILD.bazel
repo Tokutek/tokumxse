@@ -1,0 +1,23 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+py_binary(
+    name = "gpg_export_armored_key",
+    srcs = ["gpg_export_armored_key.py"],
+    main = "gpg_export_armored_key.py",
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "gpg_export_armored_key_test",
+    srcs = ["gpg_export_armored_key_test.py"],
+    data = ["gpg_export_armored_key.py"],
+    main = "gpg_export_armored_key_test.py",
+)
+
+py_binary(
+    name = "generate_embedded_public_key_header",
+    srcs = ["generate_embedded_public_key_header.py"],
+    visibility = ["//visibility:public"],
+)

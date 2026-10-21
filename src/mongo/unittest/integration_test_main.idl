@@ -1,0 +1,21 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::unittest"
+    configs:
+        source: cli
+
+configs:
+    help:
+        description: "Display help"
+        arg_vartype: Switch
+    connectionString:
+        description: The connection string associated with the test fixture
+            that this integration test should run against.
+        arg_vartype: String
+        default: "localhost:27017"
+    useEgressGRPC:
+        description: Whether or not the integration test is configured to use gRPC.
+        arg_vartype: Bool
+        default: false

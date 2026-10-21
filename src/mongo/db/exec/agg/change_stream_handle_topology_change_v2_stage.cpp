@@ -1,0 +1,1692 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/agg/change_stream_handle_topology_change_v2_stage.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/db/exec/agg/change_stream_handle_topology_change_v2_metrics.h"
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/global_catalog/type_shard.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/change_stream_pipeline_helpers.h"
+#include "mongo/db/pipeline/change_stream_read_mode.h"
+#include "mongo/db/pipeline/change_stream_reader_builder.h"
+#include "mongo/db/pipeline/change_stream_reader_context.h"
+#include "mongo/db/pipeline/change_stream_shard_targeter.h"
+#include "mongo/db/pipeline/change_stream_topology_helpers.h"
+#include "mongo/db/pipeline/data_to_shards_allocation_query_service.h"
+#include "mongo/db/pipeline/document_source_change_stream_handle_topology_change_v2.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/router_role/cluster_commands_helpers.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/topology/shard_registry.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/query/exec/establish_cursors.h"
+#include "mongo/s/query/exec/shard_tag.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <algorithm>
+#include <string>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+// Prefix that will be added to all log messages emitted by this stage.
+#define STAGE_LOG_PREFIX "ChangeStreamHandleTopologyChangeV2Stage: "
+
+namespace mongo {
+namespace {
+
+/**
+ * Return the correct namespace for pipelines that are built on the config server. This is always
+ * the "admin" namespace.
+ */
+NamespaceString buildNamespaceForConfigServerPipeline() {
+    return NamespaceString::makeCollectionlessAggregateNSS(DatabaseName::kAdmin);
+}
+
+/**
+ * A cursor manager implementation that uses the preceding 'MergeCursors' stage in the pipeline
+ * to open and close cursors.
+ */
+class V2StageCursorManager final
+    : public exec::agg::ChangeStreamHandleTopologyChangeV2Stage::CursorManager {
+public:
+    V2StageCursorManager(const ChangeStream& changeStream, ChangeStreamReaderBuilder* readerBuilder)
+        : _changeStream(changeStream), _readerBuilder(readerBuilder) {}
+
+    void initialize(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                    exec::agg::ChangeStreamHandleTopologyChangeV2Stage* stage,
+                    const ResumeTokenData& resumeTokenData) override {
+        _mergeCursors = stage->getSourceStage();
+
+        _mergeCursors->recognizeControlEvents();
+
+        // In ignore-removed-shards mode, promises made by a shard can be withdrawn when that shard
+        // is removed. Do not let the AsyncResultsMerger advance its high water mark from those
+        // promises; doing so would allow the client-visible post-batch resume token to regress.
+        if (_changeStream.getReadMode() == ChangeStreamReadMode::kIgnoreRemovedShards) {
+            _mergeCursors->disablePromisedSortKeyHighWaterMarkAdvancement();
+        }
+
+        _initializationResumeToken = ResumeToken(resumeTokenData);
+        LOGV2_DEBUG(12163604,
+                    5,
+                    "Using change stream resume token",
+                    "changeStream"_attr = _changeStream.toString(),
+                    "resumeToken"_attr = _initializationResumeToken,
+                    "resumeTokenClusterTime"_attr = resumeTokenData.clusterTime);
+        _mergeCursors->setHighWaterMark(_initializationResumeToken.toBSON());
+
+        _originalAggregateCommand = expCtx->getOriginalAggregateCommand().getOwned();
+    }
+
+    void openCursorsOnDataShards(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                 OperationContext* opCtx,
+                                 Timestamp atClusterTime,
+                                 const stdx::unordered_set<ShardId>& shardIds) override {
+        auto openedCursors =
+            openCursors(opCtx, atClusterTime, shardIds, false /* isConfigServer */, [&]() {
+                // Build the change stream pipeline command to be run on the data shards.
+                // '_originalAggregateCommand' already contains the relevant match expressions
+                // for the oplog.
+                auto cmdObj = [&]() {
+                    // If the 'atClusterTime' matches the clusterTime of
+                    // '_initializationResumeToken', we should open the $changeStream cursors by
+                    // passing the original resume token.
+                    const bool isInitialRequest =
+                        atClusterTime == _initializationResumeToken.getClusterTime();
+                    if (isInitialRequest) {
+                        return change_stream::topology_helpers::createUpdatedCommandForNewShard(
+                            expCtx,
+                            _initializationResumeToken,
+                            _originalAggregateCommand,
+                            ChangeStreamReaderVersionEnum::kV2);
+                    }
+
+                    return change_stream::topology_helpers::createUpdatedCommandForNewShard(
+                        expCtx,
+                        atClusterTime,
+                        _originalAggregateCommand,
+                        ChangeStreamReaderVersionEnum::kV2);
+                }();
+
+                LOGV2_DEBUG(10657554,
+                            3,
+                            STAGE_LOG_PREFIX "Built pipeline command for data shard",
+                            "cmdObj"_attr = redact(cmdObj),
+                            "atClusterTime"_attr = atClusterTime,
+                            "changeStream"_attr = _changeStream);
+
+                std::vector<AsyncRequestsSender::Request> remotes;
+                remotes.reserve(shardIds.size());
+                for (auto&& shardId : shardIds) {
+                    remotes.emplace_back(shardId, cmdObj);
+                }
+
+                return establishCursors(
+                    opCtx,
+                    expCtx->getMongoProcessInterface()->getTaskExecutor(/* withNullCheck */ false),
+                    expCtx->getNamespaceString(),
+                    ReadPreferenceSetting::get(opCtx),
+                    remotes,
+                    false /* allowPartialResults */);
+            });
+
+        tassert(12013801,
+                str::stream() << "number of opened cursors (" << openedCursors.size()
+                              << ") does not match expected value (" << shardIds.size() << ")",
+                openedCursors.size() == shardIds.size());
+
+        _mergeCursors->addNewShardCursors(std::move(openedCursors), ShardTag::kDataShard);
+        _currentlyTargetedDataShards.insert(shardIds.begin(), shardIds.end());
+    }
+
+    void openCursorOnConfigServer(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                  OperationContext* opCtx,
+                                  Timestamp atClusterTime) override {
+        tassert(12013803,
+                "expected to not have a cursor open on the config server when opening it",
+                !_hasOpenConfigServerCursor);
+
+        const auto shardId = getConfigShardId(opCtx);
+        auto openedCursors =
+            openCursors(opCtx, atClusterTime, {shardId}, true /* isConfigServer */, [&]() {
+                // The change stream on the config server will be opened as a change stream on the
+                // "admin" namespace.
+                const NamespaceString nss = buildNamespaceForConfigServerPipeline();
+                tassert(10657546,
+                        "expecting adminDB namespace for config server change stream",
+                        nss.isAdminDB());
+
+                // Build the V2 change stream pipeline command to be run on the config server.
+                std::vector<BSONObj> serializedPipeline =
+                    change_stream::pipeline_helpers::buildPipelineForConfigServerV2(
+                        expCtx, opCtx, atClusterTime, nss, _changeStream, _readerBuilder);
+
+                LOGV2_DEBUG(10657551,
+                            3,
+                            STAGE_LOG_PREFIX "Built pipeline for config server",
+                            "pipeline"_attr = serializedPipeline,
+                            "atClusterTime"_attr = atClusterTime,
+                            "changeStream"_attr = _changeStream);
+
+                AggregateCommandRequest aggReq(nss, std::move(serializedPipeline));
+
+                aggregation_request_helper::setFromRouter(
+                    VersionContext::getDecoration(opCtx), aggReq, true);
+                aggReq.setNeedsMerge(true);
+
+                aggregation_request_helper::addQuerySettingsToRequest(aggReq, expCtx);
+
+                SimpleCursorOptions cursor;
+                cursor.setBatchSize(0);
+                aggReq.setCursor(cursor);
+                setReadWriteConcern(opCtx, aggReq, true, !expCtx->getExplain());
+
+                return establishCursors(
+                    opCtx,
+                    expCtx->getMongoProcessInterface()->getTaskExecutor(/* withNullCheck */ false),
+                    aggReq.getNamespace(),
+                    ReadPreferenceSetting{ReadPreference::SecondaryPreferred},
+                    {{shardId, aggReq.toBSON()}},
+                    false /* allowPartialResults */);
+            });
+
+        tassert(12013800,
+                "expecting exactly one cursor to be established for the config server",
+                openedCursors.size() == 1);
+
+        _mergeCursors->addNewShardCursors(std::move(openedCursors), ShardTag::kConfigServer);
+        _hasOpenConfigServerCursor = true;
+    }
+
+    void closeCursorsOnDataShards(const stdx::unordered_set<ShardId>& shardIds) override {
+        closeCursors(shardIds, false /* isConfigServer */);
+
+        for (const auto& shardId : shardIds) {
+            _currentlyTargetedDataShards.erase(shardId);
+        }
+    }
+
+    void closeCursorOnConfigServer(OperationContext* opCtx) override {
+        tassert(12013802,
+                "expected to have a cursor open on the config server when closing it",
+                _hasOpenConfigServerCursor);
+        closeCursors({getConfigShardId(opCtx)}, true /* isConfigServer */);
+        _hasOpenConfigServerCursor = false;
+    }
+
+    bool isCursorOnConfigServerOpen() const override {
+        return _hasOpenConfigServerCursor;
+    }
+
+    const stdx::unordered_set<ShardId>& getCurrentlyTargetedDataShards() const override {
+        return _currentlyTargetedDataShards;
+    }
+
+    const ChangeStream& getChangeStream() const override {
+        return _changeStream;
+    }
+
+    void enableUndoNextMode() override {
+        _mergeCursors->enableUndoNextMode();
+    }
+
+    void disableUndoNextMode() override {
+        _mergeCursors->disableUndoNextMode();
+    }
+
+    void undoGetNext() override {
+        _mergeCursors->undoNext();
+    }
+
+    void setHighWaterMark(Timestamp highWaterMark) override {
+        _mergeCursors->setHighWaterMark(ResumeToken::makeHighWaterMarkToken(
+                                            highWaterMark, ResumeTokenData::kDefaultTokenVersion)
+                                            .toDocument()
+                                            .toBson());
+    }
+
+    void setPromisedSortKeyHighWaterMarkAdvancement(bool enabled) override {
+        if (enabled) {
+            _mergeCursors->enablePromisedSortKeyHighWaterMarkAdvancement();
+        } else {
+            _mergeCursors->disablePromisedSortKeyHighWaterMarkAdvancement();
+        }
+    }
+
+    Timestamp getTimestampFromCurrentHighWaterMark() const override {
+        // The high water mark returned by the 'AsyncResultsMerger' has the format
+        // {"_data":"..."}, so we can parse it directly.
+        BSONObj highWaterMark = _mergeCursors->getHighWaterMark();
+        return ResumeToken::extractClusterTime(highWaterMark);
+    }
+
+private:
+    /**
+     * Return the shard id of the config server.
+     */
+    ShardId getConfigShardId(OperationContext* opCtx) const {
+        return Grid::get(opCtx)->shardRegistry()->getConfigShard()->getId();
+    }
+
+    /**
+     * Reload the shard registry if at least one of specified shard ids is missing from it.
+     */
+    void reloadShardRegistryIfNotAllShardsArePresent(OperationContext* opCtx,
+                                                     const stdx::unordered_set<ShardId>& shardIds) {
+        bool allRequestedShardsArePresent = [&]() {
+            auto allAvailableShardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+            std::sort(allAvailableShardIds.begin(), allAvailableShardIds.end());
+            return std::all_of(shardIds.begin(), shardIds.end(), [&](const auto& shardId) {
+                return std::binary_search(
+                    allAvailableShardIds.begin(), allAvailableShardIds.end(), shardId);
+            });
+        }();
+
+        if (!allRequestedShardsArePresent) {
+            // In case one of the target shards is not known by the shard registry, reload the shard
+            // registry proactively.
+            reloadShardRegistry(opCtx, shardIds);
+        }
+    }
+
+    void reloadShardRegistry(OperationContext* opCtx,
+                             const stdx::unordered_set<ShardId>& shardIds) {
+        LOGV2_DEBUG(
+            10657552,
+            3,
+            STAGE_LOG_PREFIX
+            "Did not find all requested shardIds in shard registry - refreshing shard registry",
+            "shardIds"_attr = shardIds,
+            "changeStream"_attr = _changeStream);
+
+        Grid::get(opCtx)->shardRegistry()->reload(opCtx);
+    }
+
+    /**
+     * Helper function to open cursors, called by both 'openCursorsOnDataShards()' and
+     * 'openCursorOnConfigServer()'.
+     */
+    std::vector<RemoteCursor> openCursors(
+        OperationContext* opCtx,
+        Timestamp atClusterTime,
+        const stdx::unordered_set<ShardId>& shardIds,
+        bool isConfigServer,
+        const std::function<std::vector<RemoteCursor>()>& callback) {
+        tassert(10657516, "expected _mergeCursors to be set", _mergeCursors != nullptr);
+        tassert(
+            10657524, "expecting at least one shard id when opening cursors", !shardIds.empty());
+        tassert(10657525,
+                str::stream() << "expecting exactly one shard id for the config server, but got "
+                              << shardIds.size(),
+                !isConfigServer || shardIds.size() == 1);
+
+        LOGV2_DEBUG(10657531,
+                    3,
+                    STAGE_LOG_PREFIX "Trying to establish cursors on shards",
+                    "shardIds"_attr = shardIds,
+                    "isConfigServer"_attr = isConfigServer,
+                    "atClusterTime"_attr = atClusterTime,
+                    "changeStream"_attr = _changeStream);
+
+        // Reload the shard registry in case the requested shardIds is not present in the shard set
+        // of the local shard registry copy.
+        reloadShardRegistryIfNotAllShardsArePresent(opCtx, shardIds);
+
+        try {
+            // Run the callback function to open the cursors. This may throw an exception.
+            return callback();
+        } catch (const DBException& ex) {
+            LOGV2_DEBUG(10657545,
+                        3,
+                        STAGE_LOG_PREFIX "Could not open cursors to all requested shards",
+                        "shardIds"_attr = shardIds,
+                        "error"_attr = redact(ex.toStatus()),
+                        "changeStream"_attr = _changeStream);
+
+            // Reload shard registry and validate that all requested shard ids are actually
+            // contained in it.
+            reloadShardRegistry(opCtx, shardIds);
+
+            // If any of the requested shard ids cannot be found in the updated copy of the shard
+            // registry, return a 'ShardNotFound' error from here, despite the type of exception we
+            // originally caught. 'ShardNotFound' errors are "preferred" here, as they are handled
+            // in a special way by the callers inside this stage, i.e. they get converted into fatal
+            // 'ShardRemovedError's in strict more, and retryable 'RetryChangeStream' errors in
+            // ignore-removed-shards mode.
+            for (const ShardId& shardId : shardIds) {
+                if (auto swRes = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId);
+                    swRes.getStatus().code() == ErrorCodes::ShardNotFound) {
+                    // If any shard id is indeed not found, we will get a 'ShardNotFound' error from
+                    // the shard registry. In this case throw this error to the caller.
+                    LOGV2_DEBUG(10657553,
+                                3,
+                                STAGE_LOG_PREFIX "Could not find shard in shard registry",
+                                "shardId"_attr = shardId,
+                                "error"_attr = redact(ex.toStatus()),
+                                "shardStatus"_attr = redact(swRes.getStatus()),
+                                "changeStream"_attr = _changeStream);
+
+                    error_details::throwExceptionForStatus(swRes.getStatus());
+                }
+            }
+
+            // In case all shard ids are present in the updated shard registry, rethrow the original
+            // exception. This can be a 'ShardNotFound' exception or any other type of exception.
+            throw;
+        }
+    }
+
+    /**
+     * Helper function to close cursors, called by both 'closeCursorsOnDataShards()' and
+     * 'closeCursorOnConfigServer()'.
+     */
+    void closeCursors(const stdx::unordered_set<ShardId>& shardIds, bool isConfigServer) {
+        tassert(10657517, "expected _mergeCursors to be set", _mergeCursors != nullptr);
+        tassert(
+            10657526, "expecting at least one shard id when closing cursors", !shardIds.empty());
+        tassert(10657527,
+                str::stream() << "expecting exactly one shard id for the config server, but got "
+                              << shardIds.size(),
+                !isConfigServer || shardIds.size() == 1);
+
+        LOGV2_DEBUG(10657547,
+                    3,
+                    STAGE_LOG_PREFIX "Closing cursors on shards",
+                    "shardIds"_attr = shardIds,
+                    "isConfigServer"_attr = isConfigServer,
+                    "changeStream"_attr = _changeStream);
+
+        _mergeCursors->closeShardCursors(
+            shardIds, isConfigServer ? ShardTag::kConfigServer : ShardTag::kDataShard);
+    }
+
+    // The underlying change stream used by the cursor manager.
+    const ChangeStream _changeStream;
+
+    // The reader builder is used to build the oplog match expression when opening the change
+    // stream on the config server.
+    ChangeStreamReaderBuilder* _readerBuilder;
+
+    // The original aggregate pipeline command used when opening the change stream. Used when
+    // opening change streams on data shards.
+    BSONObj _originalAggregateCommand;
+
+    // ResumeToken used for initializing the CursorManager.
+    ResumeToken _initializationResumeToken;
+
+    // Pointer to the preceding 'MergeCursors' stage. Will be set in 'initialize()'.
+    exec::agg::MergeCursorsStage* _mergeCursors = nullptr;
+
+    // The currently targeted data shards. This does not include the config server.
+    stdx::unordered_set<ShardId> _currentlyTargetedDataShards;
+
+    // If a cursor to the config server is currently open.
+    bool _hasOpenConfigServerCursor = false;
+};
+
+// A ChangeStreamReaderContext implementation used by this stage
+class V2StageReaderContext final : public ChangeStreamReaderContext {
+    V2StageReaderContext(const V2StageReaderContext&) = delete;
+    V2StageReaderContext& operator=(const V2StageReaderContext&) = delete;
+
+public:
+    V2StageReaderContext(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        OperationContext* opCtx,
+        exec::agg::ChangeStreamHandleTopologyChangeV2Stage::CursorManager& cursorManager,
+        bool degradedMode)
+        : _expCtx(expCtx),
+          _opCtx(opCtx),
+          _cursorManager(cursorManager),
+          _degradedMode(degradedMode) {}
+
+    /**
+     * Record the request to open cursors on specific data shards.
+     *
+     * Preconditions for calling this method:
+     * - no previous call to "openCursorsOnDataShards()" has been made in the same context.
+     * - none of the shards in the shard set were included in a previous call to
+     * "closeCursorsOnDataShards()" in the same context.
+     */
+    void openCursorsOnDataShards(Timestamp atClusterTime,
+                                 const stdx::unordered_set<ShardId>& shardSet) override {
+        if (!shardSet.empty()) {
+            _bufferedRequests.validateStateForDataShardsAction(shardSet, true /* isOpen */);
+            _bufferedRequests.openCursorsOnDataShards.emplace(
+                std::make_pair(atClusterTime, shardSet));
+        }
+    }
+
+    /**
+     * Record the request to close cursors on specific data shards.
+     *
+     * Preconditions for calling this method:
+     * - no previous call to "closeCursorsOnDataShards()" has been made in the same context.
+     * - none of the shards in the shard set were included in a previous call to
+     * "openCursorsOnDataShards()" in the same context.
+     */
+    void closeCursorsOnDataShards(const stdx::unordered_set<ShardId>& shardSet) override {
+        if (!shardSet.empty()) {
+            _bufferedRequests.validateStateForDataShardsAction(shardSet, false /* isOpen */);
+            _bufferedRequests.closeCursorsOnDataShards.emplace(shardSet);
+        }
+    }
+
+    /**
+     * Record the request to open the cursor on the config server.
+     *
+     * Preconditions for calling this method:
+     * - no previous call to "openCursorOnConfigServer()" has been made in the same context.
+     */
+    void openCursorOnConfigServer(Timestamp atClusterTime) override {
+        _bufferedRequests.validateStateForConfigServerAction(true /* isOpen */);
+        _bufferedRequests.openCursorOnConfigServer.emplace(atClusterTime);
+    }
+
+    /**
+     * Record the request to close the cursor on the config server.
+     *
+     * Preconditions for calling this method:
+     * - no previous call to "closeCursorOnConfigServer()" has been made in the same context.
+     */
+    void closeCursorOnConfigServer() override {
+        _bufferedRequests.validateStateForConfigServerAction(false /* isOpen */);
+        _bufferedRequests.closeCursorOnConfigServer = true;
+    }
+
+    bool isCursorOnConfigServerOpen() const override {
+        return _cursorManager.isCursorOnConfigServerOpen();
+    }
+
+    const stdx::unordered_set<ShardId>& getCurrentlyTargetedDataShards() const override {
+        return _cursorManager.getCurrentlyTargetedDataShards();
+    }
+
+    const ChangeStream& getChangeStream() const override {
+        return _cursorManager.getChangeStream();
+    }
+
+    bool inDegradedMode() const override {
+        return _degradedMode;
+    }
+
+    /**
+     * Whether or not any requests were buffered to execute later.
+     */
+    bool hasBufferedCursorRequests() const {
+        return !_bufferedRequests.empty();
+    }
+
+    /**
+     * Executes the opening and closing of cursors for all batched cursor open/close calls.
+     *
+     * Executes the operations in the following order (each only if requested):
+     * 1. close existing cursor on config server
+     * 2. open new cursor on config server
+     * 3. close existing cursors on data shards
+     * 4. open new cursors on data shards
+     *
+     * The operations may contain both a close and an open call for the config server. In this case,
+     * the old config server cursor will be closed first before the new one is opened. The new
+     * config server cursor may be opened with an arbitrary 'clusterTime' value, so we cannot simply
+     * reuse the existing config server cursor.
+     *
+     * If an exception escapes during the execution of this method, the already-executed cursor
+     * open/close requests are not rolled back.
+     */
+    void executeCursorRequests() {
+        LOGV2_DEBUG(12013810,
+                    3,
+                    STAGE_LOG_PREFIX "Executing buffered cursor requests",
+                    "requests"_attr = _bufferedRequests.stringifyForLogging());
+
+        // Close existing cursor on config server.
+        if (_bufferedRequests.closeCursorOnConfigServer) {
+            _cursorManager.closeCursorOnConfigServer(_opCtx);
+        }
+
+        // Open cursor on config server.
+        if (_bufferedRequests.openCursorOnConfigServer.has_value()) {
+            try {
+                _cursorManager.openCursorOnConfigServer(
+                    _expCtx, _opCtx, *_bufferedRequests.openCursorOnConfigServer);
+            } catch (const DBException& ex) {
+                // The config server is always expected to be present, and if it is required for the
+                // change stream, we cannot continue without it. Especially because we now may have
+                // zero cursors open. Rethrow the exception as a 'RetryChangeStream' error, so the
+                // change stream consumer can try again.
+                uasserted(ErrorCodes::RetryChangeStream,
+                          str::stream()
+                              << "unable to open cursor on config server: " << ex.toStatus());
+            }
+        }
+
+        // Execute buffered requests to close cursors on data shards.
+        if (_bufferedRequests.closeCursorsOnDataShards.has_value()) {
+            _cursorManager.closeCursorsOnDataShards(*_bufferedRequests.closeCursorsOnDataShards);
+        }
+
+        // Execute buffered requests to open cursors on data shards.
+        if (_bufferedRequests.openCursorsOnDataShards.has_value()) {
+            tassert(12013812,
+                    "expecting to have buffered requests for opening data shard cursors",
+                    !_bufferedRequests.openCursorsOnDataShards->second.empty());
+
+            try {
+                // Try fast path first. This attempts to opens all cursors at once in parallel.
+                // This is an all-or-nothing attempt, and if it fails, the state of the
+                // 'CursorManager' is not modified w.r.t. newly opened data shard cursors.
+                openDataShardCursorsAllAtOnce();
+            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
+                // If the fast path fails, rethrow the 'ShardNotFound' exception when the change
+                // stream reader is opened in strict mode or there was only a single data shard
+                // cursor to open. In this case, the state of the 'CursorManager' is not modified.
+                if (getChangeStream().getReadMode() == ChangeStreamReadMode::kIgnoreRemovedShards &&
+                    _bufferedRequests.openCursorsOnDataShards->second.size() >= 2) {
+                    // When in ignoreRemovedShards mode and there is more than a single data shard
+                    // cursor to open, open the cursors individually, one by one. This allows
+                    // opening cursors to still-available shards while ignoring the shards that are
+                    // currently unavailable. This is the slow path.
+                    // 'ShardNotFound' exceptions are silenced here. Any non-'ShardNotFound'
+                    // exceptions will be bubbled up to the caller, potentially leaving additional
+                    // cursors open. This is not a problem, as any non-'ShardNotFound' error will
+                    // abort the change stream anyway.
+                    openAvailableDataShardCursors();
+                }
+
+                // Always rethrow the original 'ShardNotFound' exception, so the caller knows that
+                // at least one shard is missing.
+                throw ex;
+            }
+        }
+    }
+
+private:
+    /**
+     * Opens all data shard cursors at once. The cursors will be opened in parallel, so this is the
+     * fast path. Any exception while opening the cursors will be bubbled up to the caller. In case
+     * an exception occurs, the state of the 'CursorManager' does not change, and none of the
+     * specified cursors will be opened.
+     */
+    void openDataShardCursorsAllAtOnce() {
+        _cursorManager.openCursorsOnDataShards(_expCtx,
+                                               _opCtx,
+                                               _bufferedRequests.openCursorsOnDataShards->first,
+                                               _bufferedRequests.openCursorsOnDataShards->second);
+    }
+
+    /**
+     * Opens all data shard cursors that are still available, swallowing any 'ShardNotFound'
+     * exceptions for non-available shards along the way. The cursors will be opened sequentially,
+     * so this is the slow path. Should only be called if there is more than one cursor to open, and
+     * trying the fast path has already failed.
+     * As the cursors are opened one after the other and 'ShardNotFound' exceptions are ignored,
+     * this method modifies the state of the 'CursorManager' and opens as many cursors as possible,
+     * even if opening some cursors fails. The method will rethrow any non-'ShardNotFound' exception
+     * to the caller. If this happens, it won't roll back any of the cursor open requests that it
+     * already successfully executed.
+     */
+    void openAvailableDataShardCursors() {
+        for (const auto& shardId : _bufferedRequests.openCursorsOnDataShards->second) {
+            try {
+                _cursorManager.openCursorsOnDataShards(
+                    _expCtx, _opCtx, _bufferedRequests.openCursorsOnDataShards->first, {shardId});
+            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>&) {
+                // Intentionally ignore all 'ShardNotFound' exceptions.
+            }
+        }
+    }
+
+    // This struct keeps track of which cursor open/close calls have been recorded in the context.
+    // The buffered requests will be executed in one go in the 'executeCursorRequests()' method of
+    // the context.
+    struct CursorRequests {
+        boost::optional<std::pair<Timestamp, stdx::unordered_set<ShardId>>> openCursorsOnDataShards;
+        boost::optional<Timestamp> openCursorOnConfigServer;
+        boost::optional<stdx::unordered_set<ShardId>> closeCursorsOnDataShards;
+        bool closeCursorOnConfigServer = false;
+
+        void validateStateForDataShardsAction(const stdx::unordered_set<ShardId>& shardSet,
+                                              bool isOpen) const {
+            if (isOpen) {
+                tassert(10657534,
+                        "expecting open cursor request for data shards to be empty",
+                        !openCursorsOnDataShards.has_value());
+
+                for (auto&& shardId : shardSet) {
+                    tassert(10657535,
+                            "expecting no cursor close request for data shard to be present",
+                            !closeCursorsOnDataShards.has_value() ||
+                                !closeCursorsOnDataShards->contains(shardId));
+                }
+            } else {
+                tassert(10657536,
+                        "expecting close cursor request for data shards to be empty",
+                        !closeCursorsOnDataShards.has_value());
+
+                for (auto&& shardId : shardSet) {
+                    tassert(10657537,
+                            "expecting no cursor open request for data shard to be present",
+                            !openCursorsOnDataShards.has_value() ||
+                                !openCursorsOnDataShards->second.contains(shardId));
+                }
+            }
+        }
+
+        void validateStateForConfigServerAction(bool isOpen) const {
+            if (isOpen) {
+                tassert(10657538,
+                        "expecting open cursor request for the config server to be missing",
+                        !openCursorOnConfigServer.has_value());
+            } else {
+                tassert(10657539,
+                        "expecting close cursor request for the config server to be missing",
+                        !closeCursorOnConfigServer);
+            }
+        }
+
+        /**
+         * Returns true if there are no buffered requests to open/close cursors, false otherwise.
+         */
+        bool empty() const {
+            return !(openCursorsOnDataShards.has_value() || openCursorOnConfigServer.has_value() ||
+                     closeCursorsOnDataShards.has_value() || closeCursorOnConfigServer);
+        }
+
+        /**
+         * Stringifies the buffered requests to open/close cursors for usage in a log message.
+         */
+        std::string stringifyForLogging() const {
+            auto appendShardset = [&](const auto& shardSet) {
+                str::stream result;
+                std::string_view sep;
+                result << "{";
+                for (const auto& shardId : shardSet) {
+                    result << std::exchange(sep, ", ") << shardId.toString();
+                }
+                result << "}";
+                return result.ss.str();
+            };
+
+            str::stream s;
+
+            if (closeCursorOnConfigServer) {
+                s << ", close cursor on config server";
+            }
+            if (openCursorOnConfigServer.has_value()) {
+                s << ", open cursor on config server at " << *openCursorOnConfigServer;
+            }
+
+            if (closeCursorsOnDataShards.has_value()) {
+                s << ", close cursor on data shards " << appendShardset(*closeCursorsOnDataShards);
+            }
+
+            if (openCursorsOnDataShards.has_value()) {
+                s << ", open cursor on data shards "
+                  << appendShardset(openCursorsOnDataShards->second) << " at "
+                  << openCursorsOnDataShards->first;
+            }
+
+            // Strip leading comma
+            auto result = s.ss.str();
+            return result.empty() ? "none" : result.substr(2);
+        }
+    };
+
+    const boost::intrusive_ptr<ExpressionContext>& _expCtx;
+    OperationContext* _opCtx;
+    exec::agg::ChangeStreamHandleTopologyChangeV2Stage::CursorManager& _cursorManager;
+    const bool _degradedMode;
+
+    CursorRequests _bufferedRequests;
+};
+
+/**
+ * A simple waiter implementation that waits on the OperationContext until a deadline is reached
+ * or the operation is interrupted.
+ */
+class OperationContextDeadlineWaiter final
+    : public exec::agg::ChangeStreamHandleTopologyChangeV2Stage::DeadlineWaiter {
+public:
+    void waitUntil(OperationContext* opCtx, Date_t deadline) override {
+        // This can throw, but "time limit exceeded" errors will be caught by the caller.
+        opCtx->sleepUntil(deadline);
+    }
+};
+
+}  // namespace
+
+boost::intrusive_ptr<exec::agg::Stage> documentSourceChangeStreamHandleTopologyChangeV2ToStageFn(
+    const boost::intrusive_ptr<const DocumentSource>& documentSource) {
+    auto ds = boost::dynamic_pointer_cast<const DocumentSourceChangeStreamHandleTopologyChangeV2>(
+        documentSource);
+
+    tassert(10657523, "expected 'DocumentSourceChangeStreamHandleTopologyChangeV2' type", ds);
+
+    const auto& expCtx = ds->getExpCtx();
+
+    // Read data-to-shards allocation query service poll period from server parameter.
+    auto pollPeriod = minAllocationToShardsPollPeriodSecs.loadRelaxed();
+
+    ChangeStream changeStream = ChangeStream::buildFromExpressionContext(expCtx);
+
+    auto* serviceContext = expCtx->getOperationContext()->getServiceContext();
+    auto readerBuilder = ChangeStreamReaderBuilder::get(serviceContext);
+    auto dataToShardsAllocationQueryService =
+        DataToShardsAllocationQueryService::get(serviceContext);
+
+    auto params = std::make_shared<exec::agg::ChangeStreamHandleTopologyChangeV2Stage::Parameters>(
+        changeStream,
+        change_stream::resolveResumeTokenFromSpec(expCtx, *expCtx->getChangeStreamSpec()),
+        pollPeriod,
+        std::make_unique<OperationContextDeadlineWaiter>(),
+        std::make_shared<V2StageCursorManager>(changeStream, readerBuilder),
+        readerBuilder,
+        dataToShardsAllocationQueryService);
+
+    return make_intrusive<exec::agg::ChangeStreamHandleTopologyChangeV2Stage>(expCtx,
+                                                                              std::move(params));
+}
+
+namespace exec::agg {
+
+REGISTER_AGG_STAGE_MAPPING(_internalChangeStreamHandleTopologyChangeV2,
+                           DocumentSourceChangeStreamHandleTopologyChangeV2::id,
+                           documentSourceChangeStreamHandleTopologyChangeV2ToStageFn)
+
+ChangeStreamHandleTopologyChangeV2Stage::ChangeStreamHandleTopologyChangeV2Stage(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::shared_ptr<ChangeStreamHandleTopologyChangeV2Stage::Parameters> params,
+    ChangeStreamTopologyChangeV2MetricsRecorder metrics)
+    : Stage(DocumentSourceChangeStreamHandleTopologyChangeV2::kStageName, expCtx),
+      _params(std::move(params)),
+      _metrics(metrics) {}
+
+ChangeStreamHandleTopologyChangeV2Stage::~ChangeStreamHandleTopologyChangeV2Stage() {
+    _decrementDegradedIfCounted();
+}
+
+std::string_view ChangeStreamHandleTopologyChangeV2Stage::stateToString(
+    ChangeStreamHandleTopologyChangeV2Stage::State state) {
+    switch (state) {
+        case State::kUninitialized:
+            return "Uninitialized";
+        case State::kWaiting:
+            return "Waiting";
+        case State::kFetchingInitialization:
+            return "FetchingInitialization";
+        case State::kFetchingGettingChangeEvent:
+            return "FetchingGettingChangeEvent";
+        case State::kFetchingStartingChangeStreamSegment:
+            return "FetchingStartingChangeStreamSegment";
+        case State::kFetchingNormalGettingChangeEvent:
+            return "FetchingNormalGettingChangeEvent";
+        case State::kFetchingDegradedGettingChangeEvent:
+            return "FetchingDegradedGettingChangeEvent";
+        case State::kDowngrading:
+            return "Downgrading";
+        case State::kFinal:
+            return "Final";
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657548);
+}
+
+exec::agg::MergeCursorsStage* ChangeStreamHandleTopologyChangeV2Stage::getSourceStage() const {
+    auto source = dynamic_cast<exec::agg::MergeCursorsStage*>(pSource);
+    tassert(10657509, "expecting source stage to be a MergeCursorsStage", source);
+    return source;
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::runGetNextStateMachine_forTest() {
+    return _runGetNextStateMachine();
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::setState_forTest(State state,
+                                                               bool validateStateTransition) {
+    if (validateStateTransition) {
+        // Validate state transition. This will tassert if the state transition is not allowed.
+        _setState(state);
+    } else {
+        // Only set the target state without validating the state transition.
+        _state = state;
+    }
+}
+
+Timestamp ChangeStreamHandleTopologyChangeV2Stage::extractTimestampFromDocument(
+    const Document& input) {
+    // Extract cluster time from the current event via the sortkey metadata field. This does not
+    // rely on the "_id" field being present in the event.
+    return ResumeToken::extractClusterTime(input.metadata().getSortKey().getDocument());
+}
+
+DocumentSource::GetNextResult ChangeStreamHandleTopologyChangeV2Stage::doGetNext() {
+    // Continue advancing the state until there is either an event to return or an exception is
+    // thrown.
+    // TODO SERVER-110795: add some iteration-based or time-abort abort criteria to this loop so it
+    // does not iterate forever in case of a programming error.
+    for (;;) {
+        auto event = _runGetNextStateMachine();
+        if (event.has_value()) {
+            return *event;
+        }
+
+        // The following allows breaking out of the state machine eventually if the query has been
+        // interrupted.
+        pExpCtx->checkForInterrupt();
+    }
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_runGetNextStateMachine() {
+    LOGV2_DEBUG(10657500,
+                3,
+                STAGE_LOG_PREFIX "Executing state machine",
+                "state"_attr = stateToString(_state),
+                "changeStream"_attr = _params->changeStream,
+                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+    try {
+        switch (_state) {
+            case State::kUninitialized:
+                return _handleStateUninitialized();
+            case State::kWaiting:
+                return _handleStateWaiting();
+            case State::kFetchingInitialization:
+                return _handleStateFetchingInitialization();
+            case State::kFetchingGettingChangeEvent:
+                return _handleStateFetchingGettingChangeEvent();
+            case State::kFetchingStartingChangeStreamSegment:
+                return _handleStateFetchingStartingChangeStreamSegment();
+            case State::kFetchingNormalGettingChangeEvent:
+                return _handleStateFetchingNormalGettingChangeEvent();
+            case State::kFetchingDegradedGettingChangeEvent:
+                return _handleStateFetchingDegradedGettingChangeEvent();
+            case State::kDowngrading:
+                // Called method does not return a value and always throws.
+                _handleStateDowngrading();
+            case State::kFinal:
+                // Rethrow last error.
+                tassert(10657532, "expecting _lastError to be set", !_lastError.isOK());
+                error_details::throwExceptionForStatus(_lastError);
+        }
+
+        MONGO_UNREACHABLE_TASSERT(10657502);
+    } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
+        // Catch any 'ShardNotFound' exceptions and convert them into more appropriate errors.
+        // Any errors other than 'ShardNotFound' will escape from this method intentionally.
+        if (_params->changeStream.getReadMode() == ChangeStreamReadMode::kStrict) {
+            // In strict mode, rethrow any 'ShardNotFound' error as 'ShardRemovedError'.
+            _lastError =
+                Status(ErrorCodes::ShardRemovedError,
+                       fmt::format("unable to establish all necessary cursors as at least one "
+                                   "required shard has been removed. {}",
+                                   ex.reason()));
+        } else {
+            // In ignoreRemovedShards mode, rethrow any 'ShardNotFound' error as
+            // 'RetryChangeStream' error.
+            _lastError =
+                Status(ErrorCodes::RetryChangeStream,
+                       fmt::format("unable to establish all necessary cursors as at least one "
+                                   "shard has been removed. {}",
+                                   ex.reason()));
+        }
+        _setState(State::kFinal);
+        error_details::throwExceptionForStatus(_lastError);
+    } catch (const DBException& ex) {
+        Status status = ex.toStatus();
+
+        LOGV2_WARNING(10657501,
+                      STAGE_LOG_PREFIX "Caught exception in state machine",
+                      "state"_attr = stateToString(_state),
+                      "error"_attr = redact(status),
+                      "changeStream"_attr = _params->changeStream,
+                      "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+        // We cannot set state to kFinal if we have already been in state kFinal before.
+        if (_state != State::kFinal) {
+            _lastError = status;
+            _setState(State::kFinal);
+        }
+        throw;
+    }
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_setState(
+    ChangeStreamHandleTopologyChangeV2Stage::State newState) {
+    // Cannot set the state to the current state again.
+    tassert(10657503,
+            str::stream() << "invalid repeated state assignment for state "
+                          << stateToString(newState),
+            _state != newState);
+
+    // Cannot transition from state kFinal to another state.
+    tassert(10657504,
+            str::stream() << "cannot transition state from " << stateToString(State::kFinal)
+                          << " to " << stateToString(newState),
+            _state != State::kFinal);
+
+    // Cannot transition back to stage kUninitialized.
+    tassert(10657505,
+            str::stream() << "cannot transition state back to " << stateToString(newState),
+            newState != State::kUninitialized);
+
+    // Cannot transition to stage kWaiting except from kUninitialized.
+    tassert(10657529,
+            str::stream() << "cannot transition state to " << stateToString(newState),
+            newState != State::kWaiting || _state == State::kUninitialized);
+
+    // Cannot transition to stage kFetchingInitialization except from kUninitialized or kWaiting.
+    tassert(10657530,
+            str::stream() << "cannot transition state to " << stateToString(newState),
+            newState != State::kFetchingInitialization || _state == State::kUninitialized ||
+                _state == State::kWaiting);
+
+    LOGV2_DEBUG(10657506,
+                3,
+                STAGE_LOG_PREFIX "Transitioning state",
+                "previous"_attr = stateToString(_state),
+                "new"_attr = stateToString(newState),
+                "changeStream"_attr = _params->changeStream,
+                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+    // Count the entry into the new state. Only reached for transitions that passed the validation
+    // above, so 'kUninitialized' (forbidden as a transition target) is never recorded.
+    _recordStateEntry(newState);
+
+    // Maintain the currently-degraded gauge: +1 when this stream enters degraded mode, -1 when it
+    // leaves. The validation above guarantees '_state != newState', so exactly one of the branches
+    // below can fire. '_degradedCounted' makes the adjustment idempotent across 'doDispose()' and
+    // any post-dispose transition.
+    if (newState == State::kFetchingDegradedGettingChangeEvent && !_degradedCounted) {
+        _metrics.incrementDegraded();
+        _degradedCounted = true;
+    } else if (_state == State::kFetchingDegradedGettingChangeEvent && _degradedCounted) {
+        _metrics.decrementDegraded();
+        _degradedCounted = false;
+    }
+
+    _state = newState;
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_recordStateEntry(State newState) const {
+    switch (newState) {
+        case State::kWaiting:
+            _metrics.waiting.add(1);
+            return;
+        case State::kFetchingInitialization:
+            _metrics.fetchingInitialization.add(1);
+            return;
+        case State::kFetchingGettingChangeEvent:
+            _metrics.fetchingGettingChangeEvent.add(1);
+            return;
+        case State::kFetchingStartingChangeStreamSegment:
+            _metrics.fetchingStartingChangeStreamSegment.add(1);
+            return;
+        case State::kFetchingNormalGettingChangeEvent:
+            _metrics.fetchingNormalGettingChangeEvent.add(1);
+            return;
+        case State::kFetchingDegradedGettingChangeEvent:
+            _metrics.fetchingDegradedGettingChangeEvent.add(1);
+            return;
+        case State::kDowngrading:
+            _metrics.downgrading.add(1);
+            return;
+        case State::kFinal:
+            _metrics.final.add(1);
+            return;
+        case State::kUninitialized:
+            // Transitions back to 'kUninitialized' are forbidden (tassert in _setState()).
+            break;
+    }
+    MONGO_UNREACHABLE_TASSERT(13565600);
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::doDispose() {
+    // A stage torn down while in degraded mode never leaves it via a state transition, so
+    // decrement the gauge here. '_decrementDegradedIfCounted()' guards against
+    // double-decrementing if a transition out of degraded mode already ran, or against disposing
+    // a non-degraded stage.
+    _decrementDegradedIfCounted();
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_decrementDegradedIfCounted() {
+    if (_degradedCounted) {
+        _metrics.decrementDegraded();
+        _degradedCounted = false;
+    }
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_assertState(
+    ChangeStreamHandleTopologyChangeV2Stage::State expectedState,
+    boost::optional<ChangeStreamReadMode> expectedMode,
+    std::string_view context) const {
+    tassert(10657508,
+            str::stream() << "unexpected state in " << context << "(), expecting: "
+                          << stateToString(expectedState) << ", actual: " << stateToString(_state),
+            _state == expectedState);
+
+    auto modeToString = [](ChangeStreamReadMode mode) -> std::string_view {
+        if (mode == ChangeStreamReadMode::kStrict) {
+            return "strict";
+        }
+        return "ignoreRemovedShards";
+    };
+
+    if (expectedMode.has_value()) {
+        auto actualMode = _params->changeStream.getReadMode();
+        tassert(10657515,
+                str::stream() << "expecting change stream to be open in mode "
+                              << modeToString(*expectedMode) << ", but got "
+                              << modeToString(actualMode) << " in " << context << "()",
+                *expectedMode == actualMode);
+    }
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_ensureShardTargeter() {
+    if (_shardTargeter == nullptr) {
+        _shardTargeter = _params->changeStreamReaderBuilder->buildShardTargeter(
+            getContext()->getOperationContext(), _params->changeStream);
+    }
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_logShardTargeterDecision(
+    std::string_view context, ShardTargeterDecision targeterDecision) const {
+    LOGV2_DEBUG(10657549,
+                3,
+                STAGE_LOG_PREFIX "Shard targeter decision",
+                "state"_attr = stateToString(_state),
+                "context"_attr = context,
+                "decision"_attr = targeterDecision,
+                "changeStream"_attr = _params->changeStream,
+                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_logShardTargeterDecision(
+    std::string_view context, ShardTargeterDecision targeterDecision, const Document& event) const {
+    LOGV2_DEBUG(10657557,
+                3,
+                STAGE_LOG_PREFIX "Shard targeter decision",
+                "state"_attr = stateToString(_state),
+                "context"_attr = context,
+                "decision"_attr = targeterDecision,
+                "event"_attr = event,
+                "changeStream"_attr = _params->changeStream,
+                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_logShardTargeterDecision(
+    std::string_view context,
+    ShardTargeterDecision targeterDecision,
+    Timestamp segmentStart,
+    Timestamp segmentEnd) const {
+    LOGV2_DEBUG(10657558,
+                3,
+                STAGE_LOG_PREFIX "Shard targeter decision",
+                "state"_attr = stateToString(_state),
+                "context"_attr = context,
+                "decision"_attr = targeterDecision,
+                "segmentStart"_attr = segmentStart,
+                "segmentEnd"_attr = segmentEnd,
+                "changeStream"_attr = _params->changeStream,
+                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+}
+
+AllocationToShardsStatus ChangeStreamHandleTopologyChangeV2Stage::_getAllocationToShardsStatus(
+    Timestamp clusterTime) {
+    // Save old previous request time for logging purposes.
+    Date_t previousRequestTime = _lastAllocationToShardsRequestTime;
+    _lastAllocationToShardsRequestTime =
+        getContext()->getOperationContext()->getServiceContext()->getPreciseClockSource()->now();
+
+    AllocationToShardsStatus allocationToShardsStatus =
+        _params->dataToShardsAllocationQueryService->getAllocationToShardsStatus(
+            getContext()->getOperationContext(), clusterTime);
+
+    LOGV2_DEBUG(10657550,
+                3,
+                STAGE_LOG_PREFIX "Allocation to shards status",
+                "state"_attr = stateToString(_state),
+                "previousRequestTime"_attr = previousRequestTime,
+                "clusterTime"_attr = clusterTime,
+                "status"_attr = allocationToShardsStatus,
+                "changeStream"_attr = _params->changeStream,
+                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+    return allocationToShardsStatus;
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateUninitialized() {
+    _assertState(State::kUninitialized, {} /* mode */, "_handleStateUninitialized");
+
+    auto allocationToShardsStatus = _getAllocationToShardsStatus(_params->resumeToken.clusterTime);
+
+    if (allocationToShardsStatus == AllocationToShardsStatus::kNotAvailable) {
+        uasserted(ErrorCodes::RetryChangeStream,
+                  "No information about collection/database allocation to data shards is "
+                  "available for the requested cluster time");
+    }
+
+    _params->cursorManager->initialize(getContext(), this, _params->resumeToken);
+
+    switch (allocationToShardsStatus) {
+        case AllocationToShardsStatus::kFutureClusterTime:
+            _setState(State::kWaiting);
+            return boost::none;
+        case AllocationToShardsStatus::kOk:
+            _setState(State::kFetchingInitialization);
+            return boost::none;
+        case AllocationToShardsStatus::kNotAvailable:
+            break;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657511);
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateWaiting() {
+    _assertState(State::kWaiting, {} /* mode */, "_handleStateWaiting");
+
+    OperationContext* opCtx = getContext()->getOperationContext();
+    Date_t now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+    Seconds secondsSinceLastPoll = duration_cast<Seconds>(now - _lastAllocationToShardsRequestTime);
+
+    if (secondsSinceLastPoll < Seconds(_params->minAllocationToShardsPollPeriodSecs)) {
+        // Next planned time to poll again.
+        const Date_t nextPollTime = _lastAllocationToShardsRequestTime +
+            Seconds(_params->minAllocationToShardsPollPeriodSecs);
+
+        // For awaitData getMores the caller's deadline lives in 'awaitDataState', not on opCtx.
+        // Cap the wait time to not be larger than the maxAwaitTimeMS.
+        const auto& awaitState = awaitDataState(opCtx);
+        const Date_t waitUntilDate = awaitState.shouldWaitForInserts
+            ? std::min(nextPollTime, awaitState.waitForInsertsDeadline)
+            : nextPollTime;
+
+        try {
+            // Returns normally when 'waitUntilDate' is reached. Throws ExceededTimeLimit when
+            // the opCtx deadline expires (only set when the aggregate was issued with explicit
+            // 'maxTimeMS', as mongos does not set it for awaitData getMores) caught below.
+            _params->deadlineWaiter->waitUntil(opCtx, waitUntilDate);
+        } catch (const ExceptionFor<ErrorCategory::ExceededTimeLimitError>& ex) {
+            // OperationContext deadline reached. Reachable only on an initial aggregate where the
+            // user passed 'maxTimeMS'. Surface a clean EOF so the aggregate returns the cursor with
+            // an empty firstBatch.
+            LOGV2_DEBUG(10657544,
+                        3,
+                        STAGE_LOG_PREFIX "Deadline time limit exceeded",
+                        "nextPollTime"_attr = nextPollTime,
+                        "deadline"_attr = opCtx->getDeadline(),
+                        "state"_attr = stateToString(_state),
+                        "error"_attr = redact(ex.toStatus()),
+                        "changeStream"_attr = _params->changeStream,
+                        "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+            return GetNextResult::makeEOF();
+        }
+
+        // The wait may have ended because the awaitData deadline. Timeout is reached. Return EOF.
+        if (awaitState.shouldWaitForInserts &&
+            awaitState.waitForInsertsDeadline <=
+                opCtx->getServiceContext()->getPreciseClockSource()->now()) {
+            return GetNextResult::makeEOF();
+        }
+
+        // We only waited up to 'nextPollTime'. Stay in kWaiting.
+        return boost::none;
+    }
+
+    // Poll data-to-shards allocation again.
+    switch (_getAllocationToShardsStatus(_params->resumeToken.clusterTime)) {
+        case AllocationToShardsStatus::kNotAvailable:
+            // No placement information is available for the specified cluster time. Throw
+            // 'RetryChangeStream' exception.
+            uasserted(ErrorCodes::RetryChangeStream,
+                      "Could not retrieve placement information for the specified cluster time");
+        case AllocationToShardsStatus::kFutureClusterTime:
+            // No awaitData deadline means there's nothing to time-bound a loop against (e.g. the
+            // initial aggregate). Surface an empty batch so the client gets the cursor back and
+            // can issue getMore, which will carry the awaitData deadline.
+            if (!awaitDataState(opCtx).shouldWaitForInserts) {
+                return GetNextResult::makeEOF();
+            }
+            return boost::none;
+        case AllocationToShardsStatus::kOk:
+            // Transition to kFetchingInitialization state.
+            _setState(State::kFetchingInitialization);
+            return boost::none;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657507);
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateFetchingInitialization() {
+    _assertState(
+        State::kFetchingInitialization, {} /* mode */, "_handleStateFetchingInitialization");
+
+    tassert(10657513, "should not have shardTargeter object", _shardTargeter == nullptr);
+
+    _ensureShardTargeter();
+
+    tassert(12013805,
+            "expecting no cursors to be open when initializing fetching",
+            !_params->cursorManager->isCursorOnConfigServerOpen() &&
+                _params->cursorManager->getCurrentlyTargetedDataShards().empty());
+
+    if (_params->changeStream.getReadMode() == ChangeStreamReadMode::kIgnoreRemovedShards) {
+        // Enter state machine for ignoreRemovedShards mode.
+        _segmentStartTimestamp = _params->resumeToken.clusterTime;
+
+        // Reset failure counter.
+        _shardNotFoundFailuresInARow = 0;
+
+        _setState(State::kFetchingStartingChangeStreamSegment);
+        return boost::none;
+    }
+
+    // Strict mode.
+
+    V2StageReaderContext readerContext(getContext(),
+                                       getContext()->getOperationContext(),
+                                       *_params->cursorManager,
+                                       false /* degradedMode */);
+
+    auto shardTargeterDecision = _shardTargeter->initialize(
+        getContext()->getOperationContext(), _params->resumeToken.clusterTime, readerContext);
+
+    _logShardTargeterDecision("Initialized shardTargeter", shardTargeterDecision);
+
+    switch (shardTargeterDecision) {
+        case ShardTargeterDecision::kContinue:
+            // Opens and closes the cursors as requested in the reader context. If this throws, the
+            // exception bubbles up and we transition to the kFinal state.
+            readerContext.executeCursorRequests();
+            _setState(State::kFetchingGettingChangeEvent);
+            return boost::none;
+        case ShardTargeterDecision::kSwitchToV1:
+            _setState(State::kDowngrading);
+            return DocumentSource::GetNextResult::makeEOF();
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657512);
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateFetchingGettingChangeEvent() {
+    _assertState(State::kFetchingGettingChangeEvent,
+                 ChangeStreamReadMode::kStrict /* mode */,
+                 "_handleStateFetchingGettingChangeEvent");
+
+    auto input = pSource->getNext();
+    if (!input.isAdvancedControlDocument()) {
+        // Intentionally no state change here.
+        return input;
+    }
+
+    // Advanced control document found.
+
+    // Shard targeter should always be already present here in non-testing mode, but it may be
+    // missing when unit testing the individual states.
+    _ensureShardTargeter();
+
+    V2StageReaderContext readerContext(getContext(),
+                                       getContext()->getOperationContext(),
+                                       *_params->cursorManager,
+                                       false /* degradedMode */);
+
+    auto shardTargeterDecision = _shardTargeter->handleEvent(
+        getContext()->getOperationContext(), input.getDocument(), readerContext);
+
+    _logShardTargeterDecision("handleEvent", shardTargeterDecision, input.getDocument());
+
+    switch (shardTargeterDecision) {
+        case ShardTargeterDecision::kContinue:
+            // Opens and closes the cursors as requested in the reader context. If this throws, the
+            // exception bubbles up and we go into the kFinal state.
+            readerContext.executeCursorRequests();
+            return boost::none;
+        case ShardTargeterDecision::kSwitchToV1:
+            _setState(State::kDowngrading);
+            return DocumentSource::GetNextResult::makeEOF();
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657514);
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateFetchingStartingChangeStreamSegment() {
+    _assertState(State::kFetchingStartingChangeStreamSegment,
+                 ChangeStreamReadMode::kIgnoreRemovedShards /* mode */,
+                 "_handleStateFetchingStartingChangeStreamSegment");
+
+    // Shard targeter should always be already present here in non-testing mode, but it may be
+    // missing when unit testing the individual states.
+    _ensureShardTargeter();
+
+    tassert(10657518,
+            "expecting segment start timestamp to be set",
+            _segmentStartTimestamp.has_value());
+
+    ON_BLOCK_EXIT([&]() {
+        // Turn on undo buffering in the results merger if we are entering the degraded fetching
+        // state.
+        if (_state == State::kFetchingDegradedGettingChangeEvent) {
+            _params->cursorManager->enableUndoNextMode();
+        }
+    });
+
+    V2StageReaderContext readerContext(getContext(),
+                                       getContext()->getOperationContext(),
+                                       *_params->cursorManager,
+                                       true /* degradedMode */);
+
+    auto [shardTargeterDecision, segmentEndTimestamp] = _shardTargeter->startChangeStreamSegment(
+        getContext()->getOperationContext(), *_segmentStartTimestamp, readerContext);
+
+    _logShardTargeterDecision("Started change stream segment",
+                              shardTargeterDecision,
+                              *_segmentStartTimestamp,
+                              segmentEndTimestamp.value_or(Timestamp::max()));
+
+    switch (shardTargeterDecision) {
+        case ShardTargeterDecision::kSwitchToV1:
+            _setState(State::kDowngrading);
+            return GetNextResult::makeEOF();
+        case ShardTargeterDecision::kContinue:
+            // Opens and closes the cursors as requested in the reader context. If we catch a
+            // 'ShardNotFound' error, we continue. All other exceptions bubble up and cause a
+            // transition to the kFinal state.
+            try {
+                readerContext.executeCursorRequests();
+            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
+                LOGV2_DEBUG(10657542,
+                            3,
+                            STAGE_LOG_PREFIX "Encountered 'ShardNotFound' error",
+                            "state"_attr = stateToString(_state),
+                            "error"_attr = redact(ex.toStatus()),
+                            "shardNotFoundFailuresInARow"_attr = _shardNotFoundFailuresInARow,
+                            "maxShardNotFoundFailuresInARow"_attr = kMaxShardNotFoundFailuresInARow,
+                            "isCursorOnConfigServerOpen"_attr =
+                                _params->cursorManager->isCursorOnConfigServerOpen(),
+                            "currentlyTargetedDataShards"_attr =
+                                _params->cursorManager->getCurrentlyTargetedDataShards(),
+                            "changeStream"_attr = _params->changeStream,
+                            "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+                // Avoid an infinite loop here by counting the number of failures in a row, and
+                // break out with a tassert if we have already seen too many.
+                uassert(ErrorCodes::RetryChangeStream,
+                        str::stream()
+                            << "Encountered too many consecutive 'ShardNotFound' errors in change "
+                               "stream, try reopening the change stream at a later point: "
+                            << ex.reason(),
+                        ++_shardNotFoundFailuresInARow < kMaxShardNotFoundFailuresInARow);
+
+                // No state change has happened yet. We are returning nothing here so the state
+                // machine will run again for the same state.
+                return boost::none;
+            }
+
+            // State change to either degraded or normal fetching.
+            _segmentEndTimestamp = segmentEndTimestamp;
+            if (segmentEndTimestamp.has_value()) {
+                // When entering degraded mode fetching, no cursors to the config server should be
+                // open. This must be ensured by the shard targeter in the above call to
+                // 'startChangeStreamSegment()'.
+                tassert(12013806,
+                        "expecting no config server cursor to be open",
+                        !_params->cursorManager->isCursorOnConfigServerOpen());
+
+                // This is a bounded segment: a shard promise may point beyond the segment end, so
+                // do not let it advance the client-visible high water mark.
+                _params->cursorManager->setPromisedSortKeyHighWaterMarkAdvancement(false);
+
+                _setState(State::kFetchingDegradedGettingChangeEvent);
+            } else {
+                // Unbounded segment: promises from the current shard set are valid, so allow them
+                // to advance the client-visible high water mark again. This keeps the post-batch
+                // resume token moving forward while shards are idle.
+                _params->cursorManager->setPromisedSortKeyHighWaterMarkAdvancement(true);
+
+                _setState(State::kFetchingNormalGettingChangeEvent);
+            }
+            return boost::none;
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657519);
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateFetchingNormalGettingChangeEvent() {
+    _assertState(State::kFetchingNormalGettingChangeEvent,
+                 ChangeStreamReadMode::kIgnoreRemovedShards /* mode */,
+                 "_handleStateFetchingNormalGettingChangeEvent");
+
+    auto input = pSource->getNext();
+    if (!input.isAdvancedControlDocument()) {
+        // Intentionally no state change here.
+        return input;
+    }
+
+    // Advanced control document found.
+
+    // Shard targeter should always be already present here in non-testing mode, but it may be
+    // missing when unit testing the individual states.
+    _ensureShardTargeter();
+
+    ON_BLOCK_EXIT([&]() {
+        // Turn on undo buffering in the results merger if we are entering the degraded fetching
+        // state.
+        if (_state == State::kFetchingDegradedGettingChangeEvent) {
+            _params->cursorManager->enableUndoNextMode();
+        }
+    });
+
+    V2StageReaderContext readerContext(getContext(),
+                                       getContext()->getOperationContext(),
+                                       *_params->cursorManager,
+                                       false /* degradedMode */);
+
+    auto shardTargeterDecision = _shardTargeter->handleEvent(
+        getContext()->getOperationContext(), input.getDocument(), readerContext);
+
+    _logShardTargeterDecision(
+        "Handle event (fetching normal)", shardTargeterDecision, input.getDocument());
+
+    switch (shardTargeterDecision) {
+        case ShardTargeterDecision::kContinue:
+            // Opens and closes the cursors as requested in the reader context. If we catch a
+            // 'ShardNotFound' exception, we go into degraded mode.
+            try {
+                readerContext.executeCursorRequests();
+            } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
+                if (!_params->cursorManager->isCursorOnConfigServerOpen() &&
+                    _params->cursorManager->getCurrentlyTargetedDataShards().empty()) {
+                    // No cursor is open, so we cannot proceed with fetching from the $mergeCursors
+                    // stage. Instead, start a new segment at the current event's timestamp to open
+                    // the required cursors from this point onwards.
+                    _segmentStartTimestamp = extractTimestampFromDocument(input.getDocument());
+                    LOGV2_DEBUG(12013811,
+                                3,
+                                STAGE_LOG_PREFIX
+                                "Encountered 'ShardNotFound' error and not having any cursors "
+                                "open. Adjusting start timestamp for "
+                                "segment and transitioning to starting new segment",
+                                "state"_attr = stateToString(_state),
+                                "error"_attr = redact(ex.toStatus()),
+                                "startTimestamp"_attr = _segmentStartTimestamp.value(),
+                                "isCursorOnConfigServerOpen"_attr =
+                                    _params->cursorManager->isCursorOnConfigServerOpen(),
+                                "currentlyTargetedDataShards"_attr =
+                                    _params->cursorManager->getCurrentlyTargetedDataShards(),
+                                "changeStream"_attr = _params->changeStream,
+                                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+                    _setState(State::kFetchingStartingChangeStreamSegment);
+                } else {
+                    // Adjust end timestamp of the current segment and transition to degraded mode.
+                    _segmentEndTimestamp = extractTimestampFromDocument(input.getDocument()) + 1;
+
+                    // This segment is now bounded, so shard promises may point beyond its end. Do
+                    // not let them advance the client-visible high water mark.
+                    _params->cursorManager->setPromisedSortKeyHighWaterMarkAdvancement(false);
+
+                    LOGV2_DEBUG(10657543,
+                                3,
+                                STAGE_LOG_PREFIX
+                                "Encountered 'ShardNotFound' error. Adjusting end timestamp for "
+                                "segment and transitioning to degraded mode",
+                                "state"_attr = stateToString(_state),
+                                "error"_attr = redact(ex.toStatus()),
+                                "endTimestamp"_attr = _segmentEndTimestamp.value(),
+                                "isCursorOnConfigServerOpen"_attr =
+                                    _params->cursorManager->isCursorOnConfigServerOpen(),
+                                "currentlyTargetedDataShards"_attr =
+                                    _params->cursorManager->getCurrentlyTargetedDataShards(),
+                                "changeStream"_attr = _params->changeStream,
+                                "resumeTokenClusterTime"_attr = _params->resumeToken.clusterTime);
+
+                    _setState(State::kFetchingDegradedGettingChangeEvent);
+                }
+                // Note: the current control event is lost here and will not be processed again.
+            }
+            return boost::none;
+        case ShardTargeterDecision::kSwitchToV1:
+            _setState(State::kDowngrading);
+            return DocumentSource::GetNextResult::makeEOF();
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657520);
+}
+
+boost::optional<DocumentSource::GetNextResult>
+ChangeStreamHandleTopologyChangeV2Stage::_handleStateFetchingDegradedGettingChangeEvent() {
+    _assertState(State::kFetchingDegradedGettingChangeEvent,
+                 ChangeStreamReadMode::kIgnoreRemovedShards /* mode */,
+                 "_handleStateFetchingDegradedGettingChangeEvent");
+
+    tassert(
+        10657521, "expecting segment end timestamp to be set", _segmentEndTimestamp.has_value());
+
+    ON_BLOCK_EXIT([&]() {
+        // Turn off undo buffering in the results merger if we are exiting this state.
+        if (_state != State::kFetchingDegradedGettingChangeEvent) {
+            _params->cursorManager->disableUndoNextMode();
+        }
+    });
+
+    // Fetch next result from the predecessor $mergeCursors stage. The $mergeCursors stage itself
+    // will fetch the result from its 'BlockingResultsMerger' instance. The 'BlockingResultsMerger'
+    // can either retrieve a result from its underlying 'AsyncResultsMerger' if a result is ready,
+    // or return an ad-hoc "EOF" event in case the 'AsyncResultsMerger' is not ready to return a
+    // result.
+    auto input = pSource->getNext();
+
+    Timestamp eventTimestamp = [&]() {
+        if (input.isAdvancedControlDocument()) {
+            // Extract the cluster time from the current event. This requires parsing the resume
+            // token data, so we limit it to control events.
+            return extractTimestampFromDocument(input.getDocument());
+        }
+
+        // Extract the cluster time from the current high-water mark of the 'AsyncResultsMerger'.
+        const auto currentHighWaterMark =
+            _params->cursorManager->getTimestampFromCurrentHighWaterMark();
+
+        // If the change event was retrieved and the event was the last in the queue of
+        // 'AsyncResultsMerger', then it is possible that the high water-mark returned from
+        // 'AsyncResultsMerger' may be advanced beyond the high water-mark associated with the
+        // change event. In this case, retrieve the timestamp from the document. A check to see if
+        // 'currentHighWaterMark' is beyond the end of the segment is a performance optimization.
+        if (input.isAdvanced() && (currentHighWaterMark >= *_segmentEndTimestamp)) {
+            return extractTimestampFromDocument(input.getDocument());
+        }
+        return currentHighWaterMark;
+    }();
+
+    if (eventTimestamp >= *_segmentEndTimestamp) {
+        // End of change stream segment reached, and data was "overfetched". This means the result
+        // of the 'getNext()' call above needs to be undone.
+        _segmentStartTimestamp = _segmentEndTimestamp;
+        _segmentEndTimestamp.reset();
+
+        // Reset failure counter.
+        _shardNotFoundFailuresInARow = 0;
+        _setState(State::kFetchingStartingChangeStreamSegment);
+
+        if (!input.isEOF() && !input.isPaused()) {
+            _params->cursorManager->undoGetNext();
+        }
+        _params->cursorManager->setHighWaterMark(*_segmentStartTimestamp);
+
+        // Return here without returning the event we just pulled, because we have already stashed
+        // it back into the underlying results merger.
+        return boost::none;
+    }
+
+    if (!input.isAdvancedControlDocument()) {
+        return input;
+    }
+
+    // Advanced control document found.
+
+    // Shard targeter should always be already present here in non-testing mode, but it may be
+    // missing when unit testing the individual states.
+    _ensureShardTargeter();
+
+    V2StageReaderContext readerContext(getContext(),
+                                       getContext()->getOperationContext(),
+                                       *_params->cursorManager,
+                                       true /* degradedMode */);
+
+    auto shardTargeterDecision = _shardTargeter->handleEvent(
+        getContext()->getOperationContext(), input.getDocument(), readerContext);
+
+    _logShardTargeterDecision("Handle event (fetching degraded)", shardTargeterDecision);
+
+    switch (shardTargeterDecision) {
+        case ShardTargeterDecision::kContinue:
+            // Opening and closing cursors should not happen in degraded mode, so we intentionally
+            // do not call 'executeCursorRequests()' on the 'readerContext' here.
+            tassert(10657556,
+                    "should not have buffered any open/close requests in degraded fetching mode",
+                    !readerContext.hasBufferedCursorRequests());
+            return boost::none;
+        case ShardTargeterDecision::kSwitchToV1:
+            tasserted(
+                10922904,
+                "shard targeter in ignoreRemovedShards mode should always return 'kContinue'");
+    }
+
+    MONGO_UNREACHABLE_TASSERT(10657522);
+}
+
+void ChangeStreamHandleTopologyChangeV2Stage::_handleStateDowngrading() {
+    _assertState(State::kDowngrading, {} /* mode */, "_handleStateDowngrading");
+
+    uasserted(ErrorCodes::RetryChangeStream, "Downgrading change stream reader to v1 version");
+}
+
+}  // namespace exec::agg
+}  // namespace mongo

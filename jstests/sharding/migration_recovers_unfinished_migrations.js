@@ -1,0 +1,212 @@
+/**
+ * Tests that while there is an unfinished migration pending recovery, if a new migration (of a
+ * different collection) attempts to start, it will first need to recover the unfinished migration.
+ *
+ * @tags: [
+ *     # In the event of a config server step down, the new primary balancer may attempt to recover
+ *     # that migration by sending a new `moveChunk` command to the donor shard causing the test to
+ *     # hang.
+ *     does_not_support_stepdowns,
+ *     # Flaky with a config shard because the failovers it triggers trigger a retry from mongos,
+ *     # which can prevent the fail point from being unset and time out.
+ *     config_shard_incompatible,
+ * ]
+ */
+import {moveChunkParallel} from "jstests/libs/chunk_manipulation_util.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {startParallelOps} from "jstests/libs/test_background_ops.js";
+
+// Disable checking for index consistency to ensure that the config server doesn't trigger a
+// StaleShardVersion exception on the shards and cause them to refresh their sharding metadata. That
+// would interfere with the precise migration recovery interleaving this test requires.
+const nodeOptions = {
+    setParameter: {enableShardedIndexConsistencyCheck: false},
+};
+
+// Disable balancer in order to prevent balancing rounds from triggering shard version refreshes on
+// the shards that would interfere with the migration recovery interleaving this test requires.
+let st = new ShardingTest({
+    shards: {rs0: {nodes: 2}, rs1: {nodes: 1}},
+    config: 3,
+    other: {configOptions: nodeOptions, enableBalancer: false},
+});
+let staticMongod = MongoRunner.runMongod({});
+
+const dbName = "test";
+const collNameA = "foo";
+const collNameB = "bar";
+const nsA = dbName + "." + collNameA;
+const nsB = dbName + "." + collNameB;
+
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}),
+);
+assert.commandWorked(st.s.adminCommand({shardCollection: nsA, key: {_id: 1}}));
+assert.commandWorked(st.s.adminCommand({shardCollection: nsB, key: {_id: 1}}));
+
+const adminDB = st.s.getDB("admin");
+const usesMoveRangeCoordinatorPath = FeatureFlagUtil.isPresentAndEnabled(
+    adminDB,
+    "AuthoritativeShardsDDL",
+);
+const recoveryFailPointName = usesMoveRangeCoordinatorPath
+    ? "hangInMoveRangeCoordinatorGlobalCatalogCommit"
+    : "hangInEnsureChunkVersionIsGreaterThanInterruptible";
+
+function getPendingMigrationRecoveryNss() {
+    const configDB = st.rs0.getPrimary().getDB("config");
+    if (usesMoveRangeCoordinatorPath) {
+        return configDB
+            .getCollection("system.sharding_ddl_coordinators")
+            .find({"_id.operationType": "moveRange"})
+            .toArray()
+            .map((doc) => doc._id.namespace);
+    }
+
+    return configDB
+        .getCollection("migrationCoordinators")
+        .find()
+        .toArray()
+        .map((doc) => doc.nss);
+}
+
+let joinMoveChunk1;
+let recoveryFailpoints;
+const rs0Secondary = st.rs0.getSecondary();
+
+if (usesMoveRangeCoordinatorPath) {
+    // The MoveRangeCoordinator is itself the migration recovery mechanism. Hang it at the global
+    // catalog commit so the migration is left unfinished, then step the donor over so the new
+    // primary recovers the coordinator. The soon-to-be primary is hung at the same phase so
+    // recovery stalls there, leaving the migration pending recovery. The commit has not happened
+    // yet, so the original moveChunk command only returns once recovery is allowed to complete; it
+    // is joined at the end.
+    const commitFailpointOldPrimary = configureFailPoint(
+        st.rs0.getPrimary(),
+        recoveryFailPointName,
+    );
+    const commitFailpointNewPrimary = configureFailPoint(rs0Secondary, recoveryFailPointName);
+
+    joinMoveChunk1 = moveChunkParallel(
+        staticMongod,
+        st.s0.host,
+        {_id: 0},
+        null,
+        nsA,
+        st.shard1.shardName,
+        true /* expectSuccess */,
+    );
+
+    commitFailpointOldPrimary.wait();
+
+    st.rs0.stepUp(rs0Secondary);
+    commitFailpointNewPrimary.wait();
+    // The old primary has stepped down; its failpoint is no longer relevant.
+    commitFailpointOldPrimary.off();
+
+    recoveryFailpoints = [commitFailpointNewPrimary];
+} else {
+    // Hang before commit migration
+    let moveChunkHangAtStep5Failpoint = configureFailPoint(
+        st.rs0.getPrimary(),
+        "moveChunkHangAtStep5",
+    );
+    joinMoveChunk1 = moveChunkParallel(
+        staticMongod,
+        st.s0.host,
+        {_id: 0},
+        null,
+        nsA,
+        st.shard1.shardName,
+        true /* expectSuccess */,
+    );
+
+    moveChunkHangAtStep5Failpoint.wait();
+
+    let migrationCommitNetworkErrorFailpoint = configureFailPoint(
+        st.rs0.getPrimary(),
+        "migrationCommitNetworkError",
+    );
+    let skipShardFilteringMetadataRefreshFailpoint = configureFailPoint(
+        st.rs0.getPrimary(),
+        "skipShardFilteringMetadataRefresh",
+    );
+
+    // Don't let the migration recovery finish on the secondary that will next be stepped up.
+    recoveryFailpoints = [configureFailPoint(rs0Secondary, recoveryFailPointName)];
+
+    moveChunkHangAtStep5Failpoint.off();
+    migrationCommitNetworkErrorFailpoint.wait();
+
+    st.rs0.stepUp(rs0Secondary);
+
+    joinMoveChunk1();
+    migrationCommitNetworkErrorFailpoint.off();
+    skipShardFilteringMetadataRefreshFailpoint.off();
+}
+
+// The migration is left pending recovery.
+{
+    const pendingMigrationRecoveryNss = getPendingMigrationRecoveryNss();
+    assert.eq(1, pendingMigrationRecoveryNss.length);
+    assert.eq(nsA, pendingMigrationRecoveryNss[0]);
+}
+
+// Start a second migration on a different collection and wait until it persists its recovery
+// document.
+let moveChunkHangAtStep3Failpoint = configureFailPoint(st.rs0.getPrimary(), "moveChunkHangAtStep3");
+
+// When the MoveRangeCoordinator path is active, the recovered coordinator for the first migration
+// holds the ActiveMigrationsRegistry slot while it determines the outcome of that migration. The
+// second migration must wait for that operation to complete before it can proceed. Retry on
+// ConflictingOperationInProgress until the slot is free.
+function runMoveChunkWithRetryOnConflict(mongosURL, ns, toShardId) {
+    const admin = new Mongo(mongosURL).getDB("admin");
+    assert.soonRetryOnAcceptableErrors(() => {
+        assert.commandWorked(
+            admin.runCommand({moveChunk: ns, find: {_id: 0}, to: toShardId, _waitForDelete: true}),
+        );
+        return true;
+    }, ErrorCodes.ConflictingOperationInProgress);
+}
+
+let joinMoveChunk2 = startParallelOps(staticMongod, runMoveChunkWithRetryOnConflict, [
+    st.s0.host,
+    nsB,
+    st.shard1.shardName,
+]);
+
+// Check that second migration won't be able to persist its coordinator document until the shard has
+// been able to recover the first migration.
+sleep(5 * 1000);
+{
+    // There's still only one migration recovery document, corresponding to the first migration
+    const pendingMigrationRecoveryNss = getPendingMigrationRecoveryNss();
+    assert.eq(1, pendingMigrationRecoveryNss.length);
+    assert.eq(nsA, pendingMigrationRecoveryNss[0]);
+}
+
+// Let the migration recovery complete
+recoveryFailpoints.forEach((failpoint) => failpoint.off());
+if (usesMoveRangeCoordinatorPath) {
+    // With recovery unblocked, the recovered coordinator commits and the original moveChunk command
+    // finally returns.
+    joinMoveChunk1();
+}
+moveChunkHangAtStep3Failpoint.wait();
+
+// Check that the first migration has been recovered. There must be only one pending recovery
+// document, which corresponds to the second migration.
+{
+    const pendingMigrationRecoveryNss = getPendingMigrationRecoveryNss();
+    assert.eq(1, pendingMigrationRecoveryNss.length);
+    assert.eq(nsB, pendingMigrationRecoveryNss[0]);
+}
+
+moveChunkHangAtStep3Failpoint.off();
+joinMoveChunk2();
+
+MongoRunner.stopMongod(staticMongod);
+st.stop();

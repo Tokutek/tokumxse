@@ -1,0 +1,266 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/optimization/rule_based_rewriter.h"
+
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <array>
+#include <set>
+
+namespace mongo::rule_based_rewrites::pipeline {
+namespace {
+inline auto prevOrFirstItr(DocumentSourceContainer& container,
+                           DocumentSourceContainer::iterator itr) {
+    return itr == container.begin() ? itr : std::prev(itr);
+}
+
+/**
+ * Swaps two adjacent stages in the pipeline. The first iterator must precede the second one.
+ */
+inline auto swapStages(DocumentSourceContainer& container,
+                       DocumentSourceContainer::iterator itr1,
+                       DocumentSourceContainer::iterator itr2) {
+    tassert(11010012, "Attempted to swap non-adjacent stages", std::next(itr1) == itr2);
+    container.splice(itr1, container, itr2);
+    // The stage before the pushed before stage may be able to optimize further, if there is
+    // such a stage.
+    return prevOrFirstItr(container, itr2);
+}
+}  // namespace
+
+namespace registration_detail {
+namespace {
+struct RuleRegistration {
+    PipelineRewriteRule rule;
+    FeatureFlag* featureFlag = nullptr;
+};
+}  // namespace
+
+/**
+ * Manages a mapping between DocumentSources and rewrite rules that are applicable to them.
+ */
+class RuleRegistry {
+public:
+    void registerRules(DocumentSource::Id key,
+                       std::vector<Rule<PipelineRewriteContext>> rules,
+                       FeatureFlag* featureFlag) {
+        for (auto&& rule : rules) {
+            tassert(11010016,
+                    str::stream() << "Duplicate rule name \"" << rule.name << '\"',
+                    _registeredRuleNames.insert(rule.name).second);
+
+            _rules[key].emplace_back(std::move(rule), featureFlag);
+        }
+    }
+
+    const std::vector<RuleRegistration>& getRules(const DocumentSource& ds) const {
+        auto id = ds.getId();
+        tassert(11641501, "Out of bounds id", id < _rules.size());
+        return _rules[id];
+    }
+
+private:
+    std::set<std::string> _registeredRuleNames;
+    std::array<std::vector<RuleRegistration>, 128> _rules;
+};
+
+namespace {
+const auto getPipelineRewriteRuleRegistry = ServiceContext::declareDecoration<RuleRegistry>();
+}
+
+void registerRules(ServiceContext* serviceCtx,
+                   DocumentSource::Id key,
+                   std::vector<Rule<PipelineRewriteContext>> rules,
+                   FeatureFlag* featureFlag) {
+    tassert(11641502, "Unallocated id", key != DocumentSource::kUnallocatedId);
+    auto& registry = getPipelineRewriteRuleRegistry(serviceCtx);
+    registry.registerRules(key, std::move(rules), featureFlag);
+}
+
+void clearRulesForTest(ServiceContext* serviceCtx) {
+    auto& registry = getPipelineRewriteRuleRegistry(serviceCtx);
+    registry = {};
+}
+}  // namespace registration_detail
+
+PipelineRewriteContext::PipelineRewriteContext(Pipeline& pipeline)
+    : PipelineRewriteContext(*pipeline.getContext(), pipeline.getSources()) {}
+
+PipelineRewriteContext::PipelineRewriteContext(
+    ExpressionContext& expCtx,
+    DocumentSourceContainer& container,
+    boost::optional<DocumentSourceContainer::iterator> startingPos)
+    : _container(container),
+      _itr(startingPos.value_or(_container.begin())),
+      _expCtx(expCtx),
+      _registry(registration_detail::getPipelineRewriteRuleRegistry(
+          _expCtx.getOperationContext()->getServiceContext())),
+      _depGraphCtx(expCtx, container) {}
+
+void PipelineRewriteContext::enqueueRules() {
+    for (auto&& registration : _registry.getRules(current())) {
+        // (Generic FCV reference): Fall back to kLastLTS when 'vCtx' is not initialized.
+        bool enabled = !registration.featureFlag ||
+            registration.featureFlag->checkWithContext(
+                _expCtx.getVersionContext(),
+                *_expCtx.getIfrContext(),
+                ServerGlobalParams::FCVSnapshot{multiversion::GenericFCV::kLastLTS});
+
+        if (enabled) {
+            addRule(registration.rule);
+        }
+    }
+}
+
+void PipelineRewriteContext::advance() {
+    tassert(11010008, "Already at the end of the container", hasMore());
+    _itr = std::next(_itr);
+}
+
+void PipelineRewriteContext::postTransform() {
+    // The transformation rules in Transforms modify the list at the current, next or previous
+    // position. The conservative approach with graph invalidation is to invalidate from the
+    // previous position onwards. This could potentially be improved if we keep track of this
+    // iterator.
+    //
+    // When _itr == end(), optimizeAt() may have erased stages the graph still references.
+    // hasMore() is false so the rewriter loop exits immediately after this returns. This clears
+    // the whole graph, and it is rebuilt lazily on the next getGraph() call.
+    if (_itr == _container.end()) {
+        _depGraphCtx.invalidateFrom(_container.begin());
+        return;
+    }
+    _depGraphCtx.invalidateFrom(_itr == _container.begin() ? _container.begin() : std::prev(_itr));
+}
+
+const mongo::pipeline::dependency_graph::DependencyGraph&
+PipelineRewriteContext::getDependencyGraph() const {
+    DocumentSourceContainer::const_iterator itr = atLastStage() ? _itr : std::next(_itr);
+    return _depGraphCtx.getGraph(itr);
+}
+
+std::string PipelineRewriteContext::debugString() const {
+    str::stream ss;
+    ss << "Container (current position " << std::distance(_container.begin(), _itr) << "):\n";
+    size_t pos = 0;
+    for (auto&& stage : _container) {
+        ss << "\t" << pos++ << ": " << stage->serializeToBSONForDebug() << "\n";
+    }
+    return ss;
+}
+
+void Transforms::replaceCurrentStage(PipelineRewriteContext& ctx,
+                                     boost::intrusive_ptr<DocumentSource> ds) {
+    Transforms::insertAfter(ctx, *ds);
+    Transforms::eraseCurrent(ctx);
+}
+
+bool Transforms::swapStageWithNext(PipelineRewriteContext& ctx) {
+    tassert(11010009, "Already at the end of the container", ctx.hasMore());
+    ctx._itr = swapStages(ctx._container, ctx._itr, std::next(ctx._itr));
+    return true;
+}
+
+bool Transforms::swapStageWithPrev(PipelineRewriteContext& ctx) {
+    tassert(11010011, "Can't swap first stage with prev", !ctx.atFirstStage());
+    ctx._itr = swapStages(ctx._container, std::prev(ctx._itr), ctx._itr);
+    return true;
+}
+
+bool Transforms::insertBefore(PipelineRewriteContext& ctx, DocumentSource& d) {
+    ctx._container.insert(ctx._itr, &d);
+    ctx._itr = std::prev(ctx._itr);
+    return true;
+}
+
+bool Transforms::insertAfter(PipelineRewriteContext& ctx, DocumentSource& d) {
+    ctx._container.insert(std::next(ctx._itr), &d);
+    return false;
+}
+
+bool Transforms::eraseCurrent(PipelineRewriteContext& ctx) {
+    ctx._itr = ctx._container.erase(ctx._itr);
+    ctx._itr = prevOrFirstItr(ctx._container, ctx._itr);
+    return true;
+}
+
+bool Transforms::eraseNext(PipelineRewriteContext& ctx) {
+    tassert(11010020, "Already at the last stage", !ctx.atLastStage());
+    ctx._container.erase(std::next(ctx._itr));
+    return false;
+}
+
+bool Transforms::eraseNthNext(PipelineRewriteContext& ctx, size_t n) {
+    if (n == 0)
+        return eraseCurrent(ctx);
+    tassert(12200603,
+            str::stream() << "Expected to have " << n << " next stages",
+            ctx.hasAtLeastNNextStages(n));
+    ctx._container.erase(std::next(ctx._itr, n));
+    return true;
+}
+
+bool Transforms::partialPushdown(PipelineRewriteContext& ctx,
+                                 boost::intrusive_ptr<DocumentSource> pushdownPart,
+                                 boost::intrusive_ptr<DocumentSource> remainingPart) {
+    tassert(11010401, "Expected non-null stage for pushdown", pushdownPart);
+
+    // Erase the original stage. 'ctx._itr' will now point to the previous stage (i.e., the stage
+    // that we want in between the pushdown part and the remaining part).
+    eraseCurrent(ctx);
+
+    // Insert the pushed down part before the current stage.
+    ctx._container.insert(ctx._itr, std::move(pushdownPart));
+
+    // If 'remainingPart' is not null, the 'pushdownPart' of the $match expression
+    // was only one component of the original $match. So, we need to create a new $match stage for
+    // the remaining 'remainingPart' and insert it after 'this' - effectively keeping it in
+    // its original position in the pipeline.
+    if (remainingPart) {
+        ctx._container.insert(std::next(ctx._itr), std::move(remainingPart));
+    }
+
+    // May be able to optimize stage before the pushed down $match further.
+    ctx._itr = prevOrFirstItr(ctx._container, std::prev(ctx._itr));
+    return true;
+}
+
+DepsTracker PipelineRewriteContext::getPipelineSuffixDependencies() const {
+    if (atLastStage()) {
+        return DepsTracker{};
+    }
+    DocumentSourceContainer suffix(std::next(_itr), _container.end());
+    return Pipeline::getDependenciesForContainer(boost::intrusive_ptr<ExpressionContext>(&_expCtx),
+                                                 suffix,
+                                                 DepsTracker::NoMetadataValidation{});
+}
+
+std::set<std::string> PipelineRewriteContext::getBuiltInVariableRefsInPipelineSuffix() const {
+    // Collect all variable IDs referenced in the suffix.
+    std::set<Variables::Id> allRefs;
+    for (auto it = std::next(_itr); it != _container.end(); ++it) {
+        (*it)->addVariableRefs(&allRefs);
+    }
+
+    // Collect names of all referenced variables. A variable is included if it was found by
+    // addVariableRefs() above or if this pipeline was forwarded from a router and the variable has
+    // a value in the ExpressionContext. The second condition handles query-constant variables (e.g.
+    // $$NOW) that the router resolved to literal constants before forwarding.
+    const bool fromRouter = _expCtx.getFromRouter();
+    std::set<std::string> varNames;
+    for (const auto& [id, name] : Variables::kIdToBuiltinVarName) {
+        if (allRefs.contains(id) || (fromRouter && _expCtx.variables.hasValue(id))) {
+            varNames.insert(name);
+        }
+    }
+
+    return varNames;
+}
+
+}  // namespace mongo::rule_based_rewrites::pipeline

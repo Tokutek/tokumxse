@@ -1,0 +1,59 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "pipeline_optimization",
+    srcs = [
+        "cr_rules_to_move.cpp",
+        "lookup_rules.cpp",
+        "match_rules.cpp",
+        "projection_rules.cpp",
+        "qe_rules_to_move.cpp",
+        "qi_rules_to_move.cpp",
+        "qo_rules_to_move.cpp",
+        "simple_rules.cpp",
+        "sort_rules.cpp",
+    ],
+    deps = [
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/pipeline/optimization/qi_rules",
+        "//src/mongo/db/query/compiler/dependency_analysis:document_transformation",
+        "//src/mongo/db/query/compiler/dependency_analysis:pipeline_dependency_graph",
+        "//src/mongo/db/query/compiler/metadata:path_arrayness",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "pipeline_rewriter_test",
+    srcs = [
+        "pipeline_rewriter_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/pipeline:aggregation_context_fixture",
+        "//src/mongo/db/pipeline:expression_context_for_test",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "graph_validation_rules_test",
+    srcs = [
+        "graph_validation_rules_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/pipeline:aggregation_context_fixture",
+        "//src/mongo/db/pipeline:expression_context_for_test",
+        "//src/mongo/db/query/compiler/metadata:path_arrayness",
+    ],
+)

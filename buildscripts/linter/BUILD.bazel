@@ -1,0 +1,39 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "linter",
+    srcs = [
+        "__init__.py",
+        "base.py",
+        "filediff.py",
+        "git.py",
+        "git_base.py",
+        "mongolint.py",
+        "mypy.py",
+        "parallel.py",
+        "pyrightlinter.py",
+        "ruffchecker.py",
+        "ruffformatter.py",
+        "runner.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        dependency(
+            "pyright",
+        ),
+        "//buildscripts/patch_builds",
+        dependency(
+            "structlog",
+            group = "evergreen",
+        ),
+        dependency(
+            "gitpython",
+            group = "evergreen",
+        ),
+        dependency(
+            "packaging",
+            group = "testing",
+        ),
+    ],
+)

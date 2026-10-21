@@ -1,166 +1,134 @@
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/query/query_settings.h"
+
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/find_command.h"
+
+#include <tuple>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    using std::vector;
+//
+// AllowedIndicesFilter
+//
 
-    //
-    // HintOverride
-    //
+AllowedIndicesFilter::AllowedIndicesFilter(const BSONObjSet& indexKeyPatterns,
+                                           const stdx::unordered_set<std::string>& indexNames)
+    : indexKeyPatterns(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+      indexNames(indexNames) {
+    for (BSONObjSet::const_iterator i = indexKeyPatterns.begin(); i != indexKeyPatterns.end();
+         ++i) {
+        const BSONObj& indexKeyPattern = *i;
+        this->indexKeyPatterns.insert(indexKeyPattern.getOwned());
+    }
+}
 
-    AllowedIndices::AllowedIndices(const std::vector<BSONObj>& indexKeyPatterns) {
-        for (std::vector<BSONObj>::const_iterator i = indexKeyPatterns.begin();
-             i != indexKeyPatterns.end(); ++i) {
-            const BSONObj& indexKeyPattern = *i;
-            this->indexKeyPatterns.push_back(indexKeyPattern.getOwned());
-        }
+//
+// AllowedIndexEntry
+//
+
+AllowedIndexEntry::AllowedIndexEntry(const BSONObj& query,
+                                     const BSONObj& sort,
+                                     const BSONObj& projection,
+                                     const BSONObj& collation,
+                                     const BSONObjSet& indexKeyPatterns,
+                                     const stdx::unordered_set<std::string>& indexNames)
+    : query(query.getOwned()),
+      sort(sort.getOwned()),
+      projection(projection.getOwned()),
+      collation(collation.getOwned()),
+      indexKeyPatterns(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+      indexNames(indexNames) {
+    for (BSONObjSet::const_iterator i = indexKeyPatterns.begin(); i != indexKeyPatterns.end();
+         ++i) {
+        const BSONObj& indexKeyPattern = *i;
+        this->indexKeyPatterns.insert(indexKeyPattern.getOwned());
+    }
+}
+
+//
+// QuerySettings
+//
+
+boost::optional<AllowedIndicesFilter> QuerySettings::getAllowedIndicesFilter(
+    const CanonicalQuery& canonicalQuery) const {
+    // Fast-check if there is at least one allowed index in query settings.
+    if (!_someAllowedIndexEntriesPresent.loadRelaxed()) {
+        return {};
     }
 
-    AllowedIndices::~AllowedIndices() { }
+    // Compute the key before entering the critical section.
+    const CanonicalQuery::PlanCacheCommandKey key = canonicalQuery.encodeKeyForPlanCacheCommand();
 
-    //
-    // AllowedIndexEntry
-    //
+    std::lock_guard<std::mutex> cacheLock(_mutex);
+    AllowedIndexEntryMap::const_iterator cacheIter = _allowedIndexEntryMap.find(key);
 
-    AllowedIndexEntry::AllowedIndexEntry(const BSONObj& query, const BSONObj& sort,
-                                   const BSONObj& projection,
-                                   const std::vector<BSONObj>& indexKeyPatterns)
-        : query(query.getOwned()),
-          sort(sort.getOwned()),
-          projection(projection.getOwned()) {
-        for (std::vector<BSONObj>::const_iterator i = indexKeyPatterns.begin();
-             i != indexKeyPatterns.end(); ++i) {
-            const BSONObj& indexKeyPattern = *i;
-            this->indexKeyPatterns.push_back(indexKeyPattern.getOwned());
-        }
+    // Nothing to do if key does not exist in query settings.
+    if (cacheIter == _allowedIndexEntryMap.end()) {
+        return {};
     }
 
-    AllowedIndexEntry::~AllowedIndexEntry() { }
+    return AllowedIndicesFilter(cacheIter->second.indexKeyPatterns, cacheIter->second.indexNames);
+}
 
-    AllowedIndexEntry* AllowedIndexEntry::clone() const {
-        AllowedIndexEntry* entry = new AllowedIndexEntry(query, sort, projection, indexKeyPatterns);
-        return entry;
+std::vector<AllowedIndexEntry> QuerySettings::getAllAllowedIndices() const {
+    std::lock_guard<std::mutex> cacheLock(_mutex);
+    std::vector<AllowedIndexEntry> entries;
+    for (const auto& entryPair : _allowedIndexEntryMap) {
+        entries.push_back(entryPair.second);
+    }
+    return entries;
+}
+
+void QuerySettings::setAllowedIndices(const CanonicalQuery& canonicalQuery,
+                                      const BSONObjSet& indexKeyPatterns,
+                                      const stdx::unordered_set<std::string>& indexNames) {
+    const FindCommandRequest& findCommand = canonicalQuery.getFindCommandRequest();
+    const BSONObj& query = findCommand.getFilter();
+    const BSONObj& sort = findCommand.getSort();
+    const BSONObj& projection = findCommand.getProjection();
+    const auto key = canonicalQuery.encodeKeyForPlanCacheCommand();
+    const BSONObj collation =
+        canonicalQuery.getCollator() ? canonicalQuery.getCollator()->getSpec().toBSON() : BSONObj();
+
+    std::lock_guard<std::mutex> cacheLock(_mutex);
+    _allowedIndexEntryMap.erase(key);
+    _allowedIndexEntryMap.emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(key),
+        std::forward_as_tuple(query, sort, projection, collation, indexKeyPatterns, indexNames));
+    _updateSomeAllowedIndexEntriesPresent();
+}
+
+void QuerySettings::removeAllowedIndices(const CanonicalQuery::PlanCacheCommandKey& key) {
+    std::lock_guard<std::mutex> cacheLock(_mutex);
+    AllowedIndexEntryMap::iterator i = _allowedIndexEntryMap.find(key);
+
+    // Nothing to do if key does not exist in query settings.
+    if (i == _allowedIndexEntryMap.end()) {
+        return;
     }
 
-    //
-    // QuerySettings
-    //
+    _allowedIndexEntryMap.erase(i);
+    _updateSomeAllowedIndexEntriesPresent();
+}
 
-    QuerySettings::QuerySettings() { }
+void QuerySettings::clearAllowedIndices() {
+    std::lock_guard<std::mutex> cacheLock(_mutex);
+    _allowedIndexEntryMap.clear();
+    _updateSomeAllowedIndexEntriesPresent();
+}
 
-    QuerySettings::~QuerySettings() {
-        _clear();
-    }
-
-    bool QuerySettings::getAllowedIndices(const CanonicalQuery& query,
-                                          AllowedIndices** allowedIndicesOut) const {
-        invariant(allowedIndicesOut);
-
-        const PlanCacheKey& key = query.getPlanCacheKey();
-
-        boost::lock_guard<boost::mutex> cacheLock(_mutex);
-        AllowedIndexEntryMap::const_iterator cacheIter = _allowedIndexEntryMap.find(key);
-
-        // Nothing to do if key does not exist in query settings.
-        if (cacheIter == _allowedIndexEntryMap.end()) {
-            *allowedIndicesOut = NULL;
-            return false;
-        }
-
-        AllowedIndexEntry* entry = cacheIter->second;
-
-        // Create a AllowedIndices from entry.
-        *allowedIndicesOut = new AllowedIndices(entry->indexKeyPatterns);
-
-        return true;
-    }
-
-    std::vector<AllowedIndexEntry*> QuerySettings::getAllAllowedIndices() const {
-        boost::lock_guard<boost::mutex> cacheLock(_mutex);
-        vector<AllowedIndexEntry*> entries;
-        for (AllowedIndexEntryMap::const_iterator i = _allowedIndexEntryMap.begin(); i != _allowedIndexEntryMap.end(); ++i) {
-            AllowedIndexEntry* entry = i->second;
-            entries.push_back(entry->clone());
-        }
-        return entries;
-    }
-
-    void QuerySettings::setAllowedIndices(const CanonicalQuery& canonicalQuery,
-                                          const std::vector<BSONObj>& indexes) {
-        const LiteParsedQuery& lpq = canonicalQuery.getParsed();
-        const BSONObj& query = lpq.getFilter();
-        const BSONObj& sort = lpq.getSort();
-        const BSONObj& projection = lpq.getProj();
-        AllowedIndexEntry* entry = new AllowedIndexEntry(query, sort, projection, indexes);
-
-        const PlanCacheKey& key = canonicalQuery.getPlanCacheKey();
-        boost::lock_guard<boost::mutex> cacheLock(_mutex);
-        AllowedIndexEntryMap::iterator i = _allowedIndexEntryMap.find(key);
-        // Replace existing entry.
-        if (i != _allowedIndexEntryMap.end()) {
-            AllowedIndexEntry* entry = i->second;
-            delete entry;
-        }
-        _allowedIndexEntryMap[key] = entry;
-    }
-
-    void QuerySettings::removeAllowedIndices(const CanonicalQuery& canonicalQuery) {
-        const PlanCacheKey& key = canonicalQuery.getPlanCacheKey();
-        boost::lock_guard<boost::mutex> cacheLock(_mutex);
-        AllowedIndexEntryMap::iterator i = _allowedIndexEntryMap.find(key);
-
-        // Nothing to do if key does not exist in query settings.
-        if (i == _allowedIndexEntryMap.end()) {
-            return;
-        }
-
-        // Free up resources and delete entry.
-        AllowedIndexEntry* entry = i->second;
-        _allowedIndexEntryMap.erase(i);
-        delete entry;
-    }
-
-    void QuerySettings::clearAllowedIndices() {
-        boost::lock_guard<boost::mutex> cacheLock(_mutex);
-        _clear();
-    }
-
-    void QuerySettings::_clear() {
-        for (AllowedIndexEntryMap::const_iterator i = _allowedIndexEntryMap.begin(); i != _allowedIndexEntryMap.end(); ++i) {
-            AllowedIndexEntry* entry = i->second;
-            delete entry;
-        }
-        _allowedIndexEntryMap.clear();
-    }
+void QuerySettings::_updateSomeAllowedIndexEntriesPresent() {
+    _someAllowedIndexEntriesPresent.store(!_allowedIndexEntryMap.empty());
+}
 
 }  // namespace mongo

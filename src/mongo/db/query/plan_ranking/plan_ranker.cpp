@@ -1,0 +1,130 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/plan_ranking/plan_ranker.h"
+
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_estimator_impl.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_ranking/cbr_for_no_mp_results.h"
+#include "mongo/db/query/plan_ranking/cbr_plan_ranking.h"
+#include "mongo/db/query/plan_ranking/cost_based_plan_ranking.h"
+#include "mongo/db/query/plan_ranking/mp_plan_ranking.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/query_planner_params.h"
+
+#include <memory>
+#include <utility>
+
+namespace mongo {
+namespace plan_ranking {
+
+std::unique_ptr<PlanRankingStrategy> makeStrategy(QueryPlanRankerEnum planRanker,
+                                                  QueryMixedPlanRankingStrategyEnum mixedStrategy) {
+    using MixedStrategy = QueryMixedPlanRankingStrategyEnum;
+    switch (planRanker) {
+        case QueryPlanRankerEnum::kCostBased: {
+            return std::make_unique<CBRPlanRankingStrategy>();
+        }
+        case QueryPlanRankerEnum::kMixed: {
+            switch (mixedStrategy) {
+                case MixedStrategy::kNoMultiplanningResults: {
+                    return std::make_unique<CBRForNoMPResultsStrategy>();
+                }
+                case MixedStrategy::kEstimateRankingEffort: {
+                    return std::make_unique<CostBasedPlanRankingStrategy>();
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            }
+        }
+        case QueryPlanRankerEnum::kMultiPlanner:
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+StatusWith<PlanRankingResult> PlanRanker::rankPlans(OperationContext* opCtx,
+                                                    CanonicalQuery& query,
+                                                    QueryPlannerParams& plannerParams,
+                                                    PlanYieldPolicy::YieldPolicy yieldPolicy,
+                                                    const MultipleCollectionAccessor& collections,
+                                                    PlannerData plannerData,
+                                                    bool isClassic) {
+    auto mixedStrategy =
+        query.getExpCtx()->getQueryKnobConfiguration().getMixedPlanRankingStrategy();
+
+    const bool canUseCBR = plannerParams.isCBREnabled() && isClassic;
+
+    RankingContext rctx;
+
+    rctx.topLevelSampleFieldNames =
+        ce::extractTopLevelFieldsFromMatchExpression(query.getPrimaryMatchExpression());
+
+    // Populating the 'topLevelSampleFields' requires 2 steps:
+    //  1. Extract the fields of the relevant indexes from the plan() function by passing in
+    //  the pointer to 'topLevelSampleFieldNames' as an output parameter.
+    //  We do this also for trivially estimable queries, as the presence of relevant multikey
+    //  indices prevent us from switching to heuristicCE.
+    //  2. Extract the set of top level fields from the filter, sort and project
+    //  components of the CanonicalQuery. We do this only for CE methods which might use sampling.
+    auto statusWithMultiPlanSolns =
+        QueryPlanner::plan(query,
+                           plannerParams,
+                           rctx.topLevelSampleFieldNames.relevantIndexOutput(),
+                           boost::optional<bool&>(rctx.hasRelevantMultikeyIndex));
+    if (!statusWithMultiPlanSolns.isOK()) {
+        return statusWithMultiPlanSolns.getStatus().withContext(
+            str::stream() << "error enumerating plans for query: " << query.toStringForErrorMsg()
+                          << " planner returned error");
+    }
+
+    rctx.solutions = std::move(statusWithMultiPlanSolns.getValue());
+    auto& solutions = rctx.solutions;
+
+    auto getSingleSolution = [&] {
+        PlanRankingResult out;
+        out.solutions.push_back(std::move(solutions.front()));
+        return out;
+    };
+
+    const bool isSingleSolution = solutions.size() == 1;
+
+    if (isSingleSolution) {
+        const bool isExplain = query.getExplain().has_value();
+        // TODO(SERVER-118659): Remove this disjunction once we support costing count_scan
+        const bool isKnownUncostableSingleQuery =
+            QueryPlannerAnalysis::isCountScan(solutions[0].get()) ||
+            query.getExpCtx()->isTailable();
+
+        const bool canSkipRanking = (
+            // If CBR is disabled, single solutions will never need costing/ranking.
+            // The caller will independently apply multiplanning if plan caching is required.
+            !canUseCBR ||
+            // Must skip any strategy if the solution is a count scan or a tailable collscan.
+            // CBR cannot cost count scans, and exactCE would loop forever on tailable
+            // collscans which never reach isEOF(). Both are inherently single
+            // solution cases. Count scan plans are generated by an early heuristic that replaces
+            // all other solutions.
+            isKnownUncostableSingleQuery ||
+            // Otherwise, can avoid wasted work by skipping costing single solutions if not
+            // in explain, as there are no other solutions to rank against, and the costing
+            // info will not be used or displayed.
+            !isExplain);
+
+        if (canSkipRanking) {
+            return getSingleSolution();
+        }
+    }
+
+    std::unique_ptr<PlanRankingStrategy> strategy = canUseCBR
+        ? makeStrategy(plannerParams.planRanker, mixedStrategy)
+        : std::make_unique<MPPlanRankingStrategy>();
+
+    auto swRankingResult = strategy->rankPlans(plannerData, rctx);
+    return swRankingResult;
+}
+}  // namespace plan_ranking
+}  // namespace mongo

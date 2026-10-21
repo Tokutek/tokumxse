@@ -1,0 +1,59 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/repl/read_concern_args.idl"
+    - "mongo/db/read_write_concern_defaults.idl"
+    - "mongo/db/write_concern_options.idl"
+
+structs:
+    GetDefaultRWConcernResponse:
+        description: "Describes the response for the getDefaultRWConcern command"
+        strict: false
+        chained_structs:
+            RWConcernDefault: RWConcernDefault
+        fields:
+            inMemory:
+                description:
+                    "Whether the value came from the in-memory cache or it reflects the
+                    defaults which were persisted as of the time of invocation."
+                optional: true
+                type: bool
+            localUpdateWallClockTime:
+                description:
+                    "The wallclock time of when the default read or write concern was
+                    applied to the cache of the node, which returned the response. This
+                    value is only informational and must not be used for any recency
+                    comparisons."
+                type: date
+
+commands:
+    setDefaultRWConcern:
+        description: "Set the current read/write concern defaults (cluster-wide)"
+        command_name: setDefaultRWConcern
+        namespace: ignored
+        api_version: ""
+        fields:
+            defaultReadConcern:
+                description: "The new default read concern"
+                type: ReadConcern
+                optional: true
+            defaultWriteConcern:
+                description: "The new default write concern"
+                type: WriteConcern
+                optional: true
+
+    getDefaultRWConcern:
+        description: "Get the current read/write concern defaults being applied by this node"
+        command_name: getDefaultRWConcern
+        namespace: ignored
+        api_version: ""
+        fields:
+            inMemory:
+                type: bool
+                description: "If true, return the locally cached read/write concern defaults"
+                optional: true

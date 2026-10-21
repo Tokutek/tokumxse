@@ -1,0 +1,19 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "core",
+    srcs = [
+        "__init__.py",
+        "network.py",
+        "pipe.py",
+        "process.py",
+        "programs.py",
+        "redirect.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [dependency(
+        "packaging",
+        group = "testing",
+    )],
+)

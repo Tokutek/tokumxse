@@ -1,0 +1,76 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/change_streams_cluster_parameter.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+# Note: the parameters is this file are only present for downwards-compatibility
+# reasons. They serve no other purpose than facilitating upgrades from older
+# versions that used these parameters.
+
+structs:
+    ChangeStreamsClusterParameterStorage:
+        description: >-
+            A specification for the 'changeStreams' cluster-wide configuration parameter
+            type.
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            expireAfterSeconds:
+                description: >-
+                    The number of seconds to retain the change events. This value will be a
+                    non-zero positive value if the change stream is enabled and a zero value if the change
+                    stream is disabled.
+                    This parameter is deprecated, and its value is not used after setting it.
+                type: safeInt64
+                default: 60 * 60
+
+server_parameters:
+    changeStreams:
+        description: >-
+            The cluster-wide configuration parameter for the change stream in the serverless.
+            This parameter is deprecated, and its value is not used after setting it.
+        set_at: cluster
+        omit_in_ftdc: false
+        cpp_vartype: ChangeStreamsClusterParameterStorage
+        cpp_varname: gChangeStreamsClusterParameter
+        validator:
+            callback: validateChangeStreamsClusterParameter
+        condition:
+            min_fcv: 6.2
+        redact: false
+        is_deprecated: true
+
+    changeCollectionExpiredDocumentsRemoverJobSleepSeconds:
+        description: >-
+            Specifies the number of seconds for which the periodic change collection remover
+            job in serverless will sleep between each cycle.
+            This parameter is deprecated, and its value is not used after setting it.
+        set_at: [startup]
+        cpp_vartype: Atomic<int>
+        cpp_varname: "gChangeCollectionExpiredDocumentsRemoverJobSleepSeconds"
+        validator:
+            gte: 1
+        default: 10
+        redact: false
+        is_deprecated: true
+
+    disableExpiredChangeCollectionRemover:
+        description: >-
+            Disables the expired change collection remover in serverless.
+            This parameter is deprecated, and its value is not used after setting it.
+        set_at: [startup]
+        cpp_vartype: bool
+        cpp_varname: gChangeCollectionRemoverDisabled
+        default: false
+        test_only: true
+        redact: false
+        is_deprecated: true

@@ -1,0 +1,175 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+mongo_cc_library(
+    name = "mongo_process_interface",
+    srcs = [
+        "mongo_process_interface.cpp",
+        "mongo_process_interface_factory.cpp",
+    ],
+    deps = [
+        "//src/mongo:base",
+    ],
+)
+
+mongo_cc_library(
+    name = "stub_mongo_process_interface",
+    srcs = [],
+    deps = [
+        "mongo_process_interface",
+    ],
+)
+
+mongo_cc_library(
+    name = "common_process_interface",
+    srcs = [
+        "common_process_interface.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:operation_time_tracker",
+        "//src/mongo/db/auth",
+        "//src/mongo/db/pipeline:field_path",
+        "//src/mongo/db/query/client_cursor:generic_cursor",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/s:sharding_router_api",
+        "//src/mongo/util/concurrency:spin_lock",
+    ],
+)
+
+mongo_cc_library(
+    name = "mongos_process_interface",
+    srcs = [
+        "mongos_process_interface.cpp",
+    ],
+    deps = [
+        ":common_process_interface",
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/pipeline:sharded_agg_helpers",
+        "//src/mongo/db/session:session_catalog",
+        "//src/mongo/s/query/exec:async_results_merger",
+        "//src/mongo/s/query/exec:cluster_cursor",
+    ],
+)
+
+mongo_cc_library(
+    name = "mongos_process_interface_factory",
+    srcs = [
+        "mongos_process_interface_factory.cpp",
+    ],
+    deps = [
+        ":mongos_process_interface",
+    ],
+)
+
+# This library is the basic mongod functionality, depended on by embedded so
+# designed to exclude large components like sharding and networking.
+mongo_cc_library(
+    name = "mongod_process_interfaces",
+    srcs = [
+        "common_mongod_process_interface.cpp",
+        "non_shardsvr_process_interface.cpp",
+        "replica_set_node_process_interface.cpp",
+    ],
+    deps = [
+        ":common_process_interface",
+        "//src/mongo/db:collection_index_usage_tracker",
+        "//src/mongo/db:dbhelpers",
+        "//src/mongo/db:multitenancy",
+        "//src/mongo/db:operation_time_tracker",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db/index_builds:index_builds_coordinator_mongod",
+        "//src/mongo/db/pipeline",
+        "//src/mongo/db/query/client_cursor",
+        "//src/mongo/db/query/write_ops",
+        "//src/mongo/db/query/write_ops:write_ops_exec",
+        "//src/mongo/db/repl:intent_registry",
+        "//src/mongo/db/repl:primary_only_service",
+        "//src/mongo/db/s:query_analysis_writer",
+        "//src/mongo/db/s:transaction_coordinator",
+        "//src/mongo/db/session:session_catalog",
+        "//src/mongo/db/shard_role/lock_manager:exception_util",
+        "//src/mongo/db/shard_role/lock_manager:flow_control_ticketholder",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_helpers",
+        "//src/mongo/db/shard_role/shard_catalog:database_holder",
+        "//src/mongo/db/shard_role/shard_catalog:raw_data_operation",
+        "//src/mongo/db/stats:serveronly_stats",
+        "//src/mongo/db/stats:top",
+        "//src/mongo/db/storage:backup_cursor_hooks",
+        "//src/mongo/db/storage:feature_document_util",
+        "//src/mongo/db/storage:mdb_catalog",
+        "//src/mongo/db/timeseries:catalog_helper",
+        "//src/mongo/db/timeseries/write_ops:timeseries_write_ops",
+        "//src/mongo/db/transaction",
+        "//src/mongo/s:query_analysis_sampler",
+        "//src/mongo/s:sharding_router_api",
+        "//src/mongo/scripting:scripting_common",
+    ],
+)
+
+mongo_cc_library(
+    name = "shardsvr_process_interface",
+    srcs = [
+        "shardsvr_process_interface.cpp",
+    ],
+    deps = [
+        ":mongod_process_interfaces",
+        "//src/mongo/db:query_exec",
+        "//src/mongo/db/shard_role/ddl:index_commands_idl",
+        "//src/mongo/s:sharding_api",
+    ],
+)
+
+mongo_cc_library(
+    name = "mongod_process_interface_factory",
+    srcs = [
+        "mongod_process_interface_factory.cpp",
+    ],
+    deps = [
+        ":mongod_process_interfaces",
+        ":mongos_process_interface",
+        ":shardsvr_process_interface",
+        "//src/mongo/db:shard_role_api",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "process_interface_test",
+    srcs = [
+        "mongos_process_interface_test.cpp",
+        "shardsvr_process_interface_test.cpp",
+    ],
+    tags = ["mongo_unittest_first_group"],
+    deps = [
+        ":mongos_process_interface",
+        ":shardsvr_process_interface",
+        "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db:shard_role_api",
+        "//src/mongo/db/auth:authmocks",
+        "//src/mongo/db/pipeline:aggregation_context_fixture",
+        "//src/mongo/db/query:query_test_service_context",
+        "//src/mongo/db/repl:replmocks",
+        "//src/mongo/db/shard_role:service_context_non_d",
+        "//src/mongo/db/sharding_environment:sharding_mongos_test_fixture",
+        "//src/mongo/db/sharding_environment:unittest_noop_sharding_initialization_mongod",
+        "//src/mongo/db/topology/vector_clock:vector_clock_mongod",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "standalone_process_interface_test",
+    srcs = ["standalone_process_interface_test.cpp"],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        ":mongod_process_interfaces",
+        "//src/mongo/db/pipeline:expression_context_for_test",
+        "//src/mongo/db/sharding_environment:shard_server_test_fixture",
+    ],
+)

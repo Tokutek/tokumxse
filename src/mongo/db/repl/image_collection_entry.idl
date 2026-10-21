@@ -1,0 +1,44 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Oplog Entry IDL File
+
+global:
+    cpp_namespace: "mongo::repl"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/repl/oplog_entry.idl"
+
+structs:
+    ImageEntry:
+        description:
+            "Represents either a pre-image or post-image necessary for satisfying a
+            retryable findAndModify."
+        strict: false
+        fields:
+            _id:
+                cpp_name: _id
+                type: LogicalSessionId
+            txnNum:
+                cpp_name: txnNumber
+                type: TxnNumber
+            ts:
+                cpp_name: ts
+                type: timestamp
+            imageKind:
+                cpp_name: imageKind
+                type: RetryImage
+            image:
+                cpp_name: image
+                type: object_owned
+            invalidated:
+                cpp_name: invalidated
+                type: bool
+                default: false
+            invalidatedReason:
+                cpp_name: invalidatedReason
+                type: string
+                optional: true

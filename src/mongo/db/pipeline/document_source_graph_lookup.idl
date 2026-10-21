@@ -1,0 +1,50 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/pipeline/aggregate_command.idl"
+
+structs:
+    DocumentSourceGraphLookUpSpec:
+        description: >-
+            Specification for a $graphLookup stage.
+        strict: true
+        fields:
+            from:
+                type: IDLAnyType
+                optional: true
+            as:
+                type: IDLAnyType
+                optional: true
+            startWith:
+                type: IDLAnyType
+                optional: true
+            connectFromField:
+                type: IDLAnyType
+                optional: true
+            connectToField:
+                type: IDLAnyType
+                optional: true
+            depthField:
+                type: IDLAnyType
+                optional: true
+            maxDepth:
+                type: IDLAnyType
+                optional: true
+            restrictSearchWithMatch:
+                type: IDLAnyType
+                optional: true
+                cpp_name: additionalFilter
+            $_internalFromPipeline:
+                description: >-
+                    Internal field: the resolved view pipeline for the 'from' namespace, added by
+                    the router when dispatching to shards.
+                optional: true
+                type: pipeline
+                stability: internal
+                cpp_name: internalFromPipeline

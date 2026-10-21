@@ -1,0 +1,45 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.system.sharding_ddl_coordinators, used
+# by the shard coordinator to guarantee resilience in the event of stepdowns while resharding
+# collections.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/sharded_ddl_commands.idl"
+
+enums:
+    ReshardCollectionCoordinatorPhase:
+        description: "Current reshard collection coordinator's operation state."
+        type: string
+        values:
+            kUnset: "unset"
+            kReshard: "reshard"
+
+structs:
+    ReshardCollectionCoordinatorDocument:
+        description: "Represents a reshard collection operation on the coordinator shard."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            ReshardCollectionRequest: ReshardCollectionRequest
+        fields:
+            phase:
+                type: ReshardCollectionCoordinatorPhase
+                description: "Coordinator phase."
+                default: kUnset
+            oldShardKey:
+                type: object
+                description: "The shard key of the collection before resharding."
+                optional: true
+            oldCollectionUUID:
+                type: uuid
+                description: "The UUID of the collection before resharding."
+                optional: true

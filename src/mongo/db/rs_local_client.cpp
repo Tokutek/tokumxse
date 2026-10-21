@@ -1,0 +1,285 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/rs_local_client.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/read_concern.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/scoped_read_concern.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
+
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+void RSLocalClient::_updateLastOpTimeFromClient(OperationContext* opCtx,
+                                                const repl::OpTime& previousOpTimeOnClient) {
+    const auto lastOpTimeFromClient =
+        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+
+    if (lastOpTimeFromClient.isNull() || lastOpTimeFromClient == previousOpTimeOnClient) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(_mutex);
+    if (lastOpTimeFromClient >= _lastOpTime) {
+        // It's always possible for lastOpTimeFromClient to be less than _lastOpTime if another
+        // thread started and completed a write through this ShardLocal (updating _lastOpTime)
+        // after this operation had completed its write but before it got here.
+        _lastOpTime = lastOpTimeFromClient;
+    }
+}
+
+repl::OpTime RSLocalClient::_getLastOpTime() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return _lastOpTime;
+}
+
+StatusWith<Shard::CommandResponse> RSLocalClient::runCommandOnce(OperationContext* opCtx,
+                                                                 const DatabaseName& dbName,
+                                                                 const BSONObj& cmdObj) {
+    const auto currentOpTimeFromClient =
+        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    ON_BLOCK_EXIT([this, &opCtx, &currentOpTimeFromClient] {
+        _updateLastOpTimeFromClient(opCtx, currentOpTimeFromClient);
+    });
+
+    try {
+        DBDirectClient client(opCtx);
+
+        rpc::UniqueReply commandResponse = client.runCommand(
+            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx), dbName, cmdObj));
+
+        auto result = commandResponse->getCommandReply().getOwned();
+        return Shard::CommandResponse(boost::none,
+                                      result,
+                                      getStatusFromCommandResult(result),
+                                      getWriteConcernStatusFromCommandResult(result));
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+RetryStrategy::Result<Shard::QueryResponse> RSLocalClient::queryOnce(
+    OperationContext* opCtx,
+    const ReadPreferenceSetting& readPref,
+    const repl::ReadConcernArgs& readConcern,
+    const NamespaceString& nss,
+    const BSONObj& query,
+    const BSONObj& sort,
+    boost::optional<long long> limit,
+    const boost::optional<BSONObj>& hint,
+    const boost::optional<BSONObj>& projection) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    boost::optional<ScopeGuard<std::function<void()>>> readSourceGuard;
+    boost::optional<ScopedReadConcern> scopedReadConcern;
+
+    if (readConcern.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern ||
+        readConcern.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+        invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+        invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
+
+        if (const auto atClusterTime = readConcern.getArgsAtClusterTime();
+            !atClusterTime.has_value()) {
+            // Resets to the original read source at the end of this operation.
+            auto originalReadSource =
+                shard_role_details::getRecoveryUnit(opCtx)->getTimestampReadSource();
+            boost::optional<Timestamp> originalReadTimestamp;
+            if (originalReadSource == RecoveryUnit::ReadSource::kProvided) {
+                originalReadTimestamp =
+                    shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp();
+            }
+            readSourceGuard.emplace([opCtx, originalReadSource, originalReadTimestamp] {
+                if (originalReadSource == RecoveryUnit::ReadSource::kProvided) {
+                    shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                        originalReadSource, originalReadTimestamp);
+                } else {
+                    shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                        originalReadSource);
+                }
+            });
+
+            // Sets up operation context with majority read snapshot so correct optime can be
+            // retrieved.
+            shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kMajorityCommitted);
+            Status status =
+                shard_role_details::getRecoveryUnit(opCtx)->majorityCommittedSnapshotAvailable();
+            if (!status.isOK()) {
+                return status;
+            }
+            // Waits for any writes performed by this ShardLocal instance to be committed and
+            // visible. We hardcode majority here even if using snaphsot as both operations will do
+            // the initial snapshot at the majority timestamp.
+            Status readConcernStatus = replCoord->waitUntilOpTimeForRead(
+                opCtx,
+                repl::ReadConcernArgs{_getLastOpTime(),
+                                      repl::ReadConcernLevel::kMajorityReadConcern});
+            if (!readConcernStatus.isOK()) {
+                return readConcernStatus;
+            }
+
+            status =
+                shard_role_details::getRecoveryUnit(opCtx)->majorityCommittedSnapshotAvailable();
+            if (!status.isOK()) {
+                return status;
+            }
+            if (readConcern.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+                // Snapshot readConcern starts a snapshot at the majority timestamp, acquire the
+                // timestamp now and overwrite the majority readConcern used above.
+                const auto opTime = replCoord->getCurrentCommittedSnapshotOpTime();
+                shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
+                    RecoveryUnit::ReadSource::kProvided, opTime.getTimestamp());
+            }
+        } else {
+            // If atClusterTime was specified, just use a ScopedReadConcern and let the
+            // DBDirectClient sort it out.
+            scopedReadConcern.emplace(opCtx, readConcern);
+        }
+    } else {
+        invariant(readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+    }
+
+    DBDirectClient client(opCtx);
+    FindCommandRequest findRequest{nss};
+    findRequest.setFilter(query);
+    if (!sort.isEmpty()) {
+        findRequest.setSort(sort);
+    }
+    if (hint) {
+        findRequest.setHint(*hint);
+    }
+    if (projection) {
+        findRequest.setProjection(*projection);
+    }
+    if (limit) {
+        findRequest.setLimit(*limit);
+    }
+
+    try {
+        std::unique_ptr<DBClientCursor> cursor = client.find(std::move(findRequest), readPref);
+
+        if (!cursor) {
+            return Status{ErrorCodes::OperationFailed,
+                          str::stream() << "Failed to establish a cursor for reading "
+                                        << nss.toStringForErrorMsg() << " from local storage"};
+        }
+
+        std::vector<BSONObj> documentVector;
+        while (cursor->more()) {
+            BSONObj document = cursor->nextSafe().getOwned();
+            documentVector.push_back(std::move(document));
+        }
+
+        return Shard::QueryResponse{std::move(documentVector),
+                                    replCoord->getCurrentCommittedSnapshotOpTime()};
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+Status RSLocalClient::runAggregation(
+    OperationContext* opCtx,
+    const AggregateCommandRequest& aggRequest,
+    std::function<bool(const std::vector<BSONObj>& batch,
+                       const boost::optional<BSONObj>& postBatchResumeToken)> callback) {
+    /* We use DBDirectClient to read locally, which uses the readSource/readTimestamp set on the
+     * opCtx rather than applying the readConcern specified in the command. This is not
+     * consistent with any remote client. We extract the readConcern from the request and apply
+     * it to the opCtx's readSource/readTimestamp. Leave as it was originally before returning*/
+
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
+
+    repl::ReadConcernArgs requestReadConcernArgs = [&]() -> repl::ReadConcernArgs {
+        if (!aggRequest.getReadConcern()) {
+            // Default concern is local at the lastOp applied timestamp.
+            return repl::ReadConcernArgs{_getLastOpTime(),
+                                         repl::ReadConcernLevel::kLocalReadConcern};
+        } else {
+            return *aggRequest.getReadConcern();
+        }
+    }();
+    ScopedReadConcern scopedReadConcern(opCtx, requestReadConcernArgs);
+
+    // Waits for any writes performed by this ShardLocal instance to be committed and
+    // visible. This will set the correct ReadSource as well.
+    if (const auto& afterClusterTime = requestReadConcernArgs.getArgsAfterClusterTime();
+        afterClusterTime) {
+        // If the afterClusterTime is later than lastOp we have to wait here in order in order to
+        // prevent the operation failing due to the call to mongo::waitForReadConcern below. We
+        // don't allow specifying a future timestamp for normal operations.
+        if (const auto lastOp = _getLastOpTime();
+            afterClusterTime->asTimestamp() < lastOp.getTimestamp()) {
+            auto level = requestReadConcernArgs.getLevel();
+            if (level == repl::ReadConcernLevel::kSnapshotReadConcern) {
+                // Snapshot read concern can not be used to wait for an opTime as it is only valid
+                // with logical times (such as clusterTimes). As a result, we need to convert the
+                // user requested level to majority read concern. This is sufficient for the
+                // pre-wait because we only need to ensure _lastOpTime is majority-committed/visible
+                // before proceeding.
+                level = repl::ReadConcernLevel::kMajorityReadConcern;
+            }
+            auto status = repl::ReplicationCoordinator::get(opCtx)->waitUntilOpTimeForRead(
+                opCtx, repl::ReadConcernArgs{lastOp, level});
+            if (!status.isOK())
+                return status;
+        }
+    }
+    Status rcStatus = mongo::waitForReadConcern(
+        opCtx, requestReadConcernArgs, aggRequest.getNamespace().dbName(), true);
+    if (!rcStatus.isOK())
+        return rcStatus;
+
+    // run aggregation
+    DBDirectClient client(opCtx);
+    auto cursor = uassertStatusOKWithContext(
+        DBClientCursor::fromAggregationRequest(
+            &client, aggRequest, true /* secondaryOk */, true /* useExhaust */),
+        "Failed to establish a cursor for aggregation");
+    while (cursor->more()) {
+        std::vector<BSONObj> batchDocs;
+        batchDocs.reserve(cursor->objsLeftInBatch());
+        while (cursor->moreInCurrentBatch()) {
+            batchDocs.emplace_back(cursor->nextSafe().getOwned());
+        }
+
+        try {
+            if (!callback(batchDocs, boost::none)) {
+                break;
+            }
+        } catch (const DBException& ex) {
+            return ex
+                .toStatus(str::stream()
+                          << "Exception while running aggregation retrieval of results callback");
+        }
+    }
+
+    return Status::OK();
+}
+}  // namespace mongo

@@ -1,110 +1,82 @@
-/**
-*    Copyright (C) 2011 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
+#include "mongo/db/pipeline/document_source_skip.h"
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <iterator>
+#include <limits>
+#include <list>
+#include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
+using boost::intrusive_ptr;
 
-    const char DocumentSourceSkip::skipName[] = "$skip";
+DocumentSourceSkip::DocumentSourceSkip(const intrusive_ptr<ExpressionContext>& pExpCtx,
+                                       long long nToSkip)
+    : DocumentSource(kStageName, pExpCtx), _nToSkip(nToSkip) {}
 
-    DocumentSourceSkip::DocumentSourceSkip(const intrusive_ptr<ExpressionContext> &pExpCtx):
-        DocumentSource(pExpCtx),
-        _skip(0),
-        _needToSkip(true) {
-    }
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE(skip, SkipLiteParsed::parse, AllowedWithApiStrict::kAlways);
 
-    const char *DocumentSourceSkip::getSourceName() const {
-        return skipName;
-    }
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(skip, DocumentSourceSkip, SkipStageParams);
 
-    bool DocumentSourceSkip::coalesce(
-        const intrusive_ptr<DocumentSource> &pNextSource) {
-        DocumentSourceSkip *pSkip =
-            dynamic_cast<DocumentSourceSkip *>(pNextSource.get());
+ALLOCATE_DOCUMENT_SOURCE_ID(skip, DocumentSourceSkip::id)
 
-        /* if it's not another $skip, we can't coalesce */
-        if (!pSkip)
-            return false;
+constexpr std::string_view DocumentSourceSkip::kStageName;
 
-        /* we need to skip over the sum of the two consecutive $skips */
-        _skip += pSkip->_skip;
-        return true;
-    }
-
-    boost::optional<Document> DocumentSourceSkip::getNext() {
-        pExpCtx->checkForInterrupt();
-
-        if (_needToSkip) {
-            _needToSkip = false;
-            for (long long i=0; i < _skip; i++) {
-                if (!pSource->getNext())
-                    return boost::none;
-            }
-        }
-
-        return pSource->getNext();
-    }
-
-    Value DocumentSourceSkip::serialize(bool explain) const {
-        return Value(DOC(getSourceName() << _skip));
-    }
-
-    intrusive_ptr<DocumentSourceSkip> DocumentSourceSkip::create(
-        const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        intrusive_ptr<DocumentSourceSkip> pSource(
-            new DocumentSourceSkip(pExpCtx));
-        return pSource;
-    }
-
-    intrusive_ptr<DocumentSource> DocumentSourceSkip::createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        uassert(15972, str::stream() << DocumentSourceSkip::skipName <<
-                ":  the value to skip must be a number",
-                elem.isNumber());
-
-        intrusive_ptr<DocumentSourceSkip> pSkip(
-            DocumentSourceSkip::create(pExpCtx));
-
-        pSkip->_skip = elem.numberLong();
-        uassert(15956, str::stream() << DocumentSourceSkip::skipName <<
-                ":  the number to skip cannot be negative",
-                pSkip->_skip >= 0);
-
-        return pSkip;
-    }
+Value DocumentSourceSkip::serialize(const query_shape::SerializationOptions& opts) const {
+    return Value(DOC(getSourceName() << opts.serializeLiteral(_nToSkip)));
 }
+
+intrusive_ptr<DocumentSource> DocumentSourceSkip::optimize() {
+    return _nToSkip == 0 ? nullptr : this;
+}
+
+DocumentSourceContainer::iterator DocumentSourceSkip::optimizeAt(
+    DocumentSourceContainer::iterator itr, DocumentSourceContainer* container) {
+    tassert(11282962, "Expecting DocumentSource iterator pointing to this stage", *itr == this);
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
+    auto nextSkip = dynamic_cast<DocumentSourceSkip*>((*std::next(itr)).get());
+    if (nextSkip) {
+        // '_nToSkip' can potentially overflow causing it to become negative and skip nothing.
+        if (std::numeric_limits<long long>::max() - _nToSkip - nextSkip->getSkip() >= 0) {
+            _nToSkip += nextSkip->getSkip();
+            container->erase(std::next(itr));
+            return itr;
+        }
+    }
+    return std::next(itr);
+}
+
+intrusive_ptr<DocumentSourceSkip> DocumentSourceSkip::create(
+    const intrusive_ptr<ExpressionContext>& pExpCtx, long long nToSkip) {
+    uassert(15956, "Argument to $skip cannot be negative", nToSkip >= 0);
+    intrusive_ptr<DocumentSourceSkip> skip(new DocumentSourceSkip(pExpCtx, nToSkip));
+    return skip;
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceSkip::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    const auto nToSkip = elem.parseIntegerElementToNonNegativeLong();
+    uassert(5107200,
+            str::stream() << "invalid argument to $skip stage: " << nToSkip.getStatus().reason(),
+            nToSkip.isOK());
+    return DocumentSourceSkip::create(pExpCtx, nToSkip.getValue());
+}
+}  // namespace mongo

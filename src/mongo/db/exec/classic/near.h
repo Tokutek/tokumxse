@@ -1,0 +1,269 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/exec/classic/recordid_deduplicator.h"
+#include "mongo/db/exec/classic/requires_index_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/sorter/sorter.h"
+#include "mongo/util/modules.h"
+
+#include <limits>
+#include <memory>
+#include <string_view>
+#include <vector>
+
+namespace mongo {
+
+/**
+ * An abstract stage which uses a progressive sort to return results sorted by distance.  This
+ * is useful when we do not have a full ordering computed over the distance metric and don't
+ * want to generate one.
+ *
+ * Some parts of the geoNear implementation depend on the type of index being used, so
+ * subclasses need to implement these three functions:
+ *
+ * - initialize() - Prepares the stage to begin the geoNear search. Must return IS_EOF iff the
+ *                  stage is prepared to begin buffering documents.
+ * - nextInterval() - Must return the bounds of the next interval with a PlanStage that will find
+ *                    all of the results in this interval that have not already been buffered in
+ *                    previous intervals.
+ * - computeDistance() - Must return the distance from a document to the centroid of search using
+ *                       the correct metric (spherical/flat, radians/meters).
+ *
+ * For example - given a distance search over documents with distances from [0 -> 10], the child
+ * stage might break up the search into intervals [0->5),[5,7),[7->10].
+ *
+ * Each interval requires a PlanStage which returns all of the results in the interval that have
+ * not been buffered in a previous interval.  Results in each interval are buffered fully before
+ * being returned to ensure that ordering is preserved. Results that are in the cover, but outside
+ * the outer bounds of the current interval will remain buffered to be returned in subsequent
+ * search intervals.
+ *
+ * For efficient search, the child stage should not return too many results outside the interval,
+ * but correctness only depends on all the results in the interval being buffered before any are
+ * returned. As an example, a PlanStage for the interval [0->5) might just be a full collection
+ * scan - this will always buffer every result in the interval, but is slow.  If there is an index
+ * available, an IndexScan stage might also return all documents with distance [0->5) but
+ * would be much faster.
+ *
+ * Also for efficient search, the intervals should not be too large or too small - though again
+ * correctness does not depend on interval size.
+ *
+ * The child stage may return duplicate documents, so it is the responsibility of NearStage to
+ * deduplicate. Every document in _resultBuffer is kept track of in _seenDocuments. When a document
+ * is returned, it is removed from _seenDocuments.
+ *
+ * Right now the interface allows the nextCovering() to be adaptive, but doesn't allow
+ * aborting and shrinking a covered range being buffered if we guess wrong.
+ */
+class NearStage : public RequiresIndexStage {
+public:
+    struct CoveredInterval;
+
+    ~NearStage() override;
+
+    bool isEOF() const final;
+    StageState doWork(WorkingSetID* out) final;
+
+    StageType stageType() const final;
+    std::unique_ptr<PlanStageStats> getStats() final;
+    const SpecificStats* getSpecificStats() const final;
+
+protected:
+    /**
+     * Subclasses of NearStage must provide basics + a stats object which gets owned here.
+     */
+    NearStage(ExpressionContext* expCtx,
+              std::string_view typeName,
+              StageType type,
+              WorkingSet* workingSet,
+              CollectionAcquisition collection,
+              const IndexCatalogEntry* indexEntry);
+
+    //
+    // Methods implemented for specific search functionality
+    //
+
+    /**
+     * Constructs the next covering over the next interval to buffer results from, or nullptr if the
+     * full range has been searched.  Use the provided working set as the working set for the
+     * covering stage if required.
+     */
+    virtual std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                          WorkingSet* workingSet) = 0;
+
+    /**
+     * Computes the distance value for the given member data, or -1 if the member should not be
+     * returned in the sorted results.
+     */
+    virtual double computeDistance(WorkingSetMember* member) = 0;
+
+    /**
+     * Returns the largest distance this search can ever return, in the same units as
+     * computeDistance(). This is the maximum distance of the last interval, so a document beyond it
+     * fails the interval check of every interval and can never be returned. bufferNext() therefore
+     * discards such a document right away instead of buffering it. Defaults to no limit.
+     */
+    virtual double maxSearchDistance() const {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    /**
+     * Returns the residual document-level predicate to apply to each buffered document, or nullptr
+     * if there is none. This predicate is evaluated only on documents that the near search would
+     * otherwise return, that is, after the distance checks against the current interval and against
+     * maxSearchDistance(). See the call site in bufferNext() for why the ordering matters.
+     */
+    virtual const MatchExpression* residualFilter() const {
+        return nullptr;
+    }
+
+    /*
+     * Initialize near stage before buffering the data.
+     * Return IS_EOF if subclass finishes the initialization.
+     * Return NEED_TIME if we need more time.
+     * Return errors if an error occurs.
+     * Can't return ADVANCED.
+     */
+    virtual StageState initialize(OperationContext* opCtx,
+                                  WorkingSet* workingSet,
+                                  WorkingSetID* out) = 0;
+
+    void doSaveStateRequiresIndex() final {}
+
+    void doRestoreStateRequiresIndex() final {}
+
+    // Filled in by subclasses.
+    NearStats _specificStats;
+
+private:
+    //
+    // Generic methods for progressive search functionality
+    //
+
+    StageState initNext(WorkingSetID* out);
+    StageState bufferNext(WorkingSetID* toReturn);
+    StageState advanceNext(WorkingSetID* toReturn);
+
+    SortOptions makeSortOptions();
+    void updateSpillingStats();
+
+    void spill();
+
+    //
+    // Generic state for progressive near search
+    //
+
+    WorkingSet* const _workingSet;
+
+    // A progressive search works in stages of buffering and then advancing
+    enum class SearchState { Initializing, Buffering, Advancing, Finished } _searchState;
+
+    // Tracks RecordIds from the child stage to do our own deduping.
+    RecordIdDeduplicator _seenDocuments;
+
+    // Stats for the stage covering this interval
+    // This is owned by _specificStats
+    IntervalStats* _nextIntervalStats;
+
+    struct SorterKey {
+        double value;
+
+        SorterKey getOwned() const {
+            return {value};
+        }
+
+        void makeOwned() {}
+
+        int memUsageForSorter() const {
+            return sizeof(SorterKey);
+        }
+
+        struct SorterDeserializeSettings {};
+
+        void serializeForSorter(BufBuilder& buf) const {
+            buf.appendNum(value);
+        }
+
+        static SorterKey deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
+            return {buf.read<LittleEndian<double>>()};
+        }
+
+        std::string toString() const {
+            return std::to_string(value);
+        }
+    };
+    using SorterValue = SortableWorkingSetMember;
+    struct SorterKeyComparator {
+        int operator()(const SorterKey& lhs, const SorterKey& rhs) const {
+            if (lhs.value < rhs.value) {
+                return -1;
+            }
+            if (lhs.value > rhs.value) {
+                return 1;
+            }
+            return 0;
+        }
+    };
+
+    // Inside BoundedSorter MakeBound callback is used to determine minimal key value that can be
+    // expected. In case of NearStage this minimal value doesn't depend on sorter values and will be
+    // set externally using BoundedSorter::setBound based on the current interval.
+    struct NoOpBound {
+        SorterKey operator()(const SorterKey& key, const SorterValue& value) const {
+            return {std::numeric_limits<double>::lowest()};
+        }
+
+        Document serialize(const query_shape::SerializationOptions& opts) const {
+            // MakeBound::serialize is only used when the sorter is serialized. NearStage won't
+            // serialize the sorter, because it is always the same.
+            MONGO_UNIMPLEMENTED_TASSERT(10907700);
+        }
+    };
+
+    SorterFileStats _sorterFileStats;
+    using ResultBufferSorter =
+        BoundedSorter<SorterKey, SorterValue, SorterKeyComparator, NoOpBound>;
+    ResultBufferSorter _resultBuffer;
+
+    // Stats
+    const StageType _stageType;
+
+    // The current stage from which this stage should buffer results
+    // Pointer to the last interval in _childrenIntervals. Owned by _childrenIntervals.
+    CoveredInterval* _nextInterval;
+
+    // All children CoveredIntervals and the sub-stages owned by them.
+    //
+    // All children intervals except the last active one are only used by getStats(),
+    // because they are all EOF.
+    std::vector<std::unique_ptr<CoveredInterval>> _childrenIntervals;
+
+    // Check memory usage of the stage.
+    SimpleMemoryUsageTracker _memoryTracker;
+
+    // Tracks memory usage of the record ID deduplicator and reports metrics to serverStatus.
+    DeduplicatorReporter _dedupReporter;
+};
+
+/**
+ * A covered interval over which a portion of a near search can be run.
+ */
+struct NearStage::CoveredInterval {
+    CoveredInterval(PlanStage* covering,
+                    double minDistance,
+                    double maxDistance,
+                    bool isLastInterval);
+
+    PlanStage* const covering;  // Owned in PlanStage::_children.
+
+    const double minDistance;
+    const double maxDistance;
+    const bool isLastInterval;
+};
+
+}  // namespace mongo

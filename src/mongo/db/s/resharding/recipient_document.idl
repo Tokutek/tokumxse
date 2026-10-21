@@ -1,0 +1,84 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.localReshardingOperations.recipient on
+# the recipient shard for a resharding operation.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/s/resharding/common_types.idl"
+
+structs:
+    ReshardingRecipientMetrics:
+        description: "Contains metrics about the resharding operation on a recipient."
+        strict: false
+        fields:
+            operationRuntime:
+                type: ReshardingMetricsTimeInterval
+                description: >-
+                    The time interval of the entire resharding operation on this recipient.
+                optional: true
+            documentCopy:
+                type: ReshardingMetricsTimeInterval
+                description: >-
+                    The time interval that it takes to clone documents on this recipient.
+                optional: true
+            oplogApplication:
+                type: ReshardingMetricsTimeInterval
+                description: >-
+                    The time interval that it takes to apply oplog entries on this recipient.
+                optional: true
+            indexBuildTime:
+                type: ReshardingMetricsTimeInterval
+                description: >-
+                    The time interval that it takes to build the indexes on this recipient.
+                optional: true
+            approxDocumentsToCopy:
+                type: long
+                optional: true
+            approxBytesToCopy:
+                type: long
+                optional: true
+            finalDocumentsCopiedCount:
+                type: long
+                description: >-
+                    The total number of documents copied after the cloning step completes.
+                optional: true
+            finalBytesCopiedCount:
+                type: long
+                description: >-
+                    The total number of bytes copied after the cloning step completes.
+                optional: true
+
+    ReshardingRecipientDocument:
+        description: "Represents a resharding operation on the recipient shard."
+        inline_chained_structs: true
+        chained_structs:
+            CommonReshardingMetadata: CommonReshardingMetadata
+            ReshardingRecipientOptions: ReshardingRecipientOptions
+        generate_comparison_operators: false
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            cloneTimestamp:
+                type: timestamp
+                optional: true
+                description: "The timestamp for the snapshot read while cloning from the donors."
+            changeStreamsMonitor:
+                type: ChangeStreamsMonitorContext
+                optional: true
+            # We intentionally have the mutable state nested in a subobject to make it easy to
+            # overwrite with a single $set.
+            mutableState: RecipientShardContext
+            startConfigTxnCloneTime:
+                type: date
+                optional: true
+            metrics:
+                type: ReshardingRecipientMetrics
+                description: "Metrics related to this recipient."
+                optional: true

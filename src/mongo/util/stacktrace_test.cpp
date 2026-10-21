@@ -1,0 +1,954 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+// IWYU pragma: no_include "bits/types/__sigset_t.h"
+// IWYU pragma: no_include "bits/types/siginfo_t.h"
+// IWYU pragma: no_include "bits/types/stack_t.h"
+#include "mongo/util/stacktrace.h"
+
+#include "mongo/base/parse_number.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/json.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/stacktrace_test_helpers.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include <fmt/format.h>
+#include <fmt/printf.h>  // IWYU pragma: keep
+#include <fmt/ranges.h>  // IWYU pragma: keep
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
+#include <sys/syscall.h>
+
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+// Needs to have linkage so we can test metadata. Needs to be extern
+// "C" so it doesn't get mangled so we can name it with EXPORT_SYMBOLS
+// in SConscript.
+extern "C" MONGO_COMPILER_NOINLINE MONGO_COMPILER_API_EXPORT void
+mongo_stacktrace_test_detail_testFunctionWithLinkage() {
+    printf("...");
+}
+
+namespace mongo {
+
+namespace stacktrace_test_detail {
+
+struct RecursionParam {
+    std::uint64_t n;
+    std::function<void()> f;
+};
+
+MONGO_COMPILER_NOINLINE int recurseWithLinkage(RecursionParam& p, std::uint64_t i = 0) {
+    if (i == p.n) {
+        p.f();
+    } else {
+        recurseWithLinkage(p, i + 1);
+    }
+    return 0;
+}
+
+}  // namespace stacktrace_test_detail
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+using namespace std::literals::chrono_literals;
+
+constexpr bool kSuperVerbose = 0;  // Devel instrumentation
+
+#if defined(_WIN32)
+constexpr bool kIsWindows = true;
+#else
+constexpr bool kIsWindows = false;
+#endif
+
+class LogAdapter {
+public:
+    std::string toString() const {  // LAME
+        std::ostringstream os;
+        os << *this;
+        return os.str();
+    }
+    friend std::ostream& operator<<(std::ostream& os, const LogAdapter& x) {
+        x.doPrint(os);
+        return os;
+    }
+
+private:
+    virtual void doPrint(std::ostream& os) const = 0;
+};
+
+template <typename T>
+class LogVec : public LogAdapter {
+public:
+    explicit LogVec(const T& v, std::string_view sep = ","sv) : v(v), sep(sep) {}
+
+private:
+    void doPrint(std::ostream& os) const override {
+        os << std::hex;
+        os << "{";
+        std::string_view s;
+        for (auto&& e : v) {
+            os << s << e;
+            s = sep;
+        }
+        os << "}";
+        os << std::dec;
+    }
+    const T& v;
+    std::string_view sep = ","sv;
+};
+
+uintptr_t fromHex(const std::string& s) {
+    return static_cast<uintptr_t>(std::stoull(s, nullptr, 16));
+}
+
+bool consume(const pcre::Regex& re, std::string_view* in, std::string* out) {
+    auto m = re.matchView(*in);
+    if (!m)
+        return false;
+    *in = in->substr(m[0].size());
+    *out = std::string{m[1]};
+    return true;
+}
+
+// Log IDs used by StackTrace::sink and StackTrace::log.
+constexpr int errorCollectingStackTraceId = 31430;
+constexpr int stacktraceLogId = 31380;
+
+// Asserts exactly one log line with log id `id` was captured, and returns its index.
+size_t singleLogIndex(const unittest::LogCaptureGuard& logs, int id) {
+    auto indices = logs.indicesOfBSONContainingSubset(BSON("id" << id));
+    ASSERT_EQ(indices.size(), 1u);
+    return indices[0];
+}
+
+// Returns the number of non-overlapping occurrences of `needle` in `haystack`.
+size_t countOccurrences(std::string_view haystack, std::string_view needle) {
+    size_t count = 0;
+    for (auto pos = haystack.find(needle); pos != std::string_view::npos;
+         pos = haystack.find(needle, pos + needle.size())) {
+        ++count;
+    }
+    return count;
+}
+
+TEST(StackTrace, Log) {
+    std::string testData = "foobarbaz";
+    StackTrace trace(BSON("data" << testData));
+
+    unittest::LogCaptureGuard logs;
+    trace.log();
+
+    // The stacktrace (and no error) go into the logs.
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << errorCollectingStackTraceId)), 0)
+        << "log() logged the error for a trace without an error";
+    singleLogIndex(logs, stacktraceLogId);
+}
+
+TEST(StackTrace, LogWithError) {
+    std::string testData = "foobarbaz";
+    std::string errorString = "errorbazbarfoo";
+    StackTrace trace(BSON("data" << testData), errorString);
+
+    unittest::LogCaptureGuard logs;
+    trace.log();
+
+    // The error and stacktrace are both logged, with the error going first.
+    auto errorIndex = singleLogIndex(logs, errorCollectingStackTraceId);
+    auto stacktraceIndex = singleLogIndex(logs, stacktraceLogId);
+    ASSERT_LT(errorIndex, stacktraceIndex)
+        << "log() logged the stacktrace and error in the wrong order";
+}
+
+TEST(StackTrace, Sink) {
+    std::string testData = "foobarbaz";
+    StackTrace trace(BSON("data" << testData));
+
+    std::string s;
+    StringStackTraceSink sink(s);
+
+    unittest::LogCaptureGuard logs;
+    trace.sink(&sink);
+
+    // The stacktrace goes to the sink.
+    ASSERT_EQ(countOccurrences(s, testData), 1u)
+        << "sink() did not write the stacktrace to the sink exactly once";
+    // The stacktrace does not go to the log.
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << stacktraceLogId)), 0)
+        << "sink() logged the stacktrace to logv2";
+}
+
+TEST(StackTrace, SinkWithError) {
+    std::string testData = "foobarbaz";
+    std::string errorString = "errorbazbarfoo";
+    StackTrace trace(BSON("data" << testData), errorString);
+
+    std::string s;
+    StringStackTraceSink sink(s);
+
+    unittest::LogCaptureGuard logs;
+    trace.sink(&sink);
+
+    // The stacktrace and error go to the sink.
+    ASSERT_EQ(countOccurrences(s, errorString), 1u)
+        << "sink() did not write the error to the sink exactly once";
+    ASSERT_EQ(countOccurrences(s, testData), 1u)
+        << "sink() did not write the stacktrace to the sink exactly once";
+
+    // The error is written before the stacktrace.
+    ASSERT_LT(s.find(errorString), s.find(testData))
+        << "sink() wrote the stacktrace and error in the wrong order";
+
+    // The messages do not go to the logs.
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << stacktraceLogId)), 0)
+        << "sink() logged the stacktrace to logv2";
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << errorCollectingStackTraceId)), 0)
+        << "sink() logged the error to logv2";
+}
+
+TEST(StackTrace, NullSink) {
+    std::string testData = "foobarbaz";
+    StackTrace trace(BSON("data" << testData));
+
+    unittest::LogCaptureGuard logs;
+    trace.sink(nullptr);
+
+    // Null sink, no error, stacktrace goes to the log.
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << errorCollectingStackTraceId)), 0)
+        << "sink(nullptr) logged the error for a trace without an error";
+    singleLogIndex(logs, stacktraceLogId);
+}
+
+TEST(StackTrace, NullSinkWithError) {
+    std::string testData = "foobarbaz";
+    std::string errorString = "errorbazbarfoo";
+    StackTrace trace(BSON("data" << testData), errorString);
+
+    unittest::LogCaptureGuard logs;
+    trace.sink(nullptr);
+
+    // Null sink, the error and stacktrace are both logged, error first.
+    auto errorIndex = singleLogIndex(logs, errorCollectingStackTraceId);
+    auto stacktraceIndex = singleLogIndex(logs, stacktraceLogId);
+    ASSERT_LT(errorIndex, stacktraceIndex)
+        << "sink(nullptr) logged the stacktrace and error in the wrong order";
+}
+
+// Break down a printStackTrace output for a contrived call tree and sanity-check it.
+TEST(StackTrace, PosixFormat) {
+    if (kIsWindows) {
+        return;
+    }
+
+    std::string trace;
+    stacktrace_test_detail::RecursionParam param{3, [&] {
+                                                     StringStackTraceSink sink{trace};
+                                                     printStructuredStackTrace(sink);
+                                                 }};
+    stacktrace_test_detail::recurseWithLinkage(param, 3);
+
+    if (kSuperVerbose) {
+        LOGV2_OPTIONS(24153, {logv2::LogTruncation::Disabled}, "Trace", "trace"_attr = trace);
+    }
+
+    // Expect log to be a "BACKTRACE:" 1-line record, followed by some "Frame:" lines.
+    // Each "Frame:" line holds a full json object, but we only examine its "a" field here.
+    std::string jsonLine;
+    std::vector<uintptr_t> humanAddrs;
+    std::string_view in{trace};
+    static const pcre::Regex jsonLineRE(R"re(^BACKTRACE: (\{.*\})\n?)re");
+    ASSERT_TRUE(consume(jsonLineRE, &in, &jsonLine)) << "\"" << in << "\"";
+    while (true) {
+        std::string frameLine;
+        static const pcre::Regex frameRE(R"re(^  Frame: (\{.*\})\n?)re");
+        if (!consume(frameRE, &in, &frameLine))
+            break;
+        BSONObj frameObj = fromjson(frameLine);  // throwy
+        humanAddrs.push_back(fromHex(frameObj["a"].String()));
+    }
+    ASSERT_TRUE(in.empty()) << "must be consumed fully: \"" << in << "\"";
+
+    BSONObj jsonObj = fromjson(jsonLine);  // throwy
+    ASSERT_TRUE(jsonObj.hasField("backtrace"));
+    ASSERT_TRUE(jsonObj.hasField("processInfo"));
+
+    ASSERT_TRUE(jsonObj["processInfo"].Obj().hasField("somap"));
+    struct SoMapEntry {
+        uintptr_t base;
+        std::string path;
+    };
+
+    std::map<uintptr_t, SoMapEntry> soMap;
+    for (const auto& so : jsonObj["processInfo"]["somap"].Array()) {
+        auto soObj = so.Obj();
+        SoMapEntry ent{};
+        ent.base = fromHex(soObj["b"].String());
+        ASSERT_TRUE(soObj.hasField("path"))
+            << "no path for entry with base address " << soObj["b"].String();
+        ent.path = soObj["path"].String();
+        ASSERT_FALSE(ent.path.empty());
+        ASSERT_TRUE(soMap.find(ent.base) == soMap.end())
+            << "Duplicate entry for base address " << soObj["b"].String() << " found both "
+            << ent.path << " and " << soMap[ent.base].path;
+        soMap[ent.base] = ent;
+    }
+
+    // Sanity check: make sure all BACKTRACE addrs are represented in the Frame section.
+    std::vector<uintptr_t> btAddrs;
+    for (const auto& btElem : jsonObj["backtrace"].embeddedObject()) {
+        btAddrs.push_back(fromHex(btElem.embeddedObject()["a"].String()));
+    }
+
+    // Mac OS backtrace returns extra frames in "backtrace".
+    ASSERT_TRUE(std::search(btAddrs.begin(), btAddrs.end(), humanAddrs.begin(), humanAddrs.end()) ==
+                btAddrs.begin())
+        << LogVec(btAddrs) << " vs " << LogVec(humanAddrs);
+}
+
+
+std::vector<std::string> splitLines(std::string in) {
+    std::vector<std::string> lines;
+    while (true) {
+        auto pos = in.find('\n');
+        if (pos == std::string::npos) {
+            break;
+        } else {
+            lines.push_back(in.substr(0, pos));
+            in = in.substr(pos + 1);
+        }
+    }
+    if (!in.empty()) {
+        lines.push_back(in);
+    }
+    return lines;
+}
+
+TEST(StackTrace, WindowsFormat) {
+    if (!kIsWindows) {
+        return;
+    }
+
+    std::string trace = [&] {
+        std::string s;
+        stacktrace_test_detail::RecursionParam param{3, [&] {
+                                                         StringStackTraceSink sink{s};
+                                                         printStackTrace(sink);
+                                                     }};
+        stacktrace_test_detail::recurseWithLinkage(param);
+        return s;
+    }();
+
+    std::vector<std::string> lines = splitLines(trace);
+
+    auto re = pcre::Regex(R"re(^BACKTRACE: (\{.*\})$)re");
+    auto m = re.matchView(lines[0]);
+    ASSERT_TRUE(!!m);
+    std::string jsonLine{m[1]};
+
+    std::vector<uintptr_t> humanAddrs;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        static const pcre::Regex re(R"re(^  Frame: (?:\{"a":"(.*?)",.*\})$)re");
+        uintptr_t addr;
+        auto m = re.matchView(lines[i]);
+        ASSERT_TRUE(!!m) << lines[i];
+        ASSERT_OK(NumberParser{}.base(16)(m[1], &addr));
+        humanAddrs.push_back(addr);
+    }
+
+    BSONObj jsonObj = fromjson(jsonLine);  // throwy
+    ASSERT_TRUE(jsonObj.hasField("backtrace")) << tojson(jsonObj);
+    std::vector<uintptr_t> btAddrs;
+    for (const auto& btElem : jsonObj["backtrace"].Obj()) {
+        btAddrs.push_back(fromHex(btElem.Obj()["a"].String()));
+    }
+
+    ASSERT_TRUE(std::search(btAddrs.begin(), btAddrs.end(), humanAddrs.begin(), humanAddrs.end()) ==
+                btAddrs.begin())
+        << LogVec(btAddrs) << " vs " << LogVec(humanAddrs);
+}
+
+std::string traceString() {
+    std::ostringstream os;
+    OstreamStackTraceSink sink{os};
+    printStructuredStackTrace(sink);
+    return os.str();
+}
+
+/** Emit a stack trace before main() runs, for use in the EarlyTraceSanity test. */
+std::string earlyTrace = traceString();
+
+/**
+ * Verify that the JSON object emitted as part of a stack trace contains a "processInfo"
+ * field, and that it, in turn, contains the fields expected by mongosymb.py. Verify in
+ * particular that a stack trace emitted before main() and before the MONGO_INITIALIZERS
+ * have run will be valid according to mongosymb.py.
+ */
+TEST(StackTrace, EarlyTraceSanity) {
+    if (kIsWindows) {
+        return;
+    }
+
+    const std::string trace = traceString();
+    const std::string substrings[] = {
+        R"("processInfo":)",
+        R"("gitVersion":)",
+        R"("compiledModules":)",
+        R"("uname":)",
+        R"("somap":)",
+    };
+    for (const auto& sub : substrings) {
+        ASSERT_STRING_CONTAINS(earlyTrace, sub);
+    }
+    for (const auto& sub : substrings) {
+        ASSERT_STRING_CONTAINS(trace, sub);
+    }
+}
+
+template <int N>
+StackTrace getTrace() {
+    boost::optional<StackTrace> trace;
+    stacktrace_test::executeUnderCallstack<N>(
+        [&] { trace = stacktrace_details::getStructuredStackTrace(); });
+    ASSERT_TRUE(trace.has_value());
+    ASSERT_EQ(trace->getError(), std::string{});
+    return *trace;
+}
+
+int countGeneratedFrames(const StackTrace& trace) {
+    BSONObj bsonTrace = trace.getBSONRepresentation();
+    auto backtrace = bsonTrace["backtrace"];
+    ASSERT_FALSE(backtrace.eoo());
+    auto frames = backtrace.Array();
+    int matchingFrames = 0;
+
+    for (const auto& frame : frames) {
+        ASSERT_TRUE(frame.isABSONObj());
+        auto demangledElem = frame["C"];
+        if (demangledElem.eoo()) {
+            continue;
+        }
+        auto demangled = demangledElem.valueStringDataSafe();
+        if (demangled.find("stacktrace_test::callNext") != demangled.npos) {
+            matchingFrames++;
+        }
+    }
+
+    return matchingFrames;
+}
+
+#ifndef _WIN32
+// This test isn't enabled on Windows as we may not be able to reliably generate deep stack
+// traces on that platform.
+TEST(StackTrace, StackTrace80Frames) {
+    constexpr int numFrames = 80;
+    StackTrace trace = getTrace<numFrames>();
+    int generatedFrames = countGeneratedFrames(trace);
+    ASSERT_EQ(generatedFrames, numFrames)
+        << "Stacktrace doesn't contain all expected frames " << trace.getBSONRepresentation();
+}
+
+// This test isn't enabled on Windows as we may not be able to reliably generate deep stack
+// traces on that platform.
+TEST(StackTrace, StackTrace200Frames) {
+    using namespace unittest::match;
+    constexpr int numFrames = 200;
+    StackTrace trace = getTrace<numFrames>();
+
+    // There's a 100-frame limit and there are some frames below the last generated
+    // frame, so we expect to see close to, but less than 100 matching frames.
+    ASSERT_THAT(countGeneratedFrames(trace), AllOf(Ge(80), Le(100)))
+        << trace.getBSONRepresentation();
+}
+
+// `MetadataGenerator::load` should fill its meta member with something reasonable.
+// Only testing with functions which we expect the dynamic linker to know about, so
+// they must have external linkage.
+TEST(StackTrace, MetadataGenerator) {
+    StackTraceAddressMetadataGenerator gen;
+    struct {
+        void* ptr;
+        std::string fileSub;
+        std::string symbolSub;
+    } const tests[] = {
+        {
+            reinterpret_cast<void*>(&mongo_stacktrace_test_detail_testFunctionWithLinkage),
+            "stacktrace_test",
+            "testFunctionWithLinkage",
+        },
+        {
+            // printf's file tricky (surprises under ASAN, Mac, ...),
+            // but we should at least get a symbol name containing "printf" out of it.
+            reinterpret_cast<void*>(&std::printf),
+            {},
+            "printf",
+        },
+    };
+
+    for (const auto& test : tests) {
+        const auto& meta = gen.load(test.ptr);
+        if (kSuperVerbose) {
+            OstreamStackTraceSink sink{std::cout};
+            meta.printTo(sink);
+        }
+        ASSERT_EQUALS(meta.address(), reinterpret_cast<uintptr_t>(test.ptr));
+        if (!test.fileSub.empty()) {
+            ASSERT_TRUE(meta.file());
+            ASSERT_STRING_CONTAINS(meta.file().name(), test.fileSub);
+        }
+
+        if (!test.symbolSub.empty()) {
+            ASSERT_TRUE(meta.symbol());
+            ASSERT_STRING_CONTAINS(meta.symbol().name(), test.symbolSub);
+        }
+    }
+}
+
+TEST(StackTrace, MetadataGeneratorFunctionMeasure) {
+    // Measure the size of a C++ function as a test of metadata retrieval.
+    // Load increasing addresses until the metadata's symbol name changes.
+    StackTraceAddressMetadataGenerator gen;
+    void* fp = reinterpret_cast<void*>(&mongo_stacktrace_test_detail_testFunctionWithLinkage);
+    const auto& meta = gen.load(fp);
+    if (!meta.symbol())
+        return;  // No symbol for `fp`. forget it.
+    std::string savedSymbol{meta.symbol().name()};
+    uintptr_t fBase = meta.symbol().base();
+    ASSERT_EQ(fBase, reinterpret_cast<uintptr_t>(fp))
+        << "function pointer should match its symbol base";
+    size_t fSize = 0;
+    for (; true; ++fSize) {
+        auto& m = gen.load(reinterpret_cast<void*>(fBase + fSize));
+        if (!m.symbol() || m.symbol().name() != savedSymbol)
+            break;
+    }
+    // Place some reasonable expectation on the size of the tiny test function.
+    ASSERT_GT(fSize, 0);
+    ASSERT_LT(fSize, 512);
+}
+#endif  // _WIN32
+
+#if MONGO_HAS_SIGALTSTACK
+extern "C" typedef void(sigAction_t)(int signum, siginfo_t* info, void* context);
+
+class StackTraceSigAltStackTest : public unittest::Test {
+public:
+    using unittest::Test::Test;
+
+    template <typename T>
+    static std::string ostr(const T& v) {
+        std::ostringstream os;
+        os << v;
+        return os.str();
+    }
+
+    static void handlerPreamble(int sig) {
+        LOGV2(23387,
+              "Thread caught signal!",
+              "tid"_attr = ostr(std::this_thread::get_id()),
+              "sig"_attr = sig);
+        char storage;
+        LOGV2(23388,
+              "Local var",
+              "var"_attr = fmt::format("{:X}", reinterpret_cast<uintptr_t>(&storage)));
+    }
+
+    static void tryHandler(sigAction_t* handler) {
+        constexpr int sig = SIGUSR1;
+        constexpr size_t kStackSize = size_t{1} << 20;  // 1 MiB
+        auto buf = std::make_unique<std::array<unsigned char, kStackSize>>();
+        constexpr unsigned char kSentinel = 0xda;
+        std::fill(buf->begin(), buf->end(), kSentinel);
+        LOGV2(24157,
+              "sigaltstack buf",
+              "size"_attr = fmt::format("{:X}", buf->size()),
+              "data"_attr = fmt::format("{:X}", reinterpret_cast<uintptr_t>(buf->data())));
+        stdx::thread thr([&] {
+            LOGV2(23389, "Thread running", "tid"_attr = ostr(std::this_thread::get_id()));
+            {
+                stack_t ss;
+                ss.ss_sp = buf->data();
+                ss.ss_size = buf->size();
+                ss.ss_flags = 0;
+                if (int r = sigaltstack(&ss, nullptr); r < 0) {
+                    perror("sigaltstack");
+                }
+            }
+            {
+                struct sigaction sa = {};
+                sa.sa_sigaction = handler;
+                sa.sa_mask = {};
+                sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+                if (int r = sigaction(sig, &sa, nullptr); r < 0) {
+                    perror("sigaction");
+                }
+            }
+            raise(sig);
+            {
+                stack_t ss;
+                ss.ss_sp = 0;
+                ss.ss_size = 0;
+                ss.ss_flags = SS_DISABLE;
+                if (int r = sigaltstack(&ss, nullptr); r < 0) {
+                    perror("sigaltstack");
+                }
+            }
+        });
+        thr.join();
+        size_t used = std::distance(
+            std::find_if(buf->begin(), buf->end(), [](unsigned char x) { return x != kSentinel; }),
+            buf->end());
+        LOGV2(23390, "Stack used", "bytes"_attr = used);
+    }
+};
+
+extern "C" void stackTraceSigAltStackMinimalAction(int sig, siginfo_t*, void*) {
+    StackTraceSigAltStackTest::handlerPreamble(sig);
+}
+
+TEST_F(StackTraceSigAltStackTest, Minimal) {
+    StackTraceSigAltStackTest::tryHandler(stackTraceSigAltStackMinimalAction);
+}
+
+extern "C" void stackTraceSigAltStackPrintAction(int sig, siginfo_t*, void*) {
+    StackTraceSigAltStackTest::handlerPreamble(sig);
+    printStackTrace();
+}
+
+TEST_F(StackTraceSigAltStackTest, Print) {
+    StackTraceSigAltStackTest::tryHandler(&stackTraceSigAltStackPrintAction);
+}
+
+extern "C" void stackTraceSigAltStackBacktraceAction(int sig, siginfo_t*, void*) {
+    StackTraceSigAltStackTest::handlerPreamble(sig);
+    std::array<void*, kStackTraceFrameMax> addrs;
+    rawBacktrace(addrs.data(), addrs.size());
+}
+
+TEST_F(StackTraceSigAltStackTest, Backtrace) {
+    StackTraceSigAltStackTest::tryHandler(stackTraceSigAltStackBacktraceAction);
+}
+#endif  // MONGO_HAS_SIGALTSTACK
+
+class JsonTest : public unittest::Test {
+public:
+    using unittest::Test::Test;
+    using Hex = stacktrace_details::Hex;
+    using Dec = stacktrace_details::Dec;
+};
+
+TEST_F(JsonTest, Hex) {
+    ASSERT_EQ(std::string_view(Hex(static_cast<void*>(0))), "0");
+    ASSERT_EQ(std::string_view(Hex(0xffff)), "FFFF");
+    ASSERT_EQ(std::string_view(Hex(0xfff0)), "FFF0");
+    ASSERT_EQ(std::string_view(Hex(0x8000'0000'0000'0000)), "8000000000000000");
+    ASSERT_EQ(Hex::fromHex("FFFF"), 0xffff);
+    ASSERT_EQ(Hex::fromHex("0"), 0);
+    ASSERT_EQ(Hex::fromHex("FFFFFFFFFFFFFFFF"), 0xffff'ffff'ffff'ffff);
+
+    std::string s;
+    StringStackTraceSink sink{s};
+    sink << Hex(0xffff);
+    ASSERT_EQ(s, R"(FFFF)");
+}
+
+
+#if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+class PrintAllThreadStacksTest : public unittest::Test {
+public:
+    struct WatchInt {
+        int v = 0;
+        std::mutex* m;
+        stdx::condition_variable cond;
+
+        void incr(int i) {
+            std::unique_lock lock{*m};
+            v += i;
+            cond.notify_all();
+        }
+        void wait(int target) {
+            std::unique_lock lock{*m};
+            cond.wait(lock, [&] { return v == target; });
+        }
+    };
+
+    struct Worker {
+        stdx::thread thread;
+        int tid;
+        bool blocks = false;
+    };
+
+    void spawnWorker(bool blocksSignal = false) {
+        pending.incr(1);
+        auto& ref = workers.emplace_back();
+        ref.thread = stdx::thread([&, blocksSignal] {
+            ref.tid = syscall(SYS_gettid);
+            ref.blocks = blocksSignal;
+            if (blocksSignal) {
+                sigset_t mask;
+                sigemptyset(&mask);
+                sigaddset(&mask, SIGUSR2);
+                pthread_sigmask(SIG_BLOCK, &mask, nullptr);
+            }
+            pending.incr(-1);
+            endAll.wait(1);
+        });
+        pending.wait(0);
+    }
+
+    void reapWorkers() {
+        endAll.incr(1);
+        for (auto& w : workers)
+            w.thread.join();
+    }
+
+    void doPrintAllThreadStacks(size_t numThreads) {
+        for (size_t i = 0; i < numThreads; ++i)
+            spawnWorker();
+
+        std::string dumped;
+        StringStackTraceSink sink{dumped};
+        printAllThreadStacks(sink);
+        if (kSuperVerbose)
+            LOGV2_OPTIONS(
+                24156, {logv2::LogTruncation::Disabled}, "Dumped", "dumped"_attr = dumped);
+
+        reapWorkers();
+
+        std::set<int> seenTids;
+        std::set<int> missedTids;
+
+        // Make some assertions about `dumped`.
+        BSONObj jsonObj = fromjson(dumped);
+        auto allInfoElement = jsonObj.getObjectField("threadInfo");
+        for (const auto& ti : allInfoElement) {
+            const BSONObj& obj = ti.Obj();
+            seenTids.insert(obj.getIntField("tid"));
+            ASSERT(obj.hasElement("backtrace"));
+        }
+
+        // Collect missing thread ids. Check after we've checked for lost thread ids, since lost is
+        // worse than missing.
+        for (const auto& el : jsonObj.getObjectField("missedThreadIds")) {
+            missedTids.insert(el.Int());
+        }
+        // Confirm all the threads we spawned are accounted for in either seenTids or missedTids.
+        //
+        // Since non-test controlled threads may be running, we can only assert behavior for the
+        // worker threads spawned.
+        //
+        // TODO(SERVER-134299): It's rare but possible some worker threads have exited before we
+        // dump them during testing, leading to test flakiness.
+        std::set<int> lostTids;
+        std::set<int> missedWorkerTids;
+        for (auto&& w : workers) {
+            const int tid = w.tid;
+            if (missedTids.contains(tid)) {
+                missedWorkerTids.insert(tid);
+            } else if (!seenTids.contains(tid)) {
+                lostTids.insert(tid);
+            }
+        }
+        ASSERT_THAT(lostTids, ::testing::IsEmpty())
+            << "spawned threads unaccounted for. Recorded missedTids:" << LogVec(missedTids)
+            << ", Recorded seenTids:" << LogVec(seenTids);
+        ASSERT_THAT(missedWorkerTids, ::testing::IsEmpty()) << "spawned threads missing backtraces";
+        for (auto&& w : workers) {
+            ASSERT_TRUE(seenTids.contains(w.tid));
+        }
+    }
+
+    std::mutex mutex;
+    WatchInt endAll{0, &mutex};
+    WatchInt pending{0, &mutex};
+    std::deque<Worker> workers;
+};
+
+TEST_F(PrintAllThreadStacksTest, WithDeadThreads) {
+    for (int i = 0; i < 2; ++i)
+        spawnWorker(true);
+    for (int i = 0; i < 2; ++i)
+        spawnWorker(false);
+
+    std::string dumped;
+
+    stdx::thread dumper([&] {
+        StringStackTraceSink sink{dumped};
+        printAllThreadStacks(sink);
+    });
+
+    // Give tracer some time to signal all the threads.
+    // We know the threads with the signal blocked will not respond.
+    // The dumper thread will poll until those are dead.
+    // There's no API to monitor its progress, so sleep a hefty chunk of time.
+    sleep(2);
+
+    reapWorkers();
+
+    dumper.join();
+
+    BSONObj jsonObj = fromjson(dumped);
+    std::map<int, BSONObj> tidDumps;  // All are references into jsonObj.
+
+    std::set<int> mustSee;
+    for (const auto& w : workers)
+        mustSee.insert(w.tid);
+    for (const auto& el : jsonObj.getObjectField("missedThreadIds"))
+        mustSee.erase(el.Int());
+
+    auto allInfoElement = jsonObj.getObjectField("threadInfo");
+    for (const auto& ti : allInfoElement) {
+        const BSONObj& obj = ti.Obj();
+        int tid = obj.getIntField("tid");
+        mustSee.erase(tid);
+        auto witer =
+            std::find_if(workers.begin(), workers.end(), [&](auto&& w) { return w.tid == tid; });
+        if (witer == workers.end())
+            continue;
+        bool missingBacktrace = !obj.hasElement("backtrace");
+        ASSERT_EQ(witer->blocks, missingBacktrace);
+    }
+    ASSERT(mustSee.empty()) << fmt::format("tids missing from report: {}", fmt::join(mustSee, ","));
+}
+
+TEST_F(PrintAllThreadStacksTest, Go_2_Threads) {
+    doPrintAllThreadStacks(2);
+}
+TEST_F(PrintAllThreadStacksTest, Go_20_Threads) {
+    doPrintAllThreadStacks(20);
+}
+TEST_F(PrintAllThreadStacksTest, Go_200_Threads) {
+    doPrintAllThreadStacks(200);
+}
+
+TEST_F(PrintAllThreadStacksTest, SessionBasic) {
+    stacktrace_details::PrintAllStacksSession session;
+
+    auto waiter = boost::make_optional(session.waiter());
+    stdx::thread producer{[&] {
+        auto notifier = session.notifier();
+    }};
+    waiter = {};
+    producer.join();
+}
+
+TEST_F(PrintAllThreadStacksTest, SessionProducerConsumers) {
+    synchronized_value<std::string> values;
+    stacktrace_details::PrintAllStacksSession session;
+
+    struct PromiseFuture {
+        SharedPromise<void> promise;
+        SharedSemiFuture<void> future;
+    };
+
+    std::vector<PromiseFuture> promisesFutures(2);
+
+    for (auto& pf : promisesFutures) {
+        pf.future = pf.promise.getFuture();
+    }
+
+    std::vector<stdx::thread> consumers;
+    for (auto& pf : promisesFutures) {
+        consumers.emplace_back([&, p = &pf.promise] {
+            auto waiter = boost::make_optional(session.waiter());
+            p->emplaceValue();
+            waiter = {};
+            values->push_back('3');
+        });
+    }
+
+    // This does not enforce ordering between push_back('3') above and the push_back calls below if
+    // PrintAllStacksSession::waiter/notifier don't.
+    for (auto& pf : promisesFutures) {
+        pf.future.wait();
+    }
+
+    stdx::thread producer{[&] {
+        values->push_back('1');
+        auto notifier = boost::make_optional(session.notifier());
+        values->push_back('2');
+        notifier = {};
+        values->push_back('3');
+    }};
+
+    for (auto& consumer : consumers) {
+        consumer.join();
+    }
+
+    producer.join();
+
+    auto guard = values.synchronize();
+    ASSERT(*guard == "12333") << *guard;
+}
+
+#endif  // defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+
+#if defined(MONGO_CONFIG_USE_LIBUNWIND) || defined(MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE)
+/**
+ * Try to backtrace from a stack containing a libc function. To do this
+ * we need a libc function that makes a user-provided callback, like qsort.
+ */
+TEST(StackTrace, BacktraceThroughLibc) {
+    struct Result {
+        void notify() {
+            if (called)
+                return;
+            called = true;
+            arrSize = rawBacktrace(arr.data(), arr.size());
+        }
+        bool called = 0;
+        std::array<void*, kStackTraceFrameMax> arr;
+        size_t arrSize;
+    };
+    static Result capture;
+    std::array<int, 2> arr{{}};
+    qsort(arr.data(), arr.size(), sizeof(arr[0]), [](const void* a, const void* b) {
+        // Order them by position in the array.
+        capture.notify();
+        return static_cast<int>(static_cast<const int*>(a) < static_cast<const int*>(b));
+    });
+    LOGV2(23391, "Captured", "frameCount"_attr = capture.arrSize);
+    for (size_t i = 0; i < capture.arrSize; ++i) {
+        LOGV2(23392,
+              "Frame",
+              "i"_attr = i,
+              "frame"_attr = fmt::format("{:X}", reinterpret_cast<uintptr_t>(capture.arr[i])));
+    }
+}
+#endif  // mongo stacktrace backend
+
+
+}  // namespace
+}  // namespace mongo

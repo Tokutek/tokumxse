@@ -1,0 +1,261 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/storage/wiredtiger/spill_wiredtiger_kv_engine.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_global_options_gen.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/processinfo.h"
+
+#include <memory>
+#include <string_view>
+
+#include <boost/filesystem/fstream.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+MONGO_FAIL_POINT_DEFINE(hangOnSpillWiredTigerKVEngineCleanShutdown);
+
+namespace mongo {
+SpillWiredTigerKVEngine::SpillWiredTigerKVEngine(const std::string& canonicalName,
+                                                 const std::string& path,
+                                                 ClockSource* clockSource,
+                                                 WiredTigerConfig wtConfig,
+                                                 const SpillWiredTigerExtensions& wtExtensions)
+    : WiredTigerKVEngineBase(canonicalName, path, clockSource, std::move(wtConfig)) {
+    tassert(10588600, "SpillWiredTigerKVEngine should not be in-memory", !_wtConfig.inMemory);
+    if (!boost::filesystem::exists(path)) {
+        try {
+            boost::filesystem::create_directories(path);
+        } catch (std::exception& e) {
+            LOGV2_ERROR(10380302,
+                        "Error creating data directory",
+                        "directory"_attr = path,
+                        "error"_attr = e.what());
+            throw;
+        }
+    }
+
+    std::string config =
+        generateWTOpenConfigString(_wtConfig, wtExtensions.getOpenExtensionsConfig(), "");
+    LOGV2(10158000, "Opening spill WiredTiger", "config"_attr = config);
+
+    auto startTime = Date_t::now();
+    _openWiredTiger(path, config);
+    LOGV2(10158001, "Spill WiredTiger opened", "duration"_attr = Date_t::now() - startTime);
+    _eventHandler.setStartupSuccessful();
+    _wtOpenConfig = config;
+
+    _connection =
+        std::make_unique<WiredTigerConnection>(_conn, clockSource, /*sessionCacheMax=*/0, this);
+
+    auto param = std::make_unique<SpillWiredTigerEngineRuntimeConfigParameter>(
+        "spillWiredTigerEngineRuntimeConfig", ServerParameterType::kRuntimeOnly);
+    param->_data.second = this;
+    registerServerParameter(std::move(param));
+}
+
+SpillWiredTigerKVEngine::~SpillWiredTigerKVEngine() {
+    // Unregister the server parameter set in the ctor to prevent a duplicate if we reload the
+    // storage engine.
+    ServerParameterSet::getNodeParameterSet()->remove("spillWiredTigerEngineRuntimeConfig");
+
+    bool memLeakAllowed = true;
+    cleanShutdown(memLeakAllowed);
+}
+
+void SpillWiredTigerKVEngine::_openWiredTiger(const std::string& path,
+                                              const std::string& wtOpenConfig) {
+    auto wtEventHandler = _eventHandler.getWtEventHandler();
+
+    int ret = wiredtiger_open(path.c_str(), wtEventHandler, wtOpenConfig.c_str(), &_conn);
+    if (ret) {
+        LOGV2_FATAL_NOTRACE(10158002,
+                            "Failed to open the spill WiredTiger instance",
+                            "details"_attr = wtRCToStatus(ret, nullptr).reason());
+    }
+}
+
+std::unique_ptr<RecordStore> SpillWiredTigerKVEngine::getInternalRecordStore(RecoveryUnit& ru,
+                                                                             std::string_view ident,
+                                                                             KeyFormat keyFormat) {
+    WiredTigerRecordStore::Params params;
+    params.uuid = boost::none;
+    params.ident = std::string{ident};
+    params.engineName = _canonicalName;
+    params.keyFormat = keyFormat;
+    params.overwrite = true;
+    params.isLogged = false;
+    params.forceUpdateWithFullDocument = false;
+    params.inMemory = false;
+    params.sizeStorer = nullptr;
+    params.tracksSizeAdjustments = false;
+    return std::make_unique<WiredTigerRecordStore>(
+        this, WiredTigerRecoveryUnit::get(ru), std::move(params));
+}
+
+std::unique_ptr<RecordStore> SpillWiredTigerKVEngine::makeInternalRecordStore(
+    RecoveryUnit& ru, std::string_view ident, KeyFormat keyFormat) {
+
+    WiredTigerConnection::BlockShutdown blockShutdown(_connection.get());
+    iassert(ErrorCodes::ShutdownInProgress,
+            "Cannot create spill ident while engine is shutting down",
+            !blockShutdown.isShuttingDown());
+
+    auto& session = *WiredTigerRecoveryUnit::get(ru).getSessionNoTxn();
+
+    WiredTigerRecordStore::WiredTigerTableConfig wtTableConfig;
+    wtTableConfig.keyFormat = keyFormat;
+    // We don't log writes to spill tables.
+    wtTableConfig.logEnabled = false;
+    wtTableConfig.blockCompressor = gSpillWiredTigerBlockCompressor;
+    wtTableConfig.serverParameterOptions = _rsOptions;
+    std::string config =
+        WiredTigerRecordStore::generateCreateString({} /* internal table */, wtTableConfig);
+
+    std::string uri = WiredTigerUtil::buildTableUri(ident);
+    LOGV2_DEBUG(10158008,
+                2,
+                "SpillWiredTigerKVEngine::makeInternalRecordStore",
+                "uri"_attr = uri,
+                "config"_attr = config);
+    uassertStatusOK(wtRCToStatus(session.create(uri.c_str(), config.c_str()), session));
+
+    return getInternalRecordStore(ru, ident, keyFormat);
+}
+
+int64_t SpillWiredTigerKVEngine::storageSize(RecoveryUnit& ru) {
+    auto permit = tryGetStatsCollectionPermit();
+    if (!permit) {
+        return 0;
+    }
+
+    WiredTigerEventHandler eventHandler;
+    auto session = WiredTigerUtil::getStatisticsSession(*this, *permit, eventHandler);
+    auto idents = _wtGetAllIdents(*session);
+
+    return std::accumulate(idents.begin(),
+                           idents.end(),
+                           int64_t{0},
+                           [&session](int64_t storageSize, const std::string& ident) {
+                               return storageSize +
+                                   WiredTigerUtil::getIdentSize(
+                                          *session, WiredTigerUtil::buildTableUri(ident));
+                           });
+}
+
+bool SpillWiredTigerKVEngine::hasIdent(RecoveryUnit& ru, std::string_view ident) const {
+    WiredTigerConnection::BlockShutdown blockShutdown(_connection.get());
+    if (blockShutdown.isShuttingDown()) {
+        return false;
+    }
+    return _wtHasUri(*WiredTigerRecoveryUnit::get(ru).getSession(),
+                     WiredTigerUtil::buildTableUri(ident));
+}
+
+int64_t SpillWiredTigerKVEngine::getIdentSize(RecoveryUnit& ru, std::string_view ident) {
+    WiredTigerConnection::BlockShutdown blockShutdown(_connection.get());
+    if (blockShutdown.isShuttingDown()) {
+        return 0;
+    }
+    auto& session = *WiredTigerRecoveryUnit::get(ru).getSessionNoTxn();
+    return WiredTigerUtil::getIdentSize(session, WiredTigerUtil::buildTableUri(ident));
+}
+
+std::vector<std::string> SpillWiredTigerKVEngine::getAllIdents(RecoveryUnit& ru) const {
+    WiredTigerConnection::BlockShutdown blockShutdown(_connection.get());
+    if (blockShutdown.isShuttingDown()) {
+        return {};
+    }
+    auto& wtRu = WiredTigerRecoveryUnit::get(ru);
+    return _wtGetAllIdents(*wtRu.getSession());
+}
+
+Status SpillWiredTigerKVEngine::dropIdent(RecoveryUnit& ru,
+                                          std::string_view ident,
+                                          bool identHasSizeInfo,
+                                          boost::optional<uint64_t> schemaEpoch,
+                                          bool waitForLocks) {
+    invariant(waitForLocks);
+    WiredTigerConnection::BlockShutdown blockShutdown(_connection.get());
+    if (blockShutdown.isShuttingDown()) {
+        return Status(ErrorCodes::ShutdownInProgress,
+                      "shutdown in progress, dropping the ident is redundant");
+    }
+
+    const std::string uri = WiredTigerUtil::buildTableUri(ident);
+
+    auto& wtRu = WiredTigerRecoveryUnit::get(ru);
+    auto& session = *wtRu.getSessionNoTxn();
+    session.closeAllCursors(uri);
+
+    const int ret = session.drop(uri.c_str(), "checkpoint_wait=false,force=true");
+    Status status = (ret == 0 || ret == ENOENT)
+        // If ident doesn't exist, it is effectively dropped.
+        ? Status::OK()
+        : wtRCToStatus(ret, session);
+    LOGV2_DEBUG(10327200, 1, "WT drop", "uri"_attr = uri, "status"_attr = status);
+    return status;
+}
+
+void SpillWiredTigerKVEngine::cleanShutdown(bool memLeakAllowed) {
+    LOGV2(10158003, "SpillWiredTigerKVEngine shutting down");
+
+    if (!_conn) {
+        return;
+    }
+
+    _connection->shuttingDown(WiredTigerConnection::ShutdownReason::kCleanShutdown);
+    if (MONGO_unlikely(hangOnSpillWiredTigerKVEngineCleanShutdown.shouldFail())) {
+        hangOnSpillWiredTigerKVEngineCleanShutdown.pauseWhileSet();
+    }
+
+    const char* closeConfig = memLeakAllowed ? "leak_memory=true," : "";
+
+    const auto startTime = Date_t::now();
+    LOGV2(10158006, "Closing spill WiredTiger", "closeConfig"_attr = closeConfig);
+    invariantWTOK(_conn->close(_conn, closeConfig), nullptr);
+    LOGV2(10158007, "Closed spill WiredTiger ", "duration"_attr = Date_t::now() - startTime);
+    _conn = nullptr;
+}
+
+WiredTigerKVEngineBase::WiredTigerConfig getSpillWiredTigerConfigFromStartupOptions() {
+    WiredTigerKVEngineBase::WiredTigerConfig wtConfig;
+
+    wtConfig.cacheSizeMB = WiredTigerUtil::getSpillCacheSizeMB(ProcessInfo{}.getMemSizeMB(),
+                                                               gSpillWiredTigerCacheSizePercentage,
+                                                               gSpillWiredTigerCacheSizeMinMB,
+                                                               gSpillWiredTigerCacheSizeMaxMB);
+    wtConfig.sessionMax = gSpillWiredTigerSessionMax;
+    wtConfig.evictionThreadsMin = gSpillWiredTigerEvictionThreadsMin;
+    wtConfig.evictionThreadsMax = gSpillWiredTigerEvictionThreadsMax;
+    wtConfig.evictionDirtyTargetMB =
+        gSpillWiredTigerEvictionDirtyTargetPercentage * wtConfig.cacheSizeMB / 100;
+    wtConfig.evictionDirtyTriggerMB =
+        gSpillWiredTigerEvictionDirtyTriggerPercentage * wtConfig.cacheSizeMB / 100;
+    wtConfig.evictionUpdatesTriggerMB =
+        gSpillWiredTigerEvictionUpdatesTriggerPercentage * wtConfig.cacheSizeMB / 100;
+    wtConfig.statisticsLogWaitSecs = wiredTigerGlobalOptions.statisticsLogDelaySecs;
+    wtConfig.statisticsSetting = wiredTigerGlobalOptions.statisticsSetting;
+    wtConfig.inMemory = false;
+    wtConfig.logEnabled = false;
+    wtConfig.prefetchEnabled = false;
+    wtConfig.restoreEnabled = false;
+    wtConfig.zstdCompressorLevel = gSpillWiredTigerZstdCompressionLevel;
+    wtConfig.extraOpenOptions = gSpillWiredTigerEngineConfig;
+
+    return wtConfig;
+}
+
+}  // namespace mongo

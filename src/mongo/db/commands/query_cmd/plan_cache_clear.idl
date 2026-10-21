@@ -1,0 +1,47 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+    cpp_includes:
+        - "mongo/db/commands/query_cmd/plan_cache_commands.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/idl/generic_argument.idl"
+
+commands:
+    planCacheClear:
+        description: "Parser for the planCacheClear command"
+        command_name: planCacheClear
+        cpp_name: PlanCacheClearCommandRequest
+        strict: true
+        api_version: ""
+        namespace: concatenate_with_db
+        reply_type: OkReply
+        fields:
+            query:
+                description: "Query predicate of the plan cache query shape."
+                type: object
+                optional: true
+            sort:
+                description: "The sort associatd with the plan cache query shape."
+                type: object
+                optional: true
+            projection:
+                description: "The projection associated with the plan cache query shape."
+                type: object
+                optional: true
+            collation:
+                description: "The collation associated with the plan cache query shape."
+                type: object
+                optional: true
+                validator:
+                    callback: plan_cache_commands::validateNonEmptyCollation
+            isTimeseriesNamespace:
+                description:
+                    "This flag is set to true when the command was originally sent to
+                    mongos on the time-series view, but got rewritten to target
+                    time-series buckets namespace before being sent to shards."
+                type: optionalBool

@@ -1,258 +1,149 @@
-// expression_array.cpp
-
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/matcher/expression_array.h"
 
-#include "mongo/db/field_ref.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/query/util/make_data_structure.h"
+
+#include <algorithm>
+#include <string_view>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    Status ArrayMatchingMatchExpression::initPath( StringData path ) {
-        _path = path;
-        Status s = _elementPath.init( _path );
-        _elementPath.setTraverseLeafArray( false );
-        return s;
-    }
-
-    bool ArrayMatchingMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
-
-        while ( cursor->more() ) {
-            ElementIterator::Context e = cursor->next();
-            if ( e.element().type() != Array )
-                continue;
-
-            bool amIRoot = e.arrayOffset().eoo();
-
-            if ( !matchesArray( e.element().Obj(), amIRoot ? details : NULL ) )
-                continue;
-
-            if ( !amIRoot && details && details->needRecord() && !e.arrayOffset().eoo() ) {
-                details->setElemMatchKey( e.arrayOffset().fieldName() );
-            }
-            return true;
-        }
+bool ArrayMatchingMatchExpression::equivalent(const MatchExpression* other) const {
+    if (matchType() != other->matchType())
         return false;
-    }
 
-    bool ArrayMatchingMatchExpression::matchesSingleElement( const BSONElement& e ) const {
-        if ( e.type() != Array )
-            return false;
-        return matchesArray( e.Obj(), NULL );
-    }
+    const ArrayMatchingMatchExpression* realOther =
+        static_cast<const ArrayMatchingMatchExpression*>(other);
 
-
-    bool ArrayMatchingMatchExpression::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
-            return false;
-
-        const ArrayMatchingMatchExpression* realOther =
-            static_cast<const ArrayMatchingMatchExpression*>( other );
-
-        if ( _path != realOther->_path )
-            return false;
-
-        if ( numChildren() != realOther->numChildren() )
-            return false;
-
-        for ( unsigned i = 0; i < numChildren(); i++ )
-            if ( !getChild(i)->equivalent( realOther->getChild(i) ) )
-                return false;
-        return true;
-    }
-
-
-    // -------
-
-    Status ElemMatchObjectMatchExpression::init( StringData path, MatchExpression* sub ) {
-        _sub.reset( sub );
-        return initPath( path );
-    }
-
-    bool ElemMatchObjectMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
-        BSONObjIterator i( anArray );
-        while ( i.more() ) {
-            BSONElement inner = i.next();
-            if ( !inner.isABSONObj() )
-                continue;
-            if ( _sub->matchesBSON( inner.Obj(), NULL ) ) {
-                if ( details && details->needRecord() ) {
-                    details->setElemMatchKey( inner.fieldName() );
-                }
-                return true;
-            }
-        }
+    if (path() != realOther->path())
         return false;
-    }
 
-    void ElemMatchObjectMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << path() << " $elemMatch (obj)";
-
-        MatchExpression::TagData* td = getTag();
-        if (NULL != td) {
-            debug << " ";
-            td->debugString(&debug);
-        }
-        debug << "\n";
-        _sub->debugString( debug, level + 1 );
-    }
-
-    void ElemMatchObjectMatchExpression::toBSON(BSONObjBuilder* out) const {
-        BSONObjBuilder subBob;
-        _sub->toBSON(&subBob);
-        if (path().empty()) {
-            out->append("$elemMatch", subBob.obj());
-        }
-        else {
-            out->append(path(), BSON("$elemMatch" << subBob.obj()));
-        }
-    }
-
-
-    // -------
-
-    ElemMatchValueMatchExpression::~ElemMatchValueMatchExpression() {
-        for ( unsigned i = 0; i < _subs.size(); i++ )
-            delete _subs[i];
-        _subs.clear();
-    }
-
-    Status ElemMatchValueMatchExpression::init( StringData path, MatchExpression* sub ) {
-        init( path );
-        add( sub );
-        return Status::OK();
-    }
-
-    Status ElemMatchValueMatchExpression::init( StringData path ) {
-        return initPath( path );
-    }
-
-
-    void ElemMatchValueMatchExpression::add( MatchExpression* sub ) {
-        verify( sub );
-        _subs.push_back( sub );
-    }
-
-    bool ElemMatchValueMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
-        BSONObjIterator i( anArray );
-        while ( i.more() ) {
-            BSONElement inner = i.next();
-
-            if ( _arrayElementMatchesAll( inner ) ) {
-                if ( details && details->needRecord() ) {
-                    details->setElemMatchKey( inner.fieldName() );
-                }
-                return true;
-            }
-        }
+    if (numChildren() != realOther->numChildren())
         return false;
-    }
 
-    bool ElemMatchValueMatchExpression::_arrayElementMatchesAll( const BSONElement& e ) const {
-        for ( unsigned i = 0; i < _subs.size(); i++ ) {
-            if ( !_subs[i]->matchesSingleElement( e ) )
-                return false;
-        }
-        return true;
-    }
-
-    void ElemMatchValueMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << path() << " $elemMatch (value)";
-
-        MatchExpression::TagData* td = getTag();
-        if (NULL != td) {
-            debug << " ";
-            td->debugString(&debug);
-        }
-        debug << "\n";
-        for ( unsigned i = 0; i < _subs.size(); i++ ) {
-            _subs[i]->debugString( debug, level + 1 );
-        }
-    }
-
-    void ElemMatchValueMatchExpression::toBSON(BSONObjBuilder* out) const {
-        BSONObjBuilder emBob;
-        for ( unsigned i = 0; i < _subs.size(); i++ ) {
-            _subs[i]->toBSON(&emBob);
-        }
-        if (path().empty()) {
-            out->append("$elemMatch", emBob.obj());
-        }
-        else {
-            out->append(path(), BSON("$elemMatch" << emBob.obj()));
-        }
-    }
-
-
-    // ---------
-
-    Status SizeMatchExpression::init( StringData path, int size ) {
-        _size = size;
-        return initPath( path );
-    }
-
-    bool SizeMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
-        if ( _size < 0 )
+    for (unsigned i = 0; i < numChildren(); i++)
+        if (!getChild(i)->equivalent(realOther->getChild(i)))
             return false;
-        return anArray.nFields() == _size;
-    }
-
-    void SizeMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << path() << " $size : " << _size << "\n";
-
-        MatchExpression::TagData* td = getTag();
-        if (NULL != td) {
-            debug << " ";
-            td->debugString(&debug);
-        }
-    }
-
-    void SizeMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append(path(), BSON("$size" << _size));
-    }
-
-    bool SizeMatchExpression::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
-            return false;
-
-        const SizeMatchExpression* realOther = static_cast<const SizeMatchExpression*>( other );
-        return path() == realOther->path() && _size == realOther->_size;
-    }
-
-
-    // ------------------
-
-
-
+    return true;
 }
+
+
+// -------
+
+ElemMatchObjectMatchExpression::ElemMatchObjectMatchExpression(
+    boost::optional<std::string_view> path,
+    std::unique_ptr<MatchExpression> sub,
+    clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_OBJECT, path, std::move(annotation)),
+      _sub(std::move(sub)) {}
+
+void ElemMatchObjectMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << path() << " $elemMatch (obj)";
+    _debugStringAttachTagInfo(&debug);
+    _sub->debugString(debug, indentationLevel + 1);
+}
+
+void ElemMatchObjectMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const query_shape::SerializationOptions& opts, bool includePath) const {
+    BSONObjBuilder elemMatchBob = bob->subobjStart("$elemMatch");
+    _sub->serialize(&elemMatchBob, opts, true);
+    elemMatchBob.doneFast();
+}
+
+// -------
+
+ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(
+    boost::optional<std::string_view> path,
+    std::unique_ptr<MatchExpression> sub,
+    clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path, std::move(annotation)),
+      _subs(makeVector(std::move(sub))) {}
+
+ElemMatchValueMatchExpression::ElemMatchValueMatchExpression(
+    boost::optional<std::string_view> path, clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(ELEM_MATCH_VALUE, path, std::move(annotation)) {}
+
+void ElemMatchValueMatchExpression::add(std::unique_ptr<MatchExpression> sub) {
+    _subs.push_back(std::move(sub));
+}
+
+void ElemMatchValueMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << path() << " $elemMatch (value)";
+
+    _debugStringAttachTagInfo(&debug);
+
+    for (unsigned i = 0; i < _subs.size(); i++) {
+        _subs[i]->debugString(debug, indentationLevel + 1);
+    }
+}
+
+void ElemMatchValueMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const query_shape::SerializationOptions& opts, bool includePath) const {
+    BSONObjBuilder emBob = bob->subobjStart("$elemMatch");
+    // A body that imposes no condition on the elements matches any element, i.e. it means "this
+    // field is a non-empty array".
+    const bool bodyIsAlwaysTrue = std::all_of(
+        _subs.begin(), _subs.end(), [](const auto& child) { return child->isTriviallyTrue(); });
+    if (bodyIsAlwaysTrue) {
+        // Encode the trivially-true body as {$elemMatch: {$nin: []}}, instead of {$elemMatch:
+        // {}}. {$elemMatch: {$nin: []}} is parsed into ElemMatchValue with exactly the same
+        // semantics, whereas {$elemMatch: {}} is parsed into ElemMatchObject with an empty $and,
+        // which requires each element to be either an object or an array.
+        //
+        // Two other encodings were considered but not used:
+        //   - {$elemMatch: {$alwaysTrue: 1}} is parsed into ElemMatchObject, not the value form.
+        //   - {$elemMatch: {$exists: true}} is parsed into ElemMatchValue, but no optimizer
+        //     rewrite folds the resulting empty-path Exists back into the empty $and body, so
+        //     the re-parsed and re-optimized tree is not structurally equivalent to the original
+        //     shape, even though both match the same documents.
+        BSONArrayBuilder arrBob;
+        opts.appendLiteral(&emBob, "$nin", arrBob.arr());
+    } else {
+        for (auto&& child : _subs) {
+            child->serialize(&emBob, opts, false);
+        }
+    }
+    emBob.doneFast();
+}
+
+// ---------
+
+SizeMatchExpression::SizeMatchExpression(boost::optional<std::string_view> path,
+                                         int size,
+                                         clonable_ptr<ErrorAnnotation> annotation)
+    : ArrayMatchingMatchExpression(SIZE, path, std::move(annotation)), _size(size) {}
+
+void SizeMatchExpression::debugString(StringBuilder& debug, int indentationLevel) const {
+    _debugAddSpace(debug, indentationLevel);
+    debug << path() << " $size : " << _size;
+
+    _debugStringAttachTagInfo(&debug);
+}
+
+void SizeMatchExpression::appendSerializedRightHandSide(
+    BSONObjBuilder* bob, const query_shape::SerializationOptions& opts, bool includePath) const {
+    opts.appendLiteral(bob, "$size", _size);
+}
+
+bool SizeMatchExpression::equivalent(const MatchExpression* other) const {
+    if (matchType() != other->matchType())
+        return false;
+
+    const SizeMatchExpression* realOther = static_cast<const SizeMatchExpression*>(other);
+    return path() == realOther->path() && _size == realOther->_size;
+}
+
+
+// ------------------
+}  // namespace mongo

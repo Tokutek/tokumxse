@@ -1,0 +1,30 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "test_types.idl"
+
+structs:
+    GenericArguments:
+        description: "Validation fails due to a removed argument"
+        is_generic_cmd_list: "arg"
+        fields:
+            genericArgument:
+                forward_to_shards: false
+                type: dummyType
+            removedGenericArgument:
+                forward_to_shards: false
+                type: dummyType
+
+    GenericReplyFields:
+        description: "Validation fails due to a removed reply field"
+        is_generic_cmd_list: "reply"
+        fields:
+            genericReplyField:
+                forward_from_shards: false
+                type: dummyType
+            removedGenericReplyField:
+                forward_from_shards: false
+                type: dummyType

@@ -1,0 +1,125 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/server_options.h"
+        - "mongo/db/server_options_base.h"
+    configs:
+        section: "General options"
+        source: [cli, ini, yaml]
+        initializer:
+            register: addBaseServerOptionDefinitions
+
+configs:
+    # The verbosity level can be set at startup in the following ways.  Note that if multiple
+    # methods for setting the verbosity are specified simultaneously, the verbosity will be set
+    # based on the whichever option specifies the highest level
+    #
+    # Command Line Option | Resulting Verbosity
+    # _________________________________________
+    # (none)              | 0
+    # --verbose ""        | Error after Boost 1.59
+    # --verbose           | 1
+    # --verbose v         | 1
+    # --verbose vv        | 2 (etc.)
+    # -v                  | 1
+    # -vv                 | 2 (etc.)
+    #
+    # INI Config Option   | Resulting Verbosity
+    # _________________________________________
+    # verbose=            | 0
+    # verbose=v           | 1
+    # verbose=vv          | 2 (etc.)
+    # v=true              | 1
+    # vv=true             | 2 (etc.)
+    #
+    # YAML Config Option  | Resulting Verbosity
+    # _________________________________________
+    # systemLog:          |
+    #    verbosity: 5     | 5
+    # systemLog:          |
+    #   component:        |
+    #     verbosity: 5    | 5
+    # systemLog:          |
+    #   component:        |
+    #     Sharding:       |
+    #       verbosity: 5  | 5 (for Sharding only, 0 for default)
+    verbose:
+        description: "Be more verbose (include multiple times for more verbosity e.g. -vvvvv)"
+        single_name: v
+        arg_vartype: String
+        source: [cli, ini]
+        implicit: v
+    # vv-vvvvvvvvvvvv defined in server_options_base.cpp
+
+    "systemLog.verbosity":
+        description: "Set verbose level"
+        arg_vartype: Int
+        source: yaml
+
+    # systemLog.component.*.verbosity defined in server_options_base.cpp
+
+    "systemLog.quiet":
+        description: "Quieter output"
+        short_name: quiet
+        arg_vartype: Switch
+    logpath:
+        # Cannot roll into systemLog.path because canonicalization also sets systemLog.destination.
+        description: "Log file to send write to instead of stdout - has to be a file, not directory"
+        source: [cli, ini]
+        arg_vartype: String
+        conflicts: syslog
+    "systemLog.path":
+        description: "Log file to send write to instead of stdout - has to be a file, not directory"
+        source: yaml
+        arg_vartype: String
+        conflicts: syslog
+    "systemLog.destination":
+        description: "Destination of system log output.  (syslog/file)"
+        arg_vartype: String
+        source: yaml
+        hidden: true
+        validator:
+            callback: validateSystemLogDestinationSetting
+
+    syslog:
+        description: "Log to system's syslog facility instead of file or stdout"
+        arg_vartype: Switch
+        source: [cli, ini]
+        conflicts: "systemLog.path"
+        condition:
+            preprocessor: "!defined(_WIN32)"
+    "systemLog.syslogFacility":
+        description: "syslog facility used for mongodb syslog message"
+        short_name: syslogFacility
+        arg_vartype: String
+        condition:
+            preprocessor: "!defined(_WIN32)"
+    "systemLog.logAppend":
+        description: "Append to logpath instead of over-writing"
+        short_name: logappend
+        arg_vartype: Switch
+    "systemLog.logRotate":
+        description: "Set the log rotation behavior (rename|reopen)"
+        short_name: logRotate
+        arg_vartype: String
+    "systemLog.timeStampFormat":
+        description: Desired format for timestamps in log messages. One of iso8601-utc or iso8601-local
+        short_name: timeStampFormat
+        arg_vartype: String
+
+    setParameter:
+        description: "Set a configurable parameter"
+        arg_vartype: StringMap
+        duplicate_behavior: append
+
+    # -vvvvv
+
+    "systemLog.traceAllExceptions":
+        description: "Log stack traces for every exception"
+        short_name: traceExceptions
+        arg_vartype: Switch
+        hidden: true

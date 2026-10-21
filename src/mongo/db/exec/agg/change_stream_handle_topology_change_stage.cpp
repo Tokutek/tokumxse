@@ -1,0 +1,180 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/agg/change_stream_handle_topology_change_stage.h"
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/change_stream_topology_helpers.h"
+#include "mongo/db/pipeline/document_source_change_stream_handle_topology_change.h"
+#include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/s/query/exec/establish_cursors.h"
+#include "mongo/s/query/exec/shard_tag.h"
+
+#include <string_view>
+
+namespace mongo {
+
+boost::intrusive_ptr<exec::agg::Stage> documentSourceChangeStreamHandleTopologyChangeToStageFn(
+    const boost::intrusive_ptr<DocumentSource>& documentSource) {
+    auto* changeStreamHandleTopologyChangeDS =
+        dynamic_cast<DocumentSourceChangeStreamHandleTopologyChange*>(documentSource.get());
+
+    tassert(10561309,
+            "expected 'DocumentSourceChangeStreamHandleTopologyChange' type",
+            changeStreamHandleTopologyChangeDS);
+
+    return make_intrusive<exec::agg::ChangeStreamHandleTopologyChangeStage>(
+        changeStreamHandleTopologyChangeDS->kStageName,
+        changeStreamHandleTopologyChangeDS->getExpCtx());
+}
+
+namespace exec::agg {
+
+REGISTER_AGG_STAGE_MAPPING(_internalChangeStreamHandleTopologyChange,
+                           DocumentSourceChangeStreamHandleTopologyChange::id,
+                           documentSourceChangeStreamHandleTopologyChangeToStageFn)
+
+namespace {
+// Returns true if the change stream document is an event in 'config.shards'.
+bool isShardConfigEvent(const Document& eventDoc) {
+    // TODO SERVER-44039: we continue to generate 'kNewShardDetected' events for compatibility
+    // with 4.2, even though we no longer rely on them to detect new shards. We swallow the event
+    // here. We may wish to remove this mechanism entirely in 4.7+, or retain it for future cases
+    // where a change stream is targeted to a subset of shards. See SERVER-44039 for details.
+
+    auto opType = eventDoc[DocumentSourceChangeStream::kOperationTypeField];
+
+    // If opType isn't a string, then this document has been manipulated. This means it cannot have
+    // been produced by the internal shard-monitoring cursor that we opened on the config servers,
+    // or by the kNewShardDetectedOpType mechanism, which bypasses filtering and projection stages.
+    if (opType.getType() != BSONType::string) {
+        return false;
+    }
+
+    // TODO SERVER-112325: Remove this check once no MongoDB version generates
+    // 'migrateChunkToNewShard' events.
+    if (opType.getStringData() == DocumentSourceChangeStream::kNewShardDetectedOpType) {
+        return true;
+    }
+
+    using namespace std::literals::string_view_literals;
+    // Check whether this event occurred on the config.shards collection.
+    auto nsObj = eventDoc[DocumentSourceChangeStream::kNamespaceField];
+    auto nsDB = nsObj["db"sv];
+    auto nsColl = nsObj["coll"sv];
+    const bool isConfigDotShardsEvent = nsDB.getType() == BSONType::string &&
+        nsDB.getStringData() == NamespaceString::kConfigsvrShardsNamespace.db(omitTenant) &&
+        nsColl.getType() == BSONType::string &&
+        nsColl.getStringData() == NamespaceString::kConfigsvrShardsNamespace.coll();
+
+    // If it isn't from config.shards, treat it as a normal user event.
+    if (!isConfigDotShardsEvent) {
+        return false;
+    }
+
+    // We need to validate that this event hasn't been faked by a user projection in a way that
+    // would cause us to tassert. Check the clusterTime field, which is needed to determine the
+    // point from which the new shard should start reporting change events.
+    if (eventDoc[DocumentSourceChangeStream::kClusterTimeField].getType() != BSONType::timestamp) {
+        return false;
+    }
+    // Check the fullDocument field, which should contain details of the new shard's name and hosts.
+    auto fullDocument = eventDoc[DocumentSourceChangeStream::kFullDocumentField];
+    if (opType.getStringData() == "insert"sv && fullDocument.getType() != BSONType::object) {
+        return false;
+    }
+
+    // The event is on config.shards and is well-formed. It is still possible that it is a forgery,
+    // but all the user can do is cause their own stream to uassert.
+    return true;
+}
+}  // namespace
+
+ChangeStreamHandleTopologyChangeStage::ChangeStreamHandleTopologyChangeStage(
+    std::string_view stageName, const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
+    : Stage(stageName, pExpCtx) {}
+
+GetNextResult ChangeStreamHandleTopologyChangeStage::doGetNext() {
+    // For the first call to the 'doGetNext', the '_mergeCursors' will be null and must be
+    // populated. We also resolve the original aggregation command from the expression context.
+    if (!_mergeCursors) {
+        _mergeCursors = dynamic_cast<MergeCursorsStage*>(pSource);
+        _originalAggregateCommand = pExpCtx->getOriginalAggregateCommand().getOwned();
+
+        tassert(5549100, "Missing $mergeCursors stage", _mergeCursors);
+        tassert(
+            5549101, "Empty $changeStream command object", !_originalAggregateCommand.isEmpty());
+
+        const auto& spec = getContext()->getChangeStreamSpec();
+        tassert(12454000, "Missing change stream spec on ExpressionContext", spec);
+        _originalResumeTokenClusterTime =
+            change_stream::resolveResumeTokenFromSpec(getContext(), *spec).clusterTime;
+    }
+
+    auto childResult = pSource->getNext();
+
+    // If this is an insertion into the 'config.shards' collection, open a cursor on the new shard.
+    while (childResult.isAdvanced() && isShardConfigEvent(childResult.getDocument())) {
+        auto opType = childResult.getDocument()[DocumentSourceChangeStream::kOperationTypeField];
+        if (opType.getStringData() == DocumentSourceChangeStream::kInsertOpType) {
+            addNewShardCursors(childResult.getDocument());
+        }
+        // For shard removal or update, we do nothing. We also swallow kNewShardDetectedOpType.
+        childResult = pSource->getNext();
+    }
+    return childResult;
+}
+
+void ChangeStreamHandleTopologyChangeStage::addNewShardCursors(
+    const Document& newShardDetectedObj) {
+    // This stage is only used by v1 change stream readers, which does not close any existing remote
+    // cursors. Because cursors are never closed, we can always go with the default shard tag for
+    // all cursors.
+    _mergeCursors->addNewShardCursors(establishShardCursorsOnNewShards(newShardDetectedObj),
+                                      ShardTag::kDefault);
+}
+
+std::vector<RemoteCursor> ChangeStreamHandleTopologyChangeStage::establishShardCursorsOnNewShards(
+    const Document& newShardDetectedObj) {
+    // Reload the shard registry to see the new shard.
+    auto* opCtx = pExpCtx->getOperationContext();
+    Grid::get(opCtx)->shardRegistry()->reload(opCtx);
+
+    // Parse the new shard's information from the document inserted into 'config.shards'.
+    auto newShardSpec = newShardDetectedObj[DocumentSourceChangeStream::kFullDocumentField];
+    auto newShard = uassertStatusOK(ShardType::fromBSON(newShardSpec.getDocument().toBson()));
+
+    // Make sure we are not attempting to open a cursor on a shard that already has one.
+    if (_mergeCursors->hasShardId(newShard.getName())) {
+        return {};
+    }
+
+    // Start the new cursor at max of (shardAddedTime + 1) and '_originalResumeTokenClusterTime'.
+    // Without this, opening a stream at a future startAtOperationTime and then adding a shard would
+    // open the new cursor at the shard-added time, causing the PBRT to regress and pre-future
+    // events to leak through.
+    const Timestamp shardAddedTime =
+        newShardDetectedObj[DocumentSourceChangeStream::kClusterTimeField].getTimestamp();
+    const LogicalTime shardAddedLogicalTime{shardAddedTime};
+    const Timestamp shardAddedTimePlusOne = shardAddedLogicalTime.addTicks(1).asTimestamp();
+    const Timestamp cursorStartTime =
+        std::max(shardAddedTimePlusOne, _originalResumeTokenClusterTime);
+    auto cmdObj = change_stream::topology_helpers::createUpdatedCommandForNewShard(
+        pExpCtx, cursorStartTime, _originalAggregateCommand, ChangeStreamReaderVersionEnum::kV1);
+
+    const bool allowPartialResults = false;  // partial results are not allowed
+    return establishCursors(
+        opCtx,
+        pExpCtx->getMongoProcessInterface()->getTaskExecutor(/* withNullCheck */ false),
+        pExpCtx->getNamespaceString(),
+        ReadPreferenceSetting::get(opCtx),
+        {{newShard.getName(), cmdObj}},
+        allowPartialResults);
+}
+
+}  // namespace exec::agg
+}  // namespace mongo

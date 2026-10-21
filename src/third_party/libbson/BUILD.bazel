@@ -1,0 +1,81 @@
+load("//bazel:mongo_src_rules.bzl", "mongo_cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+mongo_cc_library(
+    name = "bson",
+    srcs = [
+        "dist/src/common/src/common-atomic.c",
+        "dist/src/common/src/common-b64.c",
+        "dist/src/common/src/common-json.c",
+        "dist/src/common/src/common-md5.c",
+        "dist/src/common/src/common-oid.c",
+        "dist/src/common/src/common-string.c",
+        "dist/src/common/src/common-thread.c",
+        "dist/src/libbson/src/bson/bson.c",
+        "dist/src/libbson/src/bson/bson-bcon.c",
+        "dist/src/libbson/src/bson/bson-clock.c",
+        "dist/src/libbson/src/bson/bson-context.c",
+        "dist/src/libbson/src/bson/bson-decimal128.c",
+        "dist/src/libbson/src/bson/bson-iso8601.c",
+        "dist/src/libbson/src/bson/bson-iter.c",
+        "dist/src/libbson/src/bson/bson-json.c",
+        "dist/src/libbson/src/bson/bson-keys.c",
+        "dist/src/libbson/src/bson/bson-oid.c",
+        "dist/src/libbson/src/bson/bson-reader.c",
+        "dist/src/libbson/src/bson/bson-string.c",
+        "dist/src/libbson/src/bson/bson-timegm.c",
+        "dist/src/libbson/src/bson/bson-utf8.c",
+        "dist/src/libbson/src/bson/bson-value.c",
+        "dist/src/libbson/src/bson/bson-vector.c",
+        "dist/src/libbson/src/bson/bson-version-functions.c",
+        "dist/src/libbson/src/bson/bson-writer.c",
+        "dist/src/libbson/src/bson/error.c",
+        "dist/src/libbson/src/bson/memory.c",
+        "dist/src/libbson/src/bson/validate.c",
+        "dist/src/libbson/src/jsonsl/jsonsl.c",
+    ],
+    hdrs = glob([
+        "dist/src/common/src/*.h",
+        "dist/src/common/src/mlib/*.h",
+        "dist/src/common/src/mlib/*.th",
+        "dist/src/libbson/src/bson/*.h",
+        "dist/src/libbson/src/jsonsl/*.h",
+    ]) + select({
+        "@platforms//os:linux": glob(["build_linux/**/*.h"]),
+        "//conditions:default": [],
+    }),
+    copts = [
+        "-Isrc/third_party/libbson/dist/src/common",
+    ] + select({
+        "@platforms//os:linux": [
+            "-Wno-sign-compare",
+            "-Wno-implicit-fallthrough",
+        ],
+        "//conditions:default": [],
+    }),
+    defines = [
+        "BSON_STATIC",
+    ],
+    includes = [
+        "dist/src/common/src",
+        "dist/src/libbson/src",
+    ] + select({
+        "@platforms//os:linux": [
+            "build_linux",
+            "build_linux/bson",
+        ],
+        "//conditions:default": [],
+    }),
+    local_defines = [
+        "BSON_COMPILATION",
+        "_DEFAULT_SOURCE",
+        "_XOPEN_SOURCE=700",
+        "_BSD_SOURCE",
+    ],
+    target_compatible_with = select({
+        "//bazel/config:linux_aarch64": [],
+        "//bazel/config:linux_x86_64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)

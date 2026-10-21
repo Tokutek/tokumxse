@@ -1,8 +1,68 @@
-# Output C #defines for errors into wiredtiger.in and the associated error
+#!/usr/bin/env python3
+
+# Output C #defines for errors into wiredtiger.h.in and the associated error
 # message code in strerror.c.
 
-import re, textwrap
-from dist import compare_srcfile
+import os, sys, textwrap
+from dist import compare_srcfile, format_srcfile
+from common_functions import filter_if_fast
+
+# Checks if return section begins and updates error defines
+def check_write_errors(tfile, skip, err_type, errors):
+    if line.count(err_type + ' return section: END'):
+        tfile.write(line)
+        skip = 0
+    elif line.count(err_type + ' return section: BEGIN'):
+        skip = 1
+        tfile.write(' */\n')
+        for err in errors:
+            if 'undoc' in err.flags:
+                tfile.write('/*! @cond internal */\n')
+            tfile.write('/*!%s.%s */\n' %
+                (('\n * ' if err.long_desc else ' ') +
+            err.desc[0].upper() + err.desc[1:],
+                ''.join('\n * ' + l for l in textwrap.wrap(
+            textwrap.dedent(err.long_desc).strip(), 77)) +
+        '\n' if err.long_desc else ''))
+            tfile.write('#define\t%s\t(%d)\n' % (err.name, err.value))
+            if 'undoc' in err.flags:
+                tfile.write('/*! @endcond */\n')
+        tfile.write('/*\n')
+    return skip
+
+def write_err_cases(tfile, err_type, errors):
+    tfile.write('''
+    \t/* Check for WiredTiger specific %s. */
+    \tswitch (error) {
+    ''' % err_type)
+    for err in errors:
+        tfile.write('\tcase ' + err.name + ':\n')
+        tfile.write('\t\treturn ("' + err.name + ': ' + err.desc + '");\n')
+    tfile.write('''\t}\n''')
+
+# Checks if lines should be skipped and updates documentation block
+def check_write_document_errors(tfile, skip, err_type, errors):
+    if line.count(f'IGNORE_BUILT_BY_API_{err_type}_END'):
+        tfile.write(line)
+        skip = 0
+    elif line.count(f'IGNORE_BUILT_BY_API_{err_type}_BEGIN'):
+        tfile.write('@endif\n\n')
+        skip = 1
+        for err in errors:
+            if 'undoc' in err.flags:
+                continue
+            tfile.write(
+                '@par \\c ' + err.name.upper() + '\n' +
+                " ".join(err.long_desc.split()) + '\n\n')
+    return skip
+
+if not [f for f in filter_if_fast([
+            "../src/conn/api_strerror.c",
+            "../src/docs/error-handling.dox",
+            "../src/include/wiredtiger.h.in",
+        ], prefix="../")]:
+    sys.exit(0)
+
 
 class Error:
     def __init__(self, name, value, desc, long_desc=None, **flags):
@@ -31,8 +91,9 @@ errors = [
         'overwrite' configuration to WT_SESSION::open_cursor.'''),
     Error('WT_ERROR', -31802,
         'non-specific WiredTiger error', '''
-        This error is returned when an error is not covered by a
-        specific error return.'''),
+        This error is returned when an error is not covered by a specific error
+        return. The operation may be retried; if a transaction is in progress,
+        it should be rolled back and the operation retried in a new transaction.'''),
     Error('WT_NOTFOUND', -31803,
         'item not found', '''
         This error indicates an operation did not find a value to
@@ -41,49 +102,198 @@ errors = [
         WT_CURSOR::update or WT_CURSOR::remove.'''),
     Error('WT_PANIC', -31804,
         'WiredTiger library panic', '''
-        This error indicates an underlying problem that requires the
-        application exit and restart. The application can exit
-        immediately when \c WT_PANIC is returned from a WiredTiger
-        interface, no further WiredTiger calls are required.'''),
+        This error indicates an underlying problem that requires a database
+        restart. The application may exit immediately, no further WiredTiger
+        calls are required (and further calls will themselves immediately
+        fail).'''),
     Error('WT_RESTART', -31805,
         'restart the operation (internal)', undoc=True),
     Error('WT_RUN_RECOVERY', -31806,
         'recovery must be run to continue', '''
-        This error is generated when wiredtiger_open is configured
-        to return an error if recovery is required to use the database.'''),
+        This error is generated when ::wiredtiger_open is configured to return
+        an error if recovery is required to use the database.'''),
+    Error('WT_CACHE_FULL', -31807,
+        'operation would overflow cache', '''
+        This error is generated when wiredtiger_open is configured to run in-memory, and a
+        data modification operation requires more than the configured cache size to complete.
+        The operation may be retried; if a transaction is in progress, it should be rolled back
+        and the operation retried in a new transaction.'''),
+    Error('WT_PREPARE_CONFLICT', -31808,
+        'conflict with a prepared update', '''
+        This error is generated when the application attempts to read an
+        updated record which is part of a transaction that has been prepared
+        but not yet resolved.'''),
+    Error('WT_TRY_SALVAGE', -31809,
+        'database corruption detected', '''
+        This error is generated when corruption is detected in an on-disk file.
+        During normal operations, this may occur in rare circumstances as a
+        result of a system crash. The application may choose to salvage the
+        file or retry wiredtiger_open with the 'salvage=true' configuration
+        setting.'''),
 ]
 
-# Update the #defines in the wiredtiger.in file.
-tmp_file = '__tmp'
+# Stable registry of sub-level error name to number mappings. These numbers
+# cannot change without breaking backward compatibility.
+# DO NOT edit this dict manually. It is automatically updated by this script
+# when new entries are added to sub_errors_def below.
+sub_error_codes = {
+    'WT_NONE': -32000,
+    'WT_BACKGROUND_COMPACT_ALREADY_RUNNING': -32001,
+    'WT_CACHE_OVERFLOW': -32002,
+    'WT_WRITE_CONFLICT': -32003,
+    'WT_OLDEST_FOR_EVICTION': -32004,
+    'WT_CONFLICT_BACKUP': -32005,
+    'WT_CONFLICT_DHANDLE': -32006,
+    'WT_CONFLICT_SCHEMA_LOCK': -32007,
+    'WT_UNCOMMITTED_DATA': -32008,
+    'WT_DIRTY_DATA': -32009,
+    'WT_CONFLICT_TABLE_LOCK': -32010,
+    'WT_CONFLICT_CHECKPOINT_LOCK': -32011,
+    'WT_MODIFY_READ_UNCOMMITTED': -32012,
+    'WT_CONFLICT_LIVE_RESTORE': -32013,
+    'WT_CONFLICT_DISAGG': -32014,
+    'WT_STEP_DOWN': -32015,
+    'WT_TXN_TOO_LARGE_FOR_CACHE': -32016,
+    'WT_VERIFY_PAGE_ID_MISMATCH': -32017,
+}
+
+# To ensure our sub-level error returns do not conflict with any other
+# package or the error returns, we use the range -32,000 to -32,199.
+#
+# To add a new sub-level error, append a new entry to this list.
+# Only name, description, and long description are needed - the number is
+# assigned automatically via sub_error_codes above.
+sub_errors_def = [
+    ('WT_NONE',
+        'No additional context', '''
+        This sub-level error code is returned by default and indicates that no
+        further context exists or is necessary.'''),
+    ('WT_BACKGROUND_COMPACT_ALREADY_RUNNING',
+        "Background compaction is already running", '''
+        This sub-level error returns when the user tries to reconfigure background
+        compaction while it is already running.'''),
+    ('WT_CACHE_OVERFLOW',
+        "Cache capacity has overflown", '''
+        This sub-level error indicates that the configured cache has exceeded full
+        capacity.'''),
+    ('WT_WRITE_CONFLICT',
+        "Write conflict between concurrent operations", '''
+        This sub-level error indicates that there is a write conflict on the same
+        page between concurrent operations.'''),
+    ('WT_OLDEST_FOR_EVICTION',
+        "Transaction has the oldest pinned transaction ID", '''
+        This sub-level error indicates that a given transaction has the oldest
+        transaction ID and needs to be rolled back.'''),
+    ('WT_CONFLICT_BACKUP',
+        "Conflict performing operation due to running backup", '''
+        This sub-level error indicates that there is a conflict performing the operation
+        because of a running backup in the system.'''),
+    ('WT_CONFLICT_DHANDLE',
+        "Another thread currently holds the data handle of the table", '''
+        This sub-level error indicates that a concurrent operation is holding the data
+        handle of the table.'''),
+    ('WT_CONFLICT_SCHEMA_LOCK',
+        "Conflict performing schema operation", '''
+        This sub-level error indicates that a concurrent operation is performing a schema
+        type operation or currently holds the schema lock.'''),
+    ('WT_UNCOMMITTED_DATA',
+        "Table has uncommitted data", '''
+        This sub-level error returns when the table has uncommitted data.'''),
+    ('WT_DIRTY_DATA',
+        "Table has dirty data", '''
+        This sub-level error returns when the table has dirty content.'''),
+    ('WT_CONFLICT_TABLE_LOCK',
+        "Another thread currently holds the table lock", '''
+        This sub-level error indicates that a concurrent operation is performing
+        a table operation.'''),
+    ('WT_CONFLICT_CHECKPOINT_LOCK',
+        "Another thread currently holds the checkpoint lock", '''
+        This sub-level error indicates that a concurrent operation is performing
+        a checkpoint.'''),
+    ('WT_MODIFY_READ_UNCOMMITTED',
+        "Read-uncommitted readers do not support reconstructing a record with modifies", '''
+        This sub-level error indicates that a reader with uncommitted isolation
+        is trying to reconstruct a record with modifies. This is not supported.'''),
+    ('WT_CONFLICT_LIVE_RESTORE',
+        "Conflict performing operation due to an in-progress live restore", '''
+        This sub-level error indicates that there is a conflict performing the operation
+        because of a running live restore in the system.'''),
+    ('WT_CONFLICT_DISAGG',
+        "Conflict with disaggregated storage", '''
+        This sub-level error indicates that an operation or configuration conflicts with
+        disaggregated storage.'''),
+    ('WT_STEP_DOWN',
+        "Write transaction straddled the step-down timestamp setting boundary", '''
+        This sub-level error indicates that a transaction was rolled back because it was in
+        flight when the step-down timestamp was set.'''),
+    ('WT_TXN_TOO_LARGE_FOR_CACHE',
+        "Transaction dirty content alone exceeds the eviction updates or dirty trigger", '''
+        This sub-level error indicates that a single transaction has dirtied more cache
+        than the eviction updates trigger or the eviction dirty trigger allows. Eviction
+        cannot reclaim content pinned by an uncommitted transaction, so the transaction
+        cannot succeed against the configured cache size and has been rolled back.'''),
+    ('WT_VERIFY_PAGE_ID_MISMATCH',
+        "Verify found a mismatch between the btree and PALI page ID lists", '''
+        This sub-level error indicates that the disaggregated-storage verify pass found
+        one or more page IDs present in the btree walk but absent from the page log (or
+        vice versa), meaning a page was either leaked or discarded prematurely.'''),
+]
+
+# Update sub_error_codes with any new entries from sub_errors_def. New entries are assigned
+# the next available number, and this file is automatically updated to reflect the changes.
+def update_sub_error_codes(sub_errors_def, sub_error_codes):
+    for name, desc, long_desc in sub_errors_def:
+        if name not in sub_error_codes:
+            sub_error_codes[name] = min(sub_error_codes.values()) - 1
+
+def write_sub_error_codes(codes):
+    lines = ['sub_error_codes = {\n']
+    for name, value in sorted(codes.items(), key=lambda kv: kv[1], reverse=True):
+        lines.append("    '%s': %d,\n" % (name, value))
+    lines.append('}\n')
+    return ''.join(lines)
+
+# Write sub_errors back into this file.
+def write_updated_sub_error_codes(sub_error_codes):
+    src = os.path.abspath(__file__)
+    tmp_file = '__tmp_api_err_registry' + str(os.getpid())
+    with open(tmp_file, 'w') as tf:
+        skip_line = False
+        for line in open(src, 'r'):
+            if line.startswith('sub_error_codes = {'):
+                tf.write(write_sub_error_codes(sub_error_codes))
+                skip_line = True
+            elif skip_line:
+                if line.startswith('}'):
+                    skip_line = False
+            else:
+                tf.write(line)
+    compare_srcfile(tmp_file, src)
+
+original_registry = dict(sub_error_codes)
+update_sub_error_codes(sub_errors_def, sub_error_codes)
+if sub_error_codes != original_registry:
+    write_updated_sub_error_codes(sub_error_codes)
+
+# Build sub_errors from sub_errors_def and sub_error_codes.
+sub_errors = []
+for name, desc, long_desc in sub_errors_def:
+    sub_errors.append(Error(name, sub_error_codes[name], desc, long_desc))
+
+# Update the #defines in the wiredtiger.h.in file.
+tmp_file = '__tmp_api_err' + str(os.getpid())
 tfile = open(tmp_file, 'w')
 skip = 0
-for line in open('../src/include/wiredtiger.in', 'r'):
+for line in open('../src/include/wiredtiger.h.in', 'r'):
     if not skip:
         tfile.write(line)
-    if line.count('Error return section: END'):
-        tfile.write(line)
-        skip = 0
-    elif line.count('Error return section: BEGIN'):
-        tfile.write(' */\n')
-        skip = 1
-        for err in errors:
-            if 'undoc' in err.flags:
-                tfile.write('/*! @cond internal */\n')
-            tfile.write('/*!%s.%s */\n' %
-                (('\n * ' if err.long_desc else ' ') +
-            err.desc[0].upper() + err.desc[1:],
-                ''.join('\n * ' + l for l in textwrap.wrap(
-            textwrap.dedent(err.long_desc).strip(), 77)) +
-        '\n' if err.long_desc else ''))
-            tfile.write('#define\t%s\t%d\n' % (err.name, err.value))
-            if 'undoc' in err.flags:
-                tfile.write('/*! @endcond */\n')
-        tfile.write('/*\n')
+    skip = check_write_errors(tfile, skip, 'Error', errors)
+    skip = check_write_errors(tfile, skip, 'Sub-level error', sub_errors)
 tfile.close()
-compare_srcfile(tmp_file, '../src/include/wiredtiger.in')
+compare_srcfile(tmp_file, '../src/include/wiredtiger.h.in')
 
-# Output the wiredtiger_strerror and wiredtiger_sterror_r code.
-tmp_file = '__tmp'
+# Output the wiredtiger_strerror and __wt_wiredtiger_error code.
+tmp_file = '__tmp_api_err' + str(os.getpid())
 tfile = open(tmp_file, 'w')
 tfile.write('''/* DO NOT EDIT: automatically built by dist/api_err.py. */
 
@@ -100,32 +310,29 @@ tfile.write('''/* DO NOT EDIT: automatically built by dist/api_err.py. */
 
 /*
  * __wt_wiredtiger_error --
- *\tReturn a constant string for WiredTiger POSIX-standard and errors.
+ *\tReturn a constant string for POSIX-standard and WiredTiger errors.
  */
 const char *
 __wt_wiredtiger_error(int error)
-{
-\tconst char *p;
+{''')
+
+write_err_cases(tfile, 'errors', errors)
+write_err_cases(tfile, 'sub-level errors', sub_errors)
+
+tfile.write('''\n\t/* Windows strerror doesn't support ENOTSUP. */
+\tif (error == ENOTSUP)
+\t\treturn ("Operation not supported");
 
 \t/*
-\t * Check for WiredTiger specific errors.
-\t */
-\tswitch (error) {
-''')
-
-for err in errors:
-    tfile.write('\tcase ' + err.name + ':\n')
-    tfile.write('\t\treturn ("' + err.name + ': ' + err.desc + '");\n')
-tfile.write('''\t}
-
-\t/*
-\t * POSIX errors are non-negative integers; check for 0 explicitly
-\t * in-case the underlying strerror doesn't handle 0, some don't.
+\t * Check for 0 in case the underlying strerror doesn't handle it, some
+\t * historically didn't.
 \t */
 \tif (error == 0)
 \t\treturn ("Successful return: 0");
-\tif (error > 0 && (p = strerror(error)) != NULL)
-\t\treturn (p);
+
+\t/* POSIX errors are non-negative integers. */
+\tif (error > 0)
+\t\treturn (strerror(error));
 
 \treturn (NULL);
 }
@@ -141,30 +348,33 @@ wiredtiger_strerror(int error)
 
 \treturn (__wt_strerror(NULL, error, buf, sizeof(buf)));
 }
+
+/*
+ * __wt_is_valid_sub_level_error --
+ *\tReturn true if the provided error falls within the valid range for sub level error codes,
+ *\treturn false otherwise.
+ */
+bool
+__wt_is_valid_sub_level_error(int sub_level_err)
+{
+\treturn (sub_level_err <= -32000 && sub_level_err > -32200);
+}
 ''')
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, '../src/conn/api_strerror.c')
 
 # Update the error documentation block.
 doc = '../src/docs/error-handling.dox'
-tmp_file = '__tmp'
+tmp_file = '__tmp_api_err' + str(os.getpid())
 tfile = open(tmp_file, 'w')
 skip = 0
 for line in open(doc, 'r'):
     if not skip:
         tfile.write(line)
-    if line.count('IGNORE_BUILT_BY_API_ERR_END'):
-        tfile.write(line)
-        skip = 0
-    elif line.count('IGNORE_BUILT_BY_API_ERR_BEGIN'):
-        tfile.write('@endif\n\n')
-        skip = 1
+    skip = check_write_document_errors(tfile, skip, 'ERR', errors)
+    skip = check_write_document_errors(tfile, skip, 'SUB_ERR', sub_errors)
 
-        for err in errors:
-            if 'undoc' in err.flags:
-                continue
-            tfile.write(
-                '@par <code>' + err.name.upper() + '</code>\n' +
-                " ".join(err.long_desc.split()) + '\n\n')
 tfile.close()
+format_srcfile(tmp_file)
 compare_srcfile(tmp_file, doc)

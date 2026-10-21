@@ -1,0 +1,310 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/hybrid_search_pipeline_builder.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_add_fields.h"
+#include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_hybrid_scoring_util.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/string_map.h"
+
+#include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+boost::intrusive_ptr<DocumentSource> HybridSearchPipelineBuilder::buildReplaceRootStage(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return DocumentSourceReplaceRoot::createFromBson(
+        BSON("$replaceWith" << BSON(getInternalDocsName() << "$$ROOT")).firstElement(), expCtx);
+}
+
+BSONObj HybridSearchPipelineBuilder::projectRemoveInternalFieldsObject() {
+    BSONObjBuilder bob;
+    {
+        BSONObjBuilder projectBob(bob.subobjStart("$project"sv));
+        projectBob.append(getInternalFieldsName(), 0);
+        projectBob.done();
+    }
+    bob.done();
+    return bob.obj();
+}
+
+boost::intrusive_ptr<DocumentSource>
+HybridSearchPipelineBuilder::constructCalculatedFinalScoreDetails(
+    const std::vector<std::string>& pipelineNames,
+    const StringMap<double>& weights,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    BSONObjBuilder bob;
+    {
+        BSONObjBuilder addFieldsBob(bob.subobjStart("$addFields"sv));
+        {
+            BSONObjBuilder internalFieldsBob(addFieldsBob.subobjStart(getInternalFieldsName()));
+            {
+                BSONArrayBuilder calculatedScoreDetailsArr;
+                for (const auto& pipelineName : pipelineNames) {
+                    const std::string internalFieldsPipelineName =
+                        hybrid_scoring_util::applyInternalFieldPrefixToFieldName(
+                            getInternalFieldsName(), pipelineName);
+                    const std::string scoreDetailsFieldName =
+                        fmt::format("${}_scoreDetails", pipelineName);
+                    double weight = hybrid_scoring_util::getPipelineWeight(weights, pipelineName);
+                    BSONObjBuilder mergeObjectsArrSubObj;
+                    mergeObjectsArrSubObj.append("inputPipelineName"sv, pipelineName);
+                    constructCalculatedFinalScoreDetailsStageSpecificScoreDetails(
+                        mergeObjectsArrSubObj, internalFieldsPipelineName, weight);
+                    mergeObjectsArrSubObj.done();
+                    BSONArrayBuilder mergeObjectsArr;
+                    mergeObjectsArr.append(mergeObjectsArrSubObj.obj());
+                    mergeObjectsArr.append(
+                        fmt::format("${}.{}_scoreDetails", getInternalFieldsName(), pipelineName));
+                    mergeObjectsArr.done();
+                    BSONObj mergeObjectsObj = BSON("$mergeObjects"sv << mergeObjectsArr.arr());
+                    calculatedScoreDetailsArr.append(mergeObjectsObj);
+                }
+                calculatedScoreDetailsArr.done();
+                internalFieldsBob.append("calculatedScoreDetails", calculatedScoreDetailsArr.arr());
+            }
+            internalFieldsBob.done();
+        }
+    }
+    const BSONObj spec = bob.obj();
+    return DocumentSourceAddFields::createFromBson(spec.firstElement(), expCtx);
+}
+
+
+std::list<boost::intrusive_ptr<DocumentSource>>
+HybridSearchPipelineBuilder::constructDesugaredOutput(
+    const std::map<std::string, std::unique_ptr<Pipeline>>& inputPipelines,
+    const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
+    // Annotate on the ExpressionContext that this is a hybrid search ($rankFusion/$scoreFusion)
+    // query: once desugared, the pipeline alone no longer reveals its hybrid-search origin, which
+    // downstream view handling needs to know so it can reject the query if it is run over a view.
+    pExpCtx->setIsHybridSearch();
+
+    std::list<boost::intrusive_ptr<DocumentSource>> outputStages;
+    // Array to store pipeline names separately because Pipeline objects in the 'inputPipelines'
+    // map will be moved eventually to other structures, rendering 'inputPipelines' unusable.
+    // With this array, we can safely use/pass the pipeline names information without using
+    // 'inputPipelines'. Note that pipeline names are stored in the same order in which
+    // pipelines are desugared.
+    std::vector<std::string> pipelineNames;
+    for (auto pipeline_it = inputPipelines.begin(); pipeline_it != inputPipelines.end();
+         pipeline_it++) {
+        const auto& [inputPipelineName, inputPipelineStages] = *pipeline_it;
+
+        pipelineNames.push_back(inputPipelineName);
+
+        // Check if an explicit weight for this pipeline has been specified.
+        // If not, the default is one.
+        double pipelineWeight =
+            hybrid_scoring_util::getPipelineWeight(getWeights(), inputPipelineName);
+
+        const bool inputGeneratesScoreDetails =
+            inputPipelineStages->generatesMetadataType(DocumentMetadataFields::kScoreDetails);
+
+        auto initialStagesInInputPipeline =
+            buildInputPipelineDesugaringStages(inputPipelineName,
+                                               pipelineWeight,
+                                               std::move(inputPipelineStages),
+                                               inputGeneratesScoreDetails,
+                                               pExpCtx);
+        if (pipeline_it == inputPipelines.begin()) {
+            // Stages for the first pipeline.
+            outputStages.splice(outputStages.end(), std::move(initialStagesInInputPipeline));
+        } else {
+            // For the input pipelines other than the first, we wrap them in a $unionWith stage
+            // to append it to the total desugared output. The input pipeline consists of the
+            // same stages returned by 'buildInputPipelineDesugaringStages'.
+            auto unionWithPipeline = Pipeline::create(initialStagesInInputPipeline, pExpCtx);
+            // Serialize the $unionWith sub-pipeline in user-facing form so that any nested
+            // $search/$searchMeta/$vectorSearch stage re-lite-parses cleanly. Without this,
+            // the serialized form would carry internal routing fields (e.g. mongotQuery), which
+            // would be rejected by the recursive LiteParse field check on external clients.
+            query_shape::SerializationOptions opts{.serializeForReparse = true};
+            std::vector<BSONObj> bsonPipeline = unionWithPipeline->serializeToBson(opts);
+
+            // TODO SERVER-121094 This should have been moved into the LiteParsedDesugarer so the
+            // check should be redundant.
+            auto ifrCtx = pExpCtx->getIfrContext();
+            auto hybridSearchFlagEnabled = ifrCtx &&
+                ifrCtx->getSavedFlagValue(feature_flags::gFeatureFlagExtensionsInsideHybridSearch);
+            if (hybridSearchFlagEnabled) {
+                auto unionNss = pExpCtx->getUserNss();
+
+                // Build the internal $unionWith's LPP from the raw input pipeline, WITHOUT view
+                // stages: parsePipelineFromLPPWithMaybeViewDefinition applies the view exactly
+                // once, and pre-stitching here applied it twice, breaking position-sensitive
+                // first stages ($text, $search).
+                LiteParsedPipeline lpp(
+                    unionNss, bsonPipeline, false, LiteParserOptions{.ifrContext = ifrCtx});
+                lpp.makeOwned();
+                auto subParams = lpp.getStageParams();
+
+                UnionWithStageParams params(std::move(unionNss),
+                                            std::move(bsonPipeline),
+                                            /* isHybridSearch= */ true,
+                                            /* ownedBsonObj= */ BSONObj{},
+                                            std::move(subParams));
+                auto docSources = DocumentSourceUnionWith::createFromStageParams(params, pExpCtx);
+                outputStages.emplace_back(docSources.front());
+            } else {
+                auto unionNss = pExpCtx->getUserNss();
+                BSONObj inputToUnionWith = BSON(
+                    "$unionWith" << BSON("coll" << unionNss.coll() << "pipeline" << bsonPipeline));
+                auto unionWithStage = DocumentSourceUnionWith::createFromBson(
+                    inputToUnionWith.firstElement(), pExpCtx);
+                outputStages.emplace_back(unionWithStage);
+            }
+        }
+    }
+    // Build all remaining stages to perform the fusion. After all the pipelines have been
+    // executed and unioned, builds the $group stage to merge the scoreFields/apply score nulls
+    // behavior.
+    std::list<boost::intrusive_ptr<DocumentSource>> scoreAndMergeStages;
+    // Group all the documents across the different $unionWiths for each input pipeline,
+    // then reshape the grouped output to restore user documents at the top level.
+    auto groupAndShapeStages = buildGroupAndReplaceRootStages(pipelineNames, pExpCtx);
+    scoreAndMergeStages.splice(scoreAndMergeStages.end(), std::move(groupAndShapeStages));
+
+    // Call the stage-specific merge logic to add the remaining desugaring stages.
+    auto restOfScoreAndMergeStages = buildScoreAndMergeStages(pipelineNames, getWeights(), pExpCtx);
+    scoreAndMergeStages.splice(scoreAndMergeStages.end(), std::move(restOfScoreAndMergeStages));
+    outputStages.splice(outputStages.end(), std::move(scoreAndMergeStages));
+    return outputStages;
+}
+
+std::list<boost::intrusive_ptr<DocumentSource>>
+HybridSearchPipelineBuilder::buildGroupAndReplaceRootStages(
+    const std::vector<std::string>& pipelineNames,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const std::string internalDocsName{getInternalDocsName()};
+    const std::string internalFieldsName{getInternalFieldsName()};
+    std::list<boost::intrusive_ptr<DocumentSource>> stages;
+
+    // Stage 1: $group — collapses multiple rows per _id into one document.
+    //
+    // Each row entering the $group came from one input pipeline, so only that pipeline's
+    // fields have real values; the rest are null. Gets the value using $max for scalar fields
+    // and $mergeObjects for scoreDetails. $group cannot output dotted paths, so all values use flat
+    // "__hs_"-prefixed names to differentiate these fields for references in the $replaceRoot
+    // stage.
+    //
+    // {$group: {
+    //     _id: "$<INTERNAL_DOCS>._id",
+    //     <INTERNAL_DOCS>: {$first: "$<INTERNAL_DOCS>"},
+    //     __hs_<p1>_score: {$max: {$ifNull: ["$<INTERNAL_FIELDS>.<p1>_score", 0]}},
+    //     *** only when scoreDetails is enabled ***
+    //     __hs_<p1>_rank/_rawScore: {$max: {$ifNull: ["$<INTERNAL_FIELDS>.<p1>_rank",0]}},
+    //     __hs_<p1>_scoreDetails: {$mergeObjects: "$<INTERNAL_FIELDS>.<p1>_scoreDetails"},
+    //     ***
+    //     __hs_<p2>_score: ...,
+    //     ...
+    // }}
+    BSONObjBuilder groupSpecBob;
+    {
+        BSONObjBuilder gBob(groupSpecBob.subobjStart("$group"sv));
+        gBob.append("_id", fmt::format("${}._id", internalDocsName));
+        gBob.append(internalDocsName, BSON("$first" << fmt::format("${}", internalDocsName)));
+
+        auto accumulateScalarField = [&](std::string_view field, const std::string& internalPath) {
+            gBob.append(fmt::format("{}{}", kHsFlatFieldPrefix, field),
+                        BSON("$max" << BSON("$ifNull"
+                                            << BSON_ARRAY(fmt::format("${}", internalPath) << 0))));
+        };
+
+        for (const auto& pipelineName : pipelineNames) {
+            const std::string scoreField =
+                hybrid_scoring_util::getScoreFieldFromPipelineName(pipelineName);
+            accumulateScalarField(scoreField,
+                                  hybrid_scoring_util::applyInternalFieldPrefixToFieldName(
+                                      internalFieldsName, scoreField));
+
+            if (shouldIncludeScoreDetails()) {
+                const std::string scalarField = getScoreDetailsScalarFieldName(pipelineName);
+                accumulateScalarField(scalarField,
+                                      hybrid_scoring_util::applyInternalFieldPrefixToFieldName(
+                                          internalFieldsName, scalarField));
+
+                const std::string scoreDetailsField = fmt::format("{}_scoreDetails", pipelineName);
+                const std::string internalScoreDetailsPath =
+                    hybrid_scoring_util::applyInternalFieldPrefixToFieldName(internalFieldsName,
+                                                                             scoreDetailsField);
+                gBob.append(fmt::format("{}{}", kHsFlatFieldPrefix, scoreDetailsField),
+                            BSON("$mergeObjects" << fmt::format("${}", internalScoreDetailsPath)));
+            }
+        }
+        gBob.done();
+    }
+    stages.emplace_back(
+        DocumentSourceGroup::createFromBson(groupSpecBob.obj().firstElement(), expCtx));
+
+    // Stage 2: $replaceRoot — replaces the $group output with a new document.
+    //
+    // $mergeObjects takes two arguments: (a) the stashed user document, whose fields get
+    // spread to the top level and (b) an object literal that reads the flat __hs_* fields via
+    // "$__hs_..." path expressions and nests them under <INTERNAL_FIELDS>. Since $replaceRoot
+    // replaces the entire document, the $group output is implicitly dropped.
+    //
+    // {$replaceRoot: {newRoot: {$mergeObjects: [
+    //     "$<INTERNAL_DOCS>",
+    //     {<INTERNAL_FIELDS>: {
+    //         <p1>_score: "$__hs_<p1>_score",
+    //         <p2>_score: "$__hs_<p2>_score",
+    //         ...
+    //     }}
+    // ]}}}
+
+    BSONObjBuilder rrSpecBob;
+    {
+        BSONObjBuilder rrBob(rrSpecBob.subobjStart("$replaceRoot"sv));
+        BSONObjBuilder newRootBob(rrBob.subobjStart("newRoot"sv));
+        {
+            BSONArrayBuilder mergeArr(newRootBob.subarrayStart("$mergeObjects"sv));
+            // Add 'internalDocsName' to promote user doc.
+            mergeArr.append(fmt::format("${}", internalDocsName));
+            BSONObjBuilder wrapperBob;
+            {
+                BSONObjBuilder internalFieldsBob(wrapperBob.subobjStart(internalFieldsName));
+
+                auto appendFlatRef = [&](std::string_view field) {
+                    internalFieldsBob.append(field,
+                                             fmt::format("${}{}", kHsFlatFieldPrefix, field));
+                };
+
+                // Get prefixed fields to nest under 'internalFieldsName'.
+                for (const auto& pipelineName : pipelineNames) {
+                    appendFlatRef(hybrid_scoring_util::getScoreFieldFromPipelineName(pipelineName));
+                    if (shouldIncludeScoreDetails()) {
+                        appendFlatRef(getScoreDetailsScalarFieldName(pipelineName));
+                        appendFlatRef(fmt::format("{}_scoreDetails", pipelineName));
+                    }
+                }
+                internalFieldsBob.done();
+            }
+            mergeArr.append(wrapperBob.obj());
+            mergeArr.done();
+        }
+        newRootBob.done();
+        rrBob.done();
+    }
+    stages.emplace_back(
+        DocumentSourceReplaceRoot::createFromBson(rrSpecBob.obj().firstElement(), expCtx));
+
+    return stages;
+}
+
+}  // namespace mongo

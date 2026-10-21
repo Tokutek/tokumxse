@@ -1,0 +1,125 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#pragma once
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/exec/agg/exec_pipeline.h"
+#include "mongo/db/hierarchical_cancelable_operation_context_factory.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/s/resharding/resharding_executable_pipeline.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/modules.h"
+
+#include <limits>
+#include <memory>
+#include <utility>
+
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+namespace mongo {
+namespace executor {
+
+class TaskExecutor;
+
+}  // namespace executor
+
+/**
+ * Transfer config.transaction information from a given source shard to this shard.
+ */
+class ReshardingTxnCloner {
+public:
+    ReshardingTxnCloner(ReshardingSourceId sourceId, Timestamp fetchTimestamp);
+
+    /**
+     * Returns a pipeline for iterating the donor shard's config.transactions collection.
+     *
+     * The pipeline itself looks like:
+     * [
+     *      {$match: {_id: {$gt: <startAfter>}}},
+     *      {$sort: {_id: 1}},
+     * ]
+     */
+    std::unique_ptr<Pipeline> makePipeline(
+        OperationContext* opCtx,
+        std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
+        const boost::optional<LogicalSessionId>& startAfter);
+
+    /**
+     * Schedules work to repeatedly fetch and update config.transactions records.
+     *
+     * Returns a future that becomes ready when either:
+     *   (a) all config.transactions records have been fetched and updated, or
+     *   (b) the cancellation token was canceled due to a stepdown or abort.
+     */
+    SemiFuture<void> run(
+        std::shared_ptr<executor::TaskExecutor> executor,
+        std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
+        CancellationToken cancelToken,
+        std::shared_ptr<HierarchicalCancelableOperationContextFactory> factory,
+        std::shared_ptr<MongoProcessInterface> mongoProcessInterface_forTest = nullptr);
+
+    /**
+     * Updates this shard's config.transactions table based on a retryable write or multi-statement
+     * transaction that already executed on the donor shard.
+     *
+     * Returns boost::none unless this shard has an active prepared transaction for the
+     * corresponding config.transactions record. It otherwise returns a future that becomes ready
+     * once the active prepared transaction on this shard commits or aborts.
+     */
+    boost::optional<SharedSemiFuture<void>> doOneRecord(OperationContext* opCtx,
+                                                        const SessionTxnRecord& donorRecord);
+
+    void updateProgressDocument_forTest(OperationContext* opCtx, const LogicalSessionId& progress) {
+        _updateProgressDocument(opCtx, progress);
+    }
+
+private:
+    boost::optional<LogicalSessionId> _fetchProgressLsid(OperationContext* opCtx);
+
+    std::unique_ptr<Pipeline> _targetAggregationRequest(OperationContext* opCtx,
+                                                        const Pipeline& pipeline);
+
+    std::unique_ptr<Pipeline> _restartPipeline(
+        OperationContext* opCtx, std::shared_ptr<MongoProcessInterface> mongoProcessInterface);
+
+    boost::optional<SessionTxnRecord> _getNextRecord(
+        OperationContext* opCtx, resharding::ReshardingExecutablePipeline& pipeline);
+
+    void _updateProgressDocument(OperationContext* opCtx, const LogicalSessionId& progress);
+
+    const ReshardingSourceId _sourceId;
+    const Timestamp _fetchTimestamp;
+    Atomic<long long> _lastWriteBlockWarningAt{std::numeric_limits<long long>::min()};
+};
+
+/**
+ * Create pipeline stages for iterating donor config.transactions.  The pipeline has these stages:
+ * pipeline: [
+ *      {$match: {_id: {$gt: <startAfter>}}},
+ *      {$sort: {_id: 1}},
+ * ],
+ * Note that the caller is responsible for making sure that the transactions ns is set in the
+ * expCtx.
+ *
+ * fetchTimestamp never isNull()
+ */
+std::unique_ptr<Pipeline> createConfigTxnCloningPipelineForResharding(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    Timestamp fetchTimestamp,
+    boost::optional<LogicalSessionId> startAfter);
+
+}  // namespace mongo

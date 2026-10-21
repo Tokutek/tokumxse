@@ -1,0 +1,459 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/s/query/exec/cluster_client_cursor_impl.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/change_stream_metrics_util.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/query/client_cursor/generic_cursor_utils.h"
+#include "mongo/db/query/query_stats/query_stats.h"
+#include "mongo/db/query/tailable_mode_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
+#include "mongo/otel/metrics/metric_names.h"
+#include "mongo/otel/metrics/metrics_service.h"
+#include "mongo/s/query/exec/async_results_merger.h"
+#include "mongo/s/query/exec/router_stage_limit.h"
+#include "mongo/s/query/exec/router_stage_merge.h"
+#include "mongo/s/query/exec/router_stage_remove_metadata_fields.h"
+#include "mongo/s/query/exec/router_stage_skip.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+
+#include <memory>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+namespace {
+namespace change_stream_metrics {
+
+
+// The total number of change stream cursors opened since the start of the mongoS process. This
+// counter corresponds to the OTEL metric "serverStatus.metrics.changeStreams.cursor.totalOpened".
+auto& gCursorsTotalOpened = change_stream::createCurorsTotalOpened();
+
+// The OTEL metric "serverStatus.metrics.changeStreams.cursor.lifespan" in the mongoS process.
+auto& gLifespan = change_stream::createCursorsLifespan();
+
+// The OTEL metric "serverStatus.metrics.changeStreams.cursor.open.total" for the currently open
+// cursors in the mongoS process.
+auto& gCursorsOpenTotal = change_stream::createCursorsOpenTotal();
+
+}  // namespace change_stream_metrics
+
+auto& mongosCursorStatsTotalOpened = *MetricBuilder<Counter64>("mongos.cursor.totalOpened");
+auto& mongosCursorStatsMoreThanOneBatch =
+    *MetricBuilder<Counter64>("mongos.cursor.moreThanOneBatch");
+}  // namespace
+
+ClusterClientCursorGuard ClusterClientCursorImpl::make(
+    OperationContext* opCtx,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    ClusterClientCursorParams&& params) {
+    return ClusterClientCursorGuard(
+        opCtx,
+        std::make_unique<ClusterClientCursorImpl>(
+            opCtx, std::move(executor), std::move(params), opCtx->getLogicalSessionId()));
+}
+
+ClusterClientCursorGuard ClusterClientCursorImpl::make(OperationContext* opCtx,
+                                                       std::unique_ptr<RouterExecStage> root,
+                                                       ClusterClientCursorParams&& params) {
+    return ClusterClientCursorGuard(
+        opCtx,
+        std::make_unique<ClusterClientCursorImpl>(
+            opCtx, std::move(root), std::move(params), opCtx->getLogicalSessionId()));
+}
+
+ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
+                                                 std::shared_ptr<executor::TaskExecutor> executor,
+                                                 ClusterClientCursorParams&& params,
+                                                 boost::optional<LogicalSessionId> lsid)
+    : _params(std::move(params)),
+      _root(buildMergerPlan(opCtx, std::move(executor), &_params)),
+      _lsid(lsid),
+      _opCtx(opCtx),
+      _rawData(isRawDataOperation(opCtx)),
+      _ifrContext(IncrementalFeatureRolloutContext::get(opCtx)),
+      _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
+      _lastUseDate(_createdDate),
+      _planCacheShapeHash(CurOp::get(opCtx)->debug().planCacheShapeHash),
+      _queryShapeHash(CurOp::get(opCtx)->debug().getQueryShapeHash()),
+      _querySettings(CurOp::get(opCtx)->debug().getQuerySettings()),
+      _shouldOmitDiagnosticInformation(CurOp::get(opCtx)->getShouldOmitDiagnosticInformation()),
+      _queryStatsKeyHash(CurOp::get(opCtx)->debug().getQueryStatsInfo().keyHash),
+      _queryStatsKey(std::move(CurOp::get(opCtx)->debug().getQueryStatsInfo().key)),
+      _isChangeStreamQuery(CurOp::get(opCtx)->debug().isChangeStreamQuery),
+      _usesChangeStreamV2ShardTargeting(
+          CurOp::get(opCtx)->debug().usesChangeStreamV2ShardTargeting) {
+    dassert(!_params.compareWholeSortKeyOnRouter ||
+            SimpleBSONObjComparator::kInstance.evaluate(
+                _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
+    mongosCursorStatsTotalOpened.increment();
+
+    _params.originatingCommandObj = generic_cursor::maybeRedactOriginatingCommand(
+        _params.originatingCommandObj, _shouldOmitDiagnosticInformation);
+
+    if (_isChangeStreamQuery) {
+        change_stream_metrics::gCursorsTotalOpened.add(1);
+        change_stream_metrics::gCursorsOpenTotal.add(1);
+    }
+}
+
+ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
+                                                 std::unique_ptr<RouterExecStage> root,
+                                                 ClusterClientCursorParams&& params,
+                                                 boost::optional<LogicalSessionId> lsid)
+    : _params(std::move(params)),
+      _root(std::move(root)),
+      _lsid(lsid),
+      _opCtx(opCtx),
+      _rawData(isRawDataOperation(opCtx)),
+      _ifrContext(IncrementalFeatureRolloutContext::get(opCtx)),
+      _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
+      _lastUseDate(_createdDate),
+      _planCacheShapeHash(CurOp::get(opCtx)->debug().planCacheShapeHash),
+      _queryShapeHash(CurOp::get(opCtx)->debug().getQueryShapeHash()),
+      _querySettings(CurOp::get(opCtx)->debug().getQuerySettings()),
+      _shouldOmitDiagnosticInformation(CurOp::get(opCtx)->getShouldOmitDiagnosticInformation()),
+      _queryStatsKeyHash(CurOp::get(opCtx)->debug().getQueryStatsInfo().keyHash),
+      _queryStatsKey(std::move(CurOp::get(opCtx)->debug().getQueryStatsInfo().key)),
+      _isChangeStreamQuery(CurOp::get(opCtx)->debug().isChangeStreamQuery),
+      _usesChangeStreamV2ShardTargeting(
+          CurOp::get(opCtx)->debug().usesChangeStreamV2ShardTargeting) {
+    dassert(!_params.compareWholeSortKeyOnRouter ||
+            SimpleBSONObjComparator::kInstance.evaluate(
+                _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
+    mongosCursorStatsTotalOpened.increment();
+
+    _params.originatingCommandObj = generic_cursor::maybeRedactOriginatingCommand(
+        _params.originatingCommandObj, _shouldOmitDiagnosticInformation);
+
+    if (_isChangeStreamQuery) {
+        change_stream_metrics::gCursorsTotalOpened.add(1);
+        change_stream_metrics::gCursorsOpenTotal.add(1);
+    }
+}
+
+ClusterClientCursorImpl::~ClusterClientCursorImpl() {
+    if (_metrics.nBatches && *_metrics.nBatches > 1)
+        mongosCursorStatsMoreThanOneBatch.increment();
+}
+
+StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next() try {
+    invariant(_opCtx);
+    const auto interruptStatus = _opCtx->checkForInterruptNoAssert();
+    if (!interruptStatus.isOK()) {
+        _maxTimeMSExpired |= (interruptStatus.code() == ErrorCodes::MaxTimeMSExpired);
+        return interruptStatus;
+    }
+
+    CurOp::get(_opCtx)->maybeLogSlowQueryStalled();
+
+    // First return stashed results, if there are any.
+    if (!_stash.empty()) {
+        auto front = std::move(_stash.front());
+        _stash.pop();
+        ++_numReturnedSoFar;
+        if (_isChangeStreamQuery) {
+            if (const auto& resultObj = front.getResult()) {
+                ++_docsReturned;
+                _bytesReturned += resultObj->objsize();
+            }
+        }
+        return {std::move(front)};
+    }
+
+    auto next = _root->next();
+    if (!next.isOK() && _isChangeStreamQuery) {
+        // Shard errors arrive here as non-OK StatusWith (not thrown), so this is the primary
+        // counting path for production change stream errors.
+        const auto code = next.getStatus().code();
+        if (change_stream::shouldCountChangeStreamError(code)) {
+            change_stream::incrementChangeStreamErrorCounters(code);
+        }
+    }
+    if (next.isOK() && !next.getValue().isEOF()) {
+        ++_numReturnedSoFar;
+        if (_isChangeStreamQuery) {
+            if (const auto& resultObj = next.getValue().getResult()) {
+                ++_docsReturned;
+                _bytesReturned += resultObj->objsize();
+            }
+        }
+    }
+    // Record if we just got a MaxTimeMSExpired error.
+    _maxTimeMSExpired |= (next.getStatus().code() == ErrorCodes::MaxTimeMSExpired);
+    return next;
+} catch (const DBException& ex) {
+    // Thrown exceptions are rare in production (mostly ChangeStreamInvalidated from the ARM),
+    // but this catch provides defense-in-depth for any stage that throws instead of returning
+    // a non-OK Status.
+    if (_isChangeStreamQuery && change_stream::shouldCountChangeStreamError(ex.code())) {
+        change_stream::incrementChangeStreamErrorCounters(ex);
+    }
+    throw;
+}
+
+Status ClusterClientCursorImpl::releaseMemory() {
+    tassert(9745605, "releaseMemory should have a valid OperationContext", _opCtx);
+    auto interruptStatus = _opCtx->checkForInterruptNoAssert();
+    if (!interruptStatus.isOK()) {
+        return interruptStatus;
+    }
+    return _root->releaseMemory();
+}
+
+void ClusterClientCursorImpl::kill(OperationContext* opCtx) {
+    tassert(7448200,
+            "Cannot kill a cluster client cursor that has already been killed",
+            !_hasBeenKilled);
+
+    try {
+        query_stats::writeQueryStatsOnCursorDisposeOrKill(opCtx,
+                                                          _queryStatsKeyHash,
+                                                          std::move(_queryStatsKey),
+                                                          _isChangeStreamQuery,
+                                                          _firstResponseExecutionTime,
+                                                          _metrics);
+
+        if (_isChangeStreamQuery) {
+            const auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+
+            // Clamp to values >= 0, because clock values may go backwards.
+            const int64_t lifespanUs = std::max<int64_t>(0, (now - _createdDate).count() * 1000);
+            change_stream_metrics::gLifespan.record(lifespanUs);
+            change_stream_metrics::gCursorsOpenTotal.add(-1);
+        }
+    } catch (...) {
+        // Continue with the disposal even if errors happen during query stats or metrics updates.
+    }
+
+    _root->kill(opCtx);
+    _hasBeenKilled = true;
+}
+
+void ClusterClientCursorImpl::reattachToOperationContext(OperationContext* opCtx) {
+    _opCtx = opCtx;
+    _root->reattachToOperationContext(opCtx);
+}
+
+void ClusterClientCursorImpl::detachFromOperationContext() {
+    _opCtx = nullptr;
+    _root->detachFromOperationContext();
+}
+
+OperationContext* ClusterClientCursorImpl::getCurrentOperationContext() const {
+    return _opCtx;
+}
+
+bool ClusterClientCursorImpl::isTailable() const {
+    return _params.tailableMode != TailableModeEnum::kNormal;
+}
+
+bool ClusterClientCursorImpl::isTailableAndAwaitData() const {
+    return _params.tailableMode == TailableModeEnum::kTailableAndAwaitData;
+}
+
+BSONObj ClusterClientCursorImpl::getOriginatingCommand() const {
+    return _params.originatingCommandObj;
+}
+
+const PrivilegeVector& ClusterClientCursorImpl::getOriginatingPrivileges() const& {
+    return _params.originatingPrivileges;
+}
+
+bool ClusterClientCursorImpl::partialResultsReturned() const {
+    // We may have timed out in this layer, or within the plan tree waiting for results from shards.
+    return (_maxTimeMSExpired && _params.isAllowPartialResults) || _root->partialResultsReturned();
+}
+
+std::size_t ClusterClientCursorImpl::getNumRemotes() const {
+    return _root->getNumRemotes();
+}
+
+BSONObj ClusterClientCursorImpl::getPostBatchResumeToken() const {
+    return _root->getPostBatchResumeToken();
+}
+
+long long ClusterClientCursorImpl::getNumReturnedSoFar() const {
+    return _numReturnedSoFar;
+}
+
+void ClusterClientCursorImpl::recordChangeStreamThroughputMetricsForBatch() {
+    if (!_isChangeStreamQuery) {
+        return;
+    }
+
+    // Record the documents and bytes returned since the previous batch, and count this batch. Guard
+    // against errors so a metrics update never disrupts returning results to the client.
+    try {
+        if (const auto docsDelta = _docsReturned - _lastReportedDocsReturned; docsDelta > 0) {
+            change_stream::cursorDocsReturned().add(docsDelta);
+            _lastReportedDocsReturned = _docsReturned;
+            // Only count a batch that actually delivered documents to the client
+            change_stream::cursorBatchesReturned().add(1);
+        }
+        if (const auto bytesDelta = _bytesReturned - _lastReportedBytesReturned; bytesDelta > 0) {
+            change_stream::cursorBytesReturned().add(bytesDelta);
+            _lastReportedBytesReturned = _bytesReturned;
+        }
+
+        // Record the read work performed on the shards since the previous batch. These totals are
+        // aggregated from shard getMore responses in AsyncResultsMerger (via
+        // DataBearingNodeMetrics) and accumulated into '_metrics' before this batch is returned to
+        // the client.
+        const auto docsExamined = _metrics.docsExamined.value_or(0);
+        if (const auto docsExaminedDelta = docsExamined - _lastReportedDocsExamined;
+            docsExaminedDelta > 0) {
+            change_stream::cursorDocsExamined().add(docsExaminedDelta);
+            _lastReportedDocsExamined = docsExamined;
+        }
+        const auto bytesRead = _metrics.bytesRead.value_or(0);
+        if (const auto bytesReadDelta = bytesRead - _lastReportedBytesRead; bytesReadDelta > 0) {
+            change_stream::cursorBytesRead().add(bytesReadDelta);
+            _lastReportedBytesRead = bytesRead;
+        }
+    } catch (...) {
+    }
+}
+
+void ClusterClientCursorImpl::queueResult(ClusterQueryResult&& result) {
+    const auto& resultObj = result.getResult();
+    if (resultObj) {
+        tassert(11052321, "Expected result object to be owned", resultObj->isOwned());
+        // This document was already counted when it emerged from next(); back it out here so that
+        // it is only counted once, when it is re-served from the stash.
+        // TODO SERVER-131216: clean up decrementing counters by extracting counting to call site
+        // where queueResult() is called
+        if (_isChangeStreamQuery) {
+            --_docsReturned;
+            _bytesReturned -= resultObj->objsize();
+        }
+    }
+    _stash.push(std::move(result));
+}
+
+bool ClusterClientCursorImpl::remotesExhausted() const {
+    return _root->remotesExhausted();
+}
+
+bool ClusterClientCursorImpl::isEOF() const {
+    return _stash.empty() && _root->isEOF();
+}
+
+bool ClusterClientCursorImpl::hasBeenKilled() const {
+    return _hasBeenKilled;
+}
+
+Status ClusterClientCursorImpl::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+    return _root->setAwaitDataTimeout(awaitDataTimeout);
+}
+
+boost::optional<LogicalSessionId> ClusterClientCursorImpl::getLsid() const {
+    return _lsid;
+}
+
+boost::optional<TxnNumber> ClusterClientCursorImpl::getTxnNumber() const {
+    return _params.osi.getTxnNumber();
+}
+
+Date_t ClusterClientCursorImpl::getCreatedDate() const {
+    return _createdDate;
+}
+
+Date_t ClusterClientCursorImpl::getLastUseDate() const {
+    return _lastUseDate;
+}
+
+bool ClusterClientCursorImpl::isChangeStreamCursor() const {
+    return _isChangeStreamQuery;
+}
+
+bool ClusterClientCursorImpl::usesChangeStreamV2ShardTargeting() const {
+    return _usesChangeStreamV2ShardTargeting;
+}
+
+void ClusterClientCursorImpl::setLastUseDate(Date_t now) {
+    _lastUseDate = std::move(now);
+}
+
+boost::optional<uint32_t> ClusterClientCursorImpl::getPlanCacheShapeHash() const {
+    return _planCacheShapeHash;
+}
+
+boost::optional<query_shape::QueryShapeHash> ClusterClientCursorImpl::getQueryShapeHash() const {
+    return _queryShapeHash;
+}
+
+const query_settings::QuerySettings& ClusterClientCursorImpl::getQuerySettings() const {
+    return _querySettings;
+}
+
+boost::optional<std::size_t> ClusterClientCursorImpl::getQueryStatsKeyHash() const {
+    return _queryStatsKeyHash;
+}
+
+APIParameters ClusterClientCursorImpl::getAPIParameters() const {
+    return _params.apiParameters;
+}
+
+std::shared_ptr<IncrementalFeatureRolloutContext> ClusterClientCursorImpl::cloneIfrContext() const {
+    return _ifrContext->clone();
+}
+
+boost::optional<ReadPreferenceSetting> ClusterClientCursorImpl::getReadPreference() const {
+    return _params.readPreference;
+}
+
+boost::optional<repl::ReadConcernArgs> ClusterClientCursorImpl::getReadConcern() const {
+    return _params.readConcern;
+}
+
+bool ClusterClientCursorImpl::getRawData() const {
+    return _rawData;
+}
+
+std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
+    OperationContext* opCtx,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    ClusterClientCursorParams* params) {
+    const auto skip = params->skipToApplyOnRouter;
+    const auto limit = params->limit;
+
+    std::unique_ptr<RouterExecStage> root =
+        std::make_unique<RouterStageMerge>(opCtx, executor, params->extractARMParams(opCtx));
+
+    if (skip) {
+        root = std::make_unique<RouterStageSkip>(opCtx, std::move(root), *skip);
+    }
+
+    if (limit) {
+        root = std::make_unique<RouterStageLimit>(opCtx, std::move(root), *limit);
+    }
+
+    const bool hasSort = !params->sortToApplyOnRouter.isEmpty();
+    if (hasSort) {
+        // Strip out the sort key after sorting.
+        root = std::make_unique<RouterStageRemoveSortKey>(opCtx, std::move(root));
+    }
+
+    return root;
+}
+
+bool ClusterClientCursorImpl::shouldOmitDiagnosticInformation() const {
+    return _shouldOmitDiagnosticInformation;
+}
+
+std::unique_ptr<query_stats::Key> ClusterClientCursorImpl::takeKey() {
+    return std::move(_queryStatsKey);
+}
+
+}  // namespace mongo

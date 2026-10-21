@@ -1,0 +1,395 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/admission/execution_control/execution_admission_context.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/read_concern_support_result.h"
+#include "mongo/db/repl/hello/hello_auth.h"
+#include "mongo/db/repl/hello/hello_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/sharding_environment/mongos_hello_response.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/topology/mongos_topology_coordinator.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/idl/idl_command_parser.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/s/load_balancer_support.h"
+#include "mongo/transport/backpressure_connection_metrics.h"
+#include "mongo/transport/hello_metrics.h"
+#include "mongo/transport/message_compressor_manager.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/time_support.h"
+
+#include <functional>
+#include <initializer_list>
+#include <memory>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
+namespace mongo {
+
+// Hangs in the beginning of each hello command when set.
+MONGO_FAIL_POINT_DEFINE(routerWaitInHello);
+
+MONGO_FAIL_POINT_DEFINE(routerAppendHelloOkToHelloResponse);
+
+namespace {
+using namespace std::literals::string_view_literals;
+
+constexpr auto kHelloString = "hello"sv;
+constexpr auto kCamelCaseIsMasterString = "isMaster"sv;
+constexpr auto kLowerCaseIsMasterString = "ismaster"sv;
+const std::string kAutomationServiceDescriptorFieldName =
+    std::string{HelloCommandReply::kAutomationServiceDescriptorFieldName};
+
+class CmdHello : public BasicCommandWithReplyBuilderInterface {
+public:
+    CmdHello() : CmdHello(kHelloString, {}) {}
+
+    const std::set<std::string>& apiVersions() const override {
+        return kApiVersions1;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
+        return false;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const final {
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{
+            ErrorCodes::InvalidOptions, "cluster wide default read concern not permitted"};
+        static const Status kImplicitDefaultReadConcernNotPermitted{
+            ErrorCodes::InvalidOptions, "implicit default read concern not permitted"};
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
+                {kDefaultReadConcernNotPermitted},
+                {kImplicitDefaultReadConcernNotPermitted}};
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    std::string help() const override {
+        return "Status information for clients negotiating a connection with this server";
+    }
+
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
+
+    bool requiresAuth() const final {
+        return false;
+    }
+
+    HandshakeRole handshakeRole() const final {
+        return HandshakeRole::kHello;
+    }
+
+    bool runWithReplyBuilder(OperationContext* opCtx,
+                             const DatabaseName& dbName,
+                             const BSONObj& cmdObj,
+                             rpc::ReplyBuilderInterface* replyBuilder) final {
+        // Critical to observability and diagnosability, categorize as immediate priority.
+        ScopedAdmissionPriority<ExecutionAdmissionContext> skipAdmissionControl(
+            opCtx, AdmissionContext::Priority::kExempt);
+
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
+        auto cmd = idl::parseCommandDocument<HelloCommand>(cmdObj, IDLParserContext("hello"));
+
+        routerWaitInHello.execute([&](const BSONObj& args) {
+            if (args.hasElement("delayMillis")) {
+                Milliseconds delay{args["delayMillis"].safeNumberLong()};
+                LOGV2(6724103,
+                      "Fail point delays Hello processing",
+                      "cmd"_attr = cmdObj,
+                      "client"_attr = opCtx->getClient()->clientAddress(true),
+                      "desc"_attr = opCtx->getClient()->desc(),
+                      "delay"_attr = delay);
+                opCtx->sleepFor(delay);
+                return;
+            }
+
+            LOGV2(6524600,
+                  "Fail point blocks Hello response until removed",
+                  "cmd"_attr = cmdObj,
+                  "client"_attr = opCtx->getClient()->clientAddress(true),
+                  "desc"_attr = opCtx->getClient()->desc());
+
+            routerWaitInHello.pauseWhileSet(opCtx);
+        });
+
+        // "hello" is exempt from error code rewrites.
+        rpc::RewriteStateChangeErrors::setEnabled(opCtx, false);
+
+        // Negotiate compressors before logging metadata so we can include the result in the log
+        // line.
+        auto result = replyBuilder->getBodyBuilder();
+        MessageCompressorManager::forSession(opCtx->getClient()->session())
+            .serverNegotiate(cmd.getCompression(), &result);
+
+        auto client = opCtx->getClient();
+        bool isInitialHandshake = false;
+        if (ClientMetadata::tryFinalize(client)) {
+            isInitialHandshake = true;
+            audit::logClientMetadata(client);
+
+            // Record client backpressure protocol version for connection metrics.
+            if (auto session = client->session()) {
+                BackpressureVersionMetrics::get(session.get())
+                    ->setVersionFromHelloField(
+                        cmd.getBackpressure().value_or(IDLAnyType{}).getElement());
+            }
+        }
+
+        if (!isInitialHandshake) {
+            if (auto updateDoc = cmd.getClientUpdate()) {
+                ClientMetadata::logClientMetadataUpdate(client, *updateDoc);
+            }
+        }
+
+        // If a client is following the awaitable hello protocol, maxAwaitTimeMS should be
+        // present if and only if topologyVersion is present in the request.
+        auto clientTopologyVersion = cmd.getTopologyVersion();
+        auto maxAwaitTimeMS = cmd.getMaxAwaitTimeMS();
+        auto curOp = CurOp::get(opCtx);
+        boost::optional<Date_t> deadline;
+        boost::optional<ScopeGuard<std::function<void()>>> timerGuard;
+        if (clientTopologyVersion && maxAwaitTimeMS) {
+            uassert(51758,
+                    "topologyVersion must have a non-negative counter",
+                    clientTopologyVersion->getCounter() >= 0);
+
+            uassert(51759, "maxAwaitTimeMS must be a non-negative integer", *maxAwaitTimeMS >= 0);
+
+            auto minWait = repl::minWaitForStreamingHelloMillis.load();
+            if (minWait > 0 && *maxAwaitTimeMS < minWait) {
+                auto* authSession = AuthorizationSession::get(opCtx->getClient());
+                if (!authSession || !authSession->isAuthenticated()) {
+                    bool willAbort = repl::abortStreamingHelloWithSmallTimeout.load();
+                    static auto& logSeverity = *new logv2::SeveritySuppressor{
+                        Seconds{5}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(3)};
+                    LOGV2_DEBUG(9830102,
+                                logSeverity().toInt(),
+                                "Pre-auth streamable hello with maxAwaitTimeMS below minimum; "
+                                "will reject with InvalidOptions if willAbort is true, otherwise "
+                                "will clamp maxAwaitTimeMS up to minWaitForStreamingHelloMillis",
+                                "maxAwaitTimeMS"_attr = *maxAwaitTimeMS,
+                                "minWaitForStreamingHelloMillis"_attr = minWait,
+                                "willAbort"_attr = willAbort);
+
+                    uassert(ErrorCodes::InvalidOptions,
+                            fmt::format("maxAwaitTimeMS of {} ms is below the minimum of {} ms",
+                                        *maxAwaitTimeMS,
+                                        minWait),
+                            !willAbort);
+
+                    // Clamp the effective timeout to the configured minimum.
+                    maxAwaitTimeMS = minWait;
+                }
+            }
+
+            deadline = opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                Milliseconds(*maxAwaitTimeMS);
+
+            LOGV2_DEBUG(23871, 3, "Using maxAwaitTimeMS for awaitable hello protocol.");
+            curOp->pauseTimer();
+            timerGuard.emplace([curOp]() { curOp->resumeTimer(); });
+        } else {
+            uassert(51760,
+                    (clientTopologyVersion
+                         ? "A request with a 'topologyVersion' must include 'maxAwaitTimeMS'"
+                         : "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'"),
+                    !clientTopologyVersion && !maxAwaitTimeMS);
+        }
+
+        const auto* mongosTopCoord = MongosTopologyCoordinator::get(opCtx);
+
+        auto mongosHelloResponse =
+            mongosTopCoord->awaitHelloResponse(opCtx, clientTopologyVersion, deadline);
+
+        timerGuard.reset();  // Resume curOp timer.
+        mongosHelloResponse->appendToBuilder(&result, useLegacyResponseFields());
+        // The hello response always includes a topologyVersion.
+        auto currentMongosTopologyVersion = mongosHelloResponse->getTopologyVersion();
+
+        load_balancer_support::handleHello(opCtx, &result, cmd.getLoadBalanced().value_or(false));
+
+        // Try to parse the optional 'helloOk' field. On mongos, if we see this field, we will
+        // respond with helloOk: true so the client knows that it can continue to send the hello
+        // command to mongos.
+        if (auto helloOk = cmd.getHelloOk()) {
+            // If the hello request contains a "helloOk" field, set _supportsHello on the Client
+            // to the value.
+            client->setSupportsHello(*helloOk);
+            // Attach helloOk: true to the response so that the client knows the server supports
+            // the hello command.
+            result.append("helloOk", true);
+        }
+
+        if (MONGO_unlikely(routerAppendHelloOkToHelloResponse.shouldFail())) {
+            result.append("clientSupportsHello", client->supportsHello());
+        }
+
+        result.appendNumber(HelloCommandReply::kMaxBsonObjectSizeFieldName, BSONObjMaxUserSize);
+        result.appendNumber(HelloCommandReply::kMaxMessageSizeBytesFieldName,
+                            static_cast<long long>(MaxMessageSizeBytes));
+        result.appendNumber(HelloCommandReply::kMaxWriteBatchSizeFieldName,
+                            static_cast<long long>(write_ops::kMaxWriteBatchSize));
+        result.appendDate(HelloCommandReply::kLocalTimeFieldName, Date_t::now());
+        result.append(HelloCommandReply::kLogicalSessionTimeoutMinutesFieldName,
+                      localLogicalSessionTimeoutMinutes);
+        result.appendNumber(HelloCommandReply::kConnectionIdFieldName,
+                            opCtx->getClient()->getConnectionId());
+
+        // Mongos tries to keep exactly the same version range of the server for which
+        // it is compiled.
+        auto wireSpec = WireSpec::getWireSpec(opCtx->getServiceContext()).get();
+        result.append(HelloCommandReply::kMaxWireVersionFieldName,
+                      wireSpec->incomingExternalClient.maxWireVersion);
+        result.append(HelloCommandReply::kMinWireVersionFieldName,
+                      wireSpec->incomingExternalClient.minWireVersion);
+
+        if (auto sp = ServerParameterSet::getNodeParameterSet()->getIfExists(
+                kAutomationServiceDescriptorFieldName)) {
+            sp->append(opCtx, &result, kAutomationServiceDescriptorFieldName, boost::none);
+        }
+
+        if (opCtx->isExhaust()) {
+            LOGV2_DEBUG(23872, 3, "Using exhaust for hello protocol");
+
+            uassert(51763,
+                    "A hello/isMaster request with exhaust must specify 'maxAwaitTimeMS'",
+                    maxAwaitTimeMS);
+            invariant(clientTopologyVersion);
+
+            InExhaustHello::get(opCtx->getClient()->session().get())->setInExhaust(commandType());
+
+            if (clientTopologyVersion->getProcessId() ==
+                    currentMongosTopologyVersion.getProcessId() &&
+                clientTopologyVersion->getCounter() == currentMongosTopologyVersion.getCounter()) {
+                // Indicate that an exhaust message should be generated and the previous BSONObj
+                // command parameters should be reused as the next BSONObj command parameters.
+                replyBuilder->setNextInvocation(boost::none);
+            } else {
+                BSONObjBuilder niBuilder;
+                for (const auto& elem : cmdObj) {
+                    if (elem.fieldNameStringData() == HelloCommand::kTopologyVersionFieldName) {
+                        BSONObjBuilder tvBuilder(
+                            niBuilder.subobjStart(HelloCommand::kTopologyVersionFieldName));
+                        currentMongosTopologyVersion.serialize(&tvBuilder);
+                    } else {
+                        niBuilder.append(elem);
+                    }
+                }
+                replyBuilder->setNextInvocation(niBuilder.obj());
+            }
+        }
+
+        handleHelloAuth(opCtx, dbName, cmd, isInitialHandshake, &result);
+
+        if (getTestCommandsEnabled()) {
+            validateResult(&result);
+        }
+
+        return true;
+    }
+
+    void validateResult(BSONObjBuilder* result) {
+        auto ret = result->asTempObj();
+        if (ret[ErrorReply::kErrmsgFieldName].eoo()) {
+            // Nominal success case, parse the object as-is.
+            HelloCommandReply::parse(ret, IDLParserContext{"hello.reply"});
+        } else {
+            // Something went wrong, still try to parse, but accept a few ignorable fields.
+            StringDataSet ignorable({ErrorReply::kCodeFieldName, ErrorReply::kErrmsgFieldName});
+            HelloCommandReply::parse(ret.removeFields(ignorable), IDLParserContext{"hello.reply"});
+        }
+    }
+
+protected:
+    CmdHello(const std::string_view cmdName, const std::initializer_list<std::string_view>& alias)
+        : BasicCommandWithReplyBuilderInterface(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() const {
+        return false;
+    }
+
+    virtual InExhaustHello::Command commandType() const {
+        return InExhaustHello::Command::kHello;
+    }
+};
+MONGO_REGISTER_COMMAND(CmdHello).forRouter();
+
+class CmdIsMaster : public CmdHello {
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+    const std::set<std::string>& apiVersions() const final {
+        return kNoApiVersions;
+    }
+
+protected:
+    bool useLegacyResponseFields() const final {
+        return true;
+    }
+
+    InExhaustHello::Command commandType() const final {
+        return InExhaustHello::Command::kIsMaster;
+    }
+};
+MONGO_REGISTER_COMMAND(CmdIsMaster).forRouter();
+
+}  // namespace
+}  // namespace mongo

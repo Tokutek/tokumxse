@@ -1,96 +1,115 @@
-/*
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
+#include "mongo/base/status.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include "mongo/base/status.h"
+#include <boost/optional.hpp>
 
 namespace mongo {
 
-    namespace optionenvironment {
-        class OptionSection;
-        class Environment;
-    } // namespace optionenvironment
+namespace optionenvironment {
+class OptionSection;
+class Environment;
+}  // namespace optionenvironment
 
-    namespace moe = mongo::optionenvironment;
+namespace moe = mongo::optionenvironment;
 
-    struct ShellGlobalParams {
-        std::string url;
-        std::string dbhost;
-        std::string port;
-        std::vector<std::string> files;
+/**
+ * The sole purpose of this class is to avoid compilation errors with the definition of 'nokillop'
+ * field in shell_options.idl which the generated option parser requires assignment operator for the
+ * field to work but Atomic<T> does not support assignment operator(s).
+ */
+class AssignableAtomicBool {
+public:
+    AssignableAtomicBool() = default;
+    explicit AssignableAtomicBool(bool value) : _value(value) {}
 
-        std::string username;
-        std::string password;
-        bool usingPassword;
-        std::string authenticationMechanism;
-        std::string authenticationDatabase;
-        std::string gssapiServiceName;
-        std::string gssapiHostName;
+    AssignableAtomicBool& operator=(bool value) {
+        store(value);
+        return *this;
+    }
 
-        bool runShell;
-        bool nodb;
-        bool norc;
+    bool load() const {
+        return _value.load();
+    }
+    void store(bool value) {
+        _value.store(value);
+    }
 
-        std::string script;
+private:
+    Atomic<bool> _value;
+};
 
-        bool autoKillOp;
-        bool useWriteCommandsDefault;
-        std::string writeMode;
+struct ShellGlobalParams {
+    std::string url;
+    std::string dbhost;
+    std::string port;
+    std::vector<std::string> files;
 
-        std::string readMode;
+    std::string username;
+    std::string password;
+    std::string authenticationMechanism;
+    std::string authenticationDatabase;
+    std::string gssapiServiceName;
+    std::string gssapiHostName;
+    std::string networkMessageCompressors;
 
-        ShellGlobalParams() : autoKillOp(false),
-                              useWriteCommandsDefault(true),
-                              writeMode("commands"),
-                              readMode("compatibility") {
-        }
-    };
+    bool runShell;
+    bool nodb;
+    bool norc;
+    bool nojit = true;
+    bool javascriptProtection = true;
+    bool enableIPv6 = false;
 
-    extern ShellGlobalParams shellGlobalParams;
+    std::string script;
 
-    Status addMongoShellOptions(moe::OptionSection* options);
+    std::string apiVersion;
+    bool apiStrict;
+    bool apiDeprecationErrors;
 
-    std::string getMongoShellHelp(StringData name, const moe::OptionSection& options);
+    bool autoKillOp = false;
 
-    /**
-     * Handle options that should come before validation, such as "help".
-     *
-     * Returns false if an option was found that implies we should prematurely exit with success.
-     */
-    bool handlePreValidationMongoShellOptions(const moe::Environment& params,
-                                                const std::vector<std::string>& args);
+    bool shouldRetryWrites = false;
+    bool shouldUseImplicitSessions = true;
 
-    Status storeMongoShellOptions(const moe::Environment& params,
-                                  const std::vector<std::string>& args);
+    bool jsDebugMode = false;
 
-    Status validateMongoShellOptions(const moe::Environment& params);
-}
+    int jsHeapLimitMB = 0;
+    bool jsAbortOnOutOfMemory = false;
+    AssignableAtomicBool nokillop{false};
+    Seconds idleSessionTimeout = Seconds{0};
+
+#ifdef MONGO_CONFIG_GRPC
+    bool gRPC = false;
+    boost::optional<std::string> gRPCAuthToken;
+#endif
+
+    bool httpClientEnableLocalhostException{false};
+};
+
+extern ShellGlobalParams shellGlobalParams;
+
+std::string getMongoShellHelp(std::string_view name, const moe::OptionSection& options);
+
+/**
+ * Handle options that should come before validation, such as "help".
+ *
+ * Returns false if an option was found that implies we should prematurely exit with success.
+ */
+bool handlePreValidationMongoShellOptions(const moe::Environment& params,
+                                          const std::vector<std::string>& args);
+
+Status storeMongoShellOptions(const moe::Environment& params, const std::vector<std::string>& args);
+
+void redactPasswordOptions(int argc, char** argv);
+
+std::string getApiParametersJSON();
+}  // namespace mongo

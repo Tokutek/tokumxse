@@ -1,0 +1,415 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+using namespace std::literals::string_view_literals;
+
+namespace mongo {
+
+#define ASSERT_VALUE_CONTENTS_AND_TYPE(v, contents, type)  \
+    do {                                                   \
+        Value evaluatedResult = v;                         \
+        ASSERT_VALUE_EQ(evaluatedResult, Value(contents)); \
+        ASSERT_EQ(evaluatedResult.getType(), type);        \
+    } while (false);
+
+namespace ExpressionConvertTest {
+
+using ExpressionConvertTest = AggregationContextFixture;
+
+TEST_F(ExpressionConvertTest, ParseAndSerializeWithoutOptionalArguments) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << "$path1"
+                                                << "to"
+                                                << "int"));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    ASSERT_VALUE_EQ(Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}}}")),
+                    convertExp->serialize());
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}}}")),
+        convertExp->serialize(query_shape::SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+}
+
+TEST_F(ExpressionConvertTest, ParseAndSerializeWithToSubDocument) {
+    auto expCtx = getExpCtx();
+
+    auto spec =
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to"
+                                        << BSON("type" << "binData"
+                                                       << "subtype" << static_cast<int>(newUUID))
+                                        << "format"
+                                        << "uuid"));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    ASSERT_VALUE_EQ(Value(fromjson(  // NOLINT
+                        R"({
+                            $convert: {
+                                input: '$path1', 
+                                to: {
+                                    type: {$const: 'binData'},
+                                    subtype: {$const: 4}
+                                },
+                                format: {$const: 'uuid'}
+                            }
+                        })")),
+                    convertExp->serialize());
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson(  // NOLINT
+            R"({
+                $convert: {
+                    input: '$path1', 
+                    to: {
+                        type: {$const: 'binData'},
+                        subtype: {$const: 4}
+                    },
+                    format: {$const: 'uuid'}
+                }
+            })")),
+        convertExp->serialize(query_shape::SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson(  // NOLINT
+            R"({
+                $convert: {
+                    input: '$path1', 
+                    to: {$const: {"?": "?"}},
+                    format: {$const: "?"}
+                }
+            })")),
+        convertExp->serialize(
+            query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions));
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson(  // NOLINT
+            R"({
+                            $convert: {
+                                input: '$path1', 
+                                to: "?object",
+                                format: "?string"
+                            }
+                        })")),
+        convertExp->serialize(query_shape::SerializationOptions::kDebugQueryShapeSerializeOptions));
+}
+
+TEST_F(ExpressionConvertTest, ParseAndSerializeWithOnError) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << "$path1"
+                                                << "to"
+                                                << "int"
+                                                << "onError" << 0));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, onError: {$const: 0}}}")),
+        convertExp->serialize());
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, onError: {$const: 0}}}")),
+        convertExp->serialize(query_shape::SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+}
+
+TEST_F(ExpressionConvertTest, ParseAndSerializeWithOnNull) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << "$path1"
+                                                << "to"
+                                                << "int"
+                                                << "onNull" << 0));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, onNull: {$const: 0}}}")),
+        convertExp->serialize());
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, onNull: {$const: 0}}}")),
+        convertExp->serialize(query_shape::SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+}
+
+TEST_F(ExpressionConvertTest, ParseAndSerializeWithBase) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << "$path1"
+                                                << "to"
+                                                << "int"
+                                                << "base" << 8));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, base: {$const: 8}}}")),
+        convertExp->serialize());
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, base: {$const: 8}}}")),
+        convertExp->serialize(query_shape::SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+
+    spec = BSON("$convert" << BSON("input" << "$path1"
+                                           << "to"
+                                           << "int"
+                                           << "base" << "$path2"));
+    convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, base: '$path2'}}")),
+        convertExp->serialize());
+
+    ASSERT_VALUE_EQ(
+        Value(fromjson("{$convert: {input: '$path1', to: {$const: 'int'}, base: '$path2'}}")),
+        convertExp->serialize(query_shape::SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)}));
+}
+
+TEST_F(ExpressionConvertTest, ConvertWithoutInputFailsToParse) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("to" << "int"
+                                             << "onError" << 0));
+    ASSERT_THROWS_WITH_CHECK(
+        Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+        AssertionException,
+        [](const AssertionException& exception) {
+            ASSERT_EQ(exception.code(), ErrorCodes::FailedToParse);
+            ASSERT_STRING_CONTAINS(exception.reason(), "Missing 'input' parameter to $convert");
+        });
+}
+
+TEST_F(ExpressionConvertTest, ConvertWithoutToFailsToParse) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << "$path1"
+                                                << "onError" << 0));
+    ASSERT_THROWS_WITH_CHECK(
+        Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+        AssertionException,
+        [](const AssertionException& exception) {
+            ASSERT_EQ(exception.code(), ErrorCodes::FailedToParse);
+            ASSERT_STRING_CONTAINS(exception.reason(), "Missing 'to' parameter to $convert");
+        });
+}
+
+TEST_F(ExpressionConvertTest, RoundTripSerialization) {
+    auto expCtx = getExpCtx();
+
+    // Round-trip serialization of an argument that *looks* like an expression.
+    auto spec =
+        BSON("$convert" << BSON(
+                 "input" << BSON("$literal" << BSON("$toString" << "this is a string")) << "to"
+                         << "string"));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    auto opts = query_shape::SerializationOptions{
+        query_shape::LiteralSerializationPolicy::kToRepresentativeParseableValue};
+    auto serialized = convertExp->serialize(opts);
+    ASSERT_VALUE_EQ(Value(BSON("$convert" << BSON("input" << BSON("$const" << BSON("?" << "?"))
+                                                          << "to" << BSON("$const" << "string")))),
+                    serialized);
+
+    auto roundTrip = Expression::parseExpression(expCtx.get(),
+                                                 serialized.getDocument().toBson(),
+                                                 expCtx->variablesParseState)
+                         ->serialize(opts);
+    ASSERT_VALUE_EQ(roundTrip, serialized);
+}
+
+TEST_F(ExpressionConvertTest, ConvertOptimizesToExpressionConstant) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << 0 << "to"
+                                                << "double"));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+    convertExp = convertExp->optimize();
+
+    auto constResult = dynamic_cast<ExpressionConstant*>(convertExp.get());
+    ASSERT(constResult);
+    ASSERT_VALUE_CONTENTS_AND_TYPE(constResult->getValue(), 0.0, BSONType::numberDouble);
+}
+
+TEST_F(ExpressionConvertTest, ConvertWithFormatOptimizesToExpressionConstant) {
+    auto expCtx = getExpCtx();
+
+    std::string inputStr{"123"};
+
+    auto spec =
+        BSON("$convert" << BSON("input" << base64::encode(inputStr) << "to"
+                                        << "binData"
+                                        << "format" << toStringData(BinDataFormat::kBase64)));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+    convertExp = convertExp->optimize();
+
+    BSONBinData result{inputStr.data(), static_cast<int>(inputStr.size()), BinDataGeneral};
+
+    auto constResult = dynamic_cast<ExpressionConstant*>(convertExp.get());
+    ASSERT(constResult);
+    ASSERT_VALUE_CONTENTS_AND_TYPE(constResult->getValue(), result, BSONType::binData);
+}
+
+TEST_F(ExpressionConvertTest, ConvertWithOnErrorOptimizesToExpressionConstant) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << 0 << "to"
+                                                << "objectId"
+                                                << "onError"
+                                                << "X"));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+    convertExp = convertExp->optimize();
+
+    auto constResult = dynamic_cast<ExpressionConstant*>(convertExp.get());
+    ASSERT(constResult);
+    ASSERT_VALUE_CONTENTS_AND_TYPE(constResult->getValue(), "X"sv, BSONType::string);
+}
+
+TEST_F(ExpressionConvertTest, ConvertWithBaseOptimizesToExpressionConstant) {
+    auto expCtx = getExpCtx();
+
+    auto spec = BSON("$convert" << BSON("input" << 160 << "to"
+                                                << "string"
+                                                << "base" << 16));
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+    convertExp = convertExp->optimize();
+
+    Value result{"A0"sv};
+
+    auto constResult = dynamic_cast<ExpressionConstant*>(convertExp.get());
+    ASSERT(constResult);
+    ASSERT_VALUE_CONTENTS_AND_TYPE(constResult->getValue(), result, BSONType::string);
+}
+
+TEST_F(ExpressionConvertTest, ConvertBinDataToIntFeatureFlagOffFails) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagBinDataConvertNumeric", false);
+
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$convert: {input: '$path1', to: 'int', byteOrder: 'little'}}");
+
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       ErrorCodes::FailedToParse);
+}
+
+TEST_F(ExpressionConvertTest, ConvertIntToBindataFeatureFlagOffFails) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagBinDataConvertNumeric", false);
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$convert: {input: '$path1', to: 'binData', byteOrder: 'little'}}");
+
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       ErrorCodes::FailedToParse);
+}
+
+TEST_F(ExpressionConvertTest, ConvertBinDataToLongFeatureFlagOffFails) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagBinDataConvertNumeric", false);
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$convert: {input: '$path1', to: 'long', byteOrder: 'little'}}");
+
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       ErrorCodes::FailedToParse);
+}
+
+TEST_F(ExpressionConvertTest, ConvertLongToBinDataFeatureFlagOffFails) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagBinDataConvertNumeric", false);
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$convert: {input: '$path1', to: 'binData', byteOrder: 'big'}}");
+
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       ErrorCodes::FailedToParse);
+}
+
+TEST_F(ExpressionConvertTest, ConvertBinDataToDoubleFeatureFlagOffFails) {
+    unittest::ServerParameterGuard featureFlagController("featureFlagBinDataConvertNumeric", false);
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$convert: {input: '$path1', to: 'double', byteOrder: 'little'}}");
+
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       ErrorCodes::FailedToParse);
+}
+
+}  // namespace ExpressionConvertTest
+
+namespace ExpressionConvertShortcutsTest {
+
+using ExpressionConvertShortcutsTest = AggregationContextFixture;
+
+TEST_F(ExpressionConvertShortcutsTest, RejectsMoreThanOneInput) {
+    auto expCtx = getExpCtx();
+
+    BSONObj spec = BSON("$toInt" << BSON_ARRAY(1 << 3));
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       50723);
+    spec = BSON("$toLong" << BSON_ARRAY(1 << 3));
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       50723);
+    spec = BSON("$toDouble" << BSON_ARRAY(1 << 3));
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       50723);
+}
+
+TEST_F(ExpressionConvertShortcutsTest, RejectsZeroInputs) {
+    auto expCtx = getExpCtx();
+
+    BSONObj spec = BSON("$toInt" << BSONArray());
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       50723);
+    spec = BSON("$toLong" << BSONArray());
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       50723);
+    spec = BSON("$toDouble" << BSONArray());
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState),
+                       AssertionException,
+                       50723);
+}
+
+}  // namespace ExpressionConvertShortcutsTest
+}  // namespace mongo

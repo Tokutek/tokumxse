@@ -1,0 +1,203 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/str_escape.h"
+
+#include <string_view>
+
+#include <fmt/compile.h>
+#include <fmt/format.h>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+class ExtendedCanonicalV200Generator {
+public:
+    void writeNull(fmt::memory_buffer& buffer) const {
+        appendTo(buffer, "null"sv);
+    }
+    void writeUndefined(fmt::memory_buffer& buffer) const {
+        appendTo(buffer, R"({"$undefined":true})"sv);
+    }
+
+    void writeString(fmt::memory_buffer& buffer, std::string_view str) const {
+        buffer.push_back('"');
+        str::escapeForJSON(buffer, str);
+        buffer.push_back('"');
+    }
+
+    void writeBool(fmt::memory_buffer& buffer, bool val) const {
+        if (val)
+            appendTo(buffer, "true"sv);
+        else
+            appendTo(buffer, "false"sv);
+    }
+
+    void writeInt32(fmt::memory_buffer& buffer, int32_t val) const {
+        fmt::format_to(std::back_inserter(buffer), FMT_COMPILE(R"({{"$numberInt":"{}"}})"), val);
+    }
+
+    void writeInt64(fmt::memory_buffer& buffer, int64_t val) const {
+        fmt::format_to(std::back_inserter(buffer), FMT_COMPILE(R"({{"$numberLong":"{}"}})"), val);
+    }
+
+    void writeDouble(fmt::memory_buffer& buffer, double val) const {
+        if (val >= std::numeric_limits<double>::lowest() &&
+            val <= std::numeric_limits<double>::max())
+            fmt::format_to(
+                std::back_inserter(buffer), FMT_COMPILE(R"({{"$numberDouble":"{}"}})"), val);
+        else if (std::isnan(val))
+            appendTo(buffer, R"({"$numberDouble":"NaN"})"sv);
+        else if (std::isinf(val)) {
+            if (val > 0)
+                appendTo(buffer, R"({"$numberDouble":"Infinity"})"sv);
+            else
+                appendTo(buffer, R"({"$numberDouble":"-Infinity"})"sv);
+        } else {
+            StringBuilder ss;
+            ss << "Number " << val << " cannot be represented in JSON";
+            uassert(51757, ss.str(), false);
+        }
+    }
+
+    void writeDecimal128(fmt::memory_buffer& buffer, Decimal128 val) const {
+        if (val.isNaN())
+            appendTo(buffer, R"({"$numberDecimal":"NaN"})"sv);
+        else if (val.isInfinite())
+            fmt::format_to(std::back_inserter(buffer),
+                           FMT_COMPILE(R"({{"$numberDecimal":"{}"}})"),
+                           val.isNegative() ? "-Infinity" : "Infinity");
+        else {
+            fmt::format_to(std::back_inserter(buffer),
+                           FMT_COMPILE(R"({{"$numberDecimal":"{}"}})"),
+                           val.toString());
+        }
+    }
+
+    void writeDate(fmt::memory_buffer& buffer, Date_t val) const {
+        fmt::format_to(std::back_inserter(buffer),
+                       FMT_COMPILE(R"({{"$date":{{"$numberLong":"{}"}}}})"),
+                       val.toMillisSinceEpoch());
+    }
+
+    void writeDBRef(fmt::memory_buffer& buffer, std::string_view ref, OID id) const {
+        // Collection names can unfortunately contain control characters that need to be escaped
+        appendTo(buffer, R"({"$ref":")"sv);
+        str::escapeForJSON(buffer, ref);
+
+        // OID is a hex string and does not need to be escaped
+        fmt::format_to(std::back_inserter(buffer), FMT_COMPILE(R"(","$id":"{}"}})"), id.toString());
+    }
+
+    void writeOID(fmt::memory_buffer& buffer, OID val) const {
+        // OID is a hex string and does not need to be escaped
+        static_assert(OID::kOIDSize == 12);
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(val.view().view());
+        fmt::format_to(
+            std::back_inserter(buffer),
+            FMT_COMPILE(
+                R"({{"$oid":"{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}"}})"),
+            data[0],
+            data[1],
+            data[2],
+            data[3],
+            data[4],
+            data[5],
+            data[6],
+            data[7],
+            data[8],
+            data[9],
+            data[10],
+            data[11]);
+    }
+
+    void writeTimestamp(fmt::memory_buffer& buffer, Timestamp val) const {
+        fmt::format_to(std::back_inserter(buffer),
+                       FMT_COMPILE(R"({{"$timestamp":{{"t":{},"i":{}}}}})"),
+                       val.getSecs(),
+                       val.getInc());
+    }
+
+    void writeBinData(fmt::memory_buffer& buffer, std::string_view data, BinDataType type) const {
+        if (type == newUUID && data.size() == 16) {
+            fmt::format_to(
+                std::back_inserter(buffer),
+                FMT_COMPILE(
+                    R"({{"$uuid":"{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}"}})"),
+                static_cast<uint8_t>(data[0]),
+                static_cast<uint8_t>(data[1]),
+                static_cast<uint8_t>(data[2]),
+                static_cast<uint8_t>(data[3]),
+                static_cast<uint8_t>(data[4]),
+                static_cast<uint8_t>(data[5]),
+                static_cast<uint8_t>(data[6]),
+                static_cast<uint8_t>(data[7]),
+                static_cast<uint8_t>(data[8]),
+                static_cast<uint8_t>(data[9]),
+                static_cast<uint8_t>(data[10]),
+                static_cast<uint8_t>(data[11]),
+                static_cast<uint8_t>(data[12]),
+                static_cast<uint8_t>(data[13]),
+                static_cast<uint8_t>(data[14]),
+                static_cast<uint8_t>(data[15]));
+        } else {
+            appendTo(buffer, R"({"$binary":{"base64":")"sv);
+            base64::encode(buffer, data);
+            fmt::format_to(
+                std::back_inserter(buffer), FMT_COMPILE(R"(","subType":"{:x}"}}}})"), type);
+        }
+    }
+
+    void writeRegex(fmt::memory_buffer& buffer,
+                    std::string_view pattern,
+                    std::string_view options) const {
+        appendTo(buffer, R"({"$regularExpression":{"pattern":")"sv);
+        str::escapeForJSON(buffer, pattern);
+        appendTo(buffer, R"(","options":")"sv);
+        str::escapeForJSON(buffer, options);
+        appendTo(buffer, R"("}})"sv);
+    }
+
+    void writeSymbol(fmt::memory_buffer& buffer, std::string_view symbol) const {
+        appendTo(buffer, R"({"$symbol":")"sv);
+        str::escapeForJSON(buffer, symbol);
+        appendTo(buffer, R"("})"sv);
+    }
+
+    void writeCode(fmt::memory_buffer& buffer, std::string_view code) const {
+        appendTo(buffer, R"({"$code":")"sv);
+        str::escapeForJSON(buffer, code);
+        appendTo(buffer, R"("})"sv);
+    }
+    void writeCodeWithScope(fmt::memory_buffer& buffer,
+                            std::string_view code,
+                            BSONObj const& scope) const {
+        appendTo(buffer, R"({"$code":")"sv);
+        str::escapeForJSON(buffer, code);
+        appendTo(buffer, R"(","$scope":)"sv);
+        scope.jsonStringGenerator(*this, 0, false, buffer);
+        appendTo(buffer, R"(})"sv);
+    }
+    void writeMinKey(fmt::memory_buffer& buffer) const {
+        appendTo(buffer, R"({"$minKey":1})"sv);
+    }
+    void writeMaxKey(fmt::memory_buffer& buffer) const {
+        appendTo(buffer, R"({"$maxKey":1})"sv);
+    }
+    void writePadding(fmt::memory_buffer& buffer) const {}
+
+protected:
+    static void appendTo(fmt::memory_buffer& buffer, std::string_view data) {
+        buffer.append(data.data(), data.data() + data.size());
+    }
+
+    static void appendTo(fmt::memory_buffer& buffer, const fmt::format_int& data) {
+        buffer.append(data.data(), data.data() + data.size());
+    }
+};
+}  // namespace mongo

@@ -1,0 +1,16 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    transitionToShardedCluster:
+        description: "The public transitionToShardedCluster command on mongod."
+        command_name: transitionToShardedCluster
+        namespace: ignored
+        api_version: ""

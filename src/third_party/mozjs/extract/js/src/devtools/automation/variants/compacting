@@ -1,0 +1,16 @@
+{
+    "configure-args": "--enable-ctypes --enable-rust-simd",
+    "optimize": true,
+    "debug": true,
+    "env": {
+        "JS_GC_ZEAL": "IncrementalMultipleSlices"
+    },
+    "extra-args": {
+        "jit-test": ["--jitflags=debug", "--ignore-timeouts={DIR}/cgc-jittest-timeouts.txt"],
+        "jstests": ["--exclude-file={DIR}/cgc-jstests-slow.txt"]
+    },
+    "skip-tests": {
+        "win32": ["jstests"],
+        "win64": ["jstests"]
+    }
+}

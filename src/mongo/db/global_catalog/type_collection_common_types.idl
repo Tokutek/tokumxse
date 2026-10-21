@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/timeseries/timeseries.idl"
+
+structs:
+    TypeCollectionTimeseriesFields:
+        description: "Fields for time-series buckets collection fields in config.collections."
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            TimeseriesOptions: TimeseriesOptions
+        fields:
+            timeseriesBucketsMayHaveMixedSchemaData:
+                type: bool
+                optional: true
+                description: "Indicates if time-series buckets may have mixed schema data."

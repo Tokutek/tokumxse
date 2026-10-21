@@ -1,87 +1,271 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/s/write_ops/batched_command_response.h"
 
-#include <string>
-
-#include "mongo/db/jsobj.h"
-#include "mongo/s/write_ops/write_error_detail.h"
-#include "mongo/platform/cstdint.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/sharding_environment/shard_id.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/db/versioning_protocol/stale_exception.h"
 #include "mongo/unittest/unittest.h"
 
+#include <ostream>
+#include <string_view>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+using namespace std::literals::string_view_literals;
+
+namespace mongo {
 namespace {
+using namespace std::literals::string_view_literals;
 
-    using mongo::BSONArray;
-    using mongo::BSONObj;
-    using mongo::BatchedCommandResponse;
-    using mongo::WriteErrorDetail;
-    using mongo::WCErrorDetail;
-    using mongo::Date_t;
-    using std::string;
+TEST(BatchedCommandResponseTest, Basic) {
+    BSONArray writeErrorsArray(
+        BSON_ARRAY(BSON("index" << 0 << "code" << ErrorCodes::IndexNotFound << "errmsg"
+                                << "index 0 failed")
+                   << BSON("index" << 1 << "code" << ErrorCodes::InvalidNamespace << "errmsg"
+                                   << "index 1 failed too")));
 
-    TEST(RoundTrip, Normal) {
+    BSONObj writeConcernError(BSON("code" << ErrorCodes::UnknownError << "codeName"
+                                          << "UnknownError"
+                                          << "errmsg"
+                                          << "norepl"
+                                          << "errInfo" << BSON("a" << 1)));
 
-        BSONArray writeErrorsArray =
-            BSON_ARRAY(
-                BSON(WriteErrorDetail::index(0) <<
-                     WriteErrorDetail::errCode(-2) <<
-                     WriteErrorDetail::errInfo(BSON("more info" << 1)) <<
-                     WriteErrorDetail::errMessage("index 0 failed")
-                    ) <<
-                BSON(WriteErrorDetail::index(1) <<
-                     WriteErrorDetail::errCode(-3) <<
-                     WriteErrorDetail::errInfo(BSON("more info" << 1)) <<
-                     WriteErrorDetail::errMessage("index 1 failed too")
-                    )
-                );
+    BSONObj origResponseObj =
+        BSON("n" << 0 << "opTime" << mongo::Timestamp(1ULL) << "writeErrors" << writeErrorsArray
+                 << "writeConcernError" << writeConcernError << "retriedStmtIds"
+                 << BSON_ARRAY(1 << 3) << "ok" << 1.0);
 
-        BSONObj writeConcernError(
-                BSON(WCErrorDetail::errCode(8) <<
-                     WCErrorDetail::errInfo(BSON("a" << 1)) <<
-                     WCErrorDetail::errMessage("norepl")));
+    std::string errMsg;
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(origResponseObj, &errMsg));
 
-        BSONObj origResponseObj =
-            BSON(BatchedCommandResponse::ok(false) <<
-                 BatchedCommandResponse::errCode(-1) <<
-                 BatchedCommandResponse::errMessage("this batch didn't work") <<
-                 BatchedCommandResponse::n(0) <<
-                 BatchedCommandResponse::lastOp(Date_t(1)) <<
-                 BatchedCommandResponse::writeErrors() << writeErrorsArray <<
-                 BatchedCommandResponse::writeConcernError() << writeConcernError);
+    ASSERT(response.areRetriedStmtIdsSet());
+    ASSERT_EQ(response.getRetriedStmtIds().size(), 2);
+    ASSERT_EQ(response.getRetriedStmtIds()[0], 1);
+    ASSERT_EQ(response.getRetriedStmtIds()[1], 3);
 
-        string errMsg;
-        BatchedCommandResponse response;
-        bool ok = response.parseBSON(origResponseObj, &errMsg);
-        ASSERT_TRUE(ok);
+    BSONObj genResponseObj = BSONObjBuilder(response.toBSON()).append("ok", 1.0).obj();
+    ASSERT_BSONOBJ_EQ(origResponseObj, genResponseObj);
+}
 
-        BSONObj genResponseObj = response.toBSON();
-        ASSERT_EQUALS(0, genResponseObj.woCompare(origResponseObj));
+TEST(BatchedCommandResponseTest, StaleConfigInfo) {
+    OID epoch = OID::gen();
+
+    StaleConfigInfo staleInfo(
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl"),
+        ShardVersionFactory::make(ChunkVersion({epoch, Timestamp(100, 0)}, {1, 0})),
+        ShardVersionFactory::make(ChunkVersion({epoch, Timestamp(100, 0)}, {2, 0})),
+        ShardId("TestShard"));
+
+    BSONObjBuilder builder(BSON("index" << 0 << "code" << ErrorCodes::StaleConfig << "errmsg"
+                                        << "StaleConfig error"));
+    staleInfo.serialize(&builder);
+
+    BSONArray writeErrorsArray(BSON_ARRAY(
+        builder.obj() << BSON("index" << 1 << "code" << ErrorCodes::InvalidNamespace << "errmsg"
+                                      << "index 1 failed too")));
+
+    BSONObj origResponseObj =
+        BSON("n" << 0 << "opTime" << mongo::Timestamp(1ULL) << "writeErrors" << writeErrorsArray
+                 << "retriedStmtIds" << BSON_ARRAY(1 << 3) << "ok" << 1.0);
+
+    std::string errMsg;
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(origResponseObj, &errMsg));
+    ASSERT_EQ(0, response.getErrDetailsAt(0).getIndex());
+    ASSERT_EQ(ErrorCodes::StaleConfig, response.getErrDetailsAt(0).getStatus().code());
+    auto extraInfo = response.getErrDetailsAt(0).getStatus().extraInfo<StaleConfigInfo>();
+    ASSERT_EQ(staleInfo.getVersionReceived(), extraInfo->getVersionReceived());
+    ASSERT_EQ(*staleInfo.getVersionWanted(), *extraInfo->getVersionWanted());
+    ASSERT_EQ(staleInfo.getShardId(), extraInfo->getShardId());
+}
+
+TEST(BatchedCommandResponseTest, TooManySmallErrors) {
+    BatchedCommandResponse response;
+
+    const auto bigstr = std::string(1024, 'x');
+
+    for (int i = 0; i < 100'000; i++) {
+        response.addToErrDetails(write_ops::WriteError(i, {ErrorCodes::BadValue, bigstr}));
     }
 
-} // unnamed namespace
+    response.setStatus(Status::OK());
+    const auto bson = response.toBSON();
+    ASSERT_LT(bson.objsize(), BSONObjMaxUserSize);
+    const auto errDetails = bson["writeErrors"].Array();
+    ASSERT_EQ(errDetails.size(), 100'000u);
+
+    for (int i = 0; i < 100'000; i++) {
+        auto errDetail = errDetails[i].Obj();
+        ASSERT_EQ(errDetail["index"].Int(), i);
+        ASSERT_EQ(errDetail["code"].Int(), ErrorCodes::BadValue);
+
+        if (i < 1024) {
+            ASSERT_EQ(errDetail["errmsg"].String(), bigstr) << i;
+        } else {
+            ASSERT_EQ(errDetail["errmsg"].String(), ""sv) << i;
+        }
+    }
+}
+
+TEST(BatchedCommandResponseTest, TooManyBigErrors) {
+    BatchedCommandResponse response;
+
+    const auto bigstr = std::string(2'000'000, 'x');
+    const auto smallstr = std::string(10, 'x');
+
+    for (int i = 0; i < 100'000; i++) {
+        response.addToErrDetails(write_ops::WriteError(
+            i, {ErrorCodes::BadValue, i < 10 ? bigstr : smallstr /* Don't waste too much RAM */}));
+    }
+
+    response.setStatus(Status::OK());
+    const auto bson = response.toBSON();
+    ASSERT_LT(bson.objsize(), BSONObjMaxUserSize);
+    const auto errDetails = bson["writeErrors"].Array();
+    ASSERT_EQ(errDetails.size(), 100'000u);
+
+    for (int i = 0; i < 100'000; i++) {
+        auto errDetail = errDetails[i].Obj();
+        ASSERT_EQ(errDetail["index"].Int(), i);
+        ASSERT_EQ(errDetail["code"].Int(), ErrorCodes::BadValue);
+
+        if (i < 2) {
+            ASSERT_EQ(errDetail["errmsg"].String(), bigstr) << i;
+        } else {
+            ASSERT_EQ(errDetail["errmsg"].String(), ""sv) << i;
+        }
+    }
+}
+
+TEST(BatchedCommandResponseTest, CompatibilityFromWriteErrorToBatchCommandResponse) {
+    CollectionGeneration gen(OID::gen(), Timestamp(2, 0));
+    const auto versionReceived = ShardVersionFactory::make(ChunkVersion(gen, {1, 0}));
+
+    write_ops::UpdateCommandReply reply;
+    reply.getWriteCommandReplyBase().setN(1);
+    reply.getWriteCommandReplyBase().setWriteErrors(std::vector<write_ops::WriteError>{
+        write_ops::WriteError(1,
+                              Status(StaleConfigInfo(NamespaceString::createNamespaceString_forTest(
+                                                         "TestDB", "TestColl"),
+                                                     versionReceived,
+                                                     boost::none,
+                                                     ShardId("TestShard")),
+                                     "Test stale config")),
+    });
+
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(reply.toBSON(), nullptr));
+    ASSERT_EQ(1U, response.getErrDetails().size());
+    ASSERT_EQ(ErrorCodes::StaleConfig, response.getErrDetailsAt(0).getStatus().code());
+    ASSERT_EQ("Test stale config", response.getErrDetailsAt(0).getStatus().reason());
+    auto staleInfo = response.getErrDetailsAt(0).getStatus().extraInfo<StaleConfigInfo>();
+    ASSERT_EQ("TestDB.TestColl", staleInfo->getNss().ns_forTest());
+    ASSERT_EQ(versionReceived, staleInfo->getVersionReceived());
+    ASSERT(!staleInfo->getVersionWanted());
+    ASSERT_EQ(ShardId("TestShard"), staleInfo->getShardId());
+}
+
+TEST(BatchedCommandResponseTest, ParseQueryStatsMetrics) {
+    // Create a response with queryStatsMetrics array containing two entries.
+    // Include every field so that we can show that round-trippings works.
+    auto makeMetrics = [](long long keysExamined, long long docsExamined, long long nMatched) {
+        return BSON("keysExamined"
+                    << keysExamined << "docsExamined" << docsExamined << "bytesRead" << 100LL
+                    << "readingTimeMicros" << 50LL << "workingTimeMillis" << 1LL << "hasSortStage"
+                    << false << "usedDisk" << false << "fromMultiPlanner" << false
+                    << "fromPlanCache" << false << "planningTimeMicros" << 10LL
+                    << "cardinalityEstimationMethods" << BSONObj() << "nDocsSampled" << 0LL
+                    << "cpuNanos" << 1000LL << "delinquentAcquisitions" << 0LL
+                    << "totalAcquisitionDelinquencyMillis" << 0LL
+                    << "maxAcquisitionDelinquencyMillis" << 0LL << "numInterruptChecks" << 5LL
+                    << "overdueInterruptApproxMaxMillis" << 0LL << "nMatched" << nMatched
+                    << "nUpserted" << 0LL << "nModified" << nMatched << "nDeleted" << 0LL
+                    << "nInserted" << 0LL << "keysInserted" << 0LL << "keysDeleted" << 0LL
+                    << "totalTimeQueuedMicros" << 0LL << "totalAdmissions" << 0LL
+                    << "totalNormalPriorityAdmissions" << 0LL << "totalLowPriorityAdmissions" << 0LL
+                    << "wasLoadShed" << false << "wasDeprioritized" << false
+                    << "wasMarkedNonDeprioritizable" << false << "clusterPeakTrackedMemBytes"
+                    << 0LL);
+    };
+
+    BSONObj origResponseObj = BSON(
+        "n" << 2 << "ok" << 1.0 << "queryStatsMetrics"
+            << BSON_ARRAY(BSON("originalOpIndex" << 0 << "metrics" << makeMetrics(10, 5, 1))
+                          << BSON("originalOpIndex" << 1 << "metrics" << makeMetrics(20, 15, 2))));
+
+    std::string errMsg;
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(origResponseObj, &errMsg));
+
+    // Verify queryStatsMetrics were parsed correctly.
+    ASSERT_TRUE(response.areQueryStatsMetricsSet());
+    const auto& metrics = response.getQueryStatsMetrics();
+    ASSERT_EQ(metrics.size(), 2);
+
+    // Verify first entry.
+    ASSERT_EQ(metrics[0].getOriginalOpIndex(), 0);
+    ASSERT_EQ(metrics[0].getMetrics().getKeysExamined(), 10);
+    ASSERT_EQ(metrics[0].getMetrics().getDocsExamined(), 5);
+    ASSERT_EQ(metrics[0].getMetrics().getNMatched(), 1);
+    ASSERT_EQ(metrics[0].getMetrics().getNModified(), 1);
+
+    // Verify second entry.
+    ASSERT_EQ(metrics[1].getOriginalOpIndex(), 1);
+    ASSERT_EQ(metrics[1].getMetrics().getKeysExamined(), 20);
+    ASSERT_EQ(metrics[1].getMetrics().getDocsExamined(), 15);
+    ASSERT_EQ(metrics[1].getMetrics().getNMatched(), 2);
+    ASSERT_EQ(metrics[1].getMetrics().getNModified(), 2);
+
+    // Make sure we can roundtrip.
+    BSONObj reserializedResponseObj = response.toBSON().addFields(BSON("ok" << 1.0));
+    ASSERT_BSONOBJ_EQ_UNORDERED(origResponseObj, reserializedResponseObj);
+}
+
+TEST(BatchedCommandResponseTest, ParseResponseWithoutQueryStatsMetrics) {
+    // Create a response without queryStatsMetrics.
+    BSONObj origResponseObj = BSON("n" << 1 << "ok" << 1.0);
+
+    std::string errMsg;
+    BatchedCommandResponse response;
+    ASSERT_TRUE(response.parseBSON(origResponseObj, &errMsg));
+
+    // Verify queryStatsMetrics is not set.
+    ASSERT_FALSE(response.areQueryStatsMetricsSet());
+}
+
+TEST(BatchedCommandResponseTest, SerializeOmitsEmptyOrUnsetQueryStatsMetrics) {
+    // When queryStatsMetrics is not set (nullptr), toBSON() should not include the field.
+    {
+        BatchedCommandResponse response;
+        response.setStatus(Status::OK());
+        response.setN(1);
+
+        BSONObj bson = response.toBSON();
+        ASSERT_FALSE(bson.hasField("queryStatsMetrics"));
+    }
+
+    // When queryStatsMetrics is set to an empty vector, toBSON() should not include the field.
+    {
+        BatchedCommandResponse response;
+        response.setStatus(Status::OK());
+        response.setN(1);
+        response.setQueryStatsMetrics({});
+
+        BSONObj bson = response.toBSON();
+        ASSERT_FALSE(bson.hasField("queryStatsMetrics"));
+    }
+}
+
+}  // namespace
+}  // namespace mongo

@@ -1,0 +1,129 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/expression_test_base.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace mongo::sbe {
+
+class SBETruncBuiltinTest : public EExpressionTestFixture {
+protected:
+    void runAndAssertExpression(value::TypeTags argumentTag,
+                                value::Value argumentValue,
+                                value::TypeTags expectedTag,
+                                value::Value expectedValue) {
+        auto [copyTag, copyValue] = value::copyValue(argumentTag, argumentValue);
+        auto truncExpr = sbe::makeE<sbe::EFunction>(
+            EFn::kTrunc, sbe::makeEs(makeE<EConstant>(copyTag, copyValue)));
+        auto compiledExpr = compileExpression(*truncExpr);
+
+        value::TagValueOwned actual =
+            value::TagValueOwned::fromRaw(runCompiledExpression(compiledExpr.get()));
+
+        // This workaround is needed because double NaN values are not equal to themselves.
+        if (expectedTag == value::TypeTags::NumberDouble) {
+            auto expectedDouble = value::bitcastTo<double>(expectedValue);
+            if (std::isnan(expectedDouble)) {
+                auto actualDouble = value::bitcastTo<double>(actual.value());
+                ASSERT(std::isnan(actualDouble));
+                return;
+            }
+        }
+
+        // This workaround is needed because Decimal128 NaN values are not equal to themselves.
+        if (expectedTag == value::TypeTags::NumberDecimal) {
+            auto expectedDecimal = value::bitcastTo<Decimal128>(expectedValue);
+            if (expectedDecimal.isNaN()) {
+                auto actualDecimal = value::bitcastTo<Decimal128>(actual.value());
+                ASSERT(actualDecimal.isNaN());
+                return;
+            }
+        }
+
+        auto [compareTag, compareValue] =
+            value::compareValue(actual.tag(), actual.value(), expectedTag, expectedValue);
+        ASSERT_EQUALS(compareTag, value::TypeTags::NumberInt32);
+        ASSERT_EQUALS(value::bitcastTo<int32_t>(compareValue), 0);
+    }
+};
+
+TEST_F(SBETruncBuiltinTest, TestIntegers) {
+    std::vector<int64_t> testCases = {1234, 0, -1234};
+
+    for (const auto& argument : testCases) {
+        runAndAssertExpression(value::TypeTags::NumberInt32,
+                               value::bitcastFrom<int64_t>(argument),
+                               value::TypeTags::NumberInt32,
+                               value::bitcastFrom<int64_t>(argument));
+
+        runAndAssertExpression(value::TypeTags::NumberInt64,
+                               value::bitcastFrom<int64_t>(argument),
+                               value::TypeTags::NumberInt64,
+                               value::bitcastFrom<int64_t>(argument));
+    }
+}
+
+TEST_F(SBETruncBuiltinTest, TestDouble) {
+    std::vector<std::pair<double, double>> testCases = {
+        {0, 0},
+        {1.2, 1},
+        {1.5, 1},
+        {1.7, 1},
+        {-1.2, -1},
+        {-1.5, -1},
+        {-1.7, -1},
+        {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()},
+        {-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()},
+        {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()},
+        {std::numeric_limits<double>::signaling_NaN(),
+         std::numeric_limits<double>::signaling_NaN()},
+    };
+
+    for (const auto& [argument, result] : testCases) {
+        runAndAssertExpression(value::TypeTags::NumberDouble,
+                               value::bitcastFrom<double>(argument),
+                               value::TypeTags::NumberDouble,
+                               value::bitcastFrom<double>(result));
+    }
+}
+
+TEST_F(SBETruncBuiltinTest, TestDecimal) {
+    std::vector<std::pair<Decimal128, Decimal128>> testCases = {
+        {Decimal128("0"), Decimal128("0")},
+        {Decimal128("1.2"), Decimal128("1")},
+        {Decimal128("1.5"), Decimal128("1")},
+        {Decimal128("1.7"), Decimal128("1")},
+        {Decimal128("-1.2"), Decimal128("-1")},
+        {Decimal128("-1.5"), Decimal128("-1")},
+        {Decimal128("-1.7"), Decimal128("-1")},
+        {Decimal128::kPositiveInfinity, Decimal128::kPositiveInfinity},
+        {Decimal128::kNegativeInfinity, Decimal128::kNegativeInfinity},
+        {Decimal128::kPositiveNaN, Decimal128::kPositiveNaN},
+        {Decimal128::kNegativeNaN, Decimal128::kNegativeNaN},
+    };
+
+    for (const auto& [argument, result] : testCases) {
+        value::TagValueOwned argumentCopy =
+            value::TagValueOwned::fromRaw(value::makeCopyDecimal(argument));
+
+        value::TagValueOwned resultCopy =
+            value::TagValueOwned::fromRaw(value::makeCopyDecimal(result));
+
+        runAndAssertExpression(
+            argumentCopy.tag(), argumentCopy.value(), resultCopy.tag(), resultCopy.value());
+    }
+}
+
+}  // namespace mongo::sbe

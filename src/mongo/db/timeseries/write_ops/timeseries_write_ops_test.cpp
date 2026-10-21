@@ -1,0 +1,342 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/timeseries/write_ops/timeseries_write_ops.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
+#include "mongo/db/commands/query_cmd/bulk_write.h"
+#include "mongo/db/commands/query_cmd/bulk_write_gen.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/database_sharding_state_mock.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/db/timeseries/bucket_compression.h"
+#include "mongo/db/timeseries/collection_pre_conditions_util.h"
+#include "mongo/db/timeseries/timeseries_test_fixture.h"
+#include "mongo/db/timeseries/write_ops/internal/timeseries_write_ops_internal.h"
+#include "mongo/db/timeseries/write_ops/timeseries_write_ops_utils_internal.h"
+#include "mongo/db/versioning_protocol/chunk_version.h"
+#include "mongo/db/versioning_protocol/database_version.h"
+#include "mongo/db/versioning_protocol/shard_version.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+
+#include <string_view>
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+class TimeseriesWriteOpsTest : public timeseries::TimeseriesTestFixture {};
+
+TEST_F(TimeseriesWriteOpsTest, OrderedTimeseriesWritesMismatchedUUID) {
+    auto insertCommandReq = write_ops::InsertCommandRequest(_resolveTimeseriesNss(_nsNoMeta));
+    insertCommandReq.setCollectionUUID(UUID::gen());
+    auto preConditions = timeseries::CollectionPreConditions(UUID::gen(),
+                                                             true,  // isTimeseries
+                                                             true,  // isViewlessTimeseries
+                                                             _resolveTimeseriesNss(_nsNoMeta),
+                                                             boost::none);  // expectedUUID
+    ASSERT_THROWS_CODE(
+        uassertStatusOK(timeseries::write_ops::internal::performAtomicTimeseriesWrites(
+            _opCtx,
+            preConditions,
+            std::vector<write_ops::InsertCommandRequest>{insertCommandReq},
+            {})),
+        DBException,
+        10685101);
+}
+
+TEST_F(TimeseriesWriteOpsTest, UnorderedTimeseriesWritesMismatchedUUID) {
+    auto insertStatements = std::vector<InsertStatement>{InsertStatement{fromjson("{_id: 0}")}};
+    auto fixer = write_ops_exec::LastOpFixer(_opCtx);
+    write_ops_exec::WriteResult result;
+    auto preConditions = timeseries::CollectionPreConditions(UUID::gen(),
+                                                             true,  // isTimeseries
+                                                             true,  // isViewlessTimeseries
+                                                             _resolveTimeseriesNss(_nsNoMeta),
+                                                             boost::none);  // expectedUUID
+
+    ASSERT_THROWS_CODE(
+        [&] {
+            write_ops_exec::insertBatchAndHandleErrors(_opCtx,
+                                                       _nsNoMeta,
+                                                       preConditions,
+                                                       false,
+                                                       insertStatements,
+                                                       OperationSource::kTimeseriesInsert,
+                                                       &fixer,
+                                                       &result);
+            for (const auto& statusWithWriteRes : result.results) {
+                uassertStatusOK(statusWithWriteRes);
+            }
+        }(),
+        DBException,
+        10685101);
+}
+
+// It is possible that a collection is dropped after an insert starts but before it finishes. In
+// those cases, since time-series inserts do not implicitly create the collection, the insert should
+// fail. BatchInsertMissingCollection, PerformTimeseriesWritesNoCollection, and
+// PerformTimeseriesUpdatesNoCollection test paths where the collection can be removed out from
+// under an insert in progress.
+
+// TODO SERVER-95114: insertBatchAndHandleErrors(), performTimeseriesWrites(), and performUpdates()
+// (as well other functions in write_ops_exec.h) should be unit tested in a broader set of
+// scenarios. This is ticketed out to clarify that these tests are not exhaustive.
+
+TEST_F(TimeseriesWriteOpsTest, BatchInsertMissingCollection) {
+    auto nss = NamespaceString::createNamespaceString_forTest(
+        "db_timeseries_write_ops_test", "system.buckets.batch_insert_missing");
+    auto insertStatements =
+        std::vector<InsertStatement>{InsertStatement{fromjson("{_id: 0, foo: 1}")}};
+    auto fixer = write_ops_exec::LastOpFixer(_opCtx);
+    write_ops_exec::WriteResult result;
+    auto preConditions = timeseries::CollectionPreConditions::getCollectionPreConditions(
+        _opCtx, nss, /*expectedUUID=*/boost::none);
+    auto shouldInsertMore =
+        write_ops_exec::insertBatchAndHandleErrors(_opCtx,
+                                                   nss,
+                                                   preConditions,
+                                                   true,
+                                                   insertStatements,
+                                                   OperationSource::kTimeseriesInsert,
+                                                   &fixer,
+                                                   &result);
+    EXPECT_FALSE(shouldInsertMore);
+    ASSERT_EQ(1, result.results.size());
+    EXPECT_EQ(ErrorCodes::NamespaceNotFound, result.results[0].getStatus());
+
+    result.results.clear();
+    insertStatements.push_back(InsertStatement{fromjson("{_id: 1, foo: 2}")});
+    insertStatements.push_back(InsertStatement{fromjson("{_id: 2, foo: 3}")});
+
+    shouldInsertMore =
+        write_ops_exec::insertBatchAndHandleErrors(_opCtx,
+                                                   nss,
+                                                   preConditions,
+                                                   true,
+                                                   insertStatements,
+                                                   OperationSource::kTimeseriesInsert,
+                                                   &fixer,
+                                                   &result);
+    EXPECT_FALSE(shouldInsertMore);
+    ASSERT_EQ(1, result.results.size());
+    EXPECT_EQ(ErrorCodes::NamespaceNotFound, result.results[0].getStatus());
+}
+
+TEST_F(TimeseriesWriteOpsTest, PerformInsertsNoCollection) {
+    auto nss = NamespaceString::createNamespaceString_forTest(
+        "db_timeseries_write_ops_test", "system.buckets.perform_inserts_no_collection");
+    write_ops::InsertCommandRequest request(nss);
+    request.setDocuments({fromjson("{_id: 0, foo: 1}")});
+    auto source = OperationSource::kTimeseriesInsert;
+    auto writeResult =
+        write_ops_exec::performInserts(_opCtx, request, /*preConditions=*/boost::none, source);
+    EXPECT_FALSE(writeResult.canContinue);
+    ASSERT_EQ(1, writeResult.results.size());
+    EXPECT_EQ(ErrorCodes::NamespaceNotFound, writeResult.results[0].getStatus());
+}
+
+TEST_F(TimeseriesWriteOpsTest, PerformTimeseriesDeletesNoCollection) {
+    auto nss = NamespaceString::createNamespaceString_forTest(
+        "db_timeseries_write_ops_test", "system.buckets.perform_timeseries_deletes_no_collection");
+    write_ops::DeleteCommandRequest request(nss);
+    request.setDeletes(
+        {write_ops::DeleteOpEntry(BSON("_id" << 0), false /* multi */, boost::none)});
+    auto source = OperationSource::kTimeseriesDelete;
+    auto writeResult =
+        write_ops_exec::performDeletes(_opCtx, request, /*preConditions=*/boost::none, source);
+    EXPECT_FALSE(writeResult.canContinue);
+    ASSERT_EQ(1, writeResult.results.size());
+    EXPECT_EQ(8555700, writeResult.results[0].getStatus().code());
+}
+
+TEST_F(TimeseriesWriteOpsTest, PerformTimeseriesWritesNoCollection) {
+    auto nss = NamespaceString::createNamespaceString_forTest(
+        "db_timeseries_write_ops_test", "system.buckets.perform_timeseries_writes_no_collection");
+    write_ops::InsertCommandRequest request(nss);
+    auto preConditions = timeseries::CollectionPreConditions::getCollectionPreConditions(
+        _opCtx, nss, /*expectedUUID=*/boost::none);
+    ASSERT_THROWS_CODE(
+        timeseries::write_ops::performTimeseriesWrites(_opCtx, request, preConditions),
+        DBException,
+        8555700);
+
+    write_ops::InsertCommandRequest requestUnordered(nss);
+    requestUnordered.setOrdered(false);
+
+    ASSERT_THROWS_CODE(
+        timeseries::write_ops::performTimeseriesWrites(_opCtx, request, preConditions),
+        DBException,
+        8555700);
+}
+
+class TimeseriesWriteOpsShardedTest : public TimeseriesWriteOpsTest {
+public:
+    void SetUp() override {
+        TimeseriesWriteOpsTest::SetUp();
+        _shardVersion = ShardVersionFactory::make(ChunkVersion(
+            CollectionGeneration{OID::gen(), Timestamp(5, 0)}, CollectionPlacement(10, 1)));
+        _incorrectShardVersion = ShardVersionFactory::make(ChunkVersion(
+            CollectionGeneration{OID::gen(), Timestamp(12, 0)}, CollectionPlacement(10, 1)));
+        _nss = _resolveTimeseriesNss(_nsNoMeta);
+        _dbName = _nss.dbName();
+
+        const auto untrackedCollectionMetadata = CollectionMetadata::UNTRACKED();
+
+        _uuid = std::invoke([&] {
+            const auto optUuid = CollectionCatalog::get(_opCtx)->lookupUUIDByNSS(_opCtx, _nss);
+            ASSERT(optUuid);
+            return *optUuid;
+        });
+
+        const ChunkRange cr{BSON("skey" << MINKEY), BSON("skey" << MAXKEY)};
+        const ShardId shardName{"myShardName"};
+        const std::vector<ChunkType> chunks{
+            ChunkType(_uuid, cr, _shardVersion.placementVersion(), shardName)};
+
+        constexpr std::string_view shardKey("skey");
+        const ShardKeyPattern shardKeyPattern{BSON(shardKey << 1)};
+
+        const auto epoch = chunks.front().getVersion().epoch();
+        const auto timestamp = chunks.front().getVersion().getTimestamp();
+
+        auto rt = RoutingTableHistory::makeNew(_nss,
+                                               _uuid,
+                                               shardKeyPattern.getKeyPattern(),
+                                               false, /* unsplittable */
+                                               nullptr,
+                                               false,
+                                               epoch,
+                                               timestamp,
+                                               boost::none /* timeseriesFields */,
+                                               boost::none /* resharding Fields */,
+                                               true /* allowMigrations */,
+                                               chunks);
+
+        const auto version = rt.getVersion();
+        const auto rtHandle = RoutingTableHistoryValueHandle(
+            std::make_shared<RoutingTableHistory>(std::move(rt)),
+            ComparableChunkVersion::makeComparableChunkVersion(version));
+
+        const auto collectionMetadata =
+            CollectionMetadata(CurrentChunkManager(rtHandle), shardName);
+
+        CollectionShardingRuntime::acquireExclusive(_opCtx, _nss)
+            ->setCollectionMetadata(_opCtx, collectionMetadata);
+    }
+
+protected:
+    UUID _uuid = UUID::gen();
+    DatabaseVersion _databaseVersion{UUID::gen(), Timestamp(1, 0)};
+    DatabaseVersion _incorrectDatabaseVersion{UUID::gen(), Timestamp(3, 0)};
+    ShardVersion _shardVersion;
+    ShardVersion _incorrectShardVersion;
+    NamespaceString _nss;
+    DatabaseName _dbName;
+};
+
+TEST_F(TimeseriesWriteOpsShardedTest, PerformTimeseriesWritesFailCollectionAcquisition) {
+
+    auto scopedDss = DatabaseShardingStateMock::acquire(_opCtx, _dbName);
+    scopedDss->expectFailureDbVersionCheckWithMismatchingVersion(_databaseVersion,
+                                                                 _incorrectDatabaseVersion);
+
+    // Set the failpoint and try another insert, expect to fail
+    // TODO(SERVER-116453): Generate the stale DB or stale shard state to test this execution path
+    // and remove the failpoint.
+    setGlobalFailPoint("failCollectionAcquisition", BSON("mode" << "alwaysOn"));
+    ON_BLOCK_EXIT([&] {
+        setGlobalFailPoint("failCollectionAcquisition", BSON("mode" << "off"));
+        auto& oss{OperationShardingState::get(_opCtx)};
+        oss.resetShardingOperationFailedStatus();
+    });
+
+    const auto request = std::invoke([this] {
+        write_ops::InsertCommandRequest request(
+            _nss,
+            std::vector{fromjson(R"({_id: 0, time:{$date:"2025-12-31T12:00:00.000Z"}, foo: 1})"),
+                        fromjson(R"({_id: 1, time:{$date:"2025-12-31T12:00:01.000Z"}, foo: 2})"),
+                        fromjson(R"({_id: 2, time:{$date:"2025-12-31T12:00:02.000Z"}, foo: 3})")});
+
+        request.setDatabaseVersion(_incorrectDatabaseVersion);
+        request.setShardVersion(_incorrectShardVersion);
+        return request;
+    });
+
+    const auto preConditions =
+        timeseries::CollectionPreConditions::getCollectionPreConditions(_opCtx, _nss, _uuid);
+
+
+    const auto cmdReply =
+        timeseries::write_ops::performTimeseriesWrites(_opCtx, request, preConditions);
+
+    EXPECT_EQ(0, cmdReply.getN());
+    EXPECT_TRUE(!cmdReply.getRetriedStmtIds() || cmdReply.getRetriedStmtIds().value().empty())
+        << "Expect retries to be boost::none or empty container";
+    ASSERT_FALSE(cmdReply.getWriteErrors().value_or(std::vector<write_ops::WriteError>{}).empty())
+        << "A write error related to shard or database version should exist";
+    const auto status = cmdReply.getWriteErrors()->front().getStatus();
+    EXPECT_EQ(status.code(), ErrorCodes::FailPointEnabled) << status;
+}
+
+
+// Verify that the invariant in performAtomicTimeseriesWrites fires when a transform update
+// changes control.min.time.
+#ifdef MONGO_CONFIG_DEBUG_BUILD
+using TimeseriesWriteOpsDeathTest = TimeseriesWriteOpsTest;
+DEATH_TEST_F(TimeseriesWriteOpsDeathTest,
+             PerformAtomicTimeseriesWritesInvariantFailsWhenControlMinTimeChanges,
+             "control.min.time must not change in a bucket update") {
+    const BSONObj bucketDoc = ::mongo::fromjson(
+        R"({"_id":{"$oid":"629e1e680958e279dc29a517"},
+            "control":{"version":1,"min":{"time":{"$date":"2022-06-06T15:34:00.000Z"},"a":1,"b":1},
+                                   "max":{"time":{"$date":"2022-06-06T15:34:30.000Z"},"a":3,"b":3}},
+            "data":{"time":{"0":{"$date":"2022-06-06T15:34:30.000Z"},
+                            "1":{"$date":"2022-06-06T15:34:30.000Z"},
+                            "2":{"$date":"2022-06-06T15:34:30.000Z"}},
+                    "a":{"0":1,"1":2,"2":3},
+                    "b":{"0":1,"1":2,"2":3}}})");
+    OID bucketId = OID::createFromString("629e1e680958e279dc29a517"sv);
+    auto compressionResult = timeseries::compressBucket(bucketDoc, "time", _nsNoMeta, false);
+    ASSERT_TRUE(compressionResult.compressedBucket.has_value());
+    const BSONObj compressedBucket = compressionResult.compressedBucket.value();
+
+    const auto bucketsNss = _resolveTimeseriesNss(_nsNoMeta);
+    AutoGetCollection bucketsColl(_opCtx, bucketsNss, LockMode::MODE_IX);
+    {
+        WriteUnitOfWork wunit{_opCtx};
+        ASSERT_OK(Helpers::insert(_opCtx, *bucketsColl, compressedBucket));
+        wunit.commit();
+    }
+
+    // Delta diff that changes control.min.time -- this must trigger the invariant.
+    // performAtomicTimeseriesWrites only handles kDelta updates, so we use the doc_diff format.
+    auto badDiff = BSON(
+        "scontrol" << BSON("smin" << BSON("u" << BSON("time" << Date_t::fromMillisSinceEpoch(0)))));
+    mongo::write_ops::UpdateModification::DiffOptions diffOptions;
+    write_ops::UpdateModification u(
+        badDiff, write_ops::UpdateModification::DeltaTag{}, diffOptions);
+    write_ops::UpdateOpEntry update(BSON("_id" << bucketId), std::move(u));
+    write_ops::UpdateCommandRequest op(bucketsNss, {update});
+
+    write_ops::WriteCommandRequestBase base;
+    base.setBypassDocumentValidation(true);
+    base.setStmtIds(std::vector<StmtId>{kUninitializedStmtId});
+    op.setWriteCommandRequestBase(std::move(base));
+    op.setCollectionUUID(bucketsColl->uuid());
+
+    auto preConditions = timeseries::CollectionPreConditions::getCollectionPreConditions(
+        _opCtx, _nsNoMeta, /*expectedUUID=*/boost::none);
+    uassertStatusOK(timeseries::write_ops::internal::performAtomicTimeseriesWrites(
+        _opCtx, preConditions, {}, {op}));
+}
+#endif  // MONGO_CONFIG_DEBUG_BUILD
+
+}  // namespace
+}  // namespace mongo

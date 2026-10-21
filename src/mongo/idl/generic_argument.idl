@@ -1,0 +1,561 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/basic_types.h"
+        - "mongo/idl/generic_argument.h"
+        - "mongo/db/versioning_protocol/shard_version.h"
+    mod_visibility: public
+
+imports:
+    - "mongo/client/read_preference_setting.idl"
+    - "mongo/db/admission/execution_control/execution_admission_type.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/feature_flag.idl"
+    - "mongo/db/repl/read_concern.idl"
+    - "mongo/db/repl/read_concern_args.idl"
+    - "mongo/db/repl/replication_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/topology/vector_clock/vector_clock.idl"
+    - "mongo/db/version_context.idl"
+    - "mongo/db/write_concern_options.idl"
+    - "mongo/rpc/metadata/audit_metadata.idl"
+    - "mongo/db/sharding_environment/sharding_types.idl"
+    - "mongo/db/router_role/gossiped_routing_cache.idl"
+    - "mongo/db/transaction/transaction_runtime_context.idl"
+
+structs:
+    IFRSenderVersion:
+        description: >-
+            The full binary version of the sender of a request, decomposed into its numeric
+            components so that receivers can compare it against another version. The components
+            mirror 'VersionInfoInterface' (major.minor.patch plus an 'extra' component that encodes
+            pre-release ordering: e.g. a release-candidate build sorts *before* the corresponding
+            final release). Comparing two 'IFRSenderVersion's lexicographically in
+            (major, minor, patch, extra) order therefore yields correct version ordering, including
+            at patch-release granularity. This is intentionally finer-grained than an FCV string
+            (e.g. "9.0") so IFR flags shipped in patch releases can be resolved correctly.
+        strict: true
+        generate_comparison_operators: true
+        fields:
+            major:
+                type: int
+                comparison_order: 0
+            minor:
+                type: int
+                comparison_order: 1
+            patch:
+                type: int
+                comparison_order: 2
+            extra:
+                type: int
+                comparison_order: 3
+                validator: {lte: 0}
+
+    GenericArguments:
+        description: "Arguments accepted by all commands."
+        strict: false
+        is_generic_cmd_list: "arg"
+        # Note that the _types_ of these fields are not checked for API version compatibility!
+        # Historically, these types were parsed and serialized directly from BSON by hand-written
+        # C++ code. The API compatibility checker does not enforce stability of the types of these fields,
+        # only of their names (i.e. that none are removed or have their name changed).
+        fields:
+            # The only value supported today is "1".
+            apiVersion:
+                type: string
+                forward_to_shards: false
+                optional: true
+                stability: "stable"
+            # When set to true, this causes commands outside the declared API version to return an
+            # APIStrictError and causes indexes unsupported by the current API version to be
+            # ignored by the query planner. If this field is specified, 'apiVersion' must also be
+            # specified.
+            apiStrict:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "stable"
+            # When set to true, this causes commands and behaviours that are deprecated in the
+            # current API version to return an APIDeprecationError. If this field is specified,
+            # 'apiVersion' must also be specified.
+            apiDeprecationErrors:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "stable"
+
+            # Common across all commands that target a database resource.
+            # Typical commands will require appropriate privileges on the specified database.
+            # The IDL compiler injects this directly into command requests, so we ignore it here.
+            # $db:
+            #     type: database_name
+            #     cpp_name: "dbName"
+            #     forward_to_shards: false
+            #     ignore: true
+            #     stability: "stable"
+
+            # A user-specified integer value dictating the maximum time that can be spent executing this query,
+            # in milliseconds.
+            maxTimeMS:
+                type: exactInt64
+                validator: {gte: 0, lte: 2147483647} # [0, 2^31 - 1]
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Specifies the read concern for the operation.
+            readConcern:
+                type: ReadConcern
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Specifies the write concern for the operation. Operations received by shard and config servers should
+            # always have write concern explicitly specified.
+            # 'j' option can only be used when the host has journaling enabled.
+            # w: 1 and w: "majority" are the only write concerns supported on a standalone node.
+            writeConcern:
+                type: WriteConcern
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Unique id of the session to attach this operation to. It is invalid to set this in a direct client. If
+            # the uid is included, then the hash must match that of the logged-in user.
+            lsid:
+                type: LogicalSessionFromClient
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Used by mongos to mark the requests it generates as part of a single sharded query.
+            clientOperationKey:
+                type: uuid
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Strictly-increasing counter set by the transaction API to match the txnNumber of the corresponding
+            # retryable write or transaction. Only allowed on a replica set member or mongos. Must be nonnegative.
+            # If txnNumber is provided, lsid must also be provided.
+            txnNumber:
+                type: TxnNumber
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Retryable writes and transactions share many of the same parameters (lsid, txnNumber, stmtId).
+            # The `autocommit` field is used to differentiate between transactions and retryable writes, in
+            # order to determine how those parameters should be interpreted.
+            # `autocommit: false` indicates that the operation is part of a transaction.
+            # No `autocommit` field indicates that the operation is part of a retryable write (if retryable
+            # writes are enabled).
+            # `autocommit: true` is invalid.
+            autocommit:
+                type: bool
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # When set to true, identifies this operation as the first operation in a transaction.
+            # `startTransaction: false` is invalid, the startTransaction field must be unset or set to true.
+            # Requires `autocommit: false`. It is invalid to set this in a direct client.
+            startTransaction:
+                type: bool
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Uniquely identifies an individually retryable operation within a retryable write or transaction.
+            # Should be nonnegative or -1. A value of -1 indicates an uninitialized/unassigned stmtId.
+            stmtId:
+                type: StmtId
+                forward_to_shards: true
+                # Various write commands treat this argument differently, so we ignore it at the generic argument
+                # level and instead defer to the individual commands' definitions of it. They should all use the same
+                # serialization rules, though.
+                #
+                # Note that if a command does not include a stmtId field in its definition, the re-serialized BSON
+                # of a parsed instance of that command struct will not contain stmtId, even if the original request
+                # did.
+                ignore: true
+                stability: "stable"
+            # User-specified comment associated to the query.
+            comment:
+                type: IDLAnyTypeOwned
+                forward_to_shards: true
+                optional: true
+                stability: "stable"
+            # Describes how clients route read operations to the members of a replica sets. Allowed values: object with
+            # the read preference. Set by the client, or by the node where the operation was generated.
+            $readPreference:
+                type: readPreference
+                cpp_name: "readPreference"
+                forward_to_shards: false
+                optional: true
+                stability: "stable"
+            # Top level logical clock of the cluster, it ticks whenever any data-bearing member does a write, it is
+            # gossiped with drivers, so they use causal consistency, and it is persisted by way of the timestamps on
+            # oplog entries on replicated writes. Allowed values: Timestamp with a valid majority write. Set by
+            # primary nodes in a cluster.
+            $clusterTime:
+                type: ClusterTime
+                cpp_name: "dollarClusterTime"
+                forward_to_shards: false
+                optional: true
+                stability: "stable"
+            # General container for end user and client information that needs to be propagated from a mongos to a config server
+            # or shard for audit logging.
+            # Allowed values: a BSON object with an optional username, a required
+            # (but possibly empty) array of rolenames, and an optional nested BSON object with an array of IP addresses representing
+            # the source and any intermediate clients a request passed through. See AuditMetadata for more details.
+            # Authorization: The client must possess the `impersonate` action on the `cluster` resource to set this field.
+            $audit:
+                type: AuditMetadata
+                cpp_name: "dollarAudit"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Optionally encodes ClientMetadata (see src/mongo/rpc/metadata/client_metadata.h).
+            # These are diagnostic and statistical tags, not meant to have functional effects.
+            $client:
+                type: object_owned
+                cpp_name: "dollarClient"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            $configServerState:
+                type: object_owned
+                cpp_name: "dollarConfigServerState"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # See: src/mongo/rpc/metadata/oplog_query_metadata.h.
+            $oplogQueryData:
+                type: IDLAnyTypeOwned
+                cpp_name: "dollarOplogQueryData"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Object wrapping the directives for the query engine; currently it only accepts a readPreference
+            # field indicating from which node (primary/secondary/nearest) the sharded data should be fetched.
+            $queryOptions:
+                type: object_owned
+                cpp_name: unwrappedReadPref
+                forward_to_shards: true
+                optional: true
+                stability: "internal"
+            # See: src/mongo/rpc/metadata/repl_set_metadata.h.
+            $replData:
+                type: IDLAnyTypeOwned
+                cpp_name: "dollarReplData"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Represents the version of a recently created database. It is changed every time a database is dropped, or
+            # it was moved with a movePrimary DDL. Allowed values: an object with a (UUID, Timestamp, int) that uniquely
+            # identifies an incarnation of a database in a cluster and reflects changes to the database's primary shard.
+            # Set by the config server.
+            databaseVersion:
+                type: database_version
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # When set to true, the query engine will not execute the provided query, but rather return a description
+            # of the requested command.
+            help:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Represents a point in time where the collection was created and it had a specific data placement within the
+            # cluster. Allowed values: includes a collection generation and a placement version, collection generation
+            # changes under some DDL like refineCollectionShardKey, reshardCollection, renameCollection, drop and recreate.
+            # Placement version is bumped once there is a data movement (a range or a chunk was moved from one shard to
+            # another successfully). Set by the primary node of a shard or the config server in some cases.
+            shardVersion:
+                type: shard_version
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            tracking_info:
+                type: object_owned
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Used by mongos to select the current shard as the coordinator for a cross-shard transaction. The coordinator
+            # will coordinate between all shards to ultimately commit or abort the transaction.
+            coordinator:
+                type: bool
+                forward_to_shards: true
+                optional: true
+                stability: "internal"
+            # An integer value dictating the maximum time that can be spent executing this query, in milliseconds.
+            # Specified by mongos on each request made to the shards, so that the total execution time doesn't exceed
+            # the user-provided maxTimeMS.
+            maxTimeMSOpOnly:
+                type: exactInt64
+                validator: {callback: "::mongo::validateMaxTimeMSOpOnly"}
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Internal flag signaling that the execution time of the query is constrained by the default setting for
+            # maxTimeMS, not by a user-provided value. When set to true, aborted operations will be reported in a
+            # separate metric.
+            usesDefaultMaxTimeMS:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Logical clock based on the majority write of the config server. It ticks when the majority commit point
+            # advances on the config server primary. It is gossiped internally in the cluster in requests and responses
+            # between mongos, config servers and shards. The values are the actual majority point timestamps of the
+            # config server primary node. Allowed values: Timestamp with a valid config server majority write. Set by
+            # the config server.
+            $configTime:
+                type: timestamp
+                cpp_name: "dollarConfigTime"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Topology logical clock, it is internal to the cluster and is gossiped on requests and responses between
+            # mongos, config servers and shards. It is ticked by the config server primary whenever the topology of the
+            # cluster changes (as in, a shard is added or removed). Allowed values: a Timestamp greater or equal to a
+            # cluster time. It is not  necessarily an oplog time. Set by the config server.
+            $topologyTime:
+                type: timestamp
+                cpp_name: "dollarTopologyTime"
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Retry counter for transactions. Must be nonnegative.
+            txnRetryCounter:
+                type: TxnRetryCounter
+                forward_to_shards: true
+                optional: true
+                stability: "internal"
+            # Immutable object that holds metadata related to snapshots of the system state taken by operations aware of
+            # the  feature compatibility version. Allowed values: an object with the version information. Set by the
+            # primary node of a shard.
+            versionContext:
+                type: version_context
+                forward_to_shards: false
+                description: "Snapshot of the FCV used by the operation,
+                    which ensures that feature flag checks are stable through its execution."
+                optional: true
+                stability: "internal"
+            # Indicates whether or not a write-based command should be allowed even if the server is blocking user writes as part
+            # of user write blocking mode.
+            # Allowed values: true or false.
+            # Authorization: This field can only be set if the client possesses action type `internal` on the `cluster` resource.
+            mayBypassWriteBlocking:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Indicates whether write-based commands should be allowed even if the server is blocking
+            # user writes as part of replica set writes blocking.
+            # Authorization: This field can only be set if the client possesses action type `internal`
+            # or `bypassReplicaSetWritesBlocking` on the `cluster` resource.
+            mayBypassReplicaSetWritesBlocking:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Specifies whether or not database names are expected to be prefixed with a tenantID
+            # in command requests. The multitenancySupport flag needs to be enabled for expectPrefix
+            # to take effect. Note that since serverless is deprecated, this will likely be removed
+            # entirely in the future.
+            # Allowed values: true or false.
+            # Authorization: The field is only appended when forwarding requests that presented a security token
+            # with the Atlas Proxy protocol. Security tokens are only allowed from internal thread Clients
+            # or if an external client possesses action type `useTenant` on the `cluster` resource.
+            expectPrefix:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Specifies an array of strings treated as names of collections; on return, the reply
+            # will contain an extra field 'routingCacheGossip' holding the collection version number
+            # for each of the requested collections, taken from the catalog cache of the server.
+            requestGossipRoutingCache:
+                type: array<IDLAnyTypeOwned>
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Used to add a shard as a participant to a transaction. The originating participant attaches
+            # `startOrContinueTransaction: true` on the request it is sending to the targeted shard.
+            startOrContinueTransaction:
+                type: bool
+                forward_to_shards: true
+                optional: true
+                stability: "internal"
+            # Requires the action type performRawDataOperations. Specifies whether the operation
+            # should be a "raw data" operation. For collections that store their information in
+            # a different format than what users interact with, "raw data" operations will operate
+            # directly on the stored format. For collections where the storage and interaction
+            # format are the same, 'rawData' has no effect but may still be specified.
+            rawData:
+                type: optionalBool
+                # Even though we do want this field to be forwarded to shards, we set
+                # forward_to_shards to false because it gets manually appended upon egress.
+                forward_to_shards: false
+                stability: "internal"
+            # Set by the router when a user directly targets a system.buckets namespace.
+            # This flag must be propagated to shards because mongos lacks FCV awareness,
+            # it cannot reliably evaluate whether BlockDirectSystemBucketsAccess is enabled
+            # for the current cluster version. Enforcement is therefore delegated to the shards.
+            isDirectSystemBucketsAccess:
+                type: optionalBool
+                # Even though this field is forwarded to shards, forward_to_shards is set to
+                # false because the standard mechanism only forwards fields present in the
+                # original command BSON. This flag is set on the OperationContext after parsing,
+                # so it is not present there. Instead, the egress metadata hook manually appends
+                # it when forwarding the request to a shard or config server. See also: rawData.
+                forward_to_shards: false
+                stability: "internal"
+            # Set by the router when the command originates from an external (user) client
+            # connection. This allows mongod to distinguish user operations routed through
+            # mongos from internal system operations (e.g. resharding, balancer) for metrics
+            # purposes such as read preference counters.
+            isExternalClientOnRouter:
+                type: optionalBool
+                # Manually appended by the egress metadata hook, not present in the original
+                # command BSON. See also: rawData, isDirectSystemBucketsAccess.
+                forward_to_shards: false
+                stability: "internal"
+            # Set by the router on versioned requests to indicate how many times the router loop has
+            # retried this operation on a StaleConfig error.
+            staleConfigRetryAttempt:
+                type: safeInt
+                validator: {gte: 0}
+                # Manually appended by the egress metadata hook from an OperationContext decoration,
+                # not present in the original command BSON.
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Set by the router to indicate that the transaction was initiated by the server itself
+            # (an internal transaction) rather than explicitly by a user. This lets the shard
+            # participant attribute its transaction lifecycle counters and metrics as internal vs.
+            # external.
+            isServerInitiatedTransaction:
+                type: bool
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Contains context fields of the current transaction
+            transactionRuntimeContext:
+                type: TransactionRuntimeContext
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Records IFR flags from the router's IFRContext. This ensures consistent view of feature flag across nodes
+            # throughout the query's execution. Currently, used only in Agg command pipeline.
+            ifrFlags:
+                type: array<IFRFlagWireEntry>
+                # This is manually forwarded on appropriate operations.
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # The sender's full binary version, decomposed into numeric components (see
+            # IFRSenderVersion). Used by the receiver to resolve IFR flags that were active on the
+            # receiver but absent from the payload: if ifrSenderVersion < flag.introductionVersion
+            # the flag defaults to false (sender predates the flag); otherwise the receiver uses its
+            # local default (sender is newer and has likely removed/promoted the flag). Carrying the
+            # full binary version rather than an FCV string lets this comparison stay correct when
+            # IFR flags ship in patch releases (a 9.0.1 router and a 9.0.5 shard report distinct
+            # versions instead of both reporting "9.0").
+            ifrSenderVersion:
+                type: IFRSenderVersion
+                # This is manually forwarded on appropriate operations.
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Requests a specific priority or task type for execution control for the command.
+            # Authorization: This field can only be set if the client possesses action type `internal` on the `cluster` resource.
+            executionAdmissionContextType:
+                type: ExecutionAdmissionType
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+
+    GenericReplyFields:
+        description: "Fields that may appear in any command reply."
+        strict: false
+        is_generic_cmd_list: "reply"
+        # The unstable fields here are marked as "internal" rather than actually "unstable" because otherwise the
+        # server internally parsing a command reply that contained one of the unstable fields along with
+        # apiStrict: true would fail at no fault to the user. apiStrict doesn't really make sense to use with reply
+        # parsing, but it's very difficult to audit the codebase to ensure it isn't being used for that. That said,
+        # the drawback here is mostly just aesthetic--as far as the API compatibility checker is concerned, "internal"
+        # and "unstable" are both considered unstable, so we don't lose any functionality here or risk breaking any stable
+        # fields.
+        fields:
+            $clusterTime:
+                type: ClusterTime
+                cpp_name: "dollarClusterTime"
+                forward_from_shards: false
+                optional: true
+                stability: "stable"
+            operationTime:
+                type: logicalTime
+                forward_from_shards: false
+                optional: true
+                stability: "stable"
+            # Timed elapsed to initialize the sharding state for the config server. Used for initialization statistics. Allowed
+            # values: Integer with the time elapsed for the initialization.
+            $configServerState:
+                type: object_owned
+                cpp_name: "dollarConfigServerState"
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            $gleStats:
+                type: object_owned
+                cpp_name: "dollarGleStats"
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            lastCommittedOpTime:
+                type: optime
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            readOnly:
+                type: bool
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            additionalParticipants:
+                type: array<object_owned>
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            $configTime:
+                type: timestamp
+                cpp_name: "dollarConfigTime"
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            $replData:
+                type: object_owned
+                cpp_name: "dollarReplData"
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            $topologyTime:
+                type: timestamp
+                cpp_name: "dollarTopologyTime"
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            $oplogQueryData:
+                type: object_owned
+                cpp_name: "dollarOplogQueryData"
+                forward_from_shards: false
+                optional: true
+                stability: "internal"
+            ok:
+                type: safeBool
+                forward_from_shards: true
+                optional: true
+                stability: "internal"
+            routingCacheGossip:
+                type: array<GossipedRoutingCache>
+                forward_from_shards: false
+                optional: true
+                stability: "internal"

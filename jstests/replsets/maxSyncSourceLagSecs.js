@@ -1,49 +1,76 @@
 // Test that setting maxSyncSourceLagSecs causes the set to change sync target
-(function() {
-    "use strict";
-    var name = "maxSyncSourceLagSecs";
-    var replTest = new ReplSetTest({name: name,
-                                    nodes: 3,
-                                    oplogSize: 5,
-                                    nodeOptions: {setParameter: "maxSyncSourceLagSecs=3"}});
-    var nodes = replTest.nodeList();
-    replTest.startSet();
-    replTest.initiate({"_id": name,
-                       "members": [
-                           { "_id": 0, "host": nodes[0], priority: 3 },
-                           { "_id": 1, "host": nodes[1], priority: 0 },
-                           { "_id": 2, "host": nodes[2], priority: 0 }],
-                      });
+//
+// This test requires the fsync command to ensure members experience a delay.
+// @tags: [requires_fsync]
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {syncFrom} from "jstests/replsets/rslib.js";
 
-    var master = replTest.getMaster();
-    master.getDB("foo").bar.save({a: 1});
-    replTest.awaitReplication();
-    var slaves = replTest.liveNodes.slaves;
+let name = "maxSyncSourceLagSecs";
+let replTest = new ReplSetTest({
+    name: name,
+    nodes: [
+        {rsConfig: {priority: 3}},
+        {rsConfig: {priority: 0}},
+        {rsConfig: {priority: 0}, setParameter: "maxSyncSourceLagSecs=3"},
+    ],
+    oplogSize: 5,
+});
+let nodes = replTest.nodeList();
+replTest.startSet();
+replTest.initiate();
+replTest.awaitNodesAgreeOnPrimary();
+let primary = replTest.getPrimary();
+let secondaries = replTest.getSecondaries();
 
-    // need to put at least maxSyncSourceLagSecs b/w first op and subsequent ops
-    // so that the shouldChangeSyncSource logic goes into effect
-    sleep(4000);
+// The default WC is majority and stopServerReplication could prevent satisfying any majority
+// writes.
+assert.commandWorked(
+    primary.adminCommand({
+        setDefaultRWConcern: 1,
+        defaultWriteConcern: {w: 1},
+        writeConcern: {w: "majority"},
+    }),
+);
 
-    jsTestLog("Setting sync target of slave 2 to slave 1");
-    assert.commandWorked(slaves[1].getDB("admin").runCommand({replSetSyncFrom: slaves[0].name}));
-    assert.soon(function() {
-            return (replTest.status().members[2].syncingTo === slaves[0].name);
-        }, "sync target not changed to other slave");
-    printjson(replTest.status());
+replTest.awaitReplication();
 
-    jsTestLog("Lock slave 1 and add some docs. Force sync target for slave 2 to change to primary");
-    assert.commandWorked(slaves[0].getDB("admin").runCommand({fsync:1, lock: 1}));
-    master.getDB("foo").bar.save({a: 2});
+syncFrom(secondaries[0], primary, replTest);
+syncFrom(secondaries[1], primary, replTest);
+primary.getDB("foo").bar.save({a: 1});
+replTest.awaitReplication();
 
-    assert.soon(function() {
-            return (replTest.status().members[2].syncingTo === master.name);
-        }, "sync target not changed back to primary");
-    printjson(replTest.status());
+jsTestLog("Setting sync target of secondary 2 to secondary 1");
+syncFrom(secondaries[1], secondaries[0], replTest);
+printjson(replTest.status());
 
-    assert.soon(function() {
-            return (slaves[1].getDB("foo").bar.count() === 2);
-        }, "slave should have caught up after syncing to primary.");
+// need to put at least maxSyncSourceLagSecs b/w first op and subsequent ops
+// so that the shouldChangeSyncSource logic goes into effect
+sleep(4000);
 
-    assert.commandWorked(slaves[0].getDB("admin").fsyncUnlock());
-    replTest.stopSet();
-}());
+jsTestLog(
+    "Lock secondary 1 and add some docs. Force sync target for secondary 2 to change to primary",
+);
+assert.commandWorked(secondaries[0].getDB("admin").runCommand({fsync: 1, lock: 1}));
+
+assert.soon(
+    function () {
+        primary.getDB("foo").bar.insert({a: 2});
+        let res = secondaries[1].getDB("admin").runCommand({"replSetGetStatus": 1});
+        let primaryHost = TestData.usePriorityPorts ? primary.priorityHost : primary.name;
+        return res.syncSourceHost === primaryHost;
+    },
+    "sync target not changed back to primary",
+    100 * 1000,
+    2 * 1000,
+);
+printjson(replTest.status());
+
+assert.soon(function () {
+    return (
+        secondaries[1].getDB("foo").bar.count({a: 1}) > 0 &&
+        secondaries[1].getDB("foo").bar.count({a: 2}) > 0
+    );
+}, "secondary should have caught up after syncing to primary.");
+
+assert.commandWorked(secondaries[0].getDB("admin").fsyncUnlock());
+replTest.stopSet();

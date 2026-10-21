@@ -1,203 +1,235 @@
-// sorted_data_interface_test_bulkbuilder.cpp
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-/**
- *    Copyright (C) 2014 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
-
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
-#include <boost/scoped_ptr.hpp>
-
+#include "mongo/db/record_id.h"
+#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/unittest/unittest.h"
 
+#include <boost/move/utility_core.hpp>
+
 namespace mongo {
+namespace {
 
-    using boost::scoped_ptr;
+// Add a key using a bulk builder.
+TEST_F(SortedDataInterfaceTest, BuilderAddKey) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-    // Add a key using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddKey ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
-
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, loc1));
+        txn.commit();
     }
 
-    // Add a compound key using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddCompoundKey ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx(), recoveryUnit()));
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+/*
+ * Add a KeyString using a bulk builder.
+ */
+TEST_F(SortedDataInterfaceTest, BuilderAddKeyString) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
+    key_string::Builder keyString1(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
 
-            ASSERT_OK( builder->addKey( compoundKey1a, loc1 ) );
-            builder->commit( false );
-        }
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
+
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), keyString1.getValueCopy());
+        txn.commit();
     }
 
-    // Add the same key multiple times using a bulk builder and verify that
-    // the returned status is ErrorCodes::DuplicateKey when duplicates are
-    // not allowed.
-    TEST( SortedDataInterface, BuilderAddSameKey ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx(), recoveryUnit()));
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+// Add a reserved RecordId using a bulk builder.
+TEST_F(SortedDataInterfaceTest, BuilderAddKeyWithReservedRecordIdLong) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), false ) );
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
 
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            ASSERT_EQUALS( ErrorCodes::DuplicateKey, builder->addKey( key1, loc2 ) );
-            builder->commit( false );
-        }
+        RecordId reservedLoc(record_id_helpers::reservedIdFor(
+            record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long));
+        ASSERT(record_id_helpers::isReserved(reservedLoc));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, reservedLoc));
+        txn.commit();
     }
 
-    // Add the same key multiple times using a bulk builder and verify that
-    // the returned status is OK when duplicates are allowed.
-    TEST( SortedDataInterface, BuilderAddSameKeyWithDupsAllowed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx(), recoveryUnit()));
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+// Add a compound key using a bulk builder.
+TEST_F(SortedDataInterfaceTest, BuilderAddCompoundKey) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true /* allow duplicates */ ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            ASSERT_OK( builder->addKey( key1, loc2 ) );
-            builder->commit( false );
-        }
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
-        }
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), compoundKey1a, loc1));
+        txn.commit();
     }
 
-    // Add multiple keys using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddMultipleKeys ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(1, sorted->numEntries(opCtx(), recoveryUnit()));
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+// Add the same key multiple times using a bulk builder results in an invalid index with duplicates.
+TEST_F(SortedDataInterfaceTest, BuilderAddSameKey) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/true, /*partial=*/false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            ASSERT_OK( builder->addKey( key2, loc2 ) );
-            ASSERT_OK( builder->addKey( key3, loc3 ) );
-            builder->commit( false );
-        }
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, loc1));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, loc2));
+        txn.commit();
     }
 
-    // Add multiple compound keys using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddMultipleCompoundKeys ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx(), recoveryUnit()));
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+// Add the same key multiple times using a bulk builder and verify that
+// the returned status is OK when duplicates are allowed.
+TEST_F(SortedDataInterfaceTest, BuilderAddSameKeyWithDupsAllowed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
 
-            ASSERT_OK( builder->addKey( compoundKey1a, loc1 ) );
-            ASSERT_OK( builder->addKey( compoundKey1b, loc2 ) );
-            ASSERT_OK( builder->addKey( compoundKey1c, loc4 ) );
-            ASSERT_OK( builder->addKey( compoundKey2b, loc3 ) );
-            ASSERT_OK( builder->addKey( compoundKey3a, loc5 ) );
-            builder->commit( false );
-        }
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 5, sorted->numEntries( opCtx.get() ) );
-        }
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, loc1));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, loc2));
+        txn.commit();
     }
 
-} // namespace mongo
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx(), recoveryUnit()));
+}
+
+/*
+ * Add the same KeyString multiple times using a bulk builder and verify that the returned status is
+ * OK when duplicates are allowed.
+ */
+TEST_F(SortedDataInterfaceTest, BuilderAddSameKeyStringWithDupsAllowed) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    key_string::Builder keyStringLoc1(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
+    key_string::Builder keyStringLoc2(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc2);
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
+
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), keyStringLoc1.getValueCopy());
+        builder->addKey(recoveryUnit(), keyStringLoc2.getValueCopy());
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(2, sorted->numEntries(opCtx(), recoveryUnit()));
+}
+
+// Add multiple keys using a bulk builder.
+TEST_F(SortedDataInterfaceTest, BuilderAddMultipleKeys) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
+
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key1, loc1));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key2, loc2));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), key3, loc3));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx(), recoveryUnit()));
+}
+
+/*
+ * Add multiple KeyStrings using a bulk builder.
+ */
+TEST_F(SortedDataInterfaceTest, BuilderAddMultipleKeyStrings) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    key_string::Builder keyString1(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
+    key_string::Builder keyString2(
+        sorted->getKeyStringVersion(), key2, sorted->getOrdering(), loc2);
+    key_string::Builder keyString3(
+        sorted->getKeyStringVersion(), key3, sorted->getOrdering(), loc3);
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
+
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), keyString1.getValueCopy());
+        builder->addKey(recoveryUnit(), keyString2.getValueCopy());
+        builder->addKey(recoveryUnit(), keyString3.getValueCopy());
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(3, sorted->numEntries(opCtx(), recoveryUnit()));
+}
+
+// Add multiple compound keys using a bulk builder.
+TEST_F(SortedDataInterfaceTest, BuilderAddMultipleCompoundKeys) {
+    const auto sorted(
+        harnessHelper()->newSortedDataInterface(opCtx(), /*unique=*/false, /*partial=*/false));
+
+    ASSERT(sorted->isEmpty(opCtx(), recoveryUnit()));
+
+    {
+        const auto builder(sorted->makeBulkBuilder(opCtx(), recoveryUnit()));
+
+        StorageWriteTransaction txn(recoveryUnit());
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), compoundKey1a, loc1));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), compoundKey1b, loc2));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), compoundKey1c, loc4));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), compoundKey2b, loc3));
+        builder->addKey(recoveryUnit(), makeKeyString(sorted.get(), compoundKey3a, loc5));
+        txn.commit();
+    }
+
+    ASSERT_EQUALS(5, sorted->numEntries(opCtx(), recoveryUnit()));
+}
+
+}  // namespace
+}  // namespace mongo

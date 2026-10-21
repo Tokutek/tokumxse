@@ -1,62 +1,74 @@
-// signal_handlers.h
-
-/**
-*    Copyright (C) 2010 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
+#include "mongo/util/duration.h"
+#include "mongo/util/modules.h"
+
+[[MONGO_MOD_PUBLIC]];
+
 namespace mongo {
 
-    /**
-     * Sets up handlers for signals and other events like terminate and new_handler.
-     *
-     * This must be called very early in main, before runGlobalInitializers().
-     *
-     * installControlCHandler - true means the program would like to setup its on Control-C handler
-     *                        - used by command line tools
-     */
-    void setupSignalHandlers(bool installControlCHandler);
+enum class LogFileStatus {
+    kNeedToRotateLogFile,
+    kNoLogFileToRotate,
+};
 
-    /**
-     * Starts the thread to handle asynchronous signals.
-     *
-     * This must be the first thread started from the main thread. Call this immediately after
-     * initializeServerGlobalState().
-     */
-    void startSignalProcessingThread();
+struct LogRotationState {
+    static constexpr auto kNever = static_cast<time_t>(-1);
+    LogFileStatus logFileStatus;
+    time_t previous;
+};
 
-    /*
-     * Uninstall the Control-C handler
-     *
-     * Windows Only
-     * Used by nt services to remove the Control-C handler after the system knows it is running
-     * as a service, and not as a console program.
-     */
-    void removeControlCHandler();
+/**
+ * Sets up handlers for signals and other events like terminate and new_handler.
+ *
+ * This must be called very early in main, before runGlobalInitializers().
+ */
+void setupSignalHandlers();
 
-} // namespace mongo
+/**
+ * Registers a user-defined callback to be invoked on the asynchronous signal handling thread
+ * after processing of a signal, but before process exit.
+ *
+ * Clobbers the previously-registered callback. Only called by asynchronous signals expected
+ * to terminate the process.
+ */
+[[MONGO_MOD_PUBLIC]] void setSignalPostProcessingCallback_forTest(std::function<void()> cb);
+
+/**
+ * Registers a user-defined callback to be invoked on the asynchronous signal handling thread
+ * when the log rotation signal is received.
+ *
+ * Clobbers the previously-registered callback. Should only be called during server
+ * intialization. Expected to be called once per process.
+ */
+void setLogRotationCallback(std::function<void(LogRotationState*)> cb);
+
+/**
+ * Starts the thread to handle asynchronous signals.
+ *
+ * This must be the first thread started from the main thread.
+ */
+void startSignalProcessingThread(LogFileStatus rotate = LogFileStatus::kNeedToRotateLogFile);
+
+/**
+ * Starts a thread that randomly picks a victim thread at randomized intervals and sends a signal
+ * to that thread in an effort to cause system calls to randomly fail with EINTR. Only works
+ * on linux, does nothing on other platforms.
+ *
+ * The given period is the average interval at which victim threads are signalled.
+ */
+void startSignalTestingThread(Milliseconds period);
+
+/*
+ * Uninstall the Control-C handler
+ *
+ * Windows Only
+ * Used by nt services to remove the Control-C handler after the system knows it is running
+ * as a service, and not as a console program.
+ */
+void removeControlCHandler();
+
+}  // namespace mongo

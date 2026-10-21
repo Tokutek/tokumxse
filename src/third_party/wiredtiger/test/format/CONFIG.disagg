@@ -1,0 +1,25 @@
+############################################
+#  RUN PARAMETERS: V3
+############################################
+# A configuration for disaggregated storage.
+backup=0
+background_compact=0
+block_cache=0
+# FIXME-WT-14738: Enable reverse collator once it is available for layered tables.
+btree.reverse=0
+checkpoint=on
+precise_checkpoint=1
+disagg.page_log=palite
+disagg.enabled=1
+disagg.layered=1
+runs.source=layered
+runs.type=row-store
+runs.tables=3
+import=0
+ops.alter=0
+ops.compaction=0
+ops.salvage=0
+ops.throttle=0
+quiet=0
+runs.in_memory=0
+transaction.timestamps=1

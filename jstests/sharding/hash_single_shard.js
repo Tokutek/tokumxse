@@ -1,15 +1,19 @@
 // Test hashed presplit with 1 shard.
-// @tags : [ hashed ]
 
-var st = new ShardingTest({ shards: 1 });
-var testDB = st.getDB('test');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
-//create hashed shard key and enable sharding
-testDB.adminCommand({ enablesharding: "test" });
-testDB.adminCommand({ shardCollection: "test.collection", key: { a: "hashed" }});
+let st = new ShardingTest({shards: 1});
+let testDB = st.getDB("test");
 
-//check the number of initial chunks.
-assert.eq(2, st.getDB('config').chunks.count(),
-    'Using hashed shard key but failing to do correct presplitting');
+// create hashed shard key and enable sharding
+testDB.adminCommand({enablesharding: "test"});
+testDB.adminCommand({shardCollection: "test.collection", key: {a: "hashed"}});
+
+// check the number of initial chunks.
+assert.eq(
+    1,
+    findChunksUtil.countChunksForNs(st.getDB("config"), "test.collection"),
+    "Using hashed shard key but failing to do correct presplitting",
+);
 st.stop();
-

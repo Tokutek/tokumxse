@@ -1,220 +1,164 @@
-/**
- * Copyright 2011 (c) 10gen Inc.
- *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 
-#include "mongo/db/pipeline/document_source.h"
-
-#include <boost/shared_ptr.hpp>
-
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/query/find_constants.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/explain_policy.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/serialization_context.h"
+
+#include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using boost::shared_ptr;
-    using std::string;
+ALLOCATE_DOCUMENT_SOURCE_ID(cursor, DocumentSourceCursor::id);
 
-    DocumentSourceCursor::~DocumentSourceCursor() {
-        dispose();
+using boost::intrusive_ptr;
+using std::string;
+
+std::string_view DocumentSourceCursor::getSourceName() const {
+    return kStageName;
+}
+
+Value DocumentSourceCursor::serialize(const query_shape::SerializationOptions& opts) const {
+    // We never parse a DocumentSourceCursor, so we only serialize for explain. Since it's never
+    // part of user input, there's no need to compute its query shape.
+    if (!opts.isSerializingForExplain() || opts.isShapifying()) {
+        return Value();
     }
 
-    const char *DocumentSourceCursor::getSourceName() const {
-        return "$cursor";
+    tassert(10422502, "PlanExecutor is null", _sharedState->exec);
+
+    uassert(50660,
+            "Mismatch between verbosity passed to serialize() and expression context verbosity",
+            opts.verbosity == getExpCtx()->getExplain());
+
+    MutableDocument out;
+
+    BSONObjBuilder explainStatsBuilder;
+    tassert(
+        10769400, "Expected the plannerContext to be set for explain", _plannerContext.has_value());
+
+    BSONObj extraInfo = BSON("cursorType" << toString(_cursorType));
+    Explain::explainStages(
+        _sharedState->exec.get(),
+        *_plannerContext,
+        opts.verbosity.value(),
+        _sharedState->execStatus,
+        _winningPlanTrialStats,
+        extraInfo,
+        SerializationContext::stateCommandReply(getExpCtx()->getSerializationContext()),
+        BSONObj(),
+        &explainStatsBuilder);
+
+    BSONObj explainStats = explainStatsBuilder.obj();
+    tassert(11294806, "Missing queryPlanner field in explain stats", explainStats["queryPlanner"]);
+    out["queryPlanner"] = Value(explainStats["queryPlanner"]);
+
+    if (explainPolicyFor(opts.verbosity.value()).hasExecStats()) {
+        tassert(11294805,
+                "Missing executionStats field in explain stats",
+                explainStats["executionStats"]);
+        out["executionStats"] = Value(explainStats["executionStats"]);
     }
 
-    boost::optional<Document> DocumentSourceCursor::getNext() {
-        pExpCtx->checkForInterrupt();
+    return Value(DOC(getSourceName() << out.freezeToValue()));
+}
 
-        if (_currentBatch.empty()) {
-            loadBatch();
-
-            if (_currentBatch.empty()) // exhausted the cursor
-                return boost::none;
-        }
-
-        Document out = _currentBatch.front();
-        _currentBatch.pop_front();
-        return out;
-    }
-
-    void DocumentSourceCursor::dispose() {
-        // Can't call in to PlanExecutor or ClientCursor registries from this function since it
-        // will be called when an agg cursor is killed which would cause a deadlock.
-        _exec.reset();
-        _currentBatch.clear();
-    }
-
-    void DocumentSourceCursor::loadBatch() {
-        if (!_exec) {
-            dispose();
-            return;
-        }
-
-        // We have already validated the sharding version when we constructed the PlanExecutor
-        // so we shouldn't check it again.
-        const NamespaceString nss(_ns);
-        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
-
-        _exec->restoreState(pExpCtx->opCtx);
-
-        int memUsageBytes = 0;
-        BSONObj obj;
-        PlanExecutor::ExecState state;
-        while ((state = _exec->getNext(&obj, NULL)) == PlanExecutor::ADVANCED) {
-            if (_dependencies) {
-                _currentBatch.push_back(_dependencies->extractFields(obj));
-            }
-            else {
-                _currentBatch.push_back(Document::fromBsonWithMetaData(obj));
-            }
-
-            if (_limit) {
-                if (++_docsAddedToBatches == _limit->getLimit()) {
-                    break;
-                }
-                verify(_docsAddedToBatches < _limit->getLimit());
-            }
-
-            memUsageBytes += _currentBatch.back().getApproximateSize();
-
-            if (memUsageBytes > MaxBytesToReturnToClientAtOnce) {
-                // End this batch and prepare PlanExecutor for yielding.
-                _exec->saveState();
-                return;
-            }
-        }
-
-        // If we got here, there won't be any more documents, so destroy the executor. Can't use
-        // dispose since we want to keep the _currentBatch.
-        _exec.reset();
-
-        uassert(16028, "collection or index disappeared when cursor yielded",
-                state != PlanExecutor::DEAD);
-
-        uassert(17285, "cursor encountered an error: " + WorkingSetCommon::toStatusString(obj),
-                state != PlanExecutor::FAILURE);
-
-        massert(17286, str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
-                state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
-    }
-
-    void DocumentSourceCursor::setSource(DocumentSource *pSource) {
-        /* this doesn't take a source */
-        verify(false);
-    }
-
-    long long DocumentSourceCursor::getLimit() const {
-        return _limit ? _limit->getLimit() : -1;
-    }
-
-    bool DocumentSourceCursor::coalesce(const intrusive_ptr<DocumentSource>& nextSource) {
-        // Note: Currently we assume the $limit is logically after any $sort or
-        // $match. If we ever pull in $match or $sort using this method, we
-        // will need to keep track of the order of the sub-stages.
-
-        if (!_limit) {
-            _limit = dynamic_cast<DocumentSourceLimit*>(nextSource.get());
-            return _limit.get(); // false if next is not a $limit
-        }
-        else {
-            return _limit->coalesce(nextSource);
-        }
-
-        return false;
-    }
-
-    Value DocumentSourceCursor::serialize(bool explain) const {
-        // we never parse a documentSourceCursor, so we only serialize for explain
-        if (!explain)
-            return Value();
-
-        // Get planner-level explain info from the underlying PlanExecutor.
-        BSONObjBuilder explainBuilder;
-        {
-            const NamespaceString nss(_ns);
-            AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
-
-            massert(17392, "No _exec. Were we disposed before explained?", _exec);
-
-            _exec->restoreState(pExpCtx->opCtx);
-            Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
-            _exec->saveState();
-        }
-
-        MutableDocument out;
-        out["query"] = Value(_query);
-
-        if (!_sort.isEmpty())
-            out["sort"] = Value(_sort);
-
-        if (_limit)
-            out["limit"] = Value(_limit->getLimit());
-
-        if (!_projection.isEmpty())
-            out["fields"] = Value(_projection);
-
-        // Add explain results from the query system into the agg explain output.
-        BSONObj explainObj = explainBuilder.obj();
-        invariant(explainObj.hasField("queryPlanner"));
-        out["queryPlanner"] = Value(explainObj["queryPlanner"]);
-
-        return Value(DOC(getSourceName() << out.freezeToValue()));
-    }
-
-    DocumentSourceCursor::DocumentSourceCursor(const string& ns,
-                                               const boost::shared_ptr<PlanExecutor>& exec,
-                                               const intrusive_ptr<ExpressionContext> &pCtx)
-        : DocumentSource(pCtx)
-        , _docsAddedToBatches(0)
-        , _ns(ns)
-        , _exec(exec)
-    {}
-
-    intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
-            const string& ns,
-            const boost::shared_ptr<PlanExecutor>& exec,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        return new DocumentSourceCursor(ns, exec, pExpCtx);
-    }
-
-    void DocumentSourceCursor::setProjection(
-            const BSONObj& projection,
-            const boost::optional<ParsedDeps>& deps) {
-        _projection = projection;
-        _dependencies = deps;
+void DocumentSourceCursor::detachSourceFromOperationContext() {
+    // Only detach the underlying executor if it hasn't been detached already.
+    if (_sharedState->exec && _sharedState->exec->getOpCtx()) {
+        _sharedState->exec->detachFromOperationContext();
     }
 }
+
+void DocumentSourceCursor::reattachSourceToOperationContext(OperationContext* opCtx) {
+    if (_sharedState->exec && _sharedState->exec->getOpCtx() != opCtx) {
+        _sharedState->exec->reattachToOperationContext(opCtx);
+    }
+}
+
+DocumentSourceCursor::~DocumentSourceCursor() {
+    if (!_sharedState->execStageCreated) {
+        _sharedState->exec->dispose(getExpCtx()->getOperationContext());
+    }
+}
+
+DocumentSourceCursor::DocumentSourceCursor(
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const intrusive_ptr<ExpressionContext>& pCtx,
+    CursorType cursorType,
+    ResumeTrackingType resumeTrackingType)
+    : DocumentSource(kStageName, pCtx),
+      _resumeTrackingType(resumeTrackingType),
+      _cursorType(cursorType),
+      _queryFramework(exec->getQueryFramework()),
+      _sharedState(std::make_shared<CursorSharedState>(
+          CursorSharedState{.exec = std::move(exec), .execStatus = Status::OK()})) {
+    // It is illegal for both 'kEmptyDocuments' to be set and resumeTrackingType to be other than
+    // 'kNone'.
+    uassert(ErrorCodes::InvalidOptions,
+            "The resumeToken is not compatible with this query",
+            cursorType != CursorType::kEmptyDocuments ||
+                resumeTrackingType == ResumeTrackingType::kNone);
+}
+
+void DocumentSourceCursor::bindCatalogInfo(
+    const MultipleCollectionAccessor& collections,
+    boost::intrusive_ptr<ShardRoleTransactionResourcesStasherForPipeline> stasher) {
+    _catalogResourceHandle = make_intrusive<DSCursorCatalogResourceHandle>(stasher);
+
+    // Later code in the DocumentSourceCursor lifecycle expects that '_exec' is in a saved state.
+    _sharedState->exec->saveState();
+
+    auto&& explainer = _sharedState->exec->getPlanExplainer();
+    explainer.getSummaryStats(&_sharedState->stats.planSummaryStats);
+
+    if (getExpCtx()->getExplain()) {
+        // It's safe to access the executor even if we don't have the collection lock since we're
+        // just going to call getStats() on it.
+        _winningPlanTrialStats = explainer.getWinningPlanTrialStats();
+        _plannerContext = Explain::makePlannerContext(*_sharedState->exec, collections);
+    }
+
+    if (collections.hasMainCollection()) {
+        const auto& coll = collections.getMainCollection();
+        CollectionIndexUsageTrackerDecoration::recordCollectionIndexUsage(
+            coll.get(),
+            _sharedState->stats.planSummaryStats.collectionScans,
+            _sharedState->stats.planSummaryStats.collectionScansNonTailable,
+            _sharedState->stats.planSummaryStats.indexesUsed);
+    }
+    for (const auto& [nss, acq] : collections.getSecondaryCollectionAcquisitions()) {
+        const auto& coll = acq.getCollectionPtr();
+        if (coll) {
+            PlanSummaryStats stats;
+            explainer.getSecondarySummaryStats(nss, &stats);
+            CollectionIndexUsageTrackerDecoration::recordCollectionIndexUsage(
+                coll.get(),
+                stats.collectionScans,
+                stats.collectionScansNonTailable,
+                stats.indexesUsed);
+        }
+    }
+}
+
+intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const intrusive_ptr<ExpressionContext>& pExpCtx,
+    CursorType cursorType,
+    ResumeTrackingType resumeTrackingType) {
+    return make_intrusive<DocumentSourceCursor>(
+        std::move(exec), pExpCtx, cursorType, resumeTrackingType);
+}
+}  // namespace mongo

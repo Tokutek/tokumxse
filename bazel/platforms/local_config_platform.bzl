@@ -1,0 +1,165 @@
+load("//bazel/platforms:psmdb_rbe_containers.bzl", "PSMDB_REMOTE_EXECUTION_CONTAINERS")
+load("//bazel/platforms:remote_execution_containers.bzl", "REMOTE_EXECUTION_CONTAINERS")
+load("//bazel/platforms:normalize.bzl", "ARCH_NORMALIZE_MAP", "ARCH_TO_PLATFORM_MAP", "OS_TO_PLATFORM_MAP")
+load("//bazel/toolchains/cc/mongo_linux:mongo_toolchain_version.bzl", "TOOLCHAIN_MAP")
+load("//bazel:utils.bzl", "get_host_distro_major_version")
+
+def _setup_local_config_platform(ctx):
+    """
+    Generates our own local_config_platform, overriding bazel's built in generation.
+
+    This allows is to setup the exec_properties on this platform so a user can use remote execution
+    without need to specify a specific platform.
+    """
+
+    if "win" in ctx.os.name:
+        os = "windows"
+    elif "mac" in ctx.os.name:
+        os = "macos"
+    else:
+        os = "linux"
+
+    raw_arch = ctx.os.arch
+    toolchain_arch = ARCH_NORMALIZE_MAP[raw_arch]
+
+    os_constraint = OS_TO_PLATFORM_MAP[os]
+    arch_constraint = ARCH_TO_PLATFORM_MAP[toolchain_arch]
+
+    constraints = [os_constraint, arch_constraint]
+    if os == "macos":
+        constraints.append("@//bazel/platforms:use_mongo_native_apple_toolchain")
+
+    # So Starlark doesn't throw an indentation error when this gets injected.
+    constraints_str = ",\n        ".join(['"%s"' % c for c in constraints])
+
+    # Keep the execution platform in sync with the image used by the wrapper. These
+    # values are declared in the repository rule's environ list below so changing an
+    # override also regenerates the platform and its action identity.
+    distro = (
+        ctx.os.environ.get("MONGO_HERMETIC_CONTAINER_DISTRO") or
+        get_host_distro_major_version(ctx)
+    )
+    arch = toolchain_arch
+    if arch == "x86_64":
+        arch = "amd64"
+    elif arch == "aarch64":
+        arch = "arm64"
+
+    # PSMDB RBE workers register with explicit Pool=x86_64 / Pool=aarch64
+    # (see jenkins-pipelines IaC/buildbarn/ondemand/compose/config/
+    # ondemand-pools.yaml `bazel_pool_value`). Upstream's default of
+    # "default" for non-amd64 was for EngFlow's ARM64 pool naming; we
+    # diverge here so the routing key matches our worker registration.
+    # Mirrors the same change in bazel/platforms/platform_util.bzl for the
+    # explicit //bazel/platforms:<distro>_<arch> targets.
+    remote_execution_pool = "x86_64" if arch == "amd64" else "aarch64"
+    result = None
+    platform_key = "{distro}_{arch}".format(distro = distro, arch = arch)
+    toolchain_key = "{distro}_{arch}".format(distro = distro, arch = toolchain_arch)
+    print("Trying to find toolchain for {}".format(toolchain_key))
+    toolchain_exists = False
+    for version in TOOLCHAIN_MAP:
+        if toolchain_key in TOOLCHAIN_MAP[version]:
+            toolchain_exists = True
+            break
+
+    cache_silo = '"cache-silo-key": "' + platform_key + '",' if ctx.os.environ.get("evergreen_remote_exec") == "off" else ""
+    if ctx.os.environ.get("USE_NATIVE_TOOLCHAIN") == "1":
+        constraints_str += ',\n        "@//bazel/platforms:use_native_toolchain"'
+        exec_props = ""
+        result = {"USE_NATIVE_TOOLCHAIN": "1"}
+    elif distro != None and distro in REMOTE_EXECUTION_CONTAINERS:
+        constraints_str += ',\n        "@//bazel/platforms:use_mongo_toolchain"'
+        constraints_str += ',\n        "@//bazel/platforms:%s"' % (distro)
+
+        # PSMDB override: prefer PSMDB-specific image map for distros we serve
+        # via the RBE cluster (see bazel/platforms/psmdb_rbe_containers.bzl
+        # for the registry URL) so the auto-generated host platform's
+        # container-image routes to an RBE worker queue. Distros not overridden in
+        # PSMDB_REMOTE_EXECUTION_CONTAINERS fall through to upstream's
+        # quay.io image unchanged. Mirrors the override done in
+        # bazel/platforms/platform_util.bzl for the explicit
+        # //bazel/platforms:<distro>_<arch> targets. See
+        # bazel/platforms/psmdb_rbe_containers.bzl for rationale and
+        # maintenance procedure. An explicit MONGO_HERMETIC_CONTAINER_IMAGE
+        # env var (upstream) still wins over both maps when set.
+        psmdb_entry = PSMDB_REMOTE_EXECUTION_CONTAINERS.get(distro)
+        container_url = (
+            ctx.os.environ.get("MONGO_HERMETIC_CONTAINER_IMAGE") or
+            (psmdb_entry["container-url"] if psmdb_entry else REMOTE_EXECUTION_CONTAINERS[distro]["container-url"])
+        )
+        web_url = REMOTE_EXECUTION_CONTAINERS[distro]["web-url"]
+        dockerfile = REMOTE_EXECUTION_CONTAINERS[distro]["dockerfile"]
+        print("Local host platform is configured to use this container if doing remote execution: {} built from {}".format(web_url, dockerfile))
+        exec_props = """
+    exec_properties = {
+        "container-image": "%s",
+        "dockerNetwork": "standard",
+        "Pool": "%s",
+        %s
+    },
+""" % (container_url, remote_execution_pool, cache_silo)
+        result = {"DISTRO": distro}
+    elif distro != None and toolchain_exists:
+        constraints_str += ',\n        "@//bazel/platforms:use_mongo_toolchain"'
+        constraints_str += ',\n        "@//bazel/platforms:%s"' % (distro)
+        result = {"DISTRO": distro}
+        exec_props = ""
+    elif os == "windows":
+        constraints_str += ',\n        "@//bazel/platforms:use_mongo_windows_toolchain_config"'
+        result = {"USE_NATIVE_TOOLCHAIN": "1"}
+        exec_props = ""
+    else:
+        result = {"USE_NATIVE_TOOLCHAIN": "1"}
+        exec_props = ""
+
+    platform_constraints_str = constraints_str
+
+    substitutions = {
+        "{constraints}": constraints_str,
+        "{platform_constraints}": platform_constraints_str,
+        "{exec_props}": exec_props,
+    }
+
+    ctx.template(
+        "host/BUILD.bazel",
+        ctx.attr.build_tpl,
+        substitutions = substitutions,
+    )
+
+    ctx.template(
+        "host/constraints.bzl",
+        ctx.attr.constraints_tpl,
+        substitutions = substitutions,
+    )
+
+    ctx.template(
+        "host/extension.bzl",
+        ctx.attr.extension_tpl,
+        substitutions = substitutions,
+    )
+
+    return result
+
+setup_local_config_platform = repository_rule(
+    implementation = _setup_local_config_platform,
+    attrs = {
+        "build_tpl": attr.label(
+            default = "//bazel/platforms:local_config_platform.BUILD",
+            doc = "Template modeling the builtin local config platform build file.",
+        ),
+        "constraints_tpl": attr.label(
+            default = "//bazel/platforms:local_config_platform_constraints.bzl",
+            doc = "Template modeling the builtin local config platform constraints file.",
+        ),
+        "extension_tpl": attr.label(
+            default = "//bazel/platforms:local_config_platform_extension.bzl",
+            doc = "Template modeling the builtin local config platform constraints file.",
+        ),
+    },
+    environ = [
+        "MONGO_HERMETIC_CONTAINER_DISTRO",
+        "MONGO_HERMETIC_CONTAINER_IMAGE",
+        "USE_NATIVE_TOOLCHAIN",
+    ],
+)

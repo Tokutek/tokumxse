@@ -1,0 +1,32 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo::test"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+structs:
+    preAndPostImagesStruct:
+        description: "Test struct storing pre/post image config params"
+        fields:
+            expireAfterSeconds:
+                description: "Amount of time before image should expire"
+                type: safeInt64
+                default: 30
+
+    testClusterParamStruct:
+        description: "Cluster server parameter struct with some test fields."
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            preAndPostImages:
+                description: "Stores config about pre/post images"
+                type: preAndPostImagesStruct
+            testStringField:
+                description: "Field to test string parsing"
+                type: string
+                default: ""

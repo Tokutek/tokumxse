@@ -1,0 +1,14 @@
+version: 1.0.0
+filters:
+  - "*":
+    approvers:
+      - 10gen/server-storage-engine-integration
+  - "oplog*":
+    approvers:
+      - 10gen/server-oplog
+  - "backup*":
+    approvers:
+      - 10gen/server-backup-restore
+  - "compact_options*":
+    approvers:
+      - 10gen/server-compact

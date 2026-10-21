@@ -1,0 +1,536 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/search/document_source_vector_search.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/agg/document_source_to_stage_registry.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/optimization/optimize.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/search/document_source_internal_search_id_lookup.h"
+#include "mongo/db/pipeline/search/search_helper_bson_obj.h"
+#include "mongo/db/query/search/mongot_options.h"
+#include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/util/scopeguard.h"
+
+
+namespace mongo {
+namespace {
+
+class DocumentSourceVectorSearchTest : service_context_test::WithSetupTransportLayer,
+                                       public AggregationContextFixture {};
+
+TEST_F(DocumentSourceVectorSearchTest, NotAllowedInTransaction) {
+    auto expCtx = getExpCtx();
+    expCtx->setUUID(UUID::gen());
+    expCtx->getOperationContext()->setInMultiDocumentTransaction();
+
+
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_THROWS_CODE(Pipeline::create({vectorStage}, expCtx),
+                       AssertionException,
+                       ErrorCodes::OperationNotSupportedInTransaction);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, NotAllowedInLookupWhenHybridSearchFlagDisabled) {
+    auto ifrCtx = IncrementalFeatureRolloutContext::forTest(std::vector<IFRFlagWireEntry>{
+        IFRFlagWireEntry{"featureFlagExtensionsInsideHybridSearch", false}});
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(getOpCtx())
+                      .ns(getExpCtx()->getNamespaceString())
+                      .ifrContext(ifrCtx)
+                      .build();
+
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    // featureFlagExtensionsInsideHybridSearch is explicitly disabled in the IFR context, so
+    // $vectorSearch is not allowed in a $lookup subpipeline.
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_FALSE(
+        vectorStage->constraints(PipelineSplitState::kUnsplit).isAllowedInLookupPipeline());
+}
+
+TEST_F(DocumentSourceVectorSearchTest, AllowedInLookupWhenHybridSearchFlagEnabled) {
+    auto ifrCtx = IncrementalFeatureRolloutContext::forTest(std::vector<IFRFlagWireEntry>{
+        IFRFlagWireEntry{"featureFlagExtensionsInsideHybridSearch", true}});
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(getOpCtx())
+                      .ns(getExpCtx()->getNamespaceString())
+                      .ifrContext(ifrCtx)
+                      .build();
+
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_TRUE(vectorStage->constraints(PipelineSplitState::kUnsplit).isAllowedInLookupPipeline());
+}
+
+TEST_F(DocumentSourceVectorSearchTest, NotAllowedInvalidFilter) {
+    // The only invalid filter is invalid MQL.
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            filter: {
+                x: {
+                    "$gibberish": false
+                }
+            }
+        }
+    })");
+
+    ASSERT_THROWS_CODE(DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       ErrorCodes::BadValue);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, NotAllowedLimitIncorrectType) {
+    // Limit argument must be correct type
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 5,
+            limit: "str"
+        }
+    })");
+
+    ASSERT_THROWS_CODE(DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       8575100);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, UnexpectedOrMissingArgumentsAllowed) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            numCandidates: 100,
+            path: "x",
+            filter: {
+                x: {
+                    "$gt": 5
+                }
+            }
+        }
+    })");
+
+    ASSERT_DOES_NOT_THROW(
+        DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()));
+
+    spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            numCandidates: 100,
+            path: "x",
+            limit: 10,
+            extra: "Here!",
+            filter: {
+                x: {
+                    "$gt": 5
+                }
+            }
+        }
+    })");
+    ASSERT_DOES_NOT_THROW(
+        DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()));
+}
+
+TEST_F(DocumentSourceVectorSearchTest, UnexpectedArgumentIsSerialized) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            numCandidates: 100,
+            path: "x",
+            limit: 10,
+            extra: "Here!",
+            filter: {
+                x: {
+                    "$gt": 5
+                }
+            }
+        }
+    })");
+    auto dsVectorSearch =
+        DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx());
+    std::vector<Value> vec;
+    dsVectorSearch->serializeToArray(vec);
+    ASSERT(
+        !vec[0].getDocument().getField("$vectorSearch").getDocument().getField("extra").missing());
+}
+
+TEST_F(DocumentSourceVectorSearchTest, RejectsUserInjectedViewName) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            viewName: "someView"
+        }
+    })");
+
+    ASSERT_THROWS_CODE(DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       12961800);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, RejectsUserInjectedCollectionUUID) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            collectionUUID: "deadbeef-dead-beef-dead-beefdeadbeef"
+        }
+    })");
+
+    ASSERT_THROWS_CODE(DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       12961800);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, RejectsUserInjectedVectorSearchCommandName) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            vectorSearch: "someCollection"
+        }
+    })");
+
+    ASSERT_THROWS_CODE(DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       12961800);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, CleanSpecWithoutTrustedFieldsParses) {
+    // Positive control: a spec without any injected trusted field parses successfully, including a
+    // field ('explain') that is mongod-owned but intentionally not rejected at parse time.
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+    ASSERT_DOES_NOT_THROW(
+        DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()));
+
+    spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            explain: {verbosity: "queryPlanner"}
+        }
+    })");
+    ASSERT_DOES_NOT_THROW(
+        DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx()));
+}
+
+TEST_F(DocumentSourceVectorSearchTest, EOFWhenCollDoesNotExist) {
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    auto vectorSearch = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), expCtx);
+    auto vectorSearchStage = exec::agg::buildStage(vectorSearch);
+    ASSERT_TRUE(vectorSearchStage->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceVectorSearchTest, HasTheCorrectStagesWhenCreated) {
+    // We want the mock to return true for isExpectedToExecuteQueries() since that will enable
+    // insertion of the idLookup stage. That means we also need mongotHost to be configured to
+    // avoid the uassert with SearchNotEnabled error.
+    unittest::ServerParameterGuard controller("mongotHost", "localhost:27017");
+    auto expCtx = getExpCtx();
+    struct MockMongoInterface final : public StubMongoProcessInterface {
+        bool inShardedEnvironment(OperationContext* opCtx) const override {
+            return false;
+        }
+
+        bool isExpectedToExecuteQueries() override {
+            return true;
+        }
+    };
+    expCtx->setMongoProcessInterface(std::make_unique<MockMongoInterface>());
+
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    auto singleVectorStage =
+        DocumentSourceVectorSearch::createFromBson(spec.firstElement(), expCtx);
+    auto vectorStage =
+        dynamic_cast<DocumentSourceVectorSearch*>(singleVectorStage.get())->desugar();
+
+    ASSERT_EQUALS(vectorStage.size(), 2UL);
+
+    const auto* vectorSearchStage =
+        dynamic_cast<DocumentSourceVectorSearch*>(vectorStage.front().get());
+    ASSERT(vectorSearchStage);
+
+    const auto* idLookupStage =
+        dynamic_cast<DocumentSourceInternalSearchIdLookUp*>(vectorStage.back().get());
+    ASSERT(idLookupStage);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, GetSortPatternReturnsOwnedVectorSearchScoreSortSpec) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx());
+    auto sortPattern = vectorStage->getSortPattern();
+    ASSERT_EQ(sortPattern.size(), 1u);
+    ASSERT_FALSE(sortPattern[0].isAscending);
+    ASSERT_TRUE(sortPattern[0].expression);
+    ASSERT_EQ(sortPattern[0].expression->getMetaType(), DocumentMetadataFields::kVectorSearchScore);
+}
+
+TEST_F(DocumentSourceVectorSearchTest, RedactsCorrectly) {
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            index: "x_index",
+            filter: {
+                x: {
+                    "$gt": 0
+                }
+            }
+        }
+    })");
+
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$vectorSearch": {
+                "filter": {
+                    "HASH<x>": {
+                        "$gt": "?number"
+                    }
+                },
+                "index": "HASH<x_index>"
+            }
+        })",
+        redact(*vectorStage));
+}
+
+TEST_F(DocumentSourceVectorSearchTest, EmptyStageRedactsCorrectly) {
+    // Mongod's contract with mongot is that we will not validate the existence (or lack thereof) of
+    // any arguments. Make sure that redaction won't choke on an empty stage.
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+        }
+    })");
+
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$vectorSearch": {
+            }
+        })",
+        redact(*vectorStage));
+}
+
+TEST_F(DocumentSourceVectorSearchTest, BadInputsRedactCorrectly) {
+    // Mongod also should not validate types or values for most parameters.
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            numCandidates: "a string",
+            index: 1000,
+            queryVector: 1.0,
+            path: 10
+        }
+    })");
+
+    auto vectorStage = DocumentSourceVectorSearch::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$vectorSearch": {
+                "index":"HASH<>"
+            }
+        })",
+        redact(*vectorStage));
+}
+
+using DocumentSourceVectorSearchDeathTest = DocumentSourceVectorSearchTest;
+
+DEATH_TEST_F(DocumentSourceVectorSearchDeathTest,
+             TassertsWhenRouterSendsExtensionFlagButExtensionNotLoaded,
+             "11632200") {
+    auto opCtx = getExpCtx()->getOperationContext();
+
+    // Set shard role to simulate request coming from mongos.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx, nss, ShardVersion::UNTRACKED(), boost::none /* databaseVersion */};
+
+    // Simulate router sending featureFlagVectorSearchExtension=true.
+    auto& flag = feature_flags::gFeatureFlagVectorSearchExtension;
+    std::vector<IFRFlagWireEntry> flagValues{IFRFlagWireEntry{flag.getName(), true}};
+    auto ifrContext = IncrementalFeatureRolloutContext::forTest(flagValues);
+
+    auto spec = fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })");
+
+    // Parse the $vectorSearch stage. Since the extension is not loaded (only the fallback parser
+    // is registered), this should trigger the tassert when the router sent the flag as true.
+    LiteParsedDocumentSource::parse(
+        nss, spec, LiteParserOptions{.ifrContext = ifrContext, .opCtx = opCtx});
+}
+
+TEST_F(DocumentSourceVectorSearchTest,
+       IsExtensionMongotPipelineReturnsTrueForVectorSearchWithReturnStoredSource) {
+    auto& flag = feature_flags::gFeatureFlagVectorSearchExtension;
+    std::vector<IFRFlagWireEntry> flagValues{IFRFlagWireEntry{flag.getName(), true}};
+    auto ifrContext = IncrementalFeatureRolloutContext::forTest(flagValues);
+
+    // Simulate that the mongot extension is loaded.
+    auto origExtensions = serverGlobalParams.extensions;
+    ScopeGuard restoreExtensions([&] { serverGlobalParams.extensions = origExtensions; });
+    serverGlobalParams.extensions.push_back(
+        std::string{search_helper_bson_obj::detail::kMongotExtensionName});
+
+    auto pipeline = std::vector<BSONObj>{fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            returnStoredSource: true
+        }
+    })")};
+
+    // With returnStoredSource: true, should still be treated as an extension pipeline.
+    ASSERT_TRUE(search_helper_bson_obj::isExtensionMongotPipeline(ifrContext, pipeline));
+    // Should NOT be treated as a legacy mongot pipeline.
+    ASSERT_FALSE(search_helper_bson_obj::isMongotPipeline(ifrContext, pipeline));
+
+    serverGlobalParams.extensions = origExtensions;
+}
+
+TEST_F(DocumentSourceVectorSearchTest,
+       IsExtensionMongotPipelineReturnsTrueForVectorSearchWithoutReturnStoredSource) {
+    auto& flag = feature_flags::gFeatureFlagVectorSearchExtension;
+    std::vector<IFRFlagWireEntry> flagValues{IFRFlagWireEntry{flag.getName(), true}};
+    auto ifrContext = IncrementalFeatureRolloutContext::forTest(flagValues);
+
+    // Simulate that the mongot extension is loaded.
+    auto origExtensions = serverGlobalParams.extensions;
+    ScopeGuard restoreExtensions([&] { serverGlobalParams.extensions = origExtensions; });
+    serverGlobalParams.extensions.push_back(
+        std::string{search_helper_bson_obj::detail::kMongotExtensionName});
+
+    auto pipeline = std::vector<BSONObj>{fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10
+        }
+    })")};
+
+    // Without returnStoredSource, should be treated as an extension pipeline.
+    ASSERT_TRUE(search_helper_bson_obj::isExtensionMongotPipeline(ifrContext, pipeline));
+    // Should NOT be a legacy mongot pipeline.
+    ASSERT_FALSE(search_helper_bson_obj::isMongotPipeline(ifrContext, pipeline));
+}
+
+TEST_F(DocumentSourceVectorSearchTest,
+       IsExtensionMongotPipelineReturnsTrueForVectorSearchWithReturnStoredSourceFalse) {
+    auto& flag = feature_flags::gFeatureFlagVectorSearchExtension;
+    std::vector<IFRFlagWireEntry> flagValues{IFRFlagWireEntry{flag.getName(), true}};
+    auto ifrContext = IncrementalFeatureRolloutContext::forTest(flagValues);
+
+    // Simulate that the mongot extension is loaded.
+    auto origExtensions = serverGlobalParams.extensions;
+    ScopeGuard restoreExtensions([&] { serverGlobalParams.extensions = origExtensions; });
+    serverGlobalParams.extensions.push_back(
+        std::string{search_helper_bson_obj::detail::kMongotExtensionName});
+
+    auto pipeline = std::vector<BSONObj>{fromjson(R"({
+        $vectorSearch: {
+            queryVector: [1.0, 2.0],
+            path: "x",
+            numCandidates: 100,
+            limit: 10,
+            returnStoredSource: false
+        }
+    })")};
+
+    // With returnStoredSource: false, should still use extension.
+    ASSERT_TRUE(search_helper_bson_obj::isExtensionMongotPipeline(ifrContext, pipeline));
+    ASSERT_FALSE(search_helper_bson_obj::isMongotPipeline(ifrContext, pipeline));
+}
+
+}  // namespace
+}  // namespace mongo

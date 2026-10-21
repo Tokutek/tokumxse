@@ -1,0 +1,141 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This IDL file describes the BSON format for a LogicalSessionId, and
+# handles the serialization to and deserialization from its BSON representation
+# for that class.
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/repl/replication_types.idl"
+
+structs:
+    LastCommittedTransaction:
+        description: "A struct representing the server status subsection on
+            the last committed transaction"
+        strict: true
+        fields:
+            operationCount:
+                type: long
+                default: 0
+            oplogOperationBytes:
+                type: long
+                default: 0
+            writeConcern:
+                type: object
+
+    PreciseCheckpointRecoveryStats:
+        description:
+            "Stats related to prepared transaction recovery from precise
+            checkpoints during startup"
+        strict: true
+        fields:
+            numReclaimedPreparedTxnsExitedPrepare:
+                type: long
+                default: 0
+            numReclaimedPreparedTxnsCommitted:
+                type: long
+                default: 0
+            numReclaimedPreparedTxnsAborted:
+                type: long
+                default: 0
+            numReclaimedPreparedTxnsRemaining:
+                type: long
+                default: 0
+            recoveryDurationMicros:
+                type: long
+                default: 0
+
+    TransactionsStats:
+        description: "A struct representing the section of the server status
+            command with information about transactions"
+        strict: true
+        fields:
+            retryableCommandsCount:
+                type: long
+                default: 0
+            retriedCommandsCount:
+                type: long
+                default: 0
+            retriedStatementsCount:
+                type: long
+                default: 0
+            transactionsCollectionWriteCount:
+                type: long
+                default: 0
+            currentActive:
+                type: long
+                default: 0
+            currentInactive:
+                type: long
+                default: 0
+            currentOpen:
+                type: long
+                default: 0
+            totalAborted:
+                type: long
+                default: 0
+            totalAbortedInternal:
+                type: long
+                default: 0
+            totalAbortedExternal:
+                type: long
+                default: 0
+            totalCommitted:
+                type: long
+                default: 0
+            totalCommittedInternal:
+                type: long
+                default: 0
+            totalCommittedExternal:
+                type: long
+                default: 0
+            totalStarted:
+                type: long
+                default: 0
+            totalStartedInternal:
+                type: long
+                default: 0
+            totalStartedExternal:
+                type: long
+                default: 0
+            totalPrepared:
+                type: long
+                default: 0
+            totalPreparedInternal:
+                type: long
+                default: 0
+            totalPreparedExternal:
+                type: long
+                default: 0
+            totalPreparedThenCommitted:
+                type: long
+                default: 0
+            totalPreparedThenCommittedInternal:
+                type: long
+                default: 0
+            totalPreparedThenCommittedExternal:
+                type: long
+                default: 0
+            totalPreparedThenAborted:
+                type: long
+                default: 0
+            totalPreparedThenAbortedInternal:
+                type: long
+                default: 0
+            totalPreparedThenAbortedExternal:
+                type: long
+                default: 0
+            currentPrepared:
+                type: long
+                default: 0
+            lastCommittedTransaction:
+                type: LastCommittedTransaction
+                optional: true
+            preciseCheckpointRecovery:
+                type: PreciseCheckpointRecoveryStats
+                optional: true

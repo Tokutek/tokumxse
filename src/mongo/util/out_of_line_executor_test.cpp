@@ -1,0 +1,225 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/out_of_line_executor.h"
+
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/executor_test_util.h"
+
+#include <atomic>
+#include <cstddef>
+#include <functional>
+#include <string>
+
+namespace mongo {
+namespace {
+
+TEST(ExecutorTest, RejectingExecutor) {
+    // Verify that the executor rejects every time and keeps an accurate count.
+    const auto exec = RejectingExecutor::make();
+
+    static constexpr size_t kCount = 1000;
+    for (size_t i = 0; i < kCount; ++i) {
+        exec->schedule([&](Status error) {
+            ASSERT_NOT_OK(error);
+            ASSERT_EQ(exec->tasksRejected.load(), (i + 1));
+        });
+    }
+}
+
+TEST(ExecutorTest, InlineQueuedCountingExecutor) {
+    // Verify that the executor accepts every time and keeps an accurate count.
+    const auto execA = InlineQueuedCountingExecutor::make();
+    const auto execB = InlineQueuedCountingExecutor::make();
+
+    // Using prime numbers so there is no chance of multiple traps
+    static constexpr size_t kCountA = 1013;
+    static constexpr size_t kCountB = 1511;
+
+    // Schedule kCountA tasks one at a time.
+    for (size_t i = 0; i < kCountA; ++i) {
+        execA->schedule([&](Status status) {
+            ASSERT_OK(status);
+            ASSERT_EQ(execA->tasksRun.load(), (i + 1));
+        });
+    }
+
+    {
+        // Schedule kCountB tasks recursively.
+        size_t i = 0;
+        std::function<void(Status)> recurseExec;
+        bool inTask = false;
+
+        recurseExec = [&](Status status) {
+            ASSERT(!std::exchange(inTask, true));
+            ASSERT_OK(status);
+
+            auto tasksRun = execB->tasksRun.load();
+            ASSERT_EQ(tasksRun, ++i);
+            if (tasksRun < kCountB) {
+                execB->schedule(recurseExec);
+            }
+
+            ASSERT(std::exchange(inTask, false));
+        };
+
+        execB->schedule(recurseExec);
+    }
+
+    // Verify that running executors together didn't change the expected counts.
+    ASSERT_EQ(execA->tasksRun.load(), kCountA);
+    ASSERT_EQ(execB->tasksRun.load(), kCountB);
+}
+
+TEST(ExecutorTest, InlineRecursiveCountingExecutor) {
+    // Verify that the executor accepts every time and keeps an accurate count.
+    const auto execA = InlineRecursiveCountingExecutor::make();
+    const auto execB = InlineRecursiveCountingExecutor::make();
+
+    // Using prime numbers so there is no chance of multiple traps
+    static constexpr size_t kCountA = 1013;
+    static constexpr size_t kCountB = 233;
+
+    // Schedule kCountA tasks one at a time.
+    for (size_t i = 0; i < kCountA; ++i) {
+        execA->schedule([&](Status status) {
+            ASSERT_OK(status);
+            ASSERT_EQ(execA->tasksRun.load(), (i + 1));
+        });
+    }
+
+    {
+        // Schedule kCountB tasks recursively.
+        size_t tasksStarted = 0;
+        size_t tasksStopped = 0;
+        std::function<void(Status)> recurseExec;
+
+        recurseExec = [&](Status status) {
+            ASSERT_EQ(tasksStopped, 0);
+            ASSERT_OK(status);
+
+            auto tasksRun = execB->tasksRun.load();
+            ASSERT_EQ(tasksRun, ++tasksStarted);
+            if (tasksRun < kCountB) {
+                execB->schedule(recurseExec);
+            }
+
+            ++tasksStopped;
+        };
+
+        execB->schedule(recurseExec);
+
+        ASSERT_EQ(tasksStarted, execB->tasksRun.load());
+        ASSERT_EQ(tasksStopped, execB->tasksRun.load());
+    }
+
+    // Verify that running executors together didn't change the expected counts.
+    ASSERT_EQ(execA->tasksRun.load(), kCountA);
+    ASSERT_EQ(execB->tasksRun.load(), kCountB);
+}
+
+DEATH_TEST(ExecutorTestDeathTest,
+           GuaranteedExecutor_MainInvalid_FallbackInvalid,
+           GuaranteedExecutor::kNoExecutorStr) {
+    // If no executor was provided, then we invariant.
+    const auto gwarExec = makeGuaranteedExecutor({});
+}
+
+DEATH_TEST(ExecutorTestDeathTest,
+           GuaranteedExecutor_MainInvalid_FallbackRejects,
+           GuaranteedExecutor::kRejectedWorkStr) {
+    // If we have a fallback and it rejects work, then we invariant.
+    const auto gwarExec = makeGuaranteedExecutor({}, RejectingExecutor::make());
+    gwarExec->schedule([](Status) { FAIL("Nothing should run the actual callback"); });
+}
+
+TEST(ExecutorTest, GuaranteedExecutor_MainInvalid_FallbackAccepts) {
+    // If we only have a fallback, then everything runs on it.
+    const auto countExec = InlineQueuedCountingExecutor::make();
+    const auto gwarExec = makeGuaranteedExecutor({}, countExec);
+
+    static constexpr size_t kCount = 1000;
+    for (size_t i = 0; i < kCount; ++i) {
+        gwarExec->schedule([&](Status status) { ASSERT_OK(status); });
+    }
+
+    ASSERT_EQ(countExec->tasksRun.load(), kCount);
+}
+
+DEATH_TEST(ExecutorTestDeathTest,
+           GuaranteedExecutor_MainRejects_FallbackInvalid,
+           GuaranteedExecutor::kRejectedWorkStr) {
+    // If we only have a main executor and it rejects work, then we invariant.
+    const auto gwarExec = makeGuaranteedExecutor(RejectingExecutor::make());
+    gwarExec->schedule([](Status) { FAIL("Nothing should run the actual callback"); });
+}
+
+DEATH_TEST(ExecutorTestDeathTest,
+           GuaranteedExecutor_MainRejects_FallbackRejects,
+           GuaranteedExecutor::kRejectedWorkStr) {
+    // If we have a main and a fallback and both reject work, then we invariant.
+    const auto gwarExec =
+        makeGuaranteedExecutor(RejectingExecutor::make(), RejectingExecutor::make());
+    gwarExec->schedule([](Status) { FAIL("Nothing should run the actual callback"); });
+}
+
+TEST(ExecutorTest, GuaranteedExecutor_MainRejects_FallbackAccepts) {
+    // If the main rejects and the fallback accepts, then run on the fallback.
+    const auto rejectExec = RejectingExecutor::make();
+    const auto countExec = InlineQueuedCountingExecutor::make();
+    const auto gwarExec = makeGuaranteedExecutor(rejectExec, countExec);
+
+    static constexpr size_t kCount = 1000;
+    for (size_t i = 0; i < kCount; ++i) {
+        gwarExec->schedule([&](Status status) { ASSERT_OK(status); });
+    }
+    ASSERT_EQ(rejectExec->tasksRejected.load(), kCount);
+    ASSERT_EQ(countExec->tasksRun.load(), kCount);
+}
+
+TEST(ExecutorTest, GuaranteedExecutor_MainAccepts_FallbackInvalid) {
+    // If the main accepts and we don't have a fallback, then run on the main.
+    const auto countExec = InlineQueuedCountingExecutor::make();
+    const auto gwarExec = makeGuaranteedExecutor(countExec, {});
+
+    static constexpr size_t kCount = 1000;
+    for (size_t i = 0; i < kCount; ++i) {
+        gwarExec->schedule([&](Status status) { ASSERT_OK(status); });
+    }
+
+    ASSERT_EQ(countExec->tasksRun.load(), kCount);
+}
+
+TEST(ExecutorTest, GuaranteedExecutor_MainAccepts_FallbackRejects) {
+    // If the main accepts and the fallback would reject, then run on the main.
+    const auto countExec = InlineQueuedCountingExecutor::make();
+    const auto rejectExec = RejectingExecutor::make();
+    const auto gwarExec = makeGuaranteedExecutor(countExec, rejectExec);
+
+    static constexpr size_t kCount = 1000;
+    for (size_t i = 0; i < kCount; ++i) {
+        gwarExec->schedule([&](Status status) { ASSERT_OK(status); });
+    }
+
+    ASSERT_EQ(countExec->tasksRun.load(), kCount);
+    ASSERT_EQ(rejectExec->tasksRejected.load(), 0);
+}
+
+TEST(ExecutorTest, GuaranteedExecutor_MainAccepts_FallbackAccepts) {
+    // If both executor accepts, then run on the main.
+    const auto countExecA = InlineQueuedCountingExecutor::make();
+    const auto countExecB = InlineQueuedCountingExecutor::make();
+    const auto gwarExec = makeGuaranteedExecutor(countExecA, countExecB);
+
+    static constexpr size_t kCount = 1000;
+    for (size_t i = 0; i < kCount; ++i) {
+        gwarExec->schedule([&](Status status) { ASSERT_OK(status); });
+    }
+
+    ASSERT_EQ(countExecA->tasksRun.load(), kCount);
+    ASSERT_EQ(countExecB->tasksRun.load(), 0);
+}
+
+}  // namespace
+}  // namespace mongo

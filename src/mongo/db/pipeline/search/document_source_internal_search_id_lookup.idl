@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+structs:
+    DocumentSourceIdLookupSpec:
+        description: Specification for $_internalSearchIdLookup stage.
+        strict: true
+        fields:
+            limit:
+                description: "Limit for the number of documents that should be returned by $_internalSearchIdLookup."
+                optional: true
+                type: safeInt64
+            viewPipeline:
+                description: >-
+                    Contains the view pipeline that should be applied after the _id lookup. This ensures the view pipeline 
+                    is serialized on the router and sent to the shards.
+                optional: true
+                type: array<object_owned>

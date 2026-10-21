@@ -1,0 +1,218 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/update/update_driver.h"
+#include "mongo/unittest/unittest.h"
+
+#include <map>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace mongo {
+namespace {
+
+// Unit tests for UpdateNode serialization. Note that these tests are, for simplicity, sensitive to
+// the order operations are serialized in (which is currently lexicographically) even though the
+// server is insensitive to this order.
+
+auto updateRoundTrip(const char* json, const std::vector<std::string> filterNames = {}) {
+    UpdateDriver driver(new ExpressionContextForTest);
+    auto bson = mongo::fromjson(json);
+    // Include some trivial array filters to allow parsing '$[<identifier>]'.
+    std::map<std::string_view, std::unique_ptr<ExpressionWithPlaceholder>> filters;
+    for (const auto& name : filterNames)
+        filters[name] = nullptr;
+    driver.parse(write_ops::UpdateModification::parseFromClassicUpdate(bson), filters);
+    return mongo::tojson(driver.serialize().getDocument().toBson(),
+                         mongo::JsonStringFormat::LegacyStrict);
+}
+
+void assertRoundTrip(const char* expr, SourceLocation loc = MONGO_SOURCE_LOCATION()) {
+    ASSERT_EQ(updateRoundTrip(expr), expr) << fmt::format("[From {}]", loc);
+}
+
+TEST(UpdateSerialization, DocumentReplacementSerializesExactly) {
+    assertRoundTrip(R"({})");
+    assertRoundTrip(R"({ "a" : 23 })");
+    assertRoundTrip(R"({ "a" : 23, "b" : false, "c" : "JSON!" })");
+    assertRoundTrip(R"({ "a" : [ 1, 2, { "three" : 3 } ] })");
+    assertRoundTrip(R"({ "a" : [], "b" : {}, "c" : null })");
+}
+
+TEST(UpdateSerialization, CurrentDateSerializesWithAddedVerbosity) {
+    assertRoundTrip(R"({ "$currentDate" : { "whattimeisit" : { "$type" : "timestamp" } } })");
+    assertRoundTrip(R"({ "$currentDate" : { "whatyearisit" : { "$type" : "date" } } })");
+    ASSERT_EQ(R"({ "$currentDate" : { "whattimeisit" : { "$type" : "timestamp" }, )"
+              R"("whatyearisit" : { "$type" : "date" } } })",
+              updateRoundTrip(R"({ "$currentDate" : { "whattimeisit" : { "$type" : "timestamp" }, )"
+                              R"("whatyearisit" : true } })"));
+}
+
+TEST(UpdateSerialization, IncrementSerializesExactly) {
+    assertRoundTrip(R"({ "$inc" : { "in.cor.per.ated" : 2147483647, "invisible" : -2 } })");
+}
+
+TEST(UpdateSerialization, MinimumSerializesExactly) {
+    std::string input = R"({ "$min" : { "e" : 2, "i" : -2 } })";
+    ASSERT_EQ(updateRoundTrip(input.c_str()), input);
+}
+
+TEST(UpdateSerialization, MaximumSerializesExactly) {
+    assertRoundTrip(R"({ "$max" : { "slacks" : 782, "tracks" : -2147483648, "x.y.z" : 0 } })");
+}
+
+TEST(UpdateSerialization, MultiplySerializesExactly) {
+    assertRoundTrip(R"({ "$mul" : { "e" : 2.71828, "pi" : 3.14 } })");
+}
+
+TEST(UpdateSerialization, RenameSerializesExactly) {
+    assertRoundTrip(R"({ "$rename" : { "name.first" : "name.fname" } })");
+}
+
+TEST(UpdateSerialization, SetSerializesExactly) {
+    assertRoundTrip(R"({ "$set" : { "a.ba.ba.45.foo" : [ null, false, NaN ] } })");
+    assertRoundTrip(R"({ "$set" : { "a.b" : 1, "a.c" : 2, "a.d.e" : 3, "a.d.f" : 4 } })");
+}
+
+TEST(UpdateSerialization, SetOnInsertSerializesExactly) {
+    assertRoundTrip(R"({ "$setOnInsert" : { "a.b.c.24" : 1, "a.b.c.d.e.24" : 2 } })");
+}
+
+TEST(UpdateSerialization, UnsetSerializesWhileDiscardingMeaninglessPayload) {
+    ASSERT_EQ(R"({ "$unset" : { "a.0.1.foo" : 1 } })",
+              updateRoundTrip(R"({ "$unset" : { "a.0.1.foo": "don't forget me" } })"));
+}
+
+TEST(UpdateSerialization, DollarPathsSerializesExactly) {
+    assertRoundTrip(R"({ "$set" : { "grades.$" : 82 } })");
+    assertRoundTrip(R"({ "$set" : { "grades.$.std" : 6 } })");
+}
+
+TEST(UpdateSerialization, DollarBracketsSerializesExactly) {
+    assertRoundTrip(R"({ "$set" : { "grades.$[]" : 82 } })");
+    assertRoundTrip(R"({ "$set" : { "grades.$[].std" : 6 } })");
+    assertRoundTrip(R"({ "$set" : { "grades.$[].questions.$[]" : 2 } })");
+    assertRoundTrip(R"({ "$set" : { "grades.$[].questions.$[].first" : 8 } })");
+}
+
+TEST(UpdateSerialization, DollarBracketsArrayFilterSerializesExactly) {
+    ASSERT_EQ(R"({ "$set" : { "grades.$[array]" : 82 } })",
+              updateRoundTrip(R"({ "$set" : { "grades.$[array]" : 82 } })", {"array"}));
+    ASSERT_EQ(R"({ "$set" : { "grades.$[array].std" : 6 } })",
+              updateRoundTrip(R"({ "$set" : { "grades.$[array].std" : 6 } })", {"array"}));
+    ASSERT_EQ(R"({ "$set" : { "grades.$[array].questions.$[filters]" : 2 } })",
+              updateRoundTrip(R"({ "$set" : { "grades.$[array].questions.$[filters]" : 2 } })",
+                              {"array", "filters"}));
+    ASSERT_EQ(
+        R"({ "$set" : { "grades.$[array].questions.$[filters].first" : 8 } })",
+        updateRoundTrip(R"({ "$set" : { "grades.$[array].questions.$[filters].first" : 8 } })",
+                        {"array", "filters"}));
+}
+
+TEST(UpdateSerialization, AddToSetSerializesWithReducedVerbosity) {
+    assertRoundTrip(R"({ "$addToSet" : { "stitch.lib" : "cool" } })");
+    assertRoundTrip(R"({ "$addToSet" : { "stitch.lib" : { "$each" : [ "cool", "sweet" ] } } })");
+    assertRoundTrip(R"({ "$addToSet" : { "stitch.lib" : { "$each" : [] } } })");
+    assertRoundTrip(R"({ "$addToSet" : { "stitch.lib" : { "$each" : [ "cool" ] } } })");
+}
+
+TEST(UpdateSerialization, PopSerializesExactly) {
+    assertRoundTrip(R"({ "$pop" : { "p.0.p" : 1 } })");
+    assertRoundTrip(R"({ "$pop" : { "p.0.p" : -1 } })");
+}
+
+TEST(UpdateSerialization, PullUpdateLanguageSerializesExactlyFindLanguageChanges) {
+    // This exercises PullNode::ObjectMatcher.
+    assertRoundTrip(R"({ "$pull" : { "lucky numbers" : [ 1, 4, 7, 82 ] } })");
+    ASSERT_EQ(
+        R"({ "$pull" : { "up" : { "$and" : [ { "push" : { "$eq" : "down" } }, { "lucky numbers" : { "$eq" : [ 1, 4, 7, 82 ] } } ] } } })",
+        updateRoundTrip(
+            R"({ "$pull" : { "up" : { "push" : "down", "lucky numbers" : [ 1, 4, 7, 82 ] } } })"));
+
+    // These exercise PullNode::WrappedObjectMatcher.
+    assertRoundTrip(R"({ "$pull" : { "up.num" : { "$gt" : 12 } } })");
+    assertRoundTrip(R"({ "$pull" : { "up.num" : { "$in" : [ 12, 13, 14 ] } } })");
+    assertRoundTrip(R"({ "$pull" : { "foo" : { "bar" : { "$gt" : 3 } } } })");
+    ASSERT_EQ(R"({ "$pull" : { "where.to.begin" : { "$regex" : "^thestart" } } })",
+              updateRoundTrip(R"({ "$pull" : { "where.to.begin" : /^thestart/ } })"));
+    // These exercise PullNode::EqualityMatcher.
+    assertRoundTrip(R"({ "$pull" : { "up.num" : 12 } })");
+    assertRoundTrip(R"({ "$pull" : { "up.num" : [ 12, 13, 14 ] } })");
+}
+
+TEST(UpdateSerialization, PushSerializesWithAddedVerbosity) {
+    ASSERT_EQ(R"({ "$push" : { "up.num" : { "$each" : [ 12 ] } } })",
+              updateRoundTrip(R"({ "$push" : { "up.num" : 12 } })"));
+    assertRoundTrip(R"({ "$push" : { "up.num" : { "$each" : [ 12 ] } } })");
+    assertRoundTrip(R"({ "$push" : { "up.num" : { "$each" : [ 12, 13, 14 ] } } })");
+
+    ASSERT_EQ(
+        R"({ "$push" : { "up.num" : { "$each" : [], "$slice" : { "$numberLong" : "3" } } } })",
+        updateRoundTrip(R"({ "$push" : { "up.num" : { "$each" : [], "$slice" : 3 } } })"));
+
+    ASSERT_EQ(
+        R"({ "$push" : { "up.num" : { "$each" : [ 12, 13, 14 ], )"
+        R"("$position" : { "$numberLong" : "3" } } } })",
+        updateRoundTrip(
+            R"({ "$push" : { "up.num" : { "$each" : [ 12, 13, 14 ] , "$position" : 3 } } })"));
+
+    // This coveres cases where $each contains non-object elements.
+    assertRoundTrip(R"({ "$push" : { "up.num" : { "$each" : [ 12, 13, 14 ], "$sort" : 1 } } })");
+    // This coveres cases where $each contains object elements.
+    assertRoundTrip(R"({ "$push" : { "up.num" : { )"
+                    R"("$each" : [ { "field" : 12 }, { "field" : 13 } ], )"
+                    R"("$sort" : { "field" : 1 } } } })");
+
+    ASSERT_EQ(
+        R"({ "$push" : { "up.num" : { "$each" : [ 12, 13, 14 ], )"
+        R"("$slice" : { "$numberLong" : "22" }, "$position" : { "$numberLong" : "3" }, )"
+        R"("$sort" : 1 } } })",
+        updateRoundTrip(
+            R"({ "$push" : { "up.num" : { )"
+            R"("$each" : [ 12, 13, 14 ] , "$slice" : 22, "$position" : 3, "$sort" : 1 } } })"));
+}
+
+TEST(UpdateSerialization, PullAllSerializesExactly) {
+    assertRoundTrip(R"({ "$pullAll" : { "no stuff" : [] } })");
+    assertRoundTrip(
+        R"({ "$pullAll" : { "up" : [ { "push" : "down", "lucky numbers" : [ 1, 4, 7, 82 ] } ] } })");
+    assertRoundTrip(R"({ "$pullAll" : { "stuff" : [ 14, false, null ] } })");
+}
+
+TEST(UpdateSerialization, BitSerializesExactly) {
+    assertRoundTrip(R"({ "$bit" : { "bitwise" : { "and" : 7 } } })");
+    assertRoundTrip(
+        R"({ "$bit" : { "bitwise" : { "and" : 7 }, "unwise" : { "or" : 63, "xor" : 255 } } })");
+}
+
+TEST(UpdateSerialization, CompoundStatementsSerialize) {
+    assertRoundTrip(R"({ "$inc" : { "in.cor.per.ated" : 2147483647, "invisible" : -2 }, )"
+                    R"("$max" : { "pi" : 3.14 }, )"
+                    R"("$mul" : { "e" : 2, "i" : -2 }, )"
+                    R"("$rename" : { "name.first" : "name.fname" }, )"
+                    R"("$set" : { "a.ba.ba.45.$" : [ null, false, NaN ] } })");
+
+    assertRoundTrip(R"({ "$addToSet" : { "stitch.lib" : { "$each" : [ "cool", "sweet" ] } }, )"
+                    R"("$pop" : { "p.0.p" : 1 }, )"
+                    R"("$pull" : { "lucky numbers" : [ 1, 4, 7, 82 ] }, )"
+                    R"("$pullAll" : { "no stuff" : [] }, )"
+                    R"("$set" : { "grades.$[].questions.$[]" : 2 } })");
+
+    assertRoundTrip(R"({ "$bit" : { "bitwise" : { "and" : 7 } }, )"
+                    R"("$currentDate" : { "whattimeisit" : { "$type" : "timestamp" } }, )"
+                    R"("$min" : { "slacks" : 782, "tracks" : -2147483648, "x.y.z" : 0 }, )"
+                    R"("$setOnInsert" : { "a.b.c.24" : 1, "a.b.c.d.e.24" : 2 }, )"
+                    R"("$unset" : { "a.0.1.foo" : 1 } })");
+}
+
+}  // namespace
+}  // namespace mongo

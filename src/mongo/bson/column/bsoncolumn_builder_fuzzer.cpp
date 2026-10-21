@@ -1,0 +1,145 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/column/bson_element_storage.h"
+#include "mongo/bson/column/bsoncolumn.h"
+#include "mongo/bson/column/bsoncolumn_expressions.h"
+#include "mongo/bson/column/bsoncolumn_fuzzer_util.h"
+#include "mongo/bson/column/bsoncolumn_test_util.h"
+#include "mongo/bson/column/bsoncolumnbuilder.h"
+#include "mongo/bson/column/simple8b_helpers.h"
+#include "mongo/bson/column/simple8b_type_util.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/util/base64.h"
+
+#include <cstring>
+
+using namespace mongo;
+
+/**
+ * Check that the BSONElement sequence passed to BSONColumnBuilder does not
+ * fatal, and that the result decodes to the original sequence we passed.
+ */
+extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
+    using namespace mongo;
+    std::forward_list<BSONObj> elementMemory;
+    std::vector<BSONElement> generatedElements;
+
+    // Generate elements from input data
+    const char* ptr = Data;
+    const char* end = Data + Size;
+    size_t totalSize = 0;
+    while (ptr < end) {
+        BSONElement element;
+        int repetition;
+        if (!mongo::bsoncolumn::createFuzzedElement(ptr, end, elementMemory, repetition, element))
+            return 0;  // Bad input string to element generation
+        int maxElementSize = (mongo::BSONObjMaxInternalSize + (1 << 10) - totalSize) / repetition;
+        if (element.size() > maxElementSize) {
+            // We want to allow the inputs to exceed max obj size, but it's not worth
+            // testing overly far ahead since our run generation can exceed the
+            // fuzzer memory limit if left unchecked.
+            return 0;
+        }
+        if (!bsoncolumn::addFuzzedElements(
+                ptr, end, elementMemory, element, repetition, generatedElements)) {
+            return 0;  // Bad input string to run generation
+        }
+        totalSize += repetition * element.size();
+    }
+
+    // Exercise the builder
+    BSONColumnBuilder builder;
+    for (auto element : generatedElements) {
+        builder.append(element);
+    }
+
+    // Verify decoding gives us original elements
+    auto diff = builder.intermediate();
+    BSONColumn col(diff.data(), diff.size());
+    auto it = col.begin();
+    for (auto elem : generatedElements) {
+        BSONElement other = *it;
+        invariant(elem.binaryEqualValues(other),
+                  str::stream() << "Decoded element: '" << it->toString()
+                                << "' does not match original: '" << elem.toString()
+                                << "'. Column: " << base64::encode(diff.data(), diff.size()));
+        invariant(it.more(),
+                  str::stream() << "There were fewer decoded elements than original. Column: "
+                                << base64::encode(diff.data(), diff.size()));
+        ++it;
+    }
+    invariant(!it.more(),
+              str::stream() << "There were more decoded elements than original. Column: "
+                            << base64::encode(diff.data(), diff.size()));
+
+    // Verify bsoncolumn::count
+    invariant(bsoncolumn::count(diff.data(), diff.size()) == generatedElements.size());
+
+    // Verify bsoncolumn::min, max, minmax
+    {
+        auto expected = bsoncolumn::expectedMinMax(generatedElements);
+
+        boost::intrusive_ptr allocator{new BSONElementStorage()};
+
+        auto minResult = bsoncolumn::min<bsoncolumn::BSONElementMaterializer>(
+            diff.data(), diff.size(), allocator);
+        invariant(minResult.first.binaryEqualValues(expected.min.first),
+                  str::stream() << "min() returned: " << minResult.first.toString()
+                                << " but expected: " << expected.min.first.toString()
+                                << ". Column: " << base64::encode(diff.data(), diff.size()));
+        if (!minResult.first.eoo()) {
+            invariant(minResult.second == expected.min.second,
+                      str::stream() << "min() returned index " << minResult.second
+                                    << " but expected index " << expected.min.second
+                                    << ". Column: " << base64::encode(diff.data(), diff.size()));
+        }
+
+        auto maxResult = bsoncolumn::max<bsoncolumn::BSONElementMaterializer>(
+            diff.data(), diff.size(), allocator);
+        invariant(maxResult.first.binaryEqualValues(expected.max.first),
+                  str::stream() << "max() returned: " << maxResult.first.toString()
+                                << " but expected: " << expected.max.first.toString()
+                                << ". Column: " << base64::encode(diff.data(), diff.size()));
+        if (!maxResult.first.eoo()) {
+            invariant(maxResult.second == expected.max.second,
+                      str::stream() << "max() returned index " << maxResult.second
+                                    << " but expected index " << expected.max.second
+                                    << ". Column: " << base64::encode(diff.data(), diff.size()));
+        }
+
+        auto [minmaxMin, minmaxMax] = bsoncolumn::minmax<bsoncolumn::BSONElementMaterializer>(
+            diff.data(), diff.size(), allocator);
+        invariant(minmaxMin.binaryEqualValues(expected.min.first),
+                  str::stream() << "minmax().first returned: " << minmaxMin.toString()
+                                << " but expected: " << expected.min.first.toString()
+                                << ". Column: " << base64::encode(diff.data(), diff.size()));
+        invariant(minmaxMax.binaryEqualValues(expected.max.first),
+                  str::stream() << "minmax().second returned: " << minmaxMax.toString()
+                                << " but expected: " << expected.max.first.toString()
+                                << ". Column: " << base64::encode(diff.data(), diff.size()));
+    }
+
+    // Verify dense: should be true iff no generated elements are EOO (skip).
+    {
+        bool hasMissing = std::any_of(generatedElements.begin(),
+                                      generatedElements.end(),
+                                      [](const BSONElement& e) { return e.eoo(); });
+        bool result = bsoncolumn::dense(diff.data(), diff.size());
+        invariant(result != hasMissing,
+                  str::stream() << "dense() returned " << result << " but hasMissing=" << hasMissing
+                                << ". Column: " << base64::encode(diff.data(), diff.size()));
+    }
+
+    // Verify binary reopen gives identical state as intermediate
+    BSONColumnBuilder reopen(diff.data(), diff.size());
+    invariant(builder.isInternalStateIdentical(reopen),
+              str::stream() << "Binary reopen does not yield equivalent state. Column: "
+                            << base64::encode(diff.data(), diff.size()));
+
+    return 0;
+}

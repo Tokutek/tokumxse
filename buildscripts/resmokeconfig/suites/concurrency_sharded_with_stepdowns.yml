@@ -1,0 +1,143 @@
+test_kind: fsm_workload_test
+
+selector:
+  roots:
+    - jstests/concurrency/fsm_workloads/**/*.js
+    - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
+  exclude_files:
+    # Disabled because MapReduce can lose cursors if the primary steps down.
+
+    # Disabled due to MongoDB restrictions and/or workload restrictions
+
+    # These workloads sometimes trigger 'Could not lock auth data update lock'
+    # errors because the AuthorizationManager currently waits for only five
+    # seconds to acquire the lock for authorization documents
+
+    # uses >100MB of data, which can overwhelm test hosts
+
+    # compact can only be run against a standalone mongod
+
+    # can cause OOM kills on test hosts
+
+    # cannot createIndex after dropDatabase without sharding first
+
+    # ChunkHelper directly talks to the config servers and doesn't support retries for network errors
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_base_partitioned.js
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_mergeChunks_partitioned.js
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_moveChunk_partitioned.js
+    - jstests/concurrency/fsm_workloads/sharded_partitioned/sharded_splitChunk_partitioned.js
+
+    # These workloads frequently time out waiting for the distributed lock to drop a sharded
+    # collection.
+
+    # Uses getmores.
+
+    # Uses non retryable writes.
+
+    # Uses non retryable commands.
+    - jstests/concurrency/fsm_workloads/ddl/collMod/collMod.js
+    - jstests/concurrency/fsm_workloads/ddl/collMod/collMod_separate_collections.js
+    - jstests/concurrency/fsm_workloads/view_catalog/view_catalog.js
+    - jstests/concurrency/fsm_workloads/view_catalog/view_catalog_cycle_lookup.js
+    - jstests/concurrency/fsm_workloads/view_catalog/view_catalog_cycle_with_drop.js
+
+    # The auto_retry_on_network_error.js override needs to overwrite the response from drop on
+    # NamespaceNotFound, and since this workload only creates and drops collections there isn't
+    # much value in running it.
+    - jstests/concurrency/fsm_workloads/ddl/drop_collection/drop_collection.js
+
+    # serverStatus does not include transaction metrics on mongos.
+
+    # Uses the same transaction id across different routers, which is not allowed because when either
+    # router tries to commit, it may not know the full participant list.
+
+    # Use non-retryable commands not allowed by the network retry helper.
+
+    # The test may spuriously fail when run against sharded clusters, due to limitations of the
+    # infrastructure. See SERVER-77039 for full details.
+
+  exclude_with_any_tags:
+    - requires_standalone
+    - assumes_against_mongod_not_mongos
+    - requires_non_retryable_writes
+    - assumes_balancer_on
+    # Curop requires readConcern local.
+    - uses_curop_agg_stage
+    # mongos has no system.profile collection.
+    - requires_profiling
+    - does_not_support_stepdowns
+    - assumes_unsharded_collection
+    # TODO (SERVER-89682): Remove this
+    - requires_getmore
+
+executor:
+  archive:
+    hooks:
+      - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
+      - ValidateCollections
+    tests: true
+  config:
+    shell_options:
+      eval: >-
+        await import("jstests/libs/override_methods/implicitly_shard_accessed_collections.js");
+      global_vars:
+        TestData:
+          runningWithConfigStepdowns: true
+          runningWithShardStepdowns: true
+          runningWithBalancer: false
+          implicitlyShardOnCreateCollectionOnly: true
+          useActionPermittedFile: [ContinuousStepdown]
+          shardCollectionProbability: 0.5
+  hooks:
+    - class: ContinuousStepdown
+      config_stepdown: true
+      shard_stepdown: true
+      is_fsm_workload: true
+      # TODO SERVER-120162: Re-enable once all the false positive have been addressed and the test is stable.
+    # - class: CheckIdleCursors
+    - class: CheckShardFilteringMetadata
+    - class: CheckReplDBHash
+    - class: CheckMetadataConsistencyInBackground
+      shell_options:
+        global_vars:
+          TestData:
+            # TODO SERVER-108424: get rid of runningWithShardStepdowns once only viewless timeseries are supported
+            runningWithShardStepdowns: true
+    - class: CheckOrphansDeleted
+    - class: CheckRoutingTableConsistency
+    - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
+    - class: CleanupConcurrencyWorkloads
+  fixture:
+    class: ShardedClusterFixture
+    enable_balancer: false
+    mongos_options:
+      set_parameters:
+        enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
+    configsvr_options:
+      num_nodes: 3
+      all_nodes_electable: true
+      mongod_options:
+        set_parameters:
+          reshardingMinimumOperationDurationMillis: 30000 # 30 seconds
+      replset_config_options:
+        settings:
+          catchUpTimeoutMillis: 0
+    shard_options:
+      all_nodes_electable: true
+      mongod_options:
+        oplogSize: 1024
+      replset_config_options:
+        settings:
+          catchUpTimeoutMillis: 0
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        enableElectionHandoff: 0
+        roleGraphInvalidationIsFatal: 1
+        queryAnalysisWriterIntervalSecs: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
+    num_rs_nodes_per_shard: 3
+    num_shards: 2
+    num_mongos: 2

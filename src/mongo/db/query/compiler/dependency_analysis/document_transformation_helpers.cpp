@@ -1,0 +1,300 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/dependency_analysis/document_transformation_helpers.h"
+
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+
+namespace mongo::document_transformation {
+
+/**
+ * Modify path which defines the new value using an Expression.
+ * These are emitted exclusively by projection executors ($set/$addFields/$project), which
+ * traverse prefix arrays element-by-element, so sibling subpaths are preserved.
+ */
+class ExpressionModifyPath final : public ModifyPath {
+public:
+    ExpressionModifyPath(std::string_view path, boost::intrusive_ptr<Expression> expr)
+        : ModifyPath(path, ModifiedPrefixPolicy::kPreserveArrays), _expr(expr) {}
+
+    bool isRemoved() const override {
+        return false;
+    }
+    bool isComputed() const override {
+        return true;
+    }
+    boost::intrusive_ptr<Expression> getExpression() const override {
+        return _expr;
+    }
+    bool canLeafBeArray() const override {
+        if (const auto* c = dynamic_cast<const ExpressionConstant*>(_expr.get())) {
+            return c->getValue().isArray();
+        }
+        return true;
+    }
+
+private:
+    const boost::intrusive_ptr<Expression> _expr;
+};
+
+/**
+ * A simple path removal, not a modification to $$REMOVE.
+ * Emitted exclusively by exclusion projection executors, which traverse prefix arrays
+ * element-by-element, so sibling subpaths are preserved.
+ */
+class RemovePath final : public ModifyPath {
+public:
+    explicit RemovePath(std::string_view path)
+        : ModifyPath(path, ModifiedPrefixPolicy::kPreserveArrays) {}
+
+    bool isRemoved() const override {
+        return true;
+    }
+    bool isComputed() const override {
+        return false;
+    }
+    boost::intrusive_ptr<Expression> getExpression() const override {
+        return nullptr;
+    }
+};
+
+namespace detail {
+
+void describeProjectedPath(DocumentOperationVisitor& visitor,
+                           std::string_view path,
+                           bool isInclusion) {
+    if (isInclusion) {
+        visitor(document_transformation::PreservePath{path});
+    } else {
+        visitor(document_transformation::RemovePath{path});
+    }
+}
+
+/**
+ * Visitor for Expressions which reports paths to a DocumentOperationVisitor for supported
+ * expressions. This fills in information which Expression::getComputedPaths does not report, but
+ * which the DocumentOperationVisitor can interpret, such as "other" renames like 'a.b': '$c.d.e'.
+ * If the Expression type is not supported, isOK() returns false, and the DocumentOperationVisitor
+ * is not called.
+ */
+class SpecializedExpressionOperationVisitor
+    : public SelectiveConstExpressionVisitorBase<SpecializedExpressionOperationVisitor> {
+public:
+    using SelectiveConstExpressionVisitorBase<SpecializedExpressionOperationVisitor>::visit;
+
+    explicit SpecializedExpressionOperationVisitor(DocumentOperationVisitor& visitor,
+                                                   std::string_view path,
+                                                   BSONDepthIndex depth)
+        : _visitor(visitor), _path(path), _depth(depth) {}
+
+    /**
+     * Returns true if DocumentOperationVisitor was called during the visit.
+     */
+    bool isOK() const {
+        return _handled;
+    }
+
+    void visit(const ExpressionFieldPath* expr) final {
+        if (expr->isVariableReference()) {
+            return;
+        }
+        const FieldPath& oldFieldPath = expr->getFieldPath();
+        if (oldFieldPath.getPathLength() == 1) {
+            return;
+        }
+        _handled = true;
+        std::string_view oldPath = oldFieldPath.tailPath();
+        BSONDepthIndex oldPathMaxArrayTraversals = std::count(oldPath.begin(), oldPath.end(), '.');
+        _visitor(RenamePathWithFixedArrayness{_path, oldPath, _depth, oldPathMaxArrayTraversals});
+    }
+
+    void visit(const ExpressionObject* expr) final {
+        _handled = true;
+        const std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>&>>& children =
+            expr->getChildExpressions();
+        for (auto&& [childField, childExpr] : children) {
+            auto childPath = FieldPath::getFullyQualifiedPath(_path, childField);
+            // The depth is used to report the maximum levels of array traversals on the left side.
+            // Since object expressions evaluate to objects, we know they will not require
+            // additional array traversal.
+            describeComputedPath(_visitor, childPath, childExpr, _depth);
+        }
+    }
+
+private:
+    DocumentOperationVisitor& _visitor;
+    const std::string_view _path;
+    const BSONDepthIndex _depth;
+    bool _handled{false};
+};
+
+/**
+ * Reports the computed paths of 'expr' into the 'visitor'.
+ * For some expression types, this may report more detailed information than
+ * Expression::getComputedPaths (since that does not report some rename cases).
+ */
+void describeComputedPath(DocumentOperationVisitor& visitor,
+                          const std::string& path,
+                          const boost::intrusive_ptr<Expression>& expr,
+                          BSONDepthIndex depth) {
+    SpecializedExpressionOperationVisitor exprVisitor{visitor, path, depth};
+    expr->acceptVisitor(&exprVisitor);
+    if (exprVisitor.isOK()) {
+        return;
+    }
+
+    auto exprComputedPaths = expr->getComputedPaths(path);
+    for (auto&& exprComputedPath : exprComputedPaths.paths) {
+        if (!exprComputedPaths.complexRenames.contains(exprComputedPath)) {
+            visitor(document_transformation::ExpressionModifyPath{exprComputedPath, expr});
+        }
+    }
+    for (auto&& [newPath, oldPath] : exprComputedPaths.renames) {
+        visitor(RenamePathWithFixedArrayness{newPath, oldPath, depth, 0});
+    }
+    for (auto&& [newPath, oldPath] : exprComputedPaths.complexRenames) {
+        visitor(RenamePathWithFixedArrayness{newPath, oldPath, depth, 1});
+    }
+}
+
+RenamePathWithFixedArrayness::RenamePathWithFixedArrayness(std::string_view newPath,
+                                                           std::string_view oldPath,
+                                                           BSONDepthIndex newPathMaxArrayTraversals,
+                                                           BSONDepthIndex oldPathMaxArrayTraversals)
+    : RenamePath(newPath, oldPath),
+      _newPathMaxArrayTraversals(newPathMaxArrayTraversals),
+      _oldPathMaxArrayTraversals(oldPathMaxArrayTraversals) {}
+
+}  // namespace detail
+
+void describeGetModPathsReturn(DocumentOperationVisitor& visitor,
+                               const GetModPathsReturnType& type,
+                               const OrderedPathSet& paths,
+                               const StringMap<std::string>& renames,
+                               const StringMap<std::string>& complexRenames) {
+    switch (type) {
+        case GetModPathsReturnType::kNotSupported:
+        case GetModPathsReturnType::kAllPaths:
+            visitor(ReplaceRoot{});
+            return;
+        case GetModPathsReturnType::kAllExcept:
+            // kAllExcept means preserved fields are known, but doesn't give any guarantees about
+            // the fields which are not listed.
+            visitor(ReplaceRoot{});
+            break;
+        case GetModPathsReturnType::kFiniteSet:
+            break;
+    }
+
+    for (const auto& path : paths) {
+        // A path in 'paths' can be:
+        // - only a preserved path, if kAllExcept
+        // - a modified path OR a complexRename, otherwise
+        if (type == GetModPathsReturnType::kAllExcept) {
+            visitor(PreservePath{path});
+        } else if (!complexRenames.contains(path)) {
+            // The DocumentOperationVisitor does not see complexRenames as modifications.
+            // Instead, it will see them as a RenamePath operation with the appropriate flags.
+            visitor(ModifyPath{path, ModifiedPrefixPolicy::kNotSupported});
+        }
+    }
+    for (const auto& [newPath, oldPath] : renames) {
+        // Simple renames means that neither path can be an array.
+        visitor(detail::RenamePathWithFixedArrayness{newPath, oldPath, 0, 0});
+    }
+    for (const auto& [newPath, oldPath] : complexRenames) {
+        // Complex renames means that oldPath can be an array and the new path cannot be.
+        visitor(detail::RenamePathWithFixedArrayness{newPath, oldPath, 0, 1});
+    }
+}
+
+void detail::GetModPathsReturnConverter::operator()(const ReplaceRoot&) {
+    tassert(11938001,
+            "When present, ReplaceRoot must be the first operation",
+            type == GetModPathsReturnType::kNotSupported);
+    type = GetModPathsReturnType::kAllPaths;
+}
+
+void detail::GetModPathsReturnConverter::operator()(const ModifyPath& op) {
+    switch (type) {
+        case GetModPathsReturnType::kNotSupported:
+            type = GetModPathsReturnType::kFiniteSet;
+            break;
+        case GetModPathsReturnType::kAllPaths:
+            // If we see ModifyPath after replace root, then this is an inclusion
+            // projection too, but we cannot report the modifications.
+            type = GetModPathsReturnType::kAllExcept;
+            return;
+        case GetModPathsReturnType::kAllExcept:
+            // GetModPathsReturn does not store modified paths when kAllExcept.
+            return;
+        case GetModPathsReturnType::kFiniteSet:
+            break;
+    }
+    paths.emplace(op.getPath());
+}
+
+void detail::GetModPathsReturnConverter::operator()(const PreservePath& op) {
+    switch (type) {
+        case GetModPathsReturnType::kNotSupported:
+            tassert(11938000,
+                    "Expected ReplaceRoot before PreservePath",
+                    type != GetModPathsReturnType::kNotSupported);
+            break;
+        case GetModPathsReturnType::kAllPaths:
+            type = GetModPathsReturnType::kAllExcept;
+            break;
+        case GetModPathsReturnType::kAllExcept:
+            break;
+        case GetModPathsReturnType::kFiniteSet:
+            // GetModPathsReturn does not store preserved paths when kFiniteSet.
+            return;
+    }
+    type = GetModPathsReturnType::kAllExcept;
+    paths.emplace(op.getPath());
+}
+
+void detail::GetModPathsReturnConverter::operator()(const RenamePath& op) {
+    switch (type) {
+        case GetModPathsReturnType::kNotSupported:
+            type = GetModPathsReturnType::kFiniteSet;
+            break;
+        case GetModPathsReturnType::kAllPaths:
+            type = GetModPathsReturnType::kAllExcept;
+            break;
+        case GetModPathsReturnType::kAllExcept:
+            break;
+        case GetModPathsReturnType::kFiniteSet:
+            break;
+    }
+    bool pathsIsModifications = type == GetModPathsReturnType::kFiniteSet;
+    BSONDepthIndex newPathArrayTraversals = op.getNewPathMaxArrayTraversals();
+    BSONDepthIndex oldPathArrayTraversals = op.getOldPathMaxArrayTraversals();
+    if (newPathArrayTraversals != 0) {
+        if (pathsIsModifications) {
+            paths.emplace(op.getNewPath());
+        }
+    } else if (oldPathArrayTraversals != 0) {
+        if (pathsIsModifications) {
+            paths.emplace(op.getNewPath());
+        }
+        if (oldPathArrayTraversals == 1) {
+            complexRenames.emplace(op.getNewPath(), op.getOldPath());
+        }
+    } else {
+        renames.emplace(op.getNewPath(), op.getOldPath());
+    }
+}
+
+GetModPathsReturn detail::GetModPathsReturnConverter::done() && {
+    if (type == GetModPathsReturnType::kNotSupported && paths.empty() && renames.empty() &&
+        complexRenames.empty()) {
+        type = GetModPathsReturnType::kFiniteSet;
+    }
+    return {type, std::move(paths), std::move(renames), std::move(complexRenames)};
+}
+
+}  // namespace mongo::document_transformation

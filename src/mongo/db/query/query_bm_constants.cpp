@@ -1,0 +1,508 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/query_bm_constants.h"
+
+#include "mongo/bson/json.h"
+
+namespace mongo {
+namespace query_benchmark_constants {
+
+// This is a snapshot of the client metadata generated from our IDHACK genny workload. The
+// specifics aren't so important, but it chosen in an attempt to be indicative of the size/shape
+// of this kind of thing "in the wild".
+const BSONObj kMockMetadataWrapper = fromjson(R"({metadata: {
+        "application" : {
+            "name" : "Genny"
+        },
+        "driver" : {
+            "name" : "mongoc / mongocxx",
+            "version" : "1.23.2 / 3.7.0"
+        },
+        "os" : {
+            "type" : "Linux",
+            "name" : "Ubuntu",
+            "version" : "22.04",
+            "architecture" : "aarch64"
+        },
+        "platform" : "cfg=0x03215e88e9 posix=200809 stdc=201710 CC=GCC 11.3.0 CFLAGS=\"-fPIC\" LDFLAGS=\"\""
+    }})");
+const BSONElement kMockClientMetadataElem =
+    query_benchmark_constants::kMockMetadataWrapper["metadata"];
+
+// Different levels of query complexity for the benchmarks.
+BSONObj queryComplexityToJSON(const QueryComplexity& complexity) {
+    switch (complexity) {
+        case QueryComplexity::kIDHack:
+            return query_benchmark_constants::kIDHackPredicate;
+        case QueryComplexity::kMildlyComplex:
+            return query_benchmark_constants::kMildlyComplexPredicate;
+        case QueryComplexity::kMkComplex:
+            return query_benchmark_constants::kComplexPredicate;
+        case QueryComplexity::kVeryComplex:
+            return query_benchmark_constants::kChangeStreamPredicate;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+const BSONObj kIDHackPredicate = fromjson("{_id: 4}");
+
+const BSONObj kMildlyComplexPredicate = fromjson(R"({
+                clientId: {$nin: ["432345", "4386945", "111111"]},
+                nEmployees: {$gte: 4, $lt: 20},
+                deactivated: false,
+                region: "US",
+                yearlySpend: {$lte: 1000}
+            })");
+
+const BSONObj kComplexPredicate = fromjson(R"({
+    "$and": [
+        {"index": {"$gte": 0, "$lt": 10}},
+        {"$or": [
+            {
+                "index": {"$in": [1, 3, 5, 7, 9]},
+                "$expr": {"$eq": [
+                    {"$mod": [{"$reduce": {"input": "$array2d", "initialValue": 0, "in": {"$add": ["$$value", {"$sum": "$$this"}]}}}, 2]},
+                    1
+                ]}
+            },
+            {
+                "index": {"$in": [0, 2, 4, 6, 8]},
+                "$expr": {"$eq": [
+                    {"$mod": [{"$reduce": {"input": "$array2d", "initialValue": 0, "in": {"$add": ["$$value", {"$sum": "$$this"}]}}}, 2]},
+                    0
+                ]}
+            }
+        ]}
+    ]
+})");
+
+const BSONObj kComplexProjection = fromjson(R"({
+    _id: 1,
+    index: 1.0,
+    array2d: 2,
+    arrayHash: {$reduce: {
+        input: "$array2d",
+        initialValue: 0,
+        in: {$mod: [
+            {$add: [
+                {$multiply: ["$$value", 31]},
+                {$reduce: {
+                    input: "$$this",
+                    initialValue: 0,
+                    in: {$mod: [{$add: [{$multiply: ["$$value", 31]}, "$$this"]}, 1000000009]}
+                }}
+            ]},
+            1000000009
+        ]}
+    }}
+
+})");
+
+const BSONObj kChangeStreamPredicate = fromjson(R"({
+  "$and": [
+    { "$or": [
+        { "$and": [
+            { "$or": [
+                { "$and": [
+                    { "$or": [
+                        { "$and": [
+                            { "o.to": { "$regex": "^test\\.coll$" } },
+                            { "o.renameCollection": { "$exists": true } }
+                          ]
+                        },
+                        { "o.collMod": { "$regex": "^coll$" } },
+                        { "o.commitIndexBuild": { "$regex": "^coll$" } },
+                        { "o.create": { "$regex": "^coll$" } },
+                        { "o.createIndexes": { "$regex": "^coll$" } },
+                        { "o.drop": { "$regex": "^coll$" } },
+                        { "o.dropIndexes": { "$regex": "^coll$" } },
+                        { "o.renameCollection": { "$regex": "^test\\.coll$" } }
+                      ]
+                    },
+                    { "op": { "$eq": "c" } },
+                    { "ns": { "$regex": "^test\\.\\$cmd$" } }
+                  ]
+                },
+                { "$and": [
+                    { "ns": { "$regex": "^test\\.coll$" } },
+                    { "$nor": [
+                        { "op": { "$eq": "n" } },
+                        { "op": { "$eq": "c" } }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            { "$or": [
+                { "$and": [
+                    { "op": { "$eq": "u" } },
+                    { "o._id": { "$exists": true } }
+                  ]
+                },
+                { "$and": [
+                    { "op": { "$eq": "c" } },
+                    { "o.drop": { "$exists": true } }
+                  ]
+                },
+                { "$and": [
+                    { "op": { "$eq": "c" } },
+                    { "o.dropDatabase": { "$exists": true } }
+                  ]
+                },
+                { "$and": [
+                    { "op": { "$eq": "c" } },
+                    { "o.renameCollection": { "$exists": true } }
+                  ]
+                },
+                { "$and": [
+                    { "op": { "$eq": "u" } },
+                    { "o._id": { "$not": { "$exists": true } } }
+                  ]
+                },
+                { "op": { "$in": [ "d", "i" ] } }
+              ]
+            }
+          ]
+        },
+        { "$and": [
+            { "$or": [
+                { "$and": [
+                    { "o.to": { "$eq": "test.coll" } },
+                    { "o.renameCollection": { "$exists": true } }
+                  ]
+                },
+                { "o.drop": { "$eq": "coll" } },
+                { "o.renameCollection": { "$eq": "test.coll" } }
+              ]
+            },
+            { "ns": { "$eq": "test.$cmd" } },
+            { "op": { "$eq": "c" } }
+          ]
+        },
+        { "$and": [
+            { "$or": [
+                { "o.applyOps": {
+                    "$elemMatch": {
+                      "$and": [
+                        { "$or": [
+                            { "o.create": { "$regex": "^coll$" } },
+                            { "o.createIndexes": { "$regex": "^coll$" } }
+                          ]
+                        },
+                        { "ns": { "$regex": "^test\\.\\$cmd$" } }
+                      ]
+                    }
+                  }
+                },
+                { "o.applyOps.ns": { "$regex": "^test\\.coll$" } },
+                { "prevOpTime": { "$not": { "$eq": 0 } } }
+              ]
+            },
+            { "op": { "$eq": "c" } },
+            { "o.partialTxn": { "$not": { "$eq": true } } },
+            { "o.prepare": { "$not": { "$eq": true } } },
+            { "o.applyOps": { "$type": [ 4 ] } }
+          ]
+        },
+        { "$and": [
+            { "$or": [
+                { "o2.refineCollectionShardKey": { "$exists": true } },
+                { "o2.reshardBegin": { "$exists": true } },
+                { "o2.reshardBlockingWrites": { "$exists": true } },
+                { "o2.reshardCollection": { "$exists": true } },
+                { "o2.reshardDoneCatchUp": { "$exists": true } },
+                { "o2.shardCollection": { "$exists": true } }
+              ]
+            },
+            { "op": { "$eq": "n" } },
+            { "ns": { "$regex": "^test\\.coll$" } }
+          ]
+        },
+        { "$and": [
+            { "o.commitTransaction": { "$eq": 1 } },
+            { "op": { "$eq": "c" } }
+          ]
+        },
+        { "$and": [
+            { "op": { "$eq": "n" } },
+            { "o2.endOfTransaction": { "$regex": "^test\\.coll$" } }
+          ]
+        }
+      ]
+    },
+    { "ts": { "$gte": 1729601565 } },
+    { "fromMigrate": { "$not": { "$eq": true } } }
+  ]
+}
+)");
+
+const BSONObj kVeryComplexProjection = fromjson(R"({
+"reflection": { "$map": {
+  "input": [ { "f": "$field", "m": 1 }, { "f": "$zipField", "m": 100 } ],
+  "as": "input",
+  "in": { "$map": {
+    "input": { "$range": [ 1, { "$size": { "$first": "$$input.f" } } ] },
+    "as": "y",
+    "in": { "$multiply": [
+      "$$input.m",
+      { "$let": {
+        "vars": {
+          "smudges": { "$reduce": {
+            "input": "$$input.f",
+            "initialValue": 0,
+            "in": { "$add": [ "$$value",
+              { "$let": {
+                "vars": { "row": "$$this" },
+                "in": { "$reduce": {
+                  "input": { "$range": [ 0, "$$y" ] },
+                  "initialValue": 0,
+                  "in": { "$let": {
+                    "vars": {
+                      "reflect": { "$arrayElemAt": [ "$$row", { "$add": [ "$$y", { "$subtract": [ "$$y", "$$this" ] }, -1 ] } ] } },
+                      "in": { "$cond":
+                        { "if": { "$or": [ { "$not": "$$reflect" }, { "$eq": [ "$$reflect", { "$arrayElemAt": [ "$$row", "$$this" ] } ] } ] },
+                          "then": "$$value",
+                          "else": { "$add": [ "$$value", 1 ] } } } } } } } } } ] } } } },
+                          "in": { "$cond": {
+                            "if": { "$eq": ["$$smudges", 1] },
+                            "then": "$$y",
+                            "else": 0
+                          } } } } ] } } } } } }
+)");
+
+// Update complexity constants for benchmarks.
+
+// A simple replacement update used in the benchmarks.
+const UpdateSpec kReplacementUpdate = {fromjson(R"({ name: "John", age: 30 })") /*u*/,
+                                       boost::none /*c*/};
+
+// An equivalent pipeline-style update, so we are benchmarking the overhead of the update style.
+const UpdateSpec kPipelineUpdateSimple = {
+    fromjson(R"([{ $set: { name: "John", age: 30 } }])") /*u*/, boost::none /*c*/};
+
+// A pipeline update that uses constants.
+const UpdateSpec kPipelineUpdateWithConstants = {
+    fromjson(R"([{ $set: { name: "$$constName", age: "$$constAge" } }])") /*u*/,
+    fromjson(R"({ constName: "John", constAge: 30 })") /*c*/};
+
+// A more complex pipeline update with multiple stages.
+const UpdateSpec kPipelineUpdateWithMultipleStages = {fromjson(R"([
+    { "$addFields": { "dessert": "Pumpkin Pie", "servings": 12 } },
+    { "$project": { "dessert": 1, "_id": 1 } }, 
+    { "$replaceRoot": { "newRoot": { "originalDoc": "$$ROOT", "napped": true } } }
+])") /*u*/,
+                                                      boost::none /*c*/};
+
+// The same pipeline structure, but using expressions instead of constants to test expression
+// shapification overhead.
+const UpdateSpec kPipelineUpdateWithMultipleStagesAndExpressions = {fromjson(R"([
+    { "$addFields": { 
+        "dessert": { "$concat": ["Pumpkin", " ", "Pie"] }, 
+        "servings": { "$multiply": [3, 4] } 
+    } },
+    { "$project": { "dessert": 1, "_id": 1 } }, 
+    { "$replaceRoot": { "newRoot": { "originalDoc": "$$ROOT", "napped": { "$eq": [1, 1] } } } }
+])") /*u*/,
+                                                                    boost::none /*c*/};
+
+UpdateSpec getUpdateSpec(const PipelineComplexity& complexity) {
+    switch (complexity) {
+        case PipelineComplexity::kSimple:
+            return kPipelineUpdateSimple;
+        case PipelineComplexity::kWithConstants:
+            return kPipelineUpdateWithConstants;
+        case PipelineComplexity::kWithMultipleStages:
+            return kPipelineUpdateWithMultipleStages;
+        case PipelineComplexity::kWithMultipleStagesAndExpressions:
+            return kPipelineUpdateWithMultipleStagesAndExpressions;
+        default:
+            MONGO_UNREACHABLE_TASSERT(11400601);
+    }
+}
+
+const UpdateSpec kModifierUpdateSimple = {.u = fromjson(R"(
+        { $set: { "grades.questions": 2 } }
+    )")};
+
+const UpdateSpec kModifierUpdateSimpleWithArrayFilters = {
+    .u = fromjson(R"(
+        { $set: { "grades.$[t].questions.$[score]": 2 } }
+    )"),
+    .arrayFilters = fromjson(R"([{"t.type": "quiz"}, {"score": {"$gte": 80}}])")};
+
+// Moderate complexity: 3 operators for progressive trend analysis
+const UpdateSpec kModifierUpdateMildlyComplex = {.u = fromjson(R"(
+        {
+            $set: { "name": "updated", "status": "active" },
+            $inc: { "count": 1, "version": 5 },
+            $push: { "tags": "newTag", "events": { "timestamp": 1234567890 } }
+        }
+    )")};
+
+const UpdateSpec kModifierUpdateMildlyComplexWithArrayFilters = {.u = fromjson(R"(
+        {
+            $set: { "items.$[i].name": "updated", "items.$[i].status": "active" },
+            $inc: { "items.$[i].count": 1, "items.$[j].version": 5 },
+            $push: { "items.$[i].tags": "newTag", "items.$[j].events": { "timestamp": 1234567890 } }
+        }
+    )"),
+                                                                 .arrayFilters = fromjson(R"([
+        {"i.price": {"$gte": 100}},
+        {"j.type": "product"}
+    ])")};
+
+// Medium complexity: 6 operators for mid-range analysis
+const UpdateSpec kModifierUpdateComplex = {.u = fromjson(R"(
+        {
+            $set: { "name": "updated", "status": "active", "metadata.version": 2 },
+            $inc: { "count": 1, "version": 5 },
+            $push: { "tags": "newTag", "events": { "timestamp": 1234567890 } },
+            $pullAll: { "queue": [1, 2, 3] },
+            $pop: { "lastInQueue": 1 },
+            $unset: { "deprecated_field": "" }
+        }
+    )")};
+
+const UpdateSpec kModifierUpdateComplexWithArrayFilters = {.u = fromjson(R"(
+        {
+            $set: { "items.$[i].name": "updated", "items.$[i].status": "active", "items.$[i].metadata.version": 2 },
+            $inc: { "items.$[i].count": 1, "items.$[j].version": 5 },
+            $push: { "items.$[i].tags": "newTag", "items.$[j].events": { "timestamp": 1234567890 } },
+            $pullAll: { "items.$[i].queue": [1, 2, 3] },
+            $pop: { "items.$[j].lastInQueue": 1 },
+            $unset: { "items.$[i].deprecated_field": "" }
+        }
+    )"),
+                                                           .arrayFilters = fromjson(R"([
+        {"i.price": {"$gte": 100}},
+        {"j.type": "product"}
+    ])")};
+
+const UpdateSpec kModifierUpdateVeryComplex = {.u = fromjson(R"(
+        {
+            $set: { "name": "updated", "status": "active", "metadata.version": 2 },
+            $inc: { "count": 1, "version": 5, "iteration": -3 },
+            $push: { "tags": "newTag", "events": { "timestamp": 1234567890, "type": "update" } },
+            $pullAll: { "queue": [1, 2, 3], "invalidIds": ["id1", "id2"] },
+            $pop: { "firstInQueue": -1, "lastInQueue": 1 },
+            $rename: { "old_field": "new_field", "legacyName": "currentName" },
+            $unset: { "deprecated_field": "", "temporary": "" },
+            $min: { "score": 50, "minRating": 1 },
+            $max: { "rating": 5, "maxAttempts": 100 },
+            $mul: { "price": 0.9, "discount": 0.8 },
+            $bit: { "flags": { "and": 255 }, "permissions": { "or": 8 }, "switches": { "xor": 3 } }
+        }
+    )")};
+
+const UpdateSpec kModifierUpdateVeryComplexWithArrayFilters = {.u = fromjson(R"(
+        {
+            $set: { "items.$[i].name": "updated", "items.$[i].status": "active" },
+            $inc: { "items.$[i].count": 1, "items.$[j].iteration": 5 },
+            $push: { "items.$[i].tags": "newTag", "items.$[j].events": { "type": "modified" } },
+            $pullAll: { "items.$[i].queue": [1, 2], "items.$[j].invalidIds": ["id1"] },
+            $pop: { "items.$[i].firstInQueue": -1, "items.$[j].lastInQueue": 1 },
+            $unset: { "items.$[i].deprecated_field": "", "items.$[j].temporary": "" },
+            $min: { "items.$[i].score": 50, "items.$[j].minRating": 1 },
+            $max: { "items.$[i].rating": 5, "items.$[j].maxAttempts": 100 },
+            $mul: { "items.$[i].price": 0.9, "items.$[j].discount": 0.8 },
+            $bit: { "items.$[i].flags": { "and": 255 }, "items.$[j].permissions": { "or": 8 } }
+        }
+    )"),
+                                                               .arrayFilters = fromjson(R"([
+        {"i.price": {"$gte": 100}},
+        {"j.type": "product"}
+    ])")};
+
+
+const UpdateSpec& getUpdateSpec(const ModifierUpdateComplexity& complexity, bool useArrayFilters) {
+    if (useArrayFilters) {
+        switch (complexity) {
+            case ModifierUpdateComplexity::kSimple:
+                return kModifierUpdateSimpleWithArrayFilters;
+            case ModifierUpdateComplexity::kMildlyComplex:
+                return kModifierUpdateMildlyComplexWithArrayFilters;
+            case ModifierUpdateComplexity::kComplex:
+                return kModifierUpdateComplexWithArrayFilters;
+            case ModifierUpdateComplexity::kVeryComplex:
+                return kModifierUpdateVeryComplexWithArrayFilters;
+            default:
+                MONGO_UNREACHABLE_TASSERT(11596700);
+        }
+    } else {
+        switch (complexity) {
+            case ModifierUpdateComplexity::kSimple:
+                return kModifierUpdateSimple;
+            case ModifierUpdateComplexity::kMildlyComplex:
+                return kModifierUpdateMildlyComplex;
+            case ModifierUpdateComplexity::kComplex:
+                return kModifierUpdateComplex;
+            case ModifierUpdateComplexity::kVeryComplex:
+                return kModifierUpdateVeryComplex;
+            default:
+                MONGO_UNREACHABLE_TASSERT(11596701);
+        }
+    }
+}
+
+// Delete benchmark constants
+
+// Let delete specs: predicates using $expr with let variables.
+
+const DeleteSpec kDeleteWithSimpleLet = {
+    .deletes = {fromjson(R"({ "$expr": { "$gt": ["$price", "$$maxPrice"] } })")},
+    .let = fromjson(R"({ "maxPrice": 100 })")};
+
+const DeleteSpec kDeleteWithComplexLet = {.deletes = {fromjson(R"({
+        "$expr": { "$and": [
+            { "$gt": [{ "$multiply": ["$price", "$quantity"] }, "$$minTotal"] },
+            { "$or": [
+                { "$eq": ["$category", "$$primaryCategory"] },
+                { "$eq": ["$category", "$$secondaryCategory"] }
+            ]},
+            { "$gte": [
+                { "$size": { "$filter": {
+                    "input": "$orders",
+                    "cond": { "$eq": ["$$this.status", "completed"] }
+                }}},
+                "$$minCompletedOrders"
+            ]},
+            { "$lte": [{ "$subtract": ["$$endDate", "$createdAt"] }, "$$maxAge"] }
+        ]}
+    })")},
+                                          .let = fromjson(R"({
+        "minTotal": 500,
+        "primaryCategory": "electronics",
+        "secondaryCategory": "appliances",
+        "endDate": 1750000000,
+        "maxAge": 86400000,
+        "minCompletedOrders": 3
+    })")};
+
+const DeleteSpec& getDeleteWithLetSpec(const LetDeleteComplexity& complexity) {
+    switch (complexity) {
+        case LetDeleteComplexity::kSimple:
+            return kDeleteWithSimpleLet;
+        case LetDeleteComplexity::kComplex:
+            return kDeleteWithComplexLet;
+        default:
+            MONGO_UNREACHABLE_TASSERT(11400703);
+    }
+}
+
+// Multi-op delete specs: a realistic bulk-delete command with several independent operations,
+// each targeting a different class of documents to be purged.
+const DeleteSpec kMultiOpDeleteSpec = {{
+    {fromjson(R"({ "status": "inactive", "lastLogin": { "$lt": 1700000000 } })")},
+    {fromjson(
+        R"({ "region": "EU", "gdprDeleteRequested": true, "dataRetentionExpiry": { "$lt": 1700000000 } })")},
+    {fromjson(
+        R"({ "accountType": "trial", "trialExpiry": { "$lt": 1700000000 }, "upgraded": { "$ne": true } })")},
+    {fromjson(
+        R"({ "email": { "$regex": "@deleted\\.example\\.com$" }, "deletedAt": { "$exists": true }, "purged": false })")},
+}};
+
+}  // namespace query_benchmark_constants
+}  // namespace mongo

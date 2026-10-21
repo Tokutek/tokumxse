@@ -1,0 +1,233 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/bson/ordering.h"
+#include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+
+#include <absl/container/inlined_vector.h>
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+value::TagValueMaybeOwned ByteCode::genericNewKeyString(ArityType arity,
+                                                        CollatorInterface* collator) {
+    auto versionView = viewFromStack(0);
+    auto orderingView = viewFromStack(1);
+    auto discriminatorView = viewFromStack(arity - 1u);
+    if (!value::isNumber(versionView.tag) || !value::isNumber(orderingView.tag) ||
+        !value::isNumber(discriminatorView.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto version = value::numericCast<int64_t>(versionView);
+    auto discriminator = value::numericCast<int64_t>(discriminatorView);
+    if ((version < 0 || version > 1) || (discriminator < 0 || discriminator > 2)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto ksVersion = static_cast<key_string::Version>(version);
+    auto ksDiscriminator = static_cast<key_string::Discriminator>(discriminator);
+
+    uint32_t orderingBits = value::numericCast<int32_t>(orderingView);
+
+    // Maximum number of orderings. An 'Ordering' cannot have more than 32 values at the moment.
+    // Limit the usage to 32 bytes here anyway, because if that definition ever changes, the amount
+    // of stack space used for the inline vector will still be reasonably bounded.
+    constexpr size_t kMaxInlineValues = std::min(size_t(32), Ordering::kMaxCompoundIndexKeys);
+    absl::InlinedVector<int8_t, kMaxInlineValues> orders;
+    for (size_t i = 0; orderingBits != 0 && i < arity - 3u; ++i, orderingBits >>= 1) {
+        orders.push_back((orderingBits & 1) ? -1 : 1);
+    }
+
+    key_string::HeapBuilder kb{ksVersion, Ordering::make(orders)};
+
+    const auto stringTransformFn = [&](std::string_view stringData) {
+        return collator->getComparisonString(stringData);
+    };
+
+    for (size_t idx = 2; idx < arity - 1u; ++idx) {
+        auto tagValView = viewFromStack(idx);
+
+        switch (tagValView.tag) {
+            case value::TypeTags::Boolean:
+                kb.appendBool(value::bitcastTo<bool>(tagValView.value));
+                break;
+            case value::TypeTags::NumberInt32:
+                kb.appendNumberInt(value::bitcastTo<int32_t>(tagValView.value));
+                break;
+            case value::TypeTags::NumberInt64:
+                kb.appendNumberLong(value::bitcastTo<int64_t>(tagValView.value));
+                break;
+            case value::TypeTags::NumberDouble:
+                kb.appendNumberDouble(value::bitcastTo<double>(tagValView.value));
+                break;
+            case value::TypeTags::NumberDecimal:
+                kb.appendNumberDecimal(value::bitcastTo<Decimal128>(tagValView.value));
+                break;
+            case value::TypeTags::StringSmall:
+            case value::TypeTags::StringBig:
+            case value::TypeTags::bsonString:
+                if (collator) {
+                    kb.appendString(value::getStringView(tagValView.tag, tagValView.value),
+                                    stringTransformFn);
+                } else {
+                    kb.appendString(value::getStringView(tagValView.tag, tagValView.value));
+                }
+                break;
+            case value::TypeTags::Null:
+                kb.appendNull();
+                break;
+            case value::TypeTags::bsonUndefined:
+                kb.appendUndefined();
+                break;
+            case value::TypeTags::bsonJavascript:
+                kb.appendCode(value::getBsonJavascriptView(tagValView.value));
+                break;
+            case value::TypeTags::Date: {
+                auto milliseconds = value::bitcastTo<int64_t>(tagValView.value);
+                auto duration = std::chrono::duration<int64_t, std::milli>(milliseconds);
+                auto date = Date_t::fromDurationSinceEpoch(duration);
+                kb.appendDate(date);
+                break;
+            }
+            case value::TypeTags::Timestamp: {
+                Timestamp ts{value::bitcastTo<uint64_t>(tagValView.value)};
+                kb.appendTimestamp(ts);
+                break;
+            }
+            case value::TypeTags::MinKey: {
+                BSONObjBuilder bob;
+                bob.appendMinKey("");
+                kb.appendBSONElement(bob.obj().firstElement());
+                break;
+            }
+            case value::TypeTags::MaxKey: {
+                BSONObjBuilder bob;
+                bob.appendMaxKey("");
+                kb.appendBSONElement(bob.obj().firstElement());
+                break;
+            }
+            case value::TypeTags::bsonArray: {
+                BSONObj bson{value::getRawPointerView(tagValView.value)};
+                if (collator) {
+                    kb.appendArray(BSONArray(BSONObj(bson)), stringTransformFn);
+                } else {
+                    kb.appendArray(BSONArray(BSONObj(bson)));
+                }
+                break;
+            }
+            case value::TypeTags::Array:
+            case value::TypeTags::ArraySet:
+            case value::TypeTags::ArrayMultiSet: {
+                value::ArrayEnumerator enumerator{tagValView.tag, tagValView.value};
+                BSONArrayBuilder arrayBuilder;
+                bson::convertToBsonArr(arrayBuilder, enumerator);
+                if (collator) {
+                    kb.appendArray(arrayBuilder.arr(), stringTransformFn);
+                } else {
+                    kb.appendArray(arrayBuilder.arr());
+                }
+                break;
+            }
+            case value::TypeTags::bsonObject: {
+                BSONObj bson{value::getRawPointerView(tagValView.value)};
+                if (collator) {
+                    kb.appendObject(bson, stringTransformFn);
+                } else {
+                    kb.appendObject(bson);
+                }
+                break;
+            }
+            case value::TypeTags::Object: {
+                BSONObjBuilder objBuilder;
+                bson::convertToBsonObj(objBuilder, value::getObjectView(tagValView.value));
+                if (collator) {
+                    kb.appendObject(objBuilder.obj(), stringTransformFn);
+                } else {
+                    kb.appendObject(objBuilder.obj());
+                }
+                break;
+            }
+            case value::TypeTags::ObjectId: {
+                auto oid = OID::from(value::getObjectIdView(tagValView.value)->data());
+                kb.appendOID(oid);
+                break;
+            }
+            case value::TypeTags::bsonObjectId: {
+                auto oid = OID::from(value::getRawPointerView(tagValView.value));
+                kb.appendOID(oid);
+                break;
+            }
+            case value::TypeTags::bsonSymbol: {
+                auto symbolView = value::getStringOrSymbolView(tagValView.tag, tagValView.value);
+                kb.appendSymbol(symbolView);
+                break;
+            }
+            case value::TypeTags::bsonBinData: {
+                auto data = value::getBSONBinData(tagValView.tag, tagValView.value);
+                auto length =
+                    static_cast<int>(value::getBSONBinDataSize(tagValView.tag, tagValView.value));
+                auto type = value::getBSONBinDataSubtype(tagValView.tag, tagValView.value);
+                BSONBinData binData{data, length, type};
+                kb.appendBinData(binData);
+                break;
+            }
+            case value::TypeTags::bsonRegex: {
+                auto sbeRegex = value::getBsonRegexView(tagValView.value);
+                BSONRegEx regex{sbeRegex.pattern, sbeRegex.flags};
+                kb.appendRegex(regex);
+                break;
+            }
+            case value::TypeTags::bsonCodeWScope: {
+                auto sbeCodeWScope = value::getBsonCodeWScopeView(tagValView.value);
+                BSONCodeWScope codeWScope{sbeCodeWScope.code, BSONObj(sbeCodeWScope.scope)};
+                kb.appendCodeWString(codeWScope);
+                break;
+            }
+            case value::TypeTags::bsonDBPointer: {
+                auto dbPointer = value::getBsonDBPointerView(tagValView.value);
+                BSONDBRef dbRef{dbPointer.ns, OID::from(dbPointer.id)};
+                kb.appendDBRef(dbRef);
+                break;
+            }
+            default:
+                uasserted(4822802,
+                          str::stream() << "Unsupported key string type: " << tagValView.tag);
+                break;
+        }
+    }
+
+    kb.appendDiscriminator(ksDiscriminator);
+
+    return value::TagValueMaybeOwned::fromRaw(
+        true, value::TypeTags::keyString, value::makeKeyString(kb.release()).second);
+}  // genericNewKeyString
+
+value::TagValueMaybeOwned ByteCode::builtinNewKeyString(ArityType arity) {
+    tassert(6333000,
+            str::stream() << "Unsupported number of arguments passed to ks(): " << arity,
+            arity >= 3 && arity <= Ordering::kMaxCompoundIndexKeys + 3);
+    return genericNewKeyString(arity);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinCollNewKeyString(ArityType arity) {
+    tassert(6511500,
+            str::stream() << "Unsupported number of arguments passed to collKs(): " << arity,
+            arity >= 4 && arity <= Ordering::kMaxCompoundIndexKeys + 4);
+
+    auto collatorView = viewFromStack(arity - 1u);
+    if (collatorView.tag != value::TypeTags::collator) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+    auto collator = value::getCollatorView(collatorView.value);
+    return genericNewKeyString(arity - 1u, collator);
+}
+
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

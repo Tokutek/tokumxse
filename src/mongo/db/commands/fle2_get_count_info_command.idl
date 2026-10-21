@@ -1,0 +1,128 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/crypto/fle_stats.idl"
+
+structs:
+    ESCPositionsPair:
+        description: "A pair of non-anchor and anchor positions"
+        strict: true
+        fields:
+            cpos:
+                description: "non-anchor position"
+                type: long
+            apos:
+                description: "anchor position"
+                type: long
+
+    ESCOptionalPositionsPair:
+        description: "A pair of optional non-anchor and anchor positions"
+        strict: true
+        fields:
+            cpos:
+                description: "non-anchor position"
+                type: long
+                optional: true
+            apos:
+                description: "anchor position"
+                type: long
+                optional: true
+
+    QECountInfoReplyTokens:
+        description: "A tokens of ESC information"
+        strict: true
+        fields:
+            t:
+                description: "ESCTwiceDerivedTagToken"
+                type: bindata_generic
+                cpp_name: ESCTwiceDerivedTagToken
+            c:
+                description: "ESC count"
+                type: long
+                cpp_name: count
+            td:
+                description: "EDCDerivedFromDataTokenAndContentionFactorToken"
+                type: bindata_generic
+                cpp_name: EDCDerivedFromDataTokenAndContentionFactorToken
+                optional: true
+            spos:
+                description: "positions returned from emuBinary"
+                type: ESCOptionalPositionsPair
+                cpp_name: SearchedPositions
+                optional: true
+            npos:
+                description: "position pair retrieved from the null anchor"
+                type: ESCPositionsPair
+                cpp_name: NullAnchorPositions
+                optional: true
+            stats:
+                description: "stats returned for compaction or cleanup algorithms"
+                type: ECStats
+                optional: true
+
+    QECountInfoReplyTokenSet:
+        description: "Array of tokens sets"
+        strict: true
+        fields:
+            tokens: array<QECountInfoReplyTokens>
+
+    QECountInfoRequestTokens:
+        description: "A ESC token to lookup in ESC"
+        strict: true
+        fields:
+            d:
+                description: "EDCDerivedFromDataTokenAndContentionFactorToken"
+                type: bindata_generic
+                cpp_name: EDCDerivedFromDataTokenAndContentionFactorToken
+                optional: true
+            s:
+                description: "ESCDerivedFromDataTokenAndContentionFactorToken"
+                type: bindata_generic
+                cpp_name: ESCDerivedFromDataTokenAndContentionFactorToken
+
+    QECountInfoRequestTokenSet:
+        description: An array of tag sets to lookup
+        strict: true
+        fields:
+            tokens: array<QECountInfoRequestTokens>
+
+    QECountInfosReply:
+        description: "Reply from the {getQueryableEncryptionCountInfo: ...} command"
+        # MongoS/Txn add fields to the reply we want to ignore
+        strict: false
+        is_command_reply: true
+        fields:
+            counts: array<QECountInfoReplyTokenSet>
+
+enums:
+    QECountInfoQueryType:
+        description: "query types"
+        type: string
+        values:
+            Insert: "insert"
+            Query: "query"
+            Compact: "compact"
+            Cleanup: "cleanup"
+            Padding: "padding"
+
+commands:
+    getQueryableEncryptionCountInfo:
+        description: "Parser for the 'getQueryableEncryptionCountInfo' command"
+        command_name: getQueryableEncryptionCountInfo
+        api_version: ""
+        namespace: concatenate_with_db
+        strict: true
+        reply_type: QECountInfosReply
+        fields:
+            tokens:
+                description: "Array of tokens to fetch"
+                type: array<QECountInfoRequestTokenSet>
+            queryType:
+                description: "Purpose of command, either for insert, query, compact, or cleanup"
+                type: QECountInfoQueryType

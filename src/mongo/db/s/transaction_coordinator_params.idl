@@ -1,0 +1,17 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo
+    mod_visibility: private
+
+server_parameters:
+    coordinateCommitReturnImmediatelyAfterPersistingDecision:
+        description: >-
+            Whether the transaction coordinator should return the decision as soon as the
+            the decision is made durable.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: coordinateCommitReturnImmediatelyAfterPersistingDecision
+        default: false
+        redact: false

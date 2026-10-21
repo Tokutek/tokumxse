@@ -1,0 +1,55 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of documents stored in config.localReshardingOperations.donor on the
+# donor shard for a resharding operation.
+# When a new top level field is added to the donor document, add the same field as a member of
+# resharding_donor_service.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/s/resharding/common_types.idl"
+
+structs:
+    ReshardingDonorMetrics:
+        description: "Contains metrics about the resharding operation on a donor."
+        strict: false
+        fields:
+            operationRuntime:
+                type: ReshardingMetricsTimeInterval
+                description: >-
+                    The time interval of the entire resharding operation on this donor.
+                optional: true
+            criticalSection:
+                type: ReshardingMetricsTimeInterval
+                description: >-
+                    The time interval of the resharding critical section on this donor.
+                optional: true
+
+    ReshardingDonorDocument:
+        description: "Represents a resharding operation on the donor shard."
+        inline_chained_structs: true
+        chained_structs:
+            CommonReshardingMetadata: CommonReshardingMetadata
+        generate_comparison_operators: false
+        # Use strict:false to avoid complications around upgrade/downgrade. This isn't technically
+        # required for resharding because durable state from all resharding operations is cleaned up
+        # before the upgrade or downgrade can complete.
+        strict: false
+        fields:
+            # We intentionally have the mutable state nested in a subobject to make it easy to
+            # overwrite with a single $set.
+            mutableState: DonorShardContext
+            recipientShards:
+                type: array<shard_id>
+                description: "The list of recipient shards that are replicating from this donor."
+            metrics:
+                type: ReshardingDonorMetrics
+                description: "Metrics related to this donor."
+                optional: true
+            changeStreamsMonitor:
+                type: ChangeStreamsMonitorContext
+                optional: true

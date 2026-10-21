@@ -1,0 +1,241 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/repl/initial_sync/database_cloner.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/repl/initial_sync/database_cloner_gen.h"
+#include "mongo/db/repl/initial_sync/initial_syncer.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/ddl/list_collections_filter.h"
+#include "mongo/db/shard_role/ddl/list_collections_gen.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
+
+#include <mutex>
+#include <string_view>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
+
+namespace mongo {
+namespace repl {
+using namespace std::literals::string_view_literals;
+
+DatabaseCloner::DatabaseCloner(const DatabaseName& dbName,
+                               InitialSyncSharedData* sharedData,
+                               const HostAndPort& source,
+                               DBClientConnection* client,
+                               StorageInterface* storageInterface,
+                               ThreadPool* dbPool,
+                               std::shared_ptr<InitialSyncSummaryStats> summaryStats,
+                               std::shared_ptr<FastCountInitialSyncAggregator> fastCountAggregator)
+    : InitialSyncBaseCloner(
+          "DatabaseCloner"sv, sharedData, source, client, storageInterface, dbPool),
+      _dbName(dbName),
+      _listCollectionsStage("listCollections", this, &DatabaseCloner::listCollectionsStage),
+      _summaryStats(summaryStats),
+      _fastCountAggregator(std::move(fastCountAggregator)) {
+    invariant(!dbName.isEmpty());
+    _stats.dbname = dbName;
+}
+
+BaseCloner::ClonerStages DatabaseCloner::getStages() {
+    return {&_listCollectionsStage};
+}
+
+void DatabaseCloner::preStage() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _stats.start = getSharedData()->getClock()->now();
+}
+
+BaseCloner::AfterStageBehavior DatabaseCloner::listCollectionsStage() {
+    ListCollections listCollectionsCmd;
+    listCollectionsCmd.setDbName(_dbName);
+    listCollectionsCmd.setFilter(ListCollectionsFilter::makeTypeCollectionFilter());
+    if (shouldUseRawDataOperations()) {
+        listCollectionsCmd.setRawData(true);
+    }
+    auto collectionInfos = uassertStatusOK(getClient()->runExhaustiveCursorCommand(
+        _dbName, listCollectionsCmd.toBSON(), QueryOption_SecondaryOk));
+    const auto storageEngine = getGlobalServiceContext()->getStorageEngine();
+
+    stdx::unordered_set<std::string> seen;
+    for (auto&& info : collectionInfos) {
+        ListCollectionResult result;
+        try {
+            result = ListCollectionResult::parse(
+                info, IDLParserContext("DatabaseCloner::listCollectionsStage"));
+        } catch (const DBException& e) {
+            uasserted(
+                ErrorCodes::FailedToParse,
+                e.toStatus()
+                    .withContext(str::stream() << "Collection info could not be parsed : " << info)
+                    .reason());
+        }
+
+        if (_fastCountAggregator) {
+            const auto& collInfo = result.getInfo();
+            const auto& fastCount = collInfo.getFastCount();
+            if (fastCount) {
+                uassert(ErrorCodes::FailedToParse,
+                        str::stream() << "Collection info with fastCount must have (validAsOf, "
+                                         "Size, and Count) or timestampStoreTs: "
+                                      << info,
+                        (fastCount->getTimestampStoreTs() &&
+                         (!fastCount->getValidAsOf() && !fastCount->getSize() &&
+                          !fastCount->getCount())) ||
+                            (fastCount->getValidAsOf() && fastCount->getSize() &&
+                             fastCount->getCount()));
+
+                if (auto tsStoreTs = fastCount->getTimestampStoreTs()) {
+                    _fastCountAggregator->recordTimestampStoreTs(*tsStoreTs);
+                }
+                if (fastCount->getValidAsOf()) {
+                    FastCountEntry entry{
+                        *fastCount->getValidAsOf(), *fastCount->getSize(), *fastCount->getCount()};
+                    _fastCountAggregator->addEntry(collInfo.getUuid(), entry);
+                }
+            }
+        }
+
+        NamespaceString collectionNamespace(
+            NamespaceStringUtil::deserialize(_dbName, result.getName()));
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
+            LOGV2_DEBUG(21146,
+                        1,
+                        "Database cloner skipping 'system' collection",
+                        logAttrs(collectionNamespace));
+            continue;
+        }
+        LOGV2_DEBUG(21147, 2, "Allowing cloning of collectionInfo", "info"_attr = info);
+
+        bool isDuplicate = seen.insert(std::string{result.getName()}).second;
+        uassert(51005,
+                str::stream() << "collection info contains duplicate collection name "
+                              << "'" << result.getName() << "': " << info,
+                isDuplicate);
+
+        // Sanitize storage engine options to remove options which might not apply to this node. See
+        // SERVER-68122.
+        auto sanitizedStorageOptions =
+            storageEngine->getSanitizedStorageOptionsForSecondaryReplication(
+                result.getOptions().storageEngine);
+        result.getOptions().storageEngine = sanitizedStorageOptions;
+
+        // While UUID is a member of CollectionOptions, listCollections does not return the
+        // collectionUUID there as part of the options, but instead places it in the 'info' field.
+        // We need to move it back to CollectionOptions to create the collection properly.
+        result.getOptions().uuid = result.getInfo().getUuid();
+        _collections.emplace_back(
+            collectionNamespace, result.getOptions(), result.getInfo().getRecordIdsReplicated());
+    }
+    return kContinueNormally;
+}
+
+bool DatabaseCloner::isMyFailPoint(const BSONObj& data) const {
+    const auto fpDbName = DatabaseNameUtil::parseFailPointData(data, "database"sv);
+    return fpDbName == _dbName && BaseCloner::isMyFailPoint(data);
+}
+
+void DatabaseCloner::postStage() {
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _stats.collections = _collections.size();
+        _stats.collectionStats.reserve(_collections.size());
+        for (const auto& coll : _collections) {
+            _stats.collectionStats.emplace_back();
+            _stats.collectionStats.back().nss = get<0>(coll);
+        }
+    }
+    _summaryStats->collectionsToClone.incrementRelaxed(_collections.size());
+    for (const auto& [sourceNss, collectionOptions, recordIdsReplicated] : _collections) {
+        {
+            std::lock_guard<std::mutex> lk(_mutex);
+            _currentCollectionCloner = std::make_unique<CollectionCloner>(sourceNss,
+                                                                          collectionOptions,
+                                                                          getSharedData(),
+                                                                          getSource(),
+                                                                          getClient(),
+                                                                          getStorageInterface(),
+                                                                          getDBPool(),
+                                                                          recordIdsReplicated,
+                                                                          _summaryStats);
+        }
+        auto collStatus = _currentCollectionCloner->run();
+        if (collStatus.isOK()) {
+            LOGV2_DEBUG(21148, 1, "Collection clone finished", logAttrs(sourceNss));
+        } else {
+            LOGV2_ERROR(21149,
+                        "Collection clone failed",
+                        logAttrs(sourceNss),
+                        "error"_attr = collStatus.toString());
+            setSyncFailedStatus(
+                {ErrorCodes::InitialSyncFailure,
+                 collStatus
+                     .withContext(str::stream() << "Error cloning collection '"
+                                                << sourceNss.toStringForErrorMsg() << "'")
+                     .toString()});
+        }
+        {
+            std::lock_guard<std::mutex> lk(_mutex);
+            _stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
+            _currentCollectionCloner = nullptr;
+            // Abort the database cloner if the collection clone failed.
+            if (!collStatus.isOK())
+                return;
+            _stats.clonedCollections++;
+            _summaryStats->collectionsCloned.incrementRelaxed();
+        }
+    }
+    std::lock_guard<std::mutex> lk(_mutex);
+    _stats.end = getSharedData()->getClock()->now();
+}
+
+DatabaseCloner::Stats DatabaseCloner::getStats() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    DatabaseCloner::Stats stats = _stats;
+    if (_currentCollectionCloner) {
+        stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
+    }
+    return stats;
+}
+
+void DatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
+    builder->appendNumber("collections", static_cast<long long>(collections));
+    builder->appendNumber("clonedCollections", static_cast<long long>(clonedCollections));
+    if (start != Date_t()) {
+        builder->appendDate("start", start);
+        if (end != Date_t()) {
+            builder->appendDate("end", end);
+            auto elapsed = end - start;
+            long long elapsedMillis = duration_cast<Milliseconds>(elapsed).count();
+            builder->appendNumber("elapsedMillis", elapsedMillis);
+        }
+    }
+
+    for (auto&& collection : collectionStats) {
+        BSONObjBuilder collectionBuilder(builder->subobjStart(
+            NamespaceStringUtil::serialize(collection.nss, SerializationContext::stateDefault())));
+        collection.append(&collectionBuilder);
+        collectionBuilder.doneFast();
+    }
+}
+
+}  // namespace repl
+}  // namespace mongo

@@ -1,0 +1,1266 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+"""
+IDL Parser.
+
+Converts a YAML document to an idl.syntax tree.
+Only validates the document is syntatically correct, not semantically.
+"""
+
+import re
+from abc import ABCMeta, abstractmethod
+
+import yaml
+
+from . import common, cpp_types, errors, syntax
+
+
+class _RuleDesc(object):
+    """
+    Describe a simple parser rule for the generic YAML node parser.
+
+    node_type is either (scalar, bool_scalar, int_scalar, scalar_or_sequence, sequence, or mapping)
+    - bool_scalar - means a scalar node which is a valid bool, populates a bool
+    - int_scalar - means a scalar node which is a valid non-negative int, populates a int
+    - scalar_or_sequence - means a scalar or sequence node, populates a list
+    - sequence - a sequence node, populates a list
+    - mapping - a mapping node, calls another parser
+    - scalar_or_mapping - means a scalar of mapping node, populates a struct
+    mapping_parser_func is only called when parsing a mapping or scalar_or_mapping yaml node.
+    Similar for sequence_parser_func.
+    """
+
+    REQUIRED = 1
+    OPTIONAL = 2
+
+    def __init__(
+        self, node_type, required=OPTIONAL, mapping_parser_func=None, sequence_parser_func=None
+    ):
+        # type: (str, int, Callable[[errors.ParserContext,yaml.nodes.MappingNode], Any], Callable[[errors.ParserContext,yaml.nodes.SequenceNode], Any]) -> None
+        """Construct a parser rule description."""
+        assert required in (_RuleDesc.REQUIRED, _RuleDesc.OPTIONAL)
+
+        self.node_type = node_type  # type: str
+        self.required = required  # type: int
+        self.mapping_parser_func = mapping_parser_func  # type: Callable[[errors.ParserContext,yaml.nodes.MappingNode], Any]
+
+        def default_seq_parser(ctxt, node):
+            return ctxt.get_list(node)
+
+        self.sequence_parser_func = sequence_parser_func or default_seq_parser  # type: Callable[[errors.ParserContext,yaml.nodes.SequenceNode], Any]
+
+
+def _has_field(
+    node,  # type: Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]
+    field_name,  # type: str
+):  # type: (...) -> bool
+    return any(kv[0].value == field_name for kv in node.value)
+
+
+def _generic_parser(
+    ctxt,  # type: errors.ParserContext
+    node,  # type: Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]
+    syntax_node_name,  # type: str
+    syntax_node,  # type: Any
+    mapping_rules,  # type: Dict[str, _RuleDesc]
+):  # type: (...) -> None
+    field_name_set = set()  # type: Set[str]
+
+    for [first_node, second_node] in node.value:
+        first_name = first_node.value
+
+        if first_name in field_name_set:
+            ctxt.add_duplicate_error(first_node, first_name)
+            continue
+
+        if first_name in mapping_rules:
+            rule_desc = mapping_rules[first_name]
+
+            if rule_desc.node_type == "scalar":
+                if ctxt.is_scalar_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = second_node.value
+            elif rule_desc.node_type == "bool_scalar":
+                if ctxt.is_scalar_bool_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = ctxt.get_bool(second_node)
+            elif rule_desc.node_type == "int_scalar":
+                if ctxt.is_scalar_non_negative_int_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = ctxt.get_non_negative_int(second_node)
+            elif rule_desc.node_type == "scalar_or_sequence":
+                if ctxt.is_scalar_sequence_or_scalar_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = rule_desc.sequence_parser_func(
+                        ctxt, second_node
+                    )
+            elif rule_desc.node_type == "sequence":
+                if ctxt.is_scalar_sequence(second_node, first_name):
+                    syntax_node.__dict__[first_name] = rule_desc.sequence_parser_func(
+                        ctxt, second_node
+                    )
+            elif rule_desc.node_type == "sequence_mapping":
+                if ctxt.is_sequence_mapping(second_node, first_name):
+                    syntax_node.__dict__[first_name] = rule_desc.sequence_parser_func(
+                        ctxt, second_node
+                    )
+            elif rule_desc.node_type == "scalar_or_mapping":
+                if ctxt.is_scalar_or_mapping_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = rule_desc.mapping_parser_func(
+                        ctxt, second_node
+                    )
+            elif rule_desc.node_type == "scalar_or_sequence_or_mapping":
+                if ctxt.is_scalar_or_sequence_or_mapping_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = rule_desc.sequence_parser_func(
+                        ctxt, second_node
+                    )
+            elif rule_desc.node_type == "mapping":
+                if ctxt.is_mapping_node(second_node, first_name):
+                    syntax_node.__dict__[first_name] = rule_desc.mapping_parser_func(
+                        ctxt, second_node
+                    )
+            elif rule_desc.node_type == "required_bool_scalar":
+                syntax_node.__dict__[first_name] = ctxt.get_required_bool(second_node)
+            else:
+                raise errors.IDLError(
+                    "Unknown node_type '%s' for parser rule" % (rule_desc.node_type)
+                )
+        else:
+            ctxt.add_unknown_node_error(first_node, syntax_node_name)
+
+        field_name_set.add(first_name)
+
+    # Check for any missing required fields
+    for name, rule_desc in list(mapping_rules.items()):
+        if not rule_desc.required == _RuleDesc.REQUIRED:
+            continue
+
+        # A bool is never "None" like other types, it simply defaults to "false".
+        # It means "if bool is None" will always return false and there is no support for required
+        # 'bool' at this time. Use the node type 'required_bool_scalar' if this behavior is not desired.
+        if not rule_desc.node_type == "bool_scalar":
+            if syntax_node.__dict__[name] is None:
+                ctxt.add_missing_required_field_error(node, syntax_node_name, name)
+        else:
+            raise errors.IDLError(
+                "Unknown node_type '%s' for parser required rule" % (rule_desc.node_type)
+            )
+
+
+def _parse_mapping(
+    ctxt,  # type: errors.ParserContext
+    spec,  # type: syntax.IDLSpec
+    node,  # type: Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]
+    syntax_node_name,  # type: str
+    func,  # type: Callable[[errors.ParserContext,syntax.IDLSpec,str,Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]], None]
+):  # type: (...) -> None
+    """Parse a top-level mapping section in the IDL file."""
+    if not ctxt.is_mapping_node(node, syntax_node_name):
+        return
+
+    for [first_node, second_node] in node.value:
+        first_name = first_node.value
+
+        func(ctxt, spec, first_name, second_node)
+
+
+def _parse_initializer(ctxt, node):
+    # type: (errors.ParserContext, Union[yaml.nodes.ScalarNode, yaml.nodes.MappingNode]) -> syntax.GlobalInitializer
+    """Parse a global initializer."""
+    init = syntax.GlobalInitializer(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    if node.id == "scalar":
+        init.name = node.value
+        return init
+
+    _generic_parser(
+        ctxt,
+        node,
+        "initializer",
+        init,
+        {
+            "register": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "store": _RuleDesc("scalar"),
+        },
+    )
+
+    return init
+
+
+def _parse_config_global(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.ConfigGlobal
+    """Parse global settings for config options."""
+    config = syntax.ConfigGlobal(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt,
+        node,
+        "configs",
+        config,
+        {
+            "section": _RuleDesc("scalar"),
+            "source": _RuleDesc("scalar_or_sequence"),
+            "initializer": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_initializer),
+        },
+    )
+
+    return config
+
+
+_mod_visibility_pattern = re.compile(
+    r"(pub|public|public_for_technical_reasons|private|file_private|needs_replacement|unfortunately_open|use_replacement\(.+\))"
+)
+
+
+def _validate_mod_visibility(
+    ctxt: errors.ParserContext, mod_visibility: str, node: yaml.nodes.Node
+):
+    if mod_visibility is not None and not _mod_visibility_pattern.fullmatch(mod_visibility):
+        ctxt.add_bad_visibility(node, mod_visibility)
+
+
+def _parse_global(ctxt, spec, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a global section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "global"):
+        return
+
+    idlglobal = syntax.Global(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt,
+        node,
+        "global",
+        idlglobal,
+        {
+            "cpp_namespace": _RuleDesc("scalar"),
+            "cpp_includes": _RuleDesc("scalar_or_sequence"),
+            "configs": _RuleDesc("mapping", mapping_parser_func=_parse_config_global),
+            "mod_visibility": _RuleDesc("scalar"),
+        },
+    )
+
+    _validate_mod_visibility(ctxt, idlglobal.mod_visibility, node)
+
+    spec.globals = idlglobal
+
+
+def _parse_imports(ctxt, spec, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse an imports section in the IDL file."""
+    if not ctxt.is_scalar_sequence(node, "imports"):
+        imports = syntax.Import(ctxt.file_name, None, None)
+        imports.imports = []
+        spec.imports = imports
+    else:
+        imports = syntax.Import(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+        imports.imports = ctxt.get_list(node)
+        spec.imports = imports
+
+
+def _parse_type(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a type section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "type"):
+        return
+
+    idltype = syntax.Type(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    idltype.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "type",
+        idltype,
+        {
+            "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "cpp_type": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "bson_serialization_type": _RuleDesc("scalar_or_sequence", _RuleDesc.REQUIRED),
+            # TODO(SERVER-133051): Make is_view required.
+            "is_view": _RuleDesc("bool_scalar"),
+            "bindata_subtype": _RuleDesc("scalar"),
+            "serializer": _RuleDesc("scalar"),
+            "deserializer": _RuleDesc("scalar"),
+            "deserialize_with_tenant": _RuleDesc("bool_scalar"),
+            "internal_only": _RuleDesc("bool_scalar"),
+            "default": _RuleDesc("scalar"),
+        },
+    )
+
+    spec.symbols.add_type(ctxt, idltype)
+
+
+def _parse_expression(ctxt, node):
+    # type: (errors.ParserContext, Union[yaml.nodes.ScalarNode,yaml.nodes.MappingNode]) -> syntax.Expression
+    """Parse an expression as either a scalar or a mapping."""
+    expr = syntax.Expression(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    if node.id == "scalar":
+        expr.literal = node.value
+        return expr
+
+    _generic_parser(
+        ctxt,
+        node,
+        "expr",
+        expr,
+        {
+            "expr": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "is_constexpr": _RuleDesc("bool_scalar"),
+        },
+    )
+
+    return expr
+
+
+def _parse_expression_or_sequence(ctxt, node):
+    # type: (errors.ParserContext, Union[yaml.nodes.ScalarNode,yaml.nodes.SequenceNode,yaml.nodes.MappingNode]) -> Union[syntax.Expression,List[syntax.Expression]]
+    """Parse an expression as either a scalar, sequence or a mapping."""
+    if node.id == "sequence":
+        return [_parse_expression(ctxt, child) for child in node.value]
+    else:
+        return _parse_expression(ctxt, node)
+
+
+def _parse_sequence_of_scalar_or_mapping(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.SequenceNode) -> List[Union[str,syntax.Expression]]
+    """Parse a sequence of scalars or mappings."""
+    if node.id == "sequence":
+        return [_parse_expression(ctxt, child) for child in node.value]
+    return [_parse_expression(ctxt, node)]
+
+
+def _parse_validator(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.Validator
+    """Parse a validator for a field."""
+    validator = syntax.Validator(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt,
+        node,
+        "validator",
+        validator,
+        {
+            "gt": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "lt": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "gte": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "lte": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "callback": _RuleDesc("scalar"),
+        },
+    )
+
+    return validator
+
+
+def _parse_condition(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.Condition
+    """Parse a condition."""
+    condition = syntax.Condition(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt,
+        node,
+        "condition",
+        condition,
+        {
+            "preprocessor": _RuleDesc("scalar"),
+            "constexpr": _RuleDesc("scalar"),
+            "expr": _RuleDesc("scalar"),
+            "feature_flag": _RuleDesc("scalar"),
+            "min_fcv": _RuleDesc("scalar"),
+        },
+    )
+
+    return condition
+
+
+def _parse_variant_alternatives(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.SequenceNode) -> List[syntax.FieldType]
+    """Parse a variant field type's alternative types."""
+    return [_parse_field_type(ctxt, child) for child in node.value]
+
+
+def _parse_field_type(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.FieldType
+    """Parse a struct field's type.
+
+    Can be a scalar like "string", or a mapping like {variant: ["string", "int"]}.
+    """
+    if node.id == "mapping":
+        # For now, FieldTypeVariant is the only non-scalar node.
+        variant = syntax.FieldTypeVariant(
+            ctxt.file_name, node.start_mark.line, node.start_mark.column
+        )
+        _generic_parser(
+            ctxt,
+            node,
+            "type",
+            variant,
+            {"variant": _RuleDesc("sequence", sequence_parser_func=_parse_variant_alternatives)},
+        )
+        return variant
+    else:
+        assert node.id == "scalar"
+        if node.value.startswith("array<variant<"):
+            variant_types = syntax.parse_array_variant_types(node.value)
+            variant = syntax.FieldTypeVariant(
+                ctxt.file_name, node.start_mark.line, node.start_mark.column
+            )
+            if variant_types is None:
+                location = common.SourceLocation(
+                    ctxt.file_name, node.start_mark.line, node.start_mark.column
+                )
+                ctxt.add_bad_array_variant_types_error(location, node.value)
+            else:
+                for variant_type in variant_types:
+                    single = syntax.FieldTypeSingle(
+                        ctxt.file_name, node.start_mark.line, node.start_mark.column
+                    )
+                    single.type_name = variant_type
+                    variant.variant.append(single)
+
+            return syntax.FieldTypeArray(variant)
+
+        single = syntax.FieldTypeSingle(
+            ctxt.file_name, node.start_mark.line, node.start_mark.column
+        )
+
+        if node.value.startswith("array<"):
+            single.type_name = syntax.parse_array_type(node.value)
+            return syntax.FieldTypeArray(single)
+
+        single.type_name = node.value
+        return single
+
+
+def _parse_field(ctxt, name, node):
+    # type: (errors.ParserContext, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> syntax.Field
+    """Parse a field in a struct/command in the IDL file."""
+    field = syntax.Field(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    field.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "field",
+        field,
+        {
+            "description": _RuleDesc("scalar"),
+            "cpp_name": _RuleDesc("scalar"),
+            "type": _RuleDesc(
+                "scalar_or_mapping", _RuleDesc.REQUIRED, mapping_parser_func=_parse_field_type
+            ),
+            "ignore": _RuleDesc("bool_scalar"),
+            "optional": _RuleDesc("bool_scalar"),
+            "default": _RuleDesc("scalar"),
+            "supports_doc_sequence": _RuleDesc("bool_scalar"),
+            "comparison_order": _RuleDesc("int_scalar"),
+            "validator": _RuleDesc("mapping", mapping_parser_func=_parse_validator),
+            "non_const_getter": _RuleDesc("bool_scalar"),
+            # Allow both 'unstable' and the new alternative 'stability' options to support IDL compatibility tests with old IDLs.
+            "unstable": _RuleDesc("bool_scalar"),
+            "stability": _RuleDesc("scalar"),
+            "always_serialize": _RuleDesc("bool_scalar"),
+            "forward_to_shards": _RuleDesc("bool_scalar"),
+            "forward_from_shards": _RuleDesc("bool_scalar"),
+            "query_shape": _RuleDesc("scalar"),
+        },
+    )
+
+    return field
+
+
+def _parse_fields(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> List[syntax.Field]
+    """Parse a fields section in a struct in the IDL file."""
+
+    fields = []
+
+    field_name_set = set()  # type: Set[str]
+
+    for [first_node, second_node] in node.value:
+        first_name = first_node.value
+
+        if first_name in field_name_set:
+            ctxt.add_duplicate_error(first_node, first_name)
+            continue
+
+        if second_node.id == "scalar":
+            # Like "fieldName: typeName".
+            field = syntax.Field(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+            field.name = first_name
+            single_type = syntax.FieldTypeSingle(
+                ctxt.file_name, node.start_mark.line, node.start_mark.column
+            )
+            array_type_name = syntax.parse_array_type(second_node.value)
+            if array_type_name:
+                single_type.type_name = array_type_name
+                array_type = syntax.FieldTypeArray(single_type)
+                field.type = array_type
+            else:
+                single_type.type_name = second_node.value
+                field.type = single_type
+
+        else:
+            # Like "fieldName: { ... options ... }".
+            field = _parse_field(ctxt, first_name, second_node)
+
+        fields.append(field)
+        field_name_set.add(first_name)
+
+    for field in fields:
+        if field.unstable is not None and field.stability is not None:
+            ctxt.add_duplicate_unstable_stability(field)
+
+        # Convert the deprecated 'unstable' option to the new 'stability' option to keep support for the IDL compatibility tests.
+        if field.unstable is not None:
+            if field.unstable:
+                field.stability = "unstable"
+            else:
+                field.stability = "stable"
+            field.unstable = None
+
+        if field.stability is not None and field.stability not in (
+            "stable",
+            "unstable",
+            "internal",
+        ):
+            ctxt.add_stability_unknown_value(field)
+
+    return fields
+
+
+def _parse_chained_struct(ctxt, name, node):
+    # type: (errors.ParserContext, str, yaml.nodes.MappingNode) -> syntax.ChainedStruct
+    """Parse a chained struct in a struct in the IDL file."""
+    chain = syntax.ChainedStruct(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    chain.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "chain",
+        chain,
+        {
+            "cpp_name": _RuleDesc("scalar"),
+        },
+    )
+
+    return chain
+
+
+def _parse_chained_structs(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> List[syntax.ChainedStruct]
+    """Parse a chained structs in a struct in the IDL file."""
+    chained_items = []
+
+    field_name_set = set()  # type: Set[str]
+
+    for [first_node, second_node] in node.value:
+        first_name = first_node.value
+
+        if first_name in field_name_set:
+            ctxt.add_duplicate_error(first_node, first_name)
+            continue
+
+        # Simple Scalar
+        if second_node.id == "scalar":
+            chain = syntax.ChainedStruct(
+                ctxt.file_name, node.start_mark.line, node.start_mark.column
+            )
+            chain.name = first_name
+            chain.cpp_name = second_node.value
+            chained_items.append(chain)
+        else:
+            chain = _parse_chained_struct(ctxt, first_name, second_node)
+            chained_items.append(chain)
+
+        field_name_set.add(first_name)
+
+    return chained_items
+
+
+def _parse_struct(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a struct section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "struct"):
+        return
+
+    struct = syntax.Struct(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    struct.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "struct",
+        struct,
+        {
+            "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "fields": _RuleDesc("mapping", mapping_parser_func=_parse_fields),
+            "chained_structs": _RuleDesc("mapping", mapping_parser_func=_parse_chained_structs),
+            "mod_visibility": _RuleDesc("scalar"),
+            "strict": _RuleDesc("bool_scalar"),
+            "inline_chained_structs": _RuleDesc("bool_scalar"),
+            "immutable": _RuleDesc("bool_scalar"),
+            "generate_comparison_operators": _RuleDesc("bool_scalar"),
+            "non_const_getter": _RuleDesc("bool_scalar"),
+            "cpp_validator_func": _RuleDesc("scalar"),
+            "is_command_reply": _RuleDesc("bool_scalar"),
+            "is_catalog_ctxt": _RuleDesc("bool_scalar"),
+            "is_generic_cmd_list": _RuleDesc("scalar"),
+            "query_shape_component": _RuleDesc("bool_scalar"),
+            "unsafe_dangerous_disable_extra_field_duplicate_checks": _RuleDesc("bool_scalar"),
+        },
+    )
+
+    if (
+        struct.generate_comparison_operators
+        and struct.fields
+        and any(isinstance(f.type, syntax.FieldTypeVariant) for f in struct.fields)
+    ):
+        ctxt.add_variant_comparison_error(struct)
+        return
+
+    _validate_mod_visibility(ctxt, struct.mod_visibility, node)
+
+    spec.symbols.add_struct(ctxt, struct)
+    if struct.is_generic_cmd_list:
+        if struct.is_generic_cmd_list == "arg":
+            spec.symbols.add_generic_argument_list(struct)
+        elif struct.is_generic_cmd_list == "reply":
+            spec.symbols.add_generic_reply_field_list(struct)
+
+
+def _parse_arbitrary_value(ctxt, node):
+    # type: (errors.ParserContext, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> Any
+    """Parse a generic YAML type to a Python type."""
+
+    if node.id == "mapping":
+        return {k.value: _parse_arbitrary_value(ctxt, v) for (k, v) in node.value}
+    elif node.id == "sequence":
+        return [_parse_arbitrary_value(ctxt, node) for node in node.value]
+    elif ctxt.is_scalar_node(node, "node"):
+        return node.value
+    else:
+        # Error added to context by is_scalar_node case above
+        return None
+
+
+def _parse_enum_values(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> List[syntax.EnumValue]
+    """Parse a values section in an enum in the IDL file."""
+
+    enum_values = []
+
+    field_name_set = set()  # type: Set[str]
+
+    for [first_node, second_node] in node.value:
+        first_name = first_node.value
+
+        if first_name in field_name_set:
+            ctxt.add_duplicate_error(first_node, first_name)
+            continue
+
+        enum_value = syntax.EnumValue(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+        enum_value.name = first_name
+
+        if second_node.id == "mapping":
+            _generic_parser(
+                ctxt,
+                second_node,
+                first_name,
+                enum_value,
+                {
+                    "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+                    "value": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+                    "extra_data": _RuleDesc("mapping", mapping_parser_func=_parse_arbitrary_value),
+                },
+            )
+        elif ctxt.is_scalar_node(second_node, first_name):
+            enum_value.value = second_node.value
+
+        enum_values.append(enum_value)
+
+        field_name_set.add(first_name)
+
+    return enum_values
+
+
+def _parse_enum(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse an enum section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "enum"):
+        return
+
+    idl_enum = syntax.Enum(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    idl_enum.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "enum",
+        idl_enum,
+        {
+            "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "type": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "mod_visibility": _RuleDesc("scalar"),
+            "values": _RuleDesc("mapping", mapping_parser_func=_parse_enum_values),
+        },
+    )
+
+    if idl_enum.values is None:
+        ctxt.add_empty_enum_error(node, idl_enum.name)
+
+    _validate_mod_visibility(ctxt, idl_enum.mod_visibility, node)
+
+    spec.symbols.add_enum(ctxt, idl_enum)
+
+
+def _parse_privilege(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.Privilege
+    """Parse a access check section in a struct in the IDL file."""
+
+    if not ctxt.is_mapping_node(node, "privilege"):
+        return None
+
+    privilege = syntax.Privilege(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt,
+        node,
+        "privilege",
+        privilege,
+        {
+            "resource_pattern": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "action_type": _RuleDesc("scalar_or_sequence", _RuleDesc.REQUIRED),
+            "agg_stage": _RuleDesc("scalar", _RuleDesc.OPTIONAL),
+        },
+    )
+
+    return privilege
+
+
+def _parse_privilege_or_check(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.AccessCheck
+    """Parse a privilege section in an access_check in the IDL file."""
+
+    access_check = syntax.AccessCheck(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    _generic_parser(
+        ctxt,
+        node,
+        "privilege_or_check",
+        access_check,
+        {
+            "check": _RuleDesc("scalar"),
+            "privilege": _RuleDesc("mapping", mapping_parser_func=_parse_privilege),
+        },
+    )
+
+    if (access_check.check is None and access_check.privilege is None) or (
+        access_check.check is not None and access_check.privilege is not None
+    ):
+        ctxt.add_either_check_or_privilege(access_check)
+        return None
+
+    return access_check
+
+
+def _parse_complex_sequence(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.SequenceNode) -> List[syntax.AccessCheck]
+    """Parse a variant field type's alternative types."""
+    return [_parse_privilege_or_check(ctxt, child) for child in node.value]
+
+
+def _parse_access_checks(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> syntax.AccessChecks
+    """Parse an access check section in a struct in the IDL file."""
+
+    access_checks = syntax.AccessChecks(
+        ctxt.file_name, node.start_mark.line, node.start_mark.column
+    )
+
+    _generic_parser(
+        ctxt,
+        node,
+        "access_check",
+        access_checks,
+        {
+            "ignore": _RuleDesc("bool_scalar"),
+            "none": _RuleDesc("bool_scalar"),
+            "simple": _RuleDesc("mapping", mapping_parser_func=_parse_privilege_or_check),
+            "complex": _RuleDesc("sequence_mapping", sequence_parser_func=_parse_complex_sequence),
+        },
+    )
+
+    if ctxt.errors.has_errors():
+        return None
+
+    if (
+        bool(access_checks.ignore)
+        + bool(access_checks.none)
+        + bool(access_checks.simple)
+        + bool(access_checks.complex)
+    ) != 1:
+        ctxt.add_empty_access_check(access_checks)
+        return None
+
+    return access_checks
+
+
+def _parse_command(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a command section in the IDL file."""
+
+    if not ctxt.is_mapping_node(node, "command"):
+        return
+
+    command = syntax.Command(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    command.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "command",
+        command,
+        {
+            "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "chained_structs": _RuleDesc("mapping", mapping_parser_func=_parse_chained_structs),
+            "fields": _RuleDesc("mapping", mapping_parser_func=_parse_fields),
+            "mod_visibility": _RuleDesc("scalar"),
+            "namespace": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "cpp_name": _RuleDesc("scalar"),
+            "type": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_field_type),
+            "command_name": _RuleDesc("scalar"),
+            "command_alias": _RuleDesc("scalar"),
+            "reply_type": _RuleDesc("scalar"),
+            "api_version": _RuleDesc("scalar"),
+            "is_deprecated": _RuleDesc("bool_scalar"),
+            "strict": _RuleDesc("bool_scalar"),
+            "inline_chained_structs": _RuleDesc("bool_scalar"),
+            "immutable": _RuleDesc("bool_scalar"),
+            "generate_comparison_operators": _RuleDesc("bool_scalar"),
+            "allow_global_collection_name": _RuleDesc("bool_scalar"),
+            "non_const_getter": _RuleDesc("bool_scalar"),
+            "access_check": _RuleDesc("mapping", mapping_parser_func=_parse_access_checks),
+        },
+    )
+
+    valid_commands = [
+        common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB,
+        common.COMMAND_NAMESPACE_IGNORED,
+        common.COMMAND_NAMESPACE_TYPE,
+        common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB_OR_UUID,
+    ]
+
+    if not command.command_name:
+        ctxt.add_missing_required_field_error(node, "command", "command_name")
+
+    if command.api_version is None:
+        ctxt.add_missing_required_field_error(node, "command", "api_version")
+
+    if command.command_alias and command.command_alias == command.command_name:
+        ctxt.add_duplicate_command_name_and_alias(node)
+
+    if command.namespace:
+        if command.namespace not in valid_commands:
+            ctxt.add_bad_command_namespace_error(
+                command, command.name, command.namespace, valid_commands
+            )
+
+        # type property must be specified for a namespace = type
+        if command.namespace == common.COMMAND_NAMESPACE_TYPE and not command.type:
+            ctxt.add_missing_required_field_error(node, "command", "type")
+
+        if command.namespace != common.COMMAND_NAMESPACE_TYPE and command.type:
+            ctxt.add_extranous_command_type(command, command.name)
+
+    if command.api_version and command.reply_type is None:
+        ctxt.add_missing_reply_type(command, command.name)
+
+    _validate_mod_visibility(ctxt, command.mod_visibility, node)
+
+    # Commands may only have the first parameter, ensure the fields property is an empty array.
+    if not command.fields:
+        command.fields = []
+
+    if not command.api_version:
+        for field in command.fields:
+            if field.stability is not None and field.stability != "stable":
+                ctxt.add_stability_no_api_version(field, command.name)
+
+    spec.symbols.add_command(ctxt, command)
+
+
+def _parse_server_parameter_class(ctxt, node):
+    # type: (errors.ParserContext, Union[yaml.nodes.ScalarNode,yaml.nodes.MappingNode]) -> syntax.ServerParameterClass
+    """Parse a server_parameter.cpp_class as either a scalar or a mapping."""
+    spc = syntax.ServerParameterClass(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+
+    if node.id == "scalar":
+        spc.name = node.value
+        return spc
+
+    _generic_parser(
+        ctxt,
+        node,
+        "cpp_class",
+        spc,
+        {
+            "name": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "data": _RuleDesc("scalar"),
+            "override_ctor": _RuleDesc("bool_scalar"),
+            "override_set": _RuleDesc("bool_scalar"),
+            "override_validate": _RuleDesc("bool_scalar"),
+            "override_warn_if_deprecated": _RuleDesc("bool_scalar"),
+        },
+    )
+
+    return spc
+
+
+def _parse_annotations(ctxt, node):
+    # type: (errors.ParserContext, yaml.nodes.MappingNode) -> Dict[str, Any]
+    """Parse an annotations block as an opaque YAML mapping."""
+    constructor = yaml.constructor.SafeConstructor()
+    return constructor.construct_object(node, deep=True)
+
+
+def _parse_server_parameter(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a server_parameters section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "server_parameters"):
+        return
+
+    param = syntax.ServerParameter(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    param.name = name
+
+    # Declare as local to avoid ugly formatting with long line.
+    map_class = _parse_server_parameter_class
+
+    _generic_parser(
+        ctxt,
+        node,
+        "server_parameters",
+        param,
+        {
+            "set_at": _RuleDesc("scalar_or_sequence", _RuleDesc.REQUIRED),
+            "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "cpp_vartype": _RuleDesc("scalar"),
+            "cpp_varname": _RuleDesc("scalar"),
+            "mod_visibility": _RuleDesc("scalar"),
+            "condition": _RuleDesc("mapping", mapping_parser_func=_parse_condition),
+            "redact": _RuleDesc("required_bool_scalar", _RuleDesc.REQUIRED),
+            "default": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "test_only": _RuleDesc("bool_scalar"),
+            "deprecated_name": _RuleDesc("scalar_or_sequence"),
+            "validator": _RuleDesc("mapping", mapping_parser_func=_parse_validator),
+            "on_update": _RuleDesc("scalar"),
+            "omit_in_ftdc": _RuleDesc("bool_scalar"),
+            "cpp_class": _RuleDesc("scalar_or_mapping", mapping_parser_func=map_class),
+            "is_deprecated": _RuleDesc("bool_scalar"),
+            "annotations": _RuleDesc("mapping", mapping_parser_func=_parse_annotations),
+        },
+    )
+
+    _validate_mod_visibility(ctxt, param.mod_visibility, node)
+
+    spec.server_parameters.append(param)
+
+
+def _parse_feature_flag(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a feature_flags section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "feature_flags"):
+        return
+
+    param = syntax.FeatureFlag(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    param.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "feature_flags",
+        param,
+        {
+            "description": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "cpp_varname": _RuleDesc("scalar"),
+            "mod_visibility": _RuleDesc("scalar"),
+            "default": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "version": _RuleDesc("scalar"),
+            "fcv_gated": _RuleDesc(
+                "scalar_or_mapping", _RuleDesc.REQUIRED, mapping_parser_func=_parse_expression
+            ),
+            "enable_on_transitional_fcv_UNSAFE": _RuleDesc("bool_scalar"),
+            "incremental_rollout_phase": _RuleDesc("scalar"),
+            "serialize_on_outgoing_requests": _RuleDesc("bool_scalar"),
+            "check_against_fcv": _RuleDesc("scalar"),
+        },
+    )
+
+    _validate_mod_visibility(ctxt, param.mod_visibility, node)
+
+    spec.feature_flags.append(param)
+
+
+def _parse_config_option(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, str, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a configs section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "configs"):
+        return
+
+    option = syntax.ConfigOption(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    option.name = name
+
+    _generic_parser(
+        ctxt,
+        node,
+        "configs",
+        option,
+        {
+            "short_name": _RuleDesc("scalar"),
+            "single_name": _RuleDesc("scalar"),
+            "deprecated_name": _RuleDesc("scalar_or_sequence"),
+            "deprecated_short_name": _RuleDesc("scalar_or_sequence"),
+            "description": _RuleDesc("scalar_or_mapping", _RuleDesc.REQUIRED, _parse_expression),
+            "section": _RuleDesc("scalar"),
+            "arg_vartype": _RuleDesc("scalar", _RuleDesc.REQUIRED),
+            "cpp_vartype": _RuleDesc("scalar"),
+            "cpp_varname": _RuleDesc("scalar"),
+            "mod_visibility": _RuleDesc("scalar"),
+            "condition": _RuleDesc("mapping", mapping_parser_func=_parse_condition),
+            "conflicts": _RuleDesc("scalar_or_sequence"),
+            "requires": _RuleDesc(
+                "scalar_or_sequence_or_mapping",
+                mapping_parser_func=_parse_expression_or_sequence,
+                sequence_parser_func=_parse_sequence_of_scalar_or_mapping,
+            ),
+            "hidden": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "redact": _RuleDesc("bool_scalar"),
+            "default": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "implicit": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
+            "source": _RuleDesc("scalar_or_sequence"),
+            "canonicalize": _RuleDesc("scalar"),
+            "duplicate_behavior": _RuleDesc("scalar"),
+            "positional": _RuleDesc("scalar"),
+            "validator": _RuleDesc("mapping", mapping_parser_func=_parse_validator),
+        },
+    )
+
+    _validate_mod_visibility(ctxt, option.mod_visibility, node)
+
+    spec.configs.append(option)
+
+
+def _prefix_with_namespace(cpp_namespace, cpp_name):
+    # type: (str, str) -> str
+    """Preface a C++ type name with a namespace if not already qualified or a primitive type."""
+    if "::" in cpp_name or cpp_types.is_primitive_scalar_type(cpp_name):
+        return cpp_name
+
+    return cpp_namespace + "::" + cpp_name
+
+
+def _propagate_globals(spec):
+    # type: (syntax.IDLSpec) -> None
+    """Propagate the globals information to each type and struct as needed."""
+    if not spec.globals or not spec.globals.cpp_namespace:
+        return
+
+    cpp_namespace = spec.globals.cpp_namespace
+
+    for struct in spec.symbols.structs:
+        struct.cpp_namespace = cpp_namespace
+
+    for command in spec.symbols.commands:
+        command.cpp_namespace = cpp_namespace
+
+    for idlenum in spec.symbols.enums:
+        idlenum.cpp_namespace = cpp_namespace
+
+    for idltype in spec.symbols.types:
+        idltype.cpp_type = _prefix_with_namespace(cpp_namespace, idltype.cpp_type)
+
+
+def parse_file(stream, error_file_name, parse_non_forward_compatible_section=True):
+    # type: (Any, str, bool) -> syntax.IDLParsedSpec
+    """
+    Parse a YAML document into an idl.syntax tree.
+
+    If parse_non_forward_compatible_section is False, don't attempt to parse the feature flag type.
+
+    stream: is a io.Stream.
+    error_file_name: just a file name for error messages to use.
+    """
+
+    # This will raise an exception if the YAML parse fails
+    root_node = yaml.compose(stream)
+
+    ctxt = errors.ParserContext(error_file_name, errors.ParserErrorCollection())
+
+    spec = syntax.IDLSpec()
+
+    # If the document is empty, we are done
+    if not root_node:
+        return syntax.IDLParsedSpec(spec, None)
+
+    if not root_node.id == "mapping":
+        raise errors.IDLError(
+            "Expected a YAML mapping node as root node of IDL document, got '%s' instead"
+            % root_node.id
+        )
+
+    field_name_set = set()  # type: Set[str]
+
+    for [first_node, second_node] in root_node.value:
+        first_name = first_node.value
+
+        if first_name in field_name_set:
+            ctxt.add_duplicate_error(first_node, first_name)
+            continue
+
+        if first_name == "global":
+            _parse_global(ctxt, spec, second_node)
+        elif first_name == "imports":
+            _parse_imports(ctxt, spec, second_node)
+        elif first_name == "enums":
+            _parse_mapping(ctxt, spec, second_node, "enums", _parse_enum)
+        elif first_name == "types":
+            _parse_mapping(ctxt, spec, second_node, "types", _parse_type)
+        elif first_name == "structs":
+            _parse_mapping(ctxt, spec, second_node, "structs", _parse_struct)
+        elif first_name == "commands":
+            _parse_mapping(ctxt, spec, second_node, "commands", _parse_command)
+        elif first_name == "server_parameters":
+            _parse_mapping(ctxt, spec, second_node, "server_parameters", _parse_server_parameter)
+        elif first_name == "configs":
+            _parse_mapping(ctxt, spec, second_node, "configs", _parse_config_option)
+        elif first_name == "feature_flags":
+            if parse_non_forward_compatible_section:
+                _parse_mapping(ctxt, spec, second_node, "feature_flags", _parse_feature_flag)
+        else:
+            ctxt.add_unknown_root_node_error(first_node)
+
+        field_name_set.add(first_name)
+
+    if ctxt.errors.has_errors():
+        return syntax.IDLParsedSpec(None, ctxt.errors)
+
+    _propagate_globals(spec)
+
+    return syntax.IDLParsedSpec(spec, None)
+
+
+class ImportResolverBase(object, metaclass=ABCMeta):
+    """Base class for resolving imported files."""
+
+    def __init__(self):
+        # type: () -> None
+        """Construct a ImportResolver."""
+        pass
+
+    @abstractmethod
+    def resolve(self, base_file, imported_file_name):
+        # type: (str, str) -> str
+        """Return the complete path to an imported file name."""
+        pass
+
+    @abstractmethod
+    def open(self, resolved_file_name):
+        # type: (str) -> Any
+        """Return an io.Stream for the requested file."""
+        pass
+
+
+def parse(stream, input_file_name, resolver, parse_non_forward_compatible_section=True):
+    # type: (Any, str, ImportResolverBase, bool) -> syntax.IDLParsedSpec
+    """
+    Parse a YAML document into an idl.syntax tree.
+
+    If parse_non_forward_compatible_section is False, don't attempt to parse the feature flag type.
+
+    stream: is a io.Stream.
+    input_file_name: a file name for error messages to use, and to help resolve imported files.
+    """
+
+    root_doc = parse_file(stream, input_file_name, parse_non_forward_compatible_section)
+
+    if root_doc.errors:
+        return root_doc
+
+    imports = []  # type: List[Tuple[common.SourceLocation, str, str]]
+
+    if root_doc.spec.symbols.commands:
+        imports.append((None, input_file_name, common.GENERIC_ARGS_FILENAME))
+
+    needs_include = []  # type: List[str]
+    if root_doc.spec.imports:
+        imports += [
+            (root_doc.spec.imports, input_file_name, import_file_name)
+            for import_file_name in root_doc.spec.imports.imports
+        ]
+
+    resolved_file_names = []  # type: List[str]
+
+    ctxt = errors.ParserContext(input_file_name, errors.ParserErrorCollection())
+
+    # Process imports in a breadth-first search
+    while imports:
+        file_import_tuple = imports[0]
+        imports = imports[1:]
+
+        import_location = file_import_tuple[0]
+        base_file_name = file_import_tuple[1]
+        imported_file_name = file_import_tuple[2]
+
+        # Check for already resolved file
+        resolved_file_name = resolver.resolve(base_file_name, imported_file_name)
+        if not resolved_file_name:
+            ctxt.add_cannot_find_import(import_location, imported_file_name)
+            return syntax.IDLParsedSpec(None, ctxt.errors)
+
+        if resolved_file_name in resolved_file_names:
+            continue
+
+        resolved_file_names.append(resolved_file_name)
+
+        # Parse imported file
+        with resolver.open(resolved_file_name) as file_stream:
+            parsed_doc = parse_file(
+                file_stream, resolved_file_name, parse_non_forward_compatible_section
+            )
+
+        # Check for errors
+        if parsed_doc.errors:
+            return parsed_doc
+
+        # We need to generate includes for imported IDL files which have structs or enums.
+        if base_file_name == input_file_name and (
+            parsed_doc.spec.symbols.structs or parsed_doc.spec.symbols.enums
+        ):
+            needs_include.append(imported_file_name)
+
+        # Add other imported files to the list of files to parse
+        if parsed_doc.spec.imports:
+            imports += [
+                (parsed_doc.spec.imports, resolved_file_name, import_file_name)
+                for import_file_name in parsed_doc.spec.imports.imports
+            ]
+
+        # Merge cpp_includes as needed
+        if parsed_doc.spec.globals and parsed_doc.spec.globals.cpp_includes:
+            root_doc.spec.globals.cpp_includes = list(
+                set(root_doc.spec.globals.cpp_includes + parsed_doc.spec.globals.cpp_includes)
+            )
+
+        # Merge symbol tables together
+        root_doc.spec.symbols.add_imported_symbol_table(ctxt, parsed_doc.spec.symbols)
+        if ctxt.errors.has_errors():
+            return syntax.IDLParsedSpec(None, ctxt.errors)
+
+    # Resolve the direct imports which contain structs for root document so they can be translated
+    # into include file paths in generated code.
+    for needs_include_name in needs_include:
+        resolved_file_name = resolver.resolve(base_file_name, needs_include_name)
+        root_doc.spec.imports.resolved_imports.append(resolved_file_name)
+
+    if root_doc.spec.imports:
+        root_doc.spec.imports.dependencies = resolved_file_names
+
+    return root_doc

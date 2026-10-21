@@ -1,0 +1,510 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/query/query_planner_test_fixture.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_test_lib.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog_entry_mock.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/unittest/unittest.h"
+
+#include <algorithm>
+#include <string_view>
+
+#include <boost/container/vector.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
+namespace mongo {
+
+
+void QueryPlannerTest::setUp() {
+    nss = NamespaceString::createNamespaceString_forTest("test.collection");
+    opCtx = serviceContext.makeOperationContext();
+    expCtx = ExpressionContextBuilder{}.opCtx(opCtx.get()).ns(nss).build();
+    params.mainCollectionInfo.options = QueryPlannerParams::INCLUDE_COLLSCAN;
+    addIndex(BSON("_id" << 1));
+}
+
+void QueryPlannerTest::clearState() {
+    plannerStatus = Status::OK();
+    solns.clear();
+    cq.reset();
+    expCtx.reset();
+    relaxBoundsCheck = false;
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern,
+                                std::string_view indexName,
+                                bool multikey,
+                                bool sparse,
+                                bool unique,
+                                BSONObj infoObj,
+                                MatchExpression* filterExpr,
+                                const CollatorInterface* collator) {
+    const auto type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
+
+    IndexSpec spec;
+    spec.version(1).name(indexName).addKeys(keyPattern);
+    auto descriptor = IndexDescriptor(IndexNames::BTREE, spec.toBSON());
+    auto mockIndexCatalogEntry = std::make_shared<IndexCatalogEntryMock>(nullptr,
+                                                                         nullptr,
+                                                                         "" /* ident */,
+                                                                         std::move(descriptor),
+                                                                         false, /* isFrozen */
+                                                                         filterExpr,
+                                                                         collator);
+
+    IndexEntry entry(keyPattern,
+                     type,
+                     IndexConfig::kLatestIndexVersion,
+                     multikey,
+                     {},
+                     {},
+                     sparse,
+                     unique,
+                     IndexEntry::Identifier{std::string(indexName)},
+                     std::move(infoObj),
+                     nullptr,
+                     std::move(mockIndexCatalogEntry));
+    params.mainCollectionInfo.indexes.push_back(entry);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse, bool unique) {
+    addIndex(
+        keyPattern, "sql_query_walks_into_bar_and_says_can_i_join_you?", multikey, sparse, unique);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, BSONObj infoObj) {
+    addIndex(keyPattern, "foo", false, false, false, std::move(infoObj));
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, MatchExpression* filterExpr) {
+    addIndex(keyPattern, "foo", false, false, false, BSONObj(), filterExpr);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, const MultikeyPaths& multikeyPaths) {
+    invariant(multikeyPaths.size() == static_cast<size_t>(keyPattern.nFields()));
+
+    const auto type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
+    const bool multikey =
+        std::any_of(multikeyPaths.cbegin(),
+                    multikeyPaths.cend(),
+                    [](const MultikeyComponents& components) { return !components.empty(); });
+    const bool sparse = false;
+    const bool unique = false;
+    const char name[] = "my_index_with_path_level_multikey_info";
+    const MatchExpression* filterExpr = nullptr;
+    const CollatorInterface* collator = nullptr;
+    const BSONObj infoObj;
+
+    IndexSpec spec;
+    spec.version(1).name("test_index").addKeys(keyPattern);
+    auto descriptor = IndexDescriptor(IndexNames::BTREE, spec.toBSON());
+    auto mockIndexCatalogEntry = std::make_shared<IndexCatalogEntryMock>(nullptr,
+                                                                         nullptr,
+                                                                         "" /* ident */,
+                                                                         std::move(descriptor),
+                                                                         false /* isFrozen */,
+                                                                         filterExpr,
+                                                                         collator);
+    IndexEntry entry(keyPattern,
+                     type,
+                     IndexConfig::kLatestIndexVersion,
+                     multikey,
+                     multikeyPaths,
+                     {},
+                     sparse,
+                     unique,
+                     IndexEntry::Identifier{name},
+                     infoObj,
+                     nullptr,
+                     std::move(mockIndexCatalogEntry));
+    params.mainCollectionInfo.indexes.push_back(entry);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern, const CollatorInterface* collator) {
+    addIndex(
+        keyPattern, "my_index_with_collator", false, false, false, BSONObj(), nullptr, collator);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern,
+                                const CollatorInterface* collator,
+                                std::string_view indexName) {
+    addIndex(keyPattern, indexName, false, false, false, BSONObj(), nullptr, collator);
+}
+
+void QueryPlannerTest::addIndex(BSONObj keyPattern,
+                                MatchExpression* filterExpr,
+                                const CollatorInterface* collator) {
+    addIndex(keyPattern,
+             "my_partial_index_with_collator",
+             false,
+             false,
+             false,
+             BSONObj(),
+             filterExpr,
+             collator);
+}
+
+void QueryPlannerTest::addIndex(const IndexEntry& ie) {
+    params.mainCollectionInfo.indexes.push_back(ie);
+}
+
+void QueryPlannerTest::runQuery(BSONObj query) {
+    runQuerySortProjSkipLimit(query, BSONObj(), BSONObj(), 0, 0);
+}
+
+void QueryPlannerTest::runQueryWithPipeline(
+    BSONObj query,
+    BSONObj proj,
+    std::vector<boost::intrusive_ptr<DocumentSource>> queryLayerPipeline) {
+    runQueryFull(query,
+                 BSONObj(),
+                 proj,
+                 0,
+                 0,
+                 BSONObj(),
+                 BSONObj(),
+                 BSONObj(),
+                 std::move(queryLayerPipeline));
+}
+
+void QueryPlannerTest::runQuerySortProj(const BSONObj& query,
+                                        const BSONObj& sort,
+                                        const BSONObj& proj) {
+    runQuerySortProjSkipLimit(query, sort, proj, 0, 0);
+}
+
+void QueryPlannerTest::runQuerySkipLimit(const BSONObj& query, long long skip, long long limit) {
+    runQuerySortProjSkipLimit(query, BSONObj(), BSONObj(), skip, limit);
+}
+
+void QueryPlannerTest::runQueryHint(const BSONObj& query, const BSONObj& hint) {
+    runQuerySortProjSkipLimitHint(query, BSONObj(), BSONObj(), 0, 0, hint);
+}
+
+void QueryPlannerTest::runQuerySortProjSkipLimit(const BSONObj& query,
+                                                 const BSONObj& sort,
+                                                 const BSONObj& proj,
+                                                 long long skip,
+                                                 long long limit) {
+    runQuerySortProjSkipLimitHint(query, sort, proj, skip, limit, BSONObj());
+}
+
+void QueryPlannerTest::runQuerySortHint(const BSONObj& query,
+                                        const BSONObj& sort,
+                                        const BSONObj& hint) {
+    runQuerySortProjSkipLimitHint(query, sort, BSONObj(), 0, 0, hint);
+}
+
+void QueryPlannerTest::runQueryHintMinMax(const BSONObj& query,
+                                          const BSONObj& hint,
+                                          const BSONObj& minObj,
+                                          const BSONObj& maxObj) {
+    runQueryFull(query, BSONObj(), BSONObj(), 0, 0, hint, minObj, maxObj);
+}
+
+void QueryPlannerTest::runQuerySortProjSkipLimitHint(const BSONObj& query,
+                                                     const BSONObj& sort,
+                                                     const BSONObj& proj,
+                                                     long long skip,
+                                                     long long limit,
+                                                     const BSONObj& hint) {
+    runQueryFull(query, sort, proj, skip, limit, hint, BSONObj(), BSONObj());
+}
+
+void QueryPlannerTest::runQueryFull(const BSONObj& query,
+                                    const BSONObj& sort,
+                                    const BSONObj& proj,
+                                    long long skip,
+                                    long long limit,
+                                    const BSONObj& hint,
+                                    const BSONObj& minObj,
+                                    const BSONObj& maxObj,
+                                    std::vector<boost::intrusive_ptr<DocumentSource>> pipeline) {
+    clearState();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    findCommand->setSort(sort);
+    findCommand->setProjection(proj);
+    if (skip) {
+        findCommand->setSkip(skip);
+    }
+    if (limit) {
+        findCommand->setLimit(limit);
+    }
+    findCommand->setHint(hint);
+    findCommand->setMin(minObj);
+    findCommand->setMax(maxObj);
+    cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                              .allowedFeatures =
+                                                  MatchExpressionParser::kAllowAllSpecialFeatures},
+        .pipeline = std::move(pipeline),
+        .isCountLike = isCountLike});
+    cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
+
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
+    ASSERT_OK(statusWithMultiPlanSolns.getStatus());
+    solns = std::move(statusWithMultiPlanSolns.getValue());
+}
+
+void QueryPlannerTest::runInvalidQuery(const BSONObj& query) {
+    runInvalidQuerySortProjSkipLimit(query, BSONObj(), BSONObj(), 0, 0);
+}
+
+void QueryPlannerTest::runInvalidQuerySortProj(const BSONObj& query,
+                                               const BSONObj& sort,
+                                               const BSONObj& proj) {
+    runInvalidQuerySortProjSkipLimit(query, sort, proj, 0, 0);
+}
+
+void QueryPlannerTest::runInvalidQuerySortProjSkipLimit(const BSONObj& query,
+                                                        const BSONObj& sort,
+                                                        const BSONObj& proj,
+                                                        long long skip,
+                                                        long long limit) {
+    runInvalidQuerySortProjSkipLimitHint(query, sort, proj, skip, limit, BSONObj());
+}
+
+void QueryPlannerTest::runInvalidQueryHint(const BSONObj& query, const BSONObj& hint) {
+    runInvalidQuerySortProjSkipLimitHint(query, BSONObj(), BSONObj(), 0, 0, hint);
+}
+
+void QueryPlannerTest::runInvalidQueryHintMinMax(const BSONObj& query,
+                                                 const BSONObj& hint,
+                                                 const BSONObj& minObj,
+                                                 const BSONObj& maxObj) {
+    runInvalidQueryFull(query, BSONObj(), BSONObj(), 0, 0, hint, minObj, maxObj);
+}
+
+void QueryPlannerTest::runInvalidQuerySortProjSkipLimitHint(const BSONObj& query,
+                                                            const BSONObj& sort,
+                                                            const BSONObj& proj,
+                                                            long long skip,
+                                                            long long limit,
+                                                            const BSONObj& hint) {
+    runInvalidQueryFull(query, sort, proj, skip, limit, hint, BSONObj(), BSONObj());
+}
+
+void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
+                                           const BSONObj& sort,
+                                           const BSONObj& proj,
+                                           long long skip,
+                                           long long limit,
+                                           const BSONObj& hint,
+                                           const BSONObj& minObj,
+                                           const BSONObj& maxObj) {
+    clearState();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(query);
+    findCommand->setSort(sort);
+    findCommand->setProjection(proj);
+    if (skip) {
+        findCommand->setSkip(skip);
+    }
+    if (limit) {
+        findCommand->setLimit(limit);
+    }
+    findCommand->setHint(hint);
+    findCommand->setMin(minObj);
+    findCommand->setMax(maxObj);
+    cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                              .allowedFeatures =
+                                                  MatchExpressionParser::kAllowAllSpecialFeatures},
+        .isCountLike = isCountLike});
+    cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
+
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
+    plannerStatus = statusWithMultiPlanSolns.getStatus();
+    ASSERT_NOT_OK(plannerStatus);
+}
+
+void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
+    clearState();
+
+    invariant(nss.isValid());
+    // If there is no '$db', append it.
+    auto cmd = OpMsgRequestBuilder::create(
+                   auth::ValidatedTenancyScope::get(opCtx.get()), nss.dbName(), cmdObj)
+                   .body;
+    std::unique_ptr<FindCommandRequest> findCommand(
+        query_request_helper::makeFromFindCommandForTests(cmd, nss));
+
+    cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                              .allowedFeatures =
+                                                  MatchExpressionParser::kAllowAllSpecialFeatures},
+        .isCountLike = isCountLike});
+    cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
+
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
+    ASSERT_OK(statusWithMultiPlanSolns.getStatus());
+    solns = std::move(statusWithMultiPlanSolns.getValue());
+}
+
+void QueryPlannerTest::runInvalidQueryAsCommand(const BSONObj& cmdObj) {
+    clearState();
+
+    invariant(nss.isValid());
+
+    // If there is no '$db', append it.
+    auto cmd = OpMsgRequestBuilder::create(
+                   auth::ValidatedTenancyScope::get(opCtx.get()), nss.dbName(), cmdObj)
+                   .body;
+    std::unique_ptr<FindCommandRequest> findCommand(
+        query_request_helper::makeFromFindCommandForTests(cmd, nss));
+
+    cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                              .allowedFeatures =
+                                                  MatchExpressionParser::kAllowAllSpecialFeatures},
+        .isCountLike = isCountLike});
+    cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
+
+    auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
+    plannerStatus = statusWithMultiPlanSolns.getStatus();
+    ASSERT_NOT_OK(plannerStatus);
+}
+
+size_t QueryPlannerTest::getNumSolutions() const {
+    return solns.size();
+}
+
+void QueryPlannerTest::dumpSolutions() const {
+    str::stream ost;
+    dumpSolutions(ost);
+    LOGV2(20985, "Solutions", "value"_attr = std::string(ost));
+}
+
+void QueryPlannerTest::dumpSolutions(str::stream& ost) const {
+    for (auto&& soln : solns) {
+        ost << soln->toString() << '\n';
+    }
+}
+
+void QueryPlannerTest::assertNumSolutions(size_t expectSolutions) const {
+    if (getNumSolutions() == expectSolutions) {
+        return;
+    }
+    str::stream ss;
+    ss << "expected " << expectSolutions << " solutions but got " << getNumSolutions()
+       << " instead. Run with --verbose=vv to see reasons for mismatch. Solutions generated: "
+       << '\n';
+    dumpSolutions(ss);
+    FAIL(std::string(ss));
+}
+
+size_t QueryPlannerTest::numSolutionMatches(const std::string& solnJson) const {
+    BSONObj testSoln = fromjson(solnJson);
+    size_t matches = 0;
+    for (auto&& soln : solns) {
+        auto matchStatus =
+            QueryPlannerTestLib::solutionMatches(testSoln, soln->root(), relaxBoundsCheck);
+        if (matchStatus.isOK()) {
+            ++matches;
+        } else {
+            LOGV2_DEBUG(
+                5676408, 2, "Mismatching solution: {reason}", "reason"_attr = matchStatus.reason());
+        }
+    }
+    return matches;
+}
+
+void QueryPlannerTest::assertSolutionExists(const std::string& solnJson, size_t numMatches) const {
+    size_t matches = numSolutionMatches(solnJson);
+    if (numMatches == matches) {
+        return;
+    }
+    str::stream ss;
+    ss << "expected " << numMatches << " matches for solution " << solnJson << " but got "
+       << matches
+       << " instead. Run with --verbose=vv to see reasons for mismatch. All solutions generated: "
+       << '\n';
+    dumpSolutions(ss);
+    FAIL(std::string(ss));
+}
+
+void QueryPlannerTest::assertSolutionDoesntExist(const std::string& solnJson) const {
+    assertSolutionExists(solnJson, 0 /* expect zero matches */);
+}
+
+void QueryPlannerTest::assertHasOneSolutionOf(const std::vector<std::string>& solnStrs) const {
+    size_t matches = 0;
+    for (std::vector<std::string>::const_iterator it = solnStrs.begin(); it != solnStrs.end();
+         ++it) {
+        if (1U == numSolutionMatches(*it)) {
+            ++matches;
+        }
+    }
+    if (1U == matches) {
+        return;
+    }
+    str::stream ss;
+    ss << "assertHasOneSolutionOf expected one matching solution"
+       << " but got " << matches
+       << " instead. Run with --verbose=vv to see reasons for mismatch. All solutions generated: "
+       << '\n';
+    dumpSolutions(ss);
+    FAIL(std::string(ss));
+}
+
+void QueryPlannerTest::assertNoSolutions() const {
+    ASSERT_EQUALS(plannerStatus.code(), ErrorCodes::NoQueryExecutionPlans);
+}
+
+void QueryPlannerTest::assertHasOnlyCollscan() const {
+    assertNumSolutions(1U);
+    assertSolutionExists("{cscan: {dir: 1}}");
+}
+
+std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(
+    const BSONObj& obj, const boost::intrusive_ptr<ExpressionContext>& optionalExpCtx) {
+    auto expCtx = optionalExpCtx;
+    if (!expCtx.get()) {
+        expCtx = make_intrusive<ExpressionContextForTest>();
+    }
+
+    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, expCtx);
+    if (!status.isOK()) {
+        FAIL(std::string(str::stream() << "failed to parse query: " << obj.toString()
+                                       << ". Reason: " << status.getStatus().toString()));
+    }
+    return std::move(status.getValue());
+}
+
+}  // namespace mongo

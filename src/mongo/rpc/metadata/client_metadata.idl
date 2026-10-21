@@ -1,0 +1,20 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/rpc/metadata/client_metadata.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+types:
+    ClientMetadata:
+        description: "Client metadata document"
+        bson_serialization_type: object
+        cpp_type: ClientMetadata
+        serializer: "mongo::ClientMetadata::getDocument"
+        deserializer: "mongo::ClientMetadata::parseFromBSON"
+        # Deserializer uses getOwned.
+        is_view: false

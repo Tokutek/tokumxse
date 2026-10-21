@@ -1,0 +1,12 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "specs",
+    srcs = glob(["*.py"]),
+    imports = [".."],
+    deps = [
+        "//src/mongo/db/query/benchmark/data_generator/datagen",
+    ],
+)

@@ -1,0 +1,259 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/global_catalog/chunk_manager.h"
+#include "mongo/db/global_catalog/ddl/shard_util.h"
+#include "mongo/db/global_catalog/shard_key_pattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/router_role/routing_cache/catalog_cache.h"
+#include "mongo/db/sharding_environment/client/shard.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace shardkeyutil {
+
+/**
+ * Encapsulates the various steps performed when validating a proposed shard key against the
+ * existing indexes for a collection when sharding a collection or refining its shard key.
+ * Subclasses provide the implementation details specific to either case.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ShardKeyValidationBehaviors {
+public:
+    virtual ~ShardKeyValidationBehaviors() {}
+
+    /*
+     * Returns index specifications for the collection 'nss'.
+     * Returned indexes are in normalized form: if the index uses the simple collation, the
+     * 'collation' field is omitted. Note that because of this normalization, these index specs
+     * cannot be passed directly to a createIndexes user-like command because attempting to
+     * normalize an already-normalized spec is not supported.
+     */
+    virtual std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const = 0;
+
+    virtual void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
+                                              const BSONObj& proposedKey) const = 0;
+
+    virtual void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                              std::string* errMsg) const = 0;
+
+    virtual void createShardKeyIndex(const NamespaceString& nss,
+                                     const BSONObj& proposedKey,
+                                     const boost::optional<BSONObj>& defaultCollation,
+                                     bool unique,
+                                     boost::optional<TimeseriesOptions> tsOpts) const = 0;
+};
+
+/**
+ * Implementation of steps for validating a shard key for shardCollection.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ValidationBehaviorsShardCollection final
+    : public ShardKeyValidationBehaviors {
+public:
+    ValidationBehaviorsShardCollection(OperationContext* opCtx, const ShardId& dataShard)
+        : _opCtx(opCtx),
+          _localClient(std::make_unique<DBDirectClient>(opCtx)),
+          _dataShard(
+              uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dataShard))) {}
+
+    std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
+
+    void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
+                                      const BSONObj& proposedKey) const override;
+
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
+
+    void createShardKeyIndex(const NamespaceString& nss,
+                             const BSONObj& proposedKey,
+                             const boost::optional<BSONObj>& defaultCollation,
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) const override;
+
+private:
+    OperationContext* _opCtx;
+    std::unique_ptr<DBDirectClient> _localClient;
+    std::shared_ptr<Shard> _dataShard;
+};
+
+/**
+ * Implementation of steps for validating a shard key for refineCollectionShardKey locally.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ValidationBehaviorsLocalRefineShardKey final
+    : public ShardKeyValidationBehaviors {
+public:
+    ValidationBehaviorsLocalRefineShardKey(OperationContext* opCtx, const CollectionPtr& coll);
+
+    std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
+
+    void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
+                                      const BSONObj& proposedKey) const override;
+
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
+
+    void createShardKeyIndex(const NamespaceString& nss,
+                             const BSONObj& proposedKey,
+                             const boost::optional<BSONObj>& defaultCollation,
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) const override;
+
+private:
+    OperationContext* _opCtx;
+
+    const CollectionPtr& _coll;
+};
+
+/**
+ * Implementation of steps for validating a shard key for resharding building indexes after cloning.
+ */
+class [[MONGO_MOD_NEEDS_REPLACEMENT]] ValidationBehaviorsReshardingBulkIndex final
+    : public ShardKeyValidationBehaviors {
+public:
+    class RecipientStateMachineExternalState;
+    ValidationBehaviorsReshardingBulkIndex();
+
+    std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
+
+    void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
+                                      const BSONObj& proposedKey) const override;
+
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
+
+    void createShardKeyIndex(const NamespaceString& nss,
+                             const BSONObj& proposedKey,
+                             const boost::optional<BSONObj>& defaultCollation,
+                             bool unique,
+                             boost::optional<TimeseriesOptions> tsOpts) const override;
+
+    void setOpCtxAndCloneTimestamp(OperationContext* opCtx, Timestamp cloneTimestamp);
+
+    boost::optional<BSONObj> getShardKeyIndexSpec() const;
+
+private:
+    OperationContext* _opCtx;
+    Timestamp _cloneTimestamp;
+    mutable boost::optional<BSONObj> _shardKeyIndexSpec;
+};
+
+/**
+ * Compares the proposed shard key with the collection's existing indexes to ensure they are a legal
+ * combination.
+ *
+ * Creates the required index if and only if (i) the collection is empty, (ii) no index on the
+ * shard key exists, and (iii) the collection is not having its shard key refined.
+ *
+ * The proposed shard key must be validated against the set of existing indexes.
+ * In particular, we must ensure the following constraints:
+ *
+ * 1. All existing unique indexes, except those which start with the _id index,
+ *    must contain the proposed key as a prefix (uniqueness of the _id index is
+ *    ensured by the _id generation process or guaranteed by the user).
+ *
+ * 2. If the collection is not empty or we are refining its shard key, there must exist at least one
+ *    index that is "useful" for the proposed key.  A "useful" index is defined as adhering to
+ *    all of the following properties:
+ *         i. contains proposedKey as a prefix
+ *         ii. is not a sparse index, partial index, or index with a non-simple collation
+ *         iii. is not multikey (maybe lift this restriction later)
+ *         iv. if a hashed index, has default seed (lift this restriction later)
+ *
+ * 3. If the proposed shard key is specified as unique, there must exist a useful,
+ *    unique index exactly equal to the proposedKey (not just a prefix).
+ *
+ * 4. If the request concerns a timeseries collection, 'nss' must refer to the buckets namespace,
+ *    'tsOpts' must have a value, and 'shardKeyPattern' must already be buckets-encoded.
+ *
+ * After validating these constraints:
+ *
+ * 5. If there is no useful index, and the collection is non-empty or we are refining the
+ *    collection's shard key, we must fail.
+ *
+ * 6. If the collection is empty and we are not refining the collection's shard key, and it's
+ *    still possible to create an index on the proposed key, we go ahead and do so.
+ *
+ * Returns true if the index has been created, false otherwise.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] bool validateShardKeyIndexExistsOrCreateIfPossible(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ShardKeyPattern& shardKeyPattern,
+    const boost::optional<BSONObj>& defaultCollation,
+    bool unique,
+    bool enforceUniquenessCheck,
+    const ShardKeyValidationBehaviors& behaviors,
+    boost::optional<TimeseriesOptions> tsOpts);
+/**
+ * Compares the proposed shard key with the collection's existing indexes to ensure they are a legal
+ * combination.
+ *
+ * Returns true if the shard key is valid and already exists. Steps 1, 2 and 3 of the previous
+ * function.
+ *
+ * It throws an exception if a valid shard key index doesn't exist and it's not possible to create
+ * one.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] bool validShardKeyIndexExists(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ShardKeyPattern& shardKeyPattern,
+    const boost::optional<BSONObj>& defaultCollation,
+    bool requiresUnique,
+    const ShardKeyValidationBehaviors& behaviors,
+    std::string* errMsg = nullptr);
+
+[[MONGO_MOD_NEEDS_REPLACEMENT]] void validateShardKeyIsNotEncrypted(
+    OperationContext* opCtx, const NamespaceString& nss, const ShardKeyPattern& shardKeyPattern);
+
+/**
+ * Validates a user provided shard key for timeseries collections.
+ * - Key pattern only contains meta field/sub-fields of meta field/time field.
+ * - If meta field is present, it can be ranged or hashed.
+ * - If time field is present, it must be ranged and at the end of the key pattern.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] void validateTimeseriesShardKey(
+    std::string_view timeFieldName,
+    boost::optional<std::string_view> metaFieldName,
+    const BSONObj& shardKeyPattern);
+
+/**
+ * Validates that 'tsShardKey' uses the user-facing time-series field names (timeField and
+ * metaField), then translates it to the internal buckets collection format.
+ * Throws if the shard key contains fields other than the defined timeField or metaField.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] BSONObj validateAndTranslateTimeseriesShardKey(
+    const TimeseriesOptions& tsOptions, const BSONObj& tsShardKey);
+
+/**
+ * Returns true if the given shard key is a valid key already in the internal buckets collection
+ * raw key format. Returns false if the key uses user-facing field names (requiring translation)
+ * or if the key is not a recognized timeseries shard key.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] bool isRawTimeseriesShardKey(const TimeseriesOptions& tsOptions,
+                                                             const BSONObj& tsShardKey);
+
+/**
+ * Returns a chunk range with extended or truncated boundaries to match the number of fields in
+ * the given metadata's shard key pattern.
+ */
+[[MONGO_MOD_NEEDS_REPLACEMENT]] ChunkRange extendOrTruncateBoundsForMetadata(
+    const CollectionMetadata& metadata, const ChunkRange& range);
+
+}  // namespace shardkeyutil
+}  // namespace mongo

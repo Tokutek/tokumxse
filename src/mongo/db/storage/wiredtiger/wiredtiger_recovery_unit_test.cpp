@@ -1,0 +1,1785 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/rss/attached_storage/attached_persistence_provider.h"
+#include "mongo/db/rss/replicated_storage_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit_test_harness.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_cursor_helpers.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/temp_dir.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
+
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include <wiredtiger.h>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace {
+
+using StepdownState = WiredTigerRecoveryUnit::StepdownState;
+
+class TimestampBlock {
+public:
+    TimestampBlock(RecoveryUnit& ru, Timestamp ts) : _ru(ru) {
+        invariant(!ru.isActive());
+        ru.setCommitTimestamp(ts);
+    }
+    ~TimestampBlock() {
+        _ru.clearCommitTimestamp();
+    }
+
+private:
+    RecoveryUnit& _ru;
+    TimestampBlock(const TimestampBlock&) = delete;
+    TimestampBlock& operator=(const TimestampBlock&) = delete;
+};
+
+template <typename EngineT = WiredTigerKVEngine>
+class WiredTigerRecoveryUnitHarnessHelperT final : public RecoveryUnitHarnessHelper {
+public:
+    WiredTigerRecoveryUnitHarnessHelperT() : _dbpath("wt_test") {
+        auto& provider =
+            rss::ReplicatedStorageService::get(serviceContext()).getPersistenceProvider();
+        WiredTigerKVEngineBase::WiredTigerConfig wtConfig =
+            getWiredTigerConfigFromStartupOptions(provider);
+        wtConfig.cacheSizeMB = 1;
+
+        // Use a replica set so that writes to replicated collections are not journaled and thus
+        // retain their timestamps.
+        _engine = std::make_unique<EngineT>(std::string{kWiredTigerEngineName},
+                                            _dbpath.path(),
+                                            &_cs,
+                                            std::move(wtConfig),
+                                            WiredTigerExtensions::get(serviceContext()),
+                                            provider,
+                                            false /* repair */,
+                                            true /* isReplSet */,
+                                            false /* shouldRecoverFromOplogAsStandalone */,
+                                            false /* inStandaloneMode */);
+
+        _engine->notifyStorageStartupRecoveryComplete();
+    }
+
+    ~WiredTigerRecoveryUnitHarnessHelperT() override {
+#if __has_feature(address_sanitizer)
+        constexpr bool memLeakAllowed = false;
+#else
+        constexpr bool memLeakAllowed = true;
+#endif
+        _engine->cleanShutdown(memLeakAllowed);
+    }
+
+    std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
+        return std::unique_ptr<RecoveryUnit>(_engine->newRecoveryUnit());
+    }
+
+    std::unique_ptr<RecordStore> createRecordStore(OperationContext* opCtx,
+                                                   const std::string& ns) final {
+        std::string ident = "collection-" + ns;
+        std::replace(ident.begin(), ident.end(), '.', '-');
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest(ns);
+        auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+        StorageWriteTransaction swt(ru);
+        const auto res =
+            _engine->createRecordStore(provider, ru, nss, ident, RecordStore::Options{});
+        swt.commit();
+        return _engine->getRecordStore(opCtx, nss, ident, RecordStore::Options{}, UUID::gen());
+    }
+
+    EngineT* getEngine() {
+        return _engine.get();
+    }
+
+    ClockSourceMock* getClockSourceMock() {
+        return &_cs;
+    }
+
+private:
+    unittest::TempDir _dbpath;
+    ClockSourceMock _cs;
+    std::unique_ptr<EngineT> _engine;
+};
+
+using WiredTigerRecoveryUnitHarnessHelper = WiredTigerRecoveryUnitHarnessHelperT<>;
+
+std::unique_ptr<RecoveryUnitHarnessHelper> makeWTRUHarnessHelper() {
+    return std::make_unique<WiredTigerRecoveryUnitHarnessHelper>();
+}
+
+MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
+    mongo::registerRecoveryUnitHarnessHelperFactory(makeWTRUHarnessHelper);
+}
+
+class WiredTigerRecoveryUnitTestFixture : public unittest::Test {
+public:
+    typedef std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>
+        ClientAndCtx;
+
+    ClientAndCtx makeClientAndOpCtx(RecoveryUnitHarnessHelper* harnessHelper,
+                                    const std::string& clientName) {
+        auto sc = harnessHelper->serviceContext();
+        auto client = sc->getService()->makeClient(clientName);
+        auto opCtx = client->makeOperationContext();
+        shard_role_details::setRecoveryUnit(opCtx.get(),
+                                            harnessHelper->newRecoveryUnit(),
+                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        return std::make_pair(std::move(client), std::move(opCtx));
+    }
+
+    void getCursor(WiredTigerRecoveryUnit* ru, WT_CURSOR** cursor) {
+        WiredTigerSession* session = ru->getSession();
+        invariantWTOK(session->create(wt_uri, wt_config), *session);
+        invariantWTOK(session->open_cursor(wt_uri, nullptr, nullptr, cursor), *session);
+    }
+
+    void getCursor(WiredTigerSession& session, WT_CURSOR*& cursor) {
+        invariantWTOK(session.open_cursor(wt_uri, nullptr, nullptr, &cursor), session);
+    }
+
+    WiredTigerKVEngine* getEngine() {
+        return static_cast<WiredTigerRecoveryUnitHarnessHelper*>(harnessHelper.get())->getEngine();
+    }
+
+    void setUp() override {
+        harnessHelper = std::make_unique<WiredTigerRecoveryUnitHarnessHelper>();
+        clientAndCtx1 = makeClientAndOpCtx(harnessHelper.get(), "writer");
+        clientAndCtx2 = makeClientAndOpCtx(harnessHelper.get(), "reader");
+        ru1 = checked_cast<WiredTigerRecoveryUnit*>(
+            shard_role_details::getRecoveryUnit(clientAndCtx1.second.get()));
+        ru1->setOperationContext(clientAndCtx1.second.get());
+        ru2 = checked_cast<WiredTigerRecoveryUnit*>(
+            shard_role_details::getRecoveryUnit(clientAndCtx2.second.get()));
+        ru2->setOperationContext(clientAndCtx2.second.get());
+        snapshotManager =
+            static_cast<WiredTigerSnapshotManager*>(getEngine()->getSnapshotManager());
+    }
+
+    std::unique_ptr<RecoveryUnitHarnessHelper> harnessHelper;
+    ClientAndCtx clientAndCtx1, clientAndCtx2;
+    WiredTigerRecoveryUnit *ru1, *ru2;
+    WiredTigerSnapshotManager* snapshotManager;
+
+private:
+    const char* wt_uri = "table:prepare_transaction";
+    const char* wt_config = "key_format=S,value_format=S,log=(enabled=false)";
+};
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, SetReadSource) {
+    ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, Timestamp(1, 1));
+    ASSERT_EQ(RecoveryUnit::ReadSource::kProvided, ru1->getTimestampReadSource());
+    ASSERT_EQ(Timestamp(1, 1), ru1->getPointInTimeReadTimestamp());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CanReadLastUsedReadTimestamp) {
+    OperationContext* opCtx1 = clientAndCtx1.second.get();
+    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx1, "a.b"));
+
+    const Timestamp ts1{1, 1};
+    RecordId rid;
+    {
+        StorageWriteTransaction txn(*ru1);
+        const std::string str = "test";
+        StatusWith<RecordId> res = rs->insertRecord(
+            opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), str.c_str(), str.size() + 1, ts1);
+        ASSERT_OK(res);
+        txn.commit();
+        rid = res.getValue();
+    }
+
+    // Before any read transaction with a timestamp has closed, getLastUsedReadTimestamp is none.
+    ASSERT_EQ(boost::none, ru1->getLastUsedReadTimestamp());
+
+    const Timestamp ts2{2, 2};
+
+    // Open a read transaction at ts2.
+    ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, ts2);
+    RecordData unused;
+    ASSERT_TRUE(rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid, &unused));
+    ASSERT_EQ(std::string("test"), std::string(unused.data(), unused.size() - 1));
+
+    // Closing the transaction should capture the read timestamp.
+    ru1->abandonSnapshot();
+    ASSERT_EQ(ts2, ru1->getLastUsedReadTimestamp());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, NoOverlapReadSource) {
+    OperationContext* opCtx1 = clientAndCtx1.second.get();
+    OperationContext* opCtx2 = clientAndCtx2.second.get();
+
+    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx1, "a.b"));
+
+    const std::string str = str::stream() << "test";
+    const Timestamp ts1{1, 1};
+    const Timestamp ts2{1, 2};
+    const Timestamp ts3{1, 2};
+
+    RecordId rid1;
+    {
+        StorageWriteTransaction txn(*ru1);
+        StatusWith<RecordId> res = rs->insertRecord(
+            opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), str.c_str(), str.size() + 1, ts1);
+        ASSERT_OK(res);
+        txn.commit();
+        rid1 = res.getValue();
+        snapshotManager->setLastApplied(ts1);
+    }
+
+    // Read without a timestamp. The write should be visible.
+    ASSERT_EQ(ru1->getTimestampReadSource(), RecoveryUnit::ReadSource::kNoTimestamp);
+    RecordData unused;
+    ASSERT_TRUE(
+        rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid1, &unused));
+
+    // Read with kNoOverlap. The write should be visible.
+    ru1->abandonSnapshot();
+    ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+    ASSERT_TRUE(
+        rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid1, &unused));
+
+    RecordId rid2, rid3;
+    {
+        // Start, but do not commit a transaction with opCtx2. This sets a timestamp at ts2, which
+        // creates a hole. kNoOverlap, which is a function of all_durable, will only be able to read
+        // at the time immediately before.
+        StorageWriteTransaction txn(*ru2);
+        StatusWith<RecordId> res = rs->insertRecord(opCtx2,
+                                                    *shard_role_details::getRecoveryUnit(opCtx2),
+                                                    str.c_str(),
+                                                    str.size() + 1,
+                                                    Timestamp());
+        ASSERT_OK(ru2->setTimestamp(ts2));
+        ASSERT_OK(res);
+        rid2 = res.getValue();
+
+        // While holding open a transaction with opCtx2, perform an insert at ts3 with opCtx1. This
+        // creates a "hole".
+        {
+            StorageWriteTransaction txn(*ru1);
+            StatusWith<RecordId> res =
+                rs->insertRecord(opCtx1,
+                                 *shard_role_details::getRecoveryUnit(opCtx1),
+                                 str.c_str(),
+                                 str.size() + 1,
+                                 ts3);
+            ASSERT_OK(res);
+            txn.commit();
+            rid3 = res.getValue();
+            snapshotManager->setLastApplied(ts3);
+        }
+
+        // Read without a timestamp, and we should see the first and third records.
+        ru1->abandonSnapshot();
+        ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        ASSERT_TRUE(
+            rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid1, &unused));
+        ASSERT_FALSE(
+            rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid2, &unused));
+        ASSERT_TRUE(
+            rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid3, &unused));
+
+        // Now read at kNoOverlap. Since the transaction at ts2 has not committed, all_durable is
+        // held back to ts1. LastApplied has advanced to ts3, but because kNoOverlap is the minimum,
+        // we should only see one record.
+        ru1->abandonSnapshot();
+        ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+        ASSERT_TRUE(
+            rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid1, &unused));
+        ASSERT_FALSE(
+            rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid2, &unused));
+        ASSERT_FALSE(
+            rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid3, &unused));
+
+        txn.commit();
+    }
+
+    // Now that the hole has been closed, kNoOverlap should see all 3 records.
+    ru1->abandonSnapshot();
+    ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+    ASSERT_TRUE(
+        rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid1, &unused));
+    ASSERT_TRUE(
+        rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid2, &unused));
+    ASSERT_TRUE(
+        rs->findRecord(opCtx1, *shard_role_details::getRecoveryUnit(opCtx1), rid3, &unused));
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture,
+       LocalReadOnADocumentBeingPreparedWithoutIgnoringPreparedTriggersPrepareConflict) {
+    // Prepare but don't commit a transaction
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    // The transaction read default enforces prepare conflicts and triggers a WT_PREPARE_CONFLICT.
+    ru2->beginUnitOfWork(clientAndCtx2.second->readOnly());
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key");
+    int ret = cursor->search(cursor);
+    ASSERT_EQ(WT_PREPARE_CONFLICT, ret);
+
+    ru1->abortUnitOfWork();
+    ru2->abortUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture,
+       LocalReadsOnADocumentBeingPreparedDontTriggerPrepareConflict) {
+    // Prepare but don't commit a transaction
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    // A transaction that chooses to ignore prepare conflicts does not see the record instead of
+    // returning a prepare conflict.
+    ru2->beginUnitOfWork(clientAndCtx2.second->readOnly());
+    ru2->setPrepareConflictBehavior(PrepareConflictBehavior::kIgnoreConflicts);
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key");
+    int ret = cursor->search(cursor);
+    ASSERT_EQ(WT_NOTFOUND, ret);
+
+    ru1->abortUnitOfWork();
+    ru2->abortUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, WriteAllowedWhileIgnorePrepareFalse) {
+    // Prepare but don't commit a transaction
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key1");
+    cursor->set_value(cursor, "value1");
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    // A transaction that chooses to ignore prepare conflicts with kIgnoreConflictsAllowWrites does
+    // not see the record
+    ru2->beginUnitOfWork(clientAndCtx2.second->readOnly());
+    ru2->setPrepareConflictBehavior(PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+
+    // The prepared write is not visible.
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key1");
+    ASSERT_EQ(WT_NOTFOUND, cursor->search(cursor));
+
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key2");
+    cursor->set_value(cursor, "value2");
+
+    // The write is allowed.
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+    ru1->abortUnitOfWork();
+    ru2->abortUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, WriteOnADocumentBeingPreparedTriggersWTRollback) {
+    // Prepare but don't commit a transaction
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    // Another transaction with write triggers WT_ROLLBACK
+    ru2->beginUnitOfWork(clientAndCtx2.second->readOnly());
+    getCursor(ru2, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value2");
+    int ret = wiredTigerCursorInsert(*ru1, cursor);
+    ASSERT_EQ(WT_ROLLBACK, ret);
+
+    ru1->abortUnitOfWork();
+    ru2->abortUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ReadUncommittedIsolation) {
+    ru2->setIsolation(RecoveryUnit::Isolation::readUncommitted);
+    auto session = ru2->getSession();
+
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ScopeGuard guard{[this] {
+        ru1->abortUnitOfWork();
+    }};
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    ASSERT_EQ(wiredTigerCursorInsert(*ru1, cursor), 0);
+
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "key");
+    ASSERT_EQ(cursor->search(cursor), 0);
+
+    ru1->commitUnitOfWork();
+    guard.dismiss();
+
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "key");
+    ASSERT_EQ(cursor->search(cursor), 0);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ReadCommittedIsolation) {
+    ru2->setIsolation(RecoveryUnit::Isolation::readCommitted);
+    auto session = ru2->getSession();
+
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ScopeGuard guard{[this] {
+        ru1->abortUnitOfWork();
+    }};
+
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    ASSERT_EQ(wiredTigerCursorInsert(*ru1, cursor), 0);
+
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "key");
+    ASSERT_EQ(cursor->search(cursor), WT_NOTFOUND);
+
+    ru1->commitUnitOfWork();
+    guard.dismiss();
+
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "key");
+    ASSERT_EQ(cursor->search(cursor), 0);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, SnapshotIsolation) {
+    ru2->setIsolation(RecoveryUnit::Isolation::snapshot);
+    auto session = ru2->getSession();
+
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ScopeGuard guard{[this] {
+        ru1->abortUnitOfWork();
+    }};
+
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    ASSERT_EQ(wiredTigerCursorInsert(*ru1, cursor), 0);
+
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "key");
+    ASSERT_EQ(cursor->search(cursor), WT_NOTFOUND);
+
+    ru1->commitUnitOfWork();
+    guard.dismiss();
+
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "key");
+    ASSERT_EQ(cursor->search(cursor), WT_NOTFOUND);
+}
+
+
+using WiredTigerRecoveryUnitTestFixtureDeathTest = WiredTigerRecoveryUnitTestFixture;
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   PrepareTimestampOlderThanStableTimestamp,
+                   "prepare timestamp .* is not newer than the stable timestamp") {
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    getEngine()->setStableTimestamp({2, 1}, false);
+    ru1->setPrepareTimestamp({1, 1});
+    // It is illegal to set the prepare timestamp older than the stable timestamp.
+    ru1->prepareUnitOfWork();
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   CommitTimestampOlderThanPrepareTimestamp,
+                   "commit timestamp .* is less than the prepare timestamp") {
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ru1->setDurableTimestamp({4, 1});  // Newer than the prepare timestamp.
+    getEngine()->setStableTimestamp({2, 1}, false);
+    ru1->setPrepareTimestamp({3, 1});  // Newer than the stable timestamp.
+    ru1->prepareUnitOfWork();
+    ru1->setCommitTimestamp({1, 1});
+    // It is illegal to set the commit timestamp older than the prepare timestamp.
+    ru1->commitUnitOfWork();
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   SetSchemaEpochOutsideUnitOfWork,
+                   "Inactive") {
+    // setSchemaEpoch must be called inside a WriteUnitOfWork.
+    ru1->setSchemaEpoch(KVEngine::kInitialSchemaEpoch + 1);
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   SetSchemaEpochTwice,
+                   "Schema epoch already set to") {
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ru1->setSchemaEpoch(KVEngine::kInitialSchemaEpoch + 1);
+    ru1->setSchemaEpoch(KVEngine::kInitialSchemaEpoch + 2);
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   SetSchemaEpochWithCommitTimestamp,
+                   "Commit timestamp is") {
+    ru1->setCommitTimestamp({1, 1});
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    // setSchemaEpoch is mutually exclusive with having a commit timestamp set.
+    ru1->setSchemaEpoch(KVEngine::kInitialSchemaEpoch + 1);
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   SetSchemaEpochWithSetTimestamp,
+                   "Last timestamp set is") {
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ASSERT_OK(ru1->setTimestamp({1, 1}));
+    // setSchemaEpoch is mutually exclusive with having a write timestamp set.
+    ru1->setSchemaEpoch(KVEngine::kInitialSchemaEpoch + 1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, RoundUpPreparedTimestamps) {
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    RecoveryUnit::OpenSnapshotOptions roundUp{.roundUpPreparedTimestamps = true};
+    ru1->preallocateSnapshot(roundUp);
+    ru1->setDurableTimestamp({4, 1});
+    getEngine()->setStableTimestamp({3, 1}, false);
+    // Check setting a prepared transaction timestamp earlier than the
+    // stable timestamp is valid with roundUpPreparedTimestamps option.
+    ru1->setPrepareTimestamp({2, 1});
+    ru1->prepareUnitOfWork();
+    // Check setting a commit timestamp earlier than the prepared transaction
+    // timestamp is valid with roundUpPreparedTimestamps option.
+    ru1->setCommitTimestamp({1, 1});
+    ru1->commitUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture,
+       ChangeIsPassedEmptyLastTimestampSetOnCommitWithNoTimestamp) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        txn.commit();
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsPassedLastTimestampSetOnCommit) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT_OK(ru1->setTimestamp(ts1));
+        ASSERT(!commitTs);
+        ASSERT_OK(ru1->setTimestamp(ts2));
+        ASSERT(!commitTs);
+        ASSERT_OK(ru1->setTimestamp(ts1));
+        ASSERT(!commitTs);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsNotPassedLastTimestampSetOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT_OK(ru1->setTimestamp(ts1));
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsPassedCommitTimestamp) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    Timestamp ts1(5, 5);
+
+    ru1->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsNotPassedCommitTimestampIfCleared) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+
+    ru1->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+    ru1->clearCommitTimestamp();
+    ASSERT(!commitTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+        txn.commit();
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsPassedNewestCommitTimestamp) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    ru1->setCommitTimestamp(ts2);
+    ASSERT(!commitTs);
+    ru1->clearCommitTimestamp();
+    ASSERT(!commitTs);
+    ru1->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsNotPassedCommitTimestampOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+
+    ru1->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampBeforeSetTimestampOnCommit) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    {
+        TimestampBlock tsBlock(*ru1, ts2);
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts2);
+    }
+    ASSERT_EQ(*commitTs, ts2);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT_OK(ru1->setTimestamp(ts1));
+        ASSERT_EQ(*commitTs, ts2);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampAfterSetTimestampOnCommit) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+        ASSERT_OK(ru1->setTimestamp(ts2));
+        ASSERT(!commitTs);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts2);
+    }
+    ASSERT_EQ(*commitTs, ts2);
+
+    ru1->setCommitTimestamp(ts1);
+    ASSERT_EQ(*commitTs, ts2);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT_EQ(*commitTs, ts2);
+        txn.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampBeforeSetTimestampOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    {
+        TimestampBlock tsBlock(*ru1, ts2);
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT_OK(ru1->setTimestamp(ts1));
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, AbortNoTxnWuowPreservesCommitTimestamp) {
+    // Aborting a no-transaction WUOW must leave the commit timestamp owned by TimestampBlock
+    // intact: the destructor's clearCommitTimestamp() requires it to still be set.
+    Timestamp ts1(5, 5);
+    {
+        TimestampBlock tsBlock(*ru1, ts1);
+        StorageWriteTransaction txn(*ru1);
+        ru1->setDurableTimestamp(ts1);
+        ru1->onCreateTable("my-table", StepdownState::before);
+    }
+
+    // Per-transaction state set inside the aborted WUOW is cleaned up, so it can be set again.
+    ru1->setDurableTimestamp(ts1);
+    ru1->setCommitTimestamp(ts1);
+    ru1->clearCommitTimestamp();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitNoWriteWuowResetsPerTransactionState) {
+    // A WUOW that performed no writes commits without opening a WT transaction, and its
+    // per-transaction state must still be cleaned up so it can be set again.
+    Timestamp ts1(5, 5);
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->setDurableTimestamp(ts1);
+        txn.commit();
+    }
+    ru1->setDurableTimestamp(ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitNoWriteWuowPreservesCommitTimestamp) {
+    // Committing a no-write WUOW must leave the commit timestamp owned by TimestampBlock intact:
+    // the destructor's clearCommitTimestamp() requires it to still be set.
+    Timestamp ts1(5, 5);
+    {
+        TimestampBlock tsBlock(*ru1, ts1);
+        StorageWriteTransaction txn(*ru1);
+        txn.commit();
+    }
+    ru1->setCommitTimestamp(ts1);
+    ru1->clearCommitTimestamp();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampAfterSetTimestampOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+        ASSERT_OK(ru1->setTimestamp(ts2));
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+
+    ru1->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCommit([&](OperationContext*, boost::optional<Timestamp> commitTime) {
+            commitTs = commitTime;
+        });
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, PreCommitHookReceivesNoTimestampWhenNoneSet) {
+    boost::optional<Timestamp> preCommitTs = boost::none;
+
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ru1->registerPreCommitHook(
+        [&](OperationContext*, boost::optional<Timestamp> ts) { preCommitTs = ts; });
+    ru1->commitUnitOfWork();
+
+    ASSERT(!preCommitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, PreCommitHookReceivesLastTimestampSet) {
+    boost::optional<Timestamp> preCommitTs = boost::none;
+    Timestamp ts1(5, 5);
+
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ASSERT_OK(ru1->setTimestamp(ts1));
+    ru1->registerPreCommitHook(
+        [&](OperationContext*, boost::optional<Timestamp> ts) { preCommitTs = ts; });
+    ru1->commitUnitOfWork();
+
+    ASSERT(preCommitTs);
+    ASSERT_EQ(*preCommitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, PreCommitHookReceivesCommitTimestamp) {
+    boost::optional<Timestamp> preCommitTs = boost::none;
+    Timestamp ts1(5, 5);
+
+    ru1->setCommitTimestamp(ts1);
+    ru1->beginUnitOfWork(clientAndCtx1.second->readOnly());
+    ru1->registerPreCommitHook(
+        [&](OperationContext*, boost::optional<Timestamp> ts) { preCommitTs = ts; });
+    ru1->commitUnitOfWork();
+
+    ASSERT(preCommitTs);
+    ASSERT_EQ(*preCommitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, StorageStatsSubsequentTransactions) {
+    auto opCtx = clientAndCtx1.second.get();
+
+    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx, "test.storage_stats"));
+
+    // Insert a record.
+    StorageWriteTransaction txn1(*ru1);
+    StatusWith<RecordId> s = rs->insertRecord(
+        opCtx, *shard_role_details::getRecoveryUnit(opCtx), "rec1", 4, Timestamp());
+    ASSERT_TRUE(s.isOK());
+    ASSERT_EQUALS(1, rs->numRecords());
+
+    // Checking the storage stats
+    auto storageStats = ru1->computeOperationStatisticsSinceLastCall();
+    WiredTigerStats* wtStats = dynamic_cast<WiredTigerStats*>(storageStats.get());
+    ASSERT_TRUE(wtStats != nullptr);
+
+    // txnDirtyBytes should be greater than zero since there is uncommitted data on the transaction
+    ASSERT_GT(wtStats->txnBytesDirty(), 0);
+
+    txn1.commit();
+
+    // A new transaction will reset stats
+    StorageWriteTransaction txn2(*ru1);
+    // The transaction won't actually start until the session is accessed
+    ru1->getSession();
+
+    storageStats = ru1->computeOperationStatisticsSinceLastCall();
+    wtStats = dynamic_cast<WiredTigerStats*>(storageStats.get());
+    ASSERT_TRUE(wtStats != nullptr);
+
+    // txnDirtyBytes should be zero since transaction was just restarted
+    ASSERT_EQUALS(wtStats->txnBytesDirty(), 0);
+    txn2.abort();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsCached) {
+    auto opCtx = clientAndCtx1.second.get();
+
+    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx, "test.read_once"));
+    auto uri = static_cast<WiredTigerRecordStore*>(rs.get())->getURI();
+
+    // Insert a record.
+    StorageWriteTransaction txn(*ru1);
+    StatusWith<RecordId> s = rs->insertRecord(
+        opCtx, *shard_role_details::getRecoveryUnit(opCtx), "data", 4, Timestamp());
+    ASSERT_TRUE(s.isOK());
+    ASSERT_EQUALS(1, rs->numRecords());
+    txn.commit();
+
+    // Test 1: A normal read should create a new cursor and release it into the session cache.
+
+    // Close all cached cursors to establish a 'before' state.
+    ru1->getSession()->closeAllCursors(uri);
+    int cachedCursorsBefore = ru1->getSession()->cachedCursors();
+
+    RecordData rd;
+    ASSERT_TRUE(
+        rs->findRecord(opCtx, *shard_role_details::getRecoveryUnit(opCtx), s.getValue(), &rd));
+
+    // A cursor should have been checked out and released into the cache.
+    ASSERT_GT(ru1->getSession()->cachedCursors(), cachedCursorsBefore);
+    // All opened cursors are returned.
+    ASSERT_EQ(0, ru1->getSession()->cursorsOut());
+
+    ru1->abandonSnapshot();
+
+    // Test 2: A read-once operation should create a new cursor because it has a different
+    // configuration. This will be released into the cache.
+
+    ru1->setReadOnce(true);
+
+    // Close any cached cursors to establish a new 'before' state.
+    ru1->getSession()->closeAllCursors(uri);
+    cachedCursorsBefore = ru1->getSession()->cachedCursors();
+
+    // The subsequent read operation will create a new read_once cursor and release into the cache.
+    ASSERT_TRUE(
+        rs->findRecord(opCtx, *shard_role_details::getRecoveryUnit(opCtx), s.getValue(), &rd));
+
+    // A new cursor should have been released into the cache.
+    ASSERT_GT(ru1->getSession()->cachedCursors(), cachedCursorsBefore);
+    // All opened cursors are closed.
+    ASSERT_EQ(0, ru1->getSession()->cursorsOut());
+
+    ASSERT(ru1->getReadOnce());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitWithDurableTimestamp) {
+    Timestamp ts1(3, 3);
+    Timestamp ts2(5, 5);
+
+    ru1->setCommitTimestamp(ts1);
+    ru1->setDurableTimestamp(ts2);
+    auto durableTs = ru1->getDurableTimestamp();
+    ASSERT_EQ(ts2, durableTs);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        txn.commit();
+    }
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitWithoutDurableTimestamp) {
+    Timestamp ts1(5, 5);
+    ru1->setCommitTimestamp(ts1);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        txn.commit();
+    }
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, MultiTimestampConstraintsInternalState) {
+    Timestamp ts1(1, 1);
+    Timestamp ts2(2, 2);
+
+    OperationContext* opCtx = clientAndCtx1.second.get();
+    ru1->beginUnitOfWork(opCtx->readOnly());
+
+    // Perform an non timestamped write.
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, "key");
+    cursor->set_value(cursor, "value");
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+    // Perform a write at ts1.
+    cursor->set_key(cursor, "key2");
+    cursor->set_value(cursor, "value");
+    ASSERT_OK(ru1->setTimestamp(ts1));
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+    // Setting the timestamp again to the same value should not fail.
+    ASSERT_OK(ru1->setTimestamp(ts1));
+
+    // Committing the unit of work should reset the internal state for the multi timestamp
+    // constraint checks.
+    ru1->commitUnitOfWork();
+    ru1->beginUnitOfWork(opCtx->readOnly());
+
+    // Perform a write at ts2.
+    cursor->set_key(cursor, "key3");
+    cursor->set_value(cursor, "value");
+    ASSERT_OK(ru1->setTimestamp(ts2));
+    invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+    ru1->commitUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, AbandonSnapshotAbortMode) {
+    ru1->setAbandonSnapshotMode(RecoveryUnit::AbandonSnapshotMode::kAbort);
+
+    OperationContext* opCtx = clientAndCtx1.second.get();
+    const char* const key = "key";
+
+    {
+        ru1->beginUnitOfWork(opCtx->readOnly());
+
+        WT_CURSOR* cursor;
+        getCursor(ru1, &cursor);
+        cursor->set_key(cursor, key);
+        cursor->set_value(cursor, "value");
+        invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+        ru1->commitUnitOfWork();
+    }
+
+    // Create a cursor. We will check that once positioned, the cursor is reset by a call to
+    // abandonSnapshot() on the associated RecoveryUnit.
+    WT_CURSOR* cursor;
+    getCursor(ru1, &cursor);
+    cursor->set_key(cursor, key);
+    ASSERT_EQ(0, cursor->search(cursor));
+
+    ru1->abandonSnapshot();
+
+    // The WT transaction should have been aborted and the cursor reset.
+
+    // Advancing to the "next" record now that the cursor has been reset should give us the first
+    // record again.
+    ASSERT_EQ(0, cursor->next(cursor));
+
+    const char* returnedKey = nullptr;
+    ASSERT_EQ(0, cursor->get_key(cursor, &returnedKey));
+    ASSERT_EQ(0, strncmp(key, returnedKey, strlen(key)));
+}
+
+// Validate the return of mdb_handle_general when killing an opCtx with the RU configured to cancel
+// cache eviction. While there is gating in place, ensure that the gating fully disables the
+// feature
+TEST_F(WiredTigerRecoveryUnitTestFixture, OptionalEvictionCanBeInterrupted) {
+    auto clientAndCtx = makeClientAndOpCtx(harnessHelper.get(), "test");
+    OperationContext* opCtx = clientAndCtx.second.get();
+    auto ru = WiredTigerRecoveryUnit::get(shard_role_details::getRecoveryUnit(opCtx));
+
+    WiredTigerEventHandler eventHandler;
+    WT_SESSION* session = ru->getSessionNoTxn()->with([](WT_SESSION* arg) { return arg; });
+    ASSERT_EQ(0,
+              eventHandler.getWtEventHandler()->handle_general(eventHandler.getWtEventHandler(),
+                                                               ru->getConnection()->conn(),
+                                                               session,
+                                                               WT_EVENT_EVICTION,
+                                                               nullptr));
+
+    opCtx->markKilled(ErrorCodes::Interrupted);
+    ASSERT_TRUE(
+        (bool)eventHandler.getWtEventHandler()->handle_general(eventHandler.getWtEventHandler(),
+                                                               ru->getConnection()->conn(),
+                                                               session,
+                                                               WT_EVENT_EVICTION,
+                                                               nullptr));
+
+    ASSERT_EQ(WiredTigerUtil::getCancelledCacheMetric_forTest(), 1);
+}
+
+class SnapshotTestDecoration {
+public:
+    void hit() {
+        _hits++;
+    }
+
+    int getHits() {
+        return _hits;
+    }
+
+private:
+    int _hits = 0;
+};
+
+const RecoveryUnit::Snapshot::Decoration<SnapshotTestDecoration> getSnapshotDecoration =
+    RecoveryUnit::Snapshot::declareDecoration<SnapshotTestDecoration>();
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, AbandonSnapshotChange) {
+    ASSERT(ru1->getSession());
+
+    getSnapshotDecoration(ru1->getSnapshot()).hit();
+    ASSERT_EQ(1, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+
+    ru1->abandonSnapshot();
+
+    // A snapshot is closed, reconstructing our decoration.
+    ASSERT_EQ(0, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitSnapshotChange) {
+    ru1->beginUnitOfWork(/*readOnly=*/false);
+
+    getSnapshotDecoration(ru1->getSnapshot()).hit();
+    ASSERT_EQ(1, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+
+    ASSERT(ru1->getSession());
+
+    ASSERT_EQ(1, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+
+    ru1->commitUnitOfWork();
+
+    // A snapshot is closed, reconstructing our decoration.
+    ASSERT_EQ(0, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, AbortSnapshotChange) {
+    // A snapshot is already open from when the RU was constructed.
+    ASSERT(ru1->getSession());
+    getSnapshotDecoration(ru1->getSnapshot()).hit();
+    ASSERT_EQ(1, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+
+    ru1->beginUnitOfWork(/*readOnly=*/false);
+    ASSERT_EQ(1, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+
+    ru1->abortUnitOfWork();
+
+    // A snapshot is closed, reconstructing our decoration.
+    ASSERT_EQ(0, getSnapshotDecoration(ru1->getSnapshot()).getHits());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, PreparedTransactionSkipsOptionalEviction) {
+    // A snapshot is already open from when the RU was constructed.
+    ASSERT(ru1->getSession());
+    ASSERT(!ru1->getNoEvictionAfterCommitOrRollback());
+
+    // Abort WUOW.
+    ru1->beginUnitOfWork(/*readOnly=*/false);
+    ASSERT(!ru1->getNoEvictionAfterCommitOrRollback());
+
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    ASSERT(ru1->getNoEvictionAfterCommitOrRollback());
+
+    ru1->abortUnitOfWork();
+    ASSERT(!ru1->getNoEvictionAfterCommitOrRollback());
+
+    // Commit WUOW.
+    ru1->beginUnitOfWork(/*readOnly=*/false);
+    ru1->setDurableTimestamp({1, 1});
+    ASSERT(!ru1->getNoEvictionAfterCommitOrRollback());
+
+    ru1->setPrepareTimestamp({1, 1});
+    ru1->prepareUnitOfWork();
+
+    ASSERT(ru1->getNoEvictionAfterCommitOrRollback());
+
+    ru1->setCommitTimestamp({1, 1});
+    ru1->commitUnitOfWork();
+    ASSERT(!ru1->getNoEvictionAfterCommitOrRollback());
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CacheSizeEstimatesTransactionBytes) {
+    OperationContext* opCtx = clientAndCtx1.second.get();
+    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx, "test.table"));
+
+    // Check that if we haven't done anything, the txn holds no cache.
+    StorageWriteTransaction txn(*ru1);
+    ASSERT_EQ(ru1->getCacheDirtyBytes(), 0);
+
+    // Write some data, now the txn is at least as large as the write.
+    std::string data(1024, 'a');  // 1MB.
+    ASSERT_OK(rs->insertRecord(opCtx,
+                               *shard_role_details::getRecoveryUnit(opCtx),
+                               data.c_str(),
+                               data.size(),
+                               Timestamp(13, 37)));
+    ASSERT_GTE(ru1->getCacheDirtyBytes(), data.size());
+
+    // Rolling back returns us to zero.
+    txn.abort();
+    ASSERT_EQ(ru1->getCacheDirtyBytes(), 0);
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+                   MultiTimestampConstraints,
+                   "Fatal assertion.*4877100") {
+    Timestamp ts1(1, 1);
+    Timestamp ts2(2, 2);
+
+    OperationContext* opCtx = clientAndCtx1.second.get();
+    ru1->beginUnitOfWork(opCtx->readOnly());
+
+    auto writeTest = [&]() {
+        // Perform an non timestamped write.
+        WT_CURSOR* cursor;
+        getCursor(ru1, &cursor);
+        cursor->set_key(cursor, "key");
+        cursor->set_value(cursor, "value");
+        invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+        // Perform a write at ts1.
+        cursor->set_key(cursor, "key2");
+        cursor->set_value(cursor, "value");
+        ASSERT_OK(ru1->setTimestamp(ts1));
+        invariantWTOK(wiredTigerCursorInsert(*ru1, cursor), cursor->session);
+
+        // Setting the timestamp again to a different value should detect that we're trying to set
+        // multiple timestamps with the first write being non timestamped.
+        ASSERT_OK(ru1->setTimestamp(ts2));
+        ru1->commitUnitOfWork();
+    };
+
+    try {
+        writeTest();
+    } catch (StorageUnavailableException const&) {
+        // It's expected to get a WCE the first time we try this, due to the multi-timestamp
+        // constraint. We'll try again and it will fassert and print out extra debug info.
+    }
+    writeTest();
+}
+
+DEATH_TEST_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+             SetDurableTimestampTwice,
+             "Trying to reset durable timestamp when it was already set.") {
+    Timestamp ts1(3, 3);
+    Timestamp ts2(5, 5);
+    ru1->setDurableTimestamp(ts1);
+    ru1->setDurableTimestamp(ts2);
+}
+
+DEATH_TEST_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+             RollbackHandlerAbortsOnTxnOpen,
+             "rollback handler reopened transaction") {
+    ASSERT(ru1->getSession());
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->assertInActiveTxn();
+        ru1->onRollback([&](OperationContext*) { ru1->getSession(); });
+    }
+}
+
+DEATH_TEST_F(WiredTigerRecoveryUnitTestFixtureDeathTest,
+             MayNotChangeReadSourceWhilePinned,
+             "Cannot change ReadSource as it is pinned.") {
+
+    ru1->pinReadSource();
+    ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+}
+
+/**
+ * A WiredTigerKVEngine subclass that allows overriding usesSchemaEpochs() and mocking
+ * publishIdent() for testing the recovery unit's commit/abort behavior.
+ */
+class MockWiredTigerKVEngine : public WiredTigerKVEngine {
+public:
+    using WiredTigerKVEngine::WiredTigerKVEngine;
+
+    bool usesSchemaEpochs() const override {
+        return _usesSchemaEpochs;
+    }
+
+    MOCK_METHOD(void,
+                publishIdent,
+                (WiredTigerRecoveryUnit & ru, const std::string& uri, uint64_t schemaEpoch),
+                (override));
+
+    MOCK_METHOD(void, pinAllDurableTimestamp, (uint64_t ts), (override));
+    MOCK_METHOD(void, unpinAllDurableTimestamp, (uint64_t ts), (override));
+
+    bool isInLeaderMode() override {
+        return _isInLeaderMode;
+    }
+
+    bool _usesSchemaEpochs = false;
+    bool _isInLeaderMode = false;
+};
+
+class WiredTigerRecoveryUnitPublishTableCreationTest : public WiredTigerRecoveryUnitTestFixture {
+public:
+    class MockPersistenceProvider : public rss::AttachedPersistenceProvider {
+    public:
+        bool usesSchemaEpochs() const override {
+            return true;
+        }
+
+        MOCK_METHOD(uint64_t, getSchemaEpochForTimestamp, (Timestamp ts), (const, override));
+    };
+
+    void setUp() override {
+        harnessHelper =
+            std::make_unique<WiredTigerRecoveryUnitHarnessHelperT<MockWiredTigerKVEngine>>();
+        auto provider = std::make_unique<MockPersistenceProvider>();
+        mockProvider = provider.get();
+        rss::ReplicatedStorageService::get(harnessHelper->serviceContext())
+            .setPersistenceProvider(std::move(provider));
+
+        clientAndCtx1 = makeClientAndOpCtx(harnessHelper.get(), "test");
+        ru1 = checked_cast<WiredTigerRecoveryUnit*>(
+            shard_role_details::getRecoveryUnit(clientAndCtx1.second.get()));
+        ru1->setOperationContext(clientAndCtx1.second.get());
+    }
+
+    MockWiredTigerKVEngine* mockEngine() {
+        return static_cast<WiredTigerRecoveryUnitHarnessHelperT<MockWiredTigerKVEngine>*>(
+                   harnessHelper.get())
+            ->getEngine();
+    }
+
+    MockPersistenceProvider* mockProvider = nullptr;
+};
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, PrimaryPathPublishesWithPinning) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    {
+        // Primary path (no _commitTimestamp set): should pin all_durable around commit+publish.
+        EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(2, 0)))
+            .WillOnce(testing::Return(42ULL));
+        EXPECT_CALL(*mockEngine(), publishIdent(testing::_, testing::_, 42ULL)).Times(1);
+        EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(1);
+        EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(1);
+
+        StorageWriteTransaction txn(*ru1);
+        ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+        ru1->onCreateTable("my-table", StepdownState::before);
+        txn.commit();
+    }
+
+    // A subsequent WUOW should not see stale _createdTables from the prior commit.
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, testing::_, testing::_)).Times(0);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ASSERT_OK(ru1->setTimestamp(Timestamp(3, 0)));
+        txn.commit();
+    }
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, AbortDoesNotCallPublish) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, testing::_, testing::_)).Times(0);
+
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCreateTable("my-table", StepdownState::before);
+        // txn goes out of scope without commit, triggering abort.
+    }
+
+    // A subsequent WUOW should not see stale _createdTables from the prior abort.
+    {
+        StorageWriteTransaction txn(*ru1);
+        ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+        txn.commit();
+    }
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, AbortNoTxnWuowResetsSchemaEpoch) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // Abort a no-transaction WUOW that set a schema epoch.
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
+        ru1->onCreateTable("table-a", StepdownState::before);
+    }
+
+    // The schema epoch must not leak into later WUOWs: the next no-transaction WUOW publishes at
+    // the epoch of its own commit timestamp, not at the aborted WUOW's schema epoch.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(5, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-b"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(),
+                publishIdent(testing::_, testing::_, KVEngine::kUntimestampedSchemaEpoch))
+        .Times(0);
+
+    TimestampBlock tsBlock(*ru1, Timestamp(5, 0));
+    StorageWriteTransaction txn(*ru1);
+    ru1->onCreateTable("table-b", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, CommitNoWriteWuowResetsSchemaEpoch) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // Commit a no-transaction WUOW that set a schema epoch but performed no writes and created no
+    // tables.
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
+        txn.commit();
+    }
+
+    // The schema epoch must not leak into later WUOWs: the next no-transaction WUOW publishes at
+    // the epoch of its own commit timestamp, not at the earlier WUOW's schema epoch.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(5, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-a"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(),
+                publishIdent(testing::_, testing::_, KVEngine::kUntimestampedSchemaEpoch))
+        .Times(0);
+
+    TimestampBlock tsBlock(*ru1, Timestamp(5, 0));
+    StorageWriteTransaction txn(*ru1);
+    ru1->onCreateTable("table-a", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       CommitDoesNotCallPublishWhenSchemaEpochsDisabled) {
+    mockEngine()->_usesSchemaEpochs = false;
+
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, testing::_, testing::_)).Times(0);
+
+    StorageWriteTransaction txn(*ru1);
+    ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+    ru1->onCreateTable("my-table", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       SecondaryPathPublishesWithCapturedTimestampWithoutPinning) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // Simulate the secondary (non-MDT) path: TimestampBlock sets _commitTimestamp before the WUOW
+    // begins. Tables should be published at the captured per-table schema epoch without pinning
+    // all_durable.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(5, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, testing::_, 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(0);
+
+    TimestampBlock block(*ru1, Timestamp(5, 0));
+    StorageWriteTransaction txn(*ru1);
+    // Activate the WT session (simulates actual writes during oplog application).
+    ru1->getSession();
+    ru1->onCreateTable("my-table", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       SecondaryPathPublishesAllTablesAtCommitTimestamp) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // Unlike the primary, the secondary applies each oplog entry under one fixed _commitTimestamp,
+    // so every table created in the transaction shares the same epoch.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(5, 0)))
+        .Times(2)
+        .WillRepeatedly(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-a"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-b"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(0);
+
+    TimestampBlock block(*ru1, Timestamp(5, 0));
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->onCreateTable("table-a", StepdownState::before);
+    ru1->onCreateTable("table-b", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       NoTxnCommitPublishesAtCommitTimestampWithoutPinning) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // The no-transaction path (follower-mode schema changes applied from the oplog): the WUOW
+    // never opens a WT transaction, and the table is published at the captured _commitTimestamp.
+    // There is no commit timestamp to protect, so all_durable is never pinned.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(5, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("my-table"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(0);
+
+    TimestampBlock block(*ru1, Timestamp(5, 0));
+    StorageWriteTransaction txn(*ru1);
+    ru1->onCreateTable("my-table", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, NoTxnSchemaEpochCommitPublishesAtSetEpoch) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // A no-transaction WUOW that set an explicit schema epoch publishes at that epoch without
+    // consulting the provider.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(
+        *mockEngine(),
+        publishIdent(testing::_, std::string("table-a"), KVEngine::kUntimestampedSchemaEpoch))
+        .Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(0);
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
+    ru1->onCreateTable("table-a", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, NoTxnCommitResetsStateForReuse) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(5, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-a"), 42ULL)).Times(1);
+
+    {
+        TimestampBlock tsBlock(*ru1, Timestamp(5, 0));
+        StorageWriteTransaction txn(*ru1);
+        ru1->onCreateTable("table-a", StepdownState::before);
+        txn.commit();
+    }
+
+    // Verify that the no-txn commit cleaned up the tables to be published and they aren't
+    // re-published by a later commit
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(3, 0)))
+        .WillOnce(testing::Return(43ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-b"), 43ULL)).Times(1);
+    {
+        StorageWriteTransaction txn(*ru1);
+        ru1->getSession();
+        ASSERT_OK(ru1->setTimestamp(Timestamp(3, 0)));
+        ru1->onCreateTable("table-b", StepdownState::before);
+        txn.commit();
+    }
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       MultiTimestampWuowPublishesEachTableAtItsOwnEpoch) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(2, 0)))
+        .WillOnce(testing::Return(41ULL));
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(3, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-a"), 41ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-b"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(1);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(1);
+
+    StorageWriteTransaction txn(*ru1);
+    ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+    ru1->onCreateTable("table-a", StepdownState::before);
+    ASSERT_OK(ru1->setTimestamp(Timestamp(3, 0)));
+    ru1->onCreateTable("table-b", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       TableCreatedBeforeAnyTimestampPublishesAtCommitTimestamp) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // The table is created before any timestamp is set. Its untimestamped writes are assigned the
+    // transaction's last timestamp at commit, so it must publish there too.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(3, 0)))
+        .WillOnce(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-a"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(1);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(1);
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->onCreateTable("table-a", StepdownState::before);
+    ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+    ASSERT_OK(ru1->setTimestamp(Timestamp(3, 0)));
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest, SchemaEpochPathPublishesAtSetEpoch) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(
+        *mockEngine(),
+        publishIdent(testing::_, std::string("table-a"), KVEngine::kUntimestampedSchemaEpoch))
+        .Times(1);
+    EXPECT_CALL(*mockEngine(), pinAllDurableTimestamp(testing::_)).Times(0);
+    EXPECT_CALL(*mockEngine(), unpinAllDurableTimestamp(testing::_)).Times(0);
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
+    ru1->onCreateTable("table-a", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitPublishTableCreationTest,
+       TableCreatedBeforeAndAfterFirstTimestampBothPublishAtCommitTimestamp) {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    // Mirrors MultiIndexBlock::init(), which creates an untimestamped resumable-state table before
+    // calling onInit() (which sets the timestamp), then creates timestamped per-index tables
+    // afterward, all in the same transaction. Both tables must publish at the same epoch.
+    EXPECT_CALL(*mockProvider, getSchemaEpochForTimestamp(Timestamp(2, 0)))
+        .Times(2)
+        .WillRepeatedly(testing::Return(42ULL));
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-a"), 42ULL)).Times(1);
+    EXPECT_CALL(*mockEngine(), publishIdent(testing::_, std::string("table-b"), 42ULL)).Times(1);
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->onCreateTable("table-a", StepdownState::before);
+    ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+    ru1->onCreateTable("table-b", StepdownState::before);
+    txn.commit();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitRollbackThrowsWriteConflictAndCleansUpState) {
+    bool onCommitCalled = false;
+    bool onRollbackCalled = false;
+
+    {
+        FailPointEnableBlock fp("WTStepDownRollbackAtCommit");
+
+        StorageWriteTransaction txn(*ru1);
+
+        // Set up a write that will fail on commit.
+        WT_CURSOR* cursor;
+        getCursor(ru1, &cursor);
+        cursor->set_key(cursor, "key");
+        cursor->set_value(cursor, "value");
+        ASSERT_EQ(wiredTigerCursorInsert(*ru1, cursor), 0);
+
+        ru1->onCommit(
+            [&](OperationContext*, boost::optional<Timestamp>) { onCommitCalled = true; });
+        ru1->onRollback([&](OperationContext*) { onRollbackCalled = true; });
+
+        ASSERT_THROWS_CODE(txn.commit(), StorageUnavailableException, ErrorCodes::WriteConflict);
+    }
+
+    EXPECT_FALSE(onCommitCalled);
+    EXPECT_TRUE(onRollbackCalled);
+
+    // The RU must be in a clean state so it can be reused for a new transaction.
+    {
+        StorageWriteTransaction txn(*ru1);
+        WT_CURSOR* cursor;
+        getCursor(ru1, &cursor);
+        cursor->set_key(cursor, "retry_key");
+        cursor->set_value(cursor, "retry_value");
+        ASSERT_EQ(wiredTigerCursorInsert(*ru1, cursor), 0);
+        txn.commit();
+    }
+
+    // Verify the retried write is visible.
+    auto session = ru1->getSession();
+    WT_CURSOR* cursor;
+    getCursor(*session, cursor);
+    cursor->set_key(cursor, "retry_key");
+    EXPECT_EQ(cursor->search(cursor), 0);
+}
+
+using WiredTigerRecoveryUnitPublishTableCreationTestDeathTest =
+    WiredTigerRecoveryUnitPublishTableCreationTest;
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitPublishTableCreationTestDeathTest,
+                   CommitWithoutTimestampOrSchemaEpochWhenSchemaEpochsInUse,
+                   "_schemaEpoch") {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->onCreateTable("my-table", StepdownState::before);
+    // Committing without a timestamp or schema epoch when schema epochs are in use must fail
+    txn.commit();
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitPublishTableCreationTestDeathTest,
+                   SchemaEpochTableAlsoGetsATimestamp,
+                   "schemaEpoch") {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
+    ru1->onCreateTable("table-a", StepdownState::before);
+    ASSERT_OK(ru1->setTimestamp(Timestamp(2, 0)));
+    // setSchemaEpoch() is only valid for a transaction that never becomes timestamped.
+    txn.commit();
+}
+
+DEATH_TEST_REGEX_F(WiredTigerRecoveryUnitPublishTableCreationTestDeathTest,
+                   SchemaEpochWithMultipleCreatedTables,
+                   "_createdTables") {
+    mockEngine()->_usesSchemaEpochs = true;
+
+    StorageWriteTransaction txn(*ru1);
+    ru1->getSession();
+    ru1->setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
+    ru1->onCreateTable("table-a", StepdownState::before);
+    ru1->onCreateTable("table-b", StepdownState::before);
+    // An explicit schema epoch only covers a transaction creating a single table.
+    txn.commit();
+}
+
+DEATH_TEST_F(WiredTigerRecoveryUnitPublishTableCreationTestDeathTest,
+             NoTxnCommitInLeaderModeIsInvalid,
+             "isInLeaderMode") {
+    mockEngine()->_usesSchemaEpochs = true;
+    mockEngine()->_isInLeaderMode = true;
+
+    // A leader creating published tables must replicate that creation, which requires a real
+    // (timestamped) transaction; committing a no-transaction WUOW in leader mode must fail.
+    ru1->setCommitTimestamp(Timestamp(5, 0));
+    StorageWriteTransaction txn(*ru1);
+    ru1->onCreateTable("my-table", StepdownState::before);
+    txn.commit();
+}
+
+}  // namespace
+}  // namespace mongo

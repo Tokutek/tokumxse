@@ -1,0 +1,438 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#include "mongo/unittest/unittest_main_core.h"
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/enhanced_reporter.h"
+#include "mongo/unittest/log_test.h"
+#include "mongo/unittest/temp_dir.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/unittest_details.h"
+#include "mongo/unittest/unittest_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debugger.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/options_parser/environment.h"
+#include "mongo/util/options_parser/option_section.h"
+#include "mongo/util/options_parser/options_parser.h"
+#include "mongo/util/options_parser/startup_option_init.h"
+#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/options_parser/value.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers.h"
+#include "mongo/util/signal_handlers_synchronous.h"
+#include "mongo/util/stacktrace.h"
+#include "mongo/util/testing_proctor.h"
+
+#include <algorithm>
+#include <csignal>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#include <stdio.h>
+#else
+#include <unistd.h>
+#endif
+
+#include <boost/filesystem.hpp>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+namespace mongo::unittest {
+using namespace std::literals::string_view_literals;
+
+static EnhancedReporter* gEnhancedReporter = nullptr;
+
+EnhancedReporter* getGlobalEnhancedReporter() {
+    return gEnhancedReporter;
+}
+
+namespace {
+
+void _dumpOutputSignalHandlerCb() {
+    if (gEnhancedReporter) {
+        gEnhancedReporter->dumpBufferedOutputForSignalHandler();
+    }
+}
+
+/** Sets and resets the FCV as each test starts and ends. */
+class FCVEventListener : public testing::EmptyTestEventListener {
+public:
+    void OnTestStart(const testing::TestInfo&) override {
+        // Attempting to read the featureCompatibilityVersion parameter before it is explicitly
+        // initialized with a meaningful value will trigger failures as of SERVER-32630.
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+        serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
+    }
+
+    void OnTestEnd(const testing::TestInfo&) override {
+        serverGlobalParams.mutableFCV.reset();
+    }
+};
+
+class ThrowListener : public testing::EmptyTestEventListener {
+    void OnTestPartResult(const testing::TestPartResult& result) override {
+        if (result.type() == testing::TestPartResult::kSuccess ||
+            result.type() == testing::TestPartResult::kSkip)
+            return;
+
+        if (GTEST_FLAG_GET(break_on_failure)) {
+#if defined(_WIN32)
+            DebugBreak();
+#else
+            raise(SIGTRAP);
+#endif
+        }
+
+        if (result.type() == testing::TestPartResult::kNonFatalFailure)
+            return;
+
+        std::string_view msg = result.message();
+        // Try to avoid throwing an exception when reporting that an unexpected C++ exception
+        // was thrown. That is because we are already in the top-level block, and if we throw
+        // an exception here, it won't be able to be caught by the same block.
+        // See ::testing::internal::FormatCxxExceptionMessage() for the format of the message,
+        // and ::testing::internal::HandleExceptionsInMethodIfSupported() for the try/catch.
+        bool unexpectedException = std::uncaught_exceptions() != 0 ||
+            (std::current_exception() &&
+             (msg.starts_with("C++ exception with description") ||
+              msg.starts_with("Unknown C++ exception")) &&
+             msg.find(" thrown in ") != std::string_view::npos);
+        if (!unexpectedException)
+            throw testing::AssertionException(result);
+    }
+};
+
+void forEachTest(const auto& f) {
+    auto inst = testing::UnitTest::GetInstance();
+    for (int si = 0; si != inst->total_test_suite_count(); ++si) {
+        auto& suite = *inst->GetTestSuite(si);
+        for (int ti = 0; ti != suite.total_test_count(); ++ti) {
+            const auto& testInfo = *suite.GetTestInfo(ti);
+            f(suite.name(), testInfo.name());
+        }
+    }
+}
+
+std::vector<const testing::TestSuite*> allSuites() {
+    std::vector<const testing::TestSuite*> out;
+    auto inst = testing::UnitTest::GetInstance();
+    for (int si = 0; si != inst->total_test_suite_count(); ++si)
+        out.push_back(inst->GetTestSuite(si));
+    return out;
+}
+
+/** The only special character is `*`. */
+bool matchesGooglePattern(std::string_view p, std::string_view s) {
+    if (p.empty())
+        return s.empty();
+    if (p.front() == '*') {
+        if (matchesGooglePattern(p.substr(1), s.substr(1)))
+            return true;
+        return matchesGooglePattern(p, s.substr(1));
+    }
+    if (p.front() == s.front())
+        return matchesGooglePattern(p.substr(1), s.substr(1));
+    return false;
+}
+
+bool matchesGoogleFilter(std::string_view filt, std::string_view suite, std::string_view test) {
+    std::string fullName = fmt::format("{}.{}", suite, test);
+    while (!filt.empty()) {
+        if (filt.front() == ':') {
+            filt.remove_prefix(1);
+            continue;
+        }
+        size_t pos = filt.find_first_of(':');
+        std::string_view elem = filt.substr(0, pos);
+        filt = filt.substr(pos);
+        if (matchesGooglePattern(elem, fullName))
+            return true;
+    }
+    return false;
+}
+
+std::string pruneGoogleFilter(const std::string& googleFilter) {
+    std::string out = googleFilter;
+    forEachTest([&](const auto& suite, const auto& test) { ; });
+    return out;
+}
+
+void applyTestFilters(const std::vector<std::string>& suites,
+                      const std::string& filter,
+                      const std::string& fileNameFilter) {
+    LOGV2_DEBUG(11861900,
+                3,
+                "Applying test filters",
+                "suites"_attr = suites,
+                "filter"_attr = filter,
+                "fileNameFilter"_attr = fileNameFilter);
+    boost::optional<pcre::Regex> filterRe;
+    boost::optional<pcre::Regex> fileNameFilterRe;
+    if (!filter.empty())
+        filterRe.emplace(filter);
+    if (!fileNameFilter.empty())
+        fileNameFilterRe.emplace(fileNameFilter);
+
+    std::vector<SelectedTest> selection;
+    auto inst = testing::UnitTest::GetInstance();
+    for (int si = 0; si != inst->total_test_suite_count(); ++si) {
+        auto& suite = *inst->GetTestSuite(si);
+        bool keepSuite = suites.empty() ||
+            std::any_of(suites.begin(), suites.end(), [&](auto&& s) { return suite.name() == s; });
+        for (int ti = 0; ti != suite.total_test_count(); ++ti) {
+            const auto& testInfo = *suite.GetTestInfo(ti);
+            bool keep = true;
+            if (!keepSuite)
+                keep = false;
+            if (fileNameFilterRe && !fileNameFilterRe->matchView(testInfo.file()))
+                keep = false;
+            if (filterRe && !filterRe->matchView(testInfo.name()))
+                keep = false;
+            selection.push_back({suite.name(), testInfo.name(), keep});
+        }
+    }
+    GTEST_FLAG_SET(filter, gtestFilterForSelection(selection));
+}
+
+bool isDeathTestChild() {
+    return !GTEST_FLAG_GET(internal_run_death_test).empty();
+}
+
+void initializeDeathTestChild() {
+    if (GTEST_FLAG_GET(internal_run_death_test).empty())
+        return;
+    // (Generic FCV reference): test-only
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
+
+#ifdef MONGO_CONFIG_DEV_STACKTRACE
+    disableDevStackTrace();
+#endif
+    details::suppressCoreDumps();
+    details::redirectStdoutToStderr();
+    ::testing::UnitTest::GetInstance()->listeners().SuppressEventForwarding(false);
+}
+
+void installEnhancedReporter(EnhancedReporter::Options options) {
+    auto& listeners = testing::UnitTest::GetInstance()->listeners();
+    auto* defaultListener = listeners.default_result_printer();
+    invariant(defaultListener, "GoogleTest default listener already removed.");
+    std::unique_ptr<testing::TestEventListener> originalPrinter{listeners.Release(defaultListener)};
+    auto enhanced =
+        std::make_unique<EnhancedReporter>(std::move(originalPrinter), std::move(options));
+    gEnhancedReporter = enhanced.get();
+    setSynchronousSignalHandlerCallback_forTest(_dumpOutputSignalHandlerCb);
+    setSignalPostProcessingCallback_forTest(_dumpOutputSignalHandlerCb);
+    listeners.Append(enhanced.release());
+}
+
+class MongoExceptionPrinter : public testing::EmptyTestEventListener {
+public:
+    void OnTestPartResult(const testing::TestPartResult& result) override {
+        if (result.type() == testing::TestPartResult::kSuccess ||
+            result.type() == testing::TestPartResult::kSkip)
+            return;
+
+        details::printExceptionInfo(stdout);
+        fflush(stdout);
+        printStackTrace();
+    }
+};
+
+void installMongoReporter() {
+    auto& listeners = testing::UnitTest::GetInstance()->listeners();
+    listeners.Append(new MongoExceptionPrinter);
+}
+
+/**
+ * Convert the vector to C-style argv to call google init functions. These might consume
+ * some elements, so we rebuild the vector after.
+ */
+void callInitGoogleTest(std::vector<std::string>& argVec) {
+    int argc = argVec.size();
+    auto ownedArgv = std::make_unique<const char*[]>(argc + 1);
+    for (int i = 0; i < argc; ++i)
+        ownedArgv[i] = argVec[i].c_str();
+    ownedArgv[argc] = nullptr;
+    auto argv = const_cast<char**>(ownedArgv.get());
+    testing::InitGoogleTest(&argc, argv);
+    testing::InitGoogleMock(&argc, argv);
+    for (int i = 0; i < argc; ++i)
+        argVec[i] = argv[i];
+    argVec.resize(argc);
+}
+
+}  // namespace
+
+std::string gtestFilterForSelection(const std::vector<SelectedTest>& selection) {
+    std::string filt;
+    std::string_view sep;
+    for (const auto& [s, t, k] : selection) {
+        if (k)
+            filt += fmt::format("{}{}.{}", std::exchange(sep, ":"sv), s, t);
+    }
+    return filt;
+}
+
+void MainProgress::initialize() {
+    if (auto ec = _parseAndAcceptOptions())
+        quickExit(static_cast<int>(*ec));
+
+    setDefaultMockBehavior(MockBehavior::nice);
+    callInitGoogleTest(_argVec);
+
+    clearSignalMask();
+    setupSynchronousSignalHandlers();
+
+    if (isDeathTestChild()) {
+        initializeDeathTestChild();
+    } else {
+        if (_options.enhancedReporter) {
+            EnhancedReporter::Options ero;
+            ero.showEachTest = _options.showEachTest;
+            installEnhancedReporter(ero);
+        } else {
+            installMongoReporter();
+        }
+
+        // Start signal processing thread after signal mask cleared.
+        if (_options.startSignalProcessingThread) {
+            // Per SERVER-7434, startSignalProcessingThread must run after any forks (i.e.
+            // initialize_server_global_state::forkServerOrDie) and before the creation of any other
+            // threads
+            startSignalProcessingThread();
+        }
+    }
+
+    GTEST_FLAG_SET(show_internal_stack_frames, false);
+
+    // Colorize when explicitly asked to. If no position is taken, colorize when we are writing
+    // to a TTY.
+    if (details::gtestColorDefaulted() && details::stdoutIsTty()) {
+        GTEST_FLAG_SET(color, "yes");
+    }
+
+    if (isDebuggerActive()) {
+        GTEST_FLAG_SET(break_on_failure, true);
+    }
+
+    if (!isDeathTestChild()) {
+        testing::UnitTest::GetInstance()->listeners().Append(new FCVEventListener{});
+    }
+
+    testing::UnitTest::GetInstance()->listeners().Append(new ThrowListener{});
+
+    if (auto&& tp = TestingProctor::instance(); !tp.isInitialized())
+        tp.setEnabled(true);
+    setTestCommandsEnabled(true);
+
+    if (!_options.suppressGlobalInitializers) {
+        runGlobalInitializersOrDie(_argVec);
+    }
+}
+
+boost::optional<ExitCode> MainProgress::_parseAndAcceptOptions() {
+    auto uto = parseUnitTestOptions(args());
+    if (uto.help) {
+        std::cerr << getUnitTestOptionsHelpString(_argVec) << std::endl;
+
+        // Hard coded construction of argv with `--gtest_help`. This is to ensure
+        // GTest help output also displays.
+        const char* gtestHelpArgv[] = {_argVec[0].c_str(), "--gtest_help", nullptr};
+        int gtestHelpArgc = 2;
+        testing::InitGoogleTest(&gtestHelpArgc, const_cast<char**>(gtestHelpArgv));
+        // This is required because we quickExit() without flushing the stdio buffer
+        // required for GTest help output.
+        std::cout.flush();
+        return ExitCode::clean;
+    }
+
+    if (uto.list && *uto.list) {
+        for (auto&& s : allSuites())
+            std::cout << s->name() << std::endl;
+        return ExitCode::clean;
+    }
+
+    if (uto.verbose) {
+        if (uto.verbose->find_first_not_of("v") != std::string::npos) {
+            std::cerr
+                << "The string for the --verbose option cannot contain characters other than 'v'"
+                << std::endl
+                << optionenvironment::startupOptions.helpString();
+            return ExitCode::fail;
+        }
+        setMinimumLoggedSeverity(logv2::LogSeverity::Debug(uto.verbose->size()));
+    }
+
+    // Transitional: Treat `--repeat n` as a synonym for `--gtest_repeat=n`.
+    if (uto.repeat && *uto.repeat != 1)
+        GTEST_FLAG_SET(repeat, *uto.repeat);
+
+    // We allow options from the unit test's caller (i.e. main) to override the filter flags.
+    auto ensureFilter = [&]() -> auto& {
+        if (!_options.filter)
+            _options.filter.emplace();
+        return _options.filter;
+    };
+    if (auto&& o = uto.suites)
+        ensureFilter()->suites = *o;
+    if (auto&& o = uto.filter)
+        ensureFilter()->filter = *o;
+    if (auto&& o = uto.fileNameFilter)
+        ensureFilter()->fileNameFilter = *o;
+
+    if (uto.tempPath)
+        TempDir::setTempPath(*uto.tempPath);
+
+    {
+        AutoUpdateConfig auc;
+        if (auto&& o = uto.autoUpdateAsserts)
+            auc.updateFailingAsserts = *o;
+        if (auto&& o = uto.rewriteAllAutoAsserts)
+            auc.revalidateAll = *o;
+        if (auc.revalidateAll && !auc.updateFailingAsserts) {
+            std::cerr << "`--rewriteAllAutoAsserts` requires `--autoUpdateAsserts`.\n";
+            return ExitCode::fail;
+        }
+        auto&& exe = _argVec.front();
+        auc.executablePath = boost::filesystem::canonical(boost::filesystem::path(exe));
+        getAutoUpdateConfig() = std::move(auc);
+    }
+
+    _options.enhancedReporter = uto.enhancedReporter.value_or(true);
+    _options.showEachTest = uto.showEachTest.value_or(false);
+
+    return {};
+}
+
+int MainProgress::test() {
+    if (auto&& o = _options.filter)
+        applyTestFilters(o->suites, o->filter, o->fileNameFilter);
+    auto result = RUN_ALL_TESTS();
+
+    if (!_options.suppressGlobalInitializers) {
+        if (auto ret = runGlobalDeinitializers(); !ret.isOK()) {
+            std::cerr << "Global deinitialization failed: " << ret.reason() << std::endl;
+        }
+    }
+
+    TestingProctor::instance().exitAbruptlyIfDeferredErrors();
+
+    return result;
+}
+
+}  // namespace mongo::unittest

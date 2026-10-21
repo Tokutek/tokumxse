@@ -1,87 +1,72 @@
-/**
- * Copyright (c) 2011 10gen Inc.
- *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/window_function/window_function_add_to_set.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_knob_descriptors_execution.h"
+#include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/platform/atomic.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <vector>
+
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using std::vector;
+using std::vector;
 
-    void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
-        if (!merging) {
-            if (!input.missing()) {
-                bool inserted = set.insert(input).second;
-                if (inserted) {
-                    _memUsageBytes += input.getApproximateSize();
-                }
-            }
+REGISTER_ACCUMULATOR(addToSet, genericParseSingleExpressionAccumulator<AccumulatorAddToSet>);
+REGISTER_STABLE_REMOVABLE_WINDOW_FUNCTION(addToSet, AccumulatorAddToSet, WindowFunctionAddToSet);
+
+void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
+    auto addValue = [this](auto&& val) {
+        bool inserted = _set.insert(val).second;
+        if (inserted) {
+            _memUsageTracker.add(val.getApproximateSize());
+            checkMemUsage();
         }
-        else {
-            // If we're merging, we need to take apart the arrays we
-            // receive and put their elements into the array we are collecting.
-            // If we didn't, then we'd get an array of arrays, with one array
-            // from each merge source.
-            verify(input.getType() == Array);
-            
-            const vector<Value>& array = input.getArray();
-            for (size_t i=0; i < array.size(); i++) {
-                bool inserted = set.insert(array[i]).second;
-                if (inserted) {
-                    _memUsageBytes += array[i].getApproximateSize();
-                }
-            }
+    };
+    if (!merging) {
+        if (!input.missing()) {
+            addValue(input);
         }
-    }
+    } else {
+        // If we're merging, we need to take apart the arrays we receive and put their elements into
+        // the array we are collecting.  If we didn't, then we'd get an array of arrays, with one
+        // array from each merge source.
+        assertMergingInputType(input, BSONType::array);
 
-    Value AccumulatorAddToSet::getValue(bool toBeMerged) const {
-        vector<Value> valVec(set.begin(), set.end());
-        return Value::consume(valVec);
-    }
-
-    AccumulatorAddToSet::AccumulatorAddToSet() {
-        _memUsageBytes = sizeof(*this);
-    }
-
-    void AccumulatorAddToSet::reset() {
-        SetType().swap(set);
-        _memUsageBytes = sizeof(*this);
-    }
-
-    intrusive_ptr<Accumulator> AccumulatorAddToSet::create() {
-        return new AccumulatorAddToSet();
-    }
-
-    const char *AccumulatorAddToSet::getOpName() const {
-        return "$addToSet";
+        for (auto&& val : input.getArray()) {
+            addValue(val);
+        }
     }
 }
+
+Value AccumulatorAddToSet::getValue(bool toBeMerged) {
+    return Value(vector<Value>(_set.begin(), _set.end()));
+}
+
+AccumulatorAddToSet::AccumulatorAddToSet(ExpressionContext* const expCtx,
+                                         boost::optional<MemoryUsageLimit> maxMemoryUsageBytes)
+    : AccumulatorState(
+          expCtx, maxMemoryUsageBytes.value_or(MemoryUsageLimit{query_knobs::kMaxAddToSetBytes})),
+      _set(expCtx->getValueComparator().makeFlatUnorderedValueSet()) {
+    _memUsageTracker.set(sizeof(*this));
+}
+
+void AccumulatorAddToSet::reset() {
+    _set = getExpressionContext()->getValueComparator().makeFlatUnorderedValueSet();
+    _memUsageTracker.set(sizeof(*this));
+}
+}  // namespace mongo

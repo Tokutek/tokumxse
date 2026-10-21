@@ -1,0 +1,1019 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/column/bsoncolumnbuilder.h"
+#include "mongo/db/change_stream_pre_images_collection_manager.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/change_stream_preimage_gen.h"
+#include "mongo/db/query/write_ops/update_request.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/shard_role/shard_catalog/collection_mock.h"
+#include "mongo/db/shard_role/shard_role_mock.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+
+#include <cstring>
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+
+namespace mongo {
+namespace repl {
+
+// Forward declaration so we can call this under test. updateObjectByRid is defined
+// at namespace-scope inside oplog.cpp but isn't exposed via oplog.h.
+UpdateResult updateObjectByRid(OperationContext* opCtx,
+                               RecordId rid,
+                               const OplogEntry& op,
+                               CollectionAcquisition& coll,
+                               OpCounters* opCounters,
+                               const BSONElement& idField,
+                               OplogApplication::Mode mode,
+                               UpdateRequest request,
+                               bool recordChangeStreamPreImage,
+                               BSONObj& preImage);
+
+namespace {
+
+/**
+ * Test fixture for update oplog entries with recordId.
+ */
+class UpdateWithRecordIdTest : public OplogApplierImplTest {
+protected:
+    void setUp() override {
+        OplogApplierImplTest::setUp();
+        _nss = NamespaceString::createNamespaceString_forTest("test.updateRecordId");
+        createCollection(_opCtx.get(), _nss, {});
+        _uuid = getCollectionUUID(_opCtx.get(), _nss);
+    }
+
+    NamespaceString _nss;
+    UUID _uuid = UUID::gen();
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+};
+
+typedef SetSteadyStateConstraints<UpdateWithRecordIdTest, false>
+    UpdateWithRecordIdTestDisableSteadyStateConstraints;
+typedef SetSteadyStateConstraints<UpdateWithRecordIdTest, true>
+    UpdateWithRecordIdTestEnableSteadyStateConstraints;
+
+// =============================================================================
+// Tests for kSecondary mode (steady state replication)
+// =============================================================================
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints, SuccessInSecondaryMode) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create and apply the update oplog entry with recordId.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 200)), rid);
+    ASSERT_OK(runOpSteadyState(op));
+
+    // Verify the document was updated.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 200), updatedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints,
+       SuccessWithV2DeltaUpdateInSecondaryMode) {
+    // Insert a document at a known recordId with multiple fields.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100 << "y" << 200 << "z" << 300);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create and apply the update oplog entry with recordId using v2 delta format.
+    // Delta format uses doc_diff sections like kUpdateSectionFieldName ("u") for updates.
+    auto deltaUpdate = update_oplog_entry::makeDeltaOplogEntry(
+        BSON(doc_diff::kUpdateSectionFieldName << BSON("x" << 150 << "y" << 250)));
+
+    auto op =
+        makeUpdateOplogEntryWithRecordId(nextOpTime(), _nss, BSON("_id" << 1), deltaUpdate, rid);
+    ASSERT_OK(runOpSteadyState(op));
+
+    // Verify the document was updated with only the specified fields changed.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 150 << "y" << 250 << "z" << 300),
+                      updatedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints,
+       SuccessWithV2DeltaDeleteFieldInSecondaryMode) {
+    // Insert a document at a known recordId with multiple fields.
+    const RecordId rid(2);
+    const BSONObj doc = BSON("_id" << 2 << "keep" << 1 << "remove" << 2);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create and apply the update oplog entry with recordId using v2 delta format
+    // to delete a field. kDeleteSectionFieldName ("d") is used for field deletions.
+    auto deltaUpdate = update_oplog_entry::makeDeltaOplogEntry(
+        BSON(doc_diff::kDeleteSectionFieldName << BSON("remove" << false)));
+
+    auto op =
+        makeUpdateOplogEntryWithRecordId(nextOpTime(), _nss, BSON("_id" << 2), deltaUpdate, rid);
+    ASSERT_OK(runOpSteadyState(op));
+
+    // Verify the field was deleted from the document.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 2 << "keep" << 1), updatedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTestDisableSteadyStateConstraints, RecordIdNotFoundInSecondaryModeFails) {
+    // Create a recordId that doesn't exist in the collection.
+    const RecordId nonExistentRid(999);
+
+    // Verify the recordId doesn't have a document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, nonExistentRid));
+
+    // TODO SERVER-118695 Application should succeed
+    // Create and apply the update oplog entry with the non-existent recordId. Oplog entries with a
+    // RecordId will never send an upsert request even when disabling steady state constraints sets
+    // alwaysUpsert:true.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("a" << 1)), nonExistentRid);
+    ASSERT_EQ(runOpSteadyState(op).code(), 11902401);
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints, RecordIdNotFoundInSecondaryModeFails) {
+    // Create a recordId that doesn't exist in the collection.
+    const RecordId nonExistentRid(999);
+
+    // Verify the recordId doesn't have a document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, nonExistentRid));
+
+    // Create and apply the update oplog entry with the non-existent recordId.
+    // With constraints enabled, the recordId path is used (no upsert) and it should fail
+    // since the document isn't found.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("a" << 1)), nonExistentRid);
+    ASSERT_NOT_OK(runOpSteadyState(op));
+}
+
+TEST_F(UpdateWithRecordIdTestDisableSteadyStateConstraints, IdMismatchFails) {
+    // Insert a document at a known recordId with _id = 1.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references the same recordId but with a different _id.
+    // With constraints disabled and alwaysUpsert=true, the code falls back to _id-based lookup.
+    // Since _id=999 doesn't exist, this will upsert a new document.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("y" << 1)), rid);
+
+    ASSERT_EQ(runOpSteadyState(op).code(), 7834902);
+    // Original document should remain unchanged since upsert path was used.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto existingDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(doc, existingDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints, IdMismatchFails) {
+    // Insert a document at a known recordId with _id = 1.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references the same recordId but with a different _id.
+    // This simulates data corruption where the record at the given rid has a different _id.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("y" << 1)), rid);
+
+    // In kSecondary mode with steady state constraints enabled, this should trigger a uassert
+    // and the record should not be updated.
+    ASSERT_EQ(runOpSteadyState(op).code(), 7834902);
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto unchangedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(doc, unchangedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints,
+       UpdateWithRecordIdMultipleDocumentsInSecondaryMode) {
+    // Insert multiple documents.
+    const RecordId rid1(10);
+    const RecordId rid2(20);
+    const RecordId rid3(30);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 10 << "x" << 1), rid1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 20 << "x" << 2), rid2);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 30 << "x" << 3), rid3);
+
+    // Verify all documents exist.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid1));
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid2));
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid3));
+
+    // Update the middle document using its recordId.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 20), BSON("$set" << BSON("x" << 200)), rid2);
+    ASSERT_OK(runOpSteadyState(op));
+
+    // Verify only the targeted document was updated.
+    auto doc1 = documentAtRecordId(_opCtx.get(), _nss, rid1);
+    auto doc2 = documentAtRecordId(_opCtx.get(), _nss, rid2);
+    auto doc3 = documentAtRecordId(_opCtx.get(), _nss, rid3);
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 10 << "x" << 1), doc1.value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 20 << "x" << 200), doc2.value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 30 << "x" << 3), doc3.value());
+}
+
+TEST_F(UpdateWithRecordIdTestDisableSteadyStateConstraints, NonExistentCollectionFails) {
+    // Insert a document at a known recordId with _id = 1.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references a collection that doesn't exist.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(),
+        NamespaceString::createNamespaceString_forTest("test.nonExistentCollection"),
+        BSON("_id" << 1),
+        BSON("$set" << BSON("y" << 1)),
+        rid);
+
+    // In kSecondary mode with steady state constraints disabled, this should trigger a uassert
+    // and the record should not be updated.
+    ASSERT_EQ(runOpSteadyState(op).code(), 11979201);
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto unchangedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(doc, unchangedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints, NonExistentCollectionFails) {
+    // Insert a document at a known recordId with _id = 1.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references a collection that doesn't exist.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(),
+        NamespaceString::createNamespaceString_forTest("test.nonExistentCollection"),
+        BSON("_id" << 1),
+        BSON("$set" << BSON("y" << 1)),
+        rid);
+
+    // In kSecondary mode with steady state constraints enabled, this should trigger a uassert
+    // and the record should not be updated.
+    ASSERT_EQ(runOpSteadyState(op).code(), 11979201);
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto unchangedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(doc, unchangedDoc.value());
+}
+
+// =============================================================================
+// Tests for kInitialSync mode
+// =============================================================================
+
+TEST_F(UpdateWithRecordIdTest, UpdateWithRecordIdSuccessInInitialSyncMode) {
+    // Insert a document at a known recordId.
+    const RecordId rid(2);
+    const BSONObj doc = BSON("_id" << 2 << "x" << 200);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create and apply the update oplog entry with recordId in initial sync mode.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 2), BSON("$set" << BSON("x" << 300)), rid);
+    ASSERT_OK(runOpInitialSync(op));
+
+    // Verify the document was updated.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 2 << "x" << 300), updatedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTest, UpdateWithRecordIdNotFoundInInitialSyncMode) {
+    // Create a recordId that doesn't exist in the collection.
+    const RecordId nonExistentRid(888);
+
+    // Verify the recordId doesn't have a document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, nonExistentRid));
+
+    // Create and apply the update oplog entry with the non-existent recordId.
+    // In initial sync mode, this should succeed (noop) since we're more lenient.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 888), BSON("$set" << BSON("a" << 1)), nonExistentRid);
+    ASSERT_OK(runOpInitialSync(op));
+}
+
+TEST_F(UpdateWithRecordIdTest, UpdateWithRecordIdMismatchIdInInitialSyncModeSucceeds) {
+    // Insert a document at a known recordId with _id = 3.
+    const RecordId rid(3);
+    const BSONObj doc = BSON("_id" << 3 << "x" << 300);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references the same recordId but with a different _id.
+    // In initial sync mode, _id mismatches are ignored (the operation returns OK without
+    // performing the update).
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 777), BSON("$set" << BSON("y" << 1)), rid);
+    ASSERT_OK(runOpInitialSync(op));
+
+    // In initial sync mode, the _id mismatch is ignored and the function returns Status::OK()
+    // without updating the document.
+    auto unchangedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(unchangedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(doc, unchangedDoc.value());
+}
+
+TEST_F(UpdateWithRecordIdTest, UpdateWithRecordIdMultipleDocumentsInInitialSyncMode) {
+    // Insert multiple documents.
+    const RecordId rid1(100);
+    const RecordId rid2(200);
+    const RecordId rid3(300);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 100 << "a" << 1), rid1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 200 << "a" << 2), rid2);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 300 << "a" << 3), rid3);
+
+    // Verify all documents exist.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid1));
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid2));
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid3));
+
+    // Update the first document using its recordId.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 100), BSON("$set" << BSON("a" << 100)), rid1);
+    ASSERT_OK(runOpInitialSync(op));
+
+    // Verify only the targeted document was updated.
+    auto doc1 = documentAtRecordId(_opCtx.get(), _nss, rid1);
+    auto doc2 = documentAtRecordId(_opCtx.get(), _nss, rid2);
+    auto doc3 = documentAtRecordId(_opCtx.get(), _nss, rid3);
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 100 << "a" << 100), doc1.value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 200 << "a" << 2), doc2.value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 300 << "a" << 3), doc3.value());
+}
+
+TEST_F(UpdateWithRecordIdTest, FcbisScenarioWithMismatchedRecordIdsInInitialSyncMode) {
+    // Scenario: Document is cloned via FCBIS at rid: 2 with {_id: 1, a: 2}.
+    // Then the following oplogs are applied in initial sync mode:
+    // 1. update {_id: 1, rid: 1, a: 3} - targets rid: 1 which doesn't exist (no-op)
+    // 2. delete {_id: 1, rid: 1} - targets rid: 1 which doesn't exist (no-op)
+    // 3. insert {_id: 1, rid: 2, a: 2} - targets rid: 2 which already has a document (skipped)
+
+    // Step 1: Simulate FCBIS clone - insert document at rid: 2.
+    const RecordId clonedRid(2);
+    const BSONObj clonedDoc = BSON("_id" << 1 << "a" << 2);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, clonedDoc, clonedRid);
+
+    // Verify the cloned document exists at rid: 2.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, clonedRid));
+
+    // Step 2: Apply update oplog entry targeting rid: 1 (should be no-op since rid: 1 doesn't
+    // exist).
+    const RecordId originalRid(1);
+    auto updateOp = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("a" << 3)), originalRid);
+    ASSERT_OK(runOpInitialSync(updateOp));
+
+    // Verify rid: 1 still doesn't exist and rid: 2 document is unchanged.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, originalRid));
+    auto docAfterUpdate = documentAtRecordId(_opCtx.get(), _nss, clonedRid);
+    ASSERT_TRUE(docAfterUpdate.has_value());
+    ASSERT_BSONOBJ_EQ(clonedDoc, docAfterUpdate.value());
+
+    // Step 3: Apply delete oplog entry targeting rid: 1 (should be no-op since rid: 1 doesn't
+    // exist).
+    auto deleteOp =
+        makeDeleteOplogEntryWithRecordId(nextOpTime(), _nss, _uuid, BSON("_id" << 1), originalRid);
+    ASSERT_OK(runOpInitialSync(deleteOp));
+
+    // Verify rid: 1 still doesn't exist and rid: 2 document is unchanged.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, originalRid));
+    auto docAfterDelete = documentAtRecordId(_opCtx.get(), _nss, clonedRid);
+    ASSERT_TRUE(docAfterDelete.has_value());
+    ASSERT_BSONOBJ_EQ(clonedDoc, docAfterDelete.value());
+
+    // Step 4: Apply insert oplog entry targeting rid: 2. Since the document already exists at
+    // rid: 2 (from FCBIS clone), this insert is skipped during initial sync (DuplicateKey errors
+    // are handled by returning Status::OK()).
+    auto insertOp = makeInsertOplogEntryWithRecordId(
+        nextOpTime(), _nss, _uuid, BSON("_id" << 1 << "a" << 2), clonedRid);
+    ASSERT_OK(runOpInitialSync(insertOp));
+
+    // Verify the final state: document at rid: 2 should still be the cloned document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, originalRid));
+    auto finalDoc = documentAtRecordId(_opCtx.get(), _nss, clonedRid);
+    ASSERT_TRUE(finalDoc.has_value());
+    ASSERT_BSONOBJ_EQ(clonedDoc, finalDoc.value());
+}
+
+// =============================================================================
+// Tests for kApplyOpsCmd mode (applyOps command)
+// =============================================================================
+
+/**
+ * Test fixture for update oplog entries in applyOps mode on a recordIdsReplicated collection.
+ */
+class ApplyOpsUpdateTest : public UpdateWithRecordIdTest {
+protected:
+    Status runOpApplyOpsCmd(const OplogEntry& op) {
+        return _applyOplogEntryOrGroupedInsertsWrapper(
+            _opCtx.get(), ApplierOperation{&op}, OplogApplication::Mode::kApplyOpsCmd);
+    }
+};
+
+TEST_F(ApplyOpsUpdateTest, UpdateByIdSucceeds) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create and apply an update oplog entry WITHOUT recordId in applyOps mode.
+    // In kApplyOpsCmd mode, updates without recordId are allowed even on recordIdsReplicated
+    // collections.
+    auto op = makeUpdateDocumentOplogEntry(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 500)));
+    ASSERT_OK(runOpApplyOpsCmd(op));
+
+    // Verify the document was updated.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 500), updatedDoc.value());
+}
+
+TEST_F(ApplyOpsUpdateTest, ApplyOpsUpdateByIdMultipleDocumentsSucceeds) {
+    // Insert multiple documents at known recordIds.
+    const RecordId rid1(10);
+    const RecordId rid2(20);
+    const RecordId rid3(30);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 10 << "value" << "a"), rid1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 20 << "value" << "b"), rid2);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 30 << "value" << "c"), rid3);
+
+    // Verify all documents exist.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid1));
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid2));
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid3));
+
+    // Update the middle document without recordId in applyOps mode.
+    auto op = makeUpdateDocumentOplogEntry(
+        nextOpTime(), _nss, BSON("_id" << 20), BSON("$set" << BSON("value" << "updated")));
+    ASSERT_OK(runOpApplyOpsCmd(op));
+
+    // Verify only the targeted document was updated.
+    auto doc1 = documentAtRecordId(_opCtx.get(), _nss, rid1);
+    auto doc2 = documentAtRecordId(_opCtx.get(), _nss, rid2);
+    auto doc3 = documentAtRecordId(_opCtx.get(), _nss, rid3);
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 10 << "value" << "a"), doc1.value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 20 << "value" << "updated"), doc2.value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 30 << "value" << "c"), doc3.value());
+}
+
+TEST_F(ApplyOpsUpdateTest, ApplyOpsUpdateByIdDocumentNotFoundFails) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 1 << "x" << 100), rid);
+
+    // Try to update a document that doesn't exist in applyOps mode.
+    // This should succeed as a no-op.
+    auto op = makeUpdateDocumentOplogEntry(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("x" << 1)));
+    // The applyOps command will set `alwaysUpsert` to false, causing an update with no matched
+    // documents to return an error status.
+    ASSERT_NOT_OK(runOpApplyOpsCmd(op));
+
+    // The existing document should still be there and unchanged.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto unchangedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 100), unchangedDoc.value());
+}
+
+TEST_F(ApplyOpsUpdateTest, ApplyOpsUpdateWithUpsertSucceeds) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create and apply an update oplog entry with upsert:true but WITHOUT a recordId.
+    // This should succeed because the upsert flag is only disallowed when combined with a recordId.
+    auto op = makeUpdateOplogEntryWithUpsert(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 600)));
+    ASSERT_OK(runOpApplyOpsCmd(op));
+
+    // Verify the document was updated.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 600), updatedDoc.value());
+}
+
+using ApplyOpsUpdateDeathTest = ApplyOpsUpdateTest;
+
+DEATH_TEST_F(ApplyOpsUpdateDeathTest, UpdateWithRidInApplyOpsCmdModeFails, "12336000") {
+    const RecordId rid(1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 1 << "x" << 100), rid);
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 500)), rid);
+    std::ignore = runOpApplyOpsCmd(op);
+}
+
+// =============================================================================
+// Tests for change stream pre-images with recordId updates
+// =============================================================================
+
+/**
+ * Test fixture for update oplog entries with recordId on collections with change stream pre-images.
+ */
+class UpdateWithRecordIdAndPreImagesTest : public OplogApplierImplTest {
+protected:
+    void setUp() override {
+        OplogApplierImplTest::setUp();
+
+        // Setup the pre-images collection.
+        ChangeStreamPreImagesCollectionManager::get(_opCtx.get())
+            .createPreImagesCollection(_opCtx.get());
+
+        _nss = NamespaceString::createNamespaceString_forTest("test.updateRecordIdPreImages");
+        createCollectionWithPreImages(_opCtx.get(), _nss);
+        _uuid = getCollectionUUID(_opCtx.get(), _nss);
+    }
+
+    NamespaceString _nss;
+    UUID _uuid = UUID::gen();
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+};
+
+TEST_F(UpdateWithRecordIdAndPreImagesTest,
+       UpdateByRecordIdInSecondaryModeRecordsChangeStreamPreImage) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    const BSONObj document = BSON("_id" << 1 << "x" << 100 << "data" << "original");
+    insertDocumentAtRecordId(_opCtx.get(), _nss, document, rid);
+
+    // Verify the document exists.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+
+    // Create an update oplog entry with recordId.
+    OpTime opTime = [opCtx = _opCtx.get()] {
+        WriteUnitOfWork wuow{opCtx};
+        ScopeGuard guard{[&wuow] {
+            wuow.commit();
+        }};
+        return repl::getNextOpTime(opCtx);
+    }();
+    auto op = makeUpdateOplogEntryWithRecordId(
+        opTime, _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 200)), rid);
+
+    // Apply the update oplog entry in secondary mode.
+    ASSERT_OK(runOpSteadyState(op));
+
+    // Verify the document was updated.
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 200 << "data" << "original"), updatedDoc.value());
+
+    // Verify the pre-image was recorded.
+    ChangeStreamPreImageId preImageId{_uuid, op.getOpTime().getTimestamp(), 0};
+    BSONObj preImageDocumentKey = BSON("_id" << preImageId.toBSON());
+    auto preImageLoadResult =
+        getStorageInterface()->findById(_opCtx.get(),
+                                        NamespaceString::kChangeStreamPreImagesNamespace,
+                                        preImageDocumentKey.firstElement());
+    ASSERT_OK(preImageLoadResult);
+
+    // Verify that the pre-image document contains the correct original document.
+    const auto preImageDocument =
+        ChangeStreamPreImage::parse(preImageLoadResult.getValue(), IDLParserContext{"test"});
+    ASSERT_BSONOBJ_EQ(preImageDocument.getPreImage(), document);
+    ASSERT_EQUALS(preImageDocument.getOperationTime(), op.getWallClockTime());
+}
+
+using UpdateWithRecordIdAndPreImagesDeathTest = UpdateWithRecordIdAndPreImagesTest;
+DEATH_TEST_F(UpdateWithRecordIdAndPreImagesDeathTest,
+             UpdateByRecordIdWithPreImagesDocumentNotFoundDies,
+             "invariant") {
+    // Do NOT insert a document at the target recordId - it should not exist.
+    const RecordId nonExistentRid(999);
+
+    // Verify the recordId doesn't have a document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, nonExistentRid));
+
+    // Create an update oplog entry with the non-existent recordId.
+    OpTime opTime = [opCtx = _opCtx.get()] {
+        WriteUnitOfWork wuow{opCtx};
+        ScopeGuard guard{[&wuow] {
+            wuow.commit();
+        }};
+        return repl::getNextOpTime(opCtx);
+    }();
+    auto op = makeUpdateOplogEntryWithRecordId(
+        opTime, _nss, BSON("_id" << 999), BSON("$set" << BSON("x" << 200)), nonExistentRid);
+
+    // Apply the update oplog entry in secondary mode. Since change stream pre-images are enabled
+    // and the document doesn't exist, we cannot retrieve the pre-image and the invariant will fail.
+    std::ignore = runOpSteadyState(op);
+}
+
+// =============================================================================
+// Tests for capped collections with recordIdsReplicated
+// =============================================================================
+
+/**
+ * Test fixture for update oplog entries with recordId on capped collections.
+ */
+class CappedUpdateWithRecordIdTest : public OplogApplierImplTest {
+protected:
+    void setUp() override {
+        OplogApplierImplTest::setUp();
+        _nss = NamespaceString::createNamespaceString_forTest("test.cappedUpdateRecordId");
+        createCappedCollection(_opCtx.get(), _nss);
+        _uuid = getCollectionUUID(_opCtx.get(), _nss);
+    }
+
+    NamespaceString _nss;
+    UUID _uuid = UUID::gen();
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+};
+
+typedef SetSteadyStateConstraints<CappedUpdateWithRecordIdTest, false>
+    CappedUpdateWithRecordIdTestDisableSteadyStateConstraints;
+typedef SetSteadyStateConstraints<CappedUpdateWithRecordIdTest, true>
+    CappedUpdateWithRecordIdTestEnableSteadyStateConstraints;
+
+TEST_F(CappedUpdateWithRecordIdTestDisableSteadyStateConstraints,
+       IdMismatchOnCappedCollectionFails) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references the same recordId but with a different _id.
+    // On capped collections with replicatedRecordId, _id mismatch is always fatal regardless
+    // of steady state constraints.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("y" << 1)), rid);
+
+    ASSERT_EQ(runOpSteadyState(op).code(), 7834902);
+    // Original document should remain unchanged.
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto existingDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(doc, existingDoc.value());
+}
+
+TEST_F(CappedUpdateWithRecordIdTestEnableSteadyStateConstraints,
+       IdMismatchOnCappedCollectionFails) {
+    // Insert a document at a known recordId.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    // Create an update oplog entry that references the same recordId but with a different _id.
+    // On capped collections with replicatedRecordId, _id mismatch is always fatal regardless
+    // of steady state constraints.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("y" << 1)), rid);
+
+    ASSERT_EQ(runOpSteadyState(op).code(), 7834902);
+    ASSERT_TRUE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+    auto unchangedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_BSONOBJ_EQ(doc, unchangedDoc.value());
+}
+
+TEST_F(CappedUpdateWithRecordIdTestDisableSteadyStateConstraints,
+       UpdateDoesNothingOnCappedCollectionFails) {
+    // Create a recordId that doesn't exist in the collection.
+    const RecordId nonExistentRid(999);
+
+    // Verify the recordId doesn't have a document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, nonExistentRid));
+
+    // Create and apply the update oplog entry with the non-existent recordId.
+    // Unlike regular capped collections (where updates that match nothing are silently ignored
+    // because the cappedDeleter may have removed the document), capped collections with
+    // replicatedRecordId should be identical on every node, so a missing document is an error. This
+    // is a fatal error regardless of steady state constraints.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("a" << 1)), nonExistentRid);
+    ASSERT_EQ(runOpSteadyState(op).code(), 11902401);
+}
+
+
+TEST_F(CappedUpdateWithRecordIdTestEnableSteadyStateConstraints,
+       UpdateDoesNothingOnCappedCollectionFails) {
+    // Create a recordId that doesn't exist in the collection.
+    const RecordId nonExistentRid(999);
+
+    // Verify the recordId doesn't have a document.
+    ASSERT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, nonExistentRid));
+
+    // Create and apply the update oplog entry with the non-existent recordId.
+    // Unlike regular capped collections (where updates that match nothing are silently ignored
+    // because the cappedDeleter may have removed the document), capped collections with
+    // replicatedRecordId should be identical on every node, so a missing document is an error. This
+    // is a fatal error regardless of steady state constraints.
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 999), BSON("$set" << BSON("a" << 1)), nonExistentRid);
+    ASSERT_EQ(runOpSteadyState(op).code(), 11902401);
+}
+
+
+// Builds a corrupted BSON buffer, with intentional garbage at the end. The length prefix of the
+// string is malformed; if an iterator incorrectly uses this, we'll end up reading beyond the BSON
+// buffer and into the memory area after. For the test, filling this with 0x77 (an invalid BSON
+// type) so walking the structure fails if we ever reach that point.
+//
+// Shape of the buffer:
+//
+//   [ valid BSON document {x: "ab"}  | trap suffix ]
+//   <----- declared size = 15 ------><-- 4 bytes -->
+//
+// Setting this in the oplog test to confirm that we catch this type of corruption at the repl
+// boundary rather than proceeding with bad data.
+const std::string& corruptedBsonBytes() {
+    static const std::string buf = [] {
+        // { x: "ab" }
+        const BSONObj validDoc = BSON("x" << "ab");
+        std::string b(validDoc.objdata(), validDoc.objsize());
+
+        // doc size header + string type byte + 2-byte field name "x\0"
+        constexpr size_t lenPrefixOffset = 4 + 1 + 2;
+        // One more than the real string length ("ab\0")
+        const int32_t lyingLen = 4;
+        // Rewrite the byte in-memory
+        std::memcpy(b.data() + lenPrefixOffset, &lyingLen, sizeof(lyingLen));
+
+        // 0x77 is not a valid BSON type. If we're iterating over the document and obey the
+        // corrupted string length, we'll end up trying to parse this area of memory as a BSON type.
+        const char trapSuffix[] = {0x77, 0x77, 0x77, 0x00};
+        b.append(trapSuffix, sizeof(trapSuffix));
+        return b;
+    }();
+    return buf;
+}
+
+class CorruptedRecordCursor : public SeekableRecordCursor {
+public:
+    explicit CorruptedRecordCursor(const char* data, int len) : _data(data), _len(len) {}
+
+    boost::optional<Record> seekExact(const RecordId& id) override {
+        return Record{id, RecordData(_data, _len)};
+    }
+
+    // Unused by updateObjectByRid; stubbed so the class is concrete.
+    boost::optional<Record> seek(const RecordId&, BoundInclusion) override {
+        return boost::none;
+    }
+    boost::optional<Record> next() override {
+        return boost::none;
+    }
+    void save() override {}
+    bool restore(RecoveryUnit&, bool) override {
+        return true;
+    }
+    void detachFromOperationContext() override {}
+    void reattachToOperationContext(OperationContext*) override {}
+    void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
+
+private:
+    const char* _data;
+    int _len;
+};
+
+// Minimal Collection mock that hands out our CorruptedRecordCursor. Everything
+// else is inherited from CollectionMock (whose stubs are MONGO_UNREACHABLE);
+// updateObjectByRid only calls getCursor() before throwing on the bad BSON, so
+// no other Collection method is reached.
+class CollectionWithCorruptedCursor : public CollectionMock {
+public:
+    using CollectionMock::CollectionMock;
+
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext*,
+                                                    bool /*forward*/) const override {
+        const auto& buf = corruptedBsonBytes();
+        return std::make_unique<CorruptedRecordCursor>(buf.data(), static_cast<int>(buf.size()));
+    }
+};
+
+// Builds a document whose 'data' field is a BSONColumn BinData with corrupt column content. The
+// document is structurally valid BSON, so mutablebson and _id extraction handle it fine, but
+// validateBSON rejects the column with NonConformantBSON (column validation is gated on the
+// validation version, not the mode, so this fails even in default mode). This is the corruption
+// shape from SERVER-130080: a time-series bucket whose compressed column was corrupted by a
+// re-applied $v:2 diff. See BSONValidateColumn.BSONColumnInBSON in bson_validate_test.cpp.
+BSONObj makeDocWithCorruptColumn() {
+    BSONColumnBuilder cb;
+    cb.append(BSON("f" << "deadbeef").getField("f"));
+    cb.append(BSON("f" << 1).getField("f"));
+    BSONBinData columnData = cb.finalize();
+
+    std::vector<char> badColumn(columnData.length);
+    std::memcpy(badColumn.data(), columnData.data, columnData.length);
+    badColumn[0] = '0';  // Corrupt a control byte so column validation fails.
+    columnData.data = badColumn.data();
+
+    // BSON() copies the BinData bytes, so the returned object is self-contained.
+    return BSON("_id" << 1 << "data" << columnData);
+}
+
+// Overwrites the raw bytes of the record at 'rid' with those of 'corruptDoc', bypassing the BSON
+// validation that the normal insert/update paths run. This lets a test write arbitrary bytes
+// (including invalid BSON) directly into a real collection.
+void corruptRecordAtRecordId(OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             const RecordId& rid,
+                             const BSONObj& corruptDoc) {
+    auto coll = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    WriteUnitOfWork wuow(opCtx);
+    ASSERT_OK(coll.getCollectionPtr()->getRecordStore()->updateRecord(
+        opCtx,
+        *shard_role_details::getRecoveryUnit(opCtx),
+        rid,
+        corruptDoc.objdata(),
+        corruptDoc.objsize()));
+    wuow.commit();
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints,
+       UpdateObjectByRidRejectsMalformedBSONFromSeekExact) {
+    // Wrap our corrupt-cursor-returning Collection in a CollectionAcquisition via
+    // shard_role_mock so updateObjectByRid sees it through the standard interface.
+    const auto nss = NamespaceString::createNamespaceString_forTest("test.corruptedBson");
+    auto mockColl = std::make_shared<CollectionWithCorruptedCursor>(UUID::gen(), nss);
+    CollectionPtr collPtr = CollectionPtr::CollectionPtr_UNSAFE(mockColl.get());
+    auto coll = shard_role_mock::acquireCollectionMocked(_opCtx.get(), nss, std::move(collPtr));
+
+    const RecordId rid(1);
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), nss, BSON("_id" << 1), BSON("$set" << BSON("a" << 1)), rid);
+
+    UpdateRequest request;
+    request.setNamespaceString(nss);
+    request.setQuery(BSON("_id" << 1));
+    request.setUpsert(false);
+
+    BSONObj preImage;
+    const auto idField = op.getObject2().value()["_id"];
+
+    // Without pre-validation, this will fail on hitting the bad BSON type 0x77. With validation,
+    // we'll get an InvalidBSON status.
+    ASSERT_THROWS_CODE(updateObjectByRid(_opCtx.get(),
+                                         rid,
+                                         op,
+                                         coll,
+                                         &globalOpCounters(),
+                                         idField,
+                                         OplogApplication::Mode::kSecondary,
+                                         std::move(request),
+                                         /*recordChangeStreamPreImage=*/false,
+                                         preImage),
+                       DBException,
+                       ErrorCodes::InvalidBSON);
+}
+
+TEST_F(UpdateWithRecordIdTestEnableSteadyStateConstraints,
+       UpdateByRidRejectsCorruptColumnInSecondaryMode) {
+    // Baseline for the skip tests below: a structurally-valid document with a corrupt BSONColumn
+    // (the SERVER-130080 shape) is rejected by the by-RecordId path's BSON validation during
+    // steady-state replication on a non-resharding collection. We place the corrupt document at a
+    // known recordId (bypassing the insert-time validation) and then apply an update by recordId.
+    const RecordId rid(1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 1), rid);
+    corruptRecordAtRecordId(_opCtx.get(), _nss, rid, makeDocWithCorruptColumn());
+
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("_id" << 1 << "a" << 1), rid);
+    ASSERT_EQ(runOpSteadyState(op).code(), ErrorCodes::NonConformantBSON);
+}
+
+TEST_F(UpdateWithRecordIdTest, UpdateByRidSkipsBSONValidationInInitialSync) {
+    // Initial sync replays the oplog at-least-once and can transiently produce invalid BSON (for
+    // example by re-applying a non-idempotent $v:2 diff against an already-advanced bucket), so the
+    // by-RecordId path must not run BSON validation in this mode, even for a non-resharding
+    // collection. The same corrupt document that is rejected in steady state
+    // (UpdateByRidRejectsCorruptColumnInSecondaryMode) must be tolerated here: applying a
+    // replacement update by recordId succeeds. The corrupt column stays opaque to the update since
+    // the replacement rewrites the document.
+    const RecordId rid(1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 1), rid);
+    corruptRecordAtRecordId(_opCtx.get(), _nss, rid, makeDocWithCorruptColumn());
+
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("_id" << 1 << "a" << 1), rid);
+    ASSERT_OK(runOpInitialSync(op));
+
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "a" << 1), updatedDoc.value());
+}
+
+// =============================================================================
+// Tests for resharding internal collections (SERVER-130723)
+//
+// Resharding materializes its internal collections through at-least-once oplog application on the
+// recipient, so those collections can transiently hold invalid BSON (for example time-series
+// buckets carrying stale $v:2 diffs) that self-heals before the collection is finalized. The
+// recipient commits this without running the by-rid path's BSON validation, so a secondary
+// replaying the temporary collection's oplog must skip that validation to avoid crashing on the
+// transiently invalid document. All the other steady-state checks (recordId/_id/size) are left
+// active because a secondary applies exactly-once and in-order, so they can only fire on genuine
+// divergence. See SERVER-130080.
+// =============================================================================
+
+/**
+ * Test fixture for update oplog entries with recordId on a temporary resharding collection.
+ */
+class ReshardingUpdateWithRecordIdTest : public OplogApplierImplTest {
+protected:
+    void setUp() override {
+        OplogApplierImplTest::setUp();
+        _nss = NamespaceString::createNamespaceString_forTest("test.system.resharding." +
+                                                              UUID::gen().toString());
+        ASSERT_TRUE(_nss.isTemporaryReshardingCollection());
+        createCollection(_opCtx.get(), _nss, {});
+        _uuid = getCollectionUUID(_opCtx.get(), _nss);
+    }
+
+    NamespaceString _nss;
+    UUID _uuid = UUID::gen();
+    unittest::ServerParameterGuard featureFlagController =
+        unittest::ServerParameterGuard("featureFlagRecordIdsReplicated", true);
+};
+
+typedef SetSteadyStateConstraints<ReshardingUpdateWithRecordIdTest, true>
+    ReshardingUpdateWithRecordIdTestEnableSteadyStateConstraints;
+
+TEST_F(ReshardingUpdateWithRecordIdTestEnableSteadyStateConstraints, SuccessInSecondaryMode) {
+    // A normal update to a resharding internal collection still applies as expected.
+    const RecordId rid(1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 1 << "x" << 100), rid);
+
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 200)), rid);
+    ASSERT_OK(runOpSteadyState(op));
+
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "x" << 200), updatedDoc.value());
+}
+
+TEST_F(ReshardingUpdateWithRecordIdTestEnableSteadyStateConstraints,
+       SkipsBSONValidationInSecondaryMode) {
+    // Resharding internal collections are materialized at-least-once: the recipient can commit a
+    // transiently-invalid document (for example a time-series bucket with a stale $v:2 diff) and
+    // replicate it. A secondary applying that document by recordId must not run BSON validation, or
+    // it would crash on bytes the recipient already accepted. The same corrupt document that fails
+    // in steady state on a non-resharding collection
+    // (UpdateByRidRejectsCorruptColumnInSecondaryMode) is tolerated here: applying a replacement
+    // update by recordId succeeds.
+    const RecordId rid(1);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, BSON("_id" << 1), rid);
+    corruptRecordAtRecordId(_opCtx.get(), _nss, rid, makeDocWithCorruptColumn());
+
+    auto op = makeUpdateOplogEntryWithRecordId(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("_id" << 1 << "a" << 1), rid);
+    ASSERT_OK(runOpSteadyState(op));
+
+    auto updatedDoc = documentAtRecordId(_opCtx.get(), _nss, rid);
+    ASSERT_TRUE(updatedDoc.has_value());
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1 << "a" << 1), updatedDoc.value());
+}
+
+}  // namespace
+}  // namespace repl
+}  // namespace mongo

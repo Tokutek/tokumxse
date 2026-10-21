@@ -1,0 +1,93 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/classic/plan_stage.h"
+#include "mongo/db/exec/classic/working_set.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/fts/fts_matcher.h"
+#include "mongo/db/fts/fts_query_impl.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
+#include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
+#include "mongo/util/modules.h"
+
+#include <memory>
+#include <string_view>
+#include <utility>
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+using fts::FTSMatcher;
+using fts::FTSQueryImpl;
+using fts::FTSSpec;
+
+
+class OperationContext;
+class RecordID;
+
+struct TextMatchParams {
+    TextMatchParams(const IndexDescriptor* index,
+                    const FTSSpec& spec,
+                    BSONObj indexPrefix,
+                    const FTSQueryImpl& query)
+        : index(index), spec(spec), indexPrefix(std::move(indexPrefix)), query(query) {}
+
+    // Text index descriptor.  IndexCatalog owns this.
+    const IndexDescriptor* const index;
+
+    // Index spec.
+    const FTSSpec spec;
+
+    // Index keys that precede the "text" index key.
+    const BSONObj indexPrefix;
+
+    // The text query.
+    const FTSQueryImpl query;
+};
+
+/**
+ * A stage that returns every document in the child that satisfies the FTS text matcher built with
+ * the query parameter.
+ *
+ * Prerequisites: A single child stage that passes up WorkingSetMembers in the RID_AND_OBJ state.
+ * Members must also have text score metadata if it is necessary for the final projection.
+ */
+class TextMatchStage final : public PlanStage {
+public:
+    TextMatchStage(ExpressionContext* expCtx,
+                   std::unique_ptr<PlanStage> child,
+                   const TextMatchParams& params,
+                   WorkingSet* ws);
+    ~TextMatchStage() override;
+
+    void addChild(PlanStage* child);
+
+    bool isEOF() const final;
+
+    StageState doWork(WorkingSetID* out) final;
+
+    StageType stageType() const final {
+        return STAGE_TEXT_MATCH;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static constexpr std::string_view kStageType = "TEXT_MATCH"sv;
+
+private:
+    // Text-specific phrase and negated term matcher.
+    FTSMatcher _ftsMatcher;
+
+    // Not owned by us.
+    WorkingSet* _ws;
+
+    TextMatchStats _specificStats;
+};
+}  // namespace mongo

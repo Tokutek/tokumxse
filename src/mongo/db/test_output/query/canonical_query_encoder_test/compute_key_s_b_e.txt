@@ -1,0 +1,56 @@
+==== VARIATION: sbe, query={}, sort={}, proj={}
+YW4ABQAAAAB8fHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={$or: [{a: 1}, {b: 2}]}, sort={}, proj={}
+b3IAW2VxAGE6EAEAAAAsZXEAYjoQAgAAAF0FAAAAAHx8fHwAAAAAbm5ubgUAAAAABQAAAABmfA==
+==== VARIATION: sbe, query={a: 1}, sort={}, proj={}
+ZXEAYToQAQAAAAUAAAAAfHx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={b: 1}, sort={}, proj={}
+ZXEAYjoQAQAAAAUAAAAAfHx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={a: 1, b: 1, c: 1}, sort={}, proj={}
+YW4AW2VxAGE6EAEAAAAsZXEAYjoQAQAAACxlcQBjOhABAAAAXQUAAAAAfHx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={}, sort={a: 1}, proj={}
+YW4ABQAAAAB8YWF8fHwAAAAAbm5ubgUAAAAABQAAAABmfA==
+==== VARIATION: sbe, query={}, sort={a: -1}, proj={}
+YW4ABQAAAAB8ZGF8fHwAAAAAbm5ubgUAAAAABQAAAABmfA==
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={a: 1}
+ZXEAYToQAQAAAAwAAAAQYQABAAAAAHxhYXx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={}, sort={a: 1}, proj={a: 1}
+YW4ADAAAABBhAAEAAAAAfGFhfHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={}, sort={a: 1}, proj={a: 1}
+YW4ADAAAABBhAAEAAAAAfGFhfHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={}, sort={}, proj={a: 1}
+YW4ADAAAABBhAAEAAAAAfHx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={}, sort={}, proj={a: true}
+YW4ACQAAAAhhAAEAfHx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={}, sort={}, proj={a: false}
+YW4ACQAAAAhhAAAAfHx8fAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={}, sort={}, proj={}, isCountLike=true
+YW4ABQAAAAB8fHx8AAEAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=1, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAHRubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAGZubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=1, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAG50bm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAG5uZm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAGMKAAAAAAAAAAAAAAAAAAAAbm5ubgUAAAAABQAAAABmfA==
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAGMAAAAAAAAAAAoAAAAAAAAAbm5ubgUAAAAABQAAAABmfA==
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={a: 1}, proj={}, hint={}, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfGFhfHx8AAAAAG5ubm4FAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={}, proj={}, hint={ $natural: 1 }, allowDiskUse=0, returnKey=0, requestResumeToken=1, resumeAfter=1
+ZXEAYToQAQAAAAUAAAAAfHx8EwAAABAkbmF0dXJhbAABAAAAAHwAAAAAbm50bhgAAAASJHJlY29yZElkAAEAAAAAAAAAAAUAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={}, proj={}, hint={ $natural: 1 }, allowDiskUse=0, returnKey=0, requestResumeToken=1, startAt=1
+ZXEAYToQAQAAAAUAAAAAfHx8EwAAABAkbmF0dXJhbAABAAAAAHwAAAAAbm50bgUAAAAAGAAAABIkcmVjb3JkSWQAAQAAAAAAAAAAZnw=
+==== VARIATION: sbe, query={a: 1}, sort={}, proj={}, hint={ a: 1 }, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfHx8DAAAABBhAAEAAAAAfAAAAABubm5uBQAAAAAFAAAAAGZ8
+==== VARIATION: sbe, query={a: 1}, sort={}, proj={}, hint={ a: -1 }, allowDiskUse=0, returnKey=0, requestResumeToken=0
+ZXEAYToQAQAAAAUAAAAAfHx8DAAAABBhAP////8AfAAAAABubm5uBQAAAAAFAAAAAGZ8

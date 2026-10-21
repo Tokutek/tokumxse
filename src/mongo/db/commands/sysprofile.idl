@@ -1,0 +1,55 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/util/uuid.h"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ProfileMode:
+        description: 'A string enum for profile mode, "record" (perf-record) samples the cpu-cycle events or "counters" (perf-counters) provides hardware events.'
+        type: string
+        values:
+            record: "record"
+            counters: "counters"
+
+structs:
+    SysProfileCommandRely:
+        description: "The sysprofile command's reply."
+        is_command_reply: true
+        fields:
+            pid:
+                description: "The perf process pid that is forked."
+                type: int
+                optional: true
+            ok:
+                type: safeDouble
+
+commands:
+    sysprofile:
+        description: "Input request for sysprofile command."
+        command_name: sysprofile
+        cpp_name: SysProfileCommandRequest
+        namespace: ignored
+        api_version: ""
+        reply_type: SysProfileCommandRely
+        access_check:
+            none: true # No auth needed because it only works when enabled via command line.
+        fields:
+            pid:
+                description: "The pid of perf process to be killed, this is returned by sysprofile command to start the perf process."
+                type: int
+                optional: true
+            filename:
+                description: "The perf output file name."
+                type: string
+                default: '"perf"'
+            mode:
+                description: "The profile mode."
+                type: ProfileMode
+                default: record

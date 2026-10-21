@@ -1,0 +1,200 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/s/query/exec/document_source_merge_cursors.h"
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/shard_role/resource_yielders.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+
+#include <string_view>
+#include <utility>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+namespace mongo {
+using namespace std::literals::string_view_literals;
+
+REGISTER_INTERNAL_LITE_PARSED_DOCUMENT_SOURCE(mergeCursors, MergeCursorsLiteParsed::parse);
+
+REGISTER_DOCUMENT_SOURCE_WITH_STAGE_PARAMS_DEFAULT(mergeCursors,
+                                                   DocumentSourceMergeCursors,
+                                                   MergeCursorsStageParams);
+
+ALLOCATE_DOCUMENT_SOURCE_ID(mergeCursors, DocumentSourceMergeCursors::id)
+
+constexpr std::string_view DocumentSourceMergeCursors::kStageName;
+
+DocumentSourceMergeCursors::DocumentSourceMergeCursors(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, AsyncResultsMergerParams armParams)
+    : DocumentSource(kStageName, expCtx), _armParams(std::move(armParams)) {}
+
+DocumentSourceMergeCursors::~DocumentSourceMergeCursors() {
+    if (_ownCursors) {
+        // Skip cursor cleanup when using StubMongoProcessInterface. populateMerger() requires a
+        // valid task executor, which stubs do not provide. A stub is used during parse-only (e.g.,
+        // when we know we must reparse from LPP due to desugaring or view changes). With nested
+        // pipelines like $unionWith, a DocumentSourceMergeCursors may be created with a stub
+        // (eventually to be reparsed) but then destructed due to failed desugaring or view
+        // validation. No cursors exist in this case, so skipping cleanup is safe.
+        if (!getExpCtx()->getMongoProcessInterface()->isExpectedToExecuteQueries()) {
+            return;
+        }
+
+        tassert(10561404, "_armParams must be set", _armParams);
+        BSONObj armParamsForLog = _armParams->toBSON();
+        if (getExpCtx()->getOperationContext()) {
+            // Method call 'populateMerger()->kill()' needs a valid operation context.
+            try {
+                populateMerger()->kill(getExpCtx()->getOperationContext());
+            } catch (const std::exception& ex) {
+                // When something goes wrong we might leak remote cursors, but we still want to keep
+                // this process running, therefore we do not let the exception out of the
+                // destructor.
+                LOGV2_ERROR(10561405,
+                            "remote cursors might be leaked due to an unexpected error",
+                            "armParams"_attr = armParamsForLog,
+                            "error"_attr = ex.what());
+            }
+        } else {
+            // We expect this object will be destroyed while still attached to the original
+            // operation context, but we still want to keep this process running, therefore no
+            // assertions here.
+            LOGV2_ERROR(
+                10561406,
+                "destroying a detached $mergeCursors stage at this point could leak remote cursors",
+                "armParams"_attr = armParamsForLog);
+        }
+    }
+}
+
+std::shared_ptr<BlockingResultsMerger>& DocumentSourceMergeCursors::populateMerger() {
+    tassert(9535001, "_blockingResultsMerger must not yet be set", !_blockingResultsMerger);
+    tassert(9535002, "_armParams must be set", _armParams);
+
+    auto* opCtx = getExpCtx()->getOperationContext();
+    const auto& resourceYielder = ResourceYielderFactory::get(*opCtx->getService());
+    _blockingResultsMerger = std::make_shared<BlockingResultsMerger>(
+        opCtx,
+        std::move(*_armParams),
+        getExpCtx()->getMongoProcessInterface()->getTaskExecutor(/* withNullCheck */ false),
+        // Assumes this is only called from the 'aggregate' or 'getMore' commands.  The code which
+        // relies on this parameter does not distinguish/care about the difference so we simply
+        // always pass 'aggregate'.
+        resourceYielder ? resourceYielder->make(opCtx, "aggregate"sv) : nullptr);
+    _armParams = boost::none;
+
+    // '_blockingResultsMerger' now owns the cursors.
+    _ownCursors = false;
+
+    // Returning the created 'BlockingResultsMerger' instance for convenience.
+    return _blockingResultsMerger;
+}
+
+std::unique_ptr<RouterStageMerge> DocumentSourceMergeCursors::convertToRouterStage() {
+    tassert(9535003, "Expected conversion to happen before execution", _armParams);
+    auto result = std::make_unique<RouterStageMerge>(
+        getExpCtx()->getOperationContext(),
+        getExpCtx()->getMongoProcessInterface()->getTaskExecutor(/* withNullCheck */ false),
+        std::move(*_armParams));
+    _armParams = boost::none;
+    _ownCursors = false;
+    return result;
+}
+
+Value DocumentSourceMergeCursors::serialize(const query_shape::SerializationOptions& opts) const {
+    // This method is the only reason 'DocumentSourceMergeCursors' needs '_blockingResultsMerger'.
+    // We cannot cache '_armParams->toBSON()', because remotes can change during the execution in
+    // case of change streams.
+
+    auto stageDefinition = [&] {
+        if (_blockingResultsMerger) {
+            return _blockingResultsMerger->asyncResultsMergerParams().toBSON(opts);
+        }
+        tassert(9535004, "_armParams must be set", _armParams);
+        return _armParams->toBSON(opts);
+    }();
+
+    if (!opts.isKeepingLiteralsUnchanged()) {
+        // The 'remotes' array contains objects with a complex structure, including a cursor command
+        // response, which must follow a strict schema to be reparsed. We simplify the query shape
+        // by serializing 'remotes' as an empty array to avoid having to define a complex custom
+        // representative value for its contents.
+        return Value(Document{
+            {kStageName,
+             stageDefinition.removeField(AsyncResultsMergerParams::kRemotesFieldName)
+                 .addFields(BSON(AsyncResultsMergerParams::kRemotesFieldName << BSONArray()))}});
+    }
+
+    return Value(Document{{kStageName, stageDefinition}});
+}
+
+boost::intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(
+    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(17026,
+            "$mergeCursors stage expected an object as argument",
+            elem.type() == BSONType::object);
+
+    auto armParams = [&]() {
+        // Check if the stage definition contains the 'recordRemoteOpWaitTime' field.
+        // The 'recordRemoteOpWaitTime' field has no meaning since version 6.2 and has been removed
+        // from the IDL for 9.0. The field is still present in the BSON serialization output of
+        // '$mergeCursors' stages in versions < 9.0.
+        // In order to safely parse the stage definition from both older versions, check if the
+        // field is present and remove it if necessary. The field will not be present in stage
+        // definitions created by 9.0 or higher, so the necessity to rewrite here should be rare.
+        // TODO SERVER-126134: remove the check and the rewrite once 9.0 is last LTS.
+        constexpr std::string_view kRecordRemoteOpWaitTimeFieldName = "recordRemoteOpWaitTime"sv;
+        BSONObj toParse;
+        if (elem.embeddedObject().hasElement(kRecordRemoteOpWaitTimeFieldName)) {
+            // 'recordRemoteOpWaitTime' is present, so remove it before parsing the stage
+            // definition.
+            toParse = elem.embeddedObject().removeField(kRecordRemoteOpWaitTimeFieldName);
+        } else {
+            // 'recordRemoteOpWaitTime' is not present, so use the provided stage definition as is
+            // for parsing.
+            toParse = elem.embeddedObject().getOwned();
+        }
+        return AsyncResultsMergerParams::parseOwned(
+            std::move(toParse),
+            IDLParserContext(kStageName,
+                             auth::ValidatedTenancyScope::get(expCtx->getOperationContext()),
+                             expCtx->getNamespaceString().tenantId(),
+                             SerializationContext::stateDefault()));
+    }();
+    return new DocumentSourceMergeCursors(expCtx, std::move(armParams));
+}
+
+boost::intrusive_ptr<DocumentSourceMergeCursors> DocumentSourceMergeCursors::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, AsyncResultsMergerParams params) {
+    return new DocumentSourceMergeCursors(expCtx, std::move(params));
+}
+void DocumentSourceMergeCursors::detachSourceFromOperationContext() {
+    if (_blockingResultsMerger) {
+        _blockingResultsMerger->detachFromOperationContext();
+    }
+}
+
+void DocumentSourceMergeCursors::reattachSourceToOperationContext(OperationContext* opCtx) {
+    if (_blockingResultsMerger) {
+        _blockingResultsMerger->reattachToOperationContext(opCtx);
+    }
+}
+
+boost::optional<NamespaceString> DocumentSourceMergeCursors::getAsyncResultMergerParamsNss_forTest()
+    const {
+    if (_armParams) {
+        return _armParams->getNss();
+    }
+    return boost::none;
+}
+
+}  // namespace mongo

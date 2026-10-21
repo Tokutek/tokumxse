@@ -1,0 +1,119 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/crypto/fle_field_schema.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/commands/fle2_compact.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+
+enums:
+    CompactStructuredEncryptionDataPhase:
+        description: "The current phase of the compactStructuredEncryptionData pipeline"
+        type: string
+        mod_visibility: private
+        values:
+            kUnset: "unset"
+            kRenameEcocForCompact: "rename-ecoc-for-compact"
+            kCompactStructuredEncryptionData: "compact-structured-encryption-data"
+            kDropTempCollection: "drop-temp-collection"
+
+structs:
+    CompactStructuredEncryptionDataState:
+        description:
+            "Represents the state of the compactStructuredEncryptionData pipeline
+            for protocol version 2"
+        strict: false
+        mod_visibility: public
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                description: "Current phase"
+                type: CompactStructuredEncryptionDataPhase
+                default: kUnset
+            skipCompact:
+                description: "Whether to skip the compaction operation"
+                type: bool
+                default: false
+            escNss:
+                description: "Collection containing insertions metadata"
+                type: namespacestring
+            ecocNss:
+                description: "Collection containing compaction metadata to perform compact with"
+                type: namespacestring
+            ecocUuid:
+                description: "UUID of the collection identified by ecocNss"
+                type: uuid
+                optional: true
+            ecocRenameNss:
+                description: "Temporary name to use while performing compaction"
+                type: namespacestring
+            ecocRenameUuid:
+                description: "UUID of the collection identified by ecocRenameNss"
+                type: uuid
+                optional: true
+            compactionTokens:
+                description: "Compaction tokens for the compact operation"
+                type: object_owned
+            escStats:
+                description: "Statistics for the ESC collection"
+                type: ECStats
+                optional: true
+            ecocStats:
+                description: "Statistics for the temporary ECOC collection"
+                type: ECOCStats
+                optional: true
+            encryptionInformation:
+                description: "Encryption Information required for collections with range tokens"
+                type: EncryptionInformation
+                optional: true
+            anchorPaddingFactor:
+                description: "Anchor padding ratio used for range fields during compact"
+                type: double
+                optional: true
+                validator:
+                    gte: 0.0
+                    lte: 1.0
+
+    CompactStructuredEncryptionDataStatePre70Compatible:
+        description: "Represents the state of the compactStructuredEncryptionData pipeline"
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+        fields:
+            phase:
+                description: "Current phase"
+                type: CompactStructuredEncryptionDataPhase
+                default: kUnset
+            skipCompact:
+                description: "Whether to skip the compaction operation"
+                type: bool
+                default: false
+            escNss:
+                description: "Collection containing insertions metadata"
+                type: namespacestring
+            ecocNss:
+                description: "Collection containing compaction metadata to perform compact with"
+                type: namespacestring
+            ecocUuid:
+                description: "UUID of the collection identified by ecocNss"
+                type: uuid
+                optional: true
+            ecocRenameNss:
+                description: "Temporary name to use while performing compaction"
+                type: namespacestring
+            ecocRenameUuid:
+                description: "UUID of the collection identified by ecocRenameNss"
+                type: uuid
+                optional: true
+            compactionTokens:
+                description: "Compaction tokens for the compact operation"
+                type: object_owned
+            response:
+                description: "Response to the compactStructuredEncryptedData command"
+                type: CompactStructuredEncryptionDataCommandReply
+                optional: true

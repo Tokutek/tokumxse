@@ -1,0 +1,282 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/idl/mutable_observer_registry.h"
+#include "mongo/s/analyze_shard_key_common_gen.h"
+#include "mongo/s/analyze_shard_key_role.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/tick_source.h"
+#include "mongo/util/uuid.h"
+
+#include <map>
+#include <mutex>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+
+// Forward declaration: QueryStats reads operation counts from an OpCounters instance rather than
+// calling globalOpCounters() directly, so that tests can inject a private OpCounters instance.
+struct OpCounters;
+
+namespace analyze_shard_key {
+
+/**
+ * Owns the machinery for sampling queries on a sampler. That consists of the following:
+ * - The periodic background job that refreshes the last exponential moving average of the number of
+ *   queries that this sampler executes per second.
+ * - The periodic background job that sends the calculated average to the coordinator to refresh the
+ *   latest configurations. The average determines the share of the cluster-wide sample rate that
+ *   will be assigned to this sampler.
+ * - The rate limiters that each controls the rate at which queries against a collection are sampled
+ *   on this sampler.
+ *
+ * On a sharded cluster, a sampler is any mongos or shardsvr mongod (that has acted as a
+ * router) in the cluster, and the coordinator is the config server's primary mongod. On a
+ * standalone replica set, a sampler is any mongod in the set and the coordinator is the primary
+ * mongod.
+ */
+class [[MONGO_MOD_PUBLIC]] QueryAnalysisSampler final {
+    QueryAnalysisSampler(const QueryAnalysisSampler&) = delete;
+    QueryAnalysisSampler& operator=(const QueryAnalysisSampler&) = delete;
+
+public:
+    /**
+     * Stores the last total number of queries that this sampler has executed and the last
+     * exponential moving average number of queries that this sampler executes per second. The
+     * average is recalculated every second when the total number of queries is refreshed.
+     */
+    struct QueryStats {
+        /**
+         * Constructs a QueryStats that reads operation counts from the process-wide
+         * globalOpCounters(). This is the production constructor.
+         */
+        QueryStats();
+
+        /**
+         * If the command is a findAndModify, count, or distinct, increment its count.
+         */
+        void gotCommand(std::string_view cmdName);
+
+        /**
+         * Replaces the OpCounters source. Intended for tests that need an isolated counter source
+         * that is unaffected by other activity in the process.
+         */
+        void setOpCountersForTest(OpCounters& opCounters) {
+            _opCounters = &opCounters;
+        }
+
+        long long getLastTotalCount() const {
+            return _lastTotalCount;
+        }
+
+        boost::optional<double> getLastAvgCount() const {
+            return _lastAvgCount;
+        }
+
+        /**
+         * Refreshes the last total count and the last exponential moving average count. To be
+         * invoked every second.
+         */
+        void refreshTotalCount();
+
+    private:
+        double _calculateExponentialMovingAverage(double prevAvg, long long newVal) const;
+
+        // The counts for update, delete, find, and aggregate are already tracked by the OpCounters.
+        long long _lastFindAndModifyQueriesCount = 0;
+        long long _lastCountQueriesCount = 0;
+        long long _lastDistinctQueriesCount = 0;
+
+        long long _lastTotalCount = 0;
+        boost::optional<double> _lastAvgCount;
+
+        // Non-owning pointer to the source of operation counts. In production this always points
+        // to globalOpCounters(). Tests may supply their own OpCounters instance via
+        // setOpCountersForTest() so that each test starts with a clean counter state without
+        // touching the process-wide global.
+        OpCounters* _opCounters;
+    };
+
+    /**
+     * Controls the per-second rate at which queries against a collection are sampled on this
+     * sampler. Uses token bucket.
+     */
+    class [[MONGO_MOD_PRIVATE]] SampleRateLimiter {
+    public:
+        static constexpr double kEpsilon = 0.001;
+
+        SampleRateLimiter(ServiceContext* serviceContext,
+                          const NamespaceString& nss,
+                          const UUID& collUuid,
+                          double numTokensPerSecond)
+            : _serviceContext(serviceContext),
+              _nss(nss),
+              _collUuid(collUuid),
+              _numTokensPerSecond(numTokensPerSecond) {
+            invariant(_numTokensPerSecond >= 0);
+            _lastRefillTimeTicks = _serviceContext->getTickSource()->getTicks();
+        };
+
+        const NamespaceString& getNss() const {
+            return _nss;
+        }
+
+        void setNss(const NamespaceString& nss) {
+            _nss = nss;
+        }
+
+        const UUID& getCollectionUuid() const {
+            return _collUuid;
+        }
+
+        double getSamplesPerSecond() const {
+            return _numTokensPerSecond;
+        }
+
+        double getBurstCapacity() const {
+            return _getBurstCapacity(_numTokensPerSecond);
+        }
+
+        /**
+         * Requests to consume one token from the bucket. Causes the bucket to be refilled with
+         * tokens created since last refill time. Does not block if the bucket is empty or there is
+         * fewer than one token in the bucket. Returns true if a token has been consumed
+         * successfully, and false otherwise.
+         */
+        bool tryConsume();
+
+        /**
+         * Sets a new rate. Causes the bucket to be refilled with tokens created since last refill
+         * time according to the previous rate.
+         */
+        void refreshSamplesPerSecond(double numTokensPerSecond);
+
+    private:
+        /**
+         * Returns the maximum of number of tokens that a bucket with given rate can store at any
+         * given time.
+         */
+        static double _getBurstCapacity(double numTokensPerSecond);
+
+        /**
+         * Fills the bucket with tokens created since last refill time according to the given rate
+         * and burst capacity.
+         */
+        void _refill(double numTokensPerSecond, double burstCapacity);
+
+        const ServiceContext* _serviceContext;
+        NamespaceString _nss;
+        const UUID _collUuid;
+        double _numTokensPerSecond;
+
+        // The bucket is only refilled when there is a consume request or a rate refresh.
+        TickSource::Tick _lastRefillTimeTicks;
+        double _lastNumTokens = 0;
+    };
+
+    QueryAnalysisSampler() = default;
+    ~QueryAnalysisSampler() = default;
+
+    QueryAnalysisSampler(QueryAnalysisSampler&& source) = delete;
+    QueryAnalysisSampler& operator=(QueryAnalysisSampler&& other) = delete;
+
+    /**
+     * Obtains the service-wide QueryAnalysisSampler instance.
+     */
+    static QueryAnalysisSampler& get(OperationContext* opCtx);
+    static QueryAnalysisSampler& get(ServiceContext* serviceContext);
+
+    static inline MutableObserverRegistry<int32_t>
+        observeQueryAnalysisSamplerConfigurationRefreshSecs;
+
+    void onStartup();
+
+    void onShutdown();
+
+    void gotCommand(std::string_view cmdName) {
+        std::lock_guard<std::mutex> lk(_queryStatsMutex);
+        _queryStats.gotCommand(cmdName);
+    }
+
+    /**
+     * Returns a unique sample id for a query if it should be sampled, and none otherwise. Can only
+     * be invoked once for each query since generating a sample id causes the number of remaining
+     * queries to sample to get decremented. Does not generate a sample id if the client is
+     * internal (defined as not having a network session) unless this operation has explicitly
+     * opted into query sampling.
+     */
+    boost::optional<UUID> tryGenerateSampleId(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              SampledCommandNameEnum cmdName);
+
+    void refreshQueryStatsForTest() {
+        _refreshQueryStats();
+    }
+
+    /**
+     * Replaces the OpCounters source used by QueryStats with the given instance. Intended for
+     * tests that need an isolated counter source that is unaffected by other activity in the
+     * process.
+     *
+     * Note: ideally this would be supplied at construction time, but QueryAnalysisSampler is a
+     * ServiceContext decoration and is therefore default-constructed by the framework with no
+     * opportunity to pass arguments. A post-construction setter is the least-bad alternative.
+     */
+    void setOpCountersForTest(OpCounters& opCounters) {
+        std::lock_guard<std::mutex> lk(_queryStatsMutex);
+        _queryStats.setOpCountersForTest(opCounters);
+    }
+
+    QueryStats getQueryStatsForTest() const {
+        std::lock_guard<std::mutex> lk(_queryStatsMutex);
+        return _queryStats;
+    }
+
+    void refreshConfigurationsForTest(OperationContext* opCtx) {
+        _refreshConfigurations(opCtx);
+    }
+
+    std::map<NamespaceString, SampleRateLimiter> getRateLimitersForTest() const {
+        std::lock_guard<std::mutex> lk(_sampleRateLimitersMutex);
+        return _sampleRateLimiters;
+    }
+
+private:
+    static constexpr size_t srlBloomFilterLg2NumBits = 9u;
+    static constexpr size_t srlBloomFilterNumBitsPerBlock = 64u;
+
+    static constexpr size_t srlBloomFilterNumBits = 1ull << srlBloomFilterLg2NumBits;
+    static constexpr size_t srlBloomFilterNumBlocks =
+        srlBloomFilterNumBits / srlBloomFilterNumBitsPerBlock;
+
+    void _refreshQueryStats();
+
+    void _refreshConfigurations(OperationContext* opCtx);
+
+    void _incrementCounters(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            SampledCommandNameEnum cmdName);
+
+    mutable std::mutex _sampleRateLimitersMutex;
+    mutable std::mutex _queryStatsMutex;
+    mutable std::mutex _jobsMutex;
+
+    PeriodicJobAnchor _periodicQueryStatsRefresher;
+    QueryStats _queryStats;
+
+    std::shared_ptr<PeriodicJobAnchor> _periodicConfigurationsRefresher;
+    std::map<NamespaceString, SampleRateLimiter> _sampleRateLimiters;
+    std::array<Atomic<uint64_t>, srlBloomFilterNumBlocks> _srlBloomFilter{};
+};
+
+}  // namespace analyze_shard_key
+}  // namespace mongo

@@ -1,0 +1,240 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/rollback_test_fixture.h"
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_recovery.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/database.h"
+#include "mongo/db/shard_role/shard_catalog/database_holder.h"
+#include "mongo/db/shard_role/shard_role.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+namespace mongo {
+namespace repl {
+
+namespace {
+
+/**
+ * Creates ReplSettings for ReplicationCoordinatorRollbackMock.
+ */
+ReplSettings createReplSettings() {
+    ReplSettings settings;
+    settings.setOplogSizeBytes(5 * 1024 * 1024);
+    settings.setReplSetString("mySet/node1:12345");
+    return settings;
+}
+
+StorageEngine::TimestampMonitor::TimestampListener mockTimestampListener([](OperationContext* opCtx,
+                                                                            auto&) {});
+
+class RollbackTestOpObserver : public OpObserverNoop {
+public:
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  const UUID& uuid,
+                                  std::uint64_t numRecords,
+                                  bool markFromMigrate,
+                                  bool isViewlessTimeseries) override {
+        // If the oplog is not disabled for this namespace, then we need to reserve an op time for
+        // the drop.
+        if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
+            OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+        }
+        return {};
+    }
+
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
+};
+
+}  // namespace
+
+void RollbackTest::setUp() {
+    ServiceContextMongoDTest::setUp();
+    cc().setOperationUnkillable_ForTest();
+
+    _storageInterface = new StorageInterfaceRollback();
+    auto serviceContext = getServiceContext();
+    serviceContext->getStorageEngine()->startTimestampMonitor({&mockTimestampListener});
+    auto consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
+    auto recovery =
+        std::make_unique<ReplicationRecoveryImpl>(_storageInterface, consistencyMarkers.get());
+    _replicationProcess = std::make_unique<ReplicationProcess>(
+        _storageInterface, std::move(consistencyMarkers), std::move(recovery));
+    StorageInterface::set(serviceContext, std::unique_ptr<StorageInterface>(_storageInterface));
+    _coordinator = new ReplicationCoordinatorRollbackMock(serviceContext);
+    ReplicationCoordinator::set(serviceContext,
+                                std::unique_ptr<ReplicationCoordinator>(_coordinator));
+
+    _opCtx = makeOperationContext();
+    _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(_opCtx.get());
+    _replicationProcess->initializeRollbackID(_opCtx.get()).transitional_ignore();
+
+    MongoDSessionCatalog::set(
+        serviceContext,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+
+    auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
+    observerRegistry->addObserver(std::make_unique<RollbackTestOpObserver>());
+
+    ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
+}
+
+RollbackTest::ReplicationCoordinatorRollbackMock::ReplicationCoordinatorRollbackMock(
+    ServiceContext* service)
+    : ReplicationCoordinatorMock(service, createReplSettings()) {}
+
+void RollbackTest::ReplicationCoordinatorRollbackMock::failSettingFollowerMode(
+    const MemberState& transitionToFail, ErrorCodes::Error codeToFailWith) {
+    _failSetFollowerModeOnThisMemberState = transitionToFail;
+    _failSetFollowerModeWithThisCode = codeToFailWith;
+}
+
+Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerMode(
+    const MemberState& newState) {
+    if (newState == _failSetFollowerModeOnThisMemberState) {
+        return Status(_failSetFollowerModeWithThisCode,
+                      str::stream()
+                          << "ReplicationCoordinatorRollbackMock set to fail on setting state to "
+                          << _failSetFollowerModeOnThisMemberState.toString());
+    }
+    return ReplicationCoordinatorMock::setFollowerMode(newState);
+}
+
+Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerModeRollback(
+    OperationContext* opCtx) {
+    return setFollowerMode(MemberState::RS_ROLLBACK);
+}
+
+std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
+                                                      Timestamp ts,
+                                                      UUID uuid,
+                                                      std::string_view nss,
+                                                      BSONObj o,
+                                                      boost::optional<BSONObj> o2,
+                                                      int recordId) {
+    invariant(opType != OpTypeEnum::kCommand);
+
+    BSONObjBuilder bob;
+    bob.append("ts", ts);
+    bob.append("op", idl::serialize(opType));
+    uuid.appendToBuilder(&bob, "ui");
+    bob.append("ns", nss);
+    bob.append("o", o);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
+    bob.append("wall", Date_t());
+
+    return std::make_pair(bob.obj(), RecordId(recordId));
+}
+
+
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
+                                                         const boost::optional<UUID>& uuid,
+                                                         const NamespaceString& nss,
+                                                         BSONObj cmdObj,
+                                                         int recordId,
+                                                         boost::optional<BSONObj> o2,
+                                                         boost::optional<TenantId> tid) {
+
+    BSONObjBuilder bob;
+    bob.append("ts", ts);
+    bob.append("op", "c");
+    if (uuid) {  // Not all ops have UUID fields.
+        uuid.value().appendToBuilder(&bob, "ui");
+    }
+    if (tid)
+        tid->serializeToBSON("tid", &bob);
+    bob.append("ns", NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
+    bob.append("wall", Date_t());
+
+    return std::make_pair(bob.obj(), RecordId(recordId));
+}
+
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOpForApplyOps(boost::optional<UUID> uuid,
+                                                                    std::string_view nss,
+                                                                    BSONObj cmdObj,
+                                                                    int recordId,
+                                                                    boost::optional<BSONObj> o2) {
+    BSONObjBuilder bob;
+    bob.append("op", "c");
+    if (uuid) {  // Not all ops have UUID fields.
+        uuid.value().appendToBuilder(&bob, "ui");
+    }
+    bob.append("ns", nss);
+    bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
+
+    return std::make_pair(bob.obj(), RecordId(recordId));
+}
+
+Collection* RollbackTest::_createCollection(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            const CollectionOptions& options) {
+    auto acq = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_X);
+    mongo::WriteUnitOfWork wuow(opCtx);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, nss.dbName());
+    ASSERT_TRUE(db);
+    db->dropCollection(opCtx, nss).transitional_ignore();
+    auto coll = db->createCollection(opCtx, nss, options);
+    ASSERT_TRUE(coll);
+    wuow.commit();
+    return coll;
+}
+
+Status RollbackTest::_insertOplogEntry(const BSONObj& doc) {
+    TimestampedBSONObj obj;
+    obj.obj = doc;
+    _storageInterface->oplogDiskLocRegister(_opCtx.get(), doc["ts"].timestamp(), true);
+    return _storageInterface->insertDocument(
+        _opCtx.get(), NamespaceString::kRsOplogNamespace, obj, 0);
+}
+
+}  // namespace repl
+}  // namespace mongo

@@ -1,0 +1,220 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "MongoHeaderBracketCheck.h"
+
+#include <filesystem>
+
+#include <clang-tidy/utils/OptionsUtils.h>
+#include <clang/Frontend/CompilerInstance.h>
+#include <clang/Lex/PPCallbacks.h>
+#include <clang/Lex/Preprocessor.h>
+#include <llvm/ADT/StringMap.h>
+#include <llvm/ADT/StringSet.h>
+
+namespace mongo::tidy {
+
+namespace {
+
+static std::optional<std::string> canonicalFromSrc(const std::filesystem::path& full) {
+    std::filesystem::path rel = full.lexically_normal();
+
+    // If absolute, try to make it relative to CWD (best effort; OK if it fails)
+    if (rel.is_absolute()) {
+        std::error_code ec;
+        auto tmp = std::filesystem::relative(rel, std::filesystem::current_path(), ec);
+        if (!ec)
+            rel = std::move(tmp);
+    }
+
+    bool seenSrc = false;
+    std::filesystem::path out;
+    for (const auto& comp : rel) {
+        // Note: on Windows, comp is a path; compare as string ignoring slashes.
+        if (!seenSrc) {
+            if (comp == "src")
+                seenSrc = true;
+            continue;
+        }
+        out /= comp;
+    }
+    if (!seenSrc || out.empty())
+        return std::nullopt;
+    return out.generic_string();  // forward slashes
+}
+
+// Skip canonical-path enforcement for generated protobuf headers (.pb.h, .grpc.pb.h, .pb.hpp)
+// Especially those coming through Bazel virtual include dirs.
+static bool isGeneratedProtoHeader(llvm::StringRef spelledName, llvm::StringRef resolvedFullPath) {
+    std::string spelled = spelledName.str();
+    std::replace(spelled.begin(), spelled.end(), '\\', '/');
+    std::string full = resolvedFullPath.str();
+    std::replace(full.begin(), full.end(), '\\', '/');
+
+    auto endsWith = [](llvm::StringRef s, llvm::StringRef suf) {
+        return s.ends_with_insensitive(suf);
+    };
+    if (endsWith(spelled, ".pb.h") || endsWith(spelled, ".grpc.pb.h") ||
+        endsWith(spelled, ".pb.hpp")) {
+        return true;
+    }
+
+    auto has = [](const std::string& hay, llvm::StringRef needle) {
+        return hay.find(needle.str()) != std::string::npos;
+    };
+    if ((has(full, "_virtual_includes/") || has(full, "bazel-out/")) &&
+        (has(full, ".pb.h") || has(full, ".grpc.pb.h") || has(full, ".pb.hpp"))) {
+        return true;
+    }
+    return false;
+}
+
+bool containsAny(llvm::StringRef fullString, clang::ArrayRef<clang::StringRef> const& patterns) {
+    return std::any_of(patterns.begin(), patterns.end(), [&](llvm::StringRef pattern) {
+        // Ensure the pattern ends with a directory delimiter to avoid matching partial names.
+        auto patternStr = pattern.str();
+        return fullString.contains(llvm::StringRef(std::filesystem::path(patternStr) / "")) ||
+            // also accept relative paths
+            fullString.contains(llvm::StringRef(std::filesystem::current_path() /
+                                                std::filesystem::path(patternStr) / ""));
+    });
+}
+
+class MongoIncludeBracketsPPCallbacks : public clang::PPCallbacks {
+public:
+    explicit MongoIncludeBracketsPPCallbacks(MongoHeaderBracketCheck& Check,
+                                             clang::LangOptions LangOpts,
+                                             const clang::SourceManager& SM)
+        : Check(Check), LangOpts(LangOpts), SM(SM) {}
+
+
+    void InclusionDirective(clang::SourceLocation HashLoc,
+                            const clang::Token& IncludeTok,
+                            llvm::StringRef FileName,
+                            bool IsAngled,
+                            clang::CharSourceRange FilenameRange,
+                            clang::OptionalFileEntryRef File,
+                            llvm::StringRef SearchPath,
+                            llvm::StringRef RelativePath,
+                            const clang::Module* SuggestedModule,
+                            bool ModuleImported,
+                            clang::SrcMgr::CharacteristicKind FileType) override {
+
+        // This represents the full path from the project root directory
+        // to the header file that is being included.
+        std::filesystem::path header_path =
+            (std::filesystem::path(SearchPath.str()) / std::filesystem::path(RelativePath.str()))
+                .lexically_normal();
+
+        // If the computed path doesn’t actually exist on disk, ignore it as it would not be used.
+        if (!std::filesystem::exists(header_path)) {
+            return;
+        }
+        // This represents the full path from the project root to the
+        // source file that is including the include that is currently being processed.
+        std::filesystem::path origin_source_path(HashLoc.printToString(SM));
+        if (origin_source_path.is_absolute()) {
+            origin_source_path =
+                std::filesystem::relative(origin_source_path, std::filesystem::current_path());
+        }
+
+        // if this is a mongo source file including a real file
+        if (!llvm::StringRef(origin_source_path).starts_with("<built-in>:") &&
+            containsAny(llvm::StringRef(origin_source_path.lexically_normal()),
+                        Check.mongoSourceDirs)) {
+
+            // Check that the a third party header which is included from a mongo source file
+            // is used angle brackets.
+            if (!IsAngled && !containsAny(llvm::StringRef(header_path), Check.mongoSourceDirs)) {
+
+                std::string Replacement = (llvm::Twine("<") + FileName + ">").str();
+                Check.diag(FilenameRange.getBegin(),
+                           "non-mongo include '%0' should use angle brackets")
+                    << FileName
+                    << clang::FixItHint::CreateReplacement(FilenameRange.getAsRange(), Replacement);
+            }
+
+            // Check that the a third party header which is in our vendored tree is not including
+            // the third_party in the include path.
+            if (!containsAny(llvm::StringRef(header_path), Check.mongoSourceDirs) &&
+                llvm::StringRef(header_path).contains("src/third_party/") &&
+                FileName.contains("third_party/")) {
+                Check.diag(FilenameRange.getBegin(),
+                           "third_party include '%0' should not start with 'third_party/'. The "
+                           "included file should be useable in either context of system or "
+                           "in-tree third_party libraries.")
+                    << FileName;
+            }
+
+            // Check that the a mongo header which is included from a mongo source file
+            // is used double quotes.
+            else if (IsAngled && containsAny(llvm::StringRef(header_path), Check.mongoSourceDirs)) {
+                // TODO(SERVER-95253): Explicitly handle third party headers inside of the
+                // enterprise module directory.
+                if (!FileName.contains("bsoncxx/") && !FileName.contains("mongocxx/")) {
+                    std::string Replacement = (llvm::Twine("\"") + FileName + "\"").str();
+                    Check.diag(FilenameRange.getBegin(),
+                               "mongo include '%0' should use double quotes")
+                        << FileName
+                        << clang::FixItHint::CreateReplacement(FilenameRange.getAsRange(),
+                                                               Replacement);
+                }
+            }
+
+            if (containsAny(llvm::StringRef(header_path), Check.mongoSourceDirs)) {
+                // Skip canonicalization for generated proto headers, but still allow your
+                // quotes/angles rules above.
+                if (!isGeneratedProtoHeader(FileName, llvm::StringRef(header_path.string())) &&
+                    !FileName.contains("bsoncxx/") && !FileName.contains("mongocxx/") &&
+                    !containsAny(llvm::StringRef(header_path),
+                                 llvm::ArrayRef<llvm::StringRef>{"mongo_tidy_checks/"})) {
+                    if (auto canon = canonicalFromSrc(header_path)) {
+                        // Normalize current spelling for reliable compare
+                        std::string spelled = FileName.str();
+                        std::replace(spelled.begin(), spelled.end(), '\\', '/');
+
+                        if (spelled != *canon) {
+                            // Always propose quotes with the canonical spelling from 'src/' (no
+                            // leading "src/").
+                            std::string Replacement =
+                                (llvm::Twine("\"") + llvm::StringRef(*canon) + "\"").str();
+                            Check.diag(
+                                FilenameRange.getBegin(),
+                                "mongo include '%0' should be referenced from 'src/' as '%1'")
+                                << FileName << *canon
+                                << clang::FixItHint::CreateReplacement(FilenameRange.getAsRange(),
+                                                                       Replacement);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    MongoHeaderBracketCheck& Check;
+    clang::LangOptions LangOpts;
+    const clang::SourceManager& SM;
+};
+
+}  // namespace
+
+MongoHeaderBracketCheck::MongoHeaderBracketCheck(llvm::StringRef Name,
+                                                 clang::tidy::ClangTidyContext* Context)
+    : ClangTidyCheck(Name, Context),
+      mongoSourceDirs(clang::tidy::utils::options::parseStringList(
+          Options.get("mongoSourceDirs", "src/mongo"))) {}
+
+void MongoHeaderBracketCheck::storeOptions(clang::tidy::ClangTidyOptions::OptionMap& Opts) {
+    Options.store(
+        Opts, "mongoSourceDirs", clang::tidy::utils::options::serializeStringList(mongoSourceDirs));
+}
+void MongoHeaderBracketCheck::registerPPCallbacks(const clang::SourceManager& SM,
+                                                  clang::Preprocessor* PP,
+                                                  clang::Preprocessor* ModuleExpanderPP) {
+    PP->addPPCallbacks(
+        ::std::make_unique<MongoIncludeBracketsPPCallbacks>(*this, getLangOpts(), SM));
+}
+
+}  // namespace mongo::tidy

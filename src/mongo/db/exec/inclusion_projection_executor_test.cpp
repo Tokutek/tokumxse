@@ -1,0 +1,1322 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/inclusion_projection_executor.h"
+
+#include "mongo/base/exact_cast.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/matcher/copyable_match_expression.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
+#include "mongo/db/query/compiler/dependency_analysis/document_transformation_helpers.h"
+#include "mongo/db/query/compiler/logical_model/projection/projection_parser.h"
+#include "mongo/db/record_id.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/server_parameter_guard.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <bitset>
+#include <string_view>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
+namespace mongo::projection_executor {
+namespace {
+using namespace std::literals::string_view_literals;
+using std::vector;
+
+template <typename T>
+BSONObj wrapInLiteral(const T& arg) {
+    return BSON("$literal" << arg);
+}
+
+enum AllowFallBackToDefault : bool {};
+enum AllowFastPath : bool {};
+
+class BaseInclusionProjectionExecutionTest : public mongo::unittest::Test,
+                                             public testing::WithParamInterface<AllowFastPath> {
+public:
+    /**
+     * The 'allowFallBackToDefault' parameter should be set to 'true', if the executor is allowed to
+     * fall back to the default inclusion projection implementation if the fast-path projection
+     * cannot be used for a specific test. If set to 'false', a tassert will be triggered if
+     * fast-path projection was expected to be chosen, but the default one has been picked instead.
+     */
+    explicit BaseInclusionProjectionExecutionTest(AllowFallBackToDefault allowFallBackToDefault)
+        : _allowFallBackToDefault{allowFallBackToDefault}, _allowFastPath{GetParam()} {}
+
+protected:
+    auto createProjectionExecutor(const BSONObj& projSpec,
+                                  boost::optional<BSONObj> matchSpec,
+                                  const ProjectionPolicies& policies) {
+        const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        auto&& [projection, matchExpr] = [&] {
+            if (matchSpec) {
+                auto matchExpr = CopyableMatchExpression{*matchSpec, expCtx};
+                return std::make_pair(
+                    projection_ast::parseAndAnalyze(
+                        expCtx, projSpec, &*matchExpr, matchExpr.inputBSON(), policies),
+                    boost::make_optional(matchExpr));
+            }
+            return std::make_pair(projection_ast::parseAndAnalyze(expCtx, projSpec, policies),
+                                  boost::optional<CopyableMatchExpression>{});
+        }();
+
+        auto builderParams{kDefaultBuilderParams};
+        if (!_allowFastPath) {
+            builderParams.reset(kAllowFastPath);
+        }
+
+        auto executor = buildProjectionExecutor(expCtx, &projection, policies, builderParams);
+        tassert(7241743,
+                "projection executor must be inclusion projections",
+                executor->getType() == TransformerInterface::TransformerType::kInclusionProjection);
+        auto inclusionExecutor = static_cast<InclusionProjectionExecutor*>(executor.get());
+        auto fastPathRootNode =
+            exact_pointer_cast<FastPathEligibleInclusionNode*>(inclusionExecutor->getRoot());
+        if (_allowFastPath) {
+            uassert(51752,
+                    "Fast-path projection mode or fall back to default expected",
+                    fastPathRootNode || _allowFallBackToDefault);
+        } else {
+            uassert(51753, "Default projection mode expected", !fastPathRootNode);
+        }
+        return std::make_pair(std::move(executor), matchExpr);
+    }
+
+    auto createProjectionExecutor(const BSONObj& spec, const ProjectionPolicies& policies) {
+        auto&& [executor, matchExpr] = createProjectionExecutor(spec, boost::none, policies);
+        return std::move(executor);
+    }
+
+    // Helper to simplify the creation of a InclusionProjectionExecutor with default policies.
+    auto makeInclusionProjectionWithDefaultPolicies(BSONObj spec) {
+        return createProjectionExecutor(spec, {});
+    }
+
+    // Helper to simplify the creation of a InclusionProjectionExecutor which excludes _id by
+    // default.
+    auto makeInclusionProjectionWithDefaultIdExclusion(BSONObj spec) {
+        ProjectionPolicies defaultExcludeId{ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+                                            ProjectionPolicies::kArrayRecursionPolicyDefault,
+                                            ProjectionPolicies::kComputedFieldsPolicyDefault};
+        return createProjectionExecutor(spec, defaultExcludeId);
+    }
+
+    // Helper to simplify the creation of a InclusionProjectionExecutor which does not recurse
+    // arrays.
+    auto makeInclusionProjectionWithNoArrayRecursion(BSONObj spec) {
+        ProjectionPolicies noArrayRecursion{
+            ProjectionPolicies::kDefaultIdPolicyDefault,
+            ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays,
+            ProjectionPolicies::kComputedFieldsPolicyDefault};
+        return createProjectionExecutor(spec, noArrayRecursion);
+    }
+
+    // Helper to simplify the creation of a InclusionProjectionExecutor with find-style projection
+    // policies.
+    auto makeInclusionProjectionWithFindPolicies(BSONObj projSpec, BSONObj matchSpec) {
+        return createProjectionExecutor(
+            projSpec, matchSpec, ProjectionPolicies::findProjectionPolicies());
+    }
+
+    AllowFallBackToDefault _allowFallBackToDefault;
+    // True, if the projection executor is allowed to use the fast-path inclusion projection
+    // implementation.
+    AllowFastPath _allowFastPath;
+};
+
+class InclusionProjectionExecutionTestWithFallBackToDefault
+    : public BaseInclusionProjectionExecutionTest {
+public:
+    InclusionProjectionExecutionTestWithFallBackToDefault()
+        : BaseInclusionProjectionExecutionTest{AllowFallBackToDefault{true}} {}
+};
+INSTANTIATE_TEST_SUITE_P(,
+                         InclusionProjectionExecutionTestWithFallBackToDefault,
+                         testing::Values(AllowFastPath{true}, AllowFastPath{false}));
+
+class InclusionProjectionExecutionTestWithoutFallBackToDefault
+    : public BaseInclusionProjectionExecutionTest {
+public:
+    InclusionProjectionExecutionTestWithoutFallBackToDefault()
+        : BaseInclusionProjectionExecutionTest{AllowFallBackToDefault{false}} {}
+};
+
+INSTANTIATE_TEST_SUITE_P(,
+                         InclusionProjectionExecutionTestWithoutFallBackToDefault,
+                         testing::Values(AllowFastPath{true}, AllowFastPath{false}));
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldAddIncludedFieldsToDependencies) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("_id" << false << "a" << true << "x.y" << true));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 2UL);
+    ASSERT_EQ(deps.fields.count("_id"), 0UL);
+    ASSERT_EQ(deps.fields.count("a"), 1UL);
+    ASSERT_EQ(deps.fields.count("x.y"), 1UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldAddIdToDependenciesIfNotSpecified) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << true));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 2UL);
+    ASSERT_EQ(deps.fields.count("_id"), 1UL);
+    ASSERT_EQ(deps.fields.count("a"), 1UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddDependenciesOfComputedFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << "$a"
+                                                                         << "x"
+                                                                         << "$z"));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 3UL);
+    ASSERT_EQ(deps.fields.count("_id"), 1UL);
+    ASSERT_EQ(deps.fields.count("a"), 1UL);
+    ASSERT_EQ(deps.fields.count("z"), 1UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddPathToDependenciesForNestedComputedFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a.b.c" << BSON("$add" << BSON_ARRAY(1 << 2))));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 3UL);
+    ASSERT_EQ(deps.fields.count("_id"), 1UL);
+    ASSERT_EQ(deps.fields.count("a"), 1UL);
+    ASSERT_EQ(deps.fields.count("a.b"), 1UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldNotAddTopLevelDependencyWithExpressionOnTopLevelPath) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("a" << BSON("$add" << BSON_ARRAY(1 << 2))));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 1UL);
+    ASSERT_EQ(deps.fields.count("_id"), 1UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddPathToDependenciesForNestedComputedFieldsUsingVariableReferences) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("x.y" << "$z"));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 3UL);
+    // Implicit "_id".
+    ASSERT_EQ(deps.fields.count("_id"), 1UL);
+    // Needed by the ExpressionFieldPath.
+    ASSERT_EQ(deps.fields.count("z"), 1UL);
+    // Needed to ensure we preserve the structure of the input document.
+    ASSERT_EQ(deps.fields.count("x"), 1UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldSerializeToEquivalentProjection) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        fromjson("{a: {$add: ['$a', 2]}, b: {d: 3}, 'x.y': {$literal: 4}}"));
+
+    // Adds implicit "_id" inclusion, converts numbers to bools, serializes expressions.
+    auto expectedSerialization =
+        Document(fromjson("{_id: true, a: {$add: [\"$a\", {$const: 2}]}, b: {d: true}, x: "
+                          "{y: {$const: 4}}}"));
+
+    // Should be the same if we're serializing for explain or for internal use.
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldSerializeExplicitExclusionOfId) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("_id" << false << "a" << true));
+
+    // Adds implicit "_id" inclusion, converts numbers to bools, serializes expressions.
+    auto expectedSerialization = Document{{"a", true}, {"_id", false}};
+
+    // Should be the same if we're serializing for explain or for internal use.
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldSerializeWithTopLevelID) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << 1 << "b" << 1));
+    auto serialization = inclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"], Value(true));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(true));
+
+    inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << 1 << "b" << BSON("c" << 1 << "d" << 1)));
+    serialization = inclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"]["c"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"]["d"], Value(true));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"]["_id"], Value());
+
+    inclusion = makeInclusionProjectionWithDefaultIdExclusion(BSON("a" << true << "b" << true));
+    serialization = inclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"], Value(true));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(false));
+
+    inclusion = makeInclusionProjectionWithDefaultIdExclusion(
+        BSON("a" << true << "b" << true << "_id" << false));
+    serialization = inclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"], Value(true));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(false));
+
+    inclusion = makeInclusionProjectionWithDefaultIdExclusion(
+        BSON("a" << true << "b" << true << "_id" << true));
+    serialization = inclusion->serializeTransformation();
+    ASSERT_VALUE_EQ(serialization["a"], Value(true));
+    ASSERT_VALUE_EQ(serialization["b"], Value(true));
+    ASSERT_VALUE_EQ(serialization["_id"], Value(true));
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldOptimizeTopLevelExpressions) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("a" << BSON("$add" << BSON_ARRAY(1 << 2))));
+
+    inclusion->optimize();
+
+    auto expectedSerialization = Document{{"_id", true}, {"a", Document{{"$const", 3}}}};
+
+    // Should be the same if we're serializing for explain or for internal use.
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldOptimizeNestedExpressions) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a.b" << BSON("$add" << BSON_ARRAY(1 << 2))));
+
+    inclusion->optimize();
+
+    auto expectedSerialization =
+        Document{{"_id", true}, {"a", Document{{"b", Document{{"$const", 3}}}}}};
+
+    // Should be the same if we're serializing for explain or for internal use.
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(query_shape::SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldReportThatAllExceptIncludedFieldsAreModified) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << wrapInLiteral("computedVal") << "b.c" << wrapInLiteral("computedVal") << "d"
+                 << true << "e.f" << true));
+
+    auto modifiedPaths = inclusion->getModifiedPaths();
+    ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
+    // Included paths are not modified.
+    ASSERT_EQ(modifiedPaths.paths.count("_id"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.count("d"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.count("e.f"), 1UL);
+    // Computed paths are modified.
+    ASSERT_EQ(modifiedPaths.paths.count("a"), 0UL);
+    ASSERT_EQ(modifiedPaths.paths.count("b.c"), 0UL);
+    ASSERT_EQ(modifiedPaths.paths.size(), 3UL);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldReportThatAllExceptIncludedFieldsAreModifiedWithIdExclusion) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("_id" << false << "a" << wrapInLiteral("computedVal") << "b.c"
+                   << wrapInLiteral("computedVal") << "d" << true << "e.f" << true));
+
+    auto modifiedPaths = inclusion->getModifiedPaths();
+    ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllExcept);
+    // Included paths are not modified.
+    ASSERT_EQ(modifiedPaths.paths.count("d"), 1UL);
+    ASSERT_EQ(modifiedPaths.paths.count("e.f"), 1UL);
+    // Computed paths are modified.
+    ASSERT_EQ(modifiedPaths.paths.count("a"), 0UL);
+    ASSERT_EQ(modifiedPaths.paths.count("b.c"), 0UL);
+    // _id is explicitly excluded.
+    ASSERT_EQ(modifiedPaths.paths.count("_id"), 0UL);
+
+    ASSERT_EQ(modifiedPaths.paths.size(), 2UL);
+}
+
+//
+// Top-level only.
+//
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldIncludeTopLevelField) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << true));
+
+    // More than one field in document.
+    auto result = inclusion->applyTransformation(Document{{"a", 1}, {"b", 2}}, {});
+    auto expectedResult = Document{{"a", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is the only field in the document.
+    result = inclusion->applyTransformation(Document{{"a", 1}}, {});
+    expectedResult = Document{{"a", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is not present in the document.
+    result = inclusion->applyTransformation(Document{{"c", 1}}, {});
+    expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // There are no fields in the document.
+    result = inclusion->applyTransformation(Document{}, {});
+    expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldAddComputedTopLevelField) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("newField" << wrapInLiteral("computedVal")));
+    auto result = inclusion->applyTransformation(Document{}, {});
+    auto expectedResult = Document{{"newField", "computedVal"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Computed field should replace existing field.
+    result = inclusion->applyTransformation(Document{{"newField", "preExisting"sv}}, {});
+    expectedResult = Document{{"newField", "computedVal"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldApplyBothInclusionsAndComputedFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << true << "newField" << wrapInLiteral("computedVal")));
+    auto result = inclusion->applyTransformation(Document{{"a", 1}}, {});
+    auto expectedResult = Document{{"a", 1}, {"newField", "computedVal"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldIncludeFieldsInOrderOfInputDoc) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("first" << true << "second" << true << "third" << true));
+    auto inputDoc = Document{{"second", 1}, {"first", 0}, {"third", 2}};
+    auto result = inclusion->applyTransformation(inputDoc, {});
+    ASSERT_DOCUMENT_EQ(result, inputDoc);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldApplyComputedFieldsInOrderSpecified) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON(
+        "firstComputed" << wrapInLiteral("FIRST") << "secondComputed" << wrapInLiteral("SECOND")));
+    auto result =
+        inclusion->applyTransformation(Document{{"first", 0}, {"second", 1}, {"third", 2}}, {});
+    auto expectedResult = Document{{"firstComputed", "FIRST"sv}, {"secondComputed", "SECOND"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldImplicitlyIncludeId) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << true));
+    auto result = inclusion->applyTransformation(Document{{"_id", "ID"sv}, {"a", 1}, {"b", 2}}, {});
+    auto expectedResult = Document{{"_id", "ID"sv}, {"a", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Should leave the "_id" in the same place as in the original document.
+    result = inclusion->applyTransformation(Document{{"a", 1}, {"b", 2}, {"_id", "ID"sv}}, {});
+    expectedResult = Document{{"a", 1}, {"_id", "ID"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldImplicitlyIncludeIdWithComputedFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("newField" << wrapInLiteral("computedVal")));
+    auto result = inclusion->applyTransformation(Document{{"_id", "ID"sv}, {"a", 1}}, {});
+    auto expectedResult = Document{{"_id", "ID"sv}, {"newField", "computedVal"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldIncludeIdIfExplicitlyIncluded) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << true << "_id" << true << "b" << true));
+    auto result =
+        inclusion->applyTransformation(Document{{"_id", "ID"sv}, {"a", 1}, {"b", 2}, {"c", 3}}, {});
+    auto expectedResult = Document{{"_id", "ID"sv}, {"a", 1}, {"b", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldExcludeIdIfExplicitlyExcluded) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("a" << true << "_id" << false));
+    auto result = inclusion->applyTransformation(Document{{"a", 1}, {"b", 2}, {"_id", "ID"sv}}, {});
+    auto expectedResult = Document{{"a", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldReplaceIdWithComputedId) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("_id" << wrapInLiteral("newId")));
+    auto result = inclusion->applyTransformation(Document{{"a", 1}, {"b", 2}, {"_id", "ID"sv}}, {});
+    auto expectedResult = Document{{"_id", "newId"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+//
+// Projections with nested fields.
+//
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldIncludeSimpleDottedFieldFromSubDoc) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << true));
+
+    // More than one field in sub document.
+    auto result = inclusion->applyTransformation(Document{{"a", Document{{"b", 1}, {"c", 2}}}}, {});
+    auto expectedResult = Document{{"a", Document{{"b", 1}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is the only field in the sub document.
+    result = inclusion->applyTransformation(Document{{"a", Document{{"b", 1}}}}, {});
+    expectedResult = Document{{"a", Document{{"b", 1}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is not present in the sub document.
+    result = inclusion->applyTransformation(Document{{"a", Document{{"c", 1}}}}, {});
+    expectedResult = Document{{"a", Document{}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // There are no fields in sub document.
+    result = inclusion->applyTransformation(Document{{"a", Document{}}}, {});
+    expectedResult = Document{{"a", Document{}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldNotCreateSubDocIfDottedIncludedFieldDoesNotExist) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("sub.target" << true));
+
+    // Should not add the path if it doesn't exist.
+    auto result = inclusion->applyTransformation(Document{}, {});
+    auto expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Should not replace the first part of the path if that part exists.
+    result = inclusion->applyTransformation(Document{{"sub", "notADocument"sv}}, {});
+    expectedResult = Document{};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldApplyDottedInclusionToEachElementInArray) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << true));
+
+    // Drops non-documents and non-arrays. Applies projection to documents, recurses on
+    // nested arrays.
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}},
+                                                 {});
+    auto expectedResult = Document{
+        {"a", {Document{}, Document{{"b", 1}}, Document{{"b", 1}}, vector<Value>{}, {Document{}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddComputedDottedFieldToSubDocument) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("sub.target" << wrapInLiteral("computedVal")));
+
+    // Other fields exist in sub document, one of which is the specified field.
+    auto result =
+        inclusion->applyTransformation(Document{{"sub", Document{{"target", 1}, {"c", 2}}}}, {});
+    auto expectedResult = Document{{"sub", Document{{"target", "computedVal"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Specified field is not present in the sub document.
+    result = inclusion->applyTransformation(Document{{"sub", Document{{"c", 1}}}}, {});
+    expectedResult = Document{{"sub", Document{{"target", "computedVal"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // There are no fields in sub document.
+    result = inclusion->applyTransformation(Document{{"sub", Document{}}}, {});
+    expectedResult = Document{{"sub", Document{{"target", "computedVal"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldCreateSubDocIfDottedComputedFieldDoesntExist) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("sub.target" << wrapInLiteral("computedVal")));
+
+    // Should add the path if it doesn't exist.
+    auto result = inclusion->applyTransformation(Document{}, {});
+    auto expectedResult = Document{{"sub", Document{{"target", "computedVal"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Should replace non-documents with documents.
+    result = inclusion->applyTransformation(Document{{"sub", "notADocument"sv}}, {});
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldCreateNestedSubDocumentsAllTheWayToComputedField) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("a.b.c.d" << wrapInLiteral("computedVal")));
+
+    // Should add the path if it doesn't exist.
+    auto result = inclusion->applyTransformation(Document{}, {});
+    auto expectedResult =
+        Document{{"a", Document{{"b", Document{{"c", Document{{"d", "computedVal"sv}}}}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // Should replace non-documents with documents.
+    result = inclusion->applyTransformation(Document{{"a", Document{{"b", "other"sv}}}}, {});
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddComputedDottedFieldToEachElementInArray) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << wrapInLiteral("COMPUTED")));
+
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}},
+                                                 {});
+    auto expectedResult =
+        Document{{"a",
+                  {Document{{"b", "COMPUTED"sv}},
+                   Document{{"b", "COMPUTED"sv}},
+                   Document{{"b", "COMPUTED"sv}},
+                   Document{{"b", "COMPUTED"sv}},
+                   vector<Value>{},
+                   {Document{{"b", "COMPUTED"sv}}, Document{{"b", "COMPUTED"sv}}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldApplyInclusionsAndAdditionsToEachElementInArray) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a.inc" << true << "a.comp" << wrapInLiteral("COMPUTED")));
+
+    auto result = inclusion->applyTransformation(
+        Document{{"a",
+                  {1,
+                   Document{},
+                   Document{{"inc", 1}},
+                   Document{{"inc", 1}, {"c", 2}},
+                   Document{{"c", 2}, {"inc", 1}},
+                   Document{{"inc", 1}, {"c", 2}, {"comp", "original"sv}},
+                   vector<Value>{},
+                   {1, Document{{"inc", 1}}}}}},
+        {});
+    auto expectedResult = Document{
+        {"a",
+         {Document{{"comp", "COMPUTED"sv}},
+          Document{{"comp", "COMPUTED"sv}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"sv}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"sv}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"sv}},
+          Document{{"inc", 1}, {"comp", "COMPUTED"sv}},
+          vector<Value>{},
+          {Document{{"comp", "COMPUTED"sv}}, Document{{"inc", 1}, {"comp", "COMPUTED"sv}}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldAddOrIncludeSubFieldsOfId) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("_id.X" << true << "_id.Z" << wrapInLiteral("NEW")));
+    auto result =
+        inclusion->applyTransformation(Document{{"_id", Document{{"X", 1}, {"Y", 2}}}}, {});
+    auto expectedResult = Document{{"_id", Document{{"X", 1}, {"Z", "NEW"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAllowMixedNestedAndDottedFields) {
+    // Include all of "a.b", "a.c", "a.d", and "a.e".
+    // Add new computed fields "a.W", "a.X", "a.Y", and "a.Z".
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a.b" << true << "a.c" << true << "a.W" << wrapInLiteral("W") << "a.X"
+                   << wrapInLiteral("X") << "a"
+                   << BSON("d" << true << "e" << true << "Y" << wrapInLiteral("Y") << "Z"
+                               << wrapInLiteral("Z"))));
+    auto result = inclusion->applyTransformation(
+        Document{
+            {"a", Document{{"b", "b"sv}, {"c", "c"sv}, {"d", "d"sv}, {"e", "e"sv}, {"f", "f"sv}}}},
+        {});
+    auto expectedResult = Document{{"a",
+                                    Document{{"b", "b"sv},
+                                             {"c", "c"sv},
+                                             {"d", "d"sv},
+                                             {"e", "e"sv},
+                                             {"W", "W"sv},
+                                             {"X", "X"sv},
+                                             {"Y", "Y"sv},
+                                             {"Z", "Z"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldApplyNestedComputedFieldsInOrderSpecified) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << wrapInLiteral("FIRST") << "b.c" << wrapInLiteral("SECOND")));
+    auto result = inclusion->applyTransformation(Document{}, {});
+    auto expectedResult = Document{{"a", "FIRST"sv}, {"b", Document{{"c", "SECOND"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldApplyComputedFieldsAfterAllInclusions) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("b.c" << wrapInLiteral("NEW") << "a" << true));
+    auto result = inclusion->applyTransformation(Document{{"a", 1}}, {});
+    auto expectedResult = Document{{"a", 1}, {"b", Document{{"c", "NEW"sv}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    result = inclusion->applyTransformation(Document{{"a", 1}, {"b", 4}}, {});
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    // In this case, the field 'b' shows up first and has a nested inclusion or computed
+    // field. Even though it is a computed field, it will appear first in the output
+    // document. This is inconsistent, but the expected behavior, and a consequence of
+    // applying the projection recursively to each sub-document.
+    result = inclusion->applyTransformation(Document{{"b", 4}, {"a", 1}}, {});
+    expectedResult = Document{{"b", Document{{"c", "NEW"sv}}}, {"a", 1}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ComputedFieldReplacingExistingShouldAppearAfterInclusions) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("b" << wrapInLiteral("NEW") << "a" << true));
+    auto result = inclusion->applyTransformation(Document{{"b", 1}, {"a", 1}}, {});
+    auto expectedResult = Document{{"a", 1}, {"b", "NEW"sv}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+
+    result = inclusion->applyTransformation(Document{{"a", 1}, {"b", 4}}, {});
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+//
+// Metadata inclusion.
+//
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldAlwaysKeepMetadataFromOriginalDoc) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << true));
+
+    MutableDocument inputDocBuilder(Document{{"a", 1}});
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setTextScore(10.0);
+    Document inputDoc = inputDocBuilder.freeze();
+
+    auto result = inclusion->applyTransformation(inputDoc, {});
+
+    MutableDocument expectedDoc(inputDoc);
+    expectedDoc.copyMetaDataFrom(inputDoc);
+    ASSERT_DOCUMENT_EQ(result, expectedDoc.freeze());
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       MetaDependenciesFalseWhenNotIncluded) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1}"));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 2UL);
+
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRecordId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kIndexKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchRootDocumentId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddSingleMetaExpressionDependency) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, b: {$meta: 'geoNearPoint'}}"));
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 2UL);
+
+    // Only geo near point should be included as a dependency.
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kRecordId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kIndexKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchRootDocumentId]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ShouldAddMetaExpressionsToDependencies) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, c: {$meta: 'textScore'}, "
+                                                            "d: {$meta: 'randVal'}, "
+                                                            "e: {$meta: 'searchScore'}, "
+                                                            "f: {$meta: 'searchHighlights'}, "
+                                                            "g: {$meta: 'geoNearDistance'}, "
+                                                            "h: {$meta: 'geoNearPoint'}, "
+                                                            "i: {$meta: 'recordId'}, "
+                                                            "j: {$meta: 'indexKey'}, "
+                                                            "k: {$meta: 'sortKey'}, "
+                                                            "l: {$meta: 'searchScoreDetails'}, "
+                                                            "m: {$meta: 'vectorSearchScore'}, "
+                                                            "n: {$meta: 'score'}, "
+                                                            "o: {$meta: 'searchRootDocumentId'}}"));
+
+
+    DepsTracker deps;
+    inclusion->addDependencies(&deps);
+
+    ASSERT_EQ(deps.fields.size(), 2UL);
+
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearDist]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kGeoNearPoint]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kRecordId]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kIndexKey]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSortKey]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchRootDocumentId]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMetaExpressions) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, c: {$meta: 'textScore'}, "
+                                                            "d: {$meta: 'randVal'}, "
+                                                            "e: {$meta: 'searchScore'}, "
+                                                            "f: {$meta: 'searchHighlights'}, "
+                                                            "g: {$meta: 'geoNearDistance'}, "
+                                                            "h: {$meta: 'geoNearPoint'}, "
+                                                            "i: {$meta: 'recordId'}, "
+                                                            "j: {$meta: 'indexKey'}, "
+                                                            "k: {$meta: 'sortKey'}, "
+                                                            "l: {$meta: 'searchScoreDetails'}, "
+                                                            "m: {$meta: 'vectorSearchScore'}, "
+                                                            "n: {$meta: 'score'}, "
+                                                            "o: {$meta: 'searchRootDocumentId'}}"));
+
+
+    MutableDocument inputDocBuilder(Document{{"a", 1}});
+    inputDocBuilder.metadata().setTextScore(0.0);
+    inputDocBuilder.metadata().setRandVal(1.0);
+    inputDocBuilder.metadata().setSearchScore(2.0);
+    inputDocBuilder.metadata().setSearchHighlights(Value{"foo"sv});
+    inputDocBuilder.metadata().setGeoNearDistance(3.0);
+    inputDocBuilder.metadata().setGeoNearPoint(Value{BSON_ARRAY(4 << 5)});
+    inputDocBuilder.metadata().setRecordId(RecordId{6});
+    inputDocBuilder.metadata().setIndexKey(BSON("foo" << 7));
+    inputDocBuilder.metadata().setSortKey(Value{Document{{"bar", 8}}}, true);
+    inputDocBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails" << "foo"));
+    inputDocBuilder.metadata().setVectorSearchScore(9.0);
+    inputDocBuilder.metadata().setScore(10.0);
+    inputDocBuilder.metadata().setSearchRootDocumentId(Value{10.0});
+    Document inputDoc = inputDocBuilder.freeze();
+
+    auto result = inclusion->applyTransformation(inputDoc, {});
+
+    ASSERT_DOCUMENT_EQ(result,
+                       Document{fromjson("{a: 1, c: 0.0, d: 1.0, e: 2.0, f: 'foo', g: 3.0, "
+                                         "h: [4, 5], i: 6, j: {foo: 7}, k: [{bar: 8}], "
+                                         "l: {scoreDetails: 'foo'}, m: 9.0, n: 10.0, o: 10.0}")});
+}
+
+//
+// _id inclusion policy.
+//
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldIncludeIdByDefault) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << true));
+
+    auto result = inclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{{"_id", 2}, {"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldIncludeIdWithIncludePolicy) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << true));
+
+    auto result = inclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{{"_id", 2}, {"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldExcludeIdWithExcludePolicy) {
+    auto inclusion = makeInclusionProjectionWithDefaultIdExclusion(BSON("a" << true));
+
+    auto result = inclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{{"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldOverrideIncludePolicyWithExplicitExcludeIdSpec) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("_id" << false << "a" << true));
+
+    auto result = inclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{{"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldOverrideExcludePolicyWithExplicitIncludeIdSpec) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultIdExclusion(BSON("_id" << true << "a" << true));
+
+    auto result = inclusion->applyTransformation(Document{{"_id", 2}, {"a", 3}}, {});
+    auto expectedResult = Document{{"_id", 2}, {"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldAllowInclusionOfIdSubfieldWithDefaultIncludePolicy) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("_id.id1" << true << "a" << true));
+
+    auto result = inclusion->applyTransformation(
+        Document{{"_id", Document{{"id1", 1}, {"id2", 2}}}, {"a", 3}, {"b", 4}}, {});
+    auto expectedResult = Document{{"_id", Document{{"id1", 1}}}, {"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldAllowInclusionOfIdSubfieldWithDefaultExcludePolicy) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultIdExclusion(BSON("_id.id1" << true << "a" << true));
+
+    auto result = inclusion->applyTransformation(
+        Document{{"_id", Document{{"id1", 1}, {"id2", 2}}}, {"a", 3}, {"b", 4}}, {});
+    auto expectedResult = Document{{"_id", Document{{"id1", 1}}}, {"a", 3}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+//
+// Nested array recursion.
+//
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldRecurseNestedArraysByDefault) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << true));
+
+    // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {a: [{b: 2}, [{b: 4}], {}]}
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{{"b", 2}, {"c", 3}},
+                                                            {Document{{"b", 4}, {"c", 5}}},
+                                                            Document{{"d", 6}}}}},
+                                                 {});
+
+    auto expectedResult = Document{{"a", {Document{{"b", 2}}, {Document{{"b", 4}}}, Document{}}}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldNotRecurseNestedArraysForNoRecursePolicy) {
+    auto inclusion = makeInclusionProjectionWithNoArrayRecursion(BSON("a.b" << true));
+
+    // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => {a: [{b: 2}, {}]}
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{{"b", 2}, {"c", 3}},
+                                                            {Document{{"b", 4}, {"c", 5}}},
+                                                            Document{{"d", 6}}}}},
+                                                 {});
+
+    auto expectedResult = Document{{"a", {Document{{"b", 2}}, Document{}}}};
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefault,
+       ShouldRetainNestedArraysIfNoRecursionNeeded) {
+    auto inclusion = makeInclusionProjectionWithNoArrayRecursion(BSON("a" << true));
+
+    // {a: [1, {b: 2, c: 3}, [{b: 4, c: 5}], {d: 6}]} => [output doc identical to input]
+    const auto inputDoc = Document{
+        {"a",
+         {1, Document{{"b", 2}, {"c", 3}}, {Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}};
+
+    auto result = inclusion->applyTransformation(inputDoc, {});
+    const auto& expectedResult = inputDoc;
+
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ComputedFieldIsAddedToNestedArrayElementsForRecursePolicy) {
+    auto inclusion =
+        makeInclusionProjectionWithDefaultPolicies(BSON("a.b" << wrapInLiteral("COMPUTED")));
+
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}},
+                                                 {});
+    auto expectedResult =
+        Document{{"a",
+                  {Document{{"b", "COMPUTED"sv}},
+                   Document{{"b", "COMPUTED"sv}},
+                   Document{{"b", "COMPUTED"sv}},
+                   Document{{"b", "COMPUTED"sv}},
+                   vector<Value>{},
+                   {Document{{"b", "COMPUTED"sv}}, Document{{"b", "COMPUTED"sv}}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ComputedFieldShouldReplaceNestedArrayForNoRecursePolicy) {
+    auto inclusion =
+        makeInclusionProjectionWithNoArrayRecursion(BSON("a.b" << wrapInLiteral("COMPUTED")));
+
+    // For kRecurseNestedArrays, the computed field (1) replaces any scalar values in the
+    // array with a subdocument containing the new field, and (2) is added to each element
+    // of the array and all nested arrays individually. With kDoNotRecurseNestedArrays, the
+    // nested arrays are replaced rather than being traversed, in exactly the same way as
+    // scalar values.
+    auto result = inclusion->applyTransformation(Document{{"a",
+                                                           {1,
+                                                            Document{},
+                                                            Document{{"b", 1}},
+                                                            Document{{"b", 1}, {"c", 2}},
+                                                            vector<Value>{},
+                                                            {1, Document{{"c", 1}}}}}},
+                                                 {});
+    auto expectedResult = Document{{"a",
+                                    {Document{{"b", "COMPUTED"sv}},
+                                     Document{{"b", "COMPUTED"sv}},
+                                     Document{{"b", "COMPUTED"sv}},
+                                     Document{{"b", "COMPUTED"sv}},
+                                     Document{{"b", "COMPUTED"sv}},
+                                     Document{{"b", "COMPUTED"sv}}}}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ExtractComputedProjections) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("computedMeta1" << BSON("$toUpper" << "$myMeta.x") << "computed2"
+                             << BSON("$add" << BSON_ARRAY(1 << "$c")) << "computedMeta3"
+                             << "$myMeta"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 2);
+    auto expectedAddFields =
+        BSON("computedMeta1" << BSON("$toUpper" << BSON_ARRAY("$meta.x")) << "computedMeta3"
+                             << "$meta");
+    ASSERT_BSONOBJ_EQ(expectedAddFields, addFields);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection =
+        Document(fromjson("{_id: true, computedMeta1: true, computed2: {$add: [{$const: "
+                          "1}, \"$c\"]}, computedMeta3: \"$computedMeta3\"}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << "$myMeta"
+                                                                         << "b"
+                                                                         << "$a"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', b: '$a'}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotIncludeId) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << BSON("$sum" << BSON_ARRAY("$myMeta" << "$_id"))));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: {$sum: ['$myMeta', '$_id']}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentSubFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << "$myMeta"
+                                                                         << "b"
+                                                                         << "$a.x"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', b: '$a.x'}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentSubFieldsWithDottedSibling) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << "$myMeta"
+                                                                         << "c.b"
+                                                                         << "$a.x"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', c: {b: '$a.x'}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, ApplyProjectionAfterSplit) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << true << "computedMeta1" << BSON("$toUpper" << "$myMeta.x") << "computed2"
+                 << BSON("$add" << BSON_ARRAY(1 << "$c")) << "c" << true << "computedMeta3"
+                 << "$myMeta"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    // Assuming the document was produced by the $_internalUnpackBucket.
+    auto result = inclusion->applyTransformation(
+        Document{{"a", 1}, {"c", 5}, {"computedMeta1", "XXX"sv}, {"computedMeta3", 2}}, {});
+    // Computed projections preserve the order in $project, field 'c' moves in front of them.
+    auto expectedResult = Document{
+        {"a", 1}, {"c", 5}, {"computedMeta1", "XXX"sv}, {"computed2", 6}, {"computedMeta3", 2}};
+    ASSERT_DOCUMENT_EQ(result, expectedResult);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, DoNotExtractReservedNames) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << true << "data" << BSON("$toUpper" << "$myMeta.x") << "newMeta"
+                 << "$myMeta"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<std::string_view> reservedNames{"meta", "data", "_id"};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 1);
+    auto expectedAddFields = BSON("newMeta" << "$meta");
+    ASSERT_BSONOBJ_EQ(expectedAddFields, addFields);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson(
+        "{_id: true, a: true, data: {\"$toUpper\" : [\"$myMeta.x\"]}, newMeta: \"$newMeta\"}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+class InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly
+    : public InclusionProjectionExecutionTestWithoutFallBackToDefault {};
+INSTANTIATE_TEST_SUITE_P(,
+                         InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+                         testing::Values(AllowFastPath{true}));
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithFindPositional) {
+    ASSERT_THROWS_CODE(
+        makeInclusionProjectionWithFindPolicies(fromjson("{a: 1, 'b.$': 1}"), fromjson("{b: 1}")),
+        AssertionException,
+        51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithFindSlice) {
+    ASSERT_THROWS_CODE(
+        makeInclusionProjectionWithFindPolicies(fromjson("{a: 1, b: {$slice: 2}}"), {}),
+        AssertionException,
+        51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithFindElemMatch) {
+    ASSERT_THROWS_CODE(
+        makeInclusionProjectionWithFindPolicies(fromjson("{a: 1, b: {$elemMatch: {c: 1}}}"), {}),
+        AssertionException,
+        51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithRegularExpression) {
+    ASSERT_THROWS_CODE(
+        makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, b: {$add: ['$c', 1]}}")),
+        AssertionException,
+        51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithMetadataExpression) {
+    ASSERT_THROWS_CODE(
+        makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, b: {$meta: 'randVal'}}")),
+        AssertionException,
+        51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithLiteral) {
+    ASSERT_THROWS_CODE(
+        makeInclusionProjectionWithDefaultPolicies(BSON("a" << 1 << "b" << wrapInLiteral("abc"))),
+        AssertionException,
+        51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithoutFallBackToDefaultFastPathOnly,
+       CannotUseFastPathWithFieldPathExpression) {
+    ASSERT_THROWS_CODE(makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, b: '$c'}")),
+                       AssertionException,
+                       51752);
+}
+
+TEST_P(InclusionProjectionExecutionTestWithFallBackToDefault, DescribeTransformation) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    for (auto includeId : {true, false}) {
+        auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+            BSON("_id" << includeId << "computed" << "value"
+                       << "computedDotted.field" << "value"
+                       << "newRename"
+                       << "$oldRename"
+                       << "newComplexRename"
+                       << "$oldComplexRename.field"
+                       << "newComputedRename.field"
+                       << "$oldComputedRename"));
+
+        auto original = inclusion->getModifiedPaths();
+        // Check that the describeTransformation provides at least the same information.
+        auto converted = document_transformation::toGetModPathsReturn(*inclusion);
+
+        EXPECT_EQ(original.type, converted.type);
+        EXPECT_EQ(original.paths, converted.paths);
+        EXPECT_EQ(original.renames, converted.renames);
+        EXPECT_EQ(original.complexRenames, converted.complexRenames);
+    }
+}
+
+}  // namespace
+}  // namespace mongo::projection_executor

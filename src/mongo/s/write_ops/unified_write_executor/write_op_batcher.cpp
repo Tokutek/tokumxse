@@ -1,0 +1,570 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/s/write_ops/unified_write_executor/write_op_batcher.h"
+
+#include "mongo/db/error_labels.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/transaction_router.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+namespace mongo {
+namespace unified_write_executor {
+
+bool analysisTypeSupportsGrouping(AnalysisType type) {
+    return type == kSingleShard || type == kMultiShard || type == kRetryableWriteWithId;
+}
+
+namespace {
+
+std::unique_ptr<write_op_helpers::BatchCommandSizeEstimatorBase> getSizeEstimator(
+    OperationContext* opCtx, const WriteCommandRef& cmdRef) {
+    if (cmdRef.isBatchWriteCommand()) {
+        return std::make_unique<write_op_helpers::BatchedCommandSizeEstimator>(
+            opCtx, cmdRef.getBatchedCommandRequest());
+    } else if (cmdRef.isBulkWriteCommand()) {
+        return std::make_unique<write_op_helpers::BulkCommandSizeEstimator>(
+            opCtx, cmdRef.getBulkWriteCommandRequest());
+    } else {
+        // For other unbatched commands, e.g. findAndModify, we do not need size estimation so just
+        // construct an estimator that always estimates zero.
+        return std::make_unique<write_op_helpers::NoBatchCommandSizeEstimator>();
+    }
+}
+}  // namespace
+
+template <bool Ordered>
+class SimpleBatchBuilderBase {
+public:
+    using DbVersionMap = absl::flat_hash_map<DatabaseName, boost::optional<DatabaseVersion>>;
+
+    SimpleBatchBuilderBase(OperationContext* opCtx,
+                           WriteOpBatcher& batcher,
+                           const WriteCommandRef& cmdRef)
+        : _batcher(batcher), _sizeEstimator(getSizeEstimator(opCtx, cmdRef)) {}
+
+    /**
+     * If ops were added to '_batch' but done() was not called, mark all the ops in '_batch' for
+     * reprocessing.
+     */
+    ~SimpleBatchBuilderBase() {
+        if (_batch) {
+            _batcher.markOpReprocess(_batch->getWriteOps());
+        }
+    }
+
+    operator bool() const {
+        return _batch.has_value();
+    }
+
+    bool operator!() const {
+        return !_batch;
+    }
+
+    bool isEmpty() const {
+        return !_batch;
+    }
+
+    /**
+     * Returns true if the specified op ('nss' / 'analysis') can be added to the current batch,
+     * otherwise returns false.
+     */
+    bool isCompatibleWithBatch(NamespaceString nss, Analysis& analysis) const {
+        const auto& endpoints = analysis.shardsAffected;
+        const AnalysisType& analysisType = analysis.type;
+        const bool opIsRetryableWriteWithId = analysisType == kRetryableWriteWithId;
+
+        // If op's analysis type doesn't support grouping, return false.
+        if (!analysisTypeSupportsGrouping(analysisType)) {
+            return false;
+        }
+
+        // If op isn't compatible with the current batch's type, return false.
+        if (_batch && (opIsRetryableWriteWithId != _batch->isRetryableWriteWithId)) {
+            return false;
+        }
+
+        // Verify that there is at least one endpoint. Also, if this op is kSingleShard, verify
+        // that there's exactly one endpoint.
+        tassert(10896511, "Expected at least one affected shard", !endpoints.empty());
+        tassert(10896512,
+                "Single shard op should only target a single shard",
+                analysisType != kSingleShard || endpoints.size() == 1);
+        // If the current batch is empty, return true.
+        if (!_batch || _batch->requestByShardId.empty()) {
+            return true;
+        }
+        // If the write command is ordered -AND- if either the op targets multiple shards, the
+        // current batch targets multiple shards, or the op and the current batch target different
+        // shards, then return false.
+        if (Ordered &&
+            (endpoints.size() > 1 || _batch->requestByShardId.size() > 1 ||
+             endpoints.front().shardName != _batch->requestByShardId.begin()->first)) {
+            return false;
+        }
+        // If, for some endpoint, the op needs to target a different shard version for namespace
+        // 'nss' vs. what the current batch is targeting for that endpoint and namespace, return
+        // false. Otherwise, return true.
+        return !wasShardAlreadyTargetedWithDifferentShardVersion(nss, analysis);
+    }
+
+    /**
+     * Returns true if there is room for the current op in this SimpleBatch. Note that this isn't
+     * needed for other op types as they hold one op each. This function doesn't add the op to the
+     * sizeEstimator, this is done when the op is actually added into the batch in 'addOp'.
+     */
+    bool wouldFitInBatch(WriteOpId opIdx, Analysis analysis) {
+        for (const auto& endpoint : analysis.shardsAffected) {
+            const auto& shardName = endpoint.shardName;
+
+            auto it = _batch->requestByShardId.find(shardName);
+            if (it == _batch->requestByShardId.end()) {
+                // If this is the first item in the batch, it can't be too big.
+                continue;
+            }
+
+            int estSizeBytesForWrite = _sizeEstimator->getOpSizeEstimate(opIdx, shardName);
+            tassert(10414701, "Expected a non-zero write operation size", estSizeBytesForWrite > 0);
+
+            if (it->second.ops.size() >= write_ops::kMaxWriteBatchSize ||
+                it->second.sizeEstimate + estSizeBytesForWrite > BSONObjMaxUserSize) {
+                // Too many items in batch, or batch would be too big.
+                LOGV2_DEBUG(10414700, 5, "Write is too large to include in the current batch");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Adds 'writeOp' to the current batch. This method will fail with a tassert if the op's
+     * analysis type is not compatible with the current batch.
+     */
+    void addOp(WriteOp& writeOp, Analysis& analysis) {
+        const AnalysisType& analysisType = analysis.type;
+        const bool opIsRetryableWriteWithId = analysisType == kRetryableWriteWithId;
+        tassert(10896513,
+                "Expected op's analysis type to support grouping",
+                analysisTypeSupportsGrouping(analysisType));
+
+        if (!_batch) {
+            _batch = SimpleWriteBatch::makeEmpty(opIsRetryableWriteWithId);
+        }
+
+        tassert(10378100,
+                "Expected op's type to be compatible with batch",
+                opIsRetryableWriteWithId == _batch->isRetryableWriteWithId);
+
+        for (const auto& endpoint : analysis.shardsAffected) {
+            auto nss = writeOp.getNss();
+            const auto& shardName = endpoint.shardName;
+            int estSizeBytesForWrite =
+                _sizeEstimator->getOpSizeEstimate(getWriteOpId(writeOp), shardName);
+
+            const bool isTracked =
+                endpoint.shardVersion && *endpoint.shardVersion != ShardVersion::UNTRACKED();
+
+            // Assert the shardVersion is compatible with the batch's shardVersion for 'nss'.
+            auto requestIt = _batch->requestByShardId.find(shardName);
+            if (requestIt != _batch->requestByShardId.end()) {
+                const auto& versionByNss = requestIt->second.versionByNss;
+                if (auto versionIt = versionByNss.find(nss); versionIt != versionByNss.end()) {
+                    tassert(10387001,
+                            "Shard version for the same namespace must be the same",
+                            versionIt->second == endpoint);
+                }
+            }
+
+            if (!isTracked) {
+                auto& dvMap = _dvMaps[shardName];
+                if (auto dvIt = dvMap.find(nss.dbName()); dvIt != dvMap.end()) {
+                    // Assert the dbVersion is compatible with what is recorded in 'dvMap'.
+                    tassert(11841902,
+                            "Database version for the same database must be the same",
+                            dvIt->second == endpoint.databaseVersion);
+                } else {
+                    // Record the dbVersion in 'dvMap'.
+                    dvMap.emplace(nss.dbName(), endpoint.databaseVersion);
+                }
+            }
+
+            if (requestIt != _batch->requestByShardId.end()) {
+                SimpleWriteBatch::ShardRequest& request = requestIt->second;
+                request.ops.push_back(writeOp);
+
+                request.versionByNss.emplace(nss, endpoint);
+
+                if (analysis.isViewfulTimeseries) {
+                    request.nssIsViewfulTimeseries.emplace(nss);
+                }
+
+                request.sizeEstimate += estSizeBytesForWrite;
+            } else {
+                std::set<NamespaceString> nssIsViewfulTimeseries;
+                if (analysis.isViewfulTimeseries) {
+                    nssIsViewfulTimeseries.emplace(nss);
+                }
+                _batch->requestByShardId.emplace(
+                    shardName,
+                    SimpleWriteBatch::ShardRequest{
+                        absl::flat_hash_map<NamespaceString, ShardEndpoint>{{nss, endpoint}},
+                        std::move(nssIsViewfulTimeseries),
+                        std::vector<WriteOp>{writeOp},
+                        std::map<WriteOpId, UUID>{},
+                        _sizeEstimator->getBaseSizeEstimate() + estSizeBytesForWrite});
+            }
+
+            const auto& targetedSampleId = analysis.targetedSampleId;
+
+            if (targetedSampleId && targetedSampleId->isFor(shardName)) {
+                auto& request = _batch->requestByShardId[shardName];
+                request.sampleIds.emplace(getWriteOpId(writeOp), targetedSampleId->getId());
+            }
+        }
+
+        if (analysis.usesSVIgnored) {
+            _batch->opsUsingSVIgnored.emplace(getWriteOpId(writeOp));
+        }
+    }
+
+    /**
+     * Returns a single op write batch if the write type should not be combined with other ops.
+     */
+    boost::optional<WriteBatch> buildSingleOpWriteBatch(const WriteOp& writeOp,
+                                                        const Analysis& analysis) {
+        // If the WriteOp is kTwoPhaseWrite, put it in a TwoPhaseWriteBatch by itself and return the
+        // batch.
+        if (analysis.type == kTwoPhaseWrite) {
+            auto sampleId = analysis.targetedSampleId.map([](auto& sid) { return sid.getId(); });
+            return WriteBatch{
+                TwoPhaseWriteBatch{writeOp, std::move(sampleId), analysis.isViewfulTimeseries}};
+        }
+        // If the WriteOp is kInternalTransaction, put it in a InternalTransactionBatch by itself
+        // and return the batch.
+        if (analysis.type == kInternalTransaction) {
+            auto sampleId = analysis.targetedSampleId.map([](auto& sid) { return sid.getId(); });
+            return WriteBatch{InternalTransactionBatch{writeOp, std::move(sampleId)}};
+        }
+        // If the WriteOp is kMultiWriteBlockingMigration, put it in a
+        // MultiWriteBlockingMigrationsBatch by itself and return the batch.
+        if (analysis.type == kMultiWriteBlockingMigrations) {
+            auto sampleId = analysis.targetedSampleId.map([](auto& sid) { return sid.getId(); });
+            return WriteBatch{MultiWriteBlockingMigrationsBatch{
+                writeOp, std::move(sampleId), analysis.isViewfulTimeseries}};
+        }
+        return boost::none;
+    }
+
+    /**
+     * Finish the current batch being built and return it.
+     */
+    WriteBatch done() {
+        WriteBatch result = _batch ? WriteBatch{std::move(*_batch)} : WriteBatch{};
+        _batch = boost::none;
+        return result;
+    }
+
+protected:
+    /**
+     * This helper method will return true if-and-only-if 'analysis', for some endpoint, needs to
+     * target a different shard version for namespace 'nss' vs. what the current batch is targeting
+     * for that endpoint and namespace.
+     */
+    bool wasShardAlreadyTargetedWithDifferentShardVersion(NamespaceString nss,
+                                                          Analysis& analysis) const {
+        if (!_batch) {
+            return false;
+        }
+
+        for (const auto& endpoint : analysis.shardsAffected) {
+            const bool isTracked =
+                endpoint.shardVersion && *endpoint.shardVersion != ShardVersion::UNTRACKED();
+            const auto& shardName = endpoint.shardName;
+            auto requestIt = _batch->requestByShardId.find(shardName);
+            auto dvMapIt = _dvMaps.find(shardName);
+
+            // If there are conflicting ShardVersions for 'nss', return true.
+            if (requestIt != _batch->requestByShardId.end()) {
+                const auto& versionByNss = requestIt->second.versionByNss;
+                auto versionIt = versionByNss.find(nss);
+                if (versionIt != versionByNss.end() && versionIt->second != endpoint) {
+                    LOGV2_DEBUG(10387002,
+                                4,
+                                "Cannot add op to batch because namespace was already targeted "
+                                "with a different shard version",
+                                "nss"_attr = nss);
+
+                    return true;
+                }
+            }
+
+            // If there are conflicting DatabaseVersions for 'nss.dbName()', return true.
+            if (!isTracked && dvMapIt != _dvMaps.end()) {
+                const auto& dvMap = dvMapIt->second;
+                if (auto dvIt = dvMap.find(nss.dbName()); dvIt != dvMap.end()) {
+                    if (dvIt->second != endpoint.databaseVersion) {
+                        LOGV2_DEBUG(11841903,
+                                    4,
+                                    "Cannot add op to batch because database was already targeted "
+                                    "with a different database version",
+                                    "dbName"_attr = nss.dbName());
+
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    WriteOpBatcher& _batcher;
+    boost::optional<SimpleWriteBatch> _batch;
+    absl::flat_hash_map<ShardId, DbVersionMap> _dvMaps;
+    std::unique_ptr<write_op_helpers::BatchCommandSizeEstimatorBase> _sizeEstimator;
+};
+
+class OrderedSimpleBatchBuilder : public SimpleBatchBuilderBase<true> {
+public:
+    using BaseT = SimpleBatchBuilderBase<true>;
+    using BaseT::BaseT;
+};
+
+class UnorderedSimpleBatchBuilder : public SimpleBatchBuilderBase<false> {
+public:
+    using BaseT = SimpleBatchBuilderBase<false>;
+    using BaseT::BaseT;
+};
+
+void WriteOpBatcher::markBatchReprocess(WriteBatch batch) {
+    markOpReprocess(batch.getWriteOps());
+}
+
+bool WriteOpBatcher::retryOnTargetError(RoutingContext& routingCtx, Status status) {
+    if (_retryOnTargetError) {
+        LOGV2_DEBUG(10896515,
+                    2,
+                    "Encountered a targeter error, will refresh RoutingContext",
+                    "error"_attr = redact(status));
+
+        for (const auto& nss : routingCtx.getNssList()) {
+            routingCtx.onStaleShardVersionError(nss, /*wantedVersion*/ boost::none);
+        }
+
+        _retryOnTargetError = false;
+        return true;
+    }
+    return false;
+}
+
+BatcherResult OrderedWriteOpBatcher::getNextBatch(OperationContext* opCtx,
+                                                  RoutingContext& routingCtx) {
+    const bool inTransaction = static_cast<bool>(TransactionRouter::get(opCtx));
+
+    std::vector<std::pair<WriteOp, Status>> opsWithErrors;
+    OrderedSimpleBatchBuilder builder(opCtx, *this, _cmdRef);
+
+    for (;;) {
+        // Peek at the next op from the producer. If the producer has been exhausted, return the
+        // current batch to the caller.
+        auto writeOp = _producer.peekNext();
+        if (!writeOp) {
+            break;
+        }
+
+        // Call analyze(). If an error occurs, handle it.
+        auto swAnalysis = _analyzer.analyze(opCtx, routingCtx, *writeOp);
+        if (!swAnalysis.isOK()) {
+            // If the write command is running in a transaction, then discard the current batch,
+            // consume the op, record the error, and return an empty batch.
+            if (inTransaction) {
+                const auto& status = swAnalysis.getStatus();
+                opsWithErrors.emplace_back(*writeOp, status);
+                _producer.advance();
+
+                const bool transientTxnError = isTransientTransactionError(
+                    status.code(), /*hasWriteConcernError*/ false, /*isCommitOrAbort*/ false);
+
+                return {WriteBatch{}, std::move(opsWithErrors), transientTxnError};
+            }
+
+            // Retry on target error once if possible.
+            if (retryOnTargetError(routingCtx, swAnalysis.getStatus())) {
+                return {WriteBatch{}, std::move(opsWithErrors)};
+            }
+
+            // When the write command is not in a transaction and '_retryOnTargetError' is false,
+            // if the current batch is empty, then we consume the op, record the error, and return
+            // an empty batch.
+            if (!builder) {
+                opsWithErrors.emplace_back(*writeOp, swAnalysis.getStatus());
+                _producer.advance();
+                return {WriteBatch{}, std::move(opsWithErrors)};
+            }
+            // When the write command is not in a transaction and '_retryOnTargetError' is false,
+            // if the current batch is _not_ empty, we choose to not record/consume the error and
+            // return the batch we've built so far.
+            break;
+        }
+
+        // If analyze() was successful, see if 'writeOp' can be added to the current batch.
+        auto& analysis = swAnalysis.getValue();
+
+        // Skips any operations for which all the shards already got successful replies.
+        removeSuccessfulShardsFromEndpoints(getWriteOpId(*writeOp), analysis.shardsAffected);
+        if (analysis.shardsAffected.empty()) {
+            _producer.advance();
+            continue;
+        }
+
+        if (builder) {
+            // If this is not the first op, see if it's compatible with the current batch.
+            if (builder.isCompatibleWithBatch(writeOp->getNss(), analysis) &&
+                builder.wouldFitInBatch(getWriteOpId(*writeOp), analysis)) {
+                // If 'writeOp', consume it and add it to the current batch, and keep looping to see
+                // if more ops can be added to the batch.
+                _producer.advance();
+                builder.addOp(*writeOp, analysis);
+            } else {
+                // If this op isn't compatible, break out of the loop and return the current batch.
+                break;
+            }
+        } else {
+            // Consume the first op.
+            _producer.advance();
+
+            // If the first WriteOp should be put into a single batch, return the batch directly.
+            if (auto singleOpWriteBatch = builder.buildSingleOpWriteBatch(*writeOp, analysis)) {
+                return {*singleOpWriteBatch, std::move(opsWithErrors)};
+            }
+
+            // If the first WriteOp is kMultiShard or kRetryableWriteWithId, then start a new
+            // SimpleWriteBatch, add the op to the batch, and break and return the batch.
+            if (analysis.type != kSingleShard) {
+                builder.addOp(*writeOp, analysis);
+                break;
+            }
+            // If the op is kSingleShard, then start a new SimpleWriteBatch and add the op to the
+            // batch, and keep looping to see if more ops can be added to the batch.
+            builder.addOp(*writeOp, analysis);
+        }
+    }
+
+    // Return the batch we've built so far.
+    return {builder.done(), std::move(opsWithErrors)};
+}
+
+BatcherResult UnorderedWriteOpBatcher::getNextBatch(OperationContext* opCtx,
+                                                    RoutingContext& routingCtx) {
+    const bool inTransaction = static_cast<bool>(TransactionRouter::get(opCtx));
+
+    // When this method returns (or when an exception is thrown), mark the ops in 'opsToReprocess'
+    // for re-processing.
+    std::vector<WriteOp> opsToReprocess;
+    ON_BLOCK_EXIT([&] { markOpReprocess(opsToReprocess); });
+
+    std::vector<std::pair<WriteOp, Status>> opsWithErrors;
+    UnorderedSimpleBatchBuilder builder(opCtx, *this, _cmdRef);
+
+    // This outer loop searches for ops to add to the current batch.
+    for (;;) {
+        boost::optional<std::pair<WriteOp, Analysis>> analyzedOp;
+
+        // This inner loop that repeatedly peeks at the next op from the producer until either:
+        // (i) we successfully analyze an op, or (ii) we exhaust the producer, or (iii) we encounter
+        // an error that requires returning to the caller.
+        while (auto writeOp = _producer.peekNext()) {
+            // Call analyze(). If it succeeds, store 'writeOp' and 'swAnalysis.getValue()' into
+            // 'analyzedOp' and break out of the inner loop.
+            auto swAnalysis = _analyzer.analyze(opCtx, routingCtx, *writeOp);
+            if (swAnalysis.isOK()) {
+                // Advance past any ops where the operation already succeeded.
+                auto analysis = swAnalysis.getValue();
+
+                // Skips any operations for which all the shards already got successful replies.
+                removeSuccessfulShardsFromEndpoints(getWriteOpId(*writeOp),
+                                                    analysis.shardsAffected);
+                if (analysis.shardsAffected.empty()) {
+                    _producer.advance();
+                    continue;
+                }
+
+                analyzedOp.emplace(std::move(*writeOp), std::move(analysis));
+                break;
+            }
+            // If the write command is running in a transaction, then discard the current batch,
+            // consume the op, record the error, and return an empty batch.
+            if (inTransaction) {
+                opsWithErrors.emplace_back(std::move(*writeOp), swAnalysis.getStatus());
+                _producer.advance();
+
+                LOGV2_DEBUG(10896517,
+                            2,
+                            "Aborting write command due to error in transaction",
+                            "error"_attr = redact(swAnalysis.getStatus()));
+
+                const bool transientTxnError =
+                    isTransientTransactionError(swAnalysis.getStatus().code(),
+                                                /*hasWriteConcernError*/ false,
+                                                /*isCommitOrAbort*/ false);
+
+                return {WriteBatch{}, std::move(opsWithErrors), transientTxnError};
+            }
+
+            // Retry on target error once if possible.
+            if (retryOnTargetError(routingCtx, swAnalysis.getStatus())) {
+                return {WriteBatch{}, std::move(opsWithErrors)};
+            }
+
+            // If the write command is not in a transaction and '_retryOnTargetError' is false,
+            // then we consume the op, record the error, and continue looking for more ops to add
+            // to the batch we're building.
+            opsWithErrors.emplace_back(std::move(*writeOp), swAnalysis.getStatus());
+            _producer.advance();
+        }
+
+        // If the producer has been exhausted, return the current batch to the caller.
+        if (!analyzedOp) {
+            break;
+        }
+
+        auto& [writeOp, analysis] = *analyzedOp;
+
+        if (builder) {
+            // Consume 'writeOp'.
+            _producer.advance();
+            // Check if 'writeOp' is compatible with the current batch.
+            if (builder.isCompatibleWithBatch(writeOp.getNss(), analysis) &&
+                builder.wouldFitInBatch(getWriteOpId(writeOp), analysis)) {
+                // Add 'writeOp' to the current batch.
+                builder.addOp(writeOp, analysis);
+            } else {
+                // If 'writeOp' cannot be added to the current batch, then we add 'writeOp' to
+                // the 'opsToReprocess' vector.
+                opsToReprocess.emplace_back(writeOp);
+            }
+            // Continue looping looking for more ops to add to the batch.
+        } else {
+            // Consume 'writeOp'.
+            _producer.advance();
+
+            // If the first WriteOp should be put into a single batch, return the batch directly.
+            if (auto singleOpWriteBatch = builder.buildSingleOpWriteBatch(writeOp, analysis)) {
+                return {*singleOpWriteBatch, std::move(opsWithErrors)};
+            }
+
+            // If the op is kSingleShard or kMultiShard or kRetryableWriteWithId, then start a new
+            // SimpleWriteBatch and add the op to the batch, and keep looping to see if more ops can
+            // be added to the batch.
+            builder.addOp(writeOp, analysis);
+        }
+    }
+
+    // Return the batch we've built so far.
+    return {builder.done(), std::move(opsWithErrors)};
+}
+
+}  // namespace unified_write_executor
+}  // namespace mongo

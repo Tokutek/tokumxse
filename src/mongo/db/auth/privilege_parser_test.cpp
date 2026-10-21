@@ -1,210 +1,285 @@
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 /**
  * Unit tests of the ParsedPrivilege class.
  */
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/parsed_privilege_gen.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/auth/privilege_parser.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
-namespace mongo {
+#include <initializer_list>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo::auth {
 namespace {
+using namespace std::literals::string_view_literals;
+constexpr auto kActions = "actions"sv;
+constexpr auto kResource = "resource"sv;
+const BSONObj kClusterResource = BSON("cluster"sv << true);
+const BSONArray kFindActions = BSON_ARRAY("find"sv);
 
-    TEST(PrivilegeParserTest, IsValidTest) {
-        ParsedPrivilege parsedPrivilege;
-        std::string errmsg;
+TEST(PrivilegeParserTest, IsNotValidTest) {
+    IDLParserContext ctx("IsNotValidTest");
 
-        // must have resource
-        parsedPrivilege.parseBSON(BSON("actions" << BSON_ARRAY("find")), &errmsg);
-        ASSERT_FALSE(parsedPrivilege.isValid(&errmsg));
+    // must have resource
+    const BSONObj noRsrc = BSON(kActions << kFindActions);
+    constexpr auto noRsrcExpect =
+        "BSON field 'IsNotValidTest.resource' is missing but a required field"sv;
+    ASSERT_THROWS_CODE_AND_WHAT(ParsedPrivilege::parse(noRsrc, ctx),
+                                DBException,
+                                ErrorCodes::IDLFailedToParse,
+                                noRsrcExpect);
 
-        // must have actions
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("cluster" << true)), &errmsg);
-        ASSERT_FALSE(parsedPrivilege.isValid(&errmsg));
+    // must have actions
+    const BSONObj noActions = BSON(kResource << kClusterResource);
+    constexpr auto noActionsExpect =
+        "BSON field 'IsNotValidTest.actions' is missing but a required field"sv;
+    ASSERT_THROWS_CODE_AND_WHAT(ParsedPrivilege::parse(noActions, ctx),
+                                DBException,
+                                ErrorCodes::IDLFailedToParse,
+                                noActionsExpect);
+}
 
-        // resource can't have cluster as well as db or collection
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("cluster" << true <<
-                                                          "db" << "" <<
-                                                          "collection" << "") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT_FALSE(parsedPrivilege.isValid(&errmsg));
+Privilege resolvePrivilege(BSONObj obj, std::vector<std::string>* unrecognized = nullptr) {
+    IDLParserContext ctx("resolvePrivilege");
+    auto pp = ParsedPrivilege::parse(obj, ctx);
+    return Privilege::resolvePrivilegeWithTenant(boost::none /* tenantId */, pp, unrecognized);
+}
 
-        // resource can't have db without collection
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT_FALSE(parsedPrivilege.isValid(&errmsg));
+const std::set<std::string_view> kBoolResourceTypes = {
+    "cluster"sv,
+    "anyResource"sv,
+};
 
-        // resource can't have collection without db
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("collection" << "") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT_FALSE(parsedPrivilege.isValid(&errmsg));
+const std::set<std::string_view> kAllResourceTypes = {
+    "cluster"sv,
+    "anyResource"sv,
+    "db"sv,
+    "collection"sv,
+    "system_buckets"sv,
+};
 
-        // Works with wildcard db and resource
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "" << "collection" << "") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
+BSONObj makeResource(const boost::optional<std::string_view>& db,
+                     const boost::optional<std::string_view>& collection,
+                     const boost::optional<std::string_view>& system_buckets) {
+    BSONObjBuilder builder;
+    if (db) {
+        builder.append("db"sv, db.get());
+    }
+    if (collection) {
+        builder.append("collection"sv, collection.get());
+    }
+    if (system_buckets) {
+        builder.append("system_buckets"sv, system_buckets.get());
+    }
+    return builder.obj();
+}
 
-        // Works with real db and collection
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "test" <<
-                                                          "collection" << "foo") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
+TEST(PrivilegeParserTest, CombiningTypesNegative) {
+    // resource can't have cluster or anyResource with other keys
+    for (std::string_view primary : {"cluster"sv, "anyResource"sv}) {
+        for (std::string_view secondary : kAllResourceTypes) {
+            if (primary == secondary) {
+                continue;
+            }
 
-        // Works with cluster resource
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("cluster" << true) <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
+            BSONObjBuilder builder;
+            {
+                BSONObjBuilder rsrcBuilder(builder.subobjStart("resource"sv));
+                rsrcBuilder.append(primary, true);
+                if (kBoolResourceTypes.count(secondary) > 0) {
+                    rsrcBuilder.append(secondary, true);
+                } else {
+                    rsrcBuilder.append(secondary, "foo"sv);
+                }
+                rsrcBuilder.doneFast();
+            }
+            builder.append("actions"sv, kFindActions);
+
+            if (secondary == "cluster"sv) {
+                // Error messages treat cluster as always primary.
+                std::swap(primary, secondary);
+            }
+            const std::string expect = str::stream()
+                << "resource: {" << primary << ": true} conflicts with resource type '" << secondary
+                << "'";
+
+            ASSERT_THROWS_CODE_AND_WHAT(
+                resolvePrivilege(builder.obj()), DBException, ErrorCodes::BadValue, expect);
+        }
     }
 
-    TEST(PrivilegeParserTest, ConvertBetweenPrivilegeTest) {
-        ParsedPrivilege parsedPrivilege;
-        Privilege privilege;
-        std::string errmsg;
-        std::vector<std::string> actionsVector;
-        actionsVector.push_back("find");
+    // collection and system_buckets may not co-exist
+    ASSERT_THROWS_CODE_AND_WHAT(
+        resolvePrivilege(BSON("resource"sv << makeResource("db"sv, "coll"sv, "bucket"sv)
+                                           << "actions"sv << kFindActions)),
+        DBException,
+        ErrorCodes::BadValue,
+        "resource: {collection: '...'} conflicts with resource type 'system_buckets'");
 
-        // Works with wildcard db and resource
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "" << "collection" << "") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(ParsedPrivilege::parsedPrivilegeToPrivilege(parsedPrivilege, &privilege, &errmsg));
-        ASSERT(privilege.getActions().contains(ActionType::find));
-        ASSERT(!privilege.getActions().contains(ActionType::insert));
-        ASSERT_EQUALS(privilege.getResourcePattern(), ResourcePattern::forAnyNormalResource());
+    // db requires collection (or system_buckets)
+    ASSERT_THROWS_CODE_AND_WHAT(
+        resolvePrivilege(BSON("resource"sv << makeResource("db"sv, boost::none, boost::none)
+                                           << "actions"sv << kFindActions)),
+        DBException,
+        ErrorCodes::BadValue,
+        "resource pattern must contain 'collection' or 'systemBuckets' specifier");
 
-        ASSERT(ParsedPrivilege::privilegeToParsedPrivilege(privilege, &parsedPrivilege, &errmsg));
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(parsedPrivilege.isResourceSet());
-        ASSERT_FALSE(parsedPrivilege.getResource().isClusterSet());
-        ASSERT(parsedPrivilege.getResource().isDbSet());
-        ASSERT(parsedPrivilege.getResource().isCollectionSet());
-        ASSERT_EQUALS("", parsedPrivilege.getResource().getDb());
-        ASSERT_EQUALS("", parsedPrivilege.getResource().getCollection());
-        ASSERT(parsedPrivilege.isActionsSet());
-        ASSERT(actionsVector == parsedPrivilege.getActions());
+    // resource can't have collection without db
+    ASSERT_THROWS_CODE_AND_WHAT(
+        resolvePrivilege(BSON("resource"sv << makeResource(boost::none, "coll"sv, boost::none)
+                                           << "actions"sv << kFindActions)),
+        DBException,
+        ErrorCodes::BadValue,
+        "resource {collection: '...'} must include 'db' field as well");
+}
 
-        // Works with exact namespaces
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "test" <<
-                                                          "collection" << "foo") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(ParsedPrivilege::parsedPrivilegeToPrivilege(parsedPrivilege, &privilege, &errmsg));
-        ASSERT(privilege.getActions().contains(ActionType::find));
-        ASSERT(!privilege.getActions().contains(ActionType::insert));
-        ASSERT_EQUALS(privilege.getResourcePattern(),
-                      ResourcePattern::forExactNamespace(NamespaceString("test.foo")));
+TEST(PrivilegeParserTest, IsValidTest) {
+    // Works with cluster resource
+    auto clusterPriv =
+        resolvePrivilege(BSON("resource"sv << kClusterResource << "actions"sv << kFindActions));
+    ASSERT_TRUE(clusterPriv.getResourcePattern().isClusterResourcePattern());
 
-        ASSERT(ParsedPrivilege::privilegeToParsedPrivilege(privilege, &parsedPrivilege, &errmsg));
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(parsedPrivilege.isResourceSet());
-        ASSERT_FALSE(parsedPrivilege.getResource().isClusterSet());
-        ASSERT(parsedPrivilege.getResource().isDbSet());
-        ASSERT(parsedPrivilege.getResource().isCollectionSet());
-        ASSERT_EQUALS("test", parsedPrivilege.getResource().getDb());
-        ASSERT_EQUALS("foo", parsedPrivilege.getResource().getCollection());
-        ASSERT(parsedPrivilege.isActionsSet());
-        ASSERT(actionsVector == parsedPrivilege.getActions());
+    // Works with anyResource resource
+    auto anyResourcePriv = resolvePrivilege(
+        BSON("resource"sv << BSON("anyResource"sv << true) << "actions"sv << kFindActions));
+    ASSERT_TRUE(anyResourcePriv.getResourcePattern().isAnyResourcePattern());
 
-        // Works with database resource
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "test" <<
-                                                          "collection" << "") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(ParsedPrivilege::parsedPrivilegeToPrivilege(parsedPrivilege, &privilege, &errmsg));
-        ASSERT(privilege.getActions().contains(ActionType::find));
-        ASSERT(!privilege.getActions().contains(ActionType::insert));
-        ASSERT_EQUALS(privilege.getResourcePattern(), ResourcePattern::forDatabaseName("test"));
+    // Works with wildcard db and resource
+    auto anyNormalPriv = resolvePrivilege(
+        BSON("resource"sv << makeResource(""sv, ""sv, boost::none) << "actions"sv << kFindActions));
+    ASSERT_TRUE(anyNormalPriv.getResourcePattern().isAnyNormalResourcePattern());
 
-        ASSERT(ParsedPrivilege::privilegeToParsedPrivilege(privilege, &parsedPrivilege, &errmsg));
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(parsedPrivilege.isResourceSet());
-        ASSERT_FALSE(parsedPrivilege.getResource().isClusterSet());
-        ASSERT(parsedPrivilege.getResource().isDbSet());
-        ASSERT(parsedPrivilege.getResource().isCollectionSet());
-        ASSERT_EQUALS("test", parsedPrivilege.getResource().getDb());
-        ASSERT_EQUALS("", parsedPrivilege.getResource().getCollection());
-        ASSERT(parsedPrivilege.isActionsSet());
-        ASSERT(actionsVector == parsedPrivilege.getActions());
+    // Works with real db and collection
+    auto exactNSSPriv =
+        resolvePrivilege(BSON("resource"sv << makeResource("db1"sv, "coll"sv, boost::none)
+                                           << "actions"sv << kFindActions));
+    ASSERT_TRUE(exactNSSPriv.getResourcePattern().isExactNamespacePattern());
+    ASSERT_EQ(exactNSSPriv.getResourcePattern().dbNameToMatch().toString_forTest(), "db1"sv);
+    ASSERT_EQ(exactNSSPriv.getResourcePattern().collectionToMatch(), "coll"sv);
 
-        // Works with collection resource
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("db" << "" <<
-                                                          "collection" << "foo") <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(ParsedPrivilege::parsedPrivilegeToPrivilege(parsedPrivilege, &privilege, &errmsg));
-        ASSERT(privilege.getActions().contains(ActionType::find));
-        ASSERT(!privilege.getActions().contains(ActionType::insert));
-        ASSERT_EQUALS(privilege.getResourcePattern(), ResourcePattern::forCollectionName("foo"));
+    // Works with any bucket in any db (implicit)
+    auto anyBucketImplicit =
+        resolvePrivilege(BSON("resource"sv << makeResource(boost::none, boost::none, ""sv)
+                                           << "actions"sv << kFindActions));
+    ASSERT_TRUE(anyBucketImplicit.getResourcePattern().isAnySystemBucketsCollection());
+    ASSERT_EQ(anyBucketImplicit.getResourcePattern().dbNameToMatch().toString_forTest(), ""sv);
+    ASSERT_EQ(anyBucketImplicit.getResourcePattern().collectionToMatch(), ""sv);
 
-        ASSERT(ParsedPrivilege::privilegeToParsedPrivilege(privilege, &parsedPrivilege, &errmsg));
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(parsedPrivilege.isResourceSet());
-        ASSERT_FALSE(parsedPrivilege.getResource().isClusterSet());
-        ASSERT(parsedPrivilege.getResource().isDbSet());
-        ASSERT(parsedPrivilege.getResource().isCollectionSet());
-        ASSERT_EQUALS("", parsedPrivilege.getResource().getDb());
-        ASSERT_EQUALS("foo", parsedPrivilege.getResource().getCollection());
-        ASSERT(parsedPrivilege.isActionsSet());
-        ASSERT(actionsVector == parsedPrivilege.getActions());
+    // Works with any bucket in any db (explicit)
+    auto anyBucketExplicit = resolvePrivilege(
+        BSON("resource"sv << makeResource(""sv, boost::none, ""sv) << "actions"sv << kFindActions));
+    ASSERT_TRUE(anyBucketExplicit.getResourcePattern().isAnySystemBucketsCollection());
+    ASSERT_EQ(anyBucketExplicit.getResourcePattern().dbNameToMatch().toString_forTest(), ""sv);
+    ASSERT_EQ(anyBucketExplicit.getResourcePattern().collectionToMatch(), ""sv);
 
-        // Works with cluster resource
-        parsedPrivilege.parseBSON(BSON("resource" << BSON("cluster" << true) <<
-                                       "actions" << BSON_ARRAY("find")),
-                                  &errmsg);
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(ParsedPrivilege::parsedPrivilegeToPrivilege(parsedPrivilege, &privilege, &errmsg));
-        ASSERT(privilege.getActions().contains(ActionType::find));
-        ASSERT(!privilege.getActions().contains(ActionType::insert));
-        ASSERT_EQUALS(privilege.getResourcePattern(), ResourcePattern::forClusterResource());
+    // Works with system_buckets in any db (implicit)
+    auto bucketAnyDBImplicit =
+        resolvePrivilege(BSON("resource"sv << makeResource(boost::none, boost::none, "bucket"sv)
+                                           << "actions"sv << kFindActions));
+    ASSERT_TRUE(bucketAnyDBImplicit.getResourcePattern().isAnySystemBucketsCollectionInAnyDB());
+    ASSERT_EQ(bucketAnyDBImplicit.getResourcePattern().dbNameToMatch().toString_forTest(), ""sv);
+    ASSERT_EQ(bucketAnyDBImplicit.getResourcePattern().collectionToMatch(), "bucket"sv);
 
-        ASSERT(ParsedPrivilege::privilegeToParsedPrivilege(privilege, &parsedPrivilege, &errmsg));
-        ASSERT(parsedPrivilege.isValid(&errmsg));
-        ASSERT(parsedPrivilege.isResourceSet());
-        ASSERT(parsedPrivilege.getResource().isClusterSet());
-        ASSERT(parsedPrivilege.getResource().getCluster());
-        ASSERT_FALSE(parsedPrivilege.getResource().isDbSet());
-        ASSERT_FALSE(parsedPrivilege.getResource().isCollectionSet());
-        ASSERT(parsedPrivilege.isActionsSet());
-        ASSERT(actionsVector == parsedPrivilege.getActions());
+    // Works with system_buckets in any db (explicit)
+    auto bucketAnyDBExplicit =
+        resolvePrivilege(BSON("resource"sv << makeResource(""sv, boost::none, "bucket"sv)
+                                           << "actions"sv << kFindActions));
+    ASSERT_TRUE(bucketAnyDBExplicit.getResourcePattern().isAnySystemBucketsCollectionInAnyDB());
+    ASSERT_EQ(bucketAnyDBExplicit.getResourcePattern().dbNameToMatch().toString_forTest(), ""sv);
+    ASSERT_EQ(bucketAnyDBExplicit.getResourcePattern().collectionToMatch(), "bucket"sv);
+
+    // Works with any system_bucket in specific db
+    auto bucketInDB = resolvePrivilege(BSON("resource"sv << makeResource("db1"sv, boost::none, ""sv)
+                                                         << "actions"sv << kFindActions));
+    ASSERT_TRUE(bucketInDB.getResourcePattern().isAnySystemBucketsCollectionInDB());
+    ASSERT_EQ(bucketInDB.getResourcePattern().dbNameToMatch().toString_forTest(), "db1"sv);
+    ASSERT_EQ(bucketInDB.getResourcePattern().collectionToMatch(), ""sv);
+
+    // Works with exact system buckets namespace.
+    auto exactBucket =
+        resolvePrivilege(BSON("resource"sv << makeResource("db1"sv, boost::none, "bucket"sv)
+                                           << "actions"sv << kFindActions));
+    ASSERT_TRUE(exactBucket.getResourcePattern().isExactSystemBucketsCollection());
+    ASSERT_EQ(exactBucket.getResourcePattern().dbNameToMatch().toString_forTest(), "db1"sv);
+    ASSERT_EQ(exactBucket.getResourcePattern().collectionToMatch(), "bucket"sv);
+}
+
+TEST(PrivilegeParserTest, RoundTrip) {
+    const std::vector<BSONObj> resourcePatterns = {
+        BSON("cluster"sv << true),
+        BSON("anyResource"sv << true),
+        BSON("db"sv << ""
+                    << "collection"sv
+                    << ""),
+        BSON("db"sv << ""
+                    << "collection"sv
+                    << "coll1"),
+        BSON("db"sv << "db1"
+                    << "collection"sv
+                    << ""),
+        BSON("db"sv << "db1"
+                    << "collection"sv
+                    << "coll1"),
+        BSON("system_buckets"sv << "bucket"sv),
+        BSON("db"sv << "db1"
+                    << "system_buckets"sv
+                    << "bucket"sv),
+    };
+    const std::vector<BSONArray> actionTypes = {
+        BSON_ARRAY("find"sv),
+        BSON_ARRAY("anyAction"sv),
+        BSON_ARRAY("find"sv << "insert"sv
+                            << "remove"sv
+                            << "update"sv),
+    };
+
+    for (const auto& pattern : resourcePatterns) {
+        for (const auto& actions : actionTypes) {
+            auto obj = BSON("resource"sv << pattern << "actions"sv << actions);
+            auto priv = resolvePrivilege(obj);
+            auto serialized = priv.toBSON();
+            ASSERT_BSONOBJ_EQ(obj, serialized);
+        }
     }
+}
+
+TEST(PrivilegeParserTest, ParseInvalidActionsTest) {
+    auto obj = BSON("resource"sv << kClusterResource << "actions"sv
+                                 << BSON_ARRAY("find"sv << "fakeAction"sv));
+    std::vector<std::string> unrecognized;
+    auto priv = resolvePrivilege(obj, &unrecognized);
+
+    ASSERT_TRUE(priv.getResourcePattern().isClusterResourcePattern());
+    ASSERT_TRUE(priv.getActions().contains(ActionType::find));
+    ASSERT_FALSE(priv.getActions().contains(ActionType::insert));
+    ASSERT_EQUALS(1U, unrecognized.size());
+    ASSERT_EQUALS("fakeAction", unrecognized[0]);
+}
 
 }  // namespace
-}  // namespace mongo
+}  // namespace mongo::auth

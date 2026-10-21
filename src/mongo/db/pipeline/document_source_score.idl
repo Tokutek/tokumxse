@@ -1,0 +1,42 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ScoreNormalization:
+        description: Normalize function options
+        type: string
+        values:
+            kNone: "none"
+            kSigmoid: "sigmoid"
+            kMinMaxScaler: "minMaxScaler"
+
+structs:
+    ScoreSpec:
+        description: Specification for a $score stage.
+        strict: true
+        fields:
+            score:
+                description: Computes new value and reports it in score details metadata
+                type: IDLAnyType
+                optional: false
+            normalization:
+                description: Type of score normalization function (none, sigmoid, minMaxScaler)
+                type: ScoreNormalization
+                default: "kNone"
+            weight:
+                description: Number to multiply the 'score' expression by, after normalization
+                type: safeDouble
+                default: 1.0
+                validator:
+                    lte: 1.0
+                    gte: 0.0
+            scoreDetails:
+                description: If true scoreDetails will be materialized. Will include sub-pipeline scoreDetails if they have them.
+                type: bool
+                default: false

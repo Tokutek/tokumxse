@@ -1,0 +1,24 @@
+version: 1.0.0
+filters:
+  - "initial_sync.js":
+    approvers:
+      - 10gen/server-initial-sync
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "mixed_version_fixture_test.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "multi_rs.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "multiversion_rollback.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "mixed_version_sharded_fixture_test.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "multi_cluster.js":
+    approvers:
+      - 10gen/server-catalog-and-routing-routing-and-topology
+  - "supported_versions.js":
+    approvers:
+      - 10gen/server-replication-reviewers

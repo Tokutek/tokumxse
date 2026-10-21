@@ -1,0 +1,279 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/db/router_role/routing_context.h"
+
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/versioning_protocol/stale_exception.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
+
+#include <exception>
+#include <optional>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+namespace mongo {
+namespace {
+boost::optional<Timestamp> getEffectiveAtClusterTime(OperationContext* opCtx) {
+    if (auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
+        // Check the read concern for the atClusterTime argument.
+        return atClusterTime->asTimestamp();
+    }
+
+    if (auto txnRouter = TransactionRouter::get(opCtx)) {
+        // Check to see if we're running in a transaction with snapshot level read concern.
+        if (auto atClusterTime = txnRouter.getSelectedAtClusterTime()) {
+            return atClusterTime->asTimestamp();
+        }
+    }
+
+    // Otherwise, the latest routing table is sufficient.
+    return boost::none;
+}
+}  // namespace
+
+RoutingContext::RoutingContext(OperationContext* opCtx,
+                               const std::vector<NamespaceString>& nssList,
+                               bool allowLocks,
+                               bool checkTimeseriesBucketsNss)
+    : _catalogCache(Grid::get(opCtx)->catalogCache()),
+      _checkTimeseriesBucketsNss(checkTimeseriesBucketsNss) {
+    _nssRoutingInfoMap.reserve(nssList.size());
+
+    for (const auto& nss : nssList) {
+        auto insertRoutingInfo = [&](NamespaceString nss, CollectionRoutingInfo cri) {
+            auto [it, inserted] = _nssRoutingInfoMap.try_emplace(
+                nss, RoutingInfoEntry{std::move(cri), false /* validated */});
+            tassert(10292300,
+                    str::stream() << "Namespace " << nss.toStringForErrorMsg()
+                                  << " declared multiple times in RoutingContext",
+                    inserted);
+        };
+
+        auto cri = uassertStatusOK(_getCollectionRoutingInfo(opCtx, nss, allowLocks));
+
+        // For tracked legacy timeseries collection we only register the buckets collection in the
+        // global catalog, therefore we only need to check when the logical namespace does not have
+        // a routing table.
+        if (checkTimeseriesBucketsNss && !cri.getChunkManager().hasRoutingTable()) {
+            auto bucketsNss = nss.makeTimeseriesBucketsNamespace();
+            const auto& bucketsCri =
+                uassertStatusOK(_getCollectionRoutingInfo(opCtx, bucketsNss, allowLocks));
+            if (bucketsCri.hasRoutingTable()) {
+                insertRoutingInfo(bucketsNss, bucketsCri);
+            }
+        }
+
+        insertRoutingInfo(nss, std::move(cri));
+    }
+}
+
+RoutingContext::RoutingContext(
+    OperationContext* opCtx,
+    const stdx::unordered_map<NamespaceString, CollectionRoutingInfo>& nssToCriMap)
+    : _catalogCache(Grid::get(opCtx)->catalogCache()) {
+    for (auto& [nss, cri] : nssToCriMap) {
+        auto [it, inserted] = _nssRoutingInfoMap.try_emplace(
+            nss, RoutingInfoEntry{std::move(cri), false /* validated */});
+        tassert(10402001,
+                str::stream() << "Namespace " << nss.toStringForErrorMsg()
+                              << " declared multiple times in RoutingContext",
+                inserted);
+    }
+}
+
+std::unique_ptr<RoutingContext> RoutingContext::createSynthetic(
+    stdx::unordered_map<NamespaceString, CollectionRoutingInfo> nssMap) {
+    return std::unique_ptr<RoutingContext>(new RoutingContext(std::move(nssMap)));
+}
+RoutingContext::RoutingContext(stdx::unordered_map<NamespaceString, CollectionRoutingInfo> nssMap)
+    : _catalogCache(nullptr), _nssRoutingInfoMap([nssMap = std::move(nssMap)]() {
+          NssRoutingInfoMap result;
+          for (auto&& [nss, cri] : nssMap) {
+              result.emplace(std::move(nss),
+                             RoutingInfoEntry{std::move(cri), false /* validated */});
+          }
+          return result;
+      }()) {}
+
+const CollectionRoutingInfo& RoutingContext::getCollectionRoutingInfo(
+    const NamespaceString& nss) const {
+    tassert(10411401,
+            "should not have acquired routing info for namespace released from routing context",
+            !_releasedNssList.contains(nss));
+    auto it = _nssRoutingInfoMap.find(nss);
+    uassert(10292301,
+            str::stream() << "Attempted to access RoutingContext for undeclared namespace "
+                          << nss.toStringForErrorMsg(),
+            it != _nssRoutingInfoMap.end());
+    return it->second.cri;
+}
+
+bool RoutingContext::hasNss(const NamespaceString& nss) const {
+    return _nssRoutingInfoMap.find(nss) != _nssRoutingInfoMap.end();
+}
+
+std::vector<NamespaceString> RoutingContext::getNssList() const {
+    std::vector<NamespaceString> nssList;
+    nssList.reserve(_nssRoutingInfoMap.size());
+
+    for (const auto& [nss, _] : _nssRoutingInfoMap) {
+        nssList.emplace_back(nss);
+    }
+
+    return nssList;
+}
+
+StatusWith<CollectionRoutingInfo> RoutingContext::_getCollectionRoutingInfo(
+    OperationContext* opCtx, const NamespaceString& nss, bool allowLocks) const {
+    if (auto atClusterTime = getEffectiveAtClusterTime(opCtx)) {
+        return _catalogCache->getCollectionRoutingInfoAt(opCtx, nss, *atClusterTime, allowLocks);
+    } else {
+        return _catalogCache->getCollectionRoutingInfo(opCtx, nss, allowLocks);
+    }
+}
+
+void RoutingContext::onRequestSentForNss(const NamespaceString& nss) {
+    tassert(10411400,
+            "should not have sent request for namespace released from routing context",
+            !_releasedNssList.contains(nss));
+    if (auto& validated = _nssRoutingInfoMap.at(nss).validated; !validated) {
+        validated = true;
+    }
+
+    if (_checkTimeseriesBucketsNss) {
+        auto bucketsNss = nss.makeTimeseriesBucketsNamespace();
+        if (_nssRoutingInfoMap.contains(bucketsNss)) {
+            _nssRoutingInfoMap.at(bucketsNss).validated = true;
+        }
+    }
+}
+
+void RoutingContext::onStaleError(const Status& status,
+                                  boost::optional<const NamespaceString&> nss) {
+
+    tassert(11451300,
+            str::stream() << "onStaleError called with invalid error category: " << status.code()
+                          << ". Expected StaleShardVersionError or StaleDbVersion",
+            status.code() == ErrorCodes::StaleDbVersion ||
+                ErrorCodes::isStaleShardVersionError(status));
+
+    if (status.code() == ErrorCodes::StaleDbVersion) {
+        auto si = status.extraInfo<StaleDbRoutingVersion>();
+        // If the database version is stale, refresh its entry in the catalog cache.
+        _catalogCache->onStaleDatabaseVersion(si->getDb(), si->getVersionWanted());
+    } else if (ErrorCodes::isStaleShardVersionError(status)) {
+        // 1. If the exception provides a shardId, add it to the set of shards requiring a refresh.
+        // 2. If the cache currently considers the collection to be unsharded, this will trigger an
+        //    epoch refresh.
+        // 3. If no shard is provided, then the epoch is stale and we must refresh.
+        if (auto si = status.extraInfo<StaleConfigInfo>()) {
+            const auto& staleNs = si->getNss();
+
+            // TODO(SERVER-118822): Remove this once 9.0 becomes last LTS
+            if (staleNs.isTimeseriesBucketsCollection()) {
+                // Legacy timeseries: buckets is tracked. Also invalidate the view namespace
+                // in case it was converted to viewless and now the main namespace is tracked.
+                _catalogCache->onStaleCollectionVersion(staleNs.getTimeseriesViewNamespace(),
+                                                        boost::none);
+            } else if (auto it = _nssRoutingInfoMap.find(staleNs); it != _nssRoutingInfoMap.end()) {
+                const auto& cri = it->second.cri;
+                if (cri.hasRoutingTable() && cri.getChunkManager().isNewTimeseriesWithoutView()) {
+                    // Viewless timeseries: view is tracked. Also invalidate the buckets
+                    // namespace in case it was converted to legacy and now the buckets namespace is
+                    // tracked.
+                    _catalogCache->onStaleCollectionVersion(
+                        staleNs.makeTimeseriesBucketsNamespace(), boost::none);
+                }
+            }
+
+            _catalogCache->onStaleCollectionVersion(staleNs, si->getVersionWanted());
+        } else if (auto sei = status.extraInfo<StaleEpochInfo>()) {
+            const auto& versionWanted = sei->getVersionWanted();
+            if (!versionWanted.has_value() || versionWanted == ShardVersion{}) {
+                // The StaleEpochInfo does not always have a valid `wanted` version.
+                _catalogCache->onStaleCollectionVersion(sei->getNss(), boost::none);
+            } else {
+                _catalogCache->onStaleCollectionVersion(sei->getNss(), versionWanted);
+            }
+        } else {
+            // StaleEpoch errors may not contain ExtraInfo with namespace information.
+            // In such cases, we require the namespace to be passed as a parameter to properly
+            // invalidate the routing cache. This is a legacy behavior that should be removed
+            // once all StaleEpoch errors are guaranteed to contain namespace information.
+            // TODO: SERVER-109793 Remove the optional nss parameter once all StaleShardVersion
+            // errors contain ExtraInfo with namespace information.
+
+            tassert(11451301,
+                    str::stream() << "StaleShardVersion error without ExtraInfo must be "
+                                  << "StaleEpoch error. Error code: " << status.code(),
+                    status.code() == ErrorCodes::StaleEpoch);
+
+            if (nss.has_value()) {
+                _catalogCache->invalidateCollectionEntry_LINEARIZABLE(*nss);
+            } else {
+                // Let's refresh all the namespaces assigned to this RoutingContext if there is no
+                // way to know what are the namespaces with stale routing info
+                // TODO: SERVER-109793 once StaleEpochInfo becomes non-optional, it won't be
+                // possible to reach this `else`. Therefore, we should replace the for below and add
+                // a tassert.
+                for (const auto& [nss, _] : _nssRoutingInfoMap) {
+                    _catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+                }
+            }
+        }
+    }
+}
+
+void RoutingContext::onStaleShardVersionError(const NamespaceString& nss,
+                                              const boost::optional<ShardVersion>& wantedVersion) {
+    _catalogCache->onStaleCollectionVersion(nss, wantedVersion);
+}
+
+void RoutingContext::skipValidation() {
+    _skipValidation = true;
+}
+
+void RoutingContext::release(const NamespaceString& nss) {
+    _releasedNssList.insert(nss);
+
+    if (_checkTimeseriesBucketsNss) {
+        auto bucketsNss = nss.makeTimeseriesBucketsNamespace();
+        if (_nssRoutingInfoMap.contains(bucketsNss)) {
+            _releasedNssList.insert(bucketsNss);
+        }
+    }
+}
+
+void RoutingContext::validateOnContextEnd() const {
+    if (_skipValidation) {
+        return;
+    }
+
+    for (const auto& [nss, routingInfoEntry] : _nssRoutingInfoMap) {
+        if (auto validated = routingInfoEntry.validated; !validated) {
+            if (_releasedNssList.contains(nss)) {
+                // If the namespace was released, we don't expect it to be validated.
+                continue;
+            }
+            if (TestingProctor::instance().isEnabled()) {
+                tasserted(10446900,
+                          str::stream()
+                              << "RoutingContext ended without validating routing tables for nss "
+                              << nss.toStringForErrorMsg());
+            } else {
+                LOGV2_ERROR(10446901,
+                            "RoutingContext ended without validating routing tables for nss.",
+                            "nss"_attr = nss.toStringForErrorMsg());
+            }
+        }
+    }
+}
+}  // namespace mongo

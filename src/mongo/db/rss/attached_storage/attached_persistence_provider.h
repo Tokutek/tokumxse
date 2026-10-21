@@ -1,0 +1,273 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/rss/persistence_provider.h"
+#include "mongo/db/storage/checkpoint_schedule_policy.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/util/modules.h"
+
+namespace mongo::rss {
+
+class AttachedPersistenceProvider : public PersistenceProvider {
+public:
+    std::string name() const override;
+
+    /**
+     * We do not have any specific initialization requirements.
+     */
+    boost::optional<Timestamp> getSentinelDataTimestamp() const override;
+
+    /**
+     * We do not have any additional WT config to add.
+     */
+    std::string getWiredTigerConfig(bool wtInMemory,
+                                    bool wtLogEnabled,
+                                    const std::string& wtLogCompressor) const override;
+
+    /**
+     * No additional settings required by the provider for tables from the main WiredTiger storage
+     * engine instance.
+     */
+    std::string getMainWiredTigerTableSettings() const override;
+
+    /**
+     * Replicated catalog identifiers aren't compatible with attached storage as of right now, as a
+     * node may create a local collection whose catalog identifier collides with that of a
+     * replicated collection created on another node.
+     */
+    bool shouldUseReplicatedCatalogIdentifiers() const override;
+
+    /**
+     * Attached storage does not require that indexes are built by the primary.
+     */
+    bool mustUsePrimaryDrivenIndexBuilds() const override;
+
+    /**
+     * Attached storage does not replicate table-level operations through the oplog.
+     */
+    bool mustUseContainerWrites() const override;
+
+    /**
+     * Attached storage does not require replicated RecordIds to function correctly.
+     */
+    bool shouldUseReplicatedRecordIds() const override;
+
+    /**
+     * Attached storage gates the clustered-on-_id oplog apply fast path behind the FCV-gated
+     * featureFlagClusteredCollectionOplogApplyFastPath, so the provider does not mandate it.
+     */
+    bool shouldUseClusteredCollectionOplogFastPath() const override;
+
+    /**
+     * Attached storage uses unreplicated truncates.
+     */
+    bool shouldUseReplicatedTruncates() const override;
+
+    /**
+     * Attached storage uses unreplicated fastcounts.
+     */
+    bool shouldUseReplicatedFastCount() const override;
+
+    /**
+     * Attached storage nodes own their physical state, so per-document validation hashes are not
+     * replicated on the oplog.
+     */
+    bool shouldUseContinuousInternodeValidation() const override;
+
+    /**
+     * Attached storage nodes own their physical container state, and initial sync cannot seed
+     * container contents for unreplicated namespaces (e.g. the oplog's own fast count entry), so
+     * container op application self-heals on state mismatches.
+     */
+    bool relaxContainerOplogConstraints() const override;
+
+    /**
+     * Flow control is based on the rate of generation of oplog data and the ability of the
+     * secondaries to keep the majority commit point relatively up-to-date.
+     */
+    bool shouldUseOplogWritesForFlowControlSampling() const override;
+
+    /**
+     * Stepping down prior to shut down allows for a graceful and quick election most of the time.
+     */
+    bool shouldStepDownForShutdown() const override;
+
+    /**
+     * We can safely initialize the catalog immediately after starting the storage engine.
+     */
+    bool shouldDelayDataAccessDuringStartup() const override;
+
+    /**
+     * Running a duplicate checkpoint for a given timestamp has little effect other than being
+     * slightly inefficient, so there's no need to use extra synchronization to avoid it.
+     */
+    bool shouldAvoidDuplicateCheckpoints() const override;
+
+    bool supportsCursorReuseForExpressPathQueries() const override;
+
+    /**
+     * We can support local, fully unreplicated collections.
+     */
+    bool supportsLocalCollections() const override;
+
+    /**
+     * We can support unstable checkpoints.
+     */
+    bool supportsUnstableCheckpoints() const override;
+
+    /**
+     * We do not support preserving prepared transactions in the precise checkpoints.
+     */
+    bool supportsPreservingPreparedTxnInPreciseCheckpoints() const override;
+
+    /**
+     * We can support version cursors.
+     */
+    bool supportsVersionCursor() const override;
+
+    /**
+     * We can support table logging.
+     */
+    bool supportsTableLogging() const override;
+
+    /**
+     * We can support cross-shard transactions.
+     */
+    bool supportsCrossShardTransactions() const override;
+
+    /**
+     * Attached storage supports storing findAndModify pre/post-images in the image collection.
+     * However, currently we disable it if featureFlagDisallowFindAndModifyImageCollection is
+     * enabled for testing purposes. The feature flag will be removed in SERVER-117324.
+     */
+    bool supportsFindAndModifyImageCollection() const override;
+
+    /*
+     * We support initializing the cap maintainer thread at startup.
+     */
+    bool supportsPersistentOplogCapMaintainerThread() const override;
+
+    /*
+     * Async oplog marker generation is supported if allowed by a feature flag.
+     */
+    bool supportsAsyncOplogMarkerGeneration() const override;
+
+    /*
+     * We can support scanning and sampling the oplog.
+     */
+    bool supportsOplogSampling() const override;
+    bool supportsOplogScanning() const override;
+
+    bool supportsWriteConcernOptions(const WriteConcernOptions& writeConcernOptions) const override;
+
+    bool supportsReadConcernLevel(const repl::ReadConcernLevel& readConcernLevel) const override;
+
+    /**
+     * We can enable it only for testing purposes.
+     */
+    bool shouldDisableTransactionUpdateCoalescing() const override;
+
+    /**
+     * The minimum FCV required for attached storage clusters.
+     */
+    multiversion::FeatureCompatibilityVersion getMinimumRequiredFCV() const override;
+
+    /**
+     * The default memory_page_max value to set on WT for the oplog in string format.
+     */
+    const char* getWTMemoryPageMaxForOplogStrValue() const override;
+
+    /**
+     * The lowest size the oplog collection can be resized to via replSetResizeOplog.
+     */
+    double getMinOplogSizeMB() const override;
+
+    /**
+     * We can support compaction.
+     */
+    bool supportsCompaction() const override;
+
+    /**
+     * We support using magic restore in classic mode.
+     */
+    bool supportsClassicMagicRestore() const override;
+
+    /**
+     * Does not use schema epochs for table creation.
+     */
+    bool usesSchemaEpochs() const override;
+
+    /**
+     * Attached storage does not use layered tables, so blind writes offer no benefit. Always
+     * returns false.
+     */
+    bool shouldUseBlindWriteWhenSafe(OperationContext* opCtx) const override;
+
+    /**
+     * Attached storage does not use schema epochs; always returns 0.
+     */
+    uint64_t getSchemaEpochForTimestamp(Timestamp ts) const override;
+
+    /**
+     * The minimum number of seconds of snapshot history to maintain.
+     */
+    int getMinSnapshotHistoryWindowInSeconds() const override;
+
+    /**
+     * Set minimum number of seconds of snapshot history to maintain.
+     */
+    void setMinSnapshotHistoryWindowInSeconds(int seconds) override;
+
+    /**
+     * Journaling can be disabled for majority writes in attached storage, so this depends on the
+     * value of writeConcernMajorityShouldJournal.
+     */
+    bool settingsProvideMajorityWriteJournalDurability(
+        bool writeConcernMajorityShouldJournal) const override;
+
+    /**
+     * Attached storage fully supports the level field on the profile command.
+     */
+    bool supportsProfilingLevel(int profilingLevel) const override;
+
+    /**
+     * The oplog has been truncated if the first entry is not a noop with an "initiating set"
+     * message (the initialization entry in attached storage).
+     */
+    bool oplogHasBeenTruncated(const BSONObj& firstOplogEntry) const override;
+
+    /**
+     * Attached storage does not support cold collections.
+     */
+    bool supportsColdCollections() const override;
+
+    /**
+     * Attached storage supports replSetTestEgress and replSetGetRBID commands.
+     */
+    bool supportsLegacyReplSetCommands() const override;
+
+    /**
+     * Attached storage supports external usage of dbHash.
+     */
+    bool supportsDBHashExternalCall() const override;
+
+    /**
+     * Returns a FixedIntervalPolicy that schedules checkpoints at a fixed interval controlled by
+     * the syncdelay parameter.
+     */
+    std::unique_ptr<CheckpointSchedulePolicy> makeCheckpointSchedulePolicy() const override;
+
+    /**
+     * Attached storage supports the apply ops user-facing command.
+     */
+    bool supportsApplyOpsCommand() const override;
+
+    /**
+     * Attached storage supports external usage of getDiagnosticData.
+     */
+    bool supportsGetDiagnosticDataExternalCall() const override;
+};
+
+}  // namespace mongo::rss

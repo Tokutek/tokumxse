@@ -1,0 +1,33 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: private
+
+server_parameters:
+    # Commit quorum option is supported only for two phase index builds.
+    enableIndexBuildCommitQuorum:
+        description: "Support for using commit quorum for two phase index builds."
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: "enableIndexBuildCommitQuorum"
+        default: true
+        test_only: true
+        redact: false
+        mod_visibility: needs_replacement
+
+    resumableIndexBuildMajorityOpTimeTimeoutMillis:
+        description: >
+            Time in milliseconds a node waits for the last optime before installing the interceptors to
+            be majority committed for a resumable index build. Once the interceptors are installed, the
+            index build process will start the collection scan phase.
+            If the majority commit point is not reached by the end of this waiting period, the index
+            build will proceed as a non-resumable index build.
+            Set to 0 to skip the wait. This will also disable resumable index builds.
+            Set to a negative value to wait indefinitely for the majority commit point.
+        set_at: startup
+        cpp_vartype: long long
+        cpp_varname: gResumableIndexBuildMajorityOpTimeTimeoutMillis
+        default: 10000
+        redact: false

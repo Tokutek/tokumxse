@@ -1,0 +1,53 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Sharding IDL file
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/sharding_environment/shard_id.h"
+        - "mongo/db/versioning_protocol/database_version.h"
+        - "mongo/db/versioning_protocol/shard_version.h"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ReshardingProvenance:
+        description: "The request type that originated the execution of a reshardCollection."
+        type: string
+        values:
+            kReshardCollection: "reshardCollection"
+            kMoveCollection: "moveCollection"
+            kUnshardCollection: "unshardCollection"
+            kBalancerMoveCollection: "balancerMoveCollection"
+            kRewriteCollection: "rewriteCollection"
+
+types:
+    shard_id:
+        bson_serialization_type: string
+        description: "String identifier for a shard's name"
+        cpp_type: "ShardId"
+        deserializer: "mongo::BSONElement::str"
+        serializer: "mongo::ShardId::toString"
+        is_view: false
+
+    database_version:
+        bson_serialization_type: object
+        description: An object representing a version for a database.
+        cpp_type: DatabaseVersion
+        serializer: "mongo::DatabaseVersion::toBSON"
+        deserializer: "mongo::DatabaseVersion"
+        # DatabaseVersion has only non view members.
+        is_view: false
+
+    shard_version:
+        bson_serialization_type: any
+        description: An object representing a shard version for a collection.
+        cpp_type: ShardVersion
+        serializer: "mongo::ShardVersion::serialize"
+        deserializer: "mongo::ShardVersion::parse"
+        # ShardVersion has only non view members.
+        is_view: false

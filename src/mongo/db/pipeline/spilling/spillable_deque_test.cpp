@@ -1,0 +1,152 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/spilling/spillable_deque.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/spilling/spilling_test_fixture.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+
+#include <string>
+
+
+namespace mongo {
+namespace {
+static constexpr bool isSingleElementSortKey = true;
+static const Value sortKeyVal = Value(1.0);
+
+class SpillableDequeTest : public SpillingTestFixture {
+public:
+    std::unique_ptr<SpillableDeque> createSpillableDeque(size_t maxMem) {
+        _tracker = std::make_unique<MemoryUsageTracker>(
+            false, MemoryUsageLimit{static_cast<int64_t>(maxMem)});
+        auto cache = std::make_unique<SpillableDeque>(_expCtx.get(), _tracker.get());
+        return cache;
+    }
+
+    void buildAndLoadDocumentSet(int numDocs, SpillableDeque* cache) {
+        for (int i = _lastIndex; i < _lastIndex + numDocs; ++i) {
+            // Make sure we can load metadata to/from the store.
+            _docSet.emplace_back(addMetadata(Document{{"val", i}}));
+            cache->addDocument(_docSet.back());
+        }
+    }
+
+    void verifyDocsInCache(int start, int end, SpillableDeque* cache) {
+        for (int i = start; i < end; ++i) {
+            auto foundDoc = cache->getDocumentById(i);
+            ASSERT_DOCUMENT_EQ(foundDoc, _docSet[i]);
+            assertMetaIsStillPresent(foundDoc);
+        }
+    }
+
+    Document addMetadata(Document&& mockInput) const {
+        MutableDocument doc(std::move(mockInput));
+        doc.metadata().setSortKey(sortKeyVal, isSingleElementSortKey);
+        std::cout << doc.peek().memUsageForSorter() << std::endl;
+        return doc.freeze();
+    }
+
+    void assertMetaIsStillPresent(const Document& foundDoc) const {
+        ASSERT_VALUE_EQ(foundDoc.metadata().getSortKey(), sortKeyVal);
+    }
+
+    std::unique_ptr<MemoryUsageTracker> _tracker;
+
+    // Docs are ~500 each.
+    std::vector<Document> _docSet;
+    int _lastIndex = 0;
+};
+
+TEST_F(SpillableDequeTest, CanReadAndWriteDocumentsInMem) {
+    _expCtx->setAllowDiskUse(false);
+    auto cache = createSpillableDeque(2000);
+    buildAndLoadDocumentSet(2, cache.get());
+    verifyDocsInCache(0, 2, cache.get());
+}
+
+TEST_F(SpillableDequeTest, LoadingFailsIfCantSpillToDisk) {
+    _expCtx->setAllowDiskUse(false);
+    auto cache = createSpillableDeque(1);
+    ASSERT_THROWS_CODE(buildAndLoadDocumentSet(1, cache.get()),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
+}
+
+TEST_F(SpillableDequeTest, CanReadAndWriteDocumentsToDisk) {
+    _expCtx->setAllowDiskUse(true);
+    auto cache = createSpillableDeque(1);
+    buildAndLoadDocumentSet(3, cache.get());
+    verifyDocsInCache(0, 3, cache.get());
+    _expCtx->setAllowDiskUse(false);
+}
+
+TEST_F(SpillableDequeTest, CanReturnDocumentsFromCacheAndDisk) {
+    _expCtx->setAllowDiskUse(true);
+    // Docs are ~500 each.
+    auto cache = createSpillableDeque(700);
+    buildAndLoadDocumentSet(3, cache.get());
+    verifyDocsInCache(0, 3, cache.get());
+    _expCtx->setAllowDiskUse(false);
+    cache->finalize();
+}
+
+using SpillableDequeTestDeathTest = SpillableDequeTest;
+DEATH_TEST_F(SpillableDequeTestDeathTest,
+             RemovesDocumentsWhenExpired,
+             "Requested expired document") {
+    _expCtx->setAllowDiskUse(false);
+    auto cache = createSpillableDeque(2000);
+    buildAndLoadDocumentSet(4, cache.get());
+    cache->freeUpTo(0);
+    verifyDocsInCache(1, 4, cache.get());
+    ASSERT_THROWS_CODE(cache->getDocumentById(0), AssertionException, 5643005);
+}
+
+TEST_F(SpillableDequeTest, ReturnsCorrectDocumentsIfSomeHaveBeenRemovedMemOnly) {
+    _expCtx->setAllowDiskUse(false);
+    auto cache = createSpillableDeque(5000);
+    buildAndLoadDocumentSet(10, cache.get());
+    cache->freeUpTo(4);
+    verifyDocsInCache(5, 10, cache.get());
+}
+
+TEST_F(SpillableDequeTest, ReturnsCorrectDocumentsIfSomeHaveBeenRemovedMixed) {
+    _expCtx->setAllowDiskUse(true);
+    auto cache = createSpillableDeque(2000);
+    buildAndLoadDocumentSet(10, cache.get());
+    // Only mark documents on disk as freed.
+    cache->freeUpTo(4);
+    // Force spilling again.
+    buildAndLoadDocumentSet(5, cache.get());
+    verifyDocsInCache(5, 15, cache.get());
+    cache->finalize();
+    _expCtx->setAllowDiskUse(false);
+}
+
+TEST_F(SpillableDequeTest, CanInsertLargeDocuments) {
+    _expCtx->setAllowDiskUse(true);
+    // 19 MB
+    auto cache = createSpillableDeque(19 * 1024 * 1024);
+    // 1 MB string
+    auto str = std::string(1024 * 1024, 'x');
+    for (int i = 0; i < 20; ++i) {
+        cache->addDocument(Document(BSON("_id" << i << "longStr" << str)));
+    }
+    // We've loaded 20 MB, so we must have spilled successfully. Check that we can get them back.
+    for (int i = 0; i < 20; ++i) {
+        auto doc = cache->getDocumentById(i);
+        ASSERT_EQ(doc["longStr"].getString(), str);
+        ASSERT_EQ(doc["_id"].getInt(), i);
+    }
+    cache->finalize();
+    _expCtx->setAllowDiskUse(false);
+}
+
+}  // namespace
+}  // namespace mongo

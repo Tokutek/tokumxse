@@ -1,0 +1,38 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# Force ShardRegistry refresh command IDL file
+
+global:
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    _flushShardRegistry:
+        description: "Internal command to flush the shard registry on the local node"
+        command_name: _flushShardRegistry
+        cpp_name: FlushShardRegistry
+        namespace: ignored
+        api_version: ""
+        strict: true
+        reply_type: FlushShardRegistryResponse
+
+structs:
+    FlushShardRegistryResponse:
+        description: "Response for _flushShardRegistry command"
+        strict: false
+        fields:
+            cachedTimeBefore:
+                description: "Timestamp of the ShardRegistry cached data before the flush"
+                type: timestamp
+            forceReloadIncrementBefore:
+                description: "Force reload increment before the flush"
+                type: long
+            cachedTimeAfter:
+                description: "Timestamp of the ShardRegistry cached data after the flush"
+                type: timestamp
+            forceReloadIncrementAfter:
+                description: "Force reload increment after the flush"
+                type: long

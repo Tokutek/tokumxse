@@ -1,0 +1,36 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# setIndexCommitQuorum IDL File.
+
+global:
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/write_concern_options.h"
+    mod_visibility: private
+
+imports:
+    - "mongo/db/index_builds/commit_quorum.idl"
+    - "mongo/db/basic_types.idl"
+
+commands:
+    setIndexCommitQuorum:
+        command_name: setIndexCommitQuorum
+        cpp_name: SetIndexCommitQuorum
+        description: "Resets the commitQuorum for an index build."
+        strict: true
+        namespace: concatenate_with_db
+        api_version: ""
+        fields:
+            indexNames:
+                type: array<string>
+                description:
+                    "an array of all index names matching a single prior createIndexes
+                    request."
+            commitQuorum:
+                type: CommitQuorum
+                description:
+                    "commitQuorum can be set to the same values as writeConcern.w and
+                    indicates how many and/or which replica set members must be ready to
+                    commit the index build before the primary will proceed to commit the
+                    index build."

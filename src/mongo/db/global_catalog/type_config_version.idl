@@ -1,0 +1,21 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    VersionType:
+        description:
+            "This represents the layout of the single document contained in
+            config.version collection and contains a unique identifier of the cluster"
+        strict: false
+        fields:
+            clusterId:
+                type: objectid
+                description: "The unique identifier of the cluster"
+                optional: false

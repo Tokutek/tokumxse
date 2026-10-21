@@ -1,0 +1,289 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/stages/sort.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/memory_tracking/memory_usage_limit.h"
+#include "mongo/db/sorter/file_based_spiller.h"
+#include "mongo/db/sorter/sorter.h"
+#include "mongo/db/sorter/sorter_template_defs.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <memory>
+#include <vector>
+
+namespace mongo::sbe {
+
+template <typename KeyRow, typename ValueRow>
+class SortStage::SortImpl final : public SortIface {
+public:
+    explicit SortImpl(SortStage& stage) : _stage(stage) {}
+
+    void prepare(CompileCtx& ctx) override {
+        _stage._children[0]->prepare(ctx);
+
+        size_t counter = 0;
+        // Process order by fields.
+        for (auto& slot : _stage._obs) {
+            _inKeyAccessors.emplace_back(_stage._children[0]->getAccessor(ctx, slot));
+            auto [it, inserted] = _outAccessors.emplace(
+                slot,
+                std::make_unique<value::MaterializedRowKeyAccessor<SorterData*>>(_outputDataIt,
+                                                                                 counter));
+            ++counter;
+            uassert(4822812, str::stream() << "duplicate field: " << slot, inserted);
+        }
+
+        counter = 0;
+        // Process value fields.
+        for (auto& slot : _stage._vals) {
+            _inValueAccessors.emplace_back(_stage._children[0]->getAccessor(ctx, slot));
+            auto [it, inserted] = _outAccessors.emplace(
+                slot,
+                std::make_unique<value::MaterializedRowValueAccessor<SorterData*>>(_outputDataIt,
+                                                                                   counter));
+            ++counter;
+            uassert(4822813, str::stream() << "duplicate field: " << slot, inserted);
+        }
+
+        if (_stage._limitExpr) {
+            _limitCode = _stage._limitExpr->compile(ctx);
+        }
+
+        _stage._memoryTracker =
+            OperationMemoryUsageTracker::createChunkedSimpleMemoryUsageTrackerForSBE(
+                _stage._opCtx,
+                MemoryUsageLimit{static_cast<int64_t>(_stage._specificStats.maxMemoryUsageBytes)});
+    }
+
+    value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) override {
+        if (auto it = _outAccessors.find(slot); it != _outAccessors.end()) {
+            return it->second.get();
+        }
+
+        return ctx.getAccessor(slot);
+    }
+
+    void open(bool reOpen) override {
+        auto optTimer(_stage.getOptTimer(_stage._opCtx));
+
+        invariant(_stage._opCtx);
+        _stage._commonStats.opens++;
+        _stage._children[0]->open(reOpen);
+
+        if (_limitCode) {
+            _stage._specificStats.limit = _runLimitCode();
+        } else {
+            _stage._specificStats.limit = std::numeric_limits<size_t>::max();
+        }
+
+        _makeSorter();
+
+        auto& memoryTracker = _stage._memoryTracker.value();
+
+        while (_stage._children[0]->getNext() == PlanState::ADVANCED) {
+            KeyRow keys{_inKeyAccessors.size()};
+
+            size_t idx = 0;
+            for (auto accessor : _inKeyAccessors) {
+                keys.reset(idx++, accessor->getViewOfValue());
+            }
+
+            // Do not allocate the values here, instead let the sorter decide, since the sorter may
+            // decide not to store the values in the case of sort-limit.
+            _sorter->emplace(std::move(keys), [&]() {
+                ValueRow vals{_inValueAccessors.size()};
+                size_t idx = 0;
+                for (auto accessor : _inValueAccessors) {
+                    vals.reset(idx++, accessor->getViewOfValue());
+                }
+                return vals;
+            });
+
+            memoryTracker.set(_sorter->stats().memUsage());
+        }
+
+        _stage._specificStats.peakTrackedMemBytes =
+            _stage._memoryTracker.value().peakTrackedMemoryBytes();
+        _stage._specificStats.totalDataSizeBytes += _sorter->stats().bytesSorted();
+        _outputIt = _sorter->done();
+        _stage._specificStats.keysSorted += _sorter->stats().numSorted();
+        if (_sorterFileStats) {
+            _stage._specificStats.spillingStats.incrementSpills(_sorter->stats().spilledRanges());
+            _stage._specificStats.spillingStats.incrementSpilledRecords(
+                _sorter->stats().spilledKeyValuePairs());
+            _stage._specificStats.spillingStats.incrementSpilledDataStorageSize(
+                _sorterFileStats->bytesSpilled());
+            _stage._specificStats.spillingStats.incrementSpilledBytes(
+                _sorterFileStats->bytesSpilledUncompressed());
+        }
+
+        _stage._children[0]->close();
+    }
+
+    PlanState getNext() override {
+        auto optTimer(_stage.getOptTimer(_stage._opCtx));
+        _stage.checkForInterruptAndYield(_stage._opCtx);
+
+        if (_outputIt && _outputIt->more()) {
+            _outputData = _outputIt->next();
+
+            // Ensure isEOF flag is up-to-date if the query has a limit.
+            if (_stage._specificStats.limit != std::numeric_limits<size_t>::max() &&
+                !_outputIt->more()) {
+                _stage._commonStats.isEOF = true;
+            }
+
+            return _stage.trackPlanState(PlanState::ADVANCED);
+        } else {
+            return _stage.trackPlanState(PlanState::IS_EOF);
+        }
+    }
+
+    void close() override {
+        auto optTimer(_stage.getOptTimer(_stage._opCtx));
+
+        _stage.trackClose();
+        _outputIt.reset();
+        _sorter.reset();
+        _stage._specificStats.peakTrackedMemBytes =
+            _stage._memoryTracker.value().peakTrackedMemoryBytes();
+        _stage._memoryTracker.value().set(0);
+    }
+
+    void forceSpill() override {
+        if (_outputIt) {
+            if (_outputIt->spillable()) {
+                auto& spillingStats = _stage._specificStats.spillingStats;
+                uint64_t previousSpilledBytes = spillingStats.getSpilledBytes();
+                uint64_t previousSpilledDataStorageSize = spillingStats.getSpilledDataStorageSize();
+
+                SorterTracker tracker;
+                auto opts = _makeSortOptions();
+                opts.Tracker(&tracker);
+
+                _outputIt = _outputIt->spill(opts, typename Sorter<KeyRow, ValueRow>::Settings());
+                _stage._memoryTracker.value().set(0);
+
+                spillingStats.incrementSpills(tracker.spilledRanges.loadRelaxed());
+                spillingStats.incrementSpilledRecords(tracker.spilledKeyValuePairs.loadRelaxed());
+                spillingStats.incrementSpilledBytes(_sorterFileStats->bytesSpilledUncompressed() -
+                                                    previousSpilledBytes);
+                spillingStats.incrementSpilledDataStorageSize(_sorterFileStats->bytesSpilled() -
+                                                              previousSpilledDataStorageSize);
+            }
+        } else if (_sorter) {
+            _sorter->spill();
+            _stage._memoryTracker.value().set(_sorter->stats().memUsage());
+        }
+    }
+
+private:
+    using SorterIterator = sorter::Iterator<KeyRow, ValueRow>;
+    using SorterData = std::pair<KeyRow, ValueRow>;
+    class Comparator {
+    public:
+        explicit Comparator(const std::vector<value::SortDirection>& sortDirections)
+            : _sortDirections(sortDirections) {}
+        int operator()(const KeyRow& lhs, const KeyRow& rhs) const {
+            auto size = lhs.size();
+            for (size_t idx = 0; idx < size; ++idx) {
+                auto [lhsTag, lhsVal] = lhs.getViewOfValue(idx);
+                auto [rhsTag, rhsVal] = rhs.getViewOfValue(idx);
+                auto [tag, val] = value::compareValue(lhsTag, lhsVal, rhsTag, rhsVal);
+                uassert(7086700, "Invalid comparison result", tag == value::TypeTags::NumberInt32);
+                auto result = value::bitcastTo<int32_t>(val);
+                if (result) {
+                    return _sortDirections[idx] == value::SortDirection::Descending ? -result
+                                                                                    : result;
+                }
+            }
+            return 0;
+        }
+
+    private:
+        std::vector<value::SortDirection> _sortDirections;
+    };
+
+    int64_t _runLimitCode() {
+        value::TagValueMaybeOwned res = vm::ByteCode{}.run(_limitCode.get());
+        tassert(8349205,
+                "Limit code returned unexpected value",
+                res.tag() == value::TypeTags::NumberInt64);
+        return value::bitcastTo<size_t>(res.value());
+    }
+
+    SortOptions _makeSortOptions() {
+        SortOptions opts;
+        opts.MaxMemoryUsageBytes(_stage._specificStats.maxMemoryUsageBytes);
+        opts.Limit(_stage._specificStats.limit != std::numeric_limits<size_t>::max()
+                       ? _stage._specificStats.limit
+                       : 0);
+        opts.MoveSortedDataIntoIterator(true);
+        if (_stage._allowDiskUse) {
+            if (!_sorterFileStats) {
+                _sorterFileStats = std::make_unique<SorterFileStats>(nullptr);
+            }
+        }
+        return opts;
+    }
+
+    void _makeSorter() {
+        auto opts = _makeSortOptions();
+        _sorter = Sorter<KeyRow, ValueRow>::template make<Comparator>(
+            opts,
+            Comparator(_stage._dirs),
+            (_stage._allowDiskUse)
+                ? std::make_shared<mongo::sorter::FileBasedSpiller<KeyRow, ValueRow, Comparator>>(
+                      boost::filesystem::path(storageGlobalParams.dbpath) / "_tmp",
+                      _sorterFileStats.get(),
+                      /*dbName=*/boost::none,
+                      sorter::kLatestChecksumVersion,
+                      static_cast<int64_t>(internalQuerySpillingMinAvailableDiskSpaceBytes.load()))
+                : nullptr,
+            {});
+        _outputIt.reset();
+    }
+
+    SortStage& _stage;
+    std::vector<value::SlotAccessor*> _inKeyAccessors;
+    std::vector<value::SlotAccessor*> _inValueAccessors;
+    value::SlotMap<std::unique_ptr<value::SlotAccessor>> _outAccessors;
+    std::unique_ptr<SorterFileStats> _sorterFileStats;
+    std::unique_ptr<SorterIterator> _outputIt;
+    SorterData _outputData{};
+    SorterData* _outputDataIt{&_outputData};
+    std::unique_ptr<Sorter<KeyRow, ValueRow>> _sorter;
+    std::unique_ptr<vm::CodeFragment> _limitCode;
+};
+
+std::unique_ptr<SortStage::SortIface> SortStage::_makeStageImpl() {
+    auto pickKeyTypeThen = [&](auto next, auto... args) {
+        switch (_obs.size()) {
+            case 1:
+                return next(args..., std::type_identity<value::FixedSizeRow<1>>{});
+            case 2:
+                return next(args..., std::type_identity<value::FixedSizeRow<2>>{});
+            case 3:
+                return next(args..., std::type_identity<value::FixedSizeRow<3>>{});
+            default:
+                return next(args..., std::type_identity<value::MaterializedRow>{});
+        }
+    };
+    auto pickValueTypeThen = [&](auto next, auto... args) {
+        switch (_vals.size()) {
+            case 1:
+                return next(args..., std::type_identity<value::FixedSizeRow<1>>{});
+            default:
+                return next(args..., std::type_identity<value::MaterializedRow>{});
+        }
+    };
+    auto makeSortImplWithTypes = [&]<typename... Ts>(std::type_identity<Ts>...) {
+        return std::unique_ptr<SortStage::SortIface>{std::make_unique<SortImpl<Ts...>>(*this)};
+    };
+    return pickKeyTypeThen(pickValueTypeThen, makeSortImplWithTypes);
+}
+
+}  // namespace mongo::sbe

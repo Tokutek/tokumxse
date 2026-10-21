@@ -1,0 +1,18 @@
+load("//bazel/uv:defs.bzl", "dependency")
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "test_change_data",
+    srcs = [
+        "__init__.py",
+        "test_change_data.py",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//buildscripts/patch_builds",
+        dependency(
+            "mock",
+            group = "testing",
+        ),
+    ],
+)

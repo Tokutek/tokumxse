@@ -1,0 +1,119 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+imports:
+    - "mongo/db/topology/cluster_parameters/cluster_server_parameter.idl"
+
+structs:
+    FLECompactionOptions:
+        description:
+            "Options related to compaction or cleanup operations in Queryable Encryption
+            protocol version 2"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            maxCompactionSize:
+                description:
+                    "Limits the total size of the set of ESC documents that will be removed by
+                    each compactStructuredEncryptionData operation"
+                type: int
+                default: 268435456 # 256 MB
+                validator:
+                    gt: 0
+            maxAnchorCompactionSize:
+                description:
+                    "Limits the total size of the set of ESC anchors that will be removed by
+                    each cleanupStructuredEncryptionData operation"
+                type: int
+                default: 268435456 # 256 MB
+                validator:
+                    gt: 0
+            maxESCEntriesPerCompactionDelete:
+                description:
+                    "Limits the number of ESC non-anchor documents that will be removed by each
+                    delete operation performed by the compactStructuredEncryptionData operation"
+                type: int
+                default: 350000
+                validator:
+                    gt: 0
+                    lte: 350000 # Limit the tags in the $in query to just under 15 MB per request
+            compactAnchorPaddingFactor:
+                description: "Default value for {compactStructuredEncryptionData.anchorPaddingFactor: %f}"
+                type: double
+                optional: true
+                validator:
+                    gte: 0.0
+                    lte: 1.0
+
+    FLEOverrideTagOverheadData:
+        description: "Container for the fleAllowTotalTagOverheadToExceedBSONLimit CSP"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            shouldOverride:
+                description: "Flag indicating whether or not the tag storage limit should be overridden"
+                type: bool
+                default: false
+
+    FLEOverrideSubstringPreviewLimits:
+        description: "Container for the fleDisableSubstringPreviewParameterLimits CSP"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: clusterServerParameter
+        fields:
+            shouldOverride:
+                description: "Flag indicating whether or not the substring preview limits should be overridden"
+                type: bool
+                default: false
+
+server_parameters:
+    unsupportedDangerousTestingFLEDiagnosticsEnabled:
+        description: "Start with test-only FLE statistics behavior enabled"
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: gUnsupportedDangerousTestingFLEDiagnosticsEnabledAtStartup
+        default: false
+        redact: false
+
+    fleCompactionOptions:
+        description:
+            "Options related to compaction or cleanup operations in Queryable Encryption
+            protocol version 2"
+        set_at: cluster
+        cpp_varname: "fleCompactionOptions"
+        cpp_vartype: FLECompactionOptions
+        redact: false
+        omit_in_ftdc: false
+
+    fleAllowTotalTagOverheadToExceedBSONLimit:
+        description:
+            "If set to true, allows QE collection creation to succeed even if the total
+            worst-case tag count for all encrypted fields exceeds the 16MiB BSON limit"
+        set_at: cluster
+        cpp_varname: "fleOverrideTagOverheadParameter"
+        cpp_vartype: FLEOverrideTagOverheadData
+        condition:
+            min_fcv: 8.2
+        redact: false
+        omit_in_ftdc: false
+
+    fleDisableSubstringPreviewParameterLimits:
+        description:
+            "If set to true, allows QE collection creation to succeed if there exists
+            substringPreview fields whose parameters exceed the preview soft limits."
+        set_at: cluster
+        cpp_varname: "fleOverrideParameterLimits"
+        cpp_vartype: FLEOverrideSubstringPreviewLimits
+        condition:
+            min_fcv: 8.2
+        redact: false
+        omit_in_ftdc: false

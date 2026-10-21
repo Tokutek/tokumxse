@@ -1,0 +1,195 @@
+"""Generate multiversion exclude tags file."""
+
+import logging
+import os
+import re
+import subprocess
+import tempfile
+from collections import defaultdict
+
+from tenacity import (
+    Retrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib.core.programs import get_binary_version_output
+from buildscripts.resmokelib.testing import tags as _tags
+from buildscripts.util.fileops import read_yaml_file
+
+BACKPORT_REQUIRED_TAG = "backport_required_multiversion"
+
+# The directory in which BACKPORTS_REQUIRED_FILE resides.
+ETC_DIR = "etc"
+BACKPORTS_REQUIRED_FILE = "backports_required_for_multiversion_tests.yml"
+BACKPORTS_REQUIRED_BASE_URL = "https://raw.githubusercontent.com/10gen/mongo"
+
+# `git fetch` reaches out to GitHub, which intermittently returns transient HTTP errors. Retry
+# the fetch with exponential backoff rather than failing the whole task.
+FETCH_MAX_ATTEMPTS = 5
+FETCH_BACKOFF_SECONDS = 5
+FETCH_BACKOFF_MAX_SECONDS = 30
+
+
+def get_backports_required_hash(mongod_path: str | None = None):
+    """Parse the old binary to get the commit hash."""
+    version = get_binary_version_output(mongod_path)
+    for line in version.splitlines():
+        if "gitVersion" in line:
+            version_line = line.split(":")[1]
+            # We identify the commit hash as the string enclosed by double quotation marks.
+            result = re.search(r'"(.*?)"', version_line)
+            if result:
+                commit_hash = result.group().strip('"')
+                if not commit_hash.isalnum():
+                    raise ValueError(
+                        f"Error parsing commit hash. Expected an "
+                        f"alpha-numeric string but got: {commit_hash}"
+                    )
+                return commit_hash
+            else:
+                break
+    raise ValueError(f"Could not find a valid commit hash from the {mongod_path} mongo binary.")
+
+
+def get_git_file_content(commit_hash: str, logger: logging.Logger) -> str:
+    """Retrieve the content of a file from a specific commit in a local Git repository."""
+
+    git_command = ["git", "show", f"{commit_hash}:{ETC_DIR}/{BACKPORTS_REQUIRED_FILE}"]
+    git_fetch_command = ["git", "fetch", "--depth", "1", "origin", commit_hash]
+
+    try:
+        result = subprocess.run(git_command, capture_output=True, text=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError:
+        pass
+
+    # If the git show command failed once, we attempt to shallow fetch the commit to ensure we
+    # have the commit's contents then try again. Both commands can reach out to GitHub -- the
+    # fetch obviously, and `git show` because Evergreen uses partial clones, so materializing a
+    # missing blob triggers a lazy fetch from the promisor remote. Either can therefore fail with
+    # a transient server-side error (e.g. the HTTP 503 in BF-45380), so retry the pair together
+    # with backoff.
+    try:
+        for attempt in Retrying(
+            stop=stop_after_attempt(FETCH_MAX_ATTEMPTS),
+            wait=wait_exponential(multiplier=FETCH_BACKOFF_SECONDS, max=FETCH_BACKOFF_MAX_SECONDS),
+            retry=retry_if_exception_type(subprocess.CalledProcessError),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                _ = subprocess.run(git_fetch_command, capture_output=True, text=True, check=True)
+                result = subprocess.run(git_command, capture_output=True, text=True, check=True)
+                return result.stdout
+    except subprocess.CalledProcessError as err:
+        raise RuntimeError(
+            f"Failed to retrieve file content using command: {' '.join(git_command)} after "
+            f"{FETCH_MAX_ATTEMPTS} attempts. Error: {err.stderr}"
+        )
+
+
+def get_old_yaml(commit_hash: str, logger: logging.Logger):
+    """Download BACKPORTS_REQUIRED_FILE from the old commit and return the yaml."""
+
+    file_content = get_git_file_content(commit_hash, logger)
+
+    old_yaml_file = f"{commit_hash}_{BACKPORTS_REQUIRED_FILE}"
+    temp_dir = tempfile.mkdtemp()
+    temp_old_yaml_file = os.path.join(temp_dir, old_yaml_file)
+
+    with open(temp_old_yaml_file, "w") as fileh:
+        fileh.write(file_content)
+
+    backports_required_old = read_yaml_file(temp_old_yaml_file)
+    return backports_required_old
+
+
+def generate_exclude_yaml(old_bin_version: str, output: str, logger: logging.Logger) -> None:
+    """
+    Create a tag file associating multiversion tests to tags for exclusion.
+
+    Compares the BACKPORTS_REQUIRED_FILE on the current branch with the same file on the
+    last-lts, last-continuous and/or last-patch branch to determine which tests should be
+    denylisted.
+    """
+
+    output = os.path.abspath(output)
+    location, _ = os.path.split(output)
+    if not os.path.isdir(location):
+        os.makedirs(location)
+
+    backports_required_latest = read_yaml_file(os.path.join(ETC_DIR, BACKPORTS_REQUIRED_FILE))
+
+    # Get the state of the backports_required_for_multiversion_tests.yml file for the old
+    # binary we are running tests against. We do this by using the commit hash from the old
+    # mongo shell executable.
+    from buildscripts.resmokelib import multiversionconstants
+
+    old_mongod = multiversionconstants.multiversion_service.get_binary_name_for_version(
+        old_bin_version, config.MONGOD_BIN_NAME
+    )
+
+    old_version_commit_hash = get_backports_required_hash(old_mongod)
+
+    # Get the yaml contents from the old commit.
+    logger.info(f"Downloading file from commit hash of old branch {old_version_commit_hash}")
+    backports_required_old = get_old_yaml(old_version_commit_hash, logger)
+
+    def diff(list1, list2):
+        return [elem for elem in (list1 or []) if elem not in (list2 or [])]
+
+    def get_suite_exclusions(version_key):
+        _suites_latest = backports_required_latest[version_key]["suites"] or {}
+        if version_key in backports_required_old.keys():
+            # The old binary's file already has this version's section (nested syntax).
+            _always_exclude = diff(
+                backports_required_latest[version_key]["all"],
+                backports_required_old[version_key]["all"],
+            )
+            _suites_old: defaultdict = defaultdict(
+                list, backports_required_old[version_key]["suites"] or {}
+            )
+        elif "all" in backports_required_old.keys():
+            # The old binary predates the nested syntax and still uses the flat top-level
+            # `all`/`suites` layout.
+            # This branch can be deleted once the nested syntax has been backported everywhere.
+            _always_exclude = diff(
+                backports_required_latest[version_key]["all"], backports_required_old["all"]
+            )
+            _suites_old: defaultdict = defaultdict(list, backports_required_old["suites"] or {})
+        else:
+            # The old binary's file has neither this version's section nor the flat layout. This
+            # happens when the section itself (e.g. `last-patch`) has not yet been backported to the
+            # old binary's branch: treat the old exclusions as empty so every current entry for this
+            # version is denylisted until it is backported.
+            _always_exclude = diff(backports_required_latest[version_key]["all"], [])
+            _suites_old: defaultdict = defaultdict(list)
+
+        return _suites_latest, _suites_old, _always_exclude
+
+    suites_latest, suites_old, always_exclude = get_suite_exclusions(
+        old_bin_version.replace("_", "-")
+    )
+
+    tags = _tags.TagsConfig()
+
+    # Tag tests that are excluded from every suite.
+    for elem in always_exclude:
+        tags.add_tag("js_test", elem["test_file"], BACKPORT_REQUIRED_TAG)
+
+    # Tag tests that are excluded on a suite-by-suite basis.
+    for suite in suites_latest.keys():
+        test_set = set()
+        for elem in diff(suites_latest[suite], suites_old[suite]):
+            test_set.add(elem["test_file"])
+        for test in test_set:
+            tags.add_tag("js_test", test, f"{suite}_{BACKPORT_REQUIRED_TAG}")
+
+    logger.info(f"Writing exclude tags to {output}.")
+    tags.write_file(
+        filename=output, preamble="Tag file that specifies exclusions from multiversion suites."
+    )

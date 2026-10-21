@@ -1,0 +1,97 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: public
+
+server_parameters:
+    maxOplogTruncationPointsAfterStartup:
+        description: "Maximum allowable number of oplog truncation points after startup has finished"
+        set_at: [startup, runtime]
+        cpp_vartype: "long long"
+        cpp_varname: gMaxOplogTruncateMarkersAfterStartup
+        default: 100
+        validator: {gt: 0}
+        redact: false
+
+    maxOplogTruncationPointsDuringStartup:
+        description: "Maximum allowable number of oplog truncation points during startup"
+        set_at: [startup]
+        cpp_vartype: "long long"
+        cpp_varname: gMaxOplogTruncateMarkersDuringStartup
+        default: 100
+        validator: {gt: 0}
+        redact: false
+
+    minOplogTruncationPoints:
+        description: "Minimum allowable number of oplog truncation points"
+        set_at: [startup, runtime]
+        cpp_vartype: "long long"
+        cpp_varname: gMinOplogTruncateMarkers
+        default: 10
+        validator: {gt: 0}
+        redact: false
+
+    oplogTruncationPointSizeMB:
+        description: "Oplog truncation point size in MB used to determine the number of oplog truncation points for an oplog of a given size. The size will be rounded up to the maximum size of an internal BSON object."
+        set_at: [startup, runtime]
+        cpp_vartype: "int"
+        cpp_varname: gOplogTruncateMarkerSizeMB
+        default: 0
+        validator: {gte: 0}
+        redact: false
+
+    maxOplogTruncationPointSizeMB:
+        description: >-
+            Maximum target size of a single oplog truncation point, bounding how much oplog may be
+            truncated in a single operation. Takes precedence over the maxOplogTruncationPoints
+            parameters. A truncation point may exceed this size by up to one oplog write batch.
+            0 disables the cap.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<long long>
+        cpp_varname: gMaxOplogTruncateMarkerSizeMB
+        default: 51200 # 50GB
+        validator: {gte: 0, lte: 1073741824} # gte 0; lte 1PB (in MB)
+        redact: false
+
+    oplogTruncationCheckPeriodSeconds:
+        description: "The number of seconds the oplog truncation thread wakes up periodically to check and truncate oplog."
+        set_at: [startup, runtime]
+        cpp_vartype: "int"
+        cpp_varname: gOplogTruncationCheckPeriodSeconds
+        default: 300
+        validator: {gt: 0}
+        redact: false
+
+    oplogSamplingAsyncEnabled:
+        description: "Whether or not oplog sampling is running asynchronously to startup."
+        set_at: [startup]
+        cpp_vartype: "bool"
+        cpp_varname: gOplogSamplingAsyncEnabled
+        default: true
+        redact: false
+
+    oplogSamplingAsyncYieldIntervalMs:
+        description: "Period of time to wait between yielding during oplog sampling. -1 is a special value that disables yielding."
+        set_at: [startup]
+        cpp_vartype: "int"
+        cpp_varname: gOplogSamplingAsyncYieldIntervalMs
+        default: 100
+        validator: {gte: -1}
+        redact: false
+
+    oplogTruncationMaxSpanHoursPerPass:
+        description: >-
+            Maximum hours of oplog that time-based truncation may remove in a single pass, so a
+            large backlog is reclaimed gradually instead of in one large truncate. 0 disables the
+            cap. Currently only honored by persistence providers that support time-based oplog
+            truncation; size-based truncation paths ignore it for now.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<double>
+        cpp_varname: gOplogTruncationMaxSpanHoursPerPass
+        default: 1
+        validator:
+            gte: 0
+            # ~100 years.
+            lte: 876000
+        redact: false

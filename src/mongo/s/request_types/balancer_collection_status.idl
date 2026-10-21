@@ -1,0 +1,50 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# _configsvrBalancerCollectionStatus and balancerCollectionStatus IDL File
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+structs:
+    BalancerCollectionStatusResponse:
+        description: "Response of the config server command"
+        strict: false
+        fields:
+            chunkSize:
+                type: safeDouble
+                description: "Configured chunk size in MiB for this collection"
+            balancerCompliant:
+                type: bool
+                description: "true if there are no actions needed, if false, then firstComplianceViolation will contain the violation with the highest priority which will be addressed next"
+            firstComplianceViolation:
+                type: string
+                optional: true
+                description: "One of the following: draining, zoneViolation, chunksImbalance or defragmentingChunks"
+            details:
+                type: object_owned
+                optional: true
+                description: "Extra information on the detected violation (if any)"
+
+commands:
+    balancerCollectionStatus:
+        command_name: balancerCollectionStatus
+        cpp_name: BalancerCollectionStatus
+        description: "Public balancerCollectionStatus command on mongos"
+        strict: true
+        namespace: type
+        api_version: ""
+        type: namespacestring
+
+    _configsvrBalancerCollectionStatus:
+        command_name: _configsvrBalancerCollectionStatus
+        cpp_name: ConfigsvrBalancerCollectionStatus
+        description: "Internal balancerCollectionStatus command on the config server"
+        strict: true
+        namespace: type
+        api_version: ""
+        type: namespacestring

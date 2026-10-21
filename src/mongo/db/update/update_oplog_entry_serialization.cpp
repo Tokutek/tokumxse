@@ -1,0 +1,142 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update/update_oplog_entry_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <string>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
+
+namespace mongo::update_oplog_entry {
+using namespace std::literals::string_view_literals;
+BSONObj makeDeltaOplogEntry(const doc_diff::Diff& diff) {
+    BSONObjBuilder builder;
+    builder.append("$v", static_cast<int>(UpdateOplogEntryVersion::kDeltaV2));
+    builder.append(kDiffObjectFieldName, diff);
+    return builder.obj();
+}
+
+BSONObj makeReplacementOplogEntry(const BSONObj& replacement) {
+    // The on-disk representation of an inserted/replaced document always has _id as the first
+    // field (see fixDocumentForInsert()). Mirror that ordering in the oplog entry so that
+    // downstream consumers (e.g. change streams' fullDocument) see the same field order as the
+    // stored document.
+    BSONObjIterator it(replacement);
+    if (!it.more()) {
+        return replacement;
+    }
+    BSONElement first = it.next();
+    if (first.fieldNameStringData() == "_id"sv) {
+        return replacement;
+    }
+    BSONElement idElem = replacement["_id"];
+    if (!idElem) {
+        return replacement;
+    }
+
+    BSONObjBuilder builder(replacement.objsize());
+    builder.append(idElem);
+    builder.append(first);
+    while (it.more()) {
+        BSONElement next = it.next();
+        if (next.fieldNameStringData() == "_id"sv) {
+            continue;
+        }
+        builder.append(next);
+    }
+    return builder.obj();
+}
+
+namespace {
+BSONElement extractNewValueForFieldFromV2Entry(const BSONObj& oField, std::string_view fieldName) {
+    auto diffField = oField[kDiffObjectFieldName];
+
+    // Every $v:2 oplog entry should have a 'diff' field that is an object.
+    invariant(diffField.type() == BSONType::object);
+    doc_diff::DocumentDiffReader reader(diffField.embeddedObject());
+
+    boost::optional<BSONElement> nextMod;
+    while ((nextMod = reader.nextUpdate()) || (nextMod = reader.nextInsert())) {
+        if (nextMod->fieldNameStringData() == fieldName) {
+            return *nextMod;
+        }
+    }
+
+    // The field may appear in the "delete" section or not at all.
+    return BSONElement();
+}
+
+FieldRemovedStatus isFieldRemovedByV2Update(const BSONObj& oField, std::string_view fieldName) {
+    auto diffField = oField[kDiffObjectFieldName];
+
+    // Every $v:2 oplog entry should have a 'diff' field that is an object.
+    invariant(diffField.type() == BSONType::object);
+    doc_diff::DocumentDiffReader reader(diffField.embeddedObject());
+
+    boost::optional<std::string_view> nextDelete;
+    while ((nextDelete = reader.nextDelete())) {
+        if (*nextDelete == fieldName) {
+            return FieldRemovedStatus::kFieldRemoved;
+        }
+    }
+    return FieldRemovedStatus::kFieldNotRemoved;
+}
+}  // namespace
+
+UpdateType extractUpdateType(const BSONObj& updateDocument) {
+    // For an update oplog entry, a replacement type should always have _id field.
+    if (updateDocument["_id"]) {
+        return UpdateType::kReplacement;
+    }
+
+    // Use the "$v" field to determine which type of update this is. Note $v:1 updates were allowed
+    // to omit the $v field so that case must be handled carefully.
+    auto vElt = updateDocument[kUpdateOplogEntryVersionFieldName];
+
+    if (vElt.ok() && vElt.numberInt() == static_cast<int>(UpdateOplogEntryVersion::kDeltaV2)) {
+        return UpdateType::kV2Delta;
+    }
+
+    // Unrecognized oplog entry version.
+    tasserted(6448500, str::stream() << "Unsupported or missing oplog version, " << vElt);
+}
+
+BSONElement extractNewValueForField(const BSONObj& oField, std::string_view fieldName) {
+    invariant(fieldName.find('.') == std::string::npos, "field name cannot contain dots");
+
+    auto type = extractUpdateType(oField);
+
+    if (type == UpdateType::kV2Delta) {
+        return extractNewValueForFieldFromV2Entry(oField, fieldName);
+    } else if (type == UpdateType::kReplacement) {
+        return oField[fieldName];
+    }
+
+    // Clearly an unsupported format.
+    MONGO_UNREACHABLE;
+}
+
+FieldRemovedStatus isFieldRemovedByUpdate(const BSONObj& oField, std::string_view fieldName) {
+    invariant(fieldName.find('.') == std::string::npos, "field name cannot contain dots");
+
+    auto type = extractUpdateType(oField);
+
+    if (type == UpdateType::kV2Delta) {
+        return isFieldRemovedByV2Update(oField, fieldName);
+    } else if (type == UpdateType::kReplacement) {
+        // The field was definitely *not* removed if it's still in the post image. Otherwise,
+        // we cannot tell if it was removed without looking at the pre image.
+        return oField.hasField(fieldName) ? FieldRemovedStatus::kFieldNotRemoved
+                                          : FieldRemovedStatus::kUnknown;
+    }
+    MONGO_UNREACHABLE;
+}
+}  // namespace mongo::update_oplog_entry

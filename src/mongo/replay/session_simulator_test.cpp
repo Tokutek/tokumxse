@@ -1,0 +1,321 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/replay/session_simulator.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/traffic_reader.h"
+#include "mongo/db/traffic_recorder.h"
+#include "mongo/db/traffic_recorder_event.h"
+#include "mongo/replay/mini_mock.h"
+#include "mongo/replay/performance_reporter.h"
+#include "mongo/replay/replay_command.h"
+#include "mongo/replay/replay_command_executor.h"
+#include "mongo/replay/replay_hook_manager.h"
+#include "mongo/replay/replay_test_server.h"
+#include "mongo/replay/test_packet.h"
+#include "mongo/replay/traffic_recording_iterator.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
+
+#include <chrono>
+#include <memory>
+#include <string_view>
+
+#include <boost/filesystem/path.hpp>
+#include <gmock/gmock-more-matchers.h>
+#include <gmock/gmock.h>
+
+namespace mongo {
+
+using namespace std::chrono_literals;
+
+static const std::string fakeResponse = R"([{
+    "_id": "681cb423980b72695075137f",
+    "name": "Alice",
+    "age": 30,
+    "city": "New York"}])";
+
+class TestSessionSimulator : public SessionSimulator {
+public:
+    using SessionSimulator::SessionSimulator;
+
+    TestSessionSimulator(PacketSource source,
+                         std::chrono::steady_clock::time_point startTime,
+                         std::string_view uri)
+        : SessionSimulator(std::move(source),
+                           0 /* sessionID */,
+                           startTime,
+                           std::string(uri),
+                           std::make_unique<ReplayCommandExecutor>(),
+                           std::make_unique<PerformanceReporter>(uri, "test.bin")) {}
+
+    std::chrono::steady_clock::time_point now() const override {
+        auto handle = nowHook.synchronize();
+        return (*handle)();
+    }
+
+    void sleepFor(std::chrono::steady_clock::duration duration) const override {
+        auto handle = sleepHook.synchronize();
+        (*handle)(duration);
+    }
+
+    using NowMockFunction = MiniMockFunction<std::chrono::steady_clock::time_point>;
+    using SleepMockFunction = MiniMockFunction<void, std::chrono::steady_clock::duration>;
+    mutable synchronized_value<NowMockFunction> nowHook{NowMockFunction{"now"}};
+    mutable synchronized_value<SleepMockFunction> sleepHook{SleepMockFunction{"sleepFor"}};
+};
+
+// Helper to allow adding mongo::Duration and std::chrono::duration.
+// Used in this file for:
+//    someDuration + 1s;
+// In these cases, the result is desired to be a mongo::Duration.
+template <class MongoDur, class Rep, class Period>
+requires duration_detail::isMongoDuration<MongoDur>
+auto operator+(const MongoDur& mongoDuration,
+               const std::chrono::duration<Rep, Period>& nonMongoDuration) {
+    return mongoDuration + mongo::duration_cast<MongoDur>(nonMongoDuration);
+}
+
+class TestPackets {
+public:
+    struct Args {
+        std::chrono::microseconds offset;
+        TestReaderPacket packet;
+    };
+
+    TestPackets& operator+=(Args&& args) {
+        args.packet.offset = mongo::duration_cast<Microseconds>(args.offset);
+        packets.push_back(std::move(args.packet));
+        return *this;
+    }
+
+    operator PacketSource() const;
+
+    const auto& operator[](size_t idx) {
+        return packets[idx];
+    }
+
+    Date_t recordingStartTime = Date_t::now();
+    std::vector<TestReaderPacket> packets;
+};
+
+TrafficRecordingPacket toOwned(const TrafficReaderPacket& packet) {
+    Message ownedMessage;
+    ownedMessage.setData(
+        packet.message.getNetworkOp(), packet.message.data(), packet.message.dataLen());
+
+    return {
+        .eventType = packet.eventType,
+        .id = packet.id,
+        .session = std::string(packet.session),
+        .offset = packet.offset,
+        .order = packet.order,
+        .message = std::move(ownedMessage),
+    };
+}
+
+class TestFiles : public FileSet {
+public:
+    TestFiles(std::vector<TestReaderPacket> packets) {
+        PacketWriter writer;
+        const boost::filesystem::path filename = UUID::gen().toString() + ".bin";
+        writer.open(filename);
+
+        for (const auto& packet : packets) {
+            writer.writePacket(toOwned(packet));
+        }
+
+        writer.close();
+
+        files = {std::make_shared<boost::iostreams::mapped_file_source>(filename.string())};
+    }
+    /**
+     * Acquire (read only) memory mapped access to the file at `index`.
+     *
+     * If the file is already mapped, shared access will be provided to the same map;
+     * it will not be blindly re-mapped.
+     */
+    std::shared_ptr<boost::iostreams::mapped_file_source> get(size_t index) override {
+        if (index >= files.size()) {
+            return nullptr;
+        }
+        return files[index];
+    }
+
+    /**
+     * Check if this FileSet contains any files.
+     */
+    bool empty() const override {
+        return files.empty();
+    }
+
+    std::vector<std::shared_ptr<boost::iostreams::mapped_file_source>> files;
+};
+
+TestPackets::operator PacketSource() const {
+    return PacketSource(std::make_shared<TestFiles>(packets));
+}
+
+TEST(SessionSimulatorTest, TestSimpleCommandNoWait) {
+    ReplayTestServer server{{"find"}, {fakeResponse}};
+
+    auto packet = TestReaderPacket::find(BSON("name" << "Alice"));
+
+    auto replayStartTime = std::chrono::steady_clock::now();
+
+    TestPackets packets;
+
+    packets += {0s, TestReaderPacket::sessionStart()};
+    // Simulate a find command occurring 1 second into the recording.
+    packets += {1s, TestReaderPacket::find(BSON("name" << "Alice"))};
+
+    // test simulator scoped in order to complete all the tasks.
+    {
+        TestSessionSimulator sessionSimulator{
+            packets, replayStartTime, server.getConnectionString()};
+
+        // SessionStart event will call now() to delay until the correct time.
+        sessionSimulator.nowHook->ret(replayStartTime);
+
+        // Initially report "now" as the exact time the find request needs to be issued.
+        sessionSimulator.nowHook->ret(replayStartTime + 1s);
+        // Don't expect any call to sleepFor.
+
+        sessionSimulator.run();
+    }
+}
+
+TEST(SessionSimulatorTest, TestSimpleCommandWait) {
+    ReplayTestServer server{{"find"}, {fakeResponse}};
+
+    auto replayStartTime = std::chrono::steady_clock::now();
+
+    TestPackets packets;
+
+    packets += {0s, TestReaderPacket::sessionStart()};
+    // Simulate a find command occurring 2 second into the recording.
+    packets += {2s, TestReaderPacket::find(BSON("name" << "Alice"))};
+
+    // Simulate another command, 3 seconds later (total offset of 5s into the recording).
+    packets += {5s, TestReaderPacket::find(BSON("name" << "Alice"))};
+
+    // test simulator scoped in order to complete all the tasks.
+    {
+        TestSessionSimulator sessionSimulator{
+            packets, replayStartTime, server.getConnectionString()};
+
+        // SessionStart event at offset 0 — "now" is also at start, so no sleep needed.
+        sessionSimulator.nowHook->ret(replayStartTime);
+
+        // First find
+
+        // Initially report "now" as the recording start time.
+        sessionSimulator.nowHook->ret(replayStartTime);
+        // Expect the simulator to try sleep for 2s.
+        sessionSimulator.sleepHook->expect(2s);
+
+        // Second find
+
+        // Report "now" as if immediately after sleeping for the previous command.
+        sessionSimulator.nowHook->ret(replayStartTime + 2s);
+        // Expect the simulator to try sleep for the remaining 3s to reach the target offset time.
+        sessionSimulator.sleepHook->expect(3s);
+
+        sessionSimulator.run();
+    }
+}
+
+TEST(SessionSimulatorTest, TestSimpleCommandNoWaitTimeInThePast) {
+    ReplayTestServer server{{"find"}, {fakeResponse}};
+    auto replayStartTime = std::chrono::steady_clock::now();
+
+    TestPackets packets;
+
+    packets += {0s, TestReaderPacket::sessionStart()};
+    // Simulate a find command occurring 1 second into the recording.
+    packets += {1s, TestReaderPacket::find(BSON("name" << "Alice"))};
+
+    // test simulator scoped in order to complete all the tasks.
+    {
+        TestSessionSimulator sessionSimulator{
+            packets, replayStartTime, server.getConnectionString()};
+
+        // SessionStart event at offset 0 — "now" is already past, so no sleep needed.
+        sessionSimulator.nowHook->ret(replayStartTime + 10s);
+
+        // Initially report "now" as _later than_ the command should have run.
+        sessionSimulator.nowHook->ret(replayStartTime + 10s);
+        // Don't expect any call to sleepFor.
+
+        sessionSimulator.run();
+    }
+}
+
+class MockObserver : public ReplayObserver {
+public:
+    MOCK_METHOD(void, onRequest, (ReplayCommand & command), (override));
+    MOCK_METHOD(void, onResponse, (ReplayCommand & command), (override));
+    MOCK_METHOD(void, onSessionStart, (ReplayCommand & command), (override));
+    MOCK_METHOD(void, onSessionEnd, (ReplayCommand & command), (override));
+    MOCK_METHOD(void,
+                onLiveResponse,
+                (const ReplayCommand& recordedResponse, const BSONObj& liveResponse),
+                (override));
+};
+
+// Server responses may contain additional fields like `"ok" :1`.
+// Tests care that the expected data is present.
+MATCHER_P(BSONSuperSetOf, expectedBSON, "") {
+    for (const auto& elem : expectedBSON) {
+        if (arg.getField(elem.fieldName()).woCompare(elem) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(SessionSimulatorTest, HooksInvoked) {
+    ReplayTestServer server{{"find"}, {fakeResponse}};
+    auto replayStartTime = std::chrono::steady_clock::now();
+
+    TestPackets packets;
+
+    auto recordedResponse = BSON("recorded" << "responseData");
+
+    // Simulate a find command occurring 1 second into the recording.
+    packets += {1ms, TestReaderPacket::sessionStart()};
+    packets += {2ms, TestReaderPacket::find(BSON("name" << "Alice"))};
+    packets += {3ms, TestReaderPacket::response(recordedResponse)};
+    packets += {4ms, TestReaderPacket::sessionEnd()};
+
+    auto observer = std::make_shared<MockObserver>();
+    ReplayObserverManager::get().registerObserver(observer);
+
+    // test simulator scoped in order to complete all the tasks.
+    {
+        TestSessionSimulator sessionSimulator{
+            packets, replayStartTime, server.getConnectionString()};
+        // Report "now" is later than all packets so replay progresses normally.
+        sessionSimulator.nowHook->defaultRet(replayStartTime + 1s);
+
+        using namespace ::testing;
+        InSequence s;
+
+        EXPECT_CALL(*observer, onSessionStart(Property(&ReplayCommand::isSessionStart, IsTrue())));
+        EXPECT_CALL(*observer,
+                    onRequest(Property(&ReplayCommand::getEventType, Eq(EventType::kRequest))));
+        EXPECT_CALL(*observer,
+                    onLiveResponse(Property(&ReplayCommand::getEventType, Eq(EventType::kResponse)),
+                                   BSONSuperSetOf(fromjson(fakeResponse))));
+        EXPECT_CALL(*observer, onSessionEnd(Property(&ReplayCommand::isSessionEnd, IsTrue())));
+
+        sessionSimulator.run();
+    }
+
+    ReplayObserverManager::get().reset();
+}
+
+}  // namespace mongo

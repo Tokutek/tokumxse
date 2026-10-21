@@ -1,0 +1,50 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# This file defines the format of the state document for the merge chunks coordinator.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/global_catalog/ddl/sharding_coordinator.idl"
+    - "mongo/db/global_catalog/ddl/merge_chunk_request.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+
+enums:
+    MergeChunksCoordinatorPhase:
+        description: "Phases for the merge chunks coordinator."
+        type: string
+        values:
+            kUnset: "unset"
+            kCheckPreconditions: "checkPreconditions"
+            kAcquireCriticalSection: "acquireCriticalSection"
+            kGlobalCatalogCommit: "globalCatalogCommit"
+            kShardCatalogCommit: "shardCatalogCommit"
+            kReleaseCriticalSection: "releaseCriticalSection"
+
+structs:
+    MergeChunksCoordinatorDocument:
+        description: "State document for the merge chunks coordinator."
+        generate_comparison_operators: false
+        strict: false
+        chained_structs:
+            ShardingCoordinatorMetadata: ShardingCoordinatorMetadata
+            ShardsvrMergeChunksRequest: ShardsvrMergeChunksRequest
+        fields:
+            phase:
+                type: MergeChunksCoordinatorPhase
+                default: kUnset
+            shardVersionPreMerge:
+                description: >-
+                    Shard placement version captured before the merge is committed to the global
+                    catalog.
+                type: ChunkVersion
+                optional: true
+            changedChunks:
+                description: >-
+                    Chunk produced by the merge commit, in config BSON format.
+                type: array<object_owned>
+                optional: true

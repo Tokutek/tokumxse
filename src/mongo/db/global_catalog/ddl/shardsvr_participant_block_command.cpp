@@ -1,0 +1,187 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/global_catalog/ddl/sharding_recovery_service.h"
+#include "mongo/db/global_catalog/sharding_catalog_client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/participant_block_gen.h"
+#include "mongo/db/sharding_environment/grid.h"
+#include "mongo/db/topology/sharding_state.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/out_of_line_executor.h"
+
+#include <memory>
+#include <string>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
+namespace mongo {
+namespace {
+
+class ShardSvrParticipantBlockCommand final : public TypedCommand<ShardSvrParticipantBlockCommand> {
+public:
+    using Request = ShardsvrParticipantBlock;
+
+    std::string help() const override {
+        return "Internal command, which is exported by the shards. Do not call directly. Blocks "
+               "CRUD operations.";
+    }
+
+    bool skipApiVersionCheck() const override {
+        // Internal command (server to server).
+        return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return Command::AllowedOnSecondary::kNever;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+            auto handleRecoverableCriticalSection = [this](auto opCtx) {
+                const auto reason = request().getReason().get_value_or(
+                    BSON("command" << "ShardSvrParticipantBlockCommand"
+                                   << "ns"
+                                   << NamespaceStringUtil::serialize(
+                                          ns(), SerializationContext::stateDefault())));
+                auto blockType = request().getBlockType().get_value_or(
+                    CriticalSectionBlockTypeEnum::kReadsAndWrites);
+
+                auto service = ShardingRecoveryService::get(opCtx);
+                switch (blockType) {
+                    case CriticalSectionBlockTypeEnum::kUnblock: {
+                        std::unique_ptr<ShardingRecoveryService::BeforeReleasingCustomAction>
+                            actionPtr;
+
+                        if (request().getClearShardCatalogCache()) {
+                            actionPtr = std::make_unique<
+                                ShardingRecoveryService::FilteringMetadataClearer>();
+                        } else {
+                            actionPtr = std::make_unique<ShardingRecoveryService::NoCustomAction>();
+                        }
+
+                        service->releaseRecoverableCriticalSection(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter(),
+                            *actionPtr,
+                            request().getThrowIfReasonDiffers().value_or(true));
+                        break;
+                    }
+                    case CriticalSectionBlockTypeEnum::kWrites:
+                        service->acquireRecoverableCriticalSectionBlockWrites(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter(),
+                            request().getClearShardCatalogCache());
+                        break;
+                    default:
+                        service->acquireRecoverableCriticalSectionBlockWrites(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter(),
+                            request().getClearShardCatalogCache());
+                        service->promoteRecoverableCriticalSectionToBlockAlsoReads(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter());
+                };
+            };
+
+            auto txnParticipant = TransactionParticipant::get(opCtx);
+            if (txnParticipant) {
+                // Use an AlternativeClientRegion because releasing a RecoverableCriticalSection
+                // triggers an update with `multi: true`, which cannot be executed inside a
+                // transaction.
+                auto newClient = getGlobalServiceContext()->getService()->makeClient(
+                    "ShardSvrParticipantBlockCmdClient");
+                AlternativeClientRegion acr(newClient);
+                auto cancelableOperationContext = CancelableOperationContext(
+                    cc().makeOperationContext(),
+                    opCtx->getCancellationToken(),
+                    Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor());
+
+                cancelableOperationContext->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+                handleRecoverableCriticalSection(cancelableOperationContext.get());
+            } else {
+                handleRecoverableCriticalSection(opCtx);
+            }
+
+            if (txnParticipant) {
+                // Since no write that generated a retryable write oplog entry with this sessionId
+                // and txnNumber happened, we need to make a dummy write so that the session gets
+                // durably persisted on the oplog. This must be the last operation done on this
+                // command.
+                DBDirectClient client(opCtx);
+                client.update(NamespaceString::kServerConfigurationNamespace,
+                              BSON("_id" << Request::kCommandName),
+                              BSON("$inc" << BSON("count" << 1)),
+                              true /* upsert */,
+                              false /* multi */);
+            }
+        }
+
+    private:
+        NamespaceString ns() const override {
+            const auto& nss = request().getNamespace();
+            return nss.isCollectionlessShardsvrParticipantBlockNS() ? NamespaceString(nss.dbName())
+                                                                    : nss;
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
+        }
+    };
+};
+MONGO_REGISTER_COMMAND(ShardSvrParticipantBlockCommand).forShard();
+
+}  // namespace
+}  // namespace mongo

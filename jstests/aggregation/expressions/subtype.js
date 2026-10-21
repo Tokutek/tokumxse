@@ -1,0 +1,107 @@
+/**
+ * Test the $subtype expression.
+ * @tags: [
+ *  requires_fcv_83,
+ *  backport_required_multiversion, # TODO SERVER-129103: remove once backported to 8.3 and 8.0.
+ * ]
+ */
+import {testExpression} from "jstests/aggregation/extras/utils.js";
+
+const collName = jsTestName();
+const coll = db[collName];
+coll.drop();
+assert.commandWorked(coll.insert({}));
+
+function runAndAssert(operand, result, allowedAsLiteral = true, literalErrorCode = 12978506) {
+    // Test with constant-folding optimization, if this operand is allowed as a literal.
+    if (allowedAsLiteral) {
+        testExpression(coll, {$subtype: operand}, result);
+    } else {
+        // The operand is rejected as a literal.
+        assert.throwsWithCode(
+            () => testExpression(coll, {$subtype: operand}, result),
+            literalErrorCode,
+        );
+    }
+    coll.drop();
+
+    // Insert args as document.
+    const document = {};
+    if (operand !== undefined) {
+        document.op = operand;
+    }
+    assert.commandWorked(coll.insertOne(document));
+
+    // Test again with fields from document.
+    assert.eq(
+        coll.aggregate([{$project: {result: {$subtype: "$op"}}}]).toArray()[0].result,
+        result,
+    );
+
+    // Clean up.
+    coll.drop();
+    assert.commandWorked(coll.insertOne({}));
+}
+
+function runAndAssertThrows(operand, code) {
+    const error = assert.throws(() =>
+        coll.aggregate([{$project: {result: {$subtype: operand}}}]).toArray(),
+    );
+    assert.commandFailedWithCode(error, code);
+}
+
+// Test BinData subtype.
+runAndAssert(BinData(0, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 0);
+runAndAssert(BinData(1, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 1);
+// ByteArrayDeprecated (2): bytes[0..3] must encode (total - 4) as a LE int32.
+// Here total=16, so bytes[0..3] = 12 (0x0C 0x00 0x00 0x00).
+runAndAssert(BinData(2, "DAAAAAAAAAAAAAAAAAAAAA=="), 2);
+runAndAssert(BinData(3, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 3);
+runAndAssert(BinData(4, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 4);
+runAndAssert(BinData(5, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 5);
+runAndAssert(BinData(6, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 6);
+// BinData subtype 7 (BSONColumn) is not allowed as a literal in a query.
+runAndAssert(BinData(7, "CQDoAwAAAAAAAAA="), 7, false /*allowedAsLiteral*/);
+runAndAssert(BinData(8, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 8);
+// A Vector (9) literal must be a valid vector.
+runAndAssert(BinData(9, "AwAB"), 9);
+runAndAssert(BinData(128, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 128);
+
+// Undocumented subtypes in the 10-127 range are not allowed as a literal. User-defined subtypes
+// (128-255) are allowed.
+runAndAssert(BinData(16, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 16, false /*allowedAsLiteral*/, 12978507);
+runAndAssert(BinData(31, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 31, false /*allowedAsLiteral*/, 12978507);
+runAndAssert(BinData(200, "gf1UcxdHTJ2HQ/EGQrO7mQ=="), 200);
+
+// Test with null and missing.
+runAndAssert(null, null);
+runAndAssert(undefined, null);
+
+// Test with sub-expressions.
+testExpression(
+    coll,
+    {
+        $subtype: {
+            $convert: {
+                input: "867dee52-c331-484e-92d1-c56479b8e67e",
+                to: {type: "binData", subtype: 4},
+                format: "uuid",
+            },
+        },
+    },
+    4,
+);
+testExpression(coll, {$subtype: UUID("81fd5473-1747-4c9d-8743-f10642b3bb99")}, 4);
+testExpression(
+    coll,
+    {$subtype: {$convert: {input: "🙂😎", to: {type: "binData", subtype: 0}, format: "utf8"}}},
+    0,
+);
+
+// Test on values without subtype.
+const noSubtypeErrorCode = 10389300;
+
+runAndAssertThrows("text", noSubtypeErrorCode);
+runAndAssertThrows(10, noSubtypeErrorCode);
+runAndAssertThrows([[BinData(0, "gf1UcxdHTJ2HQ/EGQrO7mQ==")]], noSubtypeErrorCode);
+runAndAssertThrows({val: BinData(0, "gf1UcxdHTJ2HQ/EGQrO7mQ==")}, noSubtypeErrorCode);

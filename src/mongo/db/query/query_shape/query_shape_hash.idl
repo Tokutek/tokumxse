@@ -1,0 +1,18 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo::query_shape"
+
+imports:
+    - "mongo/crypto/sha256_block.idl"
+
+types:
+    QueryShapeHash:
+        bson_serialization_type: string
+        description: "Type representing SHA256 hash of the QueryShape."
+        cpp_type: mongo::SHA256Block
+        serializer: "mongo::SHA256Block::toHexString"
+        deserializer: "mongo::SHA256Block::fromHexString"
+        is_view: false

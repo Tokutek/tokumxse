@@ -1,0 +1,46 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# _configsvrEnsureChunkVersionIsGreaterThan IDL file
+
+global:
+    cpp_namespace: "mongo"
+    mod_visibility: needs_replacement
+
+imports:
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/versioning_protocol/chunk_version.idl"
+
+commands:
+    _configsvrEnsureChunkVersionIsGreaterThan:
+        command_name: _configsvrEnsureChunkVersionIsGreaterThan
+        cpp_name: ConfigsvrEnsureChunkVersionIsGreaterThan
+        description:
+            If a chunk matching 'requestedChunk' exists, bumps the chunk's version to one
+            greater than the current collection version.
+        namespace: ignored
+        api_version: ""
+        strict: false
+        fields:
+            minKey:
+                description: The lower bound of the chunk.
+                type: object
+                optional: false
+            maxKey:
+                description: The upper bound of the chunk.
+                type: object
+                optional: false
+            version:
+                description:
+                    The data placement of the chunk, including major version, minor
+                    version, and epoch.
+                type: ChunkVersion
+                optional: false
+            collectionUUID:
+                description: The collection's UUID. This field was introduced in 5.0 as mandatory.
+                type: uuid
+                optional: false
+            nss:
+                description: The collection's namespace. This field was introduced in 5.0 as mandatory.
+                type: namespacestring
+                optional: false

@@ -1,0 +1,188 @@
+load("//bazel:mongo_src_rules.bzl", "idl_generator", "mongo_cc_benchmark", "mongo_cc_library", "mongo_cc_unit_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(
+    glob([
+        "*.h",
+        "*.cpp",
+    ]),
+)
+
+idl_generator(
+    name = "persistent_sample_gen",
+    src = "persistent_sample.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "persistent_sample_gen_lib",
+    srcs = [
+        ":persistent_sample_gen",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_library(
+    name = "sampling_test_utils",
+    srcs = [
+        "sampling_test_utils.cpp",
+    ],
+    deps = [
+        ":persistent_samples",
+        "//src/mongo/db:write_stage_common",
+        "//src/mongo/db/collection_crud",
+        "//src/mongo/db/query:query_planner",
+        "//src/mongo/db/query/compiler/ce:ce_test_utils",
+        "//src/mongo/db/query/compiler/optimizer/index_bounds_builder",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_control",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+mongo_cc_library(
+    name = "sampling_math",
+    srcs = [
+        "math.cpp",
+    ],
+    deps = [
+        "//src/mongo/db/query/compiler/ce:ce_common",
+    ],
+)
+
+mongo_cc_library(
+    name = "ce_multikey_dotted_path_support",
+    srcs = [
+        "ce_multikey_dotted_path_support.cpp",
+    ],
+    deps = [
+        "//src/mongo/db/query/compiler/ce:ce_common",
+    ],
+)
+
+mongo_cc_library(
+    name = "persistent_samples",
+    hdrs = [
+        "persistent_sample_loader.h",
+    ],
+    deps = [
+        ":persistent_sample_gen_lib",
+        "//src/mongo/db/query:query_knobs",
+    ],
+)
+
+mongo_cc_library(
+    name = "sampling_estimator",
+    srcs = [
+        "sampling_estimator_impl.cpp",
+    ],
+    deps = [
+        ":persistent_samples",
+        ":sampling_math",
+        "//src/mongo/db:query_exec",
+        "//src/mongo/db/query/compiler/ce/ndv:field_stats",
+        "//src/mongo/db/query/compiler/ce/ndv:field_stats_loader",
+        "//src/mongo/db/query/compiler/optimizer/cost_based_ranker:estimates",
+    ],
+)
+
+mongo_cc_library(
+    name = "sampling_estimator_interface",
+    deps = [
+        "//src/mongo/db:query_expressions",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "sampling_estimator_test",
+    srcs = [
+        "sampling_estimator_persistent_ndv_test.cpp",
+        "sampling_estimator_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        ":sampling_test_utils",
+        "//src/mongo/db:query_exec",
+        "//src/mongo/db/query:random_utils",
+        "//src/mongo/db/query/compiler/ce/ndv:field_stats",
+        "//src/mongo/db/query/compiler/ce/ndv:field_stats_loader",
+        "//src/mongo/db/query/compiler/optimizer/cost_based_ranker:cbr_test_utils",
+        "//src/mongo/db/query/query_knobs:query_knob_configuration_test_util",
+        "//src/mongo/db/query/query_settings:query_settings_context_test_util",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "sampling_math_test",
+    srcs = [
+        "math_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        ":sampling_math",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "persistent_samples_test",
+    srcs = [
+        "persistent_sample_loader_test.cpp",
+    ],
+    tags = ["mongo_unittest_second_group"],
+    deps = [
+        ":persistent_samples",
+        ":sampling_test_utils",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+# it's a utility that measures the accuracy of sampling CE.
+mongo_cc_unit_test(
+    name = "sampling_estimation_accuracy_analysis_test",
+    srcs = [
+        "sampling_accuracy_test.cpp",
+    ],
+    tags = ["mongo_unittest_first_group"],
+    deps = [
+        ":sampling_test_utils",
+        "//src/mongo/db/query:query_test_service_context",
+    ],
+)
+
+mongo_cc_benchmark(
+    name = "sampling_bm",
+    srcs = ["ce_sampling_bm.cpp"],
+    tags = ["second_half_bm"],
+    deps = [
+        ":sampling_test_utils",
+        "//src/mongo/db/query:query_test_service_context",
+    ],
+)
+
+mongo_cc_benchmark(
+    name = "sampling_indexscans_bm",
+    srcs = ["ce_sampling_indexscans_bm.cpp"],
+    tags = ["second_half_bm"],
+    deps = [
+        ":sampling_test_utils",
+        "//src/mongo/db/query:query_test_service_context",
+        "//src/mongo/db/query/compiler/optimizer/cost_based_ranker:cardinality_estimator",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "ce_multikey_dotted_path_support_test",
+    srcs = [
+        "ce_multikey_dotted_path_support_test.cpp",
+    ],
+    tags = ["mongo_unittest_third_group"],
+    deps = [
+        ":ce_multikey_dotted_path_support",
+    ],
+)

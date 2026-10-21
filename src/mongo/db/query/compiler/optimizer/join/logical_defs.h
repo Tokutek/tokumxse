@@ -1,0 +1,39 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#pragma once
+
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/util/modules.h"
+
+#include <cstdint>
+
+/** Common definitions for the graph logical model.
+ */
+namespace mongo::join_ordering {
+/** Join Node's identifier.
+ */
+using NodeId = uint16_t;
+
+/** Join Edge's identifier.
+ */
+using EdgeId = uint16_t;
+
+/** Resolved Path's identifier.
+ */
+using PathId = uint16_t;
+
+/** Join Predicate's unique identifier.
+ */
+using PredicateId = uint16_t;
+
+struct ResolvedPath {
+    // The join graph node this path originates from.
+    NodeId nodeId;
+    // Field path directly on the base collection that the join node 'nodeId' refers to.
+    FieldPath underlyingFieldPath;
+    // If this path was renamed by the CQ for this node, then 'fieldPathAfterRenames' refers to the
+    // name after the CQ has been applied to the base collection.
+    boost::optional<FieldPath> fieldPathAfterRenames;
+};
+}  // namespace mongo::join_ordering

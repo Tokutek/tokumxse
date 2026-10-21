@@ -1,0 +1,1218 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/exec/sbe/in_list.h"
+#include "mongo/db/exec/sbe/sbe_pattern_value_cmp.h"
+#include "mongo/db/exec/sbe/values/arith_common.h"
+#include "mongo/db/exec/sbe/values/util.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/values/value_size.h"
+#include "mongo/db/exec/sbe/vm/vm.h"
+
+#include <algorithm>
+#include <utility>
+
+namespace mongo {
+namespace sbe {
+namespace vm {
+
+namespace {
+
+void expectOwnedArray(bool owned, value::TypeTags type) {
+    tassert(11086820, "Expecting owned value", owned);
+    tassert(11086813, "Expecting array type", type == value::TypeTags::Array);
+}
+
+}  // namespace
+
+// We need to ensure that 'size_t' is wide enough to store a 32-bit index.
+// This is assumed by both builtinZipArrays and builtinExtractSubArray.
+static_assert(sizeof(size_t) >= sizeof(int32_t), "size_t must be at least 32-bits");
+
+value::TagValueMaybeOwned ByteCode::builtinNewArray(ArityType arity) {
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arr = value::getArrayView(result.value());
+
+    if (arity) {
+        size_t currentMemoryBytes = 0;
+        const size_t maxMemoryBytes =
+            internalQueryMaxSingleExpressionMemoryUsageBytes.loadRelaxed();
+
+        arr->reserve(arity);
+        for (ArityType idx = 0; idx < arity; ++idx) {
+            auto elem = moveOwnedFromStack(idx);
+            currentMemoryBytes += value::getApproximateSize(elem.tag(), elem.value());
+            if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+                uasserted(ErrorCodes::ExceededMemoryLimit,
+                          str::stream()
+                              << "$array would use too much memory (" << currentMemoryBytes
+                              << " bytes) and cannot spill to disk. Memory limit: "
+                              << maxMemoryBytes << " bytes");
+            }
+            arr->push_back(std::move(elem));
+        }
+    }
+
+    return result;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinNewArrayFromRange(ArityType arity) {
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto arr = value::getArrayView(result.value());
+
+    auto startView = viewFromStack(0);
+    auto endView = viewFromStack(1);
+    auto stepView = viewFromStack(2);
+
+    for (auto tag : {startView.tag, endView.tag, stepView.tag}) {
+        if (value::TypeTags::NumberInt32 != tag) {
+            return value::TagValueMaybeOwned::nothing();
+        }
+    }
+
+    // Cast to broader type 'int64_t' to prevent overflow during loop.
+    auto startVal = value::numericCast<int64_t>(startView);
+    auto endVal = value::numericCast<int64_t>(endView);
+    auto stepVal = value::numericCast<int64_t>(stepView);
+
+    if (stepVal == 0) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    // Calculate how much memory is needed to generate the array and avoid going over the memLimit.
+    auto steps = (endVal - startVal) / stepVal;
+    // If steps not positive then no amount of steps can get you from start to end. For example
+    // with start=5, end=7, step=-1 steps would be negative and in this case we would return an
+    // empty array.
+    auto length = steps >= 0 ? 1 + steps : 0;
+    int64_t memNeeded =
+        sizeof(value::Array) + length * value::getApproximateSize(startView.tag, startView.value);
+    auto memLimit = internalQueryMaxRangeBytes.load();
+    uassert(ErrorCodes::ExceededMemoryLimit,
+            str::stream() << "$range would use too much memory (" << memNeeded
+                          << " bytes) and cannot spill to disk. Memory limit: " << memLimit
+                          << " bytes",
+            memNeeded < memLimit);
+
+    arr->reserve(length);
+    for (auto i = startVal; stepVal > 0 ? i < endVal : i > endVal; i += stepVal) {
+        arr->push_back_raw(value::TypeTags::NumberInt32, value::bitcastTo<int32_t>(i));
+    }
+
+    return result;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAddToArray(ArityType arity) {
+    auto aggView = viewFromStack(0);
+    auto field = moveOwnedFromStack(1);
+
+    // Create a new array if it does not exist yet.
+    value::TagValueMaybeOwned agg;
+    if (aggView.tag == value::TypeTags::Nothing) {
+        agg = value::TagValueOwned::fromRaw(value::makeNewArray());
+    } else {
+        // Take ownership of the accumulator.
+        topStack(false, value::TypeTags::Nothing, 0);
+        agg = value::TagValueMaybeOwned{true, aggView.tag, aggView.value};
+    }
+    expectOwnedArray(agg.owned(), agg.tag());
+    auto arr = value::getArrayView(agg.value());
+
+    // Push back the value. Note that array will ignore Nothing.
+    arr->push_back(std::move(field));
+
+    return agg;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinAddToArrayCappedImpl(
+    value::TagValueOwned accumulatorStateTagVal,
+    value::TagValueMaybeOwned newElem,
+    int32_t sizeCap) {
+
+    // The capped array accumulator holds a value of Nothing at first and gets initialized on demand
+    // when the first value gets added. Once initialized, the state is a two-element array
+    // containing the array and its size in bytes, which is necessary to enforce the memory cap.
+    if (accumulatorStateTagVal.tag() == value::TypeTags::Nothing) {
+        accumulatorStateTagVal = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto accumulatorState = value::getArrayView(accumulatorStateTagVal.value());
+
+        // The order is important! The accumulated array should be at index
+        // AggArrayWithSize::kValues, and the size should be at index
+        // AggArrayWithSize::kSizeOfValues.
+        accumulatorState->push_back_raw(value::makeNewArray());
+        accumulatorState->push_back_raw(value::TypeTags::NumberInt64,
+                                        value::bitcastFrom<int64_t>(0));
+    }
+    tassert(11004212,
+            "Expected array for set accumulator state",
+            accumulatorStateTagVal.tag() == value::TypeTags::Array);
+
+    auto accumulatorState = value::getArrayView(accumulatorStateTagVal.value());
+    tassert(11004213,
+            "Array accumulator with invalid length",
+            accumulatorState->size() == static_cast<size_t>(AggArrayWithSize::kLast));
+
+    // Compute the size of the array after adding the new element.
+    auto accArraySizeTagVal =
+        accumulatorState->getAt(static_cast<size_t>(AggArrayWithSize::kSizeOfValues));
+    tassert(11004214,
+            "Expected integer value for array size",
+            accArraySizeTagVal.tag == value::TypeTags::NumberInt64);
+    int64_t currentSize = value::bitcastTo<int64_t>(accArraySizeTagVal.value);
+    int newElemSize = value::getApproximateSize(newElem.tag(), newElem.value());
+    int64_t newSize = currentSize + newElemSize;
+
+    // Check that array with the new element will not exceed the limit.
+    auto accArrayTagVal = accumulatorState->getAt(static_cast<size_t>(AggArrayWithSize::kValues));
+    tassert(11004215,
+            "Expected Array in accumulator state",
+            accArrayTagVal.tag == value::TypeTags::Array);
+    auto accArray = value::getArrayView(accArrayTagVal.value);
+
+    uassert(ErrorCodes::ExceededMemoryLimit,
+            str::stream() << "Used too much memory for a single array. Memory limit: " << sizeCap
+                          << " bytes. The array contains " << accArray->size()
+                          << " elements and is of size " << currentSize
+                          << " bytes. The element being added has size " << newElemSize
+                          << " bytes.",
+            newSize < sizeCap);
+
+    // Update the array's size as stored by the accumulator.
+    accumulatorState->setAt(static_cast<size_t>(AggArrayWithSize::kSizeOfValues),
+                            value::TypeTags::NumberInt64,
+                            value::bitcastFrom<int64_t>(newSize));
+
+    // Add an owned copy of the element to the array.
+    accArray->push_back_raw(newElem.releaseToOwnedRaw());
+
+    return accumulatorStateTagVal;
+}
+
+// The value being accumulated is an SBE array that contains an integer and the accumulated array,
+// where the integer is the total size in bytes of the elements in the array.
+value::TagValueMaybeOwned ByteCode::builtinAddToArrayCapped(ArityType arity) {
+    auto accumulatorState = moveOwnedFromStack(0);
+    auto newElem = moveMaybeOwnedFromStack(1);
+
+    auto sizeCap = viewFromStack(2);
+
+    // Return the unmodified accumulator state when the collator or size cap is malformed.
+    if (sizeCap.tag != value::TypeTags::NumberInt32) {
+        return accumulatorState;
+    }
+
+    return builtinAddToArrayCappedImpl(
+        std::move(accumulatorState), std::move(newElem), value::bitcastTo<int32_t>(sizeCap.value));
+}
+
+value::TagValueMaybeOwned ByteCode::builtinConcatArrays(ArityType arity) {
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto resView = value::getArrayView(result.value());
+
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxSingleExpressionMemoryUsageBytes.loadRelaxed();
+
+    for (ArityType idx = 0; idx < arity; ++idx) {
+        auto elem = viewFromStack(idx);
+        if (!value::isArray(elem.tag)) {
+            return value::TagValueMaybeOwned::nothing();
+        }
+
+        value::arrayForEach(elem.tag, elem.value, [&](value::TypeTags elTag, value::Value elVal) {
+            currentMemoryBytes += value::getApproximateSize(elTag, elVal);
+            if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+                uasserted(ErrorCodes::ExceededMemoryLimit,
+                          str::stream()
+                              << "$concatArrays would use too much memory (" << currentMemoryBytes
+                              << " bytes) and cannot spill to disk. Memory limit: "
+                              << maxMemoryBytes << " bytes");
+            }
+            resView->push_back_raw(value::copyValue(elTag, elVal));
+        });
+    }
+
+    return result;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinZipArrays(ArityType arity) {
+    ArityType localVariables = 0;
+    tassert(5156501, "Invalid parameter count for builtin ZipArrays", arity >= 2);
+
+    const auto inputSizeView = viewFromStack(localVariables++);
+    const auto useLongestLengthView = viewFromStack(localVariables++);
+
+    if (useLongestLengthView.tag != value::TypeTags::Boolean ||
+        inputSizeView.tag != value::TypeTags::NumberInt32) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    const bool useLongestLength = value::bitcastTo<bool>(useLongestLengthView.value);
+    const size_t inputSize = value::bitcastTo<int32_t>(inputSizeView.value);
+
+    // Check that the count of input arrays doesn't exceed the parameters received.
+    tassert(5156502,
+            "Invalid parameter 'input size' for builtin ZipArrays",
+            inputSize <= arity - localVariables);
+
+    // The defaults, if given, arrive as a single trailing argument holding the whole defaults
+    // array (SERVER-109615).
+    const size_t numDefaultsArgs = arity - localVariables - inputSize;
+    tassert(5156503,
+            "Invalid default argument count for builtin ZipArrays",
+            numDefaultsArgs == 0 || numDefaultsArgs == 1);
+
+    // Views into the defaults array, one per input. Left empty when defaults are absent or
+    // nullish, in which case missing input elements fall back to null.
+    std::vector<value::TagValueView> defaults;
+    if (numDefaultsArgs == 1) {
+        const auto defaultsView = viewFromStack(localVariables + inputSize);
+        if (!value::isNullish(defaultsView.tag)) {
+            uassert(10961502,
+                    "$zip defaults must resolve to an array",
+                    value::isArray(defaultsView.tag));
+            uassert(10961503,
+                    "defaults and inputs must have the same length",
+                    value::getArraySize(defaultsView.tag, defaultsView.value) == inputSize);
+
+            // Prefill views for by-column access; bsonArray does not support random access.
+            defaults.reserve(inputSize);
+            value::arrayForEach(defaultsView.tag,
+                                defaultsView.value,
+                                [&](value::TypeTags elTag, value::Value elVal) {
+                                    defaults.emplace_back(elTag, elVal);
+                                });
+        }
+    }
+
+    // Keeps enumerators to every input array.
+    absl::InlinedVector<value::ArrayEnumerator, 8> inputs;
+    inputs.reserve(inputSize);
+
+    size_t outputLength = 0;
+    for (size_t i = 0; i < inputSize; ++i) {
+        auto elem = viewFromStack(localVariables + i);
+        if (!value::isArray(elem.tag)) {
+            return value::TagValueMaybeOwned::nothing();
+        }
+
+        inputs.emplace_back(elem.tag, elem.value);
+
+        const size_t arraySize = value::getArraySize(elem.tag, elem.value);
+        if (i == 0) {
+            outputLength = arraySize;
+        } else {
+            outputLength = useLongestLength ? std::max(arraySize, outputLength)
+                                            : std::min(arraySize, outputLength);
+        }
+    }
+
+    // The final output array, e.g. [[1, 2, 3], [2, 3, 4]].
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto* resView = value::getArrayView(result.value());
+    resView->reserve(outputLength);
+
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxSingleExpressionMemoryUsageBytes.loadRelaxed();
+
+    for (size_t row = 0; row < outputLength; row++) {
+        // Used to construct each array in the output, e.g. [1, 2, 3].
+        auto intermediateRes = value::TagValueOwned::fromRaw(value::makeNewArray());
+        auto* intermediateResView = value::getArrayView(intermediateRes.value());
+        intermediateResView->reserve(inputSize);
+
+        for (size_t col = 0; col < inputSize; col++) {
+            value::ArrayEnumerator& input = inputs[col];
+            if (!input.atEnd()) {
+                // Add the value from the appropriate input array.
+                auto inputElem = input.getViewOfValue();
+                intermediateResView->push_back_raw(
+                    value::copyValue(inputElem.tag, inputElem.value));
+                input.advance();
+            } else if (col < defaults.size()) {
+                // Add the specified default value.
+                const auto& defaultElem = defaults[col];
+                intermediateResView->push_back_raw(
+                    value::copyValue(defaultElem.tag, defaultElem.value));
+            } else {
+                // Add a null default value.
+                intermediateResView->push_back_raw(value::TypeTags::Null, 0);
+            }
+        }
+        currentMemoryBytes +=
+            value::getApproximateSize(intermediateRes.tag(), intermediateRes.value());
+        if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      str::stream() << "$zip would use too much memory (" << currentMemoryBytes
+                                    << " bytes) and cannot spill to disk. Memory limit: "
+                                    << maxMemoryBytes << " bytes");
+        }
+        resView->push_back(std::move(intermediateRes));
+    }
+
+    return result;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinConcatArraysCapped(ArityType arity) {
+    auto accumulatorState = moveOwnedFromStack(0);
+    auto newArrayElements = moveOwnedFromStack(1);
+
+    auto sizeCap = viewFromStack(2);
+
+    // Return the unmodified accumulator state when the size cap is malformed.
+    if (sizeCap.tag != value::TypeTags::NumberInt32) {
+        return accumulatorState;
+    }
+
+    auto newArrayElemsSize =
+        value::getApproximateSize(newArrayElements.tag(), newArrayElements.value());
+
+    return concatArraysAccumImpl(std::move(accumulatorState),
+                                 std::move(newArrayElements),
+                                 newArrayElemsSize,
+                                 value::bitcastTo<int32_t>(sizeCap.value));
+}
+
+value::TagValueMaybeOwned ByteCode::isMemberImpl(value::TagValueView expr,
+                                                 value::TagValueView arr,
+                                                 CollatorInterface* collator) {
+    if (!value::isArray(arr.tag) && arr.tag != value::TypeTags::inList) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    if (expr.tag == value::TypeTags::Nothing) {
+        return value::TagValueMaybeOwned::boolean(false);
+    }
+
+    if (arr.tag == value::TypeTags::inList) {
+        // For InLists, we intentionally ignore the 'collator' parameter and we use the
+        // InList's collator instead.
+        InList* inList = value::getInListView(arr.value);
+        const bool found = inList->contains(expr.tag, expr.value);
+
+        return value::TagValueMaybeOwned::boolean(found);
+    } else if (arr.tag == value::TypeTags::ArraySet) {
+        // An empty ArraySet may not have a collation, but we don't need one to definitively
+        // determine that the empty set doesn't contain the value we are checking.
+        auto arrSet = value::getArraySetView(arr.value);
+        if (arrSet->size() == 0) {
+            return value::TagValueMaybeOwned::boolean(false);
+        }
+        auto& values = arrSet->values();
+        if (collator != nullptr) {
+            // An ArraySet with a collation can lose information about its members that would be
+            // necessary to answer membership queries using a different collation. We require that
+            // well formed SBE programs do not execute a "collIsMember" instruction with mismatched
+            // collations.
+            tassert(5153701,
+                    "Expected ArraySet to have matching collator",
+                    CollatorInterface::collatorsMatch(collator, arrSet->getCollator()));
+        }
+        return value::TagValueMaybeOwned::boolean(values.find({expr.tag, expr.value}) !=
+                                                  values.end());
+    }
+    const bool found =
+        value::arrayAny(arr.tag, arr.value, [&](value::TypeTags elemTag, value::Value elemVal) {
+            auto [tag, val] = value::compareValue(expr.tag, expr.value, elemTag, elemVal, collator);
+            if (tag == value::TypeTags::NumberInt32 && value::bitcastTo<int32_t>(val) == 0) {
+                return true;
+            }
+            return false;
+        });
+
+    return value::TagValueMaybeOwned::boolean(found);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinIsMember(ArityType arity) {
+    tassert(11080068, "Unexpected arity value", arity == 2);
+    auto expr = viewFromStack(0);
+    auto arr = viewFromStack(1);
+
+    return ByteCode::isMemberImpl(expr, arr, nullptr);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinCollIsMember(ArityType arity) {
+    tassert(11080067, "Unexpected arity value", arity == 3);
+    auto expr = viewFromStack(0);
+    auto arr = viewFromStack(1);
+    auto collatorView = viewFromStack(2);
+
+    CollatorInterface* collator = nullptr;
+    if (collatorView.tag == value::TypeTags::collator) {
+        collator = value::getCollatorView(collatorView.value);
+    } else {
+        // If a third parameter was supplied but it is not a Collator, return Nothing.
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    return ByteCode::isMemberImpl(expr, arr, collator);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinExtractSubArray(ArityType arity) {
+    auto arrayView = viewFromStack(0);
+    auto limitView = viewFromStack(1);
+
+    if (!value::isArray(arrayView.tag) || limitView.tag != value::TypeTags::NumberInt32) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto limit = value::bitcastTo<int32_t>(limitView.value);
+
+    auto absWithSign = [](int32_t value) -> std::pair<bool, size_t> {
+        if (value < 0) {
+            // Upcast 'value' to 'int64_t' prevent overflow during the sign change.
+            return {true, -static_cast<int64_t>(value)};
+        }
+        return {false, value};
+    };
+
+    size_t start = 0;
+    bool isNegativeStart = false;
+    size_t length = 0;
+    if (arity == 2) {
+        std::tie(isNegativeStart, start) = absWithSign(limit);
+        length = start;
+        if (!isNegativeStart) {
+            start = 0;
+        }
+    } else {
+        if (limit < 0) {
+            return value::TagValueMaybeOwned::nothing();
+        }
+        length = limit;
+
+        auto skipView = viewFromStack(2);
+        if (skipView.tag != value::TypeTags::NumberInt32) {
+            return value::TagValueMaybeOwned::nothing();
+        }
+
+        auto skip = value::bitcastTo<int32_t>(skipView.value);
+        std::tie(isNegativeStart, start) = absWithSign(skip);
+    }
+
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto resultView = value::getArrayView(result.value());
+
+    if (arrayView.tag == value::TypeTags::Array) {
+        auto inputView = value::getArrayView(arrayView.value);
+        auto arraySize = inputView->size();
+
+        auto convertedStart = [&]() -> size_t {
+            if (isNegativeStart) {
+                if (start > arraySize) {
+                    return 0;
+                } else {
+                    return arraySize - start;
+                }
+            } else {
+                return std::min(start, arraySize);
+            }
+        }();
+
+        size_t end = convertedStart + std::min(length, arraySize - convertedStart);
+        if (convertedStart < end) {
+            resultView->reserve(end - convertedStart);
+
+            for (size_t i = convertedStart; i < end; i++) {
+                auto elem = inputView->getAt(i);
+                resultView->push_back_raw(value::copyValue(elem.tag, elem.value));
+            }
+        }
+    } else {
+        auto advance = [](value::ArrayEnumerator& enumerator, size_t offset) {
+            size_t i = 0;
+            while (i < offset && !enumerator.atEnd()) {
+                i++;
+                enumerator.advance();
+            }
+        };
+
+        value::ArrayEnumerator startEnumerator{arrayView.tag, arrayView.value};
+        if (isNegativeStart) {
+            value::ArrayEnumerator windowEndEnumerator{arrayView.tag, arrayView.value};
+            advance(windowEndEnumerator, start);
+
+            while (!startEnumerator.atEnd() && !windowEndEnumerator.atEnd()) {
+                startEnumerator.advance();
+                windowEndEnumerator.advance();
+            }
+            tassert(11093713,
+                    "Enumerator didn't reach the end of the array",
+                    windowEndEnumerator.atEnd());
+        } else {
+            advance(startEnumerator, start);
+        }
+
+        size_t i = 0;
+        while (i < length && !startEnumerator.atEnd()) {
+            auto elem = startEnumerator.getViewOfValue();
+            resultView->push_back_raw(value::copyValue(elem.tag, elem.value));
+
+            i++;
+            startEnumerator.advance();
+        }
+    }
+
+    return result;
+}  // ByteCode::builtinExtractSubArray
+
+value::TagValueMaybeOwned ByteCode::builtinIsArrayEmpty(ArityType arity) {
+    tassert(11080066, "Unexpected arity value", arity == 1);
+    auto arr = viewFromStack(0);
+
+    if (!value::isArray(arr.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    if (arr.tag == value::TypeTags::Array) {
+        auto arrayView = value::getArrayView(arr.value);
+        return value::TagValueMaybeOwned::boolean(arrayView->size() == 0);
+    } else if (arr.tagIn(value::TypeTags::bsonArray, value::TypeTags::ArraySet)) {
+        value::ArrayEnumerator enumerator(arr.tag, arr.value);
+        return value::TagValueMaybeOwned::boolean(enumerator.atEnd());
+    } else {
+        // Earlier in this function we bailed out if the 'arrayType' wasn't Array, ArraySet or
+        // bsonArray, so it should be impossible to reach this point.
+        MONGO_UNREACHABLE_TASSERT(11122942);
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::builtinReverseArray(ArityType arity) {
+    tassert(11080065, "Unexpected arity value", arity == 1);
+    auto input = viewFromStack(0);
+
+    if (!value::isArray(input.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto resultView = value::getArrayView(result.value());
+
+    if (input.tag == value::TypeTags::Array) {
+        auto inputView = value::getArrayView(input.value);
+        size_t inputSize = inputView->size();
+        if (inputSize) {
+            resultView->reserve(inputSize);
+            for (size_t i = 0; i < inputSize; i++) {
+                auto orig = inputView->getAt(inputSize - 1 - i);
+                resultView->push_back_raw(copyValue(orig.tag, orig.value));
+            }
+        }
+
+        return result;
+    } else if (input.tagIn(value::TypeTags::bsonArray, value::TypeTags::ArraySet)) {
+        // Using intermediate vector since bsonArray and ArraySet don't
+        // support reverse iteration.
+        std::vector<value::TagValueView> inputContents;
+
+        if (input.tag == value::TypeTags::ArraySet) {
+            // Reserve space to avoid resizing on push_back calls.
+            auto arraySetView = value::getArraySetView(input.value);
+            inputContents.reserve(arraySetView->size());
+        }
+
+        value::arrayForEach(input.tag, input.value, [&](value::TypeTags elTag, value::Value elVal) {
+            inputContents.push_back({elTag, elVal});
+        });
+
+        if (inputContents.size()) {
+            resultView->reserve(inputContents.size());
+
+            // Run through the array backwards and copy into the result array.
+            for (auto it = inputContents.rbegin(); it != inputContents.rend(); ++it) {
+                resultView->push_back_raw(copyValue(it->tag, it->value));
+            }
+        }
+
+        return result;
+    } else {
+        // Earlier in this function we bailed out if the 'inputType' wasn't
+        // Array, ArraySet or bsonArray, so it should be impossible to reach
+        // this point.
+        MONGO_UNREACHABLE_TASSERT(11122943);
+    }
+}  // ByteCode::builtinReverseArray
+
+value::TagValueMaybeOwned ByteCode::builtinSortArray(ArityType arity) {
+    tassert(11080064, "Unexpected arity value", arity == 2 || arity == 3);
+    auto input = viewFromStack(0);
+
+    if (!value::isArray(input.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto spec = viewFromStack(1);
+
+    if (!value::isObject(spec.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    CollatorInterface* collator = nullptr;
+    if (arity == 3) {
+        auto collatorView = viewFromStack(2);
+
+        if (collatorView.tag == value::TypeTags::collator) {
+            collator = value::getCollatorView(collatorView.value);
+        } else {
+            // If a third parameter was supplied but it is not a Collator, return Nothing.
+            return value::TagValueMaybeOwned::nothing();
+        }
+    }
+
+    auto cmp = SbePatternValueCmp(spec.tag, spec.value, collator);
+
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto resultView = value::getArrayView(result.value());
+
+    if (input.tag == value::TypeTags::Array) {
+        auto inputView = value::getArrayView(input.value);
+        size_t inputSize = inputView->size();
+        if (inputSize) {
+            resultView->reserve(inputSize);
+            std::vector<value::TagValueView> sortVector;
+            sortVector.reserve(inputSize);
+            for (size_t i = 0; i < inputSize; i++) {
+                sortVector.push_back(inputView->getAt(i));
+            }
+            std::sort(sortVector.begin(), sortVector.end(), cmp);
+
+            for (auto elem : sortVector) {
+                resultView->push_back_raw(copyValue(elem.tag, elem.value));
+            }
+        }
+
+        return result;
+    } else if (input.tagIn(value::TypeTags::bsonArray, value::TypeTags::ArraySet)) {
+        value::ArrayEnumerator enumerator{input.tag, input.value};
+
+        // Using intermediate vector since bsonArray and ArraySet don't
+        // support random access.
+        std::vector<value::TagValueView> inputContents;
+
+        if (input.tag == value::TypeTags::ArraySet) {
+            // Reserve space to avoid resizing on push_back calls.
+            auto arraySetView = value::getArraySetView(input.value);
+            inputContents.reserve(arraySetView->size());
+        }
+
+        while (!enumerator.atEnd()) {
+            inputContents.push_back(enumerator.getViewOfValue());
+            enumerator.advance();
+        }
+
+        std::sort(inputContents.begin(), inputContents.end(), cmp);
+
+        if (inputContents.size()) {
+            resultView->reserve(inputContents.size());
+
+            for (auto elem : inputContents) {
+                resultView->push_back_raw(copyValue(elem.tag, elem.value));
+            }
+        }
+
+        return result;
+    } else {
+        // Earlier in this function we bailed out if the 'inputType' wasn't
+        // Array, ArraySet or bsonArray, so it should be impossible to reach
+        // this point.
+        MONGO_UNREACHABLE_TASSERT(11122944);
+    }
+}  // ByteCode::builtinSortArray
+
+namespace {
+/**
+ * Helper function to extract and validate the 'n' parameter for topN/bottomN.
+ * Returns -1 if validation fails.
+ */
+inline int64_t extractNParameter(value::TagValueView n) {
+    if (!value::isNumber(n.tag)) {
+        return -1;
+    }
+
+    int64_t result;
+    switch (n.tag) {
+        case value::TypeTags::NumberInt64:
+            result = value::bitcastTo<int64_t>(n.value);
+            break;
+        case value::TypeTags::NumberInt32:
+            result = value::bitcastTo<int32_t>(n.value);
+            break;
+        case value::TypeTags::NumberDouble: {
+            double dVal = value::bitcastTo<double>(n.value);
+            auto converted = mongo::representAs<int64_t>(dVal);
+            if (!converted) {
+                return -1;
+            }
+            result = *converted;
+            break;
+        }
+        case value::TypeTags::NumberDecimal: {
+            auto dVal = value::bitcastTo<Decimal128>(n.value);
+            auto converted = mongo::representAs<int64_t>(dVal);
+            if (!converted) {
+                return -1;
+            }
+            result = *converted;
+            break;
+        }
+        default:
+            return -1;
+    }
+
+    return result;
+}
+
+/**
+ * Helper function to perform partial sort and extract top N or bottom N elements from a vector.
+ * Modifies the input vector in place and copies the selected N elements to the result array.
+ */
+void extractTopOrBottomN(std::vector<std::pair<value::TypeTags, value::Value>>& sortVector,
+                         size_t n,
+                         value::Array* resultView,
+                         const SbePatternValueCmp& cmp,
+                         TopBottomSense sense) {
+    size_t inputSize = sortVector.size();
+    size_t nSize = std::min(inputSize, n);
+
+    // Sort the top or bottom n elements in the array in the correct order.
+    // Partial sort uses a heap to sort the elements.
+    if (sense == TopBottomSense::kBottom) {
+        auto inverse = [&cmp](const auto& lhs, const auto& rhs) {
+            return cmp(rhs, lhs);
+        };
+        std::partial_sort(
+            sortVector.rbegin(), sortVector.rbegin() + nSize, sortVector.rend(), inverse);
+    } else {
+        std::partial_sort(sortVector.begin(), sortVector.begin() + nSize, sortVector.end(), cmp);
+    }
+
+    // Copy the top or bottom n elements into the result array.
+    // For bottomN, the elements are at the end of the vector after reverse partial_sort.
+    size_t startIdx = sense == TopBottomSense::kBottom ? inputSize - nSize : 0;
+    for (size_t i = 0; i < nSize; i++) {
+        auto [tag, val] = sortVector[startIdx + i];
+        auto [copyTag, copyVal] = copyValue(tag, val);
+        resultView->push_back_raw(copyTag, copyVal);
+    }
+}
+
+
+}  // namespace
+
+value::TagValueMaybeOwned ByteCode::topOrBottomImpl(ArityType arity, TopBottomSense sense) {
+    tassert(1127464, "Unexpected arity value", arity == 2 || arity == 3);
+
+    auto input = viewFromStack(0);
+    if (!value::isArray(input.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto spec = viewFromStack(1);
+    if (!value::isObject(spec.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    const CollatorInterface* collator = nullptr;
+    if (arity == 3) {
+        auto collatorView = viewFromStack(2);
+        if (collatorView.tag == value::TypeTags::collator) {
+            collator = value::getCollatorView(collatorView.value);
+        } else {
+            // If a third parameter was supplied but it is not a Collator, return Nothing.
+            return value::TagValueMaybeOwned::nothing();
+        }
+    }
+
+    auto cmpInput = SbePatternValueCmp(spec.tag, spec.value, collator);
+
+    // Inverse comparator if the sense is kBottom
+    auto cmp = [sense, &cmpInput](auto lhs, auto rhs) {
+        if (sense == TopBottomSense::kTop) {
+            return cmpInput(lhs, rhs);
+        } else {
+            return cmpInput(rhs, lhs);
+        }
+    };
+
+    if (input.tag == value::TypeTags::Array) {
+        auto inputView = value::getArrayView(input.value);
+        size_t inputSize = inputView->size();
+        if (inputSize == 0) {
+            return {true, value::TypeTags::Null, 0};
+        }
+
+        // Get the best element, either the top or bottom element depending on cmp.
+        auto best_element = inputView->getAt(0);
+        for (size_t i = 1; i < inputSize; i++) {
+            if (cmp(inputView->getAt(i), best_element)) {
+                best_element = inputView->getAt(i);
+            }
+        }
+
+        return best_element.copy();
+    } else if (input.tagIn(value::TypeTags::bsonArray, value::TypeTags::ArraySet)) {
+        value::ArrayEnumerator enumerator{input.tag, input.value};
+
+        if (enumerator.atEnd()) {
+            return {true, value::TypeTags::Null, 0};
+        }
+
+        // Get the best element, either the top or bottom element depending on cmp.
+        auto best_element = enumerator.getViewOfValue();
+        enumerator.advance();
+        while (!enumerator.atEnd()) {
+            auto current_element = enumerator.getViewOfValue();
+            if (cmp(current_element, best_element)) {
+                best_element = current_element;
+            }
+            enumerator.advance();
+        }
+
+        return best_element.copy();
+    } else {
+        // Earlier in this function we bailed out if the 'inputType' wasn't
+        // Array, ArraySet or bsonArray, so it should be impossible to reach
+        // this point.
+        MONGO_UNREACHABLE_TASSERT(1127465);
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::topOrBottomNImpl(ArityType arity, TopBottomSense sense) {
+    tassert(1127461, "Unexpected arity value", arity == 3 || arity == 4);
+
+    auto nView = viewFromStack(0);
+    int64_t n = extractNParameter(nView);
+    if (n < 0) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto input = viewFromStack(1);
+    if (!value::isArray(input.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto spec = viewFromStack(2);
+    if (!value::isObject(spec.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    const CollatorInterface* collator = nullptr;
+    if (arity == 4) {
+        auto collatorView = viewFromStack(3);
+        if (collatorView.tag == value::TypeTags::collator) {
+            collator = value::getCollatorView(collatorView.value);
+        } else {
+            // If a fourth parameter was supplied but it is not a Collator, return Nothing.
+            return value::TagValueMaybeOwned::nothing();
+        }
+    }
+
+    auto cmp = SbePatternValueCmp(spec.tag, spec.value, collator);
+
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    auto resultView = value::getArrayView(result.value());
+
+    if (input.tag == value::TypeTags::Array) {
+        auto inputView = value::getArrayView(input.value);
+        size_t inputSize = inputView->size();
+        if (inputSize == 0) {
+            return result;
+        }
+
+        resultView->reserve(std::min(inputSize, static_cast<size_t>(n)));
+        std::vector<std::pair<value::TypeTags, value::Value>> sortVector;
+        sortVector.reserve(inputSize);
+        for (size_t i = 0; i < inputSize; i++) {
+            sortVector.push_back(inputView->getAt(i));
+        }
+        extractTopOrBottomN(sortVector, static_cast<size_t>(n), resultView, cmp, sense);
+
+        return result;
+    } else if (input.tagIn(value::TypeTags::bsonArray, value::TypeTags::ArraySet)) {
+        value::ArrayEnumerator enumerator{input.tag, input.value};
+        if (enumerator.atEnd()) {
+            return result;
+        }
+        // Using intermediate vector since bsonArray and ArraySet don't
+        // support reverse iteration.
+        std::vector<std::pair<value::TypeTags, value::Value>> inputContents;
+
+        if (input.tag == value::TypeTags::ArraySet) {
+            // Reserve space to avoid resizing on push_back calls.
+            auto arraySetView = value::getArraySetView(input.value);
+            inputContents.reserve(arraySetView->size());
+        }
+
+        while (!enumerator.atEnd()) {
+            inputContents.push_back(enumerator.getViewOfValue());
+            enumerator.advance();
+        }
+
+        if (inputContents.size()) {
+            size_t nSize = std::min(inputContents.size(), static_cast<size_t>(n));
+            resultView->reserve(nSize);
+            extractTopOrBottomN(inputContents, static_cast<size_t>(n), resultView, cmp, sense);
+        }
+
+        return result;
+    } else {
+        // Earlier in this function we bailed out if the 'inputType' wasn't
+        // Array, ArraySet or bsonArray, so it should be impossible to reach
+        // this point.
+        MONGO_UNREACHABLE_TASSERT(1127468);
+    }
+}
+
+value::TagValueMaybeOwned ByteCode::builtinTopN(ArityType arity) {
+    return topOrBottomNImpl(arity, TopBottomSense::kTop);
+}  // ByteCode::builtinTopN
+
+value::TagValueMaybeOwned ByteCode::builtinBottomN(ArityType arity) {
+    return topOrBottomNImpl(arity, TopBottomSense::kBottom);
+}  // ByteCode::builtinBottomN
+
+value::TagValueMaybeOwned ByteCode::builtinTop(ArityType arity) {
+    return topOrBottomImpl(arity, TopBottomSense::kTop);
+}  // ByteCode::builtinTop
+
+value::TagValueMaybeOwned ByteCode::builtinBottom(ArityType arity) {
+    return topOrBottomImpl(arity, TopBottomSense::kBottom);
+}  // ByteCode::builtinBottom
+
+value::TagValueMaybeOwned ByteCode::builtinArrayToObject(ArityType arity) {
+    tassert(11080063, "Unexpected arity value", arity == 1);
+
+    auto arr = viewFromStack(0);
+
+    if (!value::isArray(arr.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto obj = value::TagValueOwned::fromRaw(value::makeNewObject());
+    auto object = value::getObjectView(obj.value());
+
+    value::ArrayEnumerator arrayEnumerator(arr.tag, arr.value);
+
+    // return empty object for empty array
+    if (arrayEnumerator.atEnd()) {
+        return obj;
+    }
+
+    // There are two accepted input formats in an array: [ [key, val] ] or [ {k:key, v:val} ]. The
+    // first array element determines the format for the rest of the array. Mixing input formats is
+    // not allowed.
+    bool inputArrayFormat;
+    auto firstElem = arrayEnumerator.getViewOfValue();
+    if (value::isArray(firstElem.tag)) {
+        inputArrayFormat = true;
+    } else if (value::isObject(firstElem.tag)) {
+        inputArrayFormat = false;
+    } else {
+        uasserted(5153201, "Input to $arrayToObject should be either an array or object");
+    }
+
+    // Use a StringMap to store the indices in object for added fieldNames
+    // Only the last value should be added for duplicate fieldNames.
+    StringMap<int> keyMap{};
+
+    while (!arrayEnumerator.atEnd()) {
+        auto elem = arrayEnumerator.getViewOfValue();
+        if (inputArrayFormat) {
+            uassert(5153202,
+                    "$arrayToObject requires a consistent input format. Expected an array",
+                    value::isArray(elem.tag));
+
+            value::ArrayEnumerator innerArrayEnum(elem.tag, elem.value);
+            uassert(5153203,
+                    "$arrayToObject requires an array of size 2 arrays",
+                    !innerArrayEnum.atEnd());
+
+            auto key = innerArrayEnum.getViewOfValue();
+            uassert(5153204,
+                    "$arrayToObject requires an array of key-value pairs, where the key must be of "
+                    "type string",
+                    value::isString(key.tag));
+
+            innerArrayEnum.advance();
+            uassert(5153205,
+                    "$arrayToObject requires an array of size 2 arrays",
+                    !innerArrayEnum.atEnd());
+
+            auto val = innerArrayEnum.getViewOfValue();
+
+            innerArrayEnum.advance();
+            uassert(5153206,
+                    "$arrayToObject requires an array of size 2 arrays",
+                    innerArrayEnum.atEnd());
+
+            auto keyStringData = value::getStringView(key.tag, key.value);
+            uassert(5153207,
+                    "Key field cannot contain an embedded null byte",
+                    keyStringData.find('\0') == std::string::npos);
+
+            auto valueCopy = value::TagValueOwned::fromRaw(value::copyValue(val.tag, val.value));
+            if (keyMap.contains(keyStringData)) {
+                auto idx = keyMap[keyStringData];
+                auto [copyTag, copyVal] = valueCopy.releaseToRaw();
+                object->setAt(idx, copyTag, copyVal);
+            } else {
+                keyMap[keyStringData] = object->size();
+                auto [copyTag, copyVal] = valueCopy.releaseToRaw();
+                object->push_back_raw(keyStringData, copyTag, copyVal);
+            }
+        } else {
+            uassert(5153208,
+                    "$arrayToObject requires a consistent input format. Expected an object",
+                    value::isObject(elem.tag));
+
+            value::ObjectEnumerator innerObjEnum(elem.tag, elem.value);
+            uassert(5153209,
+                    "$arrayToObject requires an object keys of 'k' and 'v'. "
+                    "Found incorrect number of keys",
+                    !innerObjEnum.atEnd());
+
+            auto keyName = innerObjEnum.getFieldName();
+            auto key = innerObjEnum.getViewOfValue();
+
+            innerObjEnum.advance();
+            uassert(5153210,
+                    "$arrayToObject requires an object keys of 'k' and 'v'. "
+                    "Found incorrect number of keys",
+                    !innerObjEnum.atEnd());
+
+            auto valueName = innerObjEnum.getFieldName();
+            auto val = innerObjEnum.getViewOfValue();
+
+            innerObjEnum.advance();
+            uassert(5153211,
+                    "$arrayToObject requires an object keys of 'k' and 'v'. "
+                    "Found incorrect number of keys",
+                    innerObjEnum.atEnd());
+
+            uassert(5153212,
+                    "$arrayToObject requires an object with keys 'k' and 'v'.",
+                    ((keyName == "k" && valueName == "v") || (keyName == "v" && valueName == "k")));
+            if (keyName == "v" && valueName == "k") {
+                std::swap(key, val);
+            }
+
+            uassert(5153213,
+                    "$arrayToObject requires an object with keys 'k' and 'v', where "
+                    "the value of 'k' must be of type string",
+                    value::isString(key.tag));
+
+            auto keyStringData = value::getStringView(key.tag, key.value);
+            uassert(5153214,
+                    "Key field cannot contain an embedded null byte",
+                    keyStringData.find('\0') == std::string::npos);
+
+            auto valueCopy = value::TagValueOwned::fromRaw(value::copyValue(val.tag, val.value));
+            if (keyMap.contains(keyStringData)) {
+                auto idx = keyMap[keyStringData];
+                auto [copyTag, copyVal] = valueCopy.releaseToRaw();
+                object->setAt(idx, copyTag, copyVal);
+            } else {
+                keyMap[keyStringData] = object->size();
+                auto [copyTag, copyVal] = valueCopy.releaseToRaw();
+                object->push_back_raw(keyStringData, copyTag, copyVal);
+            }
+        }
+        arrayEnumerator.advance();
+    }
+    return obj;
+}  // ByteCode::builtinArrayToObject
+
+value::TagValueMaybeOwned ByteCode::builtinUnwindArray(ArityType arity) {
+    tassert(11080059, "Unexpected arity value", arity == 1);
+
+    auto arr = viewFromStack(0);
+
+    if (!value::isArray(arr.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    value::ArrayEnumerator arrayEnumerator(arr.tag, arr.value);
+    if (arrayEnumerator.atEnd()) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArray());
+    value::Array* resultView = value::getArrayView(result.value());
+
+    while (!arrayEnumerator.atEnd()) {
+        auto elem = arrayEnumerator.getViewOfValue();
+        if (value::isArray(elem.tag)) {
+            value::ArrayEnumerator subArrayEnumerator(elem.tag, elem.value);
+            while (!subArrayEnumerator.atEnd()) {
+                auto subElem = subArrayEnumerator.getViewOfValue();
+                resultView->push_back_raw(value::copyValue(subElem.tag, subElem.value));
+                subArrayEnumerator.advance();
+            }
+        } else {
+            resultView->push_back_raw(value::copyValue(elem.tag, elem.value));
+        }
+        arrayEnumerator.advance();
+    }
+
+    return result;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinArrayToSet(ArityType arity) {
+    tassert(11080058, "Unexpected arity value", arity == 1);
+    auto arr = viewFromStack(0);
+
+    if (!value::isArray(arr.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto result = value::TagValueOwned::fromRaw(value::makeNewArraySet());
+    value::ArraySet* arrSet = value::getArraySetView(result.value());
+
+    auto sizeView = getArraySize(arr);
+    tassert(11086810, "Unexpected type of size", sizeView.tag == value::TypeTags::NumberInt64);
+    arrSet->reserve(static_cast<int64_t>(sizeView.value));
+
+    value::ArrayEnumerator arrayEnumerator(arr.tag, arr.value);
+    while (!arrayEnumerator.atEnd()) {
+        auto elem = arrayEnumerator.getViewOfValue();
+        arrSet->push_back_clone(elem.tag, elem.value);
+        arrayEnumerator.advance();
+    }
+
+    return result;
+}
+
+value::TagValueMaybeOwned ByteCode::builtinCollArrayToSet(ArityType arity) {
+    tassert(11080057, "Unexpected arity value", arity == 2);
+
+    auto collView = viewFromStack(0);
+    if (collView.tag != value::TypeTags::collator) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto arr = viewFromStack(1);
+
+    if (!value::isArray(arr.tag)) {
+        return value::TagValueMaybeOwned::nothing();
+    }
+
+    auto result = value::TagValueOwned::fromRaw(
+        value::makeNewArraySet(value::getCollatorView(collView.value)));
+    value::ArraySet* arrSet = value::getArraySetView(result.value());
+
+    auto sizeView = getArraySize(arr);
+    tassert(11086809, "Unexpected type of size", sizeView.tag == value::TypeTags::NumberInt64);
+    arrSet->reserve(static_cast<int64_t>(sizeView.value));
+
+    value::ArrayEnumerator arrayEnumerator(arr.tag, arr.value);
+    while (!arrayEnumerator.atEnd()) {
+        auto elem = arrayEnumerator.getViewOfValue();
+        arrSet->push_back_clone(elem.tag, elem.value);
+        arrayEnumerator.advance();
+    }
+
+    return result;
+}
+
+}  // namespace vm
+}  // namespace sbe
+}  // namespace mongo

@@ -1,0 +1,23 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# rotateCertificates IDL File.
+
+global:
+    mod_visibility: private
+    cpp_namespace: "mongo"
+
+imports:
+    - "mongo/db/basic_types.idl"
+
+commands:
+    rotateCertificates:
+        description: "An administrative command which rotates the certificates to be used by new SSL connections"
+        command_name: rotateCertificates
+        namespace: ignored
+        api_version: ""
+        fields:
+            message:
+                description: "Message to be logged upon successful rotation"
+                type: string
+                optional: true

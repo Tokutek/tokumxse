@@ -1,0 +1,484 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bson_validate_gen.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+
+#include <cstddef>
+#include <string>
+#include <string_view>
+
+#include <benchmark/benchmark.h>
+#include <fmt/format.h>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+namespace mongo {
+namespace {
+using namespace std::literals::string_view_literals;
+
+// Returns number within a sensible range for human ages (measured in years) based on the given seed
+// 'i'.
+int pseudoRandomAge(uint64_t i) {
+    return i * 8391 % 97 + 12;
+}
+
+// Returns a number in the range [10000, 99999] resembling a zip code based on the seed 'i'.
+int pseudoRandomZipCode(uint64_t i) {
+    return 10'000 + i * 316'731 % 90'000;
+}
+
+// Returns a string which resembles a 7 digit phone number, computed based on the seed 'i'.
+std::string pseudoRandomPhoneNo(uint64_t i) {
+    return fmt::format("{}-{:04d}", i * 2923 % 900 + 100, i * 32'347 % 9999);
+}
+
+// Returns a string whose prefix is a pseudorandom number calculated based on seed 'i', followed by
+// 50 'a' characters in order to pad the string.
+std::string pseudoRandomLongStr(uint64_t i) {
+    return fmt::format("{}{:a<50s}", i * 234'397'31, "");
+}
+
+// Returns a pseudorandom number in the interval [0, 9,999,999] based on the seed 'i'.
+int pseudoRandom7Digits(uint64_t i) {
+    return i * 83'438 % 10'000'000;
+}
+
+BSONObj buildSampleObj(uint64_t i) {
+    // clang-format off
+    return BSON("_id" << OID::gen()
+                << "name" << "Wile E. Coyote"
+                << "age" << pseudoRandomAge(i)
+                << "i" << static_cast<int>(i)
+                << "address" << BSON(
+                    "street" << "433 W 43rd St"
+                    << "zip_code" << pseudoRandomZipCode(i)
+                    << "city" << "New York")
+                << "random" << pseudoRandom7Digits(i)
+                << "phone_no" << pseudoRandomPhoneNo(i)
+                << "long_string" << pseudoRandomLongStr(i));
+    // clang-format on
+}
+
+BSONObj buildDeepObj(uint64_t i, int numFields, int maxNesting, size_t possibleValueIndex = 0) {
+    std::vector<std::variant<int, std::string, BSONObj>> possibleValues;
+    possibleValues.reserve(8);
+    possibleValues.emplace_back(pseudoRandomAge(i));
+    possibleValues.emplace_back(static_cast<int>(i));
+    possibleValues.emplace_back(pseudoRandomZipCode(i));
+    possibleValues.emplace_back(pseudoRandom7Digits(i));
+    possibleValues.emplace_back(pseudoRandomPhoneNo(i));
+    possibleValues.emplace_back(pseudoRandomLongStr(i));
+    if (maxNesting > 0) {
+        possibleValues.emplace_back(buildDeepObj(i, numFields, maxNesting - 1, possibleValueIndex));
+
+        BSONArrayBuilder arrBuilder;
+        for (int i = 0; i < 5; ++i) {
+            arrBuilder.append(buildDeepObj(i, numFields, 0));
+        }
+        possibleValues.emplace_back(arrBuilder.arr());
+    }
+
+    BSONObjBuilder builder;
+    for (int j = 0; j < numFields; ++j) {
+        // Choose an 8-character field name based on 'j' by multiplying by a large prime number
+        // and then representing the low-order bits as hex.
+        uint64_t hash = (static_cast<uint64_t>(j) * 2654435761u) & 0xffffffff;
+        std::string fieldName = fmt::format("{:08x}", hash);
+
+        // Round robin through the list of possible values computed previously, dealing with the
+        // fact that they may be either int or string or nested object or array.
+        auto& value = possibleValues[possibleValueIndex++ % possibleValues.size()];
+        std::visit(
+            OverloadedVisitor{
+                [&builder, &fieldName](const auto& v) { builder.append(fieldName, v); },
+            },
+            value);
+    }
+
+    return builder.obj();
+}
+
+void BM_arrayBuilder(benchmark::State& state) {
+    size_t totalBytes = 0;
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        BSONArrayBuilder array;
+        for (auto j = 0; j < state.range(0); j++)
+            array.append(j);
+        totalBytes += array.len();
+        benchmark::DoNotOptimize(array.done());
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_arrayLookup(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(array[len]);
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+
+void BM_arrayStlIterate(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        long count = 0;
+        for (auto&& e : array) {
+            ++count;
+            benchmark::DoNotOptimize(e);
+        }
+        invariant(count == len);
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_arrayNonStlIterate(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        long count = 0;
+        auto it = BSONObjIterator(array);
+        while (it.more()) {
+            auto e = it.next();
+            ++count;
+            benchmark::DoNotOptimize(e);
+        }
+        invariant(count == len);
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_arrayStlIterateWithSize(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+    const auto emptyBSONObjSize = BSONObj().objsize();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        long count = 0;
+        auto objBytes = 0;
+        for (auto&& e : array) {
+            objBytes += e.size();
+            ++count;
+            benchmark::DoNotOptimize(e);
+        }
+        invariant(count == len);
+        invariant(objBytes + emptyBSONObjSize == array.objsize());
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BSONnFields(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(array.nFields());
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_bsonIteratorSortedConstruction(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    auto totalBytes = len * 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(j);
+    BSONObj array = builder.done();
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(BSONObjIteratorSorted(array));
+        totalBytes += array.objsize();
+    }
+    state.SetBytesProcessed(totalBytes);
+}
+
+void BM_validate(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    size_t totalSize = 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(buildSampleObj(j));
+    BSONObj array = builder.done();
+
+    const auto& elem = array[0].Obj();
+    auto status = validateBSON(elem.objdata(), elem.objsize());
+    if (!status.isOK())
+        LOGV2(4440100, "Validate failed", "elem"_attr = elem, "status"_attr = status);
+    invariant(status);
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(validateBSON(array.objdata(), array.objsize()));
+        totalSize += array.objsize();
+    }
+    state.SetBytesProcessed(totalSize);
+}
+
+void BM_validate_contents(benchmark::State& state) {
+    BSONArrayBuilder builder;
+    auto len = state.range(0);
+    size_t totalSize = 0;
+    for (auto j = 0; j < len; j++)
+        builder.append(buildSampleObj(j));
+    BSONObj array = builder.done();
+
+    const auto& elem = array[0].Obj();
+    auto status = validateBSON(elem.objdata(), elem.objsize(), BSONValidateModeEnum::kFull);
+    if (!status.isOK())
+        LOGV2(6752100, "Validate failed", "elem"_attr = elem, "status"_attr = status);
+    invariant(status);
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(
+            validateBSON(array.objdata(), array.objsize(), BSONValidateModeEnum::kFull));
+        totalSize += array.objsize();
+    }
+    state.SetBytesProcessed(totalSize);
+}
+
+void BM_validateDepthForUserStorage(benchmark::State& state) {
+    auto arrayLen = state.range(0);
+    auto numFields = state.range(1);
+    auto nestingLimit = state.range(2);
+
+    BSONArrayBuilder builder;
+    size_t totalSize = 0;
+    for (auto i = 0; i < arrayLen; ++i) {
+        builder.append(buildDeepObj(i, numFields, nestingLimit));
+    }
+    BSONObj array = builder.done();
+
+    const auto& elem = array[0].Obj();
+    auto status = validateBSONDepthForUserStorage(elem);
+    if (!status.isOK())
+        LOGV2(10101801, "Depth validation failed", "elem"_attr = elem, "status"_attr = status);
+    invariant(status);
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+        benchmark::DoNotOptimize(validateBSONDepthForUserStorage(array));
+        totalSize += array.objsize();
+    }
+    state.SetBytesProcessed(totalSize);
+}
+
+/**
+ * Benchmark BSON validation for objects that have no nesting but many field names. The first range
+ * argument (state.range(0)) indicates the number of wide objects to validate. The second range
+ * argument (state.range(1)) specifies the number of fields that each of these objects should
+ * contain.
+ *
+ * The template parameter 'M' specifies the validation mode (default, extended, or full).
+ */
+template <BSONValidateModeEnum M>
+void BM_validateObj(benchmark::State& state) {
+    auto arrayLen = state.range(0);
+    auto numFields = state.range(1);
+    auto nestingLimit = state.range(2);
+
+    BSONArrayBuilder builder;
+    size_t totalSize = 0;
+    for (auto i = 0; i < arrayLen; ++i) {
+        builder.append(buildDeepObj(i, numFields, nestingLimit));
+    }
+    BSONObj array = builder.done();
+
+    const auto& elem = array[0].Obj();
+    auto status = validateBSON(elem.objdata(), elem.objsize(), M);
+    if (!status.isOK())
+        LOGV2(10101800, "Validate failed", "elem"_attr = elem, "status"_attr = status);
+    invariant(status);
+
+    for (auto _ : state) {
+        benchmark::ClobberMemory();
+
+        benchmark::DoNotOptimize(validateBSON(array.objdata(), array.objsize(), M));
+        totalSize += array.objsize();
+    }
+    state.SetBytesProcessed(totalSize);
+}
+
+BENCHMARK(BM_arrayBuilder)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayLookup)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayNonStlIterate)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayStlIterate)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_arrayStlIterateWithSize)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BSONnFields)->Ranges({{{1}, {100'000}}});
+BENCHMARK(BM_bsonIteratorSortedConstruction)->Ranges({{{1}, {100'000}}});
+
+// BSON validation benchmarks.
+BENCHMARK(BM_validate)->Ranges({{{1}, {1'000}}});
+BENCHMARK(BM_validate_contents)->Ranges({{{1}, {1'000}}});
+BENCHMARK_TEMPLATE(BM_validateObj, BSONValidateModeEnum::kDefault)
+    ->Ranges({{64, 512}, {50, 1'000}, {0, 0}})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_validateObj, BSONValidateModeEnum::kExtended)
+    ->Ranges({{64, 512}, {50, 1'000}, {0, 0}})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_validateObj, BSONValidateModeEnum::kFull)
+    ->Ranges({{64, 512}, {50, 1'000}, {0, 0}})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_validateObj, BSONValidateModeEnum::kDefault)
+    ->Ranges({{64, 512}, {10, 20}, {2, 5}})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_validateObj, BSONValidateModeEnum::kExtended)
+    ->Ranges({{64, 512}, {10, 20}, {2, 5}})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(BM_validateObj, BSONValidateModeEnum::kFull)
+    ->Ranges({{64, 512}, {10, 20}, {2, 5}})
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_validateDepthForUserStorage)
+    ->Ranges({{1, 64}, {1, 32}, {1, 4}})
+    ->Unit(benchmark::kMicrosecond);
+
+void BM_objBuilderAppendInt(benchmark::State& state) {
+    int n = state.range(0);
+    int reps = 0;
+    for (auto _ : state) {
+        BSONObjBuilder bob;
+        for (int i = 0; i < n; ++i) {
+            bob.append("a"sv, i);
+        }
+        benchmark::DoNotOptimize(bob.done());
+        ++reps;
+    }
+    state.SetItemsProcessed(n * reps);
+}
+
+void BM_objBuilderAppendIntStreamOperator(benchmark::State& state) {
+    int n = state.range(0);
+    int reps = 0;
+    for (auto _ : state) {
+        BSONObjBuilder bob;
+        for (int i = 0; i < n; ++i) {
+            bob << "a" << i;
+        }
+        benchmark::DoNotOptimize(bob.done());
+        ++reps;
+    }
+    state.SetItemsProcessed(n * reps);
+}
+
+void BM_objBuilderAppendStreamedValue(benchmark::State& state) {
+    int n = state.range(0);
+    int reps = 0;
+    for (auto _ : state) {
+        BSONObjBuilder bob;
+        for (int i = 0; i < n; ++i) {
+            bob << "a" << Value(i);
+        }
+        benchmark::DoNotOptimize(bob.done());
+        ++reps;
+    }
+    state.SetItemsProcessed(n * reps);
+}
+
+BENCHMARK(BM_objBuilderAppendInt)->DenseRange(1, 8)->Range(9, 1 << 20);
+BENCHMARK(BM_objBuilderAppendIntStreamOperator)->DenseRange(1, 8)->Range(9, 1 << 20);
+BENCHMARK(BM_objBuilderAppendStreamedValue)->DenseRange(1, 8)->Range(9, 1 << 20);
+
+/**
+ * The BSONObjBuilder here is pre-populated with state.range(0) fields, and the object passed to
+ * appendElementsUnique() has the same number of fields, 'numOverlapping' of which have field names
+ * that already exist in the builder.
+ */
+void objBuilderAppendElementsUnique(benchmark::State& state, int numOverlapping) {
+    const int n = state.range(0);
+
+    auto makeFieldName = [](int i) {
+        return fmt::format("field_name_{}", i);
+    };
+
+    BSONObjBuilder existingBuilder;
+    for (int i = 0; i < n; ++i) {
+        existingBuilder.append(makeFieldName(i), i);
+    }
+    BSONObj existing = existingBuilder.obj();
+
+    // The first 'numOverlapping' field names of the merged object are shared with the existing
+    // object, the remaining ones are distinct from it.
+    BSONObjBuilder toMergeBuilder;
+    for (int i = 0; i < n; ++i) {
+        toMergeBuilder.append(makeFieldName(n - numOverlapping + i), i);
+    }
+    BSONObj toMerge = toMergeBuilder.obj();
+
+    int reps = 0;
+    for (auto _ : state) {
+        BSONObjBuilder bob;
+        bob.appendElements(existing);
+        bob.appendElementsUnique(toMerge);
+        benchmark::DoNotOptimize(bob.done());
+        ++reps;
+    }
+    state.SetItemsProcessed(int64_t{n} * reps);
+}
+
+// None of the fields of the merged object already exist in the builder.
+void BM_objBuilderAppendElementsUniqueNoneExisting(benchmark::State& state) {
+    objBuilderAppendElementsUnique(state, 0);
+}
+
+// Half of the fields of the merged object already exist in the builder.
+void BM_objBuilderAppendElementsUniqueHalfExisting(benchmark::State& state) {
+    objBuilderAppendElementsUnique(state, state.range(0) / 2);
+}
+
+// All fields of the merged object already exist in the builder.
+void BM_objBuilderAppendElementsUniqueAllExisting(benchmark::State& state) {
+    objBuilderAppendElementsUnique(state, state.range(0));
+}
+
+BENCHMARK(BM_objBuilderAppendElementsUniqueNoneExisting)->DenseRange(1, 8)->Range(9, 1 << 14);
+BENCHMARK(BM_objBuilderAppendElementsUniqueHalfExisting)->DenseRange(1, 8)->Range(9, 1 << 14);
+BENCHMARK(BM_objBuilderAppendElementsUniqueAllExisting)->DenseRange(1, 8)->Range(9, 1 << 14);
+
+}  // namespace
+}  // namespace mongo

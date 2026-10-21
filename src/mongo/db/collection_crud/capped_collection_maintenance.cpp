@@ -1,0 +1,209 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/collection_crud/capped_collection_maintenance.h"
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/batched_write_context.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_util.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_enabled.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_uncommitted_changes.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
+#include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+
+#include <cstdint>
+#include <memory>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+namespace mongo::collection_internal {
+namespace {
+
+struct CappedCollectionState {
+    RecordId cappedFirstRecord;
+};
+
+const auto cappedCollectionState =
+    SharedCollectionDecorations::declareDecoration<CappedCollectionState>();
+
+}  // namespace
+
+
+bool shouldDeferCappedDeletesToOplogApplication(OperationContext* opCtx,
+                                                const CollectionPtr& collection) {
+    // Secondaries only delete from capped collections via oplog application when there are explicit
+    // delete oplog entries.
+    if (!opCtx->isEnforcingConstraints()) {
+        return true;
+    }
+
+    if (collection->ns().isTemporaryReshardingCollection()) {
+        // Don't do capped deletes if this is a temporary resharding collection since that could
+        // lead to multi-timestamp violation. The recipient shard will apply the capped delete oplog
+        // entries from the donor shard anyway.
+        // TODO PM-3667: Reevaluate if we can setEnforceConstraints(false) during resharding and
+        // rely solely on the above check.
+        return true;
+    }
+
+    return false;
+}
+
+void cappedDeleteUntilBelowConfiguredMaximum(OperationContext* opCtx,
+                                             const CollectionPtr& collection,
+                                             const RecordId& justInserted,
+                                             OpDebug* opDebug) {
+    if (!collection->isCappedAndNeedsDelete(opCtx))
+        return;
+
+    if (shouldDeferCappedDeletesToOplogApplication(opCtx, collection)) {
+        // The primary has already executed the following logic and generated the necessary delete
+        // oplogs. We will apply them later.
+        return;
+    }
+
+    const auto& nss = collection->ns();
+    auto& ccs = cappedCollectionState(*collection->getSharedDecorations());
+
+    // The capped metadata lock serializes writes to ensure only one one writer is actively deleting
+    // a document at at time. As capped deletes can be part of a larger WriteUnitOfWork, this also
+    // protect 'cappedFirstRecord' until the outermost WriteUnitOfWork commits or aborts. Locking
+    // the metadata resource exclusively on the collection gives us that guarantee as it uses
+    // two-phase locking semantics and the lock is held in the onCommit handler.
+    invariant(collection->needsCappedLock());
+    invariant(shard_role_details::getLocker(opCtx)->getLockMode(
+                  ResourceId(RESOURCE_METADATA, nss)) == MODE_X);
+
+    const long long currentDataSize = collection->dataSize(opCtx);
+    const long long currentNumRecords = collection->numRecords(opCtx);
+
+    const auto cappedMaxSize = collection->getCollectionOptions().cappedSize;
+    const long long sizeOverCap =
+        (currentDataSize > cappedMaxSize) ? currentDataSize - cappedMaxSize : 0;
+
+    const auto cappedMaxDocs = collection->getCollectionOptions().cappedMaxDocs;
+    const long long docsOverCap = (cappedMaxDocs != 0 && currentNumRecords > cappedMaxDocs)
+        ? currentNumRecords - cappedMaxDocs
+        : 0;
+
+    long long sizeSaved = 0;
+    long long docsRemoved = 0;
+
+    invariant(shard_role_details::getRecoveryUnit(opCtx)->inUnitOfWork());
+
+    boost::optional<Record> record;
+    auto cursor = collection->getCursor(opCtx, /*forward=*/true);
+
+    // If the next RecordId to be deleted is known, navigate to it using seek(). Using a cursor
+    // and advancing it to the first element by calling next() will be slow for capped collections
+    // on particular storage engines, such as WiredTiger. In WiredTiger, there may be many
+    // tombstones (invisible deleted records) to traverse at the beginning of the table.
+    if (!ccs.cappedFirstRecord.isNull()) {
+        // Use a bounded seek instead of seekExact. If this node steps down and a new primary starts
+        // deleting capped documents then this node's cached record will become stale. If this node
+        // steps up again afterwards, then the cached record will be an already deleted document.
+        record =
+            cursor->seek(ccs.cappedFirstRecord, SeekableRecordCursor::BoundInclusion::kInclude);
+    } else {
+        record = cursor->next();
+    }
+
+    while (sizeSaved < sizeOverCap || docsRemoved < docsOverCap) {
+        if (!record) {
+            break;
+        }
+
+        if (record->id == justInserted) {
+            // We're prohibited from deleting what was just inserted.
+            break;
+        }
+
+        docsRemoved++;
+        sizeSaved += record->data.size();
+
+        BSONObj doc = record->data.toBson();
+        if (nss.isReplicated()) {
+            OpObserver* opObserver = opCtx->getServiceContext()->getOpObserver();
+
+            const auto& documentKey = getDocumentKey(collection, doc);
+            OplogDeleteEntryArgs args;
+
+            // If collection has change stream pre-/post-images enabled, pass the 'deletedDoc' for
+            // writing it in the pre-images collection.
+            if (collection->isChangeStreamPreAndPostImagesEnabled()) {
+                args.changeStreamPreAndPostImagesEnabledForCollection = true;
+            }
+            if (collection->areRecordIdsReplicated()) {
+                args.replicatedRecordId = record->id;
+            }
+            if (isReplicatedFastCountEnabled(opCtx)) {
+                args.replicatedSizeDelta = -doc.objsize();
+            }
+
+            // Reserves an optime for the deletion and sets the timestamp for future writes.
+            opObserver->onDelete(opCtx, collection, kUninitializedStmtId, doc, documentKey, args);
+        }
+
+        int64_t keysDeleted = 0;
+        collection->getIndexCatalog()->unindexRecord(opCtx,
+                                                     collection,
+                                                     doc,
+                                                     record->id,
+                                                     /*logIfError=*/false,
+                                                     &keysDeleted);
+
+        // We're about to delete the record our cursor is positioned on, so advance the cursor.
+        RecordId toDelete = std::move(record->id);
+        record = cursor->next();
+
+        collection->getRecordStore()->deleteRecord(
+            opCtx, *shard_role_details::getRecoveryUnit(opCtx), toDelete);
+
+        if (opDebug) {
+            opDebug->getAdditiveMetrics().incrementKeysDeleted(keysDeleted);
+            opDebug->getAdditiveMetrics().incrementNdeleted(1);
+        }
+        globalOpCounters().gotDelete();
+    }
+
+    if (isReplicatedFastCountEnabled(opCtx)) {
+        UncommittedFastCountChanges::record(
+            opCtx,
+            collection->ns(),
+            collection->uuid(),
+            UncommittedFastCountChange{
+                .delta = {.size = -sizeSaved, .count = -docsRemoved},
+                .recordStore = collection->getRecordStore(),
+            });
+    }
+
+    // Update the next record to be deleted. The next record must exist as we're using the same
+    // snapshot the insert was performed on and we can't delete newly inserted records.
+    invariant(record);
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [&ccs, recordId = std::move(record->id)](OperationContext*, boost::optional<Timestamp>) {
+            ccs.cappedFirstRecord = std::move(recordId);
+        });
+}
+
+}  // namespace mongo::collection_internal

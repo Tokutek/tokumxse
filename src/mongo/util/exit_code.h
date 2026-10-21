@@ -1,76 +1,53 @@
-/** @file mongo/util/exit_code.h
- *
- * Mongo exit codes.
- */
-
-/*    Copyright 2009 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <cstring>
+#include "mongo/util/modules.h"
 
-namespace mongo {
-    class OperationContext;
+/**
+ * Mongo exit codes.
+ */
 
-    enum ExitCode {
-        EXIT_CLEAN = 0 ,
-        EXIT_BADOPTIONS = 2 ,
-        EXIT_REPLICATION_ERROR = 3 ,
-        EXIT_NEED_UPGRADE = 4 ,
-        EXIT_SHARDING_ERROR = 5 ,
-        EXIT_KILL = 12 ,
-        EXIT_ABRUPT = 14 ,
-        EXIT_NTSERVICE_ERROR = 20 ,
-        EXIT_JAVA = 21 ,
-        EXIT_OOM_MALLOC = 42 ,
-        EXIT_OOM_REALLOC = 43 ,
-        EXIT_FS = 45 ,
-        EXIT_CLOCK_SKEW = 47 , // OpTime clock skew, deprecated
-        EXIT_NET_ERROR = 48 ,
-        EXIT_WINDOWS_SERVICE_STOP = 49 ,
-        EXIT_POSSIBLE_CORRUPTION = 60 , // this means we detected a possible corruption situation, like a buf overflow
-        EXIT_UNCAUGHT = 100 , // top level exception that wasn't caught
-        EXIT_TEST = 101
-    };
+namespace [[MONGO_MOD_PUBLIC]] mongo {
 
-    /**
-     * Exit the current executable doing whatever cleanup is necessary.
-     * Defined differently in different executables.
-     * No database locks must be held by the thread when this function is called.
-     */
-    void exitCleanly(ExitCode code);
+enum class ExitCode {
+    clean = 0,
+    fail = 1,
+    badOptions = 2,
+    replicationError = 3,
+    needUpgrade = 4,
+    shardingError = 5,
+    kill = 12,
+    abrupt = 14,
+#ifdef _WIN32
+    ntServiceError = 20,
+#endif  // _WIN32
+    java [[deprecated]] = 21,
+    oomMalloc [[deprecated]] = 42,
+    oomRealloc [[deprecated]] = 43,
+    fs [[deprecated]] = 45,
+    clockSkew [[deprecated]] = 47,  // OpTime
+    netError = 48,
+#ifdef _WIN32
+    windowsServiceStop [[deprecated]] = 49,
+#endif  // _WIN32
+    launcherMiddleError = 50,
+    launcherError = 51,
+    possibleCorruption [[deprecated]] = 60,  // e.g. buffer overflow
+    watchdog = 61,                           // Internal Watchdog has terminated mongod
+    needDowngrade = 62,                      // This exe can't use the existing data files
+    reservedBegin = 64,  // FreeBSD uses this range. Avoiding to prevent confusion.
+    perconaAuditError = 70,
+    reservedEnd = 78,         // FreeBSD uses this range. Avoiding to prevent confusion.
+    threadSanitizer = 86,     // Default exit code for Thread Sanitizer failures
+    processHealthCheck = 87,  // Process health check triggered the crash.
+    uncaught = 100,           // top level exception that wasn't caught
+    test [[deprecated]] = 101,
+    auditRotateError = 102,  // The startup rotation of audit logs failed
 
-    /**
-     * Signal main or  ServiceMain thread to exit
-     * Important for the ServiceMain thread to do the exit when mongod/s are running as NT Services
-     * on Windows.
-     * It is not required to be called before exitCleanly in the general case, only for
-     * proper NT Service shutdown.
-     */
-    void signalShutdown();
+    // Percona specific exit codes
+    perconaDataAtRestEncryptionError = 1001
+};
+
 }  // namespace mongo

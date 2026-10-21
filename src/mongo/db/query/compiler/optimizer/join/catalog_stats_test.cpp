@@ -1,0 +1,129 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/query/compiler/optimizer/join/catalog_stats.h"
+
+#include "mongo/bson/json.h"
+#include "mongo/db/query/compiler/optimizer/join/unit_test_helpers.h"
+#include "mongo/unittest/unittest.h"
+
+namespace mongo::join_ordering {
+using CatalogStatsTest = JoinOrderingTestFixture;
+
+TEST_F(CatalogStatsTest, FieldsAreUnique) {
+    UniqueFieldInformation uniqueFields =
+        buildUniqueFieldInfo({fromjson("{foo: 1}"),
+                              fromjson("{bar: 1}"),
+                              fromjson("{baz: -1, qux: 1}"),
+                              fromjson("{a: 1, b: 1, c: 1}"),
+                              fromjson("{b: 1, c: 1, d: 1, e: 1}")});
+
+    // Exact match in unique fields.
+    ASSERT_TRUE(fieldsAreUnique({"foo"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"bar"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"baz", "qux"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"qux", "baz"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"a", "b", "c"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"b", "c", "d", "e"}, uniqueFields));
+
+    // Superset of unique fields.
+    ASSERT_TRUE(fieldsAreUnique({"foo", "nonexistent"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"baz", "qux", "nonexistent"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"a", "b", "c", "foo"}, uniqueFields));
+    ASSERT_TRUE(fieldsAreUnique({"bar", "foo.subfield"}, uniqueFields));
+
+    // Subset of a unique field set is not unique.
+    ASSERT_FALSE(fieldsAreUnique({"baz"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"qux"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"b", "c", "d"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"baz", "nonexistent"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"baz", "a", "b"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"nonexistent"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"a", "b", "cc"}, uniqueFields));
+
+    // Subfield of a unique field is not unique.
+    ASSERT_FALSE(fieldsAreUnique({"foo.subfield"}, uniqueFields));
+    ASSERT_FALSE(fieldsAreUnique({"baz", "qux.subfield"}, uniqueFields));
+}
+
+TEST_F(CatalogStatsTest, NumPagesPrefersStorageEngineLeafPageCount) {
+    // A positive leaf page count is used regardless of the on-disk size, quantized to the nearest
+    // power of 2^(1/4).
+    ASSERT_EQ(CollectionStats(1000, 500, 100, 4096.0).numPages(), 4096.0);
+    ASSERT_EQ(CollectionStats(1000, 500, 100, 4140.0).numPages(), 4096.0);
+
+    // Absent or non-positive counts fall back to the size-based estimate.
+    const double sizeBasedPages = CollectionStats(1000, 500, 100).numPages();
+    ASSERT_GT(sizeBasedPages, 0);
+    ASSERT_EQ(CollectionStats(1000, 500, 100, boost::none).numPages(), sizeBasedPages);
+    ASSERT_EQ(CollectionStats(1000, 500, 100, 0.0).numPages(), sizeBasedPages);
+    ASSERT_EQ(CollectionStats(1000, 500, 100, -1.0).numPages(), sizeBasedPages);
+
+    // hasApproxNumLeafPages() reports whether the size-based fallback was avoided.
+    ASSERT_TRUE(CollectionStats(1000, 500, 100, 4096.0).hasApproxNumLeafPages());
+    ASSERT_FALSE(CollectionStats(1000, 500, 100, boost::none).hasApproxNumLeafPages());
+    ASSERT_FALSE(CollectionStats(1000, 500, 100, 0.0).hasApproxNumLeafPages());
+    ASSERT_FALSE(CollectionStats(1000, 500, 100, -1.0).hasApproxNumLeafPages());
+
+    // Both paths are quantized, so values within the same 2^(1/4) bucket produce identical
+    // results.
+    ASSERT_EQ(CollectionStats(1000, 500, 100).numPages(),
+              CollectionStats(1000, 515, 100).numPages());
+    ASSERT_EQ(CollectionStats(1000, 500, 100, 500.0).numPages(),
+              CollectionStats(1000, 500, 100, 515.0).numPages());
+
+    // Counter values far enough apart land in different buckets.
+    ASSERT_NE(CollectionStats(1000, 500, 100, 500.0).numPages(),
+              CollectionStats(1000, 500, 100, 600.0).numPages());
+}
+
+TEST_F(CatalogStatsTest, NumPagesInStorageEngineCache) {
+    const auto nss = makeNSS("coll");
+
+    auto numPages = [&](CollectionStats collStats, double cacheBytes = 2.0 * 1024 * 1024 * 1024) {
+        return CatalogStats{.collStats = {{nss, collStats}},
+                            .bytesInStorageEngineCache = cacheBytes}
+            .numPagesInStorageEngineCache(nss);
+    };
+
+    // Edge cases: when either size is 0, the function should not crash and return a positive
+    // value (falls back to the default 32 KiB in-memory page size).
+    ASSERT_GT(numPages(CollectionStats{0, 0}), 0);
+    ASSERT_GT(numPages(CollectionStats{0, 1000}), 0);
+    ASSERT_GT(numPages(CollectionStats{1000, 0}), 0);
+
+    // A larger cache should fit more pages.
+    ASSERT_GT(numPages(CollectionStats{1000, 500, 100},
+                       /*cacheBytes*/ 2000),
+              numPages(CollectionStats{1000, 500, 100},
+                       /*cacheBytes*/ 1000));
+
+    // Smaller on-disk page size → more pages on disk → smaller average in-memory page size →
+    // more pages fit in the cache.
+    ASSERT_GT(numPages(CollectionStats{1000, 500, 50}), numPages(CollectionStats{1000, 500, 100}));
+
+    // Higher compression (smaller on-disk size for same logical size) → fewer on-disk pages →
+    // larger average in-memory page → fewer pages fit in cache.
+    ASSERT_GT(numPages(CollectionStats{1000, 500, 100}), numPages(CollectionStats{1000, 250, 100}));
+
+    // When the collection is smaller than a single on-disk page, pagesInColl < 1 so the average
+    // in-memory page size exceeds the logical data size. The result should still be positive.
+    ASSERT_GT(numPages(CollectionStats{10, 10, 100}), 0);
+
+    // When the cache is smaller than the average in-memory page size, fewer than 1 page fits.
+    // The result should again be a positive fraction.
+    const double tinyCachePages = numPages(CollectionStats{1000, 500, 100},
+                                           /*cacheBytes*/ 50);
+    ASSERT_GT(tinyCachePages, 0);
+    ASSERT_LT(tinyCachePages, 1);
+
+    // Quantization: differences in onDiskSizeBytes within a 2^(1/4) bucket should produce the
+    // same result. onDisk 500 vs 515 with pageSize 100 → raw pagesInColl 5.0 vs 5.15 (~3% diff),
+    // both round to the same 2^(1/4) bucket.
+    ASSERT_EQ(numPages(CollectionStats{1000, 500, 100}), numPages(CollectionStats{1000, 515, 100}));
+
+    // Differences large enough to cross a bucket boundary should produce different results.
+    // onDisk 500 vs 520 with pageSize 100 → raw pagesInColl 5.0 vs 5.2, different buckets.
+    ASSERT_NE(numPages(CollectionStats{1000, 500, 100}), numPages(CollectionStats{1000, 520, 100}));
+}
+}  // namespace mongo::join_ordering

@@ -1,0 +1,29 @@
+Graph:
+A -- B
+Solution with seed 0:
+INDEXED_NESTED_LOOP_JOIN
+---leftEmbeddingField: (none)
+---rightEmbeddingField: b
+---joinPredicates:
+------a = b
+---Outer:
+------COLLSCAN
+---------ns = test.a
+---------filter = $and
+---------nodeId = 1
+---------fetched = 1
+---------sortedByDiskLoc = 0
+---------providedSorts = {baseSortPattern: {}, ignoredFields: []}
+---Inner:
+------FETCH
+---------ns = test.b
+---------filter:
+                b $gt 5
+---------nodeId = 3
+---------fetched = 1
+---------sortedByDiskLoc = 0
+---------providedSorts = {baseSortPattern: {}, ignoredFields: []}
+---------Child:
+------------INDEX_PROBE
+---------------Namespace: test.b Index: { b: 1 }
+

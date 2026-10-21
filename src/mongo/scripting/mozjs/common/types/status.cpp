@@ -1,0 +1,145 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/scripting/mozjs/common/types/status.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/scripting/jsexception.h"
+#include "mongo/scripting/mozjs/common/error.h"
+#include "mongo/scripting/mozjs/common/freeOpToJSContext.h"
+#include "mongo/scripting/mozjs/common/internedstring.h"
+#include "mongo/scripting/mozjs/common/objectwrapper.h"
+#include "mongo/scripting/mozjs/common/runtime.h"
+#include "mongo/scripting/mozjs/common/valuereader.h"
+#include "mongo/scripting/mozjs/common/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <jsapi.h>
+
+#include <js/CallArgs.h>
+#include <js/ComparisonOperators.h>
+#include <js/Object.h>
+#include <js/PropertyDescriptor.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
+#include <js/ValueArray.h>
+
+namespace mongo {
+namespace mozjs {
+
+const char* const MongoStatusInfo::className = "MongoStatus";
+const char* const MongoStatusInfo::inheritFrom = "Error";
+
+Status MongoStatusInfo::toStatus(JSContext* cx, JS::HandleObject object) {
+    return *JS::GetMaybePtrFromReservedSlot<Status>(object, StatusSlot);
+}
+
+Status MongoStatusInfo::toStatus(JSContext* cx, JS::HandleValue value) {
+    return *JS::GetMaybePtrFromReservedSlot<Status>(value.toObjectOrNull(), StatusSlot);
+}
+
+void MongoStatusInfo::fromStatus(JSContext* cx, Status status, JS::MutableHandleValue value) {
+    invariant(status != Status::OK());
+    auto runtime = getCommonRuntime(cx);
+
+    JS::RootedValue undef(cx);
+    undef.setUndefined();
+
+    JS::RootedValueArray<1> args(cx);
+    ValueReader(cx, args[0]).fromStringData(status.reason());
+    JS::RootedObject error(cx);
+    getProto<ErrorInfo>(runtime).newInstance(args, &error);
+
+    JS::RootedObject thisv(cx);
+    getProto<MongoStatusInfo>(runtime).newObjectWithProto(&thisv, error);
+    ObjectWrapper thisvObj(cx, thisv);
+    thisvObj.defineProperty(InternedString::code,
+                            JSPROP_ENUMERATE,
+                            smUtils::wrapConstrainedMethod<Functions::code, false, MongoStatusInfo>,
+                            nullptr);
+
+    thisvObj.defineProperty(
+        InternedString::reason,
+        JSPROP_ENUMERATE,
+        smUtils::wrapConstrainedMethod<Functions::reason, false, MongoStatusInfo>,
+        nullptr);
+
+    // We intentionally omit JSPROP_ENUMERATE to match how Error.prototype.stack is a non-enumerable
+    // property.
+    thisvObj.defineProperty(
+        InternedString::stack,
+        0,
+        smUtils::wrapConstrainedMethod<Functions::stack, false, MongoStatusInfo>,
+        nullptr);
+
+    JS::SetReservedSlot(
+        thisv, StatusSlot, JS::PrivateValue(trackedNew<Status>(runtime, std::move(status))));
+
+    value.setObjectOrNull(thisv);
+}
+
+void MongoStatusInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto status = JS::GetMaybePtrFromReservedSlot<Status>(obj, StatusSlot);
+
+    if (status)
+        trackedDelete(getCommonRuntime(freeOpToJSContext(gcCtx)), status);
+}
+
+void MongoStatusInfo::Functions::code::call(JSContext* cx, JS::CallArgs args) {
+    args.rval().setInt32(toStatus(cx, args.thisv()).code());
+}
+
+void MongoStatusInfo::Functions::reason::call(JSContext* cx, JS::CallArgs args) {
+    ValueReader(cx, args.rval()).fromStringData(toStatus(cx, args.thisv()).reason());
+}
+
+void MongoStatusInfo::Functions::stack::call(JSContext* cx, JS::CallArgs args) {
+    JS::RootedObject thisv(cx, args.thisv().toObjectOrNull());
+    JS::RootedObject parent(cx);
+
+    if (!JS_GetPrototype(cx, thisv, &parent)) {
+        uasserted(ErrorCodes::JSInterpreterFailure, "Couldn't get prototype");
+    }
+
+    ObjectWrapper parentWrapper(cx, parent);
+
+    auto status = toStatus(cx, args.thisv());
+    if (auto extraInfo = status.extraInfo<JSExceptionInfo>()) {
+        // 'status' represents an uncaught JavaScript exception that was handled in C++. It is
+        // expected to have been thrown by a JSThread. We chain its stacktrace together with the
+        // stacktrace of the JavaScript exception in the current thread in order to show more
+        // context about the latter's cause.
+        JS::RootedValue stack(cx);
+        ValueReader(cx, &stack)
+            .fromStringData(extraInfo->stack + parentWrapper.getString(InternedString::stack));
+
+        // We redefine the "stack" property as the combined JavaScript stacktrace. It is important
+        // that we omit (TODO/FIXME, no more JSPROP_SHARED) JSPROP_SHARED to the
+        // thisvObj.defineProperty() call in order to have
+        // SpiderMonkey allocate memory for the string value. We also intentionally omit
+        // JSPROP_ENUMERATE to match how Error.prototype.stack is a non-enumerable property.
+        ObjectWrapper thisvObj(cx, args.thisv());
+        thisvObj.defineProperty(InternedString::stack, stack, 0U);
+
+        // We intentionally use thisvObj.getValue() to access the "stack" property to implicitly
+        // verify it has been redefined correctly, as the alternative would be infinite recursion.
+        thisvObj.getValue(InternedString::stack, args.rval());
+    } else {
+        parentWrapper.getValue(InternedString::stack, args.rval());
+    }
+}
+
+void MongoStatusInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto) {
+    auto runtime = getCommonRuntime(cx);
+    JS::SetReservedSlot(proto,
+                        StatusSlot,
+                        JS::PrivateValue(trackedNew<Status>(
+                            runtime, Status(ErrorCodes::UnknownError, "Mongo Status Prototype"))));
+}
+
+}  // namespace mozjs
+}  // namespace mongo

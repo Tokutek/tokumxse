@@ -1,0 +1,143 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/pipeline/window_function/window_function_covariance.h"
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/expression/evaluate.h"
+#include "mongo/db/pipeline/window_function/window_function_sum.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+
+#include <limits>
+#include <vector>
+
+namespace mongo {
+
+namespace {
+// The input Value must be a vector of exactly two numeric Value.
+bool validateValue(const Value& val) {
+    return (val.isArray() && val.getArray().size() == 2 && val.getArray()[0].numeric() &&
+            val.getArray()[1].numeric());
+}
+
+// Convert the non-finite input value to a single Value that is then added to the underlying
+// 'WindowFunctionSum'.
+Value convertNonFiniteInputValue(Value value) {
+    int posCnt = 0, negCnt = 0, nanCnt = 0;
+    bool isDecimal = false;
+    for (const auto& val : value.getArray()) {
+        if (val.isNaN()) {
+            nanCnt++;
+        } else if (val.getType() == BSONType::numberDecimal) {
+            if (val.isInfinite())
+                val.coerceToDecimal().isNegative() ? negCnt++ : posCnt++;
+            isDecimal = true;
+        } else if (val.numeric()) {
+            auto doubleVal = val.coerceToDouble();
+            if (doubleVal == std::numeric_limits<double>::infinity())
+                posCnt++;
+            else if (doubleVal == -std::numeric_limits<double>::infinity())
+                negCnt++;
+        }
+    }
+
+    // Should return NaN over Inf value if both NaN and Inf exist.
+    // Returns NaN if any NaN in 'value' or the two values are of different sign.
+    if (nanCnt > 0 || posCnt * negCnt > 0)
+        return isDecimal ? Value(Decimal128::kPositiveNaN)
+                         : Value(std::numeric_limits<double>::quiet_NaN());
+
+    if (isDecimal)
+        return posCnt > 0 ? Value(Decimal128::kPositiveInfinity)
+                          : Value(Decimal128::kNegativeInfinity);
+    else
+        return posCnt > 0 ? Value(std::numeric_limits<double>::infinity())
+                          : Value(-std::numeric_limits<double>::infinity());
+}
+}  // namespace
+
+WindowFunctionCovariance::WindowFunctionCovariance(ExpressionContext* const expCtx, bool isSamp)
+    : WindowFunctionState(expCtx), _isSamp(isSamp), _meanX(expCtx), _meanY(expCtx), _cXY(expCtx) {
+    _memUsageTracker.set(sizeof(*this));
+}
+
+Value WindowFunctionCovariance::getValue(boost::optional<Value> current) const {
+    if (_count == 1 && !_isSamp)
+        return Value(0.0);
+
+    const double adjustedCount = (_isSamp ? _count - 1 : _count);
+    if (adjustedCount <= 0)
+        return kDefault;  // Covariance not well defined in this case.
+
+    auto output = _cXY.getValue();
+    if (output.getType() == BSONType::numberDecimal) {
+        output = uassertStatusOK(exec::expression::evaluateDivide(output, Value(adjustedCount)));
+    } else if (output.numeric()) {
+        output = Value(output.coerceToDouble() / adjustedCount);
+    }
+
+    return output;
+}
+
+void WindowFunctionCovariance::add(Value value) {
+    // Not supported type of input have no impact on covariance.
+    if (!validateValue(value))
+        return;
+
+    const auto& arr = value.getArray();
+    // The non-finite (nan/inf) value is handled by 'WindowFunctionSum' directly and is not taken
+    // into account when calculating the intermediate values and covariance.
+    if (arr[0].isNaN() || arr[1].isNaN() || arr[0].isInfinite() || arr[1].isInfinite()) {
+        auto infValue = convertNonFiniteInputValue(value);
+        _cXY.add(infValue);
+        return;
+    }
+
+    _count++;
+    // Update covariance and means.
+    // This is an implementation of the following algorithm:
+    // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online
+    auto deltaX = uassertStatusOK(exec::expression::evaluateSubtract(arr[0], _meanX.getValue()));
+    _meanX.add(arr[0]);
+    _meanY.add(arr[1]);
+    auto deltaY = uassertStatusOK(exec::expression::evaluateSubtract(arr[1], _meanY.getValue()));
+    auto deltaCXY = uassertStatusOK(exec::expression::evaluateMultiply(deltaX, deltaY));
+    _cXY.add(deltaCXY);
+}
+
+void WindowFunctionCovariance::remove(Value value) {
+    // Not supported type of input have no impact on covariance.
+    if (!validateValue(value))
+        return;
+
+    const auto& arr = value.getArray();
+    if (arr[0].isNaN() || arr[1].isNaN() || arr[0].isInfinite() || arr[1].isInfinite()) {
+        auto infValue = convertNonFiniteInputValue(value);
+        _cXY.remove(infValue);
+        return;
+    }
+
+    tassert(5424100, "Can't remove from an empty WindowFunctionCovariance", _count > 0);
+    _count--;
+    if (_count == 0) {
+        reset();
+        return;
+    }
+
+    _meanX.remove(arr[0]);
+    auto deltaX = uassertStatusOK(exec::expression::evaluateSubtract(arr[0], _meanX.getValue()));
+    auto deltaY = uassertStatusOK(exec::expression::evaluateSubtract(arr[1], _meanY.getValue()));
+    auto deltaCXY = uassertStatusOK(exec::expression::evaluateMultiply(deltaX, deltaY));
+    _cXY.remove(deltaCXY);
+    _meanY.remove(arr[1]);
+}
+
+void WindowFunctionCovariance::reset() {
+    _count = 0;
+    _meanX.reset();
+    _meanY.reset();
+    _cXY.reset();
+}
+
+}  // namespace mongo

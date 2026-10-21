@@ -1,0 +1,218 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/util/modules.h"
+
+namespace mongo::bsoncolumn {
+
+template <class Buffer>
+requires Appendable<Buffer>
+MONGO_COMPILER_ALWAYS_INLINE_GCC14 void BSONColumnBlockBased::decompress(Buffer& buffer) const {
+    const char* ptr = _binary;
+    const char* end = _binary + _size;
+    BSONType type = BSONType::eoo;  // needs to be set as something else before deltas are parsed
+
+    // If first block(s) are simple8B, these should all be skips.
+    ptr = BSONColumnBlockDecompressHelpers::decompressAllMissing(ptr, end, buffer);
+
+    while (ptr < end) {
+        const uint8_t control = *ptr;
+        if (control == stdx::to_underlying(BSONType::eoo)) {
+            uassert(ErrorCodes::InvalidBSONColumn,
+                    "BSONColumn data ended without reaching end of buffer",
+                    ptr + 1 == end);
+            buffer.eof();
+            return;
+        } else if (isUncompressedLiteralControlByte(control)) {
+            BSONElement literal(ptr, 1, BSONElement::TrustedInitTag{});
+            type = literal.type();
+            ptr += literal.size();
+            switch (type) {
+                case BSONType::boolean:
+                    buffer.template append<bool>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::
+                        decompressAllDeltaPrimitive<bool, int64_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            literal.boolean(),
+                            literal,
+                            [](const int64_t v, const BSONElement& ref, Buffer& buffer) {
+                                buffer.append(static_cast<bool>(v));
+                            });
+                    break;
+                case BSONType::numberInt:
+                    buffer.template append<int32_t>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::
+                        decompressAllDeltaPrimitive<int32_t, int64_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            literal._numberInt(),
+                            literal,
+                            [](const int64_t v, const BSONElement& ref, Buffer& buffer) {
+                                buffer.append(static_cast<int32_t>(v));
+                            });
+                    break;
+                case BSONType::numberLong:
+                    buffer.template append<int64_t>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::
+                        decompressAllDeltaPrimitive<int64_t, int64_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            literal._numberLong(),
+                            literal,
+                            [](const int64_t v, const BSONElement& ref, Buffer& buffer) {
+                                buffer.append(v);
+                            });
+                    break;
+                case BSONType::numberDecimal:
+                    buffer.template append<Decimal128>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::
+                        decompressAllDelta<Decimal128, int128_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            Simple8bTypeUtil::encodeDecimal128(literal._numberDecimal()),
+                            literal,
+                            [](const int128_t v, const BSONElement& ref, Buffer& buffer) {
+                                buffer.append(Simple8bTypeUtil::decodeDecimal128(v));
+                            });
+                    break;
+                case BSONType::numberDouble:
+                    buffer.template append<double>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::decompressAllDouble(
+                        ptr, end, buffer, literal._numberDouble());
+                    break;
+                case BSONType::timestamp:
+                    buffer.template append<Timestamp>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::decompressAllDeltaOfDelta<Timestamp,
+                                                                                      Buffer>(
+                        ptr,
+                        end,
+                        buffer,
+                        literal.timestampValue(),
+                        literal,
+                        [](const int64_t v, const BSONElement& ref, Buffer& buffer) {
+                            buffer.append(static_cast<Timestamp>(v));
+                        });
+                    break;
+                case BSONType::date:
+                    buffer.template append<Date_t>(literal);
+                    ptr =
+                        BSONColumnBlockDecompressHelpers::decompressAllDeltaOfDelta<Date_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            literal.date().toMillisSinceEpoch(),
+                            literal,
+                            [](const int64_t v, const BSONElement& ref, Buffer& buffer) {
+                                buffer.append(Date_t::fromMillisSinceEpoch(v));
+                            });
+                    break;
+                case BSONType::oid:
+                    buffer.template append<OID>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::decompressAllDeltaOfDelta<OID, Buffer>(
+                        ptr,
+                        end,
+                        buffer,
+                        Simple8bTypeUtil::encodeObjectId(literal.__oid()),
+                        literal,
+                        [](const int64_t v, const BSONElement& ref, Buffer& buffer) {
+                            buffer.append(Simple8bTypeUtil::decodeObjectId(
+                                v, ref.__oid().getInstanceUnique()));
+                        });
+                    break;
+                case BSONType::string:
+                    buffer.template append<std::string_view>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::
+                        decompressAllDelta<std::string_view, int128_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            Simple8bTypeUtil::encodeString(literal.valueStringData()).value_or(0),
+                            literal,
+                            [](const int128_t v, const BSONElement& ref, Buffer& buffer) {
+                                auto string = Simple8bTypeUtil::decodeString(v);
+                                buffer.append(
+                                    std::string_view((const char*)string.str.data(), string.size));
+                            });
+                    break;
+                case BSONType::binData: {
+                    buffer.template append<BSONBinData>(literal);
+                    int size;
+                    const char* binary = literal.binData(size);
+                    if (size <= 16) {
+                        ptr = BSONColumnBlockDecompressHelpers::
+                            decompressAllDelta<BSONBinData, int128_t, Buffer>(
+                                ptr,
+                                end,
+                                buffer,
+                                Simple8bTypeUtil::encodeBinary(binary, size).value_or(0),
+                                literal,
+                                [&size](const int128_t v, const BSONElement& ref, Buffer& buffer) {
+                                    char data[16];
+                                    Simple8bTypeUtil::decodeBinary(v, data, size);
+                                    buffer.append(BSONBinData(data, size, ref.binDataType()));
+                                });
+                    } else {
+                        ptr = BSONColumnBlockDecompressHelpers::decompressAllLiteral<int128_t>(
+                            ptr, end, buffer);
+                    }
+                    break;
+                }
+                case BSONType::code:
+                    buffer.template append<BSONCode>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::
+                        decompressAllDelta<BSONCode, int128_t, Buffer>(
+                            ptr,
+                            end,
+                            buffer,
+                            Simple8bTypeUtil::encodeString(literal.valueStringData()).value_or(0),
+                            literal,
+                            [](const int128_t v, const BSONElement& ref, Buffer& buffer) {
+                                auto string = Simple8bTypeUtil::decodeString(v);
+                                buffer.append(BSONCode(
+                                    std::string_view((const char*)string.str.data(), string.size)));
+                            });
+                    break;
+                case BSONType::object:
+                case BSONType::array:
+                case BSONType::undefined:
+                case BSONType::null:
+                case BSONType::regEx:
+                case BSONType::dbRef:
+                case BSONType::codeWScope:
+                case BSONType::symbol:
+                case BSONType::minKey:
+                case BSONType::maxKey:
+                    // Non-delta types, deltas should only contain skip or 0
+                    buffer.template append<BSONElement>(literal);
+                    ptr = BSONColumnBlockDecompressHelpers::decompressAllLiteral<int64_t>(
+                        ptr, end, buffer);
+                    break;
+                default:
+                    uasserted(ErrorCodes::InvalidBSONColumn, "Type not implemented");
+                    break;
+            }
+        } else if (isInterleavedStartControlByte(control)) {
+            internal::BlockBasedInterleavedDecompressor decompressor{
+                buffer.getAllocator(), ptr, end};
+
+            struct RootPath {
+                boost::container::small_vector<const char*, 1> elementsToMaterialize(
+                    BSONObj refObj, bool traverseArrays) {
+                    return {refObj.objdata()};
+                }
+            };
+            std::pair<RootPath, Buffer&> path{RootPath(), buffer};
+            ptr = decompressor.decompress(std::span{&path, 1});
+            ptr = BSONColumnBlockDecompressHelpers::decompressAllLiteral<int64_t>(ptr, end, buffer);
+        } else {
+            uasserted(ErrorCodes::InvalidBSONColumn, "Unexpected control");
+        }
+    }
+}
+
+}  // namespace mongo::bsoncolumn

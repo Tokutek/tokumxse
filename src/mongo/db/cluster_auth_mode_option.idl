@@ -1,0 +1,24 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    mod_visibility: public
+    cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/server_options.h"
+        - "mongo/db/server_options_base.h"
+    configs:
+        section: "General options"
+        source: [cli, ini, yaml]
+        initializer:
+            register: addClusterAuthModeServerOption
+
+configs:
+    "security.clusterAuthMode":
+        description: >-
+            Authentication mode used for cluster authentication. Alternatives are
+            (keyFile|sendKeyFile|sendX509|x509)
+        short_name: clusterAuthMode
+        arg_vartype: String
+        validator:
+            callback: validateSecurityClusterAuthModeSetting

@@ -1,0 +1,944 @@
+# Reference docs: https://bazel.build/run/bazelrc
+
+# coverity need to use the local command without remote execution auto
+# enabled.
+info --config=local
+
+# Used if we need to reset the cache for some reason, just change the value
+# Third party rust code doesnt get passed the --action_env
+common --action_env=RESET_CACHE=A
+common --@rules_rust//rust/settings:extra_rustc_flag=--cfg=reset_cache_A
+common --@rules_rust//rust/settings:extra_exec_rustc_flag=--cfg=reset_cache_A
+
+# Don't use legacy toolchain resolution.
+common --incompatible_enable_cc_toolchain_resolution
+
+# This forces third parties to resolve these rules against the external version of these rules rather than
+# the internal version that used to exist inside bazel
+common --incompatible_autoload_externally=+@rules_cc,+@rules_shell,+@rules_java,+@rules_proto,+@com_google_protobuf,+PyInfo
+
+# Bazel 9 flipped --incompatible_disallow_empty_glob to true. Some third parties have not yet, so disable for now
+common --noincompatible_disallow_empty_glob
+
+# Used to treat third parties as having -isystem passed to them, which is then disable on first party code
+common --features=system_include_paths
+common --host_features=system_include_paths
+
+# Require Python packages to explicitly declare their __init__.py files rather than having
+# rules_python synthesize them in executable runfiles.
+build --incompatible_default_to_explicit_init_py
+
+# https://github.com/bazelbuild/bazel/issues/8766
+# there is WIP to allow users to inject constraints
+# this flag is required because the default for BZLMOD is @platform//host:host
+build --platforms=@internal_platforms_do_not_use//host
+common --enable_workspace=false
+
+# Linter will have issues with duplicate configurations due to some of our
+# install targets depending on tests that have testonly set. This flag can be removed
+# if we stop installing our test targets.
+common --experimental_retain_test_configuration_across_testonly
+
+# allow multiple execution infos to be set
+common --incompatible_modify_execution_info_additive
+
+# This makes builds more hermetic by preventing environment variables from leaking into the execution of rules
+common --incompatible_strict_action_env=true
+
+# cc_library transitively propagates link opts. The build uses cc_shared_library to avoid this when linking
+# dynamically.
+common --experimental_cc_shared_library
+
+# Reuse sandboxes to save sandbox execution and deletion times.
+common --experimental_reuse_sandbox_directories
+
+# Disabling runfiles links drastically increases performance in slow disk IO situations
+# Do not build runfile trees by default. If an execution strategy relies on runfile
+# symlink tree, the tree is created on-demand. See: https://github.com/bazelbuild/bazel/issues/6627
+# and https://github.com/bazelbuild/bazel/commit/03246077f948f2790a83520e7dccc2625650e6df
+common --nobuild_runfile_links
+
+# This will become the default bazel 8.0+
+# https://bazel.build/reference/command-line-reference#flag--legacy_external_runfiles
+common --nolegacy_external_runfiles
+
+# Seeing as we link locally, you'll end up with 99% of the files locally anyways.
+# Using remote download all save some build time because it will immediately download an object
+# file when it is available, where toplevel will wait until the local linking job needs it
+# before starting the download.
+common --remote_download_outputs=all
+
+# Files we always want to download for debugging and error checking
+common --remote_download_regex=.*\.(dwo|h|cpp|test.xml|clang-tidy|clang-tidy\.strict)$
+
+# Disable caching of test results by default since many of our tests are non-deterministic.
+common --cache_test_results=no
+
+# Stream the test output so users can see the test progression.
+common --test_output=streamed
+
+# when using remote asset api, fallback to the direct urls to download
+common --experimental_remote_downloader_local_fallback
+
+# Build only what is necessary to run the *_test and test_suite rules that were
+# not filtered due to their size, timeout, tag, or language.
+test --build_tests_only
+
+# Skip zipping test outputs, to save the extra step of unzipping to investigate them.
+test --nozip_undeclared_test_outputs
+
+# This is a major bottleneck on remote execution concurrency and does not appear to have
+# any negative affects on local RAM usage.
+common --noexperimental_throttle_remote_action_building
+
+# Port blocks that can be exclusively used by one test action at a time, representing
+# a range of 250 ports up until the next block.
+# The contract for acquiring is detailed in buildscripts/bazel_local_resources.py.
+# "common" is used  to avoid invalidating bazel's analysis cache when switching between
+# build and test commands.
+common --local_resources=port_block=40 # 40 distinct port blocks
+common --define=LOCAL_RESOURCES="port_block=20000,20250,20500,20750,21000,21250,21500,21750,22000,22250,22500,22750,23000,23250,23500,23750,24000,24250,24500,24750,25000,25250,25500,25750,26000,26250,26500,26750,27000,27250,27500,27750,28000,28250,28500,28750,29000,29250,29500,29750"
+
+# Default resource allocation for small,medium,large,enormous tests. 
+# Memory is in MB and corresponds to remote execution pool sizes, 3.5GB, 7GB, 14GB
+# NOTE: Keep in sync with SIZE_TO_MEMORY_MB in bazel/test_exec_properties.bzl
+common --default_test_resources=memory=3584,3584,7168,14336
+common --default_test_resources=cpu=1,1,2,4
+
+# Pin down the Microsoft Visual compiler. If you would like to use
+# the default compiler version installed in this host, comment the line.
+common:windows --repo_env=BAZEL_VS="C:/Program Files/Microsoft Visual Studio/2022.14/Professional"
+common:windows --repo_env=BAZEL_VC="C:/Program Files/Microsoft Visual Studio/2022.14/Professional/VC"
+common:windows --repo_env=BAZEL_VC_FULL_VERSION=14.44.35207
+
+# Pin the Windows SDK used by the Bazel MSVC toolchain. Override with
+# --repo_env=BAZEL_WINSDK_FULL_VERSION=<sdk-version> on the command line.
+common:windows --repo_env=BAZEL_WINSDK_FULL_VERSION=10.0.20348.0
+
+# Default the Visual C Redistribution to v14.3 for Windows installer.
+common:windows --repo_env=MONGO_VC_REDIST_FULL_VERSION=v143
+
+# host_features will build tools that are meant to run in the build
+# we don't care about running sanitizer checks on tools that run in the build
+common:linux --host_features=-any_sanitizer
+common:linux --host_features=-asan
+common:linux --host_features=-fsan
+common:linux --host_features=-ubsan
+common:linux --host_features=-tsan
+# we dont need to profile or super optimize just built tools
+common:linux --host_features=-pgo_profile_generate
+common:linux --host_features=-cspgo_profile_generate
+common:linux --host_features=-thin_lto
+common:linux --host_features=-pgo_profile_use
+common:linux --host_features=-cspgo_profile_use
+
+# while in hybrid build state, using local unsandboxed linking should be faster. When most of our link
+# targets have been converted (i.e. unittest binaries) and we can BWOB, remote linking should be faster
+# in those cases:
+common --strategy=CppLink=local
+common --strategy=CppArchive=local
+common --strategy=SolibSymlink=local
+common --strategy=StripDebugInfo=local
+common --strategy=ExtractDebugInfo=local
+common --strategy=GdbGenerateIndex=local
+common --strategy=GdbApplyIndex=local
+common --strategy=TestRunner=local
+common --strategy=CoverageReport=local
+common --strategy=CcGenerateIntermediateDwp=local
+common --strategy=CcGenerateDwp=local
+common --modify_execution_info=^(TestRunner|CppLink|CppArchive|SolibSymlink|ExtractDebugInfo|StripDebugInfo|GdbApplyIndex|CcGenerateIntermediateDwp|CcGenerateDwp)$=+no-remote-cache
+
+# Global clang tidy flags to avoid invalidating analysis cache between clang-tidy / regular runs
+common --@bazel_clang_tidy//:clang_tidy_excludes=".pb.cc,icu_init.cpp"
+common --@bazel_clang_tidy//:clang_tidy_additional_configs=//:clang_tidy_config_files
+common --@bazel_clang_tidy//:clang_tidy_config=//:clang_tidy_config_strict
+common --@bazel_clang_tidy//:clang_tidy_merge_tool=//bazel:merge_tidy_configs
+common --@bazel_clang_tidy//:clang_tidy_executable=//:clang_tidy
+common --@bazel_clang_tidy//:clang_tidy_additional_deps=//:toolchain_files
+common --@bazel_clang_tidy//:clang_tidy_plugin_deps=//src/mongo/tools/mongo_tidy_checks:mongo_tidy_checks
+
+# Aliases for config flags
+common --flag_alias=linkstatic=//bazel/config:linkstatic
+common --flag_alias=compiler_type=//bazel/config:compiler_type
+common --flag_alias=linker=//bazel/config:linker
+common --flag_alias=use_gdbserver=//bazel/config:use_gdbserver
+common --flag_alias=libunwind=//bazel/config:libunwind
+common --flag_alias=spider_monkey_dbg=//bazel/config:spider_monkey_dbg
+common --flag_alias=allocator=//bazel/config:allocator
+common --flag_alias=use_lldbserver=//bazel/config:use_lldbserver
+common --flag_alias=opt=//bazel/config:opt
+common --flag_alias=dbg=//bazel/config:dbg
+common --flag_alias=gdb_index=//bazel/config:gdb_index
+common --flag_alias=debug_symbols=//bazel/config:debug_symbols
+common --flag_alias=thin_lto=//bazel/config:thin_lto
+common --flag_alias=separate_debug=//bazel/config:separate_debug
+common --flag_alias=dev_stacktrace=//bazel/config:dev_stacktrace
+common --flag_alias=use_wait_for_debugger=//bazel/config:use_wait_for_debugger
+common --flag_alias=use_ocsp_stapling=//bazel/config:use_ocsp_stapling
+common --flag_alias=use_disable_ref_track=//bazel/config:use_disable_ref_track
+common --flag_alias=use_wiredtiger=//bazel/config:use_wiredtiger
+common --flag_alias=use_glibcxx_debug=//bazel/config:use_glibcxx_debug
+common --flag_alias=use_tracing_profiler=//bazel/config:use_tracing_profiler
+common --flag_alias=build_otel=//bazel/config:build_otel
+common --flag_alias=shared_archive=//bazel/config:shared_archive
+common --flag_alias=skip_archive=//bazel/config:skip_archive
+common --flag_alias=streams_release_build=//bazel/config:streams_release_build
+common --flag_alias=release=//bazel/config:release
+common --flag_alias=build_enterprise=//bazel/config:build_enterprise
+common --flag_alias=visibility_support=//bazel/config:visibility_support
+common --flag_alias=disable_warnings_as_errors=//bazel/config:disable_warnings_as_errors
+common --flag_alias=gcov=//bazel/config:gcov
+common --flag_alias=pgo_profile_generate=//bazel/config:pgo_profile_generate
+common --flag_alias=pgo_profile_use=//bazel/config:pgo_profile_use
+common --flag_alias=cspgo_profile_generate=//bazel/config:cspgo_profile_generate
+common --flag_alias=cspgo_profile_use=//bazel/config:cspgo_profile_use
+common --flag_alias=bolt_profile_generate=//bazel/config:bolt_profile_generate
+common --flag_alias=bolt_profile_use=//bazel/config:bolt_profile_use
+common --flag_alias=bolt_use_gnu_stack=//bazel/config:bolt_use_gnu_stack
+common --flag_alias=propeller_profile_generate=//bazel/config:propeller_profile_generate
+common --flag_alias=propeller_profile_use=//bazel/config:propeller_profile_use
+common --flag_alias=server_js=//bazel/config:server_js
+common --flag_alias=ssl=//bazel/config:ssl
+common --flag_alias=inmemory=//bazel/config:inmemory
+common --flag_alias=audit=//bazel/config:audit
+common --flag_alias=full_featured=//bazel/config:full-featured
+common --flag_alias=enable_fipsmode=//bazel/config:enable-fipsmode
+common --flag_alias=enable_fcbis=//bazel/config:enable-fcbis
+common --flag_alias=enable_oidc=//bazel/config:enable-oidc
+common --flag_alias=js_engine=//bazel/config:js_engine
+common --flag_alias=use_sasl_client=//bazel/config:use_sasl_client
+common --flag_alias=enterprise_feature_all=//bazel/config:enterprise_feature_all
+common --flag_alias=link_timeout=//bazel/config:link_timeout
+common --flag_alias=compress_debug_compile=//bazel/config:compress_debug_compile
+common --flag_alias=include_mongot=//bazel/config:include_mongot
+# This flag will only work if you pass it on the command line as it is parsed by bazelisk pre-bazel script
+common --flag_alias=include_autogenerated_targets=//bazel/config:include_autogenerated_targets
+common --flag_alias=bolt=//bazel/config:bolt
+common --flag_alias=dwarf_version=//bazel/config:dwarf_version
+common --flag_alias=http_client=//bazel/config:http_client
+common --flag_alias=asan=//bazel/config:asan
+common --flag_alias=fsan=//bazel/config:fsan
+common --flag_alias=msan=//bazel/config:msan
+common --flag_alias=lsan=//bazel/config:lsan
+common --flag_alias=tsan=//bazel/config:tsan
+common --flag_alias=ubsan=//bazel/config:ubsan
+common --flag_alias=dbg_level=//bazel/config:dbg_level
+common --flag_alias=mongo_toolchain_version=//bazel/config:mongo_toolchain_version
+common --flag_alias=simple_build_id=//bazel/config:simple_build_id
+common --flag_alias=create_dwp=//bazel/config:create_dwp
+common --flag_alias=win_min_version=//bazel/config:win_min_version
+common --flag_alias=build_atlas=//bazel/config:build_atlas
+common --flag_alias=dtlto=//bazel/config:dtlto
+common --flag_alias=all_headers=//bazel/config:all_headers
+common --flag_alias=evg=//bazel/config:evg
+common --flag_alias=extensions_signature_verification_secure=//bazel/config:extensions_signature_verification_secure
+common --flag_alias=use_rbe_sysroot=//bazel/config:use_rbe_sysroot
+
+#############################################################################################################################
+# BUILD 'PROFILES' - this is the area to set up configurations of flags to be used by developers.
+# --enable_platform_specific_config=true is passed to every profile so more hardware specific
+# configurations can override the defaults in these profiles. These represent the only supported flag configurations,
+# and should be the only thing passed on the command line in most scenarios
+
+# Every profile should explicitly specify every option used by every other profile, with the exception of the
+# profile modifiers
+
+# The base profiles are fast, opt and debug - these reflect the output directories artifacts will get placed into
+# and match the bazel compilation modes
+
+# Should a profile modify another profile, it should be named {original_profile}_{modifier_name} - example fast_static
+
+# You can use .bazelrc.local to modify the default build type you want to use locally
+
+# Current Profiles:
+# fastbuild
+# dbg
+# dbg_aubsan
+# dbg_tsan
+# opt
+
+# Bazel will by default strip on fastbuild, if we want stripping we will handle it ourselves
+common --strip=never
+
+# Current default profile - fastbuild - this matches the config options of fastbuild. It does not just set --config=fastbuild
+# To avoid the bazel warning about passing multiple configs
+common -c fastbuild
+common --fission=yes
+common --//bazel/config:dwarf_version=5
+common --//bazel/config:compress_debug_compile=True
+common --//bazel/config:opt=off
+common --//bazel/config:dbg=True
+common --//bazel/config:dbg_level=1
+common --//bazel/config:gdb_index=False
+common --//bazel/config:debug_symbols=True
+common --//bazel/config:separate_debug=False
+common --//bazel/config:compiler_type=clang
+common --//bazel/config:linker=mold
+common --//bazel/config:linkstatic=True
+common --//bazel/config:build_enterprise=True
+common --//bazel/config:skip_archive=True
+common --//bazel/config:allocator=auto
+common --//bazel/config:asan=False
+common --//bazel/config:tsan=False
+common --//bazel/config:ubsan=False
+common --//bazel/config:libunwind=auto
+common --//bazel/config:dtlto=False
+common --//bazel/config:pgo_profile_use=False
+common --//bazel/config:cspgo_profile_use=False
+common --//bazel/config:bolt_profile_use=False
+common --//bazel/config:evg=False
+common --jobs=300
+common:macos --jobs=auto
+common:windows --jobs=auto
+common --enable_platform_specific_config=true
+
+# Profile for building fast with minimal debuggability - the build is fast ##################################################
+--config=fastbuild
+common:fastbuild -c fastbuild
+common:fastbuild --fission=yes
+common:fastbuild --//bazel/config:dwarf_version=5
+common:fastbuild --//bazel/config:compress_debug_compile=True
+common:fastbuild --//bazel/config:opt=off
+common:fastbuild --//bazel/config:dbg=True
+common:fastbuild --//bazel/config:dbg_level=1
+common:fastbuild --//bazel/config:debug_symbols=True
+common:fastbuild --//bazel/config:separate_debug=False
+common:fastbuild --//bazel/config:compiler_type=clang
+common:fastbuild --//bazel/config:linker=mold
+common:fastbuild --//bazel/config:linkstatic=True
+common:fastbuild --//bazel/config:build_enterprise=True
+common:fastbuild --//bazel/config:skip_archive=True
+common:fastbuild --//bazel/config:allocator=auto
+common:fastbuild --//bazel/config:asan=False
+common:fastbuild --//bazel/config:tsan=False
+common:fastbuild --//bazel/config:ubsan=False
+common:fastbuild --//bazel/config:dtlto=False
+common:fastbuild --//bazel/config:pgo_profile_use=False
+common:fastbuild --//bazel/config:cspgo_profile_use=False
+common:fastbuild --//bazel/config:bolt_profile_use=False
+common:fastbuild --//bazel/config:libunwind=auto
+common:fastbuild --enable_platform_specific_config=true
+
+# Profile for building highly debuggable code - the build is slow, the code is slow, the binaries are large #################
+--config=dbg
+common:dbg -c dbg
+common:dbg --fission=yes
+common:dbg --//bazel/config:dwarf_version=5
+common:dbg --//bazel/config:compress_debug_compile=True
+common:dbg --//bazel/config:opt=off
+common:dbg --//bazel/config:dbg=True
+common:dbg --//bazel/config:dbg_level=2
+common:dbg --//bazel/config:debug_symbols=True
+common:dbg --//bazel/config:separate_debug=False
+common:dbg --//bazel/config:compiler_type=clang
+common:dbg --//bazel/config:linker=mold
+common:dbg --//bazel/config:linkstatic=True
+common:dbg --//bazel/config:build_enterprise=True
+common:dbg --//bazel/config:skip_archive=True
+common:dbg --//bazel/config:allocator=auto
+common:dbg --//bazel/config:asan=False
+common:dbg --//bazel/config:tsan=False
+common:dbg --//bazel/config:ubsan=False
+common:dbg --//bazel/config:libunwind=auto
+common:dbg --//bazel/config:dtlto=False
+common:dbg --//bazel/config:pgo_profile_use=False
+common:dbg --//bazel/config:cspgo_profile_use=False
+common:dbg --//bazel/config:bolt_profile_use=False
+common:dbg --enable_platform_specific_config=true
+
+# Build with address and undefined sanitizers
+--config=dbg_aubsan
+common:dbg_aubsan --config=dbg
+common:dbg_aubsan --//bazel/config:opt=debug
+common:dbg_aubsan --//bazel/config:linkstatic=False
+common:dbg_aubsan --//bazel/config:allocator=system
+common:dbg_aubsan --//bazel/config:asan=True
+common:dbg_aubsan --//bazel/config:ubsan=True
+common:dbg_aubsan --enable_platform_specific_config=true
+
+# Build with thread sanitizers
+--config=dbg_tsan
+common:dbg_tsan --config=dbg
+common:dbg_tsan --//bazel/config:opt=debug
+common:dbg_tsan --//bazel/config:linkstatic=False
+common:dbg_tsan --//bazel/config:allocator=system
+common:dbg_tsan --//bazel/config:tsan=True
+common:dbg_tsan --//bazel/config:libunwind=off
+common:dbg_tsan --//bazel/config:skip_archive=False
+common:dbg_tsan --enable_platform_specific_config=true
+
+# Profile for building optimized code - the build is slow, the code is fast #################################################
+--config=opt
+common:opt -c opt
+common:opt --fission=yes
+common:opt --//bazel/config:dwarf_version=5
+common:opt --//bazel/config:compress_debug_compile=True
+common:opt --//bazel/config:opt=on
+common:opt --//bazel/config:dbg=False
+common:opt --//bazel/config:dbg_level=2
+common:opt --//bazel/config:debug_symbols=True
+common:opt --//bazel/config:separate_debug=False
+common:opt --//bazel/config:compiler_type=clang
+common:opt --//bazel/config:linker=auto
+common:opt --//bazel/config:linkstatic=True
+common:opt --//bazel/config:build_enterprise=True
+common:opt --//bazel/config:skip_archive=True
+common:opt --//bazel/config:allocator=auto
+common:opt --//bazel/config:asan=False
+common:opt --//bazel/config:tsan=False
+common:opt --//bazel/config:ubsan=False
+common:opt --//bazel/config:libunwind=auto
+common:opt --//bazel/config:dtlto=False
+common:opt --//bazel/config:pgo_profile_use=False
+common:opt --//bazel/config:cspgo_profile_use=False
+common:opt --//bazel/config:bolt_profile_use=False
+common:opt --enable_platform_specific_config=true
+
+--config=opt_profiled
+common:opt_profiled --config=opt
+common:opt_profiled --fission=no
+common:opt_profiled --//bazel/config:separate_debug=True
+common:opt_profiled --//bazel/config:compiler_type=clang
+common:opt_profiled --//bazel/config:dtlto=True
+common:opt_profiled --//bazel/config:pgo_profile_use=True
+common:opt_profiled --//bazel/config:bolt_profile_use=True
+common:opt_profiled --enable_platform_specific_config=true
+
+--config=evg
+common:evg --config=opt
+common:evg --fission=no
+common:evg --evg=True
+# TODO(SERVER-114370): Remove once atlas module is enabled in CI by default
+common:evg --//bazel/config:build_atlas=False
+common:evg --//bazel/config:opt=auto
+common:evg --//bazel/config:separate_debug=True
+# This helps CI cache more actions as it lets the remote host win more often
+common:evg --dynamic_local_execution_delay=20000
+common:evg --enable_platform_specific_config=true
+
+--config=evg_crypt
+common:evg_crypt --config=evg
+common:evg_crypt --//bazel/config:allocator=system
+common:evg_crypt --//bazel/config:js_engine=none
+common:evg_crypt --//bazel/config:ssl=False
+common:evg_crypt --//bazel/config:http_client=False
+common:evg_crypt --//bazel/config:shared_archive=True
+
+--config=evg_crypt_dbg
+common:evg_crypt_dbg --config=evg_crypt
+common:evg_crypt_dbg --//bazel/config:opt=off
+common:evg_crypt_dbg --//bazel/config:dbg=True
+
+--config=evg_crypt_test
+common:evg_crypt_test --config=evg_crypt
+common:evg_crypt_test --//bazel/config:shared_archive=False
+
+
+--config=evg_stitch
+common:evg_stitch --config=evg
+common:evg_stitch --//bazel/config:build_enterprise=False
+common:evg_stitch --//bazel/config:ssl=False
+common:evg_stitch --//bazel/config:http_client=False
+common:evg_stitch --//bazel/config:shared_archive=True
+
+--config=evg_stitch_test
+common:evg_stitch_test --config=evg_stitch
+common:evg_stitch_test --//bazel/config:shared_archive=False
+
+# TODO: Build the code as we would release it
+# common:opt_release --config=opt
+# common:opt_release --//bazel/config:separate_debug=True
+# common:opt_release --//bazel/config:build_enterprise=True
+# common:opt_release --//bazel/config:release=True
+# TODO: Open Source community build flags
+# common:community
+#############################################################################################################################
+
+--config=remote_link
+common:remote_link --strategy=CppLink=remote
+common:remote_link --strategy=CppArchive=remote
+common:remote_link --strategy=SolibSymlink=remote
+common:remote_link --strategy=ExtractDebugInfo=remote
+common:remote_link --strategy=StripDebugInfo=remote
+common:remote_link --strategy=GdbGenerateIndex=remote
+common:remote_link --//bazel/config:remote_link=True
+common:remote_link --features=-thin_archive
+
+--config=remote_test
+common:remote_test --strategy=CppLink=remote
+common:remote_test --strategy=CppArchive=remote
+common:remote_test --strategy=SolibSymlink=remote
+common:remote_test --strategy=ExtractDebugInfo=remote
+common:remote_test --strategy=StripDebugInfo=remote
+common:remote_test --strategy=GdbGenerateIndex=remote
+common:remote_test --//bazel/config:remote_link=True
+common:remote_test --//bazel/config:remote_test=True
+common:remote_test --strategy=TestRunner=remote
+common:remote_test --features=-thin_archive
+common:remote_test --remote_download_outputs=minimal
+common:remote_test --test_output=summary
+
+# The below line unsets the no-remote-cache execution info for the given strategies
+# even though upon first glance it looks like it's setting it.
+common:remote_test --modify_execution_info=^(TestRunner|CppLink|CppArchive|SolibSymlink|ExtractDebugInfo|StripDebugInfo|CcGenerateIntermediateDwp|CcGenerateDwp)$=-no-remote-cache
+common:remote_test --remote_download_regex=.*\.(core|mdmp|gz)$
+
+test:remote_test --test_tag_filters=-incompatible_with_bazel_remote_test
+
+--config=remote_unittest
+common:remote_unittest --config=remote_test
+common:remote_unittest --cache_test_results=auto
+common:remote_unittest --dev_stacktrace=False
+common:remote_unittest --test_timeout=660
+common:remote_unittest --define GIT_COMMIT_HASH=nogitversion
+common:remote_unittest --define MFP_VERSION=nogitversion
+test:remote_unittest --run_under=//bazel:test_wrapper
+test:remote_unittest --test_tag_filters=mongo_unittest,-intermediate_debug,-incompatible_with_bazel_remote_test
+
+# Coverage
+coverage --//bazel/config:coverage=True
+coverage --config=dbg
+coverage --compiler_type=clang
+coverage --linkstatic=False
+coverage --combined_report=lcov
+coverage --experimental_use_llvm_covmap
+coverage --experimental_generate_llvm_lcov
+# Only pull the coverage reports back from remote execution, not every instrumented output
+coverage --remote_download_regex=.*coverage.*\.dat$
+coverage --fission=no
+coverage --build_runfile_links
+coverage --legacy_external_runfiles
+coverage --instrumentation_filter=^//src/mongo[/:],-^//src/mongo/util:boost_assert_shim,-^//src/mongo/util:icu,-^//src/mongo/db/modules/enterprise/src/streams/third_party[/:]
+# Record the compilation directory as "." in the LLVM coverage mapping. Without this, locally
+# executed compiles bake the absolute exec root into the mapping, the collector emits lcov with
+# absolute SF: paths, and CoverageOutputGenerator discards every record -- it logs
+# "WARNING: There was no coverage found." and writes a 0-byte combined report while the tests
+# still pass. Remote compiles happen to produce relative paths already, which is why this only
+# ever showed up in Evergreen (see .bazelrc.evergreen, which disables remote execution).
+coverage --copt=-fcoverage-compilation-dir=.
+
+# This is set in .bazelrc.evergreen:
+# coverage --config=no-remote-exec
+
+# code ownership configuration
+common --define codeowners_add_auto_approve_user=True
+common --define codeowners_have_allowed_unowned_files=True
+common --define codeowners_allowed_unowned_files_path=.github/ALLOWED_UNOWNED_FILES.yml
+common --define codeowners_have_banned_codeowners=True
+common --define codeowners_banned_codeowners_file_path=.github/BANNED_CODEOWNERS.txt
+common --define codeowners_have_default_owner=True
+common --define codeowners_default_owner=@10gen/mongo-default-approvers
+
+# Don't detect the native toolchain on linux, only use the hermetic toolchains.
+# Opt out of this by passing --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0 on the command line.
+common:linux --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+
+# Build with a native/third-party C++ toolchain instead of the hermetic mongo toolchain.
+# This should be passed as the last config if passing multiple configs
+# Example command lines:
+# CC=gcc-14 CXX=g++-14 bazel build --config=opt --config=native_toolchain --compiler_type=gcc install-dist-test
+# CC=clang-19 CXX=clang++-19 bazel build --config=opt_profiled --config=native_toolchain --compiler_type=clang install-dist-test
+# The Bazel wrapper hook treats this config as a native-build opt-out from Linux action containers.
+common:native_toolchain --repo_env=USE_NATIVE_TOOLCHAIN=1
+common:native_toolchain --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=0
+# Even if we use the native toolchain, we only support mold and lld as linkers
+common:native_toolchain --linker=lld
+common:native_toolchain --config=local
+
+# Only use fission and debug compression on Linux
+common:windows --fission=no
+common:windows --//bazel/config:create_dwp=False
+common:windows --//bazel/config:compress_debug_compile=False
+common:macos --fission=no
+common:macos --//bazel/config:create_dwp=False
+common:macos --//bazel/config:compress_debug_compile=False
+
+# Dynamic linking on Windows (DLL generation) is currently not supported.
+common:windows --//bazel/config:linkstatic=True
+common:windows --//bazel/config:skip_archive=False
+
+# The only Windows compiler we support is MSVC.
+common:windows --//bazel/config:compiler_type=msvc
+common:windows --//bazel/config:linker=auto
+
+# Data dependencies don't work in bazel run or bazel test on windows without this
+startup --windows_enable_symlinks
+common:windows --enable_runfiles
+build:windows --action_env=MSYS=winsymlinks:nativestrict
+test:windows --action_env=MSYS=winsymlinks:nativestrict
+
+# Always use clang on macos
+common:macos --//bazel/config:compiler_type=clang
+common:macos --//bazel/config:linker=auto
+
+common:macos --macos_minimum_os=11.0
+# TODO(SERVER-102959): Find out why tests fail when mac is not in compilation mode dbg
+common:macos -c dbg
+
+# Remote execution and caching is the default, but only mongodb employees will be able to access
+# the engflow cluster. External builders should use the --config=local option
+
+# Disable remote execution on Windows and MacOS (they cannot reach the engflow cluster):
+common:windows --remote_executor=
+common:macos --remote_executor=
+
+# Disable atlas module by default on Windows and MacOS since Atlas is only deployed on Linux
+common:windows --//bazel/config:build_atlas=False
+common:macos --//bazel/config:build_atlas=False
+
+# Enable remote build execution and caching:
+common --remote_executor=grpcs://sodalite.cluster.engflow.com
+common --experimental_remote_downloader=grpcs://sodalite.cluster.engflow.com
+common --remote_cache=grpcs://sodalite.cluster.engflow.com
+common --bes_backend=grpcs://sodalite.cluster.engflow.com
+common --bes_results_url=https://sodalite.cluster.engflow.com/invocation/
+common --remote_cache_compression=true
+common --grpc_keepalive_time=30s
+common --nolegacy_important_outputs
+common --bes_keywords=repo:mongo
+common --remote_upload_local_results=False
+
+# Settings specific for clang-tidy
+--config=clang-tidy
+common:clang-tidy --remote_download_outputs=all
+common:clang-tidy --build_tag_filters=not_third_party,-mongo-tidy-tests,-mongo-tidy-tests_debug
+common:clang-tidy --//bazel/config:compiler_type=clang
+common:clang-tidy --keep_going
+common:clang-tidy --aspects @bazel_clang_tidy//clang_tidy:clang_tidy.bzl%clang_tidy_aspect
+common:clang-tidy --output_groups=report
+common:clang-tidy --jobs=300
+
+--config=mod-scanner
+common:mod-scanner --config=dbg
+common:mod-scanner --build_tag_filters=not_third_party,-mongo-tidy-tests,-mongo-tidy-tests_debug
+common:mod-scanner --//bazel/config:compiler_type=clang
+common:mod-scanner --//bazel/config:mongo_toolchain_version=v5
+common:mod-scanner --output_groups=report
+common:mod-scanner --aspects //modules_poc:mod_scanner.bzl%mod_scanner_aspect
+common:mod-scanner --remote_download_regex=.*\.mod_scanner_decls.json$
+
+--config=compiledb
+common:compiledb --aspects //bazel/compiledb:compiledb_aspect.bzl%compiledb_aspect
+common:compiledb --output_groups=compiledb_report
+common:compiledb --keep_going
+common:compiledb --remote_download_regex=.*\.compile_command\.json$
+
+--config=compiledb-aspect
+common:compiledb-aspect --config=compiledb
+
+--config=symbol-checker
+common:symbol-checker --aspects //bazel/symbol_checker:symbol_checker.bzl%symbol_checker_aspect
+common:symbol-checker --output_groups=symbol_checker
+common:symbol-checker --skip_archive=False
+common:symbol-checker --keep_going
+
+# if you don't have access to the remote execution cluster above, use the local config
+# by passing "--config=local" on the bazel command line
+--config=local
+common:local --remote_executor=
+common:local --experimental_remote_downloader=
+common:local --remote_cache=
+common:local --bes_backend=
+common:local --bes_results_url=
+common:local --tls_client_certificate=
+common:local --tls_client_key=
+common:local --remote_cache_compression=false
+common:local --grpc_keepalive_time=0s
+common:local --legacy_important_outputs
+common:local --jobs=auto
+# On Amazon Linux 2023, extract and use the RBE container filesystem as a
+# sysroot so that local builds use the same system headers and libraries as
+# remote execution.
+# The repo_env triggers the sysroot_dump repository rule to extract the container;
+# the config flag tells the toolchain to pass --sysroot to the compiler/linker.
+# On every other host (non-Linux, non-AL2023 distros, s390x/ppc64le) the
+# sysroot_dump repo rule is a no-op, SYSROOT_ENABLED is False, and the
+# toolchain template ignores the config flag and builds without a sysroot.
+common:local --repo_env=USE_RBE_SYSROOT=1
+common:local --//bazel/config:use_rbe_sysroot=True
+
+# Disable remote execution but keep remote cache enabled
+--config=no-remote-exec
+common:no-remote-exec --remote_executor=
+common:no-remote-exec --jobs=auto
+
+# Common settings for all types of release builds
+--config=public-release
+common:public-release --//bazel/config:release=True
+common:public-release --//bazel/config:extensions_signature_verification_secure=True
+common:public-release --remote_instance_name=release
+common:public-release --bes_instance_name=release
+common:public-release --remote_upload_local_results=false
+common:public-release --stamp
+
+# Disable remote execution for public releases but keep remote downloader for artifact caching
+--config=public-release-local
+common:public-release-local --config=public-release
+common:public-release-local --remote_executor=
+common:public-release-local --modify_execution_info=.*=+no-cache
+
+# Release configuration with rbe enabled
+--config=public-release-rbe
+common:public-release-rbe --config=public-release
+
+common --@rules_rust//rust/toolchain/channel=nightly
+common --@rules_rust//rust/settings:experimental_use_allocator_libraries_with_mangled_symbols=true
+# This keeps rust tools built in the middle of the build from using the toolchains libgcc
+# and then trying to use the local hosts libgcc when running
+common:linux --@rules_rust//rust/settings:extra_exec_rustc_flag=-Clink-arg=-static-libgcc
+
+# Treat Rust warnings as errors for all first-party crates
+common --@rules_rust//rust/settings:extra_rustc_flag=-Dwarnings
+
+common --@rules_python//python/config_settings:bootstrap_impl=script
+
+# https://github.com/bazel-contrib/rules_python/issues/2864
+common --@rules_python//python/config_settings:venvs_site_packages=no
+common --@rules_python//python/config_settings:venvs_use_declare_symlink=no
+
+# Experimental flag to collect system network usage metrics during build
+common --experimental_collect_system_network_usage
+
+--config=fission
+common:fission --fission=yes
+common:fission --remote_download_regex=.*\.dwo$
+
+--config=fuzztest
+common:fuzztest --no@fuzztest//fuzztest:use_riegeli
+common:fuzztest --@fuzztest//fuzztest:centipede_integration=True
+common:fuzztest --//bazel/config:fsan=True
+common:fuzztest --//bazel/config:ubsan=True
+common:fuzztest --//bazel/config:opt=debug
+common:fuzztest --//bazel/config:allocator=system
+common:fuzztest --compiler_type=clang
+
+# Avoid failing builds when BES metadata fails to upload.
+common --bes_upload_mode=fully_async
+
+# Default distmod if not specified.
+common --define=MONGO_DISTMOD=""
+
+# Default if .git directory is not present
+common --define=GIT_COMMIT_HASH="nogitversion"
+
+# Version stamped into the message filter plugin. Evergreen overrides this from
+# evergreen/generate_evergreen_bazelrc.sh with YYYYMMDD.hhmmss.<githash>.
+common --define=MFP_VERSION="nogitversion"
+
+# Default retry downloads three times
+common --experimental_repository_downloader_retries=3
+
+# Place golden test output files where buildscripts/golden_tests.py can find them
+common --test_env=GOLDEN_TEST_CONFIG_PATH
+
+# Upload build events to EngFlow
+common --experimental_build_event_upload_strategy=remote
+
+
+# TODO(WT-12780): delete this once wiredtiger switches to /.bazelrc.evergreen.
+try-import %workspace%/.bazelrc.evergreen_engflow_creds
+
+# Evergreen settings, ex. in evergreen this will set the key/cert options for access to the cluster
+try-import %workspace%/.bazelrc.evergreen
+
+# local default dev settings
+try-import %workspace%/.bazelrc.common_bes
+
+# Settings unconditionally written by the wrapper hook
+try-import %workspace%/.bazelrc.wrapper_hook
+
+import %workspace%/.bazelrc.psmdb
+
+# Used for build profiles and any settings a user wants to consistently use
+try-import %workspace%/.bazelrc.local
+
+# Flag as built with bazelisk
+try-import %workspace%/.bazelrc.bazelisk
+
+# Flags synced from Flag Sync
+try-import %workspace%/.bazelrc.sync
+
+# Engflow auth credentials
+try-import %workspace%/.bazelrc.engflow_creds
+
+# Flags for fuzztest
+try-import %workspace%/.bazelrc.fuzztest
+
+# Default mongo version
+try-import %workspace%/.bazelrc.target_mongo_version
+
+# local git version info (after target_mongo_version so its MONGO_VERSION override wins)
+try-import %workspace%/.bazelrc.git
+
+# Repository root absolute path to set --execution_log_compact_file
+#try-import %workspace%/.bazelrc.exec_log_file
+
+# ============================================================
+# macOS Cross-Compilation Configuration
+# ============================================================
+# To cross-compile for macOS from Linux, you need:
+# LLVM and the macOS SDK are automatically downloaded from S3.
+# To override with local paths, set LLVM_PATH and/or MACOS_SDK_PATH env vars.
+#
+# The toolchain is hermetic (LLVM tools + SDK placed into the repo),
+# so both local and remote execution work.
+#
+# Cross-compile for macOS arm64
+build:macos-cross-arm64 --platforms=//bazel/platforms:macos_arm64_cross
+# The rust-based allocator_library bundles the full Rust stdlib into its .a;
+# on Mach-O, ld64.lld then sees the same CGUs in both liballocator_library.a and
+# libstd.a and fails with duplicate-symbol errors. Fall back to the c-based
+# allocator shim for macOS cross links.
+build:macos-cross-arm64 --@rules_rust//rust/settings:experimental_use_allocator_libraries_with_mangled_symbols=false
+common:macos-cross-arm64 --remote_download_outputs=toplevel
+common:macos-cross-arm64 --remote_download_regex=.*\.(dylib|a|dSYM|plist|json|txt|tar|tgz|gz|zip)$
+
+# Cross-compile for macOS x86_64
+build:macos-cross-x86_64 --platforms=//bazel/platforms:macos_x86_64_cross
+build:macos-cross-x86_64 --@rules_rust//rust/settings:experimental_use_allocator_libraries_with_mangled_symbols=false
+common:macos-cross-x86_64 --remote_download_outputs=toplevel
+common:macos-cross-x86_64 --remote_download_regex=.*\.(dylib|a|dSYM|plist|json|txt|tar|tgz|gz|zip)$
+
+# Cross-compile for Windows x86_64 from a Linux hermetic_container/RBE execution environment.
+# The resulting binaries are Windows artifacts and can be run from the host after
+# the build downloads top-level outputs.
+common:windows-cross-x86_64 --platforms=//bazel/platforms:windows_x86_64_cross
+common:windows-cross-x86_64 --//bazel/config:compiler_type=msvc
+common:windows-cross-x86_64 --//bazel/config:linker=auto
+common:windows-cross-x86_64 --//bazel/config:linkstatic=True
+common:windows-cross-x86_64 --//bazel/config:skip_archive=False
+common:windows-cross-x86_64 --//bazel/config:build_atlas=False
+common:windows-cross-x86_64 --fission=no
+common:windows-cross-x86_64 --//bazel/config:create_dwp=False
+common:windows-cross-x86_64 --//bazel/config:compress_debug_compile=False
+common:windows-cross-x86_64 --remote_download_outputs=toplevel
+common:windows-cross-x86_64 --remote_download_regex=.*\.(exe|dll|lib|pdb|res|manifest|json|txt)$
+
+# Cross-compile Linux s390x/ppc64le from the host Bazel process. Compile and
+# tool-generation actions execute on Linux x86_64/aarch64 RBE workers; the
+# final C++ link uses the native host action container by default. The cross
+# repository composes the pinned execution compiler, target runtime, and target
+# container sysroot selected by each concrete config.
+# Keep the WASI execution architecture in these concrete configs (rather than
+# only injecting it from the wrapper hook): tools/bazel bootstraps @py_host
+# before the hook starts, and that bootstrap can instantiate @wasi_sdk.
+common:linux-s390x-cross-rbe --config=linux-s390x-rhel9-cross-rbe
+common:linux-ppc64le-cross-rbe --config=linux-ppc64le-rhel9-cross-rbe
+common:linux-s390x-cross-rbe-arm64 --config=linux-s390x-rhel9-cross-rbe-arm64
+common:linux-ppc64le-cross-rbe-arm64 --config=linux-ppc64le-rhel9-cross-rbe-arm64
+
+common:linux-cross-rbe-toolchain --//bazel/config:compiler_type=clang
+common:linux-cross-rbe-toolchain --//bazel/config:linker=lld
+common:linux-cross-rbe-toolchain --remote_download_outputs=toplevel
+common:linux-cross-rbe-toolchain --remote_download_regex=.*\.(so|a|debug|dwp|json|txt|tar|tgz|gz|zip)$
+# Test binaries are built for the target IBM architecture and run locally on
+# that native Evergreen host; only their compile/link actions use foreign RBE.
+common:linux-cross-rbe-toolchain --use_target_platform_for_tests
+# rules_pycross builds wheel helpers in Bazel's exec configuration. In that
+# configuration the target platform is the IBM host platform rather than the
+# foreign target platform, so the rules need an explicit cross-build marker to
+# select their foreign execution group. The wrapper clears this marker for
+# local release/provenance builds.
+common:linux-cross-rbe-toolchain --define=MONGO_IBM_CROSS=1
+# Prefer the main-repository protobuf toolchain constrained to the foreign
+# execution marker. Local release mode clears this list after config expansion.
+common:linux-cross-rbe-toolchain --extra_toolchains=//bazel/toolchains:mongo_linux_cross_protoc_toolchain
+
+common:linux-s390x-rhel8-cross-rbe --config=linux-cross-rbe-toolchain
+common:linux-s390x-rhel8-cross-rbe --platforms=//bazel/platforms:rhel8_s390x_cross
+common:linux-s390x-rhel8-cross-rbe --extra_execution_platforms=//bazel/platforms:rhel8_amd64_cross
+common:linux-s390x-rhel8-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_s390x_on_rhel8_x86_64//:mongo_exec_toolchain
+common:linux-s390x-rhel8-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_s390x_on_rhel8_x86_64//:mongo_exec_toolchain_for_pycross
+common:linux-s390x-rhel8-cross-rbe --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel8_s390x_on_rhel8_x86_64
+common:linux-s390x-rhel8-cross-rbe --repo_env=MONGO_WASI_SDK_EXEC_ARCH=x86_64
+
+common:linux-s390x-rhel9-cross-rbe --config=linux-cross-rbe-toolchain
+common:linux-s390x-rhel9-cross-rbe --platforms=//bazel/platforms:rhel9_s390x_cross
+common:linux-s390x-rhel9-cross-rbe --extra_execution_platforms=//bazel/platforms:rhel9_amd64_cross
+common:linux-s390x-rhel9-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_s390x_on_rhel9_x86_64//:mongo_exec_toolchain
+common:linux-s390x-rhel9-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_s390x_on_rhel9_x86_64//:mongo_exec_toolchain_for_pycross
+common:linux-s390x-rhel9-cross-rbe --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel9_s390x_on_rhel9_x86_64
+common:linux-s390x-rhel9-cross-rbe --repo_env=MONGO_WASI_SDK_EXEC_ARCH=x86_64
+
+common:linux-s390x-rhel10-cross-rbe --config=linux-cross-rbe-toolchain
+common:linux-s390x-rhel10-cross-rbe --platforms=//bazel/platforms:rhel10_s390x_cross
+common:linux-s390x-rhel10-cross-rbe --extra_execution_platforms=//bazel/platforms:rhel10_amd64_cross
+common:linux-s390x-rhel10-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_s390x_on_rhel10_x86_64//:mongo_exec_toolchain
+common:linux-s390x-rhel10-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_s390x_on_rhel10_x86_64//:mongo_exec_toolchain_for_pycross
+common:linux-s390x-rhel10-cross-rbe --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel10_s390x_on_rhel10_x86_64
+common:linux-s390x-rhel10-cross-rbe --repo_env=MONGO_WASI_SDK_EXEC_ARCH=x86_64
+
+common:linux-ppc64le-rhel8-cross-rbe --config=linux-cross-rbe-toolchain
+common:linux-ppc64le-rhel8-cross-rbe --platforms=//bazel/platforms:rhel8_ppc64le_cross
+common:linux-ppc64le-rhel8-cross-rbe --extra_execution_platforms=//bazel/platforms:rhel8_amd64_cross
+common:linux-ppc64le-rhel8-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_ppc64le_on_rhel8_x86_64//:mongo_exec_toolchain
+common:linux-ppc64le-rhel8-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_ppc64le_on_rhel8_x86_64//:mongo_exec_toolchain_for_pycross
+common:linux-ppc64le-rhel8-cross-rbe --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel8_ppc64le_on_rhel8_x86_64
+common:linux-ppc64le-rhel8-cross-rbe --repo_env=MONGO_WASI_SDK_EXEC_ARCH=x86_64
+
+common:linux-ppc64le-rhel9-cross-rbe --config=linux-cross-rbe-toolchain
+common:linux-ppc64le-rhel9-cross-rbe --platforms=//bazel/platforms:rhel9_ppc64le_cross
+common:linux-ppc64le-rhel9-cross-rbe --extra_execution_platforms=//bazel/platforms:rhel9_amd64_cross
+common:linux-ppc64le-rhel9-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_ppc64le_on_rhel9_x86_64//:mongo_exec_toolchain
+common:linux-ppc64le-rhel9-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_ppc64le_on_rhel9_x86_64//:mongo_exec_toolchain_for_pycross
+common:linux-ppc64le-rhel9-cross-rbe --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel9_ppc64le_on_rhel9_x86_64
+common:linux-ppc64le-rhel9-cross-rbe --repo_env=MONGO_WASI_SDK_EXEC_ARCH=x86_64
+
+common:linux-ppc64le-rhel10-cross-rbe --config=linux-cross-rbe-toolchain
+common:linux-ppc64le-rhel10-cross-rbe --platforms=//bazel/platforms:rhel10_ppc64le_cross
+common:linux-ppc64le-rhel10-cross-rbe --extra_execution_platforms=//bazel/platforms:rhel10_amd64_cross
+common:linux-ppc64le-rhel10-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_ppc64le_on_rhel10_x86_64//:mongo_exec_toolchain
+common:linux-ppc64le-rhel10-cross-rbe --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_ppc64le_on_rhel10_x86_64//:mongo_exec_toolchain_for_pycross
+common:linux-ppc64le-rhel10-cross-rbe --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel10_ppc64le_on_rhel10_x86_64
+common:linux-ppc64le-rhel10-cross-rbe --repo_env=MONGO_WASI_SDK_EXEC_ARCH=x86_64
+
+common:linux-s390x-rhel8-cross-rbe-arm64 --config=linux-cross-rbe-toolchain
+common:linux-s390x-rhel8-cross-rbe-arm64 --platforms=//bazel/platforms:rhel8_s390x_cross
+common:linux-s390x-rhel8-cross-rbe-arm64 --extra_execution_platforms=//bazel/platforms:rhel8_arm64_cross
+common:linux-s390x-rhel8-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_s390x_on_rhel8_aarch64//:mongo_exec_toolchain
+common:linux-s390x-rhel8-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_s390x_on_rhel8_aarch64//:mongo_exec_toolchain_for_pycross
+common:linux-s390x-rhel8-cross-rbe-arm64 --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel8_s390x_on_rhel8_aarch64
+common:linux-s390x-rhel8-cross-rbe-arm64 --repo_env=MONGO_WASI_SDK_EXEC_ARCH=aarch64
+
+common:linux-s390x-rhel9-cross-rbe-arm64 --config=linux-cross-rbe-toolchain
+common:linux-s390x-rhel9-cross-rbe-arm64 --platforms=//bazel/platforms:rhel9_s390x_cross
+common:linux-s390x-rhel9-cross-rbe-arm64 --extra_execution_platforms=//bazel/platforms:rhel9_arm64_cross
+common:linux-s390x-rhel9-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_s390x_on_rhel9_aarch64//:mongo_exec_toolchain
+common:linux-s390x-rhel9-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_s390x_on_rhel9_aarch64//:mongo_exec_toolchain_for_pycross
+common:linux-s390x-rhel9-cross-rbe-arm64 --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel9_s390x_on_rhel9_aarch64
+common:linux-s390x-rhel9-cross-rbe-arm64 --repo_env=MONGO_WASI_SDK_EXEC_ARCH=aarch64
+
+common:linux-s390x-rhel10-cross-rbe-arm64 --config=linux-cross-rbe-toolchain
+common:linux-s390x-rhel10-cross-rbe-arm64 --platforms=//bazel/platforms:rhel10_s390x_cross
+common:linux-s390x-rhel10-cross-rbe-arm64 --extra_execution_platforms=//bazel/platforms:rhel10_arm64_cross
+common:linux-s390x-rhel10-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_s390x_on_rhel10_aarch64//:mongo_exec_toolchain
+common:linux-s390x-rhel10-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_s390x_on_rhel10_aarch64//:mongo_exec_toolchain_for_pycross
+common:linux-s390x-rhel10-cross-rbe-arm64 --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel10_s390x_on_rhel10_aarch64
+common:linux-s390x-rhel10-cross-rbe-arm64 --repo_env=MONGO_WASI_SDK_EXEC_ARCH=aarch64
+
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --config=linux-cross-rbe-toolchain
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --platforms=//bazel/platforms:rhel8_ppc64le_cross
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --extra_execution_platforms=//bazel/platforms:rhel8_arm64_cross
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_ppc64le_on_rhel8_aarch64//:mongo_exec_toolchain
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel8_ppc64le_on_rhel8_aarch64//:mongo_exec_toolchain_for_pycross
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel8_ppc64le_on_rhel8_aarch64
+common:linux-ppc64le-rhel8-cross-rbe-arm64 --repo_env=MONGO_WASI_SDK_EXEC_ARCH=aarch64
+
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --config=linux-cross-rbe-toolchain
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --platforms=//bazel/platforms:rhel9_ppc64le_cross
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --extra_execution_platforms=//bazel/platforms:rhel9_arm64_cross
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_ppc64le_on_rhel9_aarch64//:mongo_exec_toolchain
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel9_ppc64le_on_rhel9_aarch64//:mongo_exec_toolchain_for_pycross
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel9_ppc64le_on_rhel9_aarch64
+common:linux-ppc64le-rhel9-cross-rbe-arm64 --repo_env=MONGO_WASI_SDK_EXEC_ARCH=aarch64
+
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --config=linux-cross-rbe-toolchain
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --platforms=//bazel/platforms:rhel10_ppc64le_cross
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --extra_execution_platforms=//bazel/platforms:rhel10_arm64_cross
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_ppc64le_on_rhel10_aarch64//:mongo_exec_toolchain
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --extra_toolchains=@mongo_linux_cross_toolchain_v5_rhel10_ppc64le_on_rhel10_aarch64//:mongo_exec_toolchain_for_pycross
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --repo_env=MONGO_LINUX_CROSS_TOOLCHAIN=rhel10_ppc64le_on_rhel10_aarch64
+common:linux-ppc64le-rhel10-cross-rbe-arm64 --repo_env=MONGO_WASI_SDK_EXEC_ARCH=aarch64
+
+# This should always be at the bottom because any platform specific configs should always be applied if possible
+common --enable_platform_specific_config=true

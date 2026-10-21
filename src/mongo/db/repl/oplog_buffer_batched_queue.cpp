@@ -1,0 +1,206 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+
+#include "mongo/db/repl/oplog_buffer_batched_queue.h"
+
+#include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+namespace mongo {
+namespace repl {
+
+OplogBufferBatchedQueue::OplogBufferBatchedQueue(std::size_t maxSize)
+    : OplogBufferBatchedQueue(maxSize, nullptr) {}
+
+OplogBufferBatchedQueue::OplogBufferBatchedQueue(std::size_t maxSize, Counters* counters)
+    : _maxSize(maxSize), _counters(counters) {
+    invariant(maxSize > 0);
+}
+
+void OplogBufferBatchedQueue::startup(OperationContext*) {
+    invariant(!_isShutdown);
+    // Update server status metric to reflect the current oplog buffer's max size.
+    if (_counters) {
+        _counters->setMaxSize(_maxSize);
+    }
+}
+
+void OplogBufferBatchedQueue::shutdown(OperationContext* opCtx) {
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _isShutdown = true;
+        _clear(lk);
+    }
+
+    if (_counters) {
+        _counters->clear();
+    }
+}
+
+void OplogBufferBatchedQueue::push(OperationContext*,
+                                   Batch::const_iterator begin,
+                                   Batch::const_iterator end,
+                                   boost::optional<const Cost&> cost) {
+    if (begin == end) {
+        return;
+    }
+
+    invariant(cost);
+    auto size = cost->size;
+    auto count = cost->count;
+
+    {
+        std::unique_lock<std::mutex> lk(_mutex);
+
+        // Block until enough space is available.
+        invariant(!_drainMode);
+        _waitForSpace(lk, size);
+
+        // Do not push anything if already shutdown.
+        if (_isShutdown) {
+            return;
+        }
+
+        bool startedEmpty = _queue.empty();
+        _queue.emplace_back(begin, end, size);
+        _curSize += size;
+        _curCount += count;
+
+        if (size > _maxSize) {
+            LOGV2_DEBUG(
+                12153601,
+                1,
+                "Pushed a batch whose size exceeds _maxSize onto oplog buffer batched queue",
+                "_curSize"_attr = _curSize,
+                "size"_attr = size,
+                "_maxSize"_attr = _maxSize);
+        }
+
+        if (startedEmpty) {
+            _notEmptyCV.notify_one();
+        }
+    }
+
+    if (_counters) {
+        _counters->incrementN(count, size);
+    }
+}
+
+void OplogBufferBatchedQueue::waitForSpace(OperationContext* opCtx, const Cost& cost) {
+    std::unique_lock<std::mutex> lk(_mutex);
+    // This buffer has no limit for count.
+    _waitForSpace(lk, cost.size);
+}
+
+bool OplogBufferBatchedQueue::isEmpty() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    invariant(!_curCount == _queue.empty());
+    return !_curCount;
+}
+
+std::size_t OplogBufferBatchedQueue::getSize() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return _curSize;
+}
+
+std::size_t OplogBufferBatchedQueue::getCount() const {
+    std::lock_guard<std::mutex> lk(_mutex);
+    return _curCount;
+}
+
+void OplogBufferBatchedQueue::clear(OperationContext*) {
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+        _clear(lk);
+    }
+
+    if (_counters) {
+        _counters->clear();
+    }
+}
+
+bool OplogBufferBatchedQueue::tryPopBatch(OperationContext* opCtx, OplogBatch<Value>* batch) {
+    {
+        std::lock_guard<std::mutex> lk(_mutex);
+
+        if (_queue.empty()) {
+            return false;
+        }
+
+        *batch = std::move(_queue.front());
+        _queue.pop_front();
+        _curSize -= batch->byteSize();
+        _curCount -= batch->count();
+
+        // Notify the producer if there is a waiting producer and enough space is available, or if
+        // the queue is now empty (needed when a single entry exceeds _maxSize).
+        if (_waitSize > 0 && (_curSize + _waitSize <= _maxSize || _queue.empty())) {
+            _notFullCV.notify_one();
+        }
+    }
+
+    if (_counters) {
+        _counters->decrementN(batch->count(), batch->byteSize());
+    }
+
+    return true;
+}
+
+bool OplogBufferBatchedQueue::waitForDataFor(Milliseconds waitDuration,
+                                             Interruptible* interruptible) {
+    std::unique_lock<std::mutex> lk(_mutex);
+
+    interruptible->waitForConditionOrInterruptFor(_notEmptyCV, lk, waitDuration, [this] {
+        return !_queue.empty() || _drainMode || _isShutdown;
+    });
+
+    return !_queue.empty();
+}
+
+bool OplogBufferBatchedQueue::waitForDataUntil(Date_t deadline, Interruptible* interruptible) {
+    std::unique_lock<std::mutex> lk(_mutex);
+
+    interruptible->waitForConditionOrInterruptUntil(
+        _notEmptyCV, lk, deadline, [this] { return !_queue.empty() || _drainMode || _isShutdown; });
+
+    return !_queue.empty();
+}
+
+void OplogBufferBatchedQueue::enterDrainMode() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _drainMode = true;
+    _notEmptyCV.notify_one();
+}
+
+void OplogBufferBatchedQueue::exitDrainMode() {
+    std::lock_guard<std::mutex> lk(_mutex);
+    _drainMode = false;
+}
+
+void OplogBufferBatchedQueue::_waitForSpace(std::unique_lock<std::mutex>& lk, std::size_t size) {
+    invariant(size > 0);
+    invariant(!_waitSize);
+
+    // When the buffer is empty and the incoming batch exceeds _maxSize (e.g. a single entry larger
+    // than the buffer capacity), we must not wait forever: the consumer can never drain enough to
+    // satisfy _curSize + size <= _maxSize when size > _maxSize on an empty queue.  Allow the
+    // oversized push to proceed immediately once the queue is empty.
+    while (_curSize + size > _maxSize && !_queue.empty() && !_isShutdown) {
+        // We only support one concurrent producer.
+        _waitSize = size;
+        _notFullCV.wait(lk);
+        _waitSize = 0;
+    }
+}
+
+void OplogBufferBatchedQueue::_clear(WithLock lk) {
+    _queue = {};
+    _curSize = 0;
+    _curCount = 0;
+    _notFullCV.notify_one();
+    _notEmptyCV.notify_one();
+}
+
+}  // namespace repl
+}  // namespace mongo

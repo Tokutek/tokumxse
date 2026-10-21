@@ -1,0 +1,165 @@
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
+#include "mongo/db/commands/kill_op_cmd_base.h"
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_killer.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
+#include <limits>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+namespace mongo {
+
+namespace {
+
+const static absl::flat_hash_set<ErrorCodes::Error> kAllowedKillOpErrorCodes = {
+    ErrorCodes::Interrupted,
+    ErrorCodes::InterruptedDueToOverload,
+};
+
+}  // namespace
+
+void KillOpCmdBase::reportSuccessfulCompletion(OperationContext* opCtx,
+                                               const DatabaseName& dbName,
+                                               const BSONObj& cmdObj) {
+
+    logv2::DynamicAttributes attr;
+
+    auto client = opCtx->getClient();
+    if (client) {
+        if (AuthorizationManager::get(client->getService())->isAuthEnabled()) {
+            if (auto user = AuthorizationSession::get(client)->getAuthenticatedUserName()) {
+                attr.add("user", BSON_ARRAY(user->toBSON()));
+            } else {
+                attr.add("user", BSONArray());
+            }
+        }
+
+        if (client->session()) {
+            attr.add("remote", client->session()->remote());
+        }
+
+        if (auto metadata = ClientMetadata::get(client)) {
+            attr.add("metadata", metadata->getDocument());
+        }
+    }
+
+    attr.add("db", dbName);
+    attr.add("command", cmdObj);
+
+    LOGV2(558700, "Successful killOp", attr);
+}
+
+
+Status KillOpCmdBase::checkAuthForOperation(OperationContext* workerOpCtx,
+                                            const DatabaseName&,
+                                            const BSONObj& cmdObj) const {
+    auto* worker = workerOpCtx->getClient();
+    auto opKiller = OperationKiller(worker);
+
+    ErrorCodes::Error errorCode = parseErrorCode(workerOpCtx, cmdObj);
+    if (!kAllowedKillOpErrorCodes.contains(errorCode)) {
+        return Status(ErrorCodes::Unauthorized, "Unauthorized");
+    }
+    if (opKiller.isGenerallyAuthorizedToKill()) {
+        return Status::OK();
+    }
+    // Only generally authorized to kill users can specify a custom error code.
+    if (errorCode != kDefaultErrorCode) {
+        return Status(ErrorCodes::Unauthorized, "Unauthorized");
+    }
+
+    if (isKillingLocalOp(cmdObj.getField("op"))) {
+        // Look up each OperationContext and see if we have permission to kill it. This is done once
+        // here and again in the command body. The check here in the checkAuthForOperation function
+        // is necessary because if the check fails, it will be picked up by the auditing system.
+        // For an array of op IDs, authorize if the user is authorized to kill all of them.
+        auto opIds = parseOpIds(cmdObj);
+        for (auto opId : opIds) {
+            auto target = worker->getServiceContext()->getLockedClient(opId);
+            if (!opKiller.isAuthorizedToKill(target)) {
+                return Status(ErrorCodes::Unauthorized, "Unauthorized");
+            }
+        }
+        return Status::OK();
+    }
+
+    return Status(ErrorCodes::Unauthorized, "Unauthorized");
+}
+
+void KillOpCmdBase::killLocalOperation(OperationContext* opCtx,
+                                       OperationId opToKill,
+                                       ErrorCodes::Error killCode) {
+    OperationKiller(opCtx->getClient()).killOperation(opToKill, killCode);
+}
+
+bool KillOpCmdBase::isKillingLocalOp(const BSONElement& opElem) {
+    return opElem.isNumber() || opElem.type() == BSONType::array;
+}
+
+unsigned int KillOpCmdBase::parseOpId(const BSONObj& cmdObj) {
+    long long op;
+    uassertStatusOK(bsonExtractIntegerField(cmdObj, "op", &op));
+
+    uassert(26823,
+            str::stream() << "invalid op : " << op << ". Op ID cannot be represented with 32 bits",
+            (op >= std::numeric_limits<int>::min()) && (op <= std::numeric_limits<int>::max()));
+
+    return static_cast<unsigned int>(op);
+}
+
+std::vector<unsigned int> KillOpCmdBase::parseOpIds(const BSONObj& cmdObj) {
+    auto opElem = cmdObj.getField("op");
+
+    if (opElem.isNumber()) {
+        return {parseOpId(cmdObj)};
+    }
+
+    uassert(12212701,
+            "\"op\" field must be a number or an array of numbers",
+            opElem.type() == BSONType::array);
+
+    std::vector<unsigned int> opIds;
+    for (auto&& elem : opElem.Array()) {
+        uassert(12212702, "Each element of the \"op\" array must be a number", elem.isNumber());
+        long long op = elem.safeNumberLong();
+        uassert(12212703,
+                str::stream() << "invalid op : " << op
+                              << ". Op ID cannot be represented with 32 bits",
+                (op >= std::numeric_limits<int>::min()) && (op <= std::numeric_limits<int>::max()));
+        opIds.push_back(static_cast<unsigned int>(op));
+    }
+
+    uassert(12212704, "\"op\" array must not be empty", !opIds.empty());
+    return opIds;
+}
+
+ErrorCodes::Error KillOpCmdBase::parseErrorCode(OperationContext* opCtx, const BSONObj& cmdObj) {
+    if (gFeatureFlagKillOpErrorCodeOverride.isEnabledUseLatestFCVWhenUninitialized(
+            VersionContext::getDecoration(opCtx),
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        if (auto bsonErrorCode = cmdObj.getField("errorCode")) {
+            return ErrorCodes::Error{bsonErrorCode.numberInt()};
+        }
+    }
+    return kDefaultErrorCode;
+}
+
+}  // namespace mongo

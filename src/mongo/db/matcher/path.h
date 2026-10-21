@@ -1,170 +1,289 @@
-// path.h
-
-/**
- *    Copyright (C) 2013 10gen Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/field_ref.h"
+#include "mongo/db/query/query_execution_knobs_gen.h"
+#include "mongo/util/modules.h"
 
-namespace mongo {
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
 
-    class ElementPath {
-    public:
-        Status init( StringData path );
+#include <boost/optional/optional.hpp>
 
-        void setTraverseNonleafArrays( bool b ) { _shouldTraverseNonleafArrays = b; }
-        void setTraverseLeafArray( bool b ) { _shouldTraverseLeafArray = b; }
+/**
+ * TODO SERVER-114832 Break audit dependency on this class.
+ */
+namespace [[MONGO_MOD_NEEDS_REPLACEMENT]] mongo {
 
-        const FieldRef& fieldRef() const { return _fieldRef; }
-        bool shouldTraverseNonleafArrays() const { return _shouldTraverseNonleafArrays; }
-        bool shouldTraverseLeafArray() const { return _shouldTraverseLeafArray; }
+class ElementPath {
+public:
+    /**
+     * Controls how the element path interacts with leaf arrays, e.g. how we will handle the path
+     * "a.b" when "b" is an array.
+     */
+    enum class LeafArrayBehavior {
+        // Matches against the elements of arrays at the end of the path (in addition to the array
+        // as a whole).
+        //
+        // For example, for the path "f" and document {f: [1, 2]}, causes the path iterator to
+        // return 1, 2, and [1, 2].
+        kTraverse,
 
-    private:
-        FieldRef _fieldRef;
-        bool _shouldTraverseNonleafArrays;
-        bool _shouldTraverseLeafArray;
+        // Does not traverse arrays at the end of the path. For the path "f" and document {f: [1,
+        // 2]}, the path iterator returns only the entire array [1, 2].
+        kNoTraversal,
+
+        // Matches against the elements of arrays at the end of the path. The same as kTraverse, but
+        // does not match the array as a whole.
+        //
+        // For example, for the path "f" and document {f: [1, 2]}, causes the path iterator to
+        // return 1 and 2.
+        kTraverseOmitArray,
     };
 
-    class ElementIterator {
-    public:
-        class Context {
-        public:
+    /**
+     * Controls how the element path interacts with non-leaf arrays, e.g. how we will handle the
+     * path "a.b" when "a" is an array.
+     */
+    enum class NonLeafArrayBehavior {
+        // Path traversal spans non-leaf arrays.
+        kTraverse,
 
-            void reset();
+        // Path traversal stops at non-leaf array boundaries. The path iterator will return no
+        // elements.
+        kNoTraversal,
 
-            void reset( BSONElement element, BSONElement arrayOffset, bool outerArray );
-
-            void setArrayOffset( BSONElement e ) { _arrayOffset = e; }
-
-            BSONElement element() const { return _element; }
-            BSONElement arrayOffset() const { return _arrayOffset; }
-            bool outerArray() const { return _outerArray; }
-
-        private:
-            BSONElement _element;
-            BSONElement _arrayOffset;
-            bool _outerArray;
-        };
-
-        virtual ~ElementIterator();
-
-        virtual bool more() = 0;
-        virtual Context next() = 0;
-
+        // Path traversal stops at non-leaf array boundaries. The path iterator will return the
+        // array element.
+        kMatchSubpath,
     };
 
-    // ---------------------------------------------------------------
+    ElementPath(std::string_view path,
+                LeafArrayBehavior leafArrayBehavior = LeafArrayBehavior::kTraverse,
+                NonLeafArrayBehavior nonLeafArrayBehavior = NonLeafArrayBehavior::kTraverse)
+        : _leafArrayBehavior(leafArrayBehavior),
+          _nonLeafArrayBehavior(nonLeafArrayBehavior),
+          _legacyDottedPathNullSemantics(internalQueryLegacyDottedPathNullSemantics.loadRelaxed()),
+          _fieldRef(path) {}
 
-    class SingleElementElementIterator : public ElementIterator {
+    /**
+     * Resets this ElementPath to 'newPath'. Note that this method will make a copy of 'newPath'
+     * such that there's no lifetime requirements for the string which 'newPath' points into.
+     */
+    void reset(std::string_view newPath) {
+        _fieldRef.parse(newPath);
+    }
+
+    void setLeafArrayBehavior(LeafArrayBehavior leafArrBehavior) {
+        _leafArrayBehavior = leafArrBehavior;
+    }
+
+    LeafArrayBehavior leafArrayBehavior() const {
+        return _leafArrayBehavior;
+    }
+
+    void setNonLeafArrayBehavior(NonLeafArrayBehavior value) {
+        _nonLeafArrayBehavior = value;
+    }
+
+    NonLeafArrayBehavior nonLeafArrayBehavior() const {
+        return _nonLeafArrayBehavior;
+    }
+
+    bool legacyDottedPathNullSemantics() const {
+        return _legacyDottedPathNullSemantics;
+    }
+
+    const FieldRef& fieldRef() const {
+        return _fieldRef;
+    }
+
+private:
+    LeafArrayBehavior _leafArrayBehavior;
+    NonLeafArrayBehavior _nonLeafArrayBehavior;
+    bool _legacyDottedPathNullSemantics;
+
+    FieldRef _fieldRef;
+};
+
+class ElementIterator {
+public:
+    class Context {
     public:
-        explicit SingleElementElementIterator( BSONElement e )
-            : _seen( false ) {
-            _element.reset( e, BSONElement(), false );
+        void reset();
+
+        void reset(BSONElement element, BSONElement arrayOffset);
+
+        void setArrayOffset(BSONElement e) {
+            _arrayOffset = e;
         }
-        virtual ~SingleElementElementIterator(){}
 
-        virtual bool more() { return !_seen; }
-        virtual Context next() { _seen = true; return _element; }
-
-    private:
-        bool _seen;
-        ElementIterator::Context _element;
-    };
-
-    class SimpleArrayElementIterator : public ElementIterator {
-    public:
-        SimpleArrayElementIterator( const BSONElement& theArray, bool returnArrayLast );
-
-        virtual bool more();
-        virtual Context next();
+        BSONElement element() const {
+            return _element;
+        }
+        BSONElement arrayOffset() const {
+            return _arrayOffset;
+        }
 
     private:
-        BSONElement _theArray;
-        bool _returnArrayLast;
-        BSONObjIterator _iterator;
+        BSONElement _element;
+        BSONElement _arrayOffset;
     };
 
-    class BSONElementIterator : public ElementIterator {
-    public:
-        BSONElementIterator();
-        BSONElementIterator( const ElementPath* path, const BSONObj& context );
+    virtual ~ElementIterator();
 
-        virtual ~BSONElementIterator();
+    virtual bool more() = 0;
+    virtual Context next() = 0;
+};
 
-        void reset( const ElementPath* path, const BSONObj& context );
+// ---------------------------------------------------------------
+
+class SingleElementElementIterator : public ElementIterator {
+public:
+    explicit SingleElementElementIterator(BSONElement e) : _seen(false) {
+        _element.reset(e, BSONElement());
+    }
+
+    ~SingleElementElementIterator() override {}
+
+    bool more() override {
+        return !_seen;
+    }
+    Context next() override {
+        _seen = true;
+        return _element;
+    }
+
+private:
+    bool _seen;
+    ElementIterator::Context _element;
+};
+
+class SimpleArrayElementIterator : public ElementIterator {
+public:
+    SimpleArrayElementIterator(const BSONElement& theArray, bool returnArrayLast);
+
+    bool more() override;
+    Context next() override;
+
+private:
+    BSONElement _theArray;
+    bool _returnArrayLast;
+    BSONObjIterator _iterator;
+};
+
+struct BSONElementSubIterator;
+
+class BSONElementIterator : public ElementIterator {
+public:
+    BSONElementIterator();
+
+    BSONElementIterator(BSONElementIterator&& other) noexcept = default;
+    BSONElementIterator(const BSONElementIterator& other) = delete;
+
+    BSONElementIterator& operator=(BSONElementIterator&& other) noexcept = default;
+    BSONElementIterator& operator=(const BSONElementIterator& other) = delete;
+
+    /**
+     * Constructs an iterator over 'elementToIterate', where the desired element(s) is/are at the
+     * end of the suffix of 'path' starting at 'suffixIndex'. For example, constructing a
+     * BSONElementIterator with path="a.b.c", suffixIndex=1, and 'elementToIterate' as the
+     * subdocument located at 'a' within the object {a: {b: [{c: 1}, {c: 2}]}} would iterate over
+     * the elements of {b: [{c: 1}, {c: 2}]} at the end of the path 'b.c'. 'elementToIterate' does
+     * not need to be of type Object, so it would also be valid to construct a BSONElementIterator
+     * with path="a.b" and 'elementToIterate' as the array within 'a.b'.
+     */
+    BSONElementIterator(const ElementPath* path, size_t suffixIndex, BSONElement elementToIterate);
+
+    /**
+     * Constructs an iterator over 'objectToIterate', where the desired element(s) is/are at the end
+     * of 'path'.
+     */
+    BSONElementIterator(const ElementPath* path, const BSONObj& objectToIterate);
+
+    ~BSONElementIterator() override;
+
+    void reset(const ElementPath* path, size_t suffixIndex, BSONElement elementToIterate);
+    void reset(const ElementPath* path, const BSONObj& objectToIterate);
+
+    bool more() override;
+    Context next() override;
+
+private:
+    /**
+     * Helper for more().  Recurs on _subCursor (which traverses the remainder of a path through
+     * subdocuments of an array).
+     */
+    bool subCursorHasMore();
+
+    /**
+     * Sets _traversalStart and _traversalStartIndex by traversing 'elementToIterate' along the
+     * suffix of '_path' starting at 'suffixIndex'.
+     */
+    void _setTraversalStart(size_t suffixIndex, BSONElement elementToIterate);
+
+    const ElementPath* _path;
+
+    // The element where we begin our iteration. This is either:
+    // -- The element at the end of _path.
+    // -- The first array element encountered along _path.
+    // -- EOO, if _path does not exist in the object/element we are exploring.
+    BSONElement _traversalStart;
+
+    // This index of _traversalStart in _path, or 0 if _traversalStart is EOO.
+    size_t _traversalStartIndex;
+
+    enum State { BEGIN, IN_ARRAY, DONE } _state;
+    Context _next;
+
+    struct ArrayIterationState {
+        void reset(const FieldRef& ref, int start);
+        void startIterator(BSONElement theArray);
 
         bool more();
-        Context next();
+        BSONElement next();
 
-    private:
-        /**
-         * Helper for more().  Recurs on _subCursor (which traverses the remainder of a path through
-         * subdocuments of an array).
-         */
-        bool subCursorHasMore();
+        bool isArrayOffsetMatch(std::string_view fieldName) const;
+        bool nextEntireRest() const {
+            return nextPieceOfPath.size() == restOfPath.size();
+        }
 
-        const ElementPath* _path;
-        BSONObj _context;
+        std::string restOfPath;
+        std::string_view nextPieceOfPath;
+        bool hasMore;
+        bool nextPieceOfPathIsNumber;
 
-        enum State { BEGIN, IN_ARRAY, DONE } _state;
-        Context _next;
-
-        struct ArrayIterationState {
-
-            void reset( const FieldRef& ref, int start );
-            void startIterator( BSONElement theArray );
-
-            bool more();
-            BSONElement next();
-
-            bool isArrayOffsetMatch( StringData fieldName ) const;
-            bool nextEntireRest() const { return nextPieceOfPath.size() == restOfPath.size(); }
-
-            std::string restOfPath;
-            bool hasMore;
-            StringData nextPieceOfPath;
-            bool nextPieceOfPathIsNumber;
-
-            BSONElement _theArray;
-            BSONElement _current;
-            boost::scoped_ptr<BSONObjIterator> _iterator;
-        };
-
-        ArrayIterationState _arrayIterationState;
-
-        boost::scoped_ptr<ElementIterator> _subCursor;
-        boost::scoped_ptr<ElementPath> _subCursorPath;
+        BSONElement _theArray;
+        BSONElement _current;
+        boost::optional<BSONObjIterator> _iterator;
     };
 
-}
+    ArrayIterationState _arrayIterationState;
+
+    // Pointer to optional. The optional is used for a convenient API to re-use the memory between
+    // instances. Need to wrap with pointer to break cycle when we recursively contain member to
+    // self.
+    std::unique_ptr<boost::optional<BSONElementSubIterator>> _subIterator;
+};
+
+struct BSONElementSubIterator {
+    BSONElementSubIterator(const BSONObj& objectToIterate,
+                           std::string_view pathToIterate,
+                           ElementPath::LeafArrayBehavior leafArrayBehavior =
+                               ElementPath::LeafArrayBehavior::kTraverse,
+                           ElementPath::NonLeafArrayBehavior nonLeafArrayBehavior =
+                               ElementPath::NonLeafArrayBehavior::kTraverse);
+
+    ElementPath path;
+    BSONElementIterator cursor;
+};
+
+}  // namespace mongo

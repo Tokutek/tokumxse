@@ -1,0 +1,32 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+global:
+    cpp_namespace: mongo
+    mod_visibility: private
+
+server_parameters:
+    waitForSecondaryBeforeNoopWriteMS:
+        description: >-
+            The length of time (in milliseconds) that a secondary must wait if the afterClusterTime
+            is greater than the last applied time from the oplog. After the
+            waitForSecondaryBeforeNoopWriteMS passes, if the afterClusterTime is still greater than
+            the last applied time, the secondary makes a no-op write to advance the last applied
+            time.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: waitForSecondaryBeforeNoopWriteMS
+        default: 10
+        redact: false
+
+    testingSnapshotBehaviorInIsolation:
+        description: >-
+            Allows for testing of snapshot behavior by skipping the replication
+            related checks and isolating the storage/query side of snapshotting.
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: gTestingSnapshotBehaviorInIsolation
+        default: false
+        redact: false
+        test_only: true
+        mod_visibility: public_for_technical_reasons

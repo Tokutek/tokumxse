@@ -1,0 +1,12 @@
+# Copyright (c) MongoDB, Inc.
+# SPDX-License-Identifier: SSPL-1.0
+
+# IDL Basic Types for compatibility testing
+
+types:
+    dummyType:
+        bson_serialization_type: string
+        description: "A dummy type used for testing compatibility"
+        cpp_type: "std::string"
+        deserializer: "mongo::BSONElement::str"
+        is_view: false
